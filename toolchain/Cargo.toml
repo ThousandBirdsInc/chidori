@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "prompt-graph-core",
+    "prompt-graph-exec",
+    "chidori",
+]
+
+[profile.release]
+lto = true

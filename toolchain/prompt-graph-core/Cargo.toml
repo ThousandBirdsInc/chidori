@@ -1,0 +1,43 @@
+[package]
+name = "prompt-graph-core"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "prompt_graph_core"
+crate-type = ["cdylib", "lib"]
+bench = false
+
+[features]
+python = []
+nodejs = []
+build-protos = []
+
+
+# https://chat.openai.com/c/52edc960-dc19-4df7-b36f-30caad9c1905
+[dependencies]
+protobuf = "3.2.0"
+sqlparser = "0.34.0"
+apollo-compiler = { git = "https://github.com/ThousandBirdsInc/apollo-rs-with-editable-encoder.git", rev = "cf9b4fd03700c87b591a64b491d79130b028e90f"}
+apollo-encoder = { git = "https://github.com/ThousandBirdsInc/apollo-rs-with-editable-encoder.git", rev = "cf9b4fd03700c87b591a64b491d79130b028e90f" }
+apollo-parser = { git = "https://github.com/ThousandBirdsInc/apollo-rs-with-editable-encoder.git", rev = "cf9b4fd03700c87b591a64b491d79130b028e90f" }
+handlebars = "4.3.7"
+anyhow = { version = "1.0", default-features = false }
+indoc = "1.0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.96"
+tonic = "0.9"
+prost = "0.11"
+num_cpus = "1"
+tokio = { version = "1", features = ["full"] }
+petgraph = "0.6.3"
+
+typescript-type-def = "0.5.7"
+env_logger = "0.10.0"
+log = "0.4.16"
+
+futures = "0.3.15"
+
+[build-dependencies]
+tonic-build = "0.9.2"

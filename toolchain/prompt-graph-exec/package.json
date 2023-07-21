@@ -1,0 +1,19 @@
+{
+  "name": "prompt_graph_exec",
+  "module": "true",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Prompt Graph Exec",
+  "main": "index.node",
+  "scripts": {
+    "build": "cargo-cp-artifact -nc index.node -- cargo build --message-format=json-render-diagnostics --features nodejs",
+    "install": "npm run build",
+    "test": "cargo test",
+    "test-js": "jest tests/nodejs"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "cargo-cp-artifact": "^0.1",
+    "jest": "^29.6.1"
+  }
+}

@@ -1,0 +1,504 @@
+syntax = "proto3";
+package promptgraph;
+
+// This format is used to serialize and deserialize
+// PromptGraph definitions
+// This is used to provide a language agnostic interface
+// for defining PromptGraphs
+
+enum SupportedChatModel {
+  GPT_4 = 0;
+  GPT_4_0314 = 1;
+  GPT_4_32K = 2;
+  GPT_4_32K_0314 = 3;
+  GPT_3_5_TURBO = 4;
+  GPT_3_5_TURBO_0301 = 5;
+}
+
+enum SupportedCompletionModel {
+  TEXT_DAVINCI_003 = 0;
+  TEXT_DAVINCI_002 = 1;
+  TEXT_CURIE_001 = 2;
+  TEXT_BABBAGE_001 = 3;
+  TEXT_ADA_00 = 4;
+}
+
+enum SupportedEmebddingModel {
+  TEXT_EMBEDDING_ADA_002 = 0;
+  TEXT_SEARCH_ADA_DOC_001 = 1;
+}
+
+enum SupportedVectorDatabase {
+  IN_MEMORY = 0;
+  CHROMA = 1;
+  PINECONEDB = 2;
+  QDRANT = 3;
+}
+
+enum SupportedSourceCodeLanguages {
+  DENO = 0;
+  STARLARK = 1;
+}
+
+message Query {
+  optional string query = 1;
+}
+
+// Processed version of the Query
+message QueryPaths {
+  string node = 1;
+  repeated Path path = 2;
+}
+
+message OutputType {
+  string output = 2;
+}
+
+// Processed version of the OutputType
+message OutputPaths {
+  string node = 1;
+  repeated Path path = 2;
+}
+
+// Alias is a reference to another node, any value set
+// on this node will propagate for the alias as well
+message PromptGraphAlias {
+  string from = 2;
+  string to = 3;
+}
+
+message PromptGraphConstant {
+  SerializedValue value = 2;
+}
+
+message PromptGraphVar {
+}
+
+message PromptGraphOutputValue {
+}
+
+
+message PromptGraphNodeCodeSourceCode {
+  SupportedSourceCodeLanguages language = 1;
+  string sourceCode = 2;
+  bool template = 3;
+}
+
+message PromptGraphParameterNode {
+}
+
+message PromptGraphMap {
+  string path = 4;
+}
+
+message PromptGraphNodeCode {
+  oneof source {
+    PromptGraphNodeCodeSourceCode sourceCode = 6;
+    bytes zipfile = 7;
+    string s3Path = 8;
+  }
+}
+
+message PromptGraphNodeLoader {
+  oneof loadFrom {
+    // Load a zip file, decompress it, and make the paths available as keys
+    bytes zipfileBytes = 1;
+  }
+}
+
+message PromptGraphNodeCustom {
+  string type_name = 1;
+}
+
+// TODO: we should allow the user to freely manipulate wall-clock time
+// Output value of this should just be the timestamp
+message PromptGraphNodeSchedule {
+  oneof policy {
+    string crontab = 1;
+    string naturalLanguage = 2;
+    string everyMs = 3;
+  }
+}
+
+message PromptGraphNodePrompt {
+  string template = 4;
+  oneof model {
+    SupportedChatModel chatModel = 5;
+    SupportedCompletionModel completionModel = 6;
+  }
+  float temperature = 7;
+  float top_p = 8;
+  int32 max_tokens = 9;
+  float presence_penalty = 10;
+  float frequency_penalty = 11;
+  repeated string stop = 12;
+  // TODO: set the user token
+  // TODO: support logit bias
+}
+
+enum MemoryAction {
+  READ = 0;
+  WRITE = 1;
+  DELETE = 2;
+}
+
+// TODO: this expects a selector for the query? - no its a template and you build that
+// TODO: what about the output type? pre-defined
+// TODO: what about the metadata?
+// TODO: metadata could be an independent query, or it could instead be a template too
+message PromptGraphNodeMemory {
+  string collectionName = 3;
+  string template = 4;
+  oneof embeddingModel {
+    SupportedEmebddingModel model = 5;
+  }
+  oneof vectorDbProvider {
+    SupportedVectorDatabase db = 6;
+  }
+  MemoryAction action = 7;
+}
+
+message PromptGraphNodeObservation {
+  string integration = 4;
+}
+
+message PromptGraphNodeComponent {
+  oneof transclusion {
+    File inlineFile = 4;
+    bytes bytesReference = 5;
+    string s3PathReference = 6;
+  }
+}
+
+message PromptGraphNodeEcho {
+}
+
+message PromptGraphNodeJoin {
+  // TODO: configure resolving joins
+}
+
+message ItemCore {
+  string name = 1;
+  repeated Query queries = 2;
+  repeated string outputTables = 3;
+  OutputType output = 4;
+}
+
+message Item {
+  ItemCore core = 1;
+  oneof item {
+    PromptGraphAlias alias = 2;
+    PromptGraphMap map = 3;
+    PromptGraphConstant constant = 4;
+    PromptGraphVar variable = 5;
+    PromptGraphOutputValue output = 6;
+    // TODO: delete above this line
+    PromptGraphNodeCode nodeCode = 7;
+    PromptGraphNodePrompt nodePrompt = 8;
+    PromptGraphNodeMemory nodeMemory = 9;
+    PromptGraphNodeComponent nodeComponent = 10;
+    PromptGraphNodeObservation nodeObservation = 11;
+    PromptGraphParameterNode nodeParameter = 12;
+    PromptGraphNodeEcho nodeEcho = 13;
+    PromptGraphNodeLoader nodeLoader = 14;
+    PromptGraphNodeCustom nodeCustom = 15;
+    PromptGraphNodeJoin nodeJoin = 16;
+  }
+}
+
+// TODO: add a flag for 'Cleaned', 'Dirty', 'Validated'
+message File {
+  string id = 1;
+  repeated Item nodes = 2;
+}
+
+message Path {
+  repeated string address = 1;
+}
+
+message TypeDefinition {
+  oneof type {
+    PrimitiveType primitive = 1;
+    ArrayType array = 2;
+    ObjectType object = 3;
+    UnionType union = 4;
+    IntersectionType intersection = 5;
+    OptionalType optional = 6;
+    EnumType enum = 7;
+  }
+}
+
+message PrimitiveType {
+  oneof primitive {
+    bool is_string = 1;
+    bool is_number = 2;
+    bool is_boolean = 3;
+    bool is_null = 4;
+    bool is_undefined = 5;
+  }
+}
+
+message ArrayType {
+  TypeDefinition type = 1;
+}
+
+message ObjectType {
+  map<string, TypeDefinition> fields = 1;
+}
+
+message UnionType {
+  repeated TypeDefinition types = 1;
+}
+
+message IntersectionType {
+  repeated TypeDefinition types = 1;
+}
+
+message OptionalType {
+  TypeDefinition type = 1;
+}
+
+message EnumType {
+  map<string, string> values = 1;
+}
+
+
+message SerializedValueArray {
+  repeated SerializedValue values = 1;
+}
+
+message SerializedValueObject {
+  map<string, SerializedValue> values = 1;
+}
+
+message SerializedValue {
+  oneof val {
+    float float = 2;
+    int32 number = 3;
+    string string = 4;
+    bool boolean = 5;
+    SerializedValueArray array = 6;
+    SerializedValueObject object = 7;
+  }
+}
+
+message ChangeValue {
+  Path path = 1;
+  SerializedValue value = 2;
+  uint64 branch = 3;
+}
+
+
+message WrappedChangeValue {
+  uint64 monotonicCounter = 3;
+  ChangeValue changeValue = 4;
+}
+
+// Computation of a node
+message NodeWillExecute {
+  string sourceNode = 1;
+  repeated WrappedChangeValue changeValuesUsedInExecution = 2;
+  uint64 matchedQueryIndex = 3;
+}
+
+// Group of node computations to run
+message DispatchResult {
+  repeated NodeWillExecute operations = 1;
+}
+
+message NodeWillExecuteOnBranch {
+  uint64 branch = 1;
+  uint64 counter = 2;
+  optional string custom_node_type_name = 3;
+  NodeWillExecute node = 4;
+}
+
+message ChangeValueWithCounter {
+  repeated ChangeValue filledValues = 1;
+  repeated uint64 parentMonotonicCounters = 2;
+  uint64 monotonicCounter = 3;
+  uint64 branch = 4;
+  string sourceNode = 5;
+}
+
+
+message CounterWithPath {
+  uint64 monotonicCounter = 1;
+  Path path = 2;
+}
+
+// Input proposals
+message InputProposal {
+  string name = 1;
+  OutputType output = 2;
+  uint64 counter = 3;
+  uint64 branch = 4;
+}
+
+
+message RequestInputProposalResponse {
+  string id = 1;
+  uint64 proposal_counter = 2;
+  repeated ChangeValue changes = 3;
+  uint64 branch = 4;
+}
+
+message DivergentBranch {
+  uint64 branch = 1;
+  uint64 diverges_at_counter = 2;
+}
+
+message Branch {
+  uint64 id = 1;
+  repeated uint64 source_branch_ids = 2;
+  repeated DivergentBranch divergent_branches = 3;
+  uint64 diverges_at_counter = 4;
+}
+
+
+message Empty {
+}
+
+
+// This is the return value from api calls that reports the current counter and branch the operation
+// was performed on.
+message ExecutionStatus {
+  string id = 1;
+  uint64 monotonicCounter = 2;
+  uint64 branch = 3;
+}
+
+message FileAddressedChangeValueWithCounter {
+  string id = 1;
+  string node_name = 2;
+  uint64 branch = 3;
+  uint64 counter = 4;
+  ChangeValueWithCounter change = 5;
+}
+
+message RequestOnlyId {
+  string id = 1;
+  uint64 branch = 2;
+}
+
+message FilteredPollNodeWillExecuteEventsRequest {
+  string id = 1;
+}
+
+
+message RequestAtFrame {
+  string id = 1;
+  uint64 frame = 2;
+  uint64 branch = 3;
+}
+
+message RequestNewBranch {
+  string id = 1;
+  uint64 sourceBranchId = 2;
+  uint64 divergesAtCounter = 3;
+}
+
+message RequestListBranches {
+  string id = 1;
+}
+
+message ListBranchesRes {
+  string id = 1;
+  repeated Branch branches = 2;
+}
+
+message RequestFileMerge {
+  string id = 1;
+  File file = 2;
+  uint64 branch = 3;
+}
+
+message ParquetFile {
+  bytes data = 1;
+}
+
+message QueryAtFrame {
+  string id = 1;
+  Query query = 2;
+  uint64 frame = 3;
+  uint64 branch = 4;
+}
+
+message QueryAtFrameResponse {
+  repeated WrappedChangeValue values = 1;
+}
+
+message RequestAckNodeWillExecuteEvent {
+  string id = 1;
+  uint64 branch = 3;
+  uint64 counter = 4;
+}
+
+message RespondPollNodeWillExecuteEvents {
+  repeated NodeWillExecuteOnBranch nodeWillExecuteEvents = 1;
+}
+
+message PromptLibraryRecord {
+  UpsertPromptLibraryRecord record = 1;
+  uint64 version_counter = 3;
+}
+
+message UpsertPromptLibraryRecord {
+  string template = 1;
+  string name = 2;
+  string id = 3;
+  optional string description = 4;
+}
+
+// API:
+service ExecutionRuntime {
+
+  rpc RunQuery(QueryAtFrame) returns (QueryAtFrameResponse) {}
+
+  // * Merge a new file - if an existing file is available at the id, will merge the new file into the existing one
+  rpc Merge(RequestFileMerge) returns (ExecutionStatus) {}
+
+  // * Get the current graph state of a file at a branch and counter position
+  rpc CurrentFileState(RequestOnlyId) returns (File) {}
+
+  // * Get the parquet history for a specific branch and Id - returns bytes
+  rpc GetParquetHistory(RequestOnlyId) returns (ParquetFile) {}
+
+  // * Resume execution
+  rpc Play(RequestAtFrame) returns (ExecutionStatus) {}
+
+  // * Pause execution
+  rpc Pause(RequestAtFrame) returns (ExecutionStatus) {}
+
+  // * Split history into a separate branch
+  rpc Branch(RequestNewBranch) returns (ExecutionStatus) {}
+
+  // * Get all branches
+  rpc ListBranches(RequestListBranches) returns (ListBranchesRes) {}
+
+  // * List all registered files
+  rpc ListRegisteredGraphs(Empty) returns (stream ExecutionStatus) {}
+
+  // * Receive a stream of input proposals <- this is a server-side stream
+  rpc ListInputProposals(RequestOnlyId) returns (stream InputProposal) {}
+
+  // * Push responses to input proposals (these wait for some input from a host until they're resolved) <- RPC client to server
+  rpc RespondToInputProposal (RequestInputProposalResponse) returns (Empty);
+
+  // * Observe the stream of execution events <- this is a server-side stream
+  rpc ListChangeEvents(RequestOnlyId) returns (stream ChangeValueWithCounter) {}
+
+  // * Observe when the server thinks our local node implementation should execute and with what changes
+  rpc PollNodeWillExecuteEvents(FilteredPollNodeWillExecuteEventsRequest) returns (RespondPollNodeWillExecuteEvents) {}
+  // TODO: this should be with the state they need to execute with
+  // TODO: need to ack that these messages have been received, and retry sending them to workers?
+  // TODO: no workers should poll for them like temporal
+  // TODO: the pace of pulling these need to be managed by the worker
+
+  rpc AckNodeWillExecuteEvent(RequestAckNodeWillExecuteEvent) returns (ExecutionStatus) {}
+
+  // * Receive events from workers <- this is an RPC client to server, we don't need to wait for a response from the server
+  rpc PushWorkerEvent(FileAddressedChangeValueWithCounter) returns (ExecutionStatus) {}
+
+  rpc PushTemplatePartial(UpsertPromptLibraryRecord) returns (ExecutionStatus) {}
+}

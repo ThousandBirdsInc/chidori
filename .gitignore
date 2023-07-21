@@ -1,0 +1,62 @@
+target
+node_modules
+toolchain/chidori/package_node/native/chidori.node
+toolcahin/chidori/build
+__pycache__
+
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+/.venv
+
+# dependencies
+/global_node_modules
+node_modules
+/.pnp
+.pnp.js
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# local env files
+.env*.local
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# Sentry Auth Token
+.sentryclirc
+
+/dist
+
+monorepo-diff-buildkite-plugin
+
+# Devenv
+.devenv*
+devenv.local.nix
+
+index.node
+databases/simulation_host_db/report.json
+databases/simulation_host_db/report.html
+
+.next

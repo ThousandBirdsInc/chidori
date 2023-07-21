@@ -1,0 +1,33 @@
+[project]
+name = "chidori"
+repository = "https://github.com/thousandbirds/chidori"
+description = "A framework for building LLM based agents"
+authors = [
+    {name = "Colton Pierson"}
+]
+classifiers=[
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "typing-extensions>=3; python_version < '3.8'",
+    "cffi"
+]
+requires-python = ">=3.9"
+
+
+[project.urls]
+homepage = "https://github.com/thousandbirds/chidori"
+documentation = "https://github.com/thousandbirds/chidori/README.md"
+repository = "https://github.com/thousandbirds/chidori"
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+features = ["python"]
+python-source = "package_python"

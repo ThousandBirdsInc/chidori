@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="JAVA_MODULE" version="4">
+  <component name="NewModuleRootManager" inherit-compiler-output="true">
+    <exclude-output />
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/pgc-sdk-rust/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/prompt-graph-core/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/prompt-graph-exec/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/rust-simple/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/sizer/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/tui-client/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/prompt-graph-core/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/prompt-graph-exec/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/prompt-graph-sdk/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/prompt-graph-sdk/tests" isTestSource="true" />
+      <excludeFolder url="file://$MODULE_DIR$/target" />
+      <excludeFolder url="file://$MODULE_DIR$/prompt-graph-core/target" />
+      <excludeFolder url="file://$MODULE_DIR$/prompt-graph-exec/target" />
+      <excludeFolder url="file://$MODULE_DIR$/rust-simple/target" />
+    </content>
+    <orderEntry type="inheritedJdk" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>
