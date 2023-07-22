@@ -1213,7 +1213,6 @@ fn main(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("chidoriBranch", Chidori::branch)?;
     cx.export_function("chidoriQuery", Chidori::query)?;
     cx.export_function("chidoriGraphStructure", Chidori::display_graph_structure)?;
-    cx.export_function("chidoriObjInterface", Chidori::obj_interface)?;
     cx.export_function("chidoriCustomNode", Chidori::custom_node)?;
     cx.export_function("chidoriDenoCodeNode", Chidori::deno_code_node)?;
     cx.export_function("chidoriVectorMemoryNode", Chidori::vector_memory_node)?;
