@@ -27,16 +27,39 @@
 
 ### Installation
 You can use Chidori from Node.js, Python or Rust.
+
+<table>
+<tr>
+<th width="450px"><b>Node.js</b></th>
+<th width="450px"><b>Python</b></th>
+<th width="450px"><b>Rust</b></th>
+</tr>
+<tr>
+<td>
+
 ```bash
 npm i @1kbirds/chidori
-yarn add @1kbirds/chidori
 ```
+
+</td>
+<td>
+
 ```bash
 pip install chidori
 ```
+
+</td>
+<td>
+
 ```bash
 cargo install chidori
 ```
+
+</td>
+</tr>
+</table>
+
+
 
 ### Environment Variables
 ```bash
