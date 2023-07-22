@@ -23,7 +23,7 @@
   "binary": {
     "module_name": "chidori",
     "module_path": "./package_node/native",
-    "host": "https://github.com/thousandbirdsinc/monorepo/releases/download/",
+    "host": "https://github.com/thousandbirdsinc/chidori/releases/download/",
     "package_name": "{module_name}-v{version}-{node_abi}-{platform}-{arch}-{libc}.tar.gz",
     "remote_path": "v{version}"
   },
