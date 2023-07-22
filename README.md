@@ -122,11 +122,10 @@ Thousand Birds pushes to be more than a simple wrapper around LLMs. Our effort i
 
 ## Inspiration
 Our framework is inspired by the work of many others, including:
-* https://temporal.io/ - providing reliability and durability to workflows
-* http://witheve.com/ - developing patterns for building reactive systems and reducing accidental complexity
-* https://timelydataflow.github.io/timely-dataflow/ - efficiently streaming changes
-* https://www.langchain.com/ - developing tools and patterns for building with LLMs
-* (many more we'll follow up on listing later)
+* [Temporal.io](https://temporal.io) - providing reliability and durability to workflows
+* [Eve](http://witheve.com) - developing patterns for building reactive systems and reducing accidental complexity
+* [Timely Dataflow](https://timelydataflow.github.io/timely-dataflow) - efficiently streaming changes
+* [Langchain](https://www.langchain.com) - developing tools and patterns for building with LLMs
 
 ## License
 Thousand Birds is under the MIT license. See the [LICENSE](LICENSE) for more information.
