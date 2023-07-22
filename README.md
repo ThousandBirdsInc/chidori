@@ -1,3 +1,5 @@
+<img alt="thousand birds logo describing the chidori project" src="/media/chidoriFrame.png">
+
 <div align="center">
 
 # &nbsp; Chidori &nbsp;
