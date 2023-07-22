@@ -129,4 +129,4 @@ Our framework is inspired by the work of many others, including:
 * (many more we'll follow up on listing later)
 
 ## License
-Thousand Birds is under the MIT license. See the [LICENSE](LICENSE.md) for more information.
+Thousand Birds is under the MIT license. See the [LICENSE](LICENSE) for more information.
