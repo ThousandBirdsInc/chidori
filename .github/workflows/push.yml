@@ -19,7 +19,8 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-        rustflags: ""
+        with:
+          rustflags: ""
       - run: cargo test
         working-directory: toolchain/chidori
 
