@@ -26,6 +26,7 @@
 
 
 ### Installation
+You can use Chidori from Node.js, Python or Rust.
 ```bash
 npm i @1kbirds/chidori
 yarn add @1kbirds/chidori
