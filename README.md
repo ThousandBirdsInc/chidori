@@ -2,7 +2,7 @@
 
 # &nbsp; Chidori &nbsp;
 
-**A Reactive Runtime for AI Systems.**
+**A Reactive Runtime for AI Agents**
 
 <p>
 <a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/ThousandBirdsInc/chidori" /></a>
