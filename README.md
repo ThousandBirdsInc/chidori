@@ -23,6 +23,9 @@
 - [About](https://github.com/ThousandBirdsInc/chidori/tree/main#-about)
 - [Roadmap](https://github.com/ThousandBirdsInc/chidori/tree/main#-roadmap)
 
+## 📖 Chidori
+Chidori is a reactive runtime for building AI agents. It provides a framework for building AI agents that are reactive, observable, and robust. It supports building agents with Node.js, Python, and Rust. It is currently in alpha, and is not yet ready for production use.
+
 ## ⚡️ Getting Started
 
 

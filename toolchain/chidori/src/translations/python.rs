@@ -37,6 +37,13 @@ impl std::convert::From<CoreError> for PyErrWrapper {
     }
 }
 
+impl std::convert::From<anyhow::Error> for PyErrWrapper {
+    fn from(err: anyhow::Error) -> PyErrWrapper {
+        PyErrWrapper(exceptions::PyOSError::new_err(err.to_string()))
+    }
+}
+
+
 #[derive(Debug)]
 pub struct PyErrWrapper(pyo3::PyErr);
 
