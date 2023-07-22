@@ -56,10 +56,10 @@ iq = await self.client.prompt_node(
 )
 
 # Get the current date
-(await self.client.deno_code_node(
+await self.client.deno_code_node(
     name="CurrentDate",
     code=""" return {"output": "" + new Date() } """,
-)).run_when(iq)
+)
 
 
 # Format the date in a fun way
@@ -72,8 +72,8 @@ await self.client.prompt_node(
 # Return the quote with the date
 await self.client.deno_code_node(
     name="ResultingQuote",
-    queries=[""" query Q { FunFormat { promptResult } } """],
-    code=""" return {"output": "Your quote: " + "{{FunFormat.promptResult}}" } """
+    queries=[""" query Q { FunFormat { promptResult } InspirationalQuote { promptResult } } """],
+    code=""" return {"output": `{{FunFormat.promptResult}}: \n {{InspirationalQuote.promptResult}}` } """
 )
 ```
 
