@@ -116,6 +116,7 @@ Thousand Birds comes with first-class support for code interpreter environments 
 We look forward to future contributions from the community. For now it will be difficult to contribute, as we are still in the process of setting up our development environment. We will update this section as soon as we have a more stable development environment.
 If you have feedback or would like to chat with us, please add to the discussion on our Github issues!
 
+## FAQ
 
 ### Why Another AI Framework?
 Thousand Birds pushes to be more than a simple wrapper around LLMs. Our effort is to resolve as much of the accidental complexity of building systems in the category of long running agents as possible, helping the broader developer community build successful systems.
