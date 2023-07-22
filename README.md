@@ -9,7 +9,6 @@
 <a href="https://github.com/ThousandBirdsInc/chidori/issues"><img alt="GitHub Issues" src="https://img.shields.io/github/issues/ThousandBirdsInc/chidori" /></a>
 <a href="https://github.com/ThousandBirdsInc/chidori/pulls"><img alt="GitHub Pull Requests" src="https://img.shields.io/github/issues-pr/ThousandBirdsInc/chidori" /></a>
 <a href="https://github.com/ThousandBirdsInc/chidori/blob/main/LICENSE"><img alt="Github License" src="https://img.shields.io/badge/License-MIT-green.svg" /></a>
-<a href="https://github.com/ThousandBirdsInc/chidori"><img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/ThousandBirdsInc/chidori?style=social" /></a>
 </p>
 
 <br />
