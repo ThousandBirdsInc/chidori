@@ -10,19 +10,22 @@ use prompt_graph_core::proto2::prompt_graph_node_prompt::Model;
 use crate::executor::NodeExecutionContext;
 use crate::integrations::openai::batch::chat_completion;
 
+
+#[tracing::instrument]
 pub async fn execute_node_prompt(ctx: &NodeExecutionContext<'_>) -> Vec<ChangeValue> {
     let &NodeExecutionContext {
-        node_will_execute,
+        node_will_execute_on_branch,
         item: item::Item::NodePrompt(n),
         item_core,
         namespaces,
-        template_partials
+        template_partials,
+        ..
     } = ctx else {
         panic!("execute_node_prompt: expected NodeExecutionContext with NodePrompt item");
     };
 
-    let mut change_set = &node_will_execute
-        .change_values_used_in_execution.iter().filter_map(|x| x.change_value.as_ref().cloned());
+    let mut change_set: Vec<ChangeValue> = node_will_execute_on_branch.node.as_ref().unwrap()
+        .change_values_used_in_execution.iter().filter_map(|x| x.change_value.clone()).collect();
     let mut filled_values = vec![];
     // n.model;
     // n.frequency_penalty;
@@ -34,7 +37,7 @@ pub async fn execute_node_prompt(ctx: &NodeExecutionContext<'_>) -> Vec<ChangeVa
 
     if let Some(Model::ChatModel(model)) = n.model {
         let m = SupportedChatModel::from_i32(model).unwrap();
-        let templated_string = render_template_prompt(&n.template, &change_set.clone().collect(), template_partials).unwrap();
+        let templated_string = render_template_prompt(&n.template, &change_set.clone(), template_partials).unwrap();
 
         let mut delay = Duration::from_secs(1);  // Start with 1 second delay
         loop {

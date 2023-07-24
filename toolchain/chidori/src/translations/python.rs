@@ -762,7 +762,7 @@ impl Chidori {
 
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut client = get_client(url).await?;
-            let result = client.poll_node_will_execute_events(FilteredPollNodeWillExecuteEventsRequest {
+            let result = client.poll_custom_node_will_execute_events(FilteredPollNodeWillExecuteEventsRequest {
                 id: file_id.clone(),
             }).await.map_err(PyErrWrapper::from)?;
             debug!("poll_local_code_node_execution result = {:?}", result);

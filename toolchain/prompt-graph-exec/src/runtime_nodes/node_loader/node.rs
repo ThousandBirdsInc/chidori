@@ -19,9 +19,10 @@ use crate::executor::NodeExecutionContext;
 //   * http - load json
 //   * sqlite - database proxy
 //   * arbitrary changes pushed by the host environment
+#[tracing::instrument]
 pub fn execute_node_loader(ctx: &NodeExecutionContext) -> Result<Vec<ChangeValue>> {
     let &NodeExecutionContext {
-        node_will_execute,
+        node_will_execute_on_branch,
         item: item::Item::NodeLoader(n),
         item_core,
         namespaces,

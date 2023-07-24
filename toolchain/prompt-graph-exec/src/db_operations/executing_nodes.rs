@@ -5,7 +5,6 @@ use sled::{Event, Subscriber};
 use prompt_graph_core::proto2::NodeWillExecuteOnBranch;
 
 
-// TODO: remove node name from all of these
 
 /// This stores logs of EventExecutionGraphExecutingNode records, denoting the input and output
 /// keys of a node's execution.
@@ -36,7 +35,7 @@ pub fn insert_will_execute(tree: &sled::Tree, will_exec: NodeWillExecuteOnBranch
     tree.insert(will_exec_pending_prefix(is_custom_node, *branch, *counter), will_exec.encode_to_vec()).unwrap();
 }
 
-pub fn scan_all_will_execute_events(tree: &sled::Tree) -> impl Iterator<Item = NodeWillExecuteOnBranch> {
+pub fn scan_all_will_execute_pending_events(tree: &sled::Tree) -> impl Iterator<Item = NodeWillExecuteOnBranch> {
     tree.scan_prefix(will_exec_pending_prefix_raw())
         .map(|c| NodeWillExecuteOnBranch::decode(c.unwrap().1.as_ref()).unwrap())
 }
@@ -53,9 +52,24 @@ pub fn move_will_execute_event_to_in_progress(tree: &sled::Tree, is_custom_node:
     }
 }
 
-pub fn move_will_execute_event_to_complete(tree: &sled::Tree, is_custom_node: bool, branch: u64, counter: u64) {
+pub fn move_will_execute_event_to_complete(tree: &sled::Tree, is_custom_node: bool, branch: u64, counter: u64) -> NodeWillExecuteOnBranch {
     let prev = tree.remove(will_exec_in_progress_prefix(is_custom_node,  branch, counter)).unwrap().expect("Changes must exist to be resolved");
-    tree.insert(will_exec_complete_prefix(is_custom_node,  branch, counter), prev).unwrap();
+    // Parse prev and return it
+    tree.insert(will_exec_complete_prefix(is_custom_node,  branch, counter), prev.clone()).unwrap();
+    NodeWillExecuteOnBranch::decode(prev.as_ref()).unwrap()
+}
+
+pub fn move_will_execute_event_to_complete_by_will_exec(tree: &sled::Tree, will_exec: &NodeWillExecuteOnBranch) {
+    let NodeWillExecuteOnBranch { custom_node_type_name, branch, counter, .. } = &will_exec;
+    let is_custom_node = custom_node_type_name.is_some();
+    if let Some(prev) = tree.remove(will_exec_pending_prefix(is_custom_node,  *branch, *counter)).unwrap() {
+        tree.insert(will_exec_complete_prefix(is_custom_node,  *branch, *counter), prev.clone()).unwrap();
+    }
+}
+
+pub fn get_complete_custom_node_will_exec(tree: &sled::Tree, is_custom_node: bool, branch: u64, counter: u64) -> Option<NodeWillExecuteOnBranch> {
+    tree.get(will_exec_complete_prefix(is_custom_node,  branch, counter)).unwrap()
+        .map(|c| NodeWillExecuteOnBranch::decode(c.as_ref()).unwrap())
 }
 
 pub fn subscribe_to_will_execute_events(tree: &sled::Tree) -> sled::Subscriber {

@@ -2,7 +2,9 @@
 members = [
     "prompt-graph-core",
     "prompt-graph-exec",
+    "prompt-graph-ui",
     "chidori",
+    "examples/top-ai-launches-hn"
 ]
 
 [profile.release]

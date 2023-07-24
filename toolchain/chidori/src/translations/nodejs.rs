@@ -870,7 +870,7 @@ impl Chidori {
                 });
                 panic!("Failed to connect to runtime service.");
             };
-            if let Ok(result) = client.poll_node_will_execute_events(FilteredPollNodeWillExecuteEventsRequest {
+            if let Ok(result) = client.poll_custom_node_will_execute_events(FilteredPollNodeWillExecuteEventsRequest {
                 id: file_id.clone(),
             }).await {
                 debug!("poll_local_code_node_execution result = {:?}", result);

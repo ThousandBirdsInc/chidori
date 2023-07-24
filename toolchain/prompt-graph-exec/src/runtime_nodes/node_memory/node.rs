@@ -33,9 +33,10 @@ use crate::executor::NodeExecutionContext;
 // TODO: choose the query function
 
 
+#[tracing::instrument]
 pub async fn execute_node_memory(ctx: &NodeExecutionContext<'_>) -> Result<Vec<ChangeValue>> {
     let &NodeExecutionContext {
-        node_will_execute,
+        node_will_execute_on_branch,
         item: item::Item::NodeMemory(n),
         item_core,
         namespaces,
@@ -45,11 +46,11 @@ pub async fn execute_node_memory(ctx: &NodeExecutionContext<'_>) -> Result<Vec<C
     };
 
     let mut filled_values = vec![];
-    let mut change_set = &node_will_execute
-        .change_values_used_in_execution.iter().filter_map(|x| x.change_value.as_ref().cloned());
+    let mut change_set: Vec<ChangeValue> = node_will_execute_on_branch.node.as_ref().unwrap()
+        .change_values_used_in_execution.iter().filter_map(|x| x.change_value.clone()).collect();
 
     // This excludes partials, there is no use case we currently know of for partials in embedding templates.
-    let content_to_embed = render_template_prompt(&n.template, &change_set.clone().collect(), &HashMap::new()).unwrap();
+    let content_to_embed = render_template_prompt(&n.template, &change_set.clone(), &HashMap::new()).unwrap();
     let collection_name = &n.collection_name;
 
     let embedding_vec = if let Some(EmbeddingModel::Model(enum_)) = n.embedding_model {
@@ -132,7 +133,7 @@ pub async fn execute_node_memory(ctx: &NodeExecutionContext<'_>) -> Result<Vec<C
                             payload.insert("key", Value::from(content_to_embed));
 
                             // As far as I can tell, qdrant doesn't support just shoving binary in here so we store as a base64 string
-                            let changes_as_str = base64::engine::general_purpose::STANDARD.encode(&node_will_execute.encode_to_vec());
+                            let changes_as_str = base64::engine::general_purpose::STANDARD.encode(&node_will_execute_on_branch.encode_to_vec());
                             payload.insert("query", Value::from(changes_as_str));
                             let points = vec![PointStruct::new(0, embedding_vec, payload.into())];
                             client

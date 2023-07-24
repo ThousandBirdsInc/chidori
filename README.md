@@ -4,7 +4,7 @@
 
 # &nbsp; Chidori &nbsp;
 
-**A reactive runtime for building AI agents**
+**A reactive runtime for building durable AI agents**
 
 <p>
 <a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="GitHub Last Commit" src="https://img.shields.io/github/actions/workflow/status/ThousandBirdsInc/chidori/push.yml" /></a>
@@ -25,6 +25,14 @@
 
 ## 📖 Chidori
 Chidori is a reactive runtime for building AI agents. It provides a framework for building AI agents that are reactive, observable, and robust. It supports building agents with Node.js, Python, and Rust. It is currently in alpha, and is not yet ready for production use.
+
+- Built from the ground up for constructing agents
+- Runtime written in Rust supporting Python and Node.js out of the box
+- Build agents that actually work :emoji:
+- LLM caching to minimize cost during development
+- Optimized for long-running AI workflows
+- Embedded code interpreter
+- Time travel debugging
 
 ## ⚡️ Getting Started
 

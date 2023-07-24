@@ -5,4 +5,5 @@ mod python;
 pub mod nodejs;
 
 mod wasm;
-mod rust;
+pub mod rust;
+mod shared;
