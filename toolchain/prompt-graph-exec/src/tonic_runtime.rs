@@ -310,7 +310,6 @@ impl ExecutionRuntime for MyExecutionRuntime {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    #[tracing::instrument]
     async fn poll_custom_node_will_execute_events(&self, request: Request<FilteredPollNodeWillExecuteEventsRequest>) -> Result<Response<RespondPollNodeWillExecuteEvents>, Status> {
         debug!("Received poll_custom_node_will_execute_events request: {:?}", request);
         let tree = self.get_tree(&request.get_ref().id.clone());
@@ -324,7 +323,6 @@ impl ExecutionRuntime for MyExecutionRuntime {
 
     // TODO: currently if we ack and then fail, we never progress
     // TODO: in progress nodes must timeout
-    #[tracing::instrument]
     async fn ack_node_will_execute_event(&self, request: Request<RequestAckNodeWillExecuteEvent>) -> Result<Response<ExecutionStatus>, Status> {
         debug!("Received ack_node_will_execute_event request: {:?}", request);
         let tree = self.get_tree(&request.get_ref().id.clone());
@@ -362,24 +360,24 @@ pub async fn run_server(url_server: String, file_path: Option<String>) -> Result
     // LogTracer::init().unwrap();
 
     // a builder for `FmtSubscriber`.
-    let subscriber = FmtSubscriber::builder()
-        // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
-        // will be written to stdout.
-        .with_max_level(Level::TRACE)
-        // completes the builder.
-        .finish();
+    // let subscriber = FmtSubscriber::builder()
+    //     // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
+    //     // will be written to stdout.
+    //     .with_max_level(Level::TRACE)
+    //     // completes the builder.
+    //     .finish();
 
-    let (chrome_layer, _guard) = ChromeLayerBuilder::new().build();
-    let (flame_layer, _guard) = FlameLayer::with_file("./tracing.folded").unwrap();
-    tracing_subscriber::registry()
-        .with(
-            EnvFilter::from_default_env()
-                .add_directive("prompt_graph_exec".parse()?)
-        )
-        // .with(fmt::layer())
-        .with(chrome_layer)
-        .with(flame_layer)
-        .init();
+    // let (chrome_layer, _guard) = ChromeLayerBuilder::new().build();
+    // let (flame_layer, _guard) = FlameLayer::with_file("./tracing.folded").unwrap();
+    // tracing_subscriber::registry()
+    //     .with(
+    //         EnvFilter::from_default_env()
+    //             .add_directive("prompt_graph_exec".parse()?)
+    //     )
+    //     .with(fmt::layer())
+    //     .with(chrome_layer)
+    //     .with(flame_layer)
+    //     .init();
 
 
     // Strip protocol from any urls passed in, invalid if URL is passed with protocol

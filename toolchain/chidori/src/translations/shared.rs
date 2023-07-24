@@ -41,7 +41,7 @@ pub fn json_value_to_paths(
                     path.pop();
                 }
             },
-            _ => panic!("Root should be a JSON object."),
+            _ => panic!("Root should be a JSON object but was {:?}", d),
         }
     }
 

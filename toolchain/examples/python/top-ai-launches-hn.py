@@ -29,7 +29,7 @@ async def fetch_hn() -> List[Story]:
 
         stories = await asyncio.gather(*tasks)
 
-        return [Story(**story) for story in stories]
+        return [Story(**dict((k, story.get(k, None)) for k in ('title', 'url', 'score'))) for story in stories]
 
 class ChidoriWorker:
     def __init__(self):
@@ -76,7 +76,8 @@ class ChidoriWorker:
         return decorator
 
     async def run(self):
-        self.build_graph()
+        await self.build_graph()
+        print(await self.c.display_graph_structure())
         for node_type, f in self.staged_custom_nodes:
             await self.c.register_custom_node_handle(node_type, f)
         c = self.c
@@ -90,9 +91,6 @@ class ChidoriWorker:
             print(f"Custom Node Loop Failed On - {e}")
 
 
-
-
-
 async def main():
     w = ChidoriWorker()
     await w.start()
@@ -100,8 +98,8 @@ async def main():
     @w.node("FetchTopHN")
     async def handle_fetch_hn(node_will_exec):
         stories = await fetch_hn()
-        result = {"output": str(stories)}
-        return json.dumps(result)
+        result = {"output": json.dumps([story.__dict__ for story in stories])}
+        return result
 
     await w.run()
 

@@ -5,7 +5,6 @@ use tonic::{Response, Status};
 use futures::executor;
 use futures::StreamExt;
 use pyo3::types::{PyDict, PyList, PyString};
-use pyo3::types::{PyBool, PyFloat, PyInt};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc};
@@ -300,8 +299,6 @@ fn py_to_json<'p>(py: Python<'p>, v: &PyAny) -> serde_json::Value {
         json!(i)
     } else if let Ok(f) = v.extract::<f64>() {
         json!(f)
-    } else if let Ok(s) = v.extract::<String>() {
-        json!(s)
     } else if let Ok(dict) = v.extract::<HashMap<String, Py<PyAny>>>() {
         let mut m = serde_json::map::Map::new();
         for (key, value) in dict {
@@ -311,6 +308,8 @@ fn py_to_json<'p>(py: Python<'p>, v: &PyAny) -> serde_json::Value {
     } else if let Ok(list) = v.extract::<Vec<Py<PyAny>>>() {
         let v: Vec<serde_json::Value> = list.iter().map(|p| py_to_json(py, p.as_ref(py))).collect();
         json!(v)
+    } else if let Ok(s) = v.extract::<String>() {
+        json!(s)
     } else {
         json!(null)
     }
@@ -402,11 +401,6 @@ async fn get_client(url: String) -> Result<ExecutionRuntimeClient<tonic::transpo
 
 // TODO: return a handle to nodes so that we can understand and inspect them
 // TODO: include a __repr__ method on those nodes
-
-
-// TODO: add an api for wiring together a system ot nodes
-// TODO: require the description of the complete system, in order to avoid mutably handling changing edges
-// TODO: system description must be fully encapsulated in a single object and applied all at once
 
 #[pyclass]
 #[derive(Clone)]
@@ -771,7 +765,6 @@ impl PyGraphBuilder {
         }
     }
 
-    // TODO: handle dispatch to this handler - should accept a callback
     // https://github.com/PyO3/pyo3/issues/525
     #[pyo3(signature = (name=String::new(), queries=vec!["None".to_string()], output_tables=vec![], output=String::from("type O {}"), node_type_name=String::new()))]
     fn custom_node<'a>(
@@ -797,16 +790,16 @@ impl PyGraphBuilder {
         })
     }
 
-    #[pyo3(signature = (name=String::new(), queries=vec!["None".to_string()], output_tables=vec![], output=String::from("type O { output: String }"), code=String::new(), is_template=false))]
+    #[pyo3(signature = (name=String::new(), queries=vec!["None".to_string()], output_tables=None, output=None, code=String::new(), is_template=None))]
     fn deno_code_node<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
         name: String,
         queries: Option<Vec<String>>,
-        output_tables: Vec<String>,
-        output: String,
+        output_tables: Option<Vec<String>>,
+        output: Option<String>,
         code: String,
-        is_template: bool
+        is_template: Option<bool>
     ) -> PyResult<&'a PyAny> {
         let g = Arc::clone(&self_.g);
         pyo3_asyncio::tokio::future_into_py(py, async move {
@@ -814,10 +807,10 @@ impl PyGraphBuilder {
             let nh = graph_builder.deno_code_node(DenoCodeNodeCreateOpts {
                 name,
                 queries,
-                output_tables: Some(output_tables),
-                output: Some(output),
+                output_tables,
+                output,
                 code,
-                is_template: Some(is_template),
+                is_template,
             }).map_err(AnyhowErrWrapper)?;
             Ok(PyNodeHandle::from(nh).map_err(AnyhowErrWrapper)?)
         })
@@ -889,15 +882,15 @@ impl PyGraphBuilder {
 
     // TODO: nodes that are added should return a clean definition of what their addition looks like
     // TODO: adding a node should also display any errors
-    #[pyo3(signature = (name=String::new(), queries=vec!["None".to_string()], output_tables=vec![], template=String::new(), model=String::from("GPT_3_5_TURBO")))]
+    #[pyo3(signature = (name=String::new(), queries=vec!["None".to_string()], output_tables=None, template=String::new(), model=None))]
     fn prompt_node<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
         name: String,
         queries: Option<Vec<String>>,
-        output_tables: Vec<String>,
+        output_tables: Option<Vec<String>>,
         template: String,
-        model: String
+        model: Option<String>
     ) -> PyResult<&'a PyAny> {
         let g = Arc::clone(&self_.g);
         pyo3_asyncio::tokio::future_into_py(py, async move {
@@ -905,9 +898,9 @@ impl PyGraphBuilder {
             let nh = graph_builder.prompt_node(PromptNodeCreateOpts {
                 name,
                 queries,
-                output_tables: Some(output_tables),
+                output_tables,
                 template,
-                model: Some(model),
+                model,
             }).map_err(AnyhowErrWrapper)?;
             Ok(PyNodeHandle::from(nh).map_err(AnyhowErrWrapper)?)
         })
@@ -939,8 +932,9 @@ impl PyGraphBuilder {
 #[pymodule]
 #[pyo3(name = "chidori")]
 fn chidori(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
-    pyo3_log::init();
+    // pyo3_log::init();
     m.add_class::<PyChidori>()?;
     m.add_class::<PyGraphBuilder>()?;
     Ok(())
 }
+
