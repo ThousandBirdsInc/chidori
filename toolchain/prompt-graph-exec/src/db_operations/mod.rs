@@ -8,10 +8,12 @@ pub mod input_proposals_and_responses;
 pub mod state_path_storage;
 pub mod playback;
 pub mod prompt_library;
+mod changes_gluesql_interface;
+pub mod custom_node_execution;
 
 #[cfg(feature = "parquet")]
 pub mod parquet_serialization;
-mod changes_gluesql_interface;
+
 
 use std::ops;
 use std::convert::TryInto;
@@ -68,6 +70,8 @@ pub const WILL_EXEC_COMPLETE_PREFIX: u16 = 19;
 
 pub const PROMPT_LIBRARY_MUTATION_PREFIX: u16 = 20;
 pub const PROMPT_COUNTER_PREFIX: u16 = 21;
+
+pub const CUSTOM_NODE_EXECUTION_PREFIX: u16 = 21;
 
 
 /// =================

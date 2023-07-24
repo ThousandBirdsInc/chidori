@@ -22,8 +22,16 @@ use prompt_graph_core::proto2::execution_runtime_server::{ExecutionRuntime, Exec
 use log::{debug, error, info, warn};
 use neon::macro_internal::runtime::buffer::new;
 use sled::Event;
+use tracing::Level;
+use tracing::level_filters::LevelFilter;
+use tracing_log::LogTracer;
+use tracing_subscriber::{EnvFilter, fmt, FmtSubscriber, Layer};
 use prompt_graph_core::execution_router::evaluate_changes_against_node;
 use prompt_graph_core::build_runtime_graph::graph_parse::{get_paths_for_query, parse_graphql_query_def};
+
+use tracing_chrome::ChromeLayerBuilder;
+use tracing_flame::FlameLayer;
+use tracing_subscriber::{registry::Registry, prelude::*};
 
 use crate::db_operations::{get_change_counter_for_branch, insert_executor_file_existence_by_id};
 use crate::db_operations::branches::{create_branch, create_root_branch, list_branches};
@@ -32,12 +40,17 @@ use crate::db_operations::input_proposals_and_responses::insert_input_response;
 use crate::db_operations::playback::pause_execution_at_frame;
 use crate::db_operations::playback::play_execution_at_frame;
 use crate::db_operations::changes::scan_all_pending_changes;
+use crate::db_operations::custom_node_execution::insert_custom_node_execution;
 use crate::db_operations::graph_mutations::{insert_pending_graph_mutation, scan_all_file_mutations_on_branch};
 use crate::db_operations::input_proposals_and_responses::scan_all_input_proposals;
-use crate::db_operations::executing_nodes::{move_will_execute_event_to_complete, move_will_execute_event_to_in_progress, scan_all_custom_node_will_execute_events, scan_all_will_execute_events, subscribe_to_will_execute_events_by_name};
+use crate::db_operations::executing_nodes::{move_will_execute_event_to_complete, move_will_execute_event_to_in_progress, scan_all_custom_node_will_execute_events, scan_all_will_execute_pending_events, subscribe_to_will_execute_events_by_name};
 use crate::db_operations::prompt_library::insert_prompt_library_mutation;
+
 use crate::executor::{Executor, InternalStateHandler};
 
+
+
+#[derive(Debug)]
 pub struct MyExecutionRuntime {
     db: Arc<sled::Db>,
     executor_started: Arc<DashMap<String, bool>>
@@ -72,6 +85,7 @@ impl MyExecutionRuntime {
 #[tonic::async_trait]
 impl ExecutionRuntime for MyExecutionRuntime {
 
+    #[tracing::instrument]
     async fn run_query(&self, request: Request<QueryAtFrame>) -> Result<Response<QueryAtFrameResponse>, Status> {
         debug!("Received run_query request: {:?}", &request);
         let query = request.get_ref().query.as_ref().unwrap();
@@ -100,6 +114,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
     /// This kicks off a new executor in an async green-thread to avoid blocking Tonic.
     /// If there is already a file with this id in place, we perform a merge with that definition
     /// which is our mechanism for runtime mutations.
+    #[tracing::instrument]
     async fn merge(&self, request: Request<RequestFileMerge>) -> Result<Response<ExecutionStatus>, Status> {
         // TODO: this needs to push the counter forward
         debug!("Received merge request: {:?}", request);
@@ -112,6 +127,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
         Ok(Response::new(ExecutionStatus{ id, monotonic_counter, branch}))
     }
 
+    #[tracing::instrument]
     async fn current_file_state(&self, request: Request<RequestOnlyId>) -> Result<Response<File>, Status> {
         debug!("Received current_file_state request: {:?}", request);
         let tree = &self.get_tree(&request.get_ref().id.clone());
@@ -148,6 +164,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
         Ok(Response::new(new_file))
     }
 
+    #[tracing::instrument]
     async fn get_parquet_history(&self, request: Request<RequestOnlyId>) -> Result<Response<ParquetFile>, Status> {
         debug!("Received get_parquet_history request: {:?}", request);
         let tree = &self.get_tree(&request.get_ref().id.clone());
@@ -155,6 +172,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
         todo!()
     }
 
+    #[tracing::instrument]
     async fn play(&self, request: Request<RequestAtFrame>) -> Result<Response<ExecutionStatus>, Status> {
         // Play also behaves as our "Connect" message
         debug!("Received play request: {:?}", request);
@@ -185,6 +203,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
         Ok(Response::new(ExecutionStatus{ id: id.clone(), monotonic_counter, branch }))
     }
 
+    #[tracing::instrument]
     async fn pause(&self, request: Request<RequestAtFrame>) -> Result<Response<ExecutionStatus>, Status> {
         debug!("Received pause request: {:?}", request);
         let id = &request.get_ref().id.clone();
@@ -196,6 +215,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
     }
 
     // TODO: branch should target a specific node (via counter and branch)
+    #[tracing::instrument]
     async fn branch(&self, request: Request<RequestNewBranch>) -> Result<Response<ExecutionStatus>, Status> {
         debug!("Received branch request: {:?}", request);
         let id = &request.get_ref().id.clone();
@@ -206,6 +226,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
         Ok(Response::new(ExecutionStatus{ id: id.clone(), monotonic_counter, branch: new_branch_id}))
     }
 
+    #[tracing::instrument]
     async fn list_branches(&self, request: Request<RequestListBranches>) -> Result<Response<ListBranchesRes>, Status> {
         debug!("Received list_branches request: {:?}", request);
         let id = &request.get_ref().id.clone();
@@ -221,6 +242,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
     type ListRegisteredGraphsStream = ReceiverStream<Result<ExecutionStatus, Status>>;
 
     /// List all of the graphs registered by ID with this execution runtime
+    #[tracing::instrument]
     async fn list_registered_graphs(&self, request: tonic::Request<prompt_graph_core::proto2::Empty>) -> Result<Response<Self::ListRegisteredGraphsStream>, Status> {
         debug!("Received list_registered_graphs request: {:?}", request);
         let tree = self.get_tree("root");
@@ -232,6 +254,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
 
     /// Fetch pending input proposals for a given graph. These should be responded to with external
     /// input to the system. Dependent execution nodes will be blocked until these are resolved.
+    #[tracing::instrument]
     async fn list_input_proposals(&self, request: Request<RequestOnlyId>) -> Result<Response<Self::ListInputProposalsStream>, Status> {
         debug!("Received list_input_proposals request: {:?}", request);
         let (mut tx, rx) = mpsc::channel(4);
@@ -245,6 +268,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
     }
 
     /// Send a response to an input proposal.
+    #[tracing::instrument]
     async fn respond_to_input_proposal(&self, request: Request<RequestInputProposalResponse>) -> Result<Response<Empty>, Status> {
         debug!("Received respond_to_input_proposal request: {:?}", request);
         let tree = self.get_tree(&request.get_ref().id.clone());
@@ -256,6 +280,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
     type ListChangeEventsStream = ReceiverStream<Result<ChangeValueWithCounter, Status>>;
 
     /// Fetch the resulting changes from the execution of a graph.
+    #[tracing::instrument]
     async fn list_change_events(&self, request: Request<RequestOnlyId>) -> Result<Response<Self::ListChangeEventsStream>, Status> {
         debug!("Received list_change_events request: {:?}", request);
         let (mut tx, rx) = mpsc::channel(4);
@@ -271,8 +296,22 @@ impl ExecutionRuntime for MyExecutionRuntime {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    async fn poll_node_will_execute_events(&self, request: Request<FilteredPollNodeWillExecuteEventsRequest>) -> Result<Response<RespondPollNodeWillExecuteEvents>, Status> {
-        debug!("Received poll_node_will_execute_events request: {:?}", request);
+    type ListNodeWillExecuteEventsStream = ReceiverStream<Result<NodeWillExecuteOnBranch, Status>>;
+
+    async fn list_node_will_execute_events(&self, request: Request<RequestOnlyId>) -> Result<Response<Self::ListNodeWillExecuteEventsStream>, Status> {
+        debug!("Received list_node_will_execute_events request: {:?}", request);
+        let (mut tx, rx) = mpsc::channel(4);
+        let tree = self.get_tree(&request.get_ref().id.clone());
+        tokio::spawn(async move {
+            for prop in scan_all_will_execute_pending_events(&tree) {
+                tx.send(Ok(prop)).await.unwrap();
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn poll_custom_node_will_execute_events(&self, request: Request<FilteredPollNodeWillExecuteEventsRequest>) -> Result<Response<RespondPollNodeWillExecuteEvents>, Status> {
+        debug!("Received poll_custom_node_will_execute_events request: {:?}", request);
         let tree = self.get_tree(&request.get_ref().id.clone());
 
         // Fetch custom node will execute events
@@ -295,6 +334,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
     }
 
     /// Used to push self-invoke (or other local exec node results) back into the runtime
+    #[tracing::instrument]
     async fn push_worker_event(&self, request: Request<FileAddressedChangeValueWithCounter>) -> Result<Response<ExecutionStatus>, Status> {
         debug!("Received push_worker_event request: {:?}", request);
         let tree = self.get_tree(&request.get_ref().id.clone());
@@ -302,12 +342,12 @@ impl ExecutionRuntime for MyExecutionRuntime {
         let counter = request.get_ref().counter.clone();
         let change = request.into_inner().change.expect("Must have a change value");
 
-        move_will_execute_event_to_complete(&tree,  true, branch, counter);
-        insert_new_change_value_with_counter(&tree, change);
-
+        let node_will_exec = move_will_execute_event_to_complete(&tree,  true, branch, counter);
+        insert_custom_node_execution(&tree, change);
         Ok(Response::new(ExecutionStatus::default()))
     }
 
+    #[tracing::instrument]
     async fn push_template_partial(&self, request: Request<UpsertPromptLibraryRecord>) -> Result<Response<ExecutionStatus>, Status> {
         let tree = self.get_tree(&request.get_ref().id.clone());
         insert_prompt_library_mutation(&tree, request.get_ref());
@@ -317,6 +357,29 @@ impl ExecutionRuntime for MyExecutionRuntime {
 
 #[tokio::main]
 pub async fn run_server(url_server: String, file_path: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    // LogTracer::init().unwrap();
+
+    // a builder for `FmtSubscriber`.
+    // let subscriber = FmtSubscriber::builder()
+    //     // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
+    //     // will be written to stdout.
+    //     .with_max_level(Level::TRACE)
+    //     // completes the builder.
+    //     .finish();
+
+    // let (chrome_layer, _guard) = ChromeLayerBuilder::new().build();
+    // let (flame_layer, _guard) = FlameLayer::with_file("./tracing.folded").unwrap();
+    // tracing_subscriber::registry()
+    //     .with(
+    //         EnvFilter::from_default_env()
+    //             .add_directive("prompt_graph_exec".parse()?)
+    //     )
+    //     .with(fmt::layer())
+    //     .with(chrome_layer)
+    //     .with(flame_layer)
+    //     .init();
+
+
     // Strip protocol from any urls passed in, invalid if URL is passed with protocol
     let url = url_server
         .replace("http://", "")

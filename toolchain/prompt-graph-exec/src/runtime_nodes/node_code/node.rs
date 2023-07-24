@@ -18,33 +18,35 @@ pub fn run_starlark(source_code: String, change_set: &Vec<ChangeValue>) -> Optio
 }
 
 
+#[tracing::instrument]
 pub fn execute_node_code(ctx: &NodeExecutionContext) -> Vec<ChangeValue> {
     let &NodeExecutionContext {
-        node_will_execute,
+        node_will_execute_on_branch,
         item: item::Item::NodeCode(n),
         item_core,
         namespaces,
         template_partials,
+        ..
     } = ctx else {
         panic!("execute_node_code: expected NodeExecutionContext with NodeCode item");
     };
 
 
-    let mut change_set = &node_will_execute
-        .change_values_used_in_execution.iter().filter_map(|x| x.change_value.clone());
+    let mut change_set: Vec<ChangeValue> = node_will_execute_on_branch.node.as_ref().unwrap()
+        .change_values_used_in_execution.iter().filter_map(|x| x.change_value.clone()).collect();
 
     debug!("execute_node_code {:?}", &n);
     let mut filled_values = vec![];
     if let Some(source) = &n.source {
         match source {
             Source::SourceCode(c) => {
-                let source_code = render_template_prompt(&c.source_code, &change_set.clone().collect(), template_partials).unwrap();
+                let source_code = render_template_prompt(&c.source_code, &change_set.clone(), template_partials).unwrap();
                 let result = match SupportedSourceCodeLanguages::from_i32(c.language).unwrap() {
                     SupportedSourceCodeLanguages::Deno => {
-                        node_code::deno::source_code_run_deno(source_code, &change_set.clone().collect())
+                        node_code::deno::source_code_run_deno(source_code, &change_set.clone())
                     },
                     SupportedSourceCodeLanguages::Starlark => {
-                        run_starlark(source_code, &change_set.clone().collect())
+                        run_starlark(source_code, &change_set.clone())
                     }
                 };
 

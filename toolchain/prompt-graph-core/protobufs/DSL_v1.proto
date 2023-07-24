@@ -203,6 +203,7 @@ message Item {
     PromptGraphNodeLoader nodeLoader = 14;
     PromptGraphNodeCustom nodeCustom = 15;
     PromptGraphNodeJoin nodeJoin = 16;
+    PromptGraphNodeSchedule nodeSchedule = 17;
   }
 }
 
@@ -488,8 +489,10 @@ service ExecutionRuntime {
   // * Observe the stream of execution events <- this is a server-side stream
   rpc ListChangeEvents(RequestOnlyId) returns (stream ChangeValueWithCounter) {}
 
+  rpc ListNodeWillExecuteEvents(RequestOnlyId) returns (stream NodeWillExecuteOnBranch) {}
+
   // * Observe when the server thinks our local node implementation should execute and with what changes
-  rpc PollNodeWillExecuteEvents(FilteredPollNodeWillExecuteEventsRequest) returns (RespondPollNodeWillExecuteEvents) {}
+  rpc PollCustomNodeWillExecuteEvents(FilteredPollNodeWillExecuteEventsRequest) returns (RespondPollNodeWillExecuteEvents) {}
   // TODO: this should be with the state they need to execute with
   // TODO: need to ack that these messages have been received, and retry sending them to workers?
   // TODO: no workers should poll for them like temporal

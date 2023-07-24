@@ -2,10 +2,11 @@ use prompt_graph_core::proto2::{ChangeValue, item, NodeWillExecute, PromptGraphM
 use prompt_graph_core::proto2::serialized_value::Val;
 use crate::executor::NodeExecutionContext;
 
+#[tracing::instrument]
 pub fn execute_node_join(ctx: &NodeExecutionContext) -> Vec<ChangeValue> {
     unimplemented!("TODO: implement execute_node_join");
     let NodeExecutionContext {
-        node_will_execute,
+        node_will_execute_on_branch,
         // TODO: incomplete
         item: item::Item::Map(n),
         item_core,
@@ -21,7 +22,7 @@ pub fn execute_node_join(ctx: &NodeExecutionContext) -> Vec<ChangeValue> {
     // TODO: join nodes look like _multiple_ nodes in the graph from the executor's perspective
 
     // TODO: any named subtree is another node instance, that must be met by the dispatch
-    let mut change_set: Vec<ChangeValue> = node_will_execute
+    let mut change_set: Vec<ChangeValue> = node_will_execute_on_branch.node.as_ref().unwrap()
         .change_values_used_in_execution.iter().filter_map(|x| x.change_value.clone()).collect();
     let mut filled_values = vec![];
     if let Some(change) = change_set.iter().find(|change| change.path.as_ref().unwrap().address.join(".") == n.path) {

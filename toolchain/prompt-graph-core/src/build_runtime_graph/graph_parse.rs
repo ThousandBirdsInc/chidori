@@ -252,7 +252,7 @@ fn parse_field_arguments(field: Field) {
 
 #[derive(Debug, Clone)]
 pub struct CleanIndividualNode {
-    name: String,
+    pub name: String,
     query_type: QueryType,
     query_path: QueryPath,
     pub output_path: OutputPath,
@@ -288,6 +288,8 @@ type QueryVecGroup = Vec<Vec<String>>;
 type QueryPath =  Vec<Option<QueryVecGroup>>;
 type OutputPath =  Vec<Vec<String>>;
 
+
+#[derive(Debug, Clone)]
 pub struct CleanedDefinitionGraph {
     pub query_types: HashMap<String, QueryType>,
     pub query_paths: HashMap<String, QueryPath>,
@@ -353,6 +355,23 @@ impl CleanedDefinitionGraph {
         graph.node_by_name = node_by_name;
 
         Ok(graph)
+    }
+
+    pub fn assert_parsing(&mut self) -> anyhow::Result<()> {
+        let recomputed = CleanedDefinitionGraph::recompute_parsed_values(
+            mem::take(&mut self.node_by_name)
+        ).unwrap();
+        self.node_by_name = recomputed.node_by_name;
+        self.query_types = recomputed.query_types;
+        self.query_paths = recomputed.query_paths;
+        self.output_types = recomputed.output_types;
+        self.output_paths = recomputed.output_paths;
+        self.gql_query_type = recomputed.gql_query_type;
+        self.output_table = recomputed.output_table;
+        self.dispatch_table = recomputed.dispatch_table;
+        self.unified_type_doc = recomputed.unified_type_doc;
+        self.node_to_output_tables = recomputed.node_to_output_tables;
+        Ok(())
     }
 
     /// Merge a file into the current as a mutation. Returns a list of _updated_ nodes by name.

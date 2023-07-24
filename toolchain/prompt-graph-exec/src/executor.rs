@@ -39,11 +39,10 @@ use crate::db_operations::input_proposals_and_responses::scan_all_input_response
 use crate::db_operations::input_proposals_and_responses::insert_input_proposal;
 use crate::db_operations::changes::insert_new_change_value_with_counter;
 use crate::db_operations::graph_mutations::{get_next_pending_graph_mutation_on_branch, resolve_pending_graph_mutation, subscribe_to_pending_graph_mutations};
-use crate::db_operations::executing_nodes::insert_will_execute;
+use crate::db_operations::executing_nodes::{insert_will_execute, move_will_execute_event_to_complete_by_will_exec};
 use crate::db_operations::prompt_library::resolve_all_partials;
 use crate::db_operations::update_change_counter_for_branch;
-use crate::runtime_nodes::{node_code, node_loader, node_map, node_memory, node_prompt};
-
+use crate::runtime_nodes::{node_code, node_custom, node_loader, node_map, node_memory, node_prompt};
 
 
 /// We preserve all internal state, this implementation includes
@@ -79,11 +78,12 @@ impl<'a> ExecutionState for InternalStateHandler<'a> {
 
 #[derive(Debug)]
 pub struct NodeExecutionContext<'a> {
-    pub node_will_execute: &'a NodeWillExecute,
+    pub node_will_execute_on_branch: &'a NodeWillExecuteOnBranch,
     pub item_core: &'a ItemCore,
     pub item: &'a item::Item,
     pub namespaces: &'a HashSet<String>,
     pub template_partials: &'a HashMap<String, PromptLibraryRecord>,
+    pub tree: &'a sled::Tree,
 }
 
 
@@ -92,6 +92,7 @@ pub struct NodeExecutionContext<'a> {
 ///    introduced to the system, it represents the furthest point of execution in the system.
 /// 2. Horizon counter: this counter represents the point of execution that is is represented
 ///    by the current internal state of the system.
+#[derive(Debug)]
 pub struct Executor {
     pub clean_definition_graph: CleanedDefinitionGraph,
     pub tree: sled::Tree,
@@ -117,6 +118,7 @@ impl Executor {
     ///
     /// Run is invoked by the main loop of the executor. Each invocation takes a piece of work from
     /// the queue and resolves it. The work is either a node that is ready to execute or an input.
+    #[tracing::instrument]
     pub async fn run(&mut self) -> Result<()> {
         // TODO: every run is a new initial branch, it depends on branches
 
@@ -173,6 +175,7 @@ impl Executor {
 
     /// At the start of execution or introduction of these nodes, they need to initialize some state in the system.
     /// Effectively speaking these nodes are executed in this way as soon as they are introduced.
+    #[tracing::instrument]
     async fn handle_graph_mutations(&mut self, file: &mut File, branch: u64, counter: u64) -> Result<()> {
         debug!("handle_graph_mutations");
 
@@ -226,6 +229,7 @@ impl Executor {
         Ok(())
     }
 
+    #[tracing::instrument]
     pub async fn progress_next_mutation(&mut self) -> Result<bool> {
         if let Some(is_playing) = get_is_playing_status(&self.tree) {
             if !is_playing {
@@ -243,11 +247,13 @@ impl Executor {
 
     }
 
+    #[tracing::instrument]
     pub async fn progress_mutations(&mut self) -> Result<()> {
         while self.progress_next_mutation().await? { }
         Ok(())
     }
 
+    #[tracing::instrument]
     pub async fn progress_next_change(&mut self) -> Result<bool> {
         if let Some(is_playing) = get_is_playing_status(&self.tree) {
             if !is_playing {
@@ -264,6 +270,7 @@ impl Executor {
         }
     }
 
+    #[tracing::instrument]
     pub async fn progress_changes(&mut self) -> Result<bool> {
         while self.progress_next_change().await? { }
         Ok(true)
@@ -273,6 +280,7 @@ impl Executor {
     /// This invokes the "dispatch_and_mutate_state" method from "core" which identifies the nodes to activate.
     /// Subsequently this invokes those nodes with that state, it may execute those nodes in any
     /// way it sees fit.
+    #[tracing::instrument]
     async fn exec_change(&mut self, change_value_with_counter: ChangeValueWithCounter, branch: u64) -> Result<()> {
         debug!("Executing change: {:?}", change_value_with_counter);
         let mut state = InternalStateHandler {
@@ -299,6 +307,7 @@ impl Executor {
     }
 
     // TODO: allow these to execute for arbitrarily long durations
+    #[tracing::instrument]
     async fn process_node_will_execute(&mut self, branch: u64, node_will_execute: &NodeWillExecute, item: Item) -> Result<()> {
         debug!("Processing node will execute: {:?}", &node_will_execute);
         // Produce will execute event and the counter that represents progressing this execution
@@ -318,12 +327,13 @@ impl Executor {
             None
         };
 
-        insert_will_execute(&self.tree, NodeWillExecuteOnBranch {
+        let node_will_execute_on_branch = NodeWillExecuteOnBranch {
             custom_node_type_name: node_type_name.cloned(),
             node: Some(node_will_execute.clone()),
             counter: result_counter,
             branch
-        });
+        };
+        insert_will_execute(&self.tree, node_will_execute_on_branch.clone());
 
         // Get counters used by all inputs
         let parent_monotonic_counters: Vec<u64> = node_will_execute
@@ -331,15 +341,13 @@ impl Executor {
             .iter()
             .map(|p| p.monotonic_counter).collect();
 
-        // let change_set = &node_will_execute
-        //     .change_values_used_in_execution.iter().map(|x| x.change_value.as_ref().unwrap().clone()).collect();
-
         let ctx = NodeExecutionContext {
-            node_will_execute: &node_will_execute,
+            node_will_execute_on_branch: &node_will_execute_on_branch,
             item_core: &item.core.as_ref().unwrap(),
             item: &item.item.as_ref().unwrap(),
             namespaces: &self.clean_definition_graph.node_to_output_tables.get(name).unwrap().clone(),
             template_partials: &resolve_all_partials(&self.tree),
+            tree: &self.tree,
         };
         debug!("Executing node with context: {:?}", &ctx);
 
@@ -365,12 +373,7 @@ impl Executor {
                 node_loader::node::execute_node_loader(&ctx)?
             }
             (c, item::Item::NodeCustom(n)) => {
-                // node_loader::node::execute_node_loader(&change_set, &n, c)?
-                // TODO: block until we find the result for this node
-                // TODO: search for the will execute response
-                let change_set: Vec<ChangeValue> = node_will_execute
-                    .change_values_used_in_execution.iter().map(|x| x.change_value.as_ref().unwrap().clone()).collect();
-                change_set
+                node_custom::execute_node_custom(&ctx).await?
             }
             (c, item::Item::NodeJoin(n)) => {
                 vec![]
@@ -391,7 +394,9 @@ impl Executor {
             monotonic_counter: result_counter,
             branch
         };
+
         debug!("Inserting new ChangeValueWithCounter {:?}", &new_change);
+        move_will_execute_event_to_complete_by_will_exec(&self.tree, &node_will_execute_on_branch);
         insert_new_change_value_with_counter(&self.tree, new_change);
 
         Ok(())

@@ -23,8 +23,11 @@ jobs:
       fail-fast: false
       matrix:
         node_version:
-          - 14
           - 16
+          - 17
+          - 18
+          - 19
+          - 20
         system:
           - os: macos-11
             target: x86_64-apple-darwin
@@ -85,7 +88,7 @@ jobs:
         working-directory: toolchain/chidori
         # Use bash, even on Windows to make find available
         shell: bash
-        # A release need to be created before upload
+        # A release needs to be created before upload
         run: gh release upload ${{ env.RELEASE_VERSION }} "$(find ./build -name *.tar.gz)" --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

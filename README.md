@@ -4,7 +4,7 @@
 
 # &nbsp; Chidori &nbsp;
 
-**A reactive runtime for building AI agents**
+**A reactive runtime for building durable AI agents**
 
 <p>
 <a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="GitHub Last Commit" src="https://img.shields.io/github/actions/workflow/status/ThousandBirdsInc/chidori/push.yml" /></a>
@@ -24,7 +24,17 @@
 - [Roadmap](https://github.com/ThousandBirdsInc/chidori/tree/main#-roadmap)
 
 ## 📖 Chidori
-Chidori is a reactive runtime for building AI agents. It provides a framework for building AI agents that are reactive, observable, and robust. It supports building agents with Node.js, Python, and Rust. It is currently in alpha, and is not yet ready for production use.
+Chidori is a reactive runtime for building AI agents. It provides a framework for building AI agents that are reactive, observable, and robust. It supports building agents with Node.js, Python, and Rust. 
+
+It is currently in alpha, and is not yet ready for production use. We are continuing to make significant changes in response to feedback.
+
+- Built from the ground up for constructing agents
+- Runtime written in Rust supporting Python and Node.js out of the box
+- Build agents that actually work :emoji:
+- LLM caching to minimize cost during development
+- Optimized for long-running AI workflows
+- Embedded code interpreter
+- Time travel debugging
 
 ## ⚡️ Getting Started
 
@@ -116,17 +126,16 @@ Thousand Birds ensures comprehensive monitoring and observability of your agents
 ### Branching and Time-Travel
 With Thousand Birds, you can take snapshots of your system and explore different possible outcomes from that point (branching), or rewind the system to a previous state (time-travel). This functionality improves error handling, debugging, and system robustness by offering alternative pathways and do-overs.
 
-### Memory via Vector Databases
-Vector databases, akin to an AI’s brain, help your AI remember and understand information. Thousand Birds comes with a built-in minimal vector database. If you prefer, you can integrate your own or choose from a selection of other options we support.
-
 ### Code Interpreter Environments
 Thousand Birds comes with first-class support for code interpreter environments like [Deno](https://deno.land/) or [Starlark](https://github.com/bazelbuild/starlark/blob/master/spec.md). You can execute code directly within your system, providing quick startup, ease of use, and secure execution. We're continually working on additional safeguards against running untrusted code, with containerized nodes support coming soon.
 
 ## 🛣️ Roadmap
 
 ### Short term
-* [ ] Improving the ergonomics of time travel and branching
-* [ ] Improving the ergonomics of subscribing nodes and constructing graphs
+* [x] Reactive subscriptions between nodes
+* [x] Branching and time travel debugging, reverting execution of a graph
+* [x] NodeJS, Python, and Rust support for building and executing graphs
+* [ ] Simple local vector db for development
 * [ ] Adding support for containerized nodes
 * [ ] Allowing filtering in node queries
 

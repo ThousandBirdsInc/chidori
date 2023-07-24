@@ -282,7 +282,7 @@ pub struct Item {
     pub core: ::core::option::Option<ItemCore>,
     #[prost(
         oneof = "item::Item",
-        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16"
+        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17"
     )]
     pub item: ::core::option::Option<item::Item>,
 }
@@ -323,6 +323,8 @@ pub mod item {
         NodeCustom(super::PromptGraphNodeCustom),
         #[prost(message, tag = "16")]
         NodeJoin(super::PromptGraphNodeJoin),
+        #[prost(message, tag = "17")]
+        NodeSchedule(super::PromptGraphNodeSchedule),
     }
 }
 /// TODO: add a flag for 'Cleaned', 'Dirty', 'Validated'
@@ -341,6 +343,108 @@ pub struct File {
 pub struct Path {
     #[prost(string, repeated, tag = "1")]
     pub address: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TypeDefinition {
+    #[prost(oneof = "type_definition::Type", tags = "1, 2, 3, 4, 5, 6, 7")]
+    pub r#type: ::core::option::Option<type_definition::Type>,
+}
+/// Nested message and enum types in `TypeDefinition`.
+pub mod type_definition {
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[allow(clippy::derive_partial_eq_without_eq)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Type {
+        #[prost(message, tag = "1")]
+        Primitive(super::PrimitiveType),
+        #[prost(message, tag = "2")]
+        Array(::prost::alloc::boxed::Box<super::ArrayType>),
+        #[prost(message, tag = "3")]
+        Object(super::ObjectType),
+        #[prost(message, tag = "4")]
+        Union(super::UnionType),
+        #[prost(message, tag = "5")]
+        Intersection(super::IntersectionType),
+        #[prost(message, tag = "6")]
+        Optional(::prost::alloc::boxed::Box<super::OptionalType>),
+        #[prost(message, tag = "7")]
+        Enum(super::EnumType),
+    }
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PrimitiveType {
+    #[prost(oneof = "primitive_type::Primitive", tags = "1, 2, 3, 4, 5")]
+    pub primitive: ::core::option::Option<primitive_type::Primitive>,
+}
+/// Nested message and enum types in `PrimitiveType`.
+pub mod primitive_type {
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[allow(clippy::derive_partial_eq_without_eq)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Primitive {
+        #[prost(bool, tag = "1")]
+        IsString(bool),
+        #[prost(bool, tag = "2")]
+        IsNumber(bool),
+        #[prost(bool, tag = "3")]
+        IsBoolean(bool),
+        #[prost(bool, tag = "4")]
+        IsNull(bool),
+        #[prost(bool, tag = "5")]
+        IsUndefined(bool),
+    }
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ArrayType {
+    #[prost(message, optional, boxed, tag = "1")]
+    pub r#type: ::core::option::Option<::prost::alloc::boxed::Box<TypeDefinition>>,
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ObjectType {
+    #[prost(map = "string, message", tag = "1")]
+    pub fields: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        TypeDefinition,
+    >,
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UnionType {
+    #[prost(message, repeated, tag = "1")]
+    pub types: ::prost::alloc::vec::Vec<TypeDefinition>,
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IntersectionType {
+    #[prost(message, repeated, tag = "1")]
+    pub types: ::prost::alloc::vec::Vec<TypeDefinition>,
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OptionalType {
+    #[prost(message, optional, boxed, tag = "1")]
+    pub r#type: ::core::option::Option<::prost::alloc::boxed::Box<TypeDefinition>>,
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EnumType {
+    #[prost(map = "string, string", tag = "1")]
+    pub values: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 #[derive(serde::Deserialize, serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -1275,8 +1379,38 @@ pub mod execution_runtime_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
+        pub async fn list_node_will_execute_events(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RequestOnlyId>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::NodeWillExecuteOnBranch>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/promptgraph.ExecutionRuntime/ListNodeWillExecuteEvents",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "promptgraph.ExecutionRuntime",
+                        "ListNodeWillExecuteEvents",
+                    ),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
         /// * Observe when the server thinks our local node implementation should execute and with what changes
-        pub async fn poll_node_will_execute_events(
+        pub async fn poll_custom_node_will_execute_events(
             &mut self,
             request: impl tonic::IntoRequest<
                 super::FilteredPollNodeWillExecuteEventsRequest,
@@ -1296,14 +1430,14 @@ pub mod execution_runtime_client {
                 })?;
             let codec = tonic::codec::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
-                "/promptgraph.ExecutionRuntime/PollNodeWillExecuteEvents",
+                "/promptgraph.ExecutionRuntime/PollCustomNodeWillExecuteEvents",
             );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(
                     GrpcMethod::new(
                         "promptgraph.ExecutionRuntime",
-                        "PollNodeWillExecuteEvents",
+                        "PollCustomNodeWillExecuteEvents",
                     ),
                 );
             self.inner.unary(req, path, codec).await
@@ -1494,8 +1628,21 @@ pub mod execution_runtime_server {
             tonic::Response<Self::ListChangeEventsStream>,
             tonic::Status,
         >;
+        /// Server streaming response type for the ListNodeWillExecuteEvents method.
+        type ListNodeWillExecuteEventsStream: futures_core::Stream<
+                Item = std::result::Result<super::NodeWillExecuteOnBranch, tonic::Status>,
+            >
+            + Send
+            + 'static;
+        async fn list_node_will_execute_events(
+            &self,
+            request: tonic::Request<super::RequestOnlyId>,
+        ) -> std::result::Result<
+            tonic::Response<Self::ListNodeWillExecuteEventsStream>,
+            tonic::Status,
+        >;
         /// * Observe when the server thinks our local node implementation should execute and with what changes
-        async fn poll_node_will_execute_events(
+        async fn poll_custom_node_will_execute_events(
             &self,
             request: tonic::Request<super::FilteredPollNodeWillExecuteEventsRequest>,
         ) -> std::result::Result<
@@ -2140,14 +2287,63 @@ pub mod execution_runtime_server {
                     };
                     Box::pin(fut)
                 }
-                "/promptgraph.ExecutionRuntime/PollNodeWillExecuteEvents" => {
+                "/promptgraph.ExecutionRuntime/ListNodeWillExecuteEvents" => {
                     #[allow(non_camel_case_types)]
-                    struct PollNodeWillExecuteEventsSvc<T: ExecutionRuntime>(pub Arc<T>);
+                    struct ListNodeWillExecuteEventsSvc<T: ExecutionRuntime>(pub Arc<T>);
+                    impl<
+                        T: ExecutionRuntime,
+                    > tonic::server::ServerStreamingService<super::RequestOnlyId>
+                    for ListNodeWillExecuteEventsSvc<T> {
+                        type Response = super::NodeWillExecuteOnBranch;
+                        type ResponseStream = T::ListNodeWillExecuteEventsStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RequestOnlyId>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                (*inner).list_node_will_execute_events(request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = ListNodeWillExecuteEventsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/promptgraph.ExecutionRuntime/PollCustomNodeWillExecuteEvents" => {
+                    #[allow(non_camel_case_types)]
+                    struct PollCustomNodeWillExecuteEventsSvc<T: ExecutionRuntime>(
+                        pub Arc<T>,
+                    );
                     impl<
                         T: ExecutionRuntime,
                     > tonic::server::UnaryService<
                         super::FilteredPollNodeWillExecuteEventsRequest,
-                    > for PollNodeWillExecuteEventsSvc<T> {
+                    > for PollCustomNodeWillExecuteEventsSvc<T> {
                         type Response = super::RespondPollNodeWillExecuteEvents;
                         type Future = BoxFuture<
                             tonic::Response<Self::Response>,
@@ -2161,7 +2357,7 @@ pub mod execution_runtime_server {
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                (*inner).poll_node_will_execute_events(request).await
+                                (*inner).poll_custom_node_will_execute_events(request).await
                             };
                             Box::pin(fut)
                         }
@@ -2173,7 +2369,7 @@ pub mod execution_runtime_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let inner = inner.0;
-                        let method = PollNodeWillExecuteEventsSvc(inner);
+                        let method = PollCustomNodeWillExecuteEventsSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
