@@ -5,6 +5,7 @@ import json
 from collections import defaultdict
 from chidori import Chidori, GraphBuilder
 
+
 class Story:
     def __init__(self, title: str, url: Optional[str], score: Optional[float]):
         self.title = title
@@ -30,50 +31,79 @@ async def fetch_hn() -> List[Story]:
 
         return [Story(**story) for story in stories]
 
+class ChidoriWorker:
+    def __init__(self):
+        self.c = Chidori("0", "http://localhost:9800")
+        self.staged_custom_nodes = []
+
+    async def start(self):
+        await self.c.start_server(":memory:")
+
+    async def build_graph(self):
+        g = GraphBuilder()
+
+        h = await g.custom_node(
+            name="FetchTopHN",
+            node_type_name="FetchTopHN",
+            output="type O { output: String }"
+        )
+
+        h_interpret = await g.prompt_node(
+            name="InterpretTheGroup",
+            template="Based on the following list of HackerNews threads, filter this list to only launches of new AI projects: {{FetchTopHN.output}}"
+        )
+        await h_interpret.run_when(g, h)
+
+        h_format_and_rank = await g.prompt_node(
+            name="FormatAndRank",
+            template="Format this list of new AI projects in markdown, ranking the most interesting projects from most interesting to least. {{InterpretTheGroup.promptResult}}"
+        )
+        await h_format_and_rank.run_when(g, h_interpret)
+
+        generate_email = await g.prompt_node(
+            name="GenerateEmailFn",
+            template="Write the body of a javascript function that returns {'subject': string, 'body': string} and populate the body with {{FormatAndRank.promptResult}} put any commentary in comments."
+        )
+        await generate_email.run_when(g, h_format_and_rank)
+
+        # Commit the graph
+        await g.commit(self.c, 0)
+
+    def node(self, node_type):
+        def decorator(f):
+            self.staged_custom_nodes.append((node_type, f))
+            return f
+        return decorator
+
+    async def run(self):
+        self.build_graph()
+        for node_type, f in self.staged_custom_nodes:
+            await self.c.register_custom_node_handle(node_type, f)
+        c = self.c
+        # Start graph execution from the root
+        await c.play(0, 0)
+
+        # Run the node execution loop
+        try:
+            await c.run_custom_node_loop()
+        except Exception as e:
+            print(f"Custom Node Loop Failed On - {e}")
+
+
+
+
+
 async def main():
-    c = Chidori("0", "http://localhost:9800")
-    await c.start_server(":memory:")
+    w = ChidoriWorker()
+    await w.start()
 
-    g = GraphBuilder()
+    @w.node("FetchTopHN")
+    async def handle_fetch_hn(node_will_exec):
+        stories = await fetch_hn()
+        result = {"output": str(stories)}
+        return json.dumps(result)
 
-    h = await g.custom_node(CustomNodeCreateOpts(
-        name="FetchTopHN",
-        node_type_name="FetchTopHN",
-        output="type O { output: String }"
-    ))
-
-    h_interpret = await g.prompt_node(PromptNodeCreateOpts(
-        name="InterpretTheGroup",
-        template="Based on the following list of HackerNews threads, filter this list to only launches of new AI projects: {{FetchTopHN.output}}"
-    ))
-    await h_interpret.run_when(g, h)
-
-    h_format_and_rank = await g.prompt_node(PromptNodeCreateOpts(
-        name="FormatAndRank",
-        template="Format this list of new AI projects in markdown, ranking the most interesting projects from most interesting to least. {{InterpretTheGroup.promptResult}}"
-    ))
-    await h_format_and_rank.run_when(g, h_interpret)
-
-    generate_email = await g.prompt_node(PromptNodeCreateOpts(
-        name="GenerateEmailFn",
-        template="Write the body of a javascript function that returns {'subject': string, 'body': string} and populate the body with {{FormatAndRank.promptResult}} put any commentary in comments."
-    ))
-    await generate_email.run_when(g, h_format_and_rank)
-
-    # Commit the graph
-    await g.commit(c, 0)
-
-    # Start graph execution from the root
-    await c.play(0, 0)
-
-    # Register the handler for our custom node
-    c.register_node_handle("FetchTopHN", handle_fetch_hn)
-
-    # Run the node execution loop
-    try:
-        await c.run_custom_node_loop()
-    except Exception as e:
-        print(f"Custom Node Loop Failed On - {e}")
+    await w.run()
 
 if __name__ == "__main__":
     asyncio.run(main())

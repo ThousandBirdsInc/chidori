@@ -31,7 +31,7 @@ async fn get_client(url: String) -> Result<ExecutionRuntimeClient<tonic::transpo
 type CallbackHandler = Box<dyn Fn(NodeWillExecuteOnBranch) -> BoxFuture<'static, anyhow::Result<serde_json::Value>> + Send + Sync>;
 
 pub struct Handler {
-    callback: CallbackHandler
+    pub(crate) callback: CallbackHandler
 }
 
 impl Handler {
@@ -52,7 +52,7 @@ pub struct Chidori {
     current_head: u64,
     current_branch: u64,
     url: String,
-    custom_node_handlers: HashMap<String, Arc<Handler>>
+    pub(crate) custom_node_handlers: HashMap<String, Arc<Handler>>
 }
 
 impl Chidori {

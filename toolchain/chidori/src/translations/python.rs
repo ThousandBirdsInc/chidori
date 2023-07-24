@@ -23,7 +23,8 @@ use ::prompt_graph_core::proto2::serialized_value::Val;
 use ::prompt_graph_core::graph_definition::{create_prompt_node, create_op_map, create_code_node, create_component_node, create_vector_memory_node, create_observation_node, create_node_parameter, SourceNodeType, create_loader_node, create_custom_node};
 use ::prompt_graph_core::utils::wasm_error::CoreError;
 use ::prompt_graph_core::build_runtime_graph::graph_parse::{CleanedDefinitionGraph, CleanIndividualNode, construct_query_from_output_type, derive_for_individual_node};
-use crate::translations::rust::{Chidori, CustomNodeCreateOpts, DenoCodeNodeCreateOpts, GraphBuilder, NodeHandle, PromptNodeCreateOpts, VectorMemoryNodeCreateOpts};
+use crate::register_node_handle;
+use crate::translations::rust::{Chidori, CustomNodeCreateOpts, DenoCodeNodeCreateOpts, GraphBuilder, Handler, NodeHandle, PromptNodeCreateOpts, VectorMemoryNodeCreateOpts};
 
 #[derive(Debug)]
 pub struct CoreErrorWrapper(CoreError);
@@ -241,6 +242,7 @@ fn pyany_to_serialized_value(p: &PyAny) -> SerializedValue {
                 "float" => {
                     let val = p.extract::<f32>().unwrap();
                     SerializedValue {
+                        //         file: Some(File {
                         val: Some(Val::Float(val)),
                     }
                 }
@@ -281,6 +283,36 @@ fn pyany_to_serialized_value(p: &PyAny) -> SerializedValue {
             }
         }
         Err(_) => SerializedValue::default(),
+    }
+}
+
+
+use pyo3::prelude::*;
+use pyo3::types::IntoPyDict;
+use serde_json::json;
+
+fn py_to_json<'p>(py: Python<'p>, v: &PyAny) -> serde_json::Value {
+    if v.is_none() {
+        json!(null)
+    } else if let Ok(b) = v.extract::<bool>() {
+        json!(b)
+    } else if let Ok(i) = v.extract::<i64>() {
+        json!(i)
+    } else if let Ok(f) = v.extract::<f64>() {
+        json!(f)
+    } else if let Ok(s) = v.extract::<String>() {
+        json!(s)
+    } else if let Ok(dict) = v.extract::<HashMap<String, Py<PyAny>>>() {
+        let mut m = serde_json::map::Map::new();
+        for (key, value) in dict {
+            m.insert(key, py_to_json(py, value.as_ref(py)));
+        }
+        json!(m)
+    } else if let Ok(list) = v.extract::<Vec<Py<PyAny>>>() {
+        let v: Vec<serde_json::Value> = list.iter().map(|p| py_to_json(py, p.as_ref(py))).collect();
+        json!(v)
+    } else {
+        json!(null)
     }
 }
 
@@ -478,32 +510,11 @@ impl PyChidori {
     }
 
     fn start_server<'a>(mut self_: PyRefMut<'_, Self>, py: Python<'a>, file_path: Option<String>) -> PyResult<&'a PyAny> {
-        let url_server = self_.url.clone();
-        std::thread::spawn(move || {
-            let result = run_server(url_server, file_path);
-            match result {
-                Ok(_) => { },
-                Err(e) => {
-                    println!("Error running server: {}", e);
-                },
-            }
-        });
-
+        let c = Arc::clone(&self_.c);
         let url = self_.url.clone();
         pyo3_asyncio::tokio::future_into_py(py, async move {
-            'retry: loop {
-                let client = get_client(url.clone());
-                match client.await {
-                    Ok(connection) => {
-                        eprintln!("Connection successfully established {:?}", &url);
-                        break 'retry
-                    },
-                    Err(e) => {
-                        eprintln!("Error connecting to server: {} with Error {}. Retrying...", &url, &e.0);
-                        std::thread::sleep(std::time::Duration::from_millis(1000));
-                    }
-                }
-            }
+            let c = c.lock().await;
+            c.start_server(file_path).await.map_err(AnyhowErrWrapper)?;
             Ok(())
         })
     }
@@ -677,93 +688,48 @@ impl PyChidori {
         })
     }
 
-
-    fn poll_local_code_node_execution<'a>(
+    pub fn register_custom_node_handle<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
+        key: String,
+        handler: PyObject
     ) -> PyResult<&'a PyAny> {
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-
+        let c = Arc::clone(&self_.c);
+        let handler = Arc::new(handler);
         pyo3_asyncio::tokio::future_into_py(py, async move {
-            let mut client = get_client(url).await?;
-            let result = client.poll_custom_node_will_execute_events(FilteredPollNodeWillExecuteEventsRequest {
-                id: file_id.clone(),
-            }).await.map_err(PyErrWrapper::from)?;
-            debug!("poll_local_code_node_execution result = {:?}", result);
-            Ok(PyRespondPollNodeWillExecuteEvents(result))
-        })
-    }
-
-    #[pyo3(signature = (branch=0, counter=0))]
-    fn ack_local_code_node_execution<'a>(
-        mut self_: PyRefMut<'_, Self>,
-        py: Python<'a>,
-        branch: u64,
-        counter: u64,
-    ) -> PyResult<&'a PyAny> {
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
-            let mut client = get_client(url).await?;
-            Ok(PyResponseExecutionStatus(client.ack_node_will_execute_event(RequestAckNodeWillExecuteEvent {
-                id: file_id.clone(),
-                branch,
-                counter,
-            }).await.map_err(PyErrWrapper::from)?))
-        })
-    }
-
-    #[pyo3(signature = (branch=0, counter=0, node_name=String::new(), response=None))]
-    fn respond_local_code_node_execution<'a>(
-        mut self_: PyRefMut<'_, Self>,
-        py: Python<'a>,
-        branch: u64,
-        counter: u64,
-        node_name: String,
-        response: Option<PyObject>
-    ) -> PyResult<&'a PyAny> {
-
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-
-        // TODO: need parent counters from the original change
-        // TODO: need source node
-
-        let response_paths = if let Some(response) = response {
-            dict_to_paths(py, response.downcast::<PyDict>(py)?)?
-        } else {
-            vec![]
-        };
-
-        pyo3_asyncio::tokio::future_into_py(py, async move {
-            let mut client = get_client(url).await?;
-
-            // TODO: need to add the output table paths to these
-            let filled_values = response_paths.into_iter().map(|path| {
-                ChangeValue {
-                    path: Some(Path {
-                        address: path.0,
-                    }),
-                    value: Some(path.1),
-                    branch,
+            let mut c = c.lock().await;
+            c.register_custom_node_handle(key, Handler::new(
+                move |n| {
+                    let handler_clone = Arc::clone(&handler);
+                    Box::pin(async move {
+                        let result = Python::with_gil(|py|  {
+                            let fut = handler_clone.as_ref().call(py, (NodeWillExecuteOnBranchWrapper(n).to_object(py), ), None)?;
+                            pyo3_asyncio::tokio::into_future(fut.as_ref(py))
+                        })?.await;
+                        match result {
+                            Ok(py_obj) => {
+                                Python::with_gil(|py|  {
+                                    let json_value = py_to_json(py, py_obj.as_ref(py));
+                                    Ok(json_value)
+                                })
+                            },
+                            Err(err) => Err(anyhow::Error::new(err)),
+                        }
+                    })
                 }
-            });
+            ));
+            Ok(())
+        })
+    }
 
-            // TODO: this needs to look more like a real change
-            Ok(PyResponseExecutionStatus(client.push_worker_event(FileAddressedChangeValueWithCounter {
-                branch,
-                counter,
-                node_name,
-                id: file_id.clone(),
-                change: Some(ChangeValueWithCounter {
-                    filled_values: filled_values.collect(),
-                    parent_monotonic_counters: vec![],
-                    monotonic_counter: counter,
-                    branch,
-                    source_node: "".to_string(),
-                })
-            }).await.map_err(PyErrWrapper::from)?))
+    fn run_custom_node_loop<'a>(
+        mut self_: PyRefMut<'_, Self>,
+        py: Python<'a>,
+    ) -> PyResult<&'a PyAny> {
+        let c = Arc::clone(&self_.c);
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let mut c = c.lock().await;
+            Ok(c.run_custom_node_loop().await.map_err(AnyhowErrWrapper)?)
         })
     }
 
