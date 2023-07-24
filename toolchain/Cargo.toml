@@ -4,7 +4,7 @@ members = [
     "prompt-graph-exec",
     "prompt-graph-ui",
     "chidori",
-    "examples/top-ai-launches-hn"
+    "examples/rust/top-ai-launches-hn"
 ]
 
 [profile.release]

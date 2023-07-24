@@ -200,7 +200,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow
             if let Event::Key(key) = event::read()? {
                 match app.input_mode {
                     InputMode::Normal => match key.code {
-                        KeyCode::Char('e') => {
+                        KeyCode::Char('s') => {
                             app.input_mode = InputMode::Editing;
                         }
                         KeyCode::Char('r') => {
@@ -265,8 +265,14 @@ fn insert_newlines(input: &str, max_length: usize) -> String {
 }
 
 fn truncate_string(input: &str) -> String {
-    let lines: Vec<&str> = input.lines().take(20).collect();
+    let lines: Vec<&str> = input.lines().take(9).collect();
     lines.join("\n")
+}
+
+fn format_table_string(input: &str) -> String {
+    let input = insert_newlines(input, 100);
+    let input = truncate_string(&input);
+    input + &String::from("\n")
 }
 
 
@@ -278,7 +284,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
             [
                 Constraint::Length(1),
                 Constraint::Length(3),
-                Constraint::Length(20),
+                Constraint::Length(10),
                 Constraint::Min(1),
             ]
                 .as_ref(),
@@ -288,11 +294,15 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     let (msg, style) = match app.input_mode {
         InputMode::Normal => (
             vec![
-                Span::raw("Press "),
-                Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(" to exit, "),
-                Span::styled("e", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(" to start editing."),
+                Span::styled("[q]uit", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled("[s]earch", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled("[c]hanges", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled("[n]odes executing", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled("[r]eload", Style::default().add_modifier(Modifier::BOLD)),
             ],
             Style::default().add_modifier(Modifier::RAPID_BLINK),
         ),
@@ -341,76 +351,77 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         }
     }
 
-    let node_will_execs = app.node_will_execs.try_lock().unwrap();
-    let changes = app.changes.try_lock().unwrap();
+    if let (Ok(node_will_execs), Ok(changes)) = ( app.node_will_execs.try_lock(), app.changes.try_lock()) {
 
-    // Table widget nodes
-    let selected_style = Style::default().add_modifier(Modifier::REVERSED);
-    let normal_style = Style::default();
-    let header_cells = ["Node", "Paths"]
-        .iter()
-        .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::REVERSED)));
-    let header = Row::new(header_cells)
-        .style(normal_style)
-        .height(1);
-    let rows = node_will_execs.iter().map(|item| {
-        let height = item
+        // Table widget nodes
+        let selected_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        let normal_style = Style::default();
+        let header_cells = ["Node", "Paths"]
             .iter()
-            .map(|content| truncate_string(&insert_newlines(&content.clone(), 100)).chars().filter(|c| *c == '\n').count())
-            .max()
-            .min(Some(10))
-            .unwrap_or(0)
-            + 1;
-        let cells = item.iter().map(|c| Cell::from(insert_newlines(&c.clone(), 100)));
-        Row::new(cells).height(height as u16)
-    });
+            .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::REVERSED)));
+        let header = Row::new(header_cells)
+            .style(normal_style)
+            .height(1);
+        let rows = node_will_execs.iter().map(|item| {
+            let height = item
+                .iter()
+                .map(|content| format_table_string(&content.clone()).chars().filter(|c| *c == '\n').count())
+                .max()
+                .min(Some(10))
+                .unwrap_or(0)
+                + 1;
+            let cells = item.iter().map(|c| Cell::from(format_table_string(&c.clone())));
+            Row::new(cells).height(height as u16)
+        });
 
-    let t = Table::new(rows)
-        .header(header)
-        .block(Block::default().borders(Borders::ALL).title("Nodes Currently Executing"))
-        // .highlight_style(selected_style)
-        // .highlight_symbol(">> ")
-        .widths(&[
-            Constraint::Min(20),
-            Constraint::Percentage(20),
-            Constraint::Percentage(80),
-        ]);
-    f.render_stateful_widget(t, rects[2], &mut app.node_will_execs_state);
+        let t = Table::new(rows)
+            .header(header)
+            .block(Block::default().borders(Borders::ALL).title("Nodes Currently Executing"))
+            // .highlight_style(selected_style)
+            // .highlight_symbol(">> ")
+            .widths(&[
+                Constraint::Min(20),
+                Constraint::Percentage(20),
+                Constraint::Percentage(80),
+            ]);
+        f.render_stateful_widget(t, rects[2], &mut app.node_will_execs_state);
 
 
-    // Table widget for query results
-    let selected_style = Style::default().add_modifier(Modifier::REVERSED);
-    let normal_style = Style::default();
-    let header_cells = ["Node", "Path", "Value"]
-        .iter()
-        .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::REVERSED)));
-    let header = Row::new(header_cells)
-        .style(normal_style)
-        .height(1);
-    let mut changes = changes.clone();
-    changes.reverse();
-    let rows = changes.iter().map(|item| {
-        let height = item
+        // Table widget for query results
+        let selected_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        let normal_style = Style::default();
+        let header_cells = ["Node", "Path", "Value (truncated)"]
             .iter()
-            .map(|content| truncate_string(&insert_newlines(&content.clone(), 100)).chars().filter(|c| *c == '\n').count())
-            .max()
-            .min(Some(10))
-            .unwrap_or(0)
-            + 1;
-        let cells = item.iter().map(|c| Cell::from(insert_newlines(&c.clone(), 100)));
-        Row::new(cells).height(height as u16).bottom_margin(1)
-    });
+            .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::REVERSED)));
+        let header = Row::new(header_cells)
+            .style(normal_style)
+            .height(1);
+        let mut changes = changes.clone();
+        changes.reverse();
+        let rows = changes.iter().map(|item| {
+            let height = item
+                .iter()
+                .map(|content| format_table_string(&content.clone()).chars().filter(|c| *c == '\n').count())
+                .max()
+                .min(Some(10))
+                .unwrap_or(0)
+                + 1;
+            let cells = item.iter().map(|c| Cell::from(format_table_string(&c.clone())));
+            Row::new(cells).height(height as u16).bottom_margin(1)
+        });
 
 
-    let t = Table::new(rows)
-        .header(header)
-        .block(Block::default().borders(Borders::ALL).title("Changes Emitted"))
-        .highlight_style(selected_style)
-        .highlight_symbol(">> ")
-        .widths(&[
-            Constraint::Min(20),
-            Constraint::Percentage(20),
-            Constraint::Percentage(80),
-        ]);
-    f.render_stateful_widget(t, rects[3], &mut app.changes_state);
+        let t = Table::new(rows)
+            .header(header)
+            .block(Block::default().borders(Borders::ALL).title("Changes Emitted"))
+            .highlight_style(selected_style)
+            .highlight_symbol(">>")
+            .widths(&[
+                Constraint::Min(20),
+                Constraint::Percentage(20),
+                Constraint::Percentage(80),
+            ]);
+        f.render_stateful_widget(t, rects[3], &mut app.changes_state);
+    }
+
 }

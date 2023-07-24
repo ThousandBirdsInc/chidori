@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "python-poetry"
+version = "0.1.0"
+description = ""
+authors = []
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+numpy = "^1.24.1"
+maturin = "1.1.0"
+pydot = "^1.4.2"
+jupyterlab = "^4.0.2"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

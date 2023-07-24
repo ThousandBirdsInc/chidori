@@ -289,7 +289,7 @@ type QueryPath =  Vec<Option<QueryVecGroup>>;
 type OutputPath =  Vec<Vec<String>>;
 
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CleanedDefinitionGraph {
     pub query_types: HashMap<String, QueryType>,
     pub query_paths: HashMap<String, QueryPath>,

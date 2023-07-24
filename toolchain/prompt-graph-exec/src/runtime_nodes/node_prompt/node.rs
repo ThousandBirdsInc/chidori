@@ -41,7 +41,7 @@ pub async fn execute_node_prompt(ctx: &NodeExecutionContext<'_>) -> Vec<ChangeVa
 
         let mut delay = Duration::from_secs(1);  // Start with 1 second delay
         loop {
-            match chat_completion(m, templated_string.clone()).await {
+            match chat_completion(&n, m, templated_string.clone()).await {
                 Ok(result) => {
                     for output_table in namespaces.iter() {
                         filled_values.push(prompt_graph_core::create_change_value(

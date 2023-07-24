@@ -8,6 +8,8 @@ use pyo3::types::{PyDict, PyList, PyString};
 use pyo3::types::{PyBool, PyFloat, PyInt};
 use pyo3::prelude::*;
 use std::collections::HashMap;
+use std::sync::{Arc};
+use tokio::sync::Mutex;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use log::{debug, info};
@@ -21,6 +23,7 @@ use ::prompt_graph_core::proto2::serialized_value::Val;
 use ::prompt_graph_core::graph_definition::{create_prompt_node, create_op_map, create_code_node, create_component_node, create_vector_memory_node, create_observation_node, create_node_parameter, SourceNodeType, create_loader_node, create_custom_node};
 use ::prompt_graph_core::utils::wasm_error::CoreError;
 use ::prompt_graph_core::build_runtime_graph::graph_parse::{CleanedDefinitionGraph, CleanIndividualNode, construct_query_from_output_type, derive_for_individual_node};
+use crate::translations::rust::{Chidori, CustomNodeCreateOpts, DenoCodeNodeCreateOpts, GraphBuilder, NodeHandle, PromptNodeCreateOpts, VectorMemoryNodeCreateOpts};
 
 #[derive(Debug)]
 pub struct CoreErrorWrapper(CoreError);
@@ -84,12 +87,27 @@ impl Into<pyo3::PyResult<()>> for PyErrWrapper {
     }
 }
 
-pub struct PyExecutionStatus(Response<ExecutionStatus>);
+
+pub struct PyExecutionStatus(ExecutionStatus);
 
 
 impl IntoPy<Py<PyAny>> for PyExecutionStatus {
     fn into_py(self, py: Python) -> Py<PyAny> {
-        let PyExecutionStatus(resp) = self;
+        let exec_status = self.0;
+        let dict = PyDict::new(py);
+        dict.set_item("id", exec_status.id).unwrap();
+        dict.set_item("monotonic_counter", exec_status.monotonic_counter).unwrap();
+        dict.set_item("branch", exec_status.branch).unwrap();
+        dict.into_py(py)
+    }
+}
+
+pub struct PyResponseExecutionStatus(Response<ExecutionStatus>);
+
+
+impl IntoPy<Py<PyAny>> for PyResponseExecutionStatus {
+    fn into_py(self, py: Python) -> Py<PyAny> {
+        let PyResponseExecutionStatus(resp) = self;
         let exec_status = resp.into_inner();
         let dict = PyDict::new(py);
         dict.set_item("id", exec_status.id).unwrap();
@@ -360,99 +378,60 @@ async fn get_client(url: String) -> Result<ExecutionRuntimeClient<tonic::transpo
 
 #[pyclass]
 #[derive(Clone)]
-struct NodeHandle {
-    url: String,
-    file_id: String,
-    node: Item,
-    exec_status: ExecutionStatus,
-    indiv: CleanIndividualNode
+struct PyNodeHandle {
+    n: NodeHandle,
 }
 
-impl NodeHandle {
-    fn from(url: String, file_id: String, node: Item, exec_status: ExecutionStatus) -> anyhow::Result<NodeHandle> {
-        let indiv = derive_for_individual_node(&node)?;
-        Ok(NodeHandle {
-            url,
-            file_id,
-            node,
-            exec_status,
-            indiv
-        })
+impl PyNodeHandle {
+    fn from(node_handle: NodeHandle) -> anyhow::Result<PyNodeHandle> {
+        Ok(PyNodeHandle { n: node_handle })
     }
 }
 
 #[pymethods]
-impl NodeHandle {
+impl PyNodeHandle {
     fn get_name(&self) -> String {
-        self.node.core.as_ref().unwrap().name.clone()
+        self.n.get_name()
     }
 
     /// This updates the definition of this node to query for the target NodeHandle's output. Moving forward
     /// it will execute whenever the target node resolves.
-    #[pyo3(signature = (node_handle=None))]
-    fn run_when<'a>(mut self_: PyRefMut<'_, Self>, py: Python<'a>, node_handle: Option<NodeHandle>) -> PyResult<&'a PyAny> {
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-        let mut node = self_.node.clone();
+    fn run_when<'a>(mut self_: PyRefMut<'_, Self>, py: Python<'a>, graph_builder: &mut PyGraphBuilder, other_node_handle: PyNodeHandle) -> PyResult<&'a PyAny> {
+        let mut n = self_.n.clone();
+        let g = Arc::clone(&graph_builder.g);
         pyo3_asyncio::tokio::future_into_py(py, async move {
-            // TODO: scan the queries and don't insert if the query already exists
-            if let Some(node_handle) = node_handle {
-                let queries = &mut node.core.as_mut().unwrap().queries;
-                let q = construct_query_from_output_type(
-                    &node_handle.get_name(),
-                    &node_handle.get_name(),
-                    &node_handle.indiv.output_path
-                ).map_err(AnyhowErrWrapper)?;
-                queries.push(Query { query: Some(q)});
-                Ok(push_file_merge(&url, &file_id, node).await?)
-            } else {
-                Err(PyErr::new::<PyTypeError, _>("node_handle must be a NodeHandle"))
-            }
+            let mut graph_builder = g.lock().await;
+            Ok(n.run_when(&mut graph_builder, &other_node_handle.n)
+                .map_err(AnyhowErrWrapper)?)
         })
     }
 
-    #[pyo3(signature = (branch=0, frame=0))]
-    fn query<'a>(mut self_: PyRefMut<'_, Self>, py: Python<'a>, branch: u64, frame: u64) -> PyResult<&'a PyAny> {
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-        let name = self_.get_name();
-
-        let query = construct_query_from_output_type(&name, &name, &self_.indiv.output_path)
-            .map_err(AnyhowErrWrapper)?;
-
-        // TODO: we need this to watch for changes to the query instead
-        // TODO: or this should await until either the target counter has elapsed or the query has resulted
-
-        pyo3_asyncio::tokio::future_into_py(py, async move {
-            let mut client = get_client(url).await?;
-            Ok(PyQueryAtFrameResponse(client.run_query(QueryAtFrame {
-                id: file_id,
-                query: Some(Query {
-                    query: Some(query)
-                }),
-                frame,
-                branch,
-            }).await.map_err(PyErrWrapper::from)?))
-        })
-    }
+    // #[pyo3(signature = (branch=0, frame=0))]
+    // fn query<'a>(mut self_: PyRefMut<'_, Self>, py: Python<'a>, file_id: String, url: String, branch: u64, frame: u64) -> PyResult<&'a PyAny> {
+    //     pyo3_asyncio::tokio::future_into_py(py, async move {
+    //         Ok(PyQueryAtFrameResponse(self_.n.query(file_id, url, branch, frame)
+    //             .await.map_err(PyErrWrapper::from)?))
+    //     })
+    // }
 
     fn __str__(&self) -> PyResult<String>   {
         // TODO: best practice is that these could be used to re-construct the same object
         let name = self.get_name();
-        Ok(format!("NodeHandle(file_id={}, node={})", self.file_id, name))
+        Ok(format!("NodeHandle(node={})", name))
     }
 
     fn __repr__(&self) -> PyResult<String> {
         let name = self.get_name();
-        Ok(format!("NodeHandle(file_id={}, node={})", self.file_id, name))
+        Ok(format!("NodeHandle(node={})", name))
     }
 }
 
 
 // TODO: all operations only apply to a specific branch at a time
 // TODO: maintain an internal map of the generated change responses for node additions to the associated query necessary to get that result
-#[pyclass]
-struct Chidori {
+#[pyclass(name="Chidori")]
+struct PyChidori {
+    c: Arc<Mutex<Chidori>>,
     file_id: String,
     current_head: u64,
     current_branch: u64,
@@ -461,34 +440,36 @@ struct Chidori {
 
 
 
-async fn push_file_merge(url: &String, file_id: &String, node: Item) -> Result<NodeHandle, PyErr> {
-    let mut client = get_client(url.clone()).await?;
-    let exec_status = client.merge(RequestFileMerge {
-        id: file_id.clone(),
-        file: Some(File {
-            nodes: vec![node.clone()],
-            ..Default::default()
-        }),
-        branch: 0,
-    }).await.map_err(PyErrWrapper::from)?.into_inner();
-    Ok(NodeHandle::from(
-        url.clone(),
-        file_id.clone(),
-        node,
-        exec_status
-    ).map_err(AnyhowErrWrapper)?)
-}
+// async fn push_file_merge(url: &String, file_id: &String, node: Item) -> Result<NodeHandle, PyErr> {
+//     let mut client = get_client(url.clone()).await?;
+//     let exec_status = client.merge(RequestFileMerge {
+//         id: file_id.clone(),
+//         file: Some(File {
+//             nodes: vec![node.clone()],
+//             ..Default::default()
+//         }),
+//         branch: 0,
+//     }).await.map_err(PyErrWrapper::from)?.into_inner();
+//     Ok(NodeHandle::from(
+//         url.clone(),
+//         file_id.clone(),
+//         node,
+//         exec_status
+//     ).map_err(AnyhowErrWrapper)?)
+// }
 
 // TODO: internally all operations should have an assigned counter
 //       we can keep the actual target counter hidden from the host sdk
 #[pymethods]
-impl Chidori {
+impl PyChidori {
 
     #[new]
     #[pyo3(signature = (file_id=String::from("0"), url=String::from("http://127.0.0.1:9800"), api_token=None))]
     fn new(file_id: String, url: String, api_token: Option<String>) -> Self {
         debug!("Creating new Chidori instance with file_id={}, url={}, api_token={:?}", file_id, url, api_token);
-        Chidori {
+        let c = Chidori::new(file_id.clone(), url.clone());
+        PyChidori {
+            c: Arc::new(Mutex::new(c)),
             file_id,
             current_head: 0,
             current_branch: 0,
@@ -533,7 +514,7 @@ impl Chidori {
         let url = self_.url.clone();
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut client = get_client(url).await?;
-            Ok(PyExecutionStatus(client.play(RequestAtFrame {
+            Ok(PyResponseExecutionStatus(client.play(RequestAtFrame {
                 id: file_id,
                 frame,
                 branch,
@@ -549,7 +530,7 @@ impl Chidori {
         let branch = self_.current_branch.clone();
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut client = get_client(url).await?;
-            Ok(PyExecutionStatus(client.pause(RequestAtFrame {
+            Ok(PyResponseExecutionStatus(client.pause(RequestAtFrame {
                 id: file_id,
                 frame,
                 branch,
@@ -570,7 +551,7 @@ impl Chidori {
                 diverges_at_counter: 0,
             }).await.map_err(PyErrWrapper::from)?;
             // TODO: need to somehow handle writing to the current_branch
-            Ok(PyExecutionStatus(result_branch))
+            Ok(PyResponseExecutionStatus(result_branch))
         })
     }
 
@@ -697,62 +678,6 @@ impl Chidori {
     }
 
 
-    // TODO: nodes that are added should return a clean definition of what their addition looks like
-    // TODO: adding a node should also display any errors
-    /// x = None
-    /// with open("/Users/coltonpierson/Downloads/files_and_dirs.zip", "rb") as zip_file:
-    ///     contents = zip_file.read()
-    ///     x = await p.load_zip_file("LoadZip", """ output: String """, contents)
-    /// x
-    #[pyo3(signature = (name=String::new(), output_tables=vec![], output=String::new(), bytes=vec![]))]
-    fn load_zip_file<'a>(
-        mut self_: PyRefMut<'_, Self>,
-        py: Python<'a>,
-        name: String,
-        output_tables: Vec<String>,
-        output: String,
-        bytes: Vec<u8>
-    ) -> PyResult<&'a PyAny> {
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
-            let node = create_loader_node(
-                name,
-                vec![],
-                output,
-                LoadFrom::ZipfileBytes(bytes),
-                output_tables
-            );
-            Ok(push_file_merge(&url, &file_id, node).await?)
-        })
-    }
-
-    // TODO: nodes that are added should return a clean definition of what their addition looks like
-    // TODO: adding a node should also display any errors
-    #[pyo3(signature = (name=String::new(), queries=vec![None], output_tables=vec![], template=String::new(), model=String::from("GPT_3_5_TURBO")))]
-    fn prompt_node<'a>(
-        mut self_: PyRefMut<'_, Self>,
-        py: Python<'a>,
-        name: String,
-        queries: Vec<Option<String>>,
-        output_tables: Vec<String>,
-        template: String,
-        model: String
-    ) -> PyResult<&'a PyAny> {
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
-            let node = create_prompt_node(
-                name,
-                queries,
-                template,
-                model,
-                output_tables
-            ).map_err(PyErrWrapper::from)?;
-            Ok(push_file_merge(&url, &file_id, node).await?)
-        })
-    }
-
     fn poll_local_code_node_execution<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
@@ -781,7 +706,7 @@ impl Chidori {
         let url = self_.url.clone();
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut client = get_client(url).await?;
-            Ok(PyExecutionStatus(client.ack_node_will_execute_event(RequestAckNodeWillExecuteEvent {
+            Ok(PyResponseExecutionStatus(client.ack_node_will_execute_event(RequestAckNodeWillExecuteEvent {
                 id: file_id.clone(),
                 branch,
                 counter,
@@ -826,7 +751,7 @@ impl Chidori {
             });
 
             // TODO: this needs to look more like a real change
-            Ok(PyExecutionStatus(client.push_worker_event(FileAddressedChangeValueWithCounter {
+            Ok(PyResponseExecutionStatus(client.push_worker_event(FileAddressedChangeValueWithCounter {
                 branch,
                 counter,
                 node_name,
@@ -839,95 +764,6 @@ impl Chidori {
                     source_node: "".to_string(),
                 })
             }).await.map_err(PyErrWrapper::from)?))
-        })
-    }
-
-    // TODO: handle dispatch to this handler - should accept a callback
-    // https://github.com/PyO3/pyo3/issues/525
-    #[pyo3(signature = (name=String::new(), queries=vec![None], output_tables=vec![], output=String::from("type O {}"), node_type_name=String::new()))]
-    fn custom_node<'a>(
-        mut self_: PyRefMut<'_, Self>,
-        py: Python<'a>,
-        name: String,
-        queries: Vec<Option<String>>,
-        output_tables: Vec<String>,
-        output: String,
-        node_type_name: String,
-    ) -> PyResult<&'a PyAny> {
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-        let branch = self_.current_branch;
-        pyo3_asyncio::tokio::future_into_py(py, async move {
-            // Register the node with the system
-            let node = create_custom_node(
-                name,
-                queries,
-                output,
-                node_type_name,
-                output_tables
-            );
-            Ok(push_file_merge(&url, &file_id, node).await?)
-        })
-    }
-
-    #[pyo3(signature = (name=String::new(), queries=vec![None], output_tables=vec![], output=String::from("type O { output: String }"), code=String::new(), is_template=false))]
-    fn deno_code_node<'a>(
-        mut self_: PyRefMut<'_, Self>,
-        py: Python<'a>,
-        name: String,
-        queries: Vec<Option<String>>,
-        output_tables: Vec<String>,
-        output: String,
-        code: String,
-        is_template: bool
-    ) -> PyResult<&'a PyAny> {
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-        let branch = self_.current_branch.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
-            let node = create_code_node(
-                name,
-                queries,
-                output,
-                SourceNodeType::Code("DENO".to_string(), code, is_template),
-                output_tables
-            );
-            Ok(push_file_merge(&url, &file_id, node).await?)
-        })
-    }
-
-
-    #[pyo3(signature = (name=String::new(), queries=vec![None], output_tables=vec![], output=String::from("type O { }"), template=String::new(), action="WRITE".to_string(), embedding_model="TEXT_EMBEDDING_ADA_002".to_string(), db_vendor="QDRANT".to_string(), collection_name=String::new()))]
-    fn vector_memory_node<'a>(
-        mut self_: PyRefMut<'_, Self>,
-        py: Python<'a>,
-        name: String,
-        queries: Vec<Option<String>>,
-        output_tables: Vec<String>,
-        output: String,
-        template: String,
-        action: String, // READ / WRITE
-        embedding_model: String,
-        db_vendor: String,
-        collection_name: String,
-    ) -> PyResult<&'a PyAny> {
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-        let branch = self_.current_branch.clone();
-
-        pyo3_asyncio::tokio::future_into_py(py, async move {
-            let node = create_vector_memory_node(
-                name,
-                queries,
-                output,
-                action,
-                embedding_model,
-                template,
-                db_vendor,
-                collection_name,
-                output_tables
-            ).map_err(PyErrWrapper::from)?;
-            Ok(push_file_merge(&url, &file_id, node).await?)
         })
     }
 
@@ -952,6 +788,184 @@ impl Chidori {
     // }
 }
 
+#[pyclass(name="GraphBuilder")]
+#[derive(Clone)]
+struct PyGraphBuilder {
+    g: Arc<Mutex<GraphBuilder>>,
+}
+
+#[pymethods]
+impl PyGraphBuilder {
+
+    #[new]
+    fn new() -> Self {
+        let g = GraphBuilder::new();
+        PyGraphBuilder {
+            g: Arc::new(Mutex::new(g)),
+        }
+    }
+
+    // TODO: handle dispatch to this handler - should accept a callback
+    // https://github.com/PyO3/pyo3/issues/525
+    #[pyo3(signature = (name=String::new(), queries=vec!["None".to_string()], output_tables=vec![], output=String::from("type O {}"), node_type_name=String::new()))]
+    fn custom_node<'a>(
+        mut self_: PyRefMut<'_, Self>,
+        py: Python<'a>,
+        name: String,
+        queries: Option<Vec<String>>,
+        output_tables: Vec<String>,
+        output: String,
+        node_type_name: String,
+    ) -> PyResult<&'a PyAny> {
+        let g = Arc::clone(&self_.g);
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let mut graph_builder = g.lock().await;
+            let nh = graph_builder.custom_node(CustomNodeCreateOpts {
+                name,
+                queries,
+                output_tables: Some(output_tables),
+                output: Some(output),
+                node_type_name,
+            }).map_err(AnyhowErrWrapper)?;
+            Ok(PyNodeHandle::from(nh).map_err(AnyhowErrWrapper)?)
+        })
+    }
+
+    #[pyo3(signature = (name=String::new(), queries=vec!["None".to_string()], output_tables=vec![], output=String::from("type O { output: String }"), code=String::new(), is_template=false))]
+    fn deno_code_node<'a>(
+        mut self_: PyRefMut<'_, Self>,
+        py: Python<'a>,
+        name: String,
+        queries: Option<Vec<String>>,
+        output_tables: Vec<String>,
+        output: String,
+        code: String,
+        is_template: bool
+    ) -> PyResult<&'a PyAny> {
+        let g = Arc::clone(&self_.g);
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let mut graph_builder = g.lock().await;
+            let nh = graph_builder.deno_code_node(DenoCodeNodeCreateOpts {
+                name,
+                queries,
+                output_tables: Some(output_tables),
+                output: Some(output),
+                code,
+                is_template: Some(is_template),
+            }).map_err(AnyhowErrWrapper)?;
+            Ok(PyNodeHandle::from(nh).map_err(AnyhowErrWrapper)?)
+        })
+    }
+
+
+    #[pyo3(signature = (name=String::new(), queries=vec!["None".to_string()], output_tables=vec![], output=String::from("type O { }"), template=String::new(), action="WRITE".to_string(), embedding_model="TEXT_EMBEDDING_ADA_002".to_string(), db_vendor="QDRANT".to_string(), collection_name=String::new()))]
+    fn vector_memory_node<'a>(
+        mut self_: PyRefMut<'_, Self>,
+        py: Python<'a>,
+        name: String,
+        queries: Option<Vec<String>>,
+        output_tables: Vec<String>,
+        output: String,
+        template: String,
+        action: String, // READ / WRITE
+        embedding_model: String,
+        db_vendor: String,
+        collection_name: String,
+    ) -> PyResult<&'a PyAny> {
+        let g = Arc::clone(&self_.g);
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let mut graph_builder = g.lock().await;
+            let nh = graph_builder.vector_memory_node(VectorMemoryNodeCreateOpts {
+                name,
+                queries,
+                output_tables: Some(output_tables),
+                output: Some(output),
+                template: Some(template),
+                action: Some(action),
+                embedding_model: Some(embedding_model),
+                db_vendor: Some(db_vendor),
+                collection_name,
+            }).map_err(AnyhowErrWrapper)?;
+            Ok(PyNodeHandle::from(nh).map_err(AnyhowErrWrapper)?)
+        })
+    }
+
+
+    // // TODO: nodes that are added should return a clean definition of what their addition looks like
+    // // TODO: adding a node should also display any errors
+    // /// x = None
+    // /// with open("/Users/coltonpierson/Downloads/files_and_dirs.zip", "rb") as zip_file:
+    // ///     contents = zip_file.read()
+    // ///     x = await p.load_zip_file("LoadZip", """ output: String """, contents)
+    // /// x
+    // #[pyo3(signature = (name=String::new(), output_tables=vec![], output=String::new(), bytes=vec![]))]
+    // fn load_zip_file<'a>(
+    //     mut self_: PyRefMut<'_, Self>,
+    //     py: Python<'a>,
+    //     name: String,
+    //     output_tables: Vec<String>,
+    //     output: String,
+    //     bytes: Vec<u8>
+    // ) -> PyResult<&'a PyAny> {
+    //     let file_id = self_.file_id.clone();
+    //     let url = self_.url.clone();
+    //     pyo3_asyncio::tokio::future_into_py(py, async move {
+    //         let node = create_loader_node(
+    //             name,
+    //             vec![],
+    //             output,
+    //             LoadFrom::ZipfileBytes(bytes),
+    //             output_tables
+    //         );
+    //         Ok(push_file_merge(&url, &file_id, node).await?)
+    //     })
+    // }
+
+    // TODO: nodes that are added should return a clean definition of what their addition looks like
+    // TODO: adding a node should also display any errors
+    #[pyo3(signature = (name=String::new(), queries=vec!["None".to_string()], output_tables=vec![], template=String::new(), model=String::from("GPT_3_5_TURBO")))]
+    fn prompt_node<'a>(
+        mut self_: PyRefMut<'_, Self>,
+        py: Python<'a>,
+        name: String,
+        queries: Option<Vec<String>>,
+        output_tables: Vec<String>,
+        template: String,
+        model: String
+    ) -> PyResult<&'a PyAny> {
+        let g = Arc::clone(&self_.g);
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let mut graph_builder = g.lock().await;
+            let nh = graph_builder.prompt_node(PromptNodeCreateOpts {
+                name,
+                queries,
+                output_tables: Some(output_tables),
+                template,
+                model: Some(model),
+            }).map_err(AnyhowErrWrapper)?;
+            Ok(PyNodeHandle::from(nh).map_err(AnyhowErrWrapper)?)
+        })
+    }
+
+    fn commit<'a>(
+        mut self_: PyRefMut<'_, Self>,
+        py: Python<'a>,
+        c: PyRef<'_, PyChidori>,
+        branch: u64
+    ) -> PyResult<&'a PyAny> {
+        let g = Arc::clone(&self_.g);
+        let c = Arc::clone(&c.c);
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let mut graph_builder = g.lock().await;
+            let mut chidori = c.lock().await;
+            let exec_status = graph_builder.commit(&chidori, branch).await
+                .map(PyExecutionStatus)
+                .map_err(AnyhowErrWrapper)?;
+            Ok(exec_status)
+        })
+    }
+}
+
 
 /// A Python module implemented in Rust. The name of this function must match
 /// the `lib.name` setting in the `Cargo.toml`, else Python will not be able to
@@ -960,6 +974,7 @@ impl Chidori {
 #[pyo3(name = "chidori")]
 fn chidori(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     pyo3_log::init();
-    m.add_class::<Chidori>()?;
+    m.add_class::<PyChidori>()?;
+    m.add_class::<PyGraphBuilder>()?;
     Ok(())
 }

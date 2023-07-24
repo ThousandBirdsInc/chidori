@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use tonic::Status;
 use prompt_graph_core::templates::json_value_to_serialized_value;
 use crate::translations::shared::json_value_to_paths;
+pub use prompt_graph_core::utils::serialized_value_to_string;
 
 async fn get_client(url: String) -> Result<ExecutionRuntimeClient<tonic::transport::Channel>, tonic::transport::Error> {
     ExecutionRuntimeClient::connect(url.clone()).await
@@ -45,6 +46,7 @@ impl Handler {
 }
 
 
+#[derive(Clone)]
 pub struct Chidori {
     file_id: String,
     current_head: u64,
@@ -448,6 +450,7 @@ fn remap_queries(queries: Option<Vec<String>>) -> Vec<Option<String>> {
     queries
 }
 
+#[derive(Clone)]
 pub struct GraphBuilder {
     clean_graph: CleanedDefinitionGraph,
 }
@@ -578,6 +581,7 @@ impl GraphBuilder {
 
 
 // Node handle
+#[derive(Clone)]
 pub struct NodeHandle {
     node: Item,
     indiv: CleanIndividualNode
@@ -595,7 +599,7 @@ impl NodeHandle {
 
 
 impl NodeHandle {
-    fn get_name(&self) -> String {
+    pub(crate) fn get_name(&self) -> String {
         self.node.core.as_ref().unwrap().name.clone()
     }
 

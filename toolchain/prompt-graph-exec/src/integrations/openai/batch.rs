@@ -13,10 +13,10 @@ use openai_api_rs::v1::chat_completion::{
 };
 use openai_api_rs::v1::error::APIError;
 use prompt_graph_core::templates::render_template_prompt;
-use prompt_graph_core::proto2::{SupportedChatModel};
+use prompt_graph_core::proto2::{PromptGraphNodePrompt, SupportedChatModel};
 
 
-pub async fn chat_completion(openai_model: SupportedChatModel, templated_string: String) -> Result<ChatCompletionResponse, APIError> {
+pub async fn chat_completion(n: &PromptGraphNodePrompt, openai_model: SupportedChatModel, templated_string: String) -> Result<ChatCompletionResponse, APIError> {
     let client = Client::new(env::var("OPENAI_API_KEY").unwrap().to_string());
 
     let model = match openai_model {
