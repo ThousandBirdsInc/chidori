@@ -99,38 +99,233 @@ OPENAI_API_KEY=...
 ```
 
 ### Example
+
+<table>
+<tr>
+<th width="450px"><b>Python</b></th>
+<th width="450px"><b>Rust</b></th>
+</tr>
+<tr>
+<td>
+
 ```python
-chidori = Chidori("100", "http://localhost:9800")
-
-# Generate an inspirational quote
-iq = await self.client.prompt_node(
-    name="InspirationalQuote",
-    template="""Come up with a novel and interesting quote. Something that will make them
-    want to seize the day. Do not wrap the quote in quotes.
-    """
-)
-
-# Get the current date
-await self.client.deno_code_node(
-    name="CurrentDate",
-    code=""" return {"output": "" + new Date() } """,
-)
+import aiohttp
+import asyncio
+from typing import List, Optional
+import json
+from chidori import Chidori, GraphBuilder
 
 
-# Format the date in a fun way
-await self.client.prompt_node(
-    name="FunFormat",
-    queries=[""" query Q { CurrentDate { output } } """],
-    template="""Format the following in a fun and more informal way: {{CodeNode.output}} """
-)
+class Story:
+    def __init__(self, title: str, url: Optional[str], score: Optional[float]):
+        self.title = title
+        self.url = url
+        self.score = score
 
-# Return the quote with the date
-await self.client.deno_code_node(
-    name="ResultingQuote",
-    queries=[""" query Q { FunFormat { promptResult } InspirationalQuote { promptResult } } """],
-    code=""" return {"output": `{{FunFormat.promptResult}}: \n {{InspirationalQuote.promptResult}}` } """
-)
+
+HN_URL_TOP_STORIES = "https://hacker-news.firebaseio.com/v0/topstories.json?print=pretty"
+
+
+async def fetch_story(session, id):
+    async with session.get(f"https://hacker-news.firebaseio.com/v0/item/{id}.json?print=pretty") as response:
+        return await response.json()
+
+
+async def fetch_hn() -> List[Story]:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(HN_URL_TOP_STORIES) as response:
+            story_ids = await response.json()
+
+        tasks = []
+        for id in story_ids[:30]:  # Limit to 30 stories
+            tasks.append(fetch_story(session, id))
+
+        stories = await asyncio.gather(*tasks)
+
+        stories_out = []
+        for story in stories:
+            for k in ('title', 'url', 'score'):
+                stories_out.append(Story(**dict((k, story.get(k, None)))))
+
+        return stories_out
+
+
+# ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+# Methods for fetching hacker news posts via api
+
+class ChidoriWorker:
+    def __init__(self):
+        self.c = Chidori("0", "http://localhost:9800")
+        self.staged_custom_nodes = []
+
+    async def build_graph(self):
+        g = GraphBuilder()
+
+        # Create a custom node, we will implement our
+        # own handler for this node type
+        h = await g.custom_node(
+            name="FetchTopHN",
+            node_type_name="FetchTopHN",
+            output="type O { output: String }"
+        )
+
+        # A prompt node, pulling in the value of the output from FetchTopHN
+        # and templating that into the prompt for GPT3.5
+        h_interpret = await g.prompt_node(
+            name="InterpretTheGroup",
+            template="""
+                Based on the following list of HackerNews threads, 
+                filter this list to only launches of new AI projects: {{FetchTopHN.output}}
+            """
+        )
+        await h_interpret.run_when(g, h)
+
+        h_format_and_rank = await g.prompt_node(
+            name="FormatAndRank",
+            template="""
+                Format this list of new AI projects in markdown, ranking the most 
+                interesting projects from most interesting to least. 
+                
+                {{InterpretTheGroup.promptResult}}
+            """
+        )
+        await h_format_and_rank.run_when(g, h_interpret)
+
+        # Commit the graph, this pushes the configured graph
+        # to our durable execution runtime.
+        await g.commit(self.c, 0)
+
+    async def run(self):
+        # Construct the agent graph
+        await self.build_graph()
+
+        # Start graph execution from the root
+        await self.c.play(0, 0)
+
+        # Run the node execution loop
+        await self.c.run_custom_node_loop()
+
+
+async def handle_fetch_hn(node_will_exec):
+    stories = await fetch_hn()
+    result = {"output": json.dumps([story.__dict__ for story in stories])}
+    return result
+
+
+async def main():
+    w = ChidoriWorker()
+    await w.c.start_server(":memory:")
+    await w.c.register_custom_node_handle("FetchTopHN", handle_fetch_hn)
+    await w.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
+
+</td>
+<td>
+
+```rust
+extern crate chidori;
+use std::collections::HashMap;
+use std::env;
+use std::net::ToSocketAddrs;
+use anyhow;
+use futures::stream::{self, StreamExt, TryStreamExt};
+use reqwest;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use chidori::{create_change_value, NodeWillExecuteOnBranch};
+use chidori::register_node_handle;
+use chidori::translations::rust::{Chidori, CustomNodeCreateOpts, DenoCodeNodeCreateOpts, GraphBuilder, Handler, PromptNodeCreateOpts, serialized_value_to_string};
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Story {
+    title: String,
+    url: Option<String>,
+    score: Option<f32>,
+}
+
+const HN_URL_TOP_STORIES: &'static str = "https://hacker-news.firebaseio.com/v0/topstories.json?print=pretty";
+
+async fn fetch_hn() -> anyhow::Result<Vec<Story>> {
+    let client = reqwest::Client::new();
+    // Fetch the top 60 story ids
+    let story_ids: Vec<u32> = client.get(HN_URL_TOP_STORIES).send().await?.json().await?;
+
+    // Fetch details for each story
+    let stories: anyhow::Result<Vec<Story>> = stream::iter(story_ids.into_iter().take(30))
+        .map(|id| {
+            let client = &client;
+            async move {
+                let resource = format!("https://hacker-news.firebaseio.com/v0/item/{}.json?print=pretty", id);
+                let mut story: Story = client.get(&resource).send().await?.json().await?;
+                Ok(story)
+            }
+        })
+        .buffer_unordered(10)  // Fetch up to 10 stories concurrently
+        .try_collect()
+        .await;
+    stories
+}
+
+async fn handle_fetch_hn(_node_will_exec: NodeWillExecuteOnBranch) -> anyhow::Result<serde_json::Value> {
+    let stories = fetch_hn().await.unwrap();
+    let mut result = HashMap::new();
+    result.insert("output", format!("{:?}", stories));
+    Ok(serde_json::to_value(result).unwrap())
+}
+
+/// Maintain a list summarizing recent AI launches across the week
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let mut c = Chidori::new(String::from("0"), String::from("http://localhost:9800"));
+    c.start_server(Some(":memory:".to_string())).await?;
+
+    let mut g = GraphBuilder::new();
+
+    let h = g.custom_node(CustomNodeCreateOpts {
+        name: "FetchTopHN".to_string(),
+        node_type_name: "FetchTopHN".to_string(),
+        output: Some("type O { output: String }".to_string()),
+        ..CustomNodeCreateOpts::default()
+    })?;
+
+    let mut h_interpret = g.prompt_node(PromptNodeCreateOpts {
+        name: "InterpretTheGroup".to_string(),
+        template: "Based on the following list of HackerNews threads, filter this list to only launches of new AI projects: {{FetchTopHN.output}}".to_string(),
+        ..PromptNodeCreateOpts::default()
+    })?;
+    h_interpret.run_when(&mut g, &h)?;
+
+    let mut h_format_and_rank = g.prompt_node(PromptNodeCreateOpts {
+        name: "FormatAndRank".to_string(),
+        template: "Format this list of new AI projects in markdown, ranking the most interesting projects from most interesting to least. {{InterpretTheGroup.promptResult}}".to_string(),
+        ..PromptNodeCreateOpts::default()
+    })?;
+    h_format_and_rank.run_when(&mut g, &h_interpret)?;
+
+    // Commit the graph
+    g.commit(&c, 0).await?;
+
+    // Start graph execution from the root
+    c.play(0, 0).await?;
+
+    // Register the handler for our custom node
+    register_node_handle!(c, "FetchTopHN", handle_fetch_hn);
+
+    // Run the node execution loop
+    if let Err(x) = c.run_custom_node_loop().await {
+        eprintln!("Custom Node Loop Failed On - {:?}", x);
+    };
+    Ok(())
+}
+```
+
+</td>
+</tr>
+</table>
 
 ## 🤔 About
 
@@ -167,8 +362,8 @@ Thousand Birds comes with first-class support for code interpreter environments 
 
 
 ## Contributing
-We look forward to future contributions from the community. For now it will be difficult to contribute, as we are still in the process of setting up our development environment. We will update this section as soon as we have a more stable development environment.
-If you have feedback or would like to chat with us, please add to the discussion on our Github issues!
+This is an early open source release and we're looking for collaborators from the community. 
+A good place to start would be to join our [discord](https://discord.gg/CJwKsPSgew)!.
 
 ## FAQ
 
