@@ -98,6 +98,8 @@ cargo install chidori
 
 
 ### Environment Variables
+You will need to set the following environment variables if you depend on nodes that
+require them.
 ```bash
 OPENAI_API_KEY=...
 ```
@@ -334,17 +336,17 @@ async fn main() -> anyhow::Result<()> {
 ## 🤔 About
 
 ### Reactive Runtime
-At its core, Thousand Birds brings a reactive runtime that orchestrates interactions between different agents and their components. The runtime is comprised of "nodes", which react to system changes they subscribe to, providing dynamic and responsive behavior in your AI systems.
+At its core, Chidori brings a reactive runtime that orchestrates interactions between different agents and their components. The runtime is comprised of "nodes", which react to system changes they subscribe to, providing dynamic and responsive behavior in your AI systems.
 Nodes can encompass code, prompts, vector databases, custom code, services, or even complete systems. 
 
 ### Monitoring and Observability
-Thousand Birds ensures comprehensive monitoring and observability of your agents. We record all the inputs and outputs emitted by nodes, enabling us to explain precisely what led to what, enhancing your debugging experience and understanding of the system’s production behavior.
+Chidori ensures comprehensive monitoring and observability of your agents. We record all the inputs and outputs emitted by nodes, enabling us to explain precisely what led to what, enhancing your debugging experience and understanding of the system’s production behavior.
 
 ### Branching and Time-Travel
-With Thousand Birds, you can take snapshots of your system and explore different possible outcomes from that point (branching), or rewind the system to a previous state (time-travel). This functionality improves error handling, debugging, and system robustness by offering alternative pathways and do-overs.
+With Chidori, you can take snapshots of your system and explore different possible outcomes from that point (branching), or rewind the system to a previous state (time-travel). This functionality improves error handling, debugging, and system robustness by offering alternative pathways and do-overs.
 
 ### Code Interpreter Environments
-Thousand Birds comes with first-class support for code interpreter environments like [Deno](https://deno.land/) or [Starlark](https://github.com/bazelbuild/starlark/blob/master/spec.md). You can execute code directly within your system, providing quick startup, ease of use, and secure execution. We're continually working on additional safeguards against running untrusted code, with containerized nodes support coming soon.
+Chidori comes with first-class support for code interpreter environments like [Deno](https://deno.land/) or [Starlark](https://github.com/bazelbuild/starlark/blob/master/spec.md). You can execute code directly within your system, providing quick startup, ease of use, and secure execution. We're continually working on additional safeguards against running untrusted code, with containerized nodes support coming soon.
 
 ## 🛣️ Roadmap
 
@@ -384,6 +386,11 @@ It also happens to mean Thousand Birds in Japanese, which is a nice coincidence.
 Thousand Birds is a reference to flocks of birds (or a murmuration) and the emergent behavior that arises from their interactions.
 We think this is a good metaphor for the behavior of long running agents, the internal units of LLM execution within them, and the emergent behavior that arises from their interactions.
 
+### Why Rust?
+Rust is a great language for building systems, we like the type system and the guarantees provided by it.
+We also like the performance characteristics of Rust, and the ability to build a single binary that can be deployed anywhere.
+The Rust ecosystem makes it fairly easy to provide bindings to other languages, which is important for us to provide a good developer experience.
+
 
 ## Inspiration
 Our framework is inspired by the work of many others, including:
@@ -394,3 +401,6 @@ Our framework is inspired by the work of many others, including:
 
 ## License
 Thousand Birds is under the MIT license. See the [LICENSE](LICENSE) for more information.
+
+## Help us out!
+Please star the github repo and give us feedback in [discord](https://discord.gg/CJwKsPSgew)!
