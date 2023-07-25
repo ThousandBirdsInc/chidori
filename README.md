@@ -367,7 +367,7 @@ Chidori comes with first-class support for code interpreter environments like [D
 * [ ] Adding support for containerized nodes
 * [ ] Allowing filtering in node queries
 
-### Med term
+### Medium term
 * [ ] Analysis tools for comparing executions
 * [ ] Agent re-evaluation with feedback
 * [ ] Definitive patterns for human in the loop agents
