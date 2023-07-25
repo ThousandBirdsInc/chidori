@@ -49,8 +49,10 @@ Check out [high level docs ](https://docs.thousandbirds.ai/3fe20a82965148c7a0b48
     - [Why Another AI Framework?](#why-another-ai-framework)
     - [Why Chidori?](#why-chidori)
     - [Well then why Thousand Birds?](#well-then-why-thousand-birds)
+    - [Why Rust?](#why-rust)
   - [Inspiration](#inspiration)
   - [License](#license)
+  - [Help us out!](#help-us-out)
 
 
 ## 📖 Chidori
