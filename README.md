@@ -362,7 +362,7 @@ Chidori comes with first-class support for code interpreter environments like [D
 ### Short term
 * [x] Reactive subscriptions between nodes
 * [x] Branching and time travel debugging, reverting execution of a graph
-* [x] NodeJS, Python, and Rust support for building and executing graphs
+* [x] Node.js, Python, and Rust support for building and executing graphs
 * [ ] Simple local vector db for development
 * [ ] Adding support for containerized nodes
 * [ ] Allowing filtering in node queries
