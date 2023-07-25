@@ -375,12 +375,12 @@ A good place to start would be to join our [discord](https://discord.gg/CJwKsPSg
 
 ### Why Another AI Framework?
 Chidori focuses more on the specifics of how LLM+code execution operates, rather than providing specific compositions of prompts.
-We havent' really seen any other frameworks that focus on this space, and we think it's a really important one.
+We haven't really seen any other frameworks that focus on this space, and we think it's a really important one.
 Our effort is to resolve as much of the accidental complexity of building systems in the category of long running agents as possible, helping the broader developer community build successful systems.
 
 ### Why Chidori?
 Chidori is the name of the lightning blade technique used by Kakashi in the Naruto anime series.
-It also happens to mean Thousand Birds in Japanese, which is a nice coincidence.
+It also happens to [mean Thousand Birds in Japanese](https://en.wikipedia.org/wiki/Chidori), which is a nice coincidence.
 
 ### Well then why Thousand Birds?
 Thousand Birds is a reference to flocks of birds (or a murmuration) and the emergent behavior that arises from their interactions.
