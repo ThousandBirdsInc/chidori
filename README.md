@@ -17,6 +17,11 @@
 
 <br />
 
+<br />
+Star us on Github! Join us on [Discord](https://discord.gg/CJwKsPSgew).
+<br />
+[High level documentation](https://docs.thousandbirds.ai/3fe20a82965148c7a0b480f7daf0aff6)
+
 </div>
 
 
@@ -59,7 +64,6 @@ It is currently in alpha, and is not yet ready for production use. We are contin
 - Time travel debugging
 
 ## ⚡️ Getting Started
-
 
 ### Installation
 You can use Chidori from Node.js, Python or Rust.
