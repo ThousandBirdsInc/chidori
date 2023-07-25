@@ -17,13 +17,12 @@
 
 <br />
 
-<br />
-Star us on Github! Join us on [Discord](https://discord.gg/CJwKsPSgew).
-<br />
-[High level documentation](https://docs.thousandbirds.ai/3fe20a82965148c7a0b480f7daf0aff6)
 
 </div>
 
+Star us on Github! Join us on [Discord](https://discord.gg/CJwKsPSgew).
+
+Check out [high level docs ](https://docs.thousandbirds.ai/3fe20a82965148c7a0b480f7daf0aff6)
 
 ## Contents
 - [  Chidori  ](#-chidori-)
