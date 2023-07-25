@@ -17,8 +17,9 @@
       <excludeFolder url="file://$MODULE_DIR$/prompt-graph-core/target" />
       <excludeFolder url="file://$MODULE_DIR$/prompt-graph-exec/target" />
       <excludeFolder url="file://$MODULE_DIR$/rust-simple/target" />
+      <excludeFolder url="file://$MODULE_DIR$/venv" />
     </content>
-    <orderEntry type="inheritedJdk" />
+    <orderEntry type="jdk" jdkName="Python 3.10 (chidori)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
 </module>

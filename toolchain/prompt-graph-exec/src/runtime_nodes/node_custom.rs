@@ -5,11 +5,6 @@ use crate::executor::NodeExecutionContext;
 
 #[tracing::instrument]
 pub async fn execute_node_custom(ctx: &NodeExecutionContext<'_>) -> anyhow::Result<Vec<ChangeValue>> {
-    // TODO: block until we find the result for this node
-    // TODO: search for the will execute response
-
-    // TODO: wait until the will execute event for this is complete
-    // TODO: this is the change that caused the custom node to execute
     let &NodeExecutionContext {
         node_will_execute_on_branch,
         item: item::Item::NodeCustom(n),
@@ -19,7 +14,6 @@ pub async fn execute_node_custom(ctx: &NodeExecutionContext<'_>) -> anyhow::Resu
     } = ctx else {
         panic!("execute_node_custom: expected NodeExecutionContext with Custom item");
     };
-
 
     let NodeWillExecuteOnBranch { branch, counter, ..} = node_will_execute_on_branch;
 
@@ -44,8 +38,4 @@ pub async fn execute_node_custom(ctx: &NodeExecutionContext<'_>) -> anyhow::Resu
             return Ok(result_filled_values);
         }
     }
-
-    // Custom nodes emit an empty change set, because they directly receive their
-    // change set from the worker itself.
-    Ok(vec![])
 }

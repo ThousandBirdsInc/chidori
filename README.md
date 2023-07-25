@@ -7,8 +7,11 @@
 **A reactive runtime for building durable AI agents**
 
 <p>
-<a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="GitHub Last Commit" src="https://img.shields.io/github/actions/workflow/status/ThousandBirdsInc/chidori/push.yml" /></a>
+<a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="Current Build Status" src="https://img.shields.io/github/actions/workflow/status/ThousandBirdsInc/chidori/push.yml" /></a>
 <a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/ThousandBirdsInc/chidori" /></a>
+<a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="Cargo.io download" src="https://img.shields.io/crates/dv/chidori/0.1.1" /></a>
+<a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="Cargo.io download" src="https://img.shields.io/pypi/v/chidori" /></a>
+<a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="Cargo.io download" src="https://img.shields.io/npm/v/@1kbirds/chidori" /></a>
 <a href="https://github.com/ThousandBirdsInc/chidori/blob/main/LICENSE"><img alt="Github License" src="https://img.shields.io/badge/License-MIT-green.svg" /></a>
 </p>
 
@@ -17,11 +20,26 @@
 </div>
 
 
-### Quick Links
-- [Getting Started](https://github.com/ThousandBirdsInc/chidori/tree/main#-getting-started)
-- [Documentation](https://www.notion.so/Documentation-3fe20a82965148c7a0b480f7daf0aff6?pvs=21)
-- [About](https://github.com/ThousandBirdsInc/chidori/tree/main#-about)
-- [Roadmap](https://github.com/ThousandBirdsInc/chidori/tree/main#-roadmap)
+## Contents
+* [📖 Chidori](#---chidori)
+* [⚡️ Getting Started](#---getting-started)
+    + [Installation](#installation)
+    + [Environment Variables](#environment-variables)
+    + [Example](#example)
+* [🤔 About](#---about)
+    + [Reactive Runtime](#reactive-runtime)
+    + [Monitoring and Observability](#monitoring-and-observability)
+    + [Branching and Time-Travel](#branching-and-time-travel)
+    + [Code Interpreter Environments](#code-interpreter-environments)
+* [🛣️ Roadmap](#----roadmap)
+    + [Short term](#short-term)
+    + [Med term](#med-term)
+* [Contributing](#contributing)
+* [FAQ](#faq)
+    + [Why Another AI Framework?](#why-another-ai-framework-)
+* [Inspiration](#inspiration)
+* [License](#license)
+
 
 ## 📖 Chidori
 Chidori is a reactive runtime for building AI agents. It provides a framework for building AI agents that are reactive, observable, and robust. It supports building agents with Node.js, Python, and Rust. 

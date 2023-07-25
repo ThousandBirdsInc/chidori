@@ -1,21 +1,19 @@
+extern crate chidori;
 use std::collections::HashMap;
 use std::env;
 use std::net::ToSocketAddrs;
-use reqwest;
-use serde::{Deserialize, Serialize};
-use futures::stream::{self, StreamExt, TryStreamExt};
-
-use lettre::transport::smtp::authentication::Credentials;
-use lettre::{Message, SmtpTransport, Transport};
-use chidori::translations::rust::{Chidori, CustomNodeCreateOpts, DenoCodeNodeCreateOpts, GraphBuilder, Handler, PromptNodeCreateOpts, serialized_value_to_string};
 use anyhow;
+use futures::stream::{self, StreamExt, TryStreamExt};
+use lettre::{Message, SmtpTransport, Transport};
+use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::Error;
 use lettre::transport::smtp::response::Response;
+use reqwest;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use chidori::{create_change_value, NodeWillExecuteOnBranch};
-extern crate chidori;
 use chidori::register_node_handle;
-
+use chidori::translations::rust::{Chidori, CustomNodeCreateOpts, DenoCodeNodeCreateOpts, GraphBuilder, Handler, PromptNodeCreateOpts, serialized_value_to_string};
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Story {
@@ -82,13 +80,6 @@ async fn main() -> anyhow::Result<()> {
         ..PromptNodeCreateOpts::default()
     })?;
     h_format_and_rank.run_when(&mut g, &h_interpret)?;
-
-    let mut generate_email = g.prompt_node(PromptNodeCreateOpts {
-        name: "GenerateEmailFn".to_string(),
-        template: "Write the body of a javascript function that returns {'subject': string, 'body': string} and populate the body with {{FormatAndRank.promptResult}} put any commentary in comments.".to_string(),
-        ..PromptNodeCreateOpts::default()
-    })?;
-    generate_email.run_when(&mut g, &h_format_and_rank)?;
 
     // Commit the graph
     g.commit(&c, 0).await?;
