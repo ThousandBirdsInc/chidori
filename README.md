@@ -18,6 +18,10 @@
 <br />
 
 
+
+https://github.com/ThousandBirdsInc/chidori/assets/515757/6b088f7d-d8f7-4c7e-9006-4360ae40d1de
+
+
 </div>
 
 Star us on Github! Join us on [Discord](https://discord.gg/CJwKsPSgew).
