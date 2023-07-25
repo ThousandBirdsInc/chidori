@@ -21,24 +21,28 @@
 
 
 ## Contents
-* [📖 Chidori](#---chidori)
-* [⚡️ Getting Started](#---getting-started)
-    + [Installation](#installation)
-    + [Environment Variables](#environment-variables)
-    + [Example](#example)
-* [🤔 About](#---about)
-    + [Reactive Runtime](#reactive-runtime)
-    + [Monitoring and Observability](#monitoring-and-observability)
-    + [Branching and Time-Travel](#branching-and-time-travel)
-    + [Code Interpreter Environments](#code-interpreter-environments)
-* [🛣️ Roadmap](#----roadmap)
-    + [Short term](#short-term)
-    + [Med term](#med-term)
-* [Contributing](#contributing)
-* [FAQ](#faq)
-    + [Why Another AI Framework?](#why-another-ai-framework-)
-* [Inspiration](#inspiration)
-* [License](#license)
+- [  Chidori  ](#-chidori-)
+  - [Contents](#contents)
+  - [📖 Chidori](#-chidori)
+  - [⚡️ Getting Started](#️-getting-started)
+    - [Installation](#installation)
+    - [Environment Variables](#environment-variables)
+    - [Example](#example)
+  - [🤔 About](#-about)
+    - [Reactive Runtime](#reactive-runtime)
+    - [Monitoring and Observability](#monitoring-and-observability)
+    - [Branching and Time-Travel](#branching-and-time-travel)
+    - [Code Interpreter Environments](#code-interpreter-environments)
+  - [🛣️ Roadmap](#️-roadmap)
+    - [Short term](#short-term)
+    - [Med term](#med-term)
+  - [Contributing](#contributing)
+  - [FAQ](#faq)
+    - [Why Another AI Framework?](#why-another-ai-framework)
+    - [Why Chidori?](#why-chidori)
+    - [Well then why Thousand Birds?](#well-then-why-thousand-birds)
+  - [Inspiration](#inspiration)
+  - [License](#license)
 
 
 ## 📖 Chidori
@@ -368,7 +372,18 @@ A good place to start would be to join our [discord](https://discord.gg/CJwKsPSg
 ## FAQ
 
 ### Why Another AI Framework?
-Thousand Birds pushes to be more than a simple wrapper around LLMs. Our effort is to resolve as much of the accidental complexity of building systems in the category of long running agents as possible, helping the broader developer community build successful systems.
+Chidori focuses more on the specifics of how LLM+code execution operates, rather than providing specific compositions of prompts.
+We havent' really seen any other frameworks that focus on this space, and we think it's a really important one.
+Our effort is to resolve as much of the accidental complexity of building systems in the category of long running agents as possible, helping the broader developer community build successful systems.
+
+### Why Chidori?
+Chidori is the name of the lightning blade technique used by Kakashi in the Naruto anime series.
+It also happens to mean Thousand Birds in Japanese, which is a nice coincidence.
+
+### Well then why Thousand Birds?
+Thousand Birds is a reference to flocks of birds (or a murmuration) and the emergent behavior that arises from their interactions.
+We think this is a good metaphor for the behavior of long running agents, the internal units of LLM execution within them, and the emergent behavior that arises from their interactions.
+
 
 ## Inspiration
 Our framework is inspired by the work of many others, including:
