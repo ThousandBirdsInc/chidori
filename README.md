@@ -494,7 +494,7 @@ Chidori comes with first-class support for code interpreter environments like [D
 
 ## Contributing
 This is an early open source release and we're looking for collaborators from the community. 
-A good place to start would be to join our [discord](https://discord.gg/CJwKsPSgew)!.
+A good place to start would be to join our [discord](https://discord.gg/CJwKsPSgew)!
 
 ## FAQ
 
