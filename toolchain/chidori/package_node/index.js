@@ -1,10 +1,7 @@
 "use strict";
 
-const { promisify } = require("util");
-
 const {
     simpleFun,
-    nodehandleDebugExample,
     nodehandleRunWhen,
     nodehandleQuery,
     chidoriNew,
@@ -15,21 +12,37 @@ const {
     chidoriBranch,
     chidoriQuery,
     chidoriGraphStructure,
-    chidoriCustomNode,
-    chidoriDenoCodeNode,
-    chidoriVectorMemoryNode
+    chidoriRegisterCustomNodeHandle,
+    chidoriRunCustomNodeLoop,
+    graphbuilderNew,
+    graphbuilderCustomNode,
+    graphbuilderPromptNode,
+    graphbuilderDenoCodeNode,
+    graphbuilderVectorMemoryNode,
+    graphbuilderCommit
 } = require("./native/chidori.node");
 
+const toSnakeCase = str => str.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
 
+const transformKeys = (obj) => {
+    if (Array.isArray(obj)) {
+        return obj.map(val => transformKeys(val));
+    } else if (obj !== null && obj.constructor === Object) {
+        return Object.keys(obj).reduce((accumulator, key) => {
+            accumulator[toSnakeCase(key)] = transformKeys(obj[key]);
+            return accumulator;
+        }, {});
+    }
+    return obj;
+};
 
-// Wrapper class for the boxed `Database` for idiomatic JavaScript usage
 class NodeHandle {
-    constructor() {
-        this.nh = nodehandleDebugExample();
+    constructor(nh) {
+        this.nh = nh;
     }
 
-    runWhen(otherNodeHandle) {
-        return nodehandleRunWhen.call(this.nh, otherNodeHandle);
+    runWhen(graphBuilder, otherNodeHandle) {
+        return nodehandleRunWhen.call(this.nh, graphBuilder.g, otherNodeHandle.nh);
     }
 
     query(branch, frame) {
@@ -43,8 +56,8 @@ class Chidori {
         this.chi = chidoriNew(fileId, url);
     }
 
-    startServer() {
-        return chidoriStartServer.call(this.chi);
+    startServer(filePath) {
+        return chidoriStartServer.call(this.chi, filePath);
     }
 
     objectInterface(executionStatus) {
@@ -55,7 +68,7 @@ class Chidori {
         return chidoriPlay.call(this.chi, branch, frame);
     }
 
-    pause() {
+    pause(branch, frame) {
         return chidoriPause.call(this.chi, branch, frame);
     }
 
@@ -63,34 +76,55 @@ class Chidori {
         return chidoriQuery.call(this.chi, query, branch, frame)
     }
 
-    branch() {
+    branch(branch, frame) {
         return chidoriBranch.call(this.chi, branch, frame);
     }
 
-    graphStructure() {
-        return chidoriGraphStructure.call(this.chi);
+    graphStructure(branch) {
+        return chidoriGraphStructure.call(this.chi, branch);
     }
 
-    objInterface() {
-        return chidoriObjInterface.call(this.chi, branch, frame);
+    registerCustomNodeHandle(nodeTypeName, handle) {
+        // TODO: we actually pass a callback to the function provided by the user, which they invoke with their result
+        return chidoriRegisterCustomNodeHandle.call(this.chi, nodeTypeName, handle);
     }
 
-    customNode(customNodeCreateOpts) {
-        return chidoriCustomNode.call(this.chi, createCustomNodeOpts);
+    runCustomNodeLoop() {
+        return chidoriRunCustomNodeLoop.call(this.chi);
+    }
+
+}
+
+class GraphBuilder {
+    constructor() {
+        this.g = graphbuilderNew();
+    }
+
+    customNode(createCustomNodeOpts) {
+        return new NodeHandle(graphbuilderCustomNode.call(this.g, transformKeys(createCustomNodeOpts)));
+    }
+
+    promptNode(promptNodeCreateOpts) {
+        return new NodeHandle(graphbuilderPromptNode.call(this.g, transformKeys(promptNodeCreateOpts)));
     }
 
     denoCodeNode(denoCodeNodeCreateOpts) {
-        return chidoriDenoCodeNode.call(this.chi, denoCodeNodeCreateOpts);
+        return new NodeHandle(graphbuilderDenoCodeNode.call(this.g, transformKeys(denoCodeNodeCreateOpts)));
     }
 
     vectorMemoryNode(vectorMemoryNodeCreateOpts) {
-        return chidoriVectorMemoryNode.call(this.chi, vectorMemoryNodeCreateOpts);
+        return new NodeHandle(graphbuilderVectorMemoryNode.call(this.g, transformKeys(vectorMemoryNodeCreateOpts)));
+    }
+
+    commit(chidori) {
+        return graphbuilderCommit.call(this.g, chidori.chi, 0);
     }
 }
 
 
 module.exports = {
     Chidori: Chidori,
+    GraphBuilder: GraphBuilder,
     NodeHandle: NodeHandle,
     simpleFun: simpleFun
 };
