@@ -24,7 +24,6 @@ jobs:
       matrix:
         node_version:
           - 16
-          - 17
           - 18
           - 19
           - 20
