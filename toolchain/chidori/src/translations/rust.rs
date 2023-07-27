@@ -142,6 +142,18 @@ impl Chidori {
         Ok(result.into_inner())
     }
 
+    pub async fn branch( &self, branch: u64, frame: u64, ) -> anyhow::Result<ExecutionStatus> {
+        let file_id = self.file_id.clone();
+        let url = self.url.clone();
+        let mut client = get_client(url).await?;
+        let result = client.branch(RequestNewBranch {
+            id: file_id,
+            source_branch_id: branch,
+            diverges_at_counter: frame
+        }).await?;
+        Ok(result.into_inner())
+    }
+
     pub async fn list_branches( &self) -> anyhow::Result<ListBranchesRes> {
         let file_id = self.file_id.clone();
         let url = self.url.clone();
@@ -323,6 +335,7 @@ impl Chidori {
                     if let Some(x) = self.custom_node_handlers.get(&ev.custom_node_type_name.clone().unwrap()) {
                         self.ack_local_code_node_execution(*branch, *counter).await?;
                         let result = (x.as_ref().callback)(ev.clone()).await?;
+                        dbg!(&result);
                         self.respond_local_code_node_execution(*branch, *counter, node_name.clone(), result).await?;
                     }
                 }
@@ -356,6 +369,16 @@ impl Default for PromptNodeCreateOpts {
         }
     }
 }
+impl PromptNodeCreateOpts {
+    pub fn merge(&mut self, other: PromptNodeCreateOpts) {
+        self.name = other.name;
+        self.queries = other.queries.or(self.queries.take());
+        self.output_tables = other.output_tables.or(self.output_tables.take());
+        self.template = other.template;
+        self.model = other.model.or(self.model.take());
+    }
+}
+
 
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -379,6 +402,17 @@ impl Default for CustomNodeCreateOpts {
         }
     }
 }
+impl CustomNodeCreateOpts {
+    pub fn merge(&mut self, other: CustomNodeCreateOpts) {
+        self.name = other.name;
+        self.queries = other.queries.or(self.queries.take());
+        self.output_tables = other.output_tables.or(self.output_tables.take());
+        self.output = other.output.or(self.output.take());
+        self.node_type_name = other.node_type_name;
+    }
+}
+
+
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct DenoCodeNodeCreateOpts {
@@ -402,7 +436,17 @@ impl Default for DenoCodeNodeCreateOpts {
         }
     }
 }
-    
+
+impl DenoCodeNodeCreateOpts {
+    pub fn merge(&mut self, other: DenoCodeNodeCreateOpts) {
+        self.name = other.name;
+        self.queries = other.queries.or(self.queries.take());
+        self.output_tables = other.output_tables.or(self.output_tables.take());
+        self.output = other.output.or(self.output.take());
+        self.code = other.code;
+        self.is_template = other.is_template.or(self.is_template.take());
+    }
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct VectorMemoryNodeCreateOpts {
@@ -435,6 +479,20 @@ impl Default for VectorMemoryNodeCreateOpts {
 }
 
 
+impl VectorMemoryNodeCreateOpts {
+    pub fn merge(&mut self, other: VectorMemoryNodeCreateOpts) {
+        self.name = other.name;
+        self.queries = other.queries.or(self.queries.take());
+        self.output_tables = other.output_tables.or(self.output_tables.take());
+        self.output = other.output.or(self.output.take());
+        self.template = other.template.or(self.template.take());
+        self.action = other.action.or(self.action.take());
+        self.embedding_model = other.embedding_model.or(self.embedding_model.take());
+        self.db_vendor = other.db_vendor.or(self.db_vendor.take());
+        self.collection_name = other.collection_name;
+    }
+}
+
 fn remap_queries(queries: Option<Vec<String>>) -> Vec<Option<String>> {
     let queries: Vec<Option<String>> = if let Some(queries) = queries {
         queries.into_iter().map(|q| {
@@ -462,23 +520,27 @@ impl GraphBuilder {
         }
     }
     pub fn prompt_node(&mut self, arg: PromptNodeCreateOpts) -> anyhow::Result<NodeHandle> {
+        let mut def = PromptNodeCreateOpts::default();
+        def.merge(arg);
         let node = create_prompt_node(
-            arg.name.clone(),
-            remap_queries(arg.queries),
-            arg.template,
-            arg.model.unwrap_or("GPT_3_5_TURBO".to_string()),
-            arg.output_tables.unwrap_or(vec![]))?;
+            def.name.clone(),
+            remap_queries(def.queries),
+            def.template,
+            def.model.unwrap_or("GPT_3_5_TURBO".to_string()),
+            def.output_tables.unwrap_or(vec![]))?;
         self.clean_graph.merge_file(&File { nodes: vec![node.clone()], ..Default::default() })?;
         Ok(NodeHandle::from(node)?)
     }
 
     pub fn custom_node(&mut self, arg: CustomNodeCreateOpts) -> anyhow::Result<NodeHandle> {
+        let mut def = CustomNodeCreateOpts::default();
+        def.merge(arg);
         let node = create_custom_node(
-            arg.name.clone(),
-            remap_queries(arg.queries.clone()),
-            arg.output.unwrap_or("type O {}".to_string()),
-            arg.node_type_name,
-            arg.output_tables.unwrap_or(vec![])
+            def.name.clone(),
+            remap_queries(def.queries.clone()),
+            def.output.unwrap_or("type O {}".to_string()),
+            def.node_type_name,
+            def.output_tables.unwrap_or(vec![])
         );
         self.clean_graph.merge_file(&File { nodes: vec![node.clone()], ..Default::default() })?;
         Ok(NodeHandle::from(node)?)
@@ -486,12 +548,14 @@ impl GraphBuilder {
 
 
     pub fn deno_code_node(&mut self, arg: DenoCodeNodeCreateOpts) -> anyhow::Result<NodeHandle> {
+        let mut def = DenoCodeNodeCreateOpts::default();
+        def.merge(arg);
         let node = create_code_node(
-            arg.name.clone(),
-            remap_queries(arg.queries.clone()),
-            arg.output.unwrap_or("type O {}".to_string()),
-            SourceNodeType::Code("DENO".to_string(), arg.code, arg.is_template.unwrap_or(false)),
-            arg.output_tables.unwrap_or(vec![])
+            def.name.clone(),
+            remap_queries(def.queries.clone()),
+            def.output.unwrap_or("type O {}".to_string()),
+            SourceNodeType::Code("DENO".to_string(), def.code, def.is_template.unwrap_or(false)),
+            def.output_tables.unwrap_or(vec![])
         );
         self.clean_graph.merge_file(&File { nodes: vec![node.clone()], ..Default::default() })?;
         Ok(NodeHandle::from(node)?)
@@ -499,16 +563,18 @@ impl GraphBuilder {
 
 
     pub fn vector_memory_node(&mut self, arg: VectorMemoryNodeCreateOpts) -> anyhow::Result<NodeHandle> {
+        let mut def = VectorMemoryNodeCreateOpts::default();
+        def.merge(arg);
         let node = create_vector_memory_node(
-            arg.name.clone(),
-            remap_queries(arg.queries.clone()),
-            arg.output.unwrap_or("type O {}".to_string()),
-            arg.action.unwrap_or("READ".to_string()),
-            arg.embedding_model.unwrap_or("TEXT_EMBEDDING_ADA_002".to_string()),
-            arg.template.unwrap_or("".to_string()),
-            arg.db_vendor.unwrap_or("QDRANT".to_string()),
-            arg.collection_name,
-            arg.output_tables.unwrap_or(vec![])
+            def.name.clone(),
+            remap_queries(def.queries.clone()),
+            def.output.unwrap_or("type O {}".to_string()),
+            def.action.unwrap_or("READ".to_string()),
+            def.embedding_model.unwrap_or("TEXT_EMBEDDING_ADA_002".to_string()),
+            def.template.unwrap_or("".to_string()),
+            def.db_vendor.unwrap_or("QDRANT".to_string()),
+            def.collection_name,
+            def.output_tables.unwrap_or(vec![])
         )?;
         self.clean_graph.merge_file(&File { nodes: vec![node.clone()], ..Default::default() })?;
         Ok(NodeHandle::from(node)?)
@@ -583,7 +649,7 @@ impl GraphBuilder {
 // Node handle
 #[derive(Clone)]
 pub struct NodeHandle {
-    node: Item,
+    pub node: Item,
     indiv: CleanIndividualNode
 }
 

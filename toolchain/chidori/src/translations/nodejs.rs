@@ -1,10 +1,14 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::marker::PhantomData;
+use std::sync::{Arc};
+use tokio::sync::{mpsc, Mutex};
 use anyhow::Error;
 use futures::StreamExt;
 use log::{debug, info};
 use neon::{prelude::*, types::Deferred};
+use neon::handle::Managed;
 use neon::result::Throw;
 use once_cell::sync::OnceCell;
 use tokio::runtime::Runtime;
@@ -15,7 +19,9 @@ use prompt_graph_core::proto2::execution_runtime_client::ExecutionRuntimeClient;
 use prompt_graph_core::proto2::serialized_value::Val;
 use prompt_graph_exec::tonic_runtime::run_server;
 use neon_serde3;
+use prost::bytes::Buf;
 use serde::{Deserialize, Serialize};
+use crate::translations::rust::{Chidori, CustomNodeCreateOpts, DenoCodeNodeCreateOpts, GraphBuilder, Handler, NodeHandle, PromptNodeCreateOpts, VectorMemoryNodeCreateOpts};
 
 // Return a global tokio runtime or create one if it doesn't exist.
 // Throws a JavaScript exception if the `Runtime` fails to create.
@@ -28,25 +34,6 @@ fn runtime<'a, C: Context<'a>>(cx: &mut C) -> NeonResult<&'static Runtime> {
 
 async fn get_client(url: String) -> Result<ExecutionRuntimeClient<tonic::transport::Channel>, tonic::transport::Error> {
     ExecutionRuntimeClient::connect(url.clone()).await
-}
-
-
-async fn push_file_merge(url: &String, file_id: &String, node: Item) -> anyhow::Result<NodeHandle> {
-    let mut client = get_client(url.clone()).await?;
-    let exec_status = client.merge(RequestFileMerge {
-        id: file_id.clone(),
-        file: Some(File {
-            nodes: vec![node.clone()],
-            ..Default::default()
-        }),
-        branch: 0,
-    }).await?.into_inner();
-    Ok(NodeHandle::from(
-        url.clone(),
-        file_id.clone(),
-        node,
-        exec_status
-    )?)
 }
 
 
@@ -116,161 +103,69 @@ fn from_js_value<'a, C: Context<'a>>(cx: &mut C, value: Handle<JsValue>) -> Neon
     cx.throw_error("Unsupported type")
 }
 
+macro_rules! return_or_throw_deferred {
+    ($channel:expr, $deferred:expr, $m:expr) => {
+        if let Ok(result) = $m {
+            $deferred.settle_with($channel, move |mut cx| {
+                neon_serde3::to_value(&mut cx, &result)
+                    .or_else(|e| cx.throw_error(e.to_string()))
+            });
+        } else {
+            $deferred.settle_with($channel, move |mut cx| {
+                cx.throw_error("Error playing")
+            });
+        }
+    };
+}
+
 
 // Node handle
 #[derive(Clone)]
-pub struct NodeHandle {
-    url: String,
-    file_id: String,
-    node: Item,
-    exec_status: ExecutionStatus,
-    indiv: CleanIndividualNode
+pub struct NodeNodeHandle {
+    n: NodeHandle
 }
 
-impl NodeHandle {
-    fn example() -> Self{
-        let node = create_code_node(
-            "Example".to_string(),
-            vec![None],
-            "type O { output: String }".to_string(),
-            SourceNodeType::Code("DENO".to_string(), r#"return {"output": "hello"}"#.to_string(), false),
-            vec![],
-        );
-        let indiv = derive_for_individual_node(&node).unwrap();
-        NodeHandle {
-            url: "localhost:9800".to_string(),
-            file_id: "0".to_string(),
-            node: node,
-            exec_status: Default::default(),
-            indiv,
-        }
-    }
-
-    fn from(url: String, file_id: String, node: Item, exec_status: ExecutionStatus) -> anyhow::Result<NodeHandle> {
-        let indiv = derive_for_individual_node(&node)?;
-        Ok(NodeHandle {
-            url,
-            file_id,
-            node,
-            exec_status,
-            indiv
-        })
+impl NodeNodeHandle {
+    fn from(n: NodeHandle) -> NodeNodeHandle {
+        NodeNodeHandle{ n }
     }
 }
 
-impl Finalize for NodeHandle {}
+impl Finalize for NodeNodeHandle {}
 
 
-impl NodeHandle {
-    pub fn js_debug_example(mut cx: FunctionContext) -> JsResult<JsBox<RefCell<NodeHandle>>> {
-        let nh = NodeHandle::example();
-        Ok(cx.boxed(RefCell::new(nh)))
-    }
-
+impl NodeNodeHandle {
     fn get_name(&self) -> String {
-        self.node.core.as_ref().unwrap().name.clone()
+        self.n.get_name()
     }
 
     pub fn run_when(mut cx: FunctionContext) -> JsResult<JsPromise> {
         let channel = cx.channel();
         let (deferred, promise) = cx.promise();
-        let other_node = cx.argument::<JsBox<RefCell<NodeHandle>>>(0)?.downcast_or_throw::<JsBox<RefCell<NodeHandle>>, _>(&mut cx)?;
-
         let self_ = cx.this()
-            .downcast_or_throw::<JsBox<RefCell<NodeHandle>>, _>(&mut cx)?;
+            .downcast_or_throw::<JsBox<RefCell<NodeNodeHandle>>, _>(&mut cx)?;
 
-        let mut self_borrow = self_.borrow_mut();
-        let queries = &mut self_borrow.node.core.as_mut().unwrap().queries;
+        let graph_builder = cx.argument::<JsBox<NodeGraphBuilder>>(0)?;
+        let other_node_handle = cx.argument::<JsBox<RefCell<NodeNodeHandle>>>(1)?;
 
-        // Get the constructed query from the target node
-        let q = construct_query_from_output_type(
-            &other_node.borrow().get_name(),
-            &other_node.borrow().get_name(),
-            &self_.borrow().indiv.output_path
-        ).unwrap();
-
-        queries.push(Query { query: Some(q)});
-
-        let url = self_.borrow().url.clone();
-        let file_id = self_.borrow().file_id.clone();
-        let node = self_.borrow().node.clone();
-        let rt = runtime(&mut cx)?;
-        rt.spawn(async move {
-            let result = push_file_merge(&url, &file_id, node).await.unwrap();
-            deferred.settle_with(&channel, move |mut cx| {
-                Ok(cx.boolean(true))
-            });
-        });
-        Ok(promise)
-    }
-
-
-    pub fn query(mut cx: FunctionContext) -> JsResult<JsPromise> {
-        let (deferred, promise) = cx.promise();
-        let channel = cx.channel();
-
-        let branch = cx.argument::<JsNumber>(0)?.value(&mut cx) as u64;
-        let frame = cx.argument::<JsNumber>(1)?.value(&mut cx) as u64;
-
-        let self_ = cx.this()
-            .downcast_or_throw::<JsBox<RefCell<NodeHandle>>, _>(&mut cx)?;
-        let mut self_borrow = self_.borrow();
-        let file_id = self_borrow.file_id.clone();
-        let url = self_borrow.url.clone();
-        let name = &self_borrow.node.core.as_ref().unwrap().name;
-
-        let query = construct_query_from_output_type(&name, &name, &self_.borrow().indiv.output_path).unwrap();
-
-        let rt = runtime(&mut cx)?;
-        rt.spawn(async move {
-            let mut client = if let Ok(mut client) = get_client(url).await {
-                client
+        let mut n = &mut self_.borrow_mut().n;
+        let g = &graph_builder.g;
+        let mut graph_builder = g.blocking_lock();
+        let other_node = &other_node_handle.borrow().n;
+        let m = n.run_when(&mut graph_builder, &other_node);
+        deferred.settle_with((&channel), move |mut cx| {
+            if let Ok(result) = m {
+                Ok(cx.boolean(result))
             } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    cx.throw_error::<&str, JsUndefined>("Failed to connect to runtime service.");
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to connect to runtime service.");
-            };
-            let result = client.run_query(QueryAtFrame {
-                id: file_id,
-                query: Some(Query {
-                    query: Some(query)
-                }),
-                frame,
-                branch,
-            }).await;
-            deferred.settle_with(&channel, move |mut cx| {
-                if let Ok(result) = result {
-                    let res = result.into_inner();
-                    let mut obj = cx.empty_object();
-                    for value in res.values.iter() {
-                        let c = value.change_value.as_ref().unwrap();
-                        let k = c.path.as_ref().unwrap().address.join(":");
-                        let v = c.value.as_ref().unwrap().clone();
-                        let js = SerializedValueWrapper(v).to_object(&mut cx);
-                        obj.set(&mut cx, k.as_str(), js?).unwrap();
-                    }
-                    Ok(obj)
-                } else {
-                    cx.throw_error("Failed to query")
-                }
-            });
+                cx.throw_error("Error playing")
+            }
         });
         Ok(promise)
+
     }
 
-
-    // fn js_to_string(mut cx: FunctionContext) -> JsResult<JsUndefined> {
-    //     let branch = cx.argument::<JsString>(0)?.value(&mut cx);
-    //     let frame = cx.argument::<JsString>(1)?.value(&mut cx);
+    // pub fn query(mut cx: FunctionContext) -> JsResult<JsPromise> {
     //
-    //     let channel = cx.channel();
-    //
-    //     // let name = self.get_name();
-    //     Ok(format!("NodeHandle(file_id={}, node={})", self.file_id, name))
-    //     //
-    //     // Ok(cx.undefined())
     // }
 }
 
@@ -305,64 +200,15 @@ fn obj_to_paths<'a, C: Context<'a>>(cx: &mut C, d: Handle<JsObject>) -> NeonResu
     Ok(paths)
 }
 
-
-
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PromptNodeCreateOpts {
-    name: String,
-    queries: Option<Vec<String>>,
-    output_tables: Option<Vec<String>>,
-    template: String,
-    model: Option<String>
+struct NodeChidori {
+    c: Arc<Mutex<Chidori>>
 }
 
+impl Finalize for NodeChidori {}
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CustomNodeCreateOpts {
-    name: String,
-    queries: Option<Vec<String>>,
-    output_tables: Option<Vec<String>>,
-    output: Option<String>,
-    node_type_name: String
-}
+impl NodeChidori {
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct DenoCodeNodeCreateOpts {
-    name: String,
-    queries: Option<Vec<String>>,
-    output_tables: Option<Vec<String>>,
-    output: Option<String>,
-    code: String,
-    is_template: Option<bool>
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct VectorMemoryNodeCreateOpts {
-    name: String,
-    queries: Option<Vec<String>>,
-    output_tables: Option<Vec<String>>,
-    output: Option<String>,
-    template: Option<String>, // TODO: default is the contents of the query
-    action: Option<String>, // TODO: default WRITE
-    embedding_model: Option<String>, // TODO: default TEXT_EMBEDDING_ADA_002
-    db_vendor: Option<String>, // TODO: default QDRANT
-    collection_name: String,
-}
-
-
-struct Chidori {
-    file_id: String,
-    current_head: u64,
-    current_branch: u64,
-    url: String
-}
-
-impl Finalize for Chidori {}
-
-impl Chidori {
-
-    fn js_new(mut cx: FunctionContext) -> JsResult<JsBox<Chidori>> {
+    fn js_new(mut cx: FunctionContext) -> JsResult<JsBox<NodeChidori>> {
         let file_id = cx.argument::<JsString>(0)?.value(&mut cx);
         let url = cx.argument::<JsString>(1)?.value(&mut cx);
 
@@ -371,55 +217,29 @@ impl Chidori {
         }
         // let api_token = cx.argument_opt(2)?.value(&mut cx);
         debug!("Creating new Chidori instance with file_id={}, url={}, api_token={:?}", file_id, url, "".to_string());
-        Ok(cx.boxed(Chidori {
-            file_id,
-            current_head: 0,
-            current_branch: 0,
-            url,
+        Ok(cx.boxed(NodeChidori {
+            c: Arc::new(Mutex::new(Chidori::new(file_id, url))),
         }))
     }
 
     fn start_server(mut cx: FunctionContext) -> JsResult<JsPromise> {
         let channel = cx.channel();
         let self_ = cx.this()
-            .downcast_or_throw::<JsBox<Chidori>, _>(&mut cx)?;
+            .downcast_or_throw::<JsBox<NodeChidori>, _>(&mut cx)?;
         let (deferred, promise) = cx.promise();
-        let url_server = self_.url.clone();
-        let file_path: Option<String> = match cx.argument_opt(0) {
-            Some(v) => Some(v.downcast_or_throw(&mut cx)),
-            None => None,
-        }.map(|p: JsResult<JsString>| p.unwrap().value(&mut cx));
-        std::thread::spawn(move || {
-            let result = run_server(url_server, file_path);
-            match result {
-                Ok(_) => {
-                    println!("Server exited");
-                },
-                Err(e) => {
-                    println!("Error running server: {}", e);
-                },
-            }
-        });
-
-        let url = self_.url.clone();
+        let file_path = cx.argument_opt(0).map(|x| x.downcast::<JsString, _>(&mut cx).unwrap().value(&mut cx));
+        let c = Arc::clone(&self_.c);
         let rt = runtime(&mut cx)?;
         rt.spawn(async move {
-            'retry: loop {
-                let client = get_client(url.clone());
-                match client.await {
-                    Ok(connection) => {
-                        eprintln!("Connection successfully established {:?}", &url);
-                        deferred.settle_with(&channel, move |mut cx| {
-                            Ok(cx.undefined())
-                        });
-                        break 'retry
-                    },
-                    Err(e) => {
-                        eprintln!("Error connecting to server: {} with Error {}. Retrying...", &url, &e.to_string());
-                        std::thread::sleep(std::time::Duration::from_millis(1000));
-                    }
+            let mut c = c.lock().await;
+            let m = c.start_server(file_path).await;
+            deferred.settle_with((&channel), move |mut cx| {
+                if let Ok(_) = m {
+                    Ok(cx.undefined())
+                } else {
+                    cx.throw_error("Error playing")
                 }
-            }
+            });
         });
         Ok(promise)
     }
@@ -428,73 +248,44 @@ impl Chidori {
         let channel = cx.channel();
         let (deferred, promise) = cx.promise();
         let self_ = cx.this()
-            .downcast_or_throw::<JsBox<Chidori>, _>(&mut cx)?;
+            .downcast_or_throw::<JsBox<NodeChidori>, _>(&mut cx)?;
         let branch = cx.argument::<JsNumber>(0).unwrap_or(JsNumber::new(&mut cx, 0.0)).value(&mut cx) as u64;
         let frame = cx.argument::<JsNumber>(1).unwrap_or(JsNumber::new(&mut cx, 0.0)).value(&mut cx) as u64;
-
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-
+        let c = Arc::clone(&self_.c);
         let rt = runtime(&mut cx)?;
         rt.spawn(async move {
-            let mut client = if let Ok(mut client) = get_client(url).await {
-                client
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    cx.throw_error::<&str, JsUndefined>("Failed to connect to runtime service.");
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to connect to runtime service.");
-            };
-            let result = client.play(RequestAtFrame {
-                id: file_id,
-                frame,
-                branch,
-            }).await;
-            deferred.settle_with(&channel, move |mut cx| {
-                if let Ok(result) = result {
-                    neon_serde3::to_value(&mut cx, &result.into_inner())
+            let c = c.lock().await;
+            let m = c.play(branch, frame).await;
+            deferred.settle_with((&channel), move |mut cx| {
+                if let Ok(result) = m {
+                    neon_serde3::to_value(&mut cx, &result)
                         .or_else(|e| cx.throw_error(e.to_string()))
                 } else {
-                    cx.throw_error("Failed to play runtime.")
+                    cx.throw_error("Error playing")
                 }
             });
         });
         Ok(promise)
+
     }
 
     fn pause(mut cx: FunctionContext) -> JsResult<JsPromise> {
         let channel = cx.channel();
         let (deferred, promise) = cx.promise();
         let self_ = cx.this()
-            .downcast_or_throw::<JsBox<Chidori>, _>(&mut cx)?;
+            .downcast_or_throw::<JsBox<NodeChidori>, _>(&mut cx)?;
         let frame = cx.argument::<JsNumber>(0).unwrap_or(JsNumber::new(&mut cx, 0.0)).value(&mut cx) as u64;
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-        let branch = self_.current_branch.clone();
-
+        let c = Arc::clone(&self_.c);
         let rt = runtime(&mut cx)?;
         rt.spawn(async move {
-            let mut client = if let Ok(mut client) = get_client(url).await {
-                client
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    cx.throw_error::<&str, JsUndefined>("Failed to connect to runtime service.");
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to connect to runtime service.");
-            };
-            let result = client.pause(RequestAtFrame {
-                id: file_id,
-                frame,
-                branch,
-            }).await;
-            deferred.settle_with(&channel, move |mut cx| {
-                if let Ok(result) = result {
-                    neon_serde3::to_value(&mut cx, &result.into_inner())
+            let c = c.lock().await;
+            let m = c.pause(frame).await;
+            deferred.settle_with((&channel), move |mut cx| {
+                if let Ok(result) = m {
+                    neon_serde3::to_value(&mut cx, &result)
                         .or_else(|e| cx.throw_error(e.to_string()))
                 } else {
-                    cx.throw_error("Failed to play runtime.")
+                    cx.throw_error("Error playing")
                 }
             });
         });
@@ -505,33 +296,20 @@ impl Chidori {
         let channel = cx.channel();
         let (deferred, promise) = cx.promise();
         let self_ = cx.this()
-            .downcast_or_throw::<JsBox<Chidori>, _>(&mut cx)?;
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-        let branch = self_.current_branch.clone();
+            .downcast_or_throw::<JsBox<NodeChidori>, _>(&mut cx)?;
+        let branch = cx.argument::<JsNumber>(0).unwrap_or(JsNumber::new(&mut cx, 0.0)).value(&mut cx) as u64;
+        let frame = cx.argument::<JsNumber>(1).unwrap_or(JsNumber::new(&mut cx, 0.0)).value(&mut cx) as u64;
+        let c = Arc::clone(&self_.c);
         let rt = runtime(&mut cx)?;
         rt.spawn(async move {
-            let mut client = if let Ok(mut client) = get_client(url).await {
-                client
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    cx.throw_error::<&str, JsUndefined>("Failed to connect to runtime service.");
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to connect to runtime service.");
-            };
-            let result = client.branch(RequestNewBranch {
-                id: file_id,
-                source_branch_id: branch,
-                diverges_at_counter: 0,
-            }).await;
-            // TODO: need to somehow handle writing to the current_branch
-            deferred.settle_with(&channel, move |mut cx| {
-                if let Ok(result) = result {
-                    neon_serde3::to_value(&mut cx, &result.into_inner())
+            let c = c.lock().await;
+            let m = c.branch(branch, frame).await;
+            deferred.settle_with((&channel), move |mut cx| {
+                if let Ok(result) = m {
+                    neon_serde3::to_value(&mut cx, &result)
                         .or_else(|e| cx.throw_error(e.to_string()))
                 } else {
-                    cx.throw_error("Failed to play runtime.")
+                    cx.throw_error("Error playing")
                 }
             });
         });
@@ -542,37 +320,22 @@ impl Chidori {
         let channel = cx.channel();
         let (deferred, promise) = cx.promise();
         let self_ = cx.this()
-            .downcast_or_throw::<JsBox<Chidori>, _>(&mut cx)?;
+            .downcast_or_throw::<JsBox<NodeChidori>, _>(&mut cx)?;
         let query = cx.argument::<JsString>(0).unwrap_or(JsString::new(&mut cx, "")).value(&mut cx);
         let branch = cx.argument::<JsNumber>(1).unwrap_or(JsNumber::new(&mut cx, 0.0)).value(&mut cx) as u64;
         let frame = cx.argument::<JsNumber>(2).unwrap_or(JsNumber::new(&mut cx, 0.0)).value(&mut cx) as u64;
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
+
+        let c = Arc::clone(&self_.c);
         let rt = runtime(&mut cx)?;
         rt.spawn(async move {
-            let mut client = if let Ok(mut client) = get_client(url).await {
-                client
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    cx.throw_error::<&str, JsUndefined>("Failed to connect to runtime service.");
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to connect to runtime service.");
-            };
-            let result = client.run_query(QueryAtFrame {
-                id: file_id,
-                query: Some(Query {
-                    query: Some(query)
-                }),
-                frame,
-                branch,
-            }).await;
-            deferred.settle_with(&channel, move |mut cx| {
-                if let Ok(result) = result {
-                    neon_serde3::to_value(&mut cx, &result.into_inner())
+            let c = c.lock().await;
+            let m = c.query(query, branch, frame).await;
+            deferred.settle_with((&channel), move |mut cx| {
+                if let Ok(result) = m {
+                    neon_serde3::to_value(&mut cx, &result)
                         .or_else(|e| cx.throw_error(e.to_string()))
                 } else {
-                    cx.throw_error("Failed to play runtime.")
+                    cx.throw_error("Error playing")
                 }
             });
         });
@@ -583,29 +346,18 @@ impl Chidori {
         let channel = cx.channel();
         let (deferred, promise) = cx.promise();
         let self_ = cx.this()
-            .downcast_or_throw::<JsBox<Chidori>, _>(&mut cx)?;
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
+            .downcast_or_throw::<JsBox<NodeChidori>, _>(&mut cx)?;
+        let c = Arc::clone(&self_.c);
         let rt = runtime(&mut cx)?;
         rt.spawn(async move {
-            let mut client = if let Ok(mut client) = get_client(url).await {
-                client
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    cx.throw_error::<&str, JsUndefined>("Failed to connect to runtime service.");
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to connect to runtime service.");
-            };
-            let result = client.list_branches(RequestListBranches {
-                id: file_id,
-            }).await;
-            deferred.settle_with(&channel, move |mut cx| {
-                if let Ok(result) = result {
-                    neon_serde3::to_value(&mut cx, &result.into_inner())
+            let c = c.lock().await;
+            let m = c.list_branches().await;
+            deferred.settle_with((&channel), move |mut cx| {
+                if let Ok(result) = m {
+                    neon_serde3::to_value(&mut cx, &result)
                         .or_else(|e| cx.throw_error(e.to_string()))
                 } else {
-                    cx.throw_error("Failed to play runtime.")
+                    cx.throw_error("Error playing")
                 }
             });
         });
@@ -616,82 +368,34 @@ impl Chidori {
         let channel = cx.channel();
         let (deferred, promise) = cx.promise();
         let self_ = cx.this()
-            .downcast_or_throw::<JsBox<Chidori>, _>(&mut cx)?;
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-        let branch = self_.current_branch.clone();
+            .downcast_or_throw::<JsBox<NodeChidori>, _>(&mut cx)?;
+        let branch = cx.argument::<JsNumber>(0).unwrap_or(JsNumber::new(&mut cx, 0.0)).value(&mut cx) as u64;
+        let c = Arc::clone(&self_.c);
         let rt = runtime(&mut cx)?;
         rt.spawn(async move {
-            let mut client = if let Ok(mut client) = get_client(url).await {
-                client
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    cx.throw_error::<&str, JsUndefined>("Failed to connect to runtime service.");
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to connect to runtime service.");
-            };
-            let file = if let Ok(file) = client.current_file_state(RequestOnlyId {
-                id: file_id,
-                branch
-            }).await {
-                file
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    cx.throw_error::<&str, JsUndefined>("Failed to get current file state.");
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to get current file state.");
-            };
-            let mut file = file.into_inner();
-            let mut g = CleanedDefinitionGraph::zero();
-            g.merge_file(&mut file).unwrap();
+            let c = c.lock().await;
+            let r= c.display_graph_structure(branch).await;
             deferred.settle_with(&channel, move |mut cx| {
-                Ok(cx.string(g.get_dot_graph()))
+                if let Ok(r) = r {
+                    Ok(cx.string(r))
+                } else {
+                    cx.throw_error("Error displaying graph structure")
+                }
             });
         });
         Ok(promise)
     }
 
-//
-//     // TODO: some of these register handlers instead
-//     // TODO: list registered graphs should not stream
-//     // TODO: add a message that sends the current graph state
-//
-
     fn list_registered_graphs(mut cx: FunctionContext) -> JsResult<JsPromise> {
         let channel = cx.channel();
         let (deferred, promise) = cx.promise();
         let self_ = cx.this()
-            .downcast_or_throw::<JsBox<Chidori>, _>(&mut cx)?;
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
+            .downcast_or_throw::<JsBox<NodeChidori>, _>(&mut cx)?;
+        let c = Arc::clone(&self_.c);
         let rt = runtime(&mut cx)?;
         rt.spawn(async move {
-            let mut client = if let Ok(mut client) = get_client(url).await {
-                client
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    cx.throw_error::<&str, JsUndefined>("Failed to connect to runtime service.");
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to connect to runtime service.");
-            };
-            let resp = if let Ok(resp) = client.list_registered_graphs(Empty {
-            }).await {
-                resp
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    cx.throw_error::<&str, JsUndefined>("Failed to get registered graph stream.");
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to get registered graph stream.");
-            };
-            let mut stream = resp.into_inner();
-            while let Some(x) = stream.next().await {
-                // callback.call(py, (x,), None);
-                info!("Registered Graph = {:?}", x);
-            };
+            let c = c.lock().await;
+            let _ = c.list_registered_graphs().await;
             deferred.settle_with(&channel, move |mut cx| {
                 Ok(cx.undefined())
             });
@@ -753,6 +457,100 @@ impl Chidori {
 //     // }
 //
 //
+
+
+
+    fn register_custom_node_handle(mut cx: FunctionContext) -> JsResult<JsValue> {
+        let channel = cx.channel();
+        let self_ = cx.this()
+            .downcast_or_throw::<JsBox<NodeChidori>, _>(&mut cx)?;
+
+        let function_name: String = cx.argument::<JsString>(0)?.value(&mut cx);
+        let callback = cx.argument::<JsFunction>(1)?.root(&mut cx);
+
+        let h = callback.to_inner(&mut cx);
+        let callback = Arc::new(callback);
+        let c = Arc::clone(&self_.c);
+
+        let rt = runtime(&mut cx)?;
+        rt.spawn(async move {
+            let mut c = c.lock().await;
+            c.register_custom_node_handle(function_name, Handler::new(
+                move |n| {
+                    let channel_clone = channel.clone();
+                    let handler_clone = Arc::clone(&callback);
+                    Box::pin(async move {
+                        // TODO: clean this up, can't use ?
+                        let (tx, mut rx) = mpsc::channel::<serde_json::Value>(1);
+                        if let Ok(_) = channel_clone.send(move |mut cx| {
+                            if let Ok(v) = neon_serde3::to_value(&mut cx, &n) {
+                                let js_function = JsFunction::new(&mut cx, move |mut cx| {
+                                    if let Ok(v) = cx.argument::<JsValue>(0) {
+                                        let value: Result<serde_json::Value, _> = neon_serde3::from_value(&mut cx, v);
+                                        if let Ok(value) = value {
+                                            tx.blocking_send(value).unwrap();
+                                        }
+                                    }
+                                    Ok(cx.undefined())
+                                })?;
+                                let callback = handler_clone.to_inner(&mut cx);
+                                let _: JsResult<JsValue> = callback.call_with(&mut cx).arg(v).arg(js_function).apply(&mut cx);
+                            }
+                            Ok(serde_json::Value::Null)
+                        }).join() {
+                            // block until we receive the result from the channel
+                            if let Some(value) = rx.recv().await {
+                                Ok(value)
+                            } else {
+                                Ok(serde_json::Value::Null)
+                            }
+                        } else {
+                            Err(anyhow::anyhow!("Failed to send result"))
+                        }
+                    })
+                }
+            ));
+        });
+        Ok(cx.undefined().upcast())
+    }
+
+
+    fn run_custom_node_loop(mut cx: FunctionContext) -> JsResult<JsPromise> {
+        let channel = cx.channel();
+        let (deferred, promise) = cx.promise();
+        let self_ = cx.this()
+            .downcast_or_throw::<JsBox<NodeChidori>, _>(&mut cx)?;
+        let c = Arc::clone(&self_.c);
+        let rt = runtime(&mut cx)?;
+        rt.spawn(async move {
+            let mut c = c.lock().await;
+            let _ = c.run_custom_node_loop().await;
+            deferred.settle_with((&channel), move |mut cx| {
+                Ok(cx.undefined())
+            });
+
+        });
+        // This promise is never resolved
+        Ok(promise)
+    }
+
+
+
+}
+
+struct NodeGraphBuilder {
+    g: Arc<Mutex<GraphBuilder>>,
+}
+
+impl Finalize for NodeGraphBuilder {}
+
+impl NodeGraphBuilder {
+    fn js_new(mut cx: FunctionContext) -> JsResult<JsBox<NodeGraphBuilder>> {
+        Ok(cx.boxed(NodeGraphBuilder {
+            g: Arc::new(Mutex::new(GraphBuilder::new())),
+        }))
+    }
+
 //     // TODO: need to figure out passing a buffer of bytes
 //     // TODO: nodes that are added should return a clean definition of what their addition looks like
 //     // TODO: adding a node should also display any errors
@@ -789,12 +587,9 @@ impl Chidori {
 //     // TODO: adding a node should also display any errors
 
 
-    fn prompt_node(mut cx: FunctionContext) -> JsResult<JsPromise> {
-        let channel = cx.channel();
-        let (deferred, promise) = cx.promise();
+    fn prompt_node(mut cx: FunctionContext) -> JsResult<JsBox<RefCell<NodeNodeHandle>>> {
         let self_ = cx.this()
-            .downcast_or_throw::<JsBox<Chidori>, _>(&mut cx)?;
-
+            .downcast_or_throw::<JsBox<NodeGraphBuilder>, _>(&mut cx)?;
         let arg0 = cx.argument::<JsValue>(0)?;
         let arg0_value: PromptNodeCreateOpts = match neon_serde3::from_value(&mut cx, arg0) {
             Ok(value) => value,
@@ -802,208 +597,17 @@ impl Chidori {
                 return cx.throw_error(e.to_string());
             }
         };
-
-        let queries: Vec<Option<String>> = if let Some(queries) = arg0_value.queries {
-            queries.into_iter().map(|q| {
-                if q == "None".to_string() {
-                    None
-                } else {
-                    Some(q)
-                }
-            }).collect()
-        } else {
-            vec![None]
-        };
-
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-        let rt = runtime(&mut cx)?;
-        rt.spawn(async move {
-            let prompt_node = create_prompt_node(
-                arg0_value.name,
-                queries,
-                arg0_value.template,
-                arg0_value.model.unwrap_or("GPT_3_5_TURBO".to_string()),
-                arg0_value.output_tables.unwrap_or(vec![]));
-            let node = if let Ok(node) = prompt_node {
-                node
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    // TODO: throw error
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to connect to runtime service.");
-            };
-
-            if let Ok(result ) = push_file_merge(&url, &file_id, node).await {
-                deferred.settle_with(&channel, move |mut cx| {
-                    Ok(cx.boxed(RefCell::new(result)))
-                });
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    // TODO: throw error
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to connect to runtime service.");
-            };
-        });
-        Ok(promise)
+        let mut g = self_.g.blocking_lock();
+        match g.prompt_node(arg0_value) {
+            Ok(result) => Ok(cx.boxed(RefCell::new(NodeNodeHandle::from(result)))),
+            Err(e) => cx.throw_error(e.to_string())
+        }
     }
 
 
-    fn poll_local_code_node_execution(mut cx: FunctionContext) -> JsResult<JsPromise> {
-        let channel = cx.channel();
-        let (deferred, promise) = cx.promise();
+    fn custom_node(mut cx: FunctionContext) -> JsResult<JsBox<RefCell<NodeNodeHandle>>> {
         let self_ = cx.this()
-            .downcast_or_throw::<JsBox<Chidori>, _>(&mut cx)?;
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-
-        let rt = runtime(&mut cx)?;
-        rt.spawn(async move {
-            let mut client = if let Ok(mut client) = get_client(url).await {
-                client
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    cx.throw_error::<&str, JsUndefined>("Failed to connect to runtime service.");
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to connect to runtime service.");
-            };
-            if let Ok(result) = client.poll_custom_node_will_execute_events(FilteredPollNodeWillExecuteEventsRequest {
-                id: file_id.clone(),
-            }).await {
-                debug!("poll_local_code_node_execution result = {:?}", result);
-                deferred.settle_with(&channel, move |mut cx| {
-                    neon_serde3::to_value(&mut cx, &result.into_inner())
-                        .or_else(|e| cx.throw_error(e.to_string()))
-                });
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    // TODO: throw error
-                    Ok(cx.undefined())
-                });
-            };
-        });
-        Ok(promise)
-    }
-    fn ack_local_code_node_execution(mut cx: FunctionContext) -> JsResult<JsPromise> {
-        let channel = cx.channel();
-        let (deferred, promise) = cx.promise();
-        let self_ = cx.this()
-            .downcast_or_throw::<JsBox<Chidori>, _>(&mut cx)?;
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-        let branch = cx.argument::<JsNumber>(0)?.value(&mut cx) as u64;
-        let counter = cx.argument::<JsNumber>(1)?.value(&mut cx) as u64;
-        let rt = runtime(&mut cx)?;
-        rt.spawn(async move {
-            let mut client = if let Ok(mut client) = get_client(url).await {
-                client
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    cx.throw_error::<&str, JsUndefined>("Failed to connect to runtime service.");
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to connect to runtime service.");
-            };
-            if let Ok(result) = client.ack_node_will_execute_event(RequestAckNodeWillExecuteEvent {
-                id: file_id.clone(),
-                branch,
-                counter,
-            }).await {
-                deferred.settle_with(&channel, move |mut cx| {
-                    neon_serde3::to_value(&mut cx, &result.into_inner())
-                        .or_else(|e| cx.throw_error(e.to_string()))
-                });
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    // TODO: throw error
-                    Ok(cx.undefined())
-                });
-            }
-        });
-        Ok(promise)
-    }
-
-    fn respond_local_code_node_execution(mut cx: FunctionContext) -> JsResult<JsPromise> {
-        let channel = cx.channel();
-        let (deferred, promise) = cx.promise();
-        let self_ = cx.this()
-            .downcast_or_throw::<JsBox<Chidori>, _>(&mut cx)?;
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-
-        let branch = cx.argument::<JsNumber>(0)?.value(&mut cx) as u64;
-        let counter = cx.argument::<JsNumber>(1)?.value(&mut cx) as u64;
-        let node_name = cx.argument::<JsString>(2)?.value(&mut cx);
-
-        let response: Option<JsResult<JsObject>> = match cx.argument_opt(0) {
-            Some(v) => Some(v.downcast_or_throw(&mut cx)),
-            None => None,
-        };
-
-        // TODO: need parent counters from the original change
-        // TODO: need source node
-
-        let response_paths = if let Some(response) = response {
-            // TODO: need better error handling here
-            obj_to_paths(&mut cx, response.unwrap()).unwrap()
-        } else {
-            vec![]
-        };
-
-        let rt = runtime(&mut cx)?;
-        rt.spawn(async move {
-            let mut client = if let Ok(mut client) = get_client(url).await {
-                client
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    cx.throw_error::<&str, JsUndefined>("Failed to connect to runtime service.");
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to connect to runtime service.");
-            };
-
-            // TODO: need to add the output table paths to these
-            let filled_values = response_paths.into_iter().map(|path| {
-                ChangeValue {
-                    path: Some(Path {
-                        address: path.0,
-                    }),
-                    value: Some(path.1),
-                    branch,
-                }
-            });
-
-            // TODO: this needs to look more like a real change
-            client.push_worker_event(FileAddressedChangeValueWithCounter {
-                branch,
-                counter,
-                node_name,
-                id: file_id.clone(),
-                change: Some(ChangeValueWithCounter {
-                    filled_values: filled_values.collect(),
-                    parent_monotonic_counters: vec![],
-                    monotonic_counter: counter,
-                    branch,
-                    source_node: "".to_string(),
-                })
-            }).await.unwrap();
-        });
-        Ok(promise)
-    }
-
-//     // }
-//
-//     // TODO: handle dispatch to this handler - should accept a callback
-//     // https://github.com/PyO3/pyo3/issues/525
-    fn custom_node(mut cx: FunctionContext) -> JsResult<JsPromise> {
-        let channel = cx.channel();
-        let (deferred, promise) = cx.promise();
-        let self_ = cx.this()
-            .downcast_or_throw::<JsBox<Chidori>, _>(&mut cx)?;
-
+            .downcast_or_throw::<JsBox<NodeGraphBuilder>, _>(&mut cx)?;
         let arg0 = cx.argument::<JsValue>(0)?;
         let arg0_value: CustomNodeCreateOpts = match neon_serde3::from_value(&mut cx, arg0) {
             Ok(value) => value,
@@ -1011,53 +615,16 @@ impl Chidori {
                 return cx.throw_error(e.to_string());
             }
         };
-
-        let queries: Vec<Option<String>> = if let Some(queries) = arg0_value.queries {
-            queries.into_iter().map(|q| {
-                if q == "None".to_string() {
-                    None
-                } else {
-                    Some(q)
-                }
-            }).collect()
-        } else {
-            vec![]
-        };
-
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-        let branch = self_.current_branch;
-        let rt = runtime(&mut cx)?;
-        rt.spawn(async move {
-            // Register the node with the system
-            let node = create_custom_node(
-                arg0_value.name,
-                queries,
-                arg0_value.output.unwrap_or("type O {}".to_string()),
-                arg0_value.node_type_name,
-                arg0_value.output_tables.unwrap_or(vec![])
-            );
-            if let Ok(result ) = push_file_merge(&url, &file_id, node).await {
-                deferred.settle_with(&channel, move |mut cx| {
-                    Ok(cx.boxed(RefCell::new(result)))
-                });
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    // TODO: throw error
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to connect to runtime service.");
-            };
-        });
-        Ok(promise)
+        let mut g = self_.g.blocking_lock();
+        match g.custom_node(arg0_value) {
+            Ok(result) => Ok(cx.boxed(RefCell::new(NodeNodeHandle::from(result)))),
+            Err(e) => cx.throw_error(e.to_string())
+        }
     }
 
-    fn deno_code_node(mut cx: FunctionContext) -> JsResult<JsPromise> {
-        let channel = cx.channel();
-        let (deferred, promise) = cx.promise();
+    fn deno_code_node(mut cx: FunctionContext) -> JsResult<JsBox<RefCell<NodeNodeHandle>>> {
         let self_ = cx.this()
-            .downcast_or_throw::<JsBox<Chidori>, _>(&mut cx)?;
-
+            .downcast_or_throw::<JsBox<NodeGraphBuilder>, _>(&mut cx)?;
         let arg0 = cx.argument::<JsValue>(0)?;
         let arg0_value: DenoCodeNodeCreateOpts = match neon_serde3::from_value(&mut cx, arg0) {
             Ok(value) => value,
@@ -1065,53 +632,16 @@ impl Chidori {
                 return cx.throw_error(e.to_string());
             }
         };
-
-        let queries: Vec<Option<String>> = if let Some(queries) = arg0_value.queries {
-            queries.into_iter().map(|q| {
-                if q == "None".to_string() {
-                    None
-                } else {
-                    Some(q)
-                }
-            }).collect()
-        } else {
-            vec![None]
-        };
-
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-        let branch = self_.current_branch;
-
-        let rt = runtime(&mut cx)?;
-        rt.spawn(async move {
-            let node = create_code_node(
-                arg0_value.name,
-                queries,
-                arg0_value.output.unwrap_or("type O {}".to_string()),
-                SourceNodeType::Code("DENO".to_string(), arg0_value.code, arg0_value.is_template.unwrap_or(false)),
-                arg0_value.output_tables.unwrap_or(vec![])
-            );
-            if let Ok(result ) = push_file_merge(&url, &file_id, node).await {
-                deferred.settle_with(&channel, move |mut cx| {
-                    Ok(cx.boxed(RefCell::new(result)))
-                });
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    // TODO: throw error
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to connect to runtime service.");
-            };
-        });
-        Ok(promise)
+        let mut g = self_.g.blocking_lock();
+        match g.deno_code_node(arg0_value) {
+            Ok(result) => Ok(cx.boxed(RefCell::new(NodeNodeHandle::from(result)))),
+            Err(e) => cx.throw_error(e.to_string())
+        }
     }
 
-    fn vector_memory_node(mut cx: FunctionContext) -> JsResult<JsPromise> {
-        let channel = cx.channel();
-        let (deferred, promise) = cx.promise();
+    fn vector_memory_node(mut cx: FunctionContext) -> JsResult<JsBox<RefCell<NodeNodeHandle>>> {
         let self_ = cx.this()
-            .downcast_or_throw::<JsBox<Chidori>, _>(&mut cx)?;
-
+            .downcast_or_throw::<JsBox<NodeGraphBuilder>, _>(&mut cx)?;
         let arg0 = cx.argument::<JsValue>(0)?;
         let arg0_value: VectorMemoryNodeCreateOpts = match neon_serde3::from_value(&mut cx, arg0) {
             Ok(value) => value,
@@ -1119,56 +649,39 @@ impl Chidori {
                 return cx.throw_error(e.to_string());
             }
         };
+        let mut g = self_.g.blocking_lock();
+        match g.vector_memory_node(arg0_value) {
+            Ok(result) => Ok(cx.boxed(RefCell::new(NodeNodeHandle::from(result)))),
+            Err(e) => cx.throw_error(e.to_string())
+        }
+    }
 
-        let queries: Vec<Option<String>> = if let Some(queries) = arg0_value.queries {
-            queries.into_iter().map(|q| {
-                if q == "None".to_string() {
-                    None
-                } else {
-                    Some(q)
-                }
-            }).collect()
-        } else {
-            vec![]
-        };
 
-        let file_id = self_.file_id.clone();
-        let url = self_.url.clone();
-        let branch = self_.current_branch;
+
+    fn commit(mut cx: FunctionContext) -> JsResult<JsPromise> {
+        let channel = cx.channel();
+        let (deferred, promise) = cx.promise();
+        let self_ = cx.this()
+            .downcast_or_throw::<JsBox<NodeGraphBuilder>, _>(&mut cx)?;
+        let node_chidori = cx.argument::<JsBox<NodeChidori>>(0)?;
+        let branch = cx.argument::<JsNumber>(1).unwrap_or(JsNumber::new(&mut cx, 0.0)).value(&mut cx) as u64;
+
+        let c = Arc::clone(&node_chidori.c);
+        let g = Arc::clone(&self_.g);
+
         let rt = runtime(&mut cx)?;
         rt.spawn(async move {
-            let node = create_vector_memory_node(
-                arg0_value.name,
-                queries,
-                arg0_value.output.unwrap_or("type O {}".to_string()),
-                arg0_value.action.unwrap_or("READ".to_string()),
-                arg0_value.embedding_model.unwrap_or("TEXT_EMBEDDING_ADA_002".to_string()),
-                arg0_value.template.unwrap_or("".to_string()),
-                arg0_value.db_vendor.unwrap_or("QDRANT".to_string()),
-                arg0_value.collection_name,
-                arg0_value.output_tables.unwrap_or(vec![])
-            );
-            let node = if let Ok(node) = node {
-                node
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    // TODO: throw error
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to connect to runtime service.");
-            };
-
-            if let Ok(result ) = push_file_merge(&url, &file_id, node).await {
-                deferred.settle_with(&channel, move |mut cx| {
-                    Ok(cx.boxed(RefCell::new(result)))
-                });
-            } else {
-                deferred.settle_with(&channel, move |mut cx| {
-                    // TODO: throw error
-                    Ok(cx.undefined())
-                });
-                panic!("Failed to connect to runtime service.");
-            };
+            let mut graph_builder = g.lock().await;
+            let mut chidori = c.lock().await;
+            let m = graph_builder.commit(&mut chidori, branch).await;
+            deferred.settle_with((&channel), move |mut cx| {
+                if let Ok(result) = m {
+                    neon_serde3::to_value(&mut cx, &result)
+                        .or_else(|e| cx.throw_error(e.to_string()))
+                } else {
+                    cx.throw_error("Error playing")
+                }
+            });
         });
         Ok(promise)
     }
@@ -1203,22 +716,24 @@ fn neon_simple_fun(mut cx: FunctionContext) -> JsResult<JsString> {
 #[neon::main]
 fn main(mut cx: ModuleContext) -> NeonResult<()> {
     env_logger::init();
-    cx.export_function("nodehandleDebugExample", NodeHandle::js_debug_example)?;
-    cx.export_function("nodehandleRunWhen", NodeHandle::run_when)?;
-    cx.export_function("nodehandleQuery", NodeHandle::query)?;
-    cx.export_function("chidoriNew", Chidori::js_new)?;
-    cx.export_function("chidoriStartServer", Chidori::start_server)?;
-    cx.export_function("chidoriPlay", Chidori::play)?;
-    cx.export_function("chidoriPause", Chidori::pause)?;
-    cx.export_function("chidoriBranch", Chidori::branch)?;
-    cx.export_function("chidoriQuery", Chidori::query)?;
-    cx.export_function("chidoriGraphStructure", Chidori::display_graph_structure)?;
-    cx.export_function("chidoriCustomNode", Chidori::custom_node)?;
-    cx.export_function("chidoriDenoCodeNode", Chidori::deno_code_node)?;
-    cx.export_function("chidoriVectorMemoryNode", Chidori::vector_memory_node)?;
-    cx.export_function("chidoriPollLocalCodeNodeExecution", Chidori::poll_local_code_node_execution)?;
-    cx.export_function("chidoriAckLocalCodeNodeExecution", Chidori::ack_local_code_node_execution)?;
-    cx.export_function("chidoriRespondLocalCodeNodeExecution", Chidori::respond_local_code_node_execution)?;
+    cx.export_function("nodehandleRunWhen", NodeNodeHandle::run_when)?;
+    // cx.export_function("nodehandleQuery", NodeNodeHandle::query)?;
+    cx.export_function("chidoriNew", NodeChidori::js_new)?;
+    cx.export_function("chidoriStartServer", NodeChidori::start_server)?;
+    cx.export_function("chidoriPlay", NodeChidori::play)?;
+    cx.export_function("chidoriPause", NodeChidori::pause)?;
+    cx.export_function("chidoriBranch", NodeChidori::branch)?;
+    cx.export_function("chidoriQuery", NodeChidori::query)?;
+    cx.export_function("chidoriGraphStructure", NodeChidori::display_graph_structure)?;
+    cx.export_function("chidoriRegisterCustomNodeHandle", NodeChidori::register_custom_node_handle)?;
+    cx.export_function("chidoriRunCustomNodeLoop", NodeChidori::run_custom_node_loop)?;
+
+    cx.export_function("graphbuilderNew", NodeGraphBuilder::js_new)?;
+    cx.export_function("graphbuilderCustomNode", NodeGraphBuilder::custom_node)?;
+    cx.export_function("graphbuilderDenoCodeNode", NodeGraphBuilder::deno_code_node)?;
+    cx.export_function("graphbuilderPromptNode", NodeGraphBuilder::prompt_node)?;
+    cx.export_function("graphbuilderVectorMemoryNode", NodeGraphBuilder::vector_memory_node)?;
+    cx.export_function("graphbuilderCommit", NodeGraphBuilder::commit)?;
     cx.export_function("simpleFun", neon_simple_fun)?;
     Ok(())
 }

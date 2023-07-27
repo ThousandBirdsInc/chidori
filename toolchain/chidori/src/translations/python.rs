@@ -464,26 +464,6 @@ struct PyChidori {
     url: String
 }
 
-
-
-// async fn push_file_merge(url: &String, file_id: &String, node: Item) -> Result<NodeHandle, PyErr> {
-//     let mut client = get_client(url.clone()).await?;
-//     let exec_status = client.merge(RequestFileMerge {
-//         id: file_id.clone(),
-//         file: Some(File {
-//             nodes: vec![node.clone()],
-//             ..Default::default()
-//         }),
-//         branch: 0,
-//     }).await.map_err(PyErrWrapper::from)?.into_inner();
-//     Ok(NodeHandle::from(
-//         url.clone(),
-//         file_id.clone(),
-//         node,
-//         exec_status
-//     ).map_err(AnyhowErrWrapper)?)
-// }
-
 // TODO: internally all operations should have an assigned counter
 //       we can keep the actual target counter hidden from the host sdk
 #[pymethods]

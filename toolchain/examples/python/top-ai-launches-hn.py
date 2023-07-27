@@ -33,9 +33,8 @@ async def fetch_hn() -> List[Story]:
 
         stories_out = []
         for story in stories:
-            for k in ('title', 'url', 'score'):
-                stories_out.append(Story(**dict((k, story.get(k, None)))))
-
+            story_dict = {k: story.get(k, None) for k in ('title', 'url', 'score')}
+            stories_out.append(Story(**story_dict))
         return stories_out
 
 
@@ -45,7 +44,6 @@ async def fetch_hn() -> List[Story]:
 class ChidoriWorker:
     def __init__(self):
         self.c = Chidori("0", "http://localhost:9800")
-        self.staged_custom_nodes = []
 
     async def build_graph(self):
         g = GraphBuilder()
