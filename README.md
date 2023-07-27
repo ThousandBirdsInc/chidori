@@ -499,9 +499,7 @@ A good place to start would be to join our [discord](https://discord.gg/CJwKsPSg
 ## FAQ
 
 ### Why Another AI Framework?
-Chidori focuses more on the specifics of how LLM+code execution operates, rather than providing specific compositions of prompts.
-We haven't really seen any other frameworks that focus on this space, and we think it's a really important one.
-Our effort is to resolve as much of the accidental complexity of building systems in the category of long running agents as possible, helping the broader developer community build successful systems.
+Chidori focuses on the specifics of how LLM+code execution operates rather than providing specific compositions of prompts. Other frameworks haven’t focused on this space, and it's an important one. We reduce accidental complexity in building systems for long-running agents; this helps developers build successful systems.
 
 ### Why Chidori?
 Chidori is the name of the lightning blade technique used by Kakashi in the Naruto anime series.
