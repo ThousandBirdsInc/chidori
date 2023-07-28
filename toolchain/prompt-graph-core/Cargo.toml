@@ -20,9 +20,7 @@ build-protos = []
 gluesql = "0.14.0"
 protobuf = "3.2.0"
 sqlparser = "0.34.0"
-apollo-compiler = { git = "https://github.com/ThousandBirdsInc/apollo-rs-with-editable-encoder.git", rev = "cf9b4fd03700c87b591a64b491d79130b028e90f"}
-apollo-encoder = { git = "https://github.com/ThousandBirdsInc/apollo-rs-with-editable-encoder.git", rev = "cf9b4fd03700c87b591a64b491d79130b028e90f" }
-apollo-parser = { git = "https://github.com/ThousandBirdsInc/apollo-rs-with-editable-encoder.git", rev = "cf9b4fd03700c87b591a64b491d79130b028e90f" }
+serde_yaml = "0.9.25"
 handlebars = "4.3.7"
 anyhow = { version = "1.0", default-features = false }
 indoc = "1.0.3"

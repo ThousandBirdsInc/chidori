@@ -670,7 +670,7 @@ impl NodeHandle {
     }
 
     fn get_output_type(&self) -> Vec<Vec<String>> {
-        self.indiv.output_path.clone()
+        self.indiv.output_paths.clone()
     }
 
     pub fn run_when(&mut self, graph_builder: &mut GraphBuilder, other_node: &NodeHandle) -> anyhow::Result<bool> {
@@ -694,7 +694,7 @@ impl NodeHandle {
 
     pub async fn query(&self, file_id: String, url: String, branch: u64, frame: u64) -> anyhow::Result<HashMap<String, SerializedValue>> {
         let name = &self.node.core.as_ref().unwrap().name;
-        let query = construct_query_from_output_type(&name, &name, &self.indiv.output_path).unwrap();
+        let query = construct_query_from_output_type(&name, &name, &self.indiv.output_paths).unwrap();
         let mut client = get_client(url).await?;
         let result = client.run_query(QueryAtFrame {
             id: file_id,

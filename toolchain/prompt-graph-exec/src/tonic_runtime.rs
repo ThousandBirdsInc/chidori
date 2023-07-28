@@ -27,7 +27,7 @@ use tracing::level_filters::LevelFilter;
 use tracing_log::LogTracer;
 use tracing_subscriber::{EnvFilter, fmt, FmtSubscriber, Layer};
 use prompt_graph_core::execution_router::evaluate_changes_against_node;
-use prompt_graph_core::build_runtime_graph::graph_parse::{get_paths_for_query, parse_graphql_query_def};
+use prompt_graph_core::build_runtime_graph::graph_parse::{query_path_from_query_string};
 
 use tracing_chrome::ChromeLayerBuilder;
 use tracing_flame::FlameLayer;
@@ -97,8 +97,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
             branch,
             counter
         };
-        let query_def = parse_graphql_query_def("", &query.query.clone().unwrap()).unwrap();
-        let paths = get_paths_for_query(&query_def);
+        let paths = query_path_from_query_string(&query.query.clone().unwrap()).unwrap();
         if let Some(values) = evaluate_changes_against_node(&state, &paths) {
             Ok(Response::new(QueryAtFrameResponse {
                 values

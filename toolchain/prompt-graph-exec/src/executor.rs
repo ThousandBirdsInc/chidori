@@ -431,7 +431,7 @@ mod tests {
         create_code_node(
             "code_node_test".to_string(),
             vec![None],
-            r#" type O { output: String } "#.to_string(),
+            r#" { output: String } "#.to_string(),
             SourceNodeType::Code(String::from("DENO"),
                  indoc! { r#"
                             return {
@@ -447,13 +447,9 @@ mod tests {
     fn gen_item_hello_plus_world() -> Item {
         create_code_node(
             "code_node_test_dep".to_string(),
-            vec![Some( r#" query Q {
-                code_node_test {
-                    output
-                }
-            }"#.to_string(),
+            vec![Some( r#" SELECT output FROM code_node_test "#.to_string(),
             )],
-            r#"type O { result: String }"#.to_string(),
+            r#"{ result: String }"#.to_string(),
             SourceNodeType::Code(
                 String::from("DENO"),
                 indoc! { r#"
@@ -470,13 +466,9 @@ mod tests {
     fn gen_item_non_deterministic() -> Item {
         create_code_node(
             "code_node_test_dep".to_string(),
-            vec![Some( r#" query Q {
-                code_node_test {
-                    output
-                }
-            }"#.to_string(),
+            vec![Some( r#"SELECT output FROM code_node_test"#.to_string(),
             )],
-            r#"type O { result: String }"#.to_string(),
+            r#"{ result: String }"#.to_string(),
             SourceNodeType::Code(
                 String::from("DENO"), indoc! { r#"
                 return {
@@ -505,7 +497,7 @@ mod tests {
                         query: None,
                     }],
                     output: Some(OutputType {
-                        output: "type O { echo: String }".to_string(),
+                        output: "{ echo: String }".to_string(),
                     }),
                     output_tables: vec![]
                 }),
