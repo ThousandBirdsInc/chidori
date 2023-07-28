@@ -1,6 +1,6 @@
 [package]
 name = "chidori"
-version = "0.1.22"
+version = "0.1.23"
 edition = "2021"
 description = "A Rust library for executing prompt-graph models"
 license = "MIT"

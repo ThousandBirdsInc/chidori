@@ -584,7 +584,7 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
 name = "chidori"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -3218,7 +3218,7 @@ dependencies = [
 
 [[package]]
 name = "prompt-graph-core"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -3243,7 +3243,7 @@ dependencies = [
 
 [[package]]
 name = "prompt-graph-exec"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3291,7 +3291,7 @@ dependencies = [
 
 [[package]]
 name = "prompt-graph-ui"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "anyhow",
  "crossterm",
