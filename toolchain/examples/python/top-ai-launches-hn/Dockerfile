@@ -1,8 +1,8 @@
 # Use an official Python runtime as a parent image
-FROM python:3.9
+FROM python:3.10
 
 # Set environment variables
-ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHNDONTWRITEBYTECODE 1
 ENV PYTHONUNBUFFERED 1
 ENV POETRY_VERSION=1.1.7
 

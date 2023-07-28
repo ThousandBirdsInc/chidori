@@ -596,8 +596,8 @@ dependencies = [
  "neon-serde3",
  "once_cell",
  "openssl",
- "prompt-graph-core",
- "prompt-graph-exec",
+ "prompt-graph-core 0.1.24",
+ "prompt-graph-exec 0.1.24",
  "prost",
  "protobuf",
  "pyo3",
@@ -613,6 +613,36 @@ dependencies = [
  "tonic-build",
  "wasm-bindgen",
  "wasm-bindgen-test",
+]
+
+[[package]]
+name = "chidori"
+version = "0.1.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2006fe68e5aaeeacb4f68c9c7369275a60c7fac6c1ac58902c176b9d9a30bb32"
+dependencies = [
+ "anyhow",
+ "env_logger",
+ "futures 0.3.28",
+ "handlebars",
+ "indoc 1.0.9",
+ "log",
+ "neon-serde3",
+ "once_cell",
+ "openssl",
+ "prompt-graph-core 0.1.24 (registry+https://github.com/rust-lang/crates.io-index)",
+ "prompt-graph-exec 0.1.24 (registry+https://github.com/rust-lang/crates.io-index)",
+ "prost",
+ "protobuf",
+ "pyo3-build-config 0.19.1",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "sqlparser 0.34.0",
+ "tokio",
+ "tonic",
+ "tonic-build",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3242,6 +3272,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "prompt-graph-core"
+version = "0.1.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18cafc385d06235ba5b063ba72fa549d4cfc41c4ca1213834daf177e48c843f9"
+dependencies = [
+ "anyhow",
+ "env_logger",
+ "futures 0.3.28",
+ "gluesql",
+ "handlebars",
+ "indoc 1.0.9",
+ "log",
+ "num_cpus",
+ "petgraph",
+ "prost",
+ "protobuf",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sqlparser 0.34.0",
+ "tokio",
+ "tonic",
+ "tonic-build",
+ "typescript-type-def",
+]
+
+[[package]]
 name = "prompt-graph-exec"
 version = "0.1.24"
 dependencies = [
@@ -3264,7 +3321,7 @@ dependencies = [
  "log",
  "neon",
  "openai-api-rs",
- "prompt-graph-core",
+ "prompt-graph-core 0.1.24",
  "prost",
  "protobuf",
  "qdrant-client",
@@ -3290,13 +3347,62 @@ dependencies = [
 ]
 
 [[package]]
+name = "prompt-graph-exec"
+version = "0.1.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70367fa8ff632a1ed87c03a4dbb79767a8c0c9625eb7c308c831e80add0e80c2"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "base64",
+ "bincode 2.0.0-rc.3",
+ "bytes",
+ "dashmap",
+ "deno_core",
+ "env_logger",
+ "futures 0.3.28",
+ "futures-core",
+ "futures-util",
+ "hnsw_rs_thousand_birds",
+ "http-body-util",
+ "hyper 1.0.0-rc.3",
+ "indoc 1.0.9",
+ "lazy_static",
+ "log",
+ "neon",
+ "openai-api-rs",
+ "prompt-graph-core 0.1.24 (registry+https://github.com/rust-lang/crates.io-index)",
+ "prost",
+ "protobuf",
+ "qdrant-client",
+ "rand 0.8.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sled",
+ "tokio",
+ "tokio-cron-scheduler",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tracing",
+ "tracing-chrome",
+ "tracing-flame",
+ "tracing-log",
+ "tracing-subscriber",
+ "twox-hash",
+ "ulid",
+ "zip",
+]
+
+[[package]]
 name = "prompt-graph-ui"
 version = "0.1.24"
 dependencies = [
  "anyhow",
  "crossterm",
  "futures 0.3.28",
- "prompt-graph-core",
+ "prompt-graph-core 0.1.24",
  "prost",
  "ratatui",
  "tokio",
@@ -4958,7 +5064,7 @@ name = "top-ai-launches-hn"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chidori",
+ "chidori 0.1.24 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures 0.3.28",
  "lettre",
  "reqwest",
