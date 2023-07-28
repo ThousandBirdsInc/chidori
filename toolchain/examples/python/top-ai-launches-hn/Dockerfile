@@ -15,6 +15,10 @@ RUN pip install "poetry==$POETRY_VERSION"
 # Copy the pyproject.toml (and optionally poetry.lock) file into the /app directory
 COPY pyproject.toml poetry.lock* /app/
 
+RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+
 # Install dependencies
 RUN poetry config virtualenvs.create false \
   && poetry install --no-interaction --no-ansi
@@ -26,4 +30,4 @@ COPY . /app/
 EXPOSE 9800
 
 # Run the application
-CMD ["python", "your_app.py"]
+CMD ["python", "top-ai-launches-hn.py"]
