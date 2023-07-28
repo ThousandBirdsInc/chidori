@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use hnsw_rs::hnsw::{Hnsw, Neighbour};
-use hnsw_rs::dist::DistDot;
+use hnsw_rs_thousand_birds::hnsw::{Hnsw, Neighbour};
+use hnsw_rs_thousand_birds::dist::DistDot;
 
 // TODO: manage multiple independent named collections
 pub struct InMemoryVectorDb<T> {

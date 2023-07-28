@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+
 ### Fixed
 
 ### Changed
@@ -16,3 +17,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Moved to SQL queries as triggers to nodes rather than graphql
 
 ### Changed
+
+
