@@ -17,6 +17,7 @@ build-protos = []
 
 # https://chat.openai.com/c/52edc960-dc19-4df7-b36f-30caad9c1905
 [dependencies]
+gluesql = "0.14.0"
 protobuf = "3.2.0"
 sqlparser = "0.34.0"
 apollo-compiler = { git = "https://github.com/ThousandBirdsInc/apollo-rs-with-editable-encoder.git", rev = "cf9b4fd03700c87b591a64b491d79130b028e90f"}

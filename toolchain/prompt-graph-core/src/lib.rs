@@ -15,13 +15,9 @@ pub mod build_runtime_graph;
 mod tests {
     use indoc::indoc;
 
-    use crate::build_runtime_graph::graph_parse::{parse_graphql_type_def, parse_where_query};
+    use crate::build_runtime_graph::graph_parse::{parse_graphql_type_def};
     use crate::proto2::item::Item;
 
-    #[test]
-    fn test_parse_where_query() {
-        parse_where_query("WHERE x = 1");
-    }
 
     #[test]
     fn test_parse_graphql_type_def() {

@@ -9,9 +9,9 @@ use apollo_parser::ast::{AstNode, Field, Value};
 use indoc::indoc;
 use petgraph::dot::{Config, Dot};
 use petgraph::graphmap::DiGraphMap;
-use sqlparser::ast::{SetExpr, Statement};
+use sqlparser::ast::{Expr, JoinConstraint, Query, Select, SelectItem, SetExpr, Statement, TableWithJoins};
 use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
+use sqlparser::parser::{Parser, ParserError};
 
 use crate::graph_definition::DefinitionGraph;
 use crate::proto2::{File, Item, item as dsl_item, ItemCore};
@@ -97,25 +97,25 @@ pub fn extract_query_types(item_core: &ItemCore) -> anyhow::Result<Vec<Option<En
 }
 
 
-pub fn parse_where_query(input: &str) {
-    // We prepend an arbitrary SELECT * FROM x to the where so its a valid statement
-    // and then ignore that because we're only interested in the where clause
-    let mut sql = String::from("SELECT * FROM x ");
-    sql.push_str(input);
 
-    // Parse the sql, and then extract the where clause AST
+pub fn parse_projection_values(input: &str) -> Vec<String> {
     let dialect = GenericDialect {};
-    let ast = Parser::parse_sql(&dialect, &sql).unwrap();
+    let ast = Parser::parse_sql(&dialect, input).unwrap();
+    let mut projected_values = Vec::new();
     for stmt in ast {
         if let Statement::Query(query) = stmt {
             if let SetExpr::Select(select) = *query.body {
-                if let Some(where_clause) = select.selection {
-                    println!("Where Clause: {:?}", where_clause);
+                for projection in select.projection {
+                    if let SelectItem::UnnamedExpr(Expr::Identifier(identifier)) = projection {
+                        projected_values.push(identifier.value);
+                    }
                 }
             }
         }
     }
+    projected_values
 }
+
 
 // TODO: using a parsed output type, generate a maximal operation query definition
 fn generate_maximal_operation_def_from_output() {
@@ -144,6 +144,118 @@ fn get_selection_set_paths(selection_set: &SelectionSet) -> Vec<Vec<String>> {
     }
     paths
 }
+
+use sqlparser::ast::{TableFactor, ObjectName, Join, JoinOperator};
+
+fn parse_expr(expr: &Expr, tables_and_columns: &mut Vec<(String, Vec<String>)>) {
+    match expr {
+        Expr::CompoundIdentifier(identifier) => {
+            if identifier.len() == 2 {
+                let table_name = identifier[0].value.to_string();
+                let column_name = identifier[1].value.to_string();
+                if let Some((_, columns)) = tables_and_columns.iter_mut().find(|(table, _)| table == &table_name) {
+                    columns.push(column_name);
+                }
+            }
+        },
+        Expr::Identifier(ident) => {
+            let column_name = ident.value.to_string();
+            for (_, columns) in tables_and_columns {
+                columns.push(column_name.clone());
+            }
+        },
+        Expr::BinaryOp { left, right, .. } => {
+            parse_expr(&*left, tables_and_columns);
+            parse_expr(&*right, tables_and_columns);
+        }
+        _ => {}
+    }
+}
+
+pub fn parse_tables_and_columns(input: &str) -> Result<Vec<(String, Vec<String>)>, sqlparser::parser::ParserError> {
+    let dialect = GenericDialect {};
+    let ast: Result<Vec<Statement>, ParserError> = Parser::parse_sql(&dialect, input);
+
+    let mut tables_and_columns = Vec::new();
+
+    match ast {
+        Ok(parsed) => {
+            for stmt in parsed {
+                if let Statement::Query(query) = stmt {
+                    let query: Query = *query;
+                    if let SetExpr::Select(select) = *query.body {
+                        let select: Select = *select;
+                        for from in &select.from {
+                            let from: &TableWithJoins = from;
+                            // handle direct table
+                            if let TableFactor::Table { name, alias, args: _, with_hints: _ } = &from.relation {
+                                let table_name = match alias {
+                                    Some(alias) => alias.name.value.to_string(),
+                                    None => name.to_string(),
+                                };
+                                tables_and_columns.push((table_name, vec![]));
+                            }
+
+                            // handle joins
+                            for join in &from.joins {
+                                let join: &Join = join;
+                                if let TableFactor::Table { name, alias, args: _, with_hints: _ } = &join.relation {
+                                    let table_name = match alias {
+                                        Some(alias) => alias.name.value.to_string(),
+                                        None => name.to_string(),
+                                    };
+                                    tables_and_columns.push((table_name, vec![]));
+                                }
+                                // Handle "ON" clause in joins
+                                if let Some(constraint) = match &join.join_operator {
+                                    JoinOperator::Inner(c) => Some(c),
+                                    JoinOperator::LeftOuter(c) => Some(c),
+                                    JoinOperator::RightOuter(c) => Some(c),
+                                    JoinOperator::FullOuter(c) => Some(c),
+                                    JoinOperator::CrossJoin => None,
+                                    JoinOperator::LeftSemi(c) => Some(c),
+                                    JoinOperator::RightSemi(c) => Some(c),
+                                    JoinOperator::LeftAnti(c) => Some(c),
+                                    JoinOperator::RightAnti(c) => Some(c),
+                                    JoinOperator::CrossApply => None,
+                                    JoinOperator::OuterApply => None,
+                                } {
+                                    if let JoinConstraint::On(expr) = &constraint {
+                                        parse_expr(expr, &mut tables_and_columns);
+                                    }
+                                }
+                            }
+                        }
+
+
+                        for projection in &select.projection {
+                            if let SelectItem::Wildcard(opts) = projection {
+                                for (_, columns) in &mut tables_and_columns {
+                                    columns.push("*".to_string());
+                                }
+                            } else if let SelectItem::ExprWithAlias { expr, .. } = projection {
+                                parse_expr(&expr, &mut tables_and_columns);
+                            } else if let SelectItem::UnnamedExpr(expr) = projection {
+                                parse_expr(&expr, &mut tables_and_columns);
+                            }
+                        }
+
+                        if let Some(where_clause) = &select.selection {
+                            parse_expr(where_clause, &mut tables_and_columns);
+                        }
+
+                    }
+
+
+                }
+            }
+
+            Ok(tables_and_columns)
+        },
+        Err(e) => Err(e),
+    }
+}
+
 
 pub fn get_paths_for_query(query_encoder_doc: &EncoderDocument) -> Vec<Vec<String>> {
     let mut paths = vec![];
@@ -253,10 +365,10 @@ fn parse_field_arguments(field: Field) {
 #[derive(Debug, Clone)]
 pub struct CleanIndividualNode {
     pub name: String,
-    query_type: QueryType,
+    // query_type: QueryType,
     query_path: QueryPath,
     pub output_path: OutputPath,
-    output_type: EncoderDocument,
+    // output_type: EncoderDocument,
     output_table: HashSet<String>,
 }
 
@@ -264,20 +376,37 @@ pub fn derive_for_individual_node(node: &Item) -> anyhow::Result<CleanIndividual
     let name = &node.core.as_ref().unwrap().name;
     let core = node.core.as_ref().unwrap();
 
+    // let query_type = extract_query_types(core)?;
+    // let query_path = query_type.iter().map(|x| x.as_ref().map(get_paths_for_query)).collect();
+
+    let mut query_path: QueryPath = vec![];
+    for query in &core.queries {
+        if let Some(q) = &query.query {
+            let dependent_on = parse_tables_and_columns(&q)?;
+            let mut paths = vec![];
+            for table in dependent_on {
+                let mut path = vec![table.0];
+                path.extend(table.1);
+                paths.push(path);
+            }
+            query_path.push(Some(paths));
+        } else {
+            query_path.push(None);
+        }
+    }
+
     // Add the node to the output table
+    let output_type = extract_output_types(&node)?;
     let mut output_table: HashSet<_> = core.output_tables.iter().cloned().collect();
     output_table.insert(core.name.clone());
-
-    let query_type = extract_query_types(core)?;
-    let output_type = extract_output_types(&node)?;
-    let query_path = query_type.iter().map(|x| x.as_ref().map(get_paths_for_query)).collect();
     let output_path = get_paths_for_output(&output_table, &output_type);
+
     Ok(CleanIndividualNode {
         name: name.clone(),
-        query_type,
+        // query_type,
         query_path,
         output_path,
-        output_type,
+        // output_type,
         output_table
     })
 }
@@ -291,16 +420,16 @@ type OutputPath =  Vec<Vec<String>>;
 
 #[derive(Debug, Clone)]
 pub struct CleanedDefinitionGraph {
-    pub query_types: HashMap<String, QueryType>,
+    // pub query_types: HashMap<String, QueryType>,
     pub query_paths: HashMap<String, QueryPath>,
-    pub output_types: HashMap<String, EncoderDocument>,
+    // pub output_types: HashMap<String, EncoderDocument>,
     pub node_by_name: HashMap<String, Item>,
     pub dispatch_table: HashMap<String, Vec<String>>,
     pub output_table: HashMap<String, Vec<String>>,
     pub node_to_output_tables: HashMap<String, HashSet<String>>,
-    pub gql_query_type: EncoderDocument,
+    // pub gql_query_type: EncoderDocument,
     pub output_paths: HashMap<String, OutputPath>,
-    pub unified_type_doc: EncoderDocument,
+    // pub unified_type_doc: EncoderDocument,
 
 }
 
@@ -316,15 +445,15 @@ impl CleanedDefinitionGraph {
 
     pub fn zero() -> Self {
         Self {
-            query_types: HashMap::new(),
+            // query_types: HashMap::new(),
             query_paths: HashMap::new(),
             output_table: HashMap::new(),
             dispatch_table: HashMap::new(),
-            output_types: HashMap::new(),
+            // output_types: HashMap::new(),
             output_paths: HashMap::new(),
             node_by_name: HashMap::new(),
-            gql_query_type: EncoderDocument::new(),
-            unified_type_doc: EncoderDocument::new(),
+            // gql_query_type: EncoderDocument::new(),
+            // unified_type_doc: EncoderDocument::new(),
             node_to_output_tables: HashMap::new(),
         }
     }
@@ -341,17 +470,17 @@ impl CleanedDefinitionGraph {
             let indiv = &mut derive_for_individual_node(node)?;
             let name = &indiv.name;
             graph.node_to_output_tables.insert(name.clone(), mem::take(&mut indiv.output_table));
-            graph.query_types.insert(name.clone(), mem::take(&mut indiv.query_type));
-            graph.output_types.insert(name.clone(), mem::take(&mut indiv.output_type));
+            // graph.query_types.insert(name.clone(), mem::take(&mut indiv.query_type));
+            // graph.output_types.insert(name.clone(), mem::take(&mut indiv.output_type));
             graph.query_paths.insert(name.clone(), mem::take(&mut indiv.query_path));
             graph.output_paths.insert(name.clone(), mem::take(&mut indiv.output_path));
         }
 
         // This aggregates all the query types into a single query type
-        graph.gql_query_type = generate_gql_schema_query_type(&graph.output_types);
+        // graph.gql_query_type = generate_gql_schema_query_type(&graph.output_types);
         graph.output_table = output_table_from_output_types(&graph.output_paths);
         graph.dispatch_table = dispatch_table_from_query_paths(&graph.query_paths);
-        graph.unified_type_doc = build_type_document(graph.output_types.iter().collect(), &graph.gql_query_type);
+        // graph.unified_type_doc = build_type_document(graph.output_types.iter().collect(), &graph.gql_query_type);
         graph.node_by_name = node_by_name;
 
         Ok(graph)
@@ -362,14 +491,14 @@ impl CleanedDefinitionGraph {
             mem::take(&mut self.node_by_name)
         ).unwrap();
         self.node_by_name = recomputed.node_by_name;
-        self.query_types = recomputed.query_types;
+        // self.query_types = recomputed.query_types;
         self.query_paths = recomputed.query_paths;
-        self.output_types = recomputed.output_types;
+        // self.output_types = recomputed.output_types;
         self.output_paths = recomputed.output_paths;
-        self.gql_query_type = recomputed.gql_query_type;
+        // self.gql_query_type = recomputed.gql_query_type;
         self.output_table = recomputed.output_table;
         self.dispatch_table = recomputed.dispatch_table;
-        self.unified_type_doc = recomputed.unified_type_doc;
+        // self.unified_type_doc = recomputed.unified_type_doc;
         self.node_to_output_tables = recomputed.node_to_output_tables;
         Ok(())
     }
@@ -477,14 +606,14 @@ impl CleanedDefinitionGraph {
         // }
 
         self.node_by_name = recomputed.node_by_name;
-        self.query_types = recomputed.query_types;
+        // self.query_types = recomputed.query_types;
         self.query_paths = recomputed.query_paths;
-        self.output_types = recomputed.output_types;
+        // self.output_types = recomputed.output_types;
         self.output_paths = recomputed.output_paths;
-        self.gql_query_type = recomputed.gql_query_type;
+        // self.gql_query_type = recomputed.gql_query_type;
         self.output_table = recomputed.output_table;
         self.dispatch_table = recomputed.dispatch_table;
-        self.unified_type_doc = recomputed.unified_type_doc;
+        // self.unified_type_doc = recomputed.unified_type_doc;
         self.node_to_output_tables = recomputed.node_to_output_tables;
 
         Ok(updated_nodes)
@@ -651,11 +780,7 @@ mod tests {
     fn gen_item_hello_plus_world() -> Item {
         create_code_node(
             "code_node_test_dep".to_string(),
-            vec![Some( r#" query Q {
-                code_node_test {
-                    output
-                }
-            }"#.to_string(),
+            vec![Some( r#" SELECT output FROM code_node_test"#.to_string(),
             )],
             r#"type O { result: String }"#.to_string(),
             SourceNodeType::Code(String::from("DENO"),
@@ -781,11 +906,7 @@ mod tests {
                 gen_item_hello_plus_world(),
                 create_code_node(
                     "code_node_test_dep_output".to_string(),
-                    vec![Some( r#" query Q {
-                        OutputTable2 {
-                            output
-                        }
-                    }"#.to_string(),
+                    vec![Some( r#"SELECT output FROM OutputTable2"#.to_string(),
                     )],
                     r#"type O { result: String }"#.to_string(),
                     SourceNodeType::Code(String::from("DENO"),
@@ -819,6 +940,55 @@ mod tests {
                 0 -> 2 [ ]
             }
         "#});
+    }
+
+    #[test]
+    fn test_parse_projection_values() {
+        let sql_query = "SELECT column1, column2 FROM table_1 WHERE column1 = 'value'";
+        let result = parse_projection_values(sql_query);
+        assert_eq!(result, vec!["column1", "column2"]);
+
+        let sql_query = "SELECT column1, column2, column3 FROM table_1 WHERE column1 = 'value' AND column2 = 'value2'";
+        let result = parse_projection_values(sql_query);
+        assert_eq!(result, vec!["column1", "column2", "column3"]);
+    }
+
+    // Extracting the tables and associated columns used in the sql query
+
+    #[test]
+    fn test_single_table_no_alias() {
+        let sql = "SELECT col1, col2 FROM table1";
+        let result = parse_tables_and_columns(sql);
+        assert_eq!(result.unwrap(), vec![("table1".to_string(), vec!["col1".to_string(), "col2".to_string()])]);
+    }
+
+    #[test]
+    fn test_single_table_with_alias() {
+        let sql = "SELECT t.col1, t.col2 FROM table1 AS t";
+        let result = parse_tables_and_columns(sql);
+        assert_eq!(result.unwrap(), vec![("t".to_string(), vec!["col1".to_string(), "col2".to_string()])]);
+    }
+
+    #[test]
+    fn test_joined_tables_no_alias() {
+        let sql = "SELECT table1.col1, table2.col2 FROM table1 JOIN table2 ON table1.id = table2.id";
+        let result = parse_tables_and_columns(sql);
+        let expected = vec![
+            ("table1".to_string(), vec!["id".to_string(), "col1".to_string()]),
+            ("table2".to_string(), vec!["id".to_string(), "col2".to_string()]),
+        ];
+        assert_eq!(result.unwrap(), expected);
+    }
+
+    #[test]
+    fn test_joined_tables_with_alias() {
+        let sql = "SELECT t1.col1, t2.col2 FROM table1 AS t1 JOIN table2 AS t2 ON t1.id = t2.id";
+        let result = parse_tables_and_columns(sql);
+        let expected = vec![
+            ("t1".to_string(), vec!["id".to_string(), "col1".to_string()]),
+            ("t2".to_string(), vec!["id".to_string(), "col2".to_string()]),
+        ];
+        assert_eq!(result.unwrap(), expected);
     }
 
 }
