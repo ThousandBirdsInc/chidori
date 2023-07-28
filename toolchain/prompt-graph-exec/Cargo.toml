@@ -40,7 +40,7 @@ twox-hash = "1.6.3"
 zip = "0.6.6"
 qdrant-client = "1.3.0"
 base64 = "0.21.2"
-hnsw_rs = { git = "https://github.com/ThousandBirdsInc/hnswlib-rs.git", rev = "59051b2c54fa8175faf08930d4b93103d50b9ca4"}
+hnsw_rs_thousand_birds = "0.1.20"
 
 anyhow = { version = "1.0", default-features = false }
 
