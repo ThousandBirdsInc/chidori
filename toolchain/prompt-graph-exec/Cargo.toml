@@ -2,6 +2,11 @@
 name = "prompt-graph-exec"
 version = "0.1.0"
 edition = "2021"
+description = "Execution of Chidori, interprets a given graph of prompts and nodes, provides grpc api to the runtime"
+license = "MIT"
+homepage = "https://docs.thousandbirds.ai"
+repository = "https://github.com/ThousandBirdsInc/chidori"
+
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

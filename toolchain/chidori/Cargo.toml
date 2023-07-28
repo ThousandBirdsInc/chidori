@@ -2,6 +2,11 @@
 name = "chidori"
 version = "0.1.7"
 edition = "2021"
+description = "A Rust library for executing prompt-graph models"
+license = "MIT"
+homepage = "https://docs.thousandbirds.ai"
+repository = "https://github.com/ThousandBirdsInc/chidori"
+
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
