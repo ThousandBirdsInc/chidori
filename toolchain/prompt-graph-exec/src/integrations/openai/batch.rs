@@ -32,7 +32,7 @@ pub async fn chat_completion(n: &PromptGraphNodePrompt, openai_model: SupportedC
         model,
         messages: vec![chat_completion::ChatCompletionMessage {
             role: chat_completion::MessageRole::user,
-            content: Some(templated_string),
+            content: templated_string,
             name: None,
             function_call: None,
         }],
