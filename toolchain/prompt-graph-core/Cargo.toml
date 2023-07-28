@@ -1,6 +1,6 @@
 [package]
 name = "prompt-graph-core"
-version = "0.1.23"
+version.workspace = true
 edition = "2021"
 description = "Core of Chidori, compiles graph and node definitions into an interpretable graph"
 license = "MIT"

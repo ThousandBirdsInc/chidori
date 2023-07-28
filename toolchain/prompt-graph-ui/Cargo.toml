@@ -1,6 +1,6 @@
 [package]
 name = "prompt-graph-ui"
-version = "0.1.23"
+version.workspace = true
 edition = "2021"
 description = "UI for Chidori, provides visualization of runtime behavior"
 license = "MIT"
