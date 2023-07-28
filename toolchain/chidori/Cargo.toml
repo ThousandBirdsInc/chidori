@@ -1,6 +1,6 @@
 [package]
 name = "chidori"
-version.workspace = true
+version= "0.1.24"
 edition = "2021"
 description = "A Rust library for executing prompt-graph models"
 license = "MIT"
@@ -36,7 +36,7 @@ sqlparser = "0.34.0"
 openssl = { version = "0.10", features = ["vendored"] }
 
 once_cell = "1"
-prompt-graph-core = { path = "../prompt-graph-core", version = "^0.1.23" }
+prompt-graph-core = { path = "../prompt-graph-core", version = "^0.1.24" }
 wasm-bindgen = {version = "0.2.86", features = []}
 handlebars = "4.3.7"
 anyhow = { version = "1.0", default-features = false }
