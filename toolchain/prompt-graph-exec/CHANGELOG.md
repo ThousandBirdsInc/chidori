@@ -7,3 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## 0.1.22 (2023-07-28)
 
+### Added
+
+### Fixed
+
+### Changed
+
+- Moved to SQL queries as triggers to nodes rather than graphql
+
+### Changed
