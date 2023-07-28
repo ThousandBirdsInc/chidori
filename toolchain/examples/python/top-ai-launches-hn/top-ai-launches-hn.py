@@ -53,7 +53,7 @@ class ChidoriWorker:
         h = await g.custom_node(
             name="FetchTopHN",
             node_type_name="FetchTopHN",
-            output="type O { output: String }"
+            output="{ output: String }"
         )
 
         # A prompt node, pulling in the value of the output from FetchTopHN

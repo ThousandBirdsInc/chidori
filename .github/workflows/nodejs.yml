@@ -1,6 +1,7 @@
 name: Nodejs - Test & Release Package
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - 'v*'
