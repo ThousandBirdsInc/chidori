@@ -1,6 +1,6 @@
 [package]
 name = "prompt-graph-exec"
-version = "0.1.0"
+version = "0.1.22"
 edition = "2021"
 description = "Execution of Chidori, interprets a given graph of prompts and nodes, provides grpc api to the runtime"
 license = "MIT"
