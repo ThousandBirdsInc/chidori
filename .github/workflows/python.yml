@@ -3,7 +3,7 @@ name: Python - Test & Release Package
 on:
   push:
     tags:
-      - '*'
+      - 'v*'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

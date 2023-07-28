@@ -3,7 +3,7 @@ name: Nodejs - Test & Release Package
 on:
   push:
     tags:
-      - '*'
+      - 'v*'
 
 defaults:
   run:
