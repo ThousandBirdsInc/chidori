@@ -21,7 +21,7 @@
     "arm64"
   ],
   "binary": {
-    "module_name": "_chidori",
+    "module_name": "chidori",
     "module_path": "./package_node/native",
     "host": "https://github.com/thousandbirdsinc/chidori/releases/download/",
     "package_name": "{module_name}-v{version}-{node_abi}-{platform}-{arch}-{libc}.tar.gz",
