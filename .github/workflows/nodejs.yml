@@ -35,14 +35,14 @@ jobs:
           - 19
           - 20
         system:
+          - os: macos-11-arm
+            target: aarch64-apple-darwin
           - os: macos-11
             target: x86_64-apple-darwin
           - os: ubuntu-20.04
             target: x86_64-unknown-linux-gnu
           - os: windows-2022
             target: x86_64-pc-windows-msvc
-          # Would like to have aarch64 support, but actions does not provide these yet.
-          # https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners
     steps:
       - uses: actions/checkout@v3
         with:
@@ -73,7 +73,9 @@ jobs:
         working-directory: toolchain/chidori
         # This will update the package version to tag version. So artifacts uploaded to Github release will be named correctly.
         run: python3 -c "import os; import json; p = json.load(open('package.json')); p['version'] = os.environ['ARTIFACT_VERSION']; json.dump(p, open('package.json', 'w'), indent=2, ensure_ascii=False);"
-
+      - name: Show package.json
+        working-directory: toolchain/chidori
+        run: cat package.json
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
