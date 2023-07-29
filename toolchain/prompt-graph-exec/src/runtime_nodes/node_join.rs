@@ -1,4 +1,4 @@
-use prompt_graph_core::proto2::{ChangeValue, item, NodeWillExecute, PromptGraphMap};
+use prompt_graph_core::proto2::{ChangeValue, item};
 use prompt_graph_core::proto2::serialized_value::Val;
 use crate::executor::NodeExecutionContext;
 
@@ -9,7 +9,7 @@ pub fn execute_node_join(ctx: &NodeExecutionContext) -> Vec<ChangeValue> {
         node_will_execute_on_branch,
         // TODO: incomplete
         item: item::Item::Map(n),
-        item_core,
+        item_core: _,
         ..
     } = ctx else {
         panic!("TODO: implement execute_node_join");

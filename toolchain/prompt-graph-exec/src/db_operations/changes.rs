@@ -3,7 +3,7 @@ use std::collections;
 use crate::db_operations;
 use crate::db_operations::{CHANGE_PENDING_PREFIX, CHANGE_RESOLVED_PREFIX};
 use prost::Message;
-use prompt_graph_core::proto2::{ChangeValue, ChangeValueWithCounter};
+use prompt_graph_core::proto2::{ChangeValueWithCounter};
 
 
 // =================
@@ -20,7 +20,7 @@ fn change_prefix_pending_only_branch(branch: u64) -> Vec<u8> {
 }
 
 fn change_prefix_pending_raw() -> Vec<u8> {
-    db_operations::encode_into_slice((CHANGE_PENDING_PREFIX)).unwrap()
+    db_operations::encode_into_slice(CHANGE_PENDING_PREFIX).unwrap()
 }
 
 fn decode_change_prefix_pending(src: &[u8]) -> (u64, u64) {
@@ -34,7 +34,7 @@ fn change_prefix_resolved(branch: u64, counter: u64) -> Vec<u8> {
 }
 
 fn change_prefix_resolved_raw() -> Vec<u8> {
-    db_operations::encode_into_slice((CHANGE_RESOLVED_PREFIX)).unwrap()
+    db_operations::encode_into_slice(CHANGE_RESOLVED_PREFIX).unwrap()
 }
 
 fn decode_change_prefix_resolved(src: &[u8]) -> (u64, u64) {

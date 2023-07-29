@@ -1,9 +1,9 @@
 use deno_core::serde_json::Value;
 use deno_core::{FastString, JsRuntime, RuntimeOptions, serde_json, serde_v8, v8};
-use prompt_graph_core::proto2::{ChangeValue, PromptGraphNodeCodeSourceCode};
-use prompt_graph_core::templates::render_template_prompt;
+use prompt_graph_core::proto2::{ChangeValue};
 
-pub fn source_code_run_deno(source_code: String, change_set: &Vec<ChangeValue>) -> Option<Value> {
+
+pub fn source_code_run_deno(source_code: String, _change_set: &Vec<ChangeValue>) -> Option<Value> {
     let wrapped_source_code = format!(r#"(function main() {{
         {}
     }})();"#, source_code);

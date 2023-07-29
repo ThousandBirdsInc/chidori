@@ -1,42 +1,42 @@
 use std::collections::{HashMap, HashSet};
-use std::env;
-use std::iter::zip;
-use std::ops::Deref;
-use std::sync::Arc;
-use std::time::Duration;
+
+
+
+
+
 use deno_core::anyhow;
-use prost::Message;
+
 use anyhow::Result;
 use log::debug;
-use sled::Tree;
-use tokio::runtime::Runtime;
+
+
 use prompt_graph_core::create_change_value;
 use prompt_graph_core::execution_router::{dispatch_and_mutate_state, evaluate_changes_against_node, ExecutionState};
-use prompt_graph_core::graph_definition::DefinitionGraph;
-use prompt_graph_core::build_runtime_graph::graph_parse::CleanedDefinitionGraph;
-use prompt_graph_core::proto2::{ChangeValue, ChangeValueWithCounter, DispatchResult, File, InputProposal, Item, MemoryAction, NodeWillExecute, PromptGraphConstant, PromptGraphMap, PromptGraphNodeCode, PromptGraphNodeCodeSourceCode, PromptGraphNodeComponent, PromptGraphNodeMemory, PromptGraphNodeObservation, PromptGraphNodePrompt, PromptGraphParameterNode, SerializedValue, SupportedEmebddingModel, SupportedSourceCodeLanguages, SupportedVectorDatabase, PromptGraphNodeCustom, PromptLibraryRecord, ItemCore};
-use prompt_graph_core::proto2 as dsl;
-use prompt_graph_core::proto2::{CounterWithPath, NodeWillExecuteOnBranch, Path};
-use prompt_graph_core::proto2::item;
-use prompt_graph_core::proto2::prompt_graph_node_code::Source;
-use prompt_graph_core::proto2::prompt_graph_node_component::Transclusion;
-use prompt_graph_core::proto2::serialized_value::Val;
-use prompt_graph_core::templates::render_template_prompt;
 
-use tokio::sync::broadcast;
-use tokio::sync::broadcast::Sender;
-use tokio::sync::broadcast::Receiver;
-use tokio::time;
+use prompt_graph_core::build_runtime_graph::graph_parse::CleanedDefinitionGraph;
+use prompt_graph_core::proto2::{ChangeValue, ChangeValueWithCounter, File, Item, NodeWillExecute, PromptGraphNodeCustom, PromptLibraryRecord, ItemCore};
+
+use prompt_graph_core::proto2::{NodeWillExecuteOnBranch};
+use prompt_graph_core::proto2::item;
+
+
+
+
+
+
+
+
+
 
 use crate::db_operations::playback::get_is_playing_status;
-use crate::db_operations::branches::{create_root_branch, get_branch};
+use crate::db_operations::branches::{create_root_branch};
 use crate::db_operations::changes::get_next_pending_change_on_branch;
 use crate::db_operations::changes::resolve_pending_change;
 use crate::db_operations::state_path_storage::{state_get, state_get_count_node_execution, state_inc_counter_node_execution};
 use crate::db_operations::state_path_storage::state_insert;
 use crate::db_operations::changes::subscribe_to_pending_change_events;
-use crate::db_operations::input_proposals_and_responses::scan_all_input_responses;
-use crate::db_operations::input_proposals_and_responses::insert_input_proposal;
+
+
 use crate::db_operations::changes::insert_new_change_value_with_counter;
 use crate::db_operations::graph_mutations::{get_next_pending_graph_mutation_on_branch, resolve_pending_graph_mutation, subscribe_to_pending_graph_mutations};
 use crate::db_operations::executing_nodes::{insert_will_execute, move_will_execute_event_to_complete_by_will_exec};
@@ -158,13 +158,13 @@ impl Executor {
             match idx {
                 // Pending graph mutation
                 0 => {
-                    if let sled::Event::Insert { key, value } = event {
+                    if let sled::Event::Insert { key: _, value: _ } = event {
                         self.progress_mutations().await?;
                     }
                 }
                 // Pending change
                 1 => {
-                    if let sled::Event::Insert { key, value } = event {
+                    if let sled::Event::Insert { key: _, value: _ } = event {
                         self.progress_changes().await?;
                     }
                 }
@@ -180,7 +180,7 @@ impl Executor {
         debug!("handle_graph_mutations");
 
         // Merge each of the nodes into clean file
-        let updated_nodes = self.clean_definition_graph.merge_file(file).unwrap();
+        let _updated_nodes = self.clean_definition_graph.merge_file(file).unwrap();
 
         // If the node had no query, we need to insert a change value with no query
         // TODO: only for the introduced mutation
@@ -190,7 +190,7 @@ impl Executor {
 
             // TODO: for each query path set for the node, evaluate the query against the current system state
             let query_paths = self.clean_definition_graph.query_paths.get(node_name).expect("Node should be guaranteed to exist").clone();
-            for (idx, opt_query_path) in query_paths.iter().enumerate() {
+            for (_idx, opt_query_path) in query_paths.iter().enumerate() {
                 if let Some(query_paths) = opt_query_path {
                     let mut state = InternalStateHandler {
                         tree: &self.tree,
@@ -352,30 +352,30 @@ impl Executor {
         debug!("Executing node with context: {:?}", &ctx);
 
         let filled_values = match (item.core.as_ref().unwrap(), item.item.as_ref().unwrap()) {
-            (c, item::Item::Map(n)) => {
+            (_c, item::Item::Map(_n)) => {
                 node_map::execute_node_map(&ctx)
             }
-            (c, item::Item::NodeCode(n)) => {
+            (_c, item::Item::NodeCode(_n)) => {
                 node_code::node::execute_node_code(&ctx)
             }
-            (c, item::Item::NodePrompt(n)) => {
+            (_c, item::Item::NodePrompt(_n)) => {
                 node_prompt::node::execute_node_prompt(&ctx).await
             }
-            (c, item::Item::NodeMemory(n)) => {
+            (_c, item::Item::NodeMemory(_n)) => {
                 node_memory::node::execute_node_memory(&ctx).await?
             }
-            (c, item::Item::NodeEcho(n)) => {
+            (_c, item::Item::NodeEcho(_n)) => {
                 let change_set: Vec<ChangeValue> = node_will_execute
                     .change_values_used_in_execution.iter().map(|x| x.change_value.as_ref().unwrap().clone()).collect();
                 change_set
             }
-            (c, item::Item::NodeLoader(n)) => {
+            (_c, item::Item::NodeLoader(_n)) => {
                 node_loader::node::execute_node_loader(&ctx)?
             }
-            (c, item::Item::NodeCustom(n)) => {
+            (_c, item::Item::NodeCustom(_n)) => {
                 node_custom::execute_node_custom(&ctx).await?
             }
-            (c, item::Item::NodeJoin(n)) => {
+            (_c, item::Item::NodeJoin(_n)) => {
                 vec![]
             },
 

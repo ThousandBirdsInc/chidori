@@ -1,5 +1,5 @@
-use std::collections::HashSet;
-use prompt_graph_core::proto2::{ChangeValue, item, ItemCore, NodeWillExecute, PromptGraphNodeCode, PromptGraphNodeCodeSourceCode, SupportedSourceCodeLanguages};
+
+use prompt_graph_core::proto2::{ChangeValue, item, SupportedSourceCodeLanguages};
 use prompt_graph_core::proto2::prompt_graph_node_code::Source;
 use prompt_graph_core::templates::{flatten_value_keys, json_value_to_serialized_value, render_template_prompt};
 use crate::runtime_nodes::node_code;
@@ -13,7 +13,7 @@ pub fn run_starlark(source_code: String, change_set: &Vec<ChangeValue>) -> Optio
 }
 
 #[cfg(not(feature = "starlark"))]
-pub fn run_starlark(source_code: String, change_set: &Vec<ChangeValue>) -> Option<Value> {
+pub fn run_starlark(_source_code: String, _change_set: &Vec<ChangeValue>) -> Option<Value> {
     None
 }
 
@@ -23,7 +23,7 @@ pub fn execute_node_code(ctx: &NodeExecutionContext) -> Vec<ChangeValue> {
     let &NodeExecutionContext {
         node_will_execute_on_branch,
         item: item::Item::NodeCode(n),
-        item_core,
+        item_core: _,
         namespaces,
         template_partials,
         ..
@@ -32,7 +32,7 @@ pub fn execute_node_code(ctx: &NodeExecutionContext) -> Vec<ChangeValue> {
     };
 
 
-    let mut change_set: Vec<ChangeValue> = node_will_execute_on_branch.node.as_ref().unwrap()
+    let change_set: Vec<ChangeValue> = node_will_execute_on_branch.node.as_ref().unwrap()
         .change_values_used_in_execution.iter().filter_map(|x| x.change_value.clone()).collect();
 
     debug!("execute_node_code {:?}", &n);

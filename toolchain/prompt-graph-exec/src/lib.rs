@@ -7,8 +7,8 @@ mod db_operations;
 #[cfg(feature = "nodejs")]
 use neon::prelude::*;
 
-use std::sync::mpsc;
-use std::thread;
+
+
 
 #[cfg(feature = "nodejs")]
 use neon::{types::Deferred};

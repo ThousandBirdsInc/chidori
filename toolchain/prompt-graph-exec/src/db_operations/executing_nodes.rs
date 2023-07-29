@@ -1,7 +1,7 @@
 use crate::db_operations;
 use crate::db_operations::{WILL_EXEC_COMPLETE_PREFIX, WILL_EXEC_IN_PROGRESS_PREFIX, WILL_EXEC_PENDING_PREFIX};
 use prost::Message;
-use sled::{Event, Subscriber};
+use sled::{Subscriber};
 use prompt_graph_core::proto2::NodeWillExecuteOnBranch;
 
 
@@ -25,12 +25,12 @@ fn will_exec_complete_prefix(is_custom_node: bool, branch: u64, counter: u64) ->
 }
 
 fn will_exec_pending_prefix_raw() -> Vec<u8> {
-    db_operations::encode_into_slice((WILL_EXEC_PENDING_PREFIX)).unwrap()
+    db_operations::encode_into_slice(WILL_EXEC_PENDING_PREFIX).unwrap()
 }
 
 pub fn insert_will_execute(tree: &sled::Tree, will_exec: NodeWillExecuteOnBranch) {
     let NodeWillExecuteOnBranch { custom_node_type_name, node, branch, counter } = &will_exec;
-    let node = node.as_ref().expect("node not found on NodeWillExecuteOnBranch");
+    let _node = node.as_ref().expect("node not found on NodeWillExecuteOnBranch");
     let is_custom_node = custom_node_type_name.is_some();
     tree.insert(will_exec_pending_prefix(is_custom_node, *branch, *counter), will_exec.encode_to_vec()).unwrap();
 }

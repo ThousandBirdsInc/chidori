@@ -9,7 +9,7 @@ fn input_proposal_prefix(branch: u64, s: String, counter: u64) -> Vec<u8> {
 }
 
 fn input_proposal_prefix_raw() -> Vec<u8> {
-    db_operations::encode_into_slice((INPUT_PROPOSAL_PREFIX)).unwrap()
+    db_operations::encode_into_slice(INPUT_PROPOSAL_PREFIX).unwrap()
 }
 
 fn input_response_prefix(branch: u64, counter: u64) -> Vec<u8> {
@@ -17,7 +17,7 @@ fn input_response_prefix(branch: u64, counter: u64) -> Vec<u8> {
 }
 
 fn input_response_prefix_raw() -> Vec<u8> {
-    db_operations::encode_into_slice((INPUT_RESPONSE_PREFIX)).unwrap()
+    db_operations::encode_into_slice(INPUT_RESPONSE_PREFIX).unwrap()
 }
 
 

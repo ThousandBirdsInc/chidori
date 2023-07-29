@@ -26,7 +26,7 @@ pub fn subscribe_to_playback_state(tree: sled::Tree) -> sled::Subscriber {
 /// Playback state is global, it would be far to complicated for users to manage separate playback
 /// state across multiple execution branches.
 fn is_playing_prefix() -> Vec<u8> {
-    db_operations::encode_into_slice((IS_PLAYING_PREFIX)).unwrap()
+    db_operations::encode_into_slice(IS_PLAYING_PREFIX).unwrap()
 }
 
 
@@ -35,7 +35,7 @@ fn is_playing_prefix() -> Vec<u8> {
 /// When a user plays from an earlier frame, we expect to re-emit all changes from that frame
 /// to the user.
 fn current_playback_frame_prefix() -> Vec<u8> {
-    db_operations::encode_into_slice((CURRENT_PLAYBACK_FRAME_KEY)).unwrap()
+    db_operations::encode_into_slice(CURRENT_PLAYBACK_FRAME_KEY).unwrap()
 }
 
 #[cfg(test)]

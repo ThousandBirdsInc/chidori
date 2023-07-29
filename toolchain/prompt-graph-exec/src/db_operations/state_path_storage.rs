@@ -22,7 +22,7 @@ pub fn state_prefix_raw_with_branch(branch: u64) -> Vec<u8> {
 }
 
 fn decode_state_prefix(src: &[u8]) -> (u64, u64, u64) {
-    let (prefix, branch, path, counter): (u16, u64, u64, u64) = db_operations::borrow_decode_from_slice(src).unwrap();
+    let (_prefix, branch, path, counter): (u16, u64, u64, u64) = db_operations::borrow_decode_from_slice(src).unwrap();
     (branch, counter, path)
 }
 
@@ -40,7 +40,7 @@ fn state_exec_counter_lookup_prefix(node_name_hash: u64) -> Vec<u8> {
 }
 
 fn decode_state_exec_counter_prefix(src: &[u8]) -> (u64, u64, u64) {
-    let (prefix, branch, node_name_hash, counter): (u16, u64, u64, u64) = db_operations::borrow_decode_from_slice(src).unwrap();
+    let (_prefix, branch, node_name_hash, counter): (u16, u64, u64, u64) = db_operations::borrow_decode_from_slice(src).unwrap();
     (branch, node_name_hash, counter)
 }
 
@@ -102,7 +102,7 @@ pub fn debug_scan_all_state_branch(tree: &sled::Tree, branch: u64) {
     let all: Vec<_> = tree.scan_prefix(state_prefix_raw_with_branch(branch))
         .map(|c| {
             let (k, v) = c.unwrap();
-            let (branch, counter, path) = decode_state_prefix(&k);
+            let (_branch, counter, path) = decode_state_prefix(&k);
             (path, counter, ChangeValue::decode(v.as_ref()).unwrap())
         }).collect();
     println!("- START debug_scan_all_state_branch");
@@ -125,7 +125,7 @@ pub fn state_get_count_node_execution(tree: &sled::Tree, node_name: &[u8], count
         .next_back()
         .transpose()
         .unwrap()
-        .map(|(k, v) | {
+        .map(|(_k, v) | {
             db_operations::bytes_to_u64(v)
         })
 }
