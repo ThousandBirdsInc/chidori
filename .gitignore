@@ -62,5 +62,6 @@ databases/simulation_host_db/report.html
 .next
 dist
 .idea
+.venv
 
 toolchain/chidori/package_python/chidori/_chidori.abi3.so
