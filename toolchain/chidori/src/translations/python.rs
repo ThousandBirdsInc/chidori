@@ -402,8 +402,8 @@ async fn get_client(url: String) -> Result<ExecutionRuntimeClient<tonic::transpo
 // TODO: return a handle to nodes so that we can understand and inspect them
 // TODO: include a __repr__ method on those nodes
 
-#[pyclass]
 #[derive(Clone)]
+#[pyclass(name="NodeHandle")]
 struct PyNodeHandle {
     n: NodeHandle,
 }
@@ -915,6 +915,7 @@ fn _chidori(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     // pyo3_log::init();
     m.add_class::<PyChidori>()?;
     m.add_class::<PyGraphBuilder>()?;
+    m.add_class::<PyNodeHandle>()?;
     Ok(())
 }
 

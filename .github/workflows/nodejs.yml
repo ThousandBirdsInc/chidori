@@ -23,6 +23,9 @@ jobs:
     permissions: write-all
     name: nodejs-${{ matrix.node_version }}-${{ matrix.system.target }}-${{ matrix.system.os }}
     runs-on: ${{ matrix.system.os }}
+    env:
+      # Set to force version number, e.g., when no tag exists.
+      ARTIFACT_VERSION: TEST-0.0.0
     strategy:
       fail-fast: false
       matrix:
@@ -44,12 +47,9 @@ jobs:
       - uses: actions/checkout@v3
         with:
           ref: ${{ github.event.release.tag_name }}
-#      - name: Set release version
-#        # Set release version in all three os, the commented run should suffice for linux and mac.
-#        run: python3 -c "import os; tag = os.environ['GITHUB_REF'].split('/')[-1]; f = open(os.environ['GITHUB_ENV'], 'a'); f.write('ARTIFACT_VERSION='+tag); f.close();"
       - name: Set release version
-         run: echo "ARTIFACT_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
-
+        if: env.ARTIFACT_VERSION == ''
+        run: python3 -c "import os; tag = os.environ['GITHUB_REF'].split('/')[-1]; f = open(os.environ['GITHUB_ENV'], 'a'); f.write('ARTIFACT_VERSION='+tag); f.close();"
       - uses: actions/setup-node@v3
         with:
           node-version: ${{ matrix.node_version }}
