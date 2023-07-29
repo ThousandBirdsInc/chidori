@@ -21,7 +21,7 @@ jobs:
     runs-on: macos-latest
     strategy:
       matrix:
-        target: [x86_64, aarch64]
+        target: [x86_64]
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-python@v4
@@ -70,7 +70,7 @@ jobs:
     runs-on: macos-latest
     strategy:
       matrix:
-        target: [x86_64]
+        target: [x86_64, aarch64]
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-python@v4
@@ -99,7 +99,7 @@ jobs:
         uses: messense/maturin-action@v1
         with:
           args: --release --universal2 --out dist --features python
-          maturin-version: "v0.13.0"
+          maturin-version: "v1.1.0"
           working-directory: toolchain/chidori
           sccache: true
       - name: Install built wheel - universal2
