@@ -51,7 +51,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --features python
-          maturin-version: "v0.13.0"
+          maturin-version: "v1.1.0"
           working-directory: toolchain/chidori
           sccache: true
       - name: Install built wheel - x86_64
@@ -148,7 +148,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --features python
-          maturin-version: "v0.13.0"
+          maturin-version: "v1.1.0"
           working-directory: toolchain/chidori
           sccache: true
       - name: Install built wheel
@@ -181,7 +181,7 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: auto
           args: --release --out dist --features python
-          maturin-version: "v0.13.0"
+          maturin-version: "v1.1.0"
           working-directory: toolchain/chidori
           sccache: true
       - name: Install built wheel
