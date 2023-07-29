@@ -59,7 +59,7 @@ jobs:
         run: |
           pip install dist/${{ env.PACKAGE_NAME }}-*.whl --force-reinstall
           pip install pytest pytest-mock pytest-asyncio
-          pytest -v
+          pytest ./tests/python
       - name: Upload wheels
         uses: actions/upload-artifact@v3
         with:
@@ -107,7 +107,7 @@ jobs:
         run: |
           pip install dist/${{ env.PACKAGE_NAME }}-*universal2.whl --force-reinstall
           pip install pytest pytest-mock pytest-asyncio
-          pytest -v
+          pytest ./tests/python
       - name: Upload wheels
         uses: actions/upload-artifact@v3
         with:
@@ -157,7 +157,7 @@ jobs:
         run: |
           python -m pip install dist/${{ env.PACKAGE_NAME }}-*.whl --force-reinstall
           pip install pytest pytest-mock pytest-asyncio
-          python -m pytest -v
+          python -m pytest -v ./tests/python
       - name: Upload wheels
         uses: actions/upload-artifact@v3
         with:
@@ -190,7 +190,7 @@ jobs:
         run: |
           pip install dist/${{ env.PACKAGE_NAME }}-*.whl --force-reinstall
           pip install pytest pytest-mock pytest-asyncio
-          pytest -v -p no:qt
+          pytest -v -p no:qt ./tests/python
       - name: Upload wheels
         uses: actions/upload-artifact@v3
         with:
