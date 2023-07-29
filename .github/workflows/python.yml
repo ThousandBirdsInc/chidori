@@ -3,6 +3,8 @@ name: Python - Test & Release Package
 on:
   workflow_dispatch:
   push:
+    branches:
+      - colton/improved-examples-and-releases
     tags:
       - 'v*'
 
