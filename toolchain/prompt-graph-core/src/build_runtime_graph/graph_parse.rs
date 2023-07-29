@@ -3,20 +3,20 @@ use std::fmt::Write;
 use std::{fmt, mem};
 
 use anyhow::anyhow;
-use gluesql::core::ast::ToSql;
-use gluesql::core::ast_builder::{Build, col, Execute, table};
-use indoc::indoc;
+
+
+
 use petgraph::dot::{Config, Dot};
 use petgraph::graphmap::DiGraphMap;
-use serde::de;
+
 use sqlparser::ast::{Expr, JoinConstraint, Query, Select, SelectItem, SetExpr, Statement, TableWithJoins};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::{Parser, ParserError};
 
 use crate::graph_definition::DefinitionGraph;
-use crate::proto2::{File, Item, item as dsl_item, ItemCore, OutputType};
-use crate::utils;
-use crate::utils::wasm_error::CoreError;
+use crate::proto2::{File, Item, item as dsl_item};
+
+
 
 
 // Used for typing outputs
@@ -103,7 +103,7 @@ fn generate_maximal_operation_def_from_output() {
 }
 
 
-use sqlparser::ast::{TableFactor, ObjectName, Join, JoinOperator};
+use sqlparser::ast::{TableFactor, Join, JoinOperator};
 
 fn parse_expr(expr: &Expr, tables_and_columns: &mut Vec<(String, Vec<String>)>) {
     match expr {
@@ -187,7 +187,7 @@ pub fn parse_tables_and_columns(input: &str) -> Result<Vec<(String, Vec<String>)
 
 
                         for projection in &select.projection {
-                            if let SelectItem::Wildcard(opts) = projection {
+                            if let SelectItem::Wildcard(_opts) = projection {
                                 for (_, columns) in &mut tables_and_columns {
                                     columns.push("*".to_string());
                                 }

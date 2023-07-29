@@ -1,11 +1,11 @@
 use anyhow::anyhow;
 use prost::Message;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use crate::proto2 as dsl;
 use crate::proto2::{ItemCore, Query};
 use crate::proto2::prompt_graph_node_loader::LoadFrom;
-use crate::utils::wasm_error::CoreError;
+
 
 fn map_string_to_vector_database(encoding: &str) -> anyhow::Result<dsl::SupportedVectorDatabase> {
     match encoding {
