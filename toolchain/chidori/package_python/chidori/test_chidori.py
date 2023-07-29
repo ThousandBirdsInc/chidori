@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
-from chidori import Chidori, GraphBuilder
+from _chidori import Chidori, GraphBuilder
 
 
 @pytest.mark.asyncio
@@ -16,13 +16,7 @@ async def test_simple_agent():
     )
     pn = await g.deno_code_node(
         name="CodeNode",
-        queries=["""
-            query Q {
-                InspirationalQuote {
-                  promptResult
-                }
-            }
-            """],
+        queries=["""SELECT promptResult FROM InspirationalQuote"""],
         code="""
             return {"output": "Here is your quote for "+ new Date() + {{InspirationalQuote.promptResult}} }
             """,

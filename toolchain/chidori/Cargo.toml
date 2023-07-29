@@ -10,7 +10,7 @@ repository = "https://github.com/ThousandBirdsInc/chidori"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
-name = "chidori"
+name = "_chidori"
 crate-type = ["cdylib", "lib"]
 bench = false
 
@@ -80,4 +80,4 @@ pyo3-build-config = "0.19.1"
 
 [package.metadata.maturin]
 python-source = "package_python"
-name = "chidori"
+name = "chidori._chidori"

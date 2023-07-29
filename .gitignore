@@ -60,5 +60,5 @@ databases/simulation_host_db/report.json
 databases/simulation_host_db/report.html
 
 .next
-
+dist
 .idea

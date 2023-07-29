@@ -746,7 +746,7 @@ impl PyGraphBuilder {
     }
 
     // https://github.com/PyO3/pyo3/issues/525
-    #[pyo3(signature = (name=String::new(), queries=vec!["None".to_string()], output_tables=vec![], output=String::from("type O {}"), node_type_name=String::new()))]
+    #[pyo3(signature = (name=String::new(), queries=vec!["None".to_string()], output_tables=vec![], output=String::from("{}"), node_type_name=String::new()))]
     fn custom_node<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
@@ -797,7 +797,7 @@ impl PyGraphBuilder {
     }
 
 
-    #[pyo3(signature = (name=String::new(), queries=vec!["None".to_string()], output_tables=vec![], output=String::from("type O { }"), template=String::new(), action="WRITE".to_string(), embedding_model="TEXT_EMBEDDING_ADA_002".to_string(), db_vendor="QDRANT".to_string(), collection_name=String::new()))]
+    #[pyo3(signature = (name=String::new(), queries=vec!["None".to_string()], output_tables=vec![], output=String::from("{}"), template=String::new(), action="WRITE".to_string(), embedding_model="TEXT_EMBEDDING_ADA_002".to_string(), db_vendor="QDRANT".to_string(), collection_name=String::new()))]
     fn vector_memory_node<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
@@ -910,8 +910,8 @@ impl PyGraphBuilder {
 /// the `lib.name` setting in the `Cargo.toml`, else Python will not be able to
 /// import the module.
 #[pymodule]
-#[pyo3(name = "chidori")]
-fn chidori(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+#[pyo3(name = "_chidori")]
+fn _chidori(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     // pyo3_log::init();
     m.add_class::<PyChidori>()?;
     m.add_class::<PyGraphBuilder>()?;

@@ -174,7 +174,7 @@ mod tests {
                     name: "EmptyNode".to_string(),
                     queries: vec![Query{ query: None}],
                     output: Some(OutputType {
-                        output: "type O {}".to_string(),
+                        output: "{}".to_string(),
                     }),
                     output_tables: vec![],
                 }),

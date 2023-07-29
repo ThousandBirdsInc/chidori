@@ -170,7 +170,7 @@ pub fn create_op_map(
             queries: query_defs.into_iter().map(create_query).collect(),
             // TODO: needs to have the type of the input
             output: create_output(r#"
-                type O {
+                {
                     result: String
                 }
             "#),
@@ -367,7 +367,7 @@ pub fn create_prompt_node(
             name: name.to_string(),
             queries: query_defs.into_iter().map(create_query).collect(),
             output: create_output(r#"
-              type O {
+              {
                   promptResult: String
               }
             "#),

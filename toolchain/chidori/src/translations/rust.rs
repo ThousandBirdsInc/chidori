@@ -538,7 +538,7 @@ impl GraphBuilder {
         let node = create_custom_node(
             def.name.clone(),
             remap_queries(def.queries.clone()),
-            def.output.unwrap_or("type O {}".to_string()),
+            def.output.unwrap_or("{}".to_string()),
             def.node_type_name,
             def.output_tables.unwrap_or(vec![])
         );
@@ -553,7 +553,7 @@ impl GraphBuilder {
         let node = create_code_node(
             def.name.clone(),
             remap_queries(def.queries.clone()),
-            def.output.unwrap_or("type O {}".to_string()),
+            def.output.unwrap_or("{}".to_string()),
             SourceNodeType::Code("DENO".to_string(), def.code, def.is_template.unwrap_or(false)),
             def.output_tables.unwrap_or(vec![])
         );
@@ -568,7 +568,7 @@ impl GraphBuilder {
         let node = create_vector_memory_node(
             def.name.clone(),
             remap_queries(def.queries.clone()),
-            def.output.unwrap_or("type O {}".to_string()),
+            def.output.unwrap_or("{}".to_string()),
             def.action.unwrap_or("READ".to_string()),
             def.embedding_model.unwrap_or("TEXT_EMBEDDING_ADA_002".to_string()),
             def.template.unwrap_or("".to_string()),
