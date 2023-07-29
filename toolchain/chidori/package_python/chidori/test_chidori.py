@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
-from _chidori import Chidori, GraphBuilder
+from chidori import Chidori, GraphBuilder
 
 
 @pytest.mark.asyncio

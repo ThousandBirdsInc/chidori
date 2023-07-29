@@ -910,7 +910,7 @@ impl PyGraphBuilder {
 /// the `lib.name` setting in the `Cargo.toml`, else Python will not be able to
 /// import the module.
 #[pymodule]
-#[pyo3(name = "_chidori")]
+#[pyo3(name = "chidori")]
 fn _chidori(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     // pyo3_log::init();
     m.add_class::<PyChidori>()?;

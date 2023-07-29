@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PACKAGE_NAME: chidori
+  PACKAGE_NAME: _chidori
   PYTHON_VERSION: "3.9" # to build abi3 wheels
 
 jobs:

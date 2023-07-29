@@ -31,3 +31,5 @@ build-backend = "maturin"
 [tool.maturin]
 features = ["python"]
 python-source = "package_python"
+module-name = "chidori._chidori"
+bindings = "pyo3"
