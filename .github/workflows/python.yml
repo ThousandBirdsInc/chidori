@@ -98,7 +98,7 @@ jobs:
       - name: Build wheels - universal2
         uses: messense/maturin-action@v1
         with:
-          args: --release --universal2 --out dist --features python
+          args: --release --out dist --features python --target universal2-apple-darwin
           maturin-version: "v1.1.0"
           working-directory: toolchain/chidori
           sccache: true
