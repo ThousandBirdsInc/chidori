@@ -126,7 +126,7 @@ pub fn dispatch_and_mutate_state(
 
 #[cfg(test)]
 mod tests {
-    use crate::proto2::{File, item, ItemCore, OutputType, PromptGraphNodeEcho, Query};
+    use crate::proto2::{File, item, Item, ItemCore, OutputType, Path, PromptGraphNodeEcho, Query};
     use crate::graph_definition::DefinitionGraph;
     use std::collections::HashMap;
 
@@ -193,7 +193,7 @@ mod tests {
                         query: None,
                     }],
                     output: Some(OutputType {
-                        output: "type O {} ".to_string(),
+                        output: "{} ".to_string(),
                     }),
                     output_tables: vec![]
                 }),

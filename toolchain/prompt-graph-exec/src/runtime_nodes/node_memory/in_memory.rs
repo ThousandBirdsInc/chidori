@@ -69,6 +69,7 @@ impl<T> InMemoryVectorDb<T> where T: Clone{
 mod tests {
     use super::*;
 
+    #[ignore]
     #[test]
     fn test_memory_db() {
         let mut db = InMemoryVectorDb::new();

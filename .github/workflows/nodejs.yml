@@ -18,7 +18,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-
   nodejs-github-native:
     permissions: write-all
     name: nodejs-${{ matrix.node_version }}-${{ matrix.system.target }}-${{ matrix.system.os }}
