@@ -1,174 +1,214 @@
 use std::collections::{HashMap, HashSet};
-use std::mem;
+use std::fmt::Write;
+use std::{fmt, mem};
 
 use anyhow::anyhow;
-use apollo_compiler::ApolloCompiler;
-use apollo_encoder::{Document as EncoderDocument, Document, FieldDefinition, Selection, SelectionSet, Field as EncoderField};
-use apollo_parser::Parser as ApolloParser;
-use apollo_parser::ast::{AstNode, Field, Value};
-use indoc::indoc;
+
+
+
 use petgraph::dot::{Config, Dot};
 use petgraph::graphmap::DiGraphMap;
-use sqlparser::ast::{SetExpr, Statement};
+
+use sqlparser::ast::{Expr, JoinConstraint, Query, Select, SelectItem, SetExpr, Statement, TableWithJoins};
 use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
+use sqlparser::parser::{Parser, ParserError};
 
 use crate::graph_definition::DefinitionGraph;
-use crate::proto2::{File, Item, item as dsl_item, ItemCore};
-use crate::utils;
-use crate::utils::wasm_error::CoreError;
+use crate::proto2::{File, Item, item as dsl_item};
 
 
-/// Takes a string for a graphql output type and returns an encoded apollo document
-pub fn parse_graphql_type_def(name: &str, output_type: &str) -> anyhow::Result<EncoderDocument> {
-    let parser = ApolloParser::new(output_type).recursion_limit(100);
-    let doc = parser.parse().document();
-    let mut encoder = EncoderDocument::try_from(doc).unwrap();
-    if let Some(encoder_def) = encoder.object_type_definitions.first() {
-        let new_type_def = apollo_encoder::ObjectDefinition {
-            name: utils::uppercase_first_letter(name),
-            description: encoder_def.description.clone(),
-            directives: encoder_def.directives.clone(),
-            fields: encoder_def.fields.clone(),
-            interfaces: encoder_def.interfaces.clone(),
-            extend: encoder_def.extend,
-        };
-        encoder.object_type_definitions = vec![new_type_def];
-    } else {
-        return Err(anyhow!("Object type definition for node is missing"));
+
+
+// Used for typing outputs
+pub enum SQLType {
+    Number,
+    Text,
+    Timestamp,
+    Boolean,
+    Null,
+}
+
+impl SQLType {
+    pub fn from_str(s: &str) -> anyhow::Result<SQLType> {
+        let s = s.to_lowercase();
+        match s.as_str() {
+            "integer" => Ok(SQLType::Number),
+            "float" => Ok(SQLType::Number),
+            "string" => Ok(SQLType::Text),
+            "text" => Ok(SQLType::Text),
+            "date" => Ok(SQLType::Timestamp),
+            "timestamp" => Ok(SQLType::Timestamp),
+            "boolean" => Ok(SQLType::Boolean),
+            "bool" => Ok(SQLType::Boolean),
+            "null" => Ok(SQLType::Null),
+            _ => Err(anyhow!("Unknown SQL type {}", s)),
+        }
     }
-    return Ok(encoder)
 }
 
-/// From an Item record, extracts the output type definition and returns it as an encoded apollo document
-pub fn extract_output_types(item: &Item) -> anyhow::Result<EncoderDocument> {
-    let name = &item.core.as_ref().unwrap().name;
-    let output_type = &item.core.as_ref().unwrap().output.as_ref().unwrap().output;
-    let doc = parse_graphql_type_def(name, &output_type)?;
-    Ok(doc)
-}
+impl<'de> serde::Deserialize<'de> for SQLType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+    {
+        struct SQLTypeVisitor;
 
+        impl<'de> serde::de::Visitor<'de> for SQLTypeVisitor {
+            type Value = SQLType;
 
-/// Generate our GQL schema for a given set of node query types. Renames the name of the query to the Title Case name of the
-/// the node.
-fn generate_gql_schema_query_type(node_output_type_docs: &HashMap<String, EncoderDocument>) -> EncoderDocument {
-    let mut object_def = apollo_encoder::ObjectDefinition::new("Query".to_string());
-    for (name, _node_output_type_doc) in node_output_type_docs.iter() {
-        let ty = apollo_encoder::Type_::NamedType { name: utils::uppercase_first_letter(&name), };
-        let field = apollo_encoder::FieldDefinition::new(utils::lowercase_first_letter(name), ty);
-        object_def.field(field);
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a valid string for SQLType")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<SQLType, E>
+                where
+                    E: serde::de::Error,
+            {
+                SQLType::from_str(value).map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(SQLTypeVisitor)
     }
-    let mut query_doc = EncoderDocument::new();
-    query_doc.object(object_def);
-    query_doc
 }
 
-/// Accepts a string for a graphql query and returns an encoded apollo document
-pub fn parse_graphql_query_def(name: &str, query: &str) -> anyhow::Result<EncoderDocument> {
-    let parser = ApolloParser::new(query).recursion_limit(100);
-    let ast = parser.parse();
-    let doc = ast.document();
-    let mut encoder = EncoderDocument::try_from(doc).unwrap();
-    if let Some(encoder_def) = encoder.operation_definitions.first() {
-        let new_op_def = apollo_encoder::OperationDefinition {
-            operation_type: apollo_encoder::OperationType::Query,
-            name: Some(utils::uppercase_first_letter(name)),
-            variable_definitions: encoder_def.variable_definitions.clone(),
-            directives: encoder_def.directives.clone(),
-            selection_set: encoder_def.selection_set.clone(),
-            shorthand: encoder_def.shorthand,
-        };
-        encoder.operation_definitions = vec![new_op_def];
-    } else {
-        return Err(anyhow!("Object type definition for node {} is missing", name));
-    }
-    Ok(encoder)
+pub type OutputTypeDefinition = HashMap<String, SQLType>;
+
+pub fn parse_output_type_def_to_paths(input: &str) -> OutputPaths {
+    serde_json::from_str(input).unwrap()
 }
 
-/// From an Item record, extracts the query type definitions and returns them as encoded apollo documents
-pub fn extract_query_types(item_core: &ItemCore) -> anyhow::Result<Vec<Option<EncoderDocument>>> {
-    let name = &item_core.name;
-    let query_docs: Result<Vec<Option<EncoderDocument>>, _>  = item_core.queries.clone().into_iter().map(|query_type| {
-        query_type.query.map(|q| {
-            parse_graphql_query_def(name, &q)
-        }).transpose()
-    }).collect();
-    query_docs
-}
-
-
-pub fn parse_where_query(input: &str) {
-    // We prepend an arbitrary SELECT * FROM x to the where so its a valid statement
-    // and then ignore that because we're only interested in the where clause
-    let mut sql = String::from("SELECT * FROM x ");
-    sql.push_str(input);
-
-    // Parse the sql, and then extract the where clause AST
+pub fn parse_projection_values(input: &str) -> Vec<String> {
     let dialect = GenericDialect {};
-    let ast = Parser::parse_sql(&dialect, &sql).unwrap();
+    let ast = Parser::parse_sql(&dialect, input).unwrap();
+    let mut projected_values = Vec::new();
     for stmt in ast {
         if let Statement::Query(query) = stmt {
             if let SetExpr::Select(select) = *query.body {
-                if let Some(where_clause) = select.selection {
-                    println!("Where Clause: {:?}", where_clause);
+                for projection in select.projection {
+                    if let SelectItem::UnnamedExpr(Expr::Identifier(identifier)) = projection {
+                        projected_values.push(identifier.value);
+                    }
                 }
             }
         }
     }
+    projected_values
 }
+
 
 // TODO: using a parsed output type, generate a maximal operation query definition
 fn generate_maximal_operation_def_from_output() {
     unimplemented!();
 }
 
-fn get_selection_set_paths(selection_set: &SelectionSet) -> Vec<Vec<String>> {
-    let mut paths = vec![];
-    for selection in &selection_set.selections {
-        match selection {
-            Selection::Field(field) => {
-                let this_path = vec![field.name.clone()];
-                if let Some(selection_set) = &field.selection_set {
-                    for path in get_selection_set_paths(selection_set) {
-                        let mut new_path = this_path.clone();
-                        new_path.extend(path);
-                        paths.push(new_path);
-                    }
-                } else {
-                    paths.push(this_path);
+
+use sqlparser::ast::{TableFactor, Join, JoinOperator};
+
+fn parse_expr(expr: &Expr, tables_and_columns: &mut Vec<(String, Vec<String>)>) {
+    match expr {
+        Expr::CompoundIdentifier(identifier) => {
+            if identifier.len() == 2 {
+                let table_name = identifier[0].value.to_string();
+                let column_name = identifier[1].value.to_string();
+                if let Some((_, columns)) = tables_and_columns.iter_mut().find(|(table, _)| table == &table_name) {
+                    columns.push(column_name);
                 }
             }
-            Selection::FragmentSpread(_) => {}
-            Selection::InlineFragment(_) => {}
-        }
-    }
-    paths
-}
-
-pub fn get_paths_for_query(query_encoder_doc: &EncoderDocument) -> Vec<Vec<String>> {
-    let mut paths = vec![];
-    query_encoder_doc.operation_definitions.iter().for_each(|op_def| {
-        for field_name_path in get_selection_set_paths(&op_def.selection_set) {
-            paths.push(field_name_path);
-        }
-    });
-    paths
-}
-
-/// Converts an output type ApolloEncoderDocument into a shredded list of resolved paths
-/// as Vec<String> for each path.
-pub fn get_paths_for_output(output_tables: &HashSet<String>, output_encoder_doc: &EncoderDocument) -> OutputPath {
-    let mut path_per_value = vec![];
-    output_encoder_doc.object_type_definitions.iter().for_each(|op_def| {
-        for field in &op_def.fields {
-            for table in output_tables.iter() {
-                path_per_value.push(vec![table.clone(), field.name.clone()]);
+        },
+        Expr::Identifier(ident) => {
+            let column_name = ident.value.to_string();
+            for (_, columns) in tables_and_columns {
+                columns.push(column_name.clone());
             }
+        },
+        Expr::BinaryOp { left, right, .. } => {
+            parse_expr(&*left, tables_and_columns);
+            parse_expr(&*right, tables_and_columns);
         }
-    });
-    path_per_value
+        _ => {}
+    }
 }
 
+pub fn parse_tables_and_columns(input: &str) -> Result<Vec<(String, Vec<String>)>, sqlparser::parser::ParserError> {
+    let dialect = GenericDialect {};
+    let ast: Result<Vec<Statement>, ParserError> = Parser::parse_sql(&dialect, input);
+
+    let mut tables_and_columns = Vec::new();
+
+    match ast {
+        Ok(parsed) => {
+            for stmt in parsed {
+                if let Statement::Query(query) = stmt {
+                    let query: Query = *query;
+                    if let SetExpr::Select(select) = *query.body {
+                        let select: Select = *select;
+                        for from in &select.from {
+                            let from: &TableWithJoins = from;
+                            // handle direct table
+                            if let TableFactor::Table { name, alias, args: _, with_hints: _ } = &from.relation {
+                                let table_name = match alias {
+                                    Some(alias) => alias.name.value.to_string(),
+                                    None => name.to_string(),
+                                };
+                                tables_and_columns.push((table_name, vec![]));
+                            }
+
+                            // handle joins
+                            for join in &from.joins {
+                                let join: &Join = join;
+                                if let TableFactor::Table { name, alias, args: _, with_hints: _ } = &join.relation {
+                                    let table_name = match alias {
+                                        Some(alias) => alias.name.value.to_string(),
+                                        None => name.to_string(),
+                                    };
+                                    tables_and_columns.push((table_name, vec![]));
+                                }
+                                // Handle "ON" clause in joins
+                                if let Some(constraint) = match &join.join_operator {
+                                    JoinOperator::Inner(c) => Some(c),
+                                    JoinOperator::LeftOuter(c) => Some(c),
+                                    JoinOperator::RightOuter(c) => Some(c),
+                                    JoinOperator::FullOuter(c) => Some(c),
+                                    JoinOperator::CrossJoin => None,
+                                    JoinOperator::LeftSemi(c) => Some(c),
+                                    JoinOperator::RightSemi(c) => Some(c),
+                                    JoinOperator::LeftAnti(c) => Some(c),
+                                    JoinOperator::RightAnti(c) => Some(c),
+                                    JoinOperator::CrossApply => None,
+                                    JoinOperator::OuterApply => None,
+                                } {
+                                    if let JoinConstraint::On(expr) = &constraint {
+                                        parse_expr(expr, &mut tables_and_columns);
+                                    }
+                                }
+                            }
+                        }
+
+
+                        for projection in &select.projection {
+                            if let SelectItem::Wildcard(_opts) = projection {
+                                for (_, columns) in &mut tables_and_columns {
+                                    columns.push("*".to_string());
+                                }
+                            } else if let SelectItem::ExprWithAlias { expr, .. } = projection {
+                                parse_expr(&expr, &mut tables_and_columns);
+                            } else if let SelectItem::UnnamedExpr(expr) = projection {
+                                parse_expr(&expr, &mut tables_and_columns);
+                            }
+                        }
+
+                        if let Some(where_clause) = &select.selection {
+                            parse_expr(where_clause, &mut tables_and_columns);
+                        }
+                    }
+                }
+            }
+            Ok(tables_and_columns)
+        },
+        Err(e) => Err(e),
+    }
+}
 
 /// Build a map of output paths to the nodes that they refer to
 pub fn output_table_from_output_types(output_paths: &HashMap<String, Vec<Vec<String>>>) -> HashMap<String, Vec<String>> {
@@ -218,89 +258,78 @@ pub fn dispatch_table_from_query_paths(query_paths: &HashMap<String, Vec<Option<
         .collect()
 }
 
-fn parse_field_arguments(field: Field) {
-    field.arguments().iter().for_each(|arg| {
-        arg.arguments().for_each(|a| {
-            if let Some(val) = a.value() {
-                match val {
-                    Value::Variable(_) => {}
-                    Value::StringValue(v) => {
-                        println!("argument {:?} = {:?}",
-                                 a.name().unwrap().text().to_string(),
-                                 v.source_string()
-                        );
-                    }
-                    Value::FloatValue(_) => {}
-                    Value::IntValue(v) => {
-                        println!("argument {:?} = {:?}",
-                                 a.name().unwrap().text().to_string(),
-                                 v.source_string()
-                        );
-
-                    }
-                    Value::BooleanValue(_) => {}
-                    Value::NullValue(_) => {}
-                    Value::EnumValue(_) => {}
-                    Value::ListValue(_) => {}
-                    Value::ObjectValue(_) => {}
-                }
-            }
-        });
-    });
-}
-
 
 #[derive(Debug, Clone)]
 pub struct CleanIndividualNode {
     pub name: String,
-    query_type: QueryType,
-    query_path: QueryPath,
-    pub output_path: OutputPath,
-    output_type: EncoderDocument,
-    output_table: HashSet<String>,
+    pub query_path: QueryPath,
+    pub output_paths: OutputPaths,
+    pub output_tables: HashSet<String>,
 }
 
 pub fn derive_for_individual_node(node: &Item) -> anyhow::Result<CleanIndividualNode> {
     let name = &node.core.as_ref().unwrap().name;
     let core = node.core.as_ref().unwrap();
 
-    // Add the node to the output table
-    let mut output_table: HashSet<_> = core.output_tables.iter().cloned().collect();
-    output_table.insert(core.name.clone());
+    let mut query_path: QueryPath = vec![];
+    for query in &core.queries {
+        if let Some(q) = &query.query {
+            let paths = query_path_from_query_string(&q)?;
+            query_path.push(Some(paths));
+        } else {
+            query_path.push(None);
+        }
+    }
 
-    let query_type = extract_query_types(core)?;
-    let output_type = extract_output_types(&node)?;
-    let query_path = query_type.iter().map(|x| x.as_ref().map(get_paths_for_query)).collect();
-    let output_path = get_paths_for_output(&output_table, &output_type);
+    // Add the node to the output table
+
+
+    let mut output_tables: HashSet<_> = core.output_tables.iter().cloned().collect();
+    output_tables.insert(core.name.clone());
+
+    let mut output_paths = vec![];
+    for output in &core.output {
+        let output_type: OutputTypeDefinition = serde_yaml::from_str(&output.output)?;
+        for output_table in &output_tables {
+            for (output_key, _ty) in &output_type {
+                output_paths.push(vec![output_table.clone(), output_key.clone()]);
+            }
+        }
+    }
+
     Ok(CleanIndividualNode {
         name: name.clone(),
-        query_type,
         query_path,
-        output_path,
-        output_type,
-        output_table
+        output_paths,
+        output_tables
     })
 }
 
+pub fn query_path_from_query_string(q: &String) -> anyhow::Result<Vec<Vec<String>>> {
+    let dependent_on = parse_tables_and_columns(&q)?;
+    let mut paths = vec![];
+    for table in dependent_on {
+        let mut path_segment = vec![table.0];
+        path_segment.extend(table.1);
+        paths.push(path_segment);
+    }
+    Ok(paths)
+}
 
-type QueryType =  Vec<Option<EncoderDocument>>;
+
 type QueryVecGroup = Vec<Vec<String>>;
 type QueryPath =  Vec<Option<QueryVecGroup>>;
-type OutputPath =  Vec<Vec<String>>;
+type OutputPaths =  Vec<Vec<String>>;
 
 
 #[derive(Debug, Clone)]
 pub struct CleanedDefinitionGraph {
-    pub query_types: HashMap<String, QueryType>,
     pub query_paths: HashMap<String, QueryPath>,
-    pub output_types: HashMap<String, EncoderDocument>,
     pub node_by_name: HashMap<String, Item>,
     pub dispatch_table: HashMap<String, Vec<String>>,
     pub output_table: HashMap<String, Vec<String>>,
     pub node_to_output_tables: HashMap<String, HashSet<String>>,
-    pub gql_query_type: EncoderDocument,
-    pub output_paths: HashMap<String, OutputPath>,
-    pub unified_type_doc: EncoderDocument,
+    pub output_paths: HashMap<String, OutputPaths>,
 
 }
 
@@ -316,15 +345,11 @@ impl CleanedDefinitionGraph {
 
     pub fn zero() -> Self {
         Self {
-            query_types: HashMap::new(),
             query_paths: HashMap::new(),
             output_table: HashMap::new(),
             dispatch_table: HashMap::new(),
-            output_types: HashMap::new(),
             output_paths: HashMap::new(),
             node_by_name: HashMap::new(),
-            gql_query_type: EncoderDocument::new(),
-            unified_type_doc: EncoderDocument::new(),
             node_to_output_tables: HashMap::new(),
         }
     }
@@ -340,18 +365,18 @@ impl CleanedDefinitionGraph {
         for node in node_by_name.values() {
             let indiv = &mut derive_for_individual_node(node)?;
             let name = &indiv.name;
-            graph.node_to_output_tables.insert(name.clone(), mem::take(&mut indiv.output_table));
-            graph.query_types.insert(name.clone(), mem::take(&mut indiv.query_type));
-            graph.output_types.insert(name.clone(), mem::take(&mut indiv.output_type));
+            graph.node_to_output_tables.insert(name.clone(), mem::take(&mut indiv.output_tables));
+            // graph.query_types.insert(name.clone(), mem::take(&mut indiv.query_type));
+            // graph.output_types.insert(name.clone(), mem::take(&mut indiv.output_type));
             graph.query_paths.insert(name.clone(), mem::take(&mut indiv.query_path));
-            graph.output_paths.insert(name.clone(), mem::take(&mut indiv.output_path));
+            graph.output_paths.insert(name.clone(), mem::take(&mut indiv.output_paths));
         }
 
         // This aggregates all the query types into a single query type
-        graph.gql_query_type = generate_gql_schema_query_type(&graph.output_types);
+        // graph.gql_query_type = generate_gql_schema_query_type(&graph.output_types);
         graph.output_table = output_table_from_output_types(&graph.output_paths);
         graph.dispatch_table = dispatch_table_from_query_paths(&graph.query_paths);
-        graph.unified_type_doc = build_type_document(graph.output_types.iter().collect(), &graph.gql_query_type);
+        // graph.unified_type_doc = build_type_document(graph.output_types.iter().collect(), &graph.gql_query_type);
         graph.node_by_name = node_by_name;
 
         Ok(graph)
@@ -362,14 +387,10 @@ impl CleanedDefinitionGraph {
             mem::take(&mut self.node_by_name)
         ).unwrap();
         self.node_by_name = recomputed.node_by_name;
-        self.query_types = recomputed.query_types;
         self.query_paths = recomputed.query_paths;
-        self.output_types = recomputed.output_types;
         self.output_paths = recomputed.output_paths;
-        self.gql_query_type = recomputed.gql_query_type;
         self.output_table = recomputed.output_table;
         self.dispatch_table = recomputed.dispatch_table;
-        self.unified_type_doc = recomputed.unified_type_doc;
         self.node_to_output_tables = recomputed.node_to_output_tables;
         Ok(())
     }
@@ -477,14 +498,10 @@ impl CleanedDefinitionGraph {
         // }
 
         self.node_by_name = recomputed.node_by_name;
-        self.query_types = recomputed.query_types;
         self.query_paths = recomputed.query_paths;
-        self.output_types = recomputed.output_types;
         self.output_paths = recomputed.output_paths;
-        self.gql_query_type = recomputed.gql_query_type;
         self.output_table = recomputed.output_table;
         self.dispatch_table = recomputed.dispatch_table;
-        self.unified_type_doc = recomputed.unified_type_doc;
         self.node_to_output_tables = recomputed.node_to_output_tables;
 
         Ok(updated_nodes)
@@ -541,86 +558,16 @@ impl CleanedDefinitionGraph {
 
 }
 
-fn validate_new_query(unified_type_doc: &Document, new_query: &Document) -> anyhow::Result<()> {
-    let mut compiler = ApolloCompiler::new();
-    compiler.add_type_system(unified_type_doc.to_string().as_str(), "".to_string());
-    validate_query_type(&mut compiler, "Query".to_string(), new_query);
-    Ok(())
-}
 
-pub fn build_type_document(docs: Vec<(&String, &EncoderDocument)>, query_operation_defintion: &EncoderDocument) -> EncoderDocument {
-    let mut unified_doc = EncoderDocument::new();
-    unified_doc.object_type_definitions.extend(query_operation_defintion.object_type_definitions.clone());
-    for (_name, doc) in docs {
-        unified_doc.object_type_definitions.extend(doc.object_type_definitions.clone());
-    }
-    unified_doc
-}
 
-pub fn validate_query_type(apollo_compiler: &mut ApolloCompiler, name: String, query: &Document) -> Vec<String> {
-    apollo_compiler.add_executable(&query.to_string(), name);
-    let diagnostics = apollo_compiler.validate();
-    diagnostics.into_iter().map(|d| d.to_string()).collect()
+
+pub fn construct_query_from_output_type(name: &String, namespace: &String, output_paths: &OutputPaths) -> anyhow::Result<String> {
+    let projection_items: Vec<String> = output_paths.iter().map(|x| format!("{}.{}", name, x.join("."))).collect();
+    let projection = projection_items.join(", ");
+    Ok(format!("SELECT {} FROM {}", projection, namespace))
 }
 
 
-fn add_to_field(
-    keys: &Vec<String>,
-    selection_set: &mut SelectionSet
-) -> anyhow::Result<()> {
-    if keys.len() == 0 {
-        return Ok(())
-    }
-    let key = &keys[0];
-    if let Some(Selection::Field(existing_field)) = selection_set.selections.iter_mut().find(|x| {
-        if let Selection::Field(f) = x {
-            &f.name == key
-        } else {
-            false
-        }
-    }) {
-        // Continue to traverse to deeper levels of the field, no mutation
-        add_to_field(&keys[1..].to_vec(), existing_field.selection_set.as_mut().unwrap())?;
-    } else {
-        // Add a new field for this key to the selection
-        selection_set.selections.push(Selection::Field(EncoderField::new(key.clone())));
-        let last_elem = selection_set.selections.last_mut().unwrap();
-        if let Selection::Field(f) = last_elem {
-            let next_keys = &keys[1..].to_vec();
-            if next_keys.len() == 0 {
-                return Ok(())
-            }
-            if f.selection_set.is_none() {
-                f.selection_set = Some(SelectionSet::new());
-            }
-            add_to_field( &next_keys, f.selection_set.as_mut().unwrap())?;
-        } else {
-            anyhow::bail!("Expected field");
-        }
-    }
-    Ok(())
-}
-
-pub fn construct_query_from_output_type(name: &String, namespace: &String, output_paths: &OutputPath) -> anyhow::Result<String> {
-    let mut encoder = EncoderDocument::new();
-
-    // TODO: this needs to start empty
-    let mut selection_set = SelectionSet::new();
-    for output_path in output_paths {
-        add_to_field(&output_path, &mut selection_set).unwrap();
-    }
-
-    encoder.operation( apollo_encoder::OperationDefinition {
-            operation_type: apollo_encoder::OperationType::Query,
-            name: Some(utils::uppercase_first_letter(&name)),
-            variable_definitions: vec![],
-            directives: vec![],
-            selection_set,
-            shorthand: false,
-        }
-    );
-    Ok(encoder.to_string())
-}
 
 #[cfg(test)]
 mod tests {
@@ -635,7 +582,7 @@ mod tests {
         create_code_node(
             "code_node_test".to_string(),
             vec![None],
-            r#" type O { output: String }"#.to_string(),
+            r#"{ "output": String }"#.to_string(),
             SourceNodeType::Code(String::from("DENO"),
                                  indoc! { r#"
                             return {
@@ -651,13 +598,9 @@ mod tests {
     fn gen_item_hello_plus_world() -> Item {
         create_code_node(
             "code_node_test_dep".to_string(),
-            vec![Some( r#" query Q {
-                code_node_test {
-                    output
-                }
-            }"#.to_string(),
+            vec![Some( r#" SELECT output FROM code_node_test"#.to_string(),
             )],
-            r#"type O { result: String }"#.to_string(),
+            r#"{ "result": String }"#.to_string(),
             SourceNodeType::Code(String::from("DENO"),
                                  indoc! { r#"
                             return {
@@ -671,78 +614,17 @@ mod tests {
     }
 
     #[test]
-    fn test_get_paths_for_query() {
-        let enc = parse_graphql_query_def("query", "query Name { user { id, name } }").unwrap();
-        let paths = get_paths_for_query(&enc);
-        assert_eq!(paths,
-                   vec![vec!["user".to_string(), "id".to_string()], vec!["user".to_string(), "name".to_string()]]);
+    fn test_construct_query_from_output_type() {
+        let output_paths : OutputPaths = vec![vec!["output".to_string()]];
+        let query = construct_query_from_output_type(&"code_node_test".to_string(), &"code_node_test".to_string(), &output_paths).unwrap();
+        assert_eq!(query, "SELECT code_node_test.output FROM code_node_test");
     }
 
     #[test]
-    fn test_get_paths_for_output() {
-        let enc = parse_graphql_type_def("query", "type RandomDie { numSides: Int! rollOnce: Int! } ").unwrap();
-        let paths = get_paths_for_output(&HashSet::from(["node".to_string()]), &enc);
-        assert_eq!(paths,
-                   vec![vec!["node".to_string(), "numSides".to_string()], vec!["node".to_string(), "rollOnce".to_string()]]);
-    }
-
-    #[test]
-    fn test_extract_query_types() {
-        let item_core = ItemCore {
-            name: "Name".to_string(),
-            queries: vec![Query {
-                query: Some("query Q { user { id, name }}".to_string())
-            }],
-            output_tables: vec![],
-            output: None,
-        };
-        let docs = extract_query_types(&item_core).unwrap();
-        assert_eq!(docs.len(), 1);
-        assert_eq!(docs[0].is_some(), true);
-        let paths = get_paths_for_query(&docs[0].as_ref().unwrap());
-        assert_eq!(paths, vec![vec!["user".to_string(), "id".to_string()], vec!["user".to_string(), "name".to_string()]]);
-    }
-
-    #[test]
-    fn test_extract_query_types_multiple_queries_and_one_none() {
-        let item_core = ItemCore {
-            name: "Name".to_string(),
-            queries: vec![
-                Query { query: Some("query Q { user { id, name } }".to_string()) },
-                Query { query: Some("query Q { account { uuid, fullName } }".to_string()) },
-                Query { query: None },
-            ],
-            output_tables: vec![],
-            output: None,
-        };
-        let docs = extract_query_types(&item_core).unwrap();
-        assert_eq!(docs.len(), 3);
-        assert_eq!(docs[0].is_some(), true);
-        let paths = get_paths_for_query(&docs[0].as_ref().unwrap());
-        assert_eq!(paths, vec![vec!["user".to_string(), "id".to_string()], vec!["user".to_string(), "name".to_string()]]);
-
-        assert_eq!(docs[1].is_some(), true);
-        let paths = get_paths_for_query(&docs[1].as_ref().unwrap());
-        assert_eq!(paths, vec![vec!["account".to_string(), "uuid".to_string()], vec!["account".to_string(), "fullName".to_string()]]);
-
-        assert_eq!(docs[2].is_none(), true);
-    }
-
-
-    #[test]
-    fn test_building_a_graphql_query_from_output_paths() {
-        let r = construct_query_from_output_type(
-            &"Name".to_string(),
-            &"Namespace".to_string(),
-            &vec![vec!["user".to_string(), "id".to_string()], vec!["user".to_string(), "name".to_string()]]).unwrap();
-        assert_eq!(r, indoc! { r#"
-            query Name {
-              user {
-                id
-                name
-              }
-            }
-        "#});
+    fn test_construct_query_from_output_type_multiple_keys() {
+        let output_paths : OutputPaths = vec![vec!["output".to_string()], vec!["result".to_string()]];
+        let query = construct_query_from_output_type(&"code_node_test".to_string(), &"code_node_test".to_string(), &output_paths).unwrap();
+        assert_eq!(query, "SELECT code_node_test.output, code_node_test.result FROM code_node_test");
     }
 
     #[test]
@@ -781,13 +663,9 @@ mod tests {
                 gen_item_hello_plus_world(),
                 create_code_node(
                     "code_node_test_dep_output".to_string(),
-                    vec![Some( r#" query Q {
-                        OutputTable2 {
-                            output
-                        }
-                    }"#.to_string(),
+                    vec![Some( r#"SELECT output FROM OutputTable2"#.to_string(),
                     )],
-                    r#"type O { result: String }"#.to_string(),
+                    r#"{ result: String }"#.to_string(),
                     SourceNodeType::Code(String::from("DENO"),
                                          indoc! { r#"
                             return {
@@ -819,6 +697,55 @@ mod tests {
                 0 -> 2 [ ]
             }
         "#});
+    }
+
+    #[test]
+    fn test_parse_projection_values() {
+        let sql_query = "SELECT column1, column2 FROM table_1 WHERE column1 = 'value'";
+        let result = parse_projection_values(sql_query);
+        assert_eq!(result, vec!["column1", "column2"]);
+
+        let sql_query = "SELECT column1, column2, column3 FROM table_1 WHERE column1 = 'value' AND column2 = 'value2'";
+        let result = parse_projection_values(sql_query);
+        assert_eq!(result, vec!["column1", "column2", "column3"]);
+    }
+
+    // Extracting the tables and associated columns used in the sql query
+
+    #[test]
+    fn test_single_table_no_alias() {
+        let sql = "SELECT col1, col2 FROM table1";
+        let result = parse_tables_and_columns(sql);
+        assert_eq!(result.unwrap(), vec![("table1".to_string(), vec!["col1".to_string(), "col2".to_string()])]);
+    }
+
+    #[test]
+    fn test_single_table_with_alias() {
+        let sql = "SELECT t.col1, t.col2 FROM table1 AS t";
+        let result = parse_tables_and_columns(sql);
+        assert_eq!(result.unwrap(), vec![("t".to_string(), vec!["col1".to_string(), "col2".to_string()])]);
+    }
+
+    #[test]
+    fn test_joined_tables_no_alias() {
+        let sql = "SELECT table1.col1, table2.col2 FROM table1 JOIN table2 ON table1.id = table2.id";
+        let result = parse_tables_and_columns(sql);
+        let expected = vec![
+            ("table1".to_string(), vec!["id".to_string(), "col1".to_string()]),
+            ("table2".to_string(), vec!["id".to_string(), "col2".to_string()]),
+        ];
+        assert_eq!(result.unwrap(), expected);
+    }
+
+    #[test]
+    fn test_joined_tables_with_alias() {
+        let sql = "SELECT t1.col1, t2.col2 FROM table1 AS t1 JOIN table2 AS t2 ON t1.id = t2.id";
+        let result = parse_tables_and_columns(sql);
+        let expected = vec![
+            ("t1".to_string(), vec!["id".to_string(), "col1".to_string()]),
+            ("t2".to_string(), vec!["id".to_string(), "col2".to_string()]),
+        ];
+        assert_eq!(result.unwrap(), expected);
     }
 
 }

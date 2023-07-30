@@ -1,10 +1,10 @@
 {
   "name": "@1kbirds/chidori",
-  "version": "0.1.7",
+  "version": "0.1.24",
   "description": "Chidori is a library for building and running reactive AI agents.",
   "main": "package_node/index.js",
   "scripts": {
-    "build": "cargo-cp-artifact -nc ./package_node/native/chidori.node -- cargo build --message-format=json-render-diagnostics --features nodejs",
+    "build": "cargo-cp-artifact -a cdylib _chidori  ./package_node/native/chidori.node -- cargo build --message-format=json-render-diagnostics --features nodejs",
     "build-debug": "npm run build --",
     "build-release": "npm run build -- --release",
     "test-rust": "cargo test",

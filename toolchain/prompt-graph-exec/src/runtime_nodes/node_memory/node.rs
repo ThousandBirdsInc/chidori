@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 use base64::{Engine as _};
 use anyhow::Result;
 use openai_api_rs::v1::api::Client;
@@ -6,13 +6,13 @@ use prompt_graph_core::proto2::{ChangeValue, ChangeValueWithCounter, InputPropos
 use prompt_graph_core::templates::render_template_prompt;
 use std::env;
 use openai_api_rs::v1::embedding::EmbeddingRequest;
-use futures::executor;
+
 use http_body_util::BodyExt;
 use prost::Message;
 use qdrant_client::prelude::*;
 use qdrant_client::qdrant::vectors_config::Config;
 use qdrant_client::qdrant::{
-    Condition, CreateCollection, Filter, SearchPoints, VectorParams, VectorsConfig,
+    CreateCollection, SearchPoints, VectorParams,
 };
 use prompt_graph_core::create_change_value;
 use prompt_graph_core::proto2::prompt_graph_node_memory::{EmbeddingModel, VectorDbProvider};
@@ -46,7 +46,7 @@ pub async fn execute_node_memory(ctx: &NodeExecutionContext<'_>) -> Result<Vec<C
     };
 
     let mut filled_values = vec![];
-    let mut change_set: Vec<ChangeValue> = node_will_execute_on_branch.node.as_ref().unwrap()
+    let change_set: Vec<ChangeValue> = node_will_execute_on_branch.node.as_ref().unwrap()
         .change_values_used_in_execution.iter().filter_map(|x| x.change_value.clone()).collect();
 
     // This excludes partials, there is no use case we currently know of for partials in embedding templates.
@@ -97,7 +97,7 @@ pub async fn execute_node_memory(ctx: &NodeExecutionContext<'_>) -> Result<Vec<C
                                 })
                                 .await?;
                             let found_point = search_result.result.into_iter().next().unwrap();
-                            let mut payload = found_point.payload;
+                            let payload = found_point.payload;
 
                             if let Some(query) = payload.get("query") {
                                 let s = query.as_str().unwrap();
@@ -156,7 +156,7 @@ pub async fn execute_node_memory(ctx: &NodeExecutionContext<'_>) -> Result<Vec<C
 }
 
 
-pub async fn initialize_node_memory_init(n: &PromptGraphNodeMemory, core: &ItemCore, branch: u64, counter: u64) -> Result<(Vec<ChangeValueWithCounter>, Vec<InputProposal>)> {
+pub async fn initialize_node_memory_init(n: &PromptGraphNodeMemory, _core: &ItemCore, _branch: u64, _counter: u64) -> Result<(Vec<ChangeValueWithCounter>, Vec<InputProposal>)> {
     let collection_name = &n.collection_name;
 
     let embedding_length = if let Some(EmbeddingModel::Model(enum_)) = n.embedding_model {

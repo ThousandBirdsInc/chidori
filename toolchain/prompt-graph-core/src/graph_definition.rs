@@ -1,11 +1,11 @@
 use anyhow::anyhow;
 use prost::Message;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use crate::proto2 as dsl;
 use crate::proto2::{ItemCore, Query};
 use crate::proto2::prompt_graph_node_loader::LoadFrom;
-use crate::utils::wasm_error::CoreError;
+
 
 fn map_string_to_vector_database(encoding: &str) -> anyhow::Result<dsl::SupportedVectorDatabase> {
     match encoding {
@@ -170,7 +170,7 @@ pub fn create_op_map(
             queries: query_defs.into_iter().map(create_query).collect(),
             // TODO: needs to have the type of the input
             output: create_output(r#"
-                type O {
+                {
                     result: String
                 }
             "#),
@@ -367,7 +367,7 @@ pub fn create_prompt_node(
             name: name.to_string(),
             queries: query_defs.into_iter().map(create_query).collect(),
             output: create_output(r#"
-              type O {
+              {
                   promptResult: String
               }
             "#),

@@ -5,7 +5,7 @@ use futures_util::stream::Stream;
 use openai_api_rs::v1::chat_completion::ChatCompletionRequest;
 use reqwest::{Client, Response};
 use serde_json::Value;
-use serde::{Serialize, Deserialize};
+
 
 pub struct GptStream {
     response: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,

@@ -1,13 +1,13 @@
 use prompt_graph_core::proto2::{ChangeValue, item, NodeWillExecuteOnBranch, Path};
 use crate::db_operations::custom_node_execution::get_custom_node_execution;
-use crate::db_operations::executing_nodes::get_complete_custom_node_will_exec;
+
 use crate::executor::NodeExecutionContext;
 
 #[tracing::instrument]
 pub async fn execute_node_custom(ctx: &NodeExecutionContext<'_>) -> anyhow::Result<Vec<ChangeValue>> {
     let &NodeExecutionContext {
         node_will_execute_on_branch,
-        item: item::Item::NodeCustom(n),
+        item: item::Item::NodeCustom(_n),
         namespaces,
         tree,
         ..

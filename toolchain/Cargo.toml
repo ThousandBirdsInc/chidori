@@ -7,5 +7,8 @@ members = [
     "examples/rust/top-ai-launches-hn"
 ]
 
+[workspace.package]
+version = "0.1.24"
+
 [profile.release]
 lto = true

@@ -1,5 +1,5 @@
 use std::env;
-use futures::executor;
+
 use openai_api_rs::v1::api::Client;
 use openai_api_rs::v1::chat_completion::{ChatCompletionRequest, ChatCompletionResponse};
 use openai_api_rs::v1::chat_completion;
@@ -12,11 +12,11 @@ use openai_api_rs::v1::chat_completion::{
     GPT4_32K_0314
 };
 use openai_api_rs::v1::error::APIError;
-use prompt_graph_core::templates::render_template_prompt;
+
 use prompt_graph_core::proto2::{PromptGraphNodePrompt, SupportedChatModel};
 
 
-pub async fn chat_completion(n: &PromptGraphNodePrompt, openai_model: SupportedChatModel, templated_string: String) -> Result<ChatCompletionResponse, APIError> {
+pub async fn chat_completion(_n: &PromptGraphNodePrompt, openai_model: SupportedChatModel, templated_string: String) -> Result<ChatCompletionResponse, APIError> {
     let client = Client::new(env::var("OPENAI_API_KEY").unwrap().to_string());
 
     let model = match openai_model {
@@ -32,7 +32,7 @@ pub async fn chat_completion(n: &PromptGraphNodePrompt, openai_model: SupportedC
         model,
         messages: vec![chat_completion::ChatCompletionMessage {
             role: chat_completion::MessageRole::user,
-            content: Some(templated_string),
+            content: templated_string,
             name: None,
             function_call: None,
         }],

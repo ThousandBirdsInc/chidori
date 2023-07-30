@@ -2,7 +2,7 @@ use log::debug;
 use crate::db_operations;
 use crate::db_operations::{CUSTOM_NODE_EXECUTION_PREFIX};
 use prost::Message;
-use sled::{Event, Subscriber};
+
 use prompt_graph_core::proto2::ChangeValueWithCounter;
 
 fn custom_node_execution_prefix(branch: u64, counter: u64) -> Vec<u8> {

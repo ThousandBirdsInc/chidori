@@ -21,7 +21,7 @@ fn graph_mutation_prefix_pending_branch_only(branch: u64) -> Vec<u8> {
 }
 
 fn graph_mutation_prefix_pending_raw() -> Vec<u8> {
-    db_operations::encode_into_slice((GRAPH_MUTATION_PENDING_PREFIX)).unwrap()
+    db_operations::encode_into_slice(GRAPH_MUTATION_PENDING_PREFIX).unwrap()
 }
 
 fn decode_graph_mutation_prefix_pending(src: &[u8]) -> (u64, u64) {

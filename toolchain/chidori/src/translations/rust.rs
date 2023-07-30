@@ -538,7 +538,7 @@ impl GraphBuilder {
         let node = create_custom_node(
             def.name.clone(),
             remap_queries(def.queries.clone()),
-            def.output.unwrap_or("type O {}".to_string()),
+            def.output.unwrap_or("{}".to_string()),
             def.node_type_name,
             def.output_tables.unwrap_or(vec![])
         );
@@ -553,7 +553,7 @@ impl GraphBuilder {
         let node = create_code_node(
             def.name.clone(),
             remap_queries(def.queries.clone()),
-            def.output.unwrap_or("type O {}".to_string()),
+            def.output.unwrap_or("{}".to_string()),
             SourceNodeType::Code("DENO".to_string(), def.code, def.is_template.unwrap_or(false)),
             def.output_tables.unwrap_or(vec![])
         );
@@ -568,7 +568,7 @@ impl GraphBuilder {
         let node = create_vector_memory_node(
             def.name.clone(),
             remap_queries(def.queries.clone()),
-            def.output.unwrap_or("type O {}".to_string()),
+            def.output.unwrap_or("{}".to_string()),
             def.action.unwrap_or("READ".to_string()),
             def.embedding_model.unwrap_or("TEXT_EMBEDDING_ADA_002".to_string()),
             def.template.unwrap_or("".to_string()),
@@ -670,7 +670,7 @@ impl NodeHandle {
     }
 
     fn get_output_type(&self) -> Vec<Vec<String>> {
-        self.indiv.output_path.clone()
+        self.indiv.output_paths.clone()
     }
 
     pub fn run_when(&mut self, graph_builder: &mut GraphBuilder, other_node: &NodeHandle) -> anyhow::Result<bool> {
@@ -694,7 +694,7 @@ impl NodeHandle {
 
     pub async fn query(&self, file_id: String, url: String, branch: u64, frame: u64) -> anyhow::Result<HashMap<String, SerializedValue>> {
         let name = &self.node.core.as_ref().unwrap().name;
-        let query = construct_query_from_output_type(&name, &name, &self.indiv.output_path).unwrap();
+        let query = construct_query_from_output_type(&name, &name, &self.indiv.output_paths).unwrap();
         let mut client = get_client(url).await?;
         let result = client.run_query(QueryAtFrame {
             id: file_id,

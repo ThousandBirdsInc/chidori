@@ -1,41 +1,41 @@
 use std::collections::HashMap;
-use std::pin::Pin;
-use std::sync::{Arc, RwLock};
-use std::sync::atomic::AtomicBool;
-use std::thread;
-use std::thread::JoinHandle;
+
+use std::sync::{Arc};
+
+
+
 
 use dashmap::DashMap;
-use futures_core::Stream;
-use prost::Message;
-use tokio::sync::{mpsc, Mutex};
-use tokio::sync::broadcast;
+
+
+use tokio::sync::{mpsc};
+
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status, Streaming, transport::Server};
-use tokio::task;
+use tonic::{Request, Response, Status, transport::Server};
 
-use prompt_graph_core::graph_definition::DefinitionGraph;
-use prompt_graph_core::proto2::{ChangeValueWithCounter, Empty, ExecutionStatus, NodeWillExecuteOnBranch, File, FileAddressedChangeValueWithCounter, FilteredPollNodeWillExecuteEventsRequest, InputProposal, ListBranchesRes, NodeWillExecute, ParquetFile, QueryAtFrame, QueryAtFrameResponse, RequestAtFrame, RequestFileMerge, RequestInputProposalResponse, RequestListBranches, RequestNewBranch, RequestOnlyId, RespondPollNodeWillExecuteEvents, RequestAckNodeWillExecuteEvent, UpsertPromptLibraryRecord};
+
+
+use prompt_graph_core::proto2::{ChangeValueWithCounter, Empty, ExecutionStatus, NodeWillExecuteOnBranch, File, FileAddressedChangeValueWithCounter, FilteredPollNodeWillExecuteEventsRequest, InputProposal, ListBranchesRes, ParquetFile, QueryAtFrame, QueryAtFrameResponse, RequestAtFrame, RequestFileMerge, RequestInputProposalResponse, RequestListBranches, RequestNewBranch, RequestOnlyId, RespondPollNodeWillExecuteEvents, RequestAckNodeWillExecuteEvent, UpsertPromptLibraryRecord};
 use prompt_graph_core::proto2::execution_runtime_server::{ExecutionRuntime, ExecutionRuntimeServer};
 
-use log::{debug, error, info, warn};
-use neon::macro_internal::runtime::buffer::new;
-use sled::Event;
-use tracing::Level;
-use tracing::level_filters::LevelFilter;
-use tracing_log::LogTracer;
-use tracing_subscriber::{EnvFilter, fmt, FmtSubscriber, Layer};
-use prompt_graph_core::execution_router::evaluate_changes_against_node;
-use prompt_graph_core::build_runtime_graph::graph_parse::{get_paths_for_query, parse_graphql_query_def};
+use log::{debug};
 
-use tracing_chrome::ChromeLayerBuilder;
-use tracing_flame::FlameLayer;
-use tracing_subscriber::{registry::Registry, prelude::*};
+
+
+
+
+
+use prompt_graph_core::execution_router::evaluate_changes_against_node;
+use prompt_graph_core::build_runtime_graph::graph_parse::{query_path_from_query_string};
+
+
+
+
 
 use crate::db_operations::{get_change_counter_for_branch, insert_executor_file_existence_by_id};
 use crate::db_operations::branches::{create_branch, create_root_branch, list_branches};
-use crate::db_operations::changes::{insert_new_change_value_with_counter, scan_all_resolved_changes};
+use crate::db_operations::changes::{scan_all_resolved_changes};
 use crate::db_operations::input_proposals_and_responses::insert_input_response;
 use crate::db_operations::playback::pause_execution_at_frame;
 use crate::db_operations::playback::play_execution_at_frame;
@@ -43,7 +43,7 @@ use crate::db_operations::changes::scan_all_pending_changes;
 use crate::db_operations::custom_node_execution::insert_custom_node_execution;
 use crate::db_operations::graph_mutations::{insert_pending_graph_mutation, scan_all_file_mutations_on_branch};
 use crate::db_operations::input_proposals_and_responses::scan_all_input_proposals;
-use crate::db_operations::executing_nodes::{move_will_execute_event_to_complete, move_will_execute_event_to_in_progress, scan_all_custom_node_will_execute_events, scan_all_will_execute_pending_events, subscribe_to_will_execute_events_by_name};
+use crate::db_operations::executing_nodes::{move_will_execute_event_to_complete, move_will_execute_event_to_in_progress, scan_all_custom_node_will_execute_events, scan_all_will_execute_pending_events};
 use crate::db_operations::prompt_library::insert_prompt_library_mutation;
 
 use crate::executor::{Executor, InternalStateHandler};
@@ -97,8 +97,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
             branch,
             counter
         };
-        let query_def = parse_graphql_query_def("", &query.query.clone().unwrap()).unwrap();
-        let paths = get_paths_for_query(&query_def);
+        let paths = query_path_from_query_string(&query.query.clone().unwrap()).unwrap();
         if let Some(values) = evaluate_changes_against_node(&state, &paths) {
             Ok(Response::new(QueryAtFrameResponse {
                 values
@@ -141,7 +140,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
             nodes: vec![],
         };
         // TODO: filter to changes below the provided counter
-        for (is_resolved, k, mutation) in mutations {
+        for (_is_resolved, k, mutation) in mutations {
             for node in mutation.nodes {
                 let node_insert = node.clone();
                 let name = node.core.unwrap().name;
@@ -167,7 +166,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
     #[tracing::instrument]
     async fn get_parquet_history(&self, request: Request<RequestOnlyId>) -> Result<Response<ParquetFile>, Status> {
         debug!("Received get_parquet_history request: {:?}", request);
-        let tree = &self.get_tree(&request.get_ref().id.clone());
+        let _tree = &self.get_tree(&request.get_ref().id.clone());
         // TODO: serialize the target branch to parquet
         todo!()
     }
@@ -245,7 +244,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
     #[tracing::instrument]
     async fn list_registered_graphs(&self, request: tonic::Request<prompt_graph_core::proto2::Empty>) -> Result<Response<Self::ListRegisteredGraphsStream>, Status> {
         debug!("Received list_registered_graphs request: {:?}", request);
-        let tree = self.get_tree("root");
+        let _tree = self.get_tree("root");
         todo!()
     }
 
@@ -257,7 +256,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
     #[tracing::instrument]
     async fn list_input_proposals(&self, request: Request<RequestOnlyId>) -> Result<Response<Self::ListInputProposalsStream>, Status> {
         debug!("Received list_input_proposals request: {:?}", request);
-        let (mut tx, rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::channel(4);
         let tree = self.get_tree(&request.get_ref().id.clone());
         tokio::spawn(async move {
             for prop in scan_all_input_proposals(&tree) {
@@ -283,7 +282,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
     #[tracing::instrument]
     async fn list_change_events(&self, request: Request<RequestOnlyId>) -> Result<Response<Self::ListChangeEventsStream>, Status> {
         debug!("Received list_change_events request: {:?}", request);
-        let (mut tx, rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::channel(4);
         let tree = self.get_tree(&request.get_ref().id.clone());
         tokio::spawn(async move {
             for prop in scan_all_pending_changes(&tree) {
@@ -300,7 +299,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
 
     async fn list_node_will_execute_events(&self, request: Request<RequestOnlyId>) -> Result<Response<Self::ListNodeWillExecuteEventsStream>, Status> {
         debug!("Received list_node_will_execute_events request: {:?}", request);
-        let (mut tx, rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::channel(4);
         let tree = self.get_tree(&request.get_ref().id.clone());
         tokio::spawn(async move {
             for prop in scan_all_will_execute_pending_events(&tree) {
@@ -342,7 +341,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
         let counter = request.get_ref().counter.clone();
         let change = request.into_inner().change.expect("Must have a change value");
 
-        let node_will_exec = move_will_execute_event_to_complete(&tree,  true, branch, counter);
+        let _node_will_exec = move_will_execute_event_to_complete(&tree,  true, branch, counter);
         insert_custom_node_execution(&tree, change);
         Ok(Response::new(ExecutionStatus::default()))
     }

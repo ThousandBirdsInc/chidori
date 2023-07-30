@@ -1,5 +1,3 @@
-use apollo_parser::ast::Document;
-use apollo_parser::ast;
 use crate::proto2::serialized_value::Val;
 use crate::proto2::SerializedValue;
 
@@ -22,16 +20,6 @@ pub fn lowercase_first_letter(s: &str) -> String {
     }
 }
 
-fn print_graphql_type_def(doc: Document) {
-    for def in doc.definitions() {
-        if let ast::Definition::ObjectTypeDefinition(object_type) = def {
-            println!("{:?}", object_type.name().unwrap().text());
-            for field_def in object_type.fields_definition().unwrap().field_definitions() {
-                println!("{}", field_def.name().unwrap().text()); // size weight
-            }
-        }
-    }
-}
 
 pub fn serialized_value_to_string(v: &SerializedValue) -> String {
     if let Some(v) = &v.val {

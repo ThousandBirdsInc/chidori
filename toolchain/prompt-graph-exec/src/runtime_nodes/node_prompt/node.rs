@@ -1,11 +1,11 @@
-use std::collections::HashSet;
+
 use tokio::time::sleep;
-use std::env;
+
 use std::time::Duration;
-use prompt_graph_core::proto2::{ChangeValue, item, ItemCore, NodeWillExecute, PromptGraphNodePrompt, SupportedChatModel};
+use prompt_graph_core::proto2::{ChangeValue, item, SupportedChatModel};
 use prompt_graph_core::proto2::serialized_value::Val;
 use prompt_graph_core::templates::render_template_prompt;
-use futures::executor;
+
 use prompt_graph_core::proto2::prompt_graph_node_prompt::Model;
 use crate::executor::NodeExecutionContext;
 use crate::integrations::openai::batch::chat_completion;
@@ -16,7 +16,7 @@ pub async fn execute_node_prompt(ctx: &NodeExecutionContext<'_>) -> Vec<ChangeVa
     let &NodeExecutionContext {
         node_will_execute_on_branch,
         item: item::Item::NodePrompt(n),
-        item_core,
+        item_core: _,
         namespaces,
         template_partials,
         ..
@@ -24,7 +24,7 @@ pub async fn execute_node_prompt(ctx: &NodeExecutionContext<'_>) -> Vec<ChangeVa
         panic!("execute_node_prompt: expected NodeExecutionContext with NodePrompt item");
     };
 
-    let mut change_set: Vec<ChangeValue> = node_will_execute_on_branch.node.as_ref().unwrap()
+    let change_set: Vec<ChangeValue> = node_will_execute_on_branch.node.as_ref().unwrap()
         .change_values_used_in_execution.iter().filter_map(|x| x.change_value.clone()).collect();
     let mut filled_values = vec![];
     // n.model;

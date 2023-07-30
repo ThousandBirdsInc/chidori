@@ -15,7 +15,7 @@ fn branch_prefix(branch: u64) -> Vec<u8> {
 }
 
 pub fn branch_prefix_raw() -> Vec<u8> {
-    db_operations::encode_into_slice((BRANCH_PREFIX)).unwrap()
+    db_operations::encode_into_slice(BRANCH_PREFIX).unwrap()
 }
 
 pub fn create_root_branch(tree: &sled::Tree) {

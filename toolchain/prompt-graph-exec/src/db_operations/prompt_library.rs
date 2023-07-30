@@ -1,6 +1,6 @@
-use std::collections;
+
 use std::collections::HashMap;
-use log::debug;
+
 use crate::db_operations;
 use crate::db_operations::{PROMPT_COUNTER_PREFIX, PROMPT_LIBRARY_MUTATION_PREFIX};
 use prost::Message;
@@ -8,7 +8,7 @@ use prompt_graph_core::proto2::{PromptLibraryRecord, UpsertPromptLibraryRecord};
 
 
 fn prompt_counter_prefix() -> Vec<u8> {
-    db_operations::encode_into_slice((PROMPT_COUNTER_PREFIX)).unwrap()
+    db_operations::encode_into_slice(PROMPT_COUNTER_PREFIX).unwrap()
 }
 
 fn prompt_library_mutation_prefix(partial_name: String) -> Vec<u8> {
@@ -16,7 +16,7 @@ fn prompt_library_mutation_prefix(partial_name: String) -> Vec<u8> {
 }
 
 fn prompt_library_mutation_prefix_raw() -> Vec<u8> {
-    db_operations::encode_into_slice((PROMPT_LIBRARY_MUTATION_PREFIX)).unwrap()
+    db_operations::encode_into_slice(PROMPT_LIBRARY_MUTATION_PREFIX).unwrap()
 }
 
 pub fn insert_prompt_library_mutation(tree: &sled::Tree, upsert: &UpsertPromptLibraryRecord) {

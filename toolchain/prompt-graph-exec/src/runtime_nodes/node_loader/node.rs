@@ -1,11 +1,11 @@
-use std::collections::HashSet;
-use openai_api_rs::v1::api::Client;
-use prompt_graph_core::proto2::{ChangeValue, item, ItemCore, MemoryAction, NodeWillExecute, PromptGraphNodeLoader, PromptGraphNodeMemory, SupportedEmebddingModel, SupportedVectorDatabase};
-use prompt_graph_core::templates::render_template_prompt;
-use std::env;
+
+
+use prompt_graph_core::proto2::{ChangeValue, item};
+
+
 use std::io::{Cursor, Read};
-use openai_api_rs::v1::embedding::EmbeddingRequest;
-use futures::executor;
+
+
 use prompt_graph_core::proto2::prompt_graph_node_loader::LoadFrom;
 use zip;
 use prompt_graph_core::proto2::serialized_value::Val;
@@ -22,7 +22,7 @@ use crate::executor::NodeExecutionContext;
 #[tracing::instrument]
 pub fn execute_node_loader(ctx: &NodeExecutionContext) -> Result<Vec<ChangeValue>> {
     let &NodeExecutionContext {
-        node_will_execute_on_branch,
+        node_will_execute_on_branch: _,
         item: item::Item::NodeLoader(n),
         item_core,
         namespaces,
@@ -32,10 +32,10 @@ pub fn execute_node_loader(ctx: &NodeExecutionContext) -> Result<Vec<ChangeValue
     };
 
     let mut filled_values = vec![];
-    let node_name = item_core.name.clone();
+    let _node_name = item_core.name.clone();
     match n.load_from.as_ref().unwrap() {
         LoadFrom::ZipfileBytes(bytes) => {
-            let mut cursor = Cursor::new(bytes);
+            let cursor = Cursor::new(bytes);
             let mut zip = zip::ZipArchive::new(cursor)?;
             for i in 0..zip.len() {
                 let mut file = zip.by_index(i)?;
@@ -71,7 +71,7 @@ mod tests {
     use protobuf::EnumOrUnknown;
     use indoc::indoc;
     use prompt_graph_core::proto2::prompt_graph_node_code::Source::SourceCode;
-    use prompt_graph_core::proto2::{ItemCore, PromptGraphNodeCode, PromptGraphNodeCodeSourceCode, SupportedSourceCodeLanguages};
+    use prompt_graph_core::proto2::{ItemCore, NodeWillExecute, PromptGraphNodeCode, PromptGraphNodeCodeSourceCode, SupportedSourceCodeLanguages};
     use crate::runtime_nodes::node_loader::node::execute_node_loader;
     use super::*;
 

@@ -1,5 +1,5 @@
-use std::collections::HashSet;
-use prompt_graph_core::proto2::{ChangeValue, item, NodeWillExecute, PromptGraphMap};
+
+use prompt_graph_core::proto2::{ChangeValue, item};
 use prompt_graph_core::proto2::serialized_value::Val;
 use crate::executor::NodeExecutionContext;
 
@@ -14,7 +14,7 @@ pub fn execute_node_map(ctx: &NodeExecutionContext) -> Vec<ChangeValue> {
         panic!("execute_node_map: expected NodeExecutionContext with Map item");
     };
 
-    let mut change_set: Vec<ChangeValue> = node_will_execute_on_branch.node.as_ref().unwrap()
+    let change_set: Vec<ChangeValue> = node_will_execute_on_branch.node.as_ref().unwrap()
         .change_values_used_in_execution.iter().filter_map(|x| x.change_value.clone()).collect();
     let mut filled_values = vec![];
     if let Some(change) = change_set.iter().find(|change| change.path.as_ref().unwrap().address.join(".") == n.path) {

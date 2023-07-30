@@ -3,7 +3,7 @@ name = "chidori"
 repository = "https://github.com/thousandbirds/chidori"
 description = "A framework for building LLM based agents"
 authors = [
-    {name = "Colton Pierson"}
+    {name = "Colton Pierson", email = "colton@thousandbirds.ai"}
 ]
 classifiers=[
     "Development Status :: 3 - Alpha",
@@ -29,5 +29,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
-features = ["python"]
 python-source = "package_python"
+module-name = "chidori._chidori"
+bindings = "pyo3"
+features = ["python"]

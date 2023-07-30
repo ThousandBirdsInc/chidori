@@ -63,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
     let h = g.custom_node(CustomNodeCreateOpts {
         name: "FetchTopHN".to_string(),
         node_type_name: "FetchTopHN".to_string(),
-        output: Some("type O { output: String }".to_string()),
+        output: Some("{ output: String }".to_string()),
         ..CustomNodeCreateOpts::default()
     })?;
 

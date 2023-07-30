@@ -1,9 +1,9 @@
 use deno_core::serde_json::Value;
 use deno_core::{FastString, JsRuntime, RuntimeOptions, serde_json, serde_v8, v8};
-use prompt_graph_core::proto2::{ChangeValue, PromptGraphNodeCodeSourceCode};
-use prompt_graph_core::templates::render_template_prompt;
+use prompt_graph_core::proto2::{ChangeValue};
 
-pub fn source_code_run_deno(source_code: String, change_set: &Vec<ChangeValue>) -> Option<Value> {
+
+pub fn source_code_run_deno(source_code: String, _change_set: &Vec<ChangeValue>) -> Option<Value> {
     let wrapped_source_code = format!(r#"(function main() {{
         {}
     }})();"#, source_code);
@@ -38,19 +38,19 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use protobuf::EnumOrUnknown;
     use indoc::indoc;
+    use sled::Config;
     use prompt_graph_core::proto2::prompt_graph_node_code::Source::SourceCode;
-    use prompt_graph_core::proto2::{item, ItemCore, NodeWillExecute, PromptGraphNodeCode, PromptGraphNodeCodeSourceCode, SupportedSourceCodeLanguages};
+    use prompt_graph_core::proto2::{item, ItemCore, NodeWillExecute, NodeWillExecuteOnBranch, PromptGraphNodeCode, PromptGraphNodeCodeSourceCode, SupportedSourceCodeLanguages};
     use crate::executor::NodeExecutionContext;
     use crate::runtime_nodes::node_code::node::execute_node_code;
     use super::*;
 
     #[test]
     fn test_exec_code_node_deno_basic() {
-        let nwe = NodeWillExecute {
-            source_node: "".to_string(),
-            change_values_used_in_execution: vec![],
-            matched_query_index: 0,
-        };
+
+        let db = Config::new().temporary(true).flush_every_ms(None).open().unwrap();
+        let tree = db.open_tree("test").unwrap();
+
         let mut output_filled_values: Vec<ChangeValue> = vec![];
         let node = PromptGraphNodeCode {
             source: Some(SourceCode(PromptGraphNodeCodeSourceCode {
@@ -66,8 +66,18 @@ mod tests {
             })),
         };
 
+        let nwe = NodeWillExecuteOnBranch {
+            branch: 0,
+            counter: 0,
+            custom_node_type_name: None,
+            node: Some(NodeWillExecute {
+                    source_node: "".to_string(),
+                    change_values_used_in_execution: vec![],
+                    matched_query_index: 0,
+                })
+        };
         let ctx = NodeExecutionContext {
-            node_will_execute: &nwe,
+            node_will_execute_on_branch: &nwe,
             item_core: &ItemCore {
                 name: "".to_string(),
                 queries: Default::default(),
@@ -76,7 +86,8 @@ mod tests {
             },
             item: &item::Item::NodeCode(node),
             namespaces: &HashSet::from(["".to_string()]),
-            template_partials: &HashMap::new()
+            template_partials: &HashMap::new(),
+            tree: &tree,
         };
         execute_node_code(&ctx);
     }

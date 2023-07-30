@@ -1,9 +1,13 @@
 name: Nodejs - Test & Release Package
 
 on:
+  workflow_dispatch:
   push:
+    branches:
+      - colton/improved-examples-and-releases
     tags:
-      - '*'
+      - 'v*'
+
 
 defaults:
   run:
@@ -14,11 +18,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-
   nodejs-github-native:
     permissions: write-all
     name: nodejs-${{ matrix.node_version }}-${{ matrix.system.target }}-${{ matrix.system.os }}
     runs-on: ${{ matrix.system.os }}
+    env:
+      # Set to force version number, e.g., when no tag exists.
+      ARTIFACT_VERSION: v0.1.25
     strategy:
       fail-fast: false
       matrix:
@@ -28,23 +34,22 @@ jobs:
           - 19
           - 20
         system:
-          - os: macos-11
+#          currently unsupported by github
+#          - os: macos-12-arm
+#            target: aarch64-apple-darwin
+          - os: macos-12
             target: x86_64-apple-darwin
           - os: ubuntu-20.04
             target: x86_64-unknown-linux-gnu
           - os: windows-2022
             target: x86_64-pc-windows-msvc
-          # Would like to have aarch64 support, but actions does not provide these yet.
-          # https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners
     steps:
       - uses: actions/checkout@v3
         with:
           ref: ${{ github.event.release.tag_name }}
       - name: Set release version
-        # Set release version in all three os, the commented run should suffice for linux and mac.
-        run: python3 -c "import os; tag = os.environ['GITHUB_REF'].split('/')[-1]; f = open(os.environ['GITHUB_ENV'], 'a'); f.write('RELEASE_VERSION='+tag); f.close();"
-        # run: echo "RELEASE_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
-
+        if: env.ARTIFACT_VERSION == ''
+        run: python3 -c "import os; tag = os.environ['GITHUB_REF'].split('/')[-1]; f = open(os.environ['GITHUB_ENV'], 'a'); f.write('ARTIFACT_VERSION='+tag); f.close();"
       - uses: actions/setup-node@v3
         with:
           node-version: ${{ matrix.node_version }}
@@ -67,8 +72,10 @@ jobs:
       - name: Tweak package.json
         working-directory: toolchain/chidori
         # This will update the package version to tag version. So artifacts uploaded to Github release will be named correctly.
-        run: python3 -c "import os; import json; p = json.load(open('package.json')); p['version'] = os.environ['RELEASE_VERSION']; json.dump(p, open('package.json', 'w'), indent=2, ensure_ascii=False);"
-
+        run: python3 -c "import os; import json; p = json.load(open('package.json')); p['version'] = os.environ['ARTIFACT_VERSION']; json.dump(p, open('package.json', 'w'), indent=2, ensure_ascii=False);"
+      - name: Show package.json
+        working-directory: toolchain/chidori
+        run: cat package.json
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
@@ -88,7 +95,7 @@ jobs:
         # Use bash, even on Windows to make find available
         shell: bash
         # A release needs to be created before upload
-        run: gh release upload ${{ env.RELEASE_VERSION }} "$(find ./build -name *.tar.gz)" --clobber
+        run: gh release upload ${{ env.ARTIFACT_VERSION }} "$(find ./build -name *.tar.gz)" --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -104,8 +111,8 @@ jobs:
           ref: ${{ github.event.release.tag_name }}
       - name: Set release version
         # Set release version in all three os, the commented run should suffice for linux and mac.
-        run: python3 -c "import os; tag = os.environ['GITHUB_REF'].split('/')[-1]; f = open(os.environ['GITHUB_ENV'], 'a'); f.write('RELEASE_VERSION='+tag); f.close();"
-        # run: echo "RELEASE_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+        run: python3 -c "import os; tag = os.environ['GITHUB_REF'].split('/')[-1]; f = open(os.environ['GITHUB_ENV'], 'a'); f.write('ARTIFACT_VERSION='+tag); f.close();"
+        # run: echo "ARTIFACT_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
 
       - uses: actions/setup-node@v3
         with:
@@ -120,7 +127,7 @@ jobs:
         # This will update the package version to tag version and
         # add an install script in package.json so users who `npm i` this package
         # will trigger the node-pre-gyp to pull the os and arch specific binary.
-        run: python3 -c "import os; import json; p = json.load(open('package.json')); p['scripts']['install'] = 'node-pre-gyp install'; p['version'] = os.environ['RELEASE_VERSION']; json.dump(p, open('package.json', 'w'), indent=2, ensure_ascii=False);"
+        run: python3 -c "import os; import json; p = json.load(open('package.json')); p['scripts']['install'] = 'node-pre-gyp install'; p['version'] = os.environ['ARTIFACT_VERSION']; json.dump(p, open('package.json', 'w'), indent=2, ensure_ascii=False);"
       - name: Publish to npm
         working-directory: toolchain/chidori
         # `--access public` is used to publish to my account's scope.
