@@ -3,8 +3,6 @@ name: Nodejs - Test & Release Package
 on:
   workflow_dispatch:
   push:
-    branches:
-      - colton/improved-examples-and-releases
     tags:
       - 'v*'
 
@@ -22,9 +20,9 @@ jobs:
     permissions: write-all
     name: nodejs-${{ matrix.node_version }}-${{ matrix.system.target }}-${{ matrix.system.os }}
     runs-on: ${{ matrix.system.os }}
-    env:
-      # Set to force version number, e.g., when no tag exists.
-      ARTIFACT_VERSION: v0.1.25
+#    env:
+#      # Set to force version number, e.g., when no tag exists.
+#      ARTIFACT_VERSION: v0.1.25
     strategy:
       fail-fast: false
       matrix:
