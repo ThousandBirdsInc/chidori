@@ -25,7 +25,7 @@ jobs:
     runs-on: ${{ matrix.system.os }}
     env:
       # Set to force version number, e.g., when no tag exists.
-      ARTIFACT_VERSION: 0.1.25
+      ARTIFACT_VERSION: v0.1.25
     strategy:
       fail-fast: false
       matrix:
