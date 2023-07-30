@@ -71,7 +71,7 @@ mod tests {
     use protobuf::EnumOrUnknown;
     use indoc::indoc;
     use prompt_graph_core::proto2::prompt_graph_node_code::Source::SourceCode;
-    use prompt_graph_core::proto2::{ItemCore, PromptGraphNodeCode, PromptGraphNodeCodeSourceCode, SupportedSourceCodeLanguages};
+    use prompt_graph_core::proto2::{ItemCore, NodeWillExecute, PromptGraphNodeCode, PromptGraphNodeCodeSourceCode, SupportedSourceCodeLanguages};
     use crate::runtime_nodes::node_loader::node::execute_node_loader;
     use super::*;
 
