@@ -411,6 +411,7 @@ mod tests {
     use prompt_graph_core::graph_definition::{create_code_node, SourceNodeType};
     use prompt_graph_core::proto2::{File, ItemCore};
     use prompt_graph_core::proto2::Item;
+    use prompt_graph_core::proto2::serialized_value::Val;
     use prompt_graph_core::proto2::OutputType;
     use prompt_graph_core::proto2::prompt_graph_node_code;
     use prompt_graph_core::proto2::PromptGraphNodeEcho;
