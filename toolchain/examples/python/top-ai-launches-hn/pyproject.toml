@@ -7,7 +7,7 @@ authors = ["Colton Pierson <colton@thousandbirds.ai>"]
 [tool.poetry.dependencies]
 python = "^3.9"
 aiohttp = "^3.7.4"
-chidori = "^0.1.24"
+chidori = "^0.1.26"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

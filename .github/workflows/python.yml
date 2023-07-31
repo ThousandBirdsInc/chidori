@@ -249,6 +249,9 @@ jobs:
         with:
           name: wheels
       - uses: actions/setup-python@v2
+      - name: Set release version
+        working-directory: toolchain/chidori
+        run: python3 ../scripts/get_target_version.py
       - name: Upload to Github releases
         working-directory: toolchain/chidori
         shell: bash

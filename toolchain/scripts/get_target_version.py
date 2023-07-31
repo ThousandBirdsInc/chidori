@@ -21,6 +21,6 @@ def get_version_from_cargo_toml(repo_root):
 if __name__ == "__main__":
     repo_root = get_git_repo_root()
     tag = get_version_from_cargo_toml(repo_root)
-    print('ARTIFACT_VERSION=' + tag)
+    print('ARTIFACT_VERSION=v' + tag)
     with open(os.environ['GITHUB_ENV'], 'a') as f:
-        f.write('ARTIFACT_VERSION=' + tag)
+        f.write('ARTIFACT_VERSION=v' + tag)
