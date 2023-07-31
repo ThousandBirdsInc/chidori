@@ -106,10 +106,7 @@ jobs:
         with:
           ref: ${{ github.event.release.tag_name }}
       - name: Set release version
-        # Set release version in all three os, the commented run should suffice for linux and mac.
-        run: python3 -c "import os; tag = os.environ['GITHUB_REF'].split('/')[-1]; f = open(os.environ['GITHUB_ENV'], 'a'); f.write('ARTIFACT_VERSION='+tag); f.close();"
-        # run: echo "ARTIFACT_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
-
+        run: python3 ../scripts/get_target_version.py
       - uses: actions/setup-node@v3
         with:
           node-version: ${{ matrix.node_version }}
@@ -127,7 +124,7 @@ jobs:
       - name: Publish to npm
         working-directory: toolchain/chidori
         # `--access public` is used to publish to my account's scope.
-        run: npm publish --access public
+        run: npm publish --access public --tag $ARTIFACT_VERSION
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
