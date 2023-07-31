@@ -17,4 +17,4 @@ COPY . .
 EXPOSE 9800
 
 # Run the application
-CMD [ "node", "your_app.js" ]
+CMD [ "node", "index.js" ]

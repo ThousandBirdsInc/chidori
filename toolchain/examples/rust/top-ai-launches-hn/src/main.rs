@@ -1,4 +1,3 @@
-extern crate chidori;
 use std::collections::HashMap;
 use std::env;
 use std::net::ToSocketAddrs;
@@ -11,9 +10,9 @@ use lettre::transport::smtp::response::Response;
 use reqwest;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use chidori::{create_change_value, NodeWillExecuteOnBranch};
-use chidori::register_node_handle;
-use chidori::translations::rust::{Chidori, CustomNodeCreateOpts, DenoCodeNodeCreateOpts, GraphBuilder, Handler, PromptNodeCreateOpts, serialized_value_to_string};
+use _chidori::{create_change_value, NodeWillExecuteOnBranch};
+use _chidori::register_node_handle;
+use _chidori::translations::rust::{Chidori, CustomNodeCreateOpts, DenoCodeNodeCreateOpts, GraphBuilder, Handler, PromptNodeCreateOpts, serialized_value_to_string};
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Story {
