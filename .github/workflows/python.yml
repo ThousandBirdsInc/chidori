@@ -245,19 +245,11 @@ jobs:
 #      - python-linux-cross
 #    if: ${{ github.ref == 'refs/heads/main' }}
     steps:
+      - uses: actions/checkout@v3
       - uses: actions/download-artifact@v3
         with:
           name: wheels
       - uses: actions/setup-python@v2
-      - name: Set release version
-        working-directory: toolchain/chidori
-        run: python3 ../scripts/get_target_version.py
-      - name: Upload to Github releases
-        working-directory: toolchain/chidori
-        shell: bash
-        run: gh release upload ${{ env.ARTIFACT_VERSION }} "$(find ./dist -name *.whl)" --clobber
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish to PyPi
         env:
           TWINE_USERNAME: __token__
