@@ -255,4 +255,4 @@ jobs:
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
         run: |
           pip install --upgrade twine
-          twine upload --skip-existing *
+           upload --skip-existing *

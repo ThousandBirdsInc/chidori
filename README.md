@@ -10,9 +10,9 @@ https://github.com/ThousandBirdsInc/chidori/assets/515757/6b088f7d-d8f7-4c7e-900
 <p>
 <a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="Current Build Status" src="https://img.shields.io/github/actions/workflow/status/ThousandBirdsInc/chidori/push.yml" /></a>
 <a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/ThousandBirdsInc/chidori" /></a>
-<a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="Cargo.io download" src="https://img.shields.io/crates/v/chidori" /></a>
-<a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="Cargo.io download" src="https://img.shields.io/pypi/v/chidori" /></a>
-<a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="Cargo.io download" src="https://img.shields.io/npm/v/@1kbirds/chidori" /></a>
+<a href="https://crates.io/crates/chidori"><img alt="Cargo.io download" src="https://img.shields.io/crates/v/chidori" /></a>
+<a href="https://pypi.org/project/chidori/"><img alt="Pypi package" src="https://img.shields.io/pypi/v/chidori" /></a>
+<a href="https://www.npmjs.com/package/@1kbirds/chidori"><img alt="NPM package" src="https://img.shields.io/npm/v/@1kbirds/chidori" /></a>
 <a href="https://github.com/ThousandBirdsInc/chidori/blob/main/LICENSE"><img alt="Github License" src="https://img.shields.io/badge/License-MIT-green.svg" /></a>
 </p>
 
