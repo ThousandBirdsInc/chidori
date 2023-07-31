@@ -1,11 +1,12 @@
 [package]
 name = "chidori"
-version= "0.1.24"
-edition = "2021"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
 description = "A Rust library for executing prompt-graph models"
-license = "MIT"
-homepage = "https://docs.thousandbirds.ai"
-repository = "https://github.com/ThousandBirdsInc/chidori"
 
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -27,8 +28,8 @@ nodejs = [
 
 # https://chat.openai.com/c/52edc960-dc19-4df7-b36f-30caad9c1905
 [dependencies]
-protobuf = "3.2.0"
-sqlparser = "0.34.0"
+protobuf.workspace = true
+sqlparser.workspace = true
 # we do not enable wasm-bindgen serde-serialize because it causes this issue https://github.com/rustwasm/wasm-bindgen/pull/3031
 # serde-wasm-bindgen should be used instead
 
@@ -36,20 +37,19 @@ sqlparser = "0.34.0"
 openssl = { version = "0.10.55", features = ["vendored"] }
 
 once_cell = "1"
-prompt-graph-core = { path = "../prompt-graph-core", version = "^0.1.24" }
+prompt-graph-core = { path = "../prompt-graph-core", version = "^0.1.26" }
 wasm-bindgen = {version = "0.2.86", features = []}
-handlebars = "4.3.7"
-anyhow = { version = "1.0", default-features = false }
-indoc = "1.0.3"
-serde = { version = "1.0", features = ["derive"] }
+anyhow.workspace = true
+indoc.workspace = true
+serde.workspace = true
 serde-wasm-bindgen = "0.4"
-serde_json = "1.0.96"
-tonic = "0.9"
-prost = "0.11"
-tokio = { version = "1", features = ["full"] }
-env_logger = "0.10.0"
-log = "0.4.16"
-futures = "0.3.15"
+serde_json.workspace = true
+tonic.workspace = true
+prost.workspace = true
+tokio.workspace = true
+env_logger.workspace = true
+log.workspace = true
+futures.workspace = true
 
 # Optional unless the python feature is enabled
 pyo3 = { version = "0.18.3", features = ["extension-module", "abi3-py37"], optional = true }
@@ -81,3 +81,5 @@ pyo3-build-config = "0.19.1"
 lto = "fat"
 codegen-units = 1
 strip = true
+
+

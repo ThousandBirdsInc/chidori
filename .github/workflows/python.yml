@@ -1,4 +1,4 @@
-name: Python - Test & Release Package
+name: Python - Test & Publish Package
 
 on:
   workflow_dispatch:
@@ -249,6 +249,12 @@ jobs:
         with:
           name: wheels
       - uses: actions/setup-python@v2
+      - name: Upload to Github releases
+        working-directory: toolchain/chidori
+        shell: bash
+        run: gh release upload ${{ env.ARTIFACT_VERSION }} "$(find ./dist -name *.whl)" --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish to PyPi
         env:
           TWINE_USERNAME: __token__

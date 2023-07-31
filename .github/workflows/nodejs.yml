@@ -1,4 +1,4 @@
-name: Nodejs - Test & Release Package
+name: Node.js - Test & Publish Package
 
 on:
   workflow_dispatch:
@@ -20,9 +20,6 @@ jobs:
     permissions: write-all
     name: nodejs-${{ matrix.node_version }}-${{ matrix.system.target }}-${{ matrix.system.os }}
     runs-on: ${{ matrix.system.os }}
-#    env:
-#      # Set to force version number, e.g., when no tag exists.
-#      ARTIFACT_VERSION: v0.1.25
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +36,8 @@ jobs:
             target: x86_64-apple-darwin
           - os: ubuntu-20.04
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-20.04
+            target: aarch64-unknown-linux-gnu
           - os: windows-2022
             target: x86_64-pc-windows-msvc
     steps:
@@ -46,8 +45,7 @@ jobs:
         with:
           ref: ${{ github.event.release.tag_name }}
       - name: Set release version
-        if: env.ARTIFACT_VERSION == ''
-        run: python3 -c "import os; tag = os.environ['GITHUB_REF'].split('/')[-1]; f = open(os.environ['GITHUB_ENV'], 'a'); f.write('ARTIFACT_VERSION='+tag); f.close();"
+        run: python3 ./toolchain/scripts/get_target_version.py
       - uses: actions/setup-node@v3
         with:
           node-version: ${{ matrix.node_version }}

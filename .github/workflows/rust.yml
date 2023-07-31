@@ -1,4 +1,4 @@
-name: Publish Cargo Crate
+name: Rust - Test & Publish Package
 
 on:
   workflow_dispatch:
@@ -22,16 +22,24 @@ jobs:
         with:
           toolchain: stable
           override: true
-
-      - name: Install cargo-smart-release
-        run: cargo install cargo-smart-release
-
       - name: Build and Test
         working-directory: toolchain
         run: cargo build --all && cargo test --all
 
-      - name: Publish with Smart Release
-        working-directory: toolchain
-        run: cargo smart-release --no-changelog-github-release --update-crates-index prompt-graph-core prompt-graph-exec chidori
+      - name: Publish prompt-graph-core
+        working-directory: toolchain/prompt-graph-core
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish prompt-graph-exec
+        working-directory: toolchain/prompt-graph-exec
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish chidori
+        working-directory: toolchain/chidori
+        run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

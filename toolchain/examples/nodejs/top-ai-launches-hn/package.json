@@ -9,6 +9,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@1kbirds/chidori": "^0.1.26",
     "axios": "^1.4.0"
   }
 }
