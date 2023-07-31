@@ -45,7 +45,7 @@ jobs:
         with:
           ref: ${{ github.event.release.tag_name }}
       - name: Set release version
-        run: python3 ./toolchain/scripts/get_target_version.py
+        run: python3 ../scripts/get_target_version.py
       - uses: actions/setup-node@v3
         with:
           node-version: ${{ matrix.node_version }}
