@@ -120,11 +120,14 @@ jobs:
         # This will update the package version to tag version and
         # add an install script in package.json so users who `npm i` this package
         # will trigger the node-pre-gyp to pull the os and arch specific binary.
-        run: python3 -c "import os; import json; p = json.load(open('package.json')); p['scripts']['install'] = 'node-pre-gyp install'; p['version'] = os.environ['ARTIFACT_VERSION']; json.dump(p, open('package.json', 'w'), indent=2, ensure_ascii=False);"
+        run: python3 -c "import os; import json; p = json.load(open('package.json')); p['scripts']['install'] = 'node-pre-gyp install'; p['version'] = os.environ['ARTIFACT_VERSION'].replace('v', ''); json.dump(p, open('package.json', 'w'), indent=2, ensure_ascii=False);"
+      - name: Show package.json
+        working-directory: toolchain/chidori
+        run: cat package.json
       - name: Publish to npm
         working-directory: toolchain/chidori
         # `--access public` is used to publish to my account's scope.
-        run: npm publish --access public --tag $ARTIFACT_VERSION
+        run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
