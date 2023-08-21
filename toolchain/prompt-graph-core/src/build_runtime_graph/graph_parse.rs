@@ -8,6 +8,7 @@ use anyhow::anyhow;
 
 use petgraph::dot::{Config, Dot};
 use petgraph::graphmap::DiGraphMap;
+use serde::Serialize;
 
 use sqlparser::ast::{Expr, JoinConstraint, Query, Select, SelectItem, SetExpr, Statement, TableWithJoins};
 use sqlparser::dialect::GenericDialect;
@@ -234,6 +235,7 @@ pub fn output_table_from_output_types(output_paths: &HashMap<String, Vec<Vec<Str
 pub fn dispatch_table_from_query_paths(query_paths: &HashMap<String, Vec<Option<QueryVecGroup>>>) -> HashMap<String, Vec<String>> {
     let mut result: HashMap<Vec<String>, Vec<String>> = HashMap::new();
 
+    // for each query path, get the node as key, and the paths
     for (key, all_opt_paths) in query_paths.iter() {
         for opt_paths in all_opt_paths {
             if let Some(paths) = opt_paths {
@@ -308,10 +310,12 @@ pub fn derive_for_individual_node(node: &Item) -> anyhow::Result<CleanIndividual
 pub fn query_path_from_query_string(q: &String) -> anyhow::Result<Vec<Vec<String>>> {
     let dependent_on = parse_tables_and_columns(&q)?;
     let mut paths = vec![];
-    for table in dependent_on {
-        let mut path_segment = vec![table.0];
-        path_segment.extend(table.1);
-        paths.push(path_segment);
+    for (table, columns) in dependent_on {
+        for column in columns {
+            let mut path_segment = vec![table.clone()];
+            path_segment.push(column);
+            paths.push(path_segment);
+        }
     }
     Ok(paths)
 }
@@ -322,7 +326,7 @@ type QueryPath =  Vec<Option<QueryVecGroup>>;
 type OutputPaths =  Vec<Vec<String>>;
 
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Debug, Clone)]
 pub struct CleanedDefinitionGraph {
     pub query_paths: HashMap<String, QueryPath>,
     pub node_by_name: HashMap<String, Item>,
@@ -522,6 +526,10 @@ impl CleanedDefinitionGraph {
         edges
     }
 
+    pub fn serialize_to_yaml(&self) -> String {
+        serde_yaml::to_string(&self).unwrap()
+    }
+
     pub fn get_dot_graph(&self) -> String {
         let mut graph: DiGraphMap<u32, u32> = petgraph::graphmap::DiGraphMap::new();
 
@@ -562,7 +570,7 @@ impl CleanedDefinitionGraph {
 
 
 pub fn construct_query_from_output_type(name: &String, namespace: &String, output_paths: &OutputPaths) -> anyhow::Result<String> {
-    let projection_items: Vec<String> = output_paths.iter().map(|x| format!("{}.{}", name, x.join("."))).collect();
+    let projection_items: Vec<String> = output_paths.iter().map(|x| x.join(".")).collect();
     let projection = projection_items.join(", ");
     Ok(format!("SELECT {} FROM {}", projection, namespace))
 }
@@ -615,16 +623,68 @@ mod tests {
 
     #[test]
     fn test_construct_query_from_output_type() {
-        let output_paths : OutputPaths = vec![vec!["output".to_string()]];
+        let output_paths : OutputPaths = vec![vec!["code_node_test".to_string(), "output".to_string()]];
         let query = construct_query_from_output_type(&"code_node_test".to_string(), &"code_node_test".to_string(), &output_paths).unwrap();
         assert_eq!(query, "SELECT code_node_test.output FROM code_node_test");
     }
 
     #[test]
     fn test_construct_query_from_output_type_multiple_keys() {
-        let output_paths : OutputPaths = vec![vec!["output".to_string()], vec!["result".to_string()]];
+        let output_paths : OutputPaths = vec![vec!["code_node_test".to_string(), "output".to_string()], vec!["code_node_test".to_string(), "result".to_string()]];
         let query = construct_query_from_output_type(&"code_node_test".to_string(), &"code_node_test".to_string(), &output_paths).unwrap();
         assert_eq!(query, "SELECT code_node_test.output, code_node_test.result FROM code_node_test");
+    }
+
+    #[test]
+    fn test_dispatch_table_from_query_paths() {
+        let mut file = File {
+            id: "test".to_string(),
+            nodes: vec![
+                gen_item_hello(vec![]),
+                // Our goal is to see changes from this node on both branches
+                gen_item_hello_plus_world()
+            ],
+        };
+        let mut g = CleanedDefinitionGraph::zero();
+        g.merge_file(&mut file).unwrap();
+
+        assert_eq!(g.dispatch_table, vec![
+            ("code_node_test:output".to_string(), vec!["code_node_test_dep".to_string()]),
+            ("".to_string(), vec!["code_node_test".to_string()])
+        ].into_iter().collect());
+    }
+
+    #[test]
+    fn test_dispatch_table_from_query_paths_multiple_keys() {
+        let mut file = File {
+            id: "test".to_string(),
+            nodes: vec![
+                gen_item_hello(vec![]),
+                // Our goal is to see changes from this node on both branches
+                gen_item_hello_plus_world(),
+                create_code_node(
+                    "code_node_test_multiple".to_string(),
+                    vec![Some( r#" SELECT code_node_test_dep.result, code_node_test_dep.second FROM code_node_test_dep"#.to_string(),
+                    )],
+                    r#"{ "result": String }"#.to_string(),
+                    SourceNodeType::Code(
+                        String::from("DENO"),
+                        indoc! { r#" return { "result": "out" } "#}.to_string(),
+                        true
+                    ),
+                    vec![]
+                )
+            ],
+        };
+        let mut g = CleanedDefinitionGraph::zero();
+        g.merge_file(&mut file).unwrap();
+
+        assert_eq!(g.dispatch_table, vec![
+            ("code_node_test_dep:second".to_string(), vec!["code_node_test_multiple".to_string()]),
+            ("code_node_test_dep:result".to_string(), vec!["code_node_test_multiple".to_string()]),
+            ("code_node_test:output".to_string(), vec!["code_node_test_dep".to_string()]),
+            ("".to_string(), vec!["code_node_test".to_string()])
+        ].into_iter().collect());
     }
 
     #[test]

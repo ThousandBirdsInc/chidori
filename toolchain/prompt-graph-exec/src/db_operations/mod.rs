@@ -13,7 +13,7 @@ pub mod custom_node_execution;
 
 #[cfg(feature = "parquet")]
 pub mod parquet_serialization;
-
+pub mod files;
 
 
 use std::convert::TryInto;
@@ -27,7 +27,7 @@ use bincode;
 
 
 
-use sled::{IVec};
+use sled::IVec;
 
 
 
@@ -73,6 +73,7 @@ pub const PROMPT_COUNTER_PREFIX: u16 = 21;
 
 pub const CUSTOM_NODE_EXECUTION_PREFIX: u16 = 21;
 
+pub const EXECUTOR_FILES_PREFIX: u16 = 21;
 
 /// =================
 /// These data prefix helpers are effectively our "Tables". Under some circumstances, we
@@ -149,11 +150,5 @@ pub fn update_change_counter_for_branch(tree: &sled::Tree, branch: u64) -> Optio
 pub fn get_change_counter_for_branch(tree: &sled::Tree, branch: u64) -> u64 {
     tree.get(change_counter_prefix(branch)).unwrap().map(bytes_to_u64)
         .expect("All instances of querying head counter must succeed")
-}
-
-// =================
-// Tracking the existence of files
-pub fn insert_executor_file_existence_by_id(tree: &sled::Tree, id: String) {
-    tree.insert(id.into_bytes(), &[1]).unwrap();
 }
 

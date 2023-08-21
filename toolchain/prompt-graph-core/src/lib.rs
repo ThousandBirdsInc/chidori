@@ -9,7 +9,7 @@ pub mod utils;
 pub mod templates;
 pub mod proto2;
 pub mod build_runtime_graph;
-
+mod reactivity;
 
 
 /// Our local server implementation is an extension of this. Implementing support for multiple

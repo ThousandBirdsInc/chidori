@@ -451,6 +451,10 @@ message UpsertPromptLibraryRecord {
   optional string description = 4;
 }
 
+message ListRegisteredGraphsResponse {
+  repeated string ids = 1;
+}
+
 // API:
 service ExecutionRuntime {
 
@@ -478,7 +482,7 @@ service ExecutionRuntime {
   rpc ListBranches(RequestListBranches) returns (ListBranchesRes) {}
 
   // * List all registered files
-  rpc ListRegisteredGraphs(Empty) returns (stream ExecutionStatus) {}
+  rpc ListRegisteredGraphs(Empty) returns (ListRegisteredGraphsResponse) {}
 
   // * Receive a stream of input proposals <- this is a server-side stream
   rpc ListInputProposals(RequestOnlyId) returns (stream InputProposal) {}

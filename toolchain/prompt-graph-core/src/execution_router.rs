@@ -126,9 +126,10 @@ pub fn dispatch_and_mutate_state(
 
 #[cfg(test)]
 mod tests {
-    use crate::proto2::{File, item, Item, ItemCore, OutputType, Path, PromptGraphNodeEcho, Query};
+    use crate::proto2::{File, item, Item, ItemCore, OutputType, Path, PromptGraphNodeEcho, Query, SerializedValue};
     use crate::graph_definition::DefinitionGraph;
     use std::collections::HashMap;
+    use crate::proto2::serialized_value::Val;
 
     use super::*;
 
@@ -202,6 +203,24 @@ mod tests {
         }
     }
 
+    fn get_file_with_paths() -> File {
+        File {
+            id: "test".to_string(),
+            nodes: vec![Item{
+                core: Some(ItemCore {
+                    name: "test_node".to_string(),
+                    queries: vec![Query {
+                        query: Some("SELECT path1, path2 FROM source".to_string()),
+                    }],
+                    output: Some(OutputType {
+                        output: "{} ".to_string(),
+                    }),
+                    output_tables: vec![]
+                }),
+                item: Some(item::Item::NodeEcho(PromptGraphNodeEcho { }))}],
+        }
+    }
+
 
     #[test]
     fn test_dispatch_with_file_and_change() {
@@ -250,6 +269,87 @@ mod tests {
         // Does not re-execute
         let result = dispatch_and_mutate_state(&g, &mut state, &c);
         assert_eq!(result.operations.len(), 0);
+    }
+
+    #[test]
+    fn test_all_paths_must_be_satisfied_before_dispatch() {
+        // State should start empty
+        let mut state = TestState::new();
+        let file = get_file_with_paths();
+        let d = DefinitionGraph::from_file(file);
+        let g = CleanedDefinitionGraph::new(&d);
+
+        // Confirm the dispatch table has the paths that we expect
+        assert_eq!(g.dispatch_table.get("source:path1"), Some(&vec!["test_node".to_string()]));
+        assert_eq!(g.dispatch_table.get("source:path2"), Some(&vec!["test_node".to_string()]));
+
+        // Dispatch a change that satisfies only one of the two paths
+        let c = ChangeValueWithCounter {
+            filled_values: vec![
+                ChangeValue {
+                    path: Some(Path {
+                        address: vec!["source".to_string(), "path1".to_string()],
+                    }),
+                    value: Some(SerializedValue{ val: Some(Val::String("value".to_string()))}),
+                    branch: 0,
+                },
+            ],
+            parent_monotonic_counters: vec![],
+            monotonic_counter: 1,
+            branch: 0,
+            source_node: "__initialize__".to_string(),
+        };
+
+        let result = dispatch_and_mutate_state(&g, &mut state, &c);
+        // The dispatch should return no operations
+        assert_eq!(result.operations.len(), 0);
+
+
+        // Fill the second path
+        let c = ChangeValueWithCounter {
+            filled_values: vec![
+                ChangeValue {
+                    path: Some(Path {
+                        address: vec!["source".to_string(), "path2".to_string()],
+                    }),
+                    value: Some(SerializedValue{ val: Some(Val::String("value".to_string()))}),
+                    branch: 0,
+                },
+            ],
+            parent_monotonic_counters: vec![],
+            monotonic_counter: 1,
+            branch: 0,
+            source_node: "__initialize__".to_string(),
+        };
+        let result = dispatch_and_mutate_state(&g, &mut state, &c);
+        // This should now return an operation because both paths have been satisfied
+        assert_eq!(result.operations.len(), 1);
+        assert_eq!(result.operations[0], NodeWillExecute {
+            source_node: "test_node".to_string(),
+            change_values_used_in_execution: vec![
+                WrappedChangeValue {
+                    monotonic_counter: 1,
+                    change_value: Some(ChangeValue {
+                        path: Some(Path {
+                            address: vec!["source".to_string(), "path1".to_string()],
+                        }),
+                        value: Some(SerializedValue{ val: Some(Val::String("value".to_string()))}),
+                        branch: 0,
+                    }),
+                },
+                WrappedChangeValue {
+                    monotonic_counter: 1,
+                    change_value: Some(ChangeValue {
+                        path: Some(Path {
+                            address: vec!["source".to_string(), "path2".to_string()],
+                        }),
+                        value: Some(SerializedValue{ val: Some(Val::String("value".to_string()))}),
+                        branch: 0,
+                    }),
+                },
+            ],
+            matched_query_index: 0,
+        });
     }
 
 }

@@ -602,11 +602,7 @@ impl PyChidori {
             let mut client = get_client(url).await?;
             let resp = client.list_registered_graphs(Empty {
             }).await.map_err(PyErrWrapper::from)?;
-            let mut stream = resp.into_inner();
-            while let Some(x) = stream.next().await {
-                // callback.call(py, (x,), None);
-                info!("Registered Graph = {:?}", x);
-            };
+            let mut graphs = resp.into_inner();
             Ok(())
         })
     }
@@ -901,6 +897,17 @@ impl PyGraphBuilder {
                 .map(PyExecutionStatus)
                 .map_err(AnyhowErrWrapper)?;
             Ok(exec_status)
+        })
+    }
+
+    fn serialize_yaml<'a>(
+        mut self_: PyRefMut<'_, Self>,
+        py: Python<'a>
+    ) -> PyResult<&'a PyAny> {
+        let g = Arc::clone(&self_.g);
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let mut graph_builder = g.lock().await;
+            Ok(graph_builder.serialize_yaml().map_err(PyErrWrapper::from)?)
         })
     }
 }

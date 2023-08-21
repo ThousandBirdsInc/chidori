@@ -196,6 +196,12 @@ fn query_paths_to_json(query_paths: &Vec<ChangeValue>) -> Value {
         if let Some(created) = query_path_to_json(path, val) {
             merge(&mut m, Value::Object(created));
         }
+        // Allow using unresolved paths as keys
+        if let Some((last, _)) = path.split_last() {
+            if let Some(created) = query_path_to_json(&vec![last.clone()], val) {
+                merge(&mut m, Value::Object(created));
+            }
+        }
     }
     m
 }
@@ -235,6 +241,7 @@ mod tests {
                 0
             ),
         ]), json!({
+            "name": "John",
             "user": {
                 "name": "John",
             }})
@@ -252,6 +259,8 @@ mod tests {
                 0
             )
         ]), json!({
+                "name": "John",
+                "last_name": "Panhuyzen",
             "user": {
                 "name": "John",
                 "last_name": "Panhuyzen"
@@ -320,6 +329,27 @@ mod tests {
             &HashMap::new()
         );
         assert_eq!(rendered.unwrap(), "Basic template John");
+    }
+
+    #[test]
+    fn test_rendering_template_clean_resolve() {
+        let rendered = render_template_prompt(
+            &"Basic template {{name}} {{last_name}}",
+            &vec![
+                create_change_value(
+                    vec![String::from("user"), String::from("name")],
+                    Some(Val::String(String::from("John"))),
+                    0
+                ),
+                create_change_value(
+                    vec![String::from("user"), String::from("last_name")],
+                    Some(Val::String(String::from("Panhuyzen"))),
+                    0
+                )
+            ],
+            &HashMap::new()
+        );
+        assert_eq!(rendered.unwrap(), "Basic template John Panhuyzen");
     }
 
     #[test]

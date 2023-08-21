@@ -782,6 +782,13 @@ pub struct UpsertPromptLibraryRecord {
     pub description: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(serde::Deserialize, serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListRegisteredGraphsResponse {
+    #[prost(string, repeated, tag = "1")]
+    pub ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(serde::Deserialize, serde::Serialize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum SupportedChatModel {
@@ -1269,7 +1276,7 @@ pub mod execution_runtime_client {
             &mut self,
             request: impl tonic::IntoRequest<super::Empty>,
         ) -> std::result::Result<
-            tonic::Response<tonic::codec::Streaming<super::ExecutionStatus>>,
+            tonic::Response<super::ListRegisteredGraphsResponse>,
             tonic::Status,
         > {
             self.inner
@@ -1293,7 +1300,7 @@ pub mod execution_runtime_client {
                         "ListRegisteredGraphs",
                     ),
                 );
-            self.inner.server_streaming(req, path, codec).await
+            self.inner.unary(req, path, codec).await
         }
         /// * Receive a stream of input proposals <- this is a server-side stream
         pub async fn list_input_proposals(
@@ -1581,18 +1588,12 @@ pub mod execution_runtime_server {
             &self,
             request: tonic::Request<super::RequestListBranches>,
         ) -> std::result::Result<tonic::Response<super::ListBranchesRes>, tonic::Status>;
-        /// Server streaming response type for the ListRegisteredGraphs method.
-        type ListRegisteredGraphsStream: futures_core::Stream<
-                Item = std::result::Result<super::ExecutionStatus, tonic::Status>,
-            >
-            + Send
-            + 'static;
         /// * List all registered files
         async fn list_registered_graphs(
             &self,
             request: tonic::Request<super::Empty>,
         ) -> std::result::Result<
-            tonic::Response<Self::ListRegisteredGraphsStream>,
+            tonic::Response<super::ListRegisteredGraphsResponse>,
             tonic::Status,
         >;
         /// Server streaming response type for the ListInputProposals method.
@@ -2103,14 +2104,11 @@ pub mod execution_runtime_server {
                 "/promptgraph.ExecutionRuntime/ListRegisteredGraphs" => {
                     #[allow(non_camel_case_types)]
                     struct ListRegisteredGraphsSvc<T: ExecutionRuntime>(pub Arc<T>);
-                    impl<
-                        T: ExecutionRuntime,
-                    > tonic::server::ServerStreamingService<super::Empty>
+                    impl<T: ExecutionRuntime> tonic::server::UnaryService<super::Empty>
                     for ListRegisteredGraphsSvc<T> {
-                        type Response = super::ExecutionStatus;
-                        type ResponseStream = T::ListRegisteredGraphsStream;
+                        type Response = super::ListRegisteredGraphsResponse;
                         type Future = BoxFuture<
-                            tonic::Response<Self::ResponseStream>,
+                            tonic::Response<Self::Response>,
                             tonic::Status,
                         >;
                         fn call(
@@ -2142,7 +2140,7 @@ pub mod execution_runtime_server {
                                 max_decoding_message_size,
                                 max_encoding_message_size,
                             );
-                        let res = grpc.server_streaming(method, req).await;
+                        let res = grpc.unary(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
