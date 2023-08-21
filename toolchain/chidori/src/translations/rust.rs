@@ -676,7 +676,7 @@ impl NodeHandle {
     }
 
     pub fn run_when(&mut self, graph_builder: &mut GraphBuilder, other_node: &NodeHandle) -> anyhow::Result<bool> {
-        let queries = &mut self.node.core.as_mut().unwrap().queries;
+        let triggers = &mut self.node.core.as_mut().unwrap().triggers;
 
         // Remove null query if it is the only one present
         if queries.len() == 1 && queries[0].query.is_none() {

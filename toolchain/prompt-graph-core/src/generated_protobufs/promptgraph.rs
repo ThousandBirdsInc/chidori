@@ -268,7 +268,7 @@ pub struct ItemCore {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "2")]
-    pub queries: ::prost::alloc::vec::Vec<Query>,
+    pub triggers: ::prost::alloc::vec::Vec<Query>,
     #[prost(string, repeated, tag = "3")]
     pub output_tables: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "4")]

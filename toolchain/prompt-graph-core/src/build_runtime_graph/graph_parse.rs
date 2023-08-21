@@ -274,7 +274,7 @@ pub fn derive_for_individual_node(node: &Item) -> anyhow::Result<CleanIndividual
     let core = node.core.as_ref().unwrap();
 
     let mut query_path: QueryPath = vec![];
-    for query in &core.queries {
+    for query in &core.triggers {
         if let Some(q) = &query.query {
             let paths = query_path_from_query_string(&q)?;
             query_path.push(Some(paths));
@@ -421,7 +421,7 @@ impl CleanedDefinitionGraph {
                 if let Some(existing_core) = &mut existing.core {
                     existing_core.name = core.name;
                     existing_core.output = core.output;
-                    existing_core.queries = core.queries;
+                    existing_core.triggers = core.triggers;
                 }
 
                 match node.item.clone().unwrap() {

@@ -134,7 +134,7 @@ pub fn create_entrypoint_query(
     dsl::Item {
         core: Some(ItemCore {
             name: "RegistrationCodeNode".to_string(),
-            queries: vec![query_element],
+            triggers: vec![query_element],
             output: Default::default(),
             output_tables: vec![],
         }),
@@ -150,7 +150,7 @@ pub fn create_node_parameter(
         core: Some(ItemCore {
             name: name.to_string(),
             output: create_output(&output_def),
-            queries: vec![Query { query: None }],
+            triggers: vec![Query { query: None }],
             output_tables: vec![],
         }),
         item: Some(dsl::item::Item::NodeParameter(dsl::PromptGraphParameterNode {
@@ -167,7 +167,7 @@ pub fn create_op_map(
     dsl::Item {
         core: Some(ItemCore {
             name: name.to_string(),
-            queries: query_defs.into_iter().map(create_query).collect(),
+            triggers: query_defs.into_iter().map(create_query).collect(),
             // TODO: needs to have the type of the input
             output: create_output(r#"
                 {
@@ -212,7 +212,7 @@ pub fn create_code_node(
     dsl::Item {
         core: Some(ItemCore {
             name: name.to_string(),
-            queries: query_defs.into_iter().map(create_query).collect(),
+            triggers: query_defs.into_iter().map(create_query).collect(),
             output: create_output(&output_def),
             output_tables
         }),
@@ -236,7 +236,7 @@ pub fn create_custom_node(
     dsl::Item {
         core: Some(ItemCore {
             name: name.to_string(),
-            queries: query_defs.into_iter().map(create_query).collect(),
+            triggers: query_defs.into_iter().map(create_query).collect(),
             output: create_output(&output_def),
             output_tables
         }),
@@ -256,7 +256,7 @@ pub fn create_observation_node(
     dsl::Item {
         core: Some(ItemCore {
             name: name.to_string(),
-            queries: query_defs.into_iter().map(create_query).collect(),
+            triggers: query_defs.into_iter().map(create_query).collect(),
             output: create_output(&output_def),
             output_tables
         }),
@@ -296,7 +296,7 @@ pub fn create_vector_memory_node(
     Ok(dsl::Item {
         core: Some(ItemCore {
             name: name.to_string(),
-            queries: query_defs.into_iter().map(create_query).collect(),
+            triggers: query_defs.into_iter().map(create_query).collect(),
             output: create_output(&output_def),
             output_tables
         }),
@@ -319,7 +319,7 @@ pub fn create_component_node(
     dsl::Item {
         core: Some(ItemCore {
             name: name.to_string(),
-            queries: query_defs.into_iter().map(create_query).collect(),
+            triggers: query_defs.into_iter().map(create_query).collect(),
             output: create_output(&output_def),
             output_tables
         }),
@@ -339,7 +339,7 @@ pub fn create_loader_node(
     dsl::Item {
         core: Some(ItemCore {
             name: name.to_string(),
-            queries: query_defs.into_iter().map(create_query).collect(),
+            triggers: query_defs.into_iter().map(create_query).collect(),
             output: create_output(&output_def),
             output_tables
         }),
@@ -365,7 +365,7 @@ pub fn create_prompt_node(
     Ok(dsl::Item {
         core: Some(ItemCore {
             name: name.to_string(),
-            queries: query_defs.into_iter().map(create_query).collect(),
+            triggers: query_defs.into_iter().map(create_query).collect(),
             output: create_output(r#"
               {
                   promptResult: String
