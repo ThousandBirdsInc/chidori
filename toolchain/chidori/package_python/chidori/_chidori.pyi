@@ -15,13 +15,48 @@ class Chidori:
     def list_change_events(self, callback: object) -> None: ...
     def poll_local_code_node_execution(self) -> None: ...
     def ack_local_code_node_execution(self, branch: int, counter: int) -> None: ...
-    def respond_local_code_node_execution(self, branch: int, counter: int, node_name: str, response: Optional[object]) -> None: ...
+    def respond_local_code_node_execution(
+        self, branch: int, counter: int, node_name: str, response: Optional[object]
+    ) -> None: ...
 
 class GraphBuilder:
-    def custom_node(self, name: str, queries: List[Optional[str]], output_tables: List[str], output: str, node_type_name: str) -> None: ...
-    def deno_code_node(self, name: str, queries: List[Optional[str]], output_tables: List[str], output: str, code: str, is_template: bool) -> None: ...
-    def vector_memory_node(self, name: str, queries: List[Optional[str]], output_tables: List[str], output: str, template: str, action: str, embedding_model: str, db_vendor: str, collection_name: str) -> None: ...
-    def prompt_node(self, name: str, queries: List[Optional[str]], output_tables: List[str], template: str, model: str) -> None: ...
+    def custom_node(
+        self,
+        name: str,
+        triggers: List[Optional[str]],
+        output_tables: List[str],
+        output: str,
+        node_type_name: str,
+    ) -> None: ...
+    def deno_code_node(
+        self,
+        name: str,
+        triggers: List[Optional[str]],
+        output_tables: List[str],
+        output: str,
+        code: str,
+        is_template: bool,
+    ) -> None: ...
+    def vector_memory_node(
+        self,
+        name: str,
+        triggers: List[Optional[str]],
+        output_tables: List[str],
+        output: str,
+        template: str,
+        action: str,
+        embedding_model: str,
+        db_vendor: str,
+        collection_name: str,
+    ) -> None: ...
+    def prompt_node(
+        self,
+        name: str,
+        triggers: List[Optional[str]],
+        output_tables: List[str],
+        template: str,
+        model: str,
+    ) -> None: ...
     def commit(self, c: Chidori, branch: int) -> None: ...
     def serialize_yaml(self) -> str: ...
 

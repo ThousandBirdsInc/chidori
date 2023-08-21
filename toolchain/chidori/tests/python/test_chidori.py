@@ -12,19 +12,16 @@ async def test_simple_agent():
         name="InspirationalQuote",
         code="""
             return {"promptResult": "placeholder for openai call" }
-            """
+            """,
     )
     pn = await g.deno_code_node(
         name="CodeNode",
-        queries=["""SELECT promptResult FROM InspirationalQuote"""],
+        triggers=["""SELECT promptResult FROM InspirationalQuote"""],
         code="""
             return {"output": "Here is your quote for "+ new Date() + {{InspirationalQuote.promptResult}} }
             """,
-        is_template=True
+        is_template=True,
     )
     # await g.commit(client, 0)
     # await client.play(0, 0)
     assert 1 == 1
-
-
-

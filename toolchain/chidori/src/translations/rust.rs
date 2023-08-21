@@ -342,14 +342,14 @@ impl Chidori {
 }
 
 
-fn default_queries() -> Option<Vec<String>> {
+fn default_triggers() -> Option<Vec<String>> {
     Some(vec!["None".to_string()])
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct PromptNodeCreateOpts {
     pub name: String,
-    pub queries: Option<Vec<String>>,
+    pub triggers: Option<Vec<String>>,
     pub output_tables: Option<Vec<String>>,
     pub template: String,
     pub model: Option<String>
@@ -359,7 +359,7 @@ impl Default for PromptNodeCreateOpts {
     fn default() -> Self {
         PromptNodeCreateOpts {
             name: "".to_string(),
-            queries: default_queries(),
+            triggers: default_triggers(),
             output_tables: None,
             template: "".to_string(),
             model: Some("GPT_3_5_TURBO".to_string()),
@@ -369,7 +369,7 @@ impl Default for PromptNodeCreateOpts {
 impl PromptNodeCreateOpts {
     pub fn merge(&mut self, other: PromptNodeCreateOpts) {
         self.name = other.name;
-        self.queries = other.queries.or(self.queries.take());
+        self.triggers = other.triggers.or(self.triggers.take());
         self.output_tables = other.output_tables.or(self.output_tables.take());
         self.template = other.template;
         self.model = other.model.or(self.model.take());
@@ -381,7 +381,7 @@ impl PromptNodeCreateOpts {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct CustomNodeCreateOpts {
     pub name: String,
-    pub queries: Option<Vec<String>>,
+    pub triggers: Option<Vec<String>>,
     pub output_tables: Option<Vec<String>>,
     pub output: Option<String>,
     pub node_type_name: String
@@ -392,7 +392,7 @@ impl Default for CustomNodeCreateOpts {
     fn default() -> Self {
         CustomNodeCreateOpts {
             name: "".to_string(),
-            queries: default_queries(),
+            triggers: default_triggers(),
             output_tables: None,
             output: None,
             node_type_name: "".to_string(),
@@ -402,7 +402,7 @@ impl Default for CustomNodeCreateOpts {
 impl CustomNodeCreateOpts {
     pub fn merge(&mut self, other: CustomNodeCreateOpts) {
         self.name = other.name;
-        self.queries = other.queries.or(self.queries.take());
+        self.triggers = other.triggers.or(self.triggers.take());
         self.output_tables = other.output_tables.or(self.output_tables.take());
         self.output = other.output.or(self.output.take());
         self.node_type_name = other.node_type_name;
@@ -414,7 +414,7 @@ impl CustomNodeCreateOpts {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct DenoCodeNodeCreateOpts {
     pub name: String,
-    pub queries: Option<Vec<String>>,
+    pub triggers: Option<Vec<String>>,
     pub output_tables: Option<Vec<String>>,
     pub output: Option<String>,
     pub code: String,
@@ -425,7 +425,7 @@ impl Default for DenoCodeNodeCreateOpts {
     fn default() -> Self {
         DenoCodeNodeCreateOpts {
             name: "".to_string(),
-            queries: default_queries(),
+            triggers: default_triggers(),
             output_tables: None,
             output: None,
             code: "".to_string(),
@@ -437,7 +437,7 @@ impl Default for DenoCodeNodeCreateOpts {
 impl DenoCodeNodeCreateOpts {
     pub fn merge(&mut self, other: DenoCodeNodeCreateOpts) {
         self.name = other.name;
-        self.queries = other.queries.or(self.queries.take());
+        self.triggers = other.triggers.or(self.triggers.take());
         self.output_tables = other.output_tables.or(self.output_tables.take());
         self.output = other.output.or(self.output.take());
         self.code = other.code;
@@ -448,7 +448,7 @@ impl DenoCodeNodeCreateOpts {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct VectorMemoryNodeCreateOpts {
     pub name: String,
-    pub queries: Option<Vec<String>>,
+    pub triggers: Option<Vec<String>>,
     pub output_tables: Option<Vec<String>>,
     pub output: Option<String>,
     pub template: Option<String>, // TODO: default is the contents of the query
@@ -463,7 +463,7 @@ impl Default for VectorMemoryNodeCreateOpts {
     fn default() -> Self {
         VectorMemoryNodeCreateOpts {
             name: "".to_string(),
-            queries: None,
+            triggers: None,
             output_tables: None,
             output: None,
             template: None,
@@ -479,7 +479,7 @@ impl Default for VectorMemoryNodeCreateOpts {
 impl VectorMemoryNodeCreateOpts {
     pub fn merge(&mut self, other: VectorMemoryNodeCreateOpts) {
         self.name = other.name;
-        self.queries = other.queries.or(self.queries.take());
+        self.triggers = other.triggers.or(self.triggers.take());
         self.output_tables = other.output_tables.or(self.output_tables.take());
         self.output = other.output.or(self.output.take());
         self.template = other.template.or(self.template.take());
@@ -490,9 +490,9 @@ impl VectorMemoryNodeCreateOpts {
     }
 }
 
-fn remap_queries(queries: Option<Vec<String>>) -> Vec<Option<String>> {
-    let queries: Vec<Option<String>> = if let Some(queries) = queries {
-        queries.into_iter().map(|q| {
+fn remap_triggers(triggers: Option<Vec<String>>) -> Vec<Option<String>> {
+    let triggers: Vec<Option<String>> = if let Some(triggers) = triggers {
+        triggers.into_iter().map(|q| {
             if q == "None".to_string() {
                 None
             } else {
@@ -502,7 +502,7 @@ fn remap_queries(queries: Option<Vec<String>>) -> Vec<Option<String>> {
     } else {
         vec![]
     };
-    queries
+    triggers
 }
 
 #[derive(Clone)]
@@ -521,7 +521,7 @@ impl GraphBuilder {
         def.merge(arg);
         let node = create_prompt_node(
             def.name.clone(),
-            remap_queries(def.queries),
+            remap_triggers(def.triggers),
             def.template,
             def.model.unwrap_or("GPT_3_5_TURBO".to_string()),
             def.output_tables.unwrap_or(vec![]))?;
@@ -534,7 +534,7 @@ impl GraphBuilder {
         def.merge(arg);
         let node = create_custom_node(
             def.name.clone(),
-            remap_queries(def.queries.clone()),
+            remap_triggers(def.triggers.clone()),
             def.output.unwrap_or("{}".to_string()),
             def.node_type_name,
             def.output_tables.unwrap_or(vec![])
@@ -549,7 +549,7 @@ impl GraphBuilder {
         def.merge(arg);
         let node = create_code_node(
             def.name.clone(),
-            remap_queries(def.queries.clone()),
+            remap_triggers(def.triggers.clone()),
             def.output.unwrap_or("{}".to_string()),
             SourceNodeType::Code("DENO".to_string(), def.code, def.is_template.unwrap_or(false)),
             def.output_tables.unwrap_or(vec![])
@@ -564,7 +564,7 @@ impl GraphBuilder {
         def.merge(arg);
         let node = create_vector_memory_node(
             def.name.clone(),
-            remap_queries(def.queries.clone()),
+            remap_triggers(def.triggers.clone()),
             def.output.unwrap_or("{}".to_string()),
             def.action.unwrap_or("READ".to_string()),
             def.embedding_model.unwrap_or("TEXT_EMBEDDING_ADA_002".to_string()),
@@ -676,11 +676,11 @@ impl NodeHandle {
     }
 
     pub fn run_when(&mut self, graph_builder: &mut GraphBuilder, other_node: &NodeHandle) -> anyhow::Result<bool> {
-        let queries = &mut self.node.core.as_mut().unwrap().queries;
+        let triggers = &mut self.node.core.as_mut().unwrap().queries; // queries->triggers Note: On next pass, change ItemCore defintion in ProtoBufs
 
         // Remove null query if it is the only one present
-        if queries.len() == 1 && queries[0].query.is_none() {
-            queries.remove(0);
+        if triggers.len() == 1 && triggers[0].query.is_none() {
+            triggers.remove(0);
         }
 
         let q = construct_query_from_output_type(
@@ -688,7 +688,7 @@ impl NodeHandle {
             &other_node.get_name(),
             &other_node.get_output_type()
         ).unwrap();
-        queries.push(Query { query: Some(q)});
+        triggers.push(Query { query: Some(q)});
         graph_builder.clean_graph.merge_file(&File { nodes: vec![self.node.clone()], ..Default::default() })?;
         Ok(true)
     }
