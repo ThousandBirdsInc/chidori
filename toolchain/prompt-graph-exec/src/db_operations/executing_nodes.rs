@@ -28,11 +28,29 @@ fn will_exec_pending_prefix_raw() -> Vec<u8> {
     db_operations::encode_into_slice(WILL_EXEC_PENDING_PREFIX).unwrap()
 }
 
+fn will_exec_complete_prefix_raw() -> Vec<u8> {
+    db_operations::encode_into_slice(WILL_EXEC_COMPLETE_PREFIX).unwrap()
+}
+
+fn will_exec_in_progress_prefix_raw() -> Vec<u8> {
+    db_operations::encode_into_slice(WILL_EXEC_IN_PROGRESS_PREFIX).unwrap()
+}
+
 pub fn insert_will_execute(tree: &sled::Tree, will_exec: NodeWillExecuteOnBranch) {
     let NodeWillExecuteOnBranch { custom_node_type_name, node, branch, counter } = &will_exec;
     let _node = node.as_ref().expect("node not found on NodeWillExecuteOnBranch");
     let is_custom_node = custom_node_type_name.is_some();
     tree.insert(will_exec_pending_prefix(is_custom_node, *branch, *counter), will_exec.encode_to_vec()).unwrap();
+}
+
+pub fn scan_all_will_execute_events(tree: &sled::Tree) -> impl Iterator<Item = NodeWillExecuteOnBranch> {
+    let pending = tree.scan_prefix(will_exec_pending_prefix_raw())
+        .map(|c| NodeWillExecuteOnBranch::decode(c.unwrap().1.as_ref()).unwrap());
+    let progress = tree.scan_prefix(will_exec_in_progress_prefix_raw())
+        .map(|c| NodeWillExecuteOnBranch::decode(c.unwrap().1.as_ref()).unwrap());
+    let complete = tree.scan_prefix(will_exec_complete_prefix_raw())
+        .map(|c| NodeWillExecuteOnBranch::decode(c.unwrap().1.as_ref()).unwrap());
+    pending.chain(progress).chain(complete)
 }
 
 pub fn scan_all_will_execute_pending_events(tree: &sled::Tree) -> impl Iterator<Item = NodeWillExecuteOnBranch> {

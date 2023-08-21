@@ -183,11 +183,8 @@ impl Chidori {
         let url = self.url.clone();
         let mut client = get_client(url).await?;
         let resp = client.list_registered_graphs(Empty { }).await?;
-        let mut stream = resp.into_inner();
-        while let Some(x) = stream.next().await {
-            // callback.call(py, (x,), None);
-            info!("Registered Graph = {:?}", x);
-        };
+        let mut graphs = resp.into_inner();
+        info!("Registered Graphs = {:?}", graphs);
         Ok(())
     }
 
@@ -630,6 +627,11 @@ impl GraphBuilder {
 //     //         Ok(push_file_merge(&url, &file_id, node).await?)
 //     //     })
 //     // }
+
+
+    pub fn serialize_yaml(&self) -> anyhow::Result<String> {
+        Ok(self.clean_graph.serialize_to_yaml())
+    }
 
     pub async fn commit(&self, c: &Chidori, branch: u64) -> anyhow::Result<ExecutionStatus> {
         let url = &c.url;

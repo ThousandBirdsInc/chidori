@@ -63,6 +63,7 @@ pub fn get_next_pending_change_on_branch(tree: &sled::Tree, branch: u64) -> Opti
 /// This change has now transitioned to being resolved, meaning that its state is now stored
 /// based on its path
 pub fn resolve_pending_change(tree: &sled::Tree, branch: u64, counter: u64) {
+    // TODO: this should allow duplicate messages
     let change = tree.remove(change_prefix_pending(branch, counter)).unwrap().expect("Changes must exist to be resolved");
     tree.insert(change_prefix_resolved(branch, counter), change).unwrap();
 }
