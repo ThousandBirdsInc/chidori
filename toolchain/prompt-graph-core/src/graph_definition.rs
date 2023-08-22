@@ -6,7 +6,7 @@ use crate::proto2 as dsl;
 use crate::proto2::{ItemCore, Query};
 use crate::proto2::prompt_graph_node_loader::LoadFrom;
 
-
+/// Maps a string to a supported vector database type
 fn map_string_to_vector_database(encoding: &str) -> anyhow::Result<dsl::SupportedVectorDatabase> {
     match encoding {
         "IN_MEMORY" => Ok(dsl::SupportedVectorDatabase::InMemory),
@@ -19,6 +19,7 @@ fn map_string_to_vector_database(encoding: &str) -> anyhow::Result<dsl::Supporte
     }
 }
 
+/// Maps a string to a supported embedding model type
 fn map_string_to_embedding_model(encoding: &str) -> anyhow::Result<dsl::SupportedEmebddingModel> {
     match encoding {
         "TEXT_EMBEDDING_ADA_002" => Ok(dsl::SupportedEmebddingModel::TextEmbeddingAda002),
@@ -29,6 +30,7 @@ fn map_string_to_embedding_model(encoding: &str) -> anyhow::Result<dsl::Supporte
     }
 }
 
+/// Maps a string to a supported chat model type
 fn map_string_to_chat_model(encoding: &str) -> anyhow::Result<dsl::SupportedChatModel> {
     match encoding {
         "GPT_4" => Ok(dsl::SupportedChatModel::Gpt4),
@@ -43,6 +45,7 @@ fn map_string_to_chat_model(encoding: &str) -> anyhow::Result<dsl::SupportedChat
     }
 }
 
+/// Maps a string to a supported source language type
 fn map_string_to_supported_source_langauge(encoding: &str) -> anyhow::Result<dsl::SupportedSourceCodeLanguages> {
     match encoding {
         "DENO" => Ok(dsl::SupportedSourceCodeLanguages::Deno),
@@ -53,12 +56,14 @@ fn map_string_to_supported_source_langauge(encoding: &str) -> anyhow::Result<dsl
     }
 }
 
+/// Converts a string representing a query definition to a Query type
 fn create_query(query_def: Option<String>) -> dsl::Query {
      dsl::Query {
         query: query_def.map(|d|d),
     }
 }
 
+/// Converts a string representing an output definition to an OutputType type
 fn create_output(output_def: &str) -> Option<dsl::OutputType> {
     Some(dsl::OutputType {
         output: output_def.to_string(),
@@ -77,45 +82,64 @@ pub struct DefinitionGraph {
     internal: dsl::File,
 }
 
+
+/// A graph definition or DefinitionGraph defines a graph of executable nodes connected by edges or 'triggers'.
+/// The graph is defined in a DSL (domain specific language) that is compiled into a binary formatted File that can be
+/// executed by the prompt-graph-core runtime.
 impl DefinitionGraph {
 
+    /// Returns the File object representing this graph definition
     pub fn get_file(&self) -> &dsl::File {
         &self.internal
     }
 
+    /// Returns an empty graph definition
     pub fn zero() -> Self {
         Self {
             internal: dsl::File::default()
         }
     }
 
+    /// Sets this graph definition to read from & write to the given File object
     pub fn from_file(file: dsl::File) -> Self {
         Self {
             internal: file
         }
     }
 
+    /// Store the given bytes (representing protobuf graph definition) as a
+    /// new File object and associate this graph definition with it
     pub fn new(bytes: &[u8]) -> Self {
         Self {
             internal: dsl::File::decode(bytes).unwrap()
         }
     }
 
+    /// Read and return the nodes from internal File object
     pub(crate) fn get_nodes(&self) -> &Vec<dsl::Item> {
         &self.internal.nodes
     }
 
+    /// Read and return a mutable collection of nodes from internal File object
     pub(crate) fn get_nodes_mut(&mut self) -> &Vec<dsl::Item> {
         &self.internal.nodes
     }
 
+    /// Serialize the internal File object to bytes and return them
     pub(crate) fn serialize(&self) -> Vec<u8> {
         let mut buffer = Vec::new();
         self.internal.encode(&mut buffer).unwrap();
         buffer
     }
 
+    /// Push a given node (defined as Item type) to the internal graph definition
     pub fn register_node(&mut self, item: dsl::Item) {
+        self.internal.nodes.push(item);
+    }
+
+    /// Push a given node (defined as bytes) to the internal graph definition
+    pub fn register_node_bytes(&mut self, item: &[u8]) {
+        let item = dsl::Item::decode(item).unwrap();
         self.internal.nodes.push(item);
     }
 }
@@ -142,6 +166,7 @@ pub fn create_entrypoint_query(
     }
 }
 
+/// Takes in common node parameters and returns a fulfilled node type (a dsl::Item type)
 pub fn create_node_parameter(
     name: String,
     output_def: String
@@ -158,6 +183,7 @@ pub fn create_node_parameter(
     }
 }
 
+/// Returns a Map type node, which maps a Path (key) to a given String (value)
 pub fn create_op_map(
     name: String,
     query_defs: Vec<Option<String>>,
@@ -184,6 +210,11 @@ pub fn create_op_map(
 
 // TODO: automatically wire these into prompt nodes that support function calling
 // TODO: https://platform.openai.com/docs/guides/gpt/function-calling
+/// Takes in executable code and returns a node that executes said code when triggered
+/// This executable code can take the format of:
+/// - a raw string of code in a supported language
+/// - a path to an S3 bucket containing code in a supported language
+/// - a zip file containing code in a supported language
 pub fn create_code_node(
     name: String,
     query_defs: Vec<Option<String>>,
@@ -226,6 +257,11 @@ pub fn create_code_node(
 
 // TODO: automatically wire these into prompt nodes that support function calling
 // TODO: https://platform.openai.com/docs/guides/gpt/function-calling
+/// Returns a custom node that executes a given function
+/// When registering a custom node in the SDK, you provide an in-language function and
+/// tell chidori to register that function under the given "type_name".
+/// This function executed is then executed in the graph
+/// when referenced by this "type_name" parameter
 pub fn create_custom_node(
     name: String,
     query_defs: Vec<Option<String>>,
@@ -246,7 +282,7 @@ pub fn create_custom_node(
     }
 }
 
-
+/// Returns a node that, when triggered, echoes back its input for easier querying
 pub fn create_observation_node(
     name: String,
     query_defs: Vec<Option<String>>,
@@ -266,6 +302,9 @@ pub fn create_observation_node(
     }
 }
 
+/// Returns a node that can perform some READ/WRITE/DELETE operation on
+/// a specified Vector database, using the specified configuration options
+/// (options like the embedding_model to use and collection_name namespace to query within)
 pub fn create_vector_memory_node(
     name: String,
     query_defs: Vec<Option<String>>,
@@ -310,6 +349,12 @@ pub fn create_vector_memory_node(
     })
 }
 
+/// Returns a node that can implement logic from another graph definition
+/// This is useful for reusing logic across multiple graphs
+/// The graph definition to transclude is specified by either
+/// - a path to an S3 bucket containing a graph definition
+/// - raw bytes of a graph definition
+/// - a File object containing a graph definition
 pub fn create_component_node(
     name: String,
     query_defs: Vec<Option<String>>,
@@ -329,6 +374,7 @@ pub fn create_component_node(
     }
 }
 
+/// Returns a node that can read bytes from a given source
 pub fn create_loader_node(
     name: String,
     query_defs: Vec<Option<String>>,
@@ -349,6 +395,9 @@ pub fn create_loader_node(
     }
 }
 
+/// Returns a node that, when triggered, performs an API call to a given language model endpoint,
+/// using the template parameter as the prompt input to the language model, and returns the result
+/// to the graph as a String type labeled "promptResult"
 pub fn create_prompt_node(
     name: String,
     query_defs: Vec<Option<String>>,
@@ -385,13 +434,4 @@ pub fn create_prompt_node(
             stop: vec![],
         })),
     })
-}
-
-impl DefinitionGraph {
-
-    pub fn register_node_bytes(&mut self, item: &[u8]) {
-        let item = dsl::Item::decode(item).unwrap();
-        self.internal.nodes.push(item);
-    }
-
 }
