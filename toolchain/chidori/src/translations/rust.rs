@@ -676,7 +676,7 @@ impl NodeHandle {
     }
 
     pub fn run_when(&mut self, graph_builder: &mut GraphBuilder, other_node: &NodeHandle) -> anyhow::Result<bool> {
-        let triggers = &mut self.node.core.as_mut().unwrap().queries; // queries->triggers Note: On next pass, change ItemCore defintion in ProtoBufs
+        let triggers = &mut self.node.core.as_mut().unwrap().triggers;
 
         // Remove null query if it is the only one present
         if triggers.len() == 1 && triggers[0].query.is_none() {

@@ -179,7 +179,7 @@ message PromptGraphNodeJoin {
 
 message ItemCore {
   string name = 1;
-  repeated Query queries = 2;
+  repeated Query triggers = 2;
   repeated string outputTables = 3;
   OutputType output = 4;
 }
