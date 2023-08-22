@@ -742,12 +742,12 @@ impl PyGraphBuilder {
     }
 
     // https://github.com/PyO3/pyo3/issues/525
-    #[pyo3(signature = (name=String::new(), queries=vec!["None".to_string()], output_tables=vec![], output=String::from("{}"), node_type_name=String::new()))]
+    #[pyo3(signature = (name=String::new(), triggers=vec!["None".to_string()], output_tables=vec![], output=String::from("{}"), node_type_name=String::new()))]
     fn custom_node<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
         name: String,
-        queries: Option<Vec<String>>,
+        triggers: Option<Vec<String>>,
         output_tables: Vec<String>,
         output: String,
         node_type_name: String,
@@ -757,7 +757,7 @@ impl PyGraphBuilder {
             let mut graph_builder = g.lock().await;
             let nh = graph_builder.custom_node(CustomNodeCreateOpts {
                 name,
-                queries,
+                triggers,
                 output_tables: Some(output_tables),
                 output: Some(output),
                 node_type_name,
@@ -766,12 +766,12 @@ impl PyGraphBuilder {
         })
     }
 
-    #[pyo3(signature = (name=String::new(), queries=vec!["None".to_string()], output_tables=None, output=None, code=String::new(), is_template=None))]
+    #[pyo3(signature = (name=String::new(), triggers=vec!["None".to_string()], output_tables=None, output=None, code=String::new(), is_template=None))]
     fn deno_code_node<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
         name: String,
-        queries: Option<Vec<String>>,
+        triggers: Option<Vec<String>>,
         output_tables: Option<Vec<String>>,
         output: Option<String>,
         code: String,
@@ -782,7 +782,7 @@ impl PyGraphBuilder {
             let mut graph_builder = g.lock().await;
             let nh = graph_builder.deno_code_node(DenoCodeNodeCreateOpts {
                 name,
-                queries,
+                triggers,
                 output_tables,
                 output,
                 code,
@@ -793,12 +793,12 @@ impl PyGraphBuilder {
     }
 
 
-    #[pyo3(signature = (name=String::new(), queries=vec!["None".to_string()], output_tables=vec![], output=String::from("{}"), template=String::new(), action="WRITE".to_string(), embedding_model="TEXT_EMBEDDING_ADA_002".to_string(), db_vendor="QDRANT".to_string(), collection_name=String::new()))]
+    #[pyo3(signature = (name=String::new(), triggers=vec!["None".to_string()], output_tables=vec![], output=String::from("{}"), template=String::new(), action="WRITE".to_string(), embedding_model="TEXT_EMBEDDING_ADA_002".to_string(), db_vendor="QDRANT".to_string(), collection_name=String::new()))]
     fn vector_memory_node<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
         name: String,
-        queries: Option<Vec<String>>,
+        triggers: Option<Vec<String>>,
         output_tables: Vec<String>,
         output: String,
         template: String,
@@ -812,7 +812,7 @@ impl PyGraphBuilder {
             let mut graph_builder = g.lock().await;
             let nh = graph_builder.vector_memory_node(VectorMemoryNodeCreateOpts {
                 name,
-                queries,
+                triggers,
                 output_tables: Some(output_tables),
                 output: Some(output),
                 template: Some(template),
@@ -858,12 +858,12 @@ impl PyGraphBuilder {
 
     // TODO: nodes that are added should return a clean definition of what their addition looks like
     // TODO: adding a node should also display any errors
-    #[pyo3(signature = (name=String::new(), queries=vec!["None".to_string()], output_tables=None, template=String::new(), model=None))]
+    #[pyo3(signature = (name=String::new(), triggers=vec!["None".to_string()], output_tables=None, template=String::new(), model=None))]
     fn prompt_node<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
         name: String,
-        queries: Option<Vec<String>>,
+        triggers: Option<Vec<String>>,
         output_tables: Option<Vec<String>>,
         template: String,
         model: Option<String>
@@ -873,7 +873,7 @@ impl PyGraphBuilder {
             let mut graph_builder = g.lock().await;
             let nh = graph_builder.prompt_node(PromptNodeCreateOpts {
                 name,
-                queries,
+                triggers,
                 output_tables,
                 template,
                 model,

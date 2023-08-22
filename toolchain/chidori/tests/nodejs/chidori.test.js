@@ -23,7 +23,7 @@ test('start server', async () => {
     });
     g.denoCodeNode({
         name: "CodeNode",
-        queries: ["query Q { InspirationalQuote { promptResult } }"],
+        triggers: ["query Q { InspirationalQuote { promptResult } }"],
         code: `return {"output": "Here is your quote for " + \`{{InspirationalQuote.promptResult}}\` }`,
         output: `type CodeNode { output: String }`,
         is_template: true
