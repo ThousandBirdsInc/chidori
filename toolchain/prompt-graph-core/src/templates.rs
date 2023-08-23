@@ -20,6 +20,7 @@ use crate::proto2::{ChangeValue, PromptLibraryRecord, SerializedValue, Serialize
 // https://github.com/sunng87/handlebars-rust/blob/23ca8d76bee783bf72f627b4c4995d1d11008d17/src/template.rs#L963
 // self.handlebars.register_template_string(name, template).unwrap();
 
+/// Verify that the template and included query paths are valid
 pub fn validate_template(template_str: &str, _query_paths: Vec<Vec<String>>) {
     // let mut handlebars = Handlebars::new();
     let template = Template::compile(template_str).unwrap();
@@ -36,6 +37,9 @@ struct ContextBlock {
     params: Vec<Parameter>,
 }
 
+/// Traverse over every partial template in a Template (which can be a set of template partials) and validate that each
+/// partial template can be matched to a either 1) some template type that Handlebars recognizes
+/// or 2) a query path that can pull data out of the event log
 fn traverse_ast(template: &Template, reference_paths: &mut Vec<(Path, Vec<ContextBlock>)>, context: Vec<ContextBlock>) {
     for el in &template.elements {
         match el {
@@ -87,6 +91,7 @@ fn extract_roles_from_template() {
 
 }
 
+/// Recursively flatten a SerializedValue into a set of key paths and values
 pub fn flatten_value_keys(sval: SerializedValue, current_path: Vec<String>) -> Vec<(Vec<String>, Val)> {
     let mut flattened = vec![];
     match sval.val {
@@ -104,6 +109,7 @@ pub fn flatten_value_keys(sval: SerializedValue, current_path: Vec<String>) -> V
 }
 
 // TODO: fix the conversion to numbers
+/// Convert a SerializedValue into a serde_json::Value
 pub fn serialized_value_to_json_value(sval: &SerializedValue) -> Value {
     match &sval.val {
         Some(Val::Float(f)) => { Value::Number(f.to_string().parse().unwrap()) }
@@ -120,6 +126,7 @@ pub fn serialized_value_to_json_value(sval: &SerializedValue) -> Value {
     }
 }
 
+/// Convert a serde_json::Value into a SerializedValue
 pub fn json_value_to_serialized_value(jval: &Value) -> SerializedValue {
     SerializedValue {
         val: match jval {
@@ -152,7 +159,7 @@ pub fn json_value_to_serialized_value(jval: &Value) -> SerializedValue {
 
 
 
-
+/// Recursively convert a path and value into a JSON map, where the path is split into nested keys that map down to the value
 fn query_path_to_json(path: &[String], val: &SerializedValue) -> Option<Map<String, Value>> {
     let mut map = JsonMap::new();
     if let Some((head, tail)) = path.split_first() {
@@ -169,6 +176,7 @@ fn query_path_to_json(path: &[String], val: &SerializedValue) -> Option<Map<Stri
     }
 }
 
+/// Merge two JSON maps together, where the second map takes precedence over the first
 fn merge(a: &mut Value, b: Value) {
     if let Value::Object(a) = a {
         if let Value::Object(b) = b {
@@ -188,6 +196,7 @@ fn merge(a: &mut Value, b: Value) {
     *a = b;
 }
 
+/// Convert a set of query paths into a JSON map where each path is split into nested keys that map down to their respective value
 fn query_paths_to_json(query_paths: &Vec<ChangeValue>) -> Value {
     let mut m = Value::Object(JsonMap::new());
     for change_value in query_paths {
@@ -211,7 +220,8 @@ fn query_paths_to_json(query_paths: &Vec<ChangeValue>) -> Value {
 // TODO: implement block helpers for User and System prompts
 
 
-
+/// Render a template string, placing in partials (names that map to prompts in the prompt library) and values from the query paths
+/// as records of changes that are made to the event log
 pub fn render_template_prompt(template_str: &str, query_paths: &Vec<ChangeValue>, partials: &HashMap<String, PromptLibraryRecord>) -> Result<String> {
     let mut reg = Handlebars::new();
     for (name, prompt) in partials.iter() {
