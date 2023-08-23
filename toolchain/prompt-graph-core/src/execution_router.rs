@@ -173,7 +173,7 @@ mod tests {
             nodes: vec![Item{
                 core: Some(ItemCore {
                     name: "EmptyNode".to_string(),
-                    queries: vec![Query{ query: None}],
+                    triggers: vec![Query{ query: None}],
                     output: Some(OutputType {
                         output: "{}".to_string(),
                     }),
@@ -190,7 +190,7 @@ mod tests {
             nodes: vec![Item{
                 core: Some(ItemCore {
                     name: "".to_string(),
-                    queries: vec![Query {
+                    triggers: vec![Query {
                         query: None,
                     }],
                     output: Some(OutputType {
@@ -209,7 +209,7 @@ mod tests {
             nodes: vec![Item{
                 core: Some(ItemCore {
                     name: "test_node".to_string(),
-                    queries: vec![Query {
+                    triggers: vec![Query {
                         query: Some("SELECT path1, path2 FROM source".to_string()),
                     }],
                     output: Some(OutputType {
