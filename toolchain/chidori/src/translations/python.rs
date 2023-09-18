@@ -90,7 +90,7 @@ impl Into<pyo3::PyResult<()>> for PyErrWrapper {
 
 pub struct PyExecutionStatus(ExecutionStatus);
 
-
+/// This is a helper trait that allows us to set some values defined by PyExecutionStatus into a python dictionary
 impl IntoPy<Py<PyAny>> for PyExecutionStatus {
     fn into_py(self, py: Python) -> Py<PyAny> {
         let exec_status = self.0;
@@ -104,7 +104,7 @@ impl IntoPy<Py<PyAny>> for PyExecutionStatus {
 
 pub struct PyResponseExecutionStatus(Response<ExecutionStatus>);
 
-
+/// This is a helper trait that allows us to set some values defined by PyResponseExecutionStatus into a python dictionary
 impl IntoPy<Py<PyAny>> for PyResponseExecutionStatus {
     fn into_py(self, py: Python) -> Py<PyAny> {
         let PyResponseExecutionStatus(resp) = self;
@@ -120,7 +120,7 @@ impl IntoPy<Py<PyAny>> for PyResponseExecutionStatus {
 
 pub struct PyListBranchesRes(Response<ListBranchesRes>);
 
-
+/// This is a helper trait that allows us to set some values defined by PyListBranchesRes into a python dictionary
 impl IntoPy<Py<PyAny>> for PyListBranchesRes {
     fn into_py(self, py: Python) -> Py<PyAny> {
         let PyListBranchesRes(resp) = self;
@@ -139,6 +139,7 @@ impl IntoPy<Py<PyAny>> for PyListBranchesRes {
 
 pub struct PyQueryAtFrameResponse(Response<QueryAtFrameResponse>);
 
+/// This is a helper trait that allows us to set some values defined by PyQueryAtFrameResponse into a python dictionary
 impl IntoPy<Py<PyAny>> for PyQueryAtFrameResponse {
     fn into_py(self, py: Python) -> Py<PyAny> {
         let PyQueryAtFrameResponse(resp) = self;
@@ -159,6 +160,7 @@ impl IntoPy<Py<PyAny>> for PyQueryAtFrameResponse {
 #[derive(Debug)]
 pub struct SerializedValueWrapper(SerializedValue);
 
+/// This is a helper trait that allows us to set some values defined by SerializedValueWrapper into a python dictionary
 impl ToPyObject for SerializedValueWrapper {
     fn to_object(&self, py: Python<'_>) -> PyObject {
         if let None = self.0.val {
@@ -191,6 +193,7 @@ impl ToPyObject for SerializedValueWrapper {
 #[derive(Debug)]
 pub struct ChangeValueWithCounterWrapper(ChangeValueWithCounter);
 
+/// This is a helper trait that allows us to set some values defined by ChangeValueWithCounterWrapper into a python dictionary
 impl IntoPy<Py<PyAny>> for ChangeValueWithCounterWrapper {
     fn into_py(self, py: Python) -> Py<PyAny> {
         let mut dict = PyDict::new(py);
@@ -205,6 +208,7 @@ impl IntoPy<Py<PyAny>> for ChangeValueWithCounterWrapper {
     }
 }
 
+/// This allows us to add values directly to a dictionary present in python
 fn add_to_dict<'p>(
     py: Python<'p>,
     keys: &Vec<String>,
@@ -227,7 +231,7 @@ fn add_to_dict<'p>(
     Ok(())
 }
 
-
+/// This allows us to serialize and send these specific rust type values to python
 fn pyany_to_serialized_value(p: &PyAny) -> SerializedValue {
     match p.get_type().name() {
         Ok(s) => {
@@ -290,6 +294,7 @@ use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
 use serde_json::json;
 
+/// This allows us to retrieve values back out of python into a rust json type
 fn py_to_json<'p>(py: Python<'p>, v: &PyAny) -> serde_json::Value {
     if v.is_none() {
         json!(null)
@@ -316,7 +321,7 @@ fn py_to_json<'p>(py: Python<'p>, v: &PyAny) -> serde_json::Value {
 }
 
 
-
+/// This converts a dictionary into a queriable path
 fn dict_to_paths<'p>(
     py: Python<'p>,
     d: &'p PyDict
@@ -348,6 +353,7 @@ fn dict_to_paths<'p>(
 #[derive(Debug)]
 pub struct NodeWillExecuteOnBranchWrapper(NodeWillExecuteOnBranch);
 
+/// This is a helper trait that allows us to set some values defined by NodeWillExecuteOnBranchWrapper into a python object
 impl ToPyObject for NodeWillExecuteOnBranchWrapper {
     fn to_object(&self, py: Python<'_>) -> PyObject {
         let NodeWillExecuteOnBranch { branch, counter, node, custom_node_type_name} = &self.0;
@@ -384,6 +390,7 @@ impl ToPyObject for NodeWillExecuteOnBranchWrapper {
 
 pub struct PyRespondPollNodeWillExecuteEvents(Response<RespondPollNodeWillExecuteEvents>);
 
+/// This is a helper trait that allows us to set some values defined by PyRespondPollNodeWillExecuteEvents into a python dictionary
 impl IntoPy<Py<PyAny>> for PyRespondPollNodeWillExecuteEvents {
     fn into_py(self, py: Python) -> Py<PyAny> {
         let PyRespondPollNodeWillExecuteEvents(resp) = self;
@@ -394,7 +401,7 @@ impl IntoPy<Py<PyAny>> for PyRespondPollNodeWillExecuteEvents {
     }
 }
 
-
+/// Returns a reference to the execution runtime
 async fn get_client(url: String) -> Result<ExecutionRuntimeClient<tonic::transport::Channel>, PyErrWrapper> {
     ExecutionRuntimeClient::connect(url.clone()).await.map_err(PyErrWrapper::from)
 }
@@ -416,6 +423,8 @@ impl PyNodeHandle {
 
 #[pymethods]
 impl PyNodeHandle {
+
+    /// This returns the name of the node that this handle is associated with
     fn get_name(&self) -> String {
         self.n.get_name()
     }
@@ -440,12 +449,14 @@ impl PyNodeHandle {
     //     })
     // }
 
+    /// This allows the node to be printably represented in python
     fn __str__(&self) -> PyResult<String>   {
         // TODO: best practice is that these could be used to re-construct the same object
         let name = self.get_name();
         Ok(format!("NodeHandle(node={})", name))
     }
 
+    /// This allows the node to be printably represented in python
     fn __repr__(&self) -> PyResult<String> {
         let name = self.get_name();
         Ok(format!("NodeHandle(node={})", name))
@@ -469,6 +480,7 @@ struct PyChidori {
 #[pymethods]
 impl PyChidori {
 
+    /// Creates a new chidori instance
     #[new]
     #[pyo3(signature = (file_id=String::from("0"), url=String::from("http://127.0.0.1:9800"), api_token=None))]
     fn new(file_id: String, url: String, api_token: Option<String>) -> Self {
@@ -483,6 +495,7 @@ impl PyChidori {
         }
     }
 
+    /// Spins up the runtime environment
     fn start_server<'a>(mut self_: PyRefMut<'_, Self>, py: Python<'a>, file_path: Option<String>) -> PyResult<&'a PyAny> {
         let c = Arc::clone(&self_.c);
         let url = self_.url.clone();
@@ -493,6 +506,7 @@ impl PyChidori {
         })
     }
 
+    /// Starts the execution of the runtime from the root, or from a defined state
     #[pyo3(signature = (branch=0, frame=0))]
     fn play<'a>(mut self_: PyRefMut<'_, Self>, py: Python<'a>, branch: u64, frame: u64) -> PyResult<&'a PyAny> {
         let file_id = self_.file_id.clone();
@@ -507,7 +521,7 @@ impl PyChidori {
         })
     }
 
-
+    /// Pauses the execution of the runtime
     #[pyo3(signature = (frame=0))]
     fn pause<'a>(mut self_: PyRefMut<'_, Self>, py: Python<'a>, frame: u64) -> PyResult<&'a PyAny> {
         let file_id = self_.file_id.clone();
@@ -523,7 +537,7 @@ impl PyChidori {
         })
     }
 
-
+    /// Branches the execution of the runtime
     fn branch<'a>(mut self_: PyRefMut<'_, Self>, py: Python<'a>) -> PyResult<&'a PyAny> {
         let file_id = self_.file_id.clone();
         let url = self_.url.clone();
@@ -540,6 +554,7 @@ impl PyChidori {
         })
     }
 
+    /// Queries for event-log values at a specific branch and frame
     #[pyo3(signature = (query=String::new(), branch=0, frame=0))]
     fn query<'a>(mut self_: PyRefMut<'_, Self>, py: Python<'a>, query: String, branch: u64, frame: u64) -> PyResult<&'a PyAny> {
         let file_id = self_.file_id.clone();
@@ -557,6 +572,7 @@ impl PyChidori {
         })
     }
 
+    /// List all available branches
     fn list_branches<'a>(mut self_: PyRefMut<'_, Self>, py: Python<'a>) -> PyResult<&'a PyAny> {
         let file_id = self_.file_id.clone();
         let url = self_.url.clone();
@@ -568,6 +584,7 @@ impl PyChidori {
         })
     }
 
+    /// Return a printable string representation of the current graph structure
     fn display_graph_structure<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>
@@ -592,6 +609,7 @@ impl PyChidori {
     // TODO: list registered graphs should not stream
     // TODO: add a message that sends the current graph state
 
+    /// Lists all registered graphs
     fn list_registered_graphs<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>
@@ -607,6 +625,7 @@ impl PyChidori {
         })
     }
 
+    /// List all pending events
     fn list_input_proposals<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
@@ -635,6 +654,7 @@ impl PyChidori {
     // }
 
     // TODO: this is a successful callback example
+    /// List all modifications of the event log
     fn list_change_events<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
@@ -658,6 +678,7 @@ impl PyChidori {
         })
     }
 
+    /// Register a named reference to a function to later be executed as a graph node
     pub fn register_custom_node_handle<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
@@ -692,6 +713,7 @@ impl PyChidori {
         })
     }
 
+    /// Iteraviely triggers the execution of nodes
     fn run_custom_node_loop<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
@@ -733,6 +755,7 @@ struct PyGraphBuilder {
 #[pymethods]
 impl PyGraphBuilder {
 
+    /// Creates a new graph builder instance
     #[new]
     fn new() -> Self {
         let g = GraphBuilder::new();
@@ -742,6 +765,7 @@ impl PyGraphBuilder {
     }
 
     // https://github.com/PyO3/pyo3/issues/525
+    /// Defines a new node that will execute a python function that has been registered under a custom node handle name
     #[pyo3(signature = (name=String::new(), triggers=vec!["None".to_string()], output_tables=vec![], output=String::from("{}"), node_type_name=String::new()))]
     fn custom_node<'a>(
         mut self_: PyRefMut<'_, Self>,
@@ -766,6 +790,7 @@ impl PyGraphBuilder {
         })
     }
 
+    /// Define a node that executes javascript code
     #[pyo3(signature = (name=String::new(), triggers=vec!["None".to_string()], output_tables=None, output=None, code=String::new(), is_template=None))]
     fn deno_code_node<'a>(
         mut self_: PyRefMut<'_, Self>,
@@ -792,7 +817,7 @@ impl PyGraphBuilder {
         })
     }
 
-
+    /// Define a node that performs an operation against a vectorDB
     #[pyo3(signature = (name=String::new(), triggers=vec!["None".to_string()], output_tables=vec![], output=String::from("{}"), template=String::new(), action="WRITE".to_string(), embedding_model="TEXT_EMBEDDING_ADA_002".to_string(), db_vendor="QDRANT".to_string(), collection_name=String::new()))]
     fn vector_memory_node<'a>(
         mut self_: PyRefMut<'_, Self>,
@@ -858,6 +883,7 @@ impl PyGraphBuilder {
 
     // TODO: nodes that are added should return a clean definition of what their addition looks like
     // TODO: adding a node should also display any errors
+    /// Define a node that triggers an API call against an existing language model
     #[pyo3(signature = (name=String::new(), triggers=vec!["None".to_string()], output_tables=None, template=String::new(), model=None))]
     fn prompt_node<'a>(
         mut self_: PyRefMut<'_, Self>,
@@ -882,6 +908,7 @@ impl PyGraphBuilder {
         })
     }
 
+    /// Commit the current graph to the runtime
     fn commit<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
@@ -900,6 +927,7 @@ impl PyGraphBuilder {
         })
     }
 
+    /// Serialize the current graph to yaml
     fn serialize_yaml<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>
