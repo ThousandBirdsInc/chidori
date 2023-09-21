@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use crate::db_operations;
 use crate::db_operations::{PROMPT_COUNTER_PREFIX, PROMPT_LIBRARY_MUTATION_PREFIX};
 use prost::Message;
-use prompt_graph_core::proto2::{PromptLibraryRecord, UpsertPromptLibraryRecord};
+use prompt_graph_core::proto::{PromptLibraryRecord, UpsertPromptLibraryRecord};
 
 
 fn prompt_counter_prefix() -> Vec<u8> {

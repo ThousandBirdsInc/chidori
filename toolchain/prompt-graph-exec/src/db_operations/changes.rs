@@ -3,7 +3,7 @@ use std::collections;
 use crate::db_operations;
 use crate::db_operations::{CHANGE_PENDING_PREFIX, CHANGE_RESOLVED_PREFIX};
 use prost::Message;
-use prompt_graph_core::proto2::{ChangeValueWithCounter};
+use prompt_graph_core::proto::{ChangeValueWithCounter};
 
 
 // =================

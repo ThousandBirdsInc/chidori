@@ -18,6 +18,8 @@
       <excludeFolder url="file://$MODULE_DIR$/prompt-graph-exec/target" />
       <excludeFolder url="file://$MODULE_DIR$/rust-simple/target" />
       <excludeFolder url="file://$MODULE_DIR$/venv" />
+      <excludeFolder url="file://$MODULE_DIR$/.venv" />
+      <excludeFolder url="file://$MODULE_DIR$/.devenv" />
     </content>
     <orderEntry type="jdk" jdkName="Python 3.10 (chidori)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />

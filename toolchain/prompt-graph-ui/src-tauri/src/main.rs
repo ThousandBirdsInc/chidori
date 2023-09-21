@@ -1,6 +1,7 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr( all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows" )]
 
+// https://rfdonnelly.github.io/posts/tauri-async-rust-process/
 
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -11,8 +12,8 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tracing::info;
 use tracing_subscriber;
-use prompt_graph_core::proto2::{ChangeValue, ChangeValueWithCounter, Empty, ListRegisteredGraphsResponse, NodeWillExecuteOnBranch, Path, RequestOnlyId, SerializedValue};
-use prompt_graph_core::proto2::execution_runtime_client::ExecutionRuntimeClient;
+use prompt_graph_core::proto::{ChangeValue, ChangeValueWithCounter, Empty, ListRegisteredGraphsResponse, NodeWillExecuteOnBranch, Path, RequestOnlyId, SerializedValue};
+use prompt_graph_core::proto::execution_runtime_client::ExecutionRuntimeClient;
 use prompt_graph_core::utils::serialized_value_to_string;
 use prost::Message;
 
@@ -158,19 +159,6 @@ fn main() {
         .expect("error while running tauri application");
 }
 
-// #[tauri::command]
-// async fn js2rs(
-//     message: String,
-//     state: tauri::State<'_, AppState>,
-// ) -> Result<(), String> {
-//     info!(?message, "js2rs");
-//     let async_proc_input_tx = state.async_proc_input_tx.lock().await;
-//     async_proc_input_tx
-//         .send(message)
-//         .await
-//         .map_err(|e| e.to_string())
-// }
-
 
 #[tauri::command]
 async fn list_files(
@@ -189,11 +177,8 @@ async fn list_files(
 async fn get_initial_state(
     state: tauri::State<'_, AppState>,
 ) -> Result<SerializedState, String> {
-    // info!(?message, "get_current_changes");
-
     let changes = state.changes.lock().await;
     let events = state.node_will_execute_events.lock().await;
-
     Ok(SerializedState {
         change_events: changes.deref().iter().map(|x| (x.monotonic_counter, x.encode_to_vec())).collect(),
         node_will_execute_events: events.deref().iter().map(|x| (x.counter, x.encode_to_vec())).collect(),

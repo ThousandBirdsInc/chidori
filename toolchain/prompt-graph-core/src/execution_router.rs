@@ -1,5 +1,5 @@
 use crate::build_runtime_graph::graph_parse::CleanedDefinitionGraph;
-use crate::proto2::{ChangeValue, ChangeValueWithCounter, DispatchResult, NodeWillExecute, WrappedChangeValue};
+use crate::proto::{ChangeValue, ChangeValueWithCounter, DispatchResult, NodeWillExecute, WrappedChangeValue};
 
 pub trait ExecutionState {
     fn get_count_node_execution(&self, node: &[u8]) -> Option<u64>;
@@ -126,10 +126,10 @@ pub fn dispatch_and_mutate_state(
 
 #[cfg(test)]
 mod tests {
-    use crate::proto2::{File, item, Item, ItemCore, OutputType, Path, PromptGraphNodeEcho, Query, SerializedValue};
+    use crate::proto::{File, item, Item, ItemCore, OutputType, Path, PromptGraphNodeEcho, Query, SerializedValue};
     use crate::graph_definition::DefinitionGraph;
     use std::collections::HashMap;
-    use crate::proto2::serialized_value::Val;
+    use crate::proto::serialized_value::Val;
 
     use super::*;
 

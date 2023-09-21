@@ -15,7 +15,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::{Parser, ParserError};
 
 use crate::graph_definition::DefinitionGraph;
-use crate::proto2::{File, Item, item as dsl_item};
+use crate::proto::{File, Item, item as dsl_item};
 
 
 
@@ -582,7 +582,7 @@ mod tests {
     use indoc::indoc;
 
     use crate::graph_definition::{create_code_node, SourceNodeType};
-    use crate::proto2::Query;
+    use crate::proto::Query;
 
     use super::*;
 

@@ -1,6 +1,6 @@
 use crate::db_operations;
 use crate::db_operations::BRANCH_PREFIX;
-use prompt_graph_core::proto2::{Branch, DivergentBranch};
+use prompt_graph_core::proto::{Branch, DivergentBranch};
 use prost::Message;
 
 

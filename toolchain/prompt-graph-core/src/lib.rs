@@ -1,15 +1,13 @@
 extern crate protobuf;
 
-
-use crate::proto2::{ChangeValue, Path, SerializedValue};
-use crate::proto2::serialized_value::Val;
+use crate::proto::{ChangeValue, Path, SerializedValue};
+use crate::proto::serialized_value::Val;
 pub mod graph_definition;
 pub mod execution_router;
 pub mod utils;
 pub mod templates;
-pub mod proto2;
+pub mod proto;
 pub mod build_runtime_graph;
-mod reactivity;
 
 
 /// Our local server implementation is an extension of this. Implementing support for multiple

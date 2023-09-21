@@ -2,9 +2,9 @@ use anyhow::anyhow;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
-use crate::proto2 as dsl;
-use crate::proto2::{ItemCore, Query};
-use crate::proto2::prompt_graph_node_loader::LoadFrom;
+use crate::proto as dsl;
+use crate::proto::{ItemCore, Query};
+use crate::proto::prompt_graph_node_loader::LoadFrom;
 
 /// Maps a string to a supported vector database type
 fn map_string_to_vector_database(encoding: &str) -> anyhow::Result<dsl::SupportedVectorDatabase> {

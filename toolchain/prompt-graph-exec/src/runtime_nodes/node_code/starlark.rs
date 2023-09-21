@@ -1,6 +1,6 @@
 use deno_core::serde_json;
 use deno_core::serde_json::Value;
-use prompt_graph_core::proto2::{ChangeValue, PromptGraphNodeCodeSourceCode};
+use prompt_graph_core::proto::{ChangeValue, PromptGraphNodeCodeSourceCode};
 use prompt_graph_core::templates::render_template_prompt;
 use starlark::syntax::{AstModule, Dialect};
 use starlark::environment::{Globals, Module as StarlarkModule};
@@ -30,8 +30,8 @@ pub fn source_code_run_starlark(c: &PromptGraphNodeCodeSourceCode, change_set: &
 mod tests {
     use protobuf::EnumOrUnknown;
     use indoc::indoc;
-    use prompt_graph_core::proto2::prompt_graph_node_code::Source::SourceCode;
-    use prompt_graph_core::proto2::{PromptGraphNodeCode, PromptGraphNodeCodeSourceCode, SupportedSourceCodeLanguages};
+    use prompt_graph_core::proto::prompt_graph_node_code::Source::SourceCode;
+    use prompt_graph_core::proto::{PromptGraphNodeCode, PromptGraphNodeCodeSourceCode, SupportedSourceCodeLanguages};
     use crate::runtime_nodes::node_code::node::execute_node_code;
     use super::*;
 

@@ -16,8 +16,8 @@ use tonic::{Request, Response, Status, transport::Server};
 
 
 
-use prompt_graph_core::proto2::{ChangeValueWithCounter, Empty, ExecutionStatus, File, FileAddressedChangeValueWithCounter, FilteredPollNodeWillExecuteEventsRequest, InputProposal, ListBranchesRes, ListRegisteredGraphsResponse, NodeWillExecuteOnBranch, ParquetFile, QueryAtFrame, QueryAtFrameResponse, RequestAckNodeWillExecuteEvent, RequestAtFrame, RequestFileMerge, RequestInputProposalResponse, RequestListBranches, RequestNewBranch, RequestOnlyId, RespondPollNodeWillExecuteEvents, UpsertPromptLibraryRecord};
-use prompt_graph_core::proto2::execution_runtime_server::{ExecutionRuntime, ExecutionRuntimeServer};
+use prompt_graph_core::proto::{ChangeValueWithCounter, Empty, ExecutionStatus, File, FileAddressedChangeValueWithCounter, FilteredPollNodeWillExecuteEventsRequest, InputProposal, ListBranchesRes, ListRegisteredGraphsResponse, NodeWillExecuteOnBranch, ParquetFile, QueryAtFrame, QueryAtFrameResponse, RequestAckNodeWillExecuteEvent, RequestAtFrame, RequestFileMerge, RequestInputProposalResponse, RequestListBranches, RequestNewBranch, RequestOnlyId, RespondPollNodeWillExecuteEvents, UpsertPromptLibraryRecord};
+use prompt_graph_core::proto::execution_runtime_server::{ExecutionRuntime, ExecutionRuntimeServer};
 
 use log::debug;
 
@@ -241,7 +241,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
 
     /// List all of the graphs registered by ID with this execution runtime
     #[tracing::instrument]
-    async fn list_registered_graphs(&self, request: tonic::Request<prompt_graph_core::proto2::Empty>) -> Result<Response<ListRegisteredGraphsResponse>, Status> {
+    async fn list_registered_graphs(&self, request: tonic::Request<prompt_graph_core::proto::Empty>) -> Result<Response<ListRegisteredGraphsResponse>, Status> {
         debug!("Received list_registered_graphs request: {:?}", request);
         let root_tree = self.get_tree("root");
         Ok(Response::new(ListRegisteredGraphsResponse {

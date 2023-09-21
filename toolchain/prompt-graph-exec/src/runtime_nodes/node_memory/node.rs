@@ -2,7 +2,7 @@ use std::collections::{HashMap};
 use base64::{Engine as _};
 use anyhow::Result;
 use openai_api_rs::v1::api::Client;
-use prompt_graph_core::proto2::{ChangeValue, ChangeValueWithCounter, InputProposal, item, ItemCore, MemoryAction, NodeWillExecute, Path, PromptGraphNodeMemory, SupportedEmebddingModel, SupportedVectorDatabase};
+use prompt_graph_core::proto::{ChangeValue, ChangeValueWithCounter, InputProposal, item, ItemCore, MemoryAction, NodeWillExecute, Path, PromptGraphNodeMemory, SupportedEmebddingModel, SupportedVectorDatabase};
 use prompt_graph_core::templates::render_template_prompt;
 use std::env;
 use openai_api_rs::v1::embedding::EmbeddingRequest;
@@ -15,8 +15,8 @@ use qdrant_client::qdrant::{
     CreateCollection, SearchPoints, VectorParams,
 };
 use prompt_graph_core::create_change_value;
-use prompt_graph_core::proto2::prompt_graph_node_memory::{EmbeddingModel, VectorDbProvider};
-use prompt_graph_core::proto2::serialized_value::Val;
+use prompt_graph_core::proto::prompt_graph_node_memory::{EmbeddingModel, VectorDbProvider};
+use prompt_graph_core::proto::serialized_value::Val;
 use crate::executor::NodeExecutionContext;
 
 
@@ -203,7 +203,7 @@ pub async fn initialize_node_memory_init(n: &PromptGraphNodeMemory, _core: &Item
 #[cfg(test)]
 mod tests {
     use prompt_graph_core::graph_definition::create_vector_memory_node;
-    use prompt_graph_core::proto2::item;
+    use prompt_graph_core::proto::item;
     use anyhow::Result;
     use super::*;
 

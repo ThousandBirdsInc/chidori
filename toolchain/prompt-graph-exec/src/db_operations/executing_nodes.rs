@@ -2,7 +2,7 @@ use crate::db_operations;
 use crate::db_operations::{WILL_EXEC_COMPLETE_PREFIX, WILL_EXEC_IN_PROGRESS_PREFIX, WILL_EXEC_PENDING_PREFIX};
 use prost::Message;
 use sled::{Subscriber};
-use prompt_graph_core::proto2::NodeWillExecuteOnBranch;
+use prompt_graph_core::proto::NodeWillExecuteOnBranch;
 
 
 
@@ -102,7 +102,7 @@ pub fn subscribe_to_will_execute_events_by_name(tree: &sled::Tree) -> Subscriber
 #[cfg(test)]
 mod tests {
     use sled::Config;
-    use prompt_graph_core::proto2::{NodeWillExecute, NodeWillExecuteOnBranch};
+    use prompt_graph_core::proto::{NodeWillExecute, NodeWillExecuteOnBranch};
     use crate::db_operations::executing_nodes::insert_will_execute;
 
     #[test]

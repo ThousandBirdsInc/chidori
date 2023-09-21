@@ -1,6 +1,6 @@
 use deno_core::serde_json::Value;
 use deno_core::{FastString, JsRuntime, RuntimeOptions, serde_json, serde_v8, v8};
-use prompt_graph_core::proto2::{ChangeValue};
+use prompt_graph_core::proto::{ChangeValue};
 
 
 pub fn source_code_run_deno(source_code: String, _change_set: &Vec<ChangeValue>) -> Option<Value> {
@@ -39,8 +39,8 @@ mod tests {
     use protobuf::EnumOrUnknown;
     use indoc::indoc;
     use sled::Config;
-    use prompt_graph_core::proto2::prompt_graph_node_code::Source::SourceCode;
-    use prompt_graph_core::proto2::{item, ItemCore, NodeWillExecute, NodeWillExecuteOnBranch, PromptGraphNodeCode, PromptGraphNodeCodeSourceCode, SupportedSourceCodeLanguages};
+    use prompt_graph_core::proto::prompt_graph_node_code::Source::SourceCode;
+    use prompt_graph_core::proto::{item, ItemCore, NodeWillExecute, NodeWillExecuteOnBranch, PromptGraphNodeCode, PromptGraphNodeCodeSourceCode, SupportedSourceCodeLanguages};
     use crate::executor::NodeExecutionContext;
     use crate::runtime_nodes::node_code::node::execute_node_code;
     use super::*;

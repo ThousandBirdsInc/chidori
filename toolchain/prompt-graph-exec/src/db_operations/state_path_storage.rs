@@ -3,7 +3,7 @@ use std::hash::Hasher;
 use crate::db_operations;
 use crate::db_operations::{branches, STATE_EXEC_COUNTER_LOOKUP_PREFIX, STATE_EXEC_COUNTER_PREFIX, STATE_PATH_LOOKUP_PREFIX, STATE_PREFIX};
 use prost::Message;
-use prompt_graph_core::proto2::{ChangeValue};
+use prompt_graph_core::proto::{ChangeValue};
 
 // =================
 // Handling interactions with the internal state of our execution
