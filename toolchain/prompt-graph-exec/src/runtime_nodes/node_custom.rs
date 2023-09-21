@@ -1,4 +1,4 @@
-use prompt_graph_core::proto2::{ChangeValue, item, NodeWillExecuteOnBranch, Path};
+use prompt_graph_core::proto::{ChangeValue, item, NodeWillExecuteOnBranch, Path};
 use crate::db_operations::custom_node_execution::get_custom_node_execution;
 
 use crate::executor::NodeExecutionContext;

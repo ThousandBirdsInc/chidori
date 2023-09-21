@@ -1,5 +1,5 @@
-use crate::proto2::serialized_value::Val;
-use crate::proto2::SerializedValue;
+use crate::proto::serialized_value::Val;
+use crate::proto::SerializedValue;
 
 
 pub mod wasm_error;

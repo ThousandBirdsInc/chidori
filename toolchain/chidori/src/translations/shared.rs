@@ -1,6 +1,6 @@
 use serde_json::Value as JsonValue;
 use std::collections::VecDeque;
-use prompt_graph_core::proto2::SerializedValue;
+use prompt_graph_core::proto::SerializedValue;
 use prompt_graph_core::templates::json_value_to_serialized_value;
 
 pub fn json_value_to_paths(

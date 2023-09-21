@@ -1,25 +1,13 @@
 #!/bin/bash
 
-# Working directory
-working_directory="chidori"
+INITIAL_DIR=$(pwd)
+GIT_ROOT=$(git rev-parse --show-toplevel)
 
 # Node versions to test
 node_versions=(16 18 19 20)
 
-# System target
-os="macos-11"
-target="arm64-apple-darwin"
-
 # Get the release version from the last git tag
-release_version=$(git describe --tags $(git rev-list --tags --max-count=1))
-
-# Get release version from args
-if [ $# -eq 1 ]; then
-  release_version=$1
-fi
-
-# Set the release version as environment variable
-export RELEASE_VERSION=$release_version
+RELEASE_VERSION=$(python3 $GIT_ROOT/toolchain/scripts/get_target_version.py)
 
 # Iterate over Node versions
 for node_version in "${node_versions[@]}"; do
@@ -30,7 +18,7 @@ for node_version in "${node_versions[@]}"; do
   nvm use $node_version
 
   # Install dependencies
-  cd $working_directory
+  cd "$GIT_ROOT/toolchain/chidori" || exit
   yarn install
 
   # Tweak package.json
@@ -43,9 +31,8 @@ for node_version in "${node_versions[@]}"; do
   npx node-pre-gyp package
 
   # Upload to Github releases
-  gh release upload $RELEASE_VERSION $(find ./build -name *.tar.gz) --clobber
+  gh release upload "$RELEASE_VERSION" "$(find $GIT_ROOT/toolchain/chidori/build -name chidori-$RELEASE_VERSION-*.tar.gz)" --clobber
 
 done
 
-# Publish to npm
-npm publish --access public
+cd "$INITIAL_DIR" || exit

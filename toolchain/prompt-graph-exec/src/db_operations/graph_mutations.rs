@@ -1,7 +1,7 @@
 use std::collections;
 use log::debug;
 use prost::Message;
-use prompt_graph_core::proto2::File;
+use prompt_graph_core::proto::File;
 
 use crate::db_operations;
 use crate::db_operations::{GRAPH_MUTATION_PENDING_PREFIX, GRAPH_MUTATION_RESOLVED_PREFIX};

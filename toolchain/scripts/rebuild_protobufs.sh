@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-cd ../prompt-graph-core
+INITIAL_DIR=$(pwd)
+GIT_ROOT=$(git rev-parse --show-toplevel)
+
+cd "${GIT_ROOT}/toolchain/prompt-graph-core"
 cargo build --features build-protos
-cd -
+cd "${INITIAL_DIR}"

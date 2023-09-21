@@ -1,14 +1,14 @@
 
 
-use prompt_graph_core::proto2::{ChangeValue, item};
+use prompt_graph_core::proto::{ChangeValue, item};
 
 
 use std::io::{Cursor, Read};
 
 
-use prompt_graph_core::proto2::prompt_graph_node_loader::LoadFrom;
+use prompt_graph_core::proto::prompt_graph_node_loader::LoadFrom;
 use zip;
-use prompt_graph_core::proto2::serialized_value::Val;
+use prompt_graph_core::proto::serialized_value::Val;
 use anyhow::Result;
 use crate::executor::NodeExecutionContext;
 
@@ -70,8 +70,8 @@ mod tests {
     use std::fs::File;
     use protobuf::EnumOrUnknown;
     use indoc::indoc;
-    use prompt_graph_core::proto2::prompt_graph_node_code::Source::SourceCode;
-    use prompt_graph_core::proto2::{ItemCore, NodeWillExecute, PromptGraphNodeCode, PromptGraphNodeCodeSourceCode, SupportedSourceCodeLanguages};
+    use prompt_graph_core::proto::prompt_graph_node_code::Source::SourceCode;
+    use prompt_graph_core::proto::{ItemCore, NodeWillExecute, PromptGraphNodeCode, PromptGraphNodeCodeSourceCode, SupportedSourceCodeLanguages};
     use crate::runtime_nodes::node_loader::node::execute_node_loader;
     use super::*;
 

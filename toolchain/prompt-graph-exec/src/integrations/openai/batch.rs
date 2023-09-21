@@ -13,7 +13,7 @@ use openai_api_rs::v1::chat_completion::{
 };
 use openai_api_rs::v1::error::APIError;
 
-use prompt_graph_core::proto2::{PromptGraphNodePrompt, SupportedChatModel};
+use prompt_graph_core::proto::{PromptGraphNodePrompt, SupportedChatModel};
 
 
 pub async fn chat_completion(_n: &PromptGraphNodePrompt, openai_model: SupportedChatModel, templated_string: String) -> Result<ChatCompletionResponse, APIError> {

@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 
 
 def get_git_repo_root():
@@ -21,6 +22,8 @@ def get_version_from_cargo_toml(repo_root):
 if __name__ == "__main__":
     repo_root = get_git_repo_root()
     tag = get_version_from_cargo_toml(repo_root)
-    print('ARTIFACT_VERSION=v' + tag)
-    with open(os.environ['GITHUB_ENV'], 'a') as f:
-        f.write('ARTIFACT_VERSION=v' + tag)
+    if os.environ.get('GITHUB_ENV'):
+        with open(os.environ['GITHUB_ENV'], 'a') as f:
+            f.write('ARTIFACT_VERSION=v' + tag)
+    sys.stdout.write('v' + tag)
+    sys.exit(0)

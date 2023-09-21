@@ -1,6 +1,6 @@
 
-use prompt_graph_core::proto2::{ChangeValue, item};
-use prompt_graph_core::proto2::serialized_value::Val;
+use prompt_graph_core::proto::{ChangeValue, item};
+use prompt_graph_core::proto::serialized_value::Val;
 use crate::executor::NodeExecutionContext;
 
 

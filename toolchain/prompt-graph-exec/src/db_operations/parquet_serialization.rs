@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use arrow::datatypes::{DataType, Field, Schema};
-use prompt_graph_core::proto2::{Branch, ChangeValueWithCounter, File, InputProposal, RequestInputProposalResponse, NodeWillExecuteOnBranch};
+use prompt_graph_core::proto::{Branch, ChangeValueWithCounter, File, InputProposal, RequestInputProposalResponse, NodeWillExecuteOnBranch};
 use std::sync::Arc;
 use arrow::array::{BinaryBuilder, ListBuilder, StringBuilder, UInt64Builder};
 use arrow::record_batch::RecordBatch;
@@ -458,7 +458,7 @@ pub fn serialize_to_parquet(tree: &sled::Tree, relative_path_directory: PathBuf)
 mod tests {
     use std::process::Output;
     use sled::Config;
-    use prompt_graph_core::proto2::{ChangeValue, ChangeValueWithCounter, File, InputProposal, Item, item, ItemCore, NodeWillExecute, NodeWillExecuteOnBranch, OutputType, Path, Query, RequestInputProposalResponse, serialized_value, SerializedValue};
+    use prompt_graph_core::proto::{ChangeValue, ChangeValueWithCounter, File, InputProposal, Item, item, ItemCore, NodeWillExecute, NodeWillExecuteOnBranch, OutputType, Path, Query, RequestInputProposalResponse, serialized_value, SerializedValue};
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use crate::db_operations::update_change_counter_for_branch;
     use crate::db_operations::branches::{create_branch, create_root_branch};
@@ -508,7 +508,7 @@ mod tests {
                         }),
                         
                     }),
-                    item: Some(item::Item::NodeEcho(prompt_graph_core::proto2::PromptGraphNodeEcho {
+                    item: Some(item::Item::NodeEcho(prompt_graph_core::proto::PromptGraphNodeEcho {
                     })),
                 }
 

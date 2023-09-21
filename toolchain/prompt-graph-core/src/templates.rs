@@ -9,8 +9,8 @@ use serde_json::value::{Map as JsonMap};
 
 
 use anyhow::{Result};
-use crate::proto2::serialized_value::Val;
-use crate::proto2::{ChangeValue, PromptLibraryRecord, SerializedValue, SerializedValueArray, SerializedValueObject};
+use crate::proto::serialized_value::Val;
+use crate::proto::{ChangeValue, PromptLibraryRecord, SerializedValue, SerializedValueArray, SerializedValueObject};
 
 
 // https://github.com/microsoft/guidance
@@ -228,7 +228,7 @@ pub fn render_template_prompt(template_str: &str, query_paths: &Vec<ChangeValue>
 mod tests {
     use serde_json::json;
     use crate::create_change_value;
-    use crate::proto2::UpsertPromptLibraryRecord;
+    use crate::proto::UpsertPromptLibraryRecord;
     use super::*;
     use crate::templates::validate_template;
 

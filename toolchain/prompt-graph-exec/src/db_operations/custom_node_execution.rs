@@ -3,7 +3,7 @@ use crate::db_operations;
 use crate::db_operations::{CUSTOM_NODE_EXECUTION_PREFIX};
 use prost::Message;
 
-use prompt_graph_core::proto2::ChangeValueWithCounter;
+use prompt_graph_core::proto::ChangeValueWithCounter;
 
 fn custom_node_execution_prefix(branch: u64, counter: u64) -> Vec<u8> {
     db_operations::encode_into_slice((CUSTOM_NODE_EXECUTION_PREFIX, branch, counter)).unwrap()

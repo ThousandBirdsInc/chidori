@@ -1,6 +1,6 @@
 {
   "name": "@1kbirds/chidori",
-  "version": "0.1.24",
+  "version": "v0.1.26",
   "description": "Chidori is a library for building and running reactive AI agents.",
   "main": "package_node/index.js",
   "scripts": {

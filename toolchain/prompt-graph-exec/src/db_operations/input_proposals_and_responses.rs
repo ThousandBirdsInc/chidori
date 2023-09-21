@@ -1,7 +1,7 @@
 use crate::db_operations;
 use crate::db_operations::{changes, INPUT_PROPOSAL_PREFIX, INPUT_RESPONSE_PREFIX};
 use prost::Message;
-use prompt_graph_core::proto2::{ChangeValueWithCounter, InputProposal, RequestInputProposalResponse};
+use prompt_graph_core::proto::{ChangeValueWithCounter, InputProposal, RequestInputProposalResponse};
 
 /// Input proposals are stored here until they are resolved by input responses
 fn input_proposal_prefix(branch: u64, s: String, counter: u64) -> Vec<u8> {

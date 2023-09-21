@@ -16,6 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Builds the native binary and uploads it to GitHub releases.
   nodejs-github-native:
     permissions: write-all
     name: nodejs-${{ matrix.node_version }}-${{ matrix.system.target }}-${{ matrix.system.os }}
@@ -44,6 +45,7 @@ jobs:
       - uses: actions/checkout@v3
         with:
           ref: ${{ github.event.release.tag_name }}
+      # Set the release version based on what we've specified in the workspace Cargo.toml
       - name: Set release version
         run: python3 ../scripts/get_target_version.py
       - uses: actions/setup-node@v3
@@ -65,28 +67,27 @@ jobs:
       - name: Install modules
         working-directory: toolchain/chidori
         run: yarn install
+      # Update the package version to tag version. So artifacts uploaded to GitHub release will be named correctly.
       - name: Tweak package.json
         working-directory: toolchain/chidori
-        # This will update the package version to tag version. So artifacts uploaded to Github release will be named correctly.
         run: python3 -c "import os; import json; p = json.load(open('package.json')); p['version'] = os.environ['ARTIFACT_VERSION']; json.dump(p, open('package.json', 'w'), indent=2, ensure_ascii=False);"
-      - name: Show package.json
-        working-directory: toolchain/chidori
-        run: cat package.json
+      # Install the rust toolchain
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
           toolchain: stable
           target: ${{ matrix.system.target }}
           override: true
-
+      # Build the native release package
       - name: Build native
         working-directory: toolchain/chidori
         run: yarn run build-release
+      # Make a node-pre-gyp package using the native binary
       - name: Package the asset
         working-directory: toolchain/chidori
-        # This will make a node-pre-gyp package.
         run: npx node-pre-gyp package
-      - name: Upload to Github releases
+      # Upload the native binary to GitHub releases, a release must be created first
+      - name: Upload to GitHub releases
         working-directory: toolchain/chidori
         # Use bash, even on Windows to make find available
         shell: bash
@@ -96,15 +97,17 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 
+  # Ships a GitHub release to the NPM registry
   nodejs-npm:
     name: nodejs-npm
     runs-on: ubuntu-latest
-    # Prevent a situation where native build fails and an npm package is uploaded.
+    # Require a successful native build before releasing to NPM.
     needs: [ nodejs-github-native ]
     steps:
       - uses: actions/checkout@v3
         with:
           ref: ${{ github.event.release.tag_name }}
+      # Set the release version based on what we've specified in the workspace Cargo.toml
       - name: Set release version
         run: python3 ../scripts/get_target_version.py
       - uses: actions/setup-node@v3
@@ -117,9 +120,9 @@ jobs:
         run: yarn install
       - name: Tweak package.json
         working-directory: toolchain/chidori
-        # This will update the package version to tag version and
-        # add an install script in package.json so users who `npm i` this package
-        # will trigger the node-pre-gyp to pull the os and arch specific binary.
+        # This will update the package version to tag version
+        # This will also add an installation script in package.json so users who `npm i` this package
+        # will trigger node-pre-gyp to pull the os and arch specific binary.
         run: python3 -c "import os; import json; p = json.load(open('package.json')); p['scripts']['install'] = 'node-pre-gyp install'; p['version'] = os.environ['ARTIFACT_VERSION'].replace('v', ''); json.dump(p, open('package.json', 'w'), indent=2, ensure_ascii=False);"
       - name: Show package.json
         working-directory: toolchain/chidori
