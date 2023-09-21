@@ -3,6 +3,8 @@ name: Node.js - Test & Publish Package
 on:
   workflow_dispatch:
   push:
+    branches:
+      - colton/improved-examples-and-releases
     tags:
       - 'v*'
 
@@ -98,40 +100,40 @@ jobs:
 
 
   # Ships a GitHub release to the NPM registry
-  nodejs-npm:
-    name: nodejs-npm
-    runs-on: ubuntu-latest
-    # Require a successful native build before releasing to NPM.
-    needs: [ nodejs-github-native ]
-    steps:
-      - uses: actions/checkout@v3
-        with:
-          ref: ${{ github.event.release.tag_name }}
-      # Set the release version based on what we've specified in the workspace Cargo.toml
-      - name: Set release version
-        run: python3 ../scripts/get_target_version.py
-      - uses: actions/setup-node@v3
-        with:
-          node-version: ${{ matrix.node_version }}
-          # Url is important! This makes NODE_AUTH_TOKEN accessible to npm publish.
-          registry-url: 'https://registry.npmjs.org'
-      - name: Install modules
-        working-directory: toolchain/chidori
-        run: yarn install
-      - name: Tweak package.json
-        working-directory: toolchain/chidori
-        # This will update the package version to tag version
-        # This will also add an installation script in package.json so users who `npm i` this package
-        # will trigger node-pre-gyp to pull the os and arch specific binary.
-        run: python3 -c "import os; import json; p = json.load(open('package.json')); p['scripts']['install'] = 'node-pre-gyp install'; p['version'] = os.environ['ARTIFACT_VERSION'].replace('v', ''); json.dump(p, open('package.json', 'w'), indent=2, ensure_ascii=False);"
-      - name: Show package.json
-        working-directory: toolchain/chidori
-        run: cat package.json
-      - name: Publish to npm
-        working-directory: toolchain/chidori
-        # `--access public` is used to publish to my account's scope.
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-
+#  nodejs-npm:
+#    name: nodejs-npm
+#    runs-on: ubuntu-latest
+#    # Require a successful native build before releasing to NPM.
+#    needs: [ nodejs-github-native ]
+#    steps:
+#      - uses: actions/checkout@v3
+#        with:
+#          ref: ${{ github.event.release.tag_name }}
+#      # Set the release version based on what we've specified in the workspace Cargo.toml
+#      - name: Set release version
+#        run: python3 ../scripts/get_target_version.py
+#      - uses: actions/setup-node@v3
+#        with:
+#          node-version: ${{ matrix.node_version }}
+#          # Url is important! This makes NODE_AUTH_TOKEN accessible to npm publish.
+#          registry-url: 'https://registry.npmjs.org'
+#      - name: Install modules
+#        working-directory: toolchain/chidori
+#        run: yarn install
+#      - name: Tweak package.json
+#        working-directory: toolchain/chidori
+#        # This will update the package version to tag version
+#        # This will also add an installation script in package.json so users who `npm i` this package
+#        # will trigger node-pre-gyp to pull the os and arch specific binary.
+#        run: python3 -c "import os; import json; p = json.load(open('package.json')); p['scripts']['install'] = 'node-pre-gyp install'; p['version'] = os.environ['ARTIFACT_VERSION'].replace('v', ''); json.dump(p, open('package.json', 'w'), indent=2, ensure_ascii=False);"
+#      - name: Show package.json
+#        working-directory: toolchain/chidori
+#        run: cat package.json
+#      - name: Publish to npm
+#        working-directory: toolchain/chidori
+#        # `--access public` is used to publish to my account's scope.
+#        run: npm publish --access public
+#        env:
+#          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+#
+#

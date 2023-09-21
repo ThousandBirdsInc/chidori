@@ -3,6 +3,8 @@ name: Rust - Test & Publish Package
 on:
   workflow_dispatch:
   push:
+    branches:
+      - colton/improved-examples-and-releases
     tags:
       - 'v*'
 
