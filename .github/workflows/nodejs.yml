@@ -87,7 +87,7 @@ jobs:
       # Make a node-pre-gyp package using the native binary
       - name: Package the asset
         working-directory: toolchain/chidori
-        run: npx node-pre-gyp package
+        run: npx @mapbox/node-pre-gyp package
       # Upload the native binary to GitHub releases, a release must be created first
       - name: Upload to GitHub releases
         working-directory: toolchain/chidori
