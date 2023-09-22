@@ -94,7 +94,7 @@ jobs:
         # Use bash, even on Windows to make find available
         shell: bash
         # A release needs to be created before upload
-        run: gh release upload ${{ env.ARTIFACT_VERSION }} "$(find ./build -name *.tar.gz)" --clobber
+        run: gh release upload ${{ env.ARTIFACT_VERSION }} "$(find ./build -name *.tar.gz)"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
