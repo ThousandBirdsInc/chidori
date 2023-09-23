@@ -32,11 +32,11 @@ jobs:
           - 19
           - 20
         system:
-#          currently unsupported by github
-#          - os: macos-12-arm
-#            target: aarch64-apple-darwin
-          - os:
-            target: x86_64-apple-darwin
+          # Currently MacOS ARM is unsupported by GitHub:
+          # on an M1 Macbook Pro run ./toolchain/scripts/release_nodejs_packages.sh
+          #
+          # - os: macos-12-arm
+          #   target: aarch64-apple-darwin
           - os: macos-12
             target: x86_64-apple-darwin
           - os: ubuntu-20.04
