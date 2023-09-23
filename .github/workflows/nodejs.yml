@@ -35,11 +35,13 @@ jobs:
 #          currently unsupported by github
 #          - os: macos-12-arm
 #            target: aarch64-apple-darwin
+          - os:
+            target: x86_64-apple-darwin
           - os: macos-12
             target: x86_64-apple-darwin
           - os: ubuntu-20.04
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-20.04
+          - os: buildjet-4vcpu-ubuntu-2204-arm
             target: aarch64-unknown-linux-gnu
           - os: windows-2022
             target: x86_64-pc-windows-msvc
@@ -88,13 +90,18 @@ jobs:
       - name: Package the asset
         working-directory: toolchain/chidori
         run: npx @mapbox/node-pre-gyp package
+      # Confirm the released package names in our logs
+      - name: Log packaged assets
+        working-directory: toolchain/chidori
+        shell: bash
+        run: find ./build -name *.tar.gz
       # Upload the native binary to GitHub releases, a release must be created first
       - name: Upload to GitHub releases
         working-directory: toolchain/chidori
         # Use bash, even on Windows to make find available
         shell: bash
         # A release needs to be created before upload
-        run: gh release upload ${{ env.ARTIFACT_VERSION }} "$(find ./build -name *.tar.gz)"
+        run: gh release upload ${{ env.ARTIFACT_VERSION }} "$(find ./build -name *.tar.gz)" --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

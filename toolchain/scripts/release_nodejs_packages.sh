@@ -9,6 +9,9 @@ node_versions=(16 18 19 20)
 # Get the release version from the last git tag
 RELEASE_VERSION=$(python3 $GIT_ROOT/toolchain/scripts/get_target_version.py)
 
+# Ensure the target build output directory is empty
+rm -r "$GIT_ROOT/toolchain/chidori/build/"
+
 # Iterate over Node versions
 for node_version in "${node_versions[@]}"; do
 
@@ -31,8 +34,10 @@ for node_version in "${node_versions[@]}"; do
   npx node-pre-gyp package
 
   # Upload to Github releases
-  gh release upload "$RELEASE_VERSION" "$(find $GIT_ROOT/toolchain/chidori/build -name chidori-$RELEASE_VERSION-*.tar.gz)" --clobber
+  gh release upload "$RELEASE_VERSION" "$(find $GIT_ROOT/toolchain/chidori/build -name chidori-$RELEASE_VERSION-*.tar.gz)"
 
+  # Clean up
+  rm -r "$GIT_ROOT/toolchain/chidori/build/"
 done
 
 cd "$INITIAL_DIR" || exit
