@@ -26,8 +26,10 @@ jobs:
           override: true
       - name: Build and Test
         working-directory: toolchain
-        run: sudo apt-get install -y libgtk-3-dev libsoup-dev && cargo build --all && cargo test --all
-
+        run: |
+          sudo apt-get install -y libgtk-3-dev libsoup-3.0-dev 
+          cargo build --all 
+          cargo test --all
       - name: Publish prompt-graph-core
         working-directory: toolchain/prompt-graph-core
         run: cargo publish
