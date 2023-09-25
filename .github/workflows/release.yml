@@ -11,11 +11,9 @@ jobs:
       - name: Create artifacts directory
         run: mkdir artifacts
 
-      - name: Get the release version from the tag
+      - name: Set release version
         if: env.ARTIFACT_VERSION == ''
-        run: |
-          echo "ARTIFACT_VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
-          echo "version is: ${{ env.ARTIFACT_VERSION }}"
+        run: python3 ../scripts/get_target_version.py
 
       - name: Create GitHub release
         id: release
