@@ -472,7 +472,7 @@ mod tests {
             nodes: vec![Item{
                 core: Some(ItemCore {
                     name: "new_echo_node".to_string(),
-                    queries: vec![Query {
+                    triggers: vec![Query {
                         query: None,
                     }],
                     output: Some(OutputType {

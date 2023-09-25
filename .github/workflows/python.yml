@@ -20,6 +20,7 @@ jobs:
     strategy:
       matrix:
         target: [x86_64]
+#    if: ${{ github.ref == 'refs/heads/main' }}
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-python@v4
@@ -234,24 +235,24 @@ jobs:
 #        with:
 #          name: wheels
 #          path: toolchain/chidori/dist
-#  release:
-#    name: Release
-#    runs-on: ubuntu-latest
-#    needs:
-#      - python-macos
-#      - python-macos-universal
-#      - python-windows
-#      - python-linux
-##      - python-linux-cross
-##    if: ${{ github.ref == 'refs/heads/main' }}
-#    steps:
-#      - uses: actions/download-artifact@v3
-#        with:
-#          name: wheels
-#      - uses: actions/setup-python@v2
-#      - name: Publish to PyPi
-#        env:
-#          TWINE_USERNAME: __token__
-#          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-#        run: |
-#          pip install --upgrade twine upload --skip-existing *
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs:
+      - python-macos
+      - python-macos-universal
+      - python-windows
+      - python-linux
+#      - python-linux-cross
+    if: ${{ github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/download-artifact@v3
+        with:
+          name: wheels
+      - uses: actions/setup-python@v2
+      - name: Publish to PyPi
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          pip install --upgrade twine upload --skip-existing *

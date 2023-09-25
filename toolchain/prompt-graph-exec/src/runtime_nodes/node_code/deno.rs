@@ -80,7 +80,7 @@ mod tests {
             node_will_execute_on_branch: &nwe,
             item_core: &ItemCore {
                 name: "".to_string(),
-                queries: Default::default(),
+                triggers: Default::default(),
                 output: Default::default(),
                 output_tables: vec![]
             },
