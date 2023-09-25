@@ -12,7 +12,7 @@ env:
 jobs:
   publish:
     runs-on: ubuntu-latest
-
+#    if: ${{ github.ref == 'refs/heads/main' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
@@ -24,8 +24,9 @@ jobs:
           override: true
       - name: Build and Test
         working-directory: toolchain
-        run: cargo build --all && cargo test --all
-
+        run: |
+          cargo build --package prompt-graph-core --package prompt-graph-exec --package chidori
+          cargo test --package prompt-graph-core --package prompt-graph-exec --package chidori
       - name: Publish prompt-graph-core
         working-directory: toolchain/prompt-graph-core
         run: cargo publish

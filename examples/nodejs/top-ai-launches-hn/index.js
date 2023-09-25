@@ -42,7 +42,7 @@ class ChidoriWorker {
         const h = g.customNode({
             name: "FetchTopHN",
             nodeTypeName: "FetchTopHN",
-            output: "type FetchTopHN { output: String }"
+            output: "output: String"
         });
 
         const hInterpret = g.promptNode({

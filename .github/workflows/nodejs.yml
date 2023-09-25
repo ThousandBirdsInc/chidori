@@ -21,6 +21,7 @@ jobs:
     permissions: write-all
     name: nodejs-${{ matrix.node_version }}-${{ matrix.system.target }}-${{ matrix.system.os }}
     runs-on: ${{ matrix.system.os }}
+#    if: ${{ github.ref == 'refs/heads/main' }}
     strategy:
       fail-fast: false
       matrix:
@@ -30,14 +31,16 @@ jobs:
           - 19
           - 20
         system:
-#          currently unsupported by github
-#          - os: macos-12-arm
-#            target: aarch64-apple-darwin
+          # Currently MacOS ARM is unsupported by GitHub:
+          # on an M1 Macbook Pro run ./toolchain/scripts/release_nodejs_packages.sh
+          #
+          # - os: macos-12-arm
+          #   target: aarch64-apple-darwin
           - os: macos-12
             target: x86_64-apple-darwin
           - os: ubuntu-20.04
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-20.04
+          - os: buildjet-4vcpu-ubuntu-2204-arm
             target: aarch64-unknown-linux-gnu
           - os: windows-2022
             target: x86_64-pc-windows-msvc
@@ -85,7 +88,12 @@ jobs:
       # Make a node-pre-gyp package using the native binary
       - name: Package the asset
         working-directory: toolchain/chidori
-        run: npx node-pre-gyp package
+        run: npx @mapbox/node-pre-gyp package
+      # Confirm the released package names in our logs
+      - name: Log packaged assets
+        working-directory: toolchain/chidori
+        shell: bash
+        run: find ./build -name *.tar.gz
       # Upload the native binary to GitHub releases, a release must be created first
       - name: Upload to GitHub releases
         working-directory: toolchain/chidori
@@ -103,6 +111,7 @@ jobs:
     runs-on: ubuntu-latest
     # Require a successful native build before releasing to NPM.
     needs: [ nodejs-github-native ]
+    if: ${{ github.ref == 'refs/heads/main' }}
     steps:
       - uses: actions/checkout@v3
         with:

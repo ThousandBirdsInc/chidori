@@ -20,6 +20,7 @@ jobs:
     strategy:
       matrix:
         target: [x86_64]
+#    if: ${{ github.ref == 'refs/heads/main' }}
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-python@v4
@@ -243,7 +244,7 @@ jobs:
       - python-windows
       - python-linux
 #      - python-linux-cross
-#    if: ${{ github.ref == 'refs/heads/main' }}
+    if: ${{ github.ref == 'refs/heads/main' }}
     steps:
       - uses: actions/download-artifact@v3
         with:
@@ -254,5 +255,4 @@ jobs:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
         run: |
-          pip install --upgrade twine
-           upload --skip-existing *
+          pip install --upgrade twine upload --skip-existing *
