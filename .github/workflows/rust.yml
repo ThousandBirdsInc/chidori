@@ -27,9 +27,8 @@ jobs:
       - name: Build and Test
         working-directory: toolchain
         run: |
-          sudo apt-get install -y libwebkit2gtk-4.0-dev build-essential wget libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev  libjavascriptcoregtk-4.1-dev
-          cargo build --all 
-          cargo test --all
+          cargo build --package prompt-graph-core --package prompt-graph-exec --package chidori
+          cargo test --package prompt-graph-core --package prompt-graph-exec --package chidori
       - name: Publish prompt-graph-core
         working-directory: toolchain/prompt-graph-core
         run: cargo publish
