@@ -26,8 +26,8 @@
 
   # https://devenv.sh/scripts/
   scripts.hello.exec = "echo Welcome to Thousand Birds";
-
   scripts.tbngrok.exec = "ngrok http --domain=thousandbirds.ngrok.dev 3002";
+  scripts.run-ui.exec = "(cd toolchain/prompt-graph-ui && yarn run tauri dev";
 
   enterShell = ''
     REPO_ROOT=`git rev-parse --show-toplevel`
