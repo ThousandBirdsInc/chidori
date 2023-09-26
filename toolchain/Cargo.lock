@@ -716,6 +716,35 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 [[package]]
 name = "chidori"
 version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8efa64d6f3cd4c55a65e89da9fe995095311ce5766b35e3fcb18073ac0d36804"
+dependencies = [
+ "anyhow",
+ "env_logger",
+ "futures 0.3.28",
+ "indoc",
+ "log",
+ "neon-serde3",
+ "once_cell",
+ "openssl",
+ "prompt-graph-core 0.1.26",
+ "prompt-graph-exec 0.1.24",
+ "prost",
+ "protobuf",
+ "pyo3-build-config 0.19.1",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "sqlparser 0.34.0",
+ "tokio",
+ "tonic",
+ "tonic-build",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "chidori"
+version = "0.1.27"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -726,8 +755,8 @@ dependencies = [
  "neon-serde3",
  "once_cell",
  "openssl",
- "prompt-graph-core 0.1.26",
- "prompt-graph-exec 0.1.26",
+ "prompt-graph-core 0.1.27",
+ "prompt-graph-exec 0.1.27",
  "prost",
  "protobuf",
  "pyo3",
@@ -743,35 +772,6 @@ dependencies = [
  "tonic-build",
  "wasm-bindgen",
  "wasm-bindgen-test",
-]
-
-[[package]]
-name = "chidori"
-version = "0.1.26"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8efa64d6f3cd4c55a65e89da9fe995095311ce5766b35e3fcb18073ac0d36804"
-dependencies = [
- "anyhow",
- "env_logger",
- "futures 0.3.28",
- "indoc",
- "log",
- "neon-serde3",
- "once_cell",
- "openssl",
- "prompt-graph-core 0.1.26 (registry+https://github.com/rust-lang/crates.io-index)",
- "prompt-graph-exec 0.1.24",
- "prost",
- "protobuf",
- "pyo3-build-config 0.19.1",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "sqlparser 0.34.0",
- "tokio",
- "tonic",
- "tonic-build",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -4194,6 +4194,8 @@ dependencies = [
 [[package]]
 name = "prompt-graph-core"
 version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08b275c273d8d19402b0b987099e87a8adfd2ffe814dc1deb8233fbfb2fb7604"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -4218,9 +4220,7 @@ dependencies = [
 
 [[package]]
 name = "prompt-graph-core"
-version = "0.1.26"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08b275c273d8d19402b0b987099e87a8adfd2ffe814dc1deb8233fbfb2fb7604"
+version = "0.1.27"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -4268,7 +4268,7 @@ dependencies = [
  "log",
  "neon",
  "openai-api-rs",
- "prompt-graph-core 0.1.26 (registry+https://github.com/rust-lang/crates.io-index)",
+ "prompt-graph-core 0.1.26",
  "prost",
  "protobuf",
  "qdrant-client",
@@ -4294,7 +4294,7 @@ dependencies = [
 
 [[package]]
 name = "prompt-graph-exec"
-version = "0.1.26"
+version = "0.1.27"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4314,7 +4314,7 @@ dependencies = [
  "log",
  "neon",
  "openai-api-rs",
- "prompt-graph-core 0.1.26",
+ "prompt-graph-core 0.1.27",
  "prost",
  "protobuf",
  "qdrant-client",
@@ -4343,9 +4343,9 @@ dependencies = [
 name = "prompt-graph-ui"
 version = "0.1.0"
 dependencies = [
- "chidori 0.1.26 (registry+https://github.com/rust-lang/crates.io-index)",
+ "chidori 0.1.26",
  "futures 0.3.28",
- "prompt-graph-core 0.1.26",
+ "prompt-graph-core 0.1.27",
  "prost",
  "serde",
  "serde_json",
