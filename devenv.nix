@@ -6,18 +6,9 @@
       pkgs.curl
       pkgs.git
       pkgs.jq
-      pkgs.kubectl
       pkgs.protobuf
-      pkgs.pulumi
-      pkgs.awscli2
       pkgs.protobuf3_21
-      pkgs.kubernetes-helm
-      pkgs.flyway
-      pkgs.argo-rollouts
-      pkgs.argocd
       pkgs.nodejs_20
-      pkgs.tilt
-      pkgs.aws-sam-cli
       pkgs.xdot
   ] ++ lib.optionals pkgs.stdenv.isDarwin (with pkgs.darwin.apple_sdk; [
        frameworks.Security
@@ -25,8 +16,7 @@
      ]);
 
   # https://devenv.sh/scripts/
-  scripts.hello.exec = "echo Welcome to Thousand Birds";
-  scripts.tbngrok.exec = "ngrok http --domain=thousandbirds.ngrok.dev 3002";
+  scripts.hello.exec = "echo Welcome to the Chidori dev enviroment";
   scripts.run-ui.exec = "(cd toolchain/prompt-graph-ui && yarn run tauri dev";
 
   enterShell = ''
@@ -56,21 +46,6 @@
        http_port: 9000
        listen_host: 127.0.0.1
      '';
-  };
-
-  services.temporal = {
-     enable = true;
-
-     port = 17233;
-
-     namespaces = [ "mynamespace" ];
-
-     state = {
-       ephemeral = true;
-       sqlite-pragma = {
-         journal_mode = "wal";
-       };
-     };
   };
 
 # See full reference at https://devenv.sh/reference/options/
