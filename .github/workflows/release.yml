@@ -8,6 +8,8 @@ jobs:
     name: create-release
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v3
+
       - name: Create artifacts directory
         run: mkdir artifacts
 
