@@ -37,7 +37,7 @@ sqlparser.workspace = true
 openssl = { version = "0.10.55", features = ["vendored"] }
 
 once_cell = "1"
-prompt-graph-core = { path = "../prompt-graph-core", version = "^0.1.26" }
+prompt-graph-core = { path = "../prompt-graph-core", version = "^0.1.28" }
 wasm-bindgen = {version = "0.2.86", features = []}
 anyhow.workspace = true
 indoc.workspace = true
