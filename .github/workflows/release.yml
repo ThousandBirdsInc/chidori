@@ -15,7 +15,8 @@ jobs:
 
       - name: Set release version
         if: env.ARTIFACT_VERSION == ''
-        run: python3 ./toolchain/scripts/get_target_version.py
+        working-directory: toolchain
+        run: python3 ./scripts/get_target_version.py
 
       - name: Create GitHub release
         id: release
