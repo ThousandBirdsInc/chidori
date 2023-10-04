@@ -210,7 +210,7 @@ mod tests {
     use super::*;
 
     // TODO: implement conditionally running this with a qdrant feature
-    // #[cfg(feature = "qdrant")]
+    #[cfg(feature = "qdrant")]
     #[tokio::test]
     async fn test_exec_memory_node_qdrant() {
         // TODO: this test will require a running qdrant instance
