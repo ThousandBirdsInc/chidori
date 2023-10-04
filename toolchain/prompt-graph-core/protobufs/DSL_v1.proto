@@ -6,6 +6,31 @@ package promptgraph;
 // This is used to provide a language agnostic interface
 // for defining PromptGraphs
 
+
+// TODO: capabilities also gives us a security model
+
+// A Node is the core primitive within a PromptGraph, it is
+// at a base level, just a function. However it includes an
+// execution_capabilities which is used to determine where in our
+// environment the function should be invoked. This allows us
+// to determine in what environment this function must run.
+message Node {
+  string handle = 1;
+  string execution_capabilities = 2;
+  repeated string argument_array = 3;
+  string inner_function_handle = 4;
+}
+
+message Triggerable {
+  string node_handle = 1;
+  Query query = 2;
+}
+
+message Subscribeable {
+  string node_handle = 1;
+  OutputType output = 2;
+}
+
 enum SupportedChatModel {
   GPT_4 = 0;
   GPT_4_0314 = 1;

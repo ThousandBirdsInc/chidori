@@ -202,8 +202,10 @@ pub async fn initialize_node_memory_init(n: &PromptGraphNodeMemory, _core: &Item
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use prompt_graph_core::graph_definition::create_vector_memory_node;
-    use prompt_graph_core::proto::item;
+    use prompt_graph_core::proto::{item, NodeWillExecuteOnBranch};
+    use sled::Config as SledConfig;
     use anyhow::Result;
     use super::*;
 
@@ -217,6 +219,8 @@ mod tests {
         // -e QDRANT__SERVICE__GRPC_PORT="6334" \
         // qdrant/qdrant
 
+        let db = SledConfig::new().temporary(true).flush_every_ms(None).open().unwrap();
+        let tree = db.open_tree("test").unwrap();
         let config = QdrantClientConfig::from_url("http://localhost:6334");
         let client = QdrantClient::new(Some(config)).unwrap();
         let _ = client.delete_collection("test_exec_memory_node_qdrant").await;
@@ -235,10 +239,16 @@ mod tests {
             vec![]
         ).unwrap();
 
-        let nwe = NodeWillExecute {
-            source_node: "".to_string(),
-            change_values_used_in_execution: vec![],
-            matched_query_index: 0
+
+        let nwe = NodeWillExecuteOnBranch {
+            branch: 0,
+            counter: 0,
+            custom_node_type_name: None,
+            node: Some(NodeWillExecute {
+                source_node: "".to_string(),
+                change_values_used_in_execution: vec![],
+                matched_query_index: 0,
+            })
         };
 
         if let (core, item::Item::NodeMemory(n)) = (write.core.unwrap(), write.item.unwrap()) {
@@ -249,11 +259,12 @@ mod tests {
                 0).await.unwrap();
 
             let ctx = NodeExecutionContext {
-                node_will_execute: &nwe,
+                node_will_execute_on_branch: &nwe,
                 item_core: &core,
                 item: &item::Item::NodeMemory(n),
                 namespaces: &HashSet::from(["".to_string()]),
-                template_partials: &HashMap::new()
+                template_partials: &HashMap::new(),
+                tree: &tree
             };
             execute_node_memory(&ctx).await.unwrap();
         } else {
@@ -261,10 +272,15 @@ mod tests {
         }
 
 
-        let nwe = NodeWillExecute {
-            source_node: "".to_string(),
-            change_values_used_in_execution: vec![],
-            matched_query_index: 0
+        let nwe = NodeWillExecuteOnBranch {
+            branch: 0,
+            counter: 0,
+            custom_node_type_name: None,
+            node: Some(NodeWillExecute {
+                source_node: "".to_string(),
+                change_values_used_in_execution: vec![],
+                matched_query_index: 0,
+            })
         };
 
         let read = create_vector_memory_node(
@@ -281,11 +297,12 @@ mod tests {
 
         if let (core, item::Item::NodeMemory(n)) = (read.core.unwrap(), read.item.unwrap()) {
             let ctx = NodeExecutionContext {
-                node_will_execute: &nwe,
+                node_will_execute_on_branch: &nwe,
                 item_core: &core,
                 item: &item::Item::NodeMemory(n),
                 namespaces: &HashSet::from(["".to_string()]),
-                template_partials: &HashMap::new()
+                template_partials: &HashMap::new(),
+                tree: &tree
             };
             let recollection = execute_node_memory( &ctx ).await.unwrap();
             assert_eq!(recollection[0].path, Some(Path { address: vec![ "".to_string(), "key".to_string() ] }));

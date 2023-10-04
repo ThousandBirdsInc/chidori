@@ -744,7 +744,7 @@ dependencies = [
 
 [[package]]
 name = "chidori"
-version = "0.1.27"
+version = "0.1.28"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -755,8 +755,8 @@ dependencies = [
  "neon-serde3",
  "once_cell",
  "openssl",
- "prompt-graph-core 0.1.27",
- "prompt-graph-exec 0.1.27",
+ "prompt-graph-core 0.1.28",
+ "prompt-graph-exec 0.1.28",
  "prost",
  "protobuf",
  "pyo3",
@@ -4220,7 +4220,7 @@ dependencies = [
 
 [[package]]
 name = "prompt-graph-core"
-version = "0.1.27"
+version = "0.1.28"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -4294,7 +4294,7 @@ dependencies = [
 
 [[package]]
 name = "prompt-graph-exec"
-version = "0.1.27"
+version = "0.1.28"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4314,7 +4314,7 @@ dependencies = [
  "log",
  "neon",
  "openai-api-rs",
- "prompt-graph-core 0.1.27",
+ "prompt-graph-core 0.1.28",
  "prost",
  "protobuf",
  "qdrant-client",
@@ -4345,7 +4345,7 @@ version = "0.1.0"
 dependencies = [
  "chidori 0.1.26",
  "futures 0.3.28",
- "prompt-graph-core 0.1.27",
+ "prompt-graph-core 0.1.28",
  "prost",
  "serde",
  "serde_json",
