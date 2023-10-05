@@ -1,18 +1,11 @@
 use std::collections::HashMap;
-use std::env;
-use std::net::ToSocketAddrs;
 use anyhow;
 use futures::stream::{self, StreamExt, TryStreamExt};
-use lettre::{Message, SmtpTransport, Transport};
-use lettre::transport::smtp::authentication::Credentials;
-use lettre::transport::smtp::Error;
-use lettre::transport::smtp::response::Response;
 use reqwest;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use _chidori::{create_change_value, NodeWillExecuteOnBranch};
+use _chidori::NodeWillExecuteOnBranch;
 use _chidori::register_node_handle;
-use _chidori::translations::rust::{Chidori, CustomNodeCreateOpts, DenoCodeNodeCreateOpts, GraphBuilder, Handler, PromptNodeCreateOpts, serialized_value_to_string};
+use _chidori::translations::rust::{Chidori, CustomNodeCreateOpts, GraphBuilder, Handler, PromptNodeCreateOpts};
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Story {
@@ -34,7 +27,7 @@ async fn fetch_hn() -> anyhow::Result<Vec<Story>> {
             let client = &client;
             async move {
                 let resource = format!("https://hacker-news.firebaseio.com/v0/item/{}.json?print=pretty", id);
-                let mut story: Story = client.get(&resource).send().await?.json().await?;
+                let story: Story = client.get(&resource).send().await?.json().await?;
                 Ok(story)
             }
         })
