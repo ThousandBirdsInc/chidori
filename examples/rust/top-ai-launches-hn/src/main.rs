@@ -1,18 +1,13 @@
 use std::collections::HashMap;
 use std::env;
-use std::net::ToSocketAddrs;
-use anyhow;
+use std::path::Path;
+use anyhow::anyhow;
 use futures::stream::{self, StreamExt, TryStreamExt};
-use lettre::{Message, SmtpTransport, Transport};
-use lettre::transport::smtp::authentication::Credentials;
-use lettre::transport::smtp::Error;
-use lettre::transport::smtp::response::Response;
 use reqwest;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use _chidori::{create_change_value, NodeWillExecuteOnBranch};
+use _chidori::NodeWillExecuteOnBranch;
 use _chidori::register_node_handle;
-use _chidori::translations::rust::{Chidori, CustomNodeCreateOpts, DenoCodeNodeCreateOpts, GraphBuilder, Handler, PromptNodeCreateOpts, serialized_value_to_string};
+use _chidori::translations::rust::{Chidori, CustomNodeCreateOpts, GraphBuilder, Handler, PromptNodeCreateOpts};
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Story {
@@ -34,7 +29,7 @@ async fn fetch_hn() -> anyhow::Result<Vec<Story>> {
             let client = &client;
             async move {
                 let resource = format!("https://hacker-news.firebaseio.com/v0/item/{}.json?print=pretty", id);
-                let mut story: Story = client.get(&resource).send().await?.json().await?;
+                let story: Story = client.get(&resource).send().await?.json().await?;
                 Ok(story)
             }
         })
@@ -51,9 +46,30 @@ async fn handle_fetch_hn(_node_will_exec: NodeWillExecuteOnBranch) -> anyhow::Re
     Ok(serde_json::to_value(result).unwrap())
 }
 
+// check if we're running inside a docker container.
+// used to print meaningful error messages when running inside a container.
+fn is_running_inside_docker() -> bool {
+    Path::new("/.dockerenv").exists()
+}
+
 /// Maintain a list summarizing recent AI launches across the week
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+      // Check for the presence of the environment variable
+      // return gracefully with a meaningful error message if it's not set.
+      if env::var("OPENAI_API_KEY").is_err() {
+        if is_running_inside_docker() {
+            eprintln!("Error: OPENAI_API_KEY is not set!");
+            eprintln!("If you're running this from container, please set the environment variable using:");
+            eprintln!("\ndocker run -e OPENAI_API_KEY=your_key_here ...\n");
+        } else {
+            eprintln!("Error: OPENAI_API_KEY is not set!");
+            eprintln!("Please set the environment variable using:");
+            eprintln!("\nexport OPENAI_API_KEY=your_key_here\n");
+        }
+        return Err(anyhow!("Environment variable not set"));
+    }
+
     let mut c = Chidori::new(String::from("0"), String::from("http://localhost:9800"));
     c.start_server(Some(":memory:".to_string())).await?;
 
