@@ -57,15 +57,15 @@ fn is_running_inside_docker() -> bool {
 async fn main() -> anyhow::Result<()> {
       // Check for the presence of the environment variable
       // return gracefully with a meaningful error message if it's not set.
-      if env::var("OPEN_AI_KEY").is_err() {
+      if env::var("OPENAI_API_KEY").is_err() {
         if is_running_inside_docker() {
-            eprintln!("Error: OPEN_AI_KEY is not set!");
+            eprintln!("Error: OPENAI_API_KEY is not set!");
             eprintln!("If you're running this from container, please set the environment variable using:");
-            eprintln!("\ndocker run -e OPEN_AI_KEY=your_key_here ...\n");
+            eprintln!("\ndocker run -e OPENAI_API_KEY=your_key_here ...\n");
         } else {
-            eprintln!("Error: OPEN_AI_KEY is not set!");
+            eprintln!("Error: OPENAI_API_KEY is not set!");
             eprintln!("Please set the environment variable using:");
-            eprintln!("\nexport OPEN_AI_KEY=your_key_here\n");
+            eprintln!("\nexport OPENAI_API_KEY=your_key_here\n");
         }
         return Err(anyhow!("Environment variable not set"));
     }
