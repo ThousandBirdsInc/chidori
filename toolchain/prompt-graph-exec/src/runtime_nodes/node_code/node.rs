@@ -1,7 +1,7 @@
 
 use prompt_graph_core::proto::{ChangeValue, item, SupportedSourceCodeLanguages};
 use prompt_graph_core::proto::prompt_graph_node_code::Source;
-use prompt_graph_core::templates::{flatten_value_keys, json_value_to_serialized_value, render_template_prompt};
+use prompt_graph_core::prompt_composition::templates::{flatten_value_keys, json_value_to_serialized_value, render_template_prompt};
 use crate::runtime_nodes::node_code;
 use deno_core::serde_json::Value;
 use log::debug;

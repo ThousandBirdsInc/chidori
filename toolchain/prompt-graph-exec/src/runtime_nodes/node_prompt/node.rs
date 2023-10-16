@@ -4,7 +4,7 @@ use tokio::time::sleep;
 use std::time::Duration;
 use prompt_graph_core::proto::{ChangeValue, item, SupportedChatModel};
 use prompt_graph_core::proto::serialized_value::Val;
-use prompt_graph_core::templates::render_template_prompt;
+use prompt_graph_core::prompt_composition::templates::render_template_prompt;
 
 use prompt_graph_core::proto::prompt_graph_node_prompt::Model;
 use crate::executor::NodeExecutionContext;

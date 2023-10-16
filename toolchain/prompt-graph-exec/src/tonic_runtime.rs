@@ -403,7 +403,7 @@ pub async fn run_server(url_server: String, file_path: Option<String>) -> Result
 
 #[cfg(test)]
 mod tests {
-    use prompt_graph_core::templates::render_template_prompt;
+    use prompt_graph_core::prompt_composition::templates::render_template_prompt;
     use super::*;
 
     #[tokio::test]

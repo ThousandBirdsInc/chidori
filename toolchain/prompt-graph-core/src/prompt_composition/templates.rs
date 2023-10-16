@@ -1,13 +1,11 @@
-use std::collections::HashMap;
-
 /// This is a wasm-compatible implementation of how we handle templates for prompts
 /// I made the decision to implement this in order to avoid needing to build equivalents for multiple platforms.
+
+use std::collections::HashMap;
 use handlebars::{Handlebars, Path, Template};
 use handlebars::template::{Parameter, TemplateElement};
 use serde_json::{Map, Value};
 use serde_json::value::{Map as JsonMap};
-
-
 use anyhow::{Result};
 use crate::proto::serialized_value::Val;
 use crate::proto::{ChangeValue, PromptLibraryRecord, SerializedValue, SerializedValueArray, SerializedValueObject};
@@ -240,7 +238,7 @@ mod tests {
     use crate::create_change_value;
     use crate::proto::UpsertPromptLibraryRecord;
     use super::*;
-    use crate::templates::validate_template;
+    use crate::prompt_composition::templates::validate_template;
 
     #[test]
     fn test_generating_json_map_from_paths() {

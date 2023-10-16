@@ -37,6 +37,7 @@ env_logger.workspace = true
 log.workspace = true
 futures.workspace = true
 
+im = "15.1.0"
 num_cpus = "1"
 petgraph = "0.6.3"
 typescript-type-def = "0.5.7"

@@ -20,7 +20,7 @@ use prompt_graph_exec::tonic_runtime::run_server;
 use neon_serde3;
 use serde::{Deserialize, Serialize};
 use tonic::Status;
-use prompt_graph_core::templates::json_value_to_serialized_value;
+use prompt_graph_core::prompt_composition::templates::json_value_to_serialized_value;
 use crate::translations::shared::json_value_to_paths;
 pub use prompt_graph_core::utils::serialized_value_to_string;
 

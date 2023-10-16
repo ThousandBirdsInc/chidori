@@ -1,7 +1,7 @@
 use deno_core::serde_json;
 use deno_core::serde_json::Value;
 use prompt_graph_core::proto::{ChangeValue, PromptGraphNodeCodeSourceCode};
-use prompt_graph_core::templates::render_template_prompt;
+use prompt_graph_core::prompt_composition::templates::render_template_prompt;
 use starlark::syntax::{AstModule, Dialect};
 use starlark::environment::{Globals, Module as StarlarkModule};
 use starlark::eval::Evaluator;

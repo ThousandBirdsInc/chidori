@@ -3,7 +3,7 @@ use base64::{Engine as _};
 use anyhow::Result;
 use openai_api_rs::v1::api::Client;
 use prompt_graph_core::proto::{ChangeValue, ChangeValueWithCounter, InputProposal, item, ItemCore, MemoryAction, NodeWillExecute, Path, PromptGraphNodeMemory, SupportedEmebddingModel, SupportedVectorDatabase};
-use prompt_graph_core::templates::render_template_prompt;
+use prompt_graph_core::prompt_composition::templates::render_template_prompt;
 use std::env;
 use openai_api_rs::v1::embedding::EmbeddingRequest;
 
@@ -215,8 +215,7 @@ mod tests {
     async fn test_exec_memory_node_qdrant() {
         // TODO: this test will require a running qdrant instance
 
-        // docker run -p 6333:6333 -p 6334:6334 \
-        // -e QDRANT__SERVICE__GRPC_PORT="6334" \
+        // docker run -p 6333:6333 -p 6334:6334 \ -e QDRANT__SERVICE__GRPC_PORT="6334" \
         // qdrant/qdrant
 
         let db = SledConfig::new().temporary(true).flush_every_ms(None).open().unwrap();
