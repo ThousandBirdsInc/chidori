@@ -1,0 +1,10 @@
+[book]
+authors = ["Colton Pierson"]
+language = "en"
+multilingual = false
+src = "book_src"
+title = "chidori"
+
+[output.html]
+cname = "chidoriai.com"
+edit-url-template = "https://github.com/ThousandBirdsInc/chidori/edit/main/{path}"

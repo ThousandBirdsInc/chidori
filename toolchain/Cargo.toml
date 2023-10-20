@@ -2,7 +2,6 @@
 members = [
     "prompt-graph-core",
     "prompt-graph-exec",
-    "prompt-graph-std",
     "prompt-graph-ui/src-tauri",
     "chidori",
 ]
@@ -19,6 +18,8 @@ repository = "https://github.com/ThousandBirdsInc/chidori"
 lto = true
 
 [workspace.dependencies]
+rkyv = {version = "0.7.42", features = ["validation"]}
+
 gluesql = "0.14.0"
 protobuf = "3.2.0"
 sqlparser = "0.34.0"

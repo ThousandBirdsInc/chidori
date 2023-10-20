@@ -1,25 +1,17 @@
-mod executor;
-mod integrations;
-mod runtime_nodes;
-pub mod tonic_runtime;
 mod db_operations;
+pub mod tonic_runtime;
 
 #[cfg(feature = "nodejs")]
 use neon::prelude::*;
 
-
-
-
 #[cfg(feature = "nodejs")]
-use neon::{types::Deferred};
+use neon::types::Deferred;
 
 #[macro_use]
 extern crate lazy_static;
 
-
 #[cfg(feature = "nodejs")]
 type DbCallback = Box<dyn FnOnce(&mut String, &Channel, Deferred) + Send>;
-
 
 #[cfg(feature = "nodejs")]
 struct ExecutorGRPCServer {
@@ -45,15 +37,17 @@ impl Finalize for ExecutorGRPCServer {}
 // Internal implementation
 #[cfg(feature = "nodejs")]
 impl ExecutorGRPCServer {
-    fn new<'a, C>(port: String, mut cx: &mut C) -> Result<Self, String> where C: Context<'a>, {
+    fn new<'a, C>(port: String, mut cx: &mut C) -> Result<Self, String>
+    where
+        C: Context<'a>,
+    {
         let (tx, rx) = mpsc::channel::<GRPCServerMessage>();
         let channel = cx.channel();
         thread::spawn(move || {
             tonic_runtime::run_server(port, None);
             while let Ok(message) = rx.recv() {
                 match message {
-                    GRPCServerMessage::Callback(deferred, f) => {
-                    }
+                    GRPCServerMessage::Callback(deferred, f) => {}
                     GRPCServerMessage::Close => break,
                 }
             }
@@ -81,7 +75,8 @@ impl ExecutorGRPCServer {
 impl ExecutorGRPCServer {
     fn js_new(mut cx: FunctionContext) -> JsResult<JsBox<ExecutorGRPCServer>> {
         let port = cx.argument::<JsString>(0)?.value(&mut cx);
-        let db = ExecutorGRPCServer::new(port, &mut cx).or_else(|err| cx.throw_error(err.to_string()))?;
+        let db = ExecutorGRPCServer::new(port, &mut cx)
+            .or_else(|err| cx.throw_error(err.to_string()))?;
         Ok(cx.boxed(db))
     }
 
@@ -92,7 +87,6 @@ impl ExecutorGRPCServer {
             .or_else(|err| cx.throw_error(err.to_string()))?;
         Ok(cx.undefined())
     }
-
 }
 
 #[cfg(feature = "nodejs")]
@@ -116,8 +110,6 @@ impl SendResultExt for Result<(), mpsc::SendError<GRPCServerMessage>> {
         })
     }
 }
-
-
 
 #[cfg(feature = "nodejs")]
 fn neon_start_server(mut cx: FunctionContext) -> JsResult<JsNumber> {

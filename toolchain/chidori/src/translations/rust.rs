@@ -1,3 +1,31 @@
+use crate::translations::shared::json_value_to_paths;
+use anyhow::Error;
+use futures::future::BoxFuture;
+use futures::StreamExt;
+use log::{debug, info};
+use neon_serde3;
+use once_cell::sync::OnceCell;
+use prompt_graph_core::build_runtime_graph::graph_parse::{
+    construct_query_from_output_type, derive_for_individual_node, CleanIndividualNode,
+    CleanedDefinitionGraph,
+};
+use prompt_graph_core::graph_definition::{
+    create_code_node, create_custom_node, create_prompt_node, create_vector_memory_node,
+    SourceNodeType,
+};
+use prompt_graph_core::prompt_composition::templates::json_value_to_serialized_value;
+use prompt_graph_core::proto::execution_runtime_client::ExecutionRuntimeClient;
+use prompt_graph_core::proto::serialized_value::Val;
+use prompt_graph_core::proto::{
+    ChangeValue, ChangeValueWithCounter, Empty, ExecutionStatus, File,
+    FileAddressedChangeValueWithCounter, FilteredPollNodeWillExecuteEventsRequest, Item,
+    ListBranchesRes, NodeWillExecute, NodeWillExecuteOnBranch, Path, Query, QueryAtFrame,
+    QueryAtFrameResponse, RequestAckNodeWillExecuteEvent, RequestAtFrame, RequestFileMerge,
+    RequestListBranches, RequestNewBranch, RequestOnlyId, RespondPollNodeWillExecuteEvents,
+    SerializedValue, SerializedValueArray, SerializedValueObject,
+};
+use prompt_graph_exec::tonic_runtime::run_server;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -5,39 +33,32 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
-use anyhow::Error;
-use futures::future::BoxFuture;
-use futures::StreamExt;
-use log::{debug, info};
-use once_cell::sync::OnceCell;
 use tokio::runtime::Runtime;
-use prompt_graph_core::build_runtime_graph::graph_parse::{CleanedDefinitionGraph, CleanIndividualNode, construct_query_from_output_type, derive_for_individual_node};
-use prompt_graph_core::graph_definition::{create_code_node, create_custom_node, create_prompt_node, create_vector_memory_node, SourceNodeType};
-use prompt_graph_core::proto::{ChangeValue, ChangeValueWithCounter, Empty, ExecutionStatus, File, FileAddressedChangeValueWithCounter, FilteredPollNodeWillExecuteEventsRequest, Item, ListBranchesRes, NodeWillExecute, NodeWillExecuteOnBranch, Path, Query, QueryAtFrame, QueryAtFrameResponse, RequestAckNodeWillExecuteEvent, RequestAtFrame, RequestFileMerge, RequestListBranches, RequestNewBranch, RequestOnlyId, RespondPollNodeWillExecuteEvents, SerializedValue, SerializedValueArray, SerializedValueObject};
-use prompt_graph_core::proto::execution_runtime_client::ExecutionRuntimeClient;
-use prompt_graph_core::proto::serialized_value::Val;
-use prompt_graph_exec::tonic_runtime::run_server;
-use neon_serde3;
-use serde::{Deserialize, Serialize};
 use tonic::Status;
-use prompt_graph_core::prompt_composition::templates::json_value_to_serialized_value;
-use crate::translations::shared::json_value_to_paths;
-pub use prompt_graph_core::utils::serialized_value_to_string;
 
-async fn get_client(url: String) -> Result<ExecutionRuntimeClient<tonic::transport::Channel>, tonic::transport::Error> {
+async fn get_client(
+    url: String,
+) -> Result<ExecutionRuntimeClient<tonic::transport::Channel>, tonic::transport::Error> {
     ExecutionRuntimeClient::connect(url.clone()).await
 }
 
-type CallbackHandler = Box<dyn Fn(NodeWillExecuteOnBranch) -> BoxFuture<'static, anyhow::Result<serde_json::Value>> + Send + Sync>;
+type CallbackHandler = Box<
+    dyn Fn(NodeWillExecuteOnBranch) -> BoxFuture<'static, anyhow::Result<serde_json::Value>>
+        + Send
+        + Sync,
+>;
 
 pub struct Handler {
-    pub(crate) callback: CallbackHandler
+    pub(crate) callback: CallbackHandler,
 }
 
 impl Handler {
     pub fn new<F>(f: F) -> Self
-        where
-            F: Fn(NodeWillExecuteOnBranch) -> BoxFuture<'static, anyhow::Result<serde_json::Value>> + Send + Sync + 'static
+    where
+        F: Fn(NodeWillExecuteOnBranch) -> BoxFuture<'static, anyhow::Result<serde_json::Value>>
+            + Send
+            + Sync
+            + 'static,
     {
         Handler {
             callback: Box::new(f),
@@ -45,24 +66,27 @@ impl Handler {
     }
 }
 
-
 #[derive(Clone)]
 pub struct Chidori {
     file_id: String,
     current_head: u64,
     current_branch: u64,
     url: String,
-    pub(crate) custom_node_handlers: HashMap<String, Arc<Handler>>
+    pub(crate) custom_node_handlers: HashMap<String, Arc<Handler>>,
 }
 
 impl Chidori {
-
     pub fn new(file_id: String, url: String) -> Self {
         if !url.contains("://") {
             panic!("Invalid url, must include protocol");
         }
         // let api_token = cx.argument_opt(2)?.value(&mut cx);
-        debug!("Creating new Chidori instance with file_id={}, url={}, api_token={:?}", file_id, url, "".to_string());
+        debug!(
+            "Creating new Chidori instance with file_id={}, url={}, api_token={:?}",
+            file_id,
+            url,
+            "".to_string()
+        );
         Chidori {
             file_id,
             current_head: 0,
@@ -79,10 +103,10 @@ impl Chidori {
             match result {
                 Ok(_) => {
                     println!("Server exited");
-                },
+                }
                 Err(e) => {
                     println!("Error running server: {}", e);
-                },
+                }
             }
         });
 
@@ -92,9 +116,13 @@ impl Chidori {
                 Ok(connection) => {
                     eprintln!("Connection successfully established {:?}", &url);
                     return Ok(());
-                },
+                }
                 Err(e) => {
-                    eprintln!("Error connecting to server: {} with Error {}. Retrying...", &url, &e.to_string());
+                    eprintln!(
+                        "Error connecting to server: {} with Error {}. Retrying...",
+                        &url,
+                        &e.to_string()
+                    );
                     std::thread::sleep(std::time::Duration::from_millis(1000));
                 }
             }
@@ -105,11 +133,13 @@ impl Chidori {
         let file_id = self.file_id.clone();
         let url = self.url.clone();
         let mut client = get_client(url).await?;
-        let result = client.play(RequestAtFrame {
-            id: file_id,
-            frame,
-            branch,
-        }).await?;
+        let result = client
+            .play(RequestAtFrame {
+                id: file_id,
+                frame,
+                branch,
+            })
+            .await?;
         Ok(result.into_inner())
     }
 
@@ -119,59 +149,70 @@ impl Chidori {
         let branch = self.current_branch.clone();
 
         let mut client = get_client(url).await?;
-        let result = client.pause(RequestAtFrame {
-            id: file_id,
-            frame,
-            branch,
-        }).await?;
+        let result = client
+            .pause(RequestAtFrame {
+                id: file_id,
+                frame,
+                branch,
+            })
+            .await?;
         Ok(result.into_inner())
     }
 
-    pub async fn query( &self, query: String, branch: u64, frame: u64, ) -> anyhow::Result<QueryAtFrameResponse> {
+    pub async fn query(
+        &self,
+        query: String,
+        branch: u64,
+        frame: u64,
+    ) -> anyhow::Result<QueryAtFrameResponse> {
         let file_id = self.file_id.clone();
         let url = self.url.clone();
         let mut client = get_client(url).await?;
-        let result = client.run_query(QueryAtFrame {
-            id: file_id,
-            query: Some(Query {
-                query: Some(query)
-            }),
-            frame,
-            branch,
-        }).await?;
+        let result = client
+            .run_query(QueryAtFrame {
+                id: file_id,
+                query: Some(Query { query: Some(query) }),
+                frame,
+                branch,
+            })
+            .await?;
         Ok(result.into_inner())
     }
 
-    pub async fn branch( &self, branch: u64, frame: u64, ) -> anyhow::Result<ExecutionStatus> {
+    pub async fn branch(&self, branch: u64, frame: u64) -> anyhow::Result<ExecutionStatus> {
         let file_id = self.file_id.clone();
         let url = self.url.clone();
         let mut client = get_client(url).await?;
-        let result = client.branch(RequestNewBranch {
-            id: file_id,
-            source_branch_id: branch,
-            diverges_at_counter: frame
-        }).await?;
+        let result = client
+            .branch(RequestNewBranch {
+                id: file_id,
+                source_branch_id: branch,
+                diverges_at_counter: frame,
+            })
+            .await?;
         Ok(result.into_inner())
     }
 
-    pub async fn list_branches( &self) -> anyhow::Result<ListBranchesRes> {
+    pub async fn list_branches(&self) -> anyhow::Result<ListBranchesRes> {
         let file_id = self.file_id.clone();
         let url = self.url.clone();
         let mut client = get_client(url).await?;
-        let result = client.list_branches(RequestListBranches {
-            id: file_id,
-        }).await?;
+        let result = client
+            .list_branches(RequestListBranches { id: file_id })
+            .await?;
         Ok(result.into_inner())
     }
 
-    pub async fn display_graph_structure( &self, branch: u64) -> anyhow::Result<String> {
+    pub async fn display_graph_structure(&self, branch: u64) -> anyhow::Result<String> {
         let file_id = self.file_id.clone();
         let url = self.url.clone();
         let mut client = get_client(url).await?;
-        let file = client.current_file_state(RequestOnlyId {
-            id: file_id,
-            branch
-        }).await?;
+        let file = client
+            .current_file_state(RequestOnlyId {
+                id: file_id,
+                branch,
+            })
+            .await?;
         let mut file = file.into_inner();
         let mut g = CleanedDefinitionGraph::zero();
         g.merge_file(&mut file).unwrap();
@@ -182,93 +223,103 @@ impl Chidori {
         let file_id = self.file_id.clone();
         let url = self.url.clone();
         let mut client = get_client(url).await?;
-        let resp = client.list_registered_graphs(Empty { }).await?;
+        let resp = client.list_registered_graphs(Empty {}).await?;
         let mut graphs = resp.into_inner();
         info!("Registered Graphs = {:?}", graphs);
         Ok(())
     }
 
-//
-//     // TODO: need to figure out how to handle callbacks
-//     // fn list_input_proposals<'a>(
-//     //     mut self_: PyRefMut<'_, Self>,
-//     //     py: Python<'a>,
-//     //     callback: PyObject
-//     // ) -> PyResult<&'a PyAny> {
-//     //     let file_id = self_.file_id.clone();
-//     //     let url = self_.url.clone();
-//     //     let branch = self_.current_branch;
-//     //     pyo3_asyncio::tokio::future_into_py(py, async move {
-//     //         let mut client = get_client(url).await?;
-//     //         let resp = client.list_input_proposals(RequestOnlyId {
-//     //             id: file_id,
-//     //             branch,
-//     //         }).await.map_err(PyErrWrapper::from)?;
-//     //         let mut stream = resp.into_inner();
-//     //         while let Some(x) = stream.next().await {
-//     //             // callback.call(py, (x,), None);
-//     //             info!("InputProposals = {:?}", x);
-//     //         };
-//     //         Ok(())
-//     //     })
-//     // }
-//
-//     // fn respond_to_input_proposal(mut self_: PyRefMut<'_, Self>) -> PyResult<()> {
-//     //     Ok(())
-//     // }
-//
-//     // TODO: need to figure out how to handle callbacks
-//     // fn list_change_events<'a>(
-//     //     mut self_: PyRefMut<'_, Self>,
-//     //     py: Python<'a>,
-//     //     callback: PyObject
-//     // ) -> PyResult<&'a PyAny> {
-//     //     let file_id = self_.file_id.clone();
-//     //     let url = self_.url.clone();
-//     //     let branch = self_.current_branch;
-//     //     pyo3_asyncio::tokio::future_into_py(py, async move {
-//     //         let mut client = get_client(url).await?;
-//     //         let resp = client.list_change_events(RequestOnlyId {
-//     //             id: file_id,
-//     //             branch,
-//     //         }).await.map_err(PyErrWrapper::from)?;
-//     //         let mut stream = resp.into_inner();
-//     //         while let Some(x) = stream.next().await {
-//     //             Python::with_gil(|py| pyo3_asyncio::tokio::into_future(callback.as_ref(py).call((x.map(ChangeValueWithCounterWrapper).map_err(PyErrWrapper::from)?,), None)?))?
-//     //                 .await?;
-//     //         };
-//     //         Ok(())
-//     //     })
-//     // }
-//
-//
-//
-//     // TODO: this should accept an "Object" instead of args
-//     // TODO: nodes that are added should return a clean definition of what their addition looks like
-//     // TODO: adding a node should also display any errors
+    //
+    //     // TODO: need to figure out how to handle callbacks
+    //     // fn list_input_proposals<'a>(
+    //     //     mut self_: PyRefMut<'_, Self>,
+    //     //     py: Python<'a>,
+    //     //     callback: PyObject
+    //     // ) -> PyResult<&'a PyAny> {
+    //     //     let file_id = self_.file_id.clone();
+    //     //     let url = self_.url.clone();
+    //     //     let branch = self_.current_branch;
+    //     //     pyo3_asyncio::tokio::future_into_py(py, async move {
+    //     //         let mut client = get_client(url).await?;
+    //     //         let resp = client.list_input_proposals(RequestOnlyId {
+    //     //             id: file_id,
+    //     //             branch,
+    //     //         }).await.map_err(PyErrWrapper::from)?;
+    //     //         let mut stream = resp.into_inner();
+    //     //         while let Some(x) = stream.next().await {
+    //     //             // callback.call(py, (x,), None);
+    //     //             info!("InputProposals = {:?}", x);
+    //     //         };
+    //     //         Ok(())
+    //     //     })
+    //     // }
+    //
+    //     // fn respond_to_input_proposal(mut self_: PyRefMut<'_, Self>) -> PyResult<()> {
+    //     //     Ok(())
+    //     // }
+    //
+    //     // TODO: need to figure out how to handle callbacks
+    //     // fn list_change_events<'a>(
+    //     //     mut self_: PyRefMut<'_, Self>,
+    //     //     py: Python<'a>,
+    //     //     callback: PyObject
+    //     // ) -> PyResult<&'a PyAny> {
+    //     //     let file_id = self_.file_id.clone();
+    //     //     let url = self_.url.clone();
+    //     //     let branch = self_.current_branch;
+    //     //     pyo3_asyncio::tokio::future_into_py(py, async move {
+    //     //         let mut client = get_client(url).await?;
+    //     //         let resp = client.list_change_events(RequestOnlyId {
+    //     //             id: file_id,
+    //     //             branch,
+    //     //         }).await.map_err(PyErrWrapper::from)?;
+    //     //         let mut stream = resp.into_inner();
+    //     //         while let Some(x) = stream.next().await {
+    //     //             Python::with_gil(|py| pyo3_asyncio::tokio::into_future(callback.as_ref(py).call((x.map(ChangeValueWithCounterWrapper).map_err(PyErrWrapper::from)?,), None)?))?
+    //     //                 .await?;
+    //     //         };
+    //     //         Ok(())
+    //     //     })
+    //     // }
+    //
+    //
+    //
+    //     // TODO: this should accept an "Object" instead of args
+    //     // TODO: nodes that are added should return a clean definition of what their addition looks like
+    //     // TODO: adding a node should also display any errors
 
     pub fn register_custom_node_handle(&mut self, key: String, handler: Handler) {
         self.custom_node_handlers.insert(key, Arc::new(handler));
     }
 
-    pub async fn poll_local_code_node_execution(&self) -> anyhow::Result<RespondPollNodeWillExecuteEvents> {
+    pub async fn poll_local_code_node_execution(
+        &self,
+    ) -> anyhow::Result<RespondPollNodeWillExecuteEvents> {
         let file_id = self.file_id.clone();
         let url = self.url.clone();
         let mut client = get_client(url).await?;
-        let req = FilteredPollNodeWillExecuteEventsRequest { id: file_id.clone() };
+        let req = FilteredPollNodeWillExecuteEventsRequest {
+            id: file_id.clone(),
+        };
         let result = client.poll_custom_node_will_execute_events(req).await?;
         Ok(result.into_inner())
     }
 
-    pub async fn ack_local_code_node_execution(&self, branch: u64, counter : u64) -> anyhow::Result<ExecutionStatus> {
+    pub async fn ack_local_code_node_execution(
+        &self,
+        branch: u64,
+        counter: u64,
+    ) -> anyhow::Result<ExecutionStatus> {
         let file_id = self.file_id.clone();
         let url = self.url.clone();
         let mut client = get_client(url).await?;
-        let result = client.ack_node_will_execute_event(RequestAckNodeWillExecuteEvent {
-            id: file_id.clone(),
-            branch,
-            counter,
-        }).await?;
+        let result = client
+            .ack_node_will_execute_event(RequestAckNodeWillExecuteEvent {
+                id: file_id.clone(),
+                branch,
+                counter,
+            })
+            .await?;
         Ok(result.into_inner())
     }
 
@@ -277,22 +328,21 @@ impl Chidori {
         branch: u64,
         counter: u64,
         node_name: String,
-        response: T
+        response: T,
     ) -> anyhow::Result<ExecutionStatus> {
         let file_id = self.file_id.clone();
         let url = self.url.clone();
 
         let json_object = serde_json::to_value(response)?;
         let response_paths = json_value_to_paths(&json_object);
-        let filled_values = response_paths.into_iter().map(|path| {
-            ChangeValue {
-                path: Some(Path {
-                    address: path.0,
-                }),
+        let filled_values = response_paths
+            .into_iter()
+            .map(|path| ChangeValue {
+                path: Some(Path { address: path.0 }),
                 value: Some(path.1),
                 branch,
-            }
-        }).collect();
+            })
+            .collect();
 
         // TODO: need parent counters from the original change
         // TODO: need source node
@@ -300,19 +350,22 @@ impl Chidori {
 
         // TODO: need to add the output table paths to these
         // TODO: this needs to look more like a real change
-        Ok(client.push_worker_event(FileAddressedChangeValueWithCounter {
-            branch,
-            counter,
-            node_name: node_name.clone(),
-            id: file_id.clone(),
-            change: Some(ChangeValueWithCounter {
-                filled_values,
-                parent_monotonic_counters: vec![],
-                monotonic_counter: counter,
+        Ok(client
+            .push_worker_event(FileAddressedChangeValueWithCounter {
                 branch,
-                source_node: node_name.clone(),
+                counter,
+                node_name: node_name.clone(),
+                id: file_id.clone(),
+                change: Some(ChangeValueWithCounter {
+                    filled_values,
+                    parent_monotonic_counters: vec![],
+                    monotonic_counter: counter,
+                    branch,
+                    source_node: node_name.clone(),
+                }),
             })
-        }).await?.into_inner())
+            .await?
+            .into_inner())
     }
 
     pub async fn run_custom_node_loop(&self) -> anyhow::Result<()> {
@@ -325,22 +378,36 @@ impl Chidori {
                 continue;
             } else {
                 backoff = 2;
-                for ev  in &events.node_will_execute_events {
+                for ev in &events.node_will_execute_events {
                     // ACK messages
-                    let NodeWillExecuteOnBranch { branch, counter, node, ..} = ev;
+                    let NodeWillExecuteOnBranch {
+                        branch,
+                        counter,
+                        node,
+                        ..
+                    } = ev;
                     let node_name = &node.as_ref().unwrap().source_node;
-                    if let Some(x) = self.custom_node_handlers.get(&ev.custom_node_type_name.clone().unwrap()) {
-                        self.ack_local_code_node_execution(*branch, *counter).await?;
+                    if let Some(x) = self
+                        .custom_node_handlers
+                        .get(&ev.custom_node_type_name.clone().unwrap())
+                    {
+                        self.ack_local_code_node_execution(*branch, *counter)
+                            .await?;
                         let result = (x.as_ref().callback)(ev.clone()).await?;
                         dbg!(&result);
-                        self.respond_local_code_node_execution(*branch, *counter, node_name.clone(), result).await?;
+                        self.respond_local_code_node_execution(
+                            *branch,
+                            *counter,
+                            node_name.clone(),
+                            result,
+                        )
+                        .await?;
                     }
                 }
             }
         }
     }
 }
-
 
 fn default_triggers() -> Option<Vec<String>> {
     Some(vec!["None".to_string()])
@@ -352,7 +419,7 @@ pub struct PromptNodeCreateOpts {
     pub triggers: Option<Vec<String>>,
     pub output_tables: Option<Vec<String>>,
     pub template: String,
-    pub model: Option<String>
+    pub model: Option<String>,
 }
 
 impl Default for PromptNodeCreateOpts {
@@ -376,17 +443,14 @@ impl PromptNodeCreateOpts {
     }
 }
 
-
-
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct CustomNodeCreateOpts {
     pub name: String,
     pub triggers: Option<Vec<String>>,
     pub output_tables: Option<Vec<String>>,
     pub output: Option<String>,
-    pub node_type_name: String
+    pub node_type_name: String,
 }
-
 
 impl Default for CustomNodeCreateOpts {
     fn default() -> Self {
@@ -409,8 +473,6 @@ impl CustomNodeCreateOpts {
     }
 }
 
-
-
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct DenoCodeNodeCreateOpts {
     pub name: String,
@@ -418,7 +480,7 @@ pub struct DenoCodeNodeCreateOpts {
     pub output_tables: Option<Vec<String>>,
     pub output: Option<String>,
     pub code: String,
-    pub is_template: Option<bool>
+    pub is_template: Option<bool>,
 }
 
 impl Default for DenoCodeNodeCreateOpts {
@@ -452,12 +514,11 @@ pub struct VectorMemoryNodeCreateOpts {
     pub output_tables: Option<Vec<String>>,
     pub output: Option<String>,
     pub template: Option<String>, // TODO: default is the contents of the query
-    pub action: Option<String>, // TODO: default WRITE
+    pub action: Option<String>,   // TODO: default WRITE
     pub embedding_model: Option<String>, // TODO: default TEXT_EMBEDDING_ADA_002
     pub db_vendor: Option<String>, // TODO: default QDRANT
     pub collection_name: String,
 }
-
 
 impl Default for VectorMemoryNodeCreateOpts {
     fn default() -> Self {
@@ -475,7 +536,6 @@ impl Default for VectorMemoryNodeCreateOpts {
     }
 }
 
-
 impl VectorMemoryNodeCreateOpts {
     pub fn merge(&mut self, other: VectorMemoryNodeCreateOpts) {
         self.name = other.name;
@@ -492,13 +552,16 @@ impl VectorMemoryNodeCreateOpts {
 
 fn remap_triggers(triggers: Option<Vec<String>>) -> Vec<Option<String>> {
     let triggers: Vec<Option<String>> = if let Some(triggers) = triggers {
-        triggers.into_iter().map(|q| {
-            if q == "None".to_string() {
-                None
-            } else {
-                Some(q)
-            }
-        }).collect()
+        triggers
+            .into_iter()
+            .map(|q| {
+                if q == "None".to_string() {
+                    None
+                } else {
+                    Some(q)
+                }
+            })
+            .collect()
     } else {
         vec![]
     };
@@ -513,7 +576,7 @@ pub struct GraphBuilder {
 impl GraphBuilder {
     pub fn new() -> Self {
         GraphBuilder {
-            clean_graph: CleanedDefinitionGraph::zero()
+            clean_graph: CleanedDefinitionGraph::zero(),
         }
     }
     pub fn prompt_node(&mut self, arg: PromptNodeCreateOpts) -> anyhow::Result<NodeHandle> {
@@ -524,8 +587,12 @@ impl GraphBuilder {
             remap_triggers(def.triggers),
             def.template,
             def.model.unwrap_or("GPT_3_5_TURBO".to_string()),
-            def.output_tables.unwrap_or(vec![]))?;
-        self.clean_graph.merge_file(&File { nodes: vec![node.clone()], ..Default::default() })?;
+            def.output_tables.unwrap_or(vec![]),
+        )?;
+        self.clean_graph.merge_file(&File {
+            nodes: vec![node.clone()],
+            ..Default::default()
+        })?;
         Ok(NodeHandle::from(node)?)
     }
 
@@ -537,12 +604,14 @@ impl GraphBuilder {
             remap_triggers(def.triggers.clone()),
             def.output.unwrap_or("{}".to_string()),
             def.node_type_name,
-            def.output_tables.unwrap_or(vec![])
+            def.output_tables.unwrap_or(vec![]),
         );
-        self.clean_graph.merge_file(&File { nodes: vec![node.clone()], ..Default::default() })?;
+        self.clean_graph.merge_file(&File {
+            nodes: vec![node.clone()],
+            ..Default::default()
+        })?;
         Ok(NodeHandle::from(node)?)
     }
-
 
     pub fn deno_code_node(&mut self, arg: DenoCodeNodeCreateOpts) -> anyhow::Result<NodeHandle> {
         let mut def = DenoCodeNodeCreateOpts::default();
@@ -551,15 +620,24 @@ impl GraphBuilder {
             def.name.clone(),
             remap_triggers(def.triggers.clone()),
             def.output.unwrap_or("{}".to_string()),
-            SourceNodeType::Code("DENO".to_string(), def.code, def.is_template.unwrap_or(false)),
-            def.output_tables.unwrap_or(vec![])
+            SourceNodeType::Code(
+                "DENO".to_string(),
+                def.code,
+                def.is_template.unwrap_or(false),
+            ),
+            def.output_tables.unwrap_or(vec![]),
         );
-        self.clean_graph.merge_file(&File { nodes: vec![node.clone()], ..Default::default() })?;
+        self.clean_graph.merge_file(&File {
+            nodes: vec![node.clone()],
+            ..Default::default()
+        })?;
         Ok(NodeHandle::from(node)?)
     }
 
-
-    pub fn vector_memory_node(&mut self, arg: VectorMemoryNodeCreateOpts) -> anyhow::Result<NodeHandle> {
+    pub fn vector_memory_node(
+        &mut self,
+        arg: VectorMemoryNodeCreateOpts,
+    ) -> anyhow::Result<NodeHandle> {
         let mut def = VectorMemoryNodeCreateOpts::default();
         def.merge(arg);
         let node = create_vector_memory_node(
@@ -567,67 +645,70 @@ impl GraphBuilder {
             remap_triggers(def.triggers.clone()),
             def.output.unwrap_or("{}".to_string()),
             def.action.unwrap_or("READ".to_string()),
-            def.embedding_model.unwrap_or("TEXT_EMBEDDING_ADA_002".to_string()),
+            def.embedding_model
+                .unwrap_or("TEXT_EMBEDDING_ADA_002".to_string()),
             def.template.unwrap_or("".to_string()),
             def.db_vendor.unwrap_or("QDRANT".to_string()),
             def.collection_name,
-            def.output_tables.unwrap_or(vec![])
+            def.output_tables.unwrap_or(vec![]),
         )?;
-        self.clean_graph.merge_file(&File { nodes: vec![node.clone()], ..Default::default() })?;
+        self.clean_graph.merge_file(&File {
+            nodes: vec![node.clone()],
+            ..Default::default()
+        })?;
         Ok(NodeHandle::from(node)?)
     }
-//
-//
-//     //
-//     // fn observation_node(mut self_: PyRefMut<'_, Self>, name: String, query_def: Option<String>, template: String, model: String) -> PyResult<()> {
-//     //     let file_id = self_.file_id.clone();
-//     //     let node = create_observation_node(
-//     //         "".to_string(),
-//     //         None,
-//     //         "".to_string(),
-//     //     );
-//     //     executor::block_on(self_.client.merge(RequestFileMerge {
-//     //         id: file_id,
-//     //         file: Some(File {
-//     //             nodes: vec![node],
-//     //             ..Default::default()
-//     //         }),
-//     //         branch: 0,
-//     //     }));
-//     //     Ok(())
-//     // }
+    //
+    //
+    //     //
+    //     // fn observation_node(mut self_: PyRefMut<'_, Self>, name: String, query_def: Option<String>, template: String, model: String) -> PyResult<()> {
+    //     //     let file_id = self_.file_id.clone();
+    //     //     let node = create_observation_node(
+    //     //         "".to_string(),
+    //     //         None,
+    //     //         "".to_string(),
+    //     //     );
+    //     //     executor::block_on(self_.client.merge(RequestFileMerge {
+    //     //         id: file_id,
+    //     //         file: Some(File {
+    //     //             nodes: vec![node],
+    //     //             ..Default::default()
+    //     //         }),
+    //     //         branch: 0,
+    //     //     }));
+    //     //     Ok(())
+    //     // }
 
     //     // TODO: need to figure out passing a buffer of bytes
-//     // TODO: nodes that are added should return a clean definition of what their addition looks like
-//     // TODO: adding a node should also display any errors
-//     /// x = None
-//     /// with open("/Users/coltonpierson/Downloads/files_and_dirs.zip", "rb") as zip_file:
-//     ///     contents = zip_file.read()
-//     ///     x = await p.load_zip_file("LoadZip", """ output: String """, contents)
-//     /// x
-//     // #[pyo3(signature = (name=String::new(), output_tables=vec![], output=String::new(), bytes=vec![]))]
-//     // fn load_zip_file<'a>(
-//     //     mut self_: PyRefMut<'_, Self>,
-//     //     py: Python<'a>,
-//     //     name: String,
-//     //     output_tables: Vec<String>,
-//     //     output: String,
-//     //     bytes: Vec<u8>
-//     // ) -> PyResult<&'a PyAny> {
-//     //     let file_id = self_.file_id.clone();
-//     //     let url = self_.url.clone();
-//     //     pyo3_asyncio::tokio::future_into_py(py, async move {
-//     //         let node = create_loader_node(
-//     //             name,
-//     //             vec![],
-//     //             output,
-//     //             LoadFrom::ZipfileBytes(bytes),
-//     //             output_tables
-//     //         );
-//     //         Ok(push_file_merge(&url, &file_id, node).await?)
-//     //     })
-//     // }
-
+    //     // TODO: nodes that are added should return a clean definition of what their addition looks like
+    //     // TODO: adding a node should also display any errors
+    //     /// x = None
+    //     /// with open("/Users/coltonpierson/Downloads/files_and_dirs.zip", "rb") as zip_file:
+    //     ///     contents = zip_file.read()
+    //     ///     x = await p.load_zip_file("LoadZip", """ output: String """, contents)
+    //     /// x
+    //     // #[pyo3(signature = (name=String::new(), output_tables=vec![], output=String::new(), bytes=vec![]))]
+    //     // fn load_zip_file<'a>(
+    //     //     mut self_: PyRefMut<'_, Self>,
+    //     //     py: Python<'a>,
+    //     //     name: String,
+    //     //     output_tables: Vec<String>,
+    //     //     output: String,
+    //     //     bytes: Vec<u8>
+    //     // ) -> PyResult<&'a PyAny> {
+    //     //     let file_id = self_.file_id.clone();
+    //     //     let url = self_.url.clone();
+    //     //     pyo3_asyncio::tokio::future_into_py(py, async move {
+    //     //         let node = create_loader_node(
+    //     //             name,
+    //     //             vec![],
+    //     //             output,
+    //     //             LoadFrom::ZipfileBytes(bytes),
+    //     //             output_tables
+    //     //         );
+    //     //         Ok(push_file_merge(&url, &file_id, node).await?)
+    //     //     })
+    //     // }
 
     pub fn serialize_yaml(&self) -> anyhow::Result<String> {
         Ok(self.clean_graph.serialize_to_yaml())
@@ -637,34 +718,40 @@ impl GraphBuilder {
         let url = &c.url;
         let file_id = &c.file_id;
         let mut client = get_client(url.clone()).await?;
-        let nodes = self.clean_graph.node_by_name.clone().into_values().collect();
+        let nodes = self
+            .clean_graph
+            .node_by_name
+            .clone()
+            .into_values()
+            .collect();
 
-        Ok(client.merge(RequestFileMerge {
-            id: file_id.clone(),
-            file: Some(File { nodes, ..Default::default() }),
-            branch: 0,
-        }).await.map(|x| x.into_inner())?)
+        Ok(client
+            .merge(RequestFileMerge {
+                id: file_id.clone(),
+                file: Some(File {
+                    nodes,
+                    ..Default::default()
+                }),
+                branch: 0,
+            })
+            .await
+            .map(|x| x.into_inner())?)
     }
 }
-
 
 // Node handle
 #[derive(Clone)]
 pub struct NodeHandle {
     pub node: Item,
-    indiv: CleanIndividualNode
+    indiv: CleanIndividualNode,
 }
 
 impl NodeHandle {
     fn from(node: Item) -> anyhow::Result<NodeHandle> {
         let indiv = derive_for_individual_node(&node)?;
-        Ok(NodeHandle {
-            node,
-            indiv
-        })
+        Ok(NodeHandle { node, indiv })
     }
 }
-
 
 impl NodeHandle {
     pub(crate) fn get_name(&self) -> String {
@@ -675,7 +762,11 @@ impl NodeHandle {
         self.indiv.output_paths.clone()
     }
 
-    pub fn run_when(&mut self, graph_builder: &mut GraphBuilder, other_node: &NodeHandle) -> anyhow::Result<bool> {
+    pub fn run_when(
+        &mut self,
+        graph_builder: &mut GraphBuilder,
+        other_node: &NodeHandle,
+    ) -> anyhow::Result<bool> {
         let triggers = &mut self.node.core.as_mut().unwrap().triggers;
 
         // Remove null query if it is the only one present
@@ -686,26 +777,36 @@ impl NodeHandle {
         let q = construct_query_from_output_type(
             &other_node.get_name(),
             &other_node.get_name(),
-            &other_node.get_output_type()
-        ).unwrap();
-        triggers.push(Query { query: Some(q)});
-        graph_builder.clean_graph.merge_file(&File { nodes: vec![self.node.clone()], ..Default::default() })?;
+            &other_node.get_output_type(),
+        )
+        .unwrap();
+        triggers.push(Query { query: Some(q) });
+        graph_builder.clean_graph.merge_file(&File {
+            nodes: vec![self.node.clone()],
+            ..Default::default()
+        })?;
         Ok(true)
     }
 
-
-    pub async fn query(&self, file_id: String, url: String, branch: u64, frame: u64) -> anyhow::Result<HashMap<String, SerializedValue>> {
+    pub async fn query(
+        &self,
+        file_id: String,
+        url: String,
+        branch: u64,
+        frame: u64,
+    ) -> anyhow::Result<HashMap<String, SerializedValue>> {
         let name = &self.node.core.as_ref().unwrap().name;
-        let query = construct_query_from_output_type(&name, &name, &self.indiv.output_paths).unwrap();
+        let query =
+            construct_query_from_output_type(&name, &name, &self.indiv.output_paths).unwrap();
         let mut client = get_client(url).await?;
-        let result = client.run_query(QueryAtFrame {
-            id: file_id,
-            query: Some(Query {
-                query: Some(query)
-            }),
-            frame,
-            branch,
-        }).await?;
+        let result = client
+            .run_query(QueryAtFrame {
+                id: file_id,
+                query: Some(Query { query: Some(query) }),
+                frame,
+                branch,
+            })
+            .await?;
         let res = result.into_inner();
         let mut obj = HashMap::new();
         for value in res.values.iter() {
@@ -716,24 +817,22 @@ impl NodeHandle {
         }
         Ok(obj)
     }
-
 }
 
 #[macro_export]
 macro_rules! register_node_handle {
     ($c:expr, $name:expr, $handler:expr) => {
-        $c.register_custom_node_handle($name.to_string(), Handler::new(
-            move |n| Box::pin(async move { ($handler)(n).await })
-        ));
+        $c.register_custom_node_handle(
+            $name.to_string(),
+            Handler::new(move |n| Box::pin(async move { ($handler)(n).await })),
+        );
     };
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_new_graph() {
-    }
+    fn test_new_graph() {}
 }
