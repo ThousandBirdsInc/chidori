@@ -214,7 +214,12 @@ mod tests {
     #[tokio::test]
     async fn test_exec_memory_node_qdrant() {
 
-        // run docker-compose up --build from the root of the project 
+        // to run the test with qdrant, run the following command
+        // go to the root of the project and run
+        // 1. chmod +x ./run-tests.sh
+        // 2. ./run-tests.sh --build for the first time 
+        // 3. ./run-tests.sh if you have already built the container
+        
         // this runs the qdrant container and runs the tests
 
        // but if you wish to run the tests manually follow the steps below.

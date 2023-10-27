@@ -14,6 +14,13 @@ then
     exit 1
 fi
 
+# Check if the --build flag was provided
+if [[ $* == *--build* ]]
+then
+    # Rebuild the Docker images
+    docker-compose build
+fi
+
 # Start the Docker Compose services and run the tests
 docker-compose up --exit-code-from tests
 
