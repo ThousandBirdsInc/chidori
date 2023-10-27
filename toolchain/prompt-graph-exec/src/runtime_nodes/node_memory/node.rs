@@ -213,15 +213,27 @@ mod tests {
     #[cfg(feature = "qdrant")]
     #[tokio::test]
     async fn test_exec_memory_node_qdrant() {
-        // TODO: this test will require a running qdrant instance
+
+        // to run the test with qdrant, run the following command
+        // go to the root of the project and run
+        // 1. chmod +x ./run-tests.sh
+        // 2. ./run-tests.sh --build for the first time 
+        // 3. ./run-tests.sh if you have already built the container
+        
+        // this runs the qdrant container and runs the tests
+
+       // but if you wish to run the tests manually follow the steps below.
+       // 1. run the qdrant container
 
         // docker run -p 6333:6333 -p 6334:6334 \
         // -e QDRANT__SERVICE__GRPC_PORT="6334" \
         // qdrant/qdrant
 
+        // 2. change the qdrant url from qdrant to localhost 
+        // Change from QdrantClientConfig::from_url("http://qdrant:6334") to QdrantClientConfig::from_url("http://localhost:6334")
         let db = SledConfig::new().temporary(true).flush_every_ms(None).open().unwrap();
         let tree = db.open_tree("test").unwrap();
-        let config = QdrantClientConfig::from_url("http://localhost:6334");
+        let config = QdrantClientConfig::from_url("http://qdrant:6334");
         let client = QdrantClient::new(Some(config)).unwrap();
         let _ = client.delete_collection("test_exec_memory_node_qdrant").await;
 

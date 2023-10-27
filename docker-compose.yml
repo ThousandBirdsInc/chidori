@@ -1,0 +1,18 @@
+version: '3.8'
+services:
+  qdrant:
+    image: qdrant/qdrant
+    ports:
+      - 6333:6333
+      - 6334:6334
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+
+  tests:
+    image: rust:1.73.0-bullseye
+    command: bash -c "cargo test --features qdrant --package prompt-graph-core --package prompt-graph-exec --package chidori"
+    volumes:
+      - ./toolchain:/usr/src/toolchain
+    working_dir: /usr/src/toolchain
+    depends_on:
+      - qdrant
