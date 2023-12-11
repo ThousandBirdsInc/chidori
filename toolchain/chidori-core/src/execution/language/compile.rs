@@ -45,6 +45,7 @@ fn compile_to_graph(program: Program) -> ExecutionGraph {
     db
 }
 
+/// This walks the AST and constructs a graph of operations
 fn eval_to_graph(
     expr: &Expr,
     funcs: &HashMap<String, Func>,

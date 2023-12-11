@@ -26,7 +26,7 @@ qdrant = []
 default = []
 
 [dependencies]
-prompt-graph-core = { path = "../prompt-graph-core", version = "0.1.28" }
+prompt-graph-core = { path = "../chidori-core", version = "0.1.28" }
 protobuf.workspace = true
 tokio.workspace = true
 openai-api-rs = "0.1.11"

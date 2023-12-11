@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "prompt-graph-core",
+    "chidori-core",
     "prompt-graph-exec",
     "prompt-graph-ui/src-tauri",
     "chidori",
