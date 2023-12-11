@@ -2,59 +2,57 @@ use std::collections::HashMap;
 
 use std::sync::Arc;
 
-
-
-
 use dashmap::DashMap;
-
 
 use tokio::sync::mpsc;
 
-use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status, transport::Server};
+use tokio_stream::StreamExt;
+use tonic::{transport::Server, Request, Response, Status};
 
-
-
-use prompt_graph_core::proto::{ChangeValueWithCounter, Empty, ExecutionStatus, File, FileAddressedChangeValueWithCounter, FilteredPollNodeWillExecuteEventsRequest, InputProposal, ListBranchesRes, ListRegisteredGraphsResponse, NodeWillExecuteOnBranch, ParquetFile, QueryAtFrame, QueryAtFrameResponse, RequestAckNodeWillExecuteEvent, RequestAtFrame, RequestFileMerge, RequestInputProposalResponse, RequestListBranches, RequestNewBranch, RequestOnlyId, RespondPollNodeWillExecuteEvents, UpsertPromptLibraryRecord};
-use prompt_graph_core::proto::execution_runtime_server::{ExecutionRuntime, ExecutionRuntimeServer};
+use prompt_graph_core::proto::execution_runtime_server::{
+    ExecutionRuntime, ExecutionRuntimeServer,
+};
+use prompt_graph_core::proto::{
+    ChangeValueWithCounter, Empty, ExecutionStatus, File, FileAddressedChangeValueWithCounter,
+    FilteredPollNodeWillExecuteEventsRequest, InputProposal, ListBranchesRes,
+    ListRegisteredGraphsResponse, NodeWillExecuteOnBranch, ParquetFile, QueryAtFrame,
+    QueryAtFrameResponse, RequestAckNodeWillExecuteEvent, RequestAtFrame, RequestFileMerge,
+    RequestInputProposalResponse, RequestListBranches, RequestNewBranch, RequestOnlyId,
+    RespondPollNodeWillExecuteEvents, UpsertPromptLibraryRecord,
+};
 
 use log::debug;
 
-
-
-
-
-
-use prompt_graph_core::execution_router::evaluate_changes_against_node;
 use prompt_graph_core::build_runtime_graph::graph_parse::query_path_from_query_string;
+use prompt_graph_core::execution_router::evaluate_changes_against_node;
 
-
-
-
-
-use crate::db_operations::get_change_counter_for_branch;
 use crate::db_operations::branches::{create_branch, create_root_branch, list_branches};
+use crate::db_operations::changes::scan_all_pending_changes;
 use crate::db_operations::changes::scan_all_resolved_changes;
+use crate::db_operations::custom_node_execution::insert_custom_node_execution;
+use crate::db_operations::executing_nodes::{
+    move_will_execute_event_to_complete, move_will_execute_event_to_in_progress,
+    scan_all_custom_node_will_execute_events, scan_all_will_execute_events,
+    scan_all_will_execute_pending_events,
+};
+use crate::db_operations::files::{insert_executor_file_existence_by_id, scan_all_executor_files};
+use crate::db_operations::get_change_counter_for_branch;
+use crate::db_operations::graph_mutations::{
+    insert_pending_graph_mutation, scan_all_file_mutations_on_branch,
+};
 use crate::db_operations::input_proposals_and_responses::insert_input_response;
+use crate::db_operations::input_proposals_and_responses::scan_all_input_proposals;
 use crate::db_operations::playback::pause_execution_at_frame;
 use crate::db_operations::playback::play_execution_at_frame;
-use crate::db_operations::changes::scan_all_pending_changes;
-use crate::db_operations::custom_node_execution::insert_custom_node_execution;
-use crate::db_operations::graph_mutations::{insert_pending_graph_mutation, scan_all_file_mutations_on_branch};
-use crate::db_operations::input_proposals_and_responses::scan_all_input_proposals;
-use crate::db_operations::executing_nodes::{move_will_execute_event_to_complete, move_will_execute_event_to_in_progress, scan_all_custom_node_will_execute_events, scan_all_will_execute_events, scan_all_will_execute_pending_events};
-use crate::db_operations::files::{insert_executor_file_existence_by_id, scan_all_executor_files};
 use crate::db_operations::prompt_library::insert_prompt_library_mutation;
 
 use crate::executor::{Executor, InternalStateHandler};
 
-
-
 #[derive(Debug)]
 pub struct MyExecutionRuntime {
     db: Arc<sled::Db>,
-    executor_started: Arc<DashMap<String, bool>>
+    executor_started: Arc<DashMap<String, bool>>,
 }
 
 impl MyExecutionRuntime {
@@ -72,7 +70,7 @@ impl MyExecutionRuntime {
 
         MyExecutionRuntime {
             db: Arc::new(db_config.open().unwrap()),
-            executor_started: Arc::new(DashMap::new())
+            executor_started: Arc::new(DashMap::new()),
         }
     }
 
@@ -82,12 +80,13 @@ impl MyExecutionRuntime {
     }
 }
 
-
 #[tonic::async_trait]
 impl ExecutionRuntime for MyExecutionRuntime {
-
     #[tracing::instrument]
-    async fn run_query(&self, request: Request<QueryAtFrame>) -> Result<Response<QueryAtFrameResponse>, Status> {
+    async fn run_query(
+        &self,
+        request: Request<QueryAtFrame>,
+    ) -> Result<Response<QueryAtFrameResponse>, Status> {
         debug!("Received run_query request: {:?}", &request);
         let query = request.get_ref().query.as_ref().unwrap();
         let branch = request.get_ref().branch;
@@ -96,17 +95,13 @@ impl ExecutionRuntime for MyExecutionRuntime {
         let state = InternalStateHandler {
             tree: &tree,
             branch,
-            counter
+            counter,
         };
         let paths = query_path_from_query_string(&query.query.clone().unwrap()).unwrap();
         if let Some(values) = evaluate_changes_against_node(&state, &paths) {
-            Ok(Response::new(QueryAtFrameResponse {
-                values
-            }))
+            Ok(Response::new(QueryAtFrameResponse { values }))
         } else {
-            Ok(Response::new(QueryAtFrameResponse {
-                values: vec![]
-            }))
+            Ok(Response::new(QueryAtFrameResponse { values: vec![] }))
         }
     }
 
@@ -115,7 +110,10 @@ impl ExecutionRuntime for MyExecutionRuntime {
     /// If there is already a file with this id in place, we perform a merge with that definition
     /// which is our mechanism for runtime mutations.
     #[tracing::instrument]
-    async fn merge(&self, request: Request<RequestFileMerge>) -> Result<Response<ExecutionStatus>, Status> {
+    async fn merge(
+        &self,
+        request: Request<RequestFileMerge>,
+    ) -> Result<Response<ExecutionStatus>, Status> {
         // TODO: this needs to push the counter forward
         debug!("Received merge request: {:?}", request);
         let file = request.get_ref().file.as_ref().unwrap();
@@ -124,11 +122,18 @@ impl ExecutionRuntime for MyExecutionRuntime {
         let tree = self.get_tree(&request.get_ref().id.clone());
         insert_pending_graph_mutation(&tree, branch, file.clone());
         let monotonic_counter = get_change_counter_for_branch(&tree, branch);
-        Ok(Response::new(ExecutionStatus{ id, monotonic_counter, branch}))
+        Ok(Response::new(ExecutionStatus {
+            id,
+            monotonic_counter,
+            branch,
+        }))
     }
 
     #[tracing::instrument]
-    async fn current_file_state(&self, request: Request<RequestOnlyId>) -> Result<Response<File>, Status> {
+    async fn current_file_state(
+        &self,
+        request: Request<RequestOnlyId>,
+    ) -> Result<Response<File>, Status> {
         debug!("Received current_file_state request: {:?}", request);
         let tree = &self.get_tree(&request.get_ref().id.clone());
         let id = request.get_ref().id.clone();
@@ -136,10 +141,7 @@ impl ExecutionRuntime for MyExecutionRuntime {
         let mutations = scan_all_file_mutations_on_branch(tree, *branch);
         let mut name_map = HashMap::new();
         let mut name_map_version_markers: HashMap<String, (u64, u64)> = HashMap::new();
-        let mut new_file = File {
-            id,
-            nodes: vec![],
-        };
+        let mut new_file = File { id, nodes: vec![] };
         // TODO: filter to changes below the provided counter
         for (_is_resolved, k, mutation) in mutations {
             for node in mutation.nodes {
@@ -165,7 +167,10 @@ impl ExecutionRuntime for MyExecutionRuntime {
     }
 
     #[tracing::instrument]
-    async fn get_parquet_history(&self, request: Request<RequestOnlyId>) -> Result<Response<ParquetFile>, Status> {
+    async fn get_parquet_history(
+        &self,
+        request: Request<RequestOnlyId>,
+    ) -> Result<Response<ParquetFile>, Status> {
         debug!("Received get_parquet_history request: {:?}", request);
         let _tree = &self.get_tree(&request.get_ref().id.clone());
         // TODO: serialize the target branch to parquet
@@ -173,7 +178,10 @@ impl ExecutionRuntime for MyExecutionRuntime {
     }
 
     #[tracing::instrument]
-    async fn play(&self, request: Request<RequestAtFrame>) -> Result<Response<ExecutionStatus>, Status> {
+    async fn play(
+        &self,
+        request: Request<RequestAtFrame>,
+    ) -> Result<Response<ExecutionStatus>, Status> {
         // Play also behaves as our "Connect" message
         debug!("Received play request: {:?}", request);
         let exec = self.executor_started.clone();
@@ -183,7 +191,11 @@ impl ExecutionRuntime for MyExecutionRuntime {
 
         play_execution_at_frame(&tree, request.get_ref().frame);
         if exec.get(id).is_some() {
-            return Ok(Response::new(ExecutionStatus{ id: id.clone(), monotonic_counter: 0, branch }));
+            return Ok(Response::new(ExecutionStatus {
+                id: id.clone(),
+                monotonic_counter: 0,
+                branch,
+            }));
         }
 
         // TODO: handle panics in the executor
@@ -192,70 +204,92 @@ impl ExecutionRuntime for MyExecutionRuntime {
 
         create_root_branch(&tree);
         let move_tree = tree.clone();
-        let _ = tokio::spawn( async move {
+        let _ = tokio::spawn(async move {
             let mut executor = Executor::new(move_tree);
             executor.run().await;
         });
 
-
         let monotonic_counter = get_change_counter_for_branch(&tree, branch);
         exec.insert(id.clone(), true);
-        Ok(Response::new(ExecutionStatus{ id: id.clone(), monotonic_counter, branch }))
+        Ok(Response::new(ExecutionStatus {
+            id: id.clone(),
+            monotonic_counter,
+            branch,
+        }))
     }
 
     #[tracing::instrument]
-    async fn pause(&self, request: Request<RequestAtFrame>) -> Result<Response<ExecutionStatus>, Status> {
+    async fn pause(
+        &self,
+        request: Request<RequestAtFrame>,
+    ) -> Result<Response<ExecutionStatus>, Status> {
         debug!("Received pause request: {:?}", request);
         let id = &request.get_ref().id.clone();
         let branch = request.get_ref().branch.clone();
         let tree = self.get_tree(id);
         pause_execution_at_frame(&tree, request.get_ref().frame);
         let monotonic_counter = get_change_counter_for_branch(&tree, branch);
-        Ok(Response::new(ExecutionStatus{ id: id.clone(), monotonic_counter, branch}))
+        Ok(Response::new(ExecutionStatus {
+            id: id.clone(),
+            monotonic_counter,
+            branch,
+        }))
     }
 
     // TODO: branch should target a specific node (via counter and branch)
     #[tracing::instrument]
-    async fn branch(&self, request: Request<RequestNewBranch>) -> Result<Response<ExecutionStatus>, Status> {
+    async fn branch(
+        &self,
+        request: Request<RequestNewBranch>,
+    ) -> Result<Response<ExecutionStatus>, Status> {
         debug!("Received branch request: {:?}", request);
         let id = &request.get_ref().id.clone();
         let source_branch_id = request.get_ref().source_branch_id.clone();
         let tree = self.get_tree(id);
         let new_branch_id = create_branch(&tree, source_branch_id, 0);
         let monotonic_counter = get_change_counter_for_branch(&tree, new_branch_id);
-        Ok(Response::new(ExecutionStatus{ id: id.clone(), monotonic_counter, branch: new_branch_id}))
+        Ok(Response::new(ExecutionStatus {
+            id: id.clone(),
+            monotonic_counter,
+            branch: new_branch_id,
+        }))
     }
 
     #[tracing::instrument]
-    async fn list_branches(&self, request: Request<RequestListBranches>) -> Result<Response<ListBranchesRes>, Status> {
+    async fn list_branches(
+        &self,
+        request: Request<RequestListBranches>,
+    ) -> Result<Response<ListBranchesRes>, Status> {
         debug!("Received list_branches request: {:?}", request);
         let id = &request.get_ref().id.clone();
-        Ok(Response::new(
-            ListBranchesRes {
-                id: id.clone(),
-                branches: list_branches(&self.get_tree(id)).collect()
-            }
-        ))
-
+        Ok(Response::new(ListBranchesRes {
+            id: id.clone(),
+            branches: list_branches(&self.get_tree(id)).collect(),
+        }))
     }
 
     /// List all of the graphs registered by ID with this execution runtime
     #[tracing::instrument]
-    async fn list_registered_graphs(&self, request: tonic::Request<prompt_graph_core::proto::Empty>) -> Result<Response<ListRegisteredGraphsResponse>, Status> {
+    async fn list_registered_graphs(
+        &self,
+        request: tonic::Request<prompt_graph_core::proto::Empty>,
+    ) -> Result<Response<ListRegisteredGraphsResponse>, Status> {
         debug!("Received list_registered_graphs request: {:?}", request);
         let root_tree = self.get_tree("root");
         Ok(Response::new(ListRegisteredGraphsResponse {
-            ids: scan_all_executor_files(&root_tree).collect()
+            ids: scan_all_executor_files(&root_tree).collect(),
         }))
     }
-
 
     type ListInputProposalsStream = ReceiverStream<Result<InputProposal, Status>>;
 
     /// Fetch pending input proposals for a given graph. These should be responded to with external
     /// input to the system. Dependent execution nodes will be blocked until these are resolved.
     #[tracing::instrument]
-    async fn list_input_proposals(&self, request: Request<RequestOnlyId>) -> Result<Response<Self::ListInputProposalsStream>, Status> {
+    async fn list_input_proposals(
+        &self,
+        request: Request<RequestOnlyId>,
+    ) -> Result<Response<Self::ListInputProposalsStream>, Status> {
         debug!("Received list_input_proposals request: {:?}", request);
         let (tx, rx) = mpsc::channel(4);
         let tree = self.get_tree(&request.get_ref().id.clone());
@@ -269,7 +303,10 @@ impl ExecutionRuntime for MyExecutionRuntime {
 
     /// Send a response to an input proposal.
     #[tracing::instrument]
-    async fn respond_to_input_proposal(&self, request: Request<RequestInputProposalResponse>) -> Result<Response<Empty>, Status> {
+    async fn respond_to_input_proposal(
+        &self,
+        request: Request<RequestInputProposalResponse>,
+    ) -> Result<Response<Empty>, Status> {
         debug!("Received respond_to_input_proposal request: {:?}", request);
         let tree = self.get_tree(&request.get_ref().id.clone());
         let rec = request.get_ref().clone();
@@ -281,7 +318,10 @@ impl ExecutionRuntime for MyExecutionRuntime {
 
     /// Fetch the resulting changes from the execution of a graph.
     #[tracing::instrument]
-    async fn list_change_events(&self, request: Request<RequestOnlyId>) -> Result<Response<Self::ListChangeEventsStream>, Status> {
+    async fn list_change_events(
+        &self,
+        request: Request<RequestOnlyId>,
+    ) -> Result<Response<Self::ListChangeEventsStream>, Status> {
         debug!("Received list_change_events request: {:?}", request);
         let (tx, rx) = mpsc::channel(4);
         let tree = self.get_tree(&request.get_ref().id.clone());
@@ -298,8 +338,14 @@ impl ExecutionRuntime for MyExecutionRuntime {
 
     type ListNodeWillExecuteEventsStream = ReceiverStream<Result<NodeWillExecuteOnBranch, Status>>;
 
-    async fn list_node_will_execute_events(&self, request: Request<RequestOnlyId>) -> Result<Response<Self::ListNodeWillExecuteEventsStream>, Status> {
-        debug!("Received list_node_will_execute_events request: {:?}", request);
+    async fn list_node_will_execute_events(
+        &self,
+        request: Request<RequestOnlyId>,
+    ) -> Result<Response<Self::ListNodeWillExecuteEventsStream>, Status> {
+        debug!(
+            "Received list_node_will_execute_events request: {:?}",
+            request
+        );
         let (tx, rx) = mpsc::channel(4);
         let tree = self.get_tree(&request.get_ref().id.clone());
         tokio::spawn(async move {
@@ -310,8 +356,14 @@ impl ExecutionRuntime for MyExecutionRuntime {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    async fn poll_custom_node_will_execute_events(&self, request: Request<FilteredPollNodeWillExecuteEventsRequest>) -> Result<Response<RespondPollNodeWillExecuteEvents>, Status> {
-        debug!("Received poll_custom_node_will_execute_events request: {:?}", request);
+    async fn poll_custom_node_will_execute_events(
+        &self,
+        request: Request<FilteredPollNodeWillExecuteEventsRequest>,
+    ) -> Result<Response<RespondPollNodeWillExecuteEvents>, Status> {
+        debug!(
+            "Received poll_custom_node_will_execute_events request: {:?}",
+            request
+        );
         let tree = self.get_tree(&request.get_ref().id.clone());
 
         // Fetch custom node will execute events
@@ -323,8 +375,14 @@ impl ExecutionRuntime for MyExecutionRuntime {
 
     // TODO: currently if we ack and then fail, we never progress
     // TODO: in progress nodes must timeout
-    async fn ack_node_will_execute_event(&self, request: Request<RequestAckNodeWillExecuteEvent>) -> Result<Response<ExecutionStatus>, Status> {
-        debug!("Received ack_node_will_execute_event request: {:?}", request);
+    async fn ack_node_will_execute_event(
+        &self,
+        request: Request<RequestAckNodeWillExecuteEvent>,
+    ) -> Result<Response<ExecutionStatus>, Status> {
+        debug!(
+            "Received ack_node_will_execute_event request: {:?}",
+            request
+        );
         let tree = self.get_tree(&request.get_ref().id.clone());
         let branch = request.get_ref().branch.clone();
         let counter = request.get_ref().counter.clone();
@@ -335,20 +393,29 @@ impl ExecutionRuntime for MyExecutionRuntime {
 
     /// Used to push self-invoke (or other local exec node results) back into the runtime
     #[tracing::instrument]
-    async fn push_worker_event(&self, request: Request<FileAddressedChangeValueWithCounter>) -> Result<Response<ExecutionStatus>, Status> {
+    async fn push_worker_event(
+        &self,
+        request: Request<FileAddressedChangeValueWithCounter>,
+    ) -> Result<Response<ExecutionStatus>, Status> {
         debug!("Received push_worker_event request: {:?}", request);
         let tree = self.get_tree(&request.get_ref().id.clone());
         let branch = request.get_ref().branch.clone();
         let counter = request.get_ref().counter.clone();
-        let change = request.into_inner().change.expect("Must have a change value");
+        let change = request
+            .into_inner()
+            .change
+            .expect("Must have a change value");
 
-        let _node_will_exec = move_will_execute_event_to_complete(&tree,  true, branch, counter);
+        let _node_will_exec = move_will_execute_event_to_complete(&tree, true, branch, counter);
         insert_custom_node_execution(&tree, change);
         Ok(Response::new(ExecutionStatus::default()))
     }
 
     #[tracing::instrument]
-    async fn push_template_partial(&self, request: Request<UpsertPromptLibraryRecord>) -> Result<Response<ExecutionStatus>, Status> {
+    async fn push_template_partial(
+        &self,
+        request: Request<UpsertPromptLibraryRecord>,
+    ) -> Result<Response<ExecutionStatus>, Status> {
         let tree = self.get_tree(&request.get_ref().id.clone());
         insert_prompt_library_mutation(&tree, request.get_ref());
         Ok(Response::new(ExecutionStatus::default()))
@@ -356,7 +423,10 @@ impl ExecutionRuntime for MyExecutionRuntime {
 }
 
 #[tokio::main]
-pub async fn run_server(url_server: String, file_path: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_server(
+    url_server: String,
+    file_path: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // LogTracer::init().unwrap();
 
     // a builder for `FmtSubscriber`.
@@ -379,7 +449,6 @@ pub async fn run_server(url_server: String, file_path: Option<String>) -> Result
     //     .with(flame_layer)
     //     .init();
 
-
     // Strip protocol from any urls passed in, invalid if URL is passed with protocol
     let url = url_server
         .replace("http://", "")
@@ -400,11 +469,10 @@ pub async fn run_server(url_server: String, file_path: Option<String>) -> Result
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
-    use prompt_graph_core::prompt_composition::templates::render_template_prompt;
     use super::*;
+    use prompt_graph_core::string_templating::templates::render_template_prompt;
 
     #[tokio::test]
     async fn test_pushing_a_partial_template() {
@@ -414,7 +482,9 @@ mod tests {
             template: "Testing".to_string(),
             name: "named".to_string(),
             id: "test".to_string(),
-        })).await.unwrap();
+        }))
+        .await
+        .unwrap();
         let tree = e.get_tree(&"test".to_string());
     }
 }

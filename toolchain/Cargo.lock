@@ -1504,6 +1504,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dotenv"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
+
+[[package]]
 name = "dtoa"
 version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3346,6 +3352,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "minreq"
+version = "2.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb3371dfc7b772c540da1380123674a8e20583aca99907087d990ca58cf44203"
+dependencies = [
+ "log",
+ "once_cell",
+ "rustls",
+ "rustls-webpki",
+ "serde",
+ "serde_json",
+ "webpki-roots 0.25.3",
+]
+
+[[package]]
 name = "mio"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3717,6 +3738,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "openai-api-rs"
+version = "2.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ead8e910b541f342b445ab68dd52ae24d695abaf781aee2ae933a77ac29ea5de"
+dependencies = [
+ "minreq",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4353,11 +4385,14 @@ dependencies = [
  "ariadne",
  "async-trait",
  "base64 0.21.2",
+ "bytes",
  "chumsky",
  "crossbeam-utils",
  "deno_core 0.236.0",
+ "dotenv",
  "env_logger",
  "futures 0.3.28",
+ "futures-util",
  "gluesql",
  "handlebars",
  "hnsw_rs_thousand_birds",
@@ -4366,6 +4401,7 @@ dependencies = [
  "indoc",
  "log",
  "num_cpus",
+ "openai-api-rs 2.1.4",
  "petgraph",
  "priority-queue",
  "prost",
@@ -4373,6 +4409,7 @@ dependencies = [
  "qdrant-client",
  "quote 1.0.28",
  "rand 0.8.5",
+ "reqwest",
  "rkyv",
  "serde",
  "serde_json",
@@ -4411,7 +4448,7 @@ dependencies = [
  "lazy_static",
  "log",
  "neon",
- "openai-api-rs",
+ "openai-api-rs 0.1.11",
  "prompt-graph-core 0.1.26",
  "prost",
  "protobuf",
@@ -4457,7 +4494,7 @@ dependencies = [
  "lazy_static",
  "log",
  "neon",
- "openai-api-rs",
+ "openai-api-rs 0.1.11",
  "prompt-graph-core 0.1.28",
  "prost",
  "protobuf",
@@ -5003,7 +5040,7 @@ dependencies = [
  "wasm-bindgen-futures 0.4.36",
  "wasm-streams",
  "web-sys",
- "webpki-roots",
+ "webpki-roots 0.22.6",
  "winreg 0.10.1",
 ]
 
@@ -7343,6 +7380,12 @@ checksum = "b6c71e40d7d2c34a5106301fb632274ca37242cd0c9d3e64dbece371a40a2d87"
 dependencies = [
  "webpki",
 ]
+
+[[package]]
+name = "webpki-roots"
+version = "0.25.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1778a42e8b3b90bff8d0f5032bf22250792889a5cdc752aa0020c84abe3aaf10"
 
 [[package]]
 name = "webview2-com"

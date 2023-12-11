@@ -52,7 +52,6 @@ impl WrappedQdrantClient for MyQdrantClient {
 
 struct MemoryQdrant<C: WrappedQdrantClient> {
     client: C,
-    collection_name: String,
 }
 
 #[async_trait]
@@ -66,14 +65,11 @@ impl<C: WrappedQdrantClient + Send + Sync> VectorDatabase<C> for MemoryQdrant<C>
         //     }))
         //     .unwrap(),
         // );
-        Ok(MemoryQdrant {
-            client,
-            collection_name: "default_collection".to_string(), // Or use a parameter
-        })
+        Ok(MemoryQdrant { client })
     }
 
     async fn create_collection(
-        &self,
+        &mut self,
         collection_name: String,
         embedding_length: u64,
     ) -> Result<(), VectorDbError> {
@@ -94,7 +90,8 @@ impl<C: WrappedQdrantClient + Send + Sync> VectorDatabase<C> for MemoryQdrant<C>
     }
 
     async fn insert_vector(
-        &self,
+        &mut self,
+        collection_name: String,
         id: u64,
         vector: Vec<f32>,
         payload: Option<serde_json::Value>,
@@ -110,20 +107,21 @@ impl<C: WrappedQdrantClient + Send + Sync> VectorDatabase<C> for MemoryQdrant<C>
             },
         )];
         self.client
-            .upsert_points_blocking(self.collection_name.clone(), points, None)
+            .upsert_points_blocking(collection_name.clone(), points, None)
             .await
             .map_err(|e| VectorDbError::InsertionError(e.to_string())) // Map the error to VectorDbError
     }
 
     async fn query_by_vector(
-        &self,
+        &mut self,
+        collection_name: String,
         vector: Vec<f32>,
         top_k: usize,
     ) -> Result<Vec<u64>, VectorDbError> {
         let search_result = self
             .client
             .search_points(&SearchPoints {
-                collection_name: self.collection_name.clone(),
+                collection_name: collection_name.clone(),
                 vector: vector.to_vec(),
                 filter: None,
                 limit: top_k as u64,
@@ -204,23 +202,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_vector() {
-        let db = MemoryQdrant {
+        let mut db = MemoryQdrant {
             client: MockQdrantClient::new("mock_connection_string"),
-            collection_name: "test_collection".to_string(),
         };
 
-        let result = db.insert_vector(123, vec![0.5, 0.6], None).await;
+        let result = db
+            .insert_vector("default".to_string(), 123, vec![0.5, 0.6], None)
+            .await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_query_by_vector() {
-        let db = MemoryQdrant {
+        let mut db = MemoryQdrant {
             client: MockQdrantClient::new("mock_connection_string"),
-            collection_name: "test_collection".to_string(),
         };
 
-        let result = db.query_by_vector(vec![0.5, 0.6], 2).await;
+        let result = db
+            .query_by_vector("default".to_string(), vec![0.5, 0.6], 2)
+            .await;
         assert!(result.is_ok());
         let ids = result.unwrap();
         assert_eq!(ids, vec![1, 2]);

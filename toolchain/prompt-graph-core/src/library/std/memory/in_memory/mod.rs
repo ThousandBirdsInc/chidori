@@ -2,18 +2,29 @@ use crate::library::std::memory::{VectorDatabase, VectorDbError};
 use async_trait::async_trait;
 use hnsw_rs_thousand_birds::dist::DistDot;
 use hnsw_rs_thousand_birds::hnsw::{Hnsw, Neighbour};
+use http_body_util::BodyExt;
 use serde_json::Value;
 use std::collections::HashMap;
 
 // TODO: manage multiple independent named collections
-pub struct InMemoryVectorDb {
+pub struct InMemoryVectorDbCollection {
     db: HashMap<usize, Value>,
     id_counter: usize,
     hnsw: Hnsw<f32, DistDot>,
 }
 
+pub struct InMemoryVectorDb {
+    collections: HashMap<String, InMemoryVectorDbCollection>,
+}
+
 impl InMemoryVectorDb {
     pub fn new() -> Self {
+        Self {
+            collections: HashMap::new(),
+        }
+    }
+
+    pub fn new_collection(&mut self, collection_name: String) {
         let mut hnsw = Hnsw::<f32, DistDot>::new(
             // max_nb_connection (in hnsw initialization) The maximum number of links from one
             // point to others. Values ranging from 16 to 64 are standard initialising values,
@@ -31,102 +42,108 @@ impl InMemoryVectorDb {
             DistDot {},
         );
         hnsw.set_extend_candidates(true);
-        Self {
-            db: HashMap::new(),
-            id_counter: 0,
-            hnsw,
-        }
+        self.collections.insert(
+            collection_name,
+            InMemoryVectorDbCollection {
+                db: HashMap::new(),
+                id_counter: 0,
+                hnsw,
+            },
+        );
     }
 
-    pub fn insert(&mut self, data: &Vec<(&Vec<f32>, Value)>) {
+    pub fn insert(&mut self, collection_name: String, data: &Vec<(&Vec<f32>, Value)>) {
         // usize is the id
+        let mut collection = self.collections.get_mut(&collection_name).unwrap();
         let mut insert_set = vec![];
         for item in data {
-            self.id_counter += 1;
-            self.db.insert(self.id_counter, item.1.clone());
-            insert_set.push((item.0, self.id_counter));
+            collection.id_counter += 1;
+            collection.db.insert(collection.id_counter, item.1.clone());
+            insert_set.push((item.0, collection.id_counter));
         }
-        self.hnsw.parallel_insert(&insert_set);
+        collection.hnsw.parallel_insert(&insert_set);
     }
 
-    pub fn search(&mut self, data: Vec<f32>, num_neighbors: usize) -> Vec<(Neighbour, T)> {
-        self.hnsw.set_searching_mode(true);
+    pub fn search(
+        &mut self,
+        collection_name: String,
+        data: Vec<f32>,
+        num_neighbors: usize,
+    ) -> Vec<(Neighbour, Value)> {
+        let mut collection = self.collections.get_mut(&collection_name).unwrap();
+        collection.hnsw.set_searching_mode(true);
         let mut results = vec![];
-        // TODO: supports searching multiple keys at once, we should support that
-        let neighbors = self.hnsw.parallel_search(&vec![data], num_neighbors, 16);
+        let neighbors = collection
+            .hnsw
+            .parallel_search(&vec![data], num_neighbors, 16);
         for neighbor in neighbors.first().unwrap() {
             results.push((
                 neighbor.clone(),
-                self.db.get(&neighbor.d_id).unwrap().clone(),
+                collection.db.get(&neighbor.d_id).unwrap().clone(),
             ));
         }
         results
     }
 }
 
-struct MemoryInMemory<T> {
-    client: InMemoryVectorDb<T>,
-    collection_name: String,
+struct MemoryInMemory {
+    client: InMemoryVectorDb,
 }
 
 #[async_trait]
-impl<T> VectorDatabase<InMemoryVectorDb<T>> for MemoryInMemory<T> {
-    fn attach_client(client: InMemoryVectorDb<T>) -> Result<Self, VectorDbError> {
-        // Assuming QdrantClient can be constructed from a connection string
-        // let client = MyQdrantClient(
-        //     QdrantClient::new(Some(QdrantClientConfig {
-        //         uri: connection_string.to_string(),
-        //         ..Default::default()
-        //     }))
-        //     .unwrap(),
-        // );
-        Ok(MemoryInMemory {
-            client,
-            collection_name: "default_collection".to_string(), // Or use a parameter
-        })
+impl VectorDatabase<InMemoryVectorDb> for MemoryInMemory {
+    fn attach_client(client: InMemoryVectorDb) -> Result<Self, VectorDbError> {
+        Ok(MemoryInMemory { client })
     }
 
     async fn create_collection(
-        &self,
+        &mut self,
         collection_name: String,
         embedding_length: u64,
     ) -> Result<(), VectorDbError> {
-        unimplemented!();
+        self.client.new_collection(collection_name);
+        Ok(())
     }
 
     async fn insert_vector(
-        &self,
+        &mut self,
+        collection_name: String,
         id: u64,
         vector: Vec<f32>,
         payload: Option<serde_json::Value>,
     ) -> Result<(), VectorDbError> {
-        db.insert(&row);
-        unimplemented!();
+        self.client
+            .insert(collection_name, &vec![(&vector, payload.unwrap())]);
+        Ok(())
     }
 
     async fn query_by_vector(
-        &self,
+        &mut self,
+        collection_name: String,
         vector: Vec<f32>,
         top_k: usize,
     ) -> Result<Vec<u64>, VectorDbError> {
-        unimplemented!();
+        let results = self.client.search(collection_name, vector, top_k);
+        Ok(results.iter().map(|r| r.0.d_id as u64).collect())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_memory_db() {
         let mut db = InMemoryVectorDb::new();
+        db.new_collection("default".to_string());
         let embedding = vec![0.1, 0.2, 0.3];
-        let contents = HashMap::from([("name", "test")]);
+        let contents = json!({"name": "test"});
         let row = vec![(&embedding, contents)];
-        db.insert(&row);
+        db.insert("default".to_string(), &row);
         let search = vec![0.1, 0.2, 0.3];
-        let result = db.search(search, 1);
+        let result = db.search("default".to_string(), search, 1);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].1, HashMap::from([("name", "test")]));
+        assert_eq!(result[0].1, json!({"name": "test"}));
     }
 }

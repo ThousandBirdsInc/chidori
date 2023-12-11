@@ -37,14 +37,15 @@ pub trait VectorDatabase<C> {
         Self: Sized;
 
     async fn create_collection(
-        &self,
+        &mut self,
         collection_name: String,
         embedding_length: u64,
     ) -> Result<(), VectorDbError>;
 
     // Inserts a vector into the database
     async fn insert_vector(
-        &self,
+        &mut self,
+        collection_name: String,
         id: u64,
         vector: Vec<f32>,
         payload: Option<serde_json::Value>,
@@ -52,7 +53,8 @@ pub trait VectorDatabase<C> {
 
     // Queries the database by vector
     async fn query_by_vector(
-        &self,
+        &mut self,
+        collection_name: String,
         vector: Vec<f32>,
         top_k: usize,
     ) -> Result<Vec<u64>, VectorDbError>;

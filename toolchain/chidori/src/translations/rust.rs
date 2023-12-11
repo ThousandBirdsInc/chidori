@@ -13,7 +13,6 @@ use prompt_graph_core::graph_definition::{
     create_code_node, create_custom_node, create_prompt_node, create_vector_memory_node,
     SourceNodeType,
 };
-use prompt_graph_core::prompt_composition::templates::json_value_to_serialized_value;
 use prompt_graph_core::proto::execution_runtime_client::ExecutionRuntimeClient;
 use prompt_graph_core::proto::serialized_value::Val;
 use prompt_graph_core::proto::{
@@ -24,6 +23,7 @@ use prompt_graph_core::proto::{
     RequestListBranches, RequestNewBranch, RequestOnlyId, RespondPollNodeWillExecuteEvents,
     SerializedValue, SerializedValueArray, SerializedValueObject,
 };
+use prompt_graph_core::string_templating::templates::json_value_to_serialized_value;
 use prompt_graph_exec::tonic_runtime::run_server;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
