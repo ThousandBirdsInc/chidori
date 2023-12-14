@@ -1,5 +1,5 @@
 [package]
-name = "prompt-graph-core"
+name = "chidori-core"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -11,7 +11,7 @@ description = "Core of Chidori, compiles graph and node definitions into an inte
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
-name = "prompt_graph_core"
+name = "chidori_core"
 crate-type = ["cdylib", "lib"]
 bench = false
 proc-macro = true
@@ -60,9 +60,17 @@ futures-util = "0.3.28"
 
 # TODO: make optional
 
+# Support for parsing typescript/javascript
+swc_common = {  version = "0.33.12", features = ["tty-emitter"]}
+swc_ecma_parser = {  version = "0.141.33"}
+swc_ecma_ast = {  version = "0.110.15"}
+
+# Support for parsing python
+rustpython-parser = "0.3.0"
+
 
 # TODO: make optional
-deno_core = "0.236.0"
+deno_core = "0.238.0"
 starlark = { version = "0.9.0"}
 http-body-util = "0.1.0-rc.2"
 zip = "0.6.6"

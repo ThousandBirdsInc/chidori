@@ -1,18 +1,10 @@
 use crate::execution::execution::execution_graph::ExecutionGraph;
-use crate::time_travel::global::HistoricalData;
 use im::HashMap as ImmutableHashMap;
 /// This describes an API for a reactive system with a function "make_triggerable" that wraps
 /// a method passing to it a set of triggerable relationships. When those relationships fire,
 /// the associated method is invoked.
 use std::collections::HashMap;
 
-impl<T: Clone + PartialEq> Subscribable for HistoricalData<T> {
-    fn has_changed(&self) -> bool {
-        // For demonstration, check if the latest change was processed.
-        // You can adjust this logic as per your requirements.
-        self.has_processed_change_at(self.history.len().saturating_sub(1))
-    }
-}
 pub trait TriggerContext {}
 
 struct Context<'a> {
@@ -42,7 +34,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::time_travel::global::HistoricalData;
 
     #[derive(Debug, Clone)]
     struct Element {
@@ -56,12 +47,6 @@ mod tests {
         }
     }
 
-    struct HistoryContext<'a> {
-        data: &'a mut HistoricalData<ImmutableHashMap<String, String>>,
-    }
-
-    impl<'a> TriggerContext for HistoryContext<'a> {}
-
     #[test]
     fn test_trigger_on_dependency_change() {
         let mut binding = false;
@@ -74,21 +59,6 @@ mod tests {
             make_triggerable(&mut registry, 2, |ctx: Vec<&Option<Vec<u8>>>| vec![1, 2]);
 
             assert_eq!(*context.triggered, true);
-        }
-    }
-
-    #[test]
-    fn test_trigger_on_dependency_change_with_historical_data() {
-        let initial_data_a = ImmutableHashMap::unit(String::from("status"), String::from("A"));
-        let mut historical_data_a = HistoricalData::new(initial_data_a);
-
-        {
-            let mut registry = ExecutionGraph::new();
-            let mut context = HistoryContext {
-                data: &mut historical_data_a,
-            };
-
-            make_triggerable(&mut registry, 2, |ctx: Vec<&Option<Vec<u8>>>| vec![1, 2]);
         }
     }
 }

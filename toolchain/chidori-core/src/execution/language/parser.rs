@@ -115,7 +115,7 @@ pub enum Value {
 }
 
 impl Value {
-    fn num(self, span: Span) -> Result<f64, Error> {
+    pub(crate) fn num(self, span: Span) -> Result<f64, Error> {
         if let Value::Num(x) = self {
             Ok(x)
         } else {
@@ -173,8 +173,15 @@ pub enum Expr {
     Binary(Box<Spanned<Self>>, BinaryOp, Box<Spanned<Self>>),
     Call(Box<Spanned<Self>>, Vec<Spanned<Self>>),
     If(Box<Spanned<Self>>, Box<Spanned<Self>>, Box<Spanned<Self>>),
-    Import(String, String, String),
     Print(Box<Spanned<Self>>),
+}
+
+// An import node in the AST.
+#[derive(Debug, PartialEq)]
+pub struct Import {
+    pub path: String,
+    pub lang: String,
+    pub alias: String,
 }
 
 // A function node in the AST.
@@ -182,28 +189,6 @@ pub enum Expr {
 pub struct Func {
     pub args: Vec<String>,
     pub body: Spanned<Expr>,
-}
-
-fn import_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token>> + Clone {
-    let string_literal = select! { Token::Str(s) => s.clone() }.labelled("string literal");
-
-    let import = just(Token::Use)
-        .ignore_then(just(Token::Ident("import".to_string())))
-        .then_ignore(just(Token::Ctrl('(')))
-        .ignore_then(string_literal.clone()) // Source path
-        .then_ignore(just(Token::Ctrl(',')))
-        .then(string_literal) // Language
-        .then_ignore(just(Token::Ctrl(')')))
-        .then_ignore(just(Token::Ident("as".to_string())))
-        .then(select! { Token::Ident(ident) => ident.clone() }) // Alias
-        .then_ignore(just(Token::Ctrl(';')))
-        .map_with_span(|((path, lang), alias), span| {
-            // Here, create an Expr variant to represent an import statement
-            (Expr::Import(path, lang, alias), span)
-        })
-        .labelled("import statement");
-
-    import
 }
 
 fn expr_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token>> + Clone {
@@ -468,9 +453,28 @@ fn funcs_parser() -> impl Parser<Token, HashMap<String, Func>, Error = Simple<To
         .then_ignore(end())
 }
 
+fn import_parser() -> impl Parser<Token, Spanned<Import>, Error = Simple<Token>> + Clone {
+    let string_literal = select! { Token::Str(s) => s.clone() }.labelled("string literal");
+
+    let import = just(Token::Use)
+        .ignore_then(just(Token::Ident("import".to_string())))
+        .then_ignore(just(Token::Ctrl('(')))
+        .ignore_then(string_literal.clone()) // Source path
+        .then_ignore(just(Token::Ctrl(',')))
+        .then(string_literal) // Language
+        .then_ignore(just(Token::Ctrl(')')))
+        .then_ignore(just(Token::Ident("as".to_string())))
+        .then(select! { Token::Ident(ident) => ident.clone() }) // Alias
+        .then_ignore(just(Token::Ctrl(';')))
+        .map_with_span(|((path, lang), alias), span| (Import { path, lang, alias }, span))
+        .labelled("import statement");
+
+    import
+}
+
 pub struct Error {
-    span: Span,
-    msg: String,
+    pub span: Span,
+    pub msg: String,
 }
 
 fn file_parser() -> impl Parser<Token, Program, Error = Simple<Token>> + Clone {
@@ -491,7 +495,7 @@ fn file_parser() -> impl Parser<Token, Program, Error = Simple<Token>> + Clone {
 // Define a structure to hold the parsed program
 #[derive(Debug)]
 pub struct Program {
-    pub imports: Vec<Spanned<Expr>>,
+    pub imports: Vec<Spanned<Import>>,
     pub funcs: HashMap<String, Func>,
 }
 
@@ -650,11 +654,11 @@ mod tests {
             .unwrap()
             .0;
 
-        let expected = Expr::Import(
-            "src/js/example".to_string(),
-            "javascript".to_string(),
-            "z".to_string(),
-        );
+        let expected = Import {
+            path: "src/js/example".to_string(),
+            lang: "javascript".to_string(),
+            alias: "z".to_string(),
+        };
 
         assert_eq!(parsed, expected);
     }
@@ -713,19 +717,35 @@ mod tests {
         let result = result.unwrap();
 
         assert_eq!(
-            Expr::Import("src/js/example".into(), "javascript".into(), "z".into()),
+            Import {
+                path: "src/js/example".into(),
+                lang: "javascript".into(),
+                alias: "z".into()
+            },
             result.imports[0].0
         );
         assert_eq!(
-            Expr::Import("src/prompt/example".into(), "prompt".into(), "p".into()),
+            Import {
+                path: "src/prompt/example".into(),
+                lang: "prompt".into(),
+                alias: "p".into()
+            },
             result.imports[1].0
         );
         assert_eq!(
-            Expr::Import("src/prompt/example".into(), "text".into(), "t".into()),
+            Import {
+                path: "src/prompt/example".into(),
+                lang: "text".into(),
+                alias: "t".into()
+            },
             result.imports[2].0
         );
         assert_eq!(
-            Expr::Import("src/py/example".into(), "python".into(), "py".into()),
+            Import {
+                path: "src/py/example".into(),
+                lang: "python".into(),
+                alias: "py".into()
+            },
             result.imports[3].0
         );
 

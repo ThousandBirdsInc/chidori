@@ -1,5 +1,3 @@
-pub mod wasm_error;
-
 pub fn uppercase_first_letter(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {

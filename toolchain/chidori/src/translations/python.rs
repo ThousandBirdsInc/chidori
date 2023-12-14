@@ -1,58 +1,51 @@
-use std::collections::VecDeque;
-use pyo3::exceptions;
-use pyo3::prelude::*;
-use tonic::{Response, Status};
-use futures::executor;
-use futures::StreamExt;
-use pyo3::types::{PyDict, PyList, PyString};
-use pyo3::prelude::*;
-use std::collections::HashMap;
-use std::sync::{Arc};
-use tokio::sync::Mutex;
-use std::time::Duration;
-use tokio::runtime::Runtime;
-use log::{debug, info};
-use pyo3::exceptions::PyTypeError;
-use tonic::transport::Channel;
-use ::prompt_graph_exec::tonic_runtime::run_server;
+use crate::register_node_handle;
+use crate::translations::rust::{
+    Chidori, CustomNodeCreateOpts, DenoCodeNodeCreateOpts, GraphBuilder, Handler, NodeHandle,
+    PromptNodeCreateOpts, VectorMemoryNodeCreateOpts,
+};
+use ::prompt_graph_core::build_runtime_graph::graph_parse::{
+    construct_query_from_output_type, derive_for_individual_node, CleanIndividualNode,
+    CleanedDefinitionGraph,
+};
+use ::prompt_graph_core::graph_definition::{
+    create_code_node, create_component_node, create_custom_node, create_loader_node,
+    create_node_parameter, create_observation_node, create_op_map, create_prompt_node,
+    create_vector_memory_node, SourceNodeType,
+};
 use ::prompt_graph_core::proto::execution_runtime_client::ExecutionRuntimeClient;
-use ::prompt_graph_core::proto::{File, Empty, ExecutionStatus, RequestInputProposalResponse, RequestOnlyId, RequestFileMerge, RequestAtFrame, RequestNewBranch, RequestListBranches, ListBranchesRes, QueryAtFrame, Query, QueryAtFrameResponse, SerializedValue, ChangeValueWithCounter, NodeWillExecuteOnBranch, FileAddressedChangeValueWithCounter, FilteredPollNodeWillExecuteEventsRequest, RespondPollNodeWillExecuteEvents, RequestAckNodeWillExecuteEvent, ChangeValue, Path, SerializedValueObject, SerializedValueArray, Item};
 use ::prompt_graph_core::proto::prompt_graph_node_loader::LoadFrom;
 use ::prompt_graph_core::proto::serialized_value::Val;
-use ::prompt_graph_core::graph_definition::{create_prompt_node, create_op_map, create_code_node, create_component_node, create_vector_memory_node, create_observation_node, create_node_parameter, SourceNodeType, create_loader_node, create_custom_node};
-use ::prompt_graph_core::utils::wasm_error::CoreError;
-use ::prompt_graph_core::build_runtime_graph::graph_parse::{CleanedDefinitionGraph, CleanIndividualNode, construct_query_from_output_type, derive_for_individual_node};
-use crate::register_node_handle;
-use crate::translations::rust::{Chidori, CustomNodeCreateOpts, DenoCodeNodeCreateOpts, GraphBuilder, Handler, NodeHandle, PromptNodeCreateOpts, VectorMemoryNodeCreateOpts};
-
-#[derive(Debug)]
-pub struct CoreErrorWrapper(CoreError);
-
-impl std::convert::From<CoreErrorWrapper> for PyErr {
-    fn from(err: CoreErrorWrapper) -> PyErr {
-        exceptions::PyOSError::new_err(err.0.to_string())
-    }
-}
-
-impl std::convert::From<CoreError> for PyErrWrapper {
-    fn from(err: CoreError) -> PyErrWrapper {
-        PyErrWrapper(exceptions::PyOSError::new_err(err.to_string()))
-    }
-}
-
-impl std::convert::From<anyhow::Error> for PyErrWrapper {
-    fn from(err: anyhow::Error) -> PyErrWrapper {
-        PyErrWrapper(exceptions::PyOSError::new_err(err.to_string()))
-    }
-}
-
+use ::prompt_graph_core::proto::{
+    ChangeValue, ChangeValueWithCounter, Empty, ExecutionStatus, File,
+    FileAddressedChangeValueWithCounter, FilteredPollNodeWillExecuteEventsRequest, Item,
+    ListBranchesRes, NodeWillExecuteOnBranch, Path, Query, QueryAtFrame, QueryAtFrameResponse,
+    RequestAckNodeWillExecuteEvent, RequestAtFrame, RequestFileMerge, RequestInputProposalResponse,
+    RequestListBranches, RequestNewBranch, RequestOnlyId, RespondPollNodeWillExecuteEvents,
+    SerializedValue, SerializedValueArray, SerializedValueObject,
+};
+use ::prompt_graph_exec::tonic_runtime::run_server;
+use futures::executor;
+use futures::StreamExt;
+use log::{debug, info};
+use pyo3::exceptions;
+use pyo3::exceptions::PyTypeError;
+use pyo3::prelude::*;
+use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList, PyString};
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::runtime::Runtime;
+use tokio::sync::Mutex;
+use tonic::transport::Channel;
+use tonic::{Response, Status};
 
 #[derive(Debug)]
 pub struct PyErrWrapper(pyo3::PyErr);
 
 #[derive(Debug)]
 pub struct AnyhowErrWrapper(anyhow::Error);
-
 
 impl std::convert::From<tonic::transport::Error> for PyErrWrapper {
     fn from(status: tonic::transport::Error) -> Self {
@@ -67,7 +60,6 @@ impl std::convert::From<Status> for PyErrWrapper {
         PyErrWrapper(exceptions::PyOSError::new_err(status.message().to_string()))
     }
 }
-
 
 impl std::convert::From<PyErrWrapper> for PyErr {
     fn from(err: PyErrWrapper) -> PyErr {
@@ -87,7 +79,6 @@ impl Into<pyo3::PyResult<()>> for PyErrWrapper {
     }
 }
 
-
 pub struct PyExecutionStatus(ExecutionStatus);
 
 /// This is a helper trait that allows us to set some values defined by PyExecutionStatus into a python dictionary
@@ -96,7 +87,8 @@ impl IntoPy<Py<PyAny>> for PyExecutionStatus {
         let exec_status = self.0;
         let dict = PyDict::new(py);
         dict.set_item("id", exec_status.id).unwrap();
-        dict.set_item("monotonic_counter", exec_status.monotonic_counter).unwrap();
+        dict.set_item("monotonic_counter", exec_status.monotonic_counter)
+            .unwrap();
         dict.set_item("branch", exec_status.branch).unwrap();
         dict.into_py(py)
     }
@@ -111,12 +103,12 @@ impl IntoPy<Py<PyAny>> for PyResponseExecutionStatus {
         let exec_status = resp.into_inner();
         let dict = PyDict::new(py);
         dict.set_item("id", exec_status.id).unwrap();
-        dict.set_item("monotonic_counter", exec_status.monotonic_counter).unwrap();
+        dict.set_item("monotonic_counter", exec_status.monotonic_counter)
+            .unwrap();
         dict.set_item("branch", exec_status.branch).unwrap();
         dict.into_py(py)
     }
 }
-
 
 pub struct PyListBranchesRes(Response<ListBranchesRes>);
 
@@ -125,17 +117,25 @@ impl IntoPy<Py<PyAny>> for PyListBranchesRes {
     fn into_py(self, py: Python) -> Py<PyAny> {
         let PyListBranchesRes(resp) = self;
         let branches = resp.into_inner();
-        let branch_list = branches.branches.into_iter().map(|branch| {
-            let mut dict = PyDict::new(py);
-            dict.set_item("id", branch.id).unwrap();
-            dict.set_item("diverges_at_counter", branch.diverges_at_counter).unwrap();
-            dict.set_item("source_branch_ids", format!("{:?}", branch.source_branch_ids)).unwrap();
-            dict
-        }).collect::<Vec<_>>();
+        let branch_list = branches
+            .branches
+            .into_iter()
+            .map(|branch| {
+                let mut dict = PyDict::new(py);
+                dict.set_item("id", branch.id).unwrap();
+                dict.set_item("diverges_at_counter", branch.diverges_at_counter)
+                    .unwrap();
+                dict.set_item(
+                    "source_branch_ids",
+                    format!("{:?}", branch.source_branch_ids),
+                )
+                .unwrap();
+                dict
+            })
+            .collect::<Vec<_>>();
         PyList::new(py, branch_list).into_py(py)
     }
 }
-
 
 pub struct PyQueryAtFrameResponse(Response<QueryAtFrameResponse>);
 
@@ -168,21 +168,25 @@ impl ToPyObject for SerializedValueWrapper {
             return x.into_py(py);
         }
         match self.0.val.as_ref().unwrap() {
-            Val::Float(x) => { x.into_py(py) }
-            Val::Number(x) => { x.into_py(py) }
-            Val::String(x) => { x.into_py(py) }
-            Val::Boolean(x) => { x.into_py(py) }
+            Val::Float(x) => x.into_py(py),
+            Val::Number(x) => x.into_py(py),
+            Val::String(x) => x.into_py(py),
+            Val::Boolean(x) => x.into_py(py),
             Val::Array(val) => {
                 let py_list = PyList::empty(py);
                 for item in &val.values {
-                    py_list.append(SerializedValueWrapper(item.clone()).to_object(py)).unwrap();
+                    py_list
+                        .append(SerializedValueWrapper(item.clone()).to_object(py))
+                        .unwrap();
                 }
                 py_list.into_py(py)
             }
             Val::Object(val) => {
                 let py_dict = PyDict::new(py);
                 for (key, value) in &val.values {
-                    py_dict.set_item(key, SerializedValueWrapper(value.clone()).to_object(py)).unwrap();
+                    py_dict
+                        .set_item(key, SerializedValueWrapper(value.clone()).to_object(py))
+                        .unwrap();
                 }
                 py_dict.into_py(py)
             }
@@ -268,7 +272,7 @@ fn pyany_to_serialized_value(p: &PyAny) -> SerializedValue {
                         .map(|item| pyany_to_serialized_value(item))
                         .collect();
                     SerializedValue {
-                        val: Some(Val::Array(SerializedValueArray { values: arr } )),
+                        val: Some(Val::Array(SerializedValueArray { values: arr })),
                     }
                 }
                 "dict" => {
@@ -288,7 +292,6 @@ fn pyany_to_serialized_value(p: &PyAny) -> SerializedValue {
         Err(_) => SerializedValue::default(),
     }
 }
-
 
 use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
@@ -320,11 +323,10 @@ fn py_to_json<'p>(py: Python<'p>, v: &PyAny) -> serde_json::Value {
     }
 }
 
-
 /// This converts a dictionary into a queriable path
 fn dict_to_paths<'p>(
     py: Python<'p>,
-    d: &'p PyDict
+    d: &'p PyDict,
 ) -> PyResult<Vec<(Vec<String>, SerializedValue)>> {
     let mut paths = Vec::new();
     let mut queue: VecDeque<(Vec<String>, &'p PyDict)> = VecDeque::new();
@@ -337,7 +339,7 @@ fn dict_to_paths<'p>(
             match val.downcast::<PyDict>() {
                 Ok(sub_dict) => {
                     queue.push_back((path.clone(), sub_dict));
-                },
+                }
                 Err(_) => {
                     paths.push((path.clone(), pyany_to_serialized_value(val)));
                 }
@@ -349,14 +351,18 @@ fn dict_to_paths<'p>(
     Ok(paths)
 }
 
-
 #[derive(Debug)]
 pub struct NodeWillExecuteOnBranchWrapper(NodeWillExecuteOnBranch);
 
 /// This is a helper trait that allows us to set some values defined by NodeWillExecuteOnBranchWrapper into a python object
 impl ToPyObject for NodeWillExecuteOnBranchWrapper {
     fn to_object(&self, py: Python<'_>) -> PyObject {
-        let NodeWillExecuteOnBranch { branch, counter, node, custom_node_type_name} = &self.0;
+        let NodeWillExecuteOnBranch {
+            branch,
+            counter,
+            node,
+            custom_node_type_name,
+        } = &self.0;
         let dict = PyDict::new(py);
         dict.set_item("branch", branch).unwrap();
         dict.set_item("counter", counter).unwrap();
@@ -369,14 +375,19 @@ impl ToPyObject for NodeWillExecuteOnBranchWrapper {
             for change in &node.change_values_used_in_execution {
                 if let Some(v) = &change.change_value {
                     match v {
-                        ChangeValue { path: Some(path), value: Some(value), .. } => {
+                        ChangeValue {
+                            path: Some(path),
+                            value: Some(value),
+                            ..
+                        } => {
                             add_to_dict(
                                 py,
                                 &path.address,
                                 SerializedValueWrapper(value.clone()).to_object(py),
                                 &event_dict,
-                            ).unwrap();
-                        },
+                            )
+                            .unwrap();
+                        }
                         _ => {}
                     }
                 }
@@ -395,22 +406,32 @@ impl IntoPy<Py<PyAny>> for PyRespondPollNodeWillExecuteEvents {
     fn into_py(self, py: Python) -> Py<PyAny> {
         let PyRespondPollNodeWillExecuteEvents(resp) = self;
         let res = resp.into_inner();
-        let RespondPollNodeWillExecuteEvents { node_will_execute_events } = res;
-        let x: Vec<NodeWillExecuteOnBranchWrapper> = node_will_execute_events.iter().cloned().map(NodeWillExecuteOnBranchWrapper).collect();
+        let RespondPollNodeWillExecuteEvents {
+            node_will_execute_events,
+        } = res;
+        let x: Vec<NodeWillExecuteOnBranchWrapper> = node_will_execute_events
+            .iter()
+            .cloned()
+            .map(NodeWillExecuteOnBranchWrapper)
+            .collect();
         PyList::new(py, x).into_py(py)
     }
 }
 
 /// Returns a reference to the execution runtime
-async fn get_client(url: String) -> Result<ExecutionRuntimeClient<tonic::transport::Channel>, PyErrWrapper> {
-    ExecutionRuntimeClient::connect(url.clone()).await.map_err(PyErrWrapper::from)
+async fn get_client(
+    url: String,
+) -> Result<ExecutionRuntimeClient<tonic::transport::Channel>, PyErrWrapper> {
+    ExecutionRuntimeClient::connect(url.clone())
+        .await
+        .map_err(PyErrWrapper::from)
 }
 
 // TODO: return a handle to nodes so that we can understand and inspect them
 // TODO: include a __repr__ method on those nodes
 
 #[derive(Clone)]
-#[pyclass(name="NodeHandle")]
+#[pyclass(name = "NodeHandle")]
 struct PyNodeHandle {
     n: NodeHandle,
 }
@@ -423,7 +444,6 @@ impl PyNodeHandle {
 
 #[pymethods]
 impl PyNodeHandle {
-
     /// This returns the name of the node that this handle is associated with
     fn get_name(&self) -> String {
         self.n.get_name()
@@ -431,7 +451,12 @@ impl PyNodeHandle {
 
     /// This updates the definition of this node to query for the target NodeHandle's output. Moving forward
     /// it will execute whenever the target node resolves.
-    fn run_when<'a>(mut self_: PyRefMut<'_, Self>, py: Python<'a>, graph_builder: &mut PyGraphBuilder, other_node_handle: PyNodeHandle) -> PyResult<&'a PyAny> {
+    fn run_when<'a>(
+        mut self_: PyRefMut<'_, Self>,
+        py: Python<'a>,
+        graph_builder: &mut PyGraphBuilder,
+        other_node_handle: PyNodeHandle,
+    ) -> PyResult<&'a PyAny> {
         let mut n = self_.n.clone();
         let g = Arc::clone(&graph_builder.g);
         pyo3_asyncio::tokio::future_into_py(py, async move {
@@ -450,7 +475,7 @@ impl PyNodeHandle {
     // }
 
     /// This allows the node to be printably represented in python
-    fn __str__(&self) -> PyResult<String>   {
+    fn __str__(&self) -> PyResult<String> {
         // TODO: best practice is that these could be used to re-construct the same object
         let name = self.get_name();
         Ok(format!("NodeHandle(node={})", name))
@@ -463,28 +488,29 @@ impl PyNodeHandle {
     }
 }
 
-
 // TODO: all operations only apply to a specific branch at a time
 // TODO: maintain an internal map of the generated change responses for node additions to the associated query necessary to get that result
-#[pyclass(name="Chidori")]
+#[pyclass(name = "Chidori")]
 struct PyChidori {
     c: Arc<Mutex<Chidori>>,
     file_id: String,
     current_head: u64,
     current_branch: u64,
-    url: String
+    url: String,
 }
 
 // TODO: internally all operations should have an assigned counter
 //       we can keep the actual target counter hidden from the host sdk
 #[pymethods]
 impl PyChidori {
-
     /// Creates a new chidori instance
     #[new]
     #[pyo3(signature = (file_id=String::from("0"), url=String::from("http://127.0.0.1:9800"), api_token=None))]
     fn new(file_id: String, url: String, api_token: Option<String>) -> Self {
-        debug!("Creating new Chidori instance with file_id={}, url={}, api_token={:?}", file_id, url, api_token);
+        debug!(
+            "Creating new Chidori instance with file_id={}, url={}, api_token={:?}",
+            file_id, url, api_token
+        );
         let c = Chidori::new(file_id.clone(), url.clone());
         PyChidori {
             c: Arc::new(Mutex::new(c)),
@@ -496,7 +522,11 @@ impl PyChidori {
     }
 
     /// Spins up the runtime environment
-    fn start_server<'a>(mut self_: PyRefMut<'_, Self>, py: Python<'a>, file_path: Option<String>) -> PyResult<&'a PyAny> {
+    fn start_server<'a>(
+        mut self_: PyRefMut<'_, Self>,
+        py: Python<'a>,
+        file_path: Option<String>,
+    ) -> PyResult<&'a PyAny> {
         let c = Arc::clone(&self_.c);
         let url = self_.url.clone();
         pyo3_asyncio::tokio::future_into_py(py, async move {
@@ -508,16 +538,26 @@ impl PyChidori {
 
     /// Starts the execution of the runtime from the root, or from a defined state
     #[pyo3(signature = (branch=0, frame=0))]
-    fn play<'a>(mut self_: PyRefMut<'_, Self>, py: Python<'a>, branch: u64, frame: u64) -> PyResult<&'a PyAny> {
+    fn play<'a>(
+        mut self_: PyRefMut<'_, Self>,
+        py: Python<'a>,
+        branch: u64,
+        frame: u64,
+    ) -> PyResult<&'a PyAny> {
         let file_id = self_.file_id.clone();
         let url = self_.url.clone();
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut client = get_client(url).await?;
-            Ok(PyResponseExecutionStatus(client.play(RequestAtFrame {
-                id: file_id,
-                frame,
-                branch,
-            }).await.map_err(PyErrWrapper::from)?))
+            Ok(PyResponseExecutionStatus(
+                client
+                    .play(RequestAtFrame {
+                        id: file_id,
+                        frame,
+                        branch,
+                    })
+                    .await
+                    .map_err(PyErrWrapper::from)?,
+            ))
         })
     }
 
@@ -529,11 +569,16 @@ impl PyChidori {
         let branch = self_.current_branch.clone();
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut client = get_client(url).await?;
-            Ok(PyResponseExecutionStatus(client.pause(RequestAtFrame {
-                id: file_id,
-                frame,
-                branch,
-            }).await.map_err(PyErrWrapper::from)?))
+            Ok(PyResponseExecutionStatus(
+                client
+                    .pause(RequestAtFrame {
+                        id: file_id,
+                        frame,
+                        branch,
+                    })
+                    .await
+                    .map_err(PyErrWrapper::from)?,
+            ))
         })
     }
 
@@ -544,11 +589,14 @@ impl PyChidori {
         let branch = self_.current_branch.clone();
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut client = get_client(url).await?;
-            let result_branch = client.branch(RequestNewBranch {
-                id: file_id,
-                source_branch_id: branch,
-                diverges_at_counter: 0,
-            }).await.map_err(PyErrWrapper::from)?;
+            let result_branch = client
+                .branch(RequestNewBranch {
+                    id: file_id,
+                    source_branch_id: branch,
+                    diverges_at_counter: 0,
+                })
+                .await
+                .map_err(PyErrWrapper::from)?;
             // TODO: need to somehow handle writing to the current_branch
             Ok(PyResponseExecutionStatus(result_branch))
         })
@@ -556,19 +604,28 @@ impl PyChidori {
 
     /// Queries for event-log values at a specific branch and frame
     #[pyo3(signature = (query=String::new(), branch=0, frame=0))]
-    fn query<'a>(mut self_: PyRefMut<'_, Self>, py: Python<'a>, query: String, branch: u64, frame: u64) -> PyResult<&'a PyAny> {
+    fn query<'a>(
+        mut self_: PyRefMut<'_, Self>,
+        py: Python<'a>,
+        query: String,
+        branch: u64,
+        frame: u64,
+    ) -> PyResult<&'a PyAny> {
         let file_id = self_.file_id.clone();
         let url = self_.url.clone();
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut client = get_client(url).await?;
-            Ok(PyQueryAtFrameResponse(client.run_query(QueryAtFrame {
-                id: file_id,
-                query: Some(Query {
-                    query: Some(query)
-                }),
-                frame,
-                branch,
-            }).await.map_err(PyErrWrapper::from)?))
+            Ok(PyQueryAtFrameResponse(
+                client
+                    .run_query(QueryAtFrame {
+                        id: file_id,
+                        query: Some(Query { query: Some(query) }),
+                        frame,
+                        branch,
+                    })
+                    .await
+                    .map_err(PyErrWrapper::from)?,
+            ))
         })
     }
 
@@ -578,26 +635,32 @@ impl PyChidori {
         let url = self_.url.clone();
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut client = get_client(url).await?;
-            Ok(PyListBranchesRes(client.list_branches(RequestListBranches {
-                id: file_id,
-            }).await.map_err(PyErrWrapper::from)?))
+            Ok(PyListBranchesRes(
+                client
+                    .list_branches(RequestListBranches { id: file_id })
+                    .await
+                    .map_err(PyErrWrapper::from)?,
+            ))
         })
     }
 
     /// Return a printable string representation of the current graph structure
     fn display_graph_structure<'a>(
         mut self_: PyRefMut<'_, Self>,
-        py: Python<'a>
+        py: Python<'a>,
     ) -> PyResult<&'a PyAny> {
         let file_id = self_.file_id.clone();
         let url = self_.url.clone();
         let branch = self_.current_branch.clone();
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut client = get_client(url).await?;
-            let file = client.current_file_state(RequestOnlyId {
-                id: file_id,
-                branch
-            }).await.map_err(PyErrWrapper::from)?;
+            let file = client
+                .current_file_state(RequestOnlyId {
+                    id: file_id,
+                    branch,
+                })
+                .await
+                .map_err(PyErrWrapper::from)?;
             let mut file = file.into_inner();
             let mut g = CleanedDefinitionGraph::zero();
             g.merge_file(&mut file).unwrap();
@@ -612,14 +675,16 @@ impl PyChidori {
     /// Lists all registered graphs
     fn list_registered_graphs<'a>(
         mut self_: PyRefMut<'_, Self>,
-        py: Python<'a>
+        py: Python<'a>,
     ) -> PyResult<&'a PyAny> {
         let file_id = self_.file_id.clone();
         let url = self_.url.clone();
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut client = get_client(url).await?;
-            let resp = client.list_registered_graphs(Empty {
-            }).await.map_err(PyErrWrapper::from)?;
+            let resp = client
+                .list_registered_graphs(Empty {})
+                .await
+                .map_err(PyErrWrapper::from)?;
             let mut graphs = resp.into_inner();
             Ok(())
         })
@@ -629,22 +694,25 @@ impl PyChidori {
     fn list_input_proposals<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
-        callback: PyObject
+        callback: PyObject,
     ) -> PyResult<&'a PyAny> {
         let file_id = self_.file_id.clone();
         let url = self_.url.clone();
         let branch = self_.current_branch;
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut client = get_client(url).await?;
-            let resp = client.list_input_proposals(RequestOnlyId {
-                id: file_id,
-                branch,
-            }).await.map_err(PyErrWrapper::from)?;
+            let resp = client
+                .list_input_proposals(RequestOnlyId {
+                    id: file_id,
+                    branch,
+                })
+                .await
+                .map_err(PyErrWrapper::from)?;
             let mut stream = resp.into_inner();
             while let Some(x) = stream.next().await {
                 // callback.call(py, (x,), None);
                 info!("InputProposals = {:?}", x);
-            };
+            }
             Ok(())
         })
     }
@@ -658,22 +726,33 @@ impl PyChidori {
     fn list_change_events<'a>(
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
-        callback: PyObject
+        callback: PyObject,
     ) -> PyResult<&'a PyAny> {
         let file_id = self_.file_id.clone();
         let url = self_.url.clone();
         let branch = self_.current_branch;
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut client = get_client(url).await?;
-            let resp = client.list_change_events(RequestOnlyId {
-                id: file_id,
-                branch,
-            }).await.map_err(PyErrWrapper::from)?;
+            let resp = client
+                .list_change_events(RequestOnlyId {
+                    id: file_id,
+                    branch,
+                })
+                .await
+                .map_err(PyErrWrapper::from)?;
             let mut stream = resp.into_inner();
             while let Some(x) = stream.next().await {
-                Python::with_gil(|py| pyo3_asyncio::tokio::into_future(callback.as_ref(py).call((x.map(ChangeValueWithCounterWrapper).map_err(PyErrWrapper::from)?,), None)?))?
-                    .await?;
-            };
+                Python::with_gil(|py| {
+                    pyo3_asyncio::tokio::into_future(
+                        callback.as_ref(py).call(
+                            (x.map(ChangeValueWithCounterWrapper)
+                                .map_err(PyErrWrapper::from)?,),
+                            None,
+                        )?,
+                    )
+                })?
+                .await?;
+            }
             Ok(())
         })
     }
@@ -683,32 +762,36 @@ impl PyChidori {
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
         key: String,
-        handler: PyObject
+        handler: PyObject,
     ) -> PyResult<&'a PyAny> {
         let c = Arc::clone(&self_.c);
         let handler = Arc::new(handler);
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut c = c.lock().await;
-            c.register_custom_node_handle(key, Handler::new(
-                move |n| {
+            c.register_custom_node_handle(
+                key,
+                Handler::new(move |n| {
                     let handler_clone = Arc::clone(&handler);
                     Box::pin(async move {
-                        let result = Python::with_gil(|py|  {
-                            let fut = handler_clone.as_ref().call(py, (NodeWillExecuteOnBranchWrapper(n).to_object(py), ), None)?;
+                        let result = Python::with_gil(|py| {
+                            let fut = handler_clone.as_ref().call(
+                                py,
+                                (NodeWillExecuteOnBranchWrapper(n).to_object(py),),
+                                None,
+                            )?;
                             pyo3_asyncio::tokio::into_future(fut.as_ref(py))
-                        })?.await;
+                        })?
+                        .await;
                         match result {
-                            Ok(py_obj) => {
-                                Python::with_gil(|py|  {
-                                    let json_value = py_to_json(py, py_obj.as_ref(py));
-                                    Ok(json_value)
-                                })
-                            },
+                            Ok(py_obj) => Python::with_gil(|py| {
+                                let json_value = py_to_json(py, py_obj.as_ref(py));
+                                Ok(json_value)
+                            }),
                             Err(err) => Err(anyhow::Error::new(err)),
                         }
                     })
-                }
-            ));
+                }),
+            );
             Ok(())
         })
     }
@@ -724,7 +807,6 @@ impl PyChidori {
             Ok(c.run_custom_node_loop().await.map_err(AnyhowErrWrapper)?)
         })
     }
-
 
     //
     // fn observation_node(mut self_: PyRefMut<'_, Self>, name: String, query_def: Option<String>, template: String, model: String) -> PyResult<()> {
@@ -746,7 +828,7 @@ impl PyChidori {
     // }
 }
 
-#[pyclass(name="GraphBuilder")]
+#[pyclass(name = "GraphBuilder")]
 #[derive(Clone)]
 struct PyGraphBuilder {
     g: Arc<Mutex<GraphBuilder>>,
@@ -754,7 +836,6 @@ struct PyGraphBuilder {
 
 #[pymethods]
 impl PyGraphBuilder {
-
     /// Creates a new graph builder instance
     #[new]
     fn new() -> Self {
@@ -779,13 +860,15 @@ impl PyGraphBuilder {
         let g = Arc::clone(&self_.g);
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut graph_builder = g.lock().await;
-            let nh = graph_builder.custom_node(CustomNodeCreateOpts {
-                name,
-                triggers,
-                output_tables: Some(output_tables),
-                output: Some(output),
-                node_type_name,
-            }).map_err(AnyhowErrWrapper)?;
+            let nh = graph_builder
+                .custom_node(CustomNodeCreateOpts {
+                    name,
+                    triggers,
+                    output_tables: Some(output_tables),
+                    output: Some(output),
+                    node_type_name,
+                })
+                .map_err(AnyhowErrWrapper)?;
             Ok(PyNodeHandle::from(nh).map_err(AnyhowErrWrapper)?)
         })
     }
@@ -800,19 +883,21 @@ impl PyGraphBuilder {
         output_tables: Option<Vec<String>>,
         output: Option<String>,
         code: String,
-        is_template: Option<bool>
+        is_template: Option<bool>,
     ) -> PyResult<&'a PyAny> {
         let g = Arc::clone(&self_.g);
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut graph_builder = g.lock().await;
-            let nh = graph_builder.deno_code_node(DenoCodeNodeCreateOpts {
-                name,
-                triggers,
-                output_tables,
-                output,
-                code,
-                is_template,
-            }).map_err(AnyhowErrWrapper)?;
+            let nh = graph_builder
+                .deno_code_node(DenoCodeNodeCreateOpts {
+                    name,
+                    triggers,
+                    output_tables,
+                    output,
+                    code,
+                    is_template,
+                })
+                .map_err(AnyhowErrWrapper)?;
             Ok(PyNodeHandle::from(nh).map_err(AnyhowErrWrapper)?)
         })
     }
@@ -835,21 +920,22 @@ impl PyGraphBuilder {
         let g = Arc::clone(&self_.g);
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut graph_builder = g.lock().await;
-            let nh = graph_builder.vector_memory_node(VectorMemoryNodeCreateOpts {
-                name,
-                triggers,
-                output_tables: Some(output_tables),
-                output: Some(output),
-                template: Some(template),
-                action: Some(action),
-                embedding_model: Some(embedding_model),
-                db_vendor: Some(db_vendor),
-                collection_name,
-            }).map_err(AnyhowErrWrapper)?;
+            let nh = graph_builder
+                .vector_memory_node(VectorMemoryNodeCreateOpts {
+                    name,
+                    triggers,
+                    output_tables: Some(output_tables),
+                    output: Some(output),
+                    template: Some(template),
+                    action: Some(action),
+                    embedding_model: Some(embedding_model),
+                    db_vendor: Some(db_vendor),
+                    collection_name,
+                })
+                .map_err(AnyhowErrWrapper)?;
             Ok(PyNodeHandle::from(nh).map_err(AnyhowErrWrapper)?)
         })
     }
-
 
     // // TODO: nodes that are added should return a clean definition of what their addition looks like
     // // TODO: adding a node should also display any errors
@@ -892,18 +978,20 @@ impl PyGraphBuilder {
         triggers: Option<Vec<String>>,
         output_tables: Option<Vec<String>>,
         template: String,
-        model: Option<String>
+        model: Option<String>,
     ) -> PyResult<&'a PyAny> {
         let g = Arc::clone(&self_.g);
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut graph_builder = g.lock().await;
-            let nh = graph_builder.prompt_node(PromptNodeCreateOpts {
-                name,
-                triggers,
-                output_tables,
-                template,
-                model,
-            }).map_err(AnyhowErrWrapper)?;
+            let nh = graph_builder
+                .prompt_node(PromptNodeCreateOpts {
+                    name,
+                    triggers,
+                    output_tables,
+                    template,
+                    model,
+                })
+                .map_err(AnyhowErrWrapper)?;
             Ok(PyNodeHandle::from(nh).map_err(AnyhowErrWrapper)?)
         })
     }
@@ -913,14 +1001,16 @@ impl PyGraphBuilder {
         mut self_: PyRefMut<'_, Self>,
         py: Python<'a>,
         c: PyRef<'_, PyChidori>,
-        branch: u64
+        branch: u64,
     ) -> PyResult<&'a PyAny> {
         let g = Arc::clone(&self_.g);
         let c = Arc::clone(&c.c);
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut graph_builder = g.lock().await;
             let mut chidori = c.lock().await;
-            let exec_status = graph_builder.commit(&chidori, branch).await
+            let exec_status = graph_builder
+                .commit(&chidori, branch)
+                .await
                 .map(PyExecutionStatus)
                 .map_err(AnyhowErrWrapper)?;
             Ok(exec_status)
@@ -928,10 +1018,7 @@ impl PyGraphBuilder {
     }
 
     /// Serialize the current graph to yaml
-    fn serialize_yaml<'a>(
-        mut self_: PyRefMut<'_, Self>,
-        py: Python<'a>
-    ) -> PyResult<&'a PyAny> {
+    fn serialize_yaml<'a>(mut self_: PyRefMut<'_, Self>, py: Python<'a>) -> PyResult<&'a PyAny> {
         let g = Arc::clone(&self_.g);
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut graph_builder = g.lock().await;
@@ -939,7 +1026,6 @@ impl PyGraphBuilder {
         })
     }
 }
-
 
 /// A Python module implemented in Rust. The name of this function must match
 /// the `lib.name` setting in the `Cargo.toml`, else Python will not be able to
@@ -953,4 +1039,3 @@ fn chidori(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyNodeHandle>()?;
     Ok(())
 }
-

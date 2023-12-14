@@ -98,6 +98,20 @@ pub struct OperationNode {
     partial_application: Vec<u8>,
 }
 
+impl core::hash::Hash for OperationNode {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+impl PartialEq for OperationNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for OperationNode {}
+
 // TODO: OperationNode need
 
 impl fmt::Debug for OperationNode {

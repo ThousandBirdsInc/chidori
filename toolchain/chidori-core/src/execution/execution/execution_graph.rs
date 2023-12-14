@@ -35,9 +35,6 @@ pub struct ExecutionGraph {
     /// Global revision number for modifications to the graph itself
     revision: usize,
 
-    /// Operation and its id
-    pub operation_by_id: HashMap<OperationId, OperationNode>,
-
     /// This is the graph of dependent execution state
     ///
     /// (branch, counter) -> steam_outputs_at_head
@@ -53,59 +50,16 @@ pub struct ExecutionGraph {
     /// Identifiers on this graph refer to points in the execution graph. In execution terms, changes
     /// along those edges are always considered to have occurred _after_ the target step.
     execution_graph: DiGraphMap<(usize, usize), ExecutionState>,
-
-    /// Dependency graph of the computable elements in the graph
-    ///
-    /// The dependency graph is a directed graph where the nodes are the ids of the operations and the
-    /// weights are the index of the input of the next operation.
-    ///
-    /// The usize::MAX index is a no-op that indicates that the operation is ready to run, an execution
-    /// order dependency rather than a value dependency.
-    dependency_graph: DiGraphMap<OperationId, Vec<ArgumentIndex>>,
 }
 
 impl ExecutionGraph {
     /// Initialize a new reactivity database. This will create a default input and output node,
     /// graphs default to being the unit function x -> x.
     pub fn new() -> Self {
-        let mut dependency_graph = DiGraphMap::new();
-        let mut operation_by_id = HashMap::new();
         ExecutionGraph {
-            operation_by_id,
             execution_graph: Default::default(),
-            dependency_graph,
             revision: 0,
         }
-    }
-
-    /// This adds an operation into the database
-    pub fn upsert_operation(
-        &mut self,
-        prev_execution_id: (usize, usize),
-        previous_state: ExecutionState,
-        node: usize,
-        args: usize,
-        func: Box<OperationFn>,
-    ) -> ((usize, usize), ExecutionState) {
-        let mut new_state = previous_state
-            .clone()
-            .add_operation(node.clone(), args, func);
-        let output_new_state = new_state.clone();
-        self.add_execution_edge(prev_execution_id, new_state, output_new_state)
-    }
-
-    /// Indicates that this operation depends on the output of the given node
-    pub fn apply_dependency_graph_mutations(
-        &mut self,
-        prev_execution_id: (usize, usize),
-        previous_state: ExecutionState,
-        mutations: Vec<DependencyGraphMutation>,
-    ) -> ((usize, usize), ExecutionState) {
-        let mut new_state = previous_state
-            .clone()
-            .apply_dependency_graph_mutations(mutations);
-        let output_new_state = new_state.clone();
-        self.add_execution_edge(prev_execution_id, new_state, output_new_state)
     }
 
     fn add_execution_edge(
@@ -147,56 +101,7 @@ impl ExecutionGraph {
         prev_execution_id: (usize, usize),
         previous_state: ExecutionState,
     ) -> ((usize, usize), ExecutionState) {
-        // Clone the previous immutable state for modification
-        let mut marked_for_consumption = HashSet::new();
-        let mut new_state = previous_state.clone();
-        let mut operation_by_id = previous_state.operation_by_id.clone();
-        let dependency_graph = previous_state.get_dependency_graph();
-
-        // Every tick, every operation consumes from each of its incoming edges.
-        'traverse_nodes: for operation_id in dependency_graph.nodes() {
-            let mut op_node = operation_by_id.get_mut(&operation_id).unwrap().borrow_mut();
-            let mut dep_count = op_node.dependency_count;
-            let mut args: Vec<&Option<Vec<u8>>> = vec![&None; dep_count];
-
-            // Ops with 0 deps should only execute once
-            if dep_count == 0 {
-                if previous_state.check_if_previously_set(&operation_id) {
-                    continue 'traverse_nodes;
-                }
-            }
-
-            // TODO: this currently disallows multiple edges from the same node?
-            // Fetch the values from the previous execution cycle for each edge on this node
-            for (from, to, argument_indices) in
-                dependency_graph.edges_directed(operation_id, Direction::Incoming)
-            {
-                // TODO: if the dependency is on usize::MAX, then this is an execution order dependency
-                if let Some(output) = previous_state.state_get(&from) {
-                    marked_for_consumption.insert(from.clone());
-                    // TODO: we can implement prioritization between different values here
-                    for weight in argument_indices {
-                        args[*weight] = output;
-                        if dep_count > 0 {
-                            dep_count -= 1;
-                        }
-                    }
-                }
-            }
-
-            // Some of the required arguments are not yet available, continue to the next node
-            if dep_count != 0 {
-                continue 'traverse_nodes;
-            }
-
-            // Execute the Operation with the given arguments
-            // TODO: support async/parallel execution
-            let result = op_node.execute(args.iter().map(|x| &**x).collect());
-
-            new_state.state_insert(operation_id, result.clone());
-        }
-        new_state.state_consume_marked(marked_for_consumption);
-
+        let mut new_state = previous_state.step_execution();
         // The edge from this node is the greatest branching id + 1
         // if we re-evaluate execution at a given node, we get a new execution branch.
         self.add_execution_edge(prev_execution_id, new_state.clone(), new_state)
@@ -226,9 +131,7 @@ mod tests {
         let mut db = ExecutionGraph::new();
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
-        let (state_id, mut state) = db.upsert_operation(
-            state_id,
-            state,
+        let mut state = state.add_operation(
             1,
             0,
             Box::new(|_args| {
@@ -236,9 +139,7 @@ mod tests {
                 return serialize_to_vec(&v);
             }),
         );
-        let (state_id, mut state) = db.upsert_operation(
-            state_id,
-            state,
+        let mut state = state.add_operation(
             2,
             0,
             Box::new(|_args| {
@@ -246,9 +147,7 @@ mod tests {
                 return serialize_to_vec(&v);
             }),
         );
-        let (state_id, mut state) = db.upsert_operation(
-            state_id,
-            state,
+        let mut state = state.add_operation(
             3,
             2,
             Box::new(|args| {
@@ -264,14 +163,11 @@ mod tests {
             }),
         );
 
-        let (state_id, mut state) = db.apply_dependency_graph_mutations(
-            (0, 0),
-            state,
-            vec![DependencyGraphMutation::Create {
+        let mut state =
+            state.apply_dependency_graph_mutations(vec![DependencyGraphMutation::Create {
                 operation_id: 3,
                 depends_on: vec![(1, 0), (2, 1)],
-            }],
-        );
+            }]);
 
         let v0 = RSV::Number(1);
         let v1 = RSV::Number(2);
@@ -300,18 +196,15 @@ mod tests {
         let mut db = ExecutionGraph::new();
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
-        let (state_id, mut state) =
-            db.upsert_operation(state_id, state, 0, 0, Box::new(|_args| vec![0, 0, 0]));
-        let (state_id, mut state) =
-            db.upsert_operation(state_id, state, 1, 0, Box::new(|_args| vec![1, 1, 1]));
-        let (state_id, state) = db.apply_dependency_graph_mutations(
-            (0, 0),
-            state,
-            vec![DependencyGraphMutation::Create {
+
+        let mut state = state.add_operation(0, 0, Box::new(|_args| vec![0, 0, 0]));
+        let mut state = state.add_operation(1, 0, Box::new(|_args| vec![1, 1, 1]));
+        let mut state =
+            state.apply_dependency_graph_mutations(vec![DependencyGraphMutation::Create {
                 operation_id: 1,
                 depends_on: vec![(0, 0)],
-            }],
-        );
+            }]);
+
         let (_, new_state) = db.step_execution(state_id, state);
         assert_eq!(new_state.state_get(&1).unwrap(), &Some(vec![1, 1, 1]));
     }
@@ -330,41 +223,22 @@ mod tests {
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
 
-        let (state_id, mut state) = db.upsert_operation(
-            state_id,
-            state,
-            0,
-            0,
-            Box::new(|args| RSV::Number(0).into()),
-        );
-        let (state_id, mut state) = db.upsert_operation(
-            state_id,
-            state,
-            1,
-            1,
-            Box::new(|args| RSV::Number(1).into()),
-        );
-        let (state_id, mut state) = db.upsert_operation(
-            state_id,
-            state,
-            2,
-            1,
-            Box::new(|args| RSV::Number(2).into()),
-        );
-        let (state_id, state) = db.apply_dependency_graph_mutations(
-            (0, 0),
-            state,
-            vec![
-                DependencyGraphMutation::Create {
-                    operation_id: 1,
-                    depends_on: vec![(0, 0)],
-                },
-                DependencyGraphMutation::Create {
-                    operation_id: 2,
-                    depends_on: vec![(1, 0)],
-                },
-            ],
-        );
+        let mut state = state.add_operation(0, 0, Box::new(|args| RSV::Number(0).into()));
+
+        let mut state = state.add_operation(1, 1, Box::new(|args| RSV::Number(1).into()));
+
+        let mut state = state.add_operation(2, 1, Box::new(|args| RSV::Number(2).into()));
+
+        let mut state = state.apply_dependency_graph_mutations(vec![
+            DependencyGraphMutation::Create {
+                operation_id: 1,
+                depends_on: vec![(0, 0)],
+            },
+            DependencyGraphMutation::Create {
+                operation_id: 2,
+                depends_on: vec![(1, 0)],
+            },
+        ]);
 
         let (state_id, state) = db.step_execution(state_id, state);
         assert_eq!(state.state_get(&1), None);
@@ -390,53 +264,26 @@ mod tests {
 
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
-        let (state_id, mut state) = db.upsert_operation(
-            state_id,
-            state,
-            0,
-            0,
-            Box::new(|args| RSV::Number(0).into()),
-        );
-        let (state_id, mut state) = db.upsert_operation(
-            state_id,
-            state,
-            1,
-            1,
-            Box::new(|args| RSV::Number(1).into()),
-        );
-        let (state_id, mut state) = db.upsert_operation(
-            state_id,
-            state,
-            2,
-            1,
-            Box::new(|args| RSV::Number(2).into()),
-        );
-        let (state_id, mut state) = db.upsert_operation(
-            state_id,
-            state,
-            3,
-            1,
-            Box::new(|args| RSV::Number(3).into()),
-        );
 
-        let (state_id, state) = db.apply_dependency_graph_mutations(
-            (0, 0),
-            state,
-            vec![
-                DependencyGraphMutation::Create {
-                    operation_id: 1,
-                    depends_on: vec![(0, 0)],
-                },
-                DependencyGraphMutation::Create {
-                    operation_id: 2,
-                    depends_on: vec![(1, 0)],
-                },
-                DependencyGraphMutation::Create {
-                    operation_id: 3,
-                    depends_on: vec![(1, 0)],
-                },
-            ],
-        );
+        let mut state = state.add_operation(0, 0, Box::new(|args| RSV::Number(0).into()));
+        let mut state = state.add_operation(1, 1, Box::new(|args| RSV::Number(1).into()));
+        let mut state = state.add_operation(2, 1, Box::new(|args| RSV::Number(2).into()));
+        let mut state = state.add_operation(3, 1, Box::new(|args| RSV::Number(3).into()));
+
+        let mut state = state.apply_dependency_graph_mutations(vec![
+            DependencyGraphMutation::Create {
+                operation_id: 1,
+                depends_on: vec![(0, 0)],
+            },
+            DependencyGraphMutation::Create {
+                operation_id: 2,
+                depends_on: vec![(1, 0)],
+            },
+            DependencyGraphMutation::Create {
+                operation_id: 3,
+                depends_on: vec![(1, 0)],
+            },
+        ]);
 
         let (state_id, state) = db.step_execution(state_id, state);
         assert_eq!(state.state_get(&1), None);
@@ -466,64 +313,30 @@ mod tests {
 
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
-        let (state_id, mut state) = db.upsert_operation(
-            state_id,
-            state,
-            0,
-            0,
-            Box::new(|args| RSV::Number(0).into()),
-        );
-        let (state_id, mut state) = db.upsert_operation(
-            state_id,
-            state,
-            1,
-            1,
-            Box::new(|args| RSV::Number(1).into()),
-        );
-        let (state_id, mut state) = db.upsert_operation(
-            state_id,
-            state,
-            2,
-            1,
-            Box::new(|args| RSV::Number(2).into()),
-        );
-        let (state_id, mut state) = db.upsert_operation(
-            state_id,
-            state,
-            3,
-            1,
-            Box::new(|args| RSV::Number(3).into()),
-        );
-        let (state_id, mut state) = db.upsert_operation(
-            state_id,
-            state,
-            4,
-            2,
-            Box::new(|args| RSV::Number(4).into()),
-        );
+        let mut state = state.add_operation(0, 0, Box::new(|args| RSV::Number(0).into()));
+        let mut state = state.add_operation(1, 1, Box::new(|args| RSV::Number(1).into()));
+        let mut state = state.add_operation(2, 1, Box::new(|args| RSV::Number(2).into()));
+        let mut state = state.add_operation(3, 1, Box::new(|args| RSV::Number(3).into()));
+        let mut state = state.add_operation(4, 2, Box::new(|args| RSV::Number(4).into()));
 
-        let (state_id, state) = db.apply_dependency_graph_mutations(
-            (0, 0),
-            state,
-            vec![
-                DependencyGraphMutation::Create {
-                    operation_id: 1,
-                    depends_on: vec![(0, 0)],
-                },
-                DependencyGraphMutation::Create {
-                    operation_id: 2,
-                    depends_on: vec![(1, 0)],
-                },
-                DependencyGraphMutation::Create {
-                    operation_id: 3,
-                    depends_on: vec![(1, 0)],
-                },
-                DependencyGraphMutation::Create {
-                    operation_id: 4,
-                    depends_on: vec![(2, 0), (3, 1)],
-                },
-            ],
-        );
+        let mut state = state.apply_dependency_graph_mutations(vec![
+            DependencyGraphMutation::Create {
+                operation_id: 1,
+                depends_on: vec![(0, 0)],
+            },
+            DependencyGraphMutation::Create {
+                operation_id: 2,
+                depends_on: vec![(1, 0)],
+            },
+            DependencyGraphMutation::Create {
+                operation_id: 3,
+                depends_on: vec![(1, 0)],
+            },
+            DependencyGraphMutation::Create {
+                operation_id: 4,
+                depends_on: vec![(2, 0), (3, 1)],
+            },
+        ]);
 
         let (state_id, state) = db.step_execution(state_id, state);
         assert_eq!(state.state_get(&1), None);
@@ -562,9 +375,7 @@ mod tests {
         let state_id = (0, 0);
 
         // We start with the number 1 at node 0
-        let (state_id, mut state) = db.upsert_operation(
-            state_id,
-            state,
+        let mut state = state.add_operation(
             0,
             0,
             Box::new(|_args| {
@@ -585,38 +396,33 @@ mod tests {
             panic!("Invalid arguments")
         };
 
-        let (state_id, mut state) = db.upsert_operation(state_id, state, 1, 1, Box::new(f1));
-        let (state_id, mut state) = db.upsert_operation(state_id, state, 2, 1, Box::new(f1));
-        let (state_id, mut state) = db.upsert_operation(state_id, state, 3, 1, Box::new(f1));
-        let (state_id, mut state) = db.upsert_operation(state_id, state, 4, 1, Box::new(f1));
-        let (state_id, mut state) = db.upsert_operation(state_id, state, 5, 1, Box::new(f1));
-
-        let (state_id, state) = db.apply_dependency_graph_mutations(
-            (0, 0),
-            state,
-            vec![
-                DependencyGraphMutation::Create {
-                    operation_id: 1,
-                    depends_on: vec![(0, 0), (3, 0)],
-                },
-                DependencyGraphMutation::Create {
-                    operation_id: 2,
-                    depends_on: vec![(1, 0)],
-                },
-                DependencyGraphMutation::Create {
-                    operation_id: 3,
-                    depends_on: vec![(4, 0)],
-                },
-                DependencyGraphMutation::Create {
-                    operation_id: 4,
-                    depends_on: vec![(2, 0)],
-                },
-                DependencyGraphMutation::Create {
-                    operation_id: 5,
-                    depends_on: vec![(4, 0)],
-                },
-            ],
-        );
+        let mut state = state.add_operation(1, 1, Box::new(f1));
+        let mut state = state.add_operation(2, 1, Box::new(f1));
+        let mut state = state.add_operation(3, 1, Box::new(f1));
+        let mut state = state.add_operation(4, 1, Box::new(f1));
+        let mut state = state.add_operation(5, 1, Box::new(f1));
+        let mut state = state.apply_dependency_graph_mutations(vec![
+            DependencyGraphMutation::Create {
+                operation_id: 1,
+                depends_on: vec![(0, 0), (3, 0)],
+            },
+            DependencyGraphMutation::Create {
+                operation_id: 2,
+                depends_on: vec![(1, 0)],
+            },
+            DependencyGraphMutation::Create {
+                operation_id: 3,
+                depends_on: vec![(4, 0)],
+            },
+            DependencyGraphMutation::Create {
+                operation_id: 4,
+                depends_on: vec![(2, 0)],
+            },
+            DependencyGraphMutation::Create {
+                operation_id: 5,
+                depends_on: vec![(4, 0)],
+            },
+        ]);
 
         // We expect to see the value at each node increment repeatedly.
         let (state_id, state) = db.step_execution(state_id, state);
@@ -688,9 +494,7 @@ mod tests {
         let state_id = (0, 0);
 
         // We start with the number 1 at node 0
-        let (state_id, mut state) = db.upsert_operation(
-            state_id,
-            state,
+        let mut state = state.add_operation(
             0,
             0,
             Box::new(|_args| {
@@ -713,25 +517,19 @@ mod tests {
             panic!("Invalid arguments")
         };
 
-        let (state_id, mut state) =
-            db.upsert_operation(state_id, state, 1, 1, Box::new(f_side_effect));
-        let (state_id, mut state) =
-            db.upsert_operation(state_id, state, 2, 1, Box::new(f_side_effect));
+        let mut state = state.add_operation(1, 1, Box::new(f_side_effect));
+        let mut state = state.add_operation(2, 1, Box::new(f_side_effect));
 
-        let (state_id, state) = db.apply_dependency_graph_mutations(
-            (0, 0),
-            state,
-            vec![
-                DependencyGraphMutation::Create {
-                    operation_id: 1,
-                    depends_on: vec![(0, 0)],
-                },
-                DependencyGraphMutation::Create {
-                    operation_id: 2,
-                    depends_on: vec![(1, 0)],
-                },
-            ],
-        );
+        let mut state = state.apply_dependency_graph_mutations(vec![
+            DependencyGraphMutation::Create {
+                operation_id: 1,
+                depends_on: vec![(0, 0)],
+            },
+            DependencyGraphMutation::Create {
+                operation_id: 2,
+                depends_on: vec![(1, 0)],
+            },
+        ]);
 
         let (state_id, state) = db.step_execution(state_id, state);
         assert_eq!(state.state_get(&1), None);
@@ -769,9 +567,7 @@ mod tests {
         let state_id = (0, 0);
 
         // We start with the number 0 at node 0
-        let (state_id, mut state) = db.upsert_operation(
-            state_id,
-            state,
+        let mut state = state.add_operation(
             0,
             0,
             Box::new(|_args| {
@@ -802,25 +598,21 @@ mod tests {
             panic!("Invalid arguments")
         };
 
-        let (state_id, mut state) = db.upsert_operation(state_id, state, 1, 1, Box::new(f_v1));
-        let (state_id, mut state) = db.upsert_operation(state_id, state, 2, 1, Box::new(f_v1));
+        let mut state = state.add_operation(1, 1, Box::new(f_v1));
+        let mut state = state.add_operation(2, 1, Box::new(f_v1));
 
-        let (state_id, state) = db.apply_dependency_graph_mutations(
-            (0, 0),
-            state,
-            vec![
-                DependencyGraphMutation::Create {
-                    operation_id: 1,
-                    depends_on: vec![(0, 0)],
-                },
-                DependencyGraphMutation::Create {
-                    operation_id: 2,
-                    depends_on: vec![(1, 0)],
-                },
-            ],
-        );
+        let mut state = state.apply_dependency_graph_mutations(vec![
+            DependencyGraphMutation::Create {
+                operation_id: 1,
+                depends_on: vec![(0, 0)],
+            },
+            DependencyGraphMutation::Create {
+                operation_id: 2,
+                depends_on: vec![(1, 0)],
+            },
+        ]);
 
-        let (x_state_id, x_state) = db.step_execution(state_id, state);
+        let (x_state_id, mut x_state) = db.step_execution(state_id, state);
         assert_eq!(x_state.state_get(&1), None);
         assert_eq!(x_state.state_get(&2), None);
         let (state_id, state) = db.step_execution(x_state_id, x_state.clone());
@@ -831,12 +623,22 @@ mod tests {
         assert_eq!(state.state_get_value(&2), Some(RSV::Number(2)));
 
         // Change the definition of the operation "1" to add 200 instead of 1, then re-evaluate
-        let (state_id, mut state) = db.upsert_operation(x_state_id, x_state, 1, 1, Box::new(f_v2));
-        let (state_id, state) = db.step_execution(state_id, state);
+        let mut state = x_state.add_operation(1, 1, Box::new(f_v2));
+        let (state_id, state) = db.step_execution(state_id, state.clone());
         assert_eq!(state.state_get_value(&1), Some(RSV::Number(200)));
         assert_eq!(state.state_get(&2), None);
         let (state_id, state) = db.step_execution(state_id, state);
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), Some(RSV::Number(201)));
+    }
+
+    #[test]
+    fn test_conditional_propagation_to_children_slots() {
+        // TODO: we should add support for propgating only to a given child under certain circumstances
+    }
+
+    #[test]
+    fn test_composition_across_nodes() {
+        // TODO: take two operators, and compose them into a single operator
     }
 }

@@ -999,7 +999,7 @@ fn tuples_in_lambda() {
                     Expression::Variable("x".into()).into(),
                     Expression::Variable("x".into()).into()
                 )
-                    .into()
+                .into()
             ),
             literal_string()
         )),
@@ -1022,9 +1022,9 @@ fn nested_tuples() {
                         Expression::Variable("x".into()).into(),
                         Expression::Variable("x".into()).into()
                     )
-                        .into()
-                )
                     .into()
+                )
+                .into()
             ),
             literal_string()
         )),
@@ -1034,7 +1034,7 @@ fn nested_tuples() {
                 Type::Literal(LiteralType::String).into(),
                 Type::Literal(LiteralType::String).into()
             )
-                .into()
+            .into()
         )
     )
 }
@@ -1067,7 +1067,7 @@ fn generalised_let() {
                     Expression::Variable("newid".into()),
                     literal_string().into()
                 )
-                    .into(),
+                .into(),
                 construct_app(Expression::Variable("newid".into()), literal_bool().into()).into()
             )
         )),
@@ -1123,9 +1123,7 @@ fn id_fn() -> Expression {
                 Type::Variable("t".into()).into(),
                 Type::Variable("t".into()).into(),
             )
-                .into(),
+            .into(),
         ),
     )
 }
-
-fn main() {}

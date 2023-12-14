@@ -1,6 +1,6 @@
 pub mod execution_graph;
 pub mod execution_state;
-pub mod mutate_active_execution;
+
 use crate::execution::integration::triggerable::{Subscribable, TriggerContext};
 use crate::execution::primitives::identifiers::{ArgumentIndex, OperationId, TimestampOfWrite};
 use crate::execution::primitives::operation::{
@@ -57,3 +57,5 @@ impl Notifications {
         self.unparker.unpark();
     }
 }
+
+trait ExecutionStateInstance {}

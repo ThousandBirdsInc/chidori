@@ -182,6 +182,7 @@ mod tests {
                         score: 0.9, // Example score
                         version: 1, // Example version
                         vectors: Some(Vectors::from(vec![0.1, 0.2])),
+                        shard_key: None,
                     },
                     ScoredPoint {
                         id: Some(PointId::from(2)),
@@ -189,6 +190,7 @@ mod tests {
                         score: 0.8, // Example score
                         version: 1, // Example version
                         vectors: Some(Vectors::from(vec![0.3, 0.4])),
+                        shard_key: None,
                     },
                 ],
                 time: 0.0,
