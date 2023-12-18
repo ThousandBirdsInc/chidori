@@ -14,6 +14,11 @@ We want to be able to take control of the execution of a program in order to giv
 improved durability guarantees. This means that we want to be able to control the
 execution of a program in order to be able to checkpoint the state of the program.
 
+In instances where there are calls to our std api functions, we want to be able to delegate back our our
+execution runtime. In order to do this and to instrument internal functions of the user's definitions - we mutate their
+AST with a special "checkpoint" function call. This function call is then intercepted by our runtime and we can pause execution,
+run our code, and then resume.
+
 
 ## Intermediate experiments
 
@@ -37,6 +42,7 @@ across function blocks. We construct the graph of computations and then we execu
 
 This is signficiantly more simple than the other explored alternatives. We implement our own patterns for capturing values and constructing
 snapshots of execution in the given languages.
+
 
 
 ## Unique features

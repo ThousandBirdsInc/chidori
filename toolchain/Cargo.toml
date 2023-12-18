@@ -4,6 +4,7 @@ members = [
     "chidori-ui/src-tauri",
     "chidori",
 ]
+resolver = "2"
 
 [workspace.package]
 version = "0.1.28"
@@ -19,7 +20,7 @@ lto = true
 [workspace.dependencies]
 rkyv = {version = "0.7.42", features = ["validation"]}
 
-gluesql = "0.14.0"
+gluesql = "0.15.0"
 protobuf = "3.2.0"
 sqlparser = "0.34.0"
 anyhow = { version = "1.0", default-features = false }

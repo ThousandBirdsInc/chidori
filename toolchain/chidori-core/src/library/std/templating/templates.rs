@@ -260,7 +260,7 @@ pub fn render_template_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gluesql::core::ast_builder::extract;
+    // use gluesql::core::ast_builder::extract;
     use indoc::indoc;
     use serde_json::json;
 
