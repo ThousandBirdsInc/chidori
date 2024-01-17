@@ -2,6 +2,8 @@ use anyhow::Result;
 use deno_core::serde_json::Value;
 use deno_core::{serde_json, serde_v8, v8, FastString, JsRuntime, RuntimeOptions};
 
+// TODO: validate suspension and resumption of execution based on a method that we provide
+
 pub fn source_code_run_deno(source_code: String, _state: Option<Value>) -> Result<Option<Value>> {
     // Wrap the source code in an entrypoint function so that it immediately evaluates
     let wrapped_source_code = format!(

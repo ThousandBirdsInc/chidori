@@ -3,6 +3,7 @@ use rkyv::{
     ser::{serializers::AllocSerializer, Serializer},
     Archive, Deserialize, Serialize,
 };
+use serde_json::Value;
 use std::collections::HashMap;
 
 #[derive(Archive, Serialize, Deserialize, Debug, PartialEq)]
@@ -51,6 +52,59 @@ pub fn deserialize_from_buf(v: &[u8]) -> RkyvSerializedValue {
     let rkyv1 = unsafe { archived_root::<RkyvSerializedValue>(v) };
     let arg1: RkyvSerializedValue = rkyv1.deserialize(&mut rkyv::Infallible).unwrap();
     arg1
+}
+
+pub fn serialized_value_to_json_value(v: &RkyvSerializedValue) -> Value {
+    match &v {
+        RkyvSerializedValue::Float(f) => Value::Number(f.to_string().parse().unwrap()),
+        RkyvSerializedValue::Number(n) => Value::Number(n.to_string().parse().unwrap()),
+        RkyvSerializedValue::String(s) => Value::String(s.to_string()),
+        RkyvSerializedValue::Boolean(b) => Value::Bool(*b),
+        RkyvSerializedValue::Array(a) => Value::Array(
+            a.iter()
+                .map(|v| serialized_value_to_json_value(v))
+                .collect(),
+        ),
+        RkyvSerializedValue::Object(a) => Value::Object(
+            a.iter()
+                .map(|(k, v)| (k.clone(), serialized_value_to_json_value(v)))
+                .collect(),
+        ),
+        RkyvSerializedValue::FunctionPointer(_) => Value::Null,
+        RkyvSerializedValue::StreamPointer(_) => Value::Null,
+        RkyvSerializedValue::Null => Value::Null,
+    }
+}
+
+/// Convert a serde_json::Value into a SerializedValue
+pub fn json_value_to_serialized_value(jval: &Value) -> RkyvSerializedValue {
+    match jval {
+        Value::Number(n) => {
+            if n.is_i64() {
+                RkyvSerializedValue::Number(n.as_i64().unwrap() as i32)
+            } else if n.is_f64() {
+                RkyvSerializedValue::Float(n.as_f64().unwrap() as f32)
+            } else {
+                panic!("Invalid number value")
+            }
+        }
+        Value::String(s) => RkyvSerializedValue::String(s.clone()),
+        Value::Bool(b) => RkyvSerializedValue::Boolean(*b),
+        Value::Array(a) => RkyvSerializedValue::Array(
+            a.iter()
+                .map(|v| json_value_to_serialized_value(v))
+                .collect(),
+        ),
+        Value::Object(o) => {
+            let mut map = HashMap::new();
+            for (k, v) in o {
+                map.insert(k.clone(), json_value_to_serialized_value(v));
+            }
+            RkyvSerializedValue::Object(map)
+        }
+        Value::Null => RkyvSerializedValue::Null,
+        _ => panic!("Invalid value type"),
+    }
 }
 
 #[cfg(test)]

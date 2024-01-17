@@ -1,0 +1,3 @@
+mod language;
+
+fn main() {}

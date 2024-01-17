@@ -876,7 +876,7 @@ dependencies = [
  "tonic",
  "tonic-build",
  "wasm-bindgen",
- "wasm-bindgen-test",
+ "wasm-bindgen-test 0.2.50",
 ]
 
 [[package]]
@@ -888,6 +888,8 @@ dependencies = [
  "async-trait",
  "base64 0.21.5",
  "bytes",
+ "chidori-prompt-format",
+ "chidori-static-analysis",
  "chumsky",
  "crossbeam-utils",
  "deno_core",
@@ -896,13 +898,17 @@ dependencies = [
  "futures 0.3.29",
  "futures-util",
  "gluesql",
- "handlebars",
+ "handlebars 4.5.0",
  "hnsw_rs_thousand_birds",
  "http-body-util",
  "im",
  "indoc",
  "log",
+ "neon",
+ "neon-serde3",
+ "num",
  "num_cpus",
+ "once_cell",
  "openai-api-rs",
  "petgraph",
  "priority-queue",
@@ -930,6 +936,45 @@ dependencies = [
  "typescript-type-def",
  "yaml-front-matter",
  "zip",
+]
+
+[[package]]
+name = "chidori-im-hashmap"
+version = "0.1.28"
+
+[[package]]
+name = "chidori-prompt-format"
+version = "0.1.35"
+dependencies = [
+ "anyhow",
+ "console_error_panic_hook",
+ "handlebars 5.0.0",
+ "indoc",
+ "lazy_static",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "serde_yaml 0.9.27",
+ "wasm-bindgen",
+ "wasm-bindgen-test 0.3.39",
+]
+
+[[package]]
+name = "chidori-static-analysis"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "console_error_panic_hook",
+ "indoc",
+ "lazy_static",
+ "rustpython-parser 0.3.0",
+ "serde",
+ "serde-wasm-bindgen",
+ "swc_common",
+ "swc_ecma_ast",
+ "swc_ecma_parser",
+ "wasm-bindgen",
+ "wasm-bindgen-test 0.3.39",
 ]
 
 [[package]]
@@ -2655,6 +2700,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "handlebars"
+version = "5.0.0"
+source = "git+https://github.com/ThousandBirdsInc/handlebars-rust?rev=fc73bb228665d27e476c5ea8c270fea79b2290cf#fc73bb228665d27e476c5ea8c270fea79b2290cf"
+dependencies = [
+ "log",
+ "pest",
+ "pest_derive",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3908,6 +3966,7 @@ version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b05180d69e3da0e530ba2a1dae5110317e49e3b7f3d41be227dc5f92e49ee7af"
 dependencies = [
+ "num-bigint",
  "num-complex",
  "num-integer",
  "num-iter",
@@ -3965,6 +4024,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0638a1c9d0a3c0914158145bc76cff373a75a627e6ecbfb71cbe6f453a5a19b0"
 dependencies = [
  "autocfg",
+ "num-bigint",
  "num-integer",
  "num-traits",
 ]
@@ -8159,7 +8219,21 @@ dependencies = [
  "scoped-tls",
  "wasm-bindgen",
  "wasm-bindgen-futures 0.3.27",
- "wasm-bindgen-test-macro",
+ "wasm-bindgen-test-macro 0.2.50",
+]
+
+[[package]]
+name = "wasm-bindgen-test"
+version = "0.3.39"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2cf9242c0d27999b831eae4767b2a146feb0b27d332d553e605864acd2afd403"
+dependencies = [
+ "console_error_panic_hook",
+ "js-sys",
+ "scoped-tls",
+ "wasm-bindgen",
+ "wasm-bindgen-futures 0.4.39",
+ "wasm-bindgen-test-macro 0.3.39",
 ]
 
 [[package]]
@@ -8170,6 +8244,17 @@ checksum = "0789dac148a8840bbcf9efe13905463b733fa96543bfbf263790535c11af7ba5"
 dependencies = [
  "proc-macro2 0.4.30",
  "quote 0.6.13",
+]
+
+[[package]]
+name = "wasm-bindgen-test-macro"
+version = "0.3.39"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "794645f5408c9a039fd09f4d113cdfb2e7eba5ff1956b07bcf701cf4b394fe89"
+dependencies = [
+ "proc-macro2 1.0.70",
+ "quote 1.0.33",
+ "syn 2.0.41",
 ]
 
 [[package]]

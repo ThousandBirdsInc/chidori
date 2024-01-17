@@ -3,6 +3,7 @@ members = [
     "chidori-core",
     "chidori-ui/src-tauri",
     "chidori",
+    "chidori-prompt-format", "chidori-im-hashmap", "chidori-static-analysis",
 ]
 resolver = "2"
 

@@ -1,0 +1,19 @@
+{
+  "scripts": {
+    "build": "wasm-pack build --target bundler --out-dir pkg --scope 1kbirds",
+    "build-local": "wasm-pack build --target nodejs --out-dir pkg_node --scope 1kbirds",
+    "test-rust": "cargo test",
+    "test-js": "jest tests/nodejs"
+  },
+  "dependencies": {
+    "@babel/preset-env": "^7.23.7",
+    "@types/jest": "^29.5.11",
+    "chidori_prompt_format": "file:./pkg",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  },
+  "devDependencies": {
+    "@babel/preset-typescript": "^7.23.3",
+    "jest": "^29.6.1"
+  }
+}
