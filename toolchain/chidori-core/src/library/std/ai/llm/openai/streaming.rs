@@ -1,7 +1,7 @@
 use crate::library::std::ai::llm;
 use crate::library::std::ai::llm::openai::OpenAIChatModel;
 use crate::library::std::ai::llm::{
-    ChatCompletionReq, ChatCompletionRes, ChatModelStream, LLMStream, Usage,
+    ChatCompletionReq, ChatModelStream, LLMStream, Usage,
 };
 use async_trait::async_trait;
 use deno_core::serde_json;

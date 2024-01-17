@@ -1,12 +1,12 @@
 use chidori_static_analysis::language::python::parse::{extract_dependencies_python, ContextPath};
-use chumsky::primitive::Container;
+
 use rustpython::vm::{
-    pyclass, pymodule, PyObject, PyPayload, PyResult, TryFromBorrowedObject, VirtualMachine,
+    pymodule, PyPayload, PyResult, VirtualMachine,
 };
 use rustpython_vm as vm;
 use rustpython_vm::builtins::{PyBool, PyDict, PyInt, PyList, PyStr};
-use rustpython_vm::AsObject;
-use serde_json::Value;
+
+
 
 use crate::execution::primitives::serialized_value::RkyvSerializedValue;
 use rustpython_vm::PyObjectRef;
@@ -25,7 +25,7 @@ fn pyobject_to_rkyv(vm: &VirtualMachine, obj: PyObjectRef) -> Result<RkyvSeriali
             Ok(RkyvSerializedValue::Object(map))
         }
         None => match obj.downcast_ref::<PyList>() {
-            Some(py_list) => {
+            Some(_py_list) => {
                 if let Some(list) = obj.payload_if_exact::<PyList>(vm) {
                     let vec: Result<Vec<_>, _> = list
                         .borrow_vec()
@@ -44,7 +44,7 @@ fn pyobject_to_rkyv(vm: &VirtualMachine, obj: PyObjectRef) -> Result<RkyvSeriali
                         py_int.try_to_primitive(vm).unwrap(),
                     )),
                     None => match obj.downcast_ref::<PyBool>() {
-                        Some(py_bool) => {
+                        Some(_py_bool) => {
                             Ok(RkyvSerializedValue::Boolean(obj.try_to_bool(vm).unwrap()))
                         }
                         None => {
@@ -103,7 +103,7 @@ pub fn source_code_run_python(source_code: String) -> anyhow::Result<RkyvSeriali
             Err(exc) => {
                 vm.print_exception(exc);
             }
-            Ok(module) => {
+            Ok(_module) => {
                 let mut result_map = HashMap::new();
                 for dependency in &dependencies {
                     if let Some(ContextPath::VariableAssignment(name)) = dependency.first() {
@@ -129,10 +129,10 @@ pub fn source_code_run_python(source_code: String) -> anyhow::Result<RkyvSeriali
 #[pymodule]
 mod rust_py_module {
     use super::*;
-    use rustpython::vm::{builtins::PyList, convert::ToPyObject, PyObjectRef};
+    
 
     #[pyfunction]
-    fn suspend(vm: &VirtualMachine) -> PyResult<usize> {
+    fn suspend(_vm: &VirtualMachine) -> PyResult<usize> {
         // TODO: we can get the frame and we can get the locals and globals
         // TODO: question is if we can store that frame somehow
         // TODO: and can we resume it later

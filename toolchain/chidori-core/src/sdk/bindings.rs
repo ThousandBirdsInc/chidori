@@ -1,21 +1,21 @@
 use crate::execution::primitives::serialized_value::RkyvSerializedValue;
 use crate::library;
-use anyhow::Error;
+
 use futures::StreamExt;
-use log::{debug, info};
-use neon::handle::Managed;
-use neon::result::Throw;
-use neon::{prelude::*, types::Deferred};
-use neon_serde3;
+
+
+
+use neon::{prelude::*};
+
 use once_cell::sync::OnceCell;
-use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
-use std::future::Future;
-use std::marker::PhantomData;
-use std::sync::Arc;
+
+
+use std::collections::{HashMap};
+
+
+
 use tokio::runtime::Runtime;
-use tokio::sync::{mpsc, Mutex};
+
 
 // Return a global tokio runtime or create one if it doesn't exist.
 // Throws a JavaScript exception if the `Runtime` fails to create.
@@ -37,27 +37,27 @@ impl RkyvSerializedValue {
             RkyvSerializedValue::Boolean(x) => Ok(cx.boolean(*x).upcast()),
             RkyvSerializedValue::Null => Ok(cx.null().upcast()),
             RkyvSerializedValue::Array(val) => {
-                let mut js_list = cx.empty_array();
+                let js_list = cx.empty_array();
                 for (idx, item) in val.iter().enumerate() {
-                    let js = item.clone().to_object(cx);
+                    let js = item.to_object(cx);
                     js_list.set(cx, idx as u32, js?)?;
                 }
                 Ok(js_list.upcast())
             }
             RkyvSerializedValue::Object(val) => {
-                let mut js_obj = cx.empty_object();
+                let js_obj = cx.empty_object();
                 for (key, value) in val {
-                    let js = value.clone().to_object(cx);
+                    let js = value.to_object(cx);
                     js_obj.set(cx, key.as_str(), js?).unwrap();
                 }
                 Ok(js_obj.upcast())
             }
             // Additional cases for the new enum variants
-            RkyvSerializedValue::StreamPointer(x) => {
+            RkyvSerializedValue::StreamPointer(_x) => {
                 // Convert to JavaScript value as needed
                 unreachable!();
             }
-            RkyvSerializedValue::FunctionPointer(x) => {
+            RkyvSerializedValue::FunctionPointer(_x) => {
                 // Convert to JavaScript value as needed
                 unreachable!();
             }

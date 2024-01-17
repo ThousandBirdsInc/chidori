@@ -1,4 +1,4 @@
-use crate::execution::primitives::serialized_value::RkyvSerializedValue as RKV;
+
 ///! The goal of prompt_composition is to enable the composition of prompts in a way where we can
 ///! trace how the final prompt was assembled and why.
 ///!

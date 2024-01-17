@@ -54,7 +54,7 @@ impl InMemoryVectorDb {
 
     pub fn insert(&mut self, collection_name: String, data: &Vec<(&Vec<f32>, Value)>) {
         // usize is the id
-        let mut collection = self.collections.get_mut(&collection_name).unwrap();
+        let collection = self.collections.get_mut(&collection_name).unwrap();
         let mut insert_set = vec![];
         for item in data {
             collection.id_counter += 1;
@@ -70,7 +70,7 @@ impl InMemoryVectorDb {
         data: Vec<f32>,
         num_neighbors: usize,
     ) -> Vec<(Neighbour, Value)> {
-        let mut collection = self.collections.get_mut(&collection_name).unwrap();
+        let collection = self.collections.get_mut(&collection_name).unwrap();
         collection.hnsw.set_searching_mode(true);
         let mut results = vec![];
         let neighbors = collection
@@ -99,7 +99,7 @@ impl VectorDatabase<InMemoryVectorDb> for MemoryInMemory {
     async fn create_collection(
         &mut self,
         collection_name: String,
-        embedding_length: u64,
+        _embedding_length: u64,
     ) -> Result<(), VectorDbError> {
         self.client.new_collection(collection_name);
         Ok(())
@@ -108,7 +108,7 @@ impl VectorDatabase<InMemoryVectorDb> for MemoryInMemory {
     async fn insert_vector(
         &mut self,
         collection_name: String,
-        id: u64,
+        _id: u64,
         vector: Vec<f32>,
         payload: Option<serde_json::Value>,
     ) -> Result<(), VectorDbError> {

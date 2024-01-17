@@ -1,15 +1,15 @@
 use crate::library::std::ai::memory::{VectorDatabase, VectorDbError};
 use async_trait::async_trait;
-use base64;
-use handlebars::JsonValue;
+
+
 use qdrant_client::prelude::*;
 use qdrant_client::qdrant::point_id::PointIdOptions;
 use qdrant_client::qdrant::vectors_config::Config;
 use qdrant_client::qdrant::{
     CreateCollection, PointId, SearchPoints, SearchResponse, VectorParams, Vectors,
 };
-use serde_json::Value;
-use std::collections::HashMap;
+
+
 
 #[async_trait]
 pub trait WrappedQdrantClient {
@@ -31,20 +31,20 @@ pub struct MyQdrantClient(QdrantClient);
 impl WrappedQdrantClient for MyQdrantClient {
     async fn upsert_points_blocking(
         &self,
-        collection_name: String,
-        points: Vec<PointStruct>,
-        option: Option<bool>,
+        _collection_name: String,
+        _points: Vec<PointStruct>,
+        _option: Option<bool>,
     ) -> Result<(), String> {
         // Actual implementation for QdrantClient
         Ok(())
     }
 
-    async fn search_points(&self, params: &SearchPoints) -> Result<SearchResponse, String> {
+    async fn search_points(&self, _params: &SearchPoints) -> Result<SearchResponse, String> {
         // Actual implementation for QdrantClient
         Err("Not implemented".to_string())
     }
 
-    async fn create_collection(&self, collection: &CreateCollection) -> Result<(), String> {
+    async fn create_collection(&self, _collection: &CreateCollection) -> Result<(), String> {
         // Actual implementation for QdrantClient
         Err("Not implemented".to_string())
     }

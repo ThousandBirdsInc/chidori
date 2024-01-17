@@ -1,16 +1,16 @@
 use async_trait::async_trait;
-use std::env;
+
 
 use crate::library::std::ai::llm;
 use crate::library::std::ai::llm::openai::OpenAIChatModel;
-use crate::library::std::ai::llm::{openai, ChatCompletionReq, ChatCompletionRes, ChatModelBatch};
-use openai_api_rs::v1::api::Client;
-use openai_api_rs::v1::chat_completion;
+use crate::library::std::ai::llm::{ChatCompletionReq, ChatCompletionRes, ChatModelBatch};
+
+
 use openai_api_rs::v1::chat_completion::{
-    ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse, FunctionCall, MessageRole,
+    ChatCompletionMessage, ChatCompletionRequest, FunctionCall, MessageRole,
 };
-use openai_api_rs::v1::common::Usage;
-use openai_api_rs::v1::error::APIError;
+
+
 
 pub enum SupportedChatModel {
     Gpt4,

@@ -1,7 +1,4 @@
-/// An Operation is a function, which can be executed on the graph. It
-/// can be pure or impure, and it can be mutable or immutable. Each Operation
-/// has a unique identifier within a given graph.
-use crate::execution::integration::triggerable::TriggerContext;
+
 use std::collections::HashMap;
 use std::fmt;
 

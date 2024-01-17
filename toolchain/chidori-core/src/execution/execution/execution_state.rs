@@ -173,7 +173,7 @@ impl ExecutionState {
     }
 
     pub fn step_execution(&self) -> ExecutionState {
-        let mut previous_state = self;
+        let previous_state = self;
         let mut new_state = previous_state.clone();
         let mut operation_by_id = previous_state.operation_by_id.clone();
         let dependency_graph = previous_state.get_dependency_graph();
@@ -194,7 +194,7 @@ impl ExecutionState {
 
             // TODO: this currently disallows multiple edges from the same node?
             // Fetch the values from the previous execution cycle for each edge on this node
-            for (from, to, argument_indices) in
+            for (from, _to, argument_indices) in
                 dependency_graph.edges_directed(operation_id, Direction::Incoming)
             {
                 // TODO: if the dependency is on usize::MAX, then this is an execution order dependency

@@ -23,7 +23,7 @@ pub fn extract_zip(bytes: &[u8]) -> Result<bool> {
         }
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer).expect("Failed to read file");
-        let string = String::from_utf8_lossy(&buffer);
+        let _string = String::from_utf8_lossy(&buffer);
     }
     Ok(true)
 }

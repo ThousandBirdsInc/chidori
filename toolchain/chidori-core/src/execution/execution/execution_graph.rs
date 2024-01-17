@@ -1,29 +1,27 @@
-use crate::execution::execution::execution_state::{DependencyGraphMutation, ExecutionState};
-use crate::execution::integration::triggerable::{Subscribable, TriggerContext};
-use crate::execution::primitives::identifiers::{ArgumentIndex, OperationId, TimestampOfWrite};
-use crate::execution::primitives::operation::{
-    OperationFn, OperationNode, OperationNodeDefinition, Signature,
-};
-use crate::execution::primitives::serialized_value::deserialize_from_buf;
-use crate::execution::primitives::serialized_value::RkyvSerializedValue as RSV;
-use crossbeam_utils::sync::Unparker;
-use futures::StreamExt;
-use im::HashMap as ImHashMap;
-use im::HashSet as ImHashSet;
-use indoc::indoc;
-use petgraph::algo::toposort;
+use crate::execution::execution::execution_state::{ExecutionState};
+
+use crate::execution::primitives::identifiers::{ArgumentIndex, OperationId};
+
+
+
+
+
+
+
+
+
 use petgraph::data::Build;
-use petgraph::dot::{Config, Dot};
-use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::dot::{Dot};
+
 use petgraph::graphmap::DiGraphMap;
-use petgraph::visit::{Dfs, IntoEdgesDirected, VisitMap, Walker};
+use petgraph::visit::{IntoEdgesDirected};
 use petgraph::Direction;
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::fmt::{self, Formatter, Write};
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+
+
+
+
+
+
 // TODO: update all of these identifies to include a "space" they're within
 
 type EdgeIdentity = (OperationId, OperationId, ArgumentIndex);
@@ -65,7 +63,7 @@ impl ExecutionGraph {
     fn add_execution_edge(
         &mut self,
         prev_execution_id: (usize, usize),
-        mut new_state: ExecutionState,
+        new_state: ExecutionState,
         output_new_state: ExecutionState,
     ) -> ((usize, usize), ExecutionState) {
         let edges = self
@@ -101,7 +99,7 @@ impl ExecutionGraph {
         prev_execution_id: (usize, usize),
         previous_state: ExecutionState,
     ) -> ((usize, usize), ExecutionState) {
-        let mut new_state = previous_state.step_execution();
+        let new_state = previous_state.step_execution();
         // The edge from this node is the greatest branching id + 1
         // if we re-evaluate execution at a given node, we get a new execution branch.
         self.add_execution_edge(prev_execution_id, new_state.clone(), new_state)

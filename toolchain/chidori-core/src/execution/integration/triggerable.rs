@@ -1,9 +1,6 @@
 use crate::execution::execution::execution_graph::ExecutionGraph;
-use im::HashMap as ImmutableHashMap;
-/// This describes an API for a reactive system with a function "make_triggerable" that wraps
-/// a method passing to it a set of triggerable relationships. When those relationships fire,
-/// the associated method is invoked.
-use std::collections::HashMap;
+
+
 
 pub trait TriggerContext {}
 
@@ -20,12 +17,12 @@ pub trait Subscribable {
 /// Registers a given function with a reactivity db, based on a pointer to the boxed function.
 /// We use this as the identity of that method and return that identity so that we can continue to
 /// mutate the composition of the registered function.
-pub fn make_triggerable<F>(reactivity_db: &mut ExecutionGraph, args: usize, func: F) -> usize
+pub fn make_triggerable<F>(_reactivity_db: &mut ExecutionGraph, _args: usize, func: F) -> usize
 where
     F: 'static + FnMut(Vec<&Option<Vec<u8>>>) -> Vec<u8>,
 {
     let boxed_fn = Box::new(func);
-    let box_address = &*boxed_fn as *const _ as usize;
+    let _box_address = &*boxed_fn as *const _ as usize;
     // reactivity_db.upsert_operation(box_address, args, boxed_fn)
     assert!(false);
     0
