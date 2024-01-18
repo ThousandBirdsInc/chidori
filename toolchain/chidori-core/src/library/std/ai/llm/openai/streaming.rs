@@ -1,8 +1,6 @@
 use crate::library::std::ai::llm;
 use crate::library::std::ai::llm::openai::OpenAIChatModel;
-use crate::library::std::ai::llm::{
-    ChatCompletionReq, ChatModelStream, LLMStream, Usage,
-};
+use crate::library::std::ai::llm::{ChatCompletionReq, ChatModelStream, LLMStream, Usage};
 use async_trait::async_trait;
 use deno_core::serde_json;
 use futures_util::stream::Stream;
@@ -151,7 +149,8 @@ mod tests {
     #[tokio::test]
     async fn test_gpt_stream_raw_line() {
         dotenv::dotenv().ok();
-        let model = OpenAIChatModel::new();
+        let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
+        let model = OpenAIChatModel::new(api_key);
         let stream = model.stream(Default::default()).await.unwrap();
         let mut stream = Box::pin(stream);
         while let Some(value) = stream.next().await {

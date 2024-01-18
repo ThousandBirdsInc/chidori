@@ -71,9 +71,3 @@ wasm-bindgen-test = "0.2"
 tonic-build = "0.9.2"
 pyo3-build-config = "0.19.1"
 
-[profile.release]
-lto = "fat"
-codegen-units = 1
-strip = true
-
-

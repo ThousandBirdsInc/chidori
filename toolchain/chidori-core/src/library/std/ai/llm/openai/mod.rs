@@ -10,8 +10,7 @@ pub struct OpenAIChatModel {
 }
 
 impl OpenAIChatModel {
-    fn new() -> Self {
-        let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
+    pub fn new(api_key: String) -> Self {
         let client = Client::new(api_key.clone());
         Self { client, api_key }
     }

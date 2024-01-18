@@ -1,16 +1,12 @@
 use async_trait::async_trait;
 
-
 use crate::library::std::ai::llm;
 use crate::library::std::ai::llm::openai::OpenAIChatModel;
 use crate::library::std::ai::llm::{ChatCompletionReq, ChatCompletionRes, ChatModelBatch};
 
-
 use openai_api_rs::v1::chat_completion::{
     ChatCompletionMessage, ChatCompletionRequest, FunctionCall, MessageRole,
 };
-
-
 
 pub enum SupportedChatModel {
     Gpt4,
@@ -94,10 +90,12 @@ impl ChatModelBatch for OpenAIChatModel {
 mod tests {
     use super::*;
     use openai_api_rs::v1::api::Client;
+    use std::env;
 
     #[tokio::test]
     async fn test_batch_completion() {
-        let model = OpenAIChatModel::new();
+        let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
+        let model = OpenAIChatModel::new(api_key);
         let chat_completion_req = ChatCompletionReq {
             model: "".to_string(),
             ..ChatCompletionReq::default()

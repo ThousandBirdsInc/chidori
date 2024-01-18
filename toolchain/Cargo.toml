@@ -17,6 +17,8 @@ repository = "https://github.com/ThousandBirdsInc/chidori"
 
 [profile.release]
 lto = true
+# Tell `rustc` to optimize for small code size.
+#opt-level = "s"
 
 [workspace.dependencies]
 rkyv = {version = "0.7.42", features = ["validation"]}

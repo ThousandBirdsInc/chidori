@@ -17,7 +17,7 @@
 
   # https://devenv.sh/scripts/
   scripts.hello.exec = "echo Welcome to the Chidori dev enviroment";
-  scripts.run-ui.exec = "(cd toolchain/prompt-graph-ui && yarn run tauri dev";
+  scripts.run-ui.exec = "(cd toolchain/prompt-graph-ui && yarn run tauri dev)";
 
   enterShell = ''
     REPO_ROOT=`git rev-parse --show-toplevel`

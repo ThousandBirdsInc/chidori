@@ -1,15 +1,18 @@
 pub mod openai;
 use async_trait::async_trait;
 use futures_util::stream::Stream;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::pin::Pin;
+use ts_rs::TS;
 
 #[derive(Debug)]
 pub enum LLMErrors {
     ConnectionError(String),
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: i32,
     pub completion_tokens: i32,
@@ -33,6 +36,8 @@ pub struct LLMStream {
     usage: Usage,
 }
 
+#[derive(TS, Debug, Serialize, Deserialize)]
+#[ts(export, export_to = "package_node/types/")]
 pub enum MessageRole {
     User,
     System,
@@ -40,11 +45,15 @@ pub enum MessageRole {
     Function,
 }
 
+#[derive(TS, Debug, Serialize, Deserialize)]
+#[ts(export, export_to = "package_node/types/")]
 pub struct FunctionCall {
     pub name: Option<String>,
     pub arguments: Option<String>,
 }
 
+#[derive(TS, Debug, Serialize, Deserialize)]
+#[ts(export, export_to = "package_node/types/")]
 pub struct TemplateMessage {
     pub role: MessageRole,
     pub content: String,
@@ -52,6 +61,8 @@ pub struct TemplateMessage {
     pub function_call: Option<FunctionCall>,
 }
 
+#[derive(TS, Debug, Serialize, Deserialize)]
+#[ts(export, export_to = "package_node/types/")]
 pub struct ChatCompletionReq {
     model: String,
     frequency_penalty: Option<f64>,
@@ -59,6 +70,8 @@ pub struct ChatCompletionReq {
     presence_penalty: Option<f64>,
     stop: Option<Vec<String>>,
     temperature: Option<f64>,
+
+    #[ts(type = "any")]
     response_format: Option<Value>,
     logit_bias: Option<HashMap<String, i32>>,
     user: Option<String>,
@@ -86,13 +99,16 @@ impl Default for ChatCompletionReq {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ChatCompletionChoice {
     pub text: Option<String>,
     pub index: i32,
+
     pub logprobs: Option<Value>,
     pub finish_reason: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ChatCompletionRes {
     pub id: String,
     pub object: String,
@@ -102,6 +118,7 @@ pub struct ChatCompletionRes {
     pub usage: Usage,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EmbeddingReq {
     model: String,
     frequency_penalty: Option<f32>,
@@ -110,6 +127,7 @@ pub struct EmbeddingReq {
     stop: Option<Vec<String>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CompletionReq {
     model: String,
     frequency_penalty: Option<f32>,
@@ -121,7 +139,7 @@ pub struct CompletionReq {
 // TODO: streams should return a struct that includes the stream and a method to capture the usage
 
 #[async_trait]
-trait ChatModelBatch {
+pub trait ChatModelBatch {
     async fn batch(
         &self,
         chat_completion_req: ChatCompletionReq,

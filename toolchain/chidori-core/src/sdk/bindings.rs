@@ -1,21 +1,13 @@
 use crate::execution::primitives::serialized_value::RkyvSerializedValue;
 use crate::library;
-
+use crate::library::std::ai::llm::ChatCompletionReq;
+use crate::library::std::ai::llm::ChatModelBatch;
 use futures::StreamExt;
-
-
-
-use neon::{prelude::*};
-
+use neon::prelude::*;
 use once_cell::sync::OnceCell;
-
-
-use std::collections::{HashMap};
-
-
-
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::runtime::Runtime;
-
 
 // Return a global tokio runtime or create one if it doesn't exist.
 // Throws a JavaScript exception if the `Runtime` fails to create.
@@ -140,6 +132,34 @@ macro_rules! return_or_throw_deferred {
 /// The standard library functions are exposed directly to JavaScript for one-off execution.
 /// ==============================
 
+fn std_ai_llm_openai_batch(mut cx: FunctionContext) -> JsResult<JsPromise> {
+    let api_key = cx.argument::<JsString>(0)?.value(&mut cx);
+    let arg1 = cx.argument::<JsValue>(1)?;
+    let arg1_value = match neon_serde3::from_value(&mut cx, arg1) {
+        Ok(value) => value,
+        Err(e) => {
+            return cx.throw_error(e.to_string());
+        }
+    };
+
+    let channel = cx.channel();
+    let (deferred, promise) = cx.promise();
+    let rt = runtime(&mut cx)?;
+    rt.spawn(async move {
+        let result = library::std::ai::llm::openai::OpenAIChatModel::new(api_key)
+            .batch(arg1_value)
+            .await;
+        deferred.settle_with((&channel), move |mut cx| {
+            if let Ok(result) = result {
+                neon_serde3::to_value(&mut cx, &result).or_else(|e| cx.throw_error(e.to_string()))
+            } else {
+                cx.throw_error("Error")
+            }
+        });
+    });
+    Ok(promise)
+}
+
 fn std_code_rustpython_source_code_run_python(mut cx: FunctionContext) -> JsResult<JsValue> {
     let source_code = cx.argument::<JsString>(0)?.value(&mut cx);
     match library::std::code::runtime_rustpython::source_code_run_python(source_code) {
@@ -151,6 +171,7 @@ fn std_code_rustpython_source_code_run_python(mut cx: FunctionContext) -> JsResu
 #[neon::main]
 fn main(mut cx: ModuleContext) -> NeonResult<()> {
     env_logger::init();
+    cx.export_function("std_ai_llm_openai_batch", std_ai_llm_openai_batch)?;
     cx.export_function(
         "std_code_rustpython_source_code_run_python",
         std_code_rustpython_source_code_run_python,

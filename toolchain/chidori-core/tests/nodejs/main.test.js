@@ -1,4 +1,4 @@
-const {} = require("../..");
+const {std_code_rustpython_source_code_run_python} = require("../..");
 
 async function delay(ms) {
     // Returns a promise that resolves after "ms" milliseconds
@@ -6,6 +6,6 @@ async function delay(ms) {
 }
 
 test('initialize without error', () => {
-    expect(true).toEqual(true);
+    expect(std_code_rustpython_source_code_run_python("x = 2+2")).toEqual({"x": 4});
 });
 

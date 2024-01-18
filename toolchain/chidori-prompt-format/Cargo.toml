@@ -36,7 +36,3 @@ rev = "fc73bb228665d27e476c5ea8c270fea79b2290cf"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.34"
-
-[profile.release]
-# Tell `rustc` to optimize for small code size.
-opt-level = "s"

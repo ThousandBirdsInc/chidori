@@ -1,5 +1,5 @@
 use rkyv::{
-    archived_root,
+    archived_root, check_archived_root,
     ser::{serializers::AllocSerializer, Serializer},
     Archive, Deserialize, Serialize,
 };
