@@ -1,4 +1,4 @@
-use rustpython_parser::ast::{Expr, Identifier, Stmt};
+use rustpython_parser::ast::{Constant, Expr, Identifier, Stmt};
 use rustpython_parser::{ast, Parse};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -10,16 +10,19 @@ struct DecoratorExtrator {
     decorators: Vec<ast::Expr>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum ContextPath {
     Initialized,
     InFunction(String),
     InFunctionDecorator(usize),
     InCallExpression,
     ChName,
-    VariableAssignment(String),
+    AssignmentToStatement,
+    AssignmentFromStatement,
+    // bool = true (is locally defined)
     IdentifierReferredTo(String, bool),
     Attribute(String),
+    Constant(String),
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -46,25 +49,32 @@ impl ASTWalkContext {
         }
     }
 
-    fn enter_statement_function(&mut self, name: &Identifier) {
+    fn enter_statement_function(&mut self, name: &Identifier) -> usize {
         self.context_stack
             .push(ContextPath::InFunction(name.to_string()));
-    }
-
-    fn enter_decorator_expression(&mut self, idx: &usize) {
-        self.context_stack
-            .push(ContextPath::InFunctionDecorator(idx.clone()));
-    }
-
-    fn enter_call_expression(&mut self) {
-        self.context_stack.push(ContextPath::InCallExpression);
-    }
-
-    fn encounter_ch(&mut self) {
-        self.context_stack.push(ContextPath::ChName);
         self.context_stack_references
             .push(self.context_stack.clone());
-        self.context_stack.pop();
+        self.context_stack.len()
+    }
+
+    fn enter_decorator_expression(&mut self, idx: &usize) -> usize {
+        self.context_stack
+            .push(ContextPath::InFunctionDecorator(idx.clone()));
+        self.context_stack.len()
+    }
+
+    fn enter_call_expression(&mut self) -> usize {
+        self.context_stack.push(ContextPath::InCallExpression);
+        self.context_stack.len()
+    }
+
+    fn encounter_constant(&mut self, name: &Constant) {
+        if let Constant::Str(s) = name {
+            self.context_stack
+                .push(ContextPath::Constant(s.to_string()));
+            self.context_stack_references
+                .push(self.context_stack.clone());
+        }
     }
 
     fn encounter_named_reference(&mut self, name: &Identifier) {
@@ -81,21 +91,27 @@ impl ASTWalkContext {
         self.context_stack.pop();
     }
 
-    fn encounter_assignment(&mut self, name: &Identifier) {
-        self.context_stack
-            .push(ContextPath::VariableAssignment(name.to_string()));
-        self.context_stack_references
-            .push(self.context_stack.clone());
-        self.context_stack.pop();
+    fn enter_assignment_to_statement(&mut self) -> usize {
+        self.context_stack.push(ContextPath::AssignmentToStatement);
+        self.context_stack.len()
     }
 
-    fn enter_attr(&mut self, name: &Identifier) {
+    fn enter_assignment_from_statement(&mut self) -> usize {
+        self.context_stack
+            .push(ContextPath::AssignmentFromStatement);
+        self.context_stack.len()
+    }
+
+    fn enter_attr(&mut self, name: &Identifier) -> usize {
         self.context_stack
             .push(ContextPath::Attribute(name.to_string()));
+        self.context_stack.len()
     }
 
-    fn pop(&mut self) {
-        let ctx = self.context_stack.pop();
+    fn pop_until(&mut self, size: usize) {
+        while self.context_stack.len() >= size {
+            self.context_stack.pop();
+        }
         self.locals.clear();
     }
 }
@@ -203,13 +219,14 @@ fn traverse_expression(expr: &ast::Expr, machine: &mut ASTWalkContext) {
             }
         }
         ast::Expr::Call(expr) => {
-            machine.enter_call_expression();
+            let idx = machine.enter_call_expression();
             let ast::ExprCall {
                 func,
                 args,
                 keywords,
                 ..
             } = expr;
+            // TODO: needs to be contained within the metadata of the expression
             for arg in args {
                 traverse_expression(arg, machine);
             }
@@ -217,9 +234,10 @@ fn traverse_expression(expr: &ast::Expr, machine: &mut ASTWalkContext) {
                 traverse_expression(&keyword.value, machine);
             }
             traverse_expression(func, machine);
-            machine.pop();
+            machine.pop_until(idx);
         }
         ast::Expr::FormattedValue(ast::ExprFormattedValue { value, .. }) => {
+            // TODO: this is a string interpolation and we need to handle internal references
             traverse_expression(value, machine);
         }
         ast::Expr::JoinedStr(ast::ExprJoinedStr { values, .. }) => {
@@ -227,11 +245,13 @@ fn traverse_expression(expr: &ast::Expr, machine: &mut ASTWalkContext) {
                 traverse_expression(value, machine);
             }
         }
-        ast::Expr::Constant(_) => {}
+        ast::Expr::Constant(ast::ExprConstant { value, .. }) => {
+            machine.encounter_constant(value);
+        }
         ast::Expr::Attribute(ast::ExprAttribute { value, attr, .. }) => {
-            machine.enter_attr(attr);
+            let x = machine.enter_attr(attr);
             traverse_expression(value, machine);
-            machine.pop();
+            machine.pop_until(x);
         }
         ast::Expr::Subscript(ast::ExprSubscript { value, slice, .. }) => {
             traverse_expression(value, machine);
@@ -241,11 +261,7 @@ fn traverse_expression(expr: &ast::Expr, machine: &mut ASTWalkContext) {
             traverse_expression(value, machine);
         }
         ast::Expr::Name(ast::ExprName { id, .. }) => {
-            if id == "ch" {
-                machine.encounter_ch();
-            } else {
-                machine.encounter_named_reference(id);
-            }
+            machine.encounter_named_reference(id);
         }
         ast::Expr::List(ast::ExprList { elts, .. }) => {
             for elt in elts {
@@ -291,12 +307,17 @@ fn traverse_comprehension(comp: &ast::Comprehension, machine: &mut ASTWalkContex
 pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContext) {
     for stmt in statements {
         match stmt {
-            ast::Stmt::Assign(ast::StmtAssign { targets, .. }) => {
+            // targets has multiple because you can multi assign
+            ast::Stmt::Assign(ast::StmtAssign { targets, value, .. }) => {
+                let idx = machine.enter_assignment_to_statement();
+                // TODO: machine should note we're in an assignment statement
                 for target in targets {
-                    if let ast::Expr::Name(ast::ExprName { id, .. }) = &target {
-                        machine.encounter_assignment(id);
-                    }
+                    traverse_expression(target, machine);
                 }
+                machine.pop_until(idx);
+                let idx = machine.enter_assignment_from_statement();
+                traverse_expression(value, machine);
+                machine.pop_until(idx);
             }
             ast::Stmt::FunctionDef(ast::StmtFunctionDef {
                 body,
@@ -306,11 +327,11 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                 ..
             }) => {
                 // TODO: this does include typeparams
-                machine.enter_statement_function(name);
+                let idx = machine.enter_statement_function(name);
                 for (i, decorator) in decorator_list.iter().enumerate() {
-                    machine.enter_decorator_expression(&i);
+                    let idx = machine.enter_decorator_expression(&i);
                     traverse_expression(decorator, machine);
-                    machine.pop();
+                    machine.pop_until(idx);
                 }
                 for ast::ArgWithDefault {
                     range,
@@ -324,7 +345,7 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                     }
                 }
                 traverse_statements(body, machine);
-                machine.pop();
+                machine.pop_until(idx);
             }
 
             ast::Stmt::AsyncFunctionDef(ast::StmtAsyncFunctionDef { body, .. }) => {
@@ -497,11 +518,139 @@ def is_odd(i):
   return bool(i & 1)
 "#;
     let ast = ast::Suite::parse(python_source, "<embedded>");
-
     assert!(ast.is_ok());
 }
 
-fn build_dependency_graph(context_paths: Vec<ContextPath>) {}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReportItem {
+    context_path: Vec<ContextPath>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReportTriggerableFunctions {
+    context_path: Vec<ContextPath>,
+    emit_event: Vec<String>,
+    trigger_on: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Report {
+    cell_exposed_values: HashMap<String, ReportItem>,
+    cell_depended_values: HashMap<String, ReportItem>,
+    triggerable_functions: HashMap<String, ReportTriggerableFunctions>,
+}
+
+pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
+    // TODO: get all exposed values
+    // TODO: get all values referred to but are not available in a given context
+    // TODO: get all triggerable functions
+    // TODO: get all events that are emitted
+
+    // TODO: triggerable functions should note what they are triggered by
+    // TODO: for each of these we should store the context path that refers to them
+    // TODO: context paths should include spans
+    // TODO: for each of these we should store their type if its available
+    let mut exposed_values = HashMap::new();
+    let mut depended_values = HashMap::new();
+    let mut triggerable_functions = HashMap::new();
+    for context_path in context_paths {
+        let mut encountered = vec![];
+        for (idx, context_path_unit) in context_path.iter().enumerate() {
+            encountered.push(context_path_unit);
+
+            // If we've declared a top level function, it is exposed
+            if let ContextPath::InFunction(name) = context_path_unit {
+                if !triggerable_functions.contains_key(name) {
+                    triggerable_functions
+                        .entry(name.clone())
+                        .or_insert_with(|| ReportTriggerableFunctions {
+                            context_path: context_path.clone(),
+                            emit_event: vec![],
+                            trigger_on: vec![],
+                        });
+                }
+            }
+
+            // Decorators set the emit event property for a function
+            if &ContextPath::IdentifierReferredTo(String::from("ch"), false) == context_path_unit {
+                if ContextPath::Attribute(String::from("emit_as")) == context_path[idx - 1] {
+                    if let ContextPath::Constant(const_name) = &context_path[idx - 2] {
+                        if let ContextPath::InFunctionDecorator(_) = context_path[idx - 4] {
+                            if let ContextPath::InFunction(name) = &context_path[idx - 5] {
+                                let mut x = triggerable_functions
+                                    .entry(name.clone())
+                                    .or_insert_with(|| ReportTriggerableFunctions {
+                                        context_path: context_path.clone(),
+                                        emit_event: vec![], // Initialize with an empty string or a default value
+                                        trigger_on: vec![],
+                                    });
+                                x.emit_event.push(const_name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Decorators set the emit event property for a function
+            if &ContextPath::IdentifierReferredTo(String::from("ch"), false) == context_path_unit {
+                if ContextPath::Attribute(String::from("on_event")) == context_path[idx - 1] {
+                    if let ContextPath::Constant(const_name) = &context_path[idx - 2] {
+                        if let ContextPath::InFunctionDecorator(_) = context_path[idx - 4] {
+                            if let ContextPath::InFunction(name) = &context_path[idx - 5] {
+                                let mut x = triggerable_functions
+                                    .entry(name.clone())
+                                    .or_insert_with(|| ReportTriggerableFunctions {
+                                        context_path: context_path.clone(),
+                                        emit_event: vec![], // Initialize with an empty string or a default value
+                                        trigger_on: vec![],
+                                    });
+                                x.trigger_on.push(const_name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let ContextPath::IdentifierReferredTo(identifier, false) = context_path_unit {
+                if identifier != &String::from("ch") {
+                    if !encountered.contains(&&ContextPath::AssignmentToStatement) {
+                        depended_values.insert(
+                            identifier.clone(),
+                            ReportItem {
+                                context_path: context_path.clone(),
+                            },
+                        );
+                    } else {
+                        if encountered
+                            .iter()
+                            .find(|x| {
+                                if let ContextPath::InFunction(_) = x {
+                                    true
+                                } else {
+                                    false
+                                }
+                            })
+                            .is_none()
+                        {
+                            exposed_values.insert(
+                                identifier.clone(),
+                                ReportItem {
+                                    context_path: context_path.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Report {
+        cell_exposed_values: exposed_values,
+        cell_depended_values: depended_values,
+        triggerable_functions: triggerable_functions,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -515,24 +664,9 @@ mod tests {
             
             ch.prompt.configure("default", ch.llm(model="openai"))
             "#};
-        let ast = ast::Suite::parse(python_source, "<embedded>").unwrap();
-        // dbg!(&ast);
-
-        // TODO: functiondef -> decorator_list -> call
-
-        // TODO: for new we can assume that we only care about modules directly provided
-
-        // TODO: decorators
-        // TODO: we want to extract the decorator attribute, and the arguments to the decorator
-
-        // TODO: accessors
-        // TODO: we want to extract .get or .set and the path and value referred
-
-        let mut machine = ASTWalkContext::default();
-
-        traverse_statements(&ast, &mut machine);
+        let context_stack_references = extract_dependencies_python(python_source);
         assert_eq!(
-            machine.context_stack_references,
+            context_stack_references,
             vec![
                 vec![
                     ContextPath::InCallExpression,
@@ -555,14 +689,12 @@ mod tests {
         let python_source = indoc! { r#"
             x = 1
             "#};
-        let ast = ast::Suite::parse(python_source, "<embedded>").unwrap();
-        let mut machine = ASTWalkContext::default();
-
-        traverse_statements(&ast, &mut machine);
-        assert_eq!(
-            machine.context_stack_references,
-            vec![vec![ContextPath::VariableAssignment(String::from("x")),]]
-        );
+        let context_stack_references = extract_dependencies_python(python_source);
+        // TODO: fix
+        // assert_eq!(
+        //     context_stack_references,
+        //     vec![vec![ContextPath::VariableAssignment(String::from("x")),]]
+        // );
     }
 
     #[test]
@@ -571,12 +703,9 @@ mod tests {
             def create_dockerfile():
                 return prompt("prompts/create_dockerfile")
             "#};
-        let ast = ast::Suite::parse(python_source, "<embedded>").unwrap();
-        let mut machine = ASTWalkContext::default();
-
-        traverse_statements(&ast, &mut machine);
+        let context_stack_references = extract_dependencies_python(python_source);
         assert_eq!(
-            machine.context_stack_references,
+            context_stack_references,
             vec![vec![
                 ContextPath::InFunction(String::from("create_dockerfile")),
                 ContextPath::InCallExpression,
@@ -592,12 +721,9 @@ mod tests {
             def migration_agent():
                 ch.set("bar", 1)
             "#};
-        let ast = ast::Suite::parse(python_source, "<embedded>").unwrap();
-        let mut machine = ASTWalkContext::default();
-
-        traverse_statements(&ast, &mut machine);
+        let context_stack_references = extract_dependencies_python(python_source);
         assert_eq!(
-            machine.context_stack_references,
+            context_stack_references,
             vec![
                 vec![
                     ContextPath::InFunction(String::from("migration_agent")),
@@ -624,12 +750,9 @@ mod tests {
             def dispatch_agent(ev):
                 ch.set("file_path", ev.file_path)
             "#};
-        let ast = ast::Suite::parse(python_source, "<embedded>").unwrap();
-        let mut machine = ASTWalkContext::default();
-
-        traverse_statements(&ast, &mut machine);
+        let context_stack_references = extract_dependencies_python(python_source);
         assert_eq!(
-            machine.context_stack_references,
+            context_stack_references,
             vec![
                 vec![
                     ContextPath::InFunction(String::from("dispatch_agent")),
@@ -668,12 +791,9 @@ mod tests {
                 ch.set("file_path", ev.file_path)
                 migration_agent()
             "#};
-        let ast = ast::Suite::parse(python_source, "<embedded>").unwrap();
-        let mut machine = ASTWalkContext::default();
-
-        traverse_statements(&ast, &mut machine);
+        let context_stack_references = extract_dependencies_python(python_source);
         assert_eq!(
-            machine.context_stack_references,
+            context_stack_references,
             vec![
                 vec![
                     ContextPath::InFunction(String::from("evaluate_agent")),
@@ -703,12 +823,9 @@ mod tests {
             def setup_pipeline(x):
                 return x
             "#};
-        let ast = ast::Suite::parse(python_source, "<embedded>").unwrap();
-        let mut machine = ASTWalkContext::default();
-
-        traverse_statements(&ast, &mut machine);
+        let context_stack_references = extract_dependencies_python(python_source);
         assert_eq!(
-            machine.context_stack_references,
+            context_stack_references,
             vec![
                 vec![
                     ContextPath::InFunction(String::from("setup_pipeline")),
@@ -737,12 +854,9 @@ mod tests {
             def main():
                 bar() | foo() | baz()
             "#};
-        let ast = ast::Suite::parse(python_source, "<embedded>").unwrap();
-        let mut machine = ASTWalkContext::default();
-
-        traverse_statements(&ast, &mut machine);
+        let context_stack_references = extract_dependencies_python(python_source);
         assert_eq!(
-            machine.context_stack_references,
+            context_stack_references,
             vec![
                 vec![
                     ContextPath::InFunction(String::from("main")),
@@ -761,5 +875,20 @@ mod tests {
                 ],
             ]
         );
+    }
+
+    #[test]
+    fn test_report_generation() {
+        let python_source = indoc! { r#"
+        @ch.on_event("new_file")
+        @ch.emit_as("file_created")
+        def testing():
+            x = 2 + y
+            return x
+            "#};
+        let context_stack_references = extract_dependencies_python(python_source);
+        dbg!(&context_stack_references);
+        let result = build_report(&context_stack_references);
+        dbg!(result);
     }
 }

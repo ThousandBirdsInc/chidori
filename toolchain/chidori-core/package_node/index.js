@@ -3,6 +3,7 @@
 const {
     std_ai_llm_openai_batch,
     std_code_rustpython_source_code_run_python,
+    get_verison
 } = require("./native/chidori-core.node");
 
 const toSnakeCase = str => str.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
@@ -22,6 +23,7 @@ const transformKeys = (obj) => {
 
 
 module.exports = {
-    std_ai_llm_openai_batch: std_ai_llm_openai_batch,
-    std_code_rustpython_source_code_run_python: std_code_rustpython_source_code_run_python
+    std_ai_llm_openai_batch,
+    std_code_rustpython_source_code_run_python,
+    get_verison
 };

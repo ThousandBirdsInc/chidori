@@ -1,12 +1,11 @@
 use chidori_static_analysis::language::python::parse::{extract_dependencies_python, ContextPath};
 
-use rustpython::vm::{
-    pymodule, PyPayload, PyResult, VirtualMachine,
-};
-use rustpython_vm as vm;
-use rustpython_vm::builtins::{PyBool, PyDict, PyInt, PyList, PyStr};
-
-
+use pyo3::prelude::*;
+use pyo3::types::PyTuple;
+use pyo3::{py_run, PyCell};
+// use rustpython::vm::{pymodule, PyPayload, PyResult, VirtualMachine};
+// use rustpython_vm as vm;
+// use rustpython_vm::builtins::{PyBool, PyDict, PyInt, PyList, PyStr};
 
 use crate::execution::primitives::serialized_value::RkyvSerializedValue;
 use rustpython_vm::PyObjectRef;
@@ -76,60 +75,60 @@ impl RkyvSerializedValue {
 pub fn source_code_run_python(source_code: String) -> anyhow::Result<RkyvSerializedValue> {
     let dependencies = extract_dependencies_python(&source_code);
 
-    let interp = rustpython::InterpreterConfig::new()
-        .init_stdlib()
-        .init_hook(Box::new(|vm| {
-            vm.add_native_module("chidori".to_owned(), Box::new(rust_py_module::make_module));
-        }))
-        .interpreter();
+    // let interp = rustpython::InterpreterConfig::new()
+    //     .init_stdlib()
+    //     .init_hook(Box::new(|vm| {
+    //         vm.add_native_module("chidori".to_owned(), Box::new(rust_py_module::make_module));
+    //     }))
+    //     .interpreter();
 
-    interp.enter(|vm| {
-        let scope = vm.new_scope_with_builtins();
-        let code_obj = vm
-            .compile(
-                &source_code,
-                vm::compiler::Mode::Exec,
-                "<embedded>".to_owned(),
-            )
-            .map_err(|err| vm.new_syntax_error(&err, Some(&source_code)))
-            .unwrap();
-        // TODO: should serialize these exceptions to show them to the user
-
-        // scope.globals.set_item()
-
-        let module = vm.run_code_obj(code_obj, scope.clone());
-
-        match module {
-            Err(exc) => {
-                vm.print_exception(exc);
-            }
-            Ok(_module) => {
-                let mut result_map = HashMap::new();
-                for dependency in &dependencies {
-                    if let Some(ContextPath::VariableAssignment(name)) = dependency.first() {
-                        let p = vm.new_pyobj(name.clone());
-                        let s = p.downcast_ref::<PyStr>().unwrap();
-                        let global = scope.globals.get_item(&*s, vm);
-                        if let Ok(global) = global {
-                            let parsed = pyobject_to_rkyv(vm, global).unwrap();
-                            result_map.insert(name.clone(), parsed);
-                        }
-                    }
-                }
-                return Ok(RkyvSerializedValue::Object(result_map));
-                // let init_fn = scope.globals.get_item("fun", vm).unwrap();
-                // init_fn.call((), vm).unwrap();
-            }
-        }
-
-        Ok(RkyvSerializedValue::Object(HashMap::new()))
-    })
+    // interp.enter(|vm| {
+    //     let scope = vm.new_scope_with_builtins();
+    //     let code_obj = vm
+    //         .compile(
+    //             &source_code,
+    //             vm::compiler::Mode::Exec,
+    //             "<embedded>".to_owned(),
+    //         )
+    //         .map_err(|err| vm.new_syntax_error(&err, Some(&source_code)))
+    //         .unwrap();
+    //     // TODO: should serialize these exceptions to show them to the user
+    //
+    //     // scope.globals.set_item()
+    //
+    //     let module = vm.run_code_obj(code_obj, scope.clone());
+    //
+    //     match module {
+    //         Err(exc) => {
+    //             vm.print_exception(exc);
+    //         }
+    //         Ok(_module) => {
+    //             let mut result_map = HashMap::new();
+    //             for dependency in &dependencies {
+    //                 if let Some(ContextPath::IdentifierReferredTo(name, false)) = dependency.first()
+    //                 {
+    //                     let p = vm.new_pyobj(name.clone());
+    //                     let s = p.downcast_ref::<PyStr>().unwrap();
+    //                     let global = scope.globals.get_item(&*s, vm);
+    //                     if let Ok(global) = global {
+    //                         let parsed = pyobject_to_rkyv(vm, global).unwrap();
+    //                         result_map.insert(name.clone(), parsed);
+    //                     }
+    //                 }
+    //             }
+    //             return Ok(RkyvSerializedValue::Object(result_map));
+    //             // let init_fn = scope.globals.get_item("fun", vm).unwrap();
+    //             // init_fn.call((), vm).unwrap();
+    //         }
+    //     }
+    //
+    //     Ok(RkyvSerializedValue::Object(HashMap::new()))
+    // })
 }
 
 #[pymodule]
 mod rust_py_module {
     use super::*;
-    
 
     #[pyfunction]
     fn suspend(_vm: &VirtualMachine) -> PyResult<usize> {

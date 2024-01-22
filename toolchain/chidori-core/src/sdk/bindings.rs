@@ -131,6 +131,36 @@ macro_rules! return_or_throw_deferred {
 /// ==============================
 /// The standard library functions are exposed directly to JavaScript for one-off execution.
 /// ==============================
+fn std_ai_llm_openai_stream(mut cx: FunctionContext) -> JsResult<JsPromise> {
+    let api_key = cx.argument::<JsString>(0)?.value(&mut cx);
+    let arg1 = cx.argument::<JsValue>(1)?;
+    let arg1_value = match neon_serde3::from_value(&mut cx, arg1) {
+        Ok(value) => value,
+        Err(e) => {
+            return cx.throw_error("Failed to parse".to_string());
+            return cx.throw_error(e.to_string());
+        }
+    };
+
+    let channel = cx.channel();
+    let (deferred, promise) = cx.promise();
+    let rt = runtime(&mut cx)?;
+    rt.spawn(async move {
+        let result = library::std::ai::llm::openai::OpenAIChatModel::new(api_key)
+            .batch(arg1_value)
+            .await;
+        deferred.settle_with((&channel), move |mut cx| match result {
+            Ok(x) => {
+                let js_value = neon_serde3::to_value(&mut cx, &x)
+                    .or_else(|e| cx.throw_error(e.to_string()))
+                    .unwrap();
+                Ok(js_value)
+            }
+            Err(x) => cx.throw_error(x.to_string()),
+        });
+    });
+    Ok(promise)
+}
 
 fn std_ai_llm_openai_batch(mut cx: FunctionContext) -> JsResult<JsPromise> {
     let api_key = cx.argument::<JsString>(0)?.value(&mut cx);
@@ -149,12 +179,14 @@ fn std_ai_llm_openai_batch(mut cx: FunctionContext) -> JsResult<JsPromise> {
         let result = library::std::ai::llm::openai::OpenAIChatModel::new(api_key)
             .batch(arg1_value)
             .await;
-        deferred.settle_with((&channel), move |mut cx| {
-            if let Ok(result) = result {
-                neon_serde3::to_value(&mut cx, &result).or_else(|e| cx.throw_error(e.to_string()))
-            } else {
-                cx.throw_error("Error")
+        deferred.settle_with((&channel), move |mut cx| match result {
+            Ok(x) => {
+                let js_value = neon_serde3::to_value(&mut cx, &x)
+                    .or_else(|e| cx.throw_error(e.to_string()))
+                    .unwrap();
+                Ok(js_value)
             }
+            Err(x) => cx.throw_error(x.to_string()),
         });
     });
     Ok(promise)
@@ -168,6 +200,10 @@ fn std_code_rustpython_source_code_run_python(mut cx: FunctionContext) -> JsResu
     }
 }
 
+fn get_version(mut cx: FunctionContext) -> JsResult<JsValue> {
+    Ok(cx.string("0.1.27").upcast())
+}
+
 #[neon::main]
 fn main(mut cx: ModuleContext) -> NeonResult<()> {
     env_logger::init();
@@ -176,5 +212,6 @@ fn main(mut cx: ModuleContext) -> NeonResult<()> {
         "std_code_rustpython_source_code_run_python",
         std_code_rustpython_source_code_run_python,
     )?;
+    cx.export_function("get_version", get_version)?;
     Ok(())
 }

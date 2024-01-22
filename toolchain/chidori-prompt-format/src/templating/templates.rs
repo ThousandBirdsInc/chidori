@@ -457,6 +457,45 @@ mod tests {
     }
 
     #[test]
+    fn test_rendering_template_with_roles() {
+        let value = json! {
+            {
+                "value": "Testing"
+            }
+        };
+
+        let roles = extract_roles_from_template(
+            &r#"
+{{#system}}You are a helpful assistant.{{value}}{{/system}}
+{{#user}}test{{/user}}
+{{#assistant}}test{{/assistant}}
+"#,
+        );
+        let rendered: Vec<_> = roles
+            .into_iter()
+            .map(|(role, template)| {
+                (
+                    role,
+                    template.map(|t| {
+                        render_template_prompt(&t.source, &value, &HashMap::new()).unwrap()
+                    }),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                (
+                    ChatModelRoles::System,
+                    Some("You are a helpful assistant.Testing".to_string())
+                ),
+                (ChatModelRoles::User, Some("test".to_string())),
+                (ChatModelRoles::Assistant, Some("test".to_string())),
+            ]
+        );
+    }
+
+    #[test]
     fn test_rendering_template_with_partial() {
         let mut partials = HashMap::new();
         partials.insert(

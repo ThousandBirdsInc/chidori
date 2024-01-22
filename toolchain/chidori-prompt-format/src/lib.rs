@@ -21,17 +21,21 @@ extern "C" {
 pub fn render_template_prompt(
     template_str: &str,
     json_value: JsValue,
-    partials_json: JsValue,
-) -> Result<String, JsValue> {
+    // partials_json: JsValue,
+) -> Result<JsValue, JsValue> {
     let json_value: Value = serde_wasm_bindgen::from_value(json_value)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    let partials: HashMap<String, PromptLibraryRecord> =
-        serde_wasm_bindgen::from_value(partials_json)
+    // let partials: HashMap<String, PromptLibraryRecord> =
+    //     serde_wasm_bindgen::from_value(partials_json)
+    //         .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let partials: HashMap<String, PromptLibraryRecord> = HashMap::new();
+
+    let result =
+        crate::templating::templates::render_template_prompt(template_str, &json_value, &partials)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    crate::templating::templates::render_template_prompt(template_str, &json_value, &partials)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
+    serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
 #[derive(Serialize, Deserialize, Debug)]

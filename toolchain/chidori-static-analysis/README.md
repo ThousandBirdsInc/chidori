@@ -1,7 +1,7 @@
 ### Build
 
 ```
-wasm-pack build
+yarn run build
 ```
 
 ### Test
@@ -20,5 +20,5 @@ yarn run test-js
 ### Publish to NPM 
 
 ```
-wasm-pack publish
+cd pkg && npm publish --access=public
 ```

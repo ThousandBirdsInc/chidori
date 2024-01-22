@@ -66,7 +66,10 @@ pub struct TemplateMessage {
 pub struct ChatCompletionReq {
     model: String,
     frequency_penalty: Option<f64>,
+
+    #[ts(type = "number | null")]
     max_tokens: Option<i64>,
+
     presence_penalty: Option<f64>,
     stop: Option<Vec<String>>,
     temperature: Option<f64>,
@@ -75,6 +78,8 @@ pub struct ChatCompletionReq {
     response_format: Option<Value>,
     logit_bias: Option<HashMap<String, i32>>,
     user: Option<String>,
+
+    #[ts(type = "number | null")]
     seed: Option<i64>,
     top_p: Option<f64>,
     template_messages: Vec<TemplateMessage>,

@@ -965,7 +965,7 @@ dependencies = [
 
 [[package]]
 name = "chidori-static-analysis"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
