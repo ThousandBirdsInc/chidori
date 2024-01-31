@@ -2,9 +2,16 @@ use anyhow::Result;
 use deno_core::serde_json::Value;
 use deno_core::{serde_json, serde_v8, v8, FastString, JsRuntime, RuntimeOptions};
 
+use crate::execution::primitives::serialized_value::RkyvSerializedValue;
+use std::collections::HashMap;
+
 // TODO: validate suspension and resumption of execution based on a method that we provide
 
-pub fn source_code_run_deno(source_code: String, _state: Option<Value>) -> Result<Option<Value>> {
+pub fn source_code_run_deno(
+    source_code: String,
+    payload: &RkyvSerializedValue,
+    function_invocation: Option<String>,
+) -> Result<Option<Value>> {
     // Wrap the source code in an entrypoint function so that it immediately evaluates
     let wrapped_source_code = format!(
         r#"(function main() {{
@@ -43,21 +50,21 @@ mod tests {
     #[test]
     fn test_source_code_run_deno_success() {
         let source_code = String::from("return 42;");
-        let result = source_code_run_deno(source_code, None);
+        let result = source_code_run_deno(source_code, &RkyvSerializedValue::Null, None);
         assert_eq!(result.unwrap(), Some(serde_json::json!(42)));
     }
 
     #[test]
     fn test_source_code_run_deno_failure() {
         let source_code = String::from("throw new Error('Test Error');");
-        let result = source_code_run_deno(source_code, None);
+        let result = source_code_run_deno(source_code, &RkyvSerializedValue::Null, None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_source_code_run_deno_json_serialization() {
         let source_code = String::from("return {foo: 'bar'};");
-        let result = source_code_run_deno(source_code, None);
+        let result = source_code_run_deno(source_code, &RkyvSerializedValue::Null, None);
         assert_eq!(result.unwrap(), Some(serde_json::json!({"foo": "bar"})));
     }
 }

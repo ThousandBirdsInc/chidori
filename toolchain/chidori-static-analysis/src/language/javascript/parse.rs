@@ -1,4 +1,9 @@
 extern crate swc_ecma_parser;
+
+use crate::language::python;
+use rustpython_parser::ast::{Constant, Identifier};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use swc_common::sync::Lrc;
 use swc_common::{
     errors::{ColorConfig, Handler},
@@ -8,10 +13,156 @@ use swc_ecma_ast as ast;
 use swc_ecma_ast::{Decl, Expr, FnDecl, ModuleDecl, ModuleItem, Pat, PatOrExpr, Stmt};
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
 
-fn traverse_module(module: ModuleItem) {
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub enum ContextPath {
+    Initialized,
+    InFunction(String),
+    InFunctionDecorator(usize),
+    InCallExpression,
+    ChName,
+    AssignmentToStatement,
+    AssignmentFromStatement,
+    // bool = true (is locally defined)
+    IdentifierReferredTo(String, bool),
+    Attribute(String),
+    Constant(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FunctionContext {
+    dependencies: Vec<Vec<ContextPath>>,
+}
+
+// TODO: we're building a filtered subset of the AST
+// TODO: what we can consider is evaluating the ast into the references
+// TODO: the context path is the accumulated state, when we pop it we evaluate it
+#[derive(Default)]
+pub struct ASTWalkContext {
+    pub context_stack_references: Vec<Vec<ContextPath>>,
+    pub context_stack: Vec<ContextPath>,
+    pub locals: HashSet<String>,
+    pub local_contexts: Vec<HashSet<String>>,
+    pub globals: HashSet<String>,
+}
+
+impl ASTWalkContext {
+    fn new() -> Self {
+        Self {
+            context_stack_references: vec![],
+            context_stack: vec![],
+            locals: HashSet::new(),
+            local_contexts: vec![],
+            globals: HashSet::new(),
+        }
+    }
+
+    fn var_exists(&self, name: &str) -> bool {
+        if self.globals.contains(name) {
+            return true;
+        }
+        if self.locals.contains(name) {
+            return true;
+        }
+        for local_context in self.local_contexts.iter().rev() {
+            if local_context.contains(name) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn new_local_context(&mut self) {
+        self.local_contexts.push(self.locals.clone());
+    }
+
+    fn pop_local_context(&mut self) {
+        self.local_contexts.pop();
+
+        // Clearing the existing locals
+        self.locals.clear();
+
+        // Union of all remaining hashsetss in local_contexts
+        self.locals.extend(
+            self.local_contexts
+                .iter()
+                .flat_map(|context| context.iter().cloned()),
+        );
+    }
+
+    fn enter_statement_function(&mut self, name: &ast::Ident) -> usize {
+        self.context_stack
+            .push(ContextPath::InFunction(name.to_string()));
+        self.context_stack_references
+            .push(self.context_stack.clone());
+        self.context_stack.len()
+    }
+
+    fn enter_decorator_expression(&mut self, idx: &usize) -> usize {
+        self.context_stack
+            .push(ContextPath::InFunctionDecorator(idx.clone()));
+        self.context_stack.len()
+    }
+
+    fn enter_call_expression(&mut self) -> usize {
+        self.context_stack.push(ContextPath::InCallExpression);
+        self.context_stack.len()
+    }
+
+    fn encounter_constant(&mut self, name: &Constant) {
+        if let Constant::Str(s) = name {
+            self.context_stack
+                .push(ContextPath::Constant(s.to_string()));
+            self.context_stack_references
+                .push(self.context_stack.clone());
+        }
+    }
+
+    fn encounter_named_reference(&mut self, name: &Identifier) {
+        // TODO: we need to check if this is a local variable or not
+        if self.var_exists(&name.to_string()) {
+            // true, the var exists in the local or global scope
+            self.context_stack
+                .push(ContextPath::IdentifierReferredTo(name.to_string(), true));
+        } else {
+            if let Some(ContextPath::AssignmentToStatement) = self.context_stack.last() {
+                self.locals.insert(name.to_string());
+            }
+            self.context_stack
+                .push(ContextPath::IdentifierReferredTo(name.to_string(), false));
+        }
+        self.context_stack_references
+            .push(self.context_stack.clone());
+        self.context_stack.pop();
+    }
+
+    fn enter_assignment_to_statement(&mut self) -> usize {
+        self.context_stack.push(ContextPath::AssignmentToStatement);
+        self.context_stack.len()
+    }
+
+    fn enter_assignment_from_statement(&mut self) -> usize {
+        self.context_stack
+            .push(ContextPath::AssignmentFromStatement);
+        self.context_stack.len()
+    }
+
+    fn enter_attr(&mut self, name: &Identifier) -> usize {
+        self.context_stack
+            .push(ContextPath::Attribute(name.to_string()));
+        self.context_stack.len()
+    }
+
+    fn pop_until(&mut self, size: usize) {
+        while self.context_stack.len() >= size {
+            self.context_stack.pop();
+        }
+    }
+}
+
+fn traverse_module(module: ModuleItem, machine: &mut ASTWalkContext) {
     match module {
         ModuleItem::ModuleDecl(mod_decl) => match mod_decl {
-            ModuleDecl::Import(_) => {}
+            ModuleDecl::Import(ast::ImportDecl { .. }) => {}
             ModuleDecl::ExportDecl(_) => {}
             ModuleDecl::ExportNamed(_) => {}
             ModuleDecl::ExportDefaultDecl(_) => {}
@@ -21,11 +172,14 @@ fn traverse_module(module: ModuleItem) {
             ModuleDecl::TsExportAssignment(_) => {}
             ModuleDecl::TsNamespaceExport(_) => {}
         },
-        ModuleItem::Stmt(_) => {}
+        ModuleItem::Stmt(stmt) => {
+            let v = vec![stmt];
+            traverse_stmts(v.as_slice(), machine);
+        }
     }
 }
 
-fn traverse_expr(expr: ast::Expr) {
+fn traverse_expr(expr: &ast::Expr, machine: &mut ASTWalkContext) {
     match expr {
         Expr::This(ast::ThisExpr { .. }) => {}
         Expr::Array(ast::ArrayLit { .. }) => {}
@@ -34,7 +188,20 @@ fn traverse_expr(expr: ast::Expr) {
         Expr::Unary(ast::UnaryExpr { .. }) => {}
         Expr::Update(ast::UpdateExpr { .. }) => {}
         Expr::Bin(ast::BinExpr { .. }) => {}
-        Expr::Assign(ast::AssignExpr { .. }) => {}
+        Expr::Assign(ast::AssignExpr {
+            op, left, right, ..
+        }) => {
+            let idx = machine.enter_assignment_to_statement();
+            match left {
+                PatOrExpr::Expr(expr) => {
+                    traverse_expr(expr, machine);
+                }
+                PatOrExpr::Pat(pat) => {}
+            }
+            machine.pop_until(idx);
+            traverse_expr(right, machine);
+            machine.pop_until(idx);
+        }
         Expr::Member(ast::MemberExpr { .. }) => {}
         Expr::SuperProp(ast::SuperPropExpr { .. }) => {}
         Expr::Cond(ast::CondExpr { .. }) => {}
@@ -54,9 +221,7 @@ fn traverse_expr(expr: ast::Expr) {
         Expr::JSXMember(ast::JSXMemberExpr { .. }) => {}
         Expr::JSXNamespacedName(ast::JSXNamespacedName { .. }) => {}
         Expr::JSXEmpty(ast::JSXEmptyExpr { .. }) => {}
-        Expr::JSXElement(el) => {
-            let ast::JSXElement { .. } = &*el;
-        }
+        Expr::JSXElement(el) => {}
         Expr::JSXFragment(ast::JSXFragment { .. }) => {}
         Expr::TsTypeAssertion(ast::TsTypeAssertion { .. }) => {}
         Expr::TsConstAssertion(ast::TsConstAssertion { .. }) => {}
@@ -70,20 +235,14 @@ fn traverse_expr(expr: ast::Expr) {
     }
 }
 
-fn traverse_stmts(stmts: &[Stmt]) {
+fn traverse_stmts(stmts: &[Stmt], machine: &mut ASTWalkContext) {
     for stmt in stmts {
         match stmt {
             Stmt::Expr(expr_stmt) => {
-                if let Expr::Assign(assign_expr) = &*expr_stmt.expr {
-                    if let PatOrExpr::Pat(pat) = &assign_expr.left {
-                        if let Pat::Ident(binding_ident) = &**pat {
-                            println!("Assignment to variable: {}", binding_ident.id.sym);
-                        }
-                    }
-                }
+                traverse_expr(&*expr_stmt.expr, machine);
             }
             Stmt::Block(block_stmt) => {
-                traverse_stmts(&block_stmt.stmts);
+                traverse_stmts(&block_stmt.stmts, machine);
             }
             Stmt::Empty(_) => {}
             Stmt::Debugger(ast::DebuggerStmt { .. }) => {}
@@ -105,7 +264,16 @@ fn traverse_stmts(stmts: &[Stmt]) {
             Stmt::ForOf(ast::ForOfStmt { .. }) => {}
             Stmt::Decl(decl) => match decl {
                 Decl::Class(_) => {}
-                Decl::Fn(_) => {}
+                Decl::Fn(ast::FnDecl {
+                    ident, function, ..
+                }) => {
+                    let idx = machine.enter_statement_function(ident);
+                    let ast::Function { body, .. } = &**function;
+                    if let Some(body) = body {
+                        traverse_stmts(&body.stmts, machine);
+                    }
+                    machine.pop_until(idx);
+                }
                 Decl::Var(_) => {}
                 Decl::Using(_) => {}
                 Decl::TsInterface(_) => {}
@@ -123,6 +291,7 @@ mod tests {
 
     #[test]
     fn test_evaluation_single_node() {
+        let machine = &mut ASTWalkContext::new();
         let cm: Lrc<SourceMap> = Default::default();
         let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
 
@@ -191,7 +360,7 @@ mod tests {
                         println!("Function name: {}", ident.sym);
                         println!("Function body: {:?}", function.body);
                         if let Some(body) = &function.body {
-                            traverse_stmts(&body.stmts);
+                            traverse_stmts(&body.stmts, machine);
                         }
                     }
                     _ => {}

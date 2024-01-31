@@ -10,7 +10,10 @@
       pkgs.protobuf3_21
       pkgs.nodejs_20
       pkgs.xdot
+      pkgs.rustup
+      pkgs.wasm-pack
   ] ++ lib.optionals pkgs.stdenv.isDarwin (with pkgs.darwin.apple_sdk; [
+       frameworks.SystemConfiguration
        frameworks.Security
        frameworks.CoreFoundation
      ]);
@@ -28,6 +31,7 @@
   languages.nix.enable = true;
 
   languages.python = {
+      version = "3.12.0";
       enable = true;
       poetry.enable = true;
       venv.enable = true;
@@ -35,6 +39,8 @@
 
   languages.rust = {
       enable = true;
+      channel = "nightly";
+      components = [ "rustc" "cargo" "clippy" "rustfmt" "rust-analyzer"];
   };
 
   # https://devenv.sh/pre-commit-hooks/

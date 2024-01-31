@@ -1,21 +1,174 @@
-
+use crate::execution::primitives::serialized_value::RkyvSerializedValue;
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::{Deref, DerefMut};
 
-#[derive(PartialEq, Debug)]
+// args, kwargs, locals and their configurations
+
+#[derive(Debug)]
+pub enum InputType {
+    String,
+}
+
+#[derive(Debug, Default)]
+pub struct InputItemConfiguation {
+    // TODO: should represent object and vec types
+    pub ty: Option<InputType>,
+    pub default: Option<RkyvSerializedValue>,
+}
+
+#[derive(Debug)]
+pub struct InputSignature {
+    pub args: HashMap<String, InputItemConfiguation>,
+    pub kwargs: HashMap<String, InputItemConfiguation>,
+    pub globals: HashMap<String, InputItemConfiguation>,
+}
+
+impl InputSignature {
+    pub fn new() -> Self {
+        Self {
+            args: HashMap::new(),
+            kwargs: HashMap::new(),
+            globals: HashMap::new(),
+        }
+    }
+
+    pub fn from_args_list(args: Vec<&str>) -> Self {
+        let mut args_map = HashMap::new();
+        for (i, arg) in args.iter().enumerate() {
+            args_map.insert(format!("{}", i), InputItemConfiguation::default());
+        }
+        Self {
+            args: args_map,
+            kwargs: HashMap::new(),
+            globals: HashMap::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.args.is_empty() && self.kwargs.is_empty() && self.globals.is_empty()
+    }
+
+    pub fn validate_input_against_signature(
+        &self,
+        args: &HashMap<String, RkyvSerializedValue>,
+        kwargs: &HashMap<String, RkyvSerializedValue>,
+        globals: &HashMap<String, RkyvSerializedValue>,
+    ) -> bool {
+        // Validate args
+        for (key, config) in &self.args {
+            if config.default.is_none() && !args.contains_key(key) {
+                return false;
+            }
+        }
+
+        // Validate kwargs
+        for (key, config) in &self.kwargs {
+            if config.default.is_none() && !kwargs.contains_key(key) {
+                return false;
+            }
+        }
+
+        // Validate globals
+        for (key, config) in &self.globals {
+            if config.default.is_none() && !globals.contains_key(key) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    pub fn prepopulate_defaults(
+        &self,
+        args: &mut HashMap<String, RkyvSerializedValue>,
+        kwargs: &mut HashMap<String, RkyvSerializedValue>,
+        globals: &mut HashMap<String, RkyvSerializedValue>,
+    ) {
+        // Prepopulate args defaults
+        for (key, config) in &self.args {
+            if let Some(default) = &config.default {
+                args.entry(key.clone()).or_insert_with(|| default.clone());
+            }
+        }
+
+        // Prepopulate kwargs defaults
+        for (key, config) in &self.kwargs {
+            if let Some(default) = &config.default {
+                kwargs.entry(key.clone()).or_insert_with(|| default.clone());
+            }
+        }
+
+        // Prepopulate globals defaults
+        for (key, config) in &self.globals {
+            if let Some(default) = &config.default {
+                globals
+                    .entry(key.clone())
+                    .or_insert_with(|| default.clone());
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TriggerConfiguration {
+    OnChange,
+    OnEvent,
+    Manual,
+}
+
+#[derive(Debug, Default)]
+pub struct OutputItemConfiguation {
+    // TODO: should represent object and vec types
+    pub ty: Option<InputType>,
+}
+
+#[derive(Debug)]
+pub struct OutputSignatureFunction {
+    input_signature: InputSignature,
+    emit_event: Vec<String>,
+    trigger_on: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct OutputSignature {
+    pub globals: HashMap<String, OutputItemConfiguation>,
+    pub functions: HashMap<String, String>,
+}
+
+impl OutputSignature {
+    pub fn new() -> Self {
+        Self {
+            globals: HashMap::new(),
+            functions: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Signature {
+    pub trigger_on: TriggerConfiguration,
+
     /// Signature of the total inputs for this graph
-    input_signature: HashMap<usize, usize>,
+    pub input_signature: InputSignature,
 
     /// Signature of the total outputs for this graph
-    output_signature: HashMap<usize, usize>,
+    pub output_signature: OutputSignature,
 }
 
 impl Signature {
     pub(crate) fn new() -> Self {
         Self {
-            input_signature: HashMap::new(),
-            output_signature: HashMap::new(),
+            trigger_on: TriggerConfiguration::OnChange,
+            input_signature: InputSignature {
+                args: HashMap::new(),
+                kwargs: HashMap::new(),
+                globals: HashMap::new(),
+            },
+            output_signature: OutputSignature {
+                globals: HashMap::new(),
+                functions: HashMap::new(),
+            },
         }
     }
 }
@@ -49,16 +202,9 @@ enum Mutability {
 /// It is up to the user to structure those maps in such a way that they don't collide with other
 /// values being represented in the state of our system. These inputs and outputs are managed
 /// by our Execution Database.
-pub type OperationFn = dyn FnMut(Vec<&Option<Vec<u8>>>) -> Vec<u8>;
+pub type OperationFn = dyn FnMut(RkyvSerializedValue) -> RkyvSerializedValue;
 
-pub struct OperationNodeDefinition {
-    /// The operation function itself
-    pub(crate) operation: Option<Box<OperationFn>>,
-
-    /// Dependencies of this node
-    pub(crate) dependency_count: usize,
-}
-
+// TODO: rather than dep_count operation node should have a specific dep mapping
 pub struct OperationNode {
     pub(crate) id: usize,
 
@@ -81,14 +227,13 @@ pub struct OperationNode {
     pub(crate) height: usize,
 
     /// Signature of the inputs and outputs of this node
-    signature: Signature,
+    pub(crate) signature: Signature,
 
     /// The operation function itself
-    operation: Option<Box<OperationFn>>,
+    operation: Box<OperationFn>,
 
     /// Dependencies of this node
     pub(crate) arity: usize,
-    pub(crate) dependency_count: usize,
     pub(crate) unresolved_dependencies: Vec<usize>,
 
     /// Partial application arena - this stores partially applied arguments for this OperationNode
@@ -122,8 +267,6 @@ impl fmt::Debug for OperationNode {
             .field("dirty", &self.dirty)
             .field("height", &self.height)
             .field("signature", &self.signature)
-            .field("operation", &self.operation.is_some())
-            .field("dependency_count", &self.dependency_count)
             .field("unresolved_dependencies", &self.unresolved_dependencies)
             .field("partial_application", &self.partial_application)
             .finish()
@@ -141,9 +284,8 @@ impl Default for OperationNode {
             height: 0,
             dirty: true,
             signature: Signature::new(),
-            operation: None,
+            operation: Box::new(|x| x),
             arity: 0,
-            dependency_count: 0,
             unresolved_dependencies: vec![],
             partial_application: Vec::new(),
         }
@@ -151,16 +293,15 @@ impl Default for OperationNode {
 }
 
 impl OperationNode {
-    pub(crate) fn new(args: usize, f: Option<Box<OperationFn>>) -> Self {
+    pub(crate) fn new(
+        input_signature: InputSignature,
+        output_signature: OutputSignature,
+        f: Box<OperationFn>,
+    ) -> Self {
         let mut node = OperationNode::default();
+        node.signature.input_signature = input_signature;
+        node.signature.output_signature = output_signature;
         node.operation = f;
-        node.dependency_count = args;
-        node
-    }
-
-    pub(crate) fn from(mut d: OperationNodeDefinition) -> Self {
-        let mut node = OperationNode::default();
-        node.operation = d.operation.take();
         node
     }
 
@@ -168,42 +309,35 @@ impl OperationNode {
         unimplemented!();
     }
 
-    pub(crate) fn execute(&mut self, context: Vec<&Option<Vec<u8>>>) -> Option<Vec<u8>> {
-        if let Some(exec) = self.operation.as_deref_mut() {
-            Some(exec(context))
-        } else {
-            None
-        }
+    pub(crate) fn execute(&mut self, context: RkyvSerializedValue) -> RkyvSerializedValue {
+        let exec = self.operation.deref_mut();
+        exec(context)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // TODO: test application of Operations/composition
+    // TODO: test manual evaluation of a composition of operations
 
     #[test]
     fn test_execute_with_operation() {
         let mut executed = false;
         let operation: Box<OperationFn> =
-            Box::new(|context: Vec<&Option<Vec<u8>>>| -> Vec<u8> { vec![0, 1] });
+            Box::new(|context| -> RkyvSerializedValue { RkyvSerializedValue::Boolean(true) });
 
         let mut node = OperationNode::default();
-        node.operation = Some(operation);
+        node.operation = operation;
 
-        let bytes = vec![1, 2, 3];
-        node.execute(vec![&Some(bytes)]);
+        let result = node.execute(RkyvSerializedValue::Null);
 
-        assert_eq!(executed, true);
+        assert_eq!(result, RkyvSerializedValue::Boolean(true));
     }
 
     #[test]
     fn test_execute_without_operation() {
         let mut node = OperationNode::default();
-
-        let bytes = vec![1, 2, 3];
-        node.execute(vec![&Some(bytes)]); // should not panic
+        node.execute(RkyvSerializedValue::Boolean(true)); // should not panic
     }
-
-    // TODO: test application of Operations/composition
-    // TODO: test manual evaluation of a composition of operations
 }

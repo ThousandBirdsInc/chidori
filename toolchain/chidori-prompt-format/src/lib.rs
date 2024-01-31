@@ -46,7 +46,7 @@ struct TemplateWithRole {
 
 #[wasm_bindgen]
 pub fn extract_roles_from_template(template: &str) -> JsValue {
-    let role_blocks = crate::templating::templates::extract_roles_from_template(&template);
+    let mut role_blocks = crate::templating::templates::extract_roles_from_template(&template);
     let templates_with_roles: Vec<TemplateWithRole> = role_blocks
         .into_iter()
         .map(|(a, b)| TemplateWithRole {

@@ -64,25 +64,25 @@ pub struct TemplateMessage {
 #[derive(TS, Debug, Serialize, Deserialize)]
 #[ts(export, export_to = "package_node/types/")]
 pub struct ChatCompletionReq {
-    model: String,
-    frequency_penalty: Option<f64>,
+    pub model: String,
+    pub frequency_penalty: Option<f64>,
 
     #[ts(type = "number | null")]
-    max_tokens: Option<i64>,
+    pub max_tokens: Option<i64>,
 
-    presence_penalty: Option<f64>,
-    stop: Option<Vec<String>>,
-    temperature: Option<f64>,
+    pub presence_penalty: Option<f64>,
+    pub stop: Option<Vec<String>>,
+    pub temperature: Option<f64>,
 
     #[ts(type = "any")]
-    response_format: Option<Value>,
-    logit_bias: Option<HashMap<String, i32>>,
-    user: Option<String>,
+    pub response_format: Option<Value>,
+    pub logit_bias: Option<HashMap<String, i32>>,
+    pub user: Option<String>,
 
     #[ts(type = "number | null")]
-    seed: Option<i64>,
-    top_p: Option<f64>,
-    template_messages: Vec<TemplateMessage>,
+    pub seed: Option<i64>,
+    pub top_p: Option<f64>,
+    pub template_messages: Vec<TemplateMessage>,
 }
 
 impl Default for ChatCompletionReq {

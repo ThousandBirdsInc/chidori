@@ -277,13 +277,15 @@ pub struct TemplateWithSource {
 pub fn extract_roles_from_template(
     template_string: &str,
 ) -> Vec<(ChatModelRoles, Option<TemplateWithSource>)> {
-    extract_roles_from_template_inner(
-        &TemplateWithSource {
-            template: Template::compile(template_string).unwrap(),
-            source: template_string.to_string(),
-        },
-        vec![],
-    )
+    let temp = TemplateWithSource {
+        template: Template::compile(template_string).unwrap(),
+        source: template_string.to_string(),
+    };
+    let mut role_blocks = extract_roles_from_template_inner(&temp, vec![]);
+    if role_blocks.is_empty() {
+        role_blocks.push((ChatModelRoles::User, Some(temp)));
+    }
+    role_blocks
 }
 
 fn extract_roles_from_template_inner(

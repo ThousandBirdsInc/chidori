@@ -923,189 +923,6 @@ fn literal_bool() -> Expression {
     Expression::Literal(Literal::Bool(true))
 }
 
-#[test]
-fn basic() {
-    assert_eq!(synth(literal_string()), Type::Literal(LiteralType::String));
-}
-
-#[test]
-fn application_string() {
-    assert_eq!(
-        synth(Expression::Application(
-            Expression::Abstraction("x".into(), Expression::Variable("x".into()).into(),).into(),
-            literal_string().into(),
-        )),
-        Type::Literal(LiteralType::String)
-    );
-}
-
-#[test]
-fn application_bool() {
-    assert_eq!(
-        synth(Expression::Application(
-            Expression::Abstraction("x".into(), Expression::Variable("x".into()).into(),).into(),
-            literal_bool().into(),
-        )),
-        Type::Literal(LiteralType::Bool)
-    );
-}
-
-#[test]
-fn lambda() {
-    assert_eq!(
-        synth(Expression::Abstraction(
-            "x".into(),
-            Expression::Variable("x".into()).into()
-        )),
-        Type::Function(
-            Type::Existential("t0".into()).into(),
-            Type::Existential("t0".into()).into()
-        )
-    );
-}
-
-#[test]
-fn idunit() {
-    assert_eq!(
-        synth(Expression::Application(
-            id_fn().into(),
-            literal_string().into()
-        )),
-        Type::Literal(LiteralType::String)
-    )
-}
-
-#[test]
-fn tuples() {
-    assert_eq!(
-        synth(Expression::Tuple(
-            literal_string().into(),
-            literal_bool().into()
-        )),
-        Type::Product(
-            Type::Literal(LiteralType::String).into(),
-            Type::Literal(LiteralType::Bool).into()
-        )
-    )
-}
-
-#[test]
-fn tuples_in_lambda() {
-    assert_eq!(
-        synth(construct_app(
-            Expression::Abstraction(
-                "x".into(),
-                Expression::Tuple(
-                    Expression::Variable("x".into()).into(),
-                    Expression::Variable("x".into()).into()
-                )
-                .into()
-            ),
-            literal_string()
-        )),
-        Type::Product(
-            Type::Literal(LiteralType::String).into(),
-            Type::Literal(LiteralType::String).into(),
-        )
-    )
-}
-
-#[test]
-fn nested_tuples() {
-    assert_eq!(
-        synth(construct_app(
-            Expression::Abstraction(
-                "x".into(),
-                Expression::Tuple(
-                    Expression::Variable("x".into()).into(),
-                    Expression::Tuple(
-                        Expression::Variable("x".into()).into(),
-                        Expression::Variable("x".into()).into()
-                    )
-                    .into()
-                )
-                .into()
-            ),
-            literal_string()
-        )),
-        Type::Product(
-            Type::Literal(LiteralType::String).into(),
-            Type::Product(
-                Type::Literal(LiteralType::String).into(),
-                Type::Literal(LiteralType::String).into()
-            )
-            .into()
-        )
-    )
-}
-
-#[test]
-fn tuples_in_fn() {
-    assert_eq!(
-        synth(Expression::Application(
-            id_fn().into(),
-            Expression::Tuple(literal_string().into(), literal_bool().into()).into()
-        )),
-        Type::Product(
-            Type::Literal(LiteralType::String).into(),
-            Type::Literal(LiteralType::Bool).into()
-        )
-    )
-}
-
-#[test]
-fn generalised_let() {
-    assert_eq!(
-        synth(construct_let(
-            "newid",
-            id_fn().into(),
-            //Without annotation, e.g.
-            //Expression::Abstraction("x".into(), Expression::Variable("x".into()).into(),).into(),
-            //It fails.
-            Expression::Tuple(
-                construct_app(
-                    Expression::Variable("newid".into()),
-                    literal_string().into()
-                )
-                .into(),
-                construct_app(Expression::Variable("newid".into()), literal_bool().into()).into()
-            )
-        )),
-        Type::Product(
-            Type::Literal(LiteralType::String).into(),
-            Type::Literal(LiteralType::Bool).into()
-        )
-    )
-}
-
-#[test]
-fn let_binding() {
-    assert_eq!(
-        synth(Expression::Let(
-            "a".into(),
-            literal_bool().into(),
-            Expression::Application(id_fn().into(), Expression::Variable("a".into()).into()).into()
-        )),
-        Type::Literal(LiteralType::Bool)
-    )
-}
-
-#[test]
-fn let_fn() {
-    assert_eq!(
-        synth(construct_app(
-            construct_let(
-                "newid",
-                Expression::Abstraction("x".into(), Expression::Variable("x".into()).into(),)
-                    .into(),
-                Expression::Variable("newid".into())
-            ),
-            literal_string().into()
-        )),
-        Type::Literal(LiteralType::String)
-    );
-}
-
 fn construct_app(e0: Expression, e1: Expression) -> Expression {
     Expression::Application(e0.into(), e1.into())
 }
@@ -1126,4 +943,196 @@ fn id_fn() -> Expression {
             .into(),
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn basic() {
+        assert_eq!(synth(literal_string()), Type::Literal(LiteralType::String));
+    }
+
+    #[test]
+    fn application_string() {
+        assert_eq!(
+            synth(Expression::Application(
+                Expression::Abstraction("x".into(), Expression::Variable("x".into()).into(),)
+                    .into(),
+                literal_string().into(),
+            )),
+            Type::Literal(LiteralType::String)
+        );
+    }
+
+    #[test]
+    fn application_bool() {
+        assert_eq!(
+            synth(Expression::Application(
+                Expression::Abstraction("x".into(), Expression::Variable("x".into()).into(),)
+                    .into(),
+                literal_bool().into(),
+            )),
+            Type::Literal(LiteralType::Bool)
+        );
+    }
+
+    #[test]
+    fn lambda() {
+        assert_eq!(
+            synth(Expression::Abstraction(
+                "x".into(),
+                Expression::Variable("x".into()).into()
+            )),
+            Type::Function(
+                Type::Existential("t0".into()).into(),
+                Type::Existential("t0".into()).into()
+            )
+        );
+    }
+
+    #[test]
+    fn idunit() {
+        assert_eq!(
+            synth(Expression::Application(
+                id_fn().into(),
+                literal_string().into()
+            )),
+            Type::Literal(LiteralType::String)
+        )
+    }
+
+    #[test]
+    fn tuples() {
+        assert_eq!(
+            synth(Expression::Tuple(
+                literal_string().into(),
+                literal_bool().into()
+            )),
+            Type::Product(
+                Type::Literal(LiteralType::String).into(),
+                Type::Literal(LiteralType::Bool).into()
+            )
+        )
+    }
+
+    #[test]
+    fn tuples_in_lambda() {
+        assert_eq!(
+            synth(construct_app(
+                Expression::Abstraction(
+                    "x".into(),
+                    Expression::Tuple(
+                        Expression::Variable("x".into()).into(),
+                        Expression::Variable("x".into()).into()
+                    )
+                    .into()
+                ),
+                literal_string()
+            )),
+            Type::Product(
+                Type::Literal(LiteralType::String).into(),
+                Type::Literal(LiteralType::String).into(),
+            )
+        )
+    }
+
+    #[test]
+    fn nested_tuples() {
+        assert_eq!(
+            synth(construct_app(
+                Expression::Abstraction(
+                    "x".into(),
+                    Expression::Tuple(
+                        Expression::Variable("x".into()).into(),
+                        Expression::Tuple(
+                            Expression::Variable("x".into()).into(),
+                            Expression::Variable("x".into()).into()
+                        )
+                        .into()
+                    )
+                    .into()
+                ),
+                literal_string()
+            )),
+            Type::Product(
+                Type::Literal(LiteralType::String).into(),
+                Type::Product(
+                    Type::Literal(LiteralType::String).into(),
+                    Type::Literal(LiteralType::String).into()
+                )
+                .into()
+            )
+        )
+    }
+
+    #[test]
+    fn tuples_in_fn() {
+        assert_eq!(
+            synth(Expression::Application(
+                id_fn().into(),
+                Expression::Tuple(literal_string().into(), literal_bool().into()).into()
+            )),
+            Type::Product(
+                Type::Literal(LiteralType::String).into(),
+                Type::Literal(LiteralType::Bool).into()
+            )
+        )
+    }
+
+    #[test]
+    fn generalised_let() {
+        assert_eq!(
+            synth(construct_let(
+                "newid",
+                id_fn().into(),
+                //Without annotation, e.g.
+                //Expression::Abstraction("x".into(), Expression::Variable("x".into()).into(),).into(),
+                //It fails.
+                Expression::Tuple(
+                    construct_app(
+                        Expression::Variable("newid".into()),
+                        literal_string().into()
+                    )
+                    .into(),
+                    construct_app(Expression::Variable("newid".into()), literal_bool().into())
+                        .into()
+                )
+            )),
+            Type::Product(
+                Type::Literal(LiteralType::String).into(),
+                Type::Literal(LiteralType::Bool).into()
+            )
+        )
+    }
+
+    #[test]
+    fn let_binding() {
+        assert_eq!(
+            synth(Expression::Let(
+                "a".into(),
+                literal_bool().into(),
+                Expression::Application(id_fn().into(), Expression::Variable("a".into()).into())
+                    .into()
+            )),
+            Type::Literal(LiteralType::Bool)
+        )
+    }
+
+    #[test]
+    fn let_fn() {
+        assert_eq!(
+            synth(construct_app(
+                construct_let(
+                    "newid",
+                    Expression::Abstraction("x".into(), Expression::Variable("x".into()).into(),)
+                        .into(),
+                    Expression::Variable("newid".into())
+                ),
+                literal_string().into()
+            )),
+            Type::Literal(LiteralType::String)
+        );
+    }
 }

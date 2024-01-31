@@ -6,7 +6,7 @@ use rkyv::{
 use serde_json::Value;
 use std::collections::HashMap;
 
-#[derive(Archive, Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Archive, Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
 #[archive(check_bytes)]
 #[archive_attr(check_bytes(
@@ -33,6 +33,72 @@ pub enum RkyvSerializedValue {
         #[archive_attr(omit_bounds)]
         HashMap<String, RkyvSerializedValue>,
     ),
+}
+
+pub struct RkyvObjectBuilder {
+    object: HashMap<String, RkyvSerializedValue>,
+}
+
+impl RkyvObjectBuilder {
+    pub fn new() -> Self {
+        RkyvObjectBuilder {
+            object: HashMap::new(),
+        }
+    }
+
+    pub fn insert_string(mut self, key: &str, value: String) -> Self {
+        self.object
+            .insert(key.to_string(), RkyvSerializedValue::String(value));
+        self
+    }
+
+    pub fn insert_number(mut self, key: &str, value: i32) -> Self {
+        self.object
+            .insert(key.to_string(), RkyvSerializedValue::Number(value));
+        self
+    }
+
+    pub fn insert_boolean(mut self, key: &str, value: bool) -> Self {
+        self.object
+            .insert(key.to_string(), RkyvSerializedValue::Boolean(value));
+        self
+    }
+
+    // Method to insert nested objects
+    pub fn insert_object(mut self, key: &str, value: RkyvObjectBuilder) -> Self {
+        self.object
+            .insert(key.to_string(), RkyvSerializedValue::Object(value.object));
+        self
+    }
+
+    pub fn build(self) -> RkyvSerializedValue {
+        RkyvSerializedValue::Object(self.object)
+    }
+}
+
+impl std::fmt::Display for RkyvSerializedValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RkyvSerializedValue::StreamPointer(_) => write!(f, "StreamPointer"),
+            RkyvSerializedValue::FunctionPointer(_) => write!(f, "FunctionPointer"),
+            RkyvSerializedValue::Float(_) => write!(f, "Float"),
+            RkyvSerializedValue::Number(_) => write!(f, "Number"),
+            RkyvSerializedValue::String(_) => write!(f, "String"),
+            RkyvSerializedValue::Boolean(_) => write!(f, "Boolean"),
+            RkyvSerializedValue::Null => write!(f, "Null"),
+            RkyvSerializedValue::Array(vec) => {
+                let shapes: Vec<String> = vec.iter().map(|item| item.to_string()).collect();
+                write!(f, "Array[{}]", shapes.join(", "))
+            }
+            RkyvSerializedValue::Object(map) => {
+                let shapes: Vec<String> = map
+                    .iter()
+                    .map(|(key, value)| format!("{}: {}", key, value))
+                    .collect();
+                write!(f, "Object{{{}}}", shapes.join(", "))
+            }
+        }
+    }
 }
 
 impl From<RkyvSerializedValue> for Vec<u8> {

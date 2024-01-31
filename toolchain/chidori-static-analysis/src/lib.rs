@@ -10,6 +10,9 @@ use rustpython_parser::{ast, Parse};
 use crate::language::python::parse::build_report;
 use crate::language::python::parse::extract_dependencies_python as extract_dependencies_python_impl;
 
+#[macro_use]
+extern crate swc_common;
+
 #[wasm_bindgen]
 extern "C" {
     // #[wasm_bindgen(js_namespace = console)]

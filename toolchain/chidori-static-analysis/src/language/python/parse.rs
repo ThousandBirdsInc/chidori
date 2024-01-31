@@ -6,10 +6,6 @@ use std::collections::HashSet;
 
 // TODO: move to using the Ruff library here to break about functions into independent snippets
 
-struct DecoratorExtrator {
-    decorators: Vec<ast::Expr>,
-}
-
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum ContextPath {
     Initialized,
@@ -38,6 +34,8 @@ pub struct ASTWalkContext {
     pub context_stack_references: Vec<Vec<ContextPath>>,
     pub context_stack: Vec<ContextPath>,
     pub locals: HashSet<String>,
+    pub local_contexts: Vec<HashSet<String>>,
+    pub globals: HashSet<String>,
 }
 
 impl ASTWalkContext {
@@ -46,7 +44,42 @@ impl ASTWalkContext {
             context_stack_references: vec![],
             context_stack: vec![],
             locals: HashSet::new(),
+            local_contexts: vec![],
+            globals: HashSet::new(),
         }
+    }
+
+    fn var_exists(&self, name: &str) -> bool {
+        if self.globals.contains(name) {
+            return true;
+        }
+        if self.locals.contains(name) {
+            return true;
+        }
+        for local_context in self.local_contexts.iter().rev() {
+            if local_context.contains(name) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn new_local_context(&mut self) {
+        self.local_contexts.push(self.locals.clone());
+    }
+
+    fn pop_local_context(&mut self) {
+        self.local_contexts.pop();
+
+        // Clearing the existing locals
+        self.locals.clear();
+
+        // Union of all remaining hashsetss in local_contexts
+        self.locals.extend(
+            self.local_contexts
+                .iter()
+                .flat_map(|context| context.iter().cloned()),
+        );
     }
 
     fn enter_statement_function(&mut self, name: &Identifier) -> usize {
@@ -79,10 +112,14 @@ impl ASTWalkContext {
 
     fn encounter_named_reference(&mut self, name: &Identifier) {
         // TODO: we need to check if this is a local variable or not
-        if self.locals.contains(&name.to_string()) {
+        if self.var_exists(&name.to_string()) {
+            // true, the var exists in the local or global scope
             self.context_stack
                 .push(ContextPath::IdentifierReferredTo(name.to_string(), true));
         } else {
+            if let Some(ContextPath::AssignmentToStatement) = self.context_stack.last() {
+                self.locals.insert(name.to_string());
+            }
             self.context_stack
                 .push(ContextPath::IdentifierReferredTo(name.to_string(), false));
         }
@@ -112,7 +149,6 @@ impl ASTWalkContext {
         while self.context_stack.len() >= size {
             self.context_stack.pop();
         }
-        self.locals.clear();
     }
 }
 
@@ -220,6 +256,7 @@ fn traverse_expression(expr: &ast::Expr, machine: &mut ASTWalkContext) {
         }
         ast::Expr::Call(expr) => {
             let idx = machine.enter_call_expression();
+            // TODO: call expressions need to extract the identifier of the function being invoked
             let ast::ExprCall {
                 func,
                 args,
@@ -310,7 +347,6 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
             // targets has multiple because you can multi assign
             ast::Stmt::Assign(ast::StmtAssign { targets, value, .. }) => {
                 let idx = machine.enter_assignment_to_statement();
-                // TODO: machine should note we're in an assignment statement
                 for target in targets {
                     traverse_expression(target, machine);
                 }
@@ -327,6 +363,7 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                 ..
             }) => {
                 // TODO: this does include typeparams
+                machine.new_local_context();
                 let idx = machine.enter_statement_function(name);
                 for (i, decorator) in decorator_list.iter().enumerate() {
                     let idx = machine.enter_decorator_expression(&i);
@@ -346,10 +383,37 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                 }
                 traverse_statements(body, machine);
                 machine.pop_until(idx);
+                machine.pop_local_context();
             }
 
-            ast::Stmt::AsyncFunctionDef(ast::StmtAsyncFunctionDef { body, .. }) => {
+            ast::Stmt::AsyncFunctionDef(ast::StmtAsyncFunctionDef {
+                body,
+                decorator_list,
+                name,
+                args,
+                ..
+            }) => {
+                machine.new_local_context();
+                let idx = machine.enter_statement_function(name);
+                for (i, decorator) in decorator_list.iter().enumerate() {
+                    let idx = machine.enter_decorator_expression(&i);
+                    traverse_expression(decorator, machine);
+                    machine.pop_until(idx);
+                }
+                for ast::ArgWithDefault {
+                    range,
+                    def,
+                    default,
+                    ..
+                } in &args.args
+                {
+                    if let ast::Arg { arg, .. } = def {
+                        machine.locals.insert(arg.to_string());
+                    }
+                }
                 traverse_statements(body, machine);
+                machine.pop_until(idx);
+                machine.pop_local_context();
             }
             ast::Stmt::ClassDef(ast::StmtClassDef { body, .. }) => {
                 // TODO: this does include typeparams
@@ -379,7 +443,6 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                 ..
             }) => {
                 // TODO: here
-                dbg!(target, annotation, value);
                 traverse_expression(target, machine);
                 traverse_expression(annotation, machine);
                 if let Some(expr) = value {
@@ -482,8 +545,14 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                     traverse_expression(expr, machine);
                 }
             }
-            ast::Stmt::Import(ast::StmtImport { .. }) => {
-                // TODO: Import
+            ast::Stmt::Import(ast::StmtImport { names, .. }) => {
+                for name in names {
+                    if let Some(name) = &name.asname {
+                        machine.globals.insert(name.to_string());
+                    } else {
+                        machine.globals.insert(name.name.to_string());
+                    }
+                }
                 // No recursion needed
             }
             ast::Stmt::ImportFrom(ast::StmtImportFrom { .. }) => {
@@ -521,6 +590,7 @@ def is_odd(i):
     assert!(ast.is_ok());
 }
 
+// TODO: it would be helpful if reports noted if a value is a global, an arg, or a kwarg
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReportItem {
     context_path: Vec<ContextPath>,
@@ -529,15 +599,18 @@ pub struct ReportItem {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReportTriggerableFunctions {
     context_path: Vec<ContextPath>,
+    // TODO: these need their own set of depended values
+    // TODO: we need to extract signatures for triggerable functions
     emit_event: Vec<String>,
     trigger_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Report {
-    cell_exposed_values: HashMap<String, ReportItem>,
-    cell_depended_values: HashMap<String, ReportItem>,
-    triggerable_functions: HashMap<String, ReportTriggerableFunctions>,
+    pub cell_exposed_values: HashMap<String, ReportItem>,
+    pub cell_depended_values: HashMap<String, ReportItem>,
+    pub triggerable_functions: HashMap<String, ReportTriggerableFunctions>,
+    pub declared_functions: HashMap<String, ReportTriggerableFunctions>,
 }
 
 pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
@@ -553,6 +626,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
     let mut exposed_values = HashMap::new();
     let mut depended_values = HashMap::new();
     let mut triggerable_functions = HashMap::new();
+    let mut declared_functions = HashMap::new();
     for context_path in context_paths {
         let mut encountered = vec![];
         for (idx, context_path_unit) in context_path.iter().enumerate() {
@@ -611,8 +685,10 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                 }
             }
 
+            // TODO: variables in returns that are locals are currently appearing in referred to
             if let ContextPath::IdentifierReferredTo(identifier, false) = context_path_unit {
                 if identifier != &String::from("ch") {
+                    // If this value is not being assigned to, then it is a dependency
                     if !encountered.contains(&&ContextPath::AssignmentToStatement) {
                         depended_values.insert(
                             identifier.clone(),
@@ -649,6 +725,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
         cell_exposed_values: exposed_values,
         cell_depended_values: depended_values,
         triggerable_functions: triggerable_functions,
+        declared_functions: declared_functions,
     }
 }
 
@@ -886,6 +963,24 @@ mod tests {
             x = 2 + y
             return x
             "#};
+        let context_stack_references = extract_dependencies_python(python_source);
+        dbg!(&context_stack_references);
+        let result = build_report(&context_stack_references);
+        dbg!(result);
+    }
+
+    #[test]
+    fn test_report_generation_with_import() {
+        let python_source = indoc! { r#"
+import random
+
+def fun_name():
+    w = function_that_doesnt_exist()
+    v = 5
+    return v
+
+x = random.randint(0, 10)            
+"#};
         let context_stack_references = extract_dependencies_python(python_source);
         dbg!(&context_stack_references);
         let result = build_report(&context_stack_references);

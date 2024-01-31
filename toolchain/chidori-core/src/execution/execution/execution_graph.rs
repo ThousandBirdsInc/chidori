@@ -84,7 +84,7 @@ impl ExecutionGraph {
     pub fn step_execution(
         &mut self,
         prev_execution_id: (usize, usize),
-        previous_state: ExecutionState,
+        previous_state: &ExecutionState,
     ) -> ((usize, usize), ExecutionState) {
         let new_state = previous_state.step_execution();
         // The edge from this node is the greatest branching id + 1
@@ -96,9 +96,12 @@ impl ExecutionGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::primitives::serialized_value::RkyvSerializedValue as RSV;
+    use crate::execution::primitives::operation::{InputSignature, OperationNode, OutputSignature};
     use crate::execution::primitives::serialized_value::{
         deserialize_from_buf, serialize_to_vec, ArchivedRkyvSerializedValue,
+    };
+    use crate::execution::primitives::serialized_value::{
+        RkyvSerializedValue as RSV, RkyvSerializedValue,
     };
     use log::warn;
     use rkyv::ser::serializers::AllocSerializer;
@@ -118,57 +121,62 @@ mod tests {
         let state_id = (0, 0);
         let mut state = state.add_operation(
             1,
-            0,
-            Box::new(|_args| {
-                let v = RSV::Number(1);
-                return serialize_to_vec(&v);
-            }),
+            OperationNode::new(
+                InputSignature::new(),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(1)),
+            ),
         );
         let mut state = state.add_operation(
             2,
-            0,
-            Box::new(|_args| {
-                let v = RSV::Number(1);
-                return serialize_to_vec(&v);
-            }),
+            OperationNode::new(
+                InputSignature::new(),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(2)),
+            ),
         );
         let mut state = state.add_operation(
             3,
-            2,
-            Box::new(|args| {
-                let arg0 = deserialize_from_buf(args[0].as_ref().unwrap().as_slice());
-                let arg1 = deserialize_from_buf(args[1].as_ref().unwrap().as_slice());
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["a", "b"]),
+                OutputSignature::new(),
+                Box::new(|args| {
+                    if let RSV::Object(m) = args {
+                        if let RSV::Object(args) = m.get("args").unwrap() {
+                            if let (Some(RSV::Number(a)), Some(RSV::Number(b))) =
+                                (args.get(&"0".to_string()), args.get(&"1".to_string()))
+                            {
+                                return RSV::Number(a + b);
+                            }
+                        }
+                    }
 
-                if let (RSV::Number(a), RSV::Number(b)) = (arg0, arg1) {
-                    let v = RSV::Number(a + b);
-                    return serialize_to_vec(&v);
-                }
-
-                panic!("Invalid arguments")
-            }),
+                    panic!("Invalid arguments")
+                }),
+            ),
         );
 
         let mut state =
             state.apply_dependency_graph_mutations(vec![DependencyGraphMutation::Create {
                 operation_id: 3,
-                depends_on: vec![(1, 0), (2, 1)],
+                depends_on: vec![
+                    (1, ArgumentIndex::Positional(0)),
+                    (2, ArgumentIndex::Positional(1)),
+                ],
             }]);
 
-        let v0 = RSV::Number(1);
-        let v1 = RSV::Number(2);
-        let arg0 = serialize_to_vec(&v0);
-        let arg1 = serialize_to_vec(&v1);
+        let arg0 = RSV::Number(1);
+        let arg1 = RSV::Number(2);
 
         // Manually manipulating the state to insert the arguments for this test
-        state.state_insert(1, Some(arg0));
-        state.state_insert(2, Some(arg1));
+        state.state_insert(1, arg0);
+        state.state_insert(2, arg1);
 
-        let (_, new_state) = db.step_execution(state_id, state.clone());
+        let (_, new_state) = db.step_execution(state_id, &state.clone());
 
         assert!(new_state.state_get(&3).is_some());
         let result = new_state.state_get(&3).unwrap();
-        let result_val = deserialize_from_buf(&result.as_ref().clone().unwrap());
-        assert_eq!(result_val, RSV::Number(3));
+        assert_eq!(result, &RSV::Number(3));
     }
 
     /*
@@ -181,17 +189,33 @@ mod tests {
         let mut db = ExecutionGraph::new();
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
-
-        let mut state = state.add_operation(0, 0, Box::new(|_args| vec![0, 0, 0]));
-        let mut state = state.add_operation(1, 0, Box::new(|_args| vec![1, 1, 1]));
+        let mut state = state.add_operation(
+            0,
+            OperationNode::new(
+                InputSignature::new(),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(0)),
+            ),
+        );
+        let mut state = state.add_operation(
+            1,
+            OperationNode::new(
+                InputSignature::new(),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(1)),
+            ),
+        );
         let mut state =
             state.apply_dependency_graph_mutations(vec![DependencyGraphMutation::Create {
                 operation_id: 1,
-                depends_on: vec![(0, 0)],
+                depends_on: vec![(0, ArgumentIndex::Positional(0))],
             }]);
 
-        let (_, new_state) = db.step_execution(state_id, state);
-        assert_eq!(new_state.state_get(&1).unwrap(), &Some(vec![1, 1, 1]));
+        let (_, new_state) = db.step_execution(state_id, &state);
+        assert_eq!(
+            new_state.state_get(&1).unwrap(),
+            &RkyvSerializedValue::Number(1)
+        );
     }
 
     #[test]
@@ -208,32 +232,53 @@ mod tests {
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
 
-        let mut state = state.add_operation(0, 0, Box::new(|args| RSV::Number(0).into()));
+        let mut state = state.add_operation(
+            0,
+            OperationNode::new(
+                InputSignature::new(),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(0)),
+            ),
+        );
 
-        let mut state = state.add_operation(1, 1, Box::new(|args| RSV::Number(1).into()));
+        let mut state = state.add_operation(
+            1,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["0"]),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(1)),
+            ),
+        );
 
-        let mut state = state.add_operation(2, 1, Box::new(|args| RSV::Number(2).into()));
+        let mut state = state.add_operation(
+            2,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["0"]),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(2)),
+            ),
+        );
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
                 operation_id: 1,
-                depends_on: vec![(0, 0)],
+                depends_on: vec![(0, ArgumentIndex::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 2,
-                depends_on: vec![(1, 0)],
+                depends_on: vec![(1, ArgumentIndex::Positional(0))],
             },
         ]);
 
-        let (state_id, state) = db.step_execution(state_id, state);
+        let (state_id, state) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
-        let (state_id, state) = db.step_execution(state_id, state);
-        assert_eq!(state.state_get_value(&1), Some(RSV::Number(1)));
+        let (state_id, state) = db.step_execution(state_id, &state);
+        assert_eq!(state.state_get(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get(&2), None);
-        let (state_id, state) = db.step_execution(state_id, state);
-        assert_eq!(state.state_get_value(&1), None);
-        assert_eq!(state.state_get_value(&2), Some(RSV::Number(2)));
+        let (state_id, state) = db.step_execution(state_id, &state);
+        assert_eq!(state.state_get(&1), None);
+        assert_eq!(state.state_get(&2), Some(&RSV::Number(2)));
     }
 
     #[test]
@@ -250,37 +295,68 @@ mod tests {
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
 
-        let mut state = state.add_operation(0, 0, Box::new(|args| RSV::Number(0).into()));
-        let mut state = state.add_operation(1, 1, Box::new(|args| RSV::Number(1).into()));
-        let mut state = state.add_operation(2, 1, Box::new(|args| RSV::Number(2).into()));
-        let mut state = state.add_operation(3, 1, Box::new(|args| RSV::Number(3).into()));
+        let mut state = state.add_operation(
+            0,
+            OperationNode::new(
+                InputSignature::new(),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(0)),
+            ),
+        );
+
+        let mut state = state.add_operation(
+            1,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["1"]),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(1)),
+            ),
+        );
+
+        let mut state = state.add_operation(
+            2,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["1"]),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(2)),
+            ),
+        );
+
+        let mut state = state.add_operation(
+            3,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["1"]),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(3)),
+            ),
+        );
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
                 operation_id: 1,
-                depends_on: vec![(0, 0)],
+                depends_on: vec![(0, ArgumentIndex::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 2,
-                depends_on: vec![(1, 0)],
+                depends_on: vec![(1, ArgumentIndex::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 3,
-                depends_on: vec![(1, 0)],
+                depends_on: vec![(1, ArgumentIndex::Positional(0))],
             },
         ]);
 
-        let (state_id, state) = db.step_execution(state_id, state);
+        let (state_id, state) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
-        let (state_id, state) = db.step_execution(state_id, state);
-        assert_eq!(state.state_get_value(&1), Some(RSV::Number(1)));
+        let (state_id, state) = db.step_execution(state_id, &state);
+        assert_eq!(state.state_get(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), None);
-        let (state_id, state) = db.step_execution(state_id, state);
+        let (state_id, state) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
-        assert_eq!(state.state_get_value(&2), Some(RSV::Number(2)));
-        assert_eq!(state.state_get_value(&3), Some(RSV::Number(3)));
+        assert_eq!(state.state_get(&2), Some(&RSV::Number(2)));
+        assert_eq!(state.state_get(&3), Some(&RSV::Number(3)));
     }
 
     #[test]
@@ -298,47 +374,89 @@ mod tests {
 
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
-        let mut state = state.add_operation(0, 0, Box::new(|args| RSV::Number(0).into()));
-        let mut state = state.add_operation(1, 1, Box::new(|args| RSV::Number(1).into()));
-        let mut state = state.add_operation(2, 1, Box::new(|args| RSV::Number(2).into()));
-        let mut state = state.add_operation(3, 1, Box::new(|args| RSV::Number(3).into()));
-        let mut state = state.add_operation(4, 2, Box::new(|args| RSV::Number(4).into()));
+        let mut state = state.add_operation(
+            0,
+            OperationNode::new(
+                InputSignature::new(),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(0)),
+            ),
+        );
+
+        let mut state = state.add_operation(
+            1,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["1"]),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(1)),
+            ),
+        );
+
+        let mut state = state.add_operation(
+            2,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["1"]),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(2)),
+            ),
+        );
+
+        let mut state = state.add_operation(
+            3,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["1"]),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(3)),
+            ),
+        );
+
+        let mut state = state.add_operation(
+            4,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["1", "2"]),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(4)),
+            ),
+        );
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
                 operation_id: 1,
-                depends_on: vec![(0, 0)],
+                depends_on: vec![(0, ArgumentIndex::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 2,
-                depends_on: vec![(1, 0)],
+                depends_on: vec![(1, ArgumentIndex::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 3,
-                depends_on: vec![(1, 0)],
+                depends_on: vec![(1, ArgumentIndex::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 4,
-                depends_on: vec![(2, 0), (3, 1)],
+                depends_on: vec![
+                    (2, ArgumentIndex::Positional(0)),
+                    (3, ArgumentIndex::Positional(1)),
+                ],
             },
         ]);
 
-        let (state_id, state) = db.step_execution(state_id, state);
+        let (state_id, state) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
-        let (state_id, state) = db.step_execution(state_id, state);
-        assert_eq!(state.state_get_value(&1), Some(RSV::Number(1)));
+        let (state_id, state) = db.step_execution(state_id, &state);
+        assert_eq!(state.state_get(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get(&2), None);
-        let (state_id, state) = db.step_execution(state_id, state);
+        let (state_id, state) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
-        assert_eq!(state.state_get_value(&2), Some(RSV::Number(2)));
-        assert_eq!(state.state_get_value(&3), Some(RSV::Number(3)));
+        assert_eq!(state.state_get(&2), Some(&RSV::Number(2)));
+        assert_eq!(state.state_get(&3), Some(&RSV::Number(3)));
         assert_eq!(state.state_get(&4), None);
-        let (state_id, state) = db.step_execution(state_id, state);
+        let (state_id, state) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), None);
-        assert_eq!(state.state_get_value(&4), Some(RSV::Number(4)));
+        assert_eq!(state.state_get(&4), Some(&RSV::Number(4)));
     }
 
     #[test]
@@ -362,106 +480,150 @@ mod tests {
         // We start with the number 1 at node 0
         let mut state = state.add_operation(
             0,
-            0,
-            Box::new(|_args| {
-                let v = RSV::Number(1);
-                return serialize_to_vec(&v);
-            }),
+            OperationNode::new(
+                InputSignature::new(),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(1)),
+            ),
         );
 
         // Each node adds 1 to the inbound item (all nodes only have one dependency per index)
-        let f1 = |args: Vec<&Option<Vec<u8>>>| {
-            let arg0 = deserialize_from_buf(args[0].as_ref().unwrap().as_slice());
-
-            if let RSV::Number(a) = arg0 {
-                let v = RSV::Number(a + 1);
-                return serialize_to_vec(&v);
+        let f1 = |args: RkyvSerializedValue| {
+            if let RSV::Object(m) = args {
+                if let RSV::Object(args) = m.get("args").unwrap() {
+                    if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
+                        return RSV::Number(a + 1);
+                    }
+                }
             }
 
             panic!("Invalid arguments")
         };
 
-        let mut state = state.add_operation(1, 1, Box::new(f1));
-        let mut state = state.add_operation(2, 1, Box::new(f1));
-        let mut state = state.add_operation(3, 1, Box::new(f1));
-        let mut state = state.add_operation(4, 1, Box::new(f1));
-        let mut state = state.add_operation(5, 1, Box::new(f1));
+        let mut state = state.add_operation(
+            1,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["1"]),
+                OutputSignature::new(),
+                Box::new(f1),
+            ),
+        );
+
+        let mut state = state.add_operation(
+            2,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["1"]),
+                OutputSignature::new(),
+                Box::new(f1),
+            ),
+        );
+
+        let mut state = state.add_operation(
+            3,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["1"]),
+                OutputSignature::new(),
+                Box::new(f1),
+            ),
+        );
+
+        let mut state = state.add_operation(
+            4,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["1"]),
+                OutputSignature::new(),
+                Box::new(f1),
+            ),
+        );
+
+        let mut state = state.add_operation(
+            5,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["1"]),
+                OutputSignature::new(),
+                Box::new(f1),
+            ),
+        );
+
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
                 operation_id: 1,
-                depends_on: vec![(0, 0), (3, 0)],
+                depends_on: vec![
+                    (0, ArgumentIndex::Positional(0)),
+                    (3, ArgumentIndex::Positional(0)),
+                ],
             },
             DependencyGraphMutation::Create {
                 operation_id: 2,
-                depends_on: vec![(1, 0)],
+                depends_on: vec![(1, ArgumentIndex::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 3,
-                depends_on: vec![(4, 0)],
+                depends_on: vec![(4, ArgumentIndex::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 4,
-                depends_on: vec![(2, 0)],
+                depends_on: vec![(2, ArgumentIndex::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 5,
-                depends_on: vec![(4, 0)],
+                depends_on: vec![(4, ArgumentIndex::Positional(0))],
             },
         ]);
 
         // We expect to see the value at each node increment repeatedly.
-        let (state_id, state) = db.step_execution(state_id, state);
+        let (state_id, state) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
-        let (state_id, state) = db.step_execution(state_id, state);
+        let (state_id, state) = db.step_execution(state_id, &state);
 
-        assert_eq!(state.state_get_value(&1), Some(RSV::Number(2)));
+        assert_eq!(state.state_get(&1), Some(&RSV::Number(2)));
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), None);
         assert_eq!(state.state_get(&4), None);
         assert_eq!(state.state_get(&5), None);
-        let (state_id, state) = db.step_execution(state_id, state);
+        let (state_id, state) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
-        assert_eq!(state.state_get_value(&2), Some(RSV::Number(3)));
+        assert_eq!(state.state_get(&2), Some(&RSV::Number(3)));
         assert_eq!(state.state_get(&3), None);
         assert_eq!(state.state_get(&4), None);
         assert_eq!(state.state_get(&5), None);
-        let (state_id, state) = db.step_execution(state_id, state);
+        let (state_id, state) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), None);
-        assert_eq!(state.state_get_value(&4), Some(RSV::Number(4)));
+        assert_eq!(state.state_get(&4), Some(&RSV::Number(4)));
         assert_eq!(state.state_get(&5), None);
-        let (state_id, state) = db.step_execution(state_id, state);
+        let (state_id, state) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
-        assert_eq!(state.state_get_value(&3), Some(RSV::Number(5)));
+        assert_eq!(state.state_get(&3), Some(&RSV::Number(5)));
         assert_eq!(state.state_get(&4), None);
-        assert_eq!(state.state_get_value(&5), Some(RSV::Number(5)));
-        let (state_id, state) = db.step_execution(state_id, state);
-        assert_eq!(state.state_get_value(&1), Some(RSV::Number(6)));
-        assert_eq!(state.state_get(&2), None);
-        assert_eq!(state.state_get(&3), None);
-        assert_eq!(state.state_get(&4), None);
-        assert_eq!(state.state_get_value(&5), Some(RSV::Number(5)));
-        let (state_id, state) = db.step_execution(state_id, state);
-        assert_eq!(state.state_get(&1), None);
-        assert_eq!(state.state_get_value(&2), Some(RSV::Number(7)));
-        assert_eq!(state.state_get(&3), None);
-        assert_eq!(state.state_get(&4), None);
-        assert_eq!(state.state_get_value(&5), Some(RSV::Number(5)));
-        let (state_id, state) = db.step_execution(state_id, state);
-        assert_eq!(state.state_get(&1), None);
+        assert_eq!(state.state_get(&5), Some(&RSV::Number(5)));
+        let (state_id, state) = db.step_execution(state_id, &state);
+        assert_eq!(state.state_get(&1), Some(&RSV::Number(6)));
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), None);
-        assert_eq!(state.state_get_value(&4), Some(RSV::Number(8)));
-        assert_eq!(state.state_get_value(&5), Some(RSV::Number(5)));
-        let (state_id, state) = db.step_execution(state_id, state);
+        assert_eq!(state.state_get(&4), None);
+        assert_eq!(state.state_get(&5), Some(&RSV::Number(5)));
+        let (state_id, state) = db.step_execution(state_id, &state);
+        assert_eq!(state.state_get(&1), None);
+        assert_eq!(state.state_get(&2), Some(&RSV::Number(7)));
+        assert_eq!(state.state_get(&3), None);
+        assert_eq!(state.state_get(&4), None);
+        assert_eq!(state.state_get(&5), Some(&RSV::Number(5)));
+        let (state_id, state) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
-        assert_eq!(state.state_get_value(&3), Some(RSV::Number(9)));
+        assert_eq!(state.state_get(&3), None);
+        assert_eq!(state.state_get(&4), Some(&RSV::Number(8)));
+        assert_eq!(state.state_get(&5), Some(&RSV::Number(5)));
+        let (state_id, state) = db.step_execution(state_id, &state);
+        assert_eq!(state.state_get(&1), None);
+        assert_eq!(state.state_get(&2), None);
+        assert_eq!(state.state_get(&3), Some(&RSV::Number(9)));
         assert_eq!(state.state_get(&4), None);
-        assert_eq!(state.state_get_value(&5), Some(RSV::Number(9)));
+        assert_eq!(state.state_get(&5), Some(&RSV::Number(9)));
     }
 
     #[test]
@@ -481,60 +643,75 @@ mod tests {
         // We start with the number 1 at node 0
         let mut state = state.add_operation(
             0,
-            0,
-            Box::new(|_args| {
-                let v = RSV::Number(1);
-                return serialize_to_vec(&v);
-            }),
+            OperationNode::new(
+                InputSignature::new(),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(1)),
+            ),
         );
 
         // Globally mutates this value, making each call to this function side-effecting
         static atomic_usize: AtomicUsize = AtomicUsize::new(0);
-        let f_side_effect = |args: Vec<&Option<Vec<u8>>>| {
-            let arg0 = deserialize_from_buf(args[0].as_ref().unwrap().as_slice());
-
-            if let RSV::Number(a) = arg0 {
-                let plus = atomic_usize.fetch_add(1, Ordering::SeqCst);
-                let v = RSV::Number(a + plus as i32);
-                return serialize_to_vec(&v);
+        let f_side_effect = |args: RkyvSerializedValue| {
+            if let RSV::Object(m) = args {
+                if let RSV::Object(args) = m.get("args").unwrap() {
+                    if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
+                        let plus = atomic_usize.fetch_add(1, Ordering::SeqCst);
+                        return RSV::Number(a + plus as i32);
+                    }
+                }
             }
 
             panic!("Invalid arguments")
         };
 
-        let mut state = state.add_operation(1, 1, Box::new(f_side_effect));
-        let mut state = state.add_operation(2, 1, Box::new(f_side_effect));
+        let mut state = state.add_operation(
+            1,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["0"]),
+                OutputSignature::new(),
+                Box::new(f_side_effect),
+            ),
+        );
+        let mut state = state.add_operation(
+            2,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["0"]),
+                OutputSignature::new(),
+                Box::new(f_side_effect),
+            ),
+        );
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
                 operation_id: 1,
-                depends_on: vec![(0, 0)],
+                depends_on: vec![(0, ArgumentIndex::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 2,
-                depends_on: vec![(1, 0)],
+                depends_on: vec![(1, ArgumentIndex::Positional(0))],
             },
         ]);
 
-        let (state_id, state) = db.step_execution(state_id, state);
+        let (state_id, state) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
-        let (x_state_id, x_state) = db.step_execution(state_id, state);
-        assert_eq!(x_state.state_get_value(&1), Some(RSV::Number(1)));
+        let (x_state_id, x_state) = db.step_execution(state_id, &state);
+        assert_eq!(x_state.state_get(&1), Some(&RSV::Number(1)));
         assert_eq!(x_state.state_get(&2), None);
 
-        let (state_id, state) = db.step_execution(x_state_id.clone(), x_state.clone());
+        let (state_id, state) = db.step_execution(x_state_id.clone(), &x_state.clone());
         assert_eq!(state_id.0, 0);
         assert_eq!(state.state_get(&1), None);
-        assert_eq!(state.state_get_value(&2), Some(RSV::Number(2)));
+        assert_eq!(state.state_get(&2), Some(&RSV::Number(2)));
 
         // When we re-evaluate from a previous point, we should get a new branch
-        let (state_id, state) = db.step_execution(x_state_id.clone(), x_state);
+        let (state_id, state) = db.step_execution(x_state_id.clone(), &x_state);
         // The state_id.0 being incremented indicates that we're on a new branch
         assert_eq!(state_id.0, 1);
         assert_eq!(state.state_get(&1), None);
         // Op 2 should re-evaluate to 3, since it's on a new branch but continuing to mutate the stateful counter
-        assert_eq!(state.state_get_value(&2), Some(RSV::Number(3)));
+        assert_eq!(state.state_get(&2), Some(&RSV::Number(3)));
     }
 
     #[test]
@@ -554,72 +731,91 @@ mod tests {
         // We start with the number 0 at node 0
         let mut state = state.add_operation(
             0,
-            0,
-            Box::new(|_args| {
-                let v = RSV::Number(0);
-                return serialize_to_vec(&v);
-            }),
+            OperationNode::new(
+                InputSignature::new(),
+                OutputSignature::new(),
+                Box::new(|_args| RSV::Number(0)),
+            ),
         );
 
-        let f_v1 = |args: Vec<&Option<Vec<u8>>>| {
-            let arg0 = deserialize_from_buf(args[0].as_ref().unwrap().as_slice());
-
-            if let RSV::Number(a) = arg0 {
-                let v = RSV::Number(a + 1);
-                return serialize_to_vec(&v);
+        let f_v1 = |args: RkyvSerializedValue| {
+            if let RSV::Object(m) = args {
+                if let RSV::Object(args) = m.get("args").unwrap() {
+                    if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
+                        return RSV::Number(a + 1);
+                    }
+                }
             }
 
             panic!("Invalid arguments")
         };
 
-        let f_v2 = |args: Vec<&Option<Vec<u8>>>| {
-            let arg0 = deserialize_from_buf(args[0].as_ref().unwrap().as_slice());
-
-            if let RSV::Number(a) = arg0 {
-                let v = RSV::Number(a + 200);
-                return serialize_to_vec(&v);
+        let f_v2 = |args: RkyvSerializedValue| {
+            if let RSV::Object(m) = args {
+                if let RSV::Object(args) = m.get("args").unwrap() {
+                    if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
+                        return RSV::Number(a + 200);
+                    }
+                }
             }
 
             panic!("Invalid arguments")
         };
 
-        let mut state = state.add_operation(1, 1, Box::new(f_v1));
-        let mut state = state.add_operation(2, 1, Box::new(f_v1));
+        let mut state = state.add_operation(
+            1,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["0"]),
+                OutputSignature::new(),
+                Box::new(f_v1),
+            ),
+        );
+        let mut state = state.add_operation(
+            2,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["0"]),
+                OutputSignature::new(),
+                Box::new(f_v1),
+            ),
+        );
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
                 operation_id: 1,
-                depends_on: vec![(0, 0)],
+                depends_on: vec![(0, ArgumentIndex::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 2,
-                depends_on: vec![(1, 0)],
+                depends_on: vec![(1, ArgumentIndex::Positional(0))],
             },
         ]);
 
-        let (x_state_id, mut x_state) = db.step_execution(state_id, state);
+        let (x_state_id, mut x_state) = db.step_execution(state_id, &state);
         assert_eq!(x_state.state_get(&1), None);
         assert_eq!(x_state.state_get(&2), None);
-        let (state_id, state) = db.step_execution(x_state_id, x_state.clone());
-        assert_eq!(state.state_get_value(&1), Some(RSV::Number(1)));
+        let (state_id, state) = db.step_execution(x_state_id, &x_state.clone());
+        assert_eq!(state.state_get(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get(&2), None);
-        let (state_id, state) = db.step_execution(state_id, state);
-        assert_eq!(state.state_get_value(&1), None);
-        assert_eq!(state.state_get_value(&2), Some(RSV::Number(2)));
+        let (state_id, state) = db.step_execution(state_id, &state);
+        assert_eq!(state.state_get(&1), None);
+        assert_eq!(state.state_get(&2), Some(&RSV::Number(2)));
 
         // Change the definition of the operation "1" to add 200 instead of 1, then re-evaluate
-        let mut state = x_state.add_operation(1, 1, Box::new(f_v2));
-        let (state_id, state) = db.step_execution(state_id, state.clone());
-        assert_eq!(state.state_get_value(&1), Some(RSV::Number(200)));
-        assert_eq!(state.state_get(&2), None);
-        let (state_id, state) = db.step_execution(state_id, state);
-        assert_eq!(state.state_get_value(&1), None);
-        assert_eq!(state.state_get_value(&2), Some(RSV::Number(201)));
-    }
+        let mut state = x_state.add_operation(
+            1,
+            OperationNode::new(
+                InputSignature::from_args_list(vec!["0"]),
+                OutputSignature::new(),
+                Box::new(f_v2),
+            ),
+        );
 
-    #[test]
-    fn test_conditional_propagation_to_children_slots() {
-        // TODO: we should add support for propgating only to a given child under certain circumstances
+        let (state_id, state) = db.step_execution(state_id, &state.clone());
+        assert_eq!(state.state_get(&1), Some(&RSV::Number(200)));
+        assert_eq!(state.state_get(&2), None);
+        let (state_id, state) = db.step_execution(state_id, &state);
+        assert_eq!(state.state_get(&1), None);
+        assert_eq!(state.state_get(&2), Some(&RSV::Number(201)));
     }
 
     #[test]

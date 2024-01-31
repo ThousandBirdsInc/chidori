@@ -9,12 +9,62 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::future::Future;
+use std::marker::PhantomData;
+use tokio::sync::{mpsc, Mutex};
+
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Serialize, Serializer};
+
 // Return a global tokio runtime or create one if it doesn't exist.
 // Throws a JavaScript exception if the `Runtime` fails to create.
 // TODO: note that oncecell has been recently stablized in rust stdlib, so we can probably use that instead
 fn runtime<'a, C: Context<'a>>(cx: &mut C) -> NeonResult<&'static Runtime> {
     static RUNTIME: OnceCell<Runtime> = OnceCell::new();
     RUNTIME.get_or_try_init(|| Runtime::new().or_else(|err| cx.throw_error(err.to_string())))
+}
+
+impl Serialize for RkyvSerializedValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            RkyvSerializedValue::Float(x) => serializer.serialize_f64(*x as f64),
+            RkyvSerializedValue::Number(x) => serializer.serialize_f64(*x as f64),
+            RkyvSerializedValue::String(x) => serializer.serialize_str(x),
+            RkyvSerializedValue::Boolean(x) => serializer.serialize_bool(*x),
+            RkyvSerializedValue::Null => serializer.serialize_unit(),
+            RkyvSerializedValue::Array(val) => {
+                let mut seq = serializer.serialize_seq(Some(val.len()))?;
+                for element in val {
+                    seq.serialize_element(element)?;
+                }
+                seq.end()
+            }
+            RkyvSerializedValue::Object(val) => {
+                let mut map = serializer.serialize_map(Some(val.len()))?;
+                for (key, value) in val {
+                    map.serialize_entry(key, value)?;
+                }
+                map.end()
+            }
+            RkyvSerializedValue::StreamPointer(_x) => {
+                // Handle serialization for StreamPointer
+                Err(serde::ser::Error::custom(
+                    "StreamPointer serialization not implemented",
+                ))
+            }
+            RkyvSerializedValue::FunctionPointer(_x) => {
+                // Handle serialization for FunctionPointer
+                Err(serde::ser::Error::custom(
+                    "FunctionPointer serialization not implemented",
+                ))
+            }
+        }
+    }
 }
 
 impl RkyvSerializedValue {
@@ -94,27 +144,37 @@ fn from_js_value<'a, C: Context<'a>>(
 /// The graph building execution engine is exposed via a stateful object interface
 /// ==============================
 
-// struct NodeChidori {
-//     c: Arc<Mutex<Chidori>>
-// }
-//
-// impl Finalize for NodeChidori {}
-//
-// impl NodeChidori {
-//     fn js_new(mut cx: FunctionContext) -> JsResult<JsBox<NodeChidori>> {
-//         let file_id = cx.argument::<JsString>(0)?.value(&mut cx);
-//         let url = cx.argument::<JsString>(1)?.value(&mut cx);
-//
-//         if !url.contains("://") {
-//             return cx.throw_error("Invalid url, must include protocol");
-//         }
-//         // let api_token = cx.argument_opt(2)?.value(&mut cx);
-//         debug!("Creating new Chidori instance with file_id={}, url={}, api_token={:?}", file_id, url, "".to_string());
-//         Ok(cx.boxed(NodeChidori {
-//             c: Arc::new(Mutex::new(Chidori::new(file_id, url))),
-//         }))
-//     }
-// }
+struct NodeChidori {
+    c: Arc<Mutex<String>>,
+}
+
+impl Finalize for NodeChidori {}
+
+impl NodeChidori {
+    fn js_new(mut cx: FunctionContext) -> JsResult<JsBox<NodeChidori>> {
+        Ok(cx.boxed(NodeChidori {
+            c: Arc::new(Mutex::new(String::new())),
+        }))
+    }
+
+    fn push_cell(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+        let mut this = cx.this();
+        let c = cx.argument::<JsString>(0)?.value(&mut cx);
+        let guard = cx.lock();
+        // let mut this = this.borrow_mut(&guard);
+        // this.c.lock().unwrap().push_str(&c);
+        Ok(cx.undefined())
+    }
+
+    fn execute(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+        let mut this = cx.this();
+        let c = cx.argument::<JsString>(0)?.value(&mut cx);
+        let guard = cx.lock();
+        // let mut this = this.borrow_mut(&guard);
+        // this.c.lock().unwrap().push_str(&c);
+        Ok(cx.undefined())
+    }
+}
 
 macro_rules! return_or_throw_deferred {
     ($channel:expr, $deferred:expr, $m:expr) => {
@@ -194,8 +254,12 @@ fn std_ai_llm_openai_batch(mut cx: FunctionContext) -> JsResult<JsPromise> {
 
 fn std_code_rustpython_source_code_run_python(mut cx: FunctionContext) -> JsResult<JsValue> {
     let source_code = cx.argument::<JsString>(0)?.value(&mut cx);
-    match library::std::code::runtime_rustpython::source_code_run_python(source_code) {
-        Ok(x) => x.to_object(&mut cx),
+    match library::std::code::runtime_rustpython::source_code_run_python(
+        &source_code,
+        &RkyvSerializedValue::Null,
+        None,
+    ) {
+        Ok(x) => neon_serde3::to_value(&mut cx, &x).or_else(|e| cx.throw_error(e.to_string())),
         Err(x) => cx.throw_error(x.to_string()),
     }
 }
