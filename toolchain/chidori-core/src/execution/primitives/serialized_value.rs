@@ -1,12 +1,14 @@
+use crate::execution::primitives::cells::CellTypes;
 use rkyv::{
     archived_root, check_archived_root,
     ser::{serializers::AllocSerializer, Serializer},
-    Archive, Deserialize, Serialize,
+    Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
+use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-#[derive(Archive, Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, PartialEq, Clone)]
 #[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
 #[archive(check_bytes)]
 #[archive_attr(check_bytes(
@@ -15,7 +17,12 @@ use std::collections::HashMap;
 #[archive_attr(derive(Debug))]
 pub enum RkyvSerializedValue {
     StreamPointer(u32),
-    FunctionPointer(u32),
+
+    /// Function pointers are to a specific cell and function name
+    FunctionPointer(usize, String),
+
+    Cell(CellTypes),
+
     Float(f32),
     Number(i32),
     String(String),
@@ -71,6 +78,11 @@ impl RkyvObjectBuilder {
         self
     }
 
+    pub fn insert_value(mut self, key: &str, value: RkyvSerializedValue) -> Self {
+        self.object.insert(key.to_string(), value);
+        self
+    }
+
     pub fn build(self) -> RkyvSerializedValue {
         RkyvSerializedValue::Object(self.object)
     }
@@ -80,7 +92,8 @@ impl std::fmt::Display for RkyvSerializedValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RkyvSerializedValue::StreamPointer(_) => write!(f, "StreamPointer"),
-            RkyvSerializedValue::FunctionPointer(_) => write!(f, "FunctionPointer"),
+            RkyvSerializedValue::FunctionPointer(_, _) => write!(f, "FunctionPointer"),
+            RkyvSerializedValue::Cell(_) => write!(f, "Cell"),
             RkyvSerializedValue::Float(_) => write!(f, "Float"),
             RkyvSerializedValue::Number(_) => write!(f, "Number"),
             RkyvSerializedValue::String(_) => write!(f, "String"),
@@ -136,8 +149,9 @@ pub fn serialized_value_to_json_value(v: &RkyvSerializedValue) -> Value {
                 .map(|(k, v)| (k.clone(), serialized_value_to_json_value(v)))
                 .collect(),
         ),
-        RkyvSerializedValue::FunctionPointer(_) => Value::Null,
+        RkyvSerializedValue::FunctionPointer(_, _) => Value::Null,
         RkyvSerializedValue::StreamPointer(_) => Value::Null,
+        RkyvSerializedValue::Cell(_) => Value::Null,
         RkyvSerializedValue::Null => Value::Null,
     }
 }
@@ -170,6 +184,32 @@ pub fn json_value_to_serialized_value(jval: &Value) -> RkyvSerializedValue {
         }
         Value::Null => RkyvSerializedValue::Null,
         _ => panic!("Invalid value type"),
+    }
+}
+
+// Implementing Serialize for RkyvSerializedValue
+impl SerdeSerialize for RkyvSerializedValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Convert self to a serde_json::Value and then serialize that
+        let value = serialized_value_to_json_value(self); // Use your existing function
+        value.serialize(serializer)
+    }
+}
+
+// Implementing Deserialize for RkyvSerializedValue
+impl<'de> SerdeDeserialize<'de> for RkyvSerializedValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Deserialize into a serde_json::Value first
+        let value = SerdeDeserialize::deserialize(deserializer)?;
+
+        // Convert the serde_json::Value to RkyvSerializedValue
+        Ok(json_value_to_serialized_value(&value)) // Use your existing function
     }
 }
 

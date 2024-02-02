@@ -1,3 +1,4 @@
+use crate::execution::primitives::cells::{CellTypes, CodeCell, SupportedLanguage};
 use crate::execution::primitives::serialized_value::RkyvSerializedValue;
 use std::collections::HashMap;
 use std::fmt;
@@ -8,6 +9,7 @@ use std::ops::{Deref, DerefMut};
 #[derive(Debug)]
 pub enum InputType {
     String,
+    Function,
 }
 
 #[derive(Debug, Default)]
@@ -133,7 +135,7 @@ pub struct OutputSignatureFunction {
 #[derive(Debug)]
 pub struct OutputSignature {
     pub globals: HashMap<String, OutputItemConfiguation>,
-    pub functions: HashMap<String, String>,
+    pub functions: HashMap<String, OutputItemConfiguation>,
 }
 
 impl OutputSignature {
@@ -208,6 +210,8 @@ pub type OperationFn = dyn FnMut(RkyvSerializedValue) -> RkyvSerializedValue;
 pub struct OperationNode {
     pub(crate) id: usize,
 
+    pub cell: CellTypes,
+
     /// Is the node pure or impure, does it have side effects? Does it depend on external state?
     purity: Purity,
 
@@ -277,6 +281,11 @@ impl Default for OperationNode {
     fn default() -> Self {
         OperationNode {
             id: 0,
+            cell: CellTypes::Code(CodeCell {
+                language: SupportedLanguage::Python,
+                source_code: "".to_string(),
+                function_invocation: None,
+            }),
             purity: Purity::Pure,
             mutability: Mutability::Mutable,
             changed_at: 0,
@@ -303,6 +312,10 @@ impl OperationNode {
         node.signature.output_signature = output_signature;
         node.operation = f;
         node
+    }
+
+    pub fn attach_cell(&mut self, cell: CellTypes) {
+        self.cell = cell;
     }
 
     fn apply() -> Self {

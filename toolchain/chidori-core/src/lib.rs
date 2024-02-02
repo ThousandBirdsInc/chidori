@@ -1,3 +1,4 @@
+#![allow(warnings)]
 #![feature(is_sorted)]
 extern crate protobuf;
 

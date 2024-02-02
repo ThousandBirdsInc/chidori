@@ -1,7 +1,8 @@
 use crate::execution::execution::execution_graph::ExecutionGraph;
 use crate::execution::execution::execution_state::ExecutionState;
 use crate::execution::execution::DependencyGraphMutation;
-use crate::execution::primitives::identifiers::ArgumentIndex;
+use crate::execution::primitives::cells::CellTypes;
+use crate::execution::primitives::identifiers::DependencyReference;
 use crate::execution::primitives::operation::{InputSignature, OperationNode, OutputSignature};
 use crate::execution::primitives::serialized_value::RkyvSerializedValue as RKV;
 use chidori_static_analysis::language::python::parse::{
@@ -11,11 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// This is an SDK for building execution graphs. It is designed to be used iteratively.
-
-enum CellTypes {
-    Code(crate::cells::CodeCell),
-    Prompt(crate::cells::LLMPromptCell),
-}
 
 type Func = fn(RKV) -> RKV;
 
@@ -55,14 +51,16 @@ impl Environment {
     pub fn upsert_cell(&mut self, cell: CellTypes) -> usize {
         self.op_counter += 1;
         let id = self.op_counter;
-        let args = 0;
-        let op = match cell {
+        let mut op = match &cell {
             CellTypes::Code(c) => crate::cells::code_cell(c),
             CellTypes::Prompt(c) => crate::cells::llm_prompt_cell(c),
         };
+        op.attach_cell(cell);
+
         // self.reported_cells.insert(id, cell_report.clone());
 
         self.state = self.state.add_operation(id, op);
+        // TODO: all declared functions should get their own operations
 
         // TODO: we collect and throw errors for: naming collisions, missing dependencies, and missing arguments
 
@@ -71,6 +69,7 @@ impl Environment {
 
         self.op_counter
     }
+
     /// Resolve the set of dependencies currently available, making necessary changes to the operator graph
     pub fn resolve_dependencies_from_input_signature(&mut self) -> Result<&ExecutionState, String> {
         // TODO: when there is a dependency on a function invocation we need to
@@ -78,6 +77,7 @@ impl Environment {
         //       It itself is not part of the call graph until it has such a depedendency.
 
         let mut available_values = HashMap::new();
+        let mut available_functions = HashMap::new();
 
         // For all reported cells, add their exposed values to the available values
         for (id, op) in self.state.operation_by_id.iter() {
@@ -89,9 +89,13 @@ impl Environment {
                 available_values.insert(key.clone(), id);
             }
 
+            for (key, value) in output_signature.functions.iter() {
+                // TODO: throw an error if there is a naming collision
+                available_functions.insert(key.clone(), id);
+            }
+
             // TODO: Store triggerable functions that may be passed as values as well
         }
-        dbg!(&available_values);
 
         // TODO: we need to report on INVOKED functions - these functions are calls to
         //       functions with the locals assigned in a particular way. But then how do we handle compositions of these?
@@ -103,20 +107,29 @@ impl Environment {
             let operation = op.borrow();
             let input_signature = &operation.signature.input_signature;
             for (value_name, value) in input_signature.globals.iter() {
-                // TODO: we should add functions as well
+                // TODO: we need to handle collisions between the two of these
+                if let Some(source_cell_id) = available_functions.get(value_name) {
+                    mutations.push(DependencyGraphMutation::Create {
+                        operation_id: destination_cell_id.clone(),
+                        depends_on: vec![(
+                            *source_cell_id.clone(),
+                            DependencyReference::FunctionInvocation(value_name.to_string()),
+                        )],
+                    });
+                }
+
                 if let Some(source_cell_id) = available_values.get(value_name) {
                     mutations.push(DependencyGraphMutation::Create {
                         operation_id: destination_cell_id.clone(),
                         depends_on: vec![(
                             *source_cell_id.clone(),
-                            ArgumentIndex::Global(value_name.to_string()),
+                            DependencyReference::Global(value_name.to_string()),
                         )],
                     });
                 }
             }
         }
 
-        dbg!(&mutations);
         self.state = self.state.apply_dependency_graph_mutations(mutations);
         Ok(&self.state)
     }
@@ -125,7 +138,9 @@ impl Environment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cells::{CodeCell, LLMPromptCell, SupportedLanguage, SupportedModelProviders};
+    use crate::execution::primitives::cells::{
+        CodeCell, LLMPromptCell, SupportedLanguage, SupportedModelProviders,
+    };
     use crate::execution::primitives::serialized_value::RkyvObjectBuilder;
     use chidori_static_analysis::language::python::parse::{
         build_report, extract_dependencies_python,
@@ -140,6 +155,7 @@ mod tests {
             source_code: String::from(indoc! { r#"
                 x = 20
                 "#}),
+            function_invocation: None,
         }));
         assert_eq!(id, 1);
         let id = env.upsert_cell(CellTypes::Code(CodeCell {
@@ -147,6 +163,7 @@ mod tests {
             source_code: String::from(indoc! { r#"
                 y = x + 1
                 "#}),
+            function_invocation: None,
         }));
         assert_eq!(id, 2);
         env.resolve_dependencies_from_input_signature();
@@ -165,6 +182,7 @@ mod tests {
         );
     }
 
+    #[ignore]
     #[test]
     fn test_execute_cells_between_code_and_llm() {
         dotenv::dotenv().ok();
@@ -174,6 +192,7 @@ mod tests {
             source_code: String::from(indoc! { r#"
                 x = "Here is a sample string"
                 "#}),
+            function_invocation: None,
         }));
         assert_eq!(id, 1);
         let id = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
@@ -206,7 +225,6 @@ mod tests {
         );
     }
 
-    #[ignore]
     #[test]
     fn test_execute_cells_via_prompt_calling_api() {
         let mut env = Environment::new();
@@ -215,6 +233,7 @@ mod tests {
             source_code: String::from(indoc! { r#"
                 x = ch.prompt("generate_names", x="John")
                 "#}),
+            function_invocation: None,
         }));
         assert_eq!(id, 1);
         let id = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
@@ -242,37 +261,39 @@ mod tests {
         );
     }
 
-    // #[test]
-    // fn test_execute_cells_invoking_a_function() {
-    //     let mut env = Environment::new();
-    //     let id = env.upsert_cell(CellTypes::Code(CodeCell {
-    //         language: SupportedLanguage::Python,
-    //         source_code: String::from(indoc! { r#"
-    //             def add(x, y):
-    //                 return x + y
-    //             "#}),
-    //     }));
-    //     assert_eq!(id, 1);
-    //     let id = env.upsert_cell(CellTypes::Code(CodeCell {
-    //         language: SupportedLanguage::Python,
-    //         source_code: String::from(indoc! { r#"
-    //             y = add(2,3)
-    //             "#}),
-    //     }));
-    //     assert_eq!(id, 2);
-    //     env.resolve_dependencies_from_input_signature();
-    //     env.state.render_dependency_graph();
-    //     env.step();
-    //     assert_eq!(
-    //         env.state.state_get(&1),
-    //         Some(&RkyvObjectBuilder::new().insert_number("x", 20).build())
-    //     );
-    //     assert_eq!(env.state.state_get(&2), None);
-    //     env.step();
-    //     assert_eq!(env.state.state_get(&1), None);
-    //     assert_eq!(
-    //         env.state.state_get(&2),
-    //         Some(&RkyvObjectBuilder::new().insert_number("y", 21).build())
-    //     );
-    // }
+    #[test]
+    fn test_execute_cells_invoking_a_function() {
+        let mut env = Environment::new();
+        let id = env.upsert_cell(CellTypes::Code(CodeCell {
+            language: SupportedLanguage::Python,
+            source_code: String::from(indoc! { r#"
+                def add(x, y):
+                    return x + y
+                "#}),
+            function_invocation: None,
+        }));
+        assert_eq!(id, 1);
+        let id = env.upsert_cell(CellTypes::Code(CodeCell {
+            function_invocation: None,
+            language: SupportedLanguage::Python,
+            source_code: String::from(indoc! { r#"
+                y = add(2,3)
+                "#}),
+        }));
+        assert_eq!(id, 2);
+        env.resolve_dependencies_from_input_signature();
+        env.state.render_dependency_graph();
+        env.step();
+        assert_eq!(
+            env.state.state_get(&1),
+            Some(&RkyvObjectBuilder::new().insert_number("x", 20).build())
+        );
+        assert_eq!(env.state.state_get(&2), None);
+        env.step();
+        assert_eq!(env.state.state_get(&1), None);
+        assert_eq!(
+            env.state.state_get(&2),
+            Some(&RkyvObjectBuilder::new().insert_number("y", 21).build())
+        );
+    }
 }

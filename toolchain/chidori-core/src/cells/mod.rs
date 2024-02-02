@@ -7,6 +7,9 @@ use crate::execution::primitives::serialized_value::{
 };
 use std::collections::HashMap;
 
+use crate::execution::primitives::cells::{
+    CodeCell, LLMPromptCell, SupportedLanguage, SupportedModelProviders,
+};
 use crate::library::std::ai::llm::{
     ChatCompletionReq, ChatCompletionRes, ChatModelBatch, EmbeddingReq, MessageRole,
     TemplateMessage,
@@ -16,18 +19,7 @@ use chidori_static_analysis::language::python::parse::Report;
 use std::env;
 use tokio::runtime;
 
-pub enum SupportedLanguage {
-    Python,
-    Starlark,
-    Deno,
-}
-
-pub(crate) struct CodeCell {
-    pub(crate) language: SupportedLanguage,
-    pub(crate) source_code: String,
-}
-
-pub fn code_cell(cell: CodeCell) -> OperationNode {
+pub fn code_cell(cell: &CodeCell) -> OperationNode {
     match cell.language {
         SupportedLanguage::Python => {
             // TODO: all callable functions should be exposed as their own OperationNodes
@@ -59,6 +51,16 @@ pub fn code_cell(cell: CodeCell) -> OperationNode {
                 );
             }
 
+            for (key, value) in &report.triggerable_functions {
+                output_signature.functions.insert(
+                    key.clone(),
+                    OutputItemConfiguation {
+                        ty: Some(InputType::Function),
+                    },
+                );
+            }
+
+            let cell = cell.clone();
             OperationNode::new(
                 input_signature,
                 output_signature,
@@ -67,7 +69,7 @@ pub fn code_cell(cell: CodeCell) -> OperationNode {
                     crate::library::std::code::runtime_rustpython::source_code_run_python(
                         &cell.source_code,
                         &x,
-                        None,
+                        &cell.function_invocation,
                     )
                     .unwrap()
                     .0
@@ -90,25 +92,7 @@ pub fn code_cell(cell: CodeCell) -> OperationNode {
     }
 }
 
-pub enum SupportedModelProviders {
-    OpenAI,
-}
-
-pub enum LLMPromptCell {
-    Chat {
-        path: Option<String>,
-        provider: SupportedModelProviders,
-        req: String,
-    },
-    Completion {
-        req: String,
-    },
-    Embedding {
-        req: String,
-    },
-}
-
-pub fn llm_prompt_cell(cell: LLMPromptCell) -> OperationNode {
+pub fn llm_prompt_cell(cell: &LLMPromptCell) -> OperationNode {
     match cell {
         LLMPromptCell::Chat { provider, req, .. } => {
             let schema =

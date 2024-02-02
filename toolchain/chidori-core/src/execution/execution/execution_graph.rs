@@ -1,6 +1,6 @@
 use crate::execution::execution::execution_state::{DependencyGraphMutation, ExecutionState};
 
-use crate::execution::primitives::identifiers::{ArgumentIndex, OperationId};
+use crate::execution::primitives::identifiers::{DependencyReference, OperationId};
 
 use petgraph::data::Build;
 use petgraph::dot::Dot;
@@ -11,7 +11,7 @@ use petgraph::Direction;
 
 // TODO: update all of these identifies to include a "space" they're within
 
-type EdgeIdentity = (OperationId, OperationId, ArgumentIndex);
+type EdgeIdentity = (OperationId, OperationId, DependencyReference);
 
 /// This models the network of reactive relationships between different components.
 ///
@@ -160,8 +160,8 @@ mod tests {
             state.apply_dependency_graph_mutations(vec![DependencyGraphMutation::Create {
                 operation_id: 3,
                 depends_on: vec![
-                    (1, ArgumentIndex::Positional(0)),
-                    (2, ArgumentIndex::Positional(1)),
+                    (1, DependencyReference::Positional(0)),
+                    (2, DependencyReference::Positional(1)),
                 ],
             }]);
 
@@ -208,7 +208,7 @@ mod tests {
         let mut state =
             state.apply_dependency_graph_mutations(vec![DependencyGraphMutation::Create {
                 operation_id: 1,
-                depends_on: vec![(0, ArgumentIndex::Positional(0))],
+                depends_on: vec![(0, DependencyReference::Positional(0))],
             }]);
 
         let (_, new_state) = db.step_execution(state_id, &state);
@@ -262,11 +262,11 @@ mod tests {
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
                 operation_id: 1,
-                depends_on: vec![(0, ArgumentIndex::Positional(0))],
+                depends_on: vec![(0, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 2,
-                depends_on: vec![(1, ArgumentIndex::Positional(0))],
+                depends_on: vec![(1, DependencyReference::Positional(0))],
             },
         ]);
 
@@ -334,15 +334,15 @@ mod tests {
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
                 operation_id: 1,
-                depends_on: vec![(0, ArgumentIndex::Positional(0))],
+                depends_on: vec![(0, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 2,
-                depends_on: vec![(1, ArgumentIndex::Positional(0))],
+                depends_on: vec![(1, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 3,
-                depends_on: vec![(1, ArgumentIndex::Positional(0))],
+                depends_on: vec![(1, DependencyReference::Positional(0))],
             },
         ]);
 
@@ -422,21 +422,21 @@ mod tests {
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
                 operation_id: 1,
-                depends_on: vec![(0, ArgumentIndex::Positional(0))],
+                depends_on: vec![(0, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 2,
-                depends_on: vec![(1, ArgumentIndex::Positional(0))],
+                depends_on: vec![(1, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 3,
-                depends_on: vec![(1, ArgumentIndex::Positional(0))],
+                depends_on: vec![(1, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 4,
                 depends_on: vec![
-                    (2, ArgumentIndex::Positional(0)),
-                    (3, ArgumentIndex::Positional(1)),
+                    (2, DependencyReference::Positional(0)),
+                    (3, DependencyReference::Positional(1)),
                 ],
             },
         ]);
@@ -549,25 +549,25 @@ mod tests {
             DependencyGraphMutation::Create {
                 operation_id: 1,
                 depends_on: vec![
-                    (0, ArgumentIndex::Positional(0)),
-                    (3, ArgumentIndex::Positional(0)),
+                    (0, DependencyReference::Positional(0)),
+                    (3, DependencyReference::Positional(0)),
                 ],
             },
             DependencyGraphMutation::Create {
                 operation_id: 2,
-                depends_on: vec![(1, ArgumentIndex::Positional(0))],
+                depends_on: vec![(1, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 3,
-                depends_on: vec![(4, ArgumentIndex::Positional(0))],
+                depends_on: vec![(4, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 4,
-                depends_on: vec![(2, ArgumentIndex::Positional(0))],
+                depends_on: vec![(2, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 5,
-                depends_on: vec![(4, ArgumentIndex::Positional(0))],
+                depends_on: vec![(4, DependencyReference::Positional(0))],
             },
         ]);
 
@@ -685,11 +685,11 @@ mod tests {
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
                 operation_id: 1,
-                depends_on: vec![(0, ArgumentIndex::Positional(0))],
+                depends_on: vec![(0, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 2,
-                depends_on: vec![(1, ArgumentIndex::Positional(0))],
+                depends_on: vec![(1, DependencyReference::Positional(0))],
             },
         ]);
 
@@ -782,11 +782,11 @@ mod tests {
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
                 operation_id: 1,
-                depends_on: vec![(0, ArgumentIndex::Positional(0))],
+                depends_on: vec![(0, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
                 operation_id: 2,
-                depends_on: vec![(1, ArgumentIndex::Positional(0))],
+                depends_on: vec![(1, DependencyReference::Positional(0))],
             },
         ]);
 

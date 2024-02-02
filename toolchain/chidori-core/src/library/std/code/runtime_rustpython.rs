@@ -11,8 +11,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 // use rustpython_vm as vm;
 // use rustpython_vm::builtins::{PyBool, PyDict, PyInt, PyList, PyStr};
 
-use crate::execution::primitives::serialized_value::RkyvSerializedValue;
+use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue};
 // use rustpython_vm::PyObjectRef;
+use crate::execution::primitives::cells::{CellTypes, CodeCell};
 use crate::execution::primitives::operation::OperationFn;
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
@@ -150,15 +151,97 @@ impl LoggingStdout {
 pub fn source_code_run_python(
     source_code: &String,
     payload: &RkyvSerializedValue,
-    function_invocation: Option<String>,
+    function_invocation: &Option<String>,
 ) -> anyhow::Result<(RkyvSerializedValue, Vec<String>)> {
-    let dependencies = extract_dependencies_python(&source_code);
-    let report = build_report(&dependencies);
     pyo3::prepare_freethreaded_python();
-
     let (sender, receiver) = mpsc::channel();
 
+    let dependencies = extract_dependencies_python(&source_code);
+    let report = build_report(&dependencies);
+
     return Python::with_gil(|py| {
+        // Configure locals and globals passed to evaluation
+        let locals = PyDict::new(py);
+        let globals = PyDict::new(py);
+
+        // Create shims for functions that are referred to, we look at what functions are being provided
+        // and create shims for matches between the function name provided and the identifiers referred to.
+        if let RkyvSerializedValue::Object(ref payload_map) = payload {
+            if let Some(RkyvSerializedValue::Object(functions_map)) = payload_map.get("functions") {
+                for (function_name, value) in functions_map {
+                    let clone_function_name = function_name.clone();
+                    // TODO: handle llm cells invoked as functions by name
+                    if let RkyvSerializedValue::Cell(cell) = value.clone() {
+                        if let CellTypes::Code(CodeCell {
+                            function_invocation,
+                            ..
+                        }) = &cell
+                        {
+                            if report
+                                .cell_depended_values
+                                .contains_key(&clone_function_name)
+                            {
+                                let closure_callable = PyCFunction::new_closure(
+                                    py,
+                                    None,
+                                    None,
+                                    move |args: &PyTuple, kwargs: Option<&PyDict>| {
+                                        let total_arg_payload = RkyvObjectBuilder::new();
+                                        let total_arg_payload =
+                                            total_arg_payload.insert_value("args", {
+                                                let mut m = HashMap::new();
+                                                for (i, a) in args.iter().enumerate() {
+                                                    m.insert(
+                                                        format!("{}", i),
+                                                        pyany_to_rkyv_serialized_value(a),
+                                                    );
+                                                }
+                                                RkyvSerializedValue::Object(m)
+                                            });
+
+                                        let total_arg_payload = if let Some(kwargs) = kwargs {
+                                            total_arg_payload.insert_value("kwargs", {
+                                                let mut m = HashMap::new();
+                                                for (i, a) in kwargs.iter() {
+                                                    let k: String = i.extract()?;
+                                                    m.insert(k, pyany_to_rkyv_serialized_value(a));
+                                                }
+                                                RkyvSerializedValue::Object(m)
+                                            })
+                                        } else {
+                                            total_arg_payload
+                                        };
+
+                                        // modify code cell to indicate execution of the target function
+                                        // reconstruction of the cell
+                                        let mut op = match &cell {
+                                            CellTypes::Code(c) => {
+                                                let mut c = c.clone();
+                                                c.function_invocation =
+                                                    Some(clone_function_name.clone());
+                                                crate::cells::code_cell(&c)
+                                            }
+                                            CellTypes::Prompt(c) => {
+                                                crate::cells::llm_prompt_cell(&c)
+                                            }
+                                        };
+
+                                        // invocation of the operation
+                                        let result = op.execute(total_arg_payload.build());
+
+                                        // Conversion back to python types
+                                        let py = args.py();
+                                        PyResult::Ok(rkyv_serialized_value_to_pyany(py, &result))
+                                    },
+                                )?;
+                                globals.set_item(function_name.clone(), closure_callable);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Create new module
         let chidori_module = PyModule::new(py, "chidori")?;
         chidori_module.add_function(wrap_pyfunction!(on_event, chidori_module)?)?;
@@ -177,10 +260,6 @@ pub fn source_code_run_python(
 
         sys.setattr("stdout", stdout_capture_py)?;
 
-        // Configure locals and globals passed to evaluation
-        let locals = PyDict::new(py);
-        let globals = PyDict::new(py);
-
         if let RkyvSerializedValue::Object(ref payload_map) = payload {
             if let Some(RkyvSerializedValue::Object(globals_map)) = payload_map.get("globals") {
                 for (key, value) in globals_map {
@@ -190,6 +269,7 @@ pub fn source_code_run_python(
             }
         }
 
+        // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Important: this is the actual point of execution
         // Execute the target source code.
         py.run(&source_code, Some(globals), Some(locals)).unwrap();
 
@@ -273,7 +353,9 @@ pub fn source_code_run_python(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::primitives::cells::SupportedLanguage;
     use crate::execution::primitives::serialized_value::RkyvObjectBuilder;
+    use indoc::indoc;
 
     //     #[test]
     //     fn test_source_code_run_py_success() {
@@ -301,7 +383,7 @@ x = 12 + y
 li = [x, y]
         "#,
         );
-        let result = source_code_run_python(&source_code, &RkyvSerializedValue::Null, None);
+        let result = source_code_run_python(&source_code, &RkyvSerializedValue::Null, &None);
         assert_eq!(
             result.unwrap(),
             (
@@ -328,7 +410,7 @@ li = [x, y]
 print("testing")
         "#,
         );
-        let result = source_code_run_python(&source_code, &RkyvSerializedValue::Null, None);
+        let result = source_code_run_python(&source_code, &RkyvSerializedValue::Null, &None);
         assert_eq!(
             result.unwrap(),
             (
@@ -353,7 +435,7 @@ def example():
         let result = source_code_run_python(
             &source_code,
             &RkyvSerializedValue::Null,
-            Some("example".to_string()),
+            &Some("example".to_string()),
         );
         assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(20), vec![]));
     }
@@ -374,8 +456,45 @@ def example(x):
             &RkyvObjectBuilder::new()
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
-            Some("example".to_string()),
+            &Some("example".to_string()),
         );
         assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(25), vec![]));
+    }
+
+    #[test]
+    fn text_execution_of_python_with_function_provided_via_cell() {
+        let source_code = String::from(
+            r#"
+a = 20 + demo()
+        "#,
+        );
+        let result = source_code_run_python(
+            &source_code,
+            &RkyvObjectBuilder::new()
+                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
+                .insert_object(
+                    "functions",
+                    RkyvObjectBuilder::new().insert_value(
+                        "demo",
+                        RkyvSerializedValue::Cell(CellTypes::Code(CodeCell {
+                            language: SupportedLanguage::Python,
+                            source_code: String::from(indoc! {r#"
+                        def demo():
+                            return 100
+                        "#}),
+                            function_invocation: None,
+                        })),
+                    ),
+                )
+                .build(),
+            &None,
+        );
+        assert_eq!(
+            result.unwrap(),
+            (
+                RkyvObjectBuilder::new().insert_number("a", 120).build(),
+                vec![]
+            )
+        );
     }
 }

@@ -26,46 +26,52 @@ fn runtime<'a, C: Context<'a>>(cx: &mut C) -> NeonResult<&'static Runtime> {
     RUNTIME.get_or_try_init(|| Runtime::new().or_else(|err| cx.throw_error(err.to_string())))
 }
 
-impl Serialize for RkyvSerializedValue {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            RkyvSerializedValue::Float(x) => serializer.serialize_f64(*x as f64),
-            RkyvSerializedValue::Number(x) => serializer.serialize_f64(*x as f64),
-            RkyvSerializedValue::String(x) => serializer.serialize_str(x),
-            RkyvSerializedValue::Boolean(x) => serializer.serialize_bool(*x),
-            RkyvSerializedValue::Null => serializer.serialize_unit(),
-            RkyvSerializedValue::Array(val) => {
-                let mut seq = serializer.serialize_seq(Some(val.len()))?;
-                for element in val {
-                    seq.serialize_element(element)?;
-                }
-                seq.end()
-            }
-            RkyvSerializedValue::Object(val) => {
-                let mut map = serializer.serialize_map(Some(val.len()))?;
-                for (key, value) in val {
-                    map.serialize_entry(key, value)?;
-                }
-                map.end()
-            }
-            RkyvSerializedValue::StreamPointer(_x) => {
-                // Handle serialization for StreamPointer
-                Err(serde::ser::Error::custom(
-                    "StreamPointer serialization not implemented",
-                ))
-            }
-            RkyvSerializedValue::FunctionPointer(_x) => {
-                // Handle serialization for FunctionPointer
-                Err(serde::ser::Error::custom(
-                    "FunctionPointer serialization not implemented",
-                ))
-            }
-        }
-    }
-}
+// impl Serialize for RkyvSerializedValue {
+//     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+//     where
+//         S: Serializer,
+//     {
+//         match self {
+//             RkyvSerializedValue::Float(x) => serializer.serialize_f64(*x as f64),
+//             RkyvSerializedValue::Number(x) => serializer.serialize_f64(*x as f64),
+//             RkyvSerializedValue::String(x) => serializer.serialize_str(x),
+//             RkyvSerializedValue::Boolean(x) => serializer.serialize_bool(*x),
+//             RkyvSerializedValue::Null => serializer.serialize_unit(),
+//             RkyvSerializedValue::Array(val) => {
+//                 let mut seq = serializer.serialize_seq(Some(val.len()))?;
+//                 for element in val {
+//                     seq.serialize_element(element)?;
+//                 }
+//                 seq.end()
+//             }
+//             RkyvSerializedValue::Object(val) => {
+//                 let mut map = serializer.serialize_map(Some(val.len()))?;
+//                 for (key, value) in val {
+//                     map.serialize_entry(key, value)?;
+//                 }
+//                 map.end()
+//             }
+//             RkyvSerializedValue::StreamPointer(_x) => {
+//                 // Handle serialization for StreamPointer
+//                 Err(serde::ser::Error::custom(
+//                     "StreamPointer serialization not implemented",
+//                 ))
+//             }
+//             RkyvSerializedValue::Cell(_) => {
+//                 // Handle serialization for FunctionPointer
+//                 Err(serde::ser::Error::custom(
+//                     "Cell serialization not implemented",
+//                 ))
+//             }
+//             RkyvSerializedValue::FunctionPointer(_, _) => {
+//                 // Handle serialization for FunctionPointer
+//                 Err(serde::ser::Error::custom(
+//                     "FunctionPointer serialization not implemented",
+//                 ))
+//             }
+//         }
+//     }
+// }
 
 impl RkyvSerializedValue {
     fn to_object<'a, T>(&self, cx: &mut T) -> JsResult<'a, JsValue>
@@ -94,12 +100,16 @@ impl RkyvSerializedValue {
                 }
                 Ok(js_obj.upcast())
             }
+            RkyvSerializedValue::Cell(_) => {
+                // Handle serialization for FunctionPointer
+                unreachable!();
+            }
             // Additional cases for the new enum variants
             RkyvSerializedValue::StreamPointer(_x) => {
                 // Convert to JavaScript value as needed
                 unreachable!();
             }
-            RkyvSerializedValue::FunctionPointer(_x) => {
+            RkyvSerializedValue::FunctionPointer(_, _) => {
                 // Convert to JavaScript value as needed
                 unreachable!();
             }
@@ -257,7 +267,7 @@ fn std_code_rustpython_source_code_run_python(mut cx: FunctionContext) -> JsResu
     match library::std::code::runtime_rustpython::source_code_run_python(
         &source_code,
         &RkyvSerializedValue::Null,
-        None,
+        &None,
     ) {
         Ok(x) => neon_serde3::to_value(&mut cx, &x).or_else(|e| cx.throw_error(e.to_string())),
         Err(x) => cx.throw_error(x.to_string()),

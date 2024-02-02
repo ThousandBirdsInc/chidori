@@ -1,4 +1,4 @@
-use crate::execution::primitives::identifiers::{ArgumentIndex, OperationId};
+use crate::execution::primitives::identifiers::{DependencyReference, OperationId};
 use crate::execution::primitives::operation::{OperationFn, OperationNode};
 use crate::execution::primitives::serialized_value::{
     deserialize_from_buf, RkyvSerializedValue as RSV, RkyvSerializedValue,
@@ -15,12 +15,11 @@ use std::fmt;
 use std::fmt::Formatter;
 use std::rc::Rc;
 
-// TODO: convert ArgumentIndex to an Enum of kwargs vs args vs locals
 #[derive(Debug)]
 pub enum DependencyGraphMutation {
     Create {
         operation_id: OperationId,
-        depends_on: Vec<(OperationId, ArgumentIndex)>,
+        depends_on: Vec<(OperationId, DependencyReference)>,
     },
     Delete {
         operation_id: OperationId,
@@ -47,7 +46,7 @@ pub struct ExecutionState {
     ///
     /// The usize::MAX index is a no-op that indicates that the operation is ready to run, an execution
     /// order dependency rather than a value dependency.
-    dependency_graph: ImHashMap<OperationId, HashSet<(OperationId, ArgumentIndex)>>,
+    dependency_map: ImHashMap<OperationId, HashSet<(OperationId, DependencyReference)>>,
 }
 
 impl std::fmt::Debug for ExecutionState {
@@ -85,7 +84,7 @@ impl ExecutionState {
             state: Default::default(),
             operation_by_id: Default::default(),
             has_been_set: Default::default(),
-            dependency_graph: Default::default(),
+            dependency_map: Default::default(),
         }
     }
 
@@ -116,9 +115,9 @@ impl ExecutionState {
         );
     }
 
-    pub fn get_dependency_graph(&self) -> DiGraphMap<OperationId, Vec<ArgumentIndex>> {
+    pub fn get_dependency_graph(&self) -> DiGraphMap<OperationId, Vec<DependencyReference>> {
         let mut graph = DiGraphMap::new();
-        for (node, value) in self.dependency_graph.clone().into_iter() {
+        for (node, value) in self.dependency_map.clone().into_iter() {
             graph.add_node(node);
             for (depends_on, index) in value.into_iter() {
                 let r = graph.add_edge(depends_on, node, vec![index]);
@@ -151,17 +150,17 @@ impl ExecutionState {
                     operation_id,
                     depends_on,
                 } => {
-                    if let Some(e) = s.dependency_graph.get_mut(&operation_id) {
+                    if let Some(e) = s.dependency_map.get_mut(&operation_id) {
                         e.clear();
                         e.extend(depends_on.into_iter());
                     } else {
-                        s.dependency_graph
+                        s.dependency_map
                             .entry(operation_id)
                             .or_insert(HashSet::from_iter(depends_on.into_iter()));
                     }
                 }
                 DependencyGraphMutation::Delete { operation_id } => {
-                    s.dependency_graph.remove(&operation_id);
+                    s.dependency_map.remove(&operation_id);
                 }
             }
         }
@@ -183,6 +182,7 @@ impl ExecutionState {
             let mut args = HashMap::new();
             let mut kwargs = HashMap::new();
             let mut globals = HashMap::new();
+            let mut functions = HashMap::new();
             signature.prepopulate_defaults(&mut args, &mut kwargs, &mut globals);
 
             // TODO: state should contain an event queue as well as the stateful globals
@@ -194,31 +194,43 @@ impl ExecutionState {
                 }
             }
 
-            // TODO: values should be exposed with names (drilling down into them and mapping),
-            //       not just Operation to Index
-
             // TODO: this currently disallows multiple edges from the same node?
             // Fetch the values from the previous execution cycle for each edge on this node
             for (from, _to, argument_indices) in
                 dependency_graph.edges_directed(operation_id, Direction::Incoming)
             {
-                // if the dependency is on usize::MAX, then this is an execution order dependency
+                // TODO: we don't need a value from previous state for function invocation dependencies
                 if let Some(output) = previous_state.state_get(&from) {
                     marked_for_consumption.insert(from.clone());
 
                     // TODO: we can implement prioritization between different values here
                     for argument_index in argument_indices {
                         match argument_index {
-                            ArgumentIndex::Positional(pos) => {
+                            DependencyReference::Positional(pos) => {
                                 args.insert(format!("{}", pos), output.clone());
                             }
-                            ArgumentIndex::Keyword(kw) => {
+                            DependencyReference::Keyword(kw) => {
                                 kwargs.insert(kw.clone(), output.clone());
                             }
-                            ArgumentIndex::Global(name) => {
+                            DependencyReference::Global(name) => {
                                 if let RkyvSerializedValue::Object(value) = output {
                                     globals.insert(name.clone(), value.get(name).unwrap().clone());
                                 }
+                            }
+                            DependencyReference::FunctionInvocation(name) => {
+                                let op = self
+                                    .operation_by_id
+                                    .get(&from)
+                                    .expect("Operation must exist")
+                                    .borrow();
+                                functions.insert(
+                                    name.clone(),
+                                    RkyvSerializedValue::Cell(op.cell.clone()),
+                                );
+                            }
+                            // if the dependency is of Ordering type, then this is an execution order dependency
+                            DependencyReference::Ordering => {
+                                // TODO: enforce that dependency executes if it has only an ordering dependence
                             }
                         }
                     }
@@ -226,21 +238,37 @@ impl ExecutionState {
             }
 
             dbg!(operation_id, &args, &kwargs, &globals, &signature);
+
             // Some of the required arguments are not yet available, continue to the next node
             if !signature.validate_input_against_signature(&args, &kwargs, &globals) {
                 continue 'traverse_nodes;
             }
 
-            // Execute the Operation with the given arguments
-            // TODO: support async/parallel execution
+            // TODO: if the operation has internal function dependencies, those need to be constructed so that
+            //       the closures for them to be invoked can be passed down to them - execute should
+            //       include a set of function pointers RKV encoded - we don't explicitly pass functions.
+            //       Inside of the operation for code invocation we resolve those pointers into closures.
+
+            // TODO: all functions that are referred to that we know are not yet defined are populated with a shim,
+            //       that shim goes to our lookup based on our function invocation dependencies.
+
+            // Construct the arguments for the given operation
             let mut argument_payload_map = HashMap::from_iter(vec![
                 ("args".to_string(), RkyvSerializedValue::Object(args)),
                 ("kwargs".to_string(), RkyvSerializedValue::Object(kwargs)),
                 ("globals".to_string(), RkyvSerializedValue::Object(globals)),
+                (
+                    "functions".to_string(),
+                    RkyvSerializedValue::Object(functions),
+                ),
             ]);
             let mut argument_payload: RkyvSerializedValue =
                 RkyvSerializedValue::Object(argument_payload_map);
+
+            // Execute the operation
+            // TODO: support async/parallel execution
             let result = op_node.execute(argument_payload);
+
             new_state.state_insert(operation_id, result.clone());
         }
         new_state.state_consume_marked(marked_for_consumption);
@@ -267,7 +295,7 @@ mod tests {
     fn test_dependency_graph_mutation() {
         let mut exec_state = ExecutionState::new();
         let operation_id = 1;
-        let depends_on = vec![(2, ArgumentIndex::Positional(0))];
+        let depends_on = vec![(2, DependencyReference::Positional(0))];
         let mutation = DependencyGraphMutation::Create {
             operation_id,
             depends_on: depends_on.clone(),
@@ -275,7 +303,7 @@ mod tests {
 
         exec_state = exec_state.apply_dependency_graph_mutations(vec![mutation]);
         assert_eq!(
-            exec_state.dependency_graph.get(&operation_id),
+            exec_state.dependency_map.get(&operation_id),
             Some(&HashSet::from_iter(depends_on.into_iter()))
         );
     }
@@ -284,7 +312,7 @@ mod tests {
     fn test_dependency_graph_deletion() {
         let mut exec_state = ExecutionState::new();
         let operation_id = 1;
-        let depends_on = vec![(2, ArgumentIndex::Positional(0))];
+        let depends_on = vec![(2, DependencyReference::Positional(0))];
         let create_mutation = DependencyGraphMutation::Create {
             operation_id,
             depends_on,
@@ -294,6 +322,8 @@ mod tests {
         let delete_mutation = DependencyGraphMutation::Delete { operation_id };
         exec_state = exec_state.apply_dependency_graph_mutations(vec![delete_mutation]);
 
-        assert!(exec_state.dependency_graph.get(&operation_id).is_none());
+        assert!(exec_state.dependency_map.get(&operation_id).is_none());
     }
+
+    // TODO: add a test that demonstrates multiple edges from the same node, filling multiple values
 }

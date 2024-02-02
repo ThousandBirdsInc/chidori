@@ -685,7 +685,6 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                 }
             }
 
-            // TODO: variables in returns that are locals are currently appearing in referred to
             if let ContextPath::IdentifierReferredTo(identifier, false) = context_path_unit {
                 if identifier != &String::from("ch") {
                     // If this value is not being assigned to, then it is a dependency
@@ -697,6 +696,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                             },
                         );
                     } else {
+                        // This is an exposed value if it does not occur inside the scope of a function
                         if encountered
                             .iter()
                             .find(|x| {
@@ -964,9 +964,39 @@ mod tests {
             return x
             "#};
         let context_stack_references = extract_dependencies_python(python_source);
-        dbg!(&context_stack_references);
         let result = build_report(&context_stack_references);
-        dbg!(result);
+        let report = Report {
+            cell_exposed_values: std::collections::HashMap::new(), // No data provided, initializing as empty
+            cell_depended_values: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "y".to_string(),
+                    ReportItem {
+                        context_path: vec![
+                            ContextPath::InFunction("testing".to_string()),
+                            ContextPath::AssignmentFromStatement,
+                            ContextPath::IdentifierReferredTo("y".to_string(), false),
+                        ],
+                    },
+                );
+                map
+            },
+            triggerable_functions: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "testing".to_string(),
+                    ReportTriggerableFunctions {
+                        context_path: vec![ContextPath::InFunction("testing".to_string())],
+                        emit_event: vec!["file_created".to_string()],
+                        trigger_on: vec!["new_file".to_string()],
+                    },
+                );
+                map
+            },
+            declared_functions: std::collections::HashMap::new(), // No data provided, initializing as empty
+        };
+
+        assert_eq!(result, report);
     }
 
     #[test]
@@ -982,8 +1012,53 @@ def fun_name():
 x = random.randint(0, 10)            
 "#};
         let context_stack_references = extract_dependencies_python(python_source);
-        dbg!(&context_stack_references);
         let result = build_report(&context_stack_references);
-        dbg!(result);
+        let report = Report {
+            cell_exposed_values: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "x".to_string(),
+                    ReportItem {
+                        context_path: vec![
+                            ContextPath::AssignmentToStatement,
+                            ContextPath::IdentifierReferredTo("x".to_string(), false),
+                        ],
+                    },
+                );
+                map
+            },
+            cell_depended_values: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "function_that_doesnt_exist".to_string(),
+                    ReportItem {
+                        context_path: vec![
+                            ContextPath::InFunction("fun_name".to_string()),
+                            ContextPath::AssignmentFromStatement,
+                            ContextPath::InCallExpression,
+                            ContextPath::IdentifierReferredTo(
+                                "function_that_doesnt_exist".to_string(),
+                                false,
+                            ),
+                        ],
+                    },
+                );
+                map
+            },
+            triggerable_functions: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "fun_name".to_string(),
+                    ReportTriggerableFunctions {
+                        context_path: vec![ContextPath::InFunction("fun_name".to_string())],
+                        emit_event: vec![],
+                        trigger_on: vec![],
+                    },
+                );
+                map
+            },
+            declared_functions: std::collections::HashMap::new(), // No data provided, initializing as empty
+        };
+        assert_eq!(result, report);
     }
 }
