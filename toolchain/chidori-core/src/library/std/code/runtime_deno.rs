@@ -9,13 +9,18 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use crate::execution::primitives::cells::{CellTypes, CodeCell};
-use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue};
+use crate::execution::primitives::serialized_value::{
+    json_value_to_serialized_value, RkyvObjectBuilder, RkyvSerializedValue,
+};
+use chidori_static_analysis::language::javascript::parse::{build_report, extract_dependencies_js};
+use deno_core::_ops::RustToV8NoScope;
 use deno_core::v8::{HandleScope, Local, Object};
 use pyo3::types::{PyCFunction, PyDict, PyTuple};
 use pyo3::PyResult;
 use std::collections::HashMap;
 use std::hash::Hash;
 
+// TODO: need to override console.log
 // TODO: https://deno.com/blog/roll-your-own-javascript-runtime-pt2
 // TODO: validate suspension and resumption of execution based on a method that we provide
 
@@ -211,7 +216,7 @@ impl op_set_globals {
                 .functions
                 .insert(function_name.clone(), function);
             js_code.push_str(&format!(
-                "globalThis.{function_name} = (...data) => Deno.core.ops.op_call_rust(\"test_function\", data, {});\n",
+                "globalThis.{function_name} = (...data) => Deno.core.ops.op_call_rust(\"{function_name}\", data, {});\n",
                 function_name = function_name
             ));
         }
@@ -223,11 +228,6 @@ impl op_set_globals {
 
         v8::String::new(scope, &"Success".to_string()).unwrap()
     }
-}
-
-fn generic_callback(data: &str) -> String {
-    // Process the data and return a response
-    format!("Processed by Rust: {}", data)
 }
 
 type InternalClosureFnMut = Box<
@@ -257,7 +257,7 @@ fn create_function_shims(
                     }) = &cell
                     {
                         if cell_depended_values.contains_key(&clone_function_name) {
-                            let closure_callable:  InternalClosureFnMut  = Box::new(move |args: Vec<RkyvSerializedValue>, kwargs: Option<HashMap<String, RkyvSerializedValue>>| {
+                            let closure_callable: InternalClosureFnMut  = Box::new(move |args: Vec<RkyvSerializedValue>, kwargs: Option<HashMap<String, RkyvSerializedValue>>| {
                                 let total_arg_payload = RkyvObjectBuilder::new();
                                 let total_arg_payload = total_arg_payload.insert_value("args", {
                                     let mut m = HashMap::new();
@@ -305,22 +305,31 @@ fn create_function_shims(
 }
 
 pub fn source_code_run_deno(
-    source_code: String,
+    source_code: &String,
     payload: &RkyvSerializedValue,
-    function_invocation: Option<String>,
-) -> Result<Option<Value>> {
+    function_invocation: &Option<String>,
+) -> anyhow::Result<(
+    crate::execution::primitives::serialized_value::RkyvSerializedValue,
+    Vec<String>,
+)> {
+    let dependencies = extract_dependencies_js(&source_code);
+    let report = build_report(&dependencies);
+
+    // A list of function names this block of code is depending on existing
     let mut cell_depended_values = HashMap::new();
-    cell_depended_values.insert("test_function".to_string(), "test_function".to_string());
+    if let RkyvSerializedValue::Object(ref payload_map) = payload {
+        if let Some(RkyvSerializedValue::Object(functions_map)) = payload_map.get("functions") {
+            for (function_name, value) in functions_map {
+                cell_depended_values.insert(function_name.clone(), function_name.clone());
+            }
+        }
+    }
 
     let my_op_state = Arc::new(Mutex::new(MyOpState {
         payload: payload.clone(),
         cell_depended_values: cell_depended_values,
         functions: Default::default(),
     }));
-
-    // Wrap the callback in a Box<dyn Fn()> and share it across threads safely using Arc<Mutex<>>.
-    let callback: Arc<Mutex<Box<dyn Fn(&str) -> String>>> =
-        Arc::new(Mutex::new(Box::new(generic_callback)));
 
     let ext = Extension {
         name: "my_ext",
@@ -366,30 +375,44 @@ pub fn source_code_run_deno(
         ),
     )?;
 
-    // TODO: the script receives the arguments as a json payload "#state"
-
-    // Wrap the source code in an entrypoint function so that it immediately evaluates
-    let wrapped_source_code = format!(
-        r#"(function main() {{
-        {}
-    }})();"#,
-        source_code
-    );
-
+    dbg!(&payload);
+    dbg!(&source_code);
+    // panic!("here");
     let result = runtime.execute_script(
         "main.js",
-        FastString::Owned(wrapped_source_code.into_boxed_str()),
+        FastString::Owned(source_code.clone().into_boxed_str()),
     );
 
+    if let Err(e) = result {
+        return Err(e);
+    }
+
+    // TODO: if not function calling api
+    // TODO: For function calling we're going to need another operator that accepts a function
+
+    // create shims for functions that are referred to
+    let mut js_code = String::new();
+    for (name, report_item) in &report.cell_exposed_values {
+        js_code.push_str("const chidoriResult = {};\n");
+        js_code.push_str(&format!(
+            r#"chidoriResult["{name}"] = {name};
+            "#,
+            name = name
+        ));
+        js_code.push_str("chidoriResult");
+    }
+
+    let result = runtime.execute_script("output.js", FastString::Owned(js_code.into()));
+
+    let scope = &mut runtime.handle_scope();
     match result {
         Ok(global) => {
-            let scope = &mut runtime.handle_scope();
             let local = v8::Local::new(scope, global);
             let deserialized_value = serde_v8::from_v8::<serde_json::Value>(scope, local);
             return Ok(if let Ok(value) = deserialized_value {
-                Some(value)
+                (json_value_to_serialized_value(&value), vec![])
             } else {
-                None
+                (RkyvSerializedValue::Null, vec![])
             });
         }
         Err(e) => Err(e),
@@ -405,9 +428,9 @@ mod tests {
 
     #[test]
     fn test_source_code_run_with_external_function_invocation() {
-        let source_code = String::from(r#"return test_function(5, 5);"#);
+        let source_code = String::from(r#"const y = test_function(5, 5);"#);
         let result = source_code_run_deno(
-            source_code,
+            &source_code,
             &RkyvObjectBuilder::new()
                 .insert_object(
                     "functions",
@@ -415,7 +438,7 @@ mod tests {
                         "test_function",
                         RkyvSerializedValue::Cell(CellTypes::Code(
                             crate::execution::primitives::cells::CodeCell {
-                                language: SupportedLanguage::Python,
+                                language: SupportedLanguage::PyO3,
                                 source_code: String::from(indoc! { r#"
                                     def test_function(a, b):
                                         return a + b
@@ -427,16 +450,22 @@ mod tests {
                     ),
                 )
                 .build(),
-            None,
+            &None,
         );
-        assert_eq!(result.unwrap(), Some(serde_json::json!(10)));
+        assert_eq!(
+            result.unwrap(),
+            (
+                RkyvObjectBuilder::new().insert_number("y", 10).build(),
+                vec![]
+            )
+        );
     }
 
     #[test]
     fn test_source_code_run_globals_set_by_payload() {
-        let source_code = String::from(r#"return a + b;"#);
+        let source_code = String::from("const z = a + b;");
         let result = source_code_run_deno(
-            source_code,
+            &source_code,
             &RkyvObjectBuilder::new()
                 .insert_object(
                     "globals",
@@ -445,29 +474,64 @@ mod tests {
                         .insert_number("b", 5),
                 )
                 .build(),
-            None,
+            &None,
         );
-        assert_eq!(result.unwrap(), Some(serde_json::json!(25)));
+        assert_eq!(
+            result.unwrap(),
+            (
+                RkyvObjectBuilder::new().insert_number("z", 25).build(),
+                vec![]
+            )
+        );
     }
 
     #[test]
     fn test_source_code_run_deno_success() {
-        let source_code = String::from("return 42;");
-        let result = source_code_run_deno(source_code, &RkyvSerializedValue::Null, None);
-        assert_eq!(result.unwrap(), Some(serde_json::json!(42)));
+        let source_code = String::from("const x = 42;");
+        let result = source_code_run_deno(&source_code, &RkyvSerializedValue::Null, &None);
+        assert_eq!(
+            result.unwrap(),
+            (
+                RkyvObjectBuilder::new().insert_number("x", 42).build(),
+                vec![]
+            )
+        );
     }
 
     #[test]
     fn test_source_code_run_deno_failure() {
         let source_code = String::from("throw new Error('Test Error');");
-        let result = source_code_run_deno(source_code, &RkyvSerializedValue::Null, None);
+        let result = source_code_run_deno(&source_code, &RkyvSerializedValue::Null, &None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_source_code_run_deno_json_serialization() {
-        let source_code = String::from("return {foo: 'bar'};");
-        let result = source_code_run_deno(source_code, &RkyvSerializedValue::Null, None);
-        assert_eq!(result.unwrap(), Some(serde_json::json!({"foo": "bar"})));
+        let source_code = String::from("const obj  = {foo: 'bar'};");
+        let result = source_code_run_deno(&source_code, &RkyvSerializedValue::Null, &None);
+        assert_eq!(
+            result.unwrap(),
+            (
+                RkyvObjectBuilder::new()
+                    .insert_object(
+                        "obj",
+                        RkyvObjectBuilder::new().insert_string("foo", "bar".to_string())
+                    )
+                    .build(),
+                vec![]
+            )
+        );
+    }
+    #[test]
+    fn test_source_code_run_deno_expose_global_variables() {
+        let source_code = String::from("const x = 30;");
+        let result = source_code_run_deno(&source_code, &RkyvSerializedValue::Null, &None);
+        assert_eq!(
+            result.unwrap(),
+            (
+                RkyvObjectBuilder::new().insert_number("x", 30).build(),
+                vec![]
+            )
+        );
     }
 }

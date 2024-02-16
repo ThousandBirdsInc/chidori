@@ -1,3 +1,4 @@
+use crate::language::{Report, ReportItem, ReportTriggerableFunctions};
 use rustpython_parser::ast::{Constant, Expr, Identifier, Stmt};
 use rustpython_parser::{ast, Parse};
 use serde::{Deserialize, Serialize};
@@ -370,6 +371,7 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                     traverse_expression(decorator, machine);
                     machine.pop_until(idx);
                 }
+                // TODO: make this less uniquely handled in the traversal
                 for ast::ArgWithDefault {
                     range,
                     def,
@@ -590,29 +592,6 @@ def is_odd(i):
     assert!(ast.is_ok());
 }
 
-// TODO: it would be helpful if reports noted if a value is a global, an arg, or a kwarg
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ReportItem {
-    context_path: Vec<ContextPath>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ReportTriggerableFunctions {
-    context_path: Vec<ContextPath>,
-    // TODO: these need their own set of depended values
-    // TODO: we need to extract signatures for triggerable functions
-    emit_event: Vec<String>,
-    trigger_on: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Report {
-    pub cell_exposed_values: HashMap<String, ReportItem>,
-    pub cell_depended_values: HashMap<String, ReportItem>,
-    pub triggerable_functions: HashMap<String, ReportTriggerableFunctions>,
-    pub declared_functions: HashMap<String, ReportTriggerableFunctions>,
-}
-
 pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
     // TODO: get all exposed values
     // TODO: get all values referred to but are not available in a given context
@@ -638,7 +617,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                     triggerable_functions
                         .entry(name.clone())
                         .or_insert_with(|| ReportTriggerableFunctions {
-                            context_path: context_path.clone(),
+                            // context_path: context_path.clone(),
                             emit_event: vec![],
                             trigger_on: vec![],
                         });
@@ -654,7 +633,6 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                                 let mut x = triggerable_functions
                                     .entry(name.clone())
                                     .or_insert_with(|| ReportTriggerableFunctions {
-                                        context_path: context_path.clone(),
                                         emit_event: vec![], // Initialize with an empty string or a default value
                                         trigger_on: vec![],
                                     });
@@ -674,7 +652,6 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                                 let mut x = triggerable_functions
                                     .entry(name.clone())
                                     .or_insert_with(|| ReportTriggerableFunctions {
-                                        context_path: context_path.clone(),
                                         emit_event: vec![], // Initialize with an empty string or a default value
                                         trigger_on: vec![],
                                     });
@@ -692,7 +669,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                         depended_values.insert(
                             identifier.clone(),
                             ReportItem {
-                                context_path: context_path.clone(),
+                                // context_path: context_path.clone(),
                             },
                         );
                     } else {
@@ -711,7 +688,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                             exposed_values.insert(
                                 identifier.clone(),
                                 ReportItem {
-                                    context_path: context_path.clone(),
+                                    // context_path: context_path.clone(),
                                 },
                             );
                         }
@@ -747,15 +724,28 @@ mod tests {
             vec![
                 vec![
                     ContextPath::InCallExpression,
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute(String::from("llm")),
-                    ContextPath::ChName
+                    ContextPath::Constant(String::from("default")),
                 ],
                 vec![
                     ContextPath::InCallExpression,
+                    ContextPath::Constant(String::from("default")),
+                    ContextPath::InCallExpression,
+                    ContextPath::Constant(String::from("openai")),
+                ],
+                vec![
+                    ContextPath::InCallExpression,
+                    ContextPath::Constant(String::from("default")),
+                    ContextPath::InCallExpression,
+                    ContextPath::Constant(String::from("openai")),
+                    ContextPath::Attribute(String::from("llm")),
+                    ContextPath::IdentifierReferredTo(String::from("ch"), false),
+                ],
+                vec![
+                    ContextPath::InCallExpression,
+                    ContextPath::Constant(String::from("default")),
                     ContextPath::Attribute(String::from("configure")),
                     ContextPath::Attribute(String::from("prompt")),
-                    ContextPath::ChName
+                    ContextPath::IdentifierReferredTo(String::from("ch"), false),
                 ],
             ]
         );
@@ -783,11 +773,20 @@ mod tests {
         let context_stack_references = extract_dependencies_python(python_source);
         assert_eq!(
             context_stack_references,
-            vec![vec![
-                ContextPath::InFunction(String::from("create_dockerfile")),
-                ContextPath::InCallExpression,
-                ContextPath::IdentifierReferredTo(String::from("prompt"), false),
-            ],]
+            vec![
+                vec![ContextPath::InFunction(String::from("create_dockerfile")),],
+                vec![
+                    ContextPath::InFunction(String::from("create_dockerfile")),
+                    ContextPath::InCallExpression,
+                    ContextPath::Constant(String::from("prompts/create_dockerfile")),
+                ],
+                vec![
+                    ContextPath::InFunction(String::from("create_dockerfile")),
+                    ContextPath::InCallExpression,
+                    ContextPath::Constant(String::from("prompts/create_dockerfile")),
+                    ContextPath::IdentifierReferredTo(String::from("prompt"), false),
+                ],
+            ]
         );
     }
 
@@ -802,18 +801,25 @@ mod tests {
         assert_eq!(
             context_stack_references,
             vec![
+                vec![ContextPath::InFunction(String::from("migration_agent")),],
                 vec![
                     ContextPath::InFunction(String::from("migration_agent")),
                     ContextPath::InFunctionDecorator(0),
                     ContextPath::InCallExpression,
                     ContextPath::Attribute(String::from("register")),
-                    ContextPath::ChName
+                    ContextPath::IdentifierReferredTo(String::from("ch"), false),
                 ],
                 vec![
                     ContextPath::InFunction(String::from("migration_agent")),
                     ContextPath::InCallExpression,
+                    ContextPath::Constant(String::from("bar")),
+                ],
+                vec![
+                    ContextPath::InFunction(String::from("migration_agent")),
+                    ContextPath::InCallExpression,
+                    ContextPath::Constant(String::from("bar")),
                     ContextPath::Attribute(String::from("set")),
-                    ContextPath::ChName
+                    ContextPath::IdentifierReferredTo(String::from("ch"), false),
                 ]
             ]
         );
@@ -831,31 +837,53 @@ mod tests {
         assert_eq!(
             context_stack_references,
             vec![
+                vec![ContextPath::InFunction("dispatch_agent".to_string())],
                 vec![
-                    ContextPath::InFunction(String::from("dispatch_agent")),
+                    ContextPath::InFunction("dispatch_agent".to_string()),
                     ContextPath::InFunctionDecorator(0),
                     ContextPath::InCallExpression,
-                    ContextPath::Attribute(String::from("on_event")),
-                    ContextPath::ChName
+                    ContextPath::Constant("new_file".to_string())
                 ],
                 vec![
-                    ContextPath::InFunction(String::from("dispatch_agent")),
+                    ContextPath::InFunction("dispatch_agent".to_string()),
+                    ContextPath::InFunctionDecorator(0),
+                    ContextPath::InCallExpression,
+                    ContextPath::Constant("new_file".to_string()),
+                    ContextPath::Attribute("on_event".to_string()),
+                    ContextPath::IdentifierReferredTo("ch".to_string(), false)
+                ],
+                vec![
+                    ContextPath::InFunction("dispatch_agent".to_string()),
                     ContextPath::InFunctionDecorator(1),
                     ContextPath::InCallExpression,
-                    ContextPath::Attribute(String::from("emit_as")),
-                    ContextPath::ChName
+                    ContextPath::Constant("file_created".to_string())
                 ],
                 vec![
-                    ContextPath::InFunction(String::from("dispatch_agent")),
+                    ContextPath::InFunction("dispatch_agent".to_string()),
+                    ContextPath::InFunctionDecorator(1),
                     ContextPath::InCallExpression,
-                    ContextPath::Attribute(String::from("file_path")),
-                    ContextPath::IdentifierReferredTo(String::from("ev"), true)
+                    ContextPath::Constant("file_created".to_string()),
+                    ContextPath::Attribute("emit_as".to_string()),
+                    ContextPath::IdentifierReferredTo("ch".to_string(), false)
                 ],
                 vec![
-                    ContextPath::InFunction(String::from("dispatch_agent")),
+                    ContextPath::InFunction("dispatch_agent".to_string()),
                     ContextPath::InCallExpression,
-                    ContextPath::Attribute(String::from("set")),
-                    ContextPath::ChName
+                    ContextPath::Constant("file_path".to_string())
+                ],
+                vec![
+                    ContextPath::InFunction("dispatch_agent".to_string()),
+                    ContextPath::InCallExpression,
+                    ContextPath::Constant("file_path".to_string()),
+                    ContextPath::Attribute("file_path".to_string()),
+                    ContextPath::IdentifierReferredTo("ev".to_string(), true)
+                ],
+                vec![
+                    ContextPath::InFunction("dispatch_agent".to_string()),
+                    ContextPath::InCallExpression,
+                    ContextPath::Constant("file_path".to_string()),
+                    ContextPath::Attribute("set".to_string()),
+                    ContextPath::IdentifierReferredTo("ch".to_string(), false)
                 ],
             ]
         );
@@ -872,17 +900,25 @@ mod tests {
         assert_eq!(
             context_stack_references,
             vec![
+                vec![ContextPath::InFunction(String::from("evaluate_agent")),],
                 vec![
                     ContextPath::InFunction(String::from("evaluate_agent")),
                     ContextPath::InCallExpression,
+                    ContextPath::Constant(String::from("file_path")),
+                ],
+                vec![
+                    ContextPath::InFunction(String::from("evaluate_agent")),
+                    ContextPath::InCallExpression,
+                    ContextPath::Constant(String::from("file_path")),
                     ContextPath::Attribute(String::from("file_path")),
                     ContextPath::IdentifierReferredTo(String::from("ev"), true),
                 ],
                 vec![
                     ContextPath::InFunction(String::from("evaluate_agent")),
                     ContextPath::InCallExpression,
+                    ContextPath::Constant(String::from("file_path")),
                     ContextPath::Attribute(String::from("set")),
-                    ContextPath::ChName
+                    ContextPath::IdentifierReferredTo(String::from("ch"), false),
                 ],
                 vec![
                     ContextPath::InFunction(String::from("evaluate_agent")),
@@ -904,6 +940,7 @@ mod tests {
         assert_eq!(
             context_stack_references,
             vec![
+                vec![ContextPath::InFunction(String::from("setup_pipeline")),],
                 vec![
                     ContextPath::InFunction(String::from("setup_pipeline")),
                     ContextPath::InFunctionDecorator(0),
@@ -915,7 +952,7 @@ mod tests {
                     ContextPath::InFunctionDecorator(0),
                     ContextPath::InCallExpression,
                     ContextPath::Attribute(String::from("p")),
-                    ContextPath::ChName
+                    ContextPath::IdentifierReferredTo(String::from("ch"), false),
                 ],
                 vec![
                     ContextPath::InFunction(String::from("setup_pipeline")),
@@ -935,6 +972,7 @@ mod tests {
         assert_eq!(
             context_stack_references,
             vec![
+                vec![ContextPath::InFunction(String::from("main")),],
                 vec![
                     ContextPath::InFunction(String::from("main")),
                     ContextPath::InCallExpression,
@@ -972,11 +1010,11 @@ mod tests {
                 map.insert(
                     "y".to_string(),
                     ReportItem {
-                        context_path: vec![
-                            ContextPath::InFunction("testing".to_string()),
-                            ContextPath::AssignmentFromStatement,
-                            ContextPath::IdentifierReferredTo("y".to_string(), false),
-                        ],
+                        // context_path: vec![
+                        //     ContextPath::InFunction("testing".to_string()),
+                        //     ContextPath::AssignmentFromStatement,
+                        //     ContextPath::IdentifierReferredTo("y".to_string(), false),
+                        // ],
                     },
                 );
                 map
@@ -986,7 +1024,7 @@ mod tests {
                 map.insert(
                     "testing".to_string(),
                     ReportTriggerableFunctions {
-                        context_path: vec![ContextPath::InFunction("testing".to_string())],
+                        // context_path: vec![ContextPath::InFunction("testing".to_string())],
                         emit_event: vec!["file_created".to_string()],
                         trigger_on: vec!["new_file".to_string()],
                     },
@@ -1019,10 +1057,10 @@ x = random.randint(0, 10)
                 map.insert(
                     "x".to_string(),
                     ReportItem {
-                        context_path: vec![
-                            ContextPath::AssignmentToStatement,
-                            ContextPath::IdentifierReferredTo("x".to_string(), false),
-                        ],
+                        // context_path: vec![
+                        //     ContextPath::AssignmentToStatement,
+                        //     ContextPath::IdentifierReferredTo("x".to_string(), false),
+                        // ],
                     },
                 );
                 map
@@ -1032,15 +1070,15 @@ x = random.randint(0, 10)
                 map.insert(
                     "function_that_doesnt_exist".to_string(),
                     ReportItem {
-                        context_path: vec![
-                            ContextPath::InFunction("fun_name".to_string()),
-                            ContextPath::AssignmentFromStatement,
-                            ContextPath::InCallExpression,
-                            ContextPath::IdentifierReferredTo(
-                                "function_that_doesnt_exist".to_string(),
-                                false,
-                            ),
-                        ],
+                        // context_path: vec![
+                        //     ContextPath::InFunction("fun_name".to_string()),
+                        //     ContextPath::AssignmentFromStatement,
+                        //     ContextPath::InCallExpression,
+                        //     ContextPath::IdentifierReferredTo(
+                        //         "function_that_doesnt_exist".to_string(),
+                        //         false,
+                        //     ),
+                        // ],
                     },
                 );
                 map
@@ -1050,7 +1088,7 @@ x = random.randint(0, 10)
                 map.insert(
                     "fun_name".to_string(),
                     ReportTriggerableFunctions {
-                        context_path: vec![ContextPath::InFunction("fun_name".to_string())],
+                        // context_path: vec![ContextPath::InFunction("fun_name".to_string())],
                         emit_event: vec![],
                         trigger_on: vec![],
                     },

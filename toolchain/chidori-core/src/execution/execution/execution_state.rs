@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Formatter;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub enum DependencyGraphMutation {
@@ -26,14 +27,15 @@ pub enum DependencyGraphMutation {
     },
 }
 
+// TODO: make this thread-safe
 #[derive(Clone)]
 pub struct ExecutionState {
     // TODO: update all operations to use this id instead of a separate representation
     id: (usize, usize),
 
-    state: ImHashMap<usize, Rc<RkyvSerializedValue>>,
+    state: ImHashMap<usize, Arc<RkyvSerializedValue>>,
 
-    pub operation_by_id: ImHashMap<OperationId, Rc<RefCell<OperationNode>>>,
+    pub operation_by_id: ImHashMap<OperationId, Arc<Mutex<OperationNode>>>,
 
     /// Note what keys have _ever_ been set, which is an optimization to avoid needing to do
     /// a complete historical traversal to verify that a value has been set.
@@ -103,7 +105,7 @@ impl ExecutionState {
     }
 
     pub fn state_insert(&mut self, operation_id: OperationId, value: RkyvSerializedValue) {
-        self.state.insert(operation_id, Rc::new(value));
+        self.state.insert(operation_id, Arc::new(value));
         self.has_been_set.insert(operation_id);
     }
 
@@ -135,7 +137,7 @@ impl ExecutionState {
     pub fn add_operation(&mut self, node: usize, operation_node: OperationNode) -> Self {
         let mut s = self.clone();
         s.operation_by_id
-            .insert(node.clone(), Rc::new(RefCell::new(operation_node)));
+            .insert(node.clone(), Arc::new(Mutex::new(operation_node)));
         s
     }
 
@@ -167,16 +169,22 @@ impl ExecutionState {
         s
     }
 
-    pub fn step_execution(&self) -> ExecutionState {
+    pub fn step_execution(&self) -> (ExecutionState, Vec<(usize, RkyvSerializedValue)>) {
         let previous_state = self;
         let mut new_state = previous_state.clone();
         let mut operation_by_id = previous_state.operation_by_id.clone();
         let dependency_graph = previous_state.get_dependency_graph();
         let mut marked_for_consumption = HashSet::new();
 
+        let mut outputs = vec![];
+
         // Every tick, every operation consumes from each of its incoming edges.
         'traverse_nodes: for operation_id in dependency_graph.nodes() {
-            let mut op_node = operation_by_id.get_mut(&operation_id).unwrap().borrow_mut();
+            let mut op_node = operation_by_id
+                .get_mut(&operation_id)
+                .unwrap()
+                .lock()
+                .unwrap();
             let signature = &op_node.signature.input_signature;
 
             let mut args = HashMap::new();
@@ -222,7 +230,8 @@ impl ExecutionState {
                                     .operation_by_id
                                     .get(&from)
                                     .expect("Operation must exist")
-                                    .borrow();
+                                    .lock()
+                                    .unwrap();
                                 functions.insert(
                                     name.clone(),
                                     RkyvSerializedValue::Cell(op.cell.clone()),
@@ -237,10 +246,8 @@ impl ExecutionState {
                 }
             }
 
-            dbg!(operation_id, &args, &kwargs, &globals, &signature);
-
             // Some of the required arguments are not yet available, continue to the next node
-            if !signature.validate_input_against_signature(&args, &kwargs, &globals) {
+            if !signature.validate_input_against_signature(&args, &kwargs, &globals, &functions) {
                 continue 'traverse_nodes;
             }
 
@@ -268,11 +275,11 @@ impl ExecutionState {
             // Execute the operation
             // TODO: support async/parallel execution
             let result = op_node.execute(argument_payload);
-
-            new_state.state_insert(operation_id, result.clone());
+            outputs.push((operation_id, result.clone()));
+            new_state.state_insert(operation_id, result);
         }
         new_state.state_consume_marked(marked_for_consumption);
-        new_state
+        (new_state, outputs)
     }
 }
 

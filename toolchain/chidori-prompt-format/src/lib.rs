@@ -59,11 +59,16 @@ pub fn extract_roles_from_template(template: &str) -> JsValue {
         .unwrap()
 }
 
-#[wasm_bindgen]
-pub fn extract_yaml_frontmatter(template: &str) -> JsValue {
+pub fn extract_yaml_frontmatter_string(template: &str) -> (HashMap<String, String>, String) {
     let result = crate::templating::templates::extract_frontmatter(&template).unwrap();
     let deserialized_data: HashMap<String, String> = serde_yaml::from_str(&result.0).unwrap();
-    serde_wasm_bindgen::to_value(&(deserialized_data, result.1))
+    (deserialized_data, result.1)
+}
+
+#[wasm_bindgen]
+pub fn extract_yaml_frontmatter(template: &str) -> JsValue {
+    let x = extract_yaml_frontmatter_string(&template);
+    serde_wasm_bindgen::to_value(&x)
         .map_err(|e| JsValue::from_str(&e.to_string()))
         .unwrap()
 }

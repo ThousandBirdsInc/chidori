@@ -8,4 +8,3 @@ mod cells;
 pub mod execution;
 pub mod library;
 pub mod sdk;
-pub mod utils;

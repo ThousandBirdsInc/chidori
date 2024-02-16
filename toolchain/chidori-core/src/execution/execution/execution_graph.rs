@@ -5,6 +5,7 @@ use crate::execution::primitives::identifiers::{DependencyReference, OperationId
 use petgraph::data::Build;
 use petgraph::dot::Dot;
 
+use crate::execution::primitives::serialized_value::RkyvSerializedValue;
 use petgraph::graphmap::DiGraphMap;
 use petgraph::visit::IntoEdgesDirected;
 use petgraph::Direction;
@@ -85,11 +86,17 @@ impl ExecutionGraph {
         &mut self,
         prev_execution_id: (usize, usize),
         previous_state: &ExecutionState,
-    ) -> ((usize, usize), ExecutionState) {
-        let new_state = previous_state.step_execution();
+    ) -> (
+        ((usize, usize), ExecutionState),
+        Vec<(usize, RkyvSerializedValue)>,
+    ) {
+        let (new_state, outputs) = previous_state.step_execution();
         // The edge from this node is the greatest branching id + 1
         // if we re-evaluate execution at a given node, we get a new execution branch.
-        self.add_execution_edge(prev_execution_id, new_state.clone(), new_state)
+        (
+            self.add_execution_edge(prev_execution_id, new_state.clone(), new_state),
+            outputs,
+        )
     }
 }
 
@@ -172,7 +179,7 @@ mod tests {
         state.state_insert(1, arg0);
         state.state_insert(2, arg1);
 
-        let (_, new_state) = db.step_execution(state_id, &state.clone());
+        let ((_, new_state), _) = db.step_execution(state_id, &state.clone());
 
         assert!(new_state.state_get(&3).is_some());
         let result = new_state.state_get(&3).unwrap();
@@ -211,7 +218,7 @@ mod tests {
                 depends_on: vec![(0, DependencyReference::Positional(0))],
             }]);
 
-        let (_, new_state) = db.step_execution(state_id, &state);
+        let ((_, new_state), _) = db.step_execution(state_id, &state);
         assert_eq!(
             new_state.state_get(&1).unwrap(),
             &RkyvSerializedValue::Number(1)
@@ -270,13 +277,13 @@ mod tests {
             },
         ]);
 
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get(&2), None);
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), Some(&RSV::Number(2)));
     }
@@ -346,14 +353,14 @@ mod tests {
             },
         ]);
 
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), None);
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), Some(&RSV::Number(2)));
         assert_eq!(state.state_get(&3), Some(&RSV::Number(3)));
@@ -441,18 +448,18 @@ mod tests {
             },
         ]);
 
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get(&2), None);
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), Some(&RSV::Number(2)));
         assert_eq!(state.state_get(&3), Some(&RSV::Number(3)));
         assert_eq!(state.state_get(&4), None);
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), None);
@@ -572,53 +579,53 @@ mod tests {
         ]);
 
         // We expect to see the value at each node increment repeatedly.
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
 
         assert_eq!(state.state_get(&1), Some(&RSV::Number(2)));
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), None);
         assert_eq!(state.state_get(&4), None);
         assert_eq!(state.state_get(&5), None);
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), Some(&RSV::Number(3)));
         assert_eq!(state.state_get(&3), None);
         assert_eq!(state.state_get(&4), None);
         assert_eq!(state.state_get(&5), None);
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), None);
         assert_eq!(state.state_get(&4), Some(&RSV::Number(4)));
         assert_eq!(state.state_get(&5), None);
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), Some(&RSV::Number(5)));
         assert_eq!(state.state_get(&4), None);
         assert_eq!(state.state_get(&5), Some(&RSV::Number(5)));
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), Some(&RSV::Number(6)));
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), None);
         assert_eq!(state.state_get(&4), None);
         assert_eq!(state.state_get(&5), Some(&RSV::Number(5)));
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), Some(&RSV::Number(7)));
         assert_eq!(state.state_get(&3), None);
         assert_eq!(state.state_get(&4), None);
         assert_eq!(state.state_get(&5), Some(&RSV::Number(5)));
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), None);
         assert_eq!(state.state_get(&4), Some(&RSV::Number(8)));
         assert_eq!(state.state_get(&5), Some(&RSV::Number(5)));
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), Some(&RSV::Number(9)));
@@ -693,20 +700,20 @@ mod tests {
             },
         ]);
 
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
-        let (x_state_id, x_state) = db.step_execution(state_id, &state);
+        let ((x_state_id, x_state), _) = db.step_execution(state_id, &state);
         assert_eq!(x_state.state_get(&1), Some(&RSV::Number(1)));
         assert_eq!(x_state.state_get(&2), None);
 
-        let (state_id, state) = db.step_execution(x_state_id.clone(), &x_state.clone());
+        let ((state_id, state), _) = db.step_execution(x_state_id.clone(), &x_state.clone());
         assert_eq!(state_id.0, 0);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), Some(&RSV::Number(2)));
 
         // When we re-evaluate from a previous point, we should get a new branch
-        let (state_id, state) = db.step_execution(x_state_id.clone(), &x_state);
+        let ((state_id, state), _) = db.step_execution(x_state_id.clone(), &x_state);
         // The state_id.0 being incremented indicates that we're on a new branch
         assert_eq!(state_id.0, 1);
         assert_eq!(state.state_get(&1), None);
@@ -790,13 +797,13 @@ mod tests {
             },
         ]);
 
-        let (x_state_id, mut x_state) = db.step_execution(state_id, &state);
+        let ((x_state_id, mut x_state), _) = db.step_execution(state_id, &state);
         assert_eq!(x_state.state_get(&1), None);
         assert_eq!(x_state.state_get(&2), None);
-        let (state_id, state) = db.step_execution(x_state_id, &x_state.clone());
+        let ((state_id, state), _) = db.step_execution(x_state_id, &x_state.clone());
         assert_eq!(state.state_get(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get(&2), None);
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), Some(&RSV::Number(2)));
 
@@ -810,10 +817,10 @@ mod tests {
             ),
         );
 
-        let (state_id, state) = db.step_execution(state_id, &state.clone());
+        let ((state_id, state), _) = db.step_execution(state_id, &state.clone());
         assert_eq!(state.state_get(&1), Some(&RSV::Number(200)));
         assert_eq!(state.state_get(&2), None);
-        let (state_id, state) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &state);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), Some(&RSV::Number(201)));
     }

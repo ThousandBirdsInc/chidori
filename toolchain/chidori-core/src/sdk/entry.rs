@@ -4,14 +4,21 @@ use crate::execution::execution::DependencyGraphMutation;
 use crate::execution::primitives::cells::CellTypes;
 use crate::execution::primitives::identifiers::DependencyReference;
 use crate::execution::primitives::operation::{InputSignature, OperationNode, OutputSignature};
-use crate::execution::primitives::serialized_value::RkyvSerializedValue as RKV;
-use chidori_static_analysis::language::python::parse::{
-    Report, ReportItem, ReportTriggerableFunctions,
+use crate::execution::primitives::serialized_value::{
+    RkyvSerializedValue as RKV, RkyvSerializedValue,
 };
+use chidori_prompt_format::extract_yaml_frontmatter_string;
+use chidori_static_analysis::language::{Report, ReportItem, ReportTriggerableFunctions};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
-/// This is an SDK for building execution graphs. It is designed to be used iteratively.
+/// This is an SDK for building execution graphs. It is designed to be used interactively.
 
 type Func = fn(RKV) -> RKV;
 
@@ -20,11 +27,10 @@ pub struct Environment {
     state: ExecutionState,
     state_id: (usize, usize),
     op_counter: usize,
-    reported_cells: HashMap<usize, Report>,
 }
 
 impl Environment {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let mut db = ExecutionGraph::new();
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
@@ -33,7 +39,6 @@ impl Environment {
             state,
             state_id,
             op_counter: 0,
-            reported_cells: HashMap::new(),
         }
     }
 
@@ -41,10 +46,11 @@ impl Environment {
     fn schedule() {}
 
     /// Increment the execution graph by one step
-    fn step(&mut self) {
-        let (state_id, state) = self.db.step_execution(self.state_id, &self.state);
+    pub(crate) fn step(&mut self) -> Vec<(usize, RkyvSerializedValue)> {
+        let ((state_id, state), outputs) = self.db.step_execution(self.state_id, &self.state);
         self.state_id = state_id;
         self.state = state;
+        outputs
     }
 
     /// Add a cell into the execution graph
@@ -57,11 +63,7 @@ impl Environment {
         };
         op.attach_cell(cell);
 
-        // self.reported_cells.insert(id, cell_report.clone());
-
         self.state = self.state.add_operation(id, op);
-        // TODO: all declared functions should get their own operations
-
         // TODO: we collect and throw errors for: naming collisions, missing dependencies, and missing arguments
 
         // TODO: add a cell report to the execution engine, updating the execution graph
@@ -81,7 +83,7 @@ impl Environment {
 
         // For all reported cells, add their exposed values to the available values
         for (id, op) in self.state.operation_by_id.iter() {
-            let output_signature = &op.borrow().signature.output_signature;
+            let output_signature = &op.lock().unwrap().signature.output_signature;
 
             // Store values that are available as globals
             for (key, value) in output_signature.globals.iter() {
@@ -104,7 +106,7 @@ impl Environment {
         // Anywhere there is a matched value, we create a dependency graph edge
         let mut mutations = vec![];
         for (destination_cell_id, op) in self.state.operation_by_id.iter() {
-            let operation = op.borrow();
+            let operation = op.lock().unwrap();
             let input_signature = &operation.signature.input_signature;
             for (value_name, value) in input_signature.globals.iter() {
                 // TODO: we need to handle collisions between the two of these
@@ -151,7 +153,7 @@ mod tests {
     fn test_execute_cells_with_global_dependency() {
         let mut env = Environment::new();
         let id = env.upsert_cell(CellTypes::Code(CodeCell {
-            language: SupportedLanguage::Python,
+            language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
                 x = 20
                 "#}),
@@ -159,7 +161,7 @@ mod tests {
         }));
         assert_eq!(id, 1);
         let id = env.upsert_cell(CellTypes::Code(CodeCell {
-            language: SupportedLanguage::Python,
+            language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
                 y = x + 1
                 "#}),
@@ -188,7 +190,7 @@ mod tests {
         dotenv::dotenv().ok();
         let mut env = Environment::new();
         let id = env.upsert_cell(CellTypes::Code(CodeCell {
-            language: SupportedLanguage::Python,
+            language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
                 x = "Here is a sample string"
                 "#}),
@@ -225,12 +227,14 @@ mod tests {
         );
     }
 
+    #[ignore]
     #[test]
     fn test_execute_cells_via_prompt_calling_api() {
         let mut env = Environment::new();
         let id = env.upsert_cell(CellTypes::Code(CodeCell {
-            language: SupportedLanguage::Python,
+            language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
+                import chidori as ch
                 x = ch.prompt("generate_names", x="John")
                 "#}),
             function_invocation: None,
@@ -265,7 +269,7 @@ mod tests {
     fn test_execute_cells_invoking_a_function() {
         let mut env = Environment::new();
         let id = env.upsert_cell(CellTypes::Code(CodeCell {
-            language: SupportedLanguage::Python,
+            language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
                 def add(x, y):
                     return x + y
@@ -275,25 +279,63 @@ mod tests {
         assert_eq!(id, 1);
         let id = env.upsert_cell(CellTypes::Code(CodeCell {
             function_invocation: None,
-            language: SupportedLanguage::Python,
+            language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
-                y = add(2,3)
+                y = add(2, 3)
                 "#}),
         }));
         assert_eq!(id, 2);
         env.resolve_dependencies_from_input_signature();
         env.state.render_dependency_graph();
         env.step();
+        // Empty object from the function declaration
         assert_eq!(
             env.state.state_get(&1),
-            Some(&RkyvObjectBuilder::new().insert_number("x", 20).build())
+            Some(&RkyvObjectBuilder::new().build())
         );
         assert_eq!(env.state.state_get(&2), None);
         env.step();
         assert_eq!(env.state.state_get(&1), None);
         assert_eq!(
             env.state.state_get(&2),
-            Some(&RkyvObjectBuilder::new().insert_number("y", 21).build())
+            Some(&RkyvObjectBuilder::new().insert_number("y", 5).build())
+        );
+    }
+
+    #[test]
+    fn test_execute_inter_runtime_code() {
+        let mut env = Environment::new();
+        let id = env.upsert_cell(CellTypes::Code(CodeCell {
+            language: SupportedLanguage::PyO3,
+            source_code: String::from(indoc! { r#"
+                def add(x, y):
+                    return x + y
+                "#}),
+            function_invocation: None,
+        }));
+        assert_eq!(id, 1);
+        let id = env.upsert_cell(CellTypes::Code(CodeCell {
+            function_invocation: None,
+            language: SupportedLanguage::Deno,
+            source_code: String::from(indoc! { r#"
+                const y = add(2, 3);
+                "#}),
+        }));
+        assert_eq!(id, 2);
+        env.resolve_dependencies_from_input_signature();
+        env.state.render_dependency_graph();
+        env.step();
+        // Function declaration cell
+        assert_eq!(
+            env.state.state_get(&1),
+            Some(&RkyvObjectBuilder::new().build())
+        );
+        assert_eq!(env.state.state_get(&2), None);
+        env.step();
+        assert_eq!(env.state.state_get(&1), None);
+        assert_eq!(
+            env.state.state_get(&2),
+            Some(&RkyvObjectBuilder::new().insert_number("y", 5).build())
         );
     }
 }

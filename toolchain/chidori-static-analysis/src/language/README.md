@@ -53,3 +53,9 @@ of a javascript function. We can declare an LLM prompt that depends on the execu
 We extract references to our library package from the AST. 
 We then build a dependency graph between snippets of code based on that AST.
 We then execute the code in the order of the dependency graph.
+
+
+# The Future
+
+As LLMs become cheaper the entire behavior of this module can likely be replaced
+extracting these reports from source code should be trivial for most LLMs.

@@ -56,6 +56,7 @@ impl InputSignature {
         args: &HashMap<String, RkyvSerializedValue>,
         kwargs: &HashMap<String, RkyvSerializedValue>,
         globals: &HashMap<String, RkyvSerializedValue>,
+        functions: &HashMap<String, RkyvSerializedValue>,
     ) -> bool {
         // Validate args
         for (key, config) in &self.args {
@@ -73,7 +74,9 @@ impl InputSignature {
 
         // Validate globals
         for (key, config) in &self.globals {
-            if config.default.is_none() && !globals.contains_key(key) {
+            if config.default.is_none()
+                && (!globals.contains_key(key) && !functions.contains_key(key))
+            {
                 return false;
             }
         }
@@ -204,7 +207,7 @@ enum Mutability {
 /// It is up to the user to structure those maps in such a way that they don't collide with other
 /// values being represented in the state of our system. These inputs and outputs are managed
 /// by our Execution Database.
-pub type OperationFn = dyn FnMut(RkyvSerializedValue) -> RkyvSerializedValue;
+pub type OperationFn = dyn FnMut(RkyvSerializedValue) -> RkyvSerializedValue + Send;
 
 // TODO: rather than dep_count operation node should have a specific dep mapping
 pub struct OperationNode {
@@ -282,7 +285,7 @@ impl Default for OperationNode {
         OperationNode {
             id: 0,
             cell: CellTypes::Code(CodeCell {
-                language: SupportedLanguage::Python,
+                language: SupportedLanguage::PyO3,
                 source_code: "".to_string(),
                 function_invocation: None,
             }),

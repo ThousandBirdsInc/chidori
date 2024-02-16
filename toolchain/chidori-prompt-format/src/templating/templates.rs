@@ -231,17 +231,17 @@ pub fn extract_frontmatter(
     let mut front_matter = String::default();
     let mut sentinel = false;
     let mut front_matter_lines = 0;
-    let lines = markdown.lines();
+    let lines: Vec<&str> = markdown.lines().collect();
 
-    for line in lines.clone() {
+    for line in &lines {
         front_matter_lines += 1;
 
         if line.trim() == "---" {
             if sentinel {
+                // If we've encountered the second `---`, break the loop
                 break;
             }
-
-            sentinel = true;
+            sentinel = true; // Mark that we've encountered the first `---`
             continue;
         }
 
@@ -251,13 +251,16 @@ pub fn extract_frontmatter(
         }
     }
 
-    Ok((
-        front_matter,
-        lines
-            .skip(front_matter_lines)
-            .collect::<Vec<&str>>()
-            .join("\n"),
-    ))
+    if sentinel {
+        // Return front matter and the rest of the markdown if front matter was found
+        Ok((
+            front_matter.trim_end().to_string(), // Trim the trailing newline from the front matter
+            lines[front_matter_lines..].join("\n"),
+        ))
+    } else {
+        // Return the entire markdown as content with an empty front matter if no front matter was found
+        Ok((String::default(), markdown.to_string()))
+    }
 }
 
 #[wasm_bindgen]
