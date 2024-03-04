@@ -21,13 +21,13 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
-      - name: Test Prompt Graph Core
+      - name: Test Chidori Prompt Format
         run: cargo test
-        working-directory: toolchain/prompt-graph-core
-      - name: Test Prompt Graph Exec
+        working-directory: toolchain/chidori-prompt-format
+      - name: Test Chidori Static Analysis
         run: cargo test
-        working-directory: toolchain/prompt-graph-exec
-      - name: Test Chidori
+        working-directory: toolchain/chidori-static-analysis
+      - name: Test Chidori Core
         run: cargo test
-        working-directory: toolchain/chidori
+        working-directory: toolchain/chidori-core
 

@@ -13,6 +13,14 @@
       <sourceFolder url="file://$MODULE_DIR$/prompt-graph-exec/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/prompt-graph-sdk/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/prompt-graph-sdk/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-core/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-core/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-core/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-im-hashmap/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-prompt-format/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-prompt-format/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-static-analysis/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-static-analysis/tests" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/prompt-graph-core/target" />
       <excludeFolder url="file://$MODULE_DIR$/prompt-graph-exec/target" />
@@ -21,6 +29,7 @@
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
       <excludeFolder url="file://$MODULE_DIR$/.devenv" />
       <excludeFolder url="file://$MODULE_DIR$/examples/python/langchain-comparison/.venv" />
+      <excludeFolder url="file://$MODULE_DIR$/toolchain/target" />
     </content>
     <orderEntry type="jdk" jdkName="Python 3.10 (chidori)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
