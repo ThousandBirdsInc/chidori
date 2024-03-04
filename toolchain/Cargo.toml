@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "chidori-core",
-    "chidori",
     "chidori-prompt-format",
     "chidori-im-hashmap",
     "chidori-static-analysis",
