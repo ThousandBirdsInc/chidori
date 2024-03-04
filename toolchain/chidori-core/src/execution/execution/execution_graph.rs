@@ -1,4 +1,6 @@
 use crate::execution::execution::execution_state::{DependencyGraphMutation, ExecutionState};
+use std::fmt;
+use std::fmt::Formatter;
 
 use crate::execution::primitives::identifiers::{DependencyReference, OperationId};
 
@@ -36,6 +38,14 @@ pub struct ExecutionGraph {
     /// Identifiers on this graph refer to points in the execution graph. In execution terms, changes
     /// along those edges are always considered to have occurred _after_ the target step.
     execution_graph: DiGraphMap<(usize, usize), ExecutionState>,
+}
+
+impl std::fmt::Debug for ExecutionGraph {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecutionGraph")
+            .field("revision", &self.revision)
+            .finish()
+    }
 }
 
 impl ExecutionGraph {
@@ -82,6 +92,7 @@ impl ExecutionGraph {
         println!("{:?}", Dot::with_config(&self.execution_graph, &[]));
     }
 
+    #[tracing::instrument]
     pub fn step_execution(
         &mut self,
         prev_execution_id: (usize, usize),

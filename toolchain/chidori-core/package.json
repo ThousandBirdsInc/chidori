@@ -5,6 +5,7 @@
   "main": "package_node/index.js",
   "scripts": {
     "build": "RUSTFLAGS=\"-C link-arg=-Wl,-rpath,/Users/coltonpierson/.rustup/toolchains/nightly-aarch64-apple-darwin/lib\" cargo-cp-artifact -a cdylib _chidori_core ./package_node/native/chidori-core.node -- cargo build --message-format=json-render-diagnostics",
+    "build-nix": "cargo-cp-artifact -a cdylib _chidori_core ./package_node/native/chidori-core.node -- cargo build --message-format=json-render-diagnostics",
     "build-debug": "npm run build --",
     "build-release": "npm run build -- --release",
     "test-rust": "cargo test",

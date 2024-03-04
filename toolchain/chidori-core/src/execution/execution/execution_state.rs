@@ -134,6 +134,7 @@ impl ExecutionState {
         graph
     }
 
+    #[tracing::instrument]
     pub fn add_operation(&mut self, node: usize, operation_node: OperationNode) -> Self {
         let mut s = self.clone();
         s.operation_by_id
@@ -141,6 +142,7 @@ impl ExecutionState {
         s
     }
 
+    #[tracing::instrument]
     pub fn apply_dependency_graph_mutations(
         &self,
         mutations: Vec<DependencyGraphMutation>,
@@ -169,6 +171,7 @@ impl ExecutionState {
         s
     }
 
+    #[tracing::instrument]
     pub fn step_execution(&self) -> (ExecutionState, Vec<(usize, RkyvSerializedValue)>) {
         let previous_state = self;
         let mut new_state = previous_state.clone();

@@ -140,6 +140,7 @@ pub fn load_md_directory(env: &mut Environment, path: &Path) -> anyhow::Result<(
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::execution::primitives::serialized_value::RkyvObjectBuilder;
     use indoc::indoc;
     use std::collections::HashMap;
 
@@ -202,6 +203,14 @@ mod test {
     fn test_load_and_eval_markdown_directory() {
         let mut env = Environment::new();
         let result = load_md_directory(&mut env, Path::new("./tests/data/markdown_graph_loader"));
-        dbg!(env.step());
+        env.state.render_dependency_graph();
+        assert_eq!(
+            env.step(),
+            vec![(1, RkyvObjectBuilder::new().insert_number("x", 5).build())]
+        );
+        assert_eq!(
+            env.step(),
+            vec![(2, RkyvObjectBuilder::new().insert_number("v", 0).build())]
+        );
     }
 }

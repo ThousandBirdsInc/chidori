@@ -363,6 +363,7 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                 args,
                 ..
             }) => {
+                machine.globals.insert(name.to_string());
                 // TODO: this does include typeparams
                 machine.new_local_context();
                 let idx = machine.enter_statement_function(name);
@@ -395,6 +396,7 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                 args,
                 ..
             }) => {
+                machine.globals.insert(name.to_string());
                 machine.new_local_context();
                 let idx = machine.enter_statement_function(name);
                 for (i, decorator) in decorator_list.iter().enumerate() {

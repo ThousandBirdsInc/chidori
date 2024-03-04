@@ -37,7 +37,7 @@ sqlparser.workspace = true
 openssl = { version = "0.10.55", features = ["vendored"] }
 
 once_cell = "1"
-chidori-core = { path = "../chidori-core", version = "^0.1.28" }
+chidori-core = { path = "../chidori-core", version = "^0.2.1" }
 wasm-bindgen = {version = "0.2.86", features = []}
 anyhow.workspace = true
 indoc.workspace = true

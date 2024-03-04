@@ -7,6 +7,7 @@ use crate::execution::primitives::operation::{InputSignature, OperationNode, Out
 use crate::execution::primitives::serialized_value::{
     RkyvSerializedValue as RKV, RkyvSerializedValue,
 };
+use crate::sdk::md::load_md_directory;
 use chidori_prompt_format::extract_yaml_frontmatter_string;
 use chidori_static_analysis::language::{Report, ReportItem, ReportTriggerableFunctions};
 use regex::Regex;
@@ -24,7 +25,7 @@ type Func = fn(RKV) -> RKV;
 
 pub struct Environment {
     db: ExecutionGraph,
-    state: ExecutionState,
+    pub state: ExecutionState,
     state_id: (usize, usize),
     op_counter: usize,
 }
@@ -44,6 +45,11 @@ impl Environment {
 
     /// Scheduled execution of a function in the graph
     fn schedule() {}
+
+    /// Watch a directory for changes, live updating the execution graph
+    fn watch(&mut self) {
+        load_md_directory(self, Path::new("path/to/md"));
+    }
 
     /// Increment the execution graph by one step
     pub(crate) fn step(&mut self) -> Vec<(usize, RkyvSerializedValue)> {
@@ -111,23 +117,27 @@ impl Environment {
             for (value_name, value) in input_signature.globals.iter() {
                 // TODO: we need to handle collisions between the two of these
                 if let Some(source_cell_id) = available_functions.get(value_name) {
-                    mutations.push(DependencyGraphMutation::Create {
-                        operation_id: destination_cell_id.clone(),
-                        depends_on: vec![(
-                            *source_cell_id.clone(),
-                            DependencyReference::FunctionInvocation(value_name.to_string()),
-                        )],
-                    });
+                    if source_cell_id != &destination_cell_id {
+                        mutations.push(DependencyGraphMutation::Create {
+                            operation_id: destination_cell_id.clone(),
+                            depends_on: vec![(
+                                *source_cell_id.clone(),
+                                DependencyReference::FunctionInvocation(value_name.to_string()),
+                            )],
+                        });
+                    }
                 }
 
                 if let Some(source_cell_id) = available_values.get(value_name) {
-                    mutations.push(DependencyGraphMutation::Create {
-                        operation_id: destination_cell_id.clone(),
-                        depends_on: vec![(
-                            *source_cell_id.clone(),
-                            DependencyReference::Global(value_name.to_string()),
-                        )],
-                    });
+                    if source_cell_id != &destination_cell_id {
+                        mutations.push(DependencyGraphMutation::Create {
+                            operation_id: destination_cell_id.clone(),
+                            depends_on: vec![(
+                                *source_cell_id.clone(),
+                                DependencyReference::Global(value_name.to_string()),
+                            )],
+                        });
+                    }
                 }
             }
         }

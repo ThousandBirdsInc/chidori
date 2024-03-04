@@ -1,6 +1,8 @@
 use crate::execution::primitives::cells::{CellTypes, CodeCell, SupportedLanguage};
 use crate::execution::primitives::serialized_value::RkyvSerializedValue;
-use std::collections::HashMap;
+
+use log::warn;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 
@@ -51,6 +53,7 @@ impl InputSignature {
         self.args.is_empty() && self.kwargs.is_empty() && self.globals.is_empty()
     }
 
+    #[tracing::instrument]
     pub fn validate_input_against_signature(
         &self,
         args: &HashMap<String, RkyvSerializedValue>,
@@ -58,17 +61,19 @@ impl InputSignature {
         globals: &HashMap<String, RkyvSerializedValue>,
         functions: &HashMap<String, RkyvSerializedValue>,
     ) -> bool {
+        let mut missing_keys = HashSet::new();
+
         // Validate args
         for (key, config) in &self.args {
             if config.default.is_none() && !args.contains_key(key) {
-                return false;
+                missing_keys.insert(format!("args: {}", key));
             }
         }
 
         // Validate kwargs
         for (key, config) in &self.kwargs {
             if config.default.is_none() && !kwargs.contains_key(key) {
-                return false;
+                missing_keys.insert(format!("kwargs: {}", key));
             }
         }
 
@@ -77,13 +82,19 @@ impl InputSignature {
             if config.default.is_none()
                 && (!globals.contains_key(key) && !functions.contains_key(key))
             {
-                return false;
+                missing_keys.insert(format!("globals or functions: {}", key));
             }
         }
 
-        true
+        if !missing_keys.is_empty() {
+            warn!("Validation failed for missing keys: {:?}", missing_keys);
+            false
+        } else {
+            true
+        }
     }
 
+    #[tracing::instrument]
     pub fn prepopulate_defaults(
         &self,
         args: &mut HashMap<String, RkyvSerializedValue>,
@@ -260,8 +271,6 @@ impl PartialEq for OperationNode {
 }
 
 impl Eq for OperationNode {}
-
-// TODO: OperationNode need
 
 impl fmt::Debug for OperationNode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

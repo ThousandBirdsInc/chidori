@@ -1,5 +1,6 @@
 extern crate swc_ecma_parser;
 
+use crate::language::javascript::parse::ContextPath::Constant;
 use crate::language::python;
 use crate::language::{Report, ReportItem, ReportTriggerableFunctions};
 use serde::{Deserialize, Serialize};
@@ -87,6 +88,11 @@ impl ASTWalkContext {
         self.local_contexts.push(self.locals.clone());
     }
 
+    fn insert_local(&mut self, ident: &ast::Ident) {
+        let name = remove_hash_and_numbers(&ident.to_string());
+        self.locals.insert(name);
+    }
+
     fn pop_local_context(&mut self) {
         self.local_contexts.pop();
 
@@ -163,15 +169,15 @@ impl ASTWalkContext {
             if let Some(ContextPath::AssignmentToStatement) = self.context_stack.last() {
                 self.locals.insert(name.to_string());
             }
-            if let Some(ContextPath::Params) = self.context_stack.last() {
+            if self.context_stack.contains(&ContextPath::Params) {
                 self.locals.insert(name.to_string());
+                self.context_stack
+                    .push(ContextPath::IdentifierReferredTo(name.to_string(), true));
+                return;
             }
             self.context_stack
                 .push(ContextPath::IdentifierReferredTo(name.to_string(), false));
         }
-        // self.context_stack_references
-        //     .push(self.context_stack.clone());
-        // self.context_stack.pop();
     }
 
     fn enter_assignment_to_statement(&mut self) -> usize {
@@ -547,6 +553,7 @@ fn traverse_stmt(stmt: &Stmt, machine: &mut ASTWalkContext) {
         Stmt::ForOf(ast::ForOfStmt {
             left, right, body, ..
         }) => {
+            // TODO: For loop declarations need to be added to locals
             match left {
                 ForHead::VarDecl(x) => {
                     let ast::VarDecl { decls, .. } = &**x;
@@ -576,6 +583,7 @@ fn traverse_stmt(stmt: &Stmt, machine: &mut ASTWalkContext) {
             Decl::Fn(ast::FnDecl {
                 ident, function, ..
             }) => {
+                machine.insert_local(ident);
                 let idx = machine.enter_statement_function(ident);
                 let ast::Function { params, body, .. } = &**function;
                 let params_idx = machine.enter_params();
@@ -792,17 +800,17 @@ mod tests {
                     ContextPath::InCallExpression,
                     ContextPath::Attribute("configure".to_string()),
                     ContextPath::Attribute("prompt".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), false),
+                    ContextPath::IdentifierReferredTo("ch".to_string(), true),
                     ContextPath::Constant("default".to_string()),
                     ContextPath::InCallExpression,
                     ContextPath::Attribute("llm".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), false)
+                    ContextPath::IdentifierReferredTo("ch".to_string(), true)
                 ],
                 vec![
                     ContextPath::InCallExpression,
                     ContextPath::Attribute("configure".to_string()),
                     ContextPath::Attribute("prompt".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), false),
+                    ContextPath::IdentifierReferredTo("ch".to_string(), true),
                     ContextPath::Constant("default".to_string())
                 ]
             ]
@@ -961,7 +969,7 @@ mod tests {
                 vec![
                     ContextPath::InFunction("dispatch_agent".to_string()),
                     ContextPath::Params,
-                    ContextPath::IdentifierReferredTo("ev".to_string(), false)
+                    ContextPath::IdentifierReferredTo("ev".to_string(), true)
                 ],
                 vec![
                     ContextPath::InFunction("dispatch_agent".to_string()),
@@ -1015,7 +1023,7 @@ mod tests {
                 vec![
                     ContextPath::InFunction("evaluate_agent".to_string()),
                     ContextPath::Params,
-                    ContextPath::IdentifierReferredTo("ev".to_string(), false)
+                    ContextPath::IdentifierReferredTo("ev".to_string(), true)
                 ],
                 vec![
                     ContextPath::InFunction("evaluate_agent".to_string()),
@@ -1051,7 +1059,7 @@ mod tests {
                 vec![
                     ContextPath::InFunction("setupPipeline".to_string()),
                     ContextPath::Params,
-                    ContextPath::IdentifierReferredTo("x".to_string(), false)
+                    ContextPath::IdentifierReferredTo("x".to_string(), true)
                 ],
                 vec![
                     ContextPath::InFunction("setupPipeline".to_string()),
@@ -1064,6 +1072,46 @@ mod tests {
                     ContextPath::InFunction("setupPipeline".to_string()),
                     ContextPath::IdentifierReferredTo("x".to_string(), true)
                 ],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ch_function_with_arguments() {
+        let js_source = indoc! { r#"
+            function subtract(a, b) {
+                return a - b;
+            }
+
+            // Example usage
+            const v = subtract(x, 5);
+            "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        assert_eq!(
+            context_stack_references,
+            vec![
+                vec![
+                    ContextPath::InFunction("subtract".to_string()),
+                    ContextPath::Params,
+                    ContextPath::IdentifierReferredTo("a".to_string(), true),
+                    ContextPath::IdentifierReferredTo("b".to_string(), true)
+                ],
+                vec![
+                    ContextPath::InFunction("subtract".to_string()),
+                    ContextPath::IdentifierReferredTo("a".to_string(), true),
+                    ContextPath::IdentifierReferredTo("b".to_string(), true)
+                ],
+                vec![
+                    ContextPath::AssignmentToStatement,
+                    ContextPath::IdentifierReferredTo("v".to_string(), false)
+                ],
+                vec![
+                    ContextPath::AssignmentFromStatement,
+                    ContextPath::InCallExpression,
+                    ContextPath::IdentifierReferredTo("subtract".to_string(), true),
+                    ContextPath::IdentifierReferredTo("x".to_string(), false)
+                ],
+                vec![ContextPath::AssignmentFromStatement],
             ]
         );
     }

@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.28"
+version = "0.2.1"
 authors = ["Colton Pierson <colton@thousandbirds.ai>"]
 edition = "2021"
 license = "MIT"
