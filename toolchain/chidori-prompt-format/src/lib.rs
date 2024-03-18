@@ -61,6 +61,9 @@ pub fn extract_roles_from_template(template: &str) -> JsValue {
 
 pub fn extract_yaml_frontmatter_string(template: &str) -> (HashMap<String, String>, String) {
     let result = crate::templating::templates::extract_frontmatter(&template).unwrap();
+    if result.0.is_empty() {
+        return (HashMap::new(), result.1);
+    }
     let deserialized_data: HashMap<String, String> = serde_yaml::from_str(&result.0).unwrap();
     (deserialized_data, result.1)
 }

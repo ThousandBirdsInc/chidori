@@ -14,7 +14,23 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Formatter;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, mpsc};
+// use std::sync::{Mutex};
+use no_deadlocks::{Mutex};
+use std::sync::mpsc::{Receiver, Sender};
+use std::time::Duration;
+use crate::execution::execution::execution_graph::ExecutionNodeId;
+
+pub enum OperationExecutionStatusOption {
+    Running,
+    LongRunning,
+    Completed,
+    Error,
+}
+
+pub enum OperationExecutionStatus {
+    ExecutionEvent(ExecutionNodeId, OperationId, OperationExecutionStatusOption),
+}
 
 #[derive(Debug)]
 pub enum DependencyGraphMutation {
@@ -26,6 +42,17 @@ pub enum DependencyGraphMutation {
         operation_id: OperationId,
     },
 }
+
+
+// fn main() {
+//     let mut graph = DiGraphMap::new();
+//     graph.add_edge("1", "2", "Edge Text");
+//
+//     let (nodes, edges) = serialize_graph(&graph);
+//
+//     println!("{}", json!({ "nodes": nodes, "edges": edges }).to_string());
+// }
+//
 
 // TODO: make this thread-safe
 #[derive(Clone)]
@@ -49,6 +76,8 @@ pub struct ExecutionState {
     /// The usize::MAX index is a no-op that indicates that the operation is ready to run, an execution
     /// order dependency rather than a value dependency.
     dependency_map: ImHashMap<OperationId, HashSet<(OperationId, DependencyReference)>>,
+
+    execution_event_sender: Option<mpsc::Sender<OperationExecutionStatus>>,
 }
 
 impl std::fmt::Debug for ExecutionState {
@@ -58,12 +87,12 @@ impl std::fmt::Debug for ExecutionState {
 }
 
 fn render_map_as_table(exec_state: &ExecutionState) -> String {
-    let mut table = String::from(indoc!(
+    let mut table = String::from("\n");
+    table.push_str(indoc!(
         r"
             | Key | Value |
             |---|---|"
     ));
-
     for key in exec_state.state.keys() {
         if let Some(val) = exec_state.state_get(key) {
             table.push_str(&format!(
@@ -75,6 +104,7 @@ fn render_map_as_table(exec_state: &ExecutionState) -> String {
             ));
         }
     }
+    table.push_str("\n");
 
     table
 }
@@ -87,6 +117,7 @@ impl ExecutionState {
             operation_by_id: Default::default(),
             has_been_set: Default::default(),
             dependency_map: Default::default(),
+            execution_event_sender: None,
         }
     }
 
@@ -98,12 +129,14 @@ impl ExecutionState {
         self.has_been_set.contains(operation_id)
     }
 
+    #[tracing::instrument]
     pub fn state_consume_marked(&mut self, marked_for_consumption: HashSet<usize>) {
         for key in marked_for_consumption.clone().into_iter() {
             self.state.remove(&key);
         }
     }
 
+    #[tracing::instrument]
     pub fn state_insert(&mut self, operation_id: OperationId, value: RkyvSerializedValue) {
         self.state.insert(operation_id, Arc::new(value));
         self.has_been_set.insert(operation_id);
@@ -171,8 +204,9 @@ impl ExecutionState {
         s
     }
 
+    // TODO: extend this with an "event", steps can occur as events are flushed based on a previous state we were in
     #[tracing::instrument]
-    pub fn step_execution(&self) -> (ExecutionState, Vec<(usize, RkyvSerializedValue)>) {
+    pub fn step_execution(&self, sender: &Sender<(ExecutionNodeId, OperationId, RkyvSerializedValue)>) -> (ExecutionState, Vec<(usize, RkyvSerializedValue)>) {
         let previous_state = self;
         let mut new_state = previous_state.clone();
         let mut operation_by_id = previous_state.operation_by_id.clone();
@@ -183,11 +217,18 @@ impl ExecutionState {
 
         // Every tick, every operation consumes from each of its incoming edges.
         'traverse_nodes: for operation_id in dependency_graph.nodes() {
-            let mut op_node = operation_by_id
+
+            // We skip nodes that are currently locked due to long running execution
+            // TODO: we can regenerate async nodes if necessary by creating them form their original cells
+            let mut op_try_lock = operation_by_id
                 .get_mut(&operation_id)
-                .unwrap()
-                .lock()
-                .unwrap();
+                .unwrap().try_lock();
+            let mut op_node = if let Ok(ref mut mutex) = op_try_lock {
+                mutex
+            } else {
+                continue;
+            };
+
             let signature = &op_node.signature.input_signature;
 
             let mut args = HashMap::new();
@@ -272,14 +313,82 @@ impl ExecutionState {
                     RkyvSerializedValue::Object(functions),
                 ),
             ]);
-            let mut argument_payload: RkyvSerializedValue =
-                RkyvSerializedValue::Object(argument_payload_map);
+            let argument_payload: RkyvSerializedValue = RkyvSerializedValue::Object(argument_payload_map);
 
             // Execute the operation
             // TODO: support async/parallel execution
-            let result = op_node.execute(argument_payload);
-            outputs.push((operation_id, result.clone()));
-            new_state.state_insert(operation_id, result);
+            if op_node.is_async {
+                // Run the target function in a background thread
+                let mut operation_by_id = previous_state.operation_by_id.clone();
+                let sender_clone = sender.clone();
+                let event_sender = self.execution_event_sender.clone();
+                std::thread::spawn(move || {
+                    let mut op_node = operation_by_id
+                        .get_mut(&operation_id)
+                        .unwrap()
+                        .lock()
+                        .unwrap();
+
+                    // This is another thread that handles annotating these events with additional metadata (operationId)
+                    let (internal_sender, internal_receiver) = mpsc::channel();
+                    std::thread::spawn(move || {
+                        loop {
+                            match internal_receiver.try_recv() {
+                                Ok((prev_execution_id, value)) => {
+                                    sender_clone.send((prev_execution_id, operation_id, value)).unwrap();
+                                },
+                                Err(mpsc::TryRecvError::Empty) => {
+                                    // No messages available, take this time to sleep a bit
+                                    std::thread::sleep(Duration::from_millis(10)); // Sleep for 10 milliseconds
+                                },
+                                Err(mpsc::TryRecvError::Disconnected) => {
+                                    // Handle the case where the sender has disconnected and no more messages will be received
+                                    break; // or handle it according to your application logic
+                                },
+                            }
+                        }
+                    });
+                    if let Some(event_sender) = &event_sender {
+                        event_sender.send(OperationExecutionStatus::ExecutionEvent(
+                            (0,0),
+                            operation_id,
+                            OperationExecutionStatusOption::LongRunning
+                        )).unwrap();
+                    }
+                    // Long-running execution
+                    let _ = op_node.execute(argument_payload, Some(internal_sender.clone()));
+
+                    if let Some(event_sender) = &event_sender {
+                        event_sender.send(OperationExecutionStatus::ExecutionEvent(
+                            (0,0),
+                            operation_id,
+                            OperationExecutionStatusOption::Completed
+                        )).unwrap();
+                    }
+                });
+                // outputs.push((operation_id, result.clone()));
+                // new_state.state_insert(operation_id, result);
+            } else {
+                if let Some(event_sender) = &self.execution_event_sender {
+                    event_sender.send(OperationExecutionStatus::ExecutionEvent(
+                        (0,0),
+                        operation_id,
+                        OperationExecutionStatusOption::Running
+                    )).unwrap();
+                }
+                let result = op_node.execute(argument_payload, None);
+
+                if let Some(event_sender) = &self.execution_event_sender {
+                    event_sender.send(OperationExecutionStatus::ExecutionEvent(
+                        (0,0),
+                        operation_id,
+                        OperationExecutionStatusOption::Completed
+                    )).unwrap();
+                }
+
+                outputs.push((operation_id, result.clone()));
+                new_state.state_insert(operation_id, result);
+            }
         }
         new_state.state_consume_marked(marked_for_consumption);
         (new_state, outputs)
@@ -336,4 +445,16 @@ mod tests {
     }
 
     // TODO: add a test that demonstrates multiple edges from the same node, filling multiple values
+
+    #[test]
+    fn test_async_execution_at_a_state() {
+        let mut exec_state = ExecutionState::new();
+        let operation_id = 1;
+        let depends_on = vec![(2, DependencyReference::Positional(0))];
+        let create_mutation = DependencyGraphMutation::Create {
+            operation_id,
+            depends_on,
+        };
+        exec_state = exec_state.apply_dependency_graph_mutations(vec![create_mutation]);
+    }
 }

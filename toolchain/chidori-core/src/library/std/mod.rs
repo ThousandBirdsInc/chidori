@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod code;
 pub mod io;
-pub mod templating;
-// pub mod schedule;
+pub mod webserver;
+mod scheduling;
+mod browser;

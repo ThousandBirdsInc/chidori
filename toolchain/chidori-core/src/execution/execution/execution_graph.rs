@@ -1,6 +1,13 @@
+use std::collections::HashMap;
 use crate::execution::execution::execution_state::{DependencyGraphMutation, ExecutionState};
 use std::fmt;
 use std::fmt::Formatter;
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, mpsc};
+// use std::sync::{Mutex};
+use no_deadlocks::{Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::execution::primitives::identifiers::{DependencyReference, OperationId};
 
@@ -15,6 +22,7 @@ use petgraph::Direction;
 // TODO: update all of these identifies to include a "space" they're within
 
 type EdgeIdentity = (OperationId, OperationId, DependencyReference);
+pub type ExecutionNodeId = (usize, usize);
 
 /// This models the network of reactive relationships between different components.
 ///
@@ -37,7 +45,14 @@ pub struct ExecutionGraph {
     ///
     /// Identifiers on this graph refer to points in the execution graph. In execution terms, changes
     /// along those edges are always considered to have occurred _after_ the target step.
-    execution_graph: DiGraphMap<(usize, usize), ExecutionState>,
+    execution_graph: Arc<Mutex<DiGraphMap<ExecutionNodeId, ExecutionState>>>,
+
+    state_id_to_state: Arc<Mutex<HashMap<ExecutionNodeId, ExecutionState>>>,
+
+    /// Sender channel for sending messages to the execution graph
+    sender: mpsc::Sender<(ExecutionNodeId, OperationId, RkyvSerializedValue)>,
+
+    pub handle: JoinHandle<()>,
 }
 
 impl std::fmt::Debug for ExecutionGraph {
@@ -48,64 +63,120 @@ impl std::fmt::Debug for ExecutionGraph {
     }
 }
 
+
+/// Execution Ids identify transitions in state during execution, as values are
+/// emitted, we update the state of the graph and create a new execution id.
+///
+/// They are structured in the format (branch, counter), counter represents
+/// iterative execution of the same branch. Branch in contrast increments when
+/// we re-evaluate a node that head already previously been evaluated - creating a
+/// new line of execution.
+fn get_execution_id(
+    execution_graph: &mut DiGraphMap<ExecutionNodeId, ExecutionState>,
+    prev_execution_id: ExecutionNodeId,
+) -> (usize, usize) {
+    let edges = execution_graph
+        .edges_directed(prev_execution_id, Direction::Outgoing);
+
+    // Get the greatest id value from the edges leaving the previous execution state
+    if let Some((_, max_to, _)) =
+        edges.max_by(|(_, a_to, _), (_, b_to, _)| (a_to.0).cmp(&(b_to.0)))
+    {
+        // Create an edge in the execution graph from the previous state to this new one
+        let id = (max_to.0 + 1, prev_execution_id.1 + 1);
+        id
+    } else {
+        // Create an edge in the execution graph from the previous state to this new one
+        let id = (0, prev_execution_id.1 + 1);
+        id
+    }
+}
+
 impl ExecutionGraph {
     /// Initialize a new reactivity database. This will create a default input and output node,
     /// graphs default to being the unit function x -> x.
+    #[tracing::instrument]
     pub fn new() -> Self {
+        let (sender, receiver) = mpsc::channel::<(ExecutionNodeId, OperationId, RkyvSerializedValue)>();
+
+        let mut state_id_to_state = HashMap::new();
+        state_id_to_state.insert((0, 0), ExecutionState::new());
+        let mut state_id_to_state = Arc::new(Mutex::new(state_id_to_state));
+
+        let mut execution_graph = Arc::new(Mutex::new(DiGraphMap::new()));
+
+        let execution_graph_clone = execution_graph.clone();
+        let state_id_to_state_clone = state_id_to_state.clone();
+
+        // Kick off a background thread that listens for events from async operations
+        // These events inject additional state into the execution graph on new branches
+        // Those branches will continue to evaluate independently.
+        let handle = std::thread::spawn(move || {
+            loop {
+                match receiver.try_recv() {
+                    Ok((prev_execution_id, operation_id, result)) => {
+                        let mut execution_graph = execution_graph_clone.lock().unwrap();
+                        let mut state_id_to_state = state_id_to_state_clone.lock().unwrap();
+                        let mut new_state = state_id_to_state.get(&prev_execution_id).unwrap().clone();
+                        new_state.state_insert(operation_id, result);
+
+                        // TODO: log this event
+                        // outputs.push((operation_id, result.clone()));
+
+                        let resulting_state_id = get_execution_id(execution_graph.deref_mut(), prev_execution_id);
+                        state_id_to_state.deref_mut().insert(resulting_state_id.clone(), new_state.clone());
+
+                        execution_graph
+                            .add_edge(prev_execution_id, resulting_state_id.clone(), new_state);
+                    },
+                    Err(mpsc::TryRecvError::Empty) => {
+                        // No messages available, take this time to sleep a bit
+                        std::thread::sleep(Duration::from_millis(10)); // Sleep for 10 milliseconds
+                    },
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        // Handle the case where the sender has disconnected and no more messages will be received
+                        break; // or handle it according to your application logic
+                    },
+                }
+            }
+            // TODO: execute the remaining graph from this state initialized as a new entity
+        });
         ExecutionGraph {
-            execution_graph: Default::default(),
+            handle,
+            state_id_to_state,
+            execution_graph,
+            sender,
             revision: 0,
         }
     }
 
-    fn add_execution_edge(
-        &mut self,
-        prev_execution_id: (usize, usize),
-        new_state: ExecutionState,
-        output_new_state: ExecutionState,
-    ) -> ((usize, usize), ExecutionState) {
-        let edges = self
-            .execution_graph
-            .edges_directed(prev_execution_id, Direction::Outgoing);
-
-        let new_id = if let Some((_, max_to, _)) =
-            edges.max_by(|(_, a_to, _), (_, b_to, _)| (a_to.0).cmp(&(b_to.0)))
-        {
-            // Create an edge in the execution graph from the previous state to this new one
-            let id = (max_to.0 + 1, prev_execution_id.1 + 1);
-            self.execution_graph
-                .add_edge(prev_execution_id, id.clone(), new_state);
-            id
-        } else {
-            // Create an edge in the execution graph from the previous state to this new one
-            let id = (0, prev_execution_id.1 + 1);
-            self.execution_graph
-                .add_edge(prev_execution_id, id.clone(), new_state);
-            id
-        };
-
-        (new_id, output_new_state)
-    }
-
-    pub fn render_execution_graph(&self) {
+    pub fn render_execution_graph_to_graphviz(&self) {
         println!("================ Execution graph ================");
-        println!("{:?}", Dot::with_config(&self.execution_graph, &[]));
+        let execution_graph = self.execution_graph.lock().unwrap();
+        println!("{:?}", Dot::with_config(&execution_graph.deref(), &[]));
     }
 
     #[tracing::instrument]
     pub fn step_execution(
         &mut self,
-        prev_execution_id: (usize, usize),
+        prev_execution_id: ExecutionNodeId,
         previous_state: &ExecutionState,
     ) -> (
-        ((usize, usize), ExecutionState),
-        Vec<(usize, RkyvSerializedValue)>,
+        ((usize, usize), ExecutionState), // the resulting total state of this step
+        Vec<(usize, RkyvSerializedValue)>, // values emitted by operations during this step
     ) {
-        let (new_state, outputs) = previous_state.step_execution();
+        let (new_state, outputs) = previous_state.step_execution(&self.sender);
         // The edge from this node is the greatest branching id + 1
         // if we re-evaluate execution at a given node, we get a new execution branch.
+        let mut execution_graph = self.execution_graph.lock().unwrap();
+        let mut state_id_to_state = self.state_id_to_state.lock().unwrap();
+        let resulting_state_id = get_execution_id(execution_graph.deref_mut(), prev_execution_id);
+        state_id_to_state.deref_mut().insert(resulting_state_id.clone(), new_state.clone());
+        execution_graph.deref_mut()
+            .add_edge(prev_execution_id, resulting_state_id.clone(), new_state.clone());
         (
-            self.add_execution_edge(prev_execution_id, new_state.clone(), new_state),
+
+            (resulting_state_id, new_state),
             outputs,
         )
     }
@@ -142,7 +213,7 @@ mod tests {
             OperationNode::new(
                 InputSignature::new(),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(1)),
+                Box::new(|_args, _| RSV::Number(1)),
             ),
         );
         let mut state = state.add_operation(
@@ -150,7 +221,7 @@ mod tests {
             OperationNode::new(
                 InputSignature::new(),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(2)),
+                Box::new(|_args, _| RSV::Number(2)),
             ),
         );
         let mut state = state.add_operation(
@@ -158,7 +229,7 @@ mod tests {
             OperationNode::new(
                 InputSignature::from_args_list(vec!["a", "b"]),
                 OutputSignature::new(),
-                Box::new(|args| {
+                Box::new(|args, _| {
                     if let RSV::Object(m) = args {
                         if let RSV::Object(args) = m.get("args").unwrap() {
                             if let (Some(RSV::Number(a)), Some(RSV::Number(b))) =
@@ -212,7 +283,7 @@ mod tests {
             OperationNode::new(
                 InputSignature::new(),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(0)),
+                Box::new(|_args, _| RSV::Number(0)),
             ),
         );
         let mut state = state.add_operation(
@@ -220,7 +291,7 @@ mod tests {
             OperationNode::new(
                 InputSignature::new(),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(1)),
+                Box::new(|_args, _| RSV::Number(1)),
             ),
         );
         let mut state =
@@ -255,7 +326,7 @@ mod tests {
             OperationNode::new(
                 InputSignature::new(),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(0)),
+                Box::new(|_args, _| RSV::Number(0)),
             ),
         );
 
@@ -264,7 +335,7 @@ mod tests {
             OperationNode::new(
                 InputSignature::from_args_list(vec!["0"]),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(1)),
+                Box::new(|_args, _| RSV::Number(1)),
             ),
         );
 
@@ -273,7 +344,7 @@ mod tests {
             OperationNode::new(
                 InputSignature::from_args_list(vec!["0"]),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(2)),
+                Box::new(|_args, _| RSV::Number(2)),
             ),
         );
 
@@ -318,7 +389,7 @@ mod tests {
             OperationNode::new(
                 InputSignature::new(),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(0)),
+                Box::new(|_args, _| RSV::Number(0)),
             ),
         );
 
@@ -327,7 +398,7 @@ mod tests {
             OperationNode::new(
                 InputSignature::from_args_list(vec!["1"]),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(1)),
+                Box::new(|_args, _| RSV::Number(1)),
             ),
         );
 
@@ -336,7 +407,7 @@ mod tests {
             OperationNode::new(
                 InputSignature::from_args_list(vec!["1"]),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(2)),
+                Box::new(|_args, _| RSV::Number(2)),
             ),
         );
 
@@ -345,7 +416,7 @@ mod tests {
             OperationNode::new(
                 InputSignature::from_args_list(vec!["1"]),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(3)),
+                Box::new(|_args, _| RSV::Number(3)),
             ),
         );
 
@@ -397,7 +468,7 @@ mod tests {
             OperationNode::new(
                 InputSignature::new(),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(0)),
+                Box::new(|_args, _| RSV::Number(0)),
             ),
         );
 
@@ -406,7 +477,7 @@ mod tests {
             OperationNode::new(
                 InputSignature::from_args_list(vec!["1"]),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(1)),
+                Box::new(|_args, _| RSV::Number(1)),
             ),
         );
 
@@ -415,7 +486,7 @@ mod tests {
             OperationNode::new(
                 InputSignature::from_args_list(vec!["1"]),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(2)),
+                Box::new(|_args, _| RSV::Number(2)),
             ),
         );
 
@@ -424,7 +495,7 @@ mod tests {
             OperationNode::new(
                 InputSignature::from_args_list(vec!["1"]),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(3)),
+                Box::new(|_args, _| RSV::Number(3)),
             ),
         );
 
@@ -433,7 +504,7 @@ mod tests {
             OperationNode::new(
                 InputSignature::from_args_list(vec!["1", "2"]),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(4)),
+                Box::new(|_args, _| RSV::Number(4)),
             ),
         );
 
@@ -501,12 +572,12 @@ mod tests {
             OperationNode::new(
                 InputSignature::new(),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(1)),
+                Box::new(|_args, _| RSV::Number(1)),
             ),
         );
 
         // Each node adds 1 to the inbound item (all nodes only have one dependency per index)
-        let f1 = |args: RkyvSerializedValue| {
+        let f1 = |args: RkyvSerializedValue, _| {
             if let RSV::Object(m) = args {
                 if let RSV::Object(args) = m.get("args").unwrap() {
                     if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
@@ -664,13 +735,13 @@ mod tests {
             OperationNode::new(
                 InputSignature::new(),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(1)),
+                Box::new(|_args, _| RSV::Number(1)),
             ),
         );
 
         // Globally mutates this value, making each call to this function side-effecting
         static atomic_usize: AtomicUsize = AtomicUsize::new(0);
-        let f_side_effect = |args: RkyvSerializedValue| {
+        let f_side_effect = |args: RkyvSerializedValue, _| {
             if let RSV::Object(m) = args {
                 if let RSV::Object(args) = m.get("args").unwrap() {
                     if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
@@ -752,11 +823,11 @@ mod tests {
             OperationNode::new(
                 InputSignature::new(),
                 OutputSignature::new(),
-                Box::new(|_args| RSV::Number(0)),
+                Box::new(|_args, _| RSV::Number(0)),
             ),
         );
 
-        let f_v1 = |args: RkyvSerializedValue| {
+        let f_v1 = |args: RkyvSerializedValue, _| {
             if let RSV::Object(m) = args {
                 if let RSV::Object(args) = m.get("args").unwrap() {
                     if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
@@ -768,7 +839,7 @@ mod tests {
             panic!("Invalid arguments")
         };
 
-        let f_v2 = |args: RkyvSerializedValue| {
+        let f_v2 = |args: RkyvSerializedValue, _| {
             if let RSV::Object(m) = args {
                 if let RSV::Object(args) = m.get("args").unwrap() {
                     if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {

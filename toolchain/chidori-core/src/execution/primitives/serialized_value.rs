@@ -1,4 +1,4 @@
-use crate::execution::primitives::cells::CellTypes;
+use crate::cells::CellTypes;
 use rkyv::{
     archived_root, check_archived_root,
     ser::{serializers::AllocSerializer, Serializer},

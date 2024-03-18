@@ -1,230 +1,279 @@
-use crate::execution::primitives::operation::{
-    InputItemConfiguation, InputSignature, InputType, OperationNode, OutputItemConfiguation,
-    OutputSignature,
-};
-use crate::execution::primitives::serialized_value::{
-    serialized_value_to_json_value, RkyvSerializedValue as RKV,
-};
-use std::collections::HashMap;
+pub mod template_cell;
+pub mod code_cell;
+pub mod web_cell;
+pub mod llm_prompt_cell;
+mod memory_cell;
 
-use crate::execution::primitives::cells::{
-    CodeCell, LLMPromptCell, SupportedLanguage, SupportedModelProviders,
-};
-use crate::library::std::ai::llm::{
-    ChatCompletionReq, ChatCompletionRes, ChatModelBatch, EmbeddingReq, MessageRole,
-    TemplateMessage,
-};
-use chidori_prompt_format::templating::templates::ChatModelRoles;
-use chidori_static_analysis::language::Report;
-use std::env;
-use tokio::runtime;
+use ts_rs::TS;
+use rkyv::{Archive, Deserialize, Serialize};
+use crate::library::std::ai::llm::ChatModelBatch;
 
-pub fn code_cell(cell: &CodeCell) -> OperationNode {
-    match cell.language {
-        SupportedLanguage::PyO3 => {
-            // TODO: all callable functions should be exposed as their own OperationNodes
-            //       these can be depended on throughout the graph as their own cells.
-            let paths =
-                chidori_static_analysis::language::python::parse::extract_dependencies_python(
-                    &cell.source_code,
-                );
-            let report = chidori_static_analysis::language::python::parse::build_report(&paths);
-
-            let mut input_signature = InputSignature::new();
-            for (key, value) in &report.cell_depended_values {
-                input_signature.globals.insert(
-                    key.clone(),
-                    InputItemConfiguation {
-                        ty: Some(InputType::String),
-                        default: None,
-                    },
-                );
-            }
-
-            let mut output_signature = OutputSignature::new();
-            for (key, value) in &report.cell_exposed_values {
-                output_signature.globals.insert(
-                    key.clone(),
-                    OutputItemConfiguation {
-                        ty: Some(InputType::String),
-                    },
-                );
-            }
-
-            for (key, value) in &report.triggerable_functions {
-                output_signature.functions.insert(
-                    key.clone(),
-                    OutputItemConfiguation {
-                        ty: Some(InputType::Function),
-                    },
-                );
-            }
-
-            let cell = cell.clone();
-            OperationNode::new(
-                input_signature,
-                output_signature,
-                Box::new(move |x| {
-                    // TODO: this needs to handle stdout and errors
-                    crate::library::std::code::runtime_pyo3::source_code_run_python(
-                        &cell.source_code,
-                        &x,
-                        &cell.function_invocation,
-                    )
-                    .unwrap()
-                    .0
-                }),
-            )
-        }
-        SupportedLanguage::Starlark => OperationNode::new(
-            InputSignature::new(),
-            OutputSignature::new(),
-            Box::new(|x| x),
-        ),
-        SupportedLanguage::Deno => {
-            let paths =
-                chidori_static_analysis::language::javascript::parse::extract_dependencies_js(
-                    &cell.source_code,
-                );
-            let report = chidori_static_analysis::language::javascript::parse::build_report(&paths);
-
-            let mut input_signature = InputSignature::new();
-            for (key, value) in &report.cell_depended_values {
-                input_signature.globals.insert(
-                    key.clone(),
-                    InputItemConfiguation {
-                        ty: Some(InputType::String),
-                        default: None,
-                    },
-                );
-            }
-
-            let mut output_signature = OutputSignature::new();
-            for (key, value) in &report.cell_exposed_values {
-                output_signature.globals.insert(
-                    key.clone(),
-                    OutputItemConfiguation {
-                        ty: Some(InputType::String),
-                    },
-                );
-            }
-
-            for (key, value) in &report.triggerable_functions {
-                output_signature.functions.insert(
-                    key.clone(),
-                    OutputItemConfiguation {
-                        ty: Some(InputType::Function),
-                    },
-                );
-            }
-
-            let cell = cell.clone();
-            OperationNode::new(
-                input_signature,
-                output_signature,
-                Box::new(move |x| {
-                    // TODO: this needs to handle stdout and errors
-                    crate::library::std::code::runtime_deno::source_code_run_deno(
-                        &cell.source_code,
-                        &x,
-                        &cell.function_invocation,
-                    )
-                    .unwrap()
-                    .0
-                }),
-            )
-        }
-    }
+#[derive(
+    TS,
+    Archive,
+    serde::Serialize,
+    serde::Deserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    PartialEq,
+    Clone,
+)]
+#[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
+#[archive(check_bytes)]
+#[archive_attr(check_bytes(
+    bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
+))]
+#[archive_attr(derive(Debug))]
+#[ts(export, export_to = "package_node/types/")]
+pub enum SupportedLanguage {
+    PyO3,
+    Starlark,
+    Deno,
 }
 
-pub fn llm_prompt_cell(cell: &LLMPromptCell) -> OperationNode {
-    match cell {
-        LLMPromptCell::Chat { provider, req, .. } => {
-            let schema =
-                chidori_prompt_format::templating::templates::analyze_referenced_partials(&req);
-            let role_blocks =
-                chidori_prompt_format::templating::templates::extract_roles_from_template(&req);
+#[derive(
+    TS,
+    Archive,
+    serde::Serialize,
+    serde::Deserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    PartialEq,
+    Clone,
+)]
+#[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
+#[archive(check_bytes)]
+#[archive_attr(check_bytes(
+    bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
+))]
+#[archive_attr(derive(Debug))]
+#[ts(export, export_to = "package_node/types/")]
+pub(crate) struct CodeCell {
+    pub(crate) language: SupportedLanguage,
+    pub(crate) source_code: String,
+    pub(crate) function_invocation: Option<String>,
+}
 
-            let mut input_signature = InputSignature::new();
-            for (key, value) in &schema.items {
-                // input_signature.kwargs.insert(
-                //     key.clone(),
-                //     InputItemConfiguation {
-                //         ty: Some(InputType::String),
-                //         default: None,
-                //     },
-                // );
-                input_signature.globals.insert(
-                    key.clone(),
-                    InputItemConfiguation {
-                        ty: Some(InputType::String),
-                        default: None,
-                    },
-                );
-            }
 
-            match provider {
-                SupportedModelProviders::OpenAI => OperationNode::new(
-                    input_signature,
-                    OutputSignature::new(),
-                    Box::new(move |x| {
-                        let mut template_messages: Vec<TemplateMessage> = Vec::new();
-                        let data = if let RKV::Object(m) = x {
-                            serialized_value_to_json_value(
-                                &m.get("globals").expect("should have globals key"),
-                            )
-                        } else {
-                            serialized_value_to_json_value(&x)
-                        };
+#[derive(
+TS,
+Archive,
+serde::Serialize,
+serde::Deserialize,
+Serialize,
+Deserialize,
+Debug,
+PartialEq,
+Clone,
+)]
+#[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
+#[archive(check_bytes)]
+#[archive_attr(check_bytes(
+bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
+))]
+#[archive_attr(derive(Debug))]
+#[ts(export, export_to = "package_node/types/")]
+pub enum SupportedMemoryProviders {
+    InMemory,
+}
 
-                        for (a, b) in &role_blocks.clone() {
-                            template_messages.push(TemplateMessage {
-                                role: match a {
-                                    ChatModelRoles::User => MessageRole::User,
-                                    ChatModelRoles::System => MessageRole::System,
-                                    ChatModelRoles::Assistant => MessageRole::Assistant,
-                                },
-                                content: chidori_prompt_format::templating::templates::render_template_prompt(&b.as_ref().unwrap().source, &data, &HashMap::new()).unwrap(),
-                                name: None,
-                                function_call: None,
-                            });
-                        }
 
-                        // TODO: replace this to being fetched from configuration
-                        let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
-                        let c = crate::library::std::ai::llm::openai::OpenAIChatModel::new(api_key);
-                        let result = {
-                            // Create a new Tokio runtime or use an existing one
-                            let rt = runtime::Runtime::new().unwrap();
+#[derive(
+TS,
+Archive,
+serde::Serialize,
+serde::Deserialize,
+Serialize,
+Deserialize,
+Debug,
+PartialEq,
+Clone,
+)]
+#[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
+#[archive(check_bytes)]
+#[archive_attr(check_bytes(
+bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
+))]
+#[archive_attr(derive(Debug))]
+#[ts(export, export_to = "package_node/types/")]
+pub(crate) struct MemoryCell {
+    pub(crate) provider: SupportedMemoryProviders,
+    pub(crate) function_invocation: Option<String>,
+}
 
-                            // Use the runtime to block on the asynchronous operation
-                            rt.block_on(async {
-                                c.batch(ChatCompletionReq {
-                                    model: "gpt-3.5-turbo".to_string(),
-                                    template_messages,
-                                    ..ChatCompletionReq::default()
-                                })
-                                .await
-                            })
-                        };
-                        if let Ok(ChatCompletionRes { choices, .. }) = result {
-                            RKV::String(choices[0].text.as_ref().unwrap().clone())
-                        } else {
-                            RKV::Null
-                        }
-                    }),
-                ),
-            }
-        }
-        LLMPromptCell::Completion { .. } => OperationNode::new(
-            InputSignature::new(),
-            OutputSignature::new(),
-            Box::new(|x| x),
-        ),
-        LLMPromptCell::Embedding { .. } => OperationNode::new(
-            InputSignature::new(),
-            OutputSignature::new(),
-            Box::new(|x| x),
-        ),
-    }
+
+#[derive(
+TS,
+Archive,
+serde::Serialize,
+serde::Deserialize,
+Serialize,
+Deserialize,
+Debug,
+PartialEq,
+Clone,
+)]
+#[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
+#[archive(check_bytes)]
+#[archive_attr(check_bytes(
+bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
+))]
+#[archive_attr(derive(Debug))]
+#[ts(export, export_to = "package_node/types/")]
+pub(crate) struct TemplateCell {
+    pub(crate) name: Option<String>,
+    pub(crate) body: String,
+}
+
+#[derive(
+TS,
+Archive,
+serde::Serialize,
+serde::Deserialize,
+Serialize,
+Deserialize,
+Debug,
+PartialEq,
+Clone,
+)]
+#[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
+#[archive(check_bytes)]
+#[archive_attr(check_bytes(
+bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
+))]
+#[archive_attr(derive(Debug))]
+#[ts(export, export_to = "package_node/types/")]
+pub(crate) struct WebserviceCellEndpoint {
+    pub(crate) method: String,
+    pub(crate) route: String,
+    pub(crate) depended_function_identity: String,
+    pub(crate) arg_mapping: Vec<(String, String)>,
+}
+
+#[derive(
+TS,
+Archive,
+serde::Serialize,
+serde::Deserialize,
+Serialize,
+Deserialize,
+Debug,
+PartialEq,
+Clone,
+)]
+#[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
+#[archive(check_bytes)]
+#[archive_attr(check_bytes(
+bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
+))]
+#[archive_attr(derive(Debug))]
+#[ts(export, export_to = "package_node/types/")]
+pub(crate) struct WebserviceCell {
+    pub(crate) configuration: String,
+    pub(crate) port: u16,
+}
+
+
+#[derive(
+TS,
+Archive,
+serde::Serialize,
+serde::Deserialize,
+Serialize,
+Deserialize,
+Debug,
+PartialEq,
+Clone,
+)]
+#[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
+#[archive(check_bytes)]
+#[archive_attr(check_bytes(
+bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
+))]
+#[archive_attr(derive(Debug))]
+#[ts(export, export_to = "package_node/types/")]
+pub(crate) struct ScheduleCell {
+    pub(crate) configuration: String,
+}
+
+
+#[derive(
+    TS,
+    Archive,
+    serde::Serialize,
+    serde::Deserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    PartialEq,
+    Clone,
+)]
+#[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
+#[archive(check_bytes)]
+#[archive_attr(check_bytes(
+    bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
+))]
+#[archive_attr(derive(Debug))]
+#[ts(export, export_to = "package_node/types/")]
+pub enum SupportedModelProviders {
+    OpenAI,
+}
+
+#[derive(
+    TS,
+    Archive,
+    serde::Serialize,
+    serde::Deserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    PartialEq,
+    Clone,
+)]
+#[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
+#[archive(check_bytes)]
+#[archive_attr(check_bytes(
+    bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
+))]
+#[archive_attr(derive(Debug))]
+#[ts(export, export_to = "package_node/types/")]
+pub enum LLMPromptCell {
+    Chat {
+        path: Option<String>,
+        provider: SupportedModelProviders,
+        req: String,
+    },
+    Completion {
+        req: String,
+    },
+    Embedding {
+        req: String,
+    },
+}
+
+#[derive(
+    TS,
+    Archive,
+    serde::Serialize,
+    serde::Deserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    PartialEq,
+    Clone,
+)]
+#[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
+#[archive(check_bytes)]
+#[archive_attr(check_bytes(
+    bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
+))]
+#[archive_attr(derive(Debug))]
+#[ts(export, export_to = "package_node/types/")]
+pub enum CellTypes {
+    Code(CodeCell),
+    Prompt(LLMPromptCell),
+    Web(WebserviceCell),
+    Template(TemplateCell)
 }

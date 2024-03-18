@@ -3,7 +3,7 @@ https://github.com/ThousandBirdsInc/chidori/assets/515757/6b088f7d-d8f7-4c7e-900
 
 <div align="center">
 
-# &nbsp; Chidori &nbsp;
+# &nbsp; Chidori (v2) &nbsp;
 
 **A reactive runtime for building durable AI agents**
 
@@ -11,8 +11,6 @@ https://github.com/ThousandBirdsInc/chidori/assets/515757/6b088f7d-d8f7-4c7e-900
 <a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="Current Build Status" src="https://img.shields.io/github/actions/workflow/status/ThousandBirdsInc/chidori/push.yml" /></a>
 <a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/ThousandBirdsInc/chidori" /></a>
 <a href="https://crates.io/crates/chidori"><img alt="Cargo.io download" src="https://img.shields.io/crates/v/chidori" /></a>
-<a href="https://pypi.org/project/chidori/"><img alt="Pypi package" src="https://img.shields.io/pypi/v/chidori" /></a>
-<a href="https://www.npmjs.com/package/@1kbirds/chidori"><img alt="NPM package" src="https://img.shields.io/npm/v/@1kbirds/chidori" /></a>
 <a href="https://github.com/ThousandBirdsInc/chidori/blob/main/LICENSE"><img alt="Github License" src="https://img.shields.io/badge/License-MIT-green.svg" /></a>
 </p>
 
@@ -54,7 +52,9 @@ Check out [high level docs ](https://docs.thousandbirds.ai/3fe20a82965148c7a0b48
 
 
 ## 📖 Chidori
-Chidori is a reactive runtime for building AI agents. It provides a framework for building AI agents that are reactive, observable, and robust. It supports building agents with Node.js, Python, and Rust. 
+Chidori is an open-source environment for building AI agents with simple and straight forward code.
+You author code like you typically would with python or javascript, and we provide a layer for interfacing
+with the complexities of AI models in long running workflows.
 
 It is currently in alpha, and is not yet ready for production use. We are continuing to make significant changes in response to feedback.
 
@@ -69,39 +69,11 @@ It is currently in alpha, and is not yet ready for production use. We are contin
 ## ⚡️ Getting Started
 
 ### Installation
-You can use Chidori from Node.js, Python or Rust.
-
-<table>
-<tr>
-<th width="450px"><b>Node.js</b></th>
-<th width="450px"><b>Python</b></th>
-<th width="450px"><b>Rust</b></th>
-</tr>
-<tr>
-<td>
+Chidori is available on [crates.io](https://crates.io/crates/chidori) and can be installed using cargo.
 
 ```bash
-npm i @1kbirds/chidori
+cargo install chidori-core
 ```
-
-</td>
-<td>
-
-```bash
-pip install chidori
-```
-
-</td>
-<td>
-
-```bash
-cargo install chidori
-```
-
-</td>
-</tr>
-</table>
-
 
 
 ### Environment Variables
@@ -120,16 +92,14 @@ the OpenAI API to filter to AI related launches and then format that data into m
 are pushed into the Chidori database and can be visualized using the prompt-graph-ui project. We'll update this example
 with a pattern that makes those results more accessible soon.
 
-<table>
-<tr>
-<th width="450px"><b>Node.js</b></th>
-<th width="450px"><b>Python</b></th>
-<th width="450px"><b>Rust</b></th>
-</tr>
-<tr>
-<td>
 
-```javascript
+Beginning here is an executable Chidori agent:
+------
+<pre>
+Chidori agents can be a single file, or a collection of files structured as a typical Typescript or Python project. 
+The following example is a single file agent.
+
+```js
 const axios = require('axios');
 const {Chidori, GraphBuilder} = require("@1kbirds/chidori");
 
@@ -231,230 +201,11 @@ async function main() {
 
 
 main();
-
 ```
+</pre>
 
-</td>
-<td>
+------
 
-```python
-import aiohttp
-import asyncio
-from typing import List, Optional
-import json
-from chidori import Chidori, GraphBuilder
-
-
-class Story:
-    def __init__(self, title: str, url: Optional[str], score: Optional[float]):
-        self.title = title
-        self.url = url
-        self.score = score
-
-
-HN_URL_TOP_STORIES = "https://hacker-news.firebaseio.com/v0/topstories.json?print=pretty"
-
-
-async def fetch_story(session, id):
-    async with session.get(f"https://hacker-news.firebaseio.com/v0/item/{id}.json?print=pretty") as response:
-        return await response.json()
-
-
-async def fetch_hn() -> List[Story]:
-    async with aiohttp.ClientSession() as session:
-        async with session.get(HN_URL_TOP_STORIES) as response:
-            story_ids = await response.json()
-
-        tasks = []
-        for id in story_ids[:30]:  # Limit to 30 stories
-            tasks.append(fetch_story(session, id))
-
-        stories = await asyncio.gather(*tasks)
-
-        stories_out = []
-        for story in stories:
-            for k in ('title', 'url', 'score'):
-                stories_out.append(Story(**dict((k, story.get(k, None)))))
-
-        return stories_out
-
-
-# ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-# Methods for fetching hacker news posts via api
-
-class ChidoriWorker:
-    def __init__(self):
-        self.c = Chidori("0", "http://localhost:9800")
-        self.staged_custom_nodes = []
-
-    async def build_graph(self):
-        g = GraphBuilder()
-
-        # Create a custom node, we will implement our
-        # own handler for this node type
-        h = await g.custom_node(
-            name="FetchTopHN",
-            node_type_name="FetchTopHN",
-            output="{ output: String }"
-        )
-
-        # A prompt node, pulling in the value of the output from FetchTopHN
-        # and templating that into the prompt for GPT3.5
-        h_interpret = await g.prompt_node(
-            name="InterpretTheGroup",
-            template="""
-                Based on the following list of HackerNews threads, 
-                filter this list to only launches of new AI projects: {{FetchTopHN.output}}
-            """
-        )
-        await h_interpret.run_when(g, h)
-
-        h_format_and_rank = await g.prompt_node(
-            name="FormatAndRank",
-            template="""
-                Format this list of new AI projects in markdown, ranking the most 
-                interesting projects from most interesting to least. 
-                
-                {{InterpretTheGroup.promptResult}}
-            """
-        )
-        await h_format_and_rank.run_when(g, h_interpret)
-
-        # Commit the graph, this pushes the configured graph
-        # to our durable execution runtime.
-        await g.commit(self.c, 0)
-
-    async def run(self):
-        # Construct the agent graph
-        await self.build_graph()
-
-        # Start graph execution from the root
-        await self.c.play(0, 0)
-
-        # Run the node execution loop
-        await self.c.run_custom_node_loop()
-
-
-async def handle_fetch_hn(node_will_exec):
-    stories = await fetch_hn()
-    result = {"output": json.dumps([story.__dict__ for story in stories])}
-    return result
-
-
-async def main():
-    w = ChidoriWorker()
-    await w.c.start_server(":memory:")
-    await w.c.register_custom_node_handle("FetchTopHN", handle_fetch_hn)
-    await w.run()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-```
-
-</td>
-<td>
-
-```rust
-extern crate chidori;
-use std::collections::HashMap;
-use std::env;
-use std::net::ToSocketAddrs;
-use anyhow;
-use futures::stream::{self, StreamExt, TryStreamExt};
-use reqwest;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use chidori::{create_change_value, NodeWillExecuteOnBranch};
-use chidori::register_node_handle;
-use chidori::translations::rust::{Chidori, CustomNodeCreateOpts, DenoCodeNodeCreateOpts, GraphBuilder, Handler, PromptNodeCreateOpts, serialized_value_to_string};
-
-#[derive(Debug, Deserialize, Serialize)]
-struct Story {
-    title: String,
-    url: Option<String>,
-    score: Option<f32>,
-}
-
-const HN_URL_TOP_STORIES: &'static str = "https://hacker-news.firebaseio.com/v0/topstories.json?print=pretty";
-
-async fn fetch_hn() -> anyhow::Result<Vec<Story>> {
-    let client = reqwest::Client::new();
-    // Fetch the top 60 story ids
-    let story_ids: Vec<u32> = client.get(HN_URL_TOP_STORIES).send().await?.json().await?;
-
-    // Fetch details for each story
-    let stories: anyhow::Result<Vec<Story>> = stream::iter(story_ids.into_iter().take(30))
-        .map(|id| {
-            let client = &client;
-            async move {
-                let resource = format!("https://hacker-news.firebaseio.com/v0/item/{}.json?print=pretty", id);
-                let mut story: Story = client.get(&resource).send().await?.json().await?;
-                Ok(story)
-            }
-        })
-        .buffer_unordered(10)  // Fetch up to 10 stories concurrently
-        .try_collect()
-        .await;
-    stories
-}
-
-async fn handle_fetch_hn(_node_will_exec: NodeWillExecuteOnBranch) -> anyhow::Result<serde_json::Value> {
-    let stories = fetch_hn().await.unwrap();
-    let mut result = HashMap::new();
-    result.insert("output", format!("{:?}", stories));
-    Ok(serde_json::to_value(result).unwrap())
-}
-
-/// Maintain a list summarizing recent AI launches across the week
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let mut c = Chidori::new(String::from("0"), String::from("http://localhost:9800"));
-    c.start_server(Some(":memory:".to_string())).await?;
-
-    let mut g = GraphBuilder::new();
-
-    let h = g.custom_node(CustomNodeCreateOpts {
-        name: "FetchTopHN".to_string(),
-        node_type_name: "FetchTopHN".to_string(),
-        output: Some("{ output: String }".to_string()),
-        ..CustomNodeCreateOpts::default()
-    })?;
-
-    let mut h_interpret = g.prompt_node(PromptNodeCreateOpts {
-        name: "InterpretTheGroup".to_string(),
-        template: "Based on the following list of HackerNews threads, filter this list to only launches of new AI projects: {{FetchTopHN.output}}".to_string(),
-        ..PromptNodeCreateOpts::default()
-    })?;
-    h_interpret.run_when(&mut g, &h)?;
-
-    let mut h_format_and_rank = g.prompt_node(PromptNodeCreateOpts {
-        name: "FormatAndRank".to_string(),
-        template: "Format this list of new AI projects in markdown, ranking the most interesting projects from most interesting to least. {{InterpretTheGroup.promptResult}}".to_string(),
-        ..PromptNodeCreateOpts::default()
-    })?;
-    h_format_and_rank.run_when(&mut g, &h_interpret)?;
-
-    // Commit the graph
-    g.commit(&c, 0).await?;
-
-    // Start graph execution from the root
-    c.play(0, 0).await?;
-
-    // Register the handler for our custom node
-    register_node_handle!(c, "FetchTopHN", handle_fetch_hn);
-
-    // Run the node execution loop
-    if let Err(x) = c.run_custom_node_loop().await {
-        eprintln!("Custom Node Loop Failed On - {:?}", x);
-    };
-    Ok(())
-}
-```
-
-</td>
-</tr>
-</table>
 
 ## 🤔 About
 

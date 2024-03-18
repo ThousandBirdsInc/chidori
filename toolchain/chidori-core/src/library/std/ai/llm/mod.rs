@@ -1,4 +1,6 @@
 pub mod openai;
+mod ollama;
+
 use async_trait::async_trait;
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};

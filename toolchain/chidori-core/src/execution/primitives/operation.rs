@@ -1,10 +1,12 @@
-use crate::execution::primitives::cells::{CellTypes, CodeCell, SupportedLanguage};
 use crate::execution::primitives::serialized_value::RkyvSerializedValue;
 
 use log::warn;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
+use std::sync::mpsc::Sender;
+use crate::cells::{CellTypes, CodeCell, SupportedLanguage};
+
 
 // args, kwargs, locals and their configurations
 
@@ -218,11 +220,14 @@ enum Mutability {
 /// It is up to the user to structure those maps in such a way that they don't collide with other
 /// values being represented in the state of our system. These inputs and outputs are managed
 /// by our Execution Database.
-pub type OperationFn = dyn FnMut(RkyvSerializedValue) -> RkyvSerializedValue + Send;
+pub type OperationFn = dyn FnMut(RkyvSerializedValue, Option<Sender<((usize, usize), RkyvSerializedValue)>>) -> RkyvSerializedValue + Send;
 
 // TODO: rather than dep_count operation node should have a specific dep mapping
 pub struct OperationNode {
     pub(crate) id: usize,
+
+    pub is_long_running: bool,
+    pub is_async: bool,
 
     pub cell: CellTypes,
 
@@ -293,6 +298,8 @@ impl Default for OperationNode {
     fn default() -> Self {
         OperationNode {
             id: 0,
+            is_long_running: false,
+            is_async: false,
             cell: CellTypes::Code(CodeCell {
                 language: SupportedLanguage::PyO3,
                 source_code: "".to_string(),
@@ -305,7 +312,7 @@ impl Default for OperationNode {
             height: 0,
             dirty: true,
             signature: Signature::new(),
-            operation: Box::new(|x| x),
+            operation: Box::new(|x, _| x),
             arity: 0,
             unresolved_dependencies: vec![],
             partial_application: Vec::new(),
@@ -334,9 +341,9 @@ impl OperationNode {
         unimplemented!();
     }
 
-    pub(crate) fn execute(&mut self, context: RkyvSerializedValue) -> RkyvSerializedValue {
+    pub(crate) fn execute(&mut self, context: RkyvSerializedValue, tx: Option<Sender<((usize, usize), RkyvSerializedValue)>>) -> RkyvSerializedValue {
         let exec = self.operation.deref_mut();
-        exec(context)
+        exec(context, tx)
     }
 }
 
@@ -350,12 +357,12 @@ mod tests {
     fn test_execute_with_operation() {
         let mut executed = false;
         let operation: Box<OperationFn> =
-            Box::new(|context| -> RkyvSerializedValue { RkyvSerializedValue::Boolean(true) });
+            Box::new(|context, _| -> RkyvSerializedValue { RkyvSerializedValue::Boolean(true) });
 
         let mut node = OperationNode::default();
         node.operation = operation;
 
-        let result = node.execute(RkyvSerializedValue::Null);
+        let result = node.execute(RkyvSerializedValue::Null, None);
 
         assert_eq!(result, RkyvSerializedValue::Boolean(true));
     }
@@ -363,6 +370,6 @@ mod tests {
     #[test]
     fn test_execute_without_operation() {
         let mut node = OperationNode::default();
-        node.execute(RkyvSerializedValue::Boolean(true)); // should not panic
+        node.execute(RkyvSerializedValue::Boolean(true), None); // should not panic
     }
 }

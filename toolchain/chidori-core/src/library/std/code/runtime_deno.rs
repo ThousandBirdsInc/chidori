@@ -1,24 +1,20 @@
 use anyhow::Result;
 use deno_core::error::AnyError;
-use deno_core::serde_json::Value;
 use deno_core::{
-    extension, op2, ops, serde_json, serde_v8, v8, Extension, FastString, JsRuntime, Op, OpState,
-    RuntimeOptions,
+    Extension, FastString, JsRuntime, Op, op2, OpState, RuntimeOptions, serde_json, serde_v8,
+    v8,
 };
-use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
-use crate::execution::primitives::cells::{CellTypes, CodeCell};
 use crate::execution::primitives::serialized_value::{
     json_value_to_serialized_value, RkyvObjectBuilder, RkyvSerializedValue,
 };
 use chidori_static_analysis::language::javascript::parse::{build_report, extract_dependencies_js};
 use deno_core::_ops::RustToV8NoScope;
-use deno_core::v8::{HandleScope, Local, Object};
-use pyo3::types::{PyCFunction, PyDict, PyTuple};
-use pyo3::PyResult;
+use deno_core::v8::HandleScope;
 use std::collections::HashMap;
 use std::hash::Hash;
+use crate::cells::{CellTypes, CodeCell};
 
 // TODO: need to override console.log
 // TODO: https://deno.com/blog/roll-your-own-javascript-runtime-pt2
@@ -285,13 +281,17 @@ fn create_function_shims(
                                     CellTypes::Code(c) => {
                                         let mut c = c.clone();
                                         c.function_invocation = Some(clone_function_name.clone());
-                                        crate::cells::code_cell(&c)
+                                        crate::cells::code_cell::code_cell(&c)
                                     }
-                                    CellTypes::Prompt(c) => crate::cells::llm_prompt_cell(&c),
+                                    CellTypes::Prompt(c) => crate::cells::llm_prompt_cell::llm_prompt_cell(&c),
+
+                                    _ => {
+                                        unreachable!("Unsupported cell type");
+                                    }
                                 };
 
                                 // invocation of the operation
-                                let result = op.execute(total_arg_payload.build());
+                                let result = op.execute(total_arg_payload.build(), None);
                                 return result;
                             });
                             functions.push((function_name.clone(), closure_callable));
@@ -375,8 +375,8 @@ pub fn source_code_run_deno(
         ),
     )?;
 
-    dbg!(&payload);
-    dbg!(&source_code);
+    // dbg!(&payload);
+    // dbg!(&source_code);
     // panic!("here");
     let result = runtime.execute_script(
         "main.js",
@@ -422,7 +422,7 @@ pub fn source_code_run_deno(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::primitives::cells::SupportedLanguage;
+    use crate::cells::SupportedLanguage;
     use crate::execution::primitives::serialized_value::RkyvObjectBuilder;
     use indoc::indoc;
 
@@ -437,7 +437,7 @@ mod tests {
                     RkyvObjectBuilder::new().insert_value(
                         "test_function",
                         RkyvSerializedValue::Cell(CellTypes::Code(
-                            crate::execution::primitives::cells::CodeCell {
+                            crate::cells::CodeCell {
                                 language: SupportedLanguage::PyO3,
                                 source_code: String::from(indoc! { r#"
                                     def test_function(a, b):

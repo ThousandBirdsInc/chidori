@@ -1,28 +1,26 @@
-use crate::execution::primitives::cells::{
-    CellTypes, CodeCell, LLMPromptCell, SupportedLanguage, SupportedModelProviders,
-};
-use crate::sdk::entry::Environment;
+use crate::sdk::entry::Chidori;
 use chidori_prompt_format::extract_yaml_frontmatter_string;
 use indoc::indoc;
 use std::collections::HashMap;
-use std::fs;
 use std::path::Path;
+use crate::cells::{CellTypes, CodeCell, LLMPromptCell, SupportedLanguage, SupportedModelProviders, TemplateCell, WebserviceCell};
 
 #[derive(PartialEq, Debug)]
-struct MarkdownCodeBlock {
+pub struct MarkdownCodeBlock {
     tag: String,
+    name: Option<String>,
     configuration: HashMap<String, String>,
     body: String,
 }
 
-struct ParsedFile {
+pub struct ParsedFile {
     // filename: Box<PathBuf>,
     // code: String,
     num_lines: usize,
-    result: Vec<MarkdownCodeBlock>,
+    pub(crate) result: Vec<MarkdownCodeBlock>,
 }
 
-fn extract_code_blocks(body: &str) -> Vec<MarkdownCodeBlock> {
+pub(crate) fn extract_code_blocks(body: &str) -> Vec<MarkdownCodeBlock> {
     let parts: Vec<&str> = body.split("```").collect();
 
     let mut code_blocks = Vec::new();
@@ -41,14 +39,22 @@ fn extract_code_blocks(body: &str) -> Vec<MarkdownCodeBlock> {
             let first_line = lines.next().unwrap_or_default();
             let rest: String = lines.collect::<Vec<&str>>().join("\n");
             let extracted = extract_yaml_frontmatter_string(&rest);
+
+            // Extract the name in parentheses from the first line
+            let tag_and_name: Vec<&str> = first_line.split_whitespace().collect();
+            let tag = tag_and_name.get(0).cloned().unwrap_or_default().to_string();
+            let name = tag_and_name.get(1).and_then(|n| n.strip_prefix('(').and_then(|n| n.strip_suffix(')').and_then(|n| Some(n.to_string()))));
+
             MarkdownCodeBlock {
-                tag: first_line.to_string(),
+                tag,
+                name,
                 configuration: extracted.0,
                 body: extracted.1,
             }
         })
         .collect()
 }
+
 
 fn parse_markdown_file(filename: &Path) -> ParsedFile {
     match std::fs::read_to_string(filename) {
@@ -71,7 +77,7 @@ fn parse_markdown_file(filename: &Path) -> ParsedFile {
     }
 }
 
-fn load_folder(path: &Path) -> anyhow::Result<Vec<ParsedFile>> {
+pub fn load_folder(path: &Path) -> anyhow::Result<Vec<ParsedFile>> {
     let mut res = vec![];
     for entry in path.read_dir()? {
         let entry = entry?;
@@ -90,52 +96,37 @@ fn load_folder(path: &Path) -> anyhow::Result<Vec<ParsedFile>> {
     Ok(res)
 }
 
-fn interpret_code_block(block: &MarkdownCodeBlock) -> Option<CellTypes> {
-    let is_code = match block.tag.as_str() {
-        "python" | "javascript" => true,
-        _ => false,
-    };
-    if is_code {
-        let language = match block.tag.as_str() {
-            "python" => SupportedLanguage::PyO3,
-            "javascript" => SupportedLanguage::Deno,
-            _ => unreachable!(),
-        };
-        return Some(CellTypes::Code(CodeCell {
-            language,
-            source_code: block.body.clone(),
-            function_invocation: None,
-        }));
-    }
-
-    let is_prompt = match block.tag.as_str() {
-        "prompt" => true,
-        _ => false,
-    };
-
-    if is_prompt {
-        return Some(CellTypes::Prompt(LLMPromptCell::Chat {
-            path: Some("generate_names".to_string()),
+pub fn interpret_code_block(block: &MarkdownCodeBlock) -> Option<CellTypes> {
+    match block.tag.as_str() {
+        "python" | "javascript" => {
+            let language = match block.tag.as_str() {
+                "python" => SupportedLanguage::PyO3,
+                "javascript" => SupportedLanguage::Deno,
+                _ => unreachable!(), // Given the outer match, this branch should never be reached
+            };
+            Some(CellTypes::Code(CodeCell {
+                language,
+                source_code: block.body.clone(),
+                function_invocation: None,
+            }))
+        },
+        "prompt" => Some(CellTypes::Prompt(LLMPromptCell::Chat {
+            path: block.name.clone(),
             provider: SupportedModelProviders::OpenAI,
             req: block.body.clone(),
-        }));
+        })),
+        "html" => Some(CellTypes::Template(TemplateCell {
+            name: block.name.clone(),
+            body: block.body.clone(),
+        })),
+        "web" => Some(CellTypes::Web(WebserviceCell {
+            configuration: block.body.clone(),
+            port: block.configuration.get("port").and_then(|p| p.parse::<u16>().ok()).or_else(|| Some(8080)).unwrap(),
+        })),
+        _ => None,
     }
-
-    None
 }
 
-pub fn load_md_directory(env: &mut Environment, path: &Path) -> anyhow::Result<()> {
-    let files = load_folder(path)?;
-    for file in files {
-        for block in file.result {
-            if let Some(block) = interpret_code_block(&block) {
-                env.upsert_cell(block);
-            }
-        }
-    }
-    env.resolve_dependencies_from_input_signature();
-    Ok(())
-}
 
 #[cfg(test)]
 mod test {
@@ -154,8 +145,7 @@ mod test {
         def add(a, b):
             return a + b
         ```
-        
-        
+
         ```javascript
         ---
         a: 2
@@ -163,8 +153,12 @@ mod test {
         const x = add(2,2);
         ```
         
-        ```prompt
+        ```prompt (multi_prompt)
         Multiply {y} times {x}
+        ```
+
+        ```html (named_html)
+        <div>Example</div>
         ```
         "#
         });
@@ -176,6 +170,7 @@ mod test {
             vec![
                 MarkdownCodeBlock {
                     tag: "python".to_string(),
+                    name: None,
                     configuration: Default::default(),
                     body: indoc! { r#"
                 y = 20
@@ -185,6 +180,7 @@ mod test {
                 },
                 MarkdownCodeBlock {
                     tag: "javascript".to_string(),
+                    name: None,
                     configuration: map,
                     body: indoc! { r#"
                     const x = add(2,2);"#}
@@ -192,25 +188,33 @@ mod test {
                 },
                 MarkdownCodeBlock {
                     tag: "prompt".to_string(),
+                    name: Some("multi_prompt".to_string()),
                     configuration: Default::default(),
                     body: "Multiply {y} times {x}".to_string(),
+                },
+                MarkdownCodeBlock {
+                    tag: "html".to_string(),
+                    name: Some("named_html".to_string()),
+                    configuration: Default::default(),
+                    body: "<div>Example</div>".to_string(),
                 }
             ]
         );
     }
 
-    #[test]
-    fn test_load_and_eval_markdown_directory() {
-        let mut env = Environment::new();
-        let result = load_md_directory(&mut env, Path::new("./tests/data/markdown_graph_loader"));
-        env.state.render_dependency_graph();
-        assert_eq!(
-            env.step(),
-            vec![(1, RkyvObjectBuilder::new().insert_number("x", 5).build())]
-        );
-        assert_eq!(
-            env.step(),
-            vec![(2, RkyvObjectBuilder::new().insert_number("v", 0).build())]
-        );
-    }
+    // TODO: move to entry
+    // #[test]
+    // fn test_load_and_eval_markdown_directory() {
+    //     let mut env = Environment::new();
+    //     let result = load_md_directory(&mut env, Path::new("./tests/data/markdown_graph_loader"));
+    //     env.state.render_dependency_graph();
+    //     assert_eq!(
+    //         env.step(),
+    //         vec![(1, RkyvObjectBuilder::new().insert_number("x", 5).build())]
+    //     );
+    //     assert_eq!(
+    //         env.step(),
+    //         vec![(2, RkyvObjectBuilder::new().insert_number("v", 0).build())]
+    //     );
+    // }
 }

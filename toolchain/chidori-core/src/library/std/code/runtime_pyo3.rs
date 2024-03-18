@@ -1,23 +1,19 @@
 use chidori_static_analysis::language::python::parse::{
-    build_report, extract_dependencies_python, ContextPath,
+    build_report, extract_dependencies_python,
 };
 
 use pyo3::prelude::*;
-use pyo3::py_run;
-use pyo3::types::{IntoPyDict, PyCFunction, PyDict, PyList, PyString, PyTuple};
-use std::sync::mpsc::{self, Receiver, Sender};
+use pyo3::types::{IntoPyDict, PyCFunction, PyDict, PyList, PyTuple};
+use std::sync::mpsc::{self, Sender};
 
 // use rustpython::vm::{pymodule, PyPayload, PyResult, VirtualMachine};
 // use rustpython_vm as vm;
 // use rustpython_vm::builtins::{PyBool, PyDict, PyInt, PyList, PyStr};
 
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue};
-// use rustpython_vm::PyObjectRef;
-use crate::execution::primitives::cells::{CellTypes, CodeCell};
-use crate::execution::primitives::operation::OperationFn;
-use once_cell::sync::OnceCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+// use rustpython_vm::PyObjectRef;
+use crate::cells::{CellTypes, CodeCell};
 
 fn pyany_to_rkyv_serialized_value(p: &PyAny) -> RkyvSerializedValue {
     match p.get_type().name() {
@@ -219,15 +215,19 @@ pub fn source_code_run_python(
                                                 let mut c = c.clone();
                                                 c.function_invocation =
                                                     Some(clone_function_name.clone());
-                                                crate::cells::code_cell(&c)
+                                                crate::cells::code_cell::code_cell(&c)
                                             }
                                             CellTypes::Prompt(c) => {
-                                                crate::cells::llm_prompt_cell(&c)
+                                                crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
+                                            }
+
+                                            _ => {
+                                                unreachable!("Unsupported cell type");
                                             }
                                         };
 
                                         // invocation of the operation
-                                        let result = op.execute(total_arg_payload.build());
+                                        let result = op.execute(total_arg_payload.build(), None);
 
                                         // Conversion back to python types
                                         let py = args.py();
@@ -269,11 +269,11 @@ pub fn source_code_run_python(
             }
         }
 
-        // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Important: this is the actual point of execution
-        // Execute the target source code.
+        // Important: this is the point of initial execution of the source code
         py.run(&source_code, Some(globals), Some(locals)).unwrap();
 
-        match function_invocation {
+        // With the source environment established, we can now invoke specific methods provided by this node
+        return match function_invocation {
             None => {
                 let mut result_map = HashMap::new();
                 for (name, report_item) in &report.cell_exposed_values {
@@ -283,9 +283,8 @@ pub fn source_code_run_python(
                         result_map.insert(name.clone(), parsed);
                     }
                 }
-
                 let output: Vec<String> = receiver.try_iter().collect();
-                return Ok((RkyvSerializedValue::Object(result_map), output));
+                Ok((RkyvSerializedValue::Object(result_map), output))
             }
             Some(name) => {
                 let local = locals.get_item(name)?;
@@ -324,10 +323,10 @@ pub fn source_code_run_python(
 
                     let result = py_func.call(args, Some(kwargs))?;
                     let output: Vec<String> = receiver.try_iter().collect();
-                    return Ok((pyany_to_rkyv_serialized_value(result), output));
+                    Ok((pyany_to_rkyv_serialized_value(result), output))
+                } else {
+                    Err(anyhow::anyhow!("Function not found"))
                 }
-                // TODO: fix this
-                unreachable!();
             }
         };
     });
@@ -353,7 +352,7 @@ pub fn source_code_run_python(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::primitives::cells::SupportedLanguage;
+    use crate::cells::SupportedLanguage;
     use crate::execution::primitives::serialized_value::RkyvObjectBuilder;
     use indoc::indoc;
 
@@ -496,5 +495,36 @@ a = 20 + demo()
                 vec![]
             )
         );
+    }
+
+    // TODO: the expected behavior is that as we execute the function again and again from another location, the state mutates
+    #[ignore]
+    #[test]
+    fn test_execution_of_internal_function_mutating_internal_state() {
+        let source_code = String::from(
+            r#"
+a = 0
+def example(x):
+    global a
+    a += 1
+    return a
+        "#,
+        );
+        let result = source_code_run_python(
+            &source_code,
+            &RkyvObjectBuilder::new()
+                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
+                .build(),
+            &Some("example".to_string()),
+        );
+        assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(1), vec![]));
+        let result = source_code_run_python(
+            &source_code,
+            &RkyvObjectBuilder::new()
+                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
+                .build(),
+            &Some("example".to_string()),
+        );
+        assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(2), vec![]));
     }
 }

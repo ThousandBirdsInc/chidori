@@ -1,6 +1,6 @@
 target
 node_modules
-toolchain/chidori/package_node/native/chidori.node
+toolchain/chidori-old/package_node/native/chidori.node
 toolcahin/chidori/build
 __pycache__
 
@@ -64,6 +64,6 @@ dist
 .idea
 .venv
 
-toolchain/chidori/package_python/chidori/_chidori.abi3.so
+toolchain/chidori-old/package_python/chidori/_chidori.abi3.so
 
 .pre-commit-config.yaml

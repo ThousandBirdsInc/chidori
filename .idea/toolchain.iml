@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <module type="JAVA_MODULE" version="4">
+  <component name="FacetManager">
+    <facet type="Python" name="Python facet">
+      <configuration sdkName="Python 3.9 (chidori)" />
+    </facet>
+  </component>
   <component name="NewModuleRootManager" inherit-compiler-output="true">
     <exclude-output />
     <content url="file://$MODULE_DIR$">
@@ -17,10 +22,14 @@
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-core/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-core/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-im-hashmap/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-im-rs/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-im-rs/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-prompt-format/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-prompt-format/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-static-analysis/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-static-analysis/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-old/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-ui/src-tauri/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/prompt-graph-core/target" />
       <excludeFolder url="file://$MODULE_DIR$/prompt-graph-exec/target" />
@@ -33,5 +42,6 @@
     </content>
     <orderEntry type="jdk" jdkName="Python 3.10 (chidori)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
+    <orderEntry type="library" name="Python 3.9 (chidori) interpreter library" level="application" />
   </component>
 </module>
