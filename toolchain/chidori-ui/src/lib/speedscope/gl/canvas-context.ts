@@ -16,8 +16,10 @@ export class CanvasContext {
   public readonly viewportRectangleRenderer: ViewportRectangleRenderer
   public readonly flamechartColorPassRenderer: FlamechartColorPassRenderer
   public readonly theme: Theme
+  public canvas: HTMLCanvasElement
 
   constructor(canvas: HTMLCanvasElement, theme: Theme) {
+    this.canvas = canvas;
     this.gl = new WebGL.Context(canvas)
     this.rectangleBatchRenderer = new RectangleBatchRenderer(this.gl)
     this.textureRenderer = new TextureRenderer(this.gl)
@@ -67,7 +69,8 @@ export class CanvasContext {
   setViewport(physicalBounds: Rect, cb: () => void): void {
     const {origin, size} = physicalBounds
     let viewportBefore = this.gl.viewport
-    this.gl.setViewport(origin.x, origin.y, size.x, size.y)
+    let {left, top} = this.canvas.getBoundingClientRect();
+    this.gl.setViewport(origin.x - left, origin.y - top, size.x, size.y)
 
     cb()
 
@@ -78,7 +81,7 @@ export class CanvasContext {
   renderBehind(el: Element, cb: () => void) {
     const bounds = el.getBoundingClientRect()
     const physicalBounds = new Rect(
-      new Vec2(0, bounds.top - 72),
+      new Vec2(bounds.left * window.devicePixelRatio, bounds.top * window.devicePixelRatio),
       new Vec2(bounds.width * window.devicePixelRatio, bounds.height * window.devicePixelRatio),
     )
 

@@ -315,11 +315,11 @@ export namespace WebGL {
     private _forceStateUpdate = true
     private _generation = 1
     private _gl: WebGLRenderingContext
-    private _height = 0
     private _oldBlendOperations = 0
     private _oldRenderTarget: RenderTarget | null = null
     private _oldViewport = new Graphics.Rect()
     private _width = 0
+    private _height = 0
 
     get widthInPixels() {
       return this._width
