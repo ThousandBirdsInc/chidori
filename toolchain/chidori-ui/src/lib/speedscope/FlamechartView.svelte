@@ -143,6 +143,7 @@
                     {hover.node.frame.file}:{hover.node.frame.line}
                 </div>
             {/if}
+            {JSON.stringify(hover.node.frame)}
         {/if}
     </div>
 </div>

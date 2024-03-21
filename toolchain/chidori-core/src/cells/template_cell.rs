@@ -43,7 +43,6 @@ pub fn template_cell(cell: &TemplateCell) -> OperationNode {
         input_signature,
         output_signature,
         Box::new(move |x, _| {
-            dbg!(&x);
             let data = if let RKV::Object(m) = x {
                 if let Some(m) = m.get("globals") {
                     serialized_value_to_json_value( m )

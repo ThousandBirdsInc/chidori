@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::sync::mpsc::Sender;
+use tracing::{Level, span};
 use crate::cells::{CellTypes, CodeCell, SupportedLanguage};
 
 
@@ -89,7 +90,8 @@ impl InputSignature {
         }
 
         if !missing_keys.is_empty() {
-            warn!("Validation failed for missing keys: {:?}", missing_keys);
+            dbg!("Validation failed for missing keys: {:?}", missing_keys);
+            dbg!("Current state", args, kwargs, globals, functions);
             false
         } else {
             true
@@ -225,6 +227,7 @@ pub type OperationFn = dyn FnMut(RkyvSerializedValue, Option<Sender<((usize, usi
 // TODO: rather than dep_count operation node should have a specific dep mapping
 pub struct OperationNode {
     pub(crate) id: usize,
+    pub(crate) name: Option<String>,
 
     pub is_long_running: bool,
     pub is_async: bool,
@@ -298,9 +301,11 @@ impl Default for OperationNode {
     fn default() -> Self {
         OperationNode {
             id: 0,
+            name: None,
             is_long_running: false,
             is_async: false,
             cell: CellTypes::Code(CodeCell {
+                name: None,
                 language: SupportedLanguage::PyO3,
                 source_code: "".to_string(),
                 function_invocation: None,
@@ -341,6 +346,7 @@ impl OperationNode {
         unimplemented!();
     }
 
+    #[tracing::instrument]
     pub(crate) fn execute(&mut self, context: RkyvSerializedValue, tx: Option<Sender<((usize, usize), RkyvSerializedValue)>>) -> RkyvSerializedValue {
         let exec = self.operation.deref_mut();
         exec(context, tx)

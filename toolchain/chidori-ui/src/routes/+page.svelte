@@ -1,26 +1,9 @@
 <script>
     // import { emit, listen } from '@tauri-apps/api/event'
-    import {onMount} from "svelte";
-    import Speedscope from "@/speedscope/Speedscope.svelte";
-    //
-    // let events = [];
-    // onMount(async () => {
-    //     // listen to the `click` event and get a function to remove the event listener
-    //     // there's also a `once` function that subscribes to an event and automatically unsubscribes the listener on the first event
-    //     const unlisten = await listen('event-name', (event) => {
-    //         // event.event is the event name (useful if you want to use a single callback fn for multiple event types)
-    //         // event.payload is the payload object
-    //         events = [...events, event]
-    //     })
-    //
-    //     // emits the `click` event with the object payload
-    //     emit('click', {
-    //         theMessage: 'Tauri is awesome!',
-    //     })
-    //     return () => {
-    //         unlisten();
-    //     }
-    // });
+    import { Button } from "@/components/ui/button";
+    import {File, Pause, Play} from "@/icons";
+    import CodePage from "./code/+page.svelte"
+    import {loadAndWatchDirectory, selectDirectory, sendPlay, sendPause, loadedPath} from "@/stores/store"
 </script>
 
 <style lang="postcss">
@@ -29,8 +12,15 @@
     }
 </style>
 
-<div class="w-full h-full relative">
-    <!--{#each events as event}-->
-    <!--    <p>{JSON.stringify(event)}</p>-->
-    <!--{/each}-->
-</div>
+{#if $loadedPath}
+    <CodePage/>
+{:else}
+    <div class="w-full h-full flex justify-center align-middle items-center">
+        <div class="flex flex-col gap-4">
+            <h1>Select a Folder to Execute</h1>
+            <Button on:click={selectDirectory} variant="default" size="sm">
+                Select Folder&nbsp;<File aria-hidden="true" />
+            </Button>
+        </div>
+    </div>
+{/if}

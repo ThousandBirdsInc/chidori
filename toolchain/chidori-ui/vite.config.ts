@@ -7,5 +7,8 @@ export default defineConfig({
 			allow: ["./sample/profiles"]
 		}
 	},
+	optimizeDeps: {
+		include: ["codemirror", "@codemirror/view"]
+	},
 	plugins: [sveltekit()]
 });

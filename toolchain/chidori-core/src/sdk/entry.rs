@@ -1,4 +1,4 @@
-use crate::execution::execution::execution_graph::ExecutionGraph;
+use crate::execution::execution::execution_graph::{ExecutionGraph, ExecutionNodeId, MergedStateHistory};
 use crate::execution::execution::execution_state::ExecutionState;
 use crate::execution::execution::DependencyGraphMutation;
 use crate::cells::CellTypes;
@@ -7,13 +7,17 @@ use crate::execution::primitives::serialized_value::{
     RkyvSerializedValue as RKV, RkyvSerializedValue,
 };
 use crate::sdk::md::{interpret_code_block, load_folder};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
 use std::{fmt, thread};
+use std::ops::Deref;
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc, Mutex, MutexGuard};
 use std::sync::mpsc::{Receiver, Sender};
-use crate::utils::telemetry::init_internal_telemetry;
+use std::thread::sleep;
+use serde::ser::SerializeMap;
+use crate::utils::telemetry::{init_internal_telemetry, TraceEvents};
+
 
 /// This is an SDK for building execution graphs. It is designed to be used interactively.
 
@@ -25,13 +29,21 @@ enum PlaybackState {
     Running,
 }
 
+// TODO: set up a channel between the host and the instance
+//     so that we can send events to instances while they run on another thread
+
+/// Instanced environments are not Send and live on a single thread.
+/// They execute their operations across multiple threads, but individual OperationNodes
+/// must remain on the given thread they're initialized on.
 pub struct InstancedEnvironment {
-    db: ExecutionGraph,
-    pub state: ExecutionState,
-    state_id: (usize, usize),
-    op_counter: usize,
+    env_rx: Receiver<UserInteractionMessage>,
+    pub db: ExecutionGraph,
+    pub execution_head_latest_state: ExecutionState,
+    execution_head_state_id: (usize, usize),
     playback_state: PlaybackState,
-    sender: Option<Sender<String>>,
+    runtime_event_sender: Option<Sender<EventsFromRuntime>>,
+    sender: Option<Sender<TraceEvents>>,
+    shared_state: Arc<Mutex<SharedState>>
 }
 
 impl std::fmt::Debug for InstancedEnvironment {
@@ -47,139 +59,211 @@ impl InstancedEnvironment {
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
         let playback_state = PlaybackState::Paused;
+        // TODO: handle this better, this just makes our tests pass until its resolved
+        let (tx, rx) = mpsc::channel();
         InstancedEnvironment {
+            env_rx: rx,
             db,
-            state,
-            state_id,
-            op_counter: 0,
+            execution_head_latest_state: state,
+            execution_head_state_id: state_id,
+            runtime_event_sender: None,
             sender: None,
-            playback_state
+            playback_state,
+            shared_state: Arc::new(Mutex::new(SharedState::new())),
         }
     }
 
-    /// Free-wheel execution of the graph
+    fn reload_cells(&mut self) {
+        let cells_to_upsert: Vec<_> = {
+            let shared_state = self.shared_state.lock().unwrap();
+            shared_state.cells.iter().map(|cell| cell.cell.clone()).collect()
+        };
+
+        let mut ids = vec![];
+        for cell in cells_to_upsert {
+            ids.push(self.upsert_cell(cell));
+        }
+
+        let mut shared_state = self.shared_state.lock().unwrap();
+        for (i, cell) in shared_state.cells.iter_mut().enumerate() {
+            cell.op_id = ids[i];
+        }
+
+        self.runtime_event_sender.as_mut().map(|sender| {
+            sender.send(EventsFromRuntime::CellsUpdated(shared_state.cells.clone())).unwrap();
+        });
+    }
+
+    /// Entrypoint for execution of an instanced environment, handles messages from the host
     #[tracing::instrument]
     pub fn run(&mut self) {
-        self.playback_state = PlaybackState::Running;
+        self.playback_state = PlaybackState::Paused;
         let _maybe_guard = self.sender.as_ref().map(|sender| {
             tracing::subscriber::set_default(init_internal_telemetry(sender.clone()))
         });
         loop {
-            if self.playback_state == PlaybackState::Paused {
-                break;
+            if let Ok(message) = self.env_rx.try_recv() {
+                match message {
+                    UserInteractionMessage::Play => {
+                        self.playback_state = PlaybackState::Running;
+                    },
+                    UserInteractionMessage::Pause => {
+                        self.playback_state = PlaybackState::Paused;
+                    },
+                    UserInteractionMessage::ReloadCells(cells) => {
+                        dbg!("Reloading cells");
+                        self.shared_state.lock().as_deref_mut().unwrap().cells = cells.iter().map(|cell| CellHolder {
+                            cell: cell.clone(),
+                            op_id: 0,
+                        }).collect();
+                        self.reload_cells();
+                    },
+                    UserInteractionMessage::RevertToState(id) => {
+                        dbg!("Reverting to state", &id);
+                        if let Some(id) = id {
+                            self.execution_head_state_id = id;
+                            self.execution_head_latest_state = self.db.get_state_at_id(id).unwrap();
+                            self.runtime_event_sender.as_mut().map(|sender| {
+                                sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&id))).unwrap();
+                            });
+                        }
+                    },
+                    _ => {}
+                }
             }
-            self.step();
+            if self.playback_state == PlaybackState::Paused {
+                sleep(std::time::Duration::from_millis(1000));
+            } else {
+                let output = self.step();
+                if output.is_empty() {
+                    sleep(std::time::Duration::from_millis(200));
+                }
+            }
         }
     }
 
     /// Increment the execution graph by one step
     #[tracing::instrument]
     pub(crate) fn step(&mut self) -> Vec<(usize, RkyvSerializedValue)> {
-        let ((state_id, state), outputs) = self.db.step_execution(self.state_id, &self.state);
-        self.state_id = state_id;
-        self.state = state;
-        outputs
+        let state = self.db.get_state_at_id(self.execution_head_state_id);
+        if let Some(state) = state {
+            let ((state_id, state), outputs) = self.db.step_execution(self.execution_head_state_id, &state);
+
+            let merged_state = self.db.get_merged_state_history(&state_id);
+            let execution_graph = self.db.get_execution_graph_elements();
+
+            // TODO: this should accumulate the state such that we can refer to the whole execution history along a selected thread
+            self.runtime_event_sender.as_mut().map(|sender| {
+                sender.send(EventsFromRuntime::ExecutionGraphUpdated(execution_graph)).unwrap();
+                sender.send(EventsFromRuntime::ExecutionStateChange(merged_state)).unwrap();
+            });
+
+            self.execution_head_state_id = state_id;
+            self.execution_head_latest_state = state;
+            outputs
+        } else {
+            vec![]
+        }
     }
 
     /// Add a cell into the execution graph
     #[tracing::instrument]
     pub fn upsert_cell(&mut self, cell: CellTypes) -> usize {
-        self.op_counter += 1;
-        let id = self.op_counter;
-        let mut op = match &cell {
-            CellTypes::Code(c) => crate::cells::code_cell::code_cell(c),
-            CellTypes::Prompt(c) => crate::cells::llm_prompt_cell::llm_prompt_cell(c),
-            CellTypes::Web(c) => crate::cells::web_cell::web_cell(c),
-            CellTypes::Template(c) => crate::cells::template_cell::template_cell(c),
-        };
-        op.attach_cell(cell);
-
-        self.state = self.state.add_operation(id, op);
-        // TODO: we collect and throw errors for: naming collisions, missing dependencies, and missing arguments
-
-        // TODO: add a cell report to the execution engine, updating the execution graph
-        // TODO: we need a model of dependencies between cells and the number of arguments they require
-
-        self.op_counter
-    }
-
-    /// Resolve the set of dependencies currently available, making necessary changes to the operator graph
-    #[tracing::instrument]
-    pub fn resolve_dependencies_from_input_signature(&mut self) -> anyhow::Result<&ExecutionState> {
-        // TODO: when there is a dependency on a function invocation we need to
-        //       instantiate a new instance of the function operation node.
-        //       It itself is not part of the call graph until it has such a dependency.
-
-        let mut available_values = HashMap::new();
-        let mut available_functions = HashMap::new();
-
-        // For all reported cells, add their exposed values to the available values
-        for (id, op) in self.state.operation_by_id.iter() {
-            let output_signature = &op.lock().unwrap().signature.output_signature;
-
-            // Store values that are available as globals
-            for (key, value) in output_signature.globals.iter() {
-                // TODO: throw an error if there is a naming collision
-                available_values.insert(key.clone(), id);
-            }
-
-            for (key, value) in output_signature.functions.iter() {
-                // TODO: throw an error if there is a naming collision
-                available_functions.insert(key.clone(), id);
-            }
-
-            // TODO: Store triggerable functions that may be passed as values as well
+        let state = self.db.get_state_at_id(self.execution_head_state_id);
+        // TODO: handle this if condition properly
+        if let Some(state) = state {
+            let ((state_id, state), op_id) = self.db.mutate_graph(self.execution_head_state_id, &state, cell);
+            let merged_state = self.db.get_merged_state_history(&state_id);
+            self.runtime_event_sender.as_mut().map(|sender| {
+                sender.send(EventsFromRuntime::ExecutionStateChange(merged_state)).unwrap();
+            });
+            self.execution_head_state_id = state_id;
+            self.execution_head_latest_state = state;
+            op_id
+        } else {
+            // TODO: should error
+            0
         }
-
-        // TODO: we need to report on INVOKED functions - these functions are calls to
-        //       functions with the locals assigned in a particular way. But then how do we handle compositions of these?
-        //       Well we just need to invoke them in the correct pattern as determined by operations in that context.
-
-        // Anywhere there is a matched value, we create a dependency graph edge
-        let mut mutations = vec![];
-        for (destination_cell_id, op) in self.state.operation_by_id.iter() {
-            let operation = op.lock().unwrap();
-            let input_signature = &operation.signature.input_signature;
-            for (value_name, value) in input_signature.globals.iter() {
-                // TODO: we need to handle collisions between the two of these
-                if let Some(source_cell_id) = available_functions.get(value_name) {
-                    if source_cell_id != &destination_cell_id {
-                        mutations.push(DependencyGraphMutation::Create {
-                            operation_id: destination_cell_id.clone(),
-                            depends_on: vec![(
-                                *source_cell_id.clone(),
-                                DependencyReference::FunctionInvocation(value_name.to_string()),
-                            )],
-                        });
-                    }
-                }
-
-                if let Some(source_cell_id) = available_values.get(value_name) {
-                    if source_cell_id != &destination_cell_id {
-                        mutations.push(DependencyGraphMutation::Create {
-                            operation_id: destination_cell_id.clone(),
-                            depends_on: vec![(
-                                *source_cell_id.clone(),
-                                DependencyReference::Global(value_name.to_string()),
-                            )],
-                        });
-                    }
-                }
-            }
-        }
-
-        self.state = self.state.apply_dependency_graph_mutations(mutations);
-        Ok(&self.state)
     }
 
     /// Scheduled execution of a function in the graph
     fn schedule() {}
 }
 
+#[derive(Debug)]
+pub enum UserInteractionMessage {
+    Play,
+    Pause,
+    UserAction(String),
+    RevertToState(Option<(usize, usize)>),
+    ReloadCells(Vec<CellTypes>),
+    FetchCells,
+    MutateCell
+}
+
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum EventsFromRuntime {
+    ExecutionGraphUpdated(Vec<(ExecutionNodeId, ExecutionNodeId)>),
+    ExecutionStateChange(MergedStateHistory),
+    CellsUpdated(Vec<CellHolder>)
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CellHolder {
+    cell: CellTypes,
+    op_id: usize,
+}
+
+#[derive(Debug)]
+pub struct SharedState {
+    latest_state: Option<ExecutionState>,
+    cells: Vec<CellHolder>,
+}
+
+
+impl Serialize for SharedState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+    {
+        let mut state = serializer.serialize_map(None)?;
+        if let Some(map) = &self.latest_state {
+            for (k, v) in &map.state {
+                state.serialize_entry(&k, v.deref())?; // Dereference `Arc` to serialize the value inside
+            }
+        }
+        state.end()
+    }
+}
+
+impl SharedState {
+    fn new() -> Self {
+        SharedState {
+            latest_state: None,
+            cells: vec![],
+        }
+    }
+}
+
+
+/// Chidori is the high level interface for interacting with our runtime.
+/// It is responsible for loading cells and creating instances of the environment.
+/// It is expected to run on a "main thread" while instances may run in background threads.
 pub struct Chidori {
-    loaded_cells: HashMap<usize, Vec<CellTypes>>,
-    load_counter: usize,
-    sender: Option<Sender<String>>,
+
+    /// Sender to push user requests to the instance, these events result in
+    /// state changes within the instance
+    instanced_env_tx: Option<Sender<UserInteractionMessage>>,
+
+    /// Sender to pass changes in state within instances back to the main thread
+    runtime_event_sender: Option<Sender<EventsFromRuntime>>,
+
+    /// Sender to collect trace events from instances
+    trace_event_sender: Option<Sender<TraceEvents>>,
+
+    shared_state: Arc<Mutex<SharedState>>,
+    pub loaded_path: Option<String>,
 }
 
 impl std::fmt::Debug for Chidori {
@@ -192,17 +276,42 @@ impl std::fmt::Debug for Chidori {
 impl Chidori {
     pub fn new() -> Self {
         Chidori {
-            loaded_cells: HashMap::new(),
-            load_counter: 0,
-            sender: None,
+            instanced_env_tx: None,
+            runtime_event_sender: None,
+            trace_event_sender: None,
+            loaded_path: None,
+            shared_state: Arc::new(Mutex::new(SharedState {
+                cells: vec![],
+                latest_state: None,
+            })),
         }
     }
 
-    pub fn new_with_events(sender: Sender<String>) -> Self {
+    pub fn new_with_events(sender: Sender<TraceEvents>, runtime_event_sender: Sender<EventsFromRuntime>) -> Self {
         Chidori {
-            loaded_cells: HashMap::new(),
-            load_counter: 0,
-            sender: Some(sender),
+            instanced_env_tx: None,
+            runtime_event_sender: Some(runtime_event_sender),
+            trace_event_sender: Some(sender),
+            loaded_path: None,
+            shared_state: Arc::new(Mutex::new(SharedState {
+                cells: vec![],
+                latest_state: None,
+            })),
+        }
+    }
+
+    pub fn get_shared_state(&self) -> MutexGuard<'_, SharedState> {
+        self.shared_state.lock().unwrap()
+    }
+
+    pub fn get_cells(&self) -> Vec<CellTypes> {
+        vec![]
+    }
+
+    #[tracing::instrument]
+    pub fn handle_user_action(&self, action: UserInteractionMessage) {
+        if let Some(tx) = &self.instanced_env_tx {
+            tx.send(action).unwrap();
         }
     }
 
@@ -212,8 +321,7 @@ impl Chidori {
             .iter()
             .filter_map(|block| interpret_code_block(block))
             .for_each(|block| { cells.push(block); });
-        self.load_counter += 1;
-        self.loaded_cells.insert(self.load_counter, cells);
+        self.handle_user_action(UserInteractionMessage::ReloadCells(cells));
         Ok(())
     }
 
@@ -227,33 +335,29 @@ impl Chidori {
                 }
             }
         }
-        self.load_counter += 1;
-        self.loaded_cells.insert(self.load_counter, cells);
+        self.loaded_path = Some(path.to_str().unwrap().to_string());
+        dbg!("handle user action load md directory");
+        self.handle_user_action(UserInteractionMessage::ReloadCells(cells));
         Ok(())
     }
 
-    pub fn get_instance(&self) -> anyhow::Result<InstancedEnvironment> {
-        if let Some(cells) = self.loaded_cells.get(&self.load_counter) {
-            let mut db = ExecutionGraph::new();
-            let mut state = ExecutionState::new();
-            let state_id = (0, 0);
-            let playback_state = PlaybackState::Paused;
-            let mut e = InstancedEnvironment {
-                db,
-                state,
-                state_id,
-                op_counter: 0,
-                sender: self.sender.clone(),
-                playback_state
-            };
-            for cell in cells {
-                e.upsert_cell(cell.clone());
-            }
-            e.resolve_dependencies_from_input_signature()?;
-            Ok(e)
-        } else {
-            Err(anyhow::anyhow!("No cells loaded"))
-        }
+    pub fn get_instance(&mut self) -> anyhow::Result<InstancedEnvironment> {
+        let (instanced_env_tx, env_rx) = mpsc::channel();
+        self.instanced_env_tx = Some(instanced_env_tx);
+        let mut db = ExecutionGraph::new();
+        let mut state = ExecutionState::new();
+        let state_id = (0, 0);
+        let playback_state = PlaybackState::Paused;
+        Ok(InstancedEnvironment {
+            env_rx,
+            db,
+            execution_head_latest_state: state,
+            execution_head_state_id: state_id,
+            runtime_event_sender: self.runtime_event_sender.clone(),
+            sender: self.trace_event_sender.clone(),
+            playback_state,
+            shared_state: self.shared_state.clone(),
+        })
     }
 }
 
@@ -269,34 +373,34 @@ mod tests {
     #[test]
     fn test_execute_cells_with_global_dependency() {
         let mut env = InstancedEnvironment::new();
-        let id = env.upsert_cell(CellTypes::Code(CodeCell {
+        let op_id_x = env.upsert_cell(CellTypes::Code(CodeCell {
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
                 x = 20
                 "#}),
             function_invocation: None,
         }));
-        assert_eq!(id, 1);
-        let id = env.upsert_cell(CellTypes::Code(CodeCell {
+        assert_eq!(op_id_x, 0);
+        let op_id_y = env.upsert_cell(CellTypes::Code(CodeCell {
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
                 y = x + 1
                 "#}),
             function_invocation: None,
         }));
-        assert_eq!(id, 2);
-        env.resolve_dependencies_from_input_signature();
-        env.state.render_dependency_graph();
-        env.step();
+        assert_eq!(op_id_y, 1);
+        // env.resolve_dependencies_from_input_signature();
+        env.execution_head_latest_state.render_dependency_graph();
+        dbg!(&env.step());
         assert_eq!(
-            env.state.state_get(&1),
+            env.execution_head_latest_state.state_get(&op_id_x),
             Some(&RkyvObjectBuilder::new().insert_number("x", 20).build())
         );
-        assert_eq!(env.state.state_get(&2), None);
+        assert_eq!(env.execution_head_latest_state.state_get(&op_id_y), None);
         env.step();
-        assert_eq!(env.state.state_get(&1), None);
+        assert_eq!(env.execution_head_latest_state.state_get(&op_id_x), None);
         assert_eq!(
-            env.state.state_get(&2),
+            env.execution_head_latest_state.state_get(&op_id_y),
             Some(&RkyvObjectBuilder::new().insert_number("y", 21).build())
         );
     }
@@ -305,16 +409,16 @@ mod tests {
     fn test_execute_cells_between_code_and_llm() {
         dotenv::dotenv().ok();
         let mut env = InstancedEnvironment::new();
-        let id = env.upsert_cell(CellTypes::Code(CodeCell {
+        let op_id_x = env.upsert_cell(CellTypes::Code(CodeCell {
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
                 x = "Here is a sample string"
                 "#}),
             function_invocation: None,
         }));
-        assert_eq!(id, 1);
-        let id = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
-            path: None,
+        assert_eq!(op_id_x, 0);
+        let op_id_y = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
+            name: None,
             provider: SupportedModelProviders::OpenAI,
             req: "\
               Say only a single word. Give no additional explanation.
@@ -322,23 +426,22 @@ mod tests {
             "
             .to_string(),
         }));
-        assert_eq!(id, 2);
-        env.resolve_dependencies_from_input_signature();
-        env.state.render_dependency_graph();
+        assert_eq!(op_id_y, 1);
+        env.execution_head_latest_state.render_dependency_graph();
         env.step();
         assert_eq!(
-            env.state.state_get(&1),
+            env.execution_head_latest_state.state_get(&op_id_x),
             Some(
                 &RkyvObjectBuilder::new()
                     .insert_string("x", "Here is a sample string".to_string())
                     .build()
             )
         );
-        assert_eq!(env.state.state_get(&2), None);
+        assert_eq!(env.execution_head_latest_state.state_get(&op_id_y), None);
         env.step();
-        assert_eq!(env.state.state_get(&1), None);
+        assert_eq!(env.execution_head_latest_state.state_get(&op_id_x), None);
         assert_eq!(
-            env.state.state_get(&2),
+            env.execution_head_latest_state.state_get(&op_id_y),
             Some(&RKV::String("Here".to_string()))
         );
     }
@@ -346,7 +449,7 @@ mod tests {
     #[test]
     fn test_execute_cells_via_prompt_calling_api() {
         let mut env = InstancedEnvironment::new();
-        let id = env.upsert_cell(CellTypes::Code(CodeCell {
+        let op_id_x = env.upsert_cell(CellTypes::Code(CodeCell {
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
                 import chidori as ch
@@ -354,28 +457,27 @@ mod tests {
                 "#}),
             function_invocation: None,
         }));
-        assert_eq!(id, 1);
-        let id = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
-            path: Some("generate_names".to_string()),
+        assert_eq!(op_id_x, 0);
+        let op_id_y = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
+            name: Some("generate_names".to_string()),
             provider: SupportedModelProviders::OpenAI,
             req: "\
               Generate names starting with {{x}}
             "
             .to_string(),
         }));
-        assert_eq!(id, 2);
-        env.resolve_dependencies_from_input_signature();
-        env.state.render_dependency_graph();
+        assert_eq!(op_id_y, 1);
+        env.execution_head_latest_state.render_dependency_graph();
         env.step();
         assert_eq!(
-            env.state.state_get(&1),
+            env.execution_head_latest_state.state_get(&op_id_x),
             Some(&RkyvObjectBuilder::new().insert_number("x", 20).build())
         );
-        assert_eq!(env.state.state_get(&2), None);
+        assert_eq!(env.execution_head_latest_state.state_get(&op_id_y), None);
         env.step();
-        assert_eq!(env.state.state_get(&1), None);
+        assert_eq!(env.execution_head_latest_state.state_get(&op_id_x), None);
         assert_eq!(
-            env.state.state_get(&2),
+            env.execution_head_latest_state.state_get(&op_id_y),
             Some(&RkyvObjectBuilder::new().insert_number("y", 21).build())
         );
     }
@@ -391,7 +493,7 @@ mod tests {
                 "#}),
             function_invocation: None,
         }));
-        assert_eq!(id, 1);
+        assert_eq!(id, 0);
         let id = env.upsert_cell(CellTypes::Code(CodeCell {
             function_invocation: None,
             language: SupportedLanguage::PyO3,
@@ -399,20 +501,19 @@ mod tests {
                 y = add(2, 3)
                 "#}),
         }));
-        assert_eq!(id, 2);
-        env.resolve_dependencies_from_input_signature();
-        env.state.render_dependency_graph();
+        assert_eq!(id, 1);
+        env.execution_head_latest_state.render_dependency_graph();
         env.step();
         // Empty object from the function declaration
         assert_eq!(
-            env.state.state_get(&1),
+            env.execution_head_latest_state.state_get(&0),
             Some(&RkyvObjectBuilder::new().build())
         );
-        assert_eq!(env.state.state_get(&2), None);
+        assert_eq!(env.execution_head_latest_state.state_get(&1), None);
         env.step();
-        assert_eq!(env.state.state_get(&1), None);
+        assert_eq!(env.execution_head_latest_state.state_get(&0), None);
         assert_eq!(
-            env.state.state_get(&2),
+            env.execution_head_latest_state.state_get(&1),
             Some(&RkyvObjectBuilder::new().insert_number("y", 5).build())
         );
     }
@@ -428,7 +529,7 @@ mod tests {
                 "#}),
             function_invocation: None,
         }));
-        assert_eq!(id, 1);
+        assert_eq!(id, 0);
         let id = env.upsert_cell(CellTypes::Code(CodeCell {
             function_invocation: None,
             language: SupportedLanguage::Deno,
@@ -436,21 +537,55 @@ mod tests {
                 const y = add(2, 3);
                 "#}),
         }));
-        assert_eq!(id, 2);
-        env.resolve_dependencies_from_input_signature();
-        env.state.render_dependency_graph();
+        assert_eq!(id, 1);
+        env.execution_head_latest_state.render_dependency_graph();
         env.step();
         // Function declaration cell
         assert_eq!(
-            env.state.state_get(&1),
+            env.execution_head_latest_state.state_get(&0),
             Some(&RkyvObjectBuilder::new().build())
         );
-        assert_eq!(env.state.state_get(&2), None);
+        assert_eq!(env.execution_head_latest_state.state_get(&1), None);
         env.step();
-        assert_eq!(env.state.state_get(&1), None);
+        assert_eq!(env.execution_head_latest_state.state_get(&0), None);
         assert_eq!(
-            env.state.state_get(&2),
+            env.execution_head_latest_state.state_get(&1),
             Some(&RkyvObjectBuilder::new().insert_number("y", 5).build())
+        );
+    }
+    #[test]
+    fn test_multiple_dependencies_across_nodes() {
+        let mut ee = Chidori::new();
+        ee.load_md_string(indoc! { r#"
+            ```python
+            v = 40
+            def add(x, y):
+                return x + y
+            ```
+
+            ```python
+            y = v * 20
+            z = add(y, y)
+            ```
+            "#
+            }).unwrap();
+        let mut env = ee.get_instance().unwrap();
+        env.execution_head_latest_state.render_dependency_graph();
+        env.step();
+        // Function declaration cell
+        assert_eq!(
+            env.execution_head_latest_state.state_get(&0),
+            Some(&RkyvObjectBuilder::new().insert_number("v", 40).build())
+        );
+        assert_eq!(env.execution_head_latest_state.state_get(&1), None);
+        env.step();
+        for x in env.execution_head_latest_state.operation_by_id.values() {
+            dbg!(&x.lock().as_ref().unwrap().signature);
+        }
+        assert_eq!(env.execution_head_latest_state.state_get(&0), None);
+        assert_eq!(
+            env.execution_head_latest_state.state_get(&1),
+            Some(&RkyvObjectBuilder::new().insert_number("z", 1600).insert_number("y", 800).build())
         );
     }
 
@@ -476,18 +611,18 @@ mod tests {
             "#
             }).unwrap();
         let mut env = ee.get_instance().unwrap();
-        env.state.render_dependency_graph();
+        env.execution_head_latest_state.render_dependency_graph();
         env.step();
         // Function declaration cell
         assert_eq!(
-            env.state.state_get(&1),
+            env.execution_head_latest_state.state_get(&0),
             Some(&RkyvObjectBuilder::new().build())
         );
-        assert_eq!(env.state.state_get(&2), None);
+        assert_eq!(env.execution_head_latest_state.state_get(&1), None);
         env.step();
-        assert_eq!(env.state.state_get(&1), None);
+        assert_eq!(env.execution_head_latest_state.state_get(&0), None);
         assert_eq!(
-            env.state.state_get(&2),
+            env.execution_head_latest_state.state_get(&1),
             Some(&RkyvObjectBuilder::new().insert_number("y", 5).build())
         );
     }
@@ -516,7 +651,7 @@ mod tests {
                 "#
             }).unwrap();
             let mut env = ee.get_instance().unwrap();
-            env.state.render_dependency_graph();
+            env.execution_head_latest_state.render_dependency_graph();
 
             // This will initialize the service
             env.step();
@@ -562,7 +697,7 @@ mod tests {
                 "#
             }).unwrap();
             let mut env = ee.get_instance().unwrap();
-            env.state.render_dependency_graph();
+            env.execution_head_latest_state.render_dependency_graph();
 
             // This will initialize the service
             env.step();

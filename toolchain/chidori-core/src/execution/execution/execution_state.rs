@@ -13,12 +13,17 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Formatter;
+use std::marker::PhantomData;
+use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::{Arc, mpsc};
 // use std::sync::{Mutex};
 use no_deadlocks::{Mutex};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::de::{MapAccess, Visitor};
+use serde::ser::{SerializeMap, SerializeStruct};
 use crate::execution::execution::execution_graph::ExecutionNodeId;
 
 pub enum OperationExecutionStatusOption {
@@ -59,8 +64,11 @@ pub enum DependencyGraphMutation {
 pub struct ExecutionState {
     // TODO: update all operations to use this id instead of a separate representation
     id: (usize, usize),
+    pub(crate) op_counter: usize,
 
-    state: ImHashMap<usize, Arc<RkyvSerializedValue>>,
+    pub state: ImHashMap<usize, Arc<RkyvSerializedValue>>,
+
+    pub operation_name_to_id: ImHashMap<String, OperationId>,
 
     pub operation_by_id: ImHashMap<OperationId, Arc<Mutex<OperationNode>>>,
 
@@ -87,7 +95,7 @@ impl std::fmt::Debug for ExecutionState {
 }
 
 fn render_map_as_table(exec_state: &ExecutionState) -> String {
-    let mut table = String::from("\n");
+    let mut table = String::from("\n --- state ----");
     table.push_str(indoc!(
         r"
             | Key | Value |
@@ -105,6 +113,24 @@ fn render_map_as_table(exec_state: &ExecutionState) -> String {
         }
     }
     table.push_str("\n");
+    // table.push_str("\n ---- operations ---- ");
+    // table.push_str(indoc!(
+    //     r"
+    //         | Key | Value |
+    //         |---|---|"
+    // ));
+    // for key in exec_state.operation_by_id.keys() {
+    //     if let Some(val) = exec_state.operation_by_id.get(key) {
+    //         table.push_str(&format!(
+    //             indoc!(
+    //                 r"
+    //             | {} | {:?} |"
+    //             ),
+    //             key, val.lock().as_deref(),
+    //         ));
+    //     }
+    // }
+    // table.push_str("\n");
 
     table
 }
@@ -113,7 +139,9 @@ impl ExecutionState {
     pub fn new() -> Self {
         ExecutionState {
             id: (0, 0),
+            op_counter: 0,
             state: Default::default(),
+            operation_name_to_id: Default::default(),
             operation_by_id: Default::default(),
             has_been_set: Default::default(),
             dependency_map: Default::default(),
@@ -146,7 +174,12 @@ impl ExecutionState {
         println!("================ Dependency graph ================");
         println!(
             "{:?}",
-            Dot::with_config(&self.get_dependency_graph(), &[Config::EdgeNoLabel])
+            Dot::with_attr_getters(
+                &self.get_dependency_graph(),
+                &[],
+                &|_, _| String::new(),
+                &|_, _| String::new()
+            )
         );
     }
 
@@ -167,12 +200,30 @@ impl ExecutionState {
         graph
     }
 
+    // TODO: remove node from signature
+    // TODO: operations should have an identity instead of using a counter
     #[tracing::instrument]
-    pub fn add_operation(&mut self, node: usize, operation_node: OperationNode) -> Self {
+    pub fn add_operation(&self, operation_node: OperationNode) -> (usize, Self) {
         let mut s = self.clone();
-        s.operation_by_id
-            .insert(node.clone(), Arc::new(Mutex::new(operation_node)));
-        s
+        if let Some(name) = &operation_node.name {
+            if (s.operation_name_to_id.contains_key(name)) {
+                let existing_id = s.operation_name_to_id.get(name).unwrap();
+                s.operation_by_id
+                    .insert(existing_id.clone(), Arc::new(Mutex::new(operation_node)));
+                (existing_id.clone(), s)
+            } else {
+                s.operation_name_to_id.insert(name.clone(), s.op_counter);
+                s.operation_by_id
+                    .insert(s.op_counter, Arc::new(Mutex::new(operation_node)));
+                s.op_counter += 1;
+                (s.op_counter - 1, s)
+            }
+        } else {
+            s.operation_by_id
+                .insert(s.op_counter, Arc::new(Mutex::new(operation_node)));
+            s.op_counter += 1;
+            (s.op_counter - 1, s)
+        }
     }
 
     #[tracing::instrument]
@@ -321,7 +372,6 @@ impl ExecutionState {
                 // Run the target function in a background thread
                 let mut operation_by_id = previous_state.operation_by_id.clone();
                 let sender_clone = sender.clone();
-                let event_sender = self.execution_event_sender.clone();
                 std::thread::spawn(move || {
                     let mut op_node = operation_by_id
                         .get_mut(&operation_id)
@@ -348,44 +398,13 @@ impl ExecutionState {
                             }
                         }
                     });
-                    if let Some(event_sender) = &event_sender {
-                        event_sender.send(OperationExecutionStatus::ExecutionEvent(
-                            (0,0),
-                            operation_id,
-                            OperationExecutionStatusOption::LongRunning
-                        )).unwrap();
-                    }
                     // Long-running execution
                     let _ = op_node.execute(argument_payload, Some(internal_sender.clone()));
-
-                    if let Some(event_sender) = &event_sender {
-                        event_sender.send(OperationExecutionStatus::ExecutionEvent(
-                            (0,0),
-                            operation_id,
-                            OperationExecutionStatusOption::Completed
-                        )).unwrap();
-                    }
                 });
                 // outputs.push((operation_id, result.clone()));
                 // new_state.state_insert(operation_id, result);
             } else {
-                if let Some(event_sender) = &self.execution_event_sender {
-                    event_sender.send(OperationExecutionStatus::ExecutionEvent(
-                        (0,0),
-                        operation_id,
-                        OperationExecutionStatusOption::Running
-                    )).unwrap();
-                }
                 let result = op_node.execute(argument_payload, None);
-
-                if let Some(event_sender) = &self.execution_event_sender {
-                    event_sender.send(OperationExecutionStatus::ExecutionEvent(
-                        (0,0),
-                        operation_id,
-                        OperationExecutionStatusOption::Completed
-                    )).unwrap();
-                }
-
                 outputs.push((operation_id, result.clone()));
                 new_state.state_insert(operation_id, result);
             }

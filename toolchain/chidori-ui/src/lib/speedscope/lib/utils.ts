@@ -61,6 +61,14 @@ export class KeyedSet<T extends HasKey> implements Iterable<T> {
   [Symbol.iterator]() {
     return this.map.values()
   }
+
+  clone(): KeyedSet<T> {
+    const clonedSet = new KeyedSet<T>();
+    this.forEach((item) => {
+      clonedSet.getOrInsert(item);
+    });
+    return clonedSet;
+  }
 }
 
 export function* itMap<T, U>(it: Iterable<T>, f: (t: T) => U): Iterable<U> {

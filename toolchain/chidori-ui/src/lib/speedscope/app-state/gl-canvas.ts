@@ -6,7 +6,5 @@ export const glCanvasStore : Writable<HTMLCanvasElement | null>= writable(null);
 
 export const canvasContext = derived(glCanvasStore, $glCanvasStoreState => {
   if ($glCanvasStoreState == null) return null;
-  const cv = getCanvasContext({ theme: lightTheme, canvas: $glCanvasStoreState });
-  console.log(cv)
-  return cv;
+  return getCanvasContext({ theme: lightTheme, canvas: $glCanvasStoreState });
 });

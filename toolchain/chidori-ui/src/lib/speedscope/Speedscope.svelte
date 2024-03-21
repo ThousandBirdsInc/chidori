@@ -18,81 +18,8 @@
       line: key.length,
     }
   }
-  function getRandomFrameId() {
-    const frames = ['a1', 'b2', 'c3', 'd4', 'e5'];
-    const index = Math.floor(Math.random() * frames.length);
-    return frames[index];
-  }
-
-  let currentTime = 0;
-  function generateFramesWithIncreasingValue(b, lastCumulativeValue, increaseStep = 1) {
-    let cumulativeValue = lastCumulativeValue + increaseStep; // Ensure increase from last value
-    const stack = [];
-
-    while (true) {
-      const action = Math.random() > 0.5; // Randomly decide to enter or leave a frame
-
-      if (stack.length > 0 && action) {
-        // Leave a frame
-        const { frameId } = stack.pop();
-        b.leaveFrame(getFrameInfo(frameId), currentTime);
-        cumulativeValue += 1; // Increase cumulative value
-      } else if (!action) {
-        // Enter a new frame
-        const frameId = getRandomFrameId();
-        stack.push({ frameId, time: currentTime });
-        b.enterFrame(getFrameInfo(frameId), currentTime);
-        cumulativeValue += 1; // Increase cumulative value
-      }
-
-      currentTime += 1; // Increment time
-
-      // Break the loop if the cumulative value has increased enough
-      if (cumulativeValue >= lastCumulativeValue + increaseStep) break;
-    }
-
-    // Ensure all frames are closed
-    while (stack.length > 0) {
-      const { frameId } = stack.pop();
-      b.leaveFrame(getFrameInfo(frameId), currentTime);
-      currentTime += 1; // Increment time to ensure logical order
-      cumulativeValue += 1; // Ensure final increase for closed frames
-    }
-
-    return cumulativeValue; // Return the new cumulative value
-  }
 
   const b = new CallTreeProfileBuilder();
-
-  // let lastCumulativeValue = 0;
-  // function appendFramesPeriodically() {
-  //   lastCumulativeValue = generateFramesWithIncreasingValue(b, lastCumulativeValue, 1); // Increase by at least 1
-  // }
-  // appendFramesPeriodically();
-
-  // // Periodically append more frames
-  // const intervalId = setInterval(() => {
-  //   appendFramesPeriodically();
-  //
-  //   // Stop after a certain condition or time
-  //   if (currentTime > 100) { // Example condition
-  //     clearInterval(intervalId);
-  //     // Use the profile as needed
-  //   }
-  //   const profile = b.build();
-  //   setProfileGroup({
-  //     name: "test",
-  //     indexToView: 0,
-  //     profiles: [profile],
-  //   });
-  // }, 5000); // Adjust the interval time as needed
-  // (async () => {
-  //   const profileGroup =  await importProfileGroupFromText("test.json", JSON.stringify(profileData));
-  //   if (profileGroup) {
-  //     setProfileGroup(profileGroup);
-  //   }
-  // })();
-
     const fa = getFrameInfo('fa')
   const fb = getFrameInfo('fb')
   const fc = getFrameInfo('fc')

@@ -2,52 +2,25 @@
   import { Button } from "@/components/ui/button";
   import { cn } from "$lib/utils.js";
   import * as Tooltip from "@/components/ui/tooltip";
-  import type { Route } from "@/config.ts";
+  import type { Route } from "@/config";
   import { dialog } from '@tauri-apps/api';
   import { invoke } from '@tauri-apps/api/tauri';
   import { emit, listen } from '@tauri-apps/api/event'
   import {File, Pause, Play} from "@/icons";
+  import {loadAndWatchDirectory, selectDirectory, sendPlay, sendPause} from "@/stores/store"
+  import { page } from '$app/stores'; // Import the page store
+  import {loadedPath} from "@/stores/store";
 
+  const isActiveRoute = (routePath: string) => $page.url.pathname === routePath;
   export let isCollapsed: boolean;
   export let routes: Route[];
 
-  function handleRun() {
-    emit('execution:run', { message: 'run' })
-  }
-
-  function runScriptOnDirectory(path) {
-    invoke('run_script_on_directory', { path })
-      .then(() => console.log('Script execution started'))
-      .catch(err => console.error(`Error running script: ${err}`));
-  }
-
-  async function selectDirectory() {
-    try {
-      const path = await dialog.open({ directory: true, multiple: false });
-      if (path) {
-        runScriptOnDirectory(path);
-      }
-    } catch (error) {
-      console.error(`Error selecting directory: ${error}`);
-    }
-  }
 </script>
 
 <div data-collapsed={isCollapsed} class="group flex flex-col gap-4 py-2 data-[collapsed=true]:py-2">
     <nav
             class="grid gap-2 px-2 group-[[data-collapsed=true]]:justify-center group-[[data-collapsed=true]]:px-2"
     >
-        <div class="p-2 flex justify-center gap-2">
-            <Button variant="default" size="sm">
-                <Play class="h-6" aria-hidden="true" />
-            </Button>
-            <Button variant="default" size="sm">
-                <Pause aria-hidden="true" />
-            </Button>
-            <Button on:click={selectDirectory} variant="default" size="sm">
-                <File aria-hidden="true" />
-            </Button>
-        </div>
 
         {#each routes as route}
             {#if isCollapsed}
@@ -56,11 +29,11 @@
                         <Button
                                 href="#"
                                 builders={[builder]}
-                                variant={route.variant}
+                                variant={isActiveRoute(route.path) ? 'default' : 'ghost'}
                                 size="icon"
                                 class={cn(
 								"size-9",
-								route.variant === "default" &&
+								(isActiveRoute(route.path) ? 'default' : 'ghost') === "default" &&
 									"dark:bg-muted dark:text-muted-foreground dark:hover:bg-muted dark:hover:text-white"
 							)}
                         >
@@ -80,11 +53,11 @@
             {:else}
                 <Button
                         href={route.path}
-                        variant={route.variant}
+                        variant={isActiveRoute(route.path) ? 'default' : 'ghost'}
                         size="sm"
                         class={cn("justify-start", {
 						"dark:bg-muted dark:text-white dark:hover:bg-muted dark:hover:text-white":
-							route.variant === "default",
+							(isActiveRoute(route.path) ? 'default' : 'ghost') === "default",
 					})}
                 >
                     <svelte:component this={route.icon} class="mr-2 size-4" aria-hidden="true" />
@@ -92,7 +65,7 @@
                     {#if route.label}
 						<span
                                 class={cn("ml-auto", {
-								"text-background dark:text-white": route.variant === "default",
+								"text-background dark:text-white": (isActiveRoute(route.path) ? 'default' : 'ghost') === "default",
 							})}
                         >
 							{route.label}
@@ -101,14 +74,5 @@
                 </Button>
             {/if}
         {/each}
-        <div class="p-2 bg-zinc-200 rounded border border-zinc-300">
-            This will be a list of running cells
-            <ul>
-                <li>Item</li>
-                <li>Item</li>
-                <li>Item</li>
-                <li>Item</li>
-            </ul>
-        </div>
     </nav>
 </div>

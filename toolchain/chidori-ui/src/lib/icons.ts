@@ -11,3 +11,8 @@ export { default as Send } from "lucide-svelte/icons/send";
 export { default as Users } from "lucide-svelte/icons/users";
 export { default as Play } from "lucide-svelte/icons/play";
 export { default as Pause } from "lucide-svelte/icons/pause";
+export { default as FileCode2 } from "lucide-svelte/icons/file-code-2";
+export { default as ScatterChart } from "lucide-svelte/icons/scatter-chart";
+export { default as MessageSquareText } from "lucide-svelte/icons/message-square-text";
+
+

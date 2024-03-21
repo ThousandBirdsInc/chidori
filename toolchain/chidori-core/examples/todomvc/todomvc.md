@@ -12,6 +12,8 @@ todo_list = []
 @ch.emit("todo_added")
 def add_todo(todo: str):
     todo_list.append(todo)
+    ch.prompt("todoagent")
+    
 
 def remove_todo(idx: int):
     todo_list.pop(idx)

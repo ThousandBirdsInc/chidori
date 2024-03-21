@@ -2,9 +2,9 @@
   import "../app.css";
   import * as Resizable from "@/components/ui/resizable";
   import { primaryRoutes } from "@/config";
-  import Nav from "@/components/Nav.svelte";
+  import Nav from "./Nav.svelte";
   import { Separator } from "@/components/ui/separator";
-  import TopNav from "@/components/TopNav.svelte";
+  import TopNav from "./TopNav.svelte";
 
   export let defaultLayout = [265, 440, 655];
   export let defaultCollapsed = false;

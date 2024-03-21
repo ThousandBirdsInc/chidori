@@ -62,18 +62,11 @@
     );
   }
 
-  function physicalViewSizeTotal() {
-    if (!overlayCanvas) return new Vec2(0, 0);
-
-    const rect = overlayCanvas.getBoundingClientRect();
-    return new Vec2(rect.width, rect.height);
-  }
-
   function physicalViewSize() {
     if (!overlayCanvas) return new Vec2(0, 0);
 
     const rect = overlayCanvas.getBoundingClientRect();
-    return new Vec2(rect.width, rect.height);
+    return new Vec2(rect.width * window.devicePixelRatio, rect.height * window.devicePixelRatio);
   }
 
   function physicalBounds() {
@@ -143,7 +136,7 @@
     const physicalViewSpaceFrameHeight =
       LOGICAL_VIEW_SPACE_FRAME_HEIGHT * window.devicePixelRatio;
 
-    const _physicalViewSize = physicalViewSizeTotal();
+    const _physicalViewSize = physicalViewSize();
 
     ctx.clearRect(0, 0, _physicalViewSize.x, _physicalViewSize.y);
 

@@ -6,7 +6,7 @@ fn main() {
     let relative_path = current_file_path.join("./");
 
     let mut env = Chidori::new();
-    env.load(&relative_path);
-    env.state.render_dependency_graph();
-    env.run();
+    env.load_md_directory(&relative_path);
+    let mut s = env.get_instance().unwrap();
+    s.run();
 }

@@ -69,8 +69,7 @@ export class CanvasContext {
   setViewport(physicalBounds: Rect, cb: () => void): void {
     const {origin, size} = physicalBounds
     let viewportBefore = this.gl.viewport
-    let {left, top} = this.canvas.getBoundingClientRect();
-    this.gl.setViewport(origin.x - left, origin.y - top, size.x, size.y)
+    this.gl.setViewport(origin.x, origin.y, size.x, size.y)
 
     cb()
 
@@ -80,8 +79,9 @@ export class CanvasContext {
 
   renderBehind(el: Element, cb: () => void) {
     const bounds = el.getBoundingClientRect()
+    let {left, top} = this.canvas.getBoundingClientRect();
     const physicalBounds = new Rect(
-      new Vec2(bounds.left * window.devicePixelRatio, bounds.top * window.devicePixelRatio),
+      new Vec2(bounds.left * window.devicePixelRatio - left * window.devicePixelRatio , bounds.top * window.devicePixelRatio - top * window.devicePixelRatio ),
       new Vec2(bounds.width * window.devicePixelRatio, bounds.height * window.devicePixelRatio),
     )
 

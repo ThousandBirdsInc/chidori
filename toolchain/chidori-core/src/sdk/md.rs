@@ -105,13 +105,14 @@ pub fn interpret_code_block(block: &MarkdownCodeBlock) -> Option<CellTypes> {
                 _ => unreachable!(), // Given the outer match, this branch should never be reached
             };
             Some(CellTypes::Code(CodeCell {
+                name: block.name.clone(),
                 language,
                 source_code: block.body.clone(),
                 function_invocation: None,
             }))
         },
         "prompt" => Some(CellTypes::Prompt(LLMPromptCell::Chat {
-            path: block.name.clone(),
+            name: block.name.clone(),
             provider: SupportedModelProviders::OpenAI,
             req: block.body.clone(),
         })),
@@ -120,6 +121,7 @@ pub fn interpret_code_block(block: &MarkdownCodeBlock) -> Option<CellTypes> {
             body: block.body.clone(),
         })),
         "web" => Some(CellTypes::Web(WebserviceCell {
+            name: block.name.clone(),
             configuration: block.body.clone(),
             port: block.configuration.get("port").and_then(|p| p.parse::<u16>().ok()).or_else(|| Some(8080)).unwrap(),
         })),

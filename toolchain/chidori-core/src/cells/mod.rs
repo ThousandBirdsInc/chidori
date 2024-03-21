@@ -51,6 +51,7 @@ pub enum SupportedLanguage {
 #[archive_attr(derive(Debug))]
 #[ts(export, export_to = "package_node/types/")]
 pub(crate) struct CodeCell {
+    pub(crate) name: Option<String>,
     pub(crate) language: SupportedLanguage,
     pub(crate) source_code: String,
     pub(crate) function_invocation: Option<String>,
@@ -171,6 +172,7 @@ bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: 
 #[archive_attr(derive(Debug))]
 #[ts(export, export_to = "package_node/types/")]
 pub(crate) struct WebserviceCell {
+    pub(crate) name: Option<String>,
     pub(crate) configuration: String,
     pub(crate) port: u16,
 }
@@ -241,7 +243,7 @@ pub enum SupportedModelProviders {
 #[ts(export, export_to = "package_node/types/")]
 pub enum LLMPromptCell {
     Chat {
-        path: Option<String>,
+        name: Option<String>,
         provider: SupportedModelProviders,
         req: String,
     },

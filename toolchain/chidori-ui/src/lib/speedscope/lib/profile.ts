@@ -18,6 +18,8 @@ export interface FrameInfo {
 
   // Column in the file, 1-based.
   col?: number
+
+  metadata?: any
 }
 
 export type SymbolRemapper = (
@@ -63,6 +65,8 @@ export class Frame extends HasWeights {
   // Column in the file
   col?: number
 
+  metadata?: any
+
   private constructor(info: FrameInfo) {
     super()
     this.key = info.key
@@ -70,6 +74,7 @@ export class Frame extends HasWeights {
     this.file = info.file
     this.line = info.line
     this.col = info.col
+    this.metadata = info.metadata
   }
 
   static root = new Frame({
@@ -599,6 +604,7 @@ export class CallTreeProfileBuilder extends Profile {
       }
       leavingStackTop.freeze()
 
+      // TODO: how do we get these to close consistently when we incrementally flush
       if (leavingStackTop.frame.key !== frame.key) {
         throw new Error(
           `Tried to leave frame "${frame.name}" while frame "${leavingStackTop.frame.name}" was at the top at ${value}`,
@@ -641,12 +647,31 @@ export class CallTreeProfileBuilder extends Profile {
   }
 
   build(): Profile {
-    // Each stack is expected to contain a single node which we initialize to be
-    // the root node.
-    if (this.appendOrderStack.length > 1 || this.groupedOrderStack.length > 1) {
-      throw new Error('Tried to complete profile construction with a non-empty stack')
+    // Create a clone of the current object
+    const clone = new CallTreeProfileBuilder();
+    clone.appendOrderStack = [...this.appendOrderStack];
+    clone.groupedOrderStack = [...this.groupedOrderStack];
+    clone.framesInStack = new Map(this.framesInStack);
+    clone.stack = [...this.stack];
+    clone.lastValue = this.lastValue;
+    clone.frames = this.frames.clone();
+    clone.weights = [...this.weights];
+    clone.samples = [...this.samples];
+    clone.totalWeight = this.totalWeight;
+
+    // Close any remaining frames in the append order stack
+    while (clone.appendOrderStack.length > 1) {
+      const frame = clone.appendOrderStack[clone.appendOrderStack.length - 1].frame;
+      clone._leaveFrame(frame, clone.lastValue, true);
     }
-    this.sortGroupedCallTree()
-    return this
+
+    // Close any remaining frames in the grouped order stack
+    while (clone.groupedOrderStack.length > 1) {
+      const frame = clone.groupedOrderStack.pop()!.frame;
+      clone._leaveFrame(frame, clone.lastValue, false);
+    }
+
+    this.sortGroupedCallTree();
+    return clone;
   }
 }
