@@ -438,6 +438,7 @@ mod tests {
                         "test_function",
                         RkyvSerializedValue::Cell(CellTypes::Code(
                             crate::cells::CodeCell {
+                                name: None,
                                 language: SupportedLanguage::PyO3,
                                 source_code: String::from(indoc! { r#"
                                     def test_function(a, b):

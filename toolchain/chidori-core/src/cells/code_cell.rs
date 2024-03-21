@@ -46,6 +46,7 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
 
             let cell = cell.clone();
             OperationNode::new(
+                cell.name,
                 input_signature,
                 output_signature,
                 Box::new(move |x, _| {
@@ -61,6 +62,7 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
             )
         }
         SupportedLanguage::Starlark => OperationNode::new(
+            cell.name.clone(),
             InputSignature::new(),
             OutputSignature::new(),
             Box::new(|x, _| x),
@@ -104,6 +106,7 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
 
             let cell = cell.clone();
             OperationNode::new(
+                cell.name,
                 input_signature,
                 output_signature,
                 Box::new(move |x, _| {

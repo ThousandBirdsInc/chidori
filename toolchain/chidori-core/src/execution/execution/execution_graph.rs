@@ -381,16 +381,19 @@ mod tests {
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::new(),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(1)),
         ));
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::new(),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(2)),
         ));
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["a", "b"]),
             OutputSignature::new(),
             Box::new(|args, _| {
@@ -442,11 +445,13 @@ mod tests {
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::new(),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(0)),
         ));
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::new(),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(1)),
@@ -479,18 +484,21 @@ mod tests {
         let state_id = (0, 0);
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::new(),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(0)),
         ));
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["0"]),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(1)),
         ));
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["0"]),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(2)),
@@ -533,24 +541,28 @@ mod tests {
         let state_id = (0, 0);
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::new(),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(0)),
         ));
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["1"]),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(1)),
         ));
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["1"]),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(2)),
         ));
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["1"]),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(3)),
@@ -600,30 +612,35 @@ mod tests {
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::new(),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(0)),
         ));
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["1"]),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(1)),
         ));
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["1"]),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(2)),
         ));
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["1"]),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(3)),
         ));
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["1", "2"]),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(4)),
@@ -689,6 +706,7 @@ mod tests {
 
         // We start with the number 1 at node 0
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::new(),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(1)),
@@ -708,30 +726,35 @@ mod tests {
         };
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["1"]),
             OutputSignature::new(),
             Box::new(f1),
         ));
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["1"]),
             OutputSignature::new(),
             Box::new(f1),
         ));
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["1"]),
             OutputSignature::new(),
             Box::new(f1),
         ));
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["1"]),
             OutputSignature::new(),
             Box::new(f1),
         ));
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["1"]),
             OutputSignature::new(),
             Box::new(f1),
@@ -834,6 +857,7 @@ mod tests {
 
         // We start with the number 1 at node 0
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::new(),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(1)),
@@ -855,11 +879,13 @@ mod tests {
         };
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["0"]),
             OutputSignature::new(),
             Box::new(f_side_effect),
         ));
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["0"]),
             OutputSignature::new(),
             Box::new(f_side_effect),
@@ -913,6 +939,7 @@ mod tests {
 
         // We start with the number 0 at node 0
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::new(),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(0)),
@@ -943,11 +970,13 @@ mod tests {
         };
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["0"]),
             OutputSignature::new(),
             Box::new(f_v1),
         ));
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["0"]),
             OutputSignature::new(),
             Box::new(f_v1),
@@ -977,6 +1006,7 @@ mod tests {
         // Change the definition of the operation "1" to add 200 instead of 1, then re-evaluate
         // TODO: we can no longer overwrite operations
         let (_, mut state) = x_state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["0"]),
             OutputSignature::new(),
             Box::new(f_v2),
@@ -1011,30 +1041,35 @@ mod tests {
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::new(),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(0)),
         ));
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["1"]),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(1)),
         ));
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["1"]),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(2)),
         ));
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["1"]),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(3)),
         ));
 
         let (_, mut state) = state.add_operation(OperationNode::new(
+            None,
             InputSignature::from_args_list(vec!["1", "2"]),
             OutputSignature::new(),
             Box::new(|_args, _| RSV::Number(4)),
@@ -1082,6 +1117,6 @@ mod tests {
         assert_eq!(state.state_get(&4), Some(&RSV::Number(4)));
 
         // TODO: convert this to an actual test
-        dbg!(db.get_merged_state_history(state_id));
+        // dbg!(db.get_merged_state_history(state_id));
     }
 }

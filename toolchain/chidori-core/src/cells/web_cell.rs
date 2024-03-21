@@ -23,6 +23,7 @@ pub fn web_cell(cell: &WebserviceCell) -> OperationNode {
 
     let cell = cell.clone();
     let mut op_node = OperationNode::new(
+        cell.name.clone(),
         input_signature,
         output_signature,
         Box::new(move |x, _| {

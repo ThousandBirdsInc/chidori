@@ -10,7 +10,19 @@ export const cellsState = writable([])
 export const loadedPath = writable("")
 export const observeState = writable({})
 export const executionGraphState = writable({})
+export const definitionGraphState = writable({})
 
+export async function syncDefinitionGraphState() {
+  const unlisten = await listen('sync:definitionGraphState', (event) => {
+    console.log('sync:definitionGraphState', event.payload)
+    try {
+      definitionGraphState.set(JSON.parse(event.payload))
+    } catch (error) {
+      definitionGraphState.set({})
+    }
+  });
+  return unlisten
+}
 
 export async function syncExecutionGraphState() {
   const unlisten = await listen('sync:executionGraphState', (event) => {
@@ -54,7 +66,8 @@ export async function selectDirectory() {
         await listenForExecutionEvents(),
         await syncObserveState(),
         await syncCellsState(),
-        await syncExecutionGraphState()
+        await syncExecutionGraphState(),
+        await syncDefinitionGraphState()
       ]
     }
   } catch (error) {

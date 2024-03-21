@@ -9,6 +9,7 @@
 
     $: cell = item["cell"];
     $: opId = item["op_id"];
+    $: appliedAt = item["applied_at"];
 
     let mostRecentStateId = null;
     let state = null;
@@ -23,7 +24,8 @@
     }
 </script>
 
-<div class="max-w-2xl p-6 bg-white rounded-lg shadow mt-10 flex flex-col gap-4">
+<div class="max-w-2xl p-6 bg-white rounded-lg border  flex flex-col gap-4">
+    {JSON.stringify(appliedAt)}
     {#if cell.hasOwnProperty('Code')}
         <CodeComponent cell={cell['Code']} />
     {:else if cell.hasOwnProperty('Prompt')}

@@ -35,13 +35,13 @@ export const primaryRoutes: Route[] = [
   //   variant: "ghost",
   //   path: "/logs",
   // },
-  // {
-  //   title: "Execution Graph",
-  //   label: "",
-  //   icon: Icons.ScatterChart,
-  //   variant: "ghost",
-  //   path: "/execution_graph",
-  // },
+  {
+    title: "Execution Graph",
+    label: "",
+    icon: Icons.ScatterChart,
+    variant: "ghost",
+    path: "/execution_graph",
+  },
   {
     title: "Graph",
     label: "",

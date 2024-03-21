@@ -40,6 +40,7 @@ pub fn template_cell(cell: &TemplateCell) -> OperationNode {
 
     let body = cell.body.clone();
     OperationNode::new(
+        cell.name.clone(),
         input_signature,
         output_signature,
         Box::new(move |x, _| {

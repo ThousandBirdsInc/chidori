@@ -1,14 +1,17 @@
+use std::cell::RefCell;
 use petgraph::graph::{NodeIndex};
 use petgraph::graph::DiGraph;
-use petgraph::visit::EdgeRef;
+use petgraph::visit::{EdgeRef, Topo};
 use std::cmp::Ordering;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::Hash;
 use petgraph::graphmap::DiGraphMap;
+use petgraph::prelude::Dfs;
 use serde_json::json;
 use serde::Serialize;
 use chidori_core::execution::primitives::identifiers::{DependencyReference, OperationId};
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 pub struct Node {
     pub(crate) id: String,
     #[serde(rename = "type")]
@@ -17,12 +20,26 @@ pub struct Node {
     pub(crate) position: Rect,
 }
 
-#[derive(Serialize, Debug)]
+impl PartialEq<Self> for Node {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Node {}
+
+impl Hash for Node {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+#[derive(Serialize, Debug, Clone)]
 pub struct Data {
     pub(crate) label: String,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 pub struct Rect {
     pub(crate) x: f32,
     pub(crate) y: f32,
@@ -31,7 +48,7 @@ pub struct Rect {
     pub(crate) height: f32,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Hash, PartialEq, Eq, Serialize, Debug, Clone)]
 pub struct Edge {
     pub(crate) id: String,
     #[serde(rename = "type")]
@@ -42,7 +59,7 @@ pub struct Edge {
 }
 
 pub struct DagreLayout<'a> {
-    graph: &'a mut DiGraph<&'a mut Node, &'a mut Edge>,
+    graph: &'a DiGraph<RefCell<&'a mut Node>, RefCell<&'a mut Edge>>,
     direction: Direction,
     node_separation: f32,
     edge_separation: f32,
@@ -54,8 +71,9 @@ pub enum Direction {
     LeftToRight,
 }
 
+
 impl<'a> DagreLayout<'a> {
-    pub(crate) fn new(graph: &'a mut DiGraph<&'a mut Node, &'a mut Edge>, direction: Direction, node_separation: f32, edge_separation: f32, rank_separation: f32) -> Self {
+    pub(crate) fn new(graph: &'a DiGraph<RefCell<&'a mut Node>, RefCell<&'a mut Edge>>, direction: Direction, node_separation: f32, edge_separation: f32, rank_separation: f32) -> Self {
         DagreLayout {
             graph,
             direction,
@@ -65,13 +83,54 @@ impl<'a> DagreLayout<'a> {
         }
     }
 
+    pub fn assert_no_cycles(&self) {
+        // Cycle detection
+        let first_node = self.graph.node_indices().next();
+        if first_node.is_none() {
+            return;
+        }
+        let first_node = first_node.unwrap();
+        let mut dfs = Dfs::new(&self.graph, first_node);
+        let mut on_stack = HashSet::new();  // Track nodes on the recursion stack
+        let mut visited = HashSet::new();   // Track visited nodes
+
+        while let Some(node) = dfs.next(&self.graph) {
+            // println!("node: {:?} {:?}", node, self.graph.node_weight(node));
+
+            if !visited.insert(node) {
+                continue; // Skip if already visited
+            }
+            on_stack.insert(node); // Add to stack when first visited
+
+            for edge in self.graph.edges_directed(node, petgraph::Outgoing) {
+                let target = edge.target();
+                // println!("target: {:?} {:?}", target, self.graph.node_weight(target));
+
+                if visited.contains(&target) {
+                    continue; // Skip if already visited
+                }
+
+                // Target not visited, but is on stack -> cycle detected
+                if on_stack.contains(&target) {
+                    panic!("Graph contains a cycle, cannot initialize layers. {:?}", target);
+                }
+
+                dfs.move_to(target); // Continue DFS from the target node
+            }
+
+            on_stack.remove(&node);  // Remove from stack when backtracking
+        }
+    }
+
     pub fn layout(&mut self) {
+        self.assert_no_cycles();
         self.initialize();
         self.layering();
         self.ordering();
         self.positioning();
         // self.edge_routing();
     }
+
 
     fn initialize(&mut self) {
         // Assign initial layers using longest path algorithm
@@ -84,39 +143,38 @@ impl<'a> DagreLayout<'a> {
             }
             layers.insert(node, max_layer);
         }
+
         for (node, layer) in layers {
-            self.graph[node].position.layer = layer;
+            self.graph[node].borrow_mut().position.layer = layer;
         }
     }
 
     fn layering(&mut self) {
-        // Iteratively update node layers
-        let mut updated = true;
-        while updated {
-            updated = false;
-            for node in self.graph.node_indices() {
-                let mut min_layer = self.graph[node].position.layer;
-                let mut max_layer = self.graph[node].position.layer;
-                for edge in self.graph.edges_directed(node, petgraph::Incoming) {
-                    let source = edge.source();
-                    min_layer = min_layer.min(self.graph[source].position.layer);
-                }
-                for edge in self.graph.edges_directed(node, petgraph::Outgoing) {
-                    let target = edge.target();
-                    max_layer = max_layer.max(self.graph[target].position.layer + 1);
-                }
-                if min_layer != self.graph[node].position.layer || max_layer != self.graph[node].position.layer {
-                    self.graph[node].position.layer = (min_layer + max_layer) / 2;
-                    updated = true;
-                }
+        // Initialize all nodes with a layer of 0
+        for node in self.graph.node_indices() {
+            self.graph[node].borrow_mut().position.layer = 0;
+        }
+
+        // Create an immutable reference for the topological sort
+        let mut topo = Topo::new(self.graph);
+
+        while let Some(node) = topo.next(self.graph) {
+            let mut max_pred_layer = 0;
+            // Look at all predecessors to find the maximum layer
+            for edge in self.graph.edges_directed(node, petgraph::Incoming) {
+                let pred = edge.source();
+                max_pred_layer = max_pred_layer.max(self.graph[pred].borrow().position.layer);
             }
+            // Temporarily reborrow self.graph mutably to update the node layer
+            self.graph[node].borrow_mut().position.layer = max_pred_layer + 1;
         }
     }
+
 
     fn ordering(&mut self) {
         // Order nodes within each layer to minimize edge crossings
         for layer in 0..self.graph.node_count() {
-            let nodes: Vec<NodeIndex> = self.graph.node_indices().filter(|&n| self.graph[n].position.layer == layer).collect();
+            let nodes: Vec<NodeIndex> = self.graph.node_indices().filter(|&n| self.graph[n].borrow().position.layer == layer).collect();
             let mut ordered_nodes = Vec::new();
             let mut remaining_nodes = nodes.clone();
             while !remaining_nodes.is_empty() {
@@ -143,7 +201,7 @@ impl<'a> DagreLayout<'a> {
                 remaining_nodes.retain(|&n| n != best_node);
             }
             for (i, &node) in ordered_nodes.iter().enumerate() {
-                self.graph[node].position.x = i as f32;
+                self.graph[node].borrow_mut().position.x = i as f32;
             }
         }
     }
@@ -153,20 +211,20 @@ impl<'a> DagreLayout<'a> {
         let mut y = 0.0;
         for layer in 0..self.graph.node_count() {
             let max_height = self.graph.node_indices()
-                .filter(|&n| self.graph[n].position.layer == layer)
-                .map(|n| self.graph[n].position.height)
+                .filter(|&n| self.graph[n].borrow().position.layer == layer)
+                .map(|n| self.graph[n].borrow().position.height)
                 .max_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
                 .unwrap_or(0.0);
-            let node_idxs: Vec<NodeIndex> = self.graph.node_indices().filter(|&n| self.graph[n].position.layer == layer).collect();
+            let node_idxs: Vec<NodeIndex> = self.graph.node_indices().filter(|&n| self.graph[n].borrow().position.layer == layer).collect();
             for node in node_idxs {
-                self.graph[node].position.y = y + max_height / 2.0;
+                self.graph[node].borrow_mut().position.y = y + max_height / 2.0;
             }
             y += max_height + self.rank_separation;
         }
 
         // Assign x-coordinates within each layer using Barycentre Method
         for layer in 0..self.graph.node_count() {
-            let nodes: Vec<NodeIndex> = self.graph.node_indices().filter(|&n| self.graph[n].position.layer == layer).collect();
+            let nodes: Vec<NodeIndex> = self.graph.node_indices().filter(|&n| self.graph[n].borrow().position.layer == layer).collect();
             let mut barycenters: HashMap<NodeIndex, f32> = HashMap::new();
 
             // Calculate barycenters for each node
@@ -176,13 +234,13 @@ impl<'a> DagreLayout<'a> {
                 for edge in self.graph.edges_directed(node, petgraph::Incoming) {
                     let source = edge.source();
                     let weight = 1.0; // Assume equal weight for all edges
-                    weighted_sum += self.graph[source].position.x * weight;
+                    weighted_sum += self.graph[source].borrow().position.x * weight;
                     total_weight += weight;
                 }
                 for edge in self.graph.edges_directed(node, petgraph::Outgoing) {
                     let target = edge.target();
                     let weight = 1.0; // Assume equal weight for all edges
-                    weighted_sum += self.graph[target].position.x * weight;
+                    weighted_sum += self.graph[target].borrow().position.x * weight;
                     total_weight += weight;
                 }
                 let barycenter = if total_weight > 0.0 {
@@ -200,8 +258,8 @@ impl<'a> DagreLayout<'a> {
             // Assign x-coordinates based on the sorted order
             let mut x = 0.0;
             for &node in &sorted_nodes {
-                self.graph[node].position.x = x;
-                x += self.graph[node].position.width + self.node_separation;
+                self.graph[node].borrow_mut().position.x = x;
+                x += self.graph[node].borrow_mut().position.width + self.node_separation;
             }
         }
     }

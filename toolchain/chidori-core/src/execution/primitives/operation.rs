@@ -57,7 +57,7 @@ impl InputSignature {
     }
 
     #[tracing::instrument]
-    pub fn validate_input_against_signature(
+    pub fn check_input_against_signature(
         &self,
         args: &HashMap<String, RkyvSerializedValue>,
         kwargs: &HashMap<String, RkyvSerializedValue>,
@@ -90,10 +90,10 @@ impl InputSignature {
         }
 
         if !missing_keys.is_empty() {
-            dbg!("Validation failed for missing keys: {:?}", missing_keys);
-            dbg!("Current state", args, kwargs, globals, functions);
+            println!("Check failed for missing keys: {:?}", missing_keys);
             false
         } else {
+            println!("Check passed");
             true
         }
     }
@@ -327,6 +327,7 @@ impl Default for OperationNode {
 
 impl OperationNode {
     pub(crate) fn new(
+        name: Option<String>,
         input_signature: InputSignature,
         output_signature: OutputSignature,
         f: Box<OperationFn>,
@@ -335,6 +336,7 @@ impl OperationNode {
         node.signature.input_signature = input_signature;
         node.signature.output_signature = output_signature;
         node.operation = f;
+        node.name = name;
         node
     }
 

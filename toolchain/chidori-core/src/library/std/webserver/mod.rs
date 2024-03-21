@@ -231,6 +231,7 @@ mod tests {
 
             let server_task = tokio::spawn(async move {
                 let configuration = WebserviceCell {
+                    name: None,
                     configuration: indoc! {r#"
                     POST / demo
                     "#}.to_string(),
@@ -241,6 +242,7 @@ mod tests {
                     .insert_object("functions", RkyvObjectBuilder::new().insert_value(
                         "demo",
                         RkyvSerializedValue::Cell(CellTypes::Code(CodeCell {
+                            name: None,
                             language: SupportedLanguage::PyO3,
                             source_code: String::from(indoc! {r#"
                         def demo():
@@ -286,6 +288,7 @@ mod tests {
 
             let server_task = tokio::spawn(async move {
                 let configuration = WebserviceCell {
+                    name: None,
                     configuration: indoc! {r#"
                     POST / add [a, b]
                     "#}.to_string(),
@@ -296,6 +299,7 @@ mod tests {
                     .insert_object("functions", RkyvObjectBuilder::new().insert_value(
                         "add",
                         RkyvSerializedValue::Cell(CellTypes::Code(CodeCell {
+                            name: None,
                             language: SupportedLanguage::PyO3,
                             source_code: String::from(indoc! {r#"
                         def add(a, b):
@@ -346,6 +350,7 @@ mod tests {
 
             let server_task = tokio::spawn(async move {
                 let configuration = WebserviceCell {
+                    name: None,
                     configuration: indoc! {r#"
                     POST / add [a, b]
                     "#}.to_string(),
@@ -356,6 +361,7 @@ mod tests {
                     .insert_object("functions", RkyvObjectBuilder::new().insert_value(
                         "add",
                         RkyvSerializedValue::Cell(CellTypes::Code(CodeCell {
+                            name: None,
                             language: SupportedLanguage::PyO3,
                             source_code: String::from(indoc! {r#"
                         def add(a, b):

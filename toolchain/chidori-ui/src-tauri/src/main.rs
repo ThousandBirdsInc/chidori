@@ -3,15 +3,18 @@
 
 mod dagre;
 
+use std::collections::HashSet;
 use diskmap::DiskMap;
 use std::ops::{Deref, DerefMut};
 use rusqlite::{Connection, Result};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread;
+use std::sync::mpsc::TryRecvError;
+use std::{panic, process, thread};
+use std::cell::RefCell;
 use std::time::Duration;
 use petgraph::graph::DiGraph;
-use petgraph::prelude::NodeIndex;
+use petgraph::prelude::{DiGraphMap, NodeIndex};
 use serde_json::json;
 use tauri::{AppHandle, Manager};
 use chidori_core::sdk::entry::{Chidori, EventsFromRuntime, InstancedEnvironment, SharedState, UserInteractionMessage};
@@ -22,6 +25,7 @@ use notify_debouncer_full::{notify::{Watcher, RecommendedWatcher, RecursiveMode}
 use tauri::async_runtime::JoinHandle;
 use ts_rs::TS;
 use chidori_core::execution::execution::execution_graph::ExecutionNodeId;
+use chidori_core::execution::primitives::identifiers::{DependencyReference, OperationId};
 
 // the payload type must implement `Serialize` and `Clone`.
 #[derive(Clone, serde::Serialize)]
@@ -50,14 +54,6 @@ struct InternalState {
     file_watch: Mutex<Option<Debouncer<RecommendedWatcher, FileIdMap>>>,
     background_thread: Mutex<Option<JoinHandle<()>>>,
     chidori: Arc<Mutex<Chidori>>,
-    observed_state: Arc<Mutex<ObservedState>>,
-}
-
-impl InternalState {
-    fn update_observed_state(&mut self, state: ObservedState) {
-        let mut observed_state = self.observed_state.lock().unwrap();
-        *observed_state = state;
-    }
 }
 
 
@@ -73,17 +69,26 @@ fn main() {
                 watched_path: Mutex::new(None),
                 background_thread: Mutex::new(None),
                 file_watch: Mutex::new(None),
-                observed_state: Arc::new(Mutex::new(ObservedState::new())),
             });
+
+            // take_hook() returns the default hook in case when a custom one is not set
+            let orig_hook = panic::take_hook();
+            panic::set_hook(Box::new(move |panic_info| {
+                // invoke the default handler and exit the process
+                orig_hook(panic_info);
+                process::exit(1);
+            }));
 
             let handle = app.handle();
             let internal_state = handle.state::<InternalState>();
-            let mut background_thread_guard = internal_state.background_thread.lock().expect("Failed to lock background_thread");
+            let mut background_thread_guard = internal_state.background_thread
+                .lock()
+                .expect("Failed to lock background_thread");
             let chidori = internal_state.chidori.clone();
             *background_thread_guard = Some(tauri::async_runtime::spawn(async move {
                 let mut chidori_guard = chidori.lock().unwrap();
                 let mut instance = chidori_guard.get_instance().unwrap();
-                // Drop the lock on chidori
+                // Drop the lock on chidori to avoid deadlock
                 drop(chidori_guard);
                 instance.run();
             }));
@@ -92,41 +97,37 @@ fn main() {
             let handle = app.handle();
             tauri::async_runtime::spawn(async move {
                 loop {
-                    match runtime_event_receiver.recv() {
+                    match runtime_event_receiver.try_recv() {
                         Ok(msg) => {
-                            println!("Runtime event: {:?}", &msg);
+                            // println!("Forwarding message to client: {:?}", &msg);
                             match msg {
                                 EventsFromRuntime::ExecutionGraphUpdated(state) => {
-                                    handle.emit_all("sync:executionGraphState", Some(maintain_execution_graph(state)));
+                                    handle.emit_all("sync:executionGraphState", Some(maintain_execution_graph(&state))).expect("Failed to emit");
                                 }
                                 EventsFromRuntime::ExecutionStateChange(state) => {
-                                    handle.emit_all("sync:observeState", Some(state));
+                                    handle.emit_all("sync:observeState", Some(state)).expect("Failed to emit");
+                                }
+                                EventsFromRuntime::DefinitionGraphUpdated(state) => {
+                                    handle.emit_all("sync:definitionGraphState", Some(maintain_definition_graph(&state))).expect("Failed to emit");
                                 }
                                 EventsFromRuntime::CellsUpdated(state) => {
-                                    handle.emit_all("sync:cellsState", Some(state));
+                                    handle.emit_all("sync:cellsState", Some(state)).expect("Failed to emit");
                                 }
                                 _ => {}
                             }
                         }
-                        Err(_) => {
-                            println!("Channel closed");
-                            break;
+                        Err(e) => {
+                            match e {
+                                TryRecvError::Empty => {}
+                                TryRecvError::Disconnected => {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
             });
 
-            // let id = app.listen_global("execution:run", move |event| {
-            //     let mut env = env_clone.lock().unwrap();
-            //     if let Ok(mut instance) = env.get_instance() {
-            //         tauri::async_runtime::spawn(async move {
-            //             instance.run();
-            //         });
-            //     }
-            // });
-
-            // unlisten to the event using the `id` returned on the `listen_global` function
-            // a `once_global` API is also exposed on the `App` struct
             // app.unlisten(id);
 
             let handle = app.handle();
@@ -153,7 +154,6 @@ fn main() {
             pause,
             load_and_watch_directory,
             move_state_view_to_id,
-            get_graph_state,
             get_loaded_path,
             set_execution_id
         ])
@@ -233,12 +233,12 @@ fn load_and_watch_directory(path: String, app_handle: AppHandle) {
     }
 }
 
-fn maintain_execution_graph(elements: Vec<(ExecutionNodeId, ExecutionNodeId)>) -> String {
-    let mut nodes = Vec::new();
-    let mut edges = Vec::new();
+fn maintain_execution_graph(elements: &Vec<(ExecutionNodeId, ExecutionNodeId)>) -> String {
+    let mut nodes = HashSet::new();
+    let mut edges = HashSet::new();
 
-    for (a, b) in &elements {
-        nodes.push(Node {
+    for (a, b) in elements {
+        nodes.insert(Node {
             id: format!("{:?}-{:?}", a.0, a.1),
             node_type: "default".to_string(),
             data: Data {
@@ -246,7 +246,7 @@ fn maintain_execution_graph(elements: Vec<(ExecutionNodeId, ExecutionNodeId)>) -
             },
             position: Rect { x: 0.0, y: 0.0, layer: 0, width: 5.0, height: 5.0 },
         });
-        nodes.push(Node {
+        nodes.insert(Node {
             id: format!("{:?}-{:?}", b.0, b.1),
             node_type: "default".to_string(),
             data: Data {
@@ -256,8 +256,8 @@ fn maintain_execution_graph(elements: Vec<(ExecutionNodeId, ExecutionNodeId)>) -
         });
     }
 
-    for edge in &elements {
-        edges.push(Edge {
+    for edge in elements {
+        edges.insert(Edge {
             id: format!("{:?}-{:?}", edge.0, edge.1),
             edge_type: "default".to_string(),
             source: format!("{:?}-{:?}", edge.0.0, edge.0.1),
@@ -265,22 +265,24 @@ fn maintain_execution_graph(elements: Vec<(ExecutionNodeId, ExecutionNodeId)>) -
             label: format!("{:?}-{:?}", edge.0.0, edge.0.1),
         });
     }
+    let mut nodes: Vec<Node> = nodes.into_iter().collect();
+    let mut edges: Vec<Edge> = edges.into_iter().collect();
 
     let mut graph = DiGraph::new();
 
     // Add nodes to the graph and keep track of their indices
     let mut index_map = std::collections::HashMap::new();
-    for node in &mut nodes {
+    for mut node in &mut nodes {
         let id = node.id.clone();
-        let index = graph.add_node(node);
+        let index = graph.add_node(RefCell::new(node));
         index_map.insert(id, index);
     }
 
     // Add edges to the graph using the indices
-    for edge in &mut edges {
-        let start_index: &NodeIndex = index_map.get(&edge.source.clone()).unwrap();
-        let end_index: &NodeIndex = index_map.get(&edge.target.clone()).unwrap();
-        graph.add_edge(end_index.clone(), start_index.clone(), edge);
+    for mut edge in &mut edges {
+        let source: &NodeIndex = index_map.get(&edge.source.clone()).unwrap();
+        let target: &NodeIndex = index_map.get(&edge.target.clone()).unwrap();
+        graph.add_edge(source.clone(), target.clone(), RefCell::new(edge));
     }
 
     let mut dagre_layout = DagreLayout::new(&mut graph, crate::dagre::Direction::TopToBottom, 20.0, 10.0, 50.0);
@@ -289,39 +291,36 @@ fn maintain_execution_graph(elements: Vec<(ExecutionNodeId, ExecutionNodeId)>) -
     json!({ "nodes": nodes, "edges": edges }).to_string()
 }
 
-#[tauri::command]
-fn get_graph_state(app_handle: AppHandle) -> String {
-    let env = app_handle.state::<InternalState>();
-    let mut ee = env.chidori.lock().unwrap();
-    let env = ee.get_instance();
-    if env.is_err() {
-        return "".to_string();
-    }
-    let env = env.unwrap();
 
+fn maintain_definition_graph(graph: &Vec<(OperationId, OperationId, Vec<DependencyReference>)>) -> String {
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
-
-    let graph = &env.execution_head_latest_state.get_dependency_graph();
-    for node in graph.nodes() {
-        let op = env.execution_head_latest_state.operation_by_id.get(&node);
+    for (node_a, node_b, weight) in graph.iter() {
         nodes.push(Node {
-            id: node.to_string(),
+            id: node_a.to_string(),
             node_type: "default".to_string(),
             data: Data {
-                label: node.to_string(),
+                label: node_a.to_string(),
+            },
+            position: Rect { x: 0.0, y: 0.0, layer: 0, width: 200.0, height: 80.0 },
+        });
+        nodes.push(Node {
+            id: node_b.to_string(),
+            node_type: "default".to_string(),
+            data: Data {
+                label: node_b.to_string(),
             },
             position: Rect { x: 0.0, y: 0.0, layer: 0, width: 200.0, height: 80.0 },
         });
     }
 
-    for edge in graph.all_edges() {
+    for (node_a, node_b, weight) in graph.iter() {
         edges.push(Edge {
-            id: format!("{}-{}", edge.0, edge.1),
+            id: format!("{}-{}", node_a, node_b),
             edge_type: "default".to_string(),
-            source: edge.0.to_string(),
-            target: edge.1.to_string(),
-            label: edge.0.to_string(),
+            source: node_a.to_string(),
+            target: node_b.to_string(),
+            label: format!("{:?}", weight)
         });
     }
 
@@ -331,7 +330,7 @@ fn get_graph_state(app_handle: AppHandle) -> String {
     let mut index_map = std::collections::HashMap::new();
     for node in &mut nodes {
         let id = node.id.clone();
-        let index = graph.add_node(node);
+        let index = graph.add_node(RefCell::new(node));
         index_map.insert(id, index);
     }
 
@@ -339,7 +338,7 @@ fn get_graph_state(app_handle: AppHandle) -> String {
     for edge in &mut edges {
         let start_index: &NodeIndex = index_map.get(&edge.source.clone()).unwrap();
         let end_index: &NodeIndex = index_map.get(&edge.target.clone()).unwrap();
-        graph.add_edge(end_index.clone(), start_index.clone(), edge);
+        graph.add_edge(end_index.clone(), start_index.clone(), RefCell::new(edge));
     }
 
     let mut dagre_layout = DagreLayout::new(&mut graph, crate::dagre::Direction::TopToBottom, 20.0, 10.0, 50.0);
@@ -355,7 +354,5 @@ mod tests {
 
     #[test]
     fn test_observed_state() {
-        let state = ObservedState::new();
-        assert_eq!(state.counter, 0);
     }
 }

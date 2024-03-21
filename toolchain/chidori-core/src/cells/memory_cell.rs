@@ -33,6 +33,7 @@ pub fn memory_cell(cell: &MemoryCell) -> OperationNode {
 
             let cell = cell.clone();
             OperationNode::new(
+                None,
                 input_signature,
                 output_signature,
                 Box::new(move |x, _| {

@@ -476,6 +476,7 @@ a = 20 + demo()
                     RkyvObjectBuilder::new().insert_value(
                         "demo",
                         RkyvSerializedValue::Cell(CellTypes::Code(CodeCell {
+                            name: None,
                             language: SupportedLanguage::PyO3,
                             source_code: String::from(indoc! {r#"
                         def demo():

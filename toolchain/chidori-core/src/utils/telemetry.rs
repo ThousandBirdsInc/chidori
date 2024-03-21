@@ -177,9 +177,9 @@ impl<S, T> Layer<T> for ForwardingLayer<S>
 
 pub fn init_internal_telemetry(sender: Sender<TraceEvents>) -> impl Subscriber {
     let custom_layer = CustomLayer::new(sender);
-    // let forwarding_layer = ForwardingLayer::new(tracing_subscriber::fmt::layer());
+    let forwarding_layer = ForwardingLayer::new(tracing_subscriber::fmt::layer());
     let subscriber = tracing_subscriber::Registry::default()
-        .with(custom_layer);
-        // .with(forwarding_layer);
+        .with(custom_layer)
+        .with(forwarding_layer);
     subscriber
 }

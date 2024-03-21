@@ -200,30 +200,22 @@ impl ExecutionState {
         graph
     }
 
-    // TODO: remove node from signature
-    // TODO: operations should have an identity instead of using a counter
     #[tracing::instrument]
     pub fn add_operation(&self, operation_node: OperationNode) -> (usize, Self) {
         let mut s = self.clone();
-        if let Some(name) = &operation_node.name {
-            if (s.operation_name_to_id.contains_key(name)) {
-                let existing_id = s.operation_name_to_id.get(name).unwrap();
-                s.operation_by_id
-                    .insert(existing_id.clone(), Arc::new(Mutex::new(operation_node)));
-                (existing_id.clone(), s)
-            } else {
-                s.operation_name_to_id.insert(name.clone(), s.op_counter);
-                s.operation_by_id
-                    .insert(s.op_counter, Arc::new(Mutex::new(operation_node)));
+        let op_id = operation_node.name.as_ref()
+            .and_then(|name| s.operation_name_to_id.get(name).copied())
+            .unwrap_or_else(|| {
+                let new_id = s.op_counter;
                 s.op_counter += 1;
-                (s.op_counter - 1, s)
-            }
-        } else {
-            s.operation_by_id
-                .insert(s.op_counter, Arc::new(Mutex::new(operation_node)));
-            s.op_counter += 1;
-            (s.op_counter - 1, s)
-        }
+                if let Some(name) = &operation_node.name {
+                    s.operation_name_to_id.insert(name.clone(), new_id);
+                }
+                new_id
+            });
+
+        s.operation_by_id.insert(op_id, Arc::new(Mutex::new(operation_node)));
+        (op_id, s)
     }
 
     #[tracing::instrument]
@@ -265,9 +257,12 @@ impl ExecutionState {
         let mut marked_for_consumption = HashSet::new();
 
         let mut outputs = vec![];
+        let operation_ids: Vec<OperationId> = operation_by_id.keys().copied().collect();
 
         // Every tick, every operation consumes from each of its incoming edges.
-        'traverse_nodes: for operation_id in dependency_graph.nodes() {
+        'traverse_nodes: for operation_id in operation_ids {
+            println!("============================================================");
+            println!("Evaluating operation {}", operation_id);
 
             // We skip nodes that are currently locked due to long running execution
             // TODO: we can regenerate async nodes if necessary by creating them form their original cells
@@ -302,6 +297,7 @@ impl ExecutionState {
             for (from, _to, argument_indices) in
                 dependency_graph.edges_directed(operation_id, Direction::Incoming)
             {
+                println!("Argument indices: {:?}", argument_indices);
                 // TODO: we don't need a value from previous state for function invocation dependencies
                 if let Some(output) = previous_state.state_get(&from) {
                     marked_for_consumption.insert(from.clone());
@@ -342,20 +338,15 @@ impl ExecutionState {
             }
 
             // Some of the required arguments are not yet available, continue to the next node
-            if !signature.validate_input_against_signature(&args, &kwargs, &globals, &functions) {
+            if !signature.check_input_against_signature(&args, &kwargs, &globals, &functions) {
                 continue 'traverse_nodes;
             }
-
-            // TODO: if the operation has internal function dependencies, those need to be constructed so that
-            //       the closures for them to be invoked can be passed down to them - execute should
-            //       include a set of function pointers RKV encoded - we don't explicitly pass functions.
-            //       Inside of the operation for code invocation we resolve those pointers into closures.
 
             // TODO: all functions that are referred to that we know are not yet defined are populated with a shim,
             //       that shim goes to our lookup based on our function invocation dependencies.
 
             // Construct the arguments for the given operation
-            let mut argument_payload_map = HashMap::from_iter(vec![
+            let argument_payload: RkyvSerializedValue = RkyvSerializedValue::Object(HashMap::from_iter(vec![
                 ("args".to_string(), RkyvSerializedValue::Object(args)),
                 ("kwargs".to_string(), RkyvSerializedValue::Object(kwargs)),
                 ("globals".to_string(), RkyvSerializedValue::Object(globals)),
@@ -363,11 +354,11 @@ impl ExecutionState {
                     "functions".to_string(),
                     RkyvSerializedValue::Object(functions),
                 ),
-            ]);
-            let argument_payload: RkyvSerializedValue = RkyvSerializedValue::Object(argument_payload_map);
+            ]));
 
             // Execute the operation
             // TODO: support async/parallel execution
+            println!("Executing node {} ({:?}) with payload {:?}", operation_id, op_node.name, argument_payload);
             if op_node.is_async {
                 // Run the target function in a background thread
                 let mut operation_by_id = previous_state.operation_by_id.clone();
@@ -405,6 +396,7 @@ impl ExecutionState {
                 // new_state.state_insert(operation_id, result);
             } else {
                 let result = op_node.execute(argument_payload, None);
+                println!("Executed node {} with result {:?}", operation_id, &result);
                 outputs.push((operation_id, result.clone()));
                 new_state.state_insert(operation_id, result);
             }

@@ -9,15 +9,14 @@
     MiniMap
   } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
+  import {definitionGraphState} from "@/stores/store";
 
   const nodes = writable([ ]);
   const edges = writable([ ]);
 
-  invoke('get_graph_state').then((data) => {
-    console.log(data)
-    let d = JSON.parse(data);
-    nodes.set(d.nodes);
-    edges.set(d.edges);
+  definitionGraphState.subscribe((value) => {
+    nodes.set(value.nodes);
+    edges.set(value.edges);
   })
 
 
