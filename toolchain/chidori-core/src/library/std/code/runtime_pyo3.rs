@@ -3,7 +3,7 @@ use chidori_static_analysis::language::python::parse::{
 };
 
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyCFunction, PyDict, PyList, PyTuple};
+use pyo3::types::{IntoPyDict, PyCFunction, PyDict, PyList, PySet, PyTuple};
 use std::sync::mpsc::{self, Sender};
 
 // use rustpython::vm::{pymodule, PyPayload, PyResult, VirtualMachine};
@@ -42,6 +42,14 @@ fn pyany_to_rkyv_serialized_value(p: &PyAny) -> RkyvSerializedValue {
                     .collect();
                 RkyvSerializedValue::Array(arr)
             }
+            "tuple" => {
+                let list = p.downcast::<PyTuple>().unwrap();
+                let arr = list
+                    .iter()
+                    .map(|item| pyany_to_rkyv_serialized_value(item))
+                    .collect();
+                RkyvSerializedValue::Array(arr)
+            }
             "dict" => {
                 let dict = p.downcast::<PyDict>().unwrap();
                 let mut map = HashMap::new();
@@ -51,7 +59,10 @@ fn pyany_to_rkyv_serialized_value(p: &PyAny) -> RkyvSerializedValue {
                 }
                 RkyvSerializedValue::Object(map)
             }
-            _ => RkyvSerializedValue::Null,
+            x @ _  => {
+                println!("Py03 marshalling unsupported type: {}", x);
+                RkyvSerializedValue::Null
+            },
         },
         Err(_) => RkyvSerializedValue::Null,
     }
@@ -168,10 +179,7 @@ pub fn source_code_run_python(
                     let clone_function_name = function_name.clone();
                     // TODO: handle llm cells invoked as functions by name
                     if let RkyvSerializedValue::Cell(cell) = value.clone() {
-                        if let CellTypes::Code(CodeCell {
-                            function_invocation,
-                            ..
-                        }) = &cell
+                        if let CellTypes::Code(CodeCell { .. }) = &cell
                         {
                             if report
                                 .cell_depended_values
@@ -220,7 +228,6 @@ pub fn source_code_run_python(
                                             CellTypes::Prompt(c) => {
                                                 crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
                                             }
-
                                             _ => {
                                                 unreachable!("Unsupported cell type");
                                             }

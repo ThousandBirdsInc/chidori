@@ -222,7 +222,7 @@ enum Mutability {
 /// It is up to the user to structure those maps in such a way that they don't collide with other
 /// values being represented in the state of our system. These inputs and outputs are managed
 /// by our Execution Database.
-pub type OperationFn = dyn FnMut(RkyvSerializedValue, Option<Sender<((usize, usize), RkyvSerializedValue)>>) -> RkyvSerializedValue + Send;
+pub type OperationFn = dyn Fn(RkyvSerializedValue, Option<Sender<((usize, usize), RkyvSerializedValue)>>) -> RkyvSerializedValue + Send;
 
 // TODO: rather than dep_count operation node should have a specific dep mapping
 pub struct OperationNode {
@@ -379,5 +379,43 @@ mod tests {
     fn test_execute_without_operation() {
         let mut node = OperationNode::default();
         node.execute(RkyvSerializedValue::Boolean(true), None); // should not panic
+    }
+
+    #[test]
+    fn test_parallel_closure() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        // Define a closure of type `dyn Fn()`
+
+        let closure: Box<OperationFn> = Box::new(|_,_ | {
+            println!("Executing closure in a thread!");
+            RkyvSerializedValue::Null
+        });
+
+        // Wrap the closure in an Arc and Mutex for shared ownership and thread safety
+        let shared_closure = Arc::new(Mutex::new(closure));
+
+        let mut handles = vec![];
+
+        for _ in 0..10 {
+            // Clone the Arc to increase the reference count
+            let closure_clone = Arc::clone(&shared_closure);
+
+            // Spawn threads and execute the closure
+            let handle = thread::spawn(move || {
+                // Lock the mutex and execute the closure
+                let closure = closure_clone.lock().unwrap();
+                (*closure)(RkyvSerializedValue::Null, None);
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
     }
 }

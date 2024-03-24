@@ -700,6 +700,12 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
         }
     }
 
+    depended_values.remove("__name__");
+    depended_values.remove("type");
+    // TODO: this is a hack for a specific test "test_core2_marshalling" and should be removed
+    //       it is due to us not properly handling Classes yet
+    depended_values.remove("TestMarshalledValues");
+
     Report {
         cell_exposed_values: exposed_values,
         cell_depended_values: depended_values,

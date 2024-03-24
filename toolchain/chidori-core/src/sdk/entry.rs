@@ -1,7 +1,7 @@
 use crate::execution::execution::execution_graph::{ExecutionGraph, ExecutionNodeId, MergedStateHistory};
 use crate::execution::execution::execution_state::ExecutionState;
 use crate::execution::execution::DependencyGraphMutation;
-use crate::cells::CellTypes;
+use crate::cells::{CellTypes, get_cell_name, LLMPromptCell};
 use crate::execution::primitives::identifiers::{DependencyReference, OperationId};
 use crate::execution::primitives::serialized_value::{
     RkyvSerializedValue as RKV, RkyvSerializedValue,
@@ -74,35 +74,33 @@ impl InstancedEnvironment {
     // TODO: reload_cells needs to diff the mutations that live on the current branch, with the state
     //       that we see in the shared state when this event is fired.
     fn reload_cells(&mut self) {
+        println!("Reloading cells");
         let cells_to_upsert: Vec<_> = {
             let shared_state = self.shared_state.lock().unwrap();
-            shared_state.cells.iter().map(|cell| cell.cell.clone()).collect()
+            shared_state.cells.iter().map(|cell| cell.clone()).collect()
         };
 
-        // TODO: we need to fetch the current cells on this branch of execution
-        //       in order to do this we need to find what identified cells exist on the current branch
-        //       then we need to compare them with ours
-
-
-        // TODO: unnamed cells are going to need some kind of heuristic to determine if they are the same
-        //       we could prevent users from updating unnamed cells
-        //       * maybe instead cells are named by their first line of code if they're not otherwise named
-        //       * or they can be named based on their signatures
-
         let mut ids = vec![];
-        for cell in cells_to_upsert {
-            ids.push(self.upsert_cell(cell));
+        for cell_holder in cells_to_upsert {
+            if cell_holder.needs_update {
+                ids.push(self.upsert_cell(cell_holder.cell.clone(), cell_holder.op_id));
+            } else {
+                // TODO: remove these unwraps and handle this better
+                ids.push((cell_holder.applied_at.unwrap(), cell_holder.op_id.unwrap()));
+            }
         }
 
         let mut shared_state = self.shared_state.lock().unwrap();
         for (i, cell) in shared_state.cells.iter_mut().enumerate() {
-            cell.applied_at = Some(ids[i].0);
-            cell.op_id = ids[i].1;
-            cell.commit = true;
+            let (applied_at, op_id) = ids[i];
+            cell.applied_at = Some(applied_at);
+            cell.op_id = Some(op_id);
+            cell.needs_update = false;
         }
 
-        let sender = self.runtime_event_sender.as_mut().unwrap();
-        sender.send(EventsFromRuntime::CellsUpdated(shared_state.cells.clone())).unwrap();
+        if let Some(sender) = self.runtime_event_sender.as_mut() {
+            sender.send(EventsFromRuntime::CellsUpdated(shared_state.cells.clone())).unwrap();
+        }
     }
 
     /// Entrypoint for execution of an instanced environment, handles messages from the host
@@ -160,34 +158,32 @@ impl InstancedEnvironment {
     pub(crate) fn step(&mut self) -> Vec<(usize, RkyvSerializedValue)> {
         println!("Executing state with id {:?}", self.execution_head_state_id);
         let state = self.db.get_state_at_id(self.execution_head_state_id);
-        if let Some(state) = state {
-            state.render_dependency_graph();
-            let ((state_id, state), outputs) = self.db.step_execution(self.execution_head_state_id, &state);
-            let merged_state = self.db.get_merged_state_history(&state_id);
-            let execution_graph = self.db.get_execution_graph_elements();
-            // TODO: this should accumulate the state such that we can refer to the whole execution history along a selected thread
-            let sender = self.runtime_event_sender.as_mut().unwrap();
-            sender.send(EventsFromRuntime::ExecutionGraphUpdated(execution_graph)).unwrap();
-            sender.send(EventsFromRuntime::ExecutionStateChange(merged_state)).unwrap();
-            self.execution_head_state_id = state_id;
-            outputs
-        } else {
-            vec![]
+        // TODO: error instead
+        if state.is_none() { return vec![]; }
+        let state = state.unwrap();
+        let ((state_id, state), outputs) = self.db.step_execution(self.execution_head_state_id, &state);
+        if let Some(sender) = self.runtime_event_sender.as_mut() {
+            sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
+            sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
         }
+        println!("Resulted in state with id {:?}", &state_id);
+        self.execution_head_state_id = state_id;
+        outputs
     }
 
     /// Add a cell into the execution graph
     #[tracing::instrument]
-    pub fn upsert_cell(&mut self, cell: CellTypes) -> (ExecutionNodeId, usize) {
+    pub fn upsert_cell(&mut self, cell: CellTypes, op_id: Option<usize>) -> (ExecutionNodeId, usize) {
         println!("Upserting cell into state with id {:?}", &self.execution_head_state_id);
         let state = self.db.get_state_at_id(self.execution_head_state_id).expect("No state found");
-        let ((state_id, state), op_id) = self.db.mutate_graph(self.execution_head_state_id, &state, cell);
-        let merged_state = self.db.get_merged_state_history(&state_id);
-        let sender = self.runtime_event_sender.as_mut().unwrap();
-        sender.send(EventsFromRuntime::ExecutionStateChange(merged_state)).unwrap();
-        let edges = state.get_dependency_graph();
-        sender.send(EventsFromRuntime::DefinitionGraphUpdated(edges.all_edges().map(|x| (x.0, x.1, x.2.clone())).collect())).unwrap();
+        let ((state_id, state), op_id) = self.db.mutate_graph(self.execution_head_state_id, &state, cell, op_id);
+        if let Some(sender) = self.runtime_event_sender.as_mut() {
+            sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
+            sender.send(EventsFromRuntime::DefinitionGraphUpdated(state.get_dependency_graph_flattened())).unwrap();
+            sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
+        }
         self.execution_head_state_id = state_id;
+        dbg!(&state_id, &op_id);
         (state_id, op_id)
     }
 
@@ -218,9 +214,9 @@ pub enum EventsFromRuntime {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CellHolder {
     cell: CellTypes,
-    op_id: usize,
+    op_id: Option<usize>,
     applied_at: Option<ExecutionNodeId>,
-    commit: bool
+    needs_update: bool
 }
 
 #[derive(Debug)]
@@ -324,12 +320,42 @@ impl Chidori {
     }
 
     fn load_cells(&mut self, cells: Vec<CellTypes>) -> anyhow::Result<()>  {
-        self.shared_state.lock().unwrap().cells = cells.iter().map(|cell| CellHolder {
-            cell: cell.clone(),
-            applied_at: None,
-            op_id: 0,
-            commit: false
-        }).collect();
+        // TODO: this overrides the entire shared state object
+        let cell_name_map = {
+            let previous_cells = &self.shared_state.lock().unwrap().cells;
+            previous_cells.iter().map(|cell| {
+                let name = get_cell_name(&cell.cell);
+                (name.clone(), cell.clone())
+            }).collect::<HashMap<_, _>>()
+        };
+
+        dbg!(&cells);
+        let mut new_cells_state = vec![];
+        for cell in cells {
+            let name = get_cell_name(&cell);
+            if let Some(prev_cell) = cell_name_map.get(&name) {
+                if prev_cell.cell != cell {
+                    new_cells_state.push(CellHolder {
+                        cell,
+                        applied_at: None,
+                        op_id: prev_cell.op_id,
+                        needs_update: true
+                    });
+                } else {
+                    new_cells_state.push(prev_cell.clone());
+                }
+            } else {
+                new_cells_state.push(CellHolder {
+                    cell,
+                    applied_at: None,
+                    op_id: None,
+                    needs_update: true
+                });
+            }
+        }
+        dbg!(&new_cells_state);
+        self.shared_state.lock().unwrap().cells = new_cells_state;
+        println!("Cells commit to shared state");
         self.handle_user_action(UserInteractionMessage::ReloadCells);
         Ok(())
     }
@@ -389,22 +415,24 @@ mod tests {
     fn test_execute_cells_with_global_dependency() {
         let mut env = InstancedEnvironment::new();
         let (_, op_id_x) = env.upsert_cell(CellTypes::Code(CodeCell {
-            name: None,
-            language: SupportedLanguage::PyO3,
-            source_code: String::from(indoc! { r#"
-                x = 20
-                "#}),
-            function_invocation: None,
-        }));
+                    name: None,
+                    language: SupportedLanguage::PyO3,
+                    source_code: String::from(indoc! { r#"
+                        x = 20
+                        "#}),
+                    function_invocation: None,
+                }),
+                                           None);
         assert_eq!(op_id_x, 0);
         let (_, op_id_y) = env.upsert_cell(CellTypes::Code(CodeCell {
-            name: None,
-            language: SupportedLanguage::PyO3,
-            source_code: String::from(indoc! { r#"
-                y = x + 1
-                "#}),
-            function_invocation: None,
-        }));
+                    name: None,
+                    language: SupportedLanguage::PyO3,
+                    source_code: String::from(indoc! { r#"
+                        y = x + 1
+                        "#}),
+                    function_invocation: None,
+                }),
+                                           None);
         assert_eq!(op_id_y, 1);
         // env.resolve_dependencies_from_input_signature();
         env.get_state().render_dependency_graph();
@@ -426,23 +454,25 @@ mod tests {
         dotenv::dotenv().ok();
         let mut env = InstancedEnvironment::new();
         let (_, op_id_x) = env.upsert_cell(CellTypes::Code(CodeCell {
-            name: None,
-            language: SupportedLanguage::PyO3,
-            source_code: String::from(indoc! { r#"
-                x = "Here is a sample string"
-                "#}),
-            function_invocation: None,
-        }));
+                    name: None,
+                    language: SupportedLanguage::PyO3,
+                    source_code: String::from(indoc! { r#"
+                        x = "Here is a sample string"
+                        "#}),
+                    function_invocation: None,
+                }),
+                                           None);
         assert_eq!(op_id_x, 0);
         let (_, op_id_y) = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
-            name: None,
-            provider: SupportedModelProviders::OpenAI,
-            req: "\
-              Say only a single word. Give no additional explanation.
-              What is the first word of the following: {{x}}.
-            "
-            .to_string(),
-        }));
+                    name: None,
+                    provider: SupportedModelProviders::OpenAI,
+                    req: "\
+                      Say only a single word. Give no additional explanation.
+                      What is the first word of the following: {{x}}.
+                    "
+                    .to_string(),
+                }),
+                                           None);
         assert_eq!(op_id_y, 1);
         env.get_state().render_dependency_graph();
         env.step();
@@ -467,23 +497,25 @@ mod tests {
     fn test_execute_cells_via_prompt_calling_api() {
         let mut env = InstancedEnvironment::new();
         let (_, op_id_x) = env.upsert_cell(CellTypes::Code(CodeCell {
-            name: None,
-            language: SupportedLanguage::PyO3,
-            source_code: String::from(indoc! { r#"
-                import chidori as ch
-                x = ch.prompt("generate_names", x="John")
-                "#}),
-            function_invocation: None,
-        }));
+                    name: None,
+                    language: SupportedLanguage::PyO3,
+                    source_code: String::from(indoc! { r#"
+                        import chidori as ch
+                        x = ch.prompt("generate_names", x="John")
+                        "#}),
+                    function_invocation: None,
+                }),
+                                           None);
         assert_eq!(op_id_x, 0);
         let (_, op_id_y) = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
-            name: Some("generate_names".to_string()),
-            provider: SupportedModelProviders::OpenAI,
-            req: "\
-              Generate names starting with {{x}}
-            "
-            .to_string(),
-        }));
+                    name: Some("generate_names".to_string()),
+                    provider: SupportedModelProviders::OpenAI,
+                    req: "\
+                      Generate names starting with {{x}}
+                    "
+                    .to_string(),
+                }),
+                                           None);
         assert_eq!(op_id_y, 1);
         env.get_state().render_dependency_graph();
         env.step();
@@ -504,23 +536,25 @@ mod tests {
     fn test_execute_cells_invoking_a_function() {
         let mut env = InstancedEnvironment::new();
         let (_, id) = env.upsert_cell(CellTypes::Code(CodeCell {
-            name: None,
-            language: SupportedLanguage::PyO3,
-            source_code: String::from(indoc! { r#"
-                def add(x, y):
-                    return x + y
-                "#}),
-            function_invocation: None,
-        }));
+                    name: None,
+                    language: SupportedLanguage::PyO3,
+                    source_code: String::from(indoc! { r#"
+                        def add(x, y):
+                            return x + y
+                        "#}),
+                    function_invocation: None,
+                }),
+                                      None);
         assert_eq!(id, 0);
         let (_, id) = env.upsert_cell(CellTypes::Code(CodeCell {
-            name: None,
-            function_invocation: None,
-            language: SupportedLanguage::PyO3,
-            source_code: String::from(indoc! { r#"
-                y = add(2, 3)
-                "#}),
-        }));
+                    name: None,
+                    function_invocation: None,
+                    language: SupportedLanguage::PyO3,
+                    source_code: String::from(indoc! { r#"
+                        y = add(2, 3)
+                        "#}),
+                }),
+                                      None);
         assert_eq!(id, 1);
         env.get_state().render_dependency_graph();
         env.step();
@@ -541,24 +575,26 @@ mod tests {
     #[test]
     fn test_execute_inter_runtime_code() {
         let mut env = InstancedEnvironment::new();
-        let id = env.upsert_cell(CellTypes::Code(CodeCell {
-            name: None,
-            language: SupportedLanguage::PyO3,
-            source_code: String::from(indoc! { r#"
-                def add(x, y):
-                    return x + y
-                "#}),
-            function_invocation: None,
-        }));
+        let (_, id) = env.upsert_cell(CellTypes::Code(CodeCell {
+                    name: None,
+                    language: SupportedLanguage::PyO3,
+                    source_code: String::from(indoc! { r#"
+                        def add(x, y):
+                            return x + y
+                        "#}),
+                    function_invocation: None,
+                }),
+                                 None);
         assert_eq!(id, 0);
-        let id = env.upsert_cell(CellTypes::Code(CodeCell {
-            name: None,
-            function_invocation: None,
-            language: SupportedLanguage::Deno,
-            source_code: String::from(indoc! { r#"
-                const y = add(2, 3);
-                "#}),
-        }));
+        let (_, id) = env.upsert_cell(CellTypes::Code(CodeCell {
+                    name: None,
+                    function_invocation: None,
+                    language: SupportedLanguage::Deno,
+                    source_code: String::from(indoc! { r#"
+                        const y = add(2, 3);
+                        "#}),
+                }),
+                                 None);
         assert_eq!(id, 1);
         env.get_state().render_dependency_graph();
         env.step();
@@ -741,6 +777,33 @@ mod tests {
 
             // TODO: why is this wrapped in quotes
             assert_eq!(res.text().await.unwrap(), "<div>Example</div>");
+        });
+    }
+
+    #[test]
+    fn test_core1_simple() {
+        let runtime = Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut ee = Chidori::new();
+            ee.load_md_directory(Path::new("./examples/core1_simple")).unwrap();
+            let mut env = ee.get_instance().unwrap();
+            env.reload_cells();
+            env.get_state().render_dependency_graph();
+            env.step();
+        });
+    }
+
+    #[test]
+    fn test_core2_marshalling() {
+        let runtime = Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut ee = Chidori::new();
+            ee.load_md_directory(Path::new("./examples/core2_marshalling")).unwrap();
+            let mut env = ee.get_instance().unwrap();
+            env.reload_cells();
+            env.get_state().render_dependency_graph();
+            env.step();
+            env.step();
         });
     }
 }

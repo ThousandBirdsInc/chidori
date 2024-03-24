@@ -25,7 +25,7 @@
 </script>
 
 <div class="max-w-2xl p-6 bg-white rounded-lg border  flex flex-col gap-4">
-    {JSON.stringify(appliedAt)}
+    {JSON.stringify({opId, appliedAt})}
     {#if cell.hasOwnProperty('Code')}
         <CodeComponent cell={cell['Code']} />
     {:else if cell.hasOwnProperty('Prompt')}

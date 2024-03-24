@@ -47,6 +47,7 @@
   let selectedNode: string | null = null;
   let nodeBatchRenderer: null | NodeBatchRenderer = null;
   let nodeBatch: null | NodeBatch = null;
+  let edges: any;
   $: {
     if ($canvasContext && $executionGraphState) {
       const parsed = JSON.parse($executionGraphState);
@@ -54,6 +55,7 @@
       parsed.nodes.forEach((node: any) => {
         nodeBatch.addSquare(new Vec2(node.position.x, node.position.y), 20, Color.fromCSSHex("#000000"));
       });
+      edges = parsed.edges;
       nodeBatchRenderer = new NodeBatchRenderer($canvasContext.gl)
     }
   }
@@ -62,6 +64,7 @@
 <div class="relative w-full h-full">
     {#if $canvasContext && nodeBatchRenderer && nodeBatch}
         <NodePanZoomView
+                edges={edges}
                 nodes={nodeBatch}
                 theme={lightTheme}
                 canvasContext={$canvasContext}

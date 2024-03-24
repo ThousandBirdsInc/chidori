@@ -770,6 +770,9 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
         }
     }
 
+    // Always exclude "Chidori" because it's available globally
+    depended_values.remove("Chidori");
+
     Report {
         cell_exposed_values: exposed_values,
         cell_depended_values: depended_values,

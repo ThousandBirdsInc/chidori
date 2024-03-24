@@ -2,12 +2,16 @@ use std::collections::HashMap;
 use crate::execution::execution::execution_state::{DependencyGraphMutation, ExecutionState};
 use std::fmt;
 use std::fmt::Formatter;
+use std::future::Future;
 use std::ops::{Deref, DerefMut};
+use std::pin::Pin;
 use std::sync::{Arc, mpsc};
+use std::task::{Context, Poll};
 // use std::sync::{Mutex};
 use no_deadlocks::{Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
+use futures_util::FutureExt;
 
 use crate::execution::primitives::identifiers::{DependencyReference, OperationId};
 
@@ -26,6 +30,11 @@ use crate::cells::CellTypes;
 // TODO: update all of these identifies to include a "space" they're within
 
 type EdgeIdentity = (OperationId, OperationId, DependencyReference);
+
+/// ExecutionId is a unique identifier for a point in the execution graph.
+/// It is a tuple of (branch, counter) where branch is an instance of a divergence from a previous
+/// execution state. Counter is the iteration of steps taken in that branch.
+// TODO: add a globally incrementing counter to this so that there can never be identity collisions
 pub type ExecutionNodeId = (usize, usize);
 
 
@@ -55,6 +64,19 @@ impl<'de> Deserialize<'de> for MergedStateHistory {
         unreachable!("ExecutionState cannot be deserialized.")
     }
 }
+
+
+// TODO: every point in the execution graph should be a top level element in an execution stack
+//       but what about async functions?
+
+// TODO: we need to introduce a concept of depth in the execution graph.
+//       depth could be more edges from an element with a particular labelling.
+//       we would need execution ids to have both branch, counter (steps), and depth they occur at.
+
+// TODO: we need to effectively step inside of a function, so effectively these are fractional
+//       steps we take within a given counter. but then those can nest even further.
+//
+
 
 /// This models the network of reactive relationships between different components.
 ///
@@ -119,7 +141,7 @@ fn get_execution_id(
         id
     } else {
         // Create an edge in the execution graph from the previous state to this new one
-        let id = (0, prev_execution_id.1 + 1);
+        let id = (prev_execution_id.0, prev_execution_id.1 + 1);
         id
     }
 }
@@ -199,6 +221,7 @@ impl ExecutionGraph {
     }
 
     pub fn get_merged_state_history(&self, endpoint: &ExecutionNodeId) -> MergedStateHistory {
+        println!("Getting merged state history for id {:?}", &endpoint);
         let execution_graph = self.execution_graph.lock();
         let graph = execution_graph.as_ref().unwrap();
         let mut dfs = Dfs::new(graph.deref(), endpoint.clone());
@@ -216,6 +239,8 @@ impl ExecutionGraph {
                 }
             }
         }
+        // TODO: for some reason this is resulting in exploring the other branches as well
+        dbg!(&queue);
         let mut merged_state = HashMap::new();
         for predecessor in queue {
             let state = self.get_state_at_id(predecessor).unwrap();
@@ -232,6 +257,7 @@ impl ExecutionGraph {
         prev_execution_id: ExecutionNodeId,
         previous_state: &ExecutionState,
         cell: CellTypes,
+        op_id: Option<usize>,
     ) -> (
         ((usize, usize), ExecutionState), // the resulting total state of this step
         usize, // id of the new operation
@@ -243,7 +269,7 @@ impl ExecutionGraph {
             CellTypes::Template(c) => crate::cells::template_cell::template_cell(c),
         };
         op.attach_cell(cell);
-        let (op_id, new_state) = previous_state.add_operation(op);
+        let (op_id, new_state) = previous_state.upsert_operation(op, op_id);
 
         // TODO: when there is a dependency on a function invocation we need to
         //       instantiate a new instance of the function operation node.
@@ -315,17 +341,20 @@ impl ExecutionGraph {
         }
 
         let final_state = new_state.apply_dependency_graph_mutations(mutations);
+        let resulting_state_id = self.progress_graph(prev_execution_id, final_state.clone());
+        ((resulting_state_id, final_state), op_id)
+    }
 
+    fn progress_graph(&mut self, prev_execution_id: ExecutionNodeId, new_state: ExecutionState) -> ExecutionNodeId {
+        // The edge from this node is the greatest branching id + 1
+        // if we re-evaluate execution at a given node, we get a new execution branch.
         let mut execution_graph = self.execution_graph.lock().unwrap();
         let mut state_id_to_state = self.state_id_to_state.lock().unwrap();
         let resulting_state_id = get_execution_id(execution_graph.deref_mut(), prev_execution_id);
-        state_id_to_state.deref_mut().insert(resulting_state_id.clone(), final_state.clone());
+        state_id_to_state.deref_mut().insert(resulting_state_id.clone(), new_state.clone());
         execution_graph.deref_mut()
-            .add_edge(prev_execution_id, resulting_state_id.clone(), final_state.clone());
-        (
-            (resulting_state_id, final_state),
-            op_id,
-        )
+            .add_edge(prev_execution_id, resulting_state_id.clone(), new_state.clone());
+        resulting_state_id
     }
 
     #[tracing::instrument]
@@ -338,19 +367,8 @@ impl ExecutionGraph {
         Vec<(usize, RkyvSerializedValue)>, // values emitted by operations during this step
     ) {
         let (new_state, outputs) = previous_state.step_execution(&self.sender);
-        // The edge from this node is the greatest branching id + 1
-        // if we re-evaluate execution at a given node, we get a new execution branch.
-        let mut execution_graph = self.execution_graph.lock().unwrap();
-        let mut state_id_to_state = self.state_id_to_state.lock().unwrap();
-        let resulting_state_id = get_execution_id(execution_graph.deref_mut(), prev_execution_id);
-        state_id_to_state.deref_mut().insert(resulting_state_id.clone(), new_state.clone());
-        execution_graph.deref_mut()
-            .add_edge(prev_execution_id, resulting_state_id.clone(), new_state.clone());
-        (
-
-            (resulting_state_id, new_state),
-            outputs,
-        )
+        let resulting_state_id = self.progress_graph(prev_execution_id, new_state.clone());
+        ((resulting_state_id, new_state), outputs)
     }
 }
 
@@ -370,6 +388,7 @@ mod tests {
     use rkyv::{archived_root, Deserialize, Serialize};
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::runtime::Runtime;
 
     /*
     Testing the execution of individual nodes. Validating that operations as defined can be executed.
@@ -380,36 +399,39 @@ mod tests {
         let mut db = ExecutionGraph::new();
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::new(),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(1)),
-        ));
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::new(),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(2)),
-        ));
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["a", "b"]),
-            OutputSignature::new(),
-            Box::new(|args, _| {
-                if let RSV::Object(m) = args {
-                    if let RSV::Object(args) = m.get("args").unwrap() {
-                        if let (Some(RSV::Number(a)), Some(RSV::Number(b))) =
-                            (args.get(&"0".to_string()), args.get(&"1".to_string()))
-                        {
-                            return RSV::Number(a + b);
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::new(),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(1)),
+                ),
+                                                    None);
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::new(),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(2)),
+                ),
+                                                    None);
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["a", "b"]),
+                    OutputSignature::new(),
+                    Box::new(|args, _| {
+                        if let RSV::Object(m) = args {
+                            if let RSV::Object(args) = m.get("args").unwrap() {
+                                if let (Some(RSV::Number(a)), Some(RSV::Number(b))) =
+                                    (args.get(&"0".to_string()), args.get(&"1".to_string()))
+                                {
+                                    return RSV::Number(a + b);
+                                }
+                            }
                         }
-                    }
-                }
 
-                panic!("Invalid arguments")
-            }),
-        ));
+                        panic!("Invalid arguments")
+                    }),
+                ),
+                                                    None);
 
         let mut state =
             state.apply_dependency_graph_mutations(vec![DependencyGraphMutation::Create {
@@ -444,18 +466,20 @@ mod tests {
         let mut db = ExecutionGraph::new();
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::new(),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(0)),
-        ));
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::new(),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(1)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::new(),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(0)),
+                ),
+                                                    None);
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::new(),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(1)),
+                ),
+                                                    None);
         let mut state =
             state.apply_dependency_graph_mutations(vec![DependencyGraphMutation::Create {
                 operation_id: 1,
@@ -483,26 +507,29 @@ mod tests {
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::new(),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(0)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::new(),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(0)),
+                ),
+                                                    None);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["0"]),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(1)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["0"]),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(1)),
+                ),
+                                                    None);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["0"]),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(2)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["0"]),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(2)),
+                ),
+                                                    None);
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
@@ -540,33 +567,37 @@ mod tests {
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::new(),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(0)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::new(),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(0)),
+                ),
+                                                    None);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["1"]),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(1)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["1"]),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(1)),
+                ),
+                                                    None);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["1"]),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(2)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["1"]),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(2)),
+                ),
+                                                    None);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["1"]),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(3)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["1"]),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(3)),
+                ),
+                                                    None);
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
@@ -611,40 +642,45 @@ mod tests {
 
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::new(),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(0)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::new(),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(0)),
+                ),
+                                                    None);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["1"]),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(1)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["1"]),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(1)),
+                ),
+                                                    None);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["1"]),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(2)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["1"]),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(2)),
+                ),
+                                                    None);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["1"]),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(3)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["1"]),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(3)),
+                ),
+                                                    None);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["1", "2"]),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(4)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["1", "2"]),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(4)),
+                ),
+                                                    None);
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
@@ -705,12 +741,13 @@ mod tests {
         let state_id = (0, 0);
 
         // We start with the number 1 at node 0
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::new(),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(1)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::new(),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(1)),
+                ),
+                                                    None);
 
         // Each node adds 1 to the inbound item (all nodes only have one dependency per index)
         let f1 = |args: RkyvSerializedValue, _| {
@@ -725,40 +762,45 @@ mod tests {
             panic!("Invalid arguments")
         };
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["1"]),
-            OutputSignature::new(),
-            Box::new(f1),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["1"]),
+                    OutputSignature::new(),
+                    Box::new(f1),
+                ),
+                                                    None);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["1"]),
-            OutputSignature::new(),
-            Box::new(f1),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["1"]),
+                    OutputSignature::new(),
+                    Box::new(f1),
+                ),
+                                                    None);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["1"]),
-            OutputSignature::new(),
-            Box::new(f1),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["1"]),
+                    OutputSignature::new(),
+                    Box::new(f1),
+                ),
+                                                    None);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["1"]),
-            OutputSignature::new(),
-            Box::new(f1),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["1"]),
+                    OutputSignature::new(),
+                    Box::new(f1),
+                ),
+                                                    None);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["1"]),
-            OutputSignature::new(),
-            Box::new(f1),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["1"]),
+                    OutputSignature::new(),
+                    Box::new(f1),
+                ),
+                                                    None);
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
@@ -856,12 +898,13 @@ mod tests {
         let state_id = (0, 0);
 
         // We start with the number 1 at node 0
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::new(),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(1)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::new(),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(1)),
+                ),
+                                                    None);
 
         // Globally mutates this value, making each call to this function side-effecting
         static atomic_usize: AtomicUsize = AtomicUsize::new(0);
@@ -878,18 +921,20 @@ mod tests {
             panic!("Invalid arguments")
         };
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["0"]),
-            OutputSignature::new(),
-            Box::new(f_side_effect),
-        ));
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["0"]),
-            OutputSignature::new(),
-            Box::new(f_side_effect),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["0"]),
+                    OutputSignature::new(),
+                    Box::new(f_side_effect),
+                ),
+                                                    None);
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["0"]),
+                    OutputSignature::new(),
+                    Box::new(f_side_effect),
+                ),
+                                                    None);
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
@@ -938,12 +983,13 @@ mod tests {
         let state_id = (0, 0);
 
         // We start with the number 0 at node 0
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::new(),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(0)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::new(),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(0)),
+                ),
+                                                    None);
 
         let f_v1 = |args: RkyvSerializedValue, _| {
             if let RSV::Object(m) = args {
@@ -969,18 +1015,20 @@ mod tests {
             panic!("Invalid arguments")
         };
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["0"]),
-            OutputSignature::new(),
-            Box::new(f_v1),
-        ));
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["0"]),
-            OutputSignature::new(),
-            Box::new(f_v1),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["0"]),
+                    OutputSignature::new(),
+                    Box::new(f_v1),
+                ),
+                                                    None);
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["0"]),
+                    OutputSignature::new(),
+                    Box::new(f_v1),
+                ),
+                                                    None);
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
@@ -1005,12 +1053,13 @@ mod tests {
 
         // Change the definition of the operation "1" to add 200 instead of 1, then re-evaluate
         // TODO: we can no longer overwrite operations
-        let (_, mut state) = x_state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["0"]),
-            OutputSignature::new(),
-            Box::new(f_v2),
-        ));
+        let (_, mut state) = x_state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["0"]),
+                    OutputSignature::new(),
+                    Box::new(f_v2),
+                ),
+                                                      None);
 
         let ((state_id, state), _) = db.step_execution(state_id, &state.clone());
         assert_eq!(state.state_get(&1), Some(&RSV::Number(200)));
@@ -1040,40 +1089,45 @@ mod tests {
 
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::new(),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(0)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::new(),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(0)),
+                ),
+                                                    None);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["1"]),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(1)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["1"]),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(1)),
+                ),
+                                                    None);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["1"]),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(2)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["1"]),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(2)),
+                ),
+                                                    None);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["1"]),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(3)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["1"]),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(3)),
+                ),
+                                                    None);
 
-        let (_, mut state) = state.add_operation(OperationNode::new(
-            None,
-            InputSignature::from_args_list(vec!["1", "2"]),
-            OutputSignature::new(),
-            Box::new(|_args, _| RSV::Number(4)),
-        ));
+        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                    None,
+                    InputSignature::from_args_list(vec!["1", "2"]),
+                    OutputSignature::new(),
+                    Box::new(|_args, _| RSV::Number(4)),
+                ),
+                                                    None);
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
@@ -1118,5 +1172,56 @@ mod tests {
 
         // TODO: convert this to an actual test
         // dbg!(db.get_merged_state_history(state_id));
+    }
+
+    #[test]
+    fn test_future_behavior() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use futures::Future;
+        use tokio::sync::oneshot;
+        use tokio::sync::oneshot::{Receiver, Sender};
+
+        // TODO: this needs to be wrapped in something to hold its already calculated state, caching the result
+        // when it actually has been resolved
+
+        // MyFuture struct as defined earlier
+        struct MyFuture {
+            receiver: Option<Receiver<i32>>,
+            cached_result: Option<i32>,
+        }
+
+        impl Future for MyFuture {
+            type Output = Option<i32>;
+
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                if let Some(rx) = self.receiver.as_mut() {
+                    match rx.poll_unpin(cx) {
+                        Poll::Ready(Ok(value)) => Poll::Ready(Some(value)),
+                        Poll::Ready(Err(_)) => Poll::Ready(None), // Channel was closed
+                        Poll::Pending => Poll::Pending,
+                    }
+                } else {
+                    Poll::Ready(None) // Receiver was already taken and we received nothing
+                }
+            }
+        }
+
+        Runtime::new().unwrap().block_on(async move {
+            // Simulating some asynchronous work that sends a value through the oneshot channel
+            let (sender, rx) = oneshot::channel();
+            let my_future = MyFuture { receiver: Some(rx), cached_result: None };
+            tokio::spawn(async move {
+                // Simulate some work with a delay
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                sender.send(42).expect("Failed to send value");
+            });
+
+            // Await the MyFuture, which internally awaits the oneshot receiver
+            match my_future.await {
+                Some(value) => println!("Received: {}", value),
+                None => println!("Did not receive any value"),
+            }
+        });
     }
 }

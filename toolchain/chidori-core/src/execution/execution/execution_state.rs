@@ -183,6 +183,11 @@ impl ExecutionState {
         );
     }
 
+    pub fn get_dependency_graph_flattened(&self) -> Vec<(OperationId, OperationId, Vec<DependencyReference>)> {
+        let edges = self.get_dependency_graph();
+        edges.all_edges().map(|x| (x.0, x.1, x.2.clone())).collect()
+    }
+
     pub fn get_dependency_graph(&self) -> DiGraphMap<OperationId, Vec<DependencyReference>> {
         let mut graph = DiGraphMap::new();
         for (node, value) in self.dependency_map.clone().into_iter() {
@@ -201,18 +206,22 @@ impl ExecutionState {
     }
 
     #[tracing::instrument]
-    pub fn add_operation(&self, operation_node: OperationNode) -> (usize, Self) {
+    pub fn upsert_operation(&self, operation_node: OperationNode, op_id: Option<usize>) -> (usize, Self) {
         let mut s = self.clone();
-        let op_id = operation_node.name.as_ref()
-            .and_then(|name| s.operation_name_to_id.get(name).copied())
-            .unwrap_or_else(|| {
-                let new_id = s.op_counter;
-                s.op_counter += 1;
-                if let Some(name) = &operation_node.name {
-                    s.operation_name_to_id.insert(name.clone(), new_id);
-                }
-                new_id
-            });
+        let op_id = if let Some(op_id) = op_id {
+            op_id
+        } else {
+            operation_node.name.as_ref()
+                .and_then(|name| s.operation_name_to_id.get(name).copied())
+                .unwrap_or_else(|| {
+                    let new_id = s.op_counter;
+                    s.op_counter += 1;
+                    if let Some(name) = &operation_node.name {
+                        s.operation_name_to_id.insert(name.clone(), new_id);
+                    }
+                    new_id
+                })
+        };
 
         s.operation_by_id.insert(op_id, Arc::new(Mutex::new(operation_node)));
         (op_id, s)

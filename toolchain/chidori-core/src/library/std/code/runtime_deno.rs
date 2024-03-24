@@ -11,7 +11,7 @@ use crate::execution::primitives::serialized_value::{
 };
 use chidori_static_analysis::language::javascript::parse::{build_report, extract_dependencies_js};
 use deno_core::_ops::RustToV8NoScope;
-use deno_core::v8::HandleScope;
+use deno_core::v8::{Global, HandleScope};
 use std::collections::HashMap;
 use std::hash::Hash;
 use crate::cells::{CellTypes, CodeCell};
@@ -66,6 +66,21 @@ impl MyOpState {
         }
     }
 }
+
+#[op2]
+#[serde]
+fn op_assert_eq(
+    #[serde] a: RkyvSerializedValue,
+    #[serde] b: RkyvSerializedValue,
+) -> Result<RkyvSerializedValue, AnyError> {
+    if a == b {
+        Ok(RkyvSerializedValue::String("Success".to_string()))
+    } else {
+        println!("Assertion failed @ {:?} != {:?}", a, b);
+        Ok(RkyvSerializedValue::String("Failure".to_string()))
+    }
+}
+
 
 #[op2]
 #[serde]
@@ -325,6 +340,7 @@ pub fn source_code_run_deno(
         }
     }
 
+    // TODO: this needs to capture stdout similar to how we do with python
     let my_op_state = Arc::new(Mutex::new(MyOpState {
         payload: payload.clone(),
         cell_depended_values: cell_depended_values,
@@ -333,7 +349,11 @@ pub fn source_code_run_deno(
 
     let ext = Extension {
         name: "my_ext",
-        ops: std::borrow::Cow::Borrowed(&[op_set_globals::DECL, op_call_rust::DECL]),
+        ops: std::borrow::Cow::Borrowed(&[
+            op_set_globals::DECL,
+            op_call_rust::DECL,
+            op_assert_eq::DECL,
+        ]),
         op_state_fn: Some(Box::new(move |state| {
             state.put(my_op_state.clone());
         })),
@@ -369,6 +389,12 @@ pub fn source_code_run_deno(
     },
   };
 
+  globalThis.Chidori = {
+    assertEq: (a, b) => {
+      return ops.op_assert_eq(a, b);
+    },
+  };
+
   ops.op_set_globals();
 })(globalThis);
         "#,
@@ -392,15 +418,15 @@ pub fn source_code_run_deno(
 
     // create shims for functions that are referred to
     let mut js_code = String::new();
+    js_code.push_str("const chidoriResult = {};\n");
     for (name, report_item) in &report.cell_exposed_values {
-        js_code.push_str("const chidoriResult = {};\n");
         js_code.push_str(&format!(
             r#"chidoriResult["{name}"] = {name};
             "#,
             name = name
         ));
-        js_code.push_str("chidoriResult");
     }
+    js_code.push_str("chidoriResult");
 
     let result = runtime.execute_script("output.js", FastString::Owned(js_code.into()));
 

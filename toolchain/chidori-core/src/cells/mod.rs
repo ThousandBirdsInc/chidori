@@ -4,6 +4,7 @@ pub mod web_cell;
 pub mod llm_prompt_cell;
 mod memory_cell;
 
+use std::cmp::Ordering;
 use ts_rs::TS;
 use rkyv::{Archive, Deserialize, Serialize};
 use crate::library::std::ai::llm::ChatModelBatch;
@@ -278,4 +279,33 @@ pub enum CellTypes {
     Prompt(LLMPromptCell),
     Web(WebserviceCell),
     Template(TemplateCell)
+}
+
+impl Eq for CellTypes {
+
+}
+
+impl PartialOrd for CellTypes {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(Ordering::Equal)
+    }
+}
+
+impl Ord for CellTypes {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+    }
+}
+
+pub fn get_cell_name(cell: &CellTypes) -> &Option<String> {
+    match &cell {
+        CellTypes::Code(c) => &c.name,
+        CellTypes::Prompt(c) => match c {
+            LLMPromptCell::Chat { name, .. } => name,
+            LLMPromptCell::Completion { .. } => &None,
+            LLMPromptCell::Embedding { .. } => &None
+        },
+        CellTypes::Web(c) => &c.name,
+        CellTypes::Template(c) => &c.name
+    }
 }

@@ -13,6 +13,7 @@
   import {getCanvasContext} from "@/speedscope/app-state/getters";
   import {lightTheme} from "@/speedscope/themes/light-theme";
 
+  export let edges: any;
   export let nodes: NodeBatch;
   export let canvasContext: CanvasContext;
   export let nodeBatchRenderer: NodeBatchRenderer;
@@ -91,6 +92,7 @@
     const ctx = overlayCtx;
     if (!ctx) return;
     if (configSpaceViewportRect.isEmpty()) return;
+    // TODO: render the edges between nodes
 
     const configToPhysical = configSpaceToPhysicalViewSpace();
 
@@ -255,6 +257,7 @@
       });
     });
   }
+
 
   // Inertial scrolling introduces tricky interaction problems.
   // Namely, if you start panning, and hit the edge of the scrollable
