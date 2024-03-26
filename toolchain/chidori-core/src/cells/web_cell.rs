@@ -1,3 +1,4 @@
+use futures_util::FutureExt;
 use tokio::runtime::Runtime;
 use crate::cells::WebserviceCell;
 use crate::execution::primitives::operation::{InputItemConfiguation, InputSignature, InputType, OperationNode, OutputSignature};
@@ -28,11 +29,11 @@ pub fn web_cell(cell: &WebserviceCell) -> OperationNode {
         output_signature,
         Box::new(move |x, _| {
             // TODO: this needs to handle stdout and errors
-            let runtime = Runtime::new().unwrap();
-            runtime.block_on(async {
+            let cell = cell.clone();
+            async move {
                 crate::library::std::webserver::run_webservice(&cell, &x).await;
-            });
-            RKV::Null
+                RKV::Null
+            }.boxed()
         }),
     );
     op_node.is_async = true;

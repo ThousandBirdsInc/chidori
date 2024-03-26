@@ -666,6 +666,7 @@ pub fn extract_dependencies_js(source: &str) -> Vec<Vec<ContextPath>> {
     machine.context_stack_references
 }
 
+
 pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
     // TODO: get all exposed values
     // TODO: get all values referred to but are not available in a given context
@@ -770,8 +771,18 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
         }
     }
 
-    // Always exclude "Chidori" because it's available globally
-    depended_values.remove("Chidori");
+    let js_built_ins: HashSet<&str> = [
+        "Chidori",  "Array", "ArrayBuffer", "Boolean", "DataView", "Date", "Error", "EvalError", "Float32Array",
+        "Float64Array", "Function", "Generator", "GeneratorFunction", "Infinity", "Int8Array",
+        "Int16Array", "Int32Array", "InternalError", "Intl", "JSON", "Map", "Math", "NaN",
+        "Number", "Object", "Promise", "Proxy", "RangeError", "ReferenceError", "Reflect",
+        "RegExp", "Set", "SharedArrayBuffer", "String", "Symbol", "SyntaxError", "TypeError",
+        "URIError", "Uint8Array", "Uint8ClampedArray", "Uint16Array", "Uint32Array", "WeakMap",
+        "WeakSet", "decodeURI", "decodeURIComponent", "encodeURI", "encodeURIComponent", "escape",
+        "eval", "isFinite", "isNaN", "parseFloat", "parseInt", "unescape", "uneval", "setTimeout", "setInterval", "console"
+    ].iter().cloned().collect();
+
+    depended_values.retain(|value,_ | !js_built_ins.contains(value.as_str()));
 
     Report {
         cell_exposed_values: exposed_values,

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use tokio_cron_scheduler::{Job, JobScheduler, JobSchedulerError};
 use crate::cells::{CellTypes, CodeCell, ScheduleCell};
+use crate::execution::execution::ExecutionState;
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue};
 
 struct ScheduledJob {
@@ -75,7 +76,7 @@ pub async fn run_cron(
 
                             dbg!(&argument_payload);
                             // invocation of the operation
-                            let result = op.execute(argument_payload, None);
+                            let result = op.execute(&ExecutionState::new(), argument_payload, None);
                         })?
                     ).await?;
                 }

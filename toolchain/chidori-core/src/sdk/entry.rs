@@ -1,5 +1,5 @@
 use crate::execution::execution::execution_graph::{ExecutionGraph, ExecutionNodeId, MergedStateHistory};
-use crate::execution::execution::execution_state::ExecutionState;
+use crate::execution::execution::execution_state::{ExecutionState, ExecutionStateEvaluation};
 use crate::execution::execution::DependencyGraphMutation;
 use crate::cells::{CellTypes, get_cell_name, LLMPromptCell};
 use crate::execution::primitives::identifiers::{DependencyReference, OperationId};
@@ -150,18 +150,17 @@ impl InstancedEnvironment {
     }
 
     pub fn get_state(&self) -> ExecutionState {
-        self.db.get_state_at_id(self.execution_head_state_id).unwrap()
+        match self.db.get_state_at_id(self.execution_head_state_id).unwrap() {
+            ExecutionStateEvaluation::Complete(s) => s,
+            ExecutionStateEvaluation::Executing(_) => ExecutionState::new()
+        }
     }
 
     /// Increment the execution graph by one step
     #[tracing::instrument]
     pub(crate) fn step(&mut self) -> Vec<(usize, RkyvSerializedValue)> {
         println!("Executing state with id {:?}", self.execution_head_state_id);
-        let state = self.db.get_state_at_id(self.execution_head_state_id);
-        // TODO: error instead
-        if state.is_none() { return vec![]; }
-        let state = state.unwrap();
-        let ((state_id, state), outputs) = self.db.step_execution(self.execution_head_state_id, &state);
+        let ((state_id, state), outputs) = self.db.external_step_execution(self.execution_head_state_id);
         if let Some(sender) = self.runtime_event_sender.as_mut() {
             sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
             sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
@@ -175,8 +174,7 @@ impl InstancedEnvironment {
     #[tracing::instrument]
     pub fn upsert_cell(&mut self, cell: CellTypes, op_id: Option<usize>) -> (ExecutionNodeId, usize) {
         println!("Upserting cell into state with id {:?}", &self.execution_head_state_id);
-        let state = self.db.get_state_at_id(self.execution_head_state_id).expect("No state found");
-        let ((state_id, state), op_id) = self.db.mutate_graph(self.execution_head_state_id, &state, cell, op_id);
+        let ((state_id, state), op_id) = self.db.external_mutate_graph(self.execution_head_state_id, cell, op_id);
         if let Some(sender) = self.runtime_event_sender.as_mut() {
             sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
             sender.send(EventsFromRuntime::DefinitionGraphUpdated(state.get_dependency_graph_flattened())).unwrap();
@@ -702,7 +700,7 @@ mod tests {
 
                 ```web
                 ---
-                port: 3838
+                port: 3839
                 ---
                 POST / add [a, b]
                 ```
@@ -723,7 +721,7 @@ mod tests {
             payload.insert("a", 123); // Replace 123 with your desired value for "a"
             payload.insert("b", 456); // Replace 456 with your desired value for "b"
 
-            let res = client.post(format!("http://127.0.0.1:{}", 3838))
+            let res = client.post(format!("http://127.0.0.1:{}", 3839))
                 .header("Content-Type", "application/json")
                 .json(&payload)
                 .send()
@@ -799,6 +797,21 @@ mod tests {
         runtime.block_on(async {
             let mut ee = Chidori::new();
             ee.load_md_directory(Path::new("./examples/core2_marshalling")).unwrap();
+            let mut env = ee.get_instance().unwrap();
+            env.reload_cells();
+            env.get_state().render_dependency_graph();
+            env.step();
+            env.step();
+        });
+    }
+
+    #[test]
+    fn test_core3_function_invocations() {
+        let runtime = Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut ee = Chidori::new();
+
+            ee.load_md_directory(Path::new("./examples/core3_function_invocations")).unwrap();
             let mut env = ee.get_instance().unwrap();
             env.reload_cells();
             env.get_state().render_dependency_graph();

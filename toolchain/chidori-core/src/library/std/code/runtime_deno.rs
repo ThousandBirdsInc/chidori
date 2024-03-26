@@ -1,20 +1,29 @@
+use std::cell::RefCell;
 use anyhow::Result;
 use deno_core::error::AnyError;
-use deno_core::{
-    Extension, FastString, JsRuntime, Op, op2, OpState, RuntimeOptions, serde_json, serde_v8,
-    v8,
-};
+use deno_core::{Extension, ExtensionFileSource, ExtensionFileSourceCode, FastString, JsRuntime, ModuleSpecifier, Op, op2, OpState, PollEventLoopOptions, RuntimeOptions, serde_json, serde_v8, v8};
+use deno_ast::MediaType;
+use deno_ast::ParseParams;
+use deno_ast::SourceTextInfo;
 use std::sync::{Arc, Mutex};
 
 use crate::execution::primitives::serialized_value::{
     json_value_to_serialized_value, RkyvObjectBuilder, RkyvSerializedValue,
 };
 use chidori_static_analysis::language::javascript::parse::{build_report, extract_dependencies_js};
-use deno_core::_ops::RustToV8NoScope;
-use deno_core::v8::{Global, HandleScope};
+use deno_core::_ops::{RustToV8, RustToV8NoScope};
+use deno_core::v8::{Global, Handle, HandleScope};
 use std::collections::HashMap;
+use std::env;
+use std::future::Future;
 use std::hash::Hash;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::rc::Rc;
+use futures_util::FutureExt;
+use tokio::runtime::Runtime;
 use crate::cells::{CellTypes, CodeCell};
+use crate::execution::execution::ExecutionState;
 
 // TODO: need to override console.log
 // TODO: https://deno.com/blog/roll-your-own-javascript-runtime-pt2
@@ -48,12 +57,7 @@ struct MyOpState {
     cell_depended_values: HashMap<String, String>,
     functions: HashMap<
         String,
-        Box<
-            dyn FnMut(
-                Vec<RkyvSerializedValue>,
-                Option<HashMap<String, RkyvSerializedValue>>,
-            ) -> RkyvSerializedValue,
-        >,
+        InternalClosureFnMut,
     >,
 }
 
@@ -82,22 +86,91 @@ fn op_assert_eq(
 }
 
 
-#[op2]
+#[op2(async)]
 #[serde]
-fn op_call_rust(
-    state: &mut OpState,
+async fn op_call_rust(
+    state: Rc<RefCell<OpState>>,
     #[string] name: String,
     #[serde] args: Vec<RkyvSerializedValue>,
     #[serde] kwargs: HashMap<String, RkyvSerializedValue>,
 ) -> Result<RkyvSerializedValue, AnyError> {
-    let mut my_op_state: &Arc<Mutex<MyOpState>> = state.borrow_mut();
+    let mut op_state = state.borrow_mut();
+    let mut my_op_state: &mut Arc<Mutex<MyOpState>> = (*op_state).borrow_mut();
     let mut my_op_state = my_op_state.lock().unwrap();
+    let func = my_op_state.functions.get_mut(&name).unwrap();
     let kwargs = if kwargs.is_empty() {
         None
     } else {
         Some(kwargs)
     };
-    Ok(my_op_state.functions.get_mut(&name).unwrap()(args, kwargs))
+    let result = func(args, kwargs).await;
+    dbg!(&result);
+    Ok(result)
+}
+
+
+struct TsModuleLoader;
+
+impl deno_core::ModuleLoader for TsModuleLoader {
+    fn resolve(
+        &self,
+        specifier: &str,
+        referrer: &str,
+        _kind: deno_core::ResolutionKind,
+    ) -> Result<deno_core::ModuleSpecifier, AnyError> {
+        deno_core::resolve_import(specifier, referrer).map_err(|e| e.into())
+    }
+
+    fn load(
+        &self,
+        module_specifier: &deno_core::ModuleSpecifier,
+        _maybe_referrer: Option<&reqwest::Url>,
+        _is_dyn_import: bool,
+    ) -> std::pin::Pin<Box<deno_core::ModuleSourceFuture>> {
+        let module_specifier = module_specifier.clone();
+        async move {
+            let path = module_specifier.to_file_path().unwrap();
+
+            let media_type = MediaType::from_path(&path);
+            let (module_type, should_transpile) = match MediaType::from_path(&path) {
+                MediaType::JavaScript | MediaType::Mjs | MediaType::Cjs => {
+                    (deno_core::ModuleType::JavaScript, false)
+                }
+                MediaType::Jsx => (deno_core::ModuleType::JavaScript, true),
+                MediaType::TypeScript
+                | MediaType::Mts
+                | MediaType::Cts
+                | MediaType::Dts
+                | MediaType::Dmts
+                | MediaType::Dcts
+                | MediaType::Tsx => (deno_core::ModuleType::JavaScript, true),
+                MediaType::Json => (deno_core::ModuleType::Json, false),
+                _ => panic!("Unknown extension {:?}", path.extension()),
+            };
+
+            let code = std::fs::read_to_string(&path)?;
+            let code = if should_transpile {
+                let parsed = deno_ast::parse_module(ParseParams {
+                    specifier: module_specifier.to_string().parse().unwrap(),
+                    text_info: SourceTextInfo::from_string(code),
+                    media_type,
+                    capture_tokens: false,
+                    scope_analysis: false,
+                    maybe_syntax: None,
+                })?;
+                parsed.transpile(&Default::default())?.text
+            } else {
+                code
+            };
+            let module = deno_core::ModuleSource::new(
+                module_type,
+                deno_core::ModuleCode::from(code),
+                &module_specifier
+            );
+            Ok(module)
+        }
+            .boxed_local()
+    }
 }
 
 // Operation to set global variables
@@ -218,16 +291,17 @@ impl op_set_globals {
         }
 
         // create shims for functions that are referred to
+        // TODO: differentiate async vs sync functions
         let mut js_code = String::new();
         let cell_depended_values = my_op_state.cell_depended_values.clone();
         for (function_name, function) in
-            create_function_shims(scope, &my_op_state.payload, cell_depended_values).unwrap()
+            create_function_shims(&my_op_state.payload, cell_depended_values).unwrap()
         {
             my_op_state
                 .functions
                 .insert(function_name.clone(), function);
             js_code.push_str(&format!(
-                "globalThis.{function_name} = (...data) => Deno.core.ops.op_call_rust(\"{function_name}\", data, {});\n",
+                "globalThis.{function_name} = async (...data) => await Deno.core.ops.op_call_rust(\"{function_name}\", data, {});\n",
                 function_name = function_name
             ));
         }
@@ -245,11 +319,10 @@ type InternalClosureFnMut = Box<
     dyn FnMut(
         Vec<RkyvSerializedValue>,
         Option<HashMap<String, RkyvSerializedValue>>,
-    ) -> RkyvSerializedValue,
+    ) -> Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>> + Send
 >;
 
 fn create_function_shims(
-    scope: &mut HandleScope,
     payload: &RkyvSerializedValue,
     cell_depended_values: HashMap<String, String>,
 ) -> Result<Vec<(String, InternalClosureFnMut)>, ()> {
@@ -269,45 +342,49 @@ fn create_function_shims(
                     {
                         if cell_depended_values.contains_key(&clone_function_name) {
                             let closure_callable: InternalClosureFnMut  = Box::new(move |args: Vec<RkyvSerializedValue>, kwargs: Option<HashMap<String, RkyvSerializedValue>>| {
-                                let total_arg_payload = RkyvObjectBuilder::new();
-                                let total_arg_payload = total_arg_payload.insert_value("args", {
-                                    let mut m = HashMap::new();
-                                    for (i, a) in args.iter().enumerate() {
-                                        m.insert(format!("{}", i), a.clone());
-                                    }
-                                    RkyvSerializedValue::Object(m)
-                                });
-
-                                let total_arg_payload = if let Some(kwargs) = kwargs {
-                                    total_arg_payload.insert_value("kwargs", {
+                                let cell = cell.clone();
+                                let clone_function_name = clone_function_name.clone();
+                                async move {
+                                    let total_arg_payload = RkyvObjectBuilder::new();
+                                    let total_arg_payload = total_arg_payload.insert_value("args", {
                                         let mut m = HashMap::new();
-                                        for (k, a) in kwargs.iter() {
-                                            m.insert(k.clone(), a.clone());
+                                        for (i, a) in args.iter().enumerate() {
+                                            m.insert(format!("{}", i), a.clone());
                                         }
                                         RkyvSerializedValue::Object(m)
-                                    })
-                                } else {
-                                    total_arg_payload
-                                };
+                                    });
 
-                                // modify code cell to indicate execution of the target function
-                                // reconstruction of the cell
-                                let mut op = match &cell {
-                                    CellTypes::Code(c) => {
-                                        let mut c = c.clone();
-                                        c.function_invocation = Some(clone_function_name.clone());
-                                        crate::cells::code_cell::code_cell(&c)
-                                    }
-                                    CellTypes::Prompt(c) => crate::cells::llm_prompt_cell::llm_prompt_cell(&c),
+                                    let total_arg_payload = if let Some(kwargs) = kwargs {
+                                        total_arg_payload.insert_value("kwargs", {
+                                            let mut m = HashMap::new();
+                                            for (k, a) in kwargs.iter() {
+                                                m.insert(k.clone(), a.clone());
+                                            }
+                                            RkyvSerializedValue::Object(m)
+                                        })
+                                    } else {
+                                        total_arg_payload
+                                    };
 
-                                    _ => {
-                                        unreachable!("Unsupported cell type");
-                                    }
-                                };
+                                    // modify code cell to indicate execution of the target function
+                                    // reconstruction of the cell
+                                    let mut op = match &cell {
+                                        CellTypes::Code(c) => {
+                                            let mut c = c.clone();
+                                            c.function_invocation = Some(clone_function_name.clone());
+                                            crate::cells::code_cell::code_cell(&c)
+                                        }
+                                        CellTypes::Prompt(c) => crate::cells::llm_prompt_cell::llm_prompt_cell(&c),
 
-                                // invocation of the operation
-                                let result = op.execute(total_arg_payload.build(), None);
-                                return result;
+                                        _ => {
+                                            unreachable!("Unsupported cell type");
+                                        }
+                                    };
+
+                                    // invocation of the operation
+                                    let result = op.execute(&ExecutionState::new(), total_arg_payload.build(), None).await;
+                                    return result;
+                                }.boxed()
                             });
                             functions.push((function_name.clone(), closure_callable));
                         }
@@ -327,51 +404,42 @@ pub fn source_code_run_deno(
     crate::execution::primitives::serialized_value::RkyvSerializedValue,
     Vec<String>,
 )> {
-    let dependencies = extract_dependencies_js(&source_code);
-    let report = build_report(&dependencies);
+    let runtime = Runtime::new().unwrap();
+    runtime.block_on(async {
+        let dependencies = extract_dependencies_js(&source_code);
+        let report = build_report(&dependencies);
 
-    // A list of function names this block of code is depending on existing
-    let mut cell_depended_values = HashMap::new();
-    if let RkyvSerializedValue::Object(ref payload_map) = payload {
-        if let Some(RkyvSerializedValue::Object(functions_map)) = payload_map.get("functions") {
-            for (function_name, value) in functions_map {
-                cell_depended_values.insert(function_name.clone(), function_name.clone());
+        // A list of function names this block of code is depending on existing
+        let mut cell_depended_values = HashMap::new();
+        if let RkyvSerializedValue::Object(ref payload_map) = payload {
+            if let Some(RkyvSerializedValue::Object(functions_map)) = payload_map.get("functions") {
+                for (function_name, value) in functions_map {
+                    cell_depended_values.insert(function_name.clone(), function_name.clone());
+                }
             }
         }
-    }
 
-    // TODO: this needs to capture stdout similar to how we do with python
-    let my_op_state = Arc::new(Mutex::new(MyOpState {
-        payload: payload.clone(),
-        cell_depended_values: cell_depended_values,
-        functions: Default::default(),
-    }));
+        // TODO: this needs to capture stdout similar to how we do with python
+        let my_op_state = Arc::new(Mutex::new(MyOpState {
+            payload: payload.clone(),
+            cell_depended_values: cell_depended_values,
+            functions: Default::default(),
+        }));
 
-    let ext = Extension {
-        name: "my_ext",
-        ops: std::borrow::Cow::Borrowed(&[
-            op_set_globals::DECL,
-            op_call_rust::DECL,
-            op_assert_eq::DECL,
-        ]),
-        op_state_fn: Some(Box::new(move |state| {
-            state.put(my_op_state.clone());
-        })),
-        ..Default::default()
-    };
-
-    // Initialize JS runtime
-    let mut runtime = JsRuntime::new(RuntimeOptions {
-        extensions: vec![ext],
-        ..Default::default()
-    });
-
-    // Set global variables, provide specialized ops
-    // TODO: like valtown, lets implement our own module loader and make chidori with its ops, a module
-    runtime.execute_script(
-        "<init>",
-        FastString::Static(
-            r#"
+        let ext = Extension {
+            name: "my_ext",
+            ops: std::borrow::Cow::Borrowed(&[
+                op_set_globals::DECL,
+                op_call_rust::DECL,
+                op_assert_eq::DECL,
+            ]),
+            op_state_fn: Some(Box::new(move |state| {
+                state.put(my_op_state.clone());
+            })),
+            js_files: std::borrow::Cow::Borrowed(&[
+                ExtensionFileSource {
+                    specifier: "",
+                    code: ExtensionFileSourceCode::IncludedInBinary(r#"
 ((globalThis) => {
   const { core } = Deno;
   const { ops } = core;
@@ -396,53 +464,68 @@ pub fn source_code_run_deno(
   };
 
   ops.op_set_globals();
-})(globalThis);
-        "#,
-        ),
-    )?;
+})(globalThis);"#, )
+                }
+            ]),
+            ..Default::default()
+        };
 
-    // dbg!(&payload);
-    // dbg!(&source_code);
-    // panic!("here");
-    let result = runtime.execute_script(
-        "main.js",
-        FastString::Owned(source_code.clone().into_boxed_str()),
-    );
+        // let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+        // let snapshot_path = out_dir.join("RUNJS_SNAPSHOT.bin");
+        // let snapshot = deno_core::snapshot_util::create_snapshot(
+        //     deno_core::snapshot_util::CreateSnapshotOptions {
+        //         cargo_manifest_dir: env!("CARGO_MANIFEST_DIR"),
+        //         snapshot_path,
+        //         startup_snapshot: None,
+        //         skip_op_registration: false,
+        //         extensions: vec![ext],
+        //         compression_cb: None,
+        //         with_runtime_cb: None,
+        //     }
+        // );
 
-    if let Err(e) = result {
-        return Err(e);
-    }
+        let mut runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
+            module_loader: Some(Rc::new(TsModuleLoader)),
+            // startup_snapshot: Some(snapshot),
+            extensions: vec![ext],
+            ..Default::default()
+        });
 
-    // TODO: if not function calling api
-    // TODO: For function calling we're going to need another operator that accepts a function
 
-    // create shims for functions that are referred to
-    let mut js_code = String::new();
-    js_code.push_str("const chidoriResult = {};\n");
-    for (name, report_item) in &report.cell_exposed_values {
-        js_code.push_str(&format!(
-            r#"chidoriResult["{name}"] = {name};
-            "#,
-            name = name
-        ));
-    }
-    js_code.push_str("chidoriResult");
+        // Initialize JS runtime
 
-    let result = runtime.execute_script("output.js", FastString::Owned(js_code.into()));
-
-    let scope = &mut runtime.handle_scope();
-    match result {
-        Ok(global) => {
-            let local = v8::Local::new(scope, global);
-            let deserialized_value = serde_v8::from_v8::<serde_json::Value>(scope, local);
-            return Ok(if let Ok(value) = deserialized_value {
-                (json_value_to_serialized_value(&value), vec![])
-            } else {
-                (RkyvSerializedValue::Null, vec![])
-            });
+        // Set global variables, provide specialized ops
+        let mut source = String::new();
+        source.push_str("export const chidoriResult = {};\n");
+        source.push_str(&source_code);
+        for (name, report_item) in &report.cell_exposed_values {
+            source.push_str(&format!(
+                r#"chidoriResult["{name}"] = {name};"#,
+                name = name
+            ));
+            source.push_str("\n");
         }
-        Err(e) => Err(e),
-    }
+        source.push_str("chidoriResult;\n");
+        let mod_id = runtime.load_main_module(&ModuleSpecifier::parse("https://localhost/main.js")?, Some(FastString::from(source.to_string()))).await?;
+        let result = runtime.mod_evaluate(mod_id);
+        runtime.run_event_loop(PollEventLoopOptions::default()).await?;
+        // wait for module to resolve
+        let resolve = result.await?;
+
+        let global = runtime.get_module_namespace(mod_id).unwrap();
+        let scope = &mut runtime.handle_scope();
+        let local_var = deno_core::v8::Local::new(scope, global);
+
+        let func_key = v8::String::new(scope, "chidoriResult").unwrap();
+        let result = local_var.get(scope, func_key.into()).unwrap();
+
+        let deserialized_value = serde_v8::from_v8::<serde_json::Value>(scope, result);
+        return Ok(if let Ok(value) = deserialized_value {
+            (json_value_to_serialized_value(&value), vec![])
+        } else {
+            (RkyvSerializedValue::Null, vec![])
+        });
+    })
 }
 
 #[cfg(test)]
@@ -454,7 +537,7 @@ mod tests {
 
     #[test]
     fn test_source_code_run_with_external_function_invocation() {
-        let source_code = String::from(r#"const y = test_function(5, 5);"#);
+        let source_code = String::from(r#"const y = await test_function(5, 5);"#);
         let result = source_code_run_deno(
             &source_code,
             &RkyvObjectBuilder::new()

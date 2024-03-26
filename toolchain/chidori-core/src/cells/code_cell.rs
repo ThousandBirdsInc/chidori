@@ -1,3 +1,4 @@
+use futures_util::FutureExt;
 use crate::cells::{CodeCell, SupportedLanguage};
 use crate::execution::primitives::operation::{InputItemConfiguation, InputSignature, InputType, OperationNode, OutputItemConfiguation, OutputSignature};
 
@@ -46,18 +47,21 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
 
             let cell = cell.clone();
             OperationNode::new(
-                cell.name,
+                cell.name.clone(),
                 input_signature,
                 output_signature,
                 Box::new(move |x, _| {
+                    let cell = cell.clone();
                     // TODO: this needs to handle stdout and errors
-                    crate::library::std::code::runtime_pyo3::source_code_run_python(
-                        &cell.source_code,
-                        &x,
-                        &cell.function_invocation,
-                    )
-                    .unwrap()
-                    .0
+                    async move {
+                        crate::library::std::code::runtime_pyo3::source_code_run_python(
+                            &cell.source_code,
+                            &x,
+                            &cell.function_invocation,
+                        )
+                            .unwrap()
+                            .0
+                    }.boxed()
                 }),
             )
         }
@@ -65,7 +69,7 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
             cell.name.clone(),
             InputSignature::new(),
             OutputSignature::new(),
-            Box::new(|x, _| x),
+            Box::new(|x, _| async move { x}.boxed()),
         ),
         SupportedLanguage::Deno => {
             let paths =
@@ -106,20 +110,33 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
 
             let cell = cell.clone();
             OperationNode::new(
-                cell.name,
+                cell.name.clone(),
                 input_signature,
                 output_signature,
                 Box::new(move |x, _| {
                     // TODO: this needs to handle stdout and errors
-                    crate::library::std::code::runtime_deno::source_code_run_deno(
-                        &cell.source_code,
-                        &x,
-                        &cell.function_invocation,
-                    )
-                    .unwrap()
-                    .0
+                    let cell = cell.clone();
+                    async move {
+                        crate::library::std::code::runtime_deno::source_code_run_deno(
+                            &cell.source_code,
+                            &x,
+                            &cell.function_invocation,
+                        )
+                            .unwrap()
+                            .0
+                    }.boxed()
                 }),
             )
         }
+    }
+}
+
+
+#[cfg(test)]
+mod test {
+    #[tokio::test]
+    async fn test_code_cell() {
+
+
     }
 }

@@ -3,10 +3,14 @@ use crate::execution::primitives::serialized_value::RkyvSerializedValue;
 use log::warn;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::future::Future;
 use std::ops::{Deref, DerefMut};
+use std::pin::Pin;
 use std::sync::mpsc::Sender;
+use futures_util::FutureExt;
 use tracing::{Level, span};
 use crate::cells::{CellTypes, CodeCell, SupportedLanguage};
+use crate::execution::execution::ExecutionState;
 
 
 // args, kwargs, locals and their configurations
@@ -222,7 +226,7 @@ enum Mutability {
 /// It is up to the user to structure those maps in such a way that they don't collide with other
 /// values being represented in the state of our system. These inputs and outputs are managed
 /// by our Execution Database.
-pub type OperationFn = dyn Fn(RkyvSerializedValue, Option<Sender<((usize, usize), RkyvSerializedValue)>>) -> RkyvSerializedValue + Send;
+pub type OperationFn = dyn Fn(RkyvSerializedValue, Option<Sender<((usize, usize), RkyvSerializedValue)>>) -> Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>> + Send;
 
 // TODO: rather than dep_count operation node should have a specific dep mapping
 pub struct OperationNode {
@@ -317,7 +321,7 @@ impl Default for OperationNode {
             height: 0,
             dirty: true,
             signature: Signature::new(),
-            operation: Box::new(|x, _| x),
+            operation: Box::new(|x, _| async move { x }.boxed()),
             arity: 0,
             unresolved_dependencies: vec![],
             partial_application: Vec::new(),
@@ -349,28 +353,29 @@ impl OperationNode {
     }
 
     #[tracing::instrument]
-    pub(crate) fn execute(&mut self, context: RkyvSerializedValue, tx: Option<Sender<((usize, usize), RkyvSerializedValue)>>) -> RkyvSerializedValue {
-        let exec = self.operation.deref_mut();
-        exec(context, tx)
+    pub(crate) fn execute(&self, state: &ExecutionState, argument_payload: RkyvSerializedValue, tx: Option<Sender<((usize, usize), RkyvSerializedValue)>>) -> Pin<Box<dyn Future<Output=RkyvSerializedValue> + Send>> {
+        let exec = self.operation.deref();
+        exec(argument_payload, tx)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use futures_util::FutureExt;
     use super::*;
     // TODO: test application of Operations/composition
     // TODO: test manual evaluation of a composition of operations
 
-    #[test]
-    fn test_execute_with_operation() {
+    #[tokio::test]
+    async fn test_execute_with_operation() {
         let mut executed = false;
         let operation: Box<OperationFn> =
-            Box::new(|context, _| -> RkyvSerializedValue { RkyvSerializedValue::Boolean(true) });
+            Box::new(|context, _| { async move { RkyvSerializedValue::Boolean(true) }.boxed() });
 
         let mut node = OperationNode::default();
         node.operation = operation;
 
-        let result = node.execute(RkyvSerializedValue::Null, None);
+        let result = node.execute(&ExecutionState::new(), RkyvSerializedValue::Null, None).await;
 
         assert_eq!(result, RkyvSerializedValue::Boolean(true));
     }
@@ -378,7 +383,7 @@ mod tests {
     #[test]
     fn test_execute_without_operation() {
         let mut node = OperationNode::default();
-        node.execute(RkyvSerializedValue::Boolean(true), None); // should not panic
+        node.execute(&ExecutionState::new(), RkyvSerializedValue::Boolean(true), None); // should not panic
     }
 
     #[test]
@@ -389,8 +394,10 @@ mod tests {
         // Define a closure of type `dyn Fn()`
 
         let closure: Box<OperationFn> = Box::new(|_,_ | {
-            println!("Executing closure in a thread!");
-            RkyvSerializedValue::Null
+            async move {
+                println!("Executing closure in a thread!");
+                RkyvSerializedValue::Null
+            }.boxed()
         });
 
         // Wrap the closure in an Arc and Mutex for shared ownership and thread safety

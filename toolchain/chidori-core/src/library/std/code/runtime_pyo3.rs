@@ -12,8 +12,10 @@ use std::sync::mpsc::{self, Sender};
 
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue};
 use std::collections::HashMap;
+use tokio::runtime::Runtime;
 // use rustpython_vm::PyObjectRef;
 use crate::cells::{CellTypes, CodeCell};
+use crate::execution::execution::ExecutionState;
 
 fn pyany_to_rkyv_serialized_value(p: &PyAny) -> RkyvSerializedValue {
     match p.get_type().name() {
@@ -91,7 +93,7 @@ fn rkyv_serialized_value_to_pyany(py: Python, value: &RkyvSerializedValue) -> Py
             py_dict.into_py(py)
         }
         RkyvSerializedValue::Null => py.None(),
-        // Handle other enum variants accordingly...
+        // TODO: Handle other types
         _ => py.None(),
     }
 }
@@ -177,7 +179,6 @@ pub fn source_code_run_python(
             if let Some(RkyvSerializedValue::Object(functions_map)) = payload_map.get("functions") {
                 for (function_name, value) in functions_map {
                     let clone_function_name = function_name.clone();
-                    // TODO: handle llm cells invoked as functions by name
                     if let RkyvSerializedValue::Cell(cell) = value.clone() {
                         if let CellTypes::Code(CodeCell { .. }) = &cell
                         {
@@ -190,55 +191,59 @@ pub fn source_code_run_python(
                                     None,
                                     None,
                                     move |args: &PyTuple, kwargs: Option<&PyDict>| {
-                                        let total_arg_payload = RkyvObjectBuilder::new();
-                                        let total_arg_payload =
-                                            total_arg_payload.insert_value("args", {
-                                                let mut m = HashMap::new();
-                                                for (i, a) in args.iter().enumerate() {
-                                                    m.insert(
-                                                        format!("{}", i),
-                                                        pyany_to_rkyv_serialized_value(a),
-                                                    );
+                                        let runtime = Runtime::new().unwrap();
+
+                                        runtime.block_on(async {
+                                            let total_arg_payload = RkyvObjectBuilder::new();
+                                            let total_arg_payload =
+                                                total_arg_payload.insert_value("args", {
+                                                    let mut m = HashMap::new();
+                                                    for (i, a) in args.iter().enumerate() {
+                                                        m.insert(
+                                                            format!("{}", i),
+                                                            pyany_to_rkyv_serialized_value(a),
+                                                        );
+                                                    }
+                                                    RkyvSerializedValue::Object(m)
+                                                });
+
+                                            let total_arg_payload = if let Some(kwargs) = kwargs {
+                                                total_arg_payload.insert_value("kwargs", {
+                                                    let mut m = HashMap::new();
+                                                    for (i, a) in kwargs.iter() {
+                                                        let k: String = i.extract()?;
+                                                        m.insert(k, pyany_to_rkyv_serialized_value(a));
+                                                    }
+                                                    RkyvSerializedValue::Object(m)
+                                                })
+                                            } else {
+                                                total_arg_payload
+                                            };
+
+                                            // modify code cell to indicate execution of the target function
+                                            // reconstruction of the cell
+                                            let mut op = match &cell {
+                                                CellTypes::Code(c) => {
+                                                    let mut c = c.clone();
+                                                    c.function_invocation =
+                                                        Some(clone_function_name.clone());
+                                                    crate::cells::code_cell::code_cell(&c)
                                                 }
-                                                RkyvSerializedValue::Object(m)
-                                            });
-
-                                        let total_arg_payload = if let Some(kwargs) = kwargs {
-                                            total_arg_payload.insert_value("kwargs", {
-                                                let mut m = HashMap::new();
-                                                for (i, a) in kwargs.iter() {
-                                                    let k: String = i.extract()?;
-                                                    m.insert(k, pyany_to_rkyv_serialized_value(a));
+                                                CellTypes::Prompt(c) => {
+                                                    crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
                                                 }
-                                                RkyvSerializedValue::Object(m)
-                                            })
-                                        } else {
-                                            total_arg_payload
-                                        };
+                                                _ => {
+                                                    unreachable!("Unsupported cell type");
+                                                }
+                                            };
 
-                                        // modify code cell to indicate execution of the target function
-                                        // reconstruction of the cell
-                                        let mut op = match &cell {
-                                            CellTypes::Code(c) => {
-                                                let mut c = c.clone();
-                                                c.function_invocation =
-                                                    Some(clone_function_name.clone());
-                                                crate::cells::code_cell::code_cell(&c)
-                                            }
-                                            CellTypes::Prompt(c) => {
-                                                crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
-                                            }
-                                            _ => {
-                                                unreachable!("Unsupported cell type");
-                                            }
-                                        };
+                                            // invocation of the operation
+                                            let result = op.execute(&ExecutionState::new(), total_arg_payload.build(), None).await;
 
-                                        // invocation of the operation
-                                        let result = op.execute(total_arg_payload.build(), None);
-
-                                        // Conversion back to python types
-                                        let py = args.py();
-                                        PyResult::Ok(rkyv_serialized_value_to_pyany(py, &result))
+                                            // Conversion back to python types
+                                            let py = args.py();
+                                            PyResult::Ok(rkyv_serialized_value_to_pyany(py, &result))
+                                        })
                                     },
                                 )?;
                                 globals.set_item(function_name.clone(), closure_callable);

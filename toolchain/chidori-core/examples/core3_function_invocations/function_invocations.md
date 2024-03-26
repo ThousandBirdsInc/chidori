@@ -7,7 +7,7 @@ def add_two(x):
 ```
 
 ```javascript
-const y = add_two(2);
+const js_y = add_two(2);
 ```
 
 ## Demonstrates defining a function in javascript and calling it in python
@@ -18,29 +18,29 @@ function addTwo(x) {
 ```
 
 ```python
-y = addTwo(2)
+py_y = addTwo(2)
 ```
 
 
 ## This demonstrates an async function in javascript being run by our executor
 ```javascript
-function sleep(ms) {
+function js_sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function sum(name, numbers) {
+async function js_sum(name, numbers) {
     let total = 0;
     for (const number of numbers) {
         console.log(`Task ${name}: Computing ${total}+${number}`);
-        await sleep(1000); // Sleep for 1 second
+        await js_sleep(1000); // Sleep for 1 second
         total += number;
     }
 }
 
 async function main() {
     await Promise.all([
-        sum("A", [1, 2]),
-        sum("B", [1, 2, 3]),
+        js_sum("A", [1, 2]),
+        js_sum("B", [1, 2, 3]),
     ]);
 }
 ```
@@ -52,21 +52,21 @@ import time
 
 start = time.time()
 
-async def sleep():
+async def py_sleep():
     time.sleep(1)
     
-async def sum(name, numbers):
+async def py_sum(name, numbers):
     total = 0
     for number in numbers:
         print(f'Task {name}: Computing {total}+{number}')
-        await sleep()
+        await py_sleep()
         total += number
 
 
 loop = asyncio.get_event_loop()
 tasks = [
-    loop.create_task(sum("A", [1, 2])),
-    loop.create_task(sum("B", [1, 2, 3])),
+    loop.create_task(py_sum("A", [1, 2])),
+    loop.create_task(py_sum("B", [1, 2, 3])),
 ]
 loop.run_until_complete(asyncio.wait(tasks))
 loop.close()

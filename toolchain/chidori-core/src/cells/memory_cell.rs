@@ -1,5 +1,7 @@
+use tonic::codegen::Body;
 use crate::cells::{MemoryCell, SupportedMemoryProviders};
 use crate::execution::primitives::operation::{InputSignature, InputType, OperationNode, OutputItemConfiguation, OutputSignature};
+use futures_util::FutureExt;
 
 /// Memory cells when first executed have no inputs. They initialize the connection to the memory store.
 /// Once initialized they become communicated with over the functions that they provide to the workspace.
@@ -38,7 +40,7 @@ pub fn memory_cell(cell: &MemoryCell) -> OperationNode {
                 output_signature,
                 Box::new(move |x, _| {
                     // TODO: this needs to handle stdout and errors
-                    x
+                    async move { x}.boxed()
                 }),
             )
         }

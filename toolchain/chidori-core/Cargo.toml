@@ -18,7 +18,6 @@ proc-macro = true
 
 # https://chat.openai.com/c/52edc960-dc19-4df7-b36f-30caad9c1905
 [dependencies]
-gluesql.workspace = true
 protobuf.workspace = true
 sqlparser.workspace = true
 anyhow.workspace = true
@@ -68,6 +67,7 @@ ts-rs = "7.1"
 # TODO: make optional
 yaml-front-matter = "0.1.0"
 deno_core = "0.238.0"
+deno_ast = { version = "0.34.2", features = ["transpiling"] }
 #starlark = { version = "0.9.0"}
 http-body-util = "0.1.0-rc.2"
 zip = "0.6.6"

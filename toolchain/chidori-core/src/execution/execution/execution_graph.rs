@@ -1,14 +1,14 @@
 use std::collections::HashMap;
-use crate::execution::execution::execution_state::{DependencyGraphMutation, ExecutionState};
+use crate::execution::execution::execution_state::{DependencyGraphMutation, ExecutionState, ExecutionStateEvaluation};
 use std::fmt;
-use std::fmt::Formatter;
+use std::fmt::Debug;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
 // use std::sync::{Mutex};
-use no_deadlocks::{Mutex};
+use no_deadlocks::Mutex;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use futures_util::FutureExt;
@@ -25,6 +25,7 @@ use petgraph::Direction;
 use petgraph::prelude::Dfs;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde::ser::SerializeMap;
+use tokio::sync::oneshot::Receiver;
 use crate::cells::CellTypes;
 
 // TODO: update all of these identifies to include a "space" they're within
@@ -35,6 +36,8 @@ type EdgeIdentity = (OperationId, OperationId, DependencyReference);
 /// It is a tuple of (branch, counter) where branch is an instance of a divergence from a previous
 /// execution state. Counter is the iteration of steps taken in that branch.
 // TODO: add a globally incrementing counter to this so that there can never be identity collisions
+
+// TODO: (branch, depth, counter)
 pub type ExecutionNodeId = (usize, usize);
 
 
@@ -99,9 +102,9 @@ pub struct ExecutionGraph {
     ///
     /// Identifiers on this graph refer to points in the execution graph. In execution terms, changes
     /// along those edges are always considered to have occurred _after_ the target step.
-    execution_graph: Arc<Mutex<DiGraphMap<ExecutionNodeId, ExecutionState>>>,
+    execution_graph: Arc<Mutex<DiGraphMap<ExecutionNodeId, ExecutionStateEvaluation>>>,
 
-    state_id_to_state: Arc<Mutex<HashMap<ExecutionNodeId, ExecutionState>>>,
+    execution_node_id_to_state: Arc<Mutex<HashMap<ExecutionNodeId, ExecutionStateEvaluation>>>,
 
     /// Sender channel for sending messages to the execution graph
     sender: mpsc::Sender<(ExecutionNodeId, OperationId, RkyvSerializedValue)>,
@@ -126,7 +129,7 @@ impl std::fmt::Debug for ExecutionGraph {
 /// we re-evaluate a node that head already previously been evaluated - creating a
 /// new line of execution.
 fn get_execution_id(
-    execution_graph: &mut DiGraphMap<ExecutionNodeId, ExecutionState>,
+    execution_graph: &mut DiGraphMap<ExecutionNodeId, ExecutionStateEvaluation>,
     prev_execution_id: ExecutionNodeId,
 ) -> (usize, usize) {
     let edges = execution_graph
@@ -154,7 +157,7 @@ impl ExecutionGraph {
         let (sender, receiver) = mpsc::channel::<(ExecutionNodeId, OperationId, RkyvSerializedValue)>();
 
         let mut state_id_to_state = HashMap::new();
-        state_id_to_state.insert((0, 0), ExecutionState::new());
+        state_id_to_state.insert((0, 0), ExecutionStateEvaluation::Complete(ExecutionState::new()));
         let mut state_id_to_state = Arc::new(Mutex::new(state_id_to_state));
 
         let mut execution_graph = Arc::new(Mutex::new(DiGraphMap::new()));
@@ -171,8 +174,12 @@ impl ExecutionGraph {
                     Ok((prev_execution_id, operation_id, result)) => {
                         let mut execution_graph = execution_graph_clone.lock().unwrap();
                         let mut state_id_to_state = state_id_to_state_clone.lock().unwrap();
+
+                        // TODO: await the result of the operation
                         let mut new_state = state_id_to_state.get(&prev_execution_id).unwrap().clone();
-                        new_state.state_insert(operation_id, result);
+                        if let ExecutionStateEvaluation::Complete(ref mut state) = &mut new_state {
+                            state.state_insert(operation_id, result);
+                        }
 
                         // TODO: log this event
                         // outputs.push((operation_id, result.clone()));
@@ -197,7 +204,7 @@ impl ExecutionGraph {
         });
         ExecutionGraph {
             handle,
-            state_id_to_state,
+            execution_node_id_to_state: state_id_to_state,
             execution_graph,
             sender,
             revision: 0,
@@ -215,8 +222,8 @@ impl ExecutionGraph {
         println!("{:?}", Dot::with_config(&execution_graph.deref(), &[]));
     }
 
-    pub fn get_state_at_id(&self, id: ExecutionNodeId) -> Option<ExecutionState> {
-        let state_id_to_state = self.state_id_to_state.lock().unwrap();
+    pub fn get_state_at_id(&self, id: ExecutionNodeId) -> Option<ExecutionStateEvaluation> {
+        let state_id_to_state = self.execution_node_id_to_state.lock().unwrap();
         state_id_to_state.get(&id).cloned()
     }
 
@@ -239,13 +246,14 @@ impl ExecutionGraph {
                 }
             }
         }
-        // TODO: for some reason this is resulting in exploring the other branches as well
-        dbg!(&queue);
+
         let mut merged_state = HashMap::new();
         for predecessor in queue {
             let state = self.get_state_at_id(predecessor).unwrap();
-            for (k, v) in state.state.iter() {
-                merged_state.insert(*k, (predecessor, v.clone()));
+            if let ExecutionStateEvaluation::Complete(state) = state {
+                for (k, v) in state.state.iter() {
+                    merged_state.insert(*k, (predecessor, v.clone()));
+                }
             }
         }
         MergedStateHistory(merged_state)
@@ -255,13 +263,18 @@ impl ExecutionGraph {
     pub fn mutate_graph(
         &mut self,
         prev_execution_id: ExecutionNodeId,
-        previous_state: &ExecutionState,
+        previous_state: &ExecutionStateEvaluation,
         cell: CellTypes,
         op_id: Option<usize>,
     ) -> (
         ((usize, usize), ExecutionState), // the resulting total state of this step
         usize, // id of the new operation
     ) {
+        let previous_state = match previous_state {
+            ExecutionStateEvaluation::Complete(state) => state,
+            ExecutionStateEvaluation::Executing(_) => panic!("Cannot mutate a graph that is currently executing"),
+        };
+
         let mut op = match &cell {
             CellTypes::Code(c) => crate::cells::code_cell::code_cell(c),
             CellTypes::Prompt(c) => crate::cells::llm_prompt_cell::llm_prompt_cell(c),
@@ -270,31 +283,14 @@ impl ExecutionGraph {
         };
         op.attach_cell(cell);
         let (op_id, new_state) = previous_state.upsert_operation(op, op_id);
+        let mutations = Self::assign_dependencies_to_operations(&new_state);
+        let final_state = new_state.apply_dependency_graph_mutations(mutations);
+        let resulting_state_id = self.progress_graph(prev_execution_id, ExecutionStateEvaluation::Complete(final_state.clone()));
+        ((resulting_state_id, final_state), op_id)
+    }
 
-        // TODO: when there is a dependency on a function invocation we need to
-        //       instantiate a new instance of the function operation node.
-        //       It itself is not part of the call graph until it has such a dependency.
-
-        let mut available_values = HashMap::new();
-        let mut available_functions = HashMap::new();
-
-        // For all reported cells, add their exposed values to the available values
-        for (id, op) in new_state.operation_by_id.iter() {
-            let output_signature = &op.lock().unwrap().signature.output_signature;
-
-            // Store values that are available as globals
-            for (key, value) in output_signature.globals.iter() {
-                // TODO: throw an error if there is a naming collision
-                available_values.insert(key.clone(), id);
-            }
-
-            for (key, value) in output_signature.functions.iter() {
-                // TODO: throw an error if there is a naming collision
-                available_functions.insert(key.clone(), id);
-            }
-
-            // TODO: Store triggerable functions that may be passed as values as well
-        }
+    fn assign_dependencies_to_operations(new_state: &ExecutionState) -> Vec<DependencyGraphMutation> {
+        let (available_values, available_functions) = Self::get_possible_dependencies(new_state);
 
         // TODO: we need to report on INVOKED functions - these functions are calls to
         //       functions with the locals assigned in a particular way. But then how do we handle compositions of these?
@@ -339,17 +335,46 @@ impl ExecutionGraph {
                 });
             }
         }
-
-        let final_state = new_state.apply_dependency_graph_mutations(mutations);
-        let resulting_state_id = self.progress_graph(prev_execution_id, final_state.clone());
-        ((resulting_state_id, final_state), op_id)
+        mutations
     }
 
-    fn progress_graph(&mut self, prev_execution_id: ExecutionNodeId, new_state: ExecutionState) -> ExecutionNodeId {
+    fn get_possible_dependencies(new_state: &ExecutionState) -> (HashMap<String, &OperationId>, HashMap<String, &OperationId>) {
+        // TODO: when there is a dependency on a function invocation we need to
+        //       instantiate a new instance of the function operation node.
+        //       It itself is not part of the call graph until it has such a dependency.
+
+        // TODO: Store trigger-able functions that may be passed as values as well
+
+        let mut available_values = HashMap::new();
+        let mut available_functions = HashMap::new();
+
+        // For all reported cells, add their exposed values to the available values
+        for (id, op) in new_state.operation_by_id.iter() {
+            let output_signature = &op.lock().unwrap().signature.output_signature;
+
+            // Store values that are available as globals
+            for (key, value) in output_signature.globals.iter() {
+                let insert_result = available_values.insert(key.clone(), id);
+                if insert_result.is_some() {
+                    panic!("Naming collision detected for value {}", key);
+                }
+            }
+
+            for (key, value) in output_signature.functions.iter() {
+                let insert_result = available_functions.insert(key.clone(), id);
+                if insert_result.is_some() {
+                    panic!("Naming collision detected for value {}", key);
+                }
+            }
+        }
+        (available_values, available_functions)
+    }
+
+    fn progress_graph(&mut self, prev_execution_id: ExecutionNodeId, new_state: ExecutionStateEvaluation) -> ExecutionNodeId {
         // The edge from this node is the greatest branching id + 1
         // if we re-evaluate execution at a given node, we get a new execution branch.
         let mut execution_graph = self.execution_graph.lock().unwrap();
-        let mut state_id_to_state = self.state_id_to_state.lock().unwrap();
+        let mut state_id_to_state = self.execution_node_id_to_state.lock().unwrap();
         let resulting_state_id = get_execution_id(execution_graph.deref_mut(), prev_execution_id);
         state_id_to_state.deref_mut().insert(resulting_state_id.clone(), new_state.clone());
         execution_graph.deref_mut()
@@ -357,18 +382,66 @@ impl ExecutionGraph {
         resulting_state_id
     }
 
+    // TODO: step execution should be able to progress even when the previous state is current held up
+    //       by an executing resolution. We instead want to return the NESTED state of the execution.
+
+    // TODO: the mechanism of our execution engine should be hidden from outside of this class
+    //       all that the parent observes is that there is a function that when they call it, it gets new states.
+    //
+    // TODO: right now, when this function is called, the parent is responsible for what execution id is being evaluated
+    //       and for providing the right state. Instead we want to hide state access within this class.
     #[tracing::instrument]
     pub fn step_execution(
         &mut self,
         prev_execution_id: ExecutionNodeId,
-        previous_state: &ExecutionState,
+        previous_state: &ExecutionStateEvaluation,
     ) -> (
-        ((usize, usize), ExecutionState), // the resulting total state of this step
+        ((usize, usize), ExecutionStateEvaluation), // the resulting total state of this step
         Vec<(usize, RkyvSerializedValue)>, // values emitted by operations during this step
     ) {
+        let previous_state = match previous_state {
+            ExecutionStateEvaluation::Complete(state) => state,
+            ExecutionStateEvaluation::Executing(_) => panic!("Cannot step an execution state that is currently executing"),
+        };
+        // TODO: Execution can only be stepped when the previous state is complete
         let (new_state, outputs) = previous_state.step_execution(&self.sender);
         let resulting_state_id = self.progress_graph(prev_execution_id, new_state.clone());
         ((resulting_state_id, new_state), outputs)
+    }
+
+
+    #[tracing::instrument]
+    pub fn external_mutate_graph(
+        &mut self,
+        prev_execution_id: ExecutionNodeId,
+        cell: CellTypes,
+        op_id: Option<usize>,
+    ) -> (
+        ((usize, usize), ExecutionState), // the resulting total state of this step
+        usize, // id of the new operation
+    ) {
+        let state = self.get_state_at_id(prev_execution_id);
+        if let Some(state) = state {
+            self.mutate_graph(prev_execution_id, &state, cell, op_id)
+        } else {
+            panic!("No state found for id {:?}", prev_execution_id);
+        }
+    }
+
+    #[tracing::instrument]
+    pub fn external_step_execution(
+        &mut self,
+        prev_execution_id: ExecutionNodeId,
+    ) -> (
+        ((usize, usize), ExecutionStateEvaluation), // the resulting total state of this step
+        Vec<(usize, RkyvSerializedValue)>, // values emitted by operations during this step
+    ) {
+        let state = self.get_state_at_id(prev_execution_id);
+        if let Some(state) = state {
+            self.step_execution(prev_execution_id, &state)
+        } else {
+            panic!("No state found for id {:?}", prev_execution_id);
+        }
     }
 }
 
@@ -377,16 +450,8 @@ mod tests {
     use super::*;
     use crate::execution::primitives::operation::{InputSignature, OperationNode, OutputSignature};
     use crate::execution::primitives::serialized_value::{
-        deserialize_from_buf, serialize_to_vec, ArchivedRkyvSerializedValue,
-    };
-    use crate::execution::primitives::serialized_value::{
         RkyvSerializedValue as RSV, RkyvSerializedValue,
     };
-    use log::warn;
-    use rkyv::ser::serializers::AllocSerializer;
-    use rkyv::ser::Serializer;
-    use rkyv::{archived_root, Deserialize, Serialize};
-    use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::runtime::Runtime;
 
@@ -403,14 +468,14 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(1)),
+                    Box::new(|_args, _| async move { RSV::Number(1) }.boxed()),
                 ),
                                                     None);
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(2)),
+                    Box::new(|_args, _| async move { RSV::Number(2) }.boxed()),
                 ),
                                                     None);
         let (_, mut state) = state.upsert_operation(OperationNode::new(
@@ -418,17 +483,19 @@ mod tests {
                     InputSignature::from_args_list(vec!["a", "b"]),
                     OutputSignature::new(),
                     Box::new(|args, _| {
-                        if let RSV::Object(m) = args {
-                            if let RSV::Object(args) = m.get("args").unwrap() {
-                                if let (Some(RSV::Number(a)), Some(RSV::Number(b))) =
-                                    (args.get(&"0".to_string()), args.get(&"1".to_string()))
-                                {
-                                    return RSV::Number(a + b);
+                        async move {
+                            if let RSV::Object(m) = args {
+                                if let RSV::Object(args) = m.get("args").unwrap() {
+                                    if let (Some(RSV::Number(a)), Some(RSV::Number(b))) =
+                                        (args.get(&"0".to_string()), args.get(&"1".to_string()))
+                                    {
+                                        return RSV::Number(a + b);
+                                    }
                                 }
                             }
-                        }
 
-                        panic!("Invalid arguments")
+                            panic!("Invalid arguments")
+                        }.boxed()
                     }),
                 ),
                                                     None);
@@ -449,7 +516,7 @@ mod tests {
         state.state_insert(0, arg0);
         state.state_insert(1, arg1);
 
-        let ((_, new_state), _) = db.step_execution(state_id, &state.clone());
+        let ((_, new_state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state.clone()));
 
         assert!(new_state.state_get(&2).is_some());
         let result = new_state.state_get(&2).unwrap();
@@ -470,14 +537,14 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(0)),
+                    Box::new(|_args, _| async move { RSV::Number(0) }.boxed()),
                 ),
                                                     None);
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(1)),
+                    Box::new(|_args, _| async move { RSV::Number(1) }.boxed()),
                 ),
                                                     None);
         let mut state =
@@ -486,7 +553,7 @@ mod tests {
                 depends_on: vec![(0, DependencyReference::Positional(0))],
             }]);
 
-        let ((_, new_state), _) = db.step_execution(state_id, &state);
+        let ((_, new_state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state));
         assert_eq!(
             new_state.state_get(&1).unwrap(),
             &RkyvSerializedValue::Number(1)
@@ -511,7 +578,7 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(0)),
+                    Box::new(|_args, _| async move { RSV::Number(0)}.boxed()),
                 ),
                                                     None);
 
@@ -519,7 +586,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["0"]),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(1)),
+                    Box::new(|_args, _| async move { RSV::Number(1)}.boxed()),
                 ),
                                                     None);
 
@@ -527,7 +594,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["0"]),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(2)),
+                    Box::new(|_args, _| async move { RSV::Number(2)}.boxed()),
                 ),
                                                     None);
 
@@ -542,7 +609,7 @@ mod tests {
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state));
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         let ((state_id, state), _) = db.step_execution(state_id, &state);
@@ -571,7 +638,7 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(0)),
+                    Box::new(|_args, _| async move { RSV::Number(0)}.boxed()),
                 ),
                                                     None);
 
@@ -579,7 +646,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(1)),
+                    Box::new(|_args, _| async move { RSV::Number(1)}.boxed()),
                 ),
                                                     None);
 
@@ -587,7 +654,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(2)),
+                    Box::new(|_args, _| async move { RSV::Number(2)}.boxed()),
                 ),
                                                     None);
 
@@ -595,7 +662,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(3)),
+                    Box::new(|_args, _| async move { RSV::Number(3)}.boxed()),
                 ),
                                                     None);
 
@@ -614,7 +681,7 @@ mod tests {
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state));
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         let ((state_id, state), _) = db.step_execution(state_id, &state);
@@ -646,7 +713,7 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(0)),
+                    Box::new(|_args, _| async move { RSV::Number(0)}.boxed()),
                 ),
                                                     None);
 
@@ -654,7 +721,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(1)),
+                    Box::new(|_args, _| async move { RSV::Number(1)}.boxed()),
                 ),
                                                     None);
 
@@ -662,7 +729,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(2)),
+                    Box::new(|_args, _| async move { RSV::Number(2)}.boxed()),
                 ),
                                                     None);
 
@@ -670,7 +737,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(3)),
+                    Box::new(|_args, _| async move { RSV::Number(3)}.boxed()),
                 ),
                                                     None);
 
@@ -678,7 +745,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1", "2"]),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(4)),
+                    Box::new(|_args, _| async move { RSV::Number(4)}.boxed()),
                 ),
                                                     None);
 
@@ -704,7 +771,7 @@ mod tests {
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state));
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         let ((state_id, state), _) = db.step_execution(state_id, &state);
@@ -745,21 +812,23 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(1)),
+                    Box::new(|_args, _| async move { RSV::Number(1)}.boxed()),
                 ),
                                                     None);
 
         // Each node adds 1 to the inbound item (all nodes only have one dependency per index)
         let f1 = |args: RkyvSerializedValue, _| {
-            if let RSV::Object(m) = args {
-                if let RSV::Object(args) = m.get("args").unwrap() {
-                    if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
-                        return RSV::Number(a + 1);
+            async move {
+                if let RSV::Object(m) = args {
+                    if let RSV::Object(args) = m.get("args").unwrap() {
+                        if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
+                            return RSV::Number(a + 1);
+                        }
                     }
                 }
-            }
 
-            panic!("Invalid arguments")
+                panic!("Invalid arguments")
+            }.boxed()
         };
 
         let (_, mut state) = state.upsert_operation(OperationNode::new(
@@ -829,7 +898,7 @@ mod tests {
         ]);
 
         // We expect to see the value at each node increment repeatedly.
-        let ((state_id, state), _) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state));
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         let ((state_id, state), _) = db.step_execution(state_id, &state);
@@ -902,23 +971,25 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(1)),
+                    Box::new(|_args, _| async move {RSV::Number(1) }.boxed()),
                 ),
                                                     None);
 
         // Globally mutates this value, making each call to this function side-effecting
         static atomic_usize: AtomicUsize = AtomicUsize::new(0);
         let f_side_effect = |args: RkyvSerializedValue, _| {
-            if let RSV::Object(m) = args {
-                if let RSV::Object(args) = m.get("args").unwrap() {
-                    if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
-                        let plus = atomic_usize.fetch_add(1, Ordering::SeqCst);
-                        return RSV::Number(a + plus as i32);
+            async move {
+                if let RSV::Object(m) = args {
+                    if let RSV::Object(args) = m.get("args").unwrap() {
+                        if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
+                            let plus = atomic_usize.fetch_add(1, Ordering::SeqCst);
+                            return RSV::Number(a + plus as i32);
+                        }
                     }
                 }
-            }
 
-            panic!("Invalid arguments")
+                panic!("Invalid arguments")
+            }.boxed()
         };
 
         let (_, mut state) = state.upsert_operation(OperationNode::new(
@@ -947,7 +1018,7 @@ mod tests {
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state));
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         let ((x_state_id, x_state), _) = db.step_execution(state_id, &state);
@@ -987,23 +1058,26 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(0)),
+                    Box::new(|_args, _| async move { RSV::Number(0)}.boxed()),
                 ),
                                                     None);
 
         let f_v1 = |args: RkyvSerializedValue, _| {
-            if let RSV::Object(m) = args {
-                if let RSV::Object(args) = m.get("args").unwrap() {
-                    if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
-                        return RSV::Number(a + 1);
+            async move {
+                if let RSV::Object(m) = args {
+                    if let RSV::Object(args) = m.get("args").unwrap() {
+                        if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
+                            return RSV::Number(a + 1);
+                        }
                     }
                 }
-            }
 
-            panic!("Invalid arguments")
+                panic!("Invalid arguments")
+            }.boxed()
         };
 
         let f_v2 = |args: RkyvSerializedValue, _| {
+            async move {
             if let RSV::Object(m) = args {
                 if let RSV::Object(args) = m.get("args").unwrap() {
                     if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
@@ -1013,6 +1087,7 @@ mod tests {
             }
 
             panic!("Invalid arguments")
+            }.boxed()
         };
 
         let (_, mut state) = state.upsert_operation(OperationNode::new(
@@ -1041,7 +1116,7 @@ mod tests {
             },
         ]);
 
-        let ((x_state_id, mut x_state), _) = db.step_execution(state_id, &state);
+        let ((x_state_id, mut x_state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state));
         assert_eq!(x_state.state_get(&1), None);
         assert_eq!(x_state.state_get(&2), None);
         let ((state_id, state), _) = db.step_execution(x_state_id, &x_state.clone());
@@ -1052,21 +1127,21 @@ mod tests {
         assert_eq!(state.state_get(&2), Some(&RSV::Number(2)));
 
         // Change the definition of the operation "1" to add 200 instead of 1, then re-evaluate
-        // TODO: we can no longer overwrite operations
-        let (_, mut state) = x_state.upsert_operation(OperationNode::new(
-                    None,
-                    InputSignature::from_args_list(vec!["0"]),
-                    OutputSignature::new(),
-                    Box::new(f_v2),
-                ),
-                                                      None);
+        if let ExecutionStateEvaluation::Complete(x_state) = x_state {
+            let (_, mut state) = x_state.upsert_operation(OperationNode::new(
+                None,
+                InputSignature::from_args_list(vec!["0"]),
+                OutputSignature::new(),
+                Box::new(f_v2),
+            ), Some(1));
+            let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state.clone()));
+            assert_eq!(state.state_get(&1), Some(&RSV::Number(200)));
+            assert_eq!(state.state_get(&2), None);
+            let ((state_id, state), _) = db.step_execution(state_id, &state);
+            assert_eq!(state.state_get(&1), None);
+            assert_eq!(state.state_get(&2), Some(&RSV::Number(201)));
+        }
 
-        let ((state_id, state), _) = db.step_execution(state_id, &state.clone());
-        assert_eq!(state.state_get(&1), Some(&RSV::Number(200)));
-        assert_eq!(state.state_get(&2), None);
-        let ((state_id, state), _) = db.step_execution(state_id, &state);
-        assert_eq!(state.state_get(&1), None);
-        assert_eq!(state.state_get(&2), Some(&RSV::Number(201)));
     }
 
     #[test]
@@ -1093,7 +1168,7 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(0)),
+                    Box::new(|_args, _| async move { RSV::Number(0)}.boxed()),
                 ),
                                                     None);
 
@@ -1101,7 +1176,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(1)),
+                    Box::new(|_args, _| async move { RSV::Number(1)}.boxed()),
                 ),
                                                     None);
 
@@ -1109,7 +1184,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(2)),
+                    Box::new(|_args, _| async move { RSV::Number(2)}.boxed()),
                 ),
                                                     None);
 
@@ -1117,7 +1192,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(3)),
+                    Box::new(|_args, _| async move { RSV::Number(3)}.boxed()),
                 ),
                                                     None);
 
@@ -1125,7 +1200,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1", "2"]),
                     OutputSignature::new(),
-                    Box::new(|_args, _| RSV::Number(4)),
+                    Box::new(|_args, _| async move { RSV::Number(4)}.boxed()),
                 ),
                                                     None);
 
@@ -1151,7 +1226,7 @@ mod tests {
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution(state_id, &state);
+        let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state));
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         let ((state_id, state), _) = db.step_execution(state_id, &state);

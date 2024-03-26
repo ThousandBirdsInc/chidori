@@ -9,11 +9,13 @@ x3 = {"a": 1, "b": 2, "c": 3}
 x4 = False
 x5 = 1.0
 x6 = (1, 2, 3)
+# TODO: marshalling of sets is not currently supported
 x7 = {"a", "b", "c"}
 
 def example(x):
     return x
 
+# TODO: marshalling of functions is not currently supported
 x8 = example
 
 # TODO: marshalling of classes is not currently supported

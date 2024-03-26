@@ -700,8 +700,18 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
         }
     }
 
-    depended_values.remove("__name__");
-    depended_values.remove("type");
+
+    let py_built_ins: HashSet<&str> = [
+        "__name__", "type", "abs", "all", "any", "ascii", "bin", "bool", "breakpoint", "bytearray",
+        "bytes", "callable", "chr", "classmethod", "compile", "complex", "delattr", "dict", "dir",
+        "divmod", "enumerate", "eval", "exec", "filter", "float", "format", "frozenset", "getattr",
+        "globals", "hasattr", "hash", "help", "hex", "id", "input", "int", "isinstance", "issubclass",
+        "iter", "len", "list", "locals", "map", "max", "memoryview", "min", "next", "object", "oct",
+        "open", "ord", "pow", "print", "property", "range", "repr", "reversed", "round", "set", "setattr",
+        "slice", "sorted", "staticmethod", "str", "sum", "super", "tuple", "type", "vars", "zip"
+    ].iter().cloned().collect();
+
+    depended_values.retain(|value,_ | !py_built_ins.contains(value.as_str()));
     // TODO: this is a hack for a specific test "test_core2_marshalling" and should be removed
     //       it is due to us not properly handling Classes yet
     depended_values.remove("TestMarshalledValues");

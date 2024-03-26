@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tonic::IntoRequest;
 use crate::cells::{CellTypes, CodeCell, WebserviceCell, WebserviceCellEndpoint};
+use crate::execution::execution::ExecutionState;
 use crate::execution::primitives::serialized_value::{json_value_to_serialized_value, RkyvObjectBuilder, RkyvSerializedValue, serialized_value_to_json_value};
 
 pub fn parse_configuration_string(configuration: &str) -> Vec<WebserviceCellEndpoint> {
@@ -117,7 +118,7 @@ pub async fn run_webservice(
 
                                 dbg!(&argument_payload);
                                 // invocation of the operation
-                                let result = op.execute(argument_payload, None);
+                                let result = op.execute(&ExecutionState::new(), argument_payload, None).await;
                                 if let RkyvSerializedValue::String(s) = &result {
                                     (StatusCode::CREATED, Html(s.clone())).into_response()
                                 } else {
@@ -172,10 +173,11 @@ pub async fn run_webservice(
                                 }
                                 // invocation of the operation
                                 let result = op.execute(
+                                    &ExecutionState::new(),
                                     RkyvObjectBuilder::new()
                                         .insert_object("args", argument_payload)
                                         .build(),
-                                    None);
+                                    None).await;
                                 (StatusCode::CREATED, Json(result))
                             }
                         }));
