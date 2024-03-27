@@ -82,20 +82,13 @@ pub fn llm_prompt_cell(cell: &LLMPromptCell) -> OperationNode {
                             // TODO: replace this to being fetched from configuration
                             let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
                             let c = crate::library::std::ai::llm::openai::OpenAIChatModel::new(api_key);
-                            let result = {
-                                // Create a new Tokio runtime or use an existing one
-                                let rt = runtime::Runtime::new().unwrap();
-
-                                // Use the runtime to block on the asynchronous operation
-                                rt.block_on(async {
+                            let result =
                                     c.batch(ChatCompletionReq {
                                         model: "gpt-3.5-turbo".to_string(),
                                         template_messages,
                                         ..ChatCompletionReq::default()
                                     })
-                                        .await
-                                })
-                            };
+                                        .await;
                             if let Ok(ChatCompletionRes { choices, .. }) = result {
                                 let mut result_map = HashMap::new();
                                 if let Some(name) = &name {

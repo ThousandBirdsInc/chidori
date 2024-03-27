@@ -203,20 +203,4 @@ mod test {
             ]
         );
     }
-
-    // TODO: move to entry
-    // #[test]
-    // fn test_load_and_eval_markdown_directory() {
-    //     let mut env = Environment::new();
-    //     let result = load_md_directory(&mut env, Path::new("./tests/data/markdown_graph_loader"));
-    //     env.state.render_dependency_graph();
-    //     assert_eq!(
-    //         env.step(),
-    //         vec![(1, RkyvObjectBuilder::new().insert_number("x", 5).build())]
-    //     );
-    //     assert_eq!(
-    //         env.step(),
-    //         vec![(2, RkyvObjectBuilder::new().insert_number("v", 0).build())]
-    //     );
-    // }
 }

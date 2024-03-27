@@ -2,7 +2,7 @@ use futures_util::FutureExt;
 use tokio::runtime::Runtime;
 use crate::cells::WebserviceCell;
 use crate::execution::primitives::operation::{InputItemConfiguation, InputSignature, InputType, OperationNode, OutputSignature};
-use crate::execution::primitives::serialized_value::RkyvSerializedValue as RKV;
+use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue as RKV};
 
 /// Web cells initialize HTTP handlers that can invoke other cells.
 #[tracing::instrument]
@@ -31,8 +31,10 @@ pub fn web_cell(cell: &WebserviceCell) -> OperationNode {
             // TODO: this needs to handle stdout and errors
             let cell = cell.clone();
             async move {
-                crate::library::std::webserver::run_webservice(&cell, &x).await;
-                RKV::Null
+                let (join_handle, port) = crate::library::std::webserver::run_webservice(&cell, &x).await;
+                RkyvObjectBuilder::new()
+                    .insert_number("port", port as i32)
+                    .build()
             }.boxed()
         }),
     );

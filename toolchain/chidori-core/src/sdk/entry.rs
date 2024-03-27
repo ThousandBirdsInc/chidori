@@ -105,7 +105,7 @@ impl InstancedEnvironment {
 
     /// Entrypoint for execution of an instanced environment, handles messages from the host
     #[tracing::instrument]
-    pub fn run(&mut self) {
+    pub async fn run(&mut self) {
         self.playback_state = PlaybackState::Paused;
 
         // Reload cells to make sure we're up to date
@@ -140,7 +140,7 @@ impl InstancedEnvironment {
             if self.playback_state == PlaybackState::Paused {
                 sleep(std::time::Duration::from_millis(1000));
             } else {
-                let output = self.step();
+                let output = self.step().await;
                 // If nothing happened, pause playback and wait for the user
                 if output.is_empty() {
                     self.playback_state = PlaybackState::Paused;
@@ -158,9 +158,9 @@ impl InstancedEnvironment {
 
     /// Increment the execution graph by one step
     #[tracing::instrument]
-    pub(crate) fn step(&mut self) -> Vec<(usize, RkyvSerializedValue)> {
+    pub(crate) async fn step(&mut self) -> Vec<(usize, RkyvSerializedValue)> {
         println!("Executing state with id {:?}", self.execution_head_state_id);
-        let ((state_id, state), outputs) = self.db.external_step_execution(self.execution_head_state_id);
+        let ((state_id, state), outputs) = self.db.external_step_execution(self.execution_head_state_id).await;
         if let Some(sender) = self.runtime_event_sender.as_mut() {
             sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
             sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
@@ -181,7 +181,6 @@ impl InstancedEnvironment {
             sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
         }
         self.execution_head_state_id = state_id;
-        dbg!(&state_id, &op_id);
         (state_id, op_id)
     }
 
@@ -409,37 +408,38 @@ mod tests {
     use crate::cells::{CodeCell, LLMPromptCell, SupportedLanguage, SupportedModelProviders};
     use crate::utils;
 
-    #[test]
-    fn test_execute_cells_with_global_dependency() {
+    #[tokio::test]
+    async fn test_execute_cells_with_global_dependency() {
         let mut env = InstancedEnvironment::new();
         let (_, op_id_x) = env.upsert_cell(CellTypes::Code(CodeCell {
-                    name: None,
-                    language: SupportedLanguage::PyO3,
-                    source_code: String::from(indoc! { r#"
+            name: None,
+            language: SupportedLanguage::PyO3,
+            source_code: String::from(indoc! { r#"
                         x = 20
                         "#}),
-                    function_invocation: None,
-                }),
+            function_invocation: None,
+        }),
                                            None);
         assert_eq!(op_id_x, 0);
         let (_, op_id_y) = env.upsert_cell(CellTypes::Code(CodeCell {
-                    name: None,
-                    language: SupportedLanguage::PyO3,
-                    source_code: String::from(indoc! { r#"
+            name: None,
+            language: SupportedLanguage::PyO3,
+            source_code: String::from(indoc! { r#"
                         y = x + 1
                         "#}),
-                    function_invocation: None,
-                }),
+            function_invocation: None,
+        }),
                                            None);
         assert_eq!(op_id_y, 1);
         // env.resolve_dependencies_from_input_signature();
         env.get_state().render_dependency_graph();
+        env.step().await;
         assert_eq!(
             env.get_state().state_get(&op_id_x),
             Some(&RkyvObjectBuilder::new().insert_number("x", 20).build())
         );
         assert_eq!(env.get_state().state_get(&op_id_y), None);
-        env.step();
+        env.step().await;
         assert_eq!(env.get_state().state_get(&op_id_x), None);
         assert_eq!(
             env.get_state().state_get(&op_id_y),
@@ -447,33 +447,33 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_execute_cells_between_code_and_llm() {
+    #[tokio::test]
+    async fn test_execute_cells_between_code_and_llm() {
         dotenv::dotenv().ok();
         let mut env = InstancedEnvironment::new();
         let (_, op_id_x) = env.upsert_cell(CellTypes::Code(CodeCell {
-                    name: None,
-                    language: SupportedLanguage::PyO3,
-                    source_code: String::from(indoc! { r#"
+            name: None,
+            language: SupportedLanguage::PyO3,
+            source_code: String::from(indoc! { r#"
                         x = "Here is a sample string"
                         "#}),
-                    function_invocation: None,
-                }),
+            function_invocation: None,
+        }),
                                            None);
         assert_eq!(op_id_x, 0);
         let (_, op_id_y) = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
-                    name: None,
-                    provider: SupportedModelProviders::OpenAI,
-                    req: "\
+            name: None,
+            provider: SupportedModelProviders::OpenAI,
+            req: "\
                       Say only a single word. Give no additional explanation.
                       What is the first word of the following: {{x}}.
                     "
-                    .to_string(),
-                }),
+                .to_string(),
+        }),
                                            None);
         assert_eq!(op_id_y, 1);
         env.get_state().render_dependency_graph();
-        env.step();
+        env.step().await;
         assert_eq!(
             env.get_state().state_get(&op_id_x),
             Some(
@@ -483,7 +483,7 @@ mod tests {
             )
         );
         assert_eq!(env.get_state().state_get(&op_id_y), None);
-        env.step();
+        env.step().await;
         assert_eq!(env.get_state().state_get(&op_id_x), None);
         assert_eq!(
             env.get_state().state_get(&op_id_y),
@@ -491,38 +491,38 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_execute_cells_via_prompt_calling_api() {
+    #[tokio::test]
+    async fn test_execute_cells_via_prompt_calling_api() {
         let mut env = InstancedEnvironment::new();
         let (_, op_id_x) = env.upsert_cell(CellTypes::Code(CodeCell {
-                    name: None,
-                    language: SupportedLanguage::PyO3,
-                    source_code: String::from(indoc! { r#"
+            name: None,
+            language: SupportedLanguage::PyO3,
+            source_code: String::from(indoc! { r#"
                         import chidori as ch
                         x = ch.prompt("generate_names", x="John")
                         "#}),
-                    function_invocation: None,
-                }),
+            function_invocation: None,
+        }),
                                            None);
         assert_eq!(op_id_x, 0);
         let (_, op_id_y) = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
-                    name: Some("generate_names".to_string()),
-                    provider: SupportedModelProviders::OpenAI,
-                    req: "\
+            name: Some("generate_names".to_string()),
+            provider: SupportedModelProviders::OpenAI,
+            req: "\
                       Generate names starting with {{x}}
                     "
-                    .to_string(),
-                }),
+                .to_string(),
+        }),
                                            None);
         assert_eq!(op_id_y, 1);
         env.get_state().render_dependency_graph();
-        env.step();
+        env.step().await;
         assert_eq!(
             env.get_state().state_get(&op_id_x),
             Some(&RkyvObjectBuilder::new().insert_number("x", 20).build())
         );
         assert_eq!(env.get_state().state_get(&op_id_y), None);
-        env.step();
+        env.step().await;
         assert_eq!(env.get_state().state_get(&op_id_x), None);
         assert_eq!(
             env.get_state().state_get(&op_id_y),
@@ -530,39 +530,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_execute_cells_invoking_a_function() {
+    #[tokio::test]
+    async fn test_execute_cells_invoking_a_function() {
         let mut env = InstancedEnvironment::new();
         let (_, id) = env.upsert_cell(CellTypes::Code(CodeCell {
-                    name: None,
-                    language: SupportedLanguage::PyO3,
-                    source_code: String::from(indoc! { r#"
+            name: None,
+            language: SupportedLanguage::PyO3,
+            source_code: String::from(indoc! { r#"
                         def add(x, y):
                             return x + y
                         "#}),
-                    function_invocation: None,
-                }),
+            function_invocation: None,
+        }),
                                       None);
         assert_eq!(id, 0);
         let (_, id) = env.upsert_cell(CellTypes::Code(CodeCell {
-                    name: None,
-                    function_invocation: None,
-                    language: SupportedLanguage::PyO3,
-                    source_code: String::from(indoc! { r#"
+            name: None,
+            function_invocation: None,
+            language: SupportedLanguage::PyO3,
+            source_code: String::from(indoc! { r#"
                         y = add(2, 3)
                         "#}),
-                }),
+        }),
                                       None);
         assert_eq!(id, 1);
         env.get_state().render_dependency_graph();
-        env.step();
+        env.step().await;
         // Empty object from the function declaration
         assert_eq!(
             env.get_state().state_get(&0),
             Some(&RkyvObjectBuilder::new().build())
         );
         assert_eq!(env.get_state().state_get(&1), None);
-        env.step();
+        env.step().await;
         assert_eq!(env.get_state().state_get(&0), None);
         assert_eq!(
             env.get_state().state_get(&1),
@@ -570,47 +570,47 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_execute_inter_runtime_code() {
+    #[tokio::test]
+    async fn test_execute_inter_runtime_code() {
         let mut env = InstancedEnvironment::new();
         let (_, id) = env.upsert_cell(CellTypes::Code(CodeCell {
-                    name: None,
-                    language: SupportedLanguage::PyO3,
-                    source_code: String::from(indoc! { r#"
+            name: None,
+            language: SupportedLanguage::PyO3,
+            source_code: String::from(indoc! { r#"
                         def add(x, y):
                             return x + y
                         "#}),
-                    function_invocation: None,
-                }),
-                                 None);
+            function_invocation: None,
+        }),
+                                      None);
         assert_eq!(id, 0);
         let (_, id) = env.upsert_cell(CellTypes::Code(CodeCell {
-                    name: None,
-                    function_invocation: None,
-                    language: SupportedLanguage::Deno,
-                    source_code: String::from(indoc! { r#"
-                        const y = add(2, 3);
+            name: None,
+            function_invocation: None,
+            language: SupportedLanguage::Deno,
+            source_code: String::from(indoc! { r#"
+                        const y = await add(2, 3);
                         "#}),
-                }),
-                                 None);
+        }),
+                                      None);
         assert_eq!(id, 1);
         env.get_state().render_dependency_graph();
-        env.step();
+        env.step().await;
         // Function declaration cell
         assert_eq!(
             env.get_state().state_get(&0),
             Some(&RkyvObjectBuilder::new().build())
         );
         assert_eq!(env.get_state().state_get(&1), None);
-        env.step();
+        env.step().await;
         assert_eq!(env.get_state().state_get(&0), None);
         assert_eq!(
             env.get_state().state_get(&1),
             Some(&RkyvObjectBuilder::new().insert_number("y", 5).build())
         );
     }
-    #[test]
-    fn test_multiple_dependencies_across_nodes() {
+    #[tokio::test]
+    async fn test_multiple_dependencies_across_nodes() {
         let mut ee = Chidori::new();
         ee.load_md_string(indoc! { r#"
             ```python
@@ -628,14 +628,14 @@ mod tests {
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
         env.get_state().render_dependency_graph();
-        env.step();
+        env.step().await;
         // Function declaration cell
         assert_eq!(
             env.get_state().state_get(&0),
             Some(&RkyvObjectBuilder::new().insert_number("v", 40).build())
         );
         assert_eq!(env.get_state().state_get(&1), None);
-        env.step();
+        env.step().await;
         assert_eq!(env.get_state().state_get(&0), None);
         assert_eq!(
             env.get_state().state_get(&1),
@@ -643,8 +643,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_execute_inter_runtime_code_md() {
+    #[tokio::test]
+    async fn test_execute_inter_runtime_code_md() {
         let mut ee = Chidori::new();
         ee.load_md_string(indoc! { r#"
             ```python
@@ -668,14 +668,14 @@ mod tests {
         let s = env.get_state();
         env.reload_cells();
         s.render_dependency_graph();
-        env.step();
+        env.step().await;
         // Function declaration cell
         assert_eq!(
             env.get_state().state_get(&0),
             Some(&RkyvObjectBuilder::new().build())
         );
         assert_eq!(env.get_state().state_get(&1), None);
-        env.step();
+        env.step().await;
         assert_eq!(env.get_state().state_get(&0), None);
         assert_eq!(
             env.get_state().state_get(&1),
@@ -683,16 +683,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_execute_webservice_and_handle_request_with_code_cell_md() {
-        let runtime = Runtime::new().unwrap();
+    #[tokio::test]
+    async fn test_execute_webservice_and_handle_request_with_code_cell_md() {
+        // initialize tracing
+        let _guard = utils::init_telemetry("http://localhost:7281").unwrap();
 
-        runtime.block_on(async {
-            // initialize tracing
-            let _guard = utils::init_telemetry("http://localhost:7281").unwrap();
-
-            let mut ee = Chidori::new();
-            ee.load_md_string(indoc! { r#"
+        let mut ee = Chidori::new();
+        ee.load_md_string(indoc! { r#"
                 ```python
                 def add(x, y):
                     return x + y
@@ -706,41 +703,37 @@ mod tests {
                 ```
                 "#
             }).unwrap();
-            let mut env = ee.get_instance().unwrap();
-            env.reload_cells();
-            env.get_state().render_dependency_graph();
+        let mut env = ee.get_instance().unwrap();
+        env.reload_cells();
+        env.get_state().render_dependency_graph();
 
-            // This will initialize the service
-            env.step();
-            env.step();
-            env.step();
+        // This will initialize the service
+        env.step().await;
+        env.step().await;
+        env.step().await;
 
-            // Function declaration cell
-            let client = reqwest::Client::new();
-            let mut payload = HashMap::new();
-            payload.insert("a", 123); // Replace 123 with your desired value for "a"
-            payload.insert("b", 456); // Replace 456 with your desired value for "b"
+        // Function declaration cell
+        let client = reqwest::Client::new();
+        let mut payload = HashMap::new();
+        payload.insert("a", 123);
+        payload.insert("b", 456);
 
-            let res = client.post(format!("http://127.0.0.1:{}", 3839))
-                .header("Content-Type", "application/json")
-                .json(&payload)
-                .send()
-                .await
-                .expect("Failed to send request");
+        let res = client.post(format!("http://127.0.0.1:{}", 3839))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .expect("Failed to send request");
 
-            assert_eq!(res.text().await.unwrap(), "579");
-        });
+        assert_eq!(res.text().await.unwrap(), "579");
     }
 
-    #[test]
-    fn test_execute_webservice_and_serve_html() {
-        let runtime = Runtime::new().unwrap();
-
-        runtime.block_on(async {
-            // initialize tracing
-            let _guard = utils::init_telemetry("http://localhost:7281").unwrap();
-            let mut ee = Chidori::new();
-            ee.load_md_string(indoc! { r#"
+    #[tokio::test]
+    async fn test_execute_webservice_and_serve_html() {
+        // initialize tracing
+        let _guard = utils::init_telemetry("http://localhost:7281").unwrap();
+        let mut ee = Chidori::new();
+        ee.load_md_string(indoc! { r#"
                 ```html (example)
                 <div>Example</div>
                 ```
@@ -753,71 +746,61 @@ mod tests {
                 ```
                 "#
             }).unwrap();
-            let mut env = ee.get_instance().unwrap();
-            env.reload_cells();
-            env.get_state().render_dependency_graph();
+        let mut env = ee.get_instance().unwrap();
+        env.reload_cells();
+        env.get_state().render_dependency_graph();
 
-            // This will initialize the service
-            env.step();
-            env.step();
-            env.step();
+        // This will initialize the service
+        env.step().await;
+        env.step().await;
+        env.step().await;
 
-            let mut payload = HashMap::new();
-            payload.insert("a", 123); // Replace 123 with your desired value for "a"
-            payload.insert("b", 456); // Replace 456 with your desired value for "b"
+        let mut payload = HashMap::new();
+        payload.insert("a", 123); // Replace 123 with your desired value for "a"
+        payload.insert("b", 456); // Replace 456 with your desired value for "b"
 
-            // Function declaration cell
-            let client = reqwest::Client::new();
-            let res = client.get(format!("http://127.0.0.1:{}", 3838))
-                .send()
-                .await
-                .expect("Failed to send request");
+        // Function declaration cell
+        let client = reqwest::Client::new();
+        let res = client.get(format!("http://127.0.0.1:{}", 3838))
+            .send()
+            .await
+            .expect("Failed to send request");
 
-            // TODO: why is this wrapped in quotes
-            assert_eq!(res.text().await.unwrap(), "<div>Example</div>");
-        });
+        // TODO: why is this wrapped in quotes
+        assert_eq!(res.text().await.unwrap(), "<div>Example</div>");
     }
 
-    #[test]
-    fn test_core1_simple() {
-        let runtime = Runtime::new().unwrap();
-        runtime.block_on(async {
-            let mut ee = Chidori::new();
-            ee.load_md_directory(Path::new("./examples/core1_simple")).unwrap();
-            let mut env = ee.get_instance().unwrap();
-            env.reload_cells();
-            env.get_state().render_dependency_graph();
-            env.step();
-        });
+    #[tokio::test]
+    async fn test_core1_simple() {
+        let mut ee = Chidori::new();
+        ee.load_md_directory(Path::new("./examples/core1_simple")).unwrap();
+        let mut env = ee.get_instance().unwrap();
+        env.reload_cells();
+        env.get_state().render_dependency_graph();
+        env.step().await;
     }
 
-    #[test]
-    fn test_core2_marshalling() {
-        let runtime = Runtime::new().unwrap();
-        runtime.block_on(async {
-            let mut ee = Chidori::new();
-            ee.load_md_directory(Path::new("./examples/core2_marshalling")).unwrap();
-            let mut env = ee.get_instance().unwrap();
-            env.reload_cells();
-            env.get_state().render_dependency_graph();
-            env.step();
-            env.step();
-        });
+    #[tokio::test]
+    async fn test_core2_marshalling() {
+        let mut ee = Chidori::new();
+        ee.load_md_directory(Path::new("./examples/core2_marshalling")).unwrap();
+        let mut env = ee.get_instance().unwrap();
+        env.reload_cells();
+        env.get_state().render_dependency_graph();
+        env.step().await;
+        env.step().await;
     }
 
-    #[test]
-    fn test_core3_function_invocations() {
-        let runtime = Runtime::new().unwrap();
-        runtime.block_on(async {
-            let mut ee = Chidori::new();
+    #[tokio::test]
+    async fn test_core3_function_invocations() {
+        let mut ee = Chidori::new();
 
-            ee.load_md_directory(Path::new("./examples/core3_function_invocations")).unwrap();
-            let mut env = ee.get_instance().unwrap();
-            env.reload_cells();
-            env.get_state().render_dependency_graph();
-            env.step();
-            env.step();
-        });
+        ee.load_md_directory(Path::new("./examples/core3_function_invocations")).unwrap();
+        let mut env = ee.get_instance().unwrap();
+        env.reload_cells();
+        env.get_state().render_dependency_graph();
+        env.step().await;
+        env.step().await;
     }
 }
 

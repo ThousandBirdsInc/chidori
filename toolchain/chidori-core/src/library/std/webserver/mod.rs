@@ -7,6 +7,7 @@ use axum::{
 use axum::response::{Html, IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::task::JoinHandle;
 use tonic::IntoRequest;
 use crate::cells::{CellTypes, CodeCell, WebserviceCell, WebserviceCellEndpoint};
 use crate::execution::execution::ExecutionState;
@@ -57,7 +58,7 @@ pub fn parse_configuration_string(configuration: &str) -> Vec<WebserviceCellEndp
 pub async fn run_webservice(
     configuration: &WebserviceCell,
     payload: &RkyvSerializedValue,
-) {
+) -> (JoinHandle<()>, u16) {
     let endpoints = parse_configuration_string(&configuration.configuration);
 
     // build our application
@@ -162,11 +163,9 @@ pub async fn run_webservice(
                                 };
 
                                 // invocation of the operation
-                                dbg!(&arg_mapping);
                                 let mut argument_payload = RkyvObjectBuilder::new();
                                 if &arg_mapping.len() > &0 {
                                     for (key, value) in &arg_mapping {
-                                        dbg!((key, value));
                                         // TODO: handle the unwrap here
                                         argument_payload = argument_payload.insert_value(key, json_value_to_serialized_value(payload.get(value).unwrap()));
                                     }
@@ -190,10 +189,18 @@ pub async fn run_webservice(
         }
     }
 
-    // run our app with hyper, listening globally on port 3000
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", configuration.port)).await.unwrap();
-    dbg!("Running axum server", &configuration);
-    axum::serve(listener, app).await.unwrap();
+    let configuration_clone = configuration.clone();
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", configuration_clone.port)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server_task = tokio::spawn(async move {
+        dbg!("Running axum server", configuration_clone);
+        let serve_result = axum::serve(listener, app).await;
+        match serve_result {
+            Ok(_) => eprintln!("Server stopped normally"),
+            Err(e) => eprintln!("Server stopped with error: {}", e),
+        }
+    });
+    (server_task, port)
 }
 
 
@@ -224,183 +231,137 @@ mod tests {
 
     use crate::cells::{CellTypes, CodeCell, SupportedLanguage, WebserviceCell};
 
-    #[test]
-    fn test_webservice() {
-        let runtime = Runtime::new().unwrap();
-
-        runtime.block_on(async {
-            // let (tx, rx) = oneshot::channel();
-
-            let server_task = tokio::spawn(async move {
-                let configuration = WebserviceCell {
-                    name: None,
-                    configuration: indoc! {r#"
+    #[tokio::test]
+    async fn test_webservice() {
+        let configuration = WebserviceCell {
+            name: None,
+            configuration: indoc! {r#"
                     POST / demo
                     "#}.to_string(),
-                    port: 3839, // TODO: make this a random port
-                };
+            port: 0,
+        };
 
-                let payload = RkyvObjectBuilder::new()
-                    .insert_object("functions", RkyvObjectBuilder::new().insert_value(
-                        "demo",
-                        RkyvSerializedValue::Cell(CellTypes::Code(CodeCell {
-                            name: None,
-                            language: SupportedLanguage::PyO3,
-                            source_code: String::from(indoc! {r#"
+        let payload = RkyvObjectBuilder::new()
+            .insert_object("functions", RkyvObjectBuilder::new().insert_value(
+                "demo",
+                RkyvSerializedValue::Cell(CellTypes::Code(CodeCell {
+                    name: None,
+                    language: SupportedLanguage::PyO3,
+                    source_code: String::from(indoc! {r#"
                         def demo():
                             return 100
                         "#}),
-                            function_invocation: None,
-                        }))))
-                    .build();
+                    function_invocation: None,
+                }))))
+            .build();
+        let (server_handle , port) = crate::library::std::webserver::run_webservice(&configuration, &payload).await;
 
-                let server_handle = crate::library::std::webserver::run_webservice(&configuration, &payload).await;
-                // let local_addr = server_handle.local_addr().expect("Failed to get the server address");
-                //
-                // // Send the server port back to the test thread.
-                // tx.send(local_addr.port()).unwrap();
+        // Receive the server port from the server task.
+        // let server_port = rx.await.expect("Failed to receive the server port");
 
-                // Await the server handle to allow for clean shutdown later.
-            });
+        let client = reqwest::Client::new();
+        let res = client.post(format!("http://127.0.0.1:{}", port))
+            .header("Content-Type", "application/json")
+            .json(&HashMap::<String, String>::new())
+            .send()
+            .await
+            .expect("Failed to send request");
 
-            // Receive the server port from the server task.
-            // let server_port = rx.await.expect("Failed to receive the server port");
-
-            let client = reqwest::Client::new();
-            let res = client.post(format!("http://127.0.0.1:{}", 3839))
-                .header("Content-Type", "application/json")
-                .json(&HashMap::<String, String>::new())
-                .send()
-                .await
-                .expect("Failed to send request");
-
-            assert_eq!(res.text().await.unwrap(), "100");
-            // assert!(res.status().is_success(), "Request was not successful");
-            server_task.abort(); // or another clean shutdown mechanism
-            let _ = server_task.await;
-        });
+        assert_eq!(res.text().await.unwrap(), "100");
+        // assert!(res.status().is_success(), "Request was not successful");
+        server_handle.abort(); // or another clean shutdown mechanism
+        let _ = server_handle.await;
     }
 
-    #[test]
-    fn test_webservice_with_payload() {
-        let runtime = Runtime::new().unwrap();
+    #[tokio::test]
+    async fn test_webservice_with_payload() {
+        // let (tx, rx) = oneshot::channel();
 
-        runtime.block_on(async {
-            // let (tx, rx) = oneshot::channel();
-
-            let server_task = tokio::spawn(async move {
-                let configuration = WebserviceCell {
-                    name: None,
-                    configuration: indoc! {r#"
+        let configuration = WebserviceCell {
+            name: None,
+            configuration: indoc! {r#"
                     POST / add [a, b]
                     "#}.to_string(),
-                    port: 3838, // TODO: make this a random port
-                };
+            port: 0,
+        };
 
-                let payload = RkyvObjectBuilder::new()
-                    .insert_object("functions", RkyvObjectBuilder::new().insert_value(
-                        "add",
-                        RkyvSerializedValue::Cell(CellTypes::Code(CodeCell {
-                            name: None,
-                            language: SupportedLanguage::PyO3,
-                            source_code: String::from(indoc! {r#"
+        let payload = RkyvObjectBuilder::new()
+            .insert_object("functions", RkyvObjectBuilder::new().insert_value(
+                "add",
+                RkyvSerializedValue::Cell(CellTypes::Code(CodeCell {
+                    name: None,
+                    language: SupportedLanguage::PyO3,
+                    source_code: String::from(indoc! {r#"
                         def add(a, b):
                             return a + b
                         "#}),
-                            function_invocation: None,
-                        }))))
-                    .build();
+                    function_invocation: None,
+                }))))
+            .build();
 
-                let server_handle = crate::library::std::webserver::run_webservice(&configuration, &payload).await;
-                // let local_addr = server_handle.local_addr().expect("Failed to get the server address");
-                //
-                // // Send the server port back to the test thread.
-                // tx.send(local_addr.port()).unwrap();
+        let (server_handle, port) = crate::library::std::webserver::run_webservice(&configuration, &payload).await;
+        let client = reqwest::Client::new();
+        let mut payload = HashMap::new();
+        payload.insert("a", 123); // Replace 123 with your desired value for "a"
+        payload.insert("b", 456); // Replace 456 with your desired value for "b"
 
-                // Await the server handle to allow for clean shutdown later.
-            });
+        let res = client.post(format!("http://127.0.0.1:{}", port))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .expect("Failed to send request");
 
-            // Receive the server port from the server task.
-            // let server_port = rx.await.expect("Failed to receive the server port");
+        assert_eq!(res.text().await.unwrap(), "579");
+        // assert!(res.status().is_success(), "Request was not successful");
 
-            let client = reqwest::Client::new();
-            let mut payload = HashMap::new();
-            payload.insert("a", 123); // Replace 123 with your desired value for "a"
-            payload.insert("b", 456); // Replace 456 with your desired value for "b"
-
-            let res = client.post(format!("http://127.0.0.1:{}", 3838))
-                .header("Content-Type", "application/json")
-                .json(&payload)
-                .send()
-                .await
-                .expect("Failed to send request");
-
-            assert_eq!(res.text().await.unwrap(), "579");
-            // assert!(res.status().is_success(), "Request was not successful");
-
-            server_task.abort(); // or another clean shutdown mechanism
-            let _ = server_task.await;
-        });
+        server_handle.abort(); // or another clean shutdown mechanism
+        let _ = server_handle.await;
     }
 
-    #[test]
-    fn test_webservice_with_payload_returning_json_response() {
-        let runtime = Runtime::new().unwrap();
+    #[tokio::test]
+    async fn test_webservice_with_payload_returning_json_response() {
+        // let (tx, rx) = oneshot::channel();
 
-        runtime.block_on(async {
-            // let (tx, rx) = oneshot::channel();
-
-            let server_task = tokio::spawn(async move {
-                let configuration = WebserviceCell {
-                    name: None,
-                    configuration: indoc! {r#"
+        let configuration = WebserviceCell {
+            name: None,
+            configuration: indoc! {r#"
                     POST / add [a, b]
                     "#}.to_string(),
-                    port: 3838, // TODO: make this a random port
-                };
+            port: 0,
+        };
 
-                let payload = RkyvObjectBuilder::new()
-                    .insert_object("functions", RkyvObjectBuilder::new().insert_value(
-                        "add",
-                        RkyvSerializedValue::Cell(CellTypes::Code(CodeCell {
-                            name: None,
-                            language: SupportedLanguage::PyO3,
-                            source_code: String::from(indoc! {r#"
+        let payload = RkyvObjectBuilder::new()
+            .insert_object("functions", RkyvObjectBuilder::new().insert_value(
+                "add",
+                RkyvSerializedValue::Cell(CellTypes::Code(CodeCell {
+                    name: None,
+                    language: SupportedLanguage::PyO3,
+                    source_code: String::from(indoc! {r#"
                         def add(a, b):
                             return {"x": a + b}
                         "#}),
-                            function_invocation: None,
-                        }))))
-                    .build();
+                    function_invocation: None,
+                }))))
+            .build();
 
-                let server_handle = crate::library::std::webserver::run_webservice(&configuration, &payload).await;
-                // let local_addr = server_handle.local_addr().expect("Failed to get the server address");
-                //
-                // // Send the server port back to the test thread.
-                // tx.send(local_addr.port()).unwrap();
+        let (server_handle, port) = crate::library::std::webserver::run_webservice(&configuration, &payload).await;
 
-                // Await the server handle to allow for clean shutdown later.
-            });
+        let client = reqwest::Client::new();
+        let mut payload = HashMap::new();
+        payload.insert("a", 123); // Replace 123 with your desired value for "a"
+        payload.insert("b", 456); // Replace 456 with your desired value for "b"
 
-            // Receive the server port from the server task.
-            // let server_port = rx.await.expect("Failed to receive the server port");
+        let res = client.post(format!("http://127.0.0.1:{}", port))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .expect("Failed to send request");
 
-            let client = reqwest::Client::new();
-            let mut payload = HashMap::new();
-            payload.insert("a", 123); // Replace 123 with your desired value for "a"
-            payload.insert("b", 456); // Replace 456 with your desired value for "b"
-
-            let res = client.post(format!("http://127.0.0.1:{}", 3838))
-                .header("Content-Type", "application/json")
-                .json(&payload)
-                .send()
-                .await
-                .expect("Failed to send request");
-
-            assert_eq!(res.text().await.unwrap(), "{\"x\":579}");
-            server_task.abort(); // or another clean shutdown mechanism
-            let _ = server_task.await;
-        });
+        assert_eq!(res.text().await.unwrap(), "{\"x\":579}");
+        server_handle.abort(); // or another clean shutdown mechanism
+        let _ = server_handle.await;
     }
 
 }

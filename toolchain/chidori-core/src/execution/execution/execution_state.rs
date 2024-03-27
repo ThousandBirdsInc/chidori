@@ -319,179 +319,173 @@ impl ExecutionState {
 
     // TODO: extend this with an "event", steps can occur as events are flushed based on a previous state we were in
     #[tracing::instrument]
-    pub fn step_execution(
+    pub async fn step_execution(
         &self,
         sender: &Sender<(ExecutionNodeId, OperationId, RkyvSerializedValue)>
     ) -> (ExecutionStateEvaluation, Vec<(usize, RkyvSerializedValue)>) {
+        let previous_state = self;
+        let mut new_state = previous_state.clone();
+        let mut operation_by_id = previous_state.operation_by_id.clone();
+        let dependency_graph = previous_state.get_dependency_graph();
+        let mut marked_for_consumption = HashSet::new();
 
-        let runtime = Runtime::new().unwrap();
+        let mut outputs = vec![];
+        let operation_ids: Vec<OperationId> = operation_by_id.keys().copied().collect();
 
-        runtime.block_on(async {
-            let previous_state = self;
-            let mut new_state = previous_state.clone();
-            let mut operation_by_id = previous_state.operation_by_id.clone();
-            let dependency_graph = previous_state.get_dependency_graph();
-            let mut marked_for_consumption = HashSet::new();
+        // Every step, each operation consumes from its incoming edges.
+        'traverse_nodes: for operation_id in operation_ids {
+            println!("============================================================");
+            println!("Evaluating operation {}", operation_id);
 
-            let mut outputs = vec![];
-            let operation_ids: Vec<OperationId> = operation_by_id.keys().copied().collect();
+            // We skip nodes that are currently locked due to long running execution
+            // TODO: we can regenerate async nodes if necessary by creating them from their original cells
+            let mut op_node = operation_by_id
+                .get_mut(&operation_id)
+                .unwrap()
+                .lock()
+                .unwrap();
+            let signature = &op_node.signature.input_signature;
 
-            // Every step, each operation consumes from its incoming edges.
-            'traverse_nodes: for operation_id in operation_ids {
-                println!("============================================================");
-                println!("Evaluating operation {}", operation_id);
+            let mut args = HashMap::new();
+            let mut kwargs = HashMap::new();
+            let mut globals = HashMap::new();
+            let mut functions = HashMap::new();
+            signature.prepopulate_defaults(&mut args, &mut kwargs, &mut globals);
 
-                // We skip nodes that are currently locked due to long running execution
-                // TODO: we can regenerate async nodes if necessary by creating them from their original cells
-                let mut op_try_lock = operation_by_id
-                    .get_mut(&operation_id)
-                    .unwrap().try_lock();
-                let mut op_node = if let Ok(ref mut mutex) = op_try_lock {
-                    mutex
-                } else {
-                    continue;
-                };
+            // TODO: state should contain an event queue as well as the stateful globals
 
-                let signature = &op_node.signature.input_signature;
-
-                let mut args = HashMap::new();
-                let mut kwargs = HashMap::new();
-                let mut globals = HashMap::new();
-                let mut functions = HashMap::new();
-                signature.prepopulate_defaults(&mut args, &mut kwargs, &mut globals);
-
-                // TODO: state should contain an event queue as well as the stateful globals
-
-                // Ops with 0 deps should only execute once, by do execute by default
-                if signature.is_empty() {
-                    if previous_state.check_if_previously_set(&operation_id) {
-                        continue 'traverse_nodes;
-                    }
+            // Ops with 0 deps should only execute once, by do execute by default
+            if signature.is_empty() {
+                if previous_state.check_if_previously_set(&operation_id) {
+                    continue 'traverse_nodes;
                 }
+            }
 
-                // Fetch the values from the previous execution cycle for each edge on this node
-                for (from, _to, argument_indices) in
-                dependency_graph.edges_directed(operation_id, Direction::Incoming)
-                {
-                    println!("Argument indices: {:?}", argument_indices);
-                    // TODO: we don't need a value from previous state for function invocation dependencies
-                    if let Some(output) = previous_state.state_get(&from) {
-                        marked_for_consumption.insert(from.clone());
+            // Fetch the values from the previous execution cycle for each edge on this node
+            for (from, _to, argument_indices) in
+            dependency_graph.edges_directed(operation_id, Direction::Incoming)
+            {
+                println!("Argument indices: {:?}", argument_indices);
+                // TODO: we don't need a value from previous state for function invocation dependencies
+                if let Some(output) = previous_state.state_get(&from) {
+                    marked_for_consumption.insert(from.clone());
 
-                        // TODO: we can implement prioritization between different values here
-                        for argument_index in argument_indices {
-                            match argument_index {
-                                DependencyReference::Positional(pos) => {
-                                    args.insert(format!("{}", pos), output.clone());
+                    // TODO: we can implement prioritization between different values here
+                    for argument_index in argument_indices {
+                        match argument_index {
+                            DependencyReference::Positional(pos) => {
+                                args.insert(format!("{}", pos), output.clone());
+                            }
+                            DependencyReference::Keyword(kw) => {
+                                kwargs.insert(kw.clone(), output.clone());
+                            }
+                            DependencyReference::Global(name) => {
+                                if let RkyvSerializedValue::Object(value) = output {
+                                    dbg!(&name);
+                                    globals.insert(name.clone(), value.get(name).unwrap().clone());
                                 }
-                                DependencyReference::Keyword(kw) => {
-                                    kwargs.insert(kw.clone(), output.clone());
-                                }
-                                DependencyReference::Global(name) => {
-                                    if let RkyvSerializedValue::Object(value) = output {
-                                        globals.insert(name.clone(), value.get(name).unwrap().clone());
-                                    }
-                                }
-                                DependencyReference::FunctionInvocation(name) => {
-                                    let op = self
-                                        .operation_by_id
-                                        .get(&from)
-                                        .expect("Operation must exist")
-                                        .lock()
-                                        .unwrap();
-                                    functions.insert(
-                                        name.clone(),
-                                        RkyvSerializedValue::Cell(op.cell.clone()),
-                                    );
-                                }
-                                // if the dependency is of Ordering type, then this is an execution order dependency
-                                DependencyReference::Ordering => {
-                                    // TODO: enforce that dependency executes if it has only an ordering dependence
-                                }
+                            }
+                            DependencyReference::FunctionInvocation(name) => {
+                                let op = self
+                                    .operation_by_id
+                                    .get(&from)
+                                    .expect("Operation must exist")
+                                    .lock()
+                                    .unwrap();
+                                functions.insert(
+                                    name.clone(),
+                                    RkyvSerializedValue::Cell(op.cell.clone()),
+                                );
+                            }
+                            // if the dependency is of Ordering type, then this is an execution order dependency
+                            DependencyReference::Ordering => {
+                                // TODO: enforce that dependency executes if it has only an ordering dependence
                             }
                         }
                     }
                 }
+            }
 
-                // Some of the required arguments are not yet available, continue to the next node
-                if !signature.check_input_against_signature(&args, &kwargs, &globals, &functions) {
-                    continue 'traverse_nodes;
-                }
+            // Some of the required arguments are not yet available, continue to the next node
+            if !signature.check_input_against_signature(&args, &kwargs, &globals, &functions) {
+                continue 'traverse_nodes;
+            }
 
-                // TODO: all functions that are referred to that we know are not yet defined are populated with a shim,
-                //       that shim goes to our lookup based on our function invocation dependencies.
+            // TODO: all functions that are referred to that we know are not yet defined are populated with a shim,
+            //       that shim goes to our lookup based on our function invocation dependencies.
 
-                // Construct the arguments for the given operation
-                let argument_payload: RkyvSerializedValue = RkyvSerializedValue::Object(HashMap::from_iter(vec![
-                    ("args".to_string(), RkyvSerializedValue::Object(args)),
-                    ("kwargs".to_string(), RkyvSerializedValue::Object(kwargs)),
-                    ("globals".to_string(), RkyvSerializedValue::Object(globals)),
-                    (
-                        "functions".to_string(),
-                        RkyvSerializedValue::Object(functions),
-                    ),
-                ]));
+            // Construct the arguments for the given operation
+            let argument_payload: RkyvSerializedValue = RkyvSerializedValue::Object(HashMap::from_iter(vec![
+                ("args".to_string(), RkyvSerializedValue::Object(args)),
+                ("kwargs".to_string(), RkyvSerializedValue::Object(kwargs)),
+                ("globals".to_string(), RkyvSerializedValue::Object(globals)),
+                (
+                    "functions".to_string(),
+                    RkyvSerializedValue::Object(functions),
+                ),
+            ]));
 
-                // Execute the operation
-                // TODO: support async/parallel execution
-                println!("Executing node {} ({:?}) with payload {:?}", operation_id, op_node.name, argument_payload);
-                if op_node.is_async {
-                    // Run the target function in a background thread
-                    let mut operation_by_id = previous_state.operation_by_id.clone();
-                    let sender_clone = sender.clone();
-                    let state_clone = self.clone();
+            // Execute the operation
+            // TODO: support async/parallel execution
+            println!("Executing node {} ({:?}) with payload {:?}", operation_id, op_node.name, argument_payload);
+            let op_node_execute = op_node.execute(&self, argument_payload, None);
+            if op_node.is_async {
+                let sender_clone = sender.clone();
+                let state_clone = self.clone();
+                let (oneshot_sender, oneshot_receiver) = tokio::sync::oneshot::channel();
+
+                // Run the target long running function in a background thread
+                tokio::spawn(async move {
+                    dbg!("Spawning async operation");
+                    dbg!("Starting background thread");
+                    // This is another thread that handles annotating these events with additional metadata (operationId)
+                    let (internal_sender, internal_receiver) = mpsc::channel();
                     std::thread::spawn(move || {
-                        async move {
-                            let mut op_node = operation_by_id
-                                .get_mut(&operation_id)
-                                .unwrap()
-                                .lock()
-                                .unwrap();
-
-                            // This is another thread that handles annotating these events with additional metadata (operationId)
-                            let (internal_sender, internal_receiver) = mpsc::channel();
-                            std::thread::spawn(move || {
-                                loop {
-                                    match internal_receiver.try_recv() {
-                                        Ok((prev_execution_id, value)) => {
-                                            sender_clone.send((prev_execution_id, operation_id, value)).unwrap();
-                                        },
-                                        Err(mpsc::TryRecvError::Empty) => {
-                                            // No messages available, take this time to sleep a bit
-                                            std::thread::sleep(Duration::from_millis(10)); // Sleep for 10 milliseconds
-                                        },
-                                        Err(mpsc::TryRecvError::Disconnected) => {
-                                            // Handle the case where the sender has disconnected and no more messages will be received
-                                            break; // or handle it according to your application logic
-                                        },
-                                    }
-                                }
-                            });
-                            // Long-running execution
-                            let _ = op_node.execute(&state_clone, argument_payload, Some(internal_sender.clone())).await;
+                        loop {
+                            match internal_receiver.try_recv() {
+                                Ok((prev_execution_id, value)) => {
+                                    sender_clone.send((prev_execution_id, operation_id, value)).unwrap();
+                                },
+                                Err(mpsc::TryRecvError::Empty) => {
+                                    // No messages available, take this time to sleep a bit
+                                    std::thread::sleep(Duration::from_millis(10)); // Sleep for 10 milliseconds
+                                },
+                                Err(mpsc::TryRecvError::Disconnected) => {
+                                    // Handle the case where the sender has disconnected and no more messages will be received
+                                    break; // or handle it according to your application logic
+                                },
+                            }
                         }
                     });
-                    // outputs.push((operation_id, result.clone()));
-                    // new_state.state_insert(operation_id, result);
-                } else {
-                    let result = op_node.execute(&self, argument_payload, None).await;
-                    println!("Executed node {} with result {:?}", operation_id, &result);
-                    outputs.push((operation_id, result.clone()));
-                    new_state.state_insert(operation_id, result);
 
-                    // Effectively during one state's execution, new intermediate states are also generated, there is a tree of states being created
-                    // how do we capture this and push it up into the execution graph itself.
-                    // We could have channels listen to events from all of the states but that doesn't feel right.
-                    // This is why what I wanted to do was to have the top level state then become a Future, it will eventually be resolved and when it
-                    // is resolved, execution can progress. But what we want to do is to still mutate the graph from there, so we need to return
-                    // while the future has been provided (which happens immediately with an async function) then we want call it again for evaluation
-                    // before we progress its child events.
-                }
+                    // Long-running execution
+                    dbg!("Long-running execution");
+                    // TODO: this is deadlocking
+                    let _ = op_node_execute.await;
+                    dbg!("Completed");
+                    let _ = oneshot_sender.send(());
+                });
+                oneshot_receiver.await.expect("Failed to receive oneshot signal");
+                // outputs.push((operation_id, result.clone()));
+                // new_state.state_insert(operation_id, result);
+            } else {
+                let result = op_node_execute.await;
+                println!("Executed node {} with result {:?}", operation_id, &result);
+                outputs.push((operation_id, result.clone()));
+                new_state.state_insert(operation_id, result);
+
+                // Effectively during one state's execution, new intermediate states are also generated, there is a tree of states being created
+                // how do we capture this and push it up into the execution graph itself.
+                // We could have channels listen to events from all of the states but that doesn't feel right.
+                // This is why what I wanted to do was to have the top level state then become a Future, it will eventually be resolved and when it
+                // is resolved, execution can progress. But what we want to do is to still mutate the graph from there, so we need to return
+                // while the future has been provided (which happens immediately with an async function) then we want call it again for evaluation
+                // before we progress its child events.
             }
-            new_state.state_consume_marked(marked_for_consumption);
+        }
+        new_state.state_consume_marked(marked_for_consumption);
 
-            (ExecutionStateEvaluation::Complete(new_state), outputs)
-        })
+        (ExecutionStateEvaluation::Complete(new_state), outputs)
     }
 }
 

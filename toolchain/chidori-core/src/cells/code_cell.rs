@@ -58,7 +58,7 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
                             &cell.source_code,
                             &x,
                             &cell.function_invocation,
-                        )
+                        ).await
                             .unwrap()
                             .0
                     }.boxed()
@@ -115,15 +115,23 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
                 output_signature,
                 Box::new(move |x, _| {
                     // TODO: this needs to handle stdout and errors
+                    // TODO: this code is crazy, there needs to be a better way to handle this.
+                    //       the issue is that source_code_run_deno uses awaits that return values that are not send
                     let cell = cell.clone();
                     async move {
-                        crate::library::std::code::runtime_deno::source_code_run_deno(
-                            &cell.source_code,
-                            &x,
-                            &cell.function_invocation,
-                        )
-                            .unwrap()
-                            .0
+                        let result = tokio::task::spawn_blocking(move || {
+                            let runtime = tokio::runtime::Runtime::new().unwrap();
+                            let result = runtime.block_on(crate::library::std::code::runtime_deno::source_code_run_deno(
+                                &cell.source_code,
+                                &x,
+                                &cell.function_invocation,
+                            ));
+                            match result {
+                                Ok(v) => v.0,
+                                Err(e) => panic!("{:?}", e),
+                            }
+                        }).await.unwrap();
+                        result
                     }.boxed()
                 }),
             )

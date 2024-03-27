@@ -157,7 +157,31 @@ impl LoggingStdout {
     }
 }
 
-pub fn source_code_run_python(
+
+async fn execute_async_block(total_arg_payload: RkyvSerializedValue, cell: &CellTypes, clone_function_name: &str) -> RkyvSerializedValue {
+    // modify code cell to indicate execution of the target function
+    // reconstruction of the cell
+    let mut op = match cell {
+        CellTypes::Code(c) => {
+            let mut c = c.clone();
+            c.function_invocation =
+                Some(clone_function_name.to_string());
+            crate::cells::code_cell::code_cell(&c)
+        }
+        CellTypes::Prompt(c) => {
+            crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
+        }
+        _ => {
+            unreachable!("Unsupported cell type");
+        }
+    };
+
+    // invocation of the operation
+    op.execute(&ExecutionState::new(), total_arg_payload, None).await
+}
+
+
+pub async fn source_code_run_python(
     source_code: &String,
     payload: &RkyvSerializedValue,
     function_invocation: &Option<String>,
@@ -191,58 +215,38 @@ pub fn source_code_run_python(
                                     None,
                                     None,
                                     move |args: &PyTuple, kwargs: Option<&PyDict>| {
-                                        let runtime = Runtime::new().unwrap();
-
-                                        runtime.block_on(async {
-                                            let total_arg_payload = RkyvObjectBuilder::new();
-                                            let total_arg_payload =
-                                                total_arg_payload.insert_value("args", {
-                                                    let mut m = HashMap::new();
-                                                    for (i, a) in args.iter().enumerate() {
-                                                        m.insert(
-                                                            format!("{}", i),
-                                                            pyany_to_rkyv_serialized_value(a),
-                                                        );
-                                                    }
-                                                    RkyvSerializedValue::Object(m)
-                                                });
-
-                                            let total_arg_payload = if let Some(kwargs) = kwargs {
-                                                total_arg_payload.insert_value("kwargs", {
-                                                    let mut m = HashMap::new();
-                                                    for (i, a) in kwargs.iter() {
-                                                        let k: String = i.extract()?;
-                                                        m.insert(k, pyany_to_rkyv_serialized_value(a));
-                                                    }
-                                                    RkyvSerializedValue::Object(m)
-                                                })
-                                            } else {
-                                                total_arg_payload
-                                            };
-
-                                            // modify code cell to indicate execution of the target function
-                                            // reconstruction of the cell
-                                            let mut op = match &cell {
-                                                CellTypes::Code(c) => {
-                                                    let mut c = c.clone();
-                                                    c.function_invocation =
-                                                        Some(clone_function_name.clone());
-                                                    crate::cells::code_cell::code_cell(&c)
+                                        let total_arg_payload = RkyvObjectBuilder::new();
+                                        let total_arg_payload =
+                                            total_arg_payload.insert_value("args", {
+                                                let mut m = HashMap::new();
+                                                for (i, a) in args.iter().enumerate() {
+                                                    m.insert(
+                                                        format!("{}", i),
+                                                        pyany_to_rkyv_serialized_value(a),
+                                                    );
                                                 }
-                                                CellTypes::Prompt(c) => {
-                                                    crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
-                                                }
-                                                _ => {
-                                                    unreachable!("Unsupported cell type");
-                                                }
-                                            };
+                                                RkyvSerializedValue::Object(m)
+                                            });
 
-                                            // invocation of the operation
-                                            let result = op.execute(&ExecutionState::new(), total_arg_payload.build(), None).await;
-
+                                        let total_arg_payload = if let Some(kwargs) = kwargs {
+                                            total_arg_payload.insert_value("kwargs", {
+                                                let mut m = HashMap::new();
+                                                for (i, a) in kwargs.iter() {
+                                                    let k: String = i.extract()?;
+                                                    m.insert(k, pyany_to_rkyv_serialized_value(a));
+                                                }
+                                                RkyvSerializedValue::Object(m)
+                                            })
+                                        } else {
+                                            total_arg_payload
+                                        }.build();
+                                        let cell = cell.clone();
+                                        let clone_function_name = clone_function_name.clone();
+                                        let py = args.py();
+                                        pyo3_asyncio::tokio::run(py, async move {
+                                            let result = execute_async_block(total_arg_payload, &cell, &clone_function_name).await;
                                             // Conversion back to python types
-                                            let py = args.py();
-                                            PyResult::Ok(rkyv_serialized_value_to_pyany(py, &result))
+                                            Python::with_gil(|py| PyResult::Ok(rkyv_serialized_value_to_pyany(py, &result)))
                                         })
                                     },
                                 )?;
@@ -368,8 +372,8 @@ mod tests {
     use crate::execution::primitives::serialized_value::RkyvObjectBuilder;
     use indoc::indoc;
 
-    //     #[test]
-    //     fn test_source_code_run_py_success() {
+    //     #[tokio::test]
+    //     async fn test_source_code_run_py_success() {
     //         let source_code = String::from(
     //             r#"
     // from chidori import suspend
@@ -385,8 +389,8 @@ mod tests {
     //         //     HashMap::from_iter(vec![("fun".to_string(), RkyvSerializedValue::Number(42),),])
     //     }
 
-    #[test]
-    fn test_py_source_without_entrypoint() {
+    #[tokio::test]
+    async fn test_py_source_without_entrypoint() {
         let source_code = String::from(
             r#"
 y = 42
@@ -394,7 +398,7 @@ x = 12 + y
 li = [x, y]
         "#,
         );
-        let result = source_code_run_python(&source_code, &RkyvSerializedValue::Null, &None);
+        let result = source_code_run_python(&source_code, &RkyvSerializedValue::Null, &None).await;
         assert_eq!(
             result.unwrap(),
             (
@@ -414,14 +418,14 @@ li = [x, y]
         );
     }
 
-    #[test]
-    fn test_py_source_without_entrypoint_with_stdout() {
+    #[tokio::test]
+    async fn test_py_source_without_entrypoint_with_stdout() {
         let source_code = String::from(
             r#"
 print("testing")
         "#,
         );
-        let result = source_code_run_python(&source_code, &RkyvSerializedValue::Null, &None);
+        let result = source_code_run_python(&source_code, &RkyvSerializedValue::Null, &None).await;
         assert_eq!(
             result.unwrap(),
             (
@@ -431,8 +435,8 @@ print("testing")
         );
     }
 
-    #[test]
-    fn test_execution_of_internal_function() {
+    #[tokio::test]
+    async fn test_execution_of_internal_function() {
         let source_code = String::from(
             r#"
 import chidori as ch
@@ -447,12 +451,12 @@ def example():
             &source_code,
             &RkyvSerializedValue::Null,
             &Some("example".to_string()),
-        );
+        ).await;
         assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(20), vec![]));
     }
 
-    #[test]
-    fn test_execution_of_internal_function_with_arguments() {
+    #[tokio::test]
+    async fn test_execution_of_internal_function_with_arguments() {
         let source_code = String::from(
             r#"
 import chidori as ch
@@ -468,12 +472,12 @@ def example(x):
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
             &Some("example".to_string()),
-        );
+        ).await;
         assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(25), vec![]));
     }
 
-    #[test]
-    fn text_execution_of_python_with_function_provided_via_cell() {
+    #[tokio::test]
+    async fn test_execution_of_python_with_function_provided_via_cell() {
         let source_code = String::from(
             r#"
 a = 20 + demo()
@@ -500,7 +504,7 @@ a = 20 + demo()
                 )
                 .build(),
             &None,
-        );
+        ).await;
         assert_eq!(
             result.unwrap(),
             (
@@ -512,8 +516,8 @@ a = 20 + demo()
 
     // TODO: the expected behavior is that as we execute the function again and again from another location, the state mutates
     #[ignore]
-    #[test]
-    fn test_execution_of_internal_function_mutating_internal_state() {
+    #[tokio::test]
+    async fn test_execution_of_internal_function_mutating_internal_state() {
         let source_code = String::from(
             r#"
 a = 0
@@ -529,7 +533,7 @@ def example(x):
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
             &Some("example".to_string()),
-        );
+        ).await;
         assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(1), vec![]));
         let result = source_code_run_python(
             &source_code,
@@ -537,7 +541,7 @@ def example(x):
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
             &Some("example".to_string()),
-        );
+        ).await;
         assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(2), vec![]));
     }
 }
