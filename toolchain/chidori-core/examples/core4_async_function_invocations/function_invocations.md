@@ -3,21 +3,21 @@
 ## Simple function calling across cells
 ### Demonstrates defining a function in python and calling it in javascript
 ```python
-def add_two(x):
+async def add_two(x):
     return x + 2
 ```
 
 ```javascript
 import { assertEquals } from "https://deno.land/std@0.221.0/assert/mod.ts";
 
-Deno.test("addition test", () => {
-    assertEquals(add_two(2), 4);
+Deno.test("async addition test", async () => {
+    assertEquals(await add_two(2), 4);
 });
 ```
 
 ### Demonstrates defining a function in javascript and calling it in python
 ```javascript
-function addTwo(x) {
+async function addTwo(x) {
     return x + 2;
 }
 ```
@@ -26,8 +26,8 @@ function addTwo(x) {
 import unittest
 
 class TestMarshalledValues(unittest.TestCase):
-    def test_addTwo(self):
-        self.assertEqual(addTwo(2), 4)
+    async def test_addTwo(self):
+        self.assertEqual(await addTwo(2), 4)
 
 unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
 ```

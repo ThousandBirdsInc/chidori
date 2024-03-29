@@ -27,7 +27,7 @@ dirs = "5.0.1"
 target-lexicon = "0.12.14"
 petgraph.workspace = true
 diskmap = "0.2.0"
-rusqlite = { version = "0.31.0", features = ["bundled"] }
+rusqlite = { version = "0.29.0", features = ["bundled"] }
 notify-debouncer-full = "0.3.1"
 ts-rs = "7.1"
 

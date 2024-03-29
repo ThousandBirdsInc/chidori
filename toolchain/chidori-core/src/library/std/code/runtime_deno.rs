@@ -5,6 +5,7 @@ use deno_core::{Extension, ExtensionFileSource, ExtensionFileSourceCode, FastStr
 use deno_ast::MediaType;
 use deno_ast::ParseParams;
 use deno_ast::SourceTextInfo;
+use deno;
 use std::sync::{Arc, Mutex};
 
 use crate::execution::primitives::serialized_value::{
@@ -20,7 +21,12 @@ use std::hash::Hash;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
+use deno::factory::CliFactory;
+use deno::file_fetcher::File;
+use deno_runtime::permissions::{Permissions, PermissionsContainer};
 use futures_util::FutureExt;
+use pyo3::{Py, PyAny};
+use pyo3::types::{IntoPyDict, PyTuple};
 use tokio::runtime::Runtime;
 use crate::cells::{CellTypes, CodeCell};
 use crate::execution::execution::ExecutionState;
@@ -28,6 +34,7 @@ use crate::execution::execution::ExecutionState;
 // TODO: need to override console.log
 // TODO: https://deno.com/blog/roll-your-own-javascript-runtime-pt2
 // TODO: validate suspension and resumption of execution based on a method that we provide
+
 
 fn serde_v8_to_rkyv(
     mut scope: &mut HandleScope,
@@ -53,6 +60,7 @@ fn serde_v8_to_rkyv(
 }
 
 struct MyOpState {
+    output: Option<RkyvSerializedValue>,
     payload: RkyvSerializedValue,
     cell_depended_values: HashMap<String, String>,
     functions: HashMap<
@@ -64,6 +72,7 @@ struct MyOpState {
 impl MyOpState {
     fn new(payload: RkyvSerializedValue) -> Self {
         MyOpState {
+            output: None,
             payload,
             cell_depended_values: Default::default(),
             functions: HashMap::new(),
@@ -108,211 +117,176 @@ async fn op_call_rust(
 }
 
 
-struct TsModuleLoader;
+#[op2]
+#[serde]
+fn op_save_result<'scope>(
+    mut state: &mut OpState,
+    #[serde] val: RkyvSerializedValue,
+) -> Result<(), AnyError> {
+    let mut my_op_state: &Arc<Mutex<MyOpState>> = state.borrow_mut();
+    let mut my_op_state = my_op_state.lock().unwrap();
+    my_op_state.output = Some(val);
+    Ok(())
+}
 
-impl deno_core::ModuleLoader for TsModuleLoader {
-    fn resolve(
-        &self,
-        specifier: &str,
-        referrer: &str,
-        _kind: deno_core::ResolutionKind,
-    ) -> Result<deno_core::ModuleSpecifier, AnyError> {
-        deno_core::resolve_import(specifier, referrer).map_err(|e| e.into())
+#[op2]
+#[serde]
+fn op_save_result_object<'scope>(
+    mut state: &mut OpState,
+    #[serde] kwargs: HashMap<String, RkyvSerializedValue>,
+) -> Result<(), AnyError> {
+    let mut my_op_state: &Arc<Mutex<MyOpState>> = state.borrow_mut();
+    let mut my_op_state = my_op_state.lock().unwrap();
+    let mut output = RkyvObjectBuilder::new();
+    for (key, value) in kwargs {
+        output = output.insert_value(&key, value);
     }
+    // TODO: union with the existing value if there is one
+    my_op_state.output = Some(output.build());
+    Ok(())
+}
 
-    fn load(
-        &self,
-        module_specifier: &deno_core::ModuleSpecifier,
-        _maybe_referrer: Option<&reqwest::Url>,
-        _is_dyn_import: bool,
-    ) -> std::pin::Pin<Box<deno_core::ModuleSourceFuture>> {
-        let module_specifier = module_specifier.clone();
-        async move {
-            let path = module_specifier.to_file_path().unwrap();
 
-            let media_type = MediaType::from_path(&path);
-            let (module_type, should_transpile) = match MediaType::from_path(&path) {
-                MediaType::JavaScript | MediaType::Mjs | MediaType::Cjs => {
-                    (deno_core::ModuleType::JavaScript, false)
-                }
-                MediaType::Jsx => (deno_core::ModuleType::JavaScript, true),
-                MediaType::TypeScript
-                | MediaType::Mts
-                | MediaType::Cts
-                | MediaType::Dts
-                | MediaType::Dmts
-                | MediaType::Dcts
-                | MediaType::Tsx => (deno_core::ModuleType::JavaScript, true),
-                MediaType::Json => (deno_core::ModuleType::Json, false),
-                _ => panic!("Unknown extension {:?}", path.extension()),
-            };
+#[op2]
+#[serde]
+fn op_invoke_function<'scope>(
+    scope: &mut v8::HandleScope<'scope>,
+    mut state: &mut OpState,
+    input: v8::Local<v8::Function>,
+) -> Result<RkyvSerializedValue, AnyError> {
+    let global = scope.get_current_context().global(scope);
 
-            let code = std::fs::read_to_string(&path)?;
-            let code = if should_transpile {
-                let parsed = deno_ast::parse_module(ParseParams {
-                    specifier: module_specifier.to_string().parse().unwrap(),
-                    text_info: SourceTextInfo::from_string(code),
-                    media_type,
-                    capture_tokens: false,
-                    scope_analysis: false,
-                    maybe_syntax: None,
-                })?;
-                parsed.transpile(&Default::default())?.text
-            } else {
-                code
-            };
-            let module = deno_core::ModuleSource::new(
-                module_type,
-                deno_core::ModuleCode::from(code),
-                &module_specifier
+    // TODO: handle async functions
+    // https://docs.rs/rusty_v8/latest/rusty_v8/struct.PromiseResolver.html
+
+    // Prepare the arguments for the function call, if any.
+    let mut args: Vec<_> = vec![];
+    let mut kwargs = vec![];
+
+    let mut my_op_state: &Arc<Mutex<MyOpState>> = state.borrow_mut();
+    let mut my_op_state = my_op_state.lock().unwrap();
+    if let RkyvSerializedValue::Object(ref payload_map) = my_op_state.payload {
+        if let Some(RkyvSerializedValue::Object(args_map)) = payload_map.get("args")
+        {
+            let mut args_vec: Vec<_> = args_map
+                .iter()
+                .map(|(k, v)| (k.parse::<i32>().unwrap(), v))
+                .collect();
+
+            args_vec.sort_by_key(|k| k.0);
+            args.extend(
+                args_vec
+                    .into_iter()
+                    .map(|(_, v)|
+                        deno_core::_ops::RustToV8Fallible::to_v8_fallible(
+                            deno_core::_ops::RustToV8Marker::<deno_core::_ops::SerdeMarker, _>::from(
+                                v,
+                            ),
+                            scope,
+                        ).unwrap()
+                    ),
             );
-            Ok(module)
         }
-            .boxed_local()
-    }
-}
 
-// Operation to set global variables
-#[allow(non_camel_case_types)]
-struct op_set_globals {
-    _unconstructable: ::std::marker::PhantomData<()>,
-}
-impl deno_core::_ops::Op for op_set_globals {
-    const NAME: &'static str = "op_set_globals";
-    const DECL: deno_core::_ops::OpDecl = deno_core::_ops::OpDecl::new_internal_op2(
-        "op_set_globals",
-        false,
-        false,
-        2usize as u8,
-        Self::v8_fn_ptr as _,
-        Self::v8_fn_ptr_metrics as _,
-        None,
-        None,
-    );
-}
-impl op_set_globals {
-    pub const fn name() -> &'static str {
-        "op_set_globals"
-    }
-    #[deprecated(note = "Use the const op::DECL instead")]
-    pub const fn decl() -> deno_core::_ops::OpDecl {
-        <Self as deno_core::_ops::Op>::DECL
-    }
-    #[inline(always)]
-    fn slow_function_impl(info: *const deno_core::v8::FunctionCallbackInfo) -> usize {
-        #[cfg(debug_assertions)]
-        let _reentrancy_check_guard =
-            deno_core::_ops::reentrancy_check(&<Self as deno_core::_ops::Op>::DECL);
-        let mut scope = unsafe { deno_core::v8::CallbackScope::new(&*info) };
-        let mut rv = deno_core::v8::ReturnValue::from_function_callback_info(unsafe { &*info });
-        let args = deno_core::v8::FunctionCallbackArguments::from_function_callback_info(unsafe {
-            &*info
-        });
-        let opctx = unsafe {
-            &*(deno_core::v8::Local::<deno_core::v8::External>::cast(args.data()).value()
-                as *const deno_core::_ops::OpCtx)
-        };
-        let opstate = &opctx.state;
-        let result = {
-            let arg0 = &mut scope;
-            let arg1 = &mut ::std::cell::RefCell::borrow_mut(&opstate);
-            Self::call(arg0, arg1, info)
-        };
-        rv.set(deno_core::_ops::RustToV8NoScope::to_v8(result));
-        return 0;
-    }
-    extern "C" fn v8_fn_ptr(info: *const deno_core::v8::FunctionCallbackInfo) {
-        Self::slow_function_impl(info);
-    }
-    extern "C" fn v8_fn_ptr_metrics(info: *const deno_core::v8::FunctionCallbackInfo) {
-        let args = deno_core::v8::FunctionCallbackArguments::from_function_callback_info(unsafe {
-            &*info
-        });
-        let opctx = unsafe {
-            &*(deno_core::v8::Local::<deno_core::v8::External>::cast(args.data()).value()
-                as *const deno_core::_ops::OpCtx)
-        };
-        deno_core::_ops::dispatch_metrics_slow(&opctx, deno_core::_ops::OpMetricsEvent::Dispatched);
-        let res = Self::slow_function_impl(info);
-        if res == 0 {
-            deno_core::_ops::dispatch_metrics_slow(
-                &opctx,
-                deno_core::_ops::OpMetricsEvent::Completed,
-            );
-        } else {
-            deno_core::_ops::dispatch_metrics_slow(&opctx, deno_core::_ops::OpMetricsEvent::Error);
+        if let Some(RkyvSerializedValue::Object(kwargs_map)) =
+            payload_map.get("kwargs")
+        {
+            for (k, v) in kwargs_map.iter() {
+                kwargs.push((k,
+                             deno_core::_ops::RustToV8Fallible::to_v8_fallible(
+                                 deno_core::_ops::RustToV8Marker::<deno_core::_ops::SerdeMarker, _>::from(
+                                     v,
+                                 ),
+                                 scope,
+                             ).unwrap()
+                ));
+            }
         }
     }
 
-    #[inline(always)]
-    fn call<'a>(
-        scope: &mut v8::HandleScope<'a>,
-        mut state: &mut OpState,
-        info: *const deno_core::v8::FunctionCallbackInfo,
-    ) -> v8::Local<'a, v8::String> {
-        // Get the global object
-        let global = scope.get_current_context().global(scope);
+    // Invoke the JavaScript function. The result is wrapped in a Result type.
+    let result = input.call(scope, global.into(), args.as_slice());
 
-        let mut my_op_state: &Arc<Mutex<MyOpState>> = state.borrow_mut();
-        let mut my_op_state = my_op_state.lock().unwrap();
+    if let Some(result) = result {
+        let result = serde_v8_to_rkyv(scope, result).unwrap();
+        Ok(result)
+    } else {
+        Err(anyhow::Error::msg("Failure".to_string()))
+    }
 
-        // put globals into the global scope before invoking
-        if let RkyvSerializedValue::Object(ref payload_map) = my_op_state.payload {
-            if let Some(RkyvSerializedValue::Object(globals_map)) = payload_map.get("globals") {
-                for (key, value) in globals_map {
-                    let key = deno_core::v8::String::new(scope, key).unwrap();
-                    if let Ok(value) = match deno_core::_ops::RustToV8Fallible::to_v8_fallible(
-                        deno_core::_ops::RustToV8Marker::<deno_core::_ops::SerdeMarker, _>::from(
-                            value,
-                        ),
-                        scope,
-                    ) {
-                        // Create a new property in the global object
-                        Ok(v) => Ok(v),
-                        Err(rv_err) => {
-                            let msg = deno_core::v8::String::new(scope, &{
-                                let res = std::fmt::format(std::format_args!(
-                                    "{}",
-                                    deno_core::anyhow::Error::from(rv_err)
-                                ));
-                                res
-                            })
+}
+
+
+#[op2]
+#[serde]
+fn op_set_globals<'scope>(
+    scope: &mut v8::HandleScope<'scope>,
+    mut state: &mut OpState,
+) -> Result<RkyvSerializedValue, AnyError> {
+    // Get the global object
+    let global = scope.get_current_context().global(scope);
+
+    let mut my_op_state: &Arc<Mutex<MyOpState>> = state.borrow_mut();
+    let mut my_op_state = my_op_state.lock().unwrap();
+
+    // put globals into the global scope before invoking
+    if let RkyvSerializedValue::Object(ref payload_map) = my_op_state.payload {
+        if let Some(RkyvSerializedValue::Object(globals_map)) = payload_map.get("globals") {
+            for (key, value) in globals_map {
+                let key = deno_core::v8::String::new(scope, key).unwrap();
+                if let Ok(value) = match deno_core::_ops::RustToV8Fallible::to_v8_fallible(
+                    deno_core::_ops::RustToV8Marker::<deno_core::_ops::SerdeMarker, _>::from(
+                        value,
+                    ),
+                    scope,
+                ) {
+                    // Create a new property in the global object
+                    Ok(v) => Ok(v),
+                    Err(rv_err) => {
+                        let msg = deno_core::v8::String::new(scope, &{
+                            let res = std::fmt::format(std::format_args!(
+                                "{}",
+                                deno_core::anyhow::Error::from(rv_err)
+                            ));
+                            res
+                        })
                             .unwrap();
-                            let exc = deno_core::v8::Exception::type_error(scope, msg);
-                            scope.throw_exception(exc);
-                            Err("Failure".to_string())
-                        }
-                    } {
-                        global.set(scope, key.into(), value.into());
+                        let exc = deno_core::v8::Exception::type_error(scope, msg);
+                        scope.throw_exception(exc);
+                        Err("Failure".to_string())
                     }
+                } {
+                    global.set(scope, key.into(), value.into());
                 }
             }
         }
-
-        // create shims for functions that are referred to
-        // TODO: differentiate async vs sync functions
-        let mut js_code = String::new();
-        let cell_depended_values = my_op_state.cell_depended_values.clone();
-        for (function_name, function) in
-            create_function_shims(&my_op_state.payload, cell_depended_values).unwrap()
-        {
-            my_op_state
-                .functions
-                .insert(function_name.clone(), function);
-            js_code.push_str(&format!(
-                "globalThis.{function_name} = async (...data) => await Deno.core.ops.op_call_rust(\"{function_name}\", data, {});\n",
-                function_name = function_name
-            ));
-        }
-
-        // Execute the JavaScript code to define the function on the global scope
-        let code = v8::String::new(scope, &js_code).unwrap();
-        let script = v8::Script::compile(scope, code, None).unwrap();
-        script.run(scope).unwrap();
-
-        v8::String::new(scope, &"Success".to_string()).unwrap()
     }
+
+    // create shims for functions that are referred to
+    // TODO: differentiate async vs sync functions
+    let mut js_code = String::new();
+    let cell_depended_values = my_op_state.cell_depended_values.clone();
+    for (function_name, function) in
+    create_function_shims(&my_op_state.payload, cell_depended_values).unwrap()
+    {
+        my_op_state
+            .functions
+            .insert(function_name.clone(), function);
+        js_code.push_str(&format!(
+            "globalThis.{function_name} = async (...data) => await op_call_rust(\"{function_name}\", data, {});\n",
+            function_name = function_name
+        ));
+    }
+
+    // Execute the JavaScript code to define the function on the global scope
+    let code = v8::String::new(scope, &js_code).unwrap();
+    let script = v8::Script::compile(scope, code, None).unwrap();
+    script.run(scope).unwrap();
+    Ok(RkyvSerializedValue::String("Success".to_string()))
 }
+
+
+// Operation to set global variables
 
 type InternalClosureFnMut = Box<
     dyn FnMut(
@@ -395,6 +369,7 @@ fn create_function_shims(
     Ok(functions)
 }
 
+
 pub async fn source_code_run_deno(
     source_code: &String,
     payload: &RkyvSerializedValue,
@@ -418,56 +393,78 @@ pub async fn source_code_run_deno(
 
     // TODO: this needs to capture stdout similar to how we do with python
     let my_op_state = Arc::new(Mutex::new(MyOpState {
+        output: None,
         payload: payload.clone(),
         cell_depended_values: cell_depended_values,
         functions: Default::default(),
     }));
 
+    let my_op_state_clone = my_op_state.clone();
     let ext = Extension {
         name: "my_ext",
         ops: std::borrow::Cow::Borrowed(&[
             op_set_globals::DECL,
             op_call_rust::DECL,
             op_assert_eq::DECL,
+            op_save_result::DECL,
+            op_save_result_object::DECL,
+            op_invoke_function::DECL
         ]),
         op_state_fn: Some(Box::new(move |state| {
-            state.put(my_op_state.clone());
+            state.put(my_op_state_clone);
         })),
-        js_files: std::borrow::Cow::Borrowed(&[
-            ExtensionFileSource {
-                specifier: "",
-                code: ExtensionFileSourceCode::IncludedInBinary(r#"
-((globalThis) => {
-  const { core } = Deno;
-  const { ops } = core;
+        js_files: {
+            const JS: &'static [::deno_core::ExtensionFileSource] = &[
+                ::deno_core::ExtensionFileSource::loaded_from_memory_during_snapshot("ext:bench_setup/setup.js", {
+                    const C: ::deno_core::v8::OneByteConst =
+                        ::deno_core::FastStaticString::create_external_onebyte_const(r#"
+      ((globalThis) => {
+          const { core } = Deno;
+          const { ops } = core;
+          const op_call_rust = Deno.core.ops.op_call_rust;
+          const op_save_result_object =  Deno.core.ops.op_save_result_object;
+          const op_save_result =  Deno.core.ops.op_save_result;
+          const op_invoke_function =  Deno.core.ops.op_invoke_function;
 
-  function argsToMessage(...args) {
-    return args.map((arg) => JSON.stringify(arg)).join(" ");
-  }
+          globalThis.op_invoke_function = op_invoke_function;
+          globalThis.op_call_rust = op_call_rust;
 
-  globalThis.console = {
-    log: (...args) => {
-      core.print(`[out]: ${argsToMessage(...args)}\n`, false);
-    },
-    error: (...args) => {
-      core.print(`[err]: ${argsToMessage(...args)}\n`, true);
-    },
-  };
+          function argsToMessage(...args) {
+              return args.map((arg) => JSON.stringify(arg)).join(" ");
+          }
 
-  globalThis.Chidori = {
-    assertEq: (a, b) => {
-      return ops.op_assert_eq(a, b);
-    },
-  };
+          globalThis.console = {
+              log: (...args) => {
+              core.print(`[out]: ${argsToMessage(...args)}\n`, false);
+              },
+              error: (...args) => {
+              core.print(`[err]: ${argsToMessage(...args)}\n`, true);
+              },
+          };
 
-  globalThis.module = {
-    exports: {}
-  };
+          globalThis.Chidori = {
+              assertEq: (a, b) => {
+                  return ops.op_assert_eq(a, b);
+              },
+              saveValue: (val) => {
+                  op_save_result(val);
+              },
+              saveOutput: (object) => {
+                  op_save_result_object(object);
+              }
+          };
 
-  ops.op_set_globals();
-})(globalThis);"#, )
-            }
-        ]),
+          globalThis.module = {
+              exports: {}
+          };
+
+          ops.op_set_globals();
+      })(globalThis);"#.as_bytes());
+                    unsafe { std::mem::transmute::<_, ::deno_core::FastStaticString>(&C) }
+                })
+            ];
+            ::std::borrow::Cow::Borrowed(JS)
+        },
         ..Default::default()
     };
 
@@ -485,57 +482,113 @@ pub async fn source_code_run_deno(
     //     }
     // );
 
-    let mut runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
-        module_loader: Some(Rc::new(TsModuleLoader)),
-        // startup_snapshot: Some(snapshot),
-        extensions: vec![ext],
-        ..Default::default()
-    });
-
 
     // Set global variables, provide specialized ops
-    let mut source = String::new();
-    source.push_str("\n");
-    source.push_str("export const chidoriResult = {};");
-    source.push_str("\n");
-    source.push_str(&source_code);
-    for (name, report_item) in &report.cell_exposed_values {
+    let source = if let Some(func_name) = function_invocation {
+
+        // let local = locals.get_item(name)?;
+        // if let Some(py_func) = local {
+        //     // Call the function
+        //
+        //     let mut args: Vec<Py<PyAny>> = vec![];
+        //     let mut kwargs = vec![];
+        //     if let RkyvSerializedValue::Object(ref payload_map) = payload {
+        //         if let Some(RkyvSerializedValue::Object(args_map)) = payload_map.get("args")
+        //         {
+        //             let mut args_vec: Vec<_> = args_map
+        //                 .iter()
+        //                 .map(|(k, v)| (k.parse::<i32>().unwrap(), v))
+        //                 .collect();
+        //
+        //             args_vec.sort_by_key(|k| k.0);
+        //             args.extend(
+        //                 args_vec
+        //                     .into_iter()
+        //                     .map(|(_, v)| crate::library::std::code::runtime_pyo3::rkyv_serialized_value_to_pyany(py, v)),
+        //             );
+        //         }
+        //
+        //         if let Some(RkyvSerializedValue::Object(kwargs_map)) =
+        //             payload_map.get("kwargs")
+        //         {
+        //             for (k, v) in kwargs_map.iter() {
+        //                 kwargs.push((k, crate::library::std::code::runtime_pyo3::rkyv_serialized_value_to_pyany(py, v)));
+        //             }
+        //         }
+        //     }
+        //
+        //     let args = PyTuple::new(py, &args);
+        //     let kwargs = kwargs.into_iter().into_py_dict(py);
+        //
+        //     let result = py_func.call(args, Some(kwargs))?;
+        //     let output: Vec<String> = receiver.try_iter().collect();
+        //     Ok((crate::library::std::code::runtime_pyo3::pyany_to_rkyv_serialized_value(result), output))
+        // } else {
+        //     Err(anyhow::anyhow!("Function not found"))
+        // }
+
+
+        let mut source = String::new();
+        source.push_str("\n");
+        source.push_str(&source_code);
         source.push_str("\n");
         source.push_str(&format!(
-            r#"chidoriResult["{name}"] = {name};"#,
-            name = name
+            r#"Chidori.saveValue(op_invoke_function({name}));"#,
+            name = func_name
         ));
         source.push_str("\n");
-    }
-    source.push_str("\n");
-    source.push_str("chidoriResult;");
-    source.push_str("\n");
-    dbg!(&source);
-    let mod_id = runtime.load_main_module(&ModuleSpecifier::parse("https://localhost/main.js")?, Some(FastString::from(source.to_string()))).await?;
-    dbg!(&mod_id);
-    let result = runtime.mod_evaluate(mod_id);
-    let err = runtime.run_event_loop(PollEventLoopOptions::default()).await;
-    if let Err(ref e) = err {
-        dbg!("{:?} {:?}", source_code, e);
-    }
-    // wait for module to resolve
-    let resolve = result.await?;
-    dbg!(&resolve);
-
-    let global = runtime.get_module_namespace(mod_id).unwrap();
-    let scope = &mut runtime.handle_scope();
-    let local_var = deno_core::v8::Local::new(scope, global);
-
-    let func_key = v8::String::new(scope, "chidoriResult").unwrap();
-    let result = local_var.get(scope, func_key.into()).unwrap();
-
-    let deserialized_value = serde_v8::from_v8::<serde_json::Value>(scope, result);
-    dbg!(&deserialized_value);
-    return Ok(if let Ok(value) = deserialized_value {
-        (json_value_to_serialized_value(&value), vec![])
+        source
     } else {
-        (RkyvSerializedValue::Null, vec![])
+        let mut source = String::new();
+        source.push_str("\n");
+        source.push_str("export const chidoriResult = {};");
+        source.push_str("\n");
+        source.push_str(&source_code);
+        for (name, report_item) in &report.cell_exposed_values {
+            source.push_str("\n");
+            source.push_str(&format!(
+                r#"chidoriResult["{name}"] = {name};"#,
+                name = name
+            ));
+            source.push_str("\n");
+        }
+        source.push_str("\n");
+        source.push_str("Chidori.saveOutput(chidoriResult);");
+        source.push_str("\n");
+        source
+    };
+
+
+    let flags = deno::args::Flags::default();
+    let factory = deno::factory::CliFactory::from_flags(flags)?;
+    let cli_options = factory.cli_options();
+    let file_fetcher = factory.file_fetcher()?;
+    let main_module = cli_options.resolve_main_module()?;
+
+    // Save a fake file into file fetcher cache
+    // to allow module access by TS compiler.
+    file_fetcher.insert_memory_files(File {
+        specifier: main_module.clone(),
+        maybe_headers: None,
+        source: source.clone().into_bytes().into(),
     });
+
+    let permissions = PermissionsContainer::new(Permissions::from_options(
+        &cli_options.permissions_options(),
+    )?);
+    // TODO: add custom extensions
+    let worker_factory = factory.create_cli_main_worker_factory().await?;
+    let mut worker = worker_factory
+        .create_custom_worker(
+            main_module,
+            permissions,
+            vec![ext],
+            Default::default(),
+        )
+        .await?;
+    let exit_code = worker.run().await?;
+    let mut my_op_state = my_op_state.lock().unwrap();
+    Ok((my_op_state.output.clone().unwrap_or(RkyvSerializedValue::Null), vec![]))
 }
 
 #[cfg(test)]
@@ -650,6 +703,22 @@ mod tests {
             result.unwrap(),
             (
                 RkyvObjectBuilder::new().insert_number("x", 30).build(),
+                vec![]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_funtion_invocation() {
+        let source_code = String::from("function demonstrationAdd(a, b) { return a + b }");
+        let args = RkyvObjectBuilder::new()
+            .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 10).insert_number("1", 20))
+            .build();
+        let result = source_code_run_deno(&source_code, &args, &Some("demonstrationAdd".to_string())).await;
+        assert_eq!(
+            result.unwrap(),
+            (
+                RkyvSerializedValue::Number(30),
                 vec![]
             )
         );

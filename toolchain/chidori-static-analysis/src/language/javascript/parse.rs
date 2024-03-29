@@ -772,7 +772,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
     }
 
     let js_built_ins: HashSet<&str> = [
-        "Chidori",  "Array", "ArrayBuffer", "Boolean", "DataView", "Date", "Error", "EvalError", "Float32Array",
+        "Deno", "Chidori",  "Array", "ArrayBuffer", "Boolean", "DataView", "Date", "Error", "EvalError", "Float32Array",
         "Float64Array", "Function", "Generator", "GeneratorFunction", "Infinity", "Int8Array",
         "Int16Array", "Int32Array", "InternalError", "Intl", "JSON", "Map", "Math", "NaN",
         "Number", "Object", "Promise", "Proxy", "RangeError", "ReferenceError", "Reflect",

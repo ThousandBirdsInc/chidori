@@ -334,8 +334,6 @@ impl ExecutionState {
 
         // Every step, each operation consumes from its incoming edges.
         'traverse_nodes: for operation_id in operation_ids {
-            println!("============================================================");
-            println!("Evaluating operation {}", operation_id);
 
             // We skip nodes that are currently locked due to long running execution
             // TODO: we can regenerate async nodes if necessary by creating them from their original cells
@@ -344,6 +342,10 @@ impl ExecutionState {
                 .unwrap()
                 .lock()
                 .unwrap();
+
+            println!("============================================================");
+            println!("Evaluating operation {}: {:?}", operation_id, op_node.name);
+
             let signature = &op_node.signature.input_signature;
 
             let mut args = HashMap::new();

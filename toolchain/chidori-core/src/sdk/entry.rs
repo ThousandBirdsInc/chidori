@@ -794,7 +794,6 @@ mod tests {
     #[tokio::test]
     async fn test_core3_function_invocations() {
         let mut ee = Chidori::new();
-
         ee.load_md_directory(Path::new("./examples/core3_function_invocations")).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
@@ -802,5 +801,18 @@ mod tests {
         env.step().await;
         env.step().await;
     }
+
+    #[tokio::test]
+    async fn test_core4_async_function_invocations() {
+        let mut ee = Chidori::new();
+        ee.load_md_directory(Path::new("./examples/core4_async_function_invocations")).unwrap();
+        let mut env = ee.get_instance().unwrap();
+        env.reload_cells();
+        env.get_state().render_dependency_graph();
+        env.step().await;
+        env.step().await;
+    }
+
+
 }
 

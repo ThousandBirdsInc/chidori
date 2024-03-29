@@ -11,6 +11,7 @@ use std::collections::HashSet;
 pub enum ContextPath {
     Initialized,
     InFunction(String),
+    InClass(String),
     InFunctionDecorator(usize),
     InCallExpression,
     ChName,
@@ -81,6 +82,14 @@ impl ASTWalkContext {
                 .iter()
                 .flat_map(|context| context.iter().cloned()),
         );
+    }
+
+    fn enter_statement_class(&mut self, name: &Identifier) -> usize {
+        self.context_stack
+            .push(ContextPath::InClass(name.to_string()));
+        self.context_stack_references
+            .push(self.context_stack.clone());
+        self.context_stack.len()
     }
 
     fn enter_statement_function(&mut self, name: &Identifier) -> usize {
@@ -419,9 +428,13 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                 machine.pop_until(idx);
                 machine.pop_local_context();
             }
-            ast::Stmt::ClassDef(ast::StmtClassDef { body, .. }) => {
+            ast::Stmt::ClassDef(ast::StmtClassDef { name, body, .. }) => {
+                machine.globals.insert(name.to_string());
+                let idx = machine.enter_statement_class(name);
                 // TODO: this does include typeparams
                 traverse_statements(body, machine);
+                machine.pop_until(idx);
+                machine.pop_local_context();
             }
             ast::Stmt::Return(ast::StmtReturn { value, .. }) => {
                 if let Some(expr) = value {
@@ -712,9 +725,6 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
     ].iter().cloned().collect();
 
     depended_values.retain(|value,_ | !py_built_ins.contains(value.as_str()));
-    // TODO: this is a hack for a specific test "test_core2_marshalling" and should be removed
-    //       it is due to us not properly handling Classes yet
-    depended_values.remove("TestMarshalledValues");
 
     Report {
         cell_exposed_values: exposed_values,
@@ -979,6 +989,66 @@ mod tests {
             ]
         );
     }
+    #[test]
+    fn test_classes_are_identified() {
+        let python_source = indoc! { r#"
+            import unittest
+
+            class TestMarshalledValues(unittest.TestCase):
+                def test_addTwo(self):
+                    self.assertEqual(addTwo(2), 4)
+
+            unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
+
+            "#};
+        let context_stack_references = extract_dependencies_python(python_source);
+        assert_eq!(
+            context_stack_references,
+            vec![
+                vec![ContextPath::InClass(String::from("TestMarshalledValues")),],
+                vec![
+                    ContextPath::InClass(String::from("TestMarshalledValues")),
+                    ContextPath::InFunction(String::from("test_addTwo")),
+                ],
+                vec![
+                    ContextPath::InClass(String::from("TestMarshalledValues")),
+                    ContextPath::InFunction(String::from("test_addTwo")),
+                    ContextPath::InCallExpression,
+                    ContextPath::InCallExpression,
+                    ContextPath::IdentifierReferredTo(String::from("addTwo"), false),
+                ],
+                vec![
+                    ContextPath::InClass(String::from("TestMarshalledValues")),
+                    ContextPath::InFunction(String::from("test_addTwo")),
+                    ContextPath::InCallExpression,
+                    ContextPath::Attribute(String::from("assertEqual")),
+                    ContextPath::IdentifierReferredTo(String::from("self"), true),
+                ],
+                vec![
+                    ContextPath::InCallExpression,
+                    ContextPath::InCallExpression,
+                    ContextPath::IdentifierReferredTo(String::from("TestMarshalledValues"), true),
+                ],
+                vec![
+                    ContextPath::InCallExpression,
+                    ContextPath::InCallExpression,
+                    ContextPath::Attribute(String::from("loadTestsFromTestCase")),
+                    ContextPath::InCallExpression,
+                    ContextPath::Attribute(String::from("TestLoader")),
+                    ContextPath::IdentifierReferredTo(String::from("unittest"), true),
+                ],
+                vec![
+                    ContextPath::InCallExpression,
+                    ContextPath::Attribute(String::from("run")),
+                    ContextPath::InCallExpression,
+                    ContextPath::Attribute(String::from("TextTestRunner")),
+                    ContextPath::IdentifierReferredTo(String::from("unittest"), true),
+                ],
+            ]
+        );
+    }
+
+
 
     #[test]
     fn test_pipe_function_composition() {
@@ -1115,6 +1185,51 @@ x = random.randint(0, 10)
             },
             declared_functions: std::collections::HashMap::new(), // No data provided, initializing as empty
         };
+        assert_eq!(result, report);
+    }
+    #[test]
+    fn test_report_generation_with_class() {
+        let python_source = indoc! { r#"
+            import unittest
+
+            class TestMarshalledValues(unittest.TestCase):
+                def test_addTwo(self):
+                    self.assertEqual(addTwo(2), 4)
+
+            unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
+            "#};
+        let context_stack_references = extract_dependencies_python(python_source);
+        let result = build_report(&context_stack_references);
+        let report = Report {
+            cell_exposed_values: std::collections::HashMap::new(), // No data provided, initializing as empty
+            cell_depended_values: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "addTwo".to_string(),
+                    ReportItem {
+                        // context_path: vec![
+                        //     ContextPath::InFunction("testing".to_string()),
+                        //     ContextPath::AssignmentFromStatement,
+                        //     ContextPath::IdentifierReferredTo("y".to_string(), false),
+                        // ],
+                    },
+                );
+                map
+            },
+            triggerable_functions: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "test_addTwo".to_string(),
+                    ReportTriggerableFunctions {
+                        emit_event: vec![],
+                        trigger_on: vec![],
+                    },
+                );
+                map
+            },
+            declared_functions: std::collections::HashMap::new(), // No data provided, initializing as empty
+        };
+
         assert_eq!(result, report);
     }
 }

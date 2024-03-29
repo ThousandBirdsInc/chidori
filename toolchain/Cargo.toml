@@ -38,7 +38,7 @@ env_logger = "0.10.0"
 log = "0.4.16"
 futures = "0.3.15"
 bytes = "1.0.1"
-reqwest = { version = "0.11.18", features = ["json", "stream"]}
+reqwest = { version = "0.11.20", features = ["json", "stream"]}
 futures-core = "0.3"
 tokio-stream = "0.1"
 ulid = "1.0.0"
