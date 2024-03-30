@@ -28,7 +28,7 @@ use futures_util::FutureExt;
 use pyo3::{Py, PyAny};
 use pyo3::types::{IntoPyDict, PyTuple};
 use tokio::runtime::Runtime;
-use crate::cells::{CellTypes, CodeCell};
+use crate::cells::{CellTypes, CodeCell, LLMPromptCell};
 use crate::execution::execution::ExecutionState;
 
 // TODO: need to override console.log
@@ -308,12 +308,7 @@ fn create_function_shims(
                 let clone_function_name = function_name.clone();
                 // TODO: handle llm cells invoked as functions by name
                 if let RkyvSerializedValue::Cell(cell) = value.clone() {
-                    if let CellTypes::Code(CodeCell {
-                        function_invocation,
-                        ..
-                    }) = &cell
-                    {
-                        if cell_depended_values.contains_key(&clone_function_name) {
+                    if cell_depended_values.contains_key(&clone_function_name) {
                             let closure_callable: InternalClosureFnMut  = Box::new(move |args: Vec<RkyvSerializedValue>, kwargs: Option<HashMap<String, RkyvSerializedValue>>| {
                                 let cell = cell.clone();
                                 let clone_function_name = clone_function_name.clone();
@@ -347,8 +342,18 @@ fn create_function_shims(
                                             c.function_invocation = Some(clone_function_name.clone());
                                             crate::cells::code_cell::code_cell(&c)
                                         }
-                                        CellTypes::Prompt(c) => crate::cells::llm_prompt_cell::llm_prompt_cell(&c),
-
+                                        CellTypes::Prompt(c) => {
+                                            let mut c = c.clone();
+                                            match c {
+                                                LLMPromptCell::Chat{ref mut function_invocation, ..} => {
+                                                    *function_invocation = true;
+                                                    crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
+                                                }
+                                                _ => {
+                                                    crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
+                                                }
+                                            }
+                                        },
                                         _ => {
                                             unreachable!("Unsupported cell type");
                                         }
@@ -361,7 +366,6 @@ fn create_function_shims(
                             });
                             functions.push((function_name.clone(), closure_callable));
                         }
-                    }
                 }
             }
         }
@@ -485,49 +489,6 @@ pub async fn source_code_run_deno(
 
     // Set global variables, provide specialized ops
     let source = if let Some(func_name) = function_invocation {
-
-        // let local = locals.get_item(name)?;
-        // if let Some(py_func) = local {
-        //     // Call the function
-        //
-        //     let mut args: Vec<Py<PyAny>> = vec![];
-        //     let mut kwargs = vec![];
-        //     if let RkyvSerializedValue::Object(ref payload_map) = payload {
-        //         if let Some(RkyvSerializedValue::Object(args_map)) = payload_map.get("args")
-        //         {
-        //             let mut args_vec: Vec<_> = args_map
-        //                 .iter()
-        //                 .map(|(k, v)| (k.parse::<i32>().unwrap(), v))
-        //                 .collect();
-        //
-        //             args_vec.sort_by_key(|k| k.0);
-        //             args.extend(
-        //                 args_vec
-        //                     .into_iter()
-        //                     .map(|(_, v)| crate::library::std::code::runtime_pyo3::rkyv_serialized_value_to_pyany(py, v)),
-        //             );
-        //         }
-        //
-        //         if let Some(RkyvSerializedValue::Object(kwargs_map)) =
-        //             payload_map.get("kwargs")
-        //         {
-        //             for (k, v) in kwargs_map.iter() {
-        //                 kwargs.push((k, crate::library::std::code::runtime_pyo3::rkyv_serialized_value_to_pyany(py, v)));
-        //             }
-        //         }
-        //     }
-        //
-        //     let args = PyTuple::new(py, &args);
-        //     let kwargs = kwargs.into_iter().into_py_dict(py);
-        //
-        //     let result = py_func.call(args, Some(kwargs))?;
-        //     let output: Vec<String> = receiver.try_iter().collect();
-        //     Ok((crate::library::std::code::runtime_pyo3::pyany_to_rkyv_serialized_value(result), output))
-        // } else {
-        //     Err(anyhow::anyhow!("Function not found"))
-        // }
-
-
         let mut source = String::new();
         source.push_str("\n");
         source.push_str(&source_code);

@@ -159,7 +159,7 @@ impl InstancedEnvironment {
     /// Increment the execution graph by one step
     #[tracing::instrument]
     pub(crate) async fn step(&mut self) -> Vec<(usize, RkyvSerializedValue)> {
-        println!("Executing state with id {:?}", self.execution_head_state_id);
+        println!("======================= Executing state with id {:?} ======================", self.execution_head_state_id);
         let ((state_id, state), outputs) = self.db.external_step_execution(self.execution_head_state_id).await;
         if let Some(sender) = self.runtime_event_sender.as_mut() {
             sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
@@ -462,6 +462,8 @@ mod tests {
                                            None);
         assert_eq!(op_id_x, 0);
         let (_, op_id_y) = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
+            function_invocation: false,
+            configuration: HashMap::new(),
             name: None,
             provider: SupportedModelProviders::OpenAI,
             req: "\
@@ -506,6 +508,8 @@ mod tests {
                                            None);
         assert_eq!(op_id_x, 0);
         let (_, op_id_y) = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
+            function_invocation: false,
+            configuration: HashMap::new(),
             name: Some("generate_names".to_string()),
             provider: SupportedModelProviders::OpenAI,
             req: "\
@@ -800,6 +804,7 @@ mod tests {
         env.get_state().render_dependency_graph();
         env.step().await;
         env.step().await;
+        assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
     }
 
     #[tokio::test]
@@ -811,8 +816,21 @@ mod tests {
         env.get_state().render_dependency_graph();
         env.step().await;
         env.step().await;
+        assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
     }
 
 
+    #[tokio::test]
+    async fn test_core5_prompts_invoking_code() {
+        let mut ee = Chidori::new();
+        ee.load_md_directory(Path::new("./examples/core5_prompts_invoking_code")).unwrap();
+        let mut env = ee.get_instance().unwrap();
+        env.reload_cells();
+        env.get_state().render_dependency_graph();
+        env.step().await;
+        env.step().await;
+        env.step().await;
+        assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
+    }
 }
 

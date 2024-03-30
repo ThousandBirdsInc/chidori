@@ -1,7 +1,12 @@
+
+mod patch_asyncio;
+
+use std::pin::Pin;
 use chidori_static_analysis::language::python::parse::{
     build_report, extract_dependencies_python,
 };
 
+use futures_util::FutureExt;
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyCFunction, PyDict, PyList, PySet, PyTuple};
 use std::sync::mpsc::{self, Sender};
@@ -12,10 +17,16 @@ use std::sync::mpsc::{self, Sender};
 
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue};
 use std::collections::HashMap;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+use anyhow::Error;
+use pyo3_asyncio::generic;
 use tokio::runtime::Runtime;
+use chidori_static_analysis::language::Report;
 // use rustpython_vm::PyObjectRef;
-use crate::cells::{CellTypes, CodeCell};
+use crate::cells::{CellTypes, CodeCell, LLMPromptCell};
 use crate::execution::execution::ExecutionState;
+
 
 fn pyany_to_rkyv_serialized_value(p: &PyAny) -> RkyvSerializedValue {
     match p.get_type().name() {
@@ -62,7 +73,7 @@ fn pyany_to_rkyv_serialized_value(p: &PyAny) -> RkyvSerializedValue {
                 RkyvSerializedValue::Object(map)
             }
             x @ _  => {
-                println!("Py03 marshalling unsupported type: {}", x);
+                panic!("Py03 marshalling unsupported type: {}", x);
                 RkyvSerializedValue::Null
             },
         },
@@ -139,21 +150,24 @@ fn invoke(py: Python, arg: PyObject) -> PyResult<PyObject> {
 // TODO: need to be able to capture output results
 
 #[pyclass]
-struct LoggingStdout {
+struct LoggingToChannel {
     sender: Sender<String>,
 }
 
-impl LoggingStdout {
+impl LoggingToChannel {
     fn new(sender: Sender<String>) -> Self {
-        LoggingStdout { sender }
+        LoggingToChannel { sender }
     }
 }
 
 #[pymethods]
-impl LoggingStdout {
+impl LoggingToChannel {
     fn write(&mut self, data: &str) {
         let _ = self.sender.send(data.to_string());
         // You might want to handle the error in real code
+    }
+
+    fn flush(&mut self) {
     }
 }
 
@@ -169,7 +183,16 @@ async fn execute_async_block(total_arg_payload: RkyvSerializedValue, cell: &Cell
             crate::cells::code_cell::code_cell(&c)
         }
         CellTypes::Prompt(c) => {
-            crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
+            let mut c = c.clone();
+            match c {
+                LLMPromptCell::Chat{ref mut function_invocation, ..} => {
+                    *function_invocation = true;
+                    crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
+                }
+                _ => {
+                    crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
+                }
+            }
         }
         _ => {
             unreachable!("Unsupported cell type");
@@ -177,6 +200,7 @@ async fn execute_async_block(total_arg_payload: RkyvSerializedValue, cell: &Cell
     };
 
     // invocation of the operation
+    // TODO: the total arg payload here does not include necessary function calls for this cell itself
     op.execute(&ExecutionState::new(), total_arg_payload, None).await
 }
 
@@ -185,128 +209,133 @@ pub async fn source_code_run_python(
     source_code: &String,
     payload: &RkyvSerializedValue,
     function_invocation: &Option<String>,
-) -> anyhow::Result<(RkyvSerializedValue, Vec<String>)> {
+) -> anyhow::Result<(RkyvSerializedValue, Vec<String>, Vec<String>)> {
     pyo3::prepare_freethreaded_python();
-    let (sender, receiver) = mpsc::channel();
+    let (sender_stdout, receiver_stdout) = mpsc::channel();
+    let (sender_stderr, receiver_stderr) = mpsc::channel();
 
     let dependencies = extract_dependencies_python(&source_code);
     let report = build_report(&dependencies);
 
-    return Python::with_gil(|py| {
+    let result =  Python::with_gil(|py| {
+        let current_event_loop = pyo3_asyncio::tokio::get_current_loop(py);
+
+        // Initialize our event loop if one is not established
+        let event_loop = if current_event_loop.is_err() {
+            let asyncio = py.import("asyncio")?;
+            let event_loop = asyncio.call_method0("new_event_loop")?;
+            asyncio.call_method1("set_event_loop", (event_loop,))?;
+            // let nest_asyncio = patch_asyncio::get_module(py)?;
+            // nest_asyncio.getattr("apply")?.call0()?;
+            event_loop
+        } else {
+            current_event_loop.unwrap()
+        };
+
         // Configure locals and globals passed to evaluation
-        let locals = PyDict::new(py);
         let globals = PyDict::new(py);
+        create_function_shims(payload, &report, py, globals)?;
 
-        // Create shims for functions that are referred to, we look at what functions are being provided
-        // and create shims for matches between the function name provided and the identifiers referred to.
-        if let RkyvSerializedValue::Object(ref payload_map) = payload {
-            if let Some(RkyvSerializedValue::Object(functions_map)) = payload_map.get("functions") {
-                for (function_name, value) in functions_map {
-                    let clone_function_name = function_name.clone();
-                    if let RkyvSerializedValue::Cell(cell) = value.clone() {
-                        if let CellTypes::Code(CodeCell { .. }) = &cell
-                        {
-                            if report
-                                .cell_depended_values
-                                .contains_key(&clone_function_name)
-                            {
-                                let closure_callable = PyCFunction::new_closure(
-                                    py,
-                                    None,
-                                    None,
-                                    move |args: &PyTuple, kwargs: Option<&PyDict>| {
-                                        let total_arg_payload = RkyvObjectBuilder::new();
-                                        let total_arg_payload =
-                                            total_arg_payload.insert_value("args", {
-                                                let mut m = HashMap::new();
-                                                for (i, a) in args.iter().enumerate() {
-                                                    m.insert(
-                                                        format!("{}", i),
-                                                        pyany_to_rkyv_serialized_value(a),
-                                                    );
-                                                }
-                                                RkyvSerializedValue::Object(m)
-                                            });
-
-                                        let total_arg_payload = if let Some(kwargs) = kwargs {
-                                            total_arg_payload.insert_value("kwargs", {
-                                                let mut m = HashMap::new();
-                                                for (i, a) in kwargs.iter() {
-                                                    let k: String = i.extract()?;
-                                                    m.insert(k, pyany_to_rkyv_serialized_value(a));
-                                                }
-                                                RkyvSerializedValue::Object(m)
-                                            })
-                                        } else {
-                                            total_arg_payload
-                                        }.build();
-                                        let cell = cell.clone();
-                                        let clone_function_name = clone_function_name.clone();
-                                        let py = args.py();
-                                        pyo3_asyncio::tokio::run(py, async move {
-                                            let result = execute_async_block(total_arg_payload, &cell, &clone_function_name).await;
-                                            // Conversion back to python types
-                                            Python::with_gil(|py| PyResult::Ok(rkyv_serialized_value_to_pyany(py, &result)))
-                                        })
-                                    },
-                                )?;
-                                globals.set_item(function_name.clone(), closure_callable);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let output = Arc::new(Mutex::new(HashMap::new()));
 
         // Create new module
         let chidori_module = PyModule::new(py, "chidori")?;
         chidori_module.add_function(wrap_pyfunction!(on_event, chidori_module)?)?;
         chidori_module.add_function(wrap_pyfunction!(identity_function, chidori_module)?)?;
+        let output_clone = output.clone();
+        let chidori_set_value = PyCFunction::new_closure(
+            py,
+            None,
+            None,
+            move |args: &PyTuple, kwargs: Option<&PyDict>| {
+                if args.len() == 2 {
+                    let name: String = args.get_item(0).unwrap().extract::<String>().unwrap();
+                    let mut output_lock = output_clone.lock().unwrap();
+                    let value = args.get_item(1).unwrap(); // Keep as PyAny
+                    output_lock.insert(name, pyany_to_rkyv_serialized_value(value));
+                }
+            },
+        )?;
+        chidori_module.add("set_value", chidori_set_value)?;
 
         // Import and get sys.modules
         let sys = py.import("sys")?;
         let py_modules = sys.getattr("modules")?;
 
-        // Insert foo into sys.modules
+        // Insert our custom module
         py_modules.set_item("chidori", chidori_module)?;
 
         // Set up capture of stdout from python process and storing it into a Vec
-        let stdout_capture = LoggingStdout::new(sender);
+        let stdout_capture = LoggingToChannel::new(sender_stdout);
         let stdout_capture_py = stdout_capture.into_py(py);
+        let stderr_capture = LoggingToChannel::new(sender_stderr);
+        let stderr_capture_py = stderr_capture.into_py(py);
 
         sys.setattr("stdout", stdout_capture_py)?;
+        sys.setattr("stderr", stderr_capture_py)?;
 
         if let RkyvSerializedValue::Object(ref payload_map) = payload {
             if let Some(RkyvSerializedValue::Object(globals_map)) = payload_map.get("globals") {
                 for (key, value) in globals_map {
+                    println!("Setting globals {}: {:?}", key, value);
                     let py_value = rkyv_serialized_value_to_pyany(py, value); // Implement this function to convert RkyvSerializedValue to PyObject
                     globals.set_item(key, py_value)?;
                 }
             }
         }
 
+        // Add recording of specific values to the source code since we're going to wrap it
+        let mut initial_source_code = source_code.clone();
+
+        // If any instances of these lines are located, skip wrapping anything because the code will initialize its own async runtime.
+        let does_contain_async_runtime = initial_source_code
+            .lines()
+            .any(|line| line.contains("asyncio.run") || line.contains("unittest.IsolatedAsyncioTestCase") || line.contains("loadTestsFromTestCase"));
+
+        let complete_code = if does_contain_async_runtime {
+            // If we have an async function, we don't need to wrap it in an async function
+            initial_source_code
+        } else {
+            for (name, report_item) in &report.cell_exposed_values {
+                initial_source_code.push_str("\n");
+                initial_source_code.push_str(&format!(
+                    r#"chidori.set_value("{name}", {name})"#,
+                    name = name
+                ));
+            }
+            for (name, report_item) in &report.triggerable_functions {
+                initial_source_code.push_str("\n");
+                initial_source_code.push_str(&format!(
+                    r#"globals()["{name}"] = {name}"#,
+                    name = name
+                ));
+            }
+            let indent_all_source_code = initial_source_code.lines().map(|line| format!("    {}", line)).collect::<Vec<_>>().join("\n");
+            // Wrap all of our code in a top level async wrapper
+            format!(r#"
+import asyncio
+import chidori
+async def __wrapper():
+{}
+asyncio.run(__wrapper())
+        "#, indent_all_source_code)
+        };
+
         // Important: this is the point of initial execution of the source code
-        py.run(&source_code, Some(globals), Some(locals)).unwrap();
+        py.run(&complete_code, Some(globals), None).unwrap();
 
         // With the source environment established, we can now invoke specific methods provided by this node
         return match function_invocation {
             None => {
-                let mut result_map = HashMap::new();
-                for (name, report_item) in &report.cell_exposed_values {
-                    let local = locals.get_item(name);
-                    if let Ok(Some(local)) = local {
-                        let parsed = pyany_to_rkyv_serialized_value(local);
-                        result_map.insert(name.clone(), parsed);
-                    }
-                }
-                let output: Vec<String> = receiver.try_iter().collect();
-                Ok((RkyvSerializedValue::Object(result_map), output))
+                let output_lock = output.lock().unwrap().clone();
+                Ok(Box::pin(async move {
+                    RkyvSerializedValue::Object(output_lock)
+                }) as Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>>)
             }
             Some(name) => {
-                let local = locals.get_item(name)?;
+                let local = globals.get_item(name)?;
                 if let Some(py_func) = local {
                     // Call the function
-
                     let mut args: Vec<Py<PyAny>> = vec![];
                     let mut kwargs = vec![];
                     if let RkyvSerializedValue::Object(ref payload_map) = payload {
@@ -338,32 +367,102 @@ pub async fn source_code_run_python(
                     let kwargs = kwargs.into_iter().into_py_dict(py);
 
                     let result = py_func.call(args, Some(kwargs))?;
-                    let output: Vec<String> = receiver.try_iter().collect();
-                    Ok((pyany_to_rkyv_serialized_value(result), output))
+                    if result.get_type().name().unwrap() == "coroutine" {
+                        // If the function is a coroutine, we need to await it
+                        let f = pyo3_asyncio::tokio::into_future(result)?;
+                        Ok(Box::pin(async move {
+                            let py_any = &f.await.unwrap();
+                            Python::with_gil(|py| {
+                                let py_any: &PyAny = py_any.as_ref(py);
+                                pyany_to_rkyv_serialized_value(py_any)
+                            })
+                        }) as Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>>)
+                    } else {
+                        let result: PyObject = result.into_py(py);
+                        Ok(Box::pin(async move {
+                            Python::with_gil(|py| {
+                                let py_any: &PyAny = result.as_ref(py);
+                                pyany_to_rkyv_serialized_value(py_any)
+                            })
+                        }) as Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>>)
+                    }
                 } else {
                     Err(anyhow::anyhow!("Function not found"))
                 }
             }
-        };
+        }
     });
+    let output_stdout: Vec<String> = receiver_stdout.try_iter().collect();
+    let output_stderr: Vec<String> = receiver_stderr.try_iter().collect();
+    if let Ok(result) = result {
+        Ok((result.await, output_stdout, output_stderr))
+    } else {
+        return Err(anyhow::anyhow!("No result"));
+    }
 }
 
-// #[pymodule]
-// mod rust_py_module {
-//     use super::*;
-//
-//     #[pyfunction]
-//     fn suspend(_vm: &VirtualMachine) -> PyResult<usize> {
-//         // TODO: we can get the frame and we can get the locals and globals
-//         // TODO: question is if we can store that frame somehow
-//         // TODO: and can we resume it later
-//         // dbg!(vm.current_frame());
-//         // dbg!(vm.current_locals());
-//         // dbg!(vm.current_globals());
-//         println!("suspension_function");
-//         Ok(1)
-//     }
-// }
+fn create_function_shims(payload: &RkyvSerializedValue, report: &Report, py: Python, globals: &PyDict) -> Result<(), Error> {
+    // Create shims for functions that are referred to, we look at what functions are being provided
+    // and create shims for matches between the function name provided and the identifiers referred to.
+    if let RkyvSerializedValue::Object(ref payload_map) = payload {
+        if let Some(RkyvSerializedValue::Object(functions_map)) = payload_map.get("functions") {
+            for (function_name, value) in functions_map {
+                let clone_function_name = function_name.clone();
+                if let RkyvSerializedValue::Cell(cell) = value.clone() {
+                    if report
+                        .cell_depended_values
+                        .contains_key(&clone_function_name)
+                    {
+                        let closure_callable = PyCFunction::new_closure(
+                            py,
+                            None,
+                            None,
+                            move |args: &PyTuple, kwargs: Option<&PyDict>| -> PyResult<PyObject> {
+                                let total_arg_payload = RkyvObjectBuilder::new();
+                                let total_arg_payload =
+                                    total_arg_payload.insert_value("args", {
+                                        let mut m = HashMap::new();
+                                        for (i, a) in args.iter().enumerate() {
+                                            m.insert(
+                                                format!("{}", i),
+                                                pyany_to_rkyv_serialized_value(a),
+                                            );
+                                        }
+                                        RkyvSerializedValue::Object(m)
+                                    });
+
+                                let total_arg_payload = if let Some(kwargs) = kwargs {
+                                    total_arg_payload.insert_value("kwargs", {
+                                        let mut m = HashMap::new();
+                                        for (i, a) in kwargs.iter() {
+                                            let k: String = i.extract()?;
+                                            m.insert(k, pyany_to_rkyv_serialized_value(a));
+                                        }
+                                        RkyvSerializedValue::Object(m)
+                                    })
+                                } else {
+                                    total_arg_payload
+                                }.build();
+                                let cell = cell.clone();
+                                let clone_function_name = clone_function_name.clone();
+                                let py = args.py();
+
+                                // All function calls across cells are forced to be async
+                                pyo3_asyncio::tokio::future_into_py(py, async move {
+                                    let result = execute_async_block(total_arg_payload, &cell, &clone_function_name).await;
+                                    PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result)))
+                                }).map(|x| x.into())
+                            },
+                        )?;
+                        globals.set_item(function_name.clone(), closure_callable);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -413,6 +512,7 @@ li = [x, y]
                         ]),
                     )
                 ])),
+                vec![],
                 vec![]
             )
         );
@@ -430,7 +530,8 @@ print("testing")
             result.unwrap(),
             (
                 RkyvSerializedValue::Object(HashMap::from_iter(vec![])),
-                vec![String::from("testing"), String::from("\n")]
+                vec![String::from("testing"), String::from("\n")],
+                vec![]
             )
         );
     }
@@ -452,7 +553,7 @@ def example():
             &RkyvSerializedValue::Null,
             &Some("example".to_string()),
         ).await;
-        assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(20), vec![]));
+        assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(20), vec![], vec![]));
     }
 
     #[tokio::test]
@@ -473,14 +574,14 @@ def example(x):
                 .build(),
             &Some("example".to_string()),
         ).await;
-        assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(25), vec![]));
+        assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(25), vec![], vec![]));
     }
 
     #[tokio::test]
     async fn test_execution_of_python_with_function_provided_via_cell() {
         let source_code = String::from(
             r#"
-a = 20 + demo()
+a = 20 + await demo()
         "#,
         );
         let result = source_code_run_python(
@@ -509,9 +610,152 @@ a = 20 + demo()
             result.unwrap(),
             (
                 RkyvObjectBuilder::new().insert_number("a", 120).build(),
+                vec![],
                 vec![]
             )
         );
+    }
+
+    #[tokio::test]
+    async fn test_running_async_function_dependency_and_exposing_async_data() {
+        let source_code = String::from(
+            r#"
+data = await demo()
+        "#,
+        );
+        let result = source_code_run_python(
+            &source_code,
+            &RkyvObjectBuilder::new()
+                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
+                .insert_object(
+                    "functions",
+                    RkyvObjectBuilder::new().insert_value(
+                        "demo",
+                        RkyvSerializedValue::Cell(CellTypes::Code(CodeCell {
+                            name: None,
+                            language: SupportedLanguage::PyO3,
+                            source_code: String::from(indoc! {r#"
+                        import asyncio
+                        async def demo():
+                            await asyncio.sleep(1)
+                            return 100
+                        "#}),
+                            function_invocation: None,
+                        })),
+                    ),
+                )
+                .build(),
+            &None,
+        ).await;
+        assert_eq!(
+            result.unwrap(),
+            (
+                RkyvObjectBuilder::new().insert_number("a", 120).build(),
+                vec![],
+                vec![]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chain_of_dependent_python_functions() {
+        // TODO: this should validate that we can invoke a function that depends on another function
+        let source_code = String::from(
+            r#"
+data = await demo()
+        "#,
+        );
+        let result = source_code_run_python(
+            &source_code,
+            &RkyvObjectBuilder::new()
+                .insert_object(
+                    "functions",
+                    RkyvObjectBuilder::new().insert_value(
+                        "demo",
+                        RkyvSerializedValue::Cell(CellTypes::Code(CodeCell {
+                            name: None,
+                            language: SupportedLanguage::PyO3,
+                            source_code: String::from(indoc! {r#"
+                        import asyncio
+                        async def demo():
+                            await asyncio.sleep(1)
+                            return 100
+                        "#}),
+                            function_invocation: None,
+                        })),
+                    ),
+                )
+                .build(),
+            &None,
+        ).await;
+        assert_eq!(
+            result.unwrap(),
+            (
+                RkyvObjectBuilder::new().build(),
+                vec![],
+                vec![]
+            )
+        );
+    }
+
+
+
+    #[tokio::test]
+    async fn test_running_sync_unit_test() {
+        let source_code = String::from(
+            r#"
+import unittest
+
+def addTwo(x):
+    return x + 2
+
+class TestMarshalledValues(unittest.TestCase):
+    def test_addTwo(self):
+        self.assertEqual(addTwo(2), 4)
+
+unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
+        "#,
+        );
+        let result = source_code_run_python(
+            &source_code,
+            &RkyvObjectBuilder::new()
+                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
+                .build(),
+            &None,
+        ).await;
+        let (result, _, stderr) = result.unwrap();
+        assert_eq!(stderr.iter().filter(|x| x.contains("Ran 1 test")).count(), 1);
+        assert_eq!(stderr.iter().filter(|x| x.contains("OK")).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_running_async_unit_test() {
+        let source_code = String::from(
+            r#"
+import unittest
+import asyncio
+
+async def add(a, b):
+    await asyncio.sleep(1)
+    return a + b
+
+class TestMarshalledValues(unittest.IsolatedAsyncioTestCase):
+    async def test_run_prompt(self):
+        self.assertEqual(await add(2, 2), 4)
+
+unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
+        "#,
+        );
+        let result = source_code_run_python(
+            &source_code,
+            &RkyvObjectBuilder::new()
+                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
+                .build(),
+            &None,
+        ).await;
+        let (result, _, stderr) = result.unwrap();
+        assert_eq!(stderr.iter().filter(|x| x.contains("Ran 1 test")).count(), 1);
+        assert_eq!(stderr.iter().filter(|x| x.contains("OK")).count(), 1);
     }
 
     // TODO: the expected behavior is that as we execute the function again and again from another location, the state mutates
@@ -534,7 +778,7 @@ def example(x):
                 .build(),
             &Some("example".to_string()),
         ).await;
-        assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(1), vec![]));
+        assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(1), vec![], vec![]));
         let result = source_code_run_python(
             &source_code,
             &RkyvObjectBuilder::new()
@@ -542,6 +786,6 @@ def example(x):
                 .build(),
             &Some("example".to_string()),
         ).await;
-        assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(2), vec![]));
+        assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(2), vec![], vec![]));
     }
 }

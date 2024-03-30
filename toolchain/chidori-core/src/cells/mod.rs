@@ -5,6 +5,7 @@ pub mod llm_prompt_cell;
 mod memory_cell;
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use ts_rs::TS;
 use rkyv::{Archive, Deserialize, Serialize};
 use crate::library::std::ai::llm::ChatModelBatch;
@@ -244,6 +245,8 @@ pub enum SupportedModelProviders {
 #[ts(export, export_to = "package_node/types/")]
 pub enum LLMPromptCell {
     Chat {
+        function_invocation: bool,
+        configuration: HashMap<String, String>,
         name: Option<String>,
         provider: SupportedModelProviders,
         req: String,

@@ -112,6 +112,8 @@ pub fn interpret_code_block(block: &MarkdownCodeBlock) -> Option<CellTypes> {
             }))
         },
         "prompt" => Some(CellTypes::Prompt(LLMPromptCell::Chat {
+            function_invocation: false,
+            configuration: block.configuration.clone(),
             name: block.name.clone(),
             provider: SupportedModelProviders::OpenAI,
             req: block.body.clone(),

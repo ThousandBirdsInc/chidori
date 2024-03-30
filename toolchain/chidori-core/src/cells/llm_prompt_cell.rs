@@ -13,14 +13,24 @@ use futures_util::FutureExt;
 #[tracing::instrument]
 pub fn llm_prompt_cell(cell: &LLMPromptCell) -> OperationNode {
     match cell {
-        LLMPromptCell::Chat { name, provider, req, .. } => {
+        LLMPromptCell::Chat {function_invocation, configuration, name, provider, req, .. } => {
             let schema =
                 chidori_prompt_format::templating::templates::analyze_referenced_partials(&req);
             let role_blocks =
                 chidori_prompt_format::templating::templates::extract_roles_from_template(&req);
 
             let mut output_signature = OutputSignature::new();
+            if let Some(fn_name) = configuration.get("fn") {
+                output_signature.functions.insert(
+                    fn_name.clone(),
+                    OutputItemConfiguation {
+                        ty: Some(InputType::String),
+                    },
+                );
+            }
             if let Some(name)  = name {
+                // The result of executing the prompt is available as the name of the cell
+                // when the cell is named.
                 output_signature.globals.insert(
                     name.clone(),
                     OutputItemConfiguation {
@@ -30,24 +40,30 @@ pub fn llm_prompt_cell(cell: &LLMPromptCell) -> OperationNode {
             }
 
             let mut input_signature = InputSignature::new();
-            for (key, value) in &schema.items {
-                // input_signature.kwargs.insert(
-                //     key.clone(),
-                //     InputItemConfiguation {
-                //         ty: Some(InputType::String),
-                //         default: None,
-                //     },
-                // );
-                input_signature.globals.insert(
-                    key.clone(),
-                    InputItemConfiguation {
-                        ty: Some(InputType::String),
-                        default: None,
-                    },
-                );
+            // We only require the globals to be passed in if the user has not specified this prompt as a function
+            if configuration.get("fn").is_none() {
+                for (key, value) in &schema.items {
+                    // input_signature.kwargs.insert(
+                    //     key.clone(),
+                    //     InputItemConfiguation {
+                    //         ty: Some(InputType::String),
+                    //         default: None,
+                    //     },
+                    // );
+                    input_signature.globals.insert(
+                        key.clone(),
+                        InputItemConfiguation {
+                            ty: Some(InputType::String),
+                            default: None,
+                        },
+                    );
+                }
             }
 
+
             let name = name.clone();
+            let configuration = configuration.clone();
+            let function_invocation = function_invocation.clone();
             match provider {
                 SupportedModelProviders::OpenAI => OperationNode::new(
                     name.clone(),
@@ -56,6 +72,10 @@ pub fn llm_prompt_cell(cell: &LLMPromptCell) -> OperationNode {
                     Box::new(move |x, _| {
                         let role_blocks = role_blocks.clone();
                         let name = name.clone();
+                        dbg!(&function_invocation);
+                        if configuration.get("fn").is_some() && !function_invocation {
+                            return async move { RkyvSerializedValue::Null }.boxed();
+                        }
                         async move {
                             let mut template_messages: Vec<TemplateMessage> = Vec::new();
                             let data = if let RKV::Object(m) = x {
@@ -82,13 +102,11 @@ pub fn llm_prompt_cell(cell: &LLMPromptCell) -> OperationNode {
                             // TODO: replace this to being fetched from configuration
                             let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
                             let c = crate::library::std::ai::llm::openai::OpenAIChatModel::new(api_key);
-                            let result =
-                                    c.batch(ChatCompletionReq {
-                                        model: "gpt-3.5-turbo".to_string(),
-                                        template_messages,
-                                        ..ChatCompletionReq::default()
-                                    })
-                                        .await;
+                            let result = c.batch(ChatCompletionReq {
+                                model: "gpt-3.5-turbo".to_string(),
+                                template_messages,
+                                ..ChatCompletionReq::default()
+                            }).await;
                             if let Ok(ChatCompletionRes { choices, .. }) = result {
                                 let mut result_map = HashMap::new();
                                 if let Some(name) = &name {

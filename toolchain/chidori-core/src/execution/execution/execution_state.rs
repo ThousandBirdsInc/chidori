@@ -25,7 +25,7 @@ use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 use futures_util::FutureExt;
 use tokio::runtime::Runtime;
-use crate::cells::{CellTypes, CodeCell};
+use crate::cells::{CellTypes, CodeCell, get_cell_name};
 use crate::execution::execution::execution_graph::ExecutionNodeId;
 
 pub enum OperationExecutionStatusOption {
@@ -114,7 +114,7 @@ pub struct ExecutionState {
 
     /// Note what keys have _ever_ been set, which is an optimization to avoid needing to do
     /// a complete historical traversal to verify that a value has been set.
-    has_been_set: ImHashSet<usize>,
+    pub has_been_set: ImHashSet<usize>,
 
     /// Dependency graph of the computable elements in the graph
     ///
@@ -190,6 +190,10 @@ impl ExecutionState {
         }
     }
 
+    pub fn have_all_operations_been_set_at_least_once(&self) -> bool {
+        return self.has_been_set.len() == self.operation_by_id.len()
+    }
+
     pub fn state_get(&self, operation_id: &OperationId) -> Option<&RkyvSerializedValue> {
         self.state.get(operation_id).map(|x| x.as_ref())
     }
@@ -218,8 +222,18 @@ impl ExecutionState {
             Dot::with_attr_getters(
                 &self.get_dependency_graph(),
                 &[],
-                &|_, _| String::new(),
-                &|_, _| String::new()
+                &|_, e| String::new(), // Edge attributes, assuming you don't need to modify this
+                &|_, n| {
+                    // Node attributes
+                    if let Some(op) = self.operation_by_id.get(n.1) {
+                        let op = op.lock().unwrap();
+                        let default = format!("{:?}", n.1);
+                        let name = get_cell_name(&op.cell).as_ref().unwrap_or(&default);
+                        format!("label=\"{}\"", name) // Assuming get_name() fetches the cell name
+                    } else {
+                        String::new()
+                    }
+                }
             )
         );
     }
@@ -331,6 +345,8 @@ impl ExecutionState {
 
         let mut outputs = vec![];
         let operation_ids: Vec<OperationId> = operation_by_id.keys().copied().collect();
+
+
 
         // Every step, each operation consumes from its incoming edges.
         'traverse_nodes: for operation_id in operation_ids {
