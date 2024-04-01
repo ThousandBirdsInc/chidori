@@ -1,6 +1,4 @@
 
-mod patch_asyncio;
-
 use std::pin::Pin;
 use chidori_static_analysis::language::python::parse::{
     build_report, extract_dependencies_python,
@@ -225,8 +223,6 @@ pub async fn source_code_run_python(
             let asyncio = py.import("asyncio")?;
             let event_loop = asyncio.call_method0("new_event_loop")?;
             asyncio.call_method1("set_event_loop", (event_loop,))?;
-            // let nest_asyncio = patch_asyncio::get_module(py)?;
-            // nest_asyncio.getattr("apply")?.call0()?;
             event_loop
         } else {
             current_event_loop.unwrap()
@@ -303,6 +299,7 @@ pub async fn source_code_run_python(
                     name = name
                 ));
             }
+            // Necessary to expose defined functions to the global scope from the inside of the __wrapper function
             for (name, report_item) in &report.triggerable_functions {
                 initial_source_code.push_str("\n");
                 initial_source_code.push_str(&format!(
@@ -371,6 +368,7 @@ asyncio.run(__wrapper())
                         // If the function is a coroutine, we need to await it
                         let f = pyo3_asyncio::tokio::into_future(result)?;
                         Ok(Box::pin(async move {
+                            // TODO: these should return Result so that we don't unwrap here
                             let py_any = &f.await.unwrap();
                             Python::with_gil(|py| {
                                 let py_any: &PyAny = py_any.as_ref(py);
@@ -617,7 +615,7 @@ a = 20 + await demo()
     }
 
     #[tokio::test]
-    async fn test_running_async_function_dependency_and_exposing_async_data() {
+    async fn test_running_async_function_dependency() {
         let source_code = String::from(
             r#"
 data = await demo()
@@ -650,7 +648,7 @@ data = await demo()
         assert_eq!(
             result.unwrap(),
             (
-                RkyvObjectBuilder::new().insert_number("a", 120).build(),
+                RkyvObjectBuilder::new().insert_number("data", 100).build(),
                 vec![],
                 vec![]
             )
@@ -658,7 +656,7 @@ data = await demo()
     }
 
     #[tokio::test]
-    async fn test_chain_of_dependent_python_functions() {
+    async fn test_chain_of_multiple_dependent_python_functions() {
         // TODO: this should validate that we can invoke a function that depends on another function
         let source_code = String::from(
             r#"

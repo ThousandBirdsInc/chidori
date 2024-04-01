@@ -46,7 +46,7 @@ pub fn template_cell(cell: &TemplateCell) -> OperationNode {
         cell.name.clone(),
         input_signature,
         output_signature,
-        Box::new(move |x, _| {
+        Box::new(move |_, x, _| {
             let body = body.clone();
             async move {
                 let data = if let RKV::Object(m) = x {

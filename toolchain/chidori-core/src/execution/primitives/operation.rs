@@ -226,7 +226,7 @@ enum Mutability {
 /// It is up to the user to structure those maps in such a way that they don't collide with other
 /// values being represented in the state of our system. These inputs and outputs are managed
 /// by our Execution Database.
-pub type OperationFn = dyn Fn(RkyvSerializedValue, Option<Sender<((usize, usize), RkyvSerializedValue)>>) -> Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>> + Send;
+pub type OperationFn = dyn Fn(&ExecutionState, RkyvSerializedValue, Option<Sender<((usize, usize), RkyvSerializedValue)>>) -> Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>> + Send;
 
 // TODO: rather than dep_count operation node should have a specific dep mapping
 pub struct OperationNode {
@@ -321,7 +321,7 @@ impl Default for OperationNode {
             height: 0,
             dirty: true,
             signature: Signature::new(),
-            operation: Box::new(|x, _| async move { x }.boxed()),
+            operation: Box::new(|_, x, _| async move { x }.boxed()),
             arity: 0,
             unresolved_dependencies: vec![],
             partial_application: Vec::new(),
@@ -355,7 +355,7 @@ impl OperationNode {
     #[tracing::instrument]
     pub(crate) fn execute(&self, state: &ExecutionState, argument_payload: RkyvSerializedValue, tx: Option<Sender<((usize, usize), RkyvSerializedValue)>>) -> Pin<Box<dyn Future<Output=RkyvSerializedValue> + Send>> {
         let exec = self.operation.deref();
-        exec(argument_payload, tx)
+        exec(state, argument_payload, tx)
     }
 }
 
@@ -370,7 +370,7 @@ mod tests {
     async fn test_execute_with_operation() {
         let mut executed = false;
         let operation: Box<OperationFn> =
-            Box::new(|context, _| { async move { RkyvSerializedValue::Boolean(true) }.boxed() });
+            Box::new(|_, context, _| { async move { RkyvSerializedValue::Boolean(true) }.boxed() });
 
         let mut node = OperationNode::default();
         node.operation = operation;
@@ -393,7 +393,7 @@ mod tests {
 
         // Define a closure of type `dyn Fn()`
 
-        let closure: Box<OperationFn> = Box::new(|_,_ | {
+        let closure: Box<OperationFn> = Box::new(|_, _,_ | {
             async move {
                 println!("Executing closure in a thread!");
                 RkyvSerializedValue::Null
@@ -413,7 +413,8 @@ mod tests {
             let handle = thread::spawn(move || {
                 // Lock the mutex and execute the closure
                 let closure = closure_clone.lock().unwrap();
-                (*closure)(RkyvSerializedValue::Null, None);
+                let s = ExecutionState::new();
+                (*closure)(&s, RkyvSerializedValue::Null, None);
             });
 
             handles.push(handle);

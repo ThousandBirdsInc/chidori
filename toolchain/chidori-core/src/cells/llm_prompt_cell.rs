@@ -69,7 +69,7 @@ pub fn llm_prompt_cell(cell: &LLMPromptCell) -> OperationNode {
                     name.clone(),
                     input_signature,
                     output_signature,
-                    Box::new(move |x, _| {
+                    Box::new(move |_, x, _| {
                         let role_blocks = role_blocks.clone();
                         let name = name.clone();
                         dbg!(&function_invocation);
@@ -127,13 +127,13 @@ pub fn llm_prompt_cell(cell: &LLMPromptCell) -> OperationNode {
             None,
             InputSignature::new(),
             OutputSignature::new(),
-            Box::new(|x, _| async move { x }.boxed()),
+            Box::new(|_, x, _| async move { x }.boxed()),
         ),
         LLMPromptCell::Embedding { .. } => OperationNode::new(
             None,
             InputSignature::new(),
             OutputSignature::new(),
-            Box::new(|x, _|  async move { x }.boxed()),
+            Box::new(|_, x, _|  async move { x }.boxed()),
         ),
     }
 }

@@ -98,7 +98,6 @@ impl Debug for ExecutionStateEvaluation {
 #[derive(Clone)]
 pub struct ExecutionState {
     // TODO: update all operations to use this id instead of a separate representation
-    id: (usize, usize),
     pub(crate) op_counter: usize,
 
     pub state: ImHashMap<usize, Arc<RkyvSerializedValue>>,
@@ -178,7 +177,6 @@ fn render_map_as_table(exec_state: &ExecutionState) -> String {
 impl ExecutionState {
     pub fn new() -> Self {
         ExecutionState {
-            id: (0, 0),
             op_counter: 0,
             state: Default::default(),
             operation_name_to_id: Default::default(),

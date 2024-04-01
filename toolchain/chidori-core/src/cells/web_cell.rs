@@ -27,7 +27,7 @@ pub fn web_cell(cell: &WebserviceCell) -> OperationNode {
         cell.name.clone(),
         input_signature,
         output_signature,
-        Box::new(move |x, _| {
+        Box::new(move |_, x, _| {
             // TODO: this needs to handle stdout and errors
             let cell = cell.clone();
             async move {

@@ -38,7 +38,7 @@ pub fn memory_cell(cell: &MemoryCell) -> OperationNode {
                 None,
                 input_signature,
                 output_signature,
-                Box::new(move |x, _| {
+                Box::new(move |_, x, _| {
                     // TODO: this needs to handle stdout and errors
                     async move { x}.boxed()
                 }),
