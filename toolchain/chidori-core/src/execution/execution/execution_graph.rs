@@ -7,8 +7,8 @@ use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
-// use std::sync::{Mutex};
-use no_deadlocks::Mutex;
+use std::sync::{Mutex};
+// use no_deadlocks::Mutex;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use futures_util::FutureExt;
@@ -83,7 +83,7 @@ impl<'de> Deserialize<'de> for MergedStateHistory {
 
 /// This models the network of reactive relationships between different components.
 ///
-/// This is heavily inspired by works such as Salsa, Verde, Incremental, Adapton, and Differential Dataflow.
+/// This was initially inspired by works such as Salsa, Verde, Incremental, Adapton, and Differential Dataflow.
 pub struct ExecutionGraph {
     /// Global revision number for modifications to the graph itself
     revision: usize,
@@ -1249,54 +1249,4 @@ mod tests {
         // dbg!(db.get_merged_state_history(state_id));
     }
 
-    #[tokio::test]
-    async fn test_future_behavior() {
-        use std::pin::Pin;
-        use std::task::{Context, Poll};
-        use futures::Future;
-        use tokio::sync::oneshot;
-        use tokio::sync::oneshot::{Receiver, Sender};
-
-        // TODO: this needs to be wrapped in something to hold its already calculated state, caching the result
-        // when it actually has been resolved
-
-        // MyFuture struct as defined earlier
-        struct MyFuture {
-            receiver: Option<Receiver<i32>>,
-            cached_result: Option<i32>,
-        }
-
-        impl Future for MyFuture {
-            type Output = Option<i32>;
-
-            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                if let Some(rx) = self.receiver.as_mut() {
-                    match rx.poll_unpin(cx) {
-                        Poll::Ready(Ok(value)) => Poll::Ready(Some(value)),
-                        Poll::Ready(Err(_)) => Poll::Ready(None), // Channel was closed
-                        Poll::Pending => Poll::Pending,
-                    }
-                } else {
-                    Poll::Ready(None) // Receiver was already taken and we received nothing
-                }
-            }
-        }
-
-        Runtime::new().unwrap().block_on(async move {
-            // Simulating some asynchronous work that sends a value through the oneshot channel
-            let (sender, rx) = oneshot::channel();
-            let my_future = MyFuture { receiver: Some(rx), cached_result: None };
-            tokio::spawn(async move {
-                // Simulate some work with a delay
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                sender.send(42).expect("Failed to send value");
-            });
-
-            // Await the MyFuture, which internally awaits the oneshot receiver
-            match my_future.await {
-                Some(value) => println!("Received: {}", value),
-                None => println!("Did not receive any value"),
-            }
-        });
-    }
 }

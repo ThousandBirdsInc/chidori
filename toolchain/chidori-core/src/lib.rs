@@ -1,3 +1,6 @@
+#![feature(coroutines)]
+#![feature(coroutine_trait)]
+
 #![allow(warnings)]
 #![feature(is_sorted)]
 extern crate protobuf;

@@ -204,6 +204,7 @@ async fn execute_async_block(total_arg_payload: RkyvSerializedValue, cell: &Cell
 
 
 pub async fn source_code_run_python(
+    execution_state: &ExecutionState,
     source_code: &String,
     payload: &RkyvSerializedValue,
     function_invocation: &Option<String>,
@@ -416,31 +417,7 @@ fn create_function_shims(payload: &RkyvSerializedValue, report: &Report, py: Pyt
                             None,
                             None,
                             move |args: &PyTuple, kwargs: Option<&PyDict>| -> PyResult<PyObject> {
-                                let total_arg_payload = RkyvObjectBuilder::new();
-                                let total_arg_payload =
-                                    total_arg_payload.insert_value("args", {
-                                        let mut m = HashMap::new();
-                                        for (i, a) in args.iter().enumerate() {
-                                            m.insert(
-                                                format!("{}", i),
-                                                pyany_to_rkyv_serialized_value(a),
-                                            );
-                                        }
-                                        RkyvSerializedValue::Object(m)
-                                    });
-
-                                let total_arg_payload = if let Some(kwargs) = kwargs {
-                                    total_arg_payload.insert_value("kwargs", {
-                                        let mut m = HashMap::new();
-                                        for (i, a) in kwargs.iter() {
-                                            let k: String = i.extract()?;
-                                            m.insert(k, pyany_to_rkyv_serialized_value(a));
-                                        }
-                                        RkyvSerializedValue::Object(m)
-                                    })
-                                } else {
-                                    total_arg_payload
-                                }.build();
+                                let total_arg_payload = python_args_to_rkyv(args, kwargs)?;
                                 let cell = cell.clone();
                                 let clone_function_name = clone_function_name.clone();
                                 let py = args.py();
@@ -459,6 +436,35 @@ fn create_function_shims(payload: &RkyvSerializedValue, report: &Report, py: Pyt
         }
     }
     Ok(())
+}
+
+fn python_args_to_rkyv(args: &PyTuple, kwargs: Option<&PyDict>) -> Result<RkyvSerializedValue, PyErr> {
+    let total_arg_payload = RkyvObjectBuilder::new();
+    let total_arg_payload =
+        total_arg_payload.insert_value("args", {
+            let mut m = HashMap::new();
+            for (i, a) in args.iter().enumerate() {
+                m.insert(
+                    format!("{}", i),
+                    pyany_to_rkyv_serialized_value(a),
+                );
+            }
+            RkyvSerializedValue::Object(m)
+        });
+
+    let total_arg_payload = if let Some(kwargs) = kwargs {
+        total_arg_payload.insert_value("kwargs", {
+            let mut m = HashMap::new();
+            for (i, a) in kwargs.iter() {
+                let k: String = i.extract()?;
+                m.insert(k, pyany_to_rkyv_serialized_value(a));
+            }
+            RkyvSerializedValue::Object(m)
+        })
+    } else {
+        total_arg_payload
+    }.build();
+    Ok(total_arg_payload)
 }
 
 
@@ -495,7 +501,7 @@ x = 12 + y
 li = [x, y]
         "#,
         );
-        let result = source_code_run_python(&source_code, &RkyvSerializedValue::Null, &None).await;
+        let result = source_code_run_python(&ExecutionState::new(), &source_code, &RkyvSerializedValue::Null, &None).await;
         assert_eq!(
             result.unwrap(),
             (
@@ -523,7 +529,7 @@ li = [x, y]
 print("testing")
         "#,
         );
-        let result = source_code_run_python(&source_code, &RkyvSerializedValue::Null, &None).await;
+        let result = source_code_run_python(&ExecutionState::new(), &source_code, &RkyvSerializedValue::Null, &None).await;
         assert_eq!(
             result.unwrap(),
             (
@@ -546,8 +552,8 @@ def example():
     return a
         "#,
         );
-        let result = source_code_run_python(
-            &source_code,
+        let result = source_code_run_python(&ExecutionState::new(),
+                                            &source_code,
             &RkyvSerializedValue::Null,
             &Some("example".to_string()),
         ).await;
@@ -565,8 +571,8 @@ def example(x):
     return a
         "#,
         );
-        let result = source_code_run_python(
-            &source_code,
+        let result = source_code_run_python(&ExecutionState::new(),
+                                            &source_code,
             &RkyvObjectBuilder::new()
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
@@ -582,8 +588,8 @@ def example(x):
 a = 20 + await demo()
         "#,
         );
-        let result = source_code_run_python(
-            &source_code,
+        let result = source_code_run_python(&ExecutionState::new(),
+                                            &source_code,
             &RkyvObjectBuilder::new()
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .insert_object(
@@ -621,8 +627,8 @@ a = 20 + await demo()
 data = await demo()
         "#,
         );
-        let result = source_code_run_python(
-            &source_code,
+        let result = source_code_run_python(&ExecutionState::new(),
+                                            &source_code,
             &RkyvObjectBuilder::new()
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .insert_object(
@@ -663,8 +669,8 @@ data = await demo()
 data = await demo()
         "#,
         );
-        let result = source_code_run_python(
-            &source_code,
+        let result = source_code_run_python(&ExecutionState::new(),
+                                            &source_code,
             &RkyvObjectBuilder::new()
                 .insert_object(
                     "functions",
@@ -714,8 +720,8 @@ class TestMarshalledValues(unittest.TestCase):
 unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
         "#,
         );
-        let result = source_code_run_python(
-            &source_code,
+        let result = source_code_run_python(&ExecutionState::new(),
+                                            &source_code,
             &RkyvObjectBuilder::new()
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
@@ -744,8 +750,8 @@ class TestMarshalledValues(unittest.IsolatedAsyncioTestCase):
 unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
         "#,
         );
-        let result = source_code_run_python(
-            &source_code,
+        let result = source_code_run_python(&ExecutionState::new(),
+                                            &source_code,
             &RkyvObjectBuilder::new()
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
@@ -769,16 +775,16 @@ def example(x):
     return a
         "#,
         );
-        let result = source_code_run_python(
-            &source_code,
+        let result = source_code_run_python(&ExecutionState::new(),
+                                            &source_code,
             &RkyvObjectBuilder::new()
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
             &Some("example".to_string()),
         ).await;
         assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(1), vec![], vec![]));
-        let result = source_code_run_python(
-            &source_code,
+        let result = source_code_run_python(&ExecutionState::new(),
+                                            &source_code,
             &RkyvObjectBuilder::new()
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),

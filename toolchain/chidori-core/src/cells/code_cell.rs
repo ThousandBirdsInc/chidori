@@ -50,11 +50,13 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
                 cell.name.clone(),
                 input_signature,
                 output_signature,
-                Box::new(move |_, x, _| {
+                Box::new(move |s, x, _| {
                     let cell = cell.clone();
                     // TODO: this needs to handle stdout and errors
+                    let s = s.clone();
                     async move {
                         crate::library::std::code::runtime_pyo3::source_code_run_python(
+                            &s,
                             &cell.source_code,
                             &x,
                             &cell.function_invocation,

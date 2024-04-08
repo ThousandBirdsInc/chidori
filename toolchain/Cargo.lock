@@ -1075,6 +1075,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "ts-rs",
+ "typed-arena",
  "typescript-type-def",
  "uuid",
  "yaml-front-matter",

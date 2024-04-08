@@ -53,6 +53,7 @@ rand = "0.8"
 async-trait = "0.1.69"
 dotenv = "0.15.0"
 futures-util = "0.3.28"
+typed-arena = "2.0.1"
 
 
 # Support for parsing python

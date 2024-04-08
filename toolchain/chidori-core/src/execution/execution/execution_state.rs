@@ -10,7 +10,7 @@ use petgraph::Direction;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::{Debug, Formatter};
-use std::ops::Deref;
+use std::ops::{Coroutine, CoroutineState, Deref};
 use std::sync::{Arc, mpsc};
 // use std::sync::{Mutex};
 use no_deadlocks::Mutex;
@@ -25,7 +25,7 @@ use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 use futures_util::FutureExt;
 use tokio::runtime::Runtime;
-use crate::cells::{CellTypes, CodeCell, get_cell_name};
+use crate::cells::{CellTypes, CodeCell, get_cell_name, LLMPromptCell};
 use crate::execution::execution::execution_graph::ExecutionNodeId;
 
 pub enum OperationExecutionStatusOption {
@@ -94,11 +94,23 @@ impl Debug for ExecutionStateEvaluation {
     }
 }
 
+
+enum CoroutineYieldValue {
+    Value(RkyvSerializedValue),
+    Coroutine(Box<dyn Coroutine<Return=CoroutineYieldValue, Yield=CoroutineYieldValue>>),
+}
+
+
+
+
 // TODO: make this thread-safe
 #[derive(Clone)]
 pub struct ExecutionState {
     // TODO: update all operations to use this id instead of a separate representation
     pub(crate) op_counter: usize,
+
+    // TODO: call_stack is only ever a single coroutine at a time and instead its the stack of execution states being resolved?
+    // pub call_stack: Arc<Mutex<Pin<Box<dyn Coroutine<Return=CoroutineYieldValue, Yield=CoroutineYieldValue>>>>>,
 
     pub state: ImHashMap<usize, Arc<RkyvSerializedValue>>,
 
@@ -178,6 +190,7 @@ impl ExecutionState {
     pub fn new() -> Self {
         ExecutionState {
             op_counter: 0,
+            // call_stack: Default::default(),
             state: Default::default(),
             operation_name_to_id: Default::default(),
             operation_by_id: Default::default(),
@@ -313,20 +326,105 @@ impl ExecutionState {
         s
     }
 
+    fn get_callable_functions(&mut self) {
+        for (id, op) in &self.operation_by_id {
+            let mut op_node = op
+                .lock()
+                .unwrap();
+            for (function_name, function_config) in &op_node.signature.output_signature.functions {
+                self.function_name_to_operation_id.insert(function_name.clone(), id.clone());
+            }
+        }
+    }
+
     /// Invoke a function made available by the execution state, this accepts arguments derived in the context
     /// of a parent function's scope. This targets a specific function by name that we've identified a dependence on.
-    pub fn dispatch(&self, function_name: &str, payload: RkyvSerializedValue) {
+    // TODO: this should create a coroutine that yields with the result of the function invocation
+    pub async fn dispatch(&self, function_name: &str, payload: RkyvSerializedValue) -> ExecutionState {
         // Store the invocation payload into an execution state and record this before executing
         let mut state = self.clone();
-        state.state_insert(usize::MAX, payload);
+        state.state_insert(usize::MAX, payload.clone());
 
-        self.function_name_to_operation_id.get(function_name).map(|op_id| {
+        let op = self.function_name_to_operation_id.get(function_name).map(|op_id| {
             let op = state.operation_by_id.get(op_id).unwrap().lock().unwrap();
-            op.execute(&state, RkyvSerializedValue::Object(HashMap::new()), None);
+            op
         });
+        let cell = &op.unwrap().cell.clone();
+
+        // modify code cell to indicate execution of the target function
+        // reconstruction of the cell
+        let clone_function_name = function_name.to_string();
+        let mut op = match cell {
+            CellTypes::Code(c) => {
+                let mut c = c.clone();
+                c.function_invocation =
+                    Some(clone_function_name.to_string());
+                crate::cells::code_cell::code_cell(&c)
+            }
+            CellTypes::Prompt(c) => {
+                let mut c = c.clone();
+                match c {
+                    LLMPromptCell::Chat{ref mut function_invocation, ..} => {
+                        *function_invocation = true;
+                        crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
+                    }
+                    _ => {
+                        crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
+                    }
+                }
+            }
+            _ => {
+                unreachable!("Unsupported cell type");
+            }
+        };
+
+        // invocation of the operation
+        // TODO: the total arg payload here does not include necessary function calls for this cell itself
+        let result = op.execute(&ExecutionState::new(), payload, None).await;
 
         // TODO: return the result, which we will use in the context of the parent function
+        self.clone()
     }
+
+    /// Steps through the execution of the current stack of coroutines, progressing execution of our agent.
+    // TODO: this stack needs enough metadata to restore a state of previous execution
+    // fn get_from_stack(&self) -> ExecutionState {
+    //     let last: Arc<Mutex<Pin<Box<dyn Coroutine<Return=CoroutineYieldValue, Yield=CoroutineYieldValue>>>>> = self.call_stack.last_mut();
+    //     let mut last = last.lock().unwrap().as_mut();
+    //     let mut cr = last.resume(());
+    //     match cr {
+    //         CoroutineState::Yielded(v) => {
+    //             let mut call_stack = self.call_stack.clone();
+    //             match v {
+    //                 CoroutineYieldValue::Value(v) => {
+    //                     dbg!(v);
+    //                 }
+    //                 CoroutineYieldValue::Coroutine(c) => {
+    //                     call_stack.push(Arc::new(Mutex::new(Box::into_pin(c))));
+    //                 }
+    //             }
+    //             let mut n = self.clone();
+    //             n.call_stack = call_stack;
+    //             n
+    //         }
+    //         CoroutineState::Complete(c) =>  {
+    //             let mut call_stack = self.call_stack.clone();
+    //             call_stack.pop();
+    //             match c {
+    //                 CoroutineYieldValue::Value(v) => {
+    //                     dbg!(v);
+    //                 }
+    //                 CoroutineYieldValue::Coroutine(c) => {
+    //                     call_stack.push(Arc::new(Mutex::new(Box::into_pin(c))));
+    //                 }
+    //             }
+    //             let mut n = self.clone();
+    //             n.call_stack = call_stack;
+    //             n
+    //         },
+    //         _ => panic!("unexpected return from resume"),
+    //     }
+    // }
 
 
     // TODO: extend this with an "event", steps can occur as events are flushed based on a previous state we were in
@@ -343,8 +441,6 @@ impl ExecutionState {
 
         let mut outputs = vec![];
         let operation_ids: Vec<OperationId> = operation_by_id.keys().copied().collect();
-
-
 
         // Every step, each operation consumes from its incoming edges.
         'traverse_nodes: for operation_id in operation_ids {
@@ -447,7 +543,6 @@ impl ExecutionState {
             let op_node_execute = op_node.execute(&self, argument_payload, None);
             if op_node.is_async {
                 let sender_clone = sender.clone();
-                let state_clone = self.clone();
                 let (oneshot_sender, oneshot_receiver) = tokio::sync::oneshot::channel();
 
                 // Run the target long running function in a background thread
