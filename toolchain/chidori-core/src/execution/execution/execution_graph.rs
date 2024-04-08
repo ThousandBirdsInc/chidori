@@ -259,117 +259,6 @@ impl ExecutionGraph {
         MergedStateHistory(merged_state)
     }
 
-    #[tracing::instrument]
-    pub fn mutate_graph(
-        &mut self,
-        prev_execution_id: ExecutionNodeId,
-        previous_state: &ExecutionStateEvaluation,
-        cell: CellTypes,
-        op_id: Option<usize>,
-    ) -> (
-        ((usize, usize), ExecutionState), // the resulting total state of this step
-        usize, // id of the new operation
-    ) {
-        let previous_state = match previous_state {
-            ExecutionStateEvaluation::Complete(state) => state,
-            ExecutionStateEvaluation::Executing(_) => panic!("Cannot mutate a graph that is currently executing"),
-        };
-
-        let mut op = match &cell {
-            CellTypes::Code(c) => crate::cells::code_cell::code_cell(c),
-            CellTypes::Prompt(c) => crate::cells::llm_prompt_cell::llm_prompt_cell(c),
-            CellTypes::Web(c) => crate::cells::web_cell::web_cell(c),
-            CellTypes::Template(c) => crate::cells::template_cell::template_cell(c),
-        };
-        op.attach_cell(cell);
-        let (op_id, new_state) = previous_state.upsert_operation(op, op_id);
-        let mutations = Self::assign_dependencies_to_operations(&new_state);
-        let final_state = new_state.apply_dependency_graph_mutations(mutations);
-        let resulting_state_id = self.progress_graph(prev_execution_id, ExecutionStateEvaluation::Complete(final_state.clone()));
-        ((resulting_state_id, final_state), op_id)
-    }
-
-    fn assign_dependencies_to_operations(new_state: &ExecutionState) -> Vec<DependencyGraphMutation> {
-        let (available_values, available_functions) = Self::get_possible_dependencies(new_state);
-
-        // TODO: we need to report on INVOKED functions - these functions are calls to
-        //       functions with the locals assigned in a particular way. But then how do we handle compositions of these?
-        //       Well we just need to invoke them in the correct pattern as determined by operations in that context.
-
-        // Anywhere there is a matched value, we create a dependency graph edge
-        let mut mutations = vec![];
-
-        // let mut unsatisfied_dependencies = vec![];
-        // For each destination cell, we inspect their input signatures and accumulate the
-        // mutation operations that we need to apply to the dependency graph.
-        for (destination_cell_id, op) in new_state.operation_by_id.iter() {
-            let operation = op.lock().unwrap();
-            let input_signature = &operation.signature.input_signature;
-            let mut accum = vec![];
-            for (value_name, value) in input_signature.globals.iter() {
-
-                // TODO: we need to handle collisions between the two of these
-                if let Some(source_cell_id) = available_functions.get(value_name) {
-                    if source_cell_id != &destination_cell_id {
-                        accum.push((
-                            *source_cell_id.clone(),
-                            DependencyReference::FunctionInvocation(value_name.to_string()),
-                        ));
-                    }
-                }
-
-                if let Some(source_cell_id) = available_values.get(value_name) {
-                    if source_cell_id != &destination_cell_id {
-                        accum.push((
-                            *source_cell_id.clone(),
-                            DependencyReference::Global(value_name.to_string()),
-                        ));
-                    }
-                }
-                // unsatisfied_dependencies.push(value_name.clone())
-            }
-            if accum.len() > 0 {
-                mutations.push(DependencyGraphMutation::Create {
-                    operation_id: destination_cell_id.clone(),
-                    depends_on: accum,
-                });
-            }
-        }
-        mutations
-    }
-
-    fn get_possible_dependencies(new_state: &ExecutionState) -> (HashMap<String, &OperationId>, HashMap<String, &OperationId>) {
-        // TODO: when there is a dependency on a function invocation we need to
-        //       instantiate a new instance of the function operation node.
-        //       It itself is not part of the call graph until it has such a dependency.
-
-        // TODO: Store trigger-able functions that may be passed as values as well
-
-        let mut available_values = HashMap::new();
-        let mut available_functions = HashMap::new();
-
-        // For all reported cells, add their exposed values to the available values
-        for (id, op) in new_state.operation_by_id.iter() {
-            let output_signature = &op.lock().unwrap().signature.output_signature;
-
-            // Store values that are available as globals
-            for (key, value) in output_signature.globals.iter() {
-                let insert_result = available_values.insert(key.clone(), id);
-                if insert_result.is_some() {
-                    panic!("Naming collision detected for value {}", key);
-                }
-            }
-
-            for (key, value) in output_signature.functions.iter() {
-                let insert_result = available_functions.insert(key.clone(), id);
-                if insert_result.is_some() {
-                    panic!("Naming collision detected for value {}", key);
-                }
-            }
-        }
-        (available_values, available_functions)
-    }
-
     fn progress_graph(&mut self, prev_execution_id: ExecutionNodeId, new_state: ExecutionStateEvaluation) -> ExecutionNodeId {
         // The edge from this node is the greatest branching id + 1
         // if we re-evaluate execution at a given node, we get a new execution branch.
@@ -411,7 +300,7 @@ impl ExecutionGraph {
 
 
     #[tracing::instrument]
-    pub fn external_mutate_graph(
+    pub fn mutate_graph(
         &mut self,
         prev_execution_id: ExecutionNodeId,
         cell: CellTypes,
@@ -422,7 +311,12 @@ impl ExecutionGraph {
     ) {
         let state = self.get_state_at_id(prev_execution_id);
         if let Some(state) = state {
-            self.mutate_graph(prev_execution_id, &state, cell, op_id)
+            let (final_state, op_id2) = match &state {
+                ExecutionStateEvaluation::Complete(state1) => state1.update_op(cell, op_id),
+                ExecutionStateEvaluation::Executing(_) => panic!("Cannot mutate a graph that is currently executing"),
+            };
+            let resulting_state_id = self.progress_graph(prev_execution_id, ExecutionStateEvaluation::Complete(final_state.clone()));
+            ((resulting_state_id, final_state), op_id2)
         } else {
             panic!("No state found for id {:?}", prev_execution_id);
         }

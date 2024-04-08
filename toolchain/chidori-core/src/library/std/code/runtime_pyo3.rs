@@ -16,6 +16,7 @@ use std::sync::mpsc::{self, Sender};
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue};
 use std::collections::HashMap;
 use std::future::Future;
+use std::mem;
 use std::sync::{Arc, Mutex};
 use anyhow::Error;
 use pyo3_asyncio::generic;
@@ -231,7 +232,8 @@ pub async fn source_code_run_python(
 
         // Configure locals and globals passed to evaluation
         let globals = PyDict::new(py);
-        create_function_shims(payload, &report, py, globals)?;
+        let execution_state = Arc::new(Mutex::new(execution_state.clone()));
+        create_function_shims(&execution_state, &report, py, globals)?;
 
         let output = Arc::new(Mutex::new(HashMap::new()));
 
@@ -400,39 +402,57 @@ asyncio.run(__wrapper())
     }
 }
 
-fn create_function_shims(payload: &RkyvSerializedValue, report: &Report, py: Python, globals: &PyDict) -> Result<(), Error> {
+fn create_function_shims(execution_state_handle: &Arc<Mutex<ExecutionState>>, report: &Report, py: Python, globals: &PyDict) -> Result<(), Error> {
     // Create shims for functions that are referred to, we look at what functions are being provided
     // and create shims for matches between the function name provided and the identifiers referred to.
-    if let RkyvSerializedValue::Object(ref payload_map) = payload {
-        if let Some(RkyvSerializedValue::Object(functions_map)) = payload_map.get("functions") {
-            for (function_name, value) in functions_map {
-                let clone_function_name = function_name.clone();
-                if let RkyvSerializedValue::Cell(cell) = value.clone() {
-                    if report
-                        .cell_depended_values
-                        .contains_key(&clone_function_name)
-                    {
-                        let closure_callable = PyCFunction::new_closure(
-                            py,
-                            None,
-                            None,
-                            move |args: &PyTuple, kwargs: Option<&PyDict>| -> PyResult<PyObject> {
-                                let total_arg_payload = python_args_to_rkyv(args, kwargs)?;
-                                let cell = cell.clone();
-                                let clone_function_name = clone_function_name.clone();
-                                let py = args.py();
 
-                                // All function calls across cells are forced to be async
-                                pyo3_asyncio::tokio::future_into_py(py, async move {
-                                    let result = execute_async_block(total_arg_payload, &cell, &clone_function_name).await;
-                                    PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result)))
-                                }).map(|x| x.into())
-                            },
-                        )?;
-                        globals.set_item(function_name.clone(), closure_callable);
-                    }
-                }
-            }
+    let function_names = {
+        let execution_state_handle = execution_state_handle.clone();
+        let mut exec_state = execution_state_handle.lock().unwrap();
+        exec_state.function_name_to_operation_id.keys().cloned().collect::<Vec<_>>()
+    };
+    for function_name in function_names {
+        if report
+            .cell_depended_values
+            .contains_key(&function_name)
+        {
+            let clone_function_name = function_name.clone();
+            let execution_state_handle = execution_state_handle.clone();
+            let closure_callable = PyCFunction::new_closure(
+                py,
+                None, // name
+                None, // doc
+                move |args: &PyTuple, kwargs: Option<&PyDict>| -> PyResult<PyObject> {
+                    let total_arg_payload = python_args_to_rkyv(args, kwargs)?;
+                    let clone_function_name = clone_function_name.clone();
+                    let py = args.py();
+
+                    // All function calls across cells are forced to be async
+                    // TODO: clone the execution state, sending it to the execution graph and use the dispatch method to execute the code
+                    // TODO: we want to fetch the execution state at the time this function is called
+                    // TODO: this needs an Arc to something that holds our latest execution state
+
+                    // TODO: replace the execution state here and notify the execution graph that we have a new execution state generated
+                    //       HOW do we do this in a transactional way?
+                    let mut exec_state = execution_state_handle.lock().unwrap();
+                    let mut new_exec_state = exec_state.clone();
+                    // TODO: update the state with the args we're about to execute
+
+                    std::mem::swap(&mut *exec_state, &mut new_exec_state);
+
+
+                    pyo3_asyncio::tokio::future_into_py(py, async move {
+                        // TODO: await here, before we execute the dispatch, pausing before running the next operation
+                        let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload).await;
+                        // let result = execute_async_block(total_arg_payload, &cell, &clone_function_name).await;
+                        // TODO: await here, after we execute the dispatch, pausing before running the next operation
+                        PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result)))
+                    }).map(|x| x.into())
+                },
+            )?;
+            // TODO: this should get something that identifies some kind of signal
+            //       for how to fetch the execution state
+            globals.set_item(function_name.clone(), closure_callable);
         }
     }
     Ok(())
@@ -588,25 +608,20 @@ def example(x):
 a = 20 + await demo()
         "#,
         );
-        let result = source_code_run_python(&ExecutionState::new(),
-                                            &source_code,
-            &RkyvObjectBuilder::new()
-                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
-                .insert_object(
-                    "functions",
-                    RkyvObjectBuilder::new().insert_value(
-                        "demo",
-                        RkyvSerializedValue::Cell(CellTypes::Code(CodeCell {
-                            name: None,
-                            language: SupportedLanguage::PyO3,
-                            source_code: String::from(indoc! {r#"
+        let mut state = ExecutionState::new();
+        let (state, _) = state.update_op(CellTypes::Code(CodeCell {
+            name: None,
+            language: SupportedLanguage::PyO3,
+            source_code: String::from(indoc! {r#"
                         def demo():
                             return 100
                         "#}),
-                            function_invocation: None,
-                        })),
-                    ),
-                )
+            function_invocation: None,
+        }), Some(0));
+        let result = source_code_run_python(&state,
+                                            &source_code,
+            &RkyvObjectBuilder::new()
+                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
             &None,
         ).await;
@@ -627,27 +642,23 @@ a = 20 + await demo()
 data = await demo()
         "#,
         );
-        let result = source_code_run_python(&ExecutionState::new(),
-                                            &source_code,
-            &RkyvObjectBuilder::new()
-                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
-                .insert_object(
-                    "functions",
-                    RkyvObjectBuilder::new().insert_value(
-                        "demo",
-                        RkyvSerializedValue::Cell(CellTypes::Code(CodeCell {
-                            name: None,
-                            language: SupportedLanguage::PyO3,
-                            source_code: String::from(indoc! {r#"
+        let mut state = ExecutionState::new();
+        let (state, _) = state.update_op(CellTypes::Code(CodeCell {
+            name: None,
+            language: SupportedLanguage::PyO3,
+            source_code: String::from(indoc! {r#"
                         import asyncio
                         async def demo():
                             await asyncio.sleep(1)
                             return 100
                         "#}),
-                            function_invocation: None,
-                        })),
-                    ),
-                )
+            function_invocation: None,
+        }), Some(0));
+        let result = source_code_run_python(&state,
+                                            &source_code,
+            &RkyvObjectBuilder::new()
+                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
+
                 .build(),
             &None,
         ).await;
@@ -669,33 +680,39 @@ data = await demo()
 data = await demo()
         "#,
         );
-        let result = source_code_run_python(&ExecutionState::new(),
-                                            &source_code,
-            &RkyvObjectBuilder::new()
-                .insert_object(
-                    "functions",
-                    RkyvObjectBuilder::new().insert_value(
-                        "demo",
-                        RkyvSerializedValue::Cell(CellTypes::Code(CodeCell {
-                            name: None,
-                            language: SupportedLanguage::PyO3,
-                            source_code: String::from(indoc! {r#"
+        let mut state = ExecutionState::new();
+        let (mut state, _) = state.update_op(CellTypes::Code(CodeCell {
+            name: None,
+            language: SupportedLanguage::PyO3,
+            source_code: String::from(indoc! {r#"
                         import asyncio
                         async def demo():
                             await asyncio.sleep(1)
+                            return 100 + await demo_second_function_call()
+                        "#}),
+            function_invocation: None,
+        }), Some(0));
+        let (state, _) = state.update_op(CellTypes::Code(CodeCell {
+            name: None,
+            language: SupportedLanguage::PyO3,
+            source_code: String::from(indoc! {r#"
+                        import asyncio
+                        async def demo_second_function_call():
+                            await asyncio.sleep(1)
                             return 100
                         "#}),
-                            function_invocation: None,
-                        })),
-                    ),
-                )
+            function_invocation: None,
+        }), Some(1));
+        let result = source_code_run_python(&state,
+                                            &source_code,
+            &RkyvObjectBuilder::new()
                 .build(),
             &None,
         ).await;
         assert_eq!(
             result.unwrap(),
             (
-                RkyvObjectBuilder::new().build(),
+                RkyvObjectBuilder::new().insert_number("data", 200).build(),
                 vec![],
                 vec![]
             )

@@ -63,21 +63,11 @@ struct MyOpState {
     output: Option<RkyvSerializedValue>,
     payload: RkyvSerializedValue,
     cell_depended_values: HashMap<String, String>,
+    execution_state_handle: Arc<Mutex<ExecutionState>>,
     functions: HashMap<
         String,
         InternalClosureFnMut,
     >,
-}
-
-impl MyOpState {
-    fn new(payload: RkyvSerializedValue) -> Self {
-        MyOpState {
-            output: None,
-            payload,
-            cell_depended_values: Default::default(),
-            functions: HashMap::new(),
-        }
-    }
 }
 
 #[op2]
@@ -265,9 +255,8 @@ fn op_set_globals<'scope>(
     // create shims for functions that are referred to
     // TODO: differentiate async vs sync functions
     let mut js_code = String::new();
-    let cell_depended_values = my_op_state.cell_depended_values.clone();
     for (function_name, function) in
-    create_function_shims(&my_op_state.payload, cell_depended_values).unwrap()
+    create_function_shims(&my_op_state.execution_state_handle, &my_op_state.cell_depended_values).unwrap()
     {
         my_op_state
             .functions
@@ -296,85 +285,69 @@ type InternalClosureFnMut = Box<
 >;
 
 fn create_function_shims(
-    payload: &RkyvSerializedValue,
-    cell_depended_values: HashMap<String, String>,
+    execution_state_handle: &Arc<Mutex<ExecutionState>>,
+    cell_depended_values: &HashMap<String, String>,
 ) -> Result<Vec<(String, InternalClosureFnMut)>, ()> {
     let mut functions = Vec::new();
     // Create shims for functions that are referred to, we look at what functions are being provided
     // and create shims for matches between the function name provided and the identifiers referred to.
-    if let RkyvSerializedValue::Object(ref payload_map) = payload {
-        if let Some(RkyvSerializedValue::Object(functions_map)) = payload_map.get("functions") {
-            for (function_name, value) in functions_map {
-                let clone_function_name = function_name.clone();
-                // TODO: handle llm cells invoked as functions by name
-                if let RkyvSerializedValue::Cell(cell) = value.clone() {
-                    if cell_depended_values.contains_key(&clone_function_name) {
-                            let closure_callable: InternalClosureFnMut  = Box::new(move |args: Vec<RkyvSerializedValue>, kwargs: Option<HashMap<String, RkyvSerializedValue>>| {
-                                let cell = cell.clone();
-                                let clone_function_name = clone_function_name.clone();
-                                async move {
-                                    let total_arg_payload = RkyvObjectBuilder::new();
-                                    let total_arg_payload = total_arg_payload.insert_value("args", {
-                                        let mut m = HashMap::new();
-                                        for (i, a) in args.iter().enumerate() {
-                                            m.insert(format!("{}", i), a.clone());
-                                        }
-                                        RkyvSerializedValue::Object(m)
-                                    });
-
-                                    let total_arg_payload = if let Some(kwargs) = kwargs {
-                                        total_arg_payload.insert_value("kwargs", {
-                                            let mut m = HashMap::new();
-                                            for (k, a) in kwargs.iter() {
-                                                m.insert(k.clone(), a.clone());
-                                            }
-                                            RkyvSerializedValue::Object(m)
-                                        })
-                                    } else {
-                                        total_arg_payload
-                                    };
-
-                                    // modify code cell to indicate execution of the target function
-                                    // reconstruction of the cell
-                                    let mut op = match &cell {
-                                        CellTypes::Code(c) => {
-                                            let mut c = c.clone();
-                                            c.function_invocation = Some(clone_function_name.clone());
-                                            crate::cells::code_cell::code_cell(&c)
-                                        }
-                                        CellTypes::Prompt(c) => {
-                                            let mut c = c.clone();
-                                            match c {
-                                                LLMPromptCell::Chat{ref mut function_invocation, ..} => {
-                                                    *function_invocation = true;
-                                                    crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
-                                                }
-                                                _ => {
-                                                    crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
-                                                }
-                                            }
-                                        },
-                                        _ => {
-                                            unreachable!("Unsupported cell type");
-                                        }
-                                    };
-
-                                    // invocation of the operation
-                                    let result = op.execute(&ExecutionState::new(), total_arg_payload.build(), None).await;
-                                    return result;
-                                }.boxed()
-                            });
-                            functions.push((function_name.clone(), closure_callable));
-                        }
-                }
-            }
+    let function_names = {
+        let execution_state_handle = execution_state_handle.clone();
+        let mut exec_state = execution_state_handle.lock().unwrap();
+        exec_state.function_name_to_operation_id.keys().cloned().collect::<Vec<_>>()
+    };
+    for function_name in function_names {
+        if cell_depended_values.contains_key(&function_name) {
+            let clone_function_name = function_name.clone();
+            let execution_state_handle = execution_state_handle.clone();
+            let closure_callable: InternalClosureFnMut  = Box::new(move |args: Vec<RkyvSerializedValue>, kwargs: Option<HashMap<String, RkyvSerializedValue>>| {
+                let clone_function_name = clone_function_name.clone();
+                let execution_state_handle = execution_state_handle.clone();
+                async move {
+                    let total_arg_payload = js_args_to_rkyv(args, kwargs);
+                    let mut new_exec_state = {
+                        let mut exec_state = execution_state_handle.lock().unwrap();
+                        let mut v = exec_state.clone();
+                        std::mem::swap(&mut *exec_state, &mut v);
+                        v
+                    };
+                    let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload).await;
+                    return result;
+                }.boxed()
+            });
+            functions.push((function_name.clone(), closure_callable));
         }
     }
     Ok(functions)
 }
 
+fn js_args_to_rkyv(args: Vec<RkyvSerializedValue>, kwargs: Option<HashMap<String, RkyvSerializedValue>>) -> RkyvSerializedValue {
+    let total_arg_payload = RkyvObjectBuilder::new();
+    let total_arg_payload = total_arg_payload.insert_value("args", {
+        let mut m = HashMap::new();
+        for (i, a) in args.iter().enumerate() {
+            m.insert(format!("{}", i), a.clone());
+        }
+        RkyvSerializedValue::Object(m)
+    });
+
+    let total_arg_payload = if let Some(kwargs) = kwargs {
+        total_arg_payload.insert_value("kwargs", {
+            let mut m = HashMap::new();
+            for (k, a) in kwargs.iter() {
+                m.insert(k.clone(), a.clone());
+            }
+            RkyvSerializedValue::Object(m)
+        })
+    } else {
+        total_arg_payload
+    };
+    total_arg_payload.build()
+}
+
 
 pub async fn source_code_run_deno(
+    execution_state: &ExecutionState,
     source_code: &String,
     payload: &RkyvSerializedValue,
     function_invocation: &Option<String>,
@@ -387,20 +360,18 @@ pub async fn source_code_run_deno(
 
     // A list of function names this block of code is depending on existing
     let mut cell_depended_values = HashMap::new();
-    if let RkyvSerializedValue::Object(ref payload_map) = payload {
-        if let Some(RkyvSerializedValue::Object(functions_map)) = payload_map.get("functions") {
-            for (function_name, value) in functions_map {
-                cell_depended_values.insert(function_name.clone(), function_name.clone());
-            }
-        }
-    }
+    report.cell_depended_values.iter().for_each(|(k, _)| {
+        cell_depended_values.insert(k.clone(), k.clone());
+    });
 
+    let execution_state_handle = Arc::new(Mutex::new(execution_state.clone()));
     // TODO: this needs to capture stdout similar to how we do with python
     let my_op_state = Arc::new(Mutex::new(MyOpState {
         output: None,
         payload: payload.clone(),
-        cell_depended_values: cell_depended_values,
+        cell_depended_values,
         functions: Default::default(),
+        execution_state_handle
     }));
 
     let my_op_state_clone = my_op_state.clone();
@@ -562,27 +533,24 @@ mod tests {
     #[tokio::test]
     async fn test_source_code_run_with_external_function_invocation() {
         let source_code = String::from(r#"const y = await test_function(5, 5);"#);
-        let result = source_code_run_deno(
-            &source_code,
-            &RkyvObjectBuilder::new()
-                .insert_object(
-                    "functions",
-                    RkyvObjectBuilder::new().insert_value(
-                        "test_function",
-                        RkyvSerializedValue::Cell(CellTypes::Code(
-                            crate::cells::CodeCell {
-                                name: None,
-                                language: SupportedLanguage::PyO3,
-                                source_code: String::from(indoc! { r#"
+
+        let mut state = ExecutionState::new();
+        let (state, _) = state.update_op(CellTypes::Code(
+            crate::cells::CodeCell {
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: String::from(indoc! { r#"
                                     def test_function(a, b):
                                         return a + b
                                 "#
                                 }),
-                                function_invocation: None,
-                            },
-                        )),
-                    ),
-                )
+                function_invocation: None,
+            },
+        ), Some(0));
+        let result = source_code_run_deno(
+            &state,
+            &source_code,
+            &RkyvObjectBuilder::new()
                 .build(),
             &None,
         ).await;
@@ -599,6 +567,7 @@ mod tests {
     async fn test_source_code_run_globals_set_by_payload() {
         let source_code = String::from("const z = a + b;");
         let result = source_code_run_deno(
+            &ExecutionState::new(),
             &source_code,
             &RkyvObjectBuilder::new()
                 .insert_object(
@@ -622,7 +591,7 @@ mod tests {
     #[tokio::test]
     async fn test_source_code_run_deno_success() {
         let source_code = String::from("const x = 42;");
-        let result = source_code_run_deno(&source_code, &RkyvSerializedValue::Null, &None).await;
+        let result = source_code_run_deno(&ExecutionState::new(), &source_code, &RkyvSerializedValue::Null, &None).await;
         assert_eq!(
             result.unwrap(),
             (
@@ -635,14 +604,14 @@ mod tests {
     #[tokio::test]
     async fn test_source_code_run_deno_failure() {
         let source_code = String::from("throw new Error('Test Error');");
-        let result = source_code_run_deno(&source_code, &RkyvSerializedValue::Null, &None).await;
+        let result = source_code_run_deno(&ExecutionState::new(), &source_code, &RkyvSerializedValue::Null, &None).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_source_code_run_deno_json_serialization() {
         let source_code = String::from("const obj  = {foo: 'bar'};");
-        let result = source_code_run_deno(&source_code, &RkyvSerializedValue::Null, &None).await;
+        let result = source_code_run_deno(&ExecutionState::new(), &source_code, &RkyvSerializedValue::Null, &None).await;
         assert_eq!(
             result.unwrap(),
             (
@@ -659,7 +628,7 @@ mod tests {
     #[tokio::test]
     async fn test_source_code_run_deno_expose_global_variables() {
         let source_code = String::from("const x = 30;");
-        let result = source_code_run_deno(&source_code, &RkyvSerializedValue::Null, &None).await;
+        let result = source_code_run_deno(&ExecutionState::new(), &source_code, &RkyvSerializedValue::Null, &None).await;
         assert_eq!(
             result.unwrap(),
             (
@@ -675,7 +644,7 @@ mod tests {
         let args = RkyvObjectBuilder::new()
             .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 10).insert_number("1", 20))
             .build();
-        let result = source_code_run_deno(&source_code, &args, &Some("demonstrationAdd".to_string())).await;
+        let result = source_code_run_deno(&ExecutionState::new(), &source_code, &args, &Some("demonstrationAdd".to_string())).await;
         assert_eq!(
             result.unwrap(),
             (

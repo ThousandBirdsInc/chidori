@@ -103,11 +103,16 @@ enum CoroutineYieldValue {
 
 
 
+
 // TODO: make this thread-safe
 #[derive(Clone)]
 pub struct ExecutionState {
+
     // TODO: update all operations to use this id instead of a separate representation
     pub(crate) op_counter: usize,
+
+    // TODO: this is a channel sender to update the execution graph
+    pub graph_sender: Option<Arc<Sender<(ExecutionState, tokio::sync::mpsc::Sender<String>)>>>,
 
     // TODO: call_stack is only ever a single coroutine at a time and instead its the stack of execution states being resolved?
     // pub call_stack: Arc<Mutex<Pin<Box<dyn Coroutine<Return=CoroutineYieldValue, Yield=CoroutineYieldValue>>>>>,
@@ -190,7 +195,21 @@ impl ExecutionState {
     pub fn new() -> Self {
         ExecutionState {
             op_counter: 0,
-            // call_stack: Default::default(),
+            graph_sender: None,
+            state: Default::default(),
+            operation_name_to_id: Default::default(),
+            operation_by_id: Default::default(),
+            function_name_to_operation_id: Default::default(),
+            has_been_set: Default::default(),
+            dependency_map: Default::default(),
+            execution_event_sender: None,
+        }
+    }
+
+    pub fn with_graph_sender(graph_sender: Arc<Sender<(ExecutionState, tokio::sync::mpsc::Sender<String>)>>) -> Self {
+        ExecutionState {
+            op_counter: 0,
+            graph_sender: Some(graph_sender),
             state: Default::default(),
             operation_name_to_id: Default::default(),
             operation_by_id: Default::default(),
@@ -271,6 +290,105 @@ impl ExecutionState {
         graph
     }
 
+    pub fn update_op(
+        &self,
+        cell: CellTypes,
+        op_id: Option<usize>,
+    ) -> (ExecutionState, usize) {
+        let mut op = match &cell {
+            CellTypes::Code(c) => crate::cells::code_cell::code_cell(c),
+            CellTypes::Prompt(c) => crate::cells::llm_prompt_cell::llm_prompt_cell(c),
+            CellTypes::Web(c) => crate::cells::web_cell::web_cell(c),
+            CellTypes::Template(c) => crate::cells::template_cell::template_cell(c),
+        };
+        op.attach_cell(cell);
+        let (op_id, new_state) = self.upsert_operation(op, op_id);
+        let mutations = Self::assign_dependencies_to_operations(&new_state);
+        let final_state = new_state.apply_dependency_graph_mutations(mutations);
+        (final_state, op_id)
+    }
+
+    fn assign_dependencies_to_operations(new_state: &ExecutionState) -> Vec<DependencyGraphMutation> {
+        let (available_values, available_functions) = Self::get_possible_dependencies(new_state);
+
+        // TODO: we need to report on INVOKED functions - these functions are calls to
+        //       functions with the locals assigned in a particular way. But then how do we handle compositions of these?
+        //       Well we just need to invoke them in the correct pattern as determined by operations in that context.
+
+        // Anywhere there is a matched value, we create a dependency graph edge
+        let mut mutations = vec![];
+
+        // let mut unsatisfied_dependencies = vec![];
+        // For each destination cell, we inspect their input signatures and accumulate the
+        // mutation operations that we need to apply to the dependency graph.
+        for (destination_cell_id, op) in new_state.operation_by_id.iter() {
+            let operation = op.lock().unwrap();
+            let input_signature = &operation.signature.input_signature;
+            let mut accum = vec![];
+            for (value_name, value) in input_signature.globals.iter() {
+
+                // TODO: we need to handle collisions between the two of these
+                if let Some(source_cell_id) = available_functions.get(value_name) {
+                    if source_cell_id != &destination_cell_id {
+                        accum.push((
+                            *source_cell_id.clone(),
+                            DependencyReference::FunctionInvocation(value_name.to_string()),
+                        ));
+                    }
+                }
+
+                if let Some(source_cell_id) = available_values.get(value_name) {
+                    if source_cell_id != &destination_cell_id {
+                        accum.push((
+                            *source_cell_id.clone(),
+                            DependencyReference::Global(value_name.to_string()),
+                        ));
+                    }
+                }
+                // unsatisfied_dependencies.push(value_name.clone())
+            }
+            if accum.len() > 0 {
+                mutations.push(DependencyGraphMutation::Create {
+                    operation_id: destination_cell_id.clone(),
+                    depends_on: accum,
+                });
+            }
+        }
+        mutations
+    }
+
+    fn get_possible_dependencies(new_state: &ExecutionState) -> (HashMap<String, &OperationId>, HashMap<String, &OperationId>) {
+        // TODO: when there is a dependency on a function invocation we need to
+        //       instantiate a new instance of the function operation node.
+        //       It itself is not part of the call graph until it has such a dependency.
+
+        // TODO: Store trigger-able functions that may be passed as values as well
+
+        let mut available_values = HashMap::new();
+        let mut available_functions = HashMap::new();
+
+        // For all reported cells, add their exposed values to the available values
+        for (id, op) in new_state.operation_by_id.iter() {
+            let output_signature = &op.lock().unwrap().signature.output_signature;
+
+            // Store values that are available as globals
+            for (key, value) in output_signature.globals.iter() {
+                let insert_result = available_values.insert(key.clone(), id);
+                if insert_result.is_some() {
+                    panic!("Naming collision detected for value {}", key);
+                }
+            }
+
+            for (key, value) in output_signature.functions.iter() {
+                let insert_result = available_functions.insert(key.clone(), id);
+                if insert_result.is_some() {
+                    panic!("Naming collision detected for value {}", key);
+                }
+            }
+        }
+        (available_values, available_functions)
+    }
+
     /// Inserts a new operation into the execution state, returning the operation id and the new state.
     /// That operation can then be referred to by its id.
     #[tracing::instrument]
@@ -292,6 +410,7 @@ impl ExecutionState {
         };
 
         s.operation_by_id.insert(op_id, Arc::new(Mutex::new(operation_node)));
+        s.update_callable_functions();
         (op_id, s)
     }
 
@@ -326,7 +445,7 @@ impl ExecutionState {
         s
     }
 
-    fn get_callable_functions(&mut self) {
+    fn update_callable_functions(&mut self) {
         for (id, op) in &self.operation_by_id {
             let mut op_node = op
                 .lock()
@@ -340,7 +459,9 @@ impl ExecutionState {
     /// Invoke a function made available by the execution state, this accepts arguments derived in the context
     /// of a parent function's scope. This targets a specific function by name that we've identified a dependence on.
     // TODO: this should create a coroutine that yields with the result of the function invocation
-    pub async fn dispatch(&self, function_name: &str, payload: RkyvSerializedValue) -> ExecutionState {
+    pub async fn dispatch(&self, function_name: &str, payload: RkyvSerializedValue) -> (RkyvSerializedValue, ExecutionState) {
+        // TODO: this should return a closure that executes the code
+
         // Store the invocation payload into an execution state and record this before executing
         let mut state = self.clone();
         state.state_insert(usize::MAX, payload.clone());
@@ -380,10 +501,10 @@ impl ExecutionState {
 
         // invocation of the operation
         // TODO: the total arg payload here does not include necessary function calls for this cell itself
-        let result = op.execute(&ExecutionState::new(), payload, None).await;
+        let result = op.execute(&self, payload, None).await;
 
         // TODO: return the result, which we will use in the context of the parent function
-        self.clone()
+        (result, self.clone())
     }
 
     /// Steps through the execution of the current stack of coroutines, progressing execution of our agent.

@@ -174,7 +174,7 @@ impl InstancedEnvironment {
     #[tracing::instrument]
     pub fn upsert_cell(&mut self, cell: CellTypes, op_id: Option<usize>) -> (ExecutionNodeId, usize) {
         println!("Upserting cell into state with id {:?}", &self.execution_head_state_id);
-        let ((state_id, state), op_id) = self.db.external_mutate_graph(self.execution_head_state_id, cell, op_id);
+        let ((state_id, state), op_id) = self.db.mutate_graph(self.execution_head_state_id, cell, op_id);
         if let Some(sender) = self.runtime_event_sender.as_mut() {
             sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
             sender.send(EventsFromRuntime::DefinitionGraphUpdated(state.get_dependency_graph_flattened())).unwrap();

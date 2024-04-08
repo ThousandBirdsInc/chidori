@@ -1,5 +1,6 @@
 use futures_util::FutureExt;
 use crate::cells::{CodeCell, SupportedLanguage};
+use crate::execution::execution::ExecutionState;
 use crate::execution::primitives::operation::{InputItemConfiguation, InputSignature, InputType, OperationNode, OutputItemConfiguation, OutputSignature};
 
 /// Code cells allow notebooks to evaluate source code in a variety of languages.
@@ -124,6 +125,7 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
                         let result = tokio::task::spawn_blocking(move || {
                             let runtime = tokio::runtime::Runtime::new().unwrap();
                             let result = runtime.block_on(crate::library::std::code::runtime_deno::source_code_run_deno(
+                                &ExecutionState::new(),
                                 &cell.source_code,
                                 &x,
                                 &cell.function_invocation,
