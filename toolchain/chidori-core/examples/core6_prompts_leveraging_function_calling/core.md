@@ -1,27 +1,37 @@
-# Demonstrating how a prompt is capable of being invoked by code and vice versa
-
-
-```python (run_prompt)
-async def run_prompt(number_of_states):
-    out = ""
-    for state in (await get_states_first_letters(num=number_of_states)).split('\n'):
-        out += await first_letter(state)
-    return "demo" + out
-```
-
-
-```prompt (states)
----
-fn: get_states_first_letters
----
-List the first {{num}} US states to be added to the union.
-Return this as a `-` bulleted list with the name of the state on each line.
-```
-
+# Demonstrating how to leverage function calling in prompts
 
 ```python (first_letter)
 def first_letter(s):
     return s[0]
+```
+
+```python (math_demo)
+def do_some_math(a, b):
+      return a + b
+```
+
+
+```javascript (jsdemo)
+function jsMath(a, b) {
+    return a + b;
+}
+```
+
+```typescript (tsdemo)
+function tsTypesafe(a: string, b: number) {
+    return a + b;
+}
+```
+
+```prompt (current_weather_in_sf)
+---
+import:
+  - first_letter
+  - jsMath
+  - do_some_math
+---
+List the first {{num}} US states to be added to the union.
+Return this as a `-` bulleted list with the name of the state on each line.
 ```
 
 

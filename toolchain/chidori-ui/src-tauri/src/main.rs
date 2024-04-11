@@ -17,15 +17,17 @@ use petgraph::graph::DiGraph;
 use petgraph::prelude::{DiGraphMap, NodeIndex};
 use serde_json::json;
 use tauri::{AppHandle, Manager};
-use chidori_core::sdk::entry::{Chidori, EventsFromRuntime, InstancedEnvironment, SharedState, UserInteractionMessage};
+use chidori_core::sdk::entry::{Chidori, EventsFromRuntime, InstancedEnvironment, SharedState, UserInteractionMessage, CellHolder};
 use chidori_core::cells::CellTypes;
 use crate::dagre::DagreLayout;
 use crate::dagre::{Data, Edge, Node, Rect};
 use notify_debouncer_full::{notify::{Watcher, RecommendedWatcher, RecursiveMode}, new_debouncer, DebounceEventResult, Debouncer, FileIdCache, FileIdMap};
 use tauri::async_runtime::JoinHandle;
 use ts_rs::TS;
-use chidori_core::execution::execution::execution_graph::ExecutionNodeId;
+use chidori_core::execution::execution::execution_graph::{ExecutionNodeId, MergedStateHistory};
 use chidori_core::execution::primitives::identifiers::{DependencyReference, OperationId};
+use chidori_core::utils::telemetry::TraceEvents;
+
 
 // the payload type must implement `Serialize` and `Clone`.
 #[derive(Clone, serde::Serialize)]

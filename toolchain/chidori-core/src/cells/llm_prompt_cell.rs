@@ -72,7 +72,7 @@ pub fn llm_prompt_cell(cell: &LLMPromptCell) -> OperationNode {
                     Box::new(move |s, payload, _, _| {
                         let role_blocks = role_blocks.clone();
                         let name = name.clone();
-                        dbg!(&is_function_invocation);
+                        // TODO: this state should error? or what should this do
                         if configuration.get("fn").is_some() && !is_function_invocation {
                             return async move { RkyvSerializedValue::Null }.boxed();
                         }

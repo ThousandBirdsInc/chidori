@@ -176,6 +176,26 @@ trait EmbeddingModel {
 }
 
 
+pub async fn ai_llm_run_completion_model(
+    execution_state: &ExecutionState,
+    payload: RkyvSerializedValue,
+    role_blocks: Vec<(ChatModelRoles, Option<TemplateWithSource>)>,
+    name: Option<String>,
+    is_function_invocation: bool,
+) -> RkyvSerializedValue {
+    RkyvSerializedValue::Null
+}
+
+pub async fn ai_llm_run_embedding_model(
+    execution_state: &ExecutionState,
+    payload: RkyvSerializedValue,
+    role_blocks: Vec<(ChatModelRoles, Option<TemplateWithSource>)>,
+    name: Option<String>,
+    is_function_invocation: bool,
+) -> RkyvSerializedValue {
+    RkyvSerializedValue::Null
+}
+
 pub async fn ai_llm_run_chat_model(
     execution_state: &ExecutionState,
     payload: RkyvSerializedValue,
@@ -217,7 +237,6 @@ pub async fn ai_llm_run_chat_model(
         template_messages,
         ..ChatCompletionReq::default()
     }).await;
-    dbg!(&result);
     if let Ok(ChatCompletionRes { choices, .. }) = result {
         // TODO: if invoked as a function don't nest this
         let mut result_map = HashMap::new();

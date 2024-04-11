@@ -191,6 +191,17 @@ fn render_map_as_table(exec_state: &ExecutionState) -> String {
     table
 }
 
+/// This causes the current async loop to pause until we send a signal over the oneshot sender returned
+async fn pause_future_with_oneshot(value: RkyvSerializedValue, sender: Sender<(RkyvSerializedValue, tokio::sync::oneshot::Sender<()>)>) -> Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>> {
+    let (oneshot_sender, oneshot_receiver) = tokio::sync::oneshot::channel();
+    let future = async move {
+        oneshot_receiver.await.expect("Failed to receive oneshot signal");
+        RkyvSerializedValue::Null
+    };
+    sender.send((value, oneshot_sender)).expect("Failed to send oneshot signal");
+    Box::pin(future)
+}
+
 impl ExecutionState {
     pub fn new() -> Self {
         ExecutionState {
@@ -660,18 +671,9 @@ impl ExecutionState {
                 println!("Executed node {} with result {:?}", operation_id, &result);
                 outputs.push((operation_id, result.clone()));
                 new_state.state_insert(operation_id, result);
-
-                // Effectively during one state's execution, new intermediate states are also generated, there is a tree of states being created
-                // how do we capture this and push it up into the execution graph itself.
-                // We could have channels listen to events from all of the states but that doesn't feel right.
-                // This is why what I wanted to do was to have the top level state then become a Future, it will eventually be resolved and when it
-                // is resolved, execution can progress. But what we want to do is to still mutate the graph from there, so we need to return
-                // while the future has been provided (which happens immediately with an async function) then we want call it again for evaluation
-                // before we progress its child events.
             }
         }
         new_state.state_consume_marked(marked_for_consumption);
-
         (ExecutionStateEvaluation::Complete(new_state), outputs)
     }
 }

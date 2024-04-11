@@ -819,16 +819,15 @@ mod tests {
 
 
     #[tokio::test]
-    async fn test_core5_prompts_invoking_code() {
+    async fn test_core5_prompts_invoked_as_functions() {
         let mut ee = Chidori::new();
-        ee.load_md_directory(Path::new("./examples/core5_prompts_invoking_code")).unwrap();
+        ee.load_md_directory(Path::new("./examples/core5_prompts_invoked_as_functions")).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
         env.get_state().render_dependency_graph();
         let out = env.step().await;
         let out = env.step().await;
         let out = env.step().await;
-        dbg!(out);
         let out = env.step().await;
         assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
     }
