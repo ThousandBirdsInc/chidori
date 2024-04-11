@@ -2,12 +2,22 @@
 
 This example is based on [this crewAI example](https://github.com/joaomdmoura/crewAI-examples/tree/main/trip_planner)
 
+```prompt (researcher)
+---
+fn: scrape_and_summarize_website_researcher
+---
+Role: Principal Researcher
+Goal: Do amazing researches and summaries based on the content you are working with
+Backstory: You're a Principal Researcher at a big company and you need to do a research about a given topic.
+{{task}}
+```
+
 ```python
 import json
 import os
 import requests
 
-def scrape_and_summarize_website(website):
+async def scrape_and_summarize_website(website):
     """Useful to scrape and summarize a website content"""
     url = f"https://chrome.browserless.io/content?token={os.environ['BROWSERLESS_API_KEY']}"
     payload = json.dumps({"url": website})
@@ -18,19 +28,8 @@ def scrape_and_summarize_website(website):
     content = [content[i:i + 8000] for i in range(0, len(content), 8000)]
     summaries = []
     for chunk in content:
-        agent = Agent(
-            role='Principal Researcher',
-            goal=
-            'Do amazing researches and summaries based on the content you are working with',
-            backstory=
-            "You're a Principal Researcher at a big company and you need to do a research about a given topic.",
-            allow_delegation=False)
-        task = Task(
-            agent=agent,
-            description=
-            f'Analyze and summarize the content bellow, make sure to include the most relevant information in the summary, return only the summary nothing else.\n\nCONTENT\n----------\n{chunk}'
-        )
-        summary = task.execute()
+        summary = await scrape_and_summarize_website_researcher(
+            task=f'Analyze and summarize the content bellow, make sure to include the most relevant information in the summary, return only the summary nothing else.\n\nCONTENT\n----------\n{chunk}')
         summaries.append(summary)
     return "\n\n".join(summaries)
 ```
@@ -116,4 +115,61 @@ import:
 Role: Amazing Travel Concierge
 Goal: Create the most amazing travel iterinaries within budget and packing suggestions for the city
 Backstory: Specialist in travel planning an logistics with decades of experience
+```
+
+```python
+ def __init__(self, origin, cities, date_range, interests):
+    self.cities = cities
+    self.origin = origin
+    self.interests = interests
+    self.date_range = date_range
+
+  def run(self):
+    agents = TripAgents()
+    tasks = TripTasks()
+
+    city_selector_agent = agents.city_selection_agent()
+    local_expert_agent = agents.local_expert()
+    travel_concierge_agent = agents.travel_concierge()
+
+    identify_task = tasks.identify_task(
+      city_selector_agent,
+      self.origin,
+      self.cities,
+      self.interests,
+      self.date_range
+    )
+    gather_task = tasks.gather_task(
+      local_expert_agent,
+      self.origin,
+      self.interests,
+      self.date_range
+    )
+    plan_task = tasks.plan_task(
+      travel_concierge_agent, 
+      self.origin,
+      self.interests,
+      self.date_range
+    )
+
+if __name__ == "__main__":
+    print("## Welcome to Trip Planner Crew")
+    print('-------------------------------')
+    location = input(
+        dedent("""
+      From where will you be traveling from?
+    """))
+    cities = input(
+        dedent("""
+      What are the cities options you are interested in visiting?
+    """))
+    date_range = input(
+        dedent("""
+      What is the date range you are interested in traveling?
+    """))
+    interests = input(
+        dedent("""
+      What are some of your high level interests and hobbies?
+    """))
+
 ```
