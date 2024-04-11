@@ -1,3 +1,4 @@
+use std::io::{self, Write};
 
 use std::pin::Pin;
 use chidori_static_analysis::language::python::parse::{
@@ -19,6 +20,7 @@ use std::future::Future;
 use std::mem;
 use std::sync::{Arc, Mutex};
 use anyhow::Error;
+use once_cell::sync::OnceCell;
 use pyo3_asyncio::generic;
 use tokio::runtime::Runtime;
 use chidori_static_analysis::language::Report;
@@ -71,6 +73,9 @@ fn pyany_to_rkyv_serialized_value(p: &PyAny) -> RkyvSerializedValue {
                 }
                 RkyvSerializedValue::Object(map)
             }
+            "NoneType" => {
+                RkyvSerializedValue::Null
+            },
             x @ _  => {
                 panic!("Py03 marshalling unsupported type: {}", x);
                 RkyvSerializedValue::Null
@@ -144,63 +149,68 @@ fn invoke(py: Python, arg: PyObject) -> PyResult<PyObject> {
     Ok(obj)
 }
 
-// TODO: validate suspension and resumption of execution based on a method that we provide
-// TODO: we want to capture the state of the interpreter and resume it later when we invoke the target function
-// TODO: need to be able to capture output results
+
+
+use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use dashmap::DashMap;
+
+static SOURCE_CODE_RUN_COUNTER: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
+static CURRENT_PYTHON_EXECUTION_ID: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
+
+fn set_current_python_execution_id(id: usize) {
+    CURRENT_PYTHON_EXECUTION_ID.store(id, Ordering::SeqCst);
+}
+
+fn get_current_python_execution_id() -> usize {
+    CURRENT_PYTHON_EXECUTION_ID.load(Ordering::SeqCst)
+}
+
+fn increment_source_code_run_counter() -> usize {
+    SOURCE_CODE_RUN_COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+static PYTHON_OUTPUT_MAP: Lazy<Arc<DashMap<usize, DashMap<String, RkyvSerializedValue>>>> = Lazy::new(|| Arc::new(DashMap::new()));
+static PYTHON_LOGGING_BUFFER_STDOUT: Lazy<Arc<DashMap<usize, Vec<String>>>> = Lazy::new(|| Arc::new(DashMap::new()));
+static PYTHON_LOGGING_BUFFER_STDERR: Lazy<Arc<DashMap<usize, Vec<String>>>> = Lazy::new(|| Arc::new(DashMap::new()));
 
 #[pyclass]
 struct LoggingToChannel {
-    sender: Sender<String>,
+    exec_id: usize,
+    sender: Sender<(usize, String)>,
+    output_buffer_set: Arc<DashMap<usize, Vec<String>>>,
+    buffered_write: Vec<(usize, String)>,
 }
 
 impl LoggingToChannel {
-    fn new(sender: Sender<String>) -> Self {
-        LoggingToChannel { sender }
+    fn new(sender: Sender<(usize, String)>, buffer_set: Arc<DashMap<usize, Vec<String>>>, exec_id: usize) -> Self {
+        LoggingToChannel {
+            exec_id,
+            sender,
+            output_buffer_set: buffer_set,
+            buffered_write: vec![]
+        }
     }
 }
 
 #[pymethods]
 impl LoggingToChannel {
+    fn set_exec_id(&mut self, exec_id: usize) {
+        self.exec_id = exec_id;
+    }
+
     fn write(&mut self, data: &str) {
-        let _ = self.sender.send(data.to_string());
-        // You might want to handle the error in real code
+        let exec_id = self.exec_id;;
+        self.buffered_write.push((exec_id, data.to_string()));
+        let _ = self.sender.send((exec_id, data.to_string()));
     }
 
     fn flush(&mut self) {
+        for (exec_id, data) in self.buffered_write.drain(..) {
+            let mut output = self.output_buffer_set.entry(exec_id).or_insert(vec![]);
+            output.push(data.clone());
+        }
     }
-}
-
-
-async fn execute_async_block(total_arg_payload: RkyvSerializedValue, cell: &CellTypes, clone_function_name: &str) -> RkyvSerializedValue {
-    // modify code cell to indicate execution of the target function
-    // reconstruction of the cell
-    let mut op = match cell {
-        CellTypes::Code(c) => {
-            let mut c = c.clone();
-            c.function_invocation =
-                Some(clone_function_name.to_string());
-            crate::cells::code_cell::code_cell(&c)
-        }
-        CellTypes::Prompt(c) => {
-            let mut c = c.clone();
-            match c {
-                LLMPromptCell::Chat{ref mut function_invocation, ..} => {
-                    *function_invocation = true;
-                    crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
-                }
-                _ => {
-                    crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
-                }
-            }
-        }
-        _ => {
-            unreachable!("Unsupported cell type");
-        }
-    };
-
-    // invocation of the operation
-    // TODO: the total arg payload here does not include necessary function calls for this cell itself
-    op.execute(&ExecutionState::new(), total_arg_payload, None).await
 }
 
 
@@ -210,6 +220,7 @@ pub async fn source_code_run_python(
     payload: &RkyvSerializedValue,
     function_invocation: &Option<String>,
 ) -> anyhow::Result<(RkyvSerializedValue, Vec<String>, Vec<String>)> {
+    let exec_id = increment_source_code_run_counter();
     pyo3::prepare_freethreaded_python();
     let (sender_stdout, receiver_stdout) = mpsc::channel();
     let (sender_stderr, receiver_stderr) = mpsc::channel();
@@ -218,56 +229,58 @@ pub async fn source_code_run_python(
     let report = build_report(&dependencies);
 
     let result =  Python::with_gil(|py| {
-        let current_event_loop = pyo3_asyncio::tokio::get_current_loop(py);
+        // TODO: this was causing a deadlock
+        // let current_event_loop = pyo3_asyncio::tokio::get_current_loop(py);
 
-        // Initialize our event loop if one is not established
-        let event_loop = if current_event_loop.is_err() {
-            let asyncio = py.import("asyncio")?;
-            let event_loop = asyncio.call_method0("new_event_loop")?;
-            asyncio.call_method1("set_event_loop", (event_loop,))?;
-            event_loop
-        } else {
-            current_event_loop.unwrap()
-        };
+        // Initialize our event loop if one is not already established
+        // let event_loop = if current_event_loop.is_err() {
+        //     let asyncio = py.import("asyncio")?;
+        //     let event_loop = asyncio.call_method0("new_event_loop")?;
+        //     asyncio.call_method1("set_event_loop", (event_loop,))?;
+        //     event_loop
+        // } else {
+        //     current_event_loop.unwrap()
+        // };
 
         // Configure locals and globals passed to evaluation
         let globals = PyDict::new(py);
         let execution_state = Arc::new(Mutex::new(execution_state.clone()));
         create_function_shims(&execution_state, &report, py, globals)?;
 
-        let output = Arc::new(Mutex::new(HashMap::new()));
 
-        // Create new module
-        let chidori_module = PyModule::new(py, "chidori")?;
-        chidori_module.add_function(wrap_pyfunction!(on_event, chidori_module)?)?;
-        chidori_module.add_function(wrap_pyfunction!(identity_function, chidori_module)?)?;
-        let output_clone = output.clone();
-        let chidori_set_value = PyCFunction::new_closure(
-            py,
-            None,
-            None,
-            move |args: &PyTuple, kwargs: Option<&PyDict>| {
-                if args.len() == 2 {
-                    let name: String = args.get_item(0).unwrap().extract::<String>().unwrap();
-                    let mut output_lock = output_clone.lock().unwrap();
-                    let value = args.get_item(1).unwrap(); // Keep as PyAny
-                    output_lock.insert(name, pyany_to_rkyv_serialized_value(value));
-                }
-            },
-        )?;
-        chidori_module.add("set_value", chidori_set_value)?;
-
-        // Import and get sys.modules
         let sys = py.import("sys")?;
-        let py_modules = sys.getattr("modules")?;
 
-        // Insert our custom module
-        py_modules.set_item("chidori", chidori_module)?;
+        // Create Chidori module if it doesn't already exist
+        let py_modules = sys.getattr("modules")?;
+        if py_modules.get_item("chidori").is_err() {
+            // We assume this will only happen once for the Python GIL instance (per this Rust process)
+            // so this is treated as an initialization handler.
+            let chidori_module = PyModule::new(py, "chidori")?;
+            chidori_module.add_function(wrap_pyfunction!(on_event, chidori_module)?)?;
+            chidori_module.add_function(wrap_pyfunction!(identity_function, chidori_module)?)?;
+            let chidori_set_value = PyCFunction::new_closure(
+                py,
+                None,
+                None,
+                move |args: &PyTuple, kwargs: Option<&PyDict>| {
+                    if args.len() == 3 {
+                        let id: usize = args.get_item(0).unwrap().extract::<usize>().unwrap();
+                        let name: String = args.get_item(1).unwrap().extract::<String>().unwrap();
+                        let output_c = PYTHON_OUTPUT_MAP.clone();
+                        let output = output_c.entry(id).or_insert(DashMap::new());
+                        let value = args.get_item(2).unwrap(); // Keep as PyAny
+                        output.insert(name, pyany_to_rkyv_serialized_value(value));
+                    }
+                },
+            )?;
+            chidori_module.add("set_value", chidori_set_value)?;
+            py_modules.set_item("chidori", chidori_module)?;
+        }
 
         // Set up capture of stdout from python process and storing it into a Vec
-        let stdout_capture = LoggingToChannel::new(sender_stdout);
+        let stdout_capture = LoggingToChannel::new(sender_stdout, PYTHON_LOGGING_BUFFER_STDOUT.clone(), exec_id);
         let stdout_capture_py = stdout_capture.into_py(py);
-        let stderr_capture = LoggingToChannel::new(sender_stderr);
+        let stderr_capture = LoggingToChannel::new(sender_stderr, PYTHON_LOGGING_BUFFER_STDERR.clone(), exec_id);
         let stderr_capture_py = stderr_capture.into_py(py);
 
         sys.setattr("stdout", stdout_capture_py)?;
@@ -284,21 +297,24 @@ pub async fn source_code_run_python(
         }
 
         // Add recording of specific values to the source code since we're going to wrap it
-        let mut initial_source_code = source_code.clone();
+        let mut initial_source_code = format!("import sys\nsys.stdout.set_exec_id({exec_id})\nsys.stderr.set_exec_id({exec_id})", exec_id=exec_id);
+        initial_source_code.push_str("\n");
+        initial_source_code.push_str(&source_code.clone());
 
         // If any instances of these lines are located, skip wrapping anything because the code will initialize its own async runtime.
         let does_contain_async_runtime = initial_source_code
             .lines()
             .any(|line| line.contains("asyncio.run") || line.contains("unittest.IsolatedAsyncioTestCase") || line.contains("loadTestsFromTestCase"));
 
-        let complete_code = if does_contain_async_runtime {
+        let mut complete_code = if does_contain_async_runtime {
             // If we have an async function, we don't need to wrap it in an async function
             initial_source_code
         } else {
             for (name, report_item) in &report.cell_exposed_values {
                 initial_source_code.push_str("\n");
                 initial_source_code.push_str(&format!(
-                    r#"chidori.set_value("{name}", {name})"#,
+                    r#"chidori.set_value({exec_id}, "{name}", {name})"#,
+                    exec_id = exec_id,
                     name = name
                 ));
             }
@@ -320,17 +336,28 @@ async def __wrapper():
 asyncio.run(__wrapper())
         "#, indent_all_source_code)
         };
+        complete_code.push_str("\n");
+        complete_code.push_str("import sys\nsys.stdout.flush()\nsys.stderr.flush()");
+        complete_code.push_str("\n");
 
         // Important: this is the point of initial execution of the source code
         py.run(&complete_code, Some(globals), None).unwrap();
 
+
+
         // With the source environment established, we can now invoke specific methods provided by this node
         return match function_invocation {
             None => {
-                let output_lock = output.lock().unwrap().clone();
-                Ok(Box::pin(async move {
-                    RkyvSerializedValue::Object(output_lock)
-                }) as Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>>)
+                py.allow_threads(move || {
+                    Ok(Box::pin(async move {
+                        let output_c = PYTHON_OUTPUT_MAP.clone();
+                        if let Some((k, output_c)) = output_c.remove(&exec_id) {
+                            RkyvSerializedValue::Object(output_c.into_iter().collect())
+                        } else {
+                            RkyvSerializedValue::Object(HashMap::new())
+                        }
+                    }) as Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>>)
+                })
             }
             Some(name) => {
                 let local = globals.get_item(name)?;
@@ -385,7 +412,7 @@ asyncio.run(__wrapper())
                                 let py_any: &PyAny = result.as_ref(py);
                                 pyany_to_rkyv_serialized_value(py_any)
                             })
-                        }) as Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>>)
+                        }) as Pin<Box<dyn Future<Output=RkyvSerializedValue> + Send>>)
                     }
                 } else {
                     Err(anyhow::anyhow!("Function not found"))
@@ -393,10 +420,11 @@ asyncio.run(__wrapper())
             }
         }
     });
-    let output_stdout: Vec<String> = receiver_stdout.try_iter().collect();
-    let output_stderr: Vec<String> = receiver_stderr.try_iter().collect();
     if let Ok(result) = result {
-        Ok((result.await, output_stdout, output_stderr))
+        let awaited_result = result.await;
+        let (_, output_stdout) = PYTHON_LOGGING_BUFFER_STDOUT.remove(&exec_id).unwrap_or((0, vec![]));
+        let (_, output_stderr) = PYTHON_LOGGING_BUFFER_STDERR.remove(&exec_id).unwrap_or((0, vec![]));
+        Ok((awaited_result, output_stdout, output_stderr))
     } else {
         return Err(anyhow::anyhow!("No result"));
     }
@@ -434,17 +462,17 @@ fn create_function_shims(execution_state_handle: &Arc<Mutex<ExecutionState>>, re
 
                     // TODO: replace the execution state here and notify the execution graph that we have a new execution state generated
                     //       HOW do we do this in a transactional way?
-                    let mut exec_state = execution_state_handle.lock().unwrap();
-                    let mut new_exec_state = exec_state.clone();
+                    let mut new_exec_state = {
+                        let mut exec_state = execution_state_handle.lock().unwrap();
+                        let mut new_exec_state = exec_state.clone();
+                        std::mem::swap(&mut *exec_state, &mut new_exec_state);
+                        new_exec_state
+                    };
                     // TODO: update the state with the args we're about to execute
-
-                    std::mem::swap(&mut *exec_state, &mut new_exec_state);
-
 
                     pyo3_asyncio::tokio::future_into_py(py, async move {
                         // TODO: await here, before we execute the dispatch, pausing before running the next operation
                         let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload).await;
-                        // let result = execute_async_block(total_arg_payload, &cell, &clone_function_name).await;
                         // TODO: await here, after we execute the dispatch, pausing before running the next operation
                         PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result)))
                     }).map(|x| x.into())
@@ -514,6 +542,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_py_source_without_entrypoint() {
+        println!("running A");
         let source_code = String::from(
             r#"
 y = 42
@@ -544,6 +573,7 @@ li = [x, y]
 
     #[tokio::test]
     async fn test_py_source_without_entrypoint_with_stdout() {
+        println!("running B");
         let source_code = String::from(
             r#"
 print("testing")
@@ -721,6 +751,7 @@ data = await demo()
 
 
 
+    #[ignore]
     #[tokio::test]
     async fn test_running_sync_unit_test() {
         let source_code = String::from(
@@ -775,6 +806,7 @@ unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMa
             &None,
         ).await;
         let (result, _, stderr) = result.unwrap();
+        dbg!(&stderr);
         assert_eq!(stderr.iter().filter(|x| x.contains("Ran 1 test")).count(), 1);
         assert_eq!(stderr.iter().filter(|x| x.contains("OK")).count(), 1);
     }

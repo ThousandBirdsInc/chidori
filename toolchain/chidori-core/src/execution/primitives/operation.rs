@@ -6,7 +6,8 @@ use std::fmt;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
+use tokio::sync::oneshot;
 use futures_util::FutureExt;
 use tracing::{Level, span};
 use crate::cells::{CellTypes, CodeCell, SupportedLanguage};
@@ -209,6 +210,40 @@ enum Mutability {
     Immutable,
 }
 
+
+
+/// This is an object that is passed to OperationNode OperationFn that allows
+/// them to expose an interactive internal environment. This is used to provide
+/// mutable internal state within the execution of the OperationNode.
+///
+/// It provides:
+///    - oneshot for the node to expose its callable interface to the execution graph without completing execution
+///    - receiver for the node to receive messages from the execution graph
+///         - the receiver is sent tuples of inputs and a oneshot sender to reply with its output
+pub struct AsyncRPCCommunication {
+    pub(crate) callable_interface_sender: oneshot::Sender<Vec<String>>,
+    pub(crate) receiver: tokio::sync::mpsc::UnboundedReceiver<(String, RkyvSerializedValue, oneshot::Sender<RkyvSerializedValue>)>,
+}
+
+impl AsyncRPCCommunication {
+    fn new() -> (AsyncRPCCommunication, tokio::sync::mpsc::UnboundedSender<(String, RkyvSerializedValue, tokio::sync::oneshot::Sender<RkyvSerializedValue>)>, oneshot::Receiver<Vec<String>>) {
+        let (callable_interface_sender, callable_interface_receiver) = oneshot::channel();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let async_rpc_communication = AsyncRPCCommunication {
+            callable_interface_sender,
+            receiver,
+        };
+        (async_rpc_communication, sender, callable_interface_receiver)
+    }
+}
+
+impl fmt::Debug for AsyncRPCCommunication {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AsyncRPCCommunication")
+            .finish()
+    }
+}
+
 /// OperationFn represents functions that can be executed on the graph
 /// they accept a byte array and return a new byte vector. This is to allow
 /// for the generic operation over any data type across any programming language.
@@ -226,15 +261,20 @@ enum Mutability {
 /// It is up to the user to structure those maps in such a way that they don't collide with other
 /// values being represented in the state of our system. These inputs and outputs are managed
 /// by our Execution Database.
-pub type OperationFn = dyn Fn(&ExecutionState, RkyvSerializedValue, Option<Sender<((usize, usize), RkyvSerializedValue)>>) -> Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>> + Send;
+pub type OperationFn = dyn Fn(
+    &ExecutionState,
+    RkyvSerializedValue,
+    Option<Sender<((usize, usize), RkyvSerializedValue)>>,
+    Option<AsyncRPCCommunication>
+) -> Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>> + Send;
 
 // TODO: rather than dep_count operation node should have a specific dep mapping
 pub struct OperationNode {
     pub(crate) id: usize,
     pub(crate) name: Option<String>,
 
-    pub is_long_running: bool,
-    pub is_async: bool,
+    /// Should this operation run in a background thread
+    pub is_long_running_background_thread: bool,
 
     pub cell: CellTypes,
 
@@ -253,9 +293,6 @@ pub struct OperationNode {
     /// Is this operation dirty
     pub(crate) dirty: bool,
 
-    /// The height of this node
-    pub(crate) height: usize,
-
     /// Signature of the inputs and outputs of this node
     pub(crate) signature: Signature,
 
@@ -263,7 +300,6 @@ pub struct OperationNode {
     operation: Box<OperationFn>,
 
     /// Dependencies of this node
-    pub(crate) arity: usize,
     pub(crate) unresolved_dependencies: Vec<usize>,
 
     /// Partial application arena - this stores partially applied arguments for this OperationNode
@@ -293,7 +329,6 @@ impl fmt::Debug for OperationNode {
             .field("changed_at", &self.changed_at)
             .field("verified_at", &self.verified_at)
             .field("dirty", &self.dirty)
-            .field("height", &self.height)
             .field("signature", &self.signature)
             .field("unresolved_dependencies", &self.unresolved_dependencies)
             .field("partial_application", &self.partial_application)
@@ -306,8 +341,7 @@ impl Default for OperationNode {
         OperationNode {
             id: 0,
             name: None,
-            is_long_running: false,
-            is_async: false,
+            is_long_running_background_thread: false,
             cell: CellTypes::Code(CodeCell {
                 name: None,
                 language: SupportedLanguage::PyO3,
@@ -318,11 +352,9 @@ impl Default for OperationNode {
             mutability: Mutability::Mutable,
             changed_at: 0,
             verified_at: 0,
-            height: 0,
             dirty: true,
             signature: Signature::new(),
-            operation: Box::new(|_, x, _| async move { x }.boxed()),
-            arity: 0,
+            operation: Box::new(|_, x, _, _| async move { x }.boxed()),
             unresolved_dependencies: vec![],
             partial_application: Vec::new(),
         }
@@ -353,14 +385,22 @@ impl OperationNode {
     }
 
     #[tracing::instrument]
-    pub(crate) fn execute(&self, state: &ExecutionState, argument_payload: RkyvSerializedValue, tx: Option<Sender<((usize, usize), RkyvSerializedValue)>>) -> Pin<Box<dyn Future<Output=RkyvSerializedValue> + Send>> {
+    pub(crate) fn execute(
+        &self,
+        state: &ExecutionState,
+        argument_payload: RkyvSerializedValue,
+        intermediate_output_channel_tx: Option<Sender<((usize, usize), RkyvSerializedValue)>>,
+        async_communication_channel: Option<AsyncRPCCommunication>,
+    ) -> Pin<Box<dyn Future<Output=RkyvSerializedValue> + Send>> {
+        /// Receiver that we pass to the exec for it to capture oneshot RPC communication
         let exec = self.operation.deref();
-        exec(state, argument_payload, tx)
+        exec(state, argument_payload, intermediate_output_channel_tx, async_communication_channel)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
     use futures_util::FutureExt;
     use super::*;
     // TODO: test application of Operations/composition
@@ -368,14 +408,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_with_operation() {
-        let mut executed = false;
         let operation: Box<OperationFn> =
-            Box::new(|_, context, _| { async move { RkyvSerializedValue::Boolean(true) }.boxed() });
+            Box::new(|_, context, _, _| { async move { RkyvSerializedValue::Boolean(true) }.boxed() });
 
         let mut node = OperationNode::default();
         node.operation = operation;
 
-        let result = node.execute(&ExecutionState::new(), RkyvSerializedValue::Null, None).await;
+        let result = node.execute(&ExecutionState::new(), RkyvSerializedValue::Null, None, None).await;
 
         assert_eq!(result, RkyvSerializedValue::Boolean(true));
     }
@@ -383,47 +422,65 @@ mod tests {
     #[test]
     fn test_execute_without_operation() {
         let mut node = OperationNode::default();
-        node.execute(&ExecutionState::new(), RkyvSerializedValue::Boolean(true), None); // should not panic
+        node.execute(&ExecutionState::new(), RkyvSerializedValue::Boolean(true), None, None); // should not panic
     }
 
-    #[test]
-    fn test_parallel_closure() {
-        use std::sync::{Arc, Mutex};
-        use std::thread;
-
-        // Define a closure of type `dyn Fn()`
-
-        let closure: Box<OperationFn> = Box::new(|_, _,_ | {
-            async move {
-                println!("Executing closure in a thread!");
+    /// Demonstrates mutable internal execution of a closure and an RPC interface for interacting with it
+    #[tokio::test]
+    async fn test_async_communication_rpc() {
+        let (async_rpc_communication, rpc_sender, callable_interface_receiver) = AsyncRPCCommunication::new();
+        let op = OperationNode {
+            id: 0,
+            name: None,
+            is_long_running_background_thread: false,
+            cell: CellTypes::Code(CodeCell {
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "".to_string(),
+                function_invocation: None,
+            }),
+            purity: Purity::Pure,
+            mutability: Mutability::Mutable,
+            changed_at: 0,
+            verified_at: 0,
+            dirty: true,
+            signature: Signature::new(),
+            operation: Box::new(|_, p: RkyvSerializedValue, _, async_rpccommunication: Option<AsyncRPCCommunication>| async move {
+                let mut state = 0;
+                let mut async_rpccommunication: AsyncRPCCommunication = async_rpccommunication.unwrap();
+                async_rpccommunication.callable_interface_sender.send(vec!["run".to_string()]).unwrap();
+                tokio::spawn(async move {
+                    loop {
+                        if let Ok((key, value, sender)) = async_rpccommunication.receiver.try_recv() {
+                            sender.send(RkyvSerializedValue::Number(state)).unwrap();
+                            state += 1;
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(10)).await; // Sleep for 10 milliseconds
+                        }
+                    }
+                }).await;
                 RkyvSerializedValue::Null
-            }.boxed()
+            }.boxed()),
+            unresolved_dependencies: vec![],
+            partial_application: Vec::new(),
+        };
+        let ex = op.execute(&ExecutionState::new(), RkyvSerializedValue::Boolean(true), None, Some(async_rpc_communication));
+        let join_handle = tokio::spawn(async move {
+            ex.await;
         });
-
-        // Wrap the closure in an Arc and Mutex for shared ownership and thread safety
-        let shared_closure = Arc::new(Mutex::new(closure));
-
-        let mut handles = vec![];
-
-        for _ in 0..10 {
-            // Clone the Arc to increase the reference count
-            let closure_clone = Arc::clone(&shared_closure);
-
-            // Spawn threads and execute the closure
-            let handle = thread::spawn(move || {
-                // Lock the mutex and execute the closure
-                let closure = closure_clone.lock().unwrap();
-                let s = ExecutionState::new();
-                (*closure)(&s, RkyvSerializedValue::Null, None);
-            });
-
-            handles.push(handle);
-        }
-
-        // Wait for all threads to complete
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
+        let callable_interface = callable_interface_receiver.await;
+        assert_eq!(callable_interface, Ok(vec!["run".to_string()]));
+        let (s, r) = tokio::sync::oneshot::channel();
+        rpc_sender.send(("run".to_string(), RkyvSerializedValue::Boolean(true), s)).unwrap();
+        let result = r.await.unwrap();
+        assert_eq!(result, RkyvSerializedValue::Number(0));
+        let (s, r) = tokio::sync::oneshot::channel();
+        rpc_sender.send(("run".to_string(), RkyvSerializedValue::Boolean(true), s)).unwrap();
+        let result = r.await.unwrap();
+        assert_eq!(result, RkyvSerializedValue::Number(1));
+        let (s, r) = tokio::sync::oneshot::channel();
+        rpc_sender.send(("run".to_string(), RkyvSerializedValue::Boolean(true), s)).unwrap();
+        let result = r.await.unwrap();
+        assert_eq!(result, RkyvSerializedValue::Number(2));
     }
 }

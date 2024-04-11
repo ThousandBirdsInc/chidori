@@ -51,7 +51,7 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
                 cell.name.clone(),
                 input_signature,
                 output_signature,
-                Box::new(move |s, x, _| {
+                Box::new(move |s, x, _, _| {
                     let cell = cell.clone();
                     // TODO: this needs to handle stdout and errors
                     let s = s.clone();
@@ -72,7 +72,7 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
             cell.name.clone(),
             InputSignature::new(),
             OutputSignature::new(),
-            Box::new(|_, x, _| async move { x}.boxed()),
+            Box::new(|_, x, _, _| async move { x}.boxed()),
         ),
         SupportedLanguage::Deno => {
             let paths =
@@ -116,10 +116,8 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
                 cell.name.clone(),
                 input_signature,
                 output_signature,
-                Box::new(move |_, x, _| {
+                Box::new(move |_, x, _, _| {
                     // TODO: this needs to handle stdout and errors
-                    // TODO: this code is crazy, there needs to be a better way to handle this.
-                    //       the issue is that source_code_run_deno uses awaits that return values that are not send
                     let cell = cell.clone();
                     async move {
                         let result = tokio::task::spawn_blocking(move || {

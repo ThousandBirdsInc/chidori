@@ -501,52 +501,11 @@ impl ExecutionState {
 
         // invocation of the operation
         // TODO: the total arg payload here does not include necessary function calls for this cell itself
-        let result = op.execute(&self, payload, None).await;
+        let result = op.execute(&self, payload, None, None).await;
 
         // TODO: return the result, which we will use in the context of the parent function
         (result, self.clone())
     }
-
-    /// Steps through the execution of the current stack of coroutines, progressing execution of our agent.
-    // TODO: this stack needs enough metadata to restore a state of previous execution
-    // fn get_from_stack(&self) -> ExecutionState {
-    //     let last: Arc<Mutex<Pin<Box<dyn Coroutine<Return=CoroutineYieldValue, Yield=CoroutineYieldValue>>>>> = self.call_stack.last_mut();
-    //     let mut last = last.lock().unwrap().as_mut();
-    //     let mut cr = last.resume(());
-    //     match cr {
-    //         CoroutineState::Yielded(v) => {
-    //             let mut call_stack = self.call_stack.clone();
-    //             match v {
-    //                 CoroutineYieldValue::Value(v) => {
-    //                     dbg!(v);
-    //                 }
-    //                 CoroutineYieldValue::Coroutine(c) => {
-    //                     call_stack.push(Arc::new(Mutex::new(Box::into_pin(c))));
-    //                 }
-    //             }
-    //             let mut n = self.clone();
-    //             n.call_stack = call_stack;
-    //             n
-    //         }
-    //         CoroutineState::Complete(c) =>  {
-    //             let mut call_stack = self.call_stack.clone();
-    //             call_stack.pop();
-    //             match c {
-    //                 CoroutineYieldValue::Value(v) => {
-    //                     dbg!(v);
-    //                 }
-    //                 CoroutineYieldValue::Coroutine(c) => {
-    //                     call_stack.push(Arc::new(Mutex::new(Box::into_pin(c))));
-    //                 }
-    //             }
-    //             let mut n = self.clone();
-    //             n.call_stack = call_stack;
-    //             n
-    //         },
-    //         _ => panic!("unexpected return from resume"),
-    //     }
-    // }
-
 
     // TODO: extend this with an "event", steps can occur as events are flushed based on a previous state we were in
     #[tracing::instrument]
@@ -614,7 +573,6 @@ impl ExecutionState {
                             }
                             DependencyReference::Global(name) => {
                                 if let RkyvSerializedValue::Object(value) = output {
-                                    dbg!(&name);
                                     globals.insert(name.clone(), value.get(name).unwrap().clone());
                                 }
                             }
@@ -661,15 +619,13 @@ impl ExecutionState {
             // Execute the operation
             // TODO: support async/parallel execution
             println!("Executing node {} ({:?}) with payload {:?}", operation_id, op_node.name, argument_payload);
-            let op_node_execute = op_node.execute(&self, argument_payload, None);
-            if op_node.is_async {
+            let op_node_execute = op_node.execute(&self, argument_payload, None, None);
+            if op_node.is_long_running_background_thread {
                 let sender_clone = sender.clone();
                 let (oneshot_sender, oneshot_receiver) = tokio::sync::oneshot::channel();
 
                 // Run the target long running function in a background thread
                 tokio::spawn(async move {
-                    dbg!("Spawning async operation");
-                    dbg!("Starting background thread");
                     // This is another thread that handles annotating these events with additional metadata (operationId)
                     let (internal_sender, internal_receiver) = mpsc::channel();
                     std::thread::spawn(move || {
@@ -692,7 +648,6 @@ impl ExecutionState {
 
                     // Long-running execution
                     dbg!("Long-running execution");
-                    // TODO: this is deadlocking
                     let _ = op_node_execute.await;
                     dbg!("Completed");
                     let _ = oneshot_sender.send(());

@@ -76,7 +76,7 @@ pub async fn run_cron(
 
                             dbg!(&argument_payload);
                             // invocation of the operation
-                            let result = op.execute(&ExecutionState::new(), argument_payload, None);
+                            let result = op.execute(&ExecutionState::new(), argument_payload, None, None);
                         })?
                     ).await?;
                 }

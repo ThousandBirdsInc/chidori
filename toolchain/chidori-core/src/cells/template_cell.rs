@@ -46,7 +46,7 @@ pub fn template_cell(cell: &TemplateCell) -> OperationNode {
         cell.name.clone(),
         input_signature,
         output_signature,
-        Box::new(move |_, x, _| {
+        Box::new(move |_, x, _, _| {
             let body = body.clone();
             async move {
                 let data = if let RKV::Object(m) = x {
@@ -80,7 +80,7 @@ mod test {
         let input = crate::execution::primitives::serialized_value::RkyvSerializedValue::Object(
             std::collections::HashMap::new()
         );
-        let output = op.execute(&ExecutionState::new(), input, None).await;
+        let output = op.execute(&ExecutionState::new(), input, None, None).await;
         assert_eq!(output, crate::execution::primitives::serialized_value::RkyvSerializedValue::String("Hello, !".to_string()));
     }
 }

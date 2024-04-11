@@ -326,7 +326,6 @@ impl Chidori {
             }).collect::<HashMap<_, _>>()
         };
 
-        dbg!(&cells);
         let mut new_cells_state = vec![];
         for cell in cells {
             let name = get_cell_name(&cell);
@@ -350,7 +349,6 @@ impl Chidori {
                 });
             }
         }
-        dbg!(&new_cells_state);
         self.shared_state.lock().unwrap().cells = new_cells_state;
         println!("Cells commit to shared state");
         self.handle_user_action(UserInteractionMessage::ReloadCells);
@@ -827,9 +825,11 @@ mod tests {
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
         env.get_state().render_dependency_graph();
-        env.step().await;
-        env.step().await;
-        env.step().await;
+        let out = env.step().await;
+        let out = env.step().await;
+        let out = env.step().await;
+        dbg!(out);
+        let out = env.step().await;
         assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
     }
 }

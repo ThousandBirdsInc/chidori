@@ -5,8 +5,12 @@ use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::env;
 use std::pin::Pin;
 use ts_rs::TS;
+use chidori_prompt_format::templating::templates::{ChatModelRoles, TemplateWithSource};
+use crate::execution::execution::ExecutionState;
+use crate::execution::primitives::serialized_value::{RkyvSerializedValue, serialized_value_to_json_value};
 
 #[derive(Debug)]
 pub enum LLMErrors {
@@ -169,4 +173,62 @@ trait CompletionModel {
 #[async_trait]
 trait EmbeddingModel {
     async fn embed(&self, chat_completion_req: ChatCompletionReq) -> Result<Vec<f32>, String>;
+}
+
+
+pub async fn ai_llm_run_chat_model(
+    execution_state: &ExecutionState,
+    payload: RkyvSerializedValue,
+    role_blocks: Vec<(ChatModelRoles, Option<TemplateWithSource>)>,
+    name: Option<String>,
+    is_function_invocation: bool,
+) -> RkyvSerializedValue {
+    let mut template_messages: Vec<TemplateMessage> = Vec::new();
+    let data = if let RkyvSerializedValue::Object(ref m) = payload {
+        if let Some(m) = m.get("globals") {
+            serialized_value_to_json_value(m)
+        } else if let Some(m) = m.get("kwargs") {
+            serialized_value_to_json_value(m)
+        } else {
+            serialized_value_to_json_value(&payload)
+        }
+    } else {
+        serialized_value_to_json_value(&payload)
+    };
+
+    for (a, b) in &role_blocks.clone() {
+        template_messages.push(TemplateMessage {
+            role: match a {
+                ChatModelRoles::User => MessageRole::User,
+                ChatModelRoles::System => MessageRole::System,
+                ChatModelRoles::Assistant => MessageRole::Assistant,
+            },
+            content: chidori_prompt_format::templating::templates::render_template_prompt(&b.as_ref().unwrap().source, &data, &HashMap::new()).unwrap(),
+            name: None,
+            function_call: None,
+        });
+    }
+
+    // TODO: replace this to being fetched from configuration
+    let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
+    let c = crate::library::std::ai::llm::openai::OpenAIChatModel::new(api_key);
+    let result = c.batch(ChatCompletionReq {
+        model: "gpt-3.5-turbo".to_string(),
+        template_messages,
+        ..ChatCompletionReq::default()
+    }).await;
+    dbg!(&result);
+    if let Ok(ChatCompletionRes { choices, .. }) = result {
+        // TODO: if invoked as a function don't nest this
+        let mut result_map = HashMap::new();
+        if !is_function_invocation {
+            if let Some(name) = &name {
+                result_map.insert(name.clone(), RkyvSerializedValue::String(choices[0].text.as_ref().unwrap().clone()));
+                return RkyvSerializedValue::Object(result_map);
+            }
+        }
+        RkyvSerializedValue::String(choices[0].text.as_ref().unwrap().clone())
+    } else {
+        RkyvSerializedValue::Null
+    }
 }

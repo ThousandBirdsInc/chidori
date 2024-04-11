@@ -65,6 +65,8 @@ chidori-static-analysis = { path = "../chidori-static-analysis" }
 ts-rs = "7.1"
 
 
+dashmap = "5.5.3"
+
 # TODO: make optional
 yaml-front-matter = "0.1.0"
 deno = {path = "/Users/coltonpierson/work/deno/cli"}

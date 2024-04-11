@@ -473,6 +473,10 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                 orelse,
                 ..
             }) => {
+                // TODO: target needs to get declared in scope
+                let idx = machine.enter_assignment_to_statement();
+                traverse_expression(target, machine);
+                machine.pop_until(idx);
                 traverse_expression(target, machine);
                 traverse_expression(iter, machine);
                 traverse_statements(body, machine);
@@ -1049,6 +1053,86 @@ mod tests {
     }
 
 
+    #[test]
+    fn test_for_loop_assignments_are_captured() {
+        let python_source = indoc! { r#"
+        async def run_prompt(number_of_states):
+            out = ""
+            for state in (await get_states_first_letters(num=number_of_states)).split('\n'):
+                out += await first_letter(state)
+            return "demo" + out
+            "#};
+        let context_stack_references = extract_dependencies_python(python_source);
+        assert_eq!(
+            context_stack_references,
+            vec![
+                vec![ContextPath::InFunction(String::from("run_prompt"))],
+                vec![
+                    ContextPath::InFunction(String::from("run_prompt")),
+                    ContextPath::AssignmentToStatement,
+                    ContextPath::IdentifierReferredTo(String::from("out"), false)
+                ],
+                vec![
+                    ContextPath::InFunction(String::from("run_prompt")),
+                    ContextPath::AssignmentFromStatement,
+                    ContextPath::Constant(String::new())
+                ],
+                vec![
+                    ContextPath::InFunction(String::from("run_prompt")),
+                    ContextPath::AssignmentToStatement,
+                    ContextPath::IdentifierReferredTo(String::from("state"), false)
+                ],
+                vec![
+                    ContextPath::InFunction(String::from("run_prompt")),
+                    ContextPath::IdentifierReferredTo(String::from("state"), true)
+                ],
+                vec![
+                    ContextPath::InFunction(String::from("run_prompt")),
+                    ContextPath::InCallExpression,
+                    ContextPath::Constant(String::from("\n"))
+                ],
+                vec![
+                    ContextPath::InFunction(String::from("run_prompt")),
+                    ContextPath::InCallExpression,
+                    ContextPath::Constant(String::from("\n")),
+                    ContextPath::Attribute(String::from("split")),
+                    ContextPath::InCallExpression,
+                    ContextPath::IdentifierReferredTo(String::from("number_of_states"), true)
+                ],
+                vec![
+                    ContextPath::InFunction(String::from("run_prompt")),
+                    ContextPath::InCallExpression,
+                    ContextPath::Constant(String::from("\n")),
+                    ContextPath::Attribute(String::from("split")),
+                    ContextPath::InCallExpression,
+                    ContextPath::IdentifierReferredTo(String::from("get_states_first_letters"), false)
+                ],
+                vec![
+                    ContextPath::InFunction(String::from("run_prompt")),
+                    ContextPath::IdentifierReferredTo(String::from("out"), true)
+                ],
+                vec![
+                    ContextPath::InFunction(String::from("run_prompt")),
+                    ContextPath::InCallExpression,
+                    ContextPath::IdentifierReferredTo(String::from("state"), true)
+                ],
+                vec![
+                    ContextPath::InFunction(String::from("run_prompt")),
+                    ContextPath::InCallExpression,
+                    ContextPath::IdentifierReferredTo(String::from("first_letter"), false)
+                ],
+                vec![
+                    ContextPath::InFunction(String::from("run_prompt")),
+                    ContextPath::Constant(String::from("demo"))
+                ],
+                vec![
+                    ContextPath::InFunction(String::from("run_prompt")),
+                    ContextPath::Constant(String::from("demo")),
+                    ContextPath::IdentifierReferredTo(String::from("out"), true)
+                ]
+            ]
+        );
+    }
 
     #[test]
     fn test_pipe_function_composition() {
@@ -1187,6 +1271,62 @@ x = random.randint(0, 10)
         };
         assert_eq!(result, report);
     }
+
+    #[test]
+    fn test_report_generation_for_loop_variable_assignment() {
+        let python_source = indoc! { r#"
+        async def run_prompt(number_of_states):
+            out = ""
+            for state in (await get_states_first_letters(num=number_of_states)).split('\n'):
+                out += await first_letter(state)
+            return "demo" + out
+            "#};
+        let context_stack_references = extract_dependencies_python(python_source);
+        let result = build_report(&context_stack_references);
+        let report = Report {
+            cell_exposed_values: std::collections::HashMap::new(), // No data provided, initializing as empty
+            cell_depended_values: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "get_states_first_letters".to_string(),
+                    ReportItem {
+                        // context_path: vec![
+                        //     ContextPath::InFunction("testing".to_string()),
+                        //     ContextPath::AssignmentFromStatement,
+                        //     ContextPath::IdentifierReferredTo("y".to_string(), false),
+                        // ],
+                    },
+                );
+                map.insert(
+                    "first_letter".to_string(),
+                    ReportItem {
+                        // context_path: vec![
+                        //     ContextPath::InFunction("testing".to_string()),
+                        //     ContextPath::AssignmentFromStatement,
+                        //     ContextPath::IdentifierReferredTo("y".to_string(), false),
+                        // ],
+                    },
+                );
+                map
+            },
+            triggerable_functions: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "run_prompt".to_string(),
+                    ReportTriggerableFunctions {
+                        // context_path: vec![ContextPath::InFunction("testing".to_string())],
+                        emit_event: vec![],
+                        trigger_on: vec![],
+                    },
+                );
+                map
+            },
+            declared_functions: std::collections::HashMap::new(), // No data provided, initializing as empty
+        };
+
+        assert_eq!(result, report);
+    }
+
     #[test]
     fn test_report_generation_with_class() {
         let python_source = indoc! { r#"

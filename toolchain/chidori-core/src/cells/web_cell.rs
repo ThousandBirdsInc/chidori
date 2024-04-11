@@ -27,7 +27,7 @@ pub fn web_cell(cell: &WebserviceCell) -> OperationNode {
         cell.name.clone(),
         input_signature,
         output_signature,
-        Box::new(move |_, x, _| {
+        Box::new(move |_, x, _, _| {
             // TODO: this needs to handle stdout and errors
             let cell = cell.clone();
             async move {
@@ -38,7 +38,6 @@ pub fn web_cell(cell: &WebserviceCell) -> OperationNode {
             }.boxed()
         }),
     );
-    op_node.is_async = true;
-    op_node.is_long_running = true;
+    op_node.is_long_running_background_thread = true;
     op_node
 }
