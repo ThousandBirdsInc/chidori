@@ -23,7 +23,7 @@ use petgraph::graphmap::DiGraphMap;
 use petgraph::visit::{IntoEdgesDirected, VisitMap};
 use petgraph::Direction;
 use petgraph::prelude::Dfs;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+pub use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde::ser::SerializeMap;
 use tokio::sync::oneshot::Receiver;
 use crate::cells::CellTypes;
@@ -45,7 +45,7 @@ pub type ExecutionNodeId = (usize, usize);
 pub struct MergedStateHistory(HashMap<usize, (ExecutionNodeId, Arc<RkyvSerializedValue>)>);
 
 
-impl Serialize for MergedStateHistory {
+impl serde::Serialize for MergedStateHistory {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where
             S: Serializer,
@@ -59,7 +59,7 @@ impl Serialize for MergedStateHistory {
 }
 
 
-impl<'de> Deserialize<'de> for MergedStateHistory {
+impl<'de> serde::Deserialize<'de> for MergedStateHistory {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
         where
             D: Deserializer<'de>,

@@ -208,7 +208,7 @@ pub enum EventsFromRuntime {
     CellsUpdated(Vec<CellHolder>)
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct CellHolder {
     cell: CellTypes,
     op_id: Option<usize>,

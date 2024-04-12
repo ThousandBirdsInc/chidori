@@ -10,7 +10,7 @@ use petgraph::Direction;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::{Debug, Formatter};
-use std::ops::{Coroutine, CoroutineState, Deref};
+use std::ops::{Deref};
 use std::sync::{Arc, mpsc};
 // use std::sync::{Mutex};
 use no_deadlocks::Mutex;
@@ -95,10 +95,6 @@ impl Debug for ExecutionStateEvaluation {
 }
 
 
-enum CoroutineYieldValue {
-    Value(RkyvSerializedValue),
-    Coroutine(Box<dyn Coroutine<Return=CoroutineYieldValue, Yield=CoroutineYieldValue>>),
-}
 
 
 

@@ -24,6 +24,7 @@ use crate::dagre::{Data, Edge, Node, Rect};
 use notify_debouncer_full::{notify::{Watcher, RecommendedWatcher, RecursiveMode}, new_debouncer, DebounceEventResult, Debouncer, FileIdCache, FileIdMap};
 use tauri::async_runtime::JoinHandle;
 use ts_rs::TS;
+use serde::Serialize;
 use chidori_core::execution::execution::execution_graph::{ExecutionNodeId, MergedStateHistory};
 use chidori_core::execution::primitives::identifiers::{DependencyReference, OperationId};
 use chidori_core::utils::telemetry::TraceEvents;
@@ -113,6 +114,8 @@ fn main() {
                                     handle.emit_all("sync:definitionGraphState", Some(maintain_definition_graph(&state))).expect("Failed to emit");
                                 }
                                 EventsFromRuntime::CellsUpdated(state) => {
+                                    let state: Vec<CellHolder> = state;
+                                    serde_json::to_string(&state.first().unwrap());
                                     handle.emit_all("sync:cellsState", Some(state)).expect("Failed to emit");
                                 }
                                 _ => {}

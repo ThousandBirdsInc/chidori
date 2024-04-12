@@ -54,8 +54,8 @@ fn add_extension_module_link_args(triple: &Triple) -> io::Result<()> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
   let target_triple = env::var("TARGET").expect("TARGET was not set");
   let triple = Triple::from_str(&target_triple).expect("Invalid target triple");
-  add_extension_module_link_args(&triple);
-  pyo3_build_config::add_extension_module_link_args();
+  // add_extension_module_link_args(&triple);
+  // pyo3_build_config::add_extension_module_link_args();
   tauri_build::build();
   Ok(())
 }
