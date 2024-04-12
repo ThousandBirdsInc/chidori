@@ -2,9 +2,6 @@ use std::cell::RefCell;
 use anyhow::Result;
 use deno_core::error::AnyError;
 use deno_core::{Extension, ExtensionFileSource, ExtensionFileSourceCode, FastString, JsRuntime, ModuleSpecifier, Op, op2, OpState, PollEventLoopOptions, RuntimeOptions, serde_json, serde_v8, v8};
-use deno_ast::MediaType;
-use deno_ast::ParseParams;
-use deno_ast::SourceTextInfo;
 use deno;
 use std::sync::{Arc, Mutex};
 

@@ -23,6 +23,7 @@ sqlparser.workspace = true
 anyhow.workspace = true
 indoc.workspace = true
 serde.workspace = true
+serde_derive.workspace = true
 serde_json.workspace = true
 tonic.workspace = true
 prost.workspace = true
@@ -72,7 +73,6 @@ yaml-front-matter = "0.1.0"
 deno = {path = "/Users/coltonpierson/work/deno/cli"}
 deno_runtime = {path = "/Users/coltonpierson/work/deno/runtime"}
 deno_core = "0.272.0"
-deno_ast = { version = "0.34.2", features = ["transpiling"] }
 #starlark = { version = "0.9.0"}
 http-body-util = "0.1.0-rc.2"
 zip = "0.6.6"

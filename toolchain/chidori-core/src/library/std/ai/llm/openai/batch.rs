@@ -64,6 +64,8 @@ impl ChatModelBatch for OpenAIChatModel {
                     }),
                 })
                 .collect(),
+            tool_choice: None,
+            tools: None,
             functions: None,
             function_call: None,
             temperature: chat_completion_req.temperature,
