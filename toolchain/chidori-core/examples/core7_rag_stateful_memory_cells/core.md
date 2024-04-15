@@ -5,9 +5,9 @@
 ---
 ```
 
-```python
-
+```embedding (rag)
 ```
+
 
 ```python (entry)
 import unittest

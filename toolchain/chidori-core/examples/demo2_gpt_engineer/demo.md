@@ -1,3 +1,10 @@
+# GPT Migrate
+
+This is a port of [GPT Migrate](https://github.com/joshpxyne/gpt-migrate) to the Chidori framework, demonstrating how functionality of the framework simplifies the implementation.
+
+
+
+
 ```prompt (guidelines)
     \n\n PREFERENCE LEVEL 1
 

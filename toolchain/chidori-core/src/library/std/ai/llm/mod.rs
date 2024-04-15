@@ -11,6 +11,7 @@ use ts_rs::TS;
 use chidori_prompt_format::templating::templates::{ChatModelRoles, TemplateWithSource};
 use crate::execution::execution::ExecutionState;
 use crate::execution::primitives::serialized_value::{RkyvSerializedValue, serialized_value_to_json_value};
+use crate::library::std::ai::llm::openai::OpenAIChatModel;
 
 #[derive(Debug)]
 pub enum LLMErrors {
@@ -187,13 +188,39 @@ pub async fn ai_llm_run_completion_model(
     RkyvSerializedValue::Null
 }
 
+
 pub async fn ai_llm_run_embedding_model(
     execution_state: &ExecutionState,
     payload: RkyvSerializedValue,
+    template: TemplateWithSource,
     name: Option<String>,
     is_function_invocation: bool,
 ) -> RkyvSerializedValue {
-    RkyvSerializedValue::Null
+    let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
+    let api_url_v1: &str = "https://api.openai.com/v1";
+    let model = OpenAIChatModel::new(api_url_v1.to_string(), api_key);
+    let data = template_data_payload_from_rkyv(&payload);
+    let result = model.embed(EmbeddingReq {
+        content: chidori_prompt_format::templating::templates::render_template_prompt(&template.source, &data, &HashMap::new()).unwrap(),
+        model: "text-embedding-3-small".to_string(),
+        frequency_penalty: None,
+        max_tokens: None,
+        presence_penalty: None,
+        stop: None,
+    }).await;
+    if let Ok(result) = result {
+        // if invoked as a function don't nest the result in a named key, return the response as a direct string
+        let mut result_map = HashMap::new();
+        if !is_function_invocation {
+            if let Some(name) = &name {
+                result_map.insert(name.clone(), RkyvSerializedValue::Array(result.iter().map(|v| RkyvSerializedValue::Float(*v)).collect()));
+                return RkyvSerializedValue::Object(result_map);
+            }
+        }
+        RkyvSerializedValue::Array(result.iter().map(|v| RkyvSerializedValue::Float(*v)).collect())
+    } else {
+        RkyvSerializedValue::Null
+    }
 }
 
 pub async fn ai_llm_run_chat_model(
@@ -204,17 +231,7 @@ pub async fn ai_llm_run_chat_model(
     is_function_invocation: bool,
 ) -> RkyvSerializedValue {
     let mut template_messages: Vec<TemplateMessage> = Vec::new();
-    let data = if let RkyvSerializedValue::Object(ref m) = payload {
-        if let Some(m) = m.get("globals") {
-            serialized_value_to_json_value(m)
-        } else if let Some(m) = m.get("kwargs") {
-            serialized_value_to_json_value(m)
-        } else {
-            serialized_value_to_json_value(&payload)
-        }
-    } else {
-        serialized_value_to_json_value(&payload)
-    };
+    let data = template_data_payload_from_rkyv(&payload);
 
     for (a, b) in &role_blocks.clone() {
         template_messages.push(TemplateMessage {
@@ -231,12 +248,21 @@ pub async fn ai_llm_run_chat_model(
 
     // TODO: replace this to being fetched from configuration
     let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
-    let API_URL_V1: &str = "https://api.openai.com/v1";
-    let c = crate::library::std::ai::llm::openai::OpenAIChatModel::new(API_URL_V1.to_string(), api_key);
+    let api_url_v1: &str = "https://api.openai.com/v1";
+    let c = crate::library::std::ai::llm::openai::OpenAIChatModel::new(api_url_v1.to_string(), api_key);
     let result = c.batch(ChatCompletionReq {
         model: "gpt-3.5-turbo".to_string(),
+        frequency_penalty: None,
+        max_tokens: None,
+        presence_penalty: None,
+        stop: None,
+        temperature: None,
+        response_format: None,
+        logit_bias: None,
+        user: None,
+        seed: None,
+        top_p: None,
         template_messages,
-        ..ChatCompletionReq::default()
     }).await;
     if let Ok(ChatCompletionRes { choices, .. }) = result {
         // if invoked as a function don't nest the result in a named key, return the response as a direct string
@@ -251,4 +277,19 @@ pub async fn ai_llm_run_chat_model(
     } else {
         RkyvSerializedValue::Null
     }
+}
+
+fn template_data_payload_from_rkyv(payload: &RkyvSerializedValue) -> Value {
+    let data = if let RkyvSerializedValue::Object(ref m) = payload {
+        if let Some(m) = m.get("globals") {
+            serialized_value_to_json_value(m)
+        } else if let Some(m) = m.get("kwargs") {
+            serialized_value_to_json_value(m)
+        } else {
+            serialized_value_to_json_value(&payload)
+        }
+    } else {
+        serialized_value_to_json_value(&payload)
+    };
+    data
 }

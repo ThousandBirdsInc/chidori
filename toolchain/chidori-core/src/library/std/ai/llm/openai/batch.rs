@@ -24,25 +24,27 @@ impl ChatModelBatch for OpenAIChatModel {
         chat_completion_req: ChatCompletionReq,
     ) -> Result<ChatCompletionRes, String> {
         let model = chat_completion_req.model;
-        if !vec![
-            "gpt-4-1106-preview",
-            "gpt-4-vision-preview",
-            "gpt-4",
-            "gpt-4-0314",
-            "gpt-4-0613",
-            "gpt-4-32k",
-            "gpt-4-32k-0314",
-            "gpt-4-32k-0613",
-            "gpt-3.5-turbo",
-            "gpt-3.5-turbo-16k",
-            "gpt-3.5-turbo-0301",
-            "gpt-3.5-turbo-0613",
-            "gpt-3.5-turbo-1106",
-            "gpt-3.5-turbo-16k-0613",
-        ]
-        .contains(&model.as_str())
-        {
-            return Err(format!("Model {} is not supported", model));
+        if self.api_url == "https://api.openai.com/v1" {
+            if !vec![
+                "gpt-4-1106-preview",
+                "gpt-4-vision-preview",
+                "gpt-4",
+                "gpt-4-0314",
+                "gpt-4-0613",
+                "gpt-4-32k",
+                "gpt-4-32k-0314",
+                "gpt-4-32k-0613",
+                "gpt-3.5-turbo",
+                "gpt-3.5-turbo-16k",
+                "gpt-3.5-turbo-0301",
+                "gpt-3.5-turbo-0613",
+                "gpt-3.5-turbo-1106",
+                "gpt-3.5-turbo-16k-0613",
+            ]
+                .contains(&model.as_str())
+            {
+                return Err(format!("Model {} is not supported", model));
+            }
         }
         let req = ChatCompletionRequest {
             model,
@@ -117,8 +119,8 @@ mod tests {
     #[tokio::test]
     async fn test_batch_completion() {
         let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
-        let API_URL_V1: &str = "https://api.openai.com/v1";
-        let model = OpenAIChatModel::new(API_URL_V1.to_string(), api_key);
+        let api_url_v1: &str = "https://api.openai.com/v1";
+        let model = OpenAIChatModel::new(api_url_v1.to_string(), api_key);
         let chat_completion_req = ChatCompletionReq {
             model: "".to_string(),
             ..ChatCompletionReq::default()

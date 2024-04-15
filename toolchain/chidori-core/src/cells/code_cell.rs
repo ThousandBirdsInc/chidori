@@ -1,4 +1,5 @@
 use futures_util::FutureExt;
+use chidori_static_analysis::language::Report;
 use crate::cells::{CodeCell, SupportedLanguage};
 use crate::execution::execution::ExecutionState;
 use crate::execution::primitives::operation::{InputItemConfiguation, InputSignature, InputType, OperationNode, OutputItemConfiguation, OutputSignature};
@@ -16,35 +17,7 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
                 );
             let report = chidori_static_analysis::language::python::parse::build_report(&paths);
 
-            let mut input_signature = InputSignature::new();
-            for (key, value) in &report.cell_depended_values {
-                input_signature.globals.insert(
-                    key.clone(),
-                    InputItemConfiguation {
-                        ty: Some(InputType::String),
-                        default: None,
-                    },
-                );
-            }
-
-            let mut output_signature = OutputSignature::new();
-            for (key, value) in &report.cell_exposed_values {
-                output_signature.globals.insert(
-                    key.clone(),
-                    OutputItemConfiguation {
-                        ty: Some(InputType::String),
-                    },
-                );
-            }
-
-            for (key, value) in &report.triggerable_functions {
-                output_signature.functions.insert(
-                    key.clone(),
-                    OutputItemConfiguation {
-                        ty: Some(InputType::Function),
-                    },
-                );
-            }
+            let (input_signature, output_signature) = signatures_from_report(&report);
 
             let cell = cell.clone();
             OperationNode::new(
@@ -81,35 +54,7 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
                 );
             let report = chidori_static_analysis::language::javascript::parse::build_report(&paths);
 
-            let mut input_signature = InputSignature::new();
-            for (key, value) in &report.cell_depended_values {
-                input_signature.globals.insert(
-                    key.clone(),
-                    InputItemConfiguation {
-                        ty: Some(InputType::String),
-                        default: None,
-                    },
-                );
-            }
-
-            let mut output_signature = OutputSignature::new();
-            for (key, value) in &report.cell_exposed_values {
-                output_signature.globals.insert(
-                    key.clone(),
-                    OutputItemConfiguation {
-                        ty: Some(InputType::String),
-                    },
-                );
-            }
-
-            for (key, value) in &report.triggerable_functions {
-                output_signature.functions.insert(
-                    key.clone(),
-                    OutputItemConfiguation {
-                        ty: Some(InputType::Function),
-                    },
-                );
-            }
+            let (input_signature, output_signature) = signatures_from_report(&report);
 
             let cell = cell.clone();
             OperationNode::new(
@@ -139,6 +84,39 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
             )
         }
     }
+}
+
+fn signatures_from_report(report: &Report) -> (InputSignature, OutputSignature) {
+    let mut input_signature = InputSignature::new();
+    for (key, value) in &report.cell_depended_values {
+        input_signature.globals.insert(
+            key.clone(),
+            InputItemConfiguation {
+                ty: Some(InputType::String),
+                default: None,
+            },
+        );
+    }
+
+    let mut output_signature = OutputSignature::new();
+    for (key, value) in &report.cell_exposed_values {
+        output_signature.globals.insert(
+            key.clone(),
+            OutputItemConfiguation {
+                ty: Some(InputType::String),
+            },
+        );
+    }
+
+    for (key, value) in &report.triggerable_functions {
+        output_signature.functions.insert(
+            key.clone(),
+            OutputItemConfiguation {
+                ty: Some(InputType::Function),
+            },
+        );
+    }
+    (input_signature, output_signature)
 }
 
 

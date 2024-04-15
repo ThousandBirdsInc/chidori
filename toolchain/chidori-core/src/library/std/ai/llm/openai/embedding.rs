@@ -6,8 +6,23 @@ use crate::library::std::ai::llm::openai::OpenAIChatModel;
 #[async_trait]
 impl EmbeddingModel for OpenAIChatModel {
     async fn embed(&self, embedding_request: EmbeddingReq) -> Result<Vec<f32>, String> {
+        let model = embedding_request.model;
+        if self.api_url == "https://api.openai.com/v1" {
+            if !vec![
+                "text-embedding-3-small",
+                "text-embedding-3-large",
+                "text-embedding-ada-002",
+            ]
+                .contains(&model.as_str())
+            {
+                return Err(format!("OpenAI model {} is not supported", model));
+            }
+        }
+        if self.api_url == "http://localhost:11434/v1" {
+            return Err("Ollama does not yet support the openai embeddings api format".to_string());
+        }
         let req = EmbeddingRequest {
-            model: embedding_request.model,
+            model,
             input: embedding_request.content,
             user: None,
         };
@@ -27,19 +42,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_openai_embedding() {
-        // TODO: Ollama doesnt support embeddings api
         let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
-        let API_URL_V1: &str = "https://api.openai.com/v1";
-        let model = OpenAIChatModel::new(API_URL_V1.to_string(), api_key);
-        let embedding_req = EmbeddingReq {
+        let api_url_v1: &str = "https://api.openai.com/v1";
+        let model = OpenAIChatModel::new(api_url_v1.to_string(), api_key);
+        let result = model.embed(EmbeddingReq {
             content: "".to_string(),
-            model: "".to_string(),
+            model: "text-embedding-3-small".to_string(),
             frequency_penalty: None,
             max_tokens: None,
             presence_penalty: None,
             stop: None,
-        };
-        let result = model.embed(embedding_req).await;
+        }).await;
         assert!(result.is_ok());
         let response = result.unwrap();
     }

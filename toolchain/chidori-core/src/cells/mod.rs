@@ -102,6 +102,7 @@ bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: 
 #[archive_attr(derive(Debug))]
 #[ts(export, export_to = "package_node/types/")]
 pub(crate) struct MemoryCell {
+    pub(crate) name: Option<String>,
     pub(crate) provider: SupportedMemoryProviders,
     pub(crate) embedding_function: String,
 }
@@ -255,6 +256,9 @@ pub enum LLMPromptCell {
         req: String,
     },
     Embedding {
+        function_invocation: bool,
+        configuration: HashMap<String, String>,
+        name: Option<String>,
         req: String,
     },
 }
@@ -281,7 +285,8 @@ pub enum CellTypes {
     Code(CodeCell),
     Prompt(LLMPromptCell),
     Web(WebserviceCell),
-    Template(TemplateCell)
+    Template(TemplateCell),
+    Memory(MemoryCell),
 }
 
 impl Eq for CellTypes {
@@ -309,6 +314,7 @@ pub fn get_cell_name(cell: &CellTypes) -> &Option<String> {
             LLMPromptCell::Embedding { .. } => &None
         },
         CellTypes::Web(c) => &c.name,
-        CellTypes::Template(c) => &c.name
+        CellTypes::Template(c) => &c.name,
+        CellTypes::Memory(c) => &c.name
     }
 }

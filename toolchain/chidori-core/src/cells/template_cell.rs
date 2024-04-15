@@ -14,13 +14,6 @@ pub fn template_cell(cell: &TemplateCell) -> OperationNode {
 
     let mut input_signature = InputSignature::new();
     for (key, value) in &schema.items {
-        // input_signature.kwargs.insert(
-        //     key.clone(),
-        //     InputItemConfiguation {
-        //         ty: Some(InputType::String),
-        //         default: None,
-        //     },
-        // );
         input_signature.globals.insert(
             key.clone(),
             InputItemConfiguation {
