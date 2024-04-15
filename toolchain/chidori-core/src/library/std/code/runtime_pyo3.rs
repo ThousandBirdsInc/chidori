@@ -420,13 +420,16 @@ asyncio.run(__wrapper())
             }
         }
     });
-    if let Ok(result) = result {
-        let awaited_result = result.await;
-        let (_, output_stdout) = PYTHON_LOGGING_BUFFER_STDOUT.remove(&exec_id).unwrap_or((0, vec![]));
-        let (_, output_stderr) = PYTHON_LOGGING_BUFFER_STDERR.remove(&exec_id).unwrap_or((0, vec![]));
-        Ok((awaited_result, output_stdout, output_stderr))
-    } else {
-        return Err(anyhow::anyhow!("No result"));
+    match result {
+        Ok(result) => {
+            let awaited_result = result.await;
+            let (_, output_stdout) = PYTHON_LOGGING_BUFFER_STDOUT.remove(&exec_id).unwrap_or((0, vec![]));
+            let (_, output_stderr) = PYTHON_LOGGING_BUFFER_STDERR.remove(&exec_id).unwrap_or((0, vec![]));
+            Ok((awaited_result, output_stdout, output_stderr))
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(e.to_string()));
+        }
     }
 }
 

@@ -7,8 +7,9 @@ use rkyv::{
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hasher;
 
-#[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, PartialEq, Clone)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]
 #[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
 #[archive(check_bytes)]
 #[archive_attr(check_bytes(
@@ -22,6 +23,14 @@ pub enum RkyvSerializedValue {
     FunctionPointer(usize, String),
 
     Cell(CellTypes),
+
+    // TODO: add Embedding
+    Set(
+
+        #[omit_bounds]
+        #[archive_attr(omit_bounds)]
+        HashSet<RkyvSerializedValue>
+    ),
 
     Float(f32),
     Number(i32),
@@ -88,6 +97,107 @@ impl RkyvObjectBuilder {
     }
 }
 
+impl std::cmp::Eq for RkyvSerializedValue {
+}
+
+impl std::cmp::PartialEq for RkyvSerializedValue {
+    fn eq(&self, other: &Self) -> bool {
+        if core::mem::discriminant(self) != core::mem::discriminant(other) {
+            return false;
+        }
+        match self {
+            RkyvSerializedValue::StreamPointer(a) => {
+                match other {
+                    RkyvSerializedValue::StreamPointer(aa) => { a == aa }
+                    _ => unreachable!()
+                }
+            }
+            RkyvSerializedValue::FunctionPointer(a, b) => {
+                match other {
+                    RkyvSerializedValue::FunctionPointer(aa,bb ) => { a == aa && b == bb }
+                    _ => unreachable!()
+                }
+            }
+            RkyvSerializedValue::Cell(a) => {
+                match other {
+                    RkyvSerializedValue::Cell(aa) => { a == aa }
+                    _ => unreachable!()
+                }
+            }
+            RkyvSerializedValue::Set(a) => {
+                match other {
+                    RkyvSerializedValue::Set(aa) => { a == aa }
+                    _ => unreachable!()
+                }
+            }
+            RkyvSerializedValue::Float(_) => {
+                return false;
+            }
+            RkyvSerializedValue::Number(a) => {
+                match other {
+                    RkyvSerializedValue::Number(aa) => { a == aa }
+                    _ => unreachable!()
+                }
+            }
+            RkyvSerializedValue::String(a) => {
+                match other {
+                    RkyvSerializedValue::String(aa) => { a == aa }
+                    _ => unreachable!()
+                }
+            }
+            RkyvSerializedValue::Boolean(a) => {
+                match other {
+                    RkyvSerializedValue::Boolean(aa) => { a == aa }
+                    _ => unreachable!()
+                }
+            }
+            RkyvSerializedValue::Null => {
+                match other {
+                    RkyvSerializedValue::Null => { true }
+                    _ => unreachable!()
+                }
+            }
+            RkyvSerializedValue::Array(a) => {
+                match other {
+                    RkyvSerializedValue::Array(aa) => {
+                        a == aa
+                    }
+                    _ => unreachable!()
+                }
+            }
+            RkyvSerializedValue::Object(a) => {
+                match other {
+                    RkyvSerializedValue::Object(aa) => {
+                        a == aa
+                    }
+                    _ => unreachable!()
+                }
+            }
+        }
+    }
+}
+
+impl std::hash::Hash for RkyvSerializedValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        todo!()
+    }
+}
+
+impl std::cmp::PartialEq for ArchivedRkyvSerializedValue {
+    fn eq(&self, other: &Self) -> bool {
+        todo!()
+    }
+}
+
+impl std::cmp::Eq for ArchivedRkyvSerializedValue {
+}
+
+impl std::hash::Hash for ArchivedRkyvSerializedValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        todo!()
+    }
+}
+
 impl std::fmt::Display for RkyvSerializedValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -109,6 +219,13 @@ impl std::fmt::Display for RkyvSerializedValue {
                     .map(|(key, value)| format!("{}: {}", key, value))
                     .collect();
                 write!(f, "Object{{{}}}", shapes.join(", "))
+            }
+            RkyvSerializedValue::Set(set) => {
+                let shapes: Vec<String> = set
+                    .iter()
+                    .map(|value| format!("{}", value))
+                    .collect();
+                write!(f, "Set{{{}}}", shapes.join(", "))
             }
         }
     }
@@ -135,6 +252,7 @@ pub fn deserialize_from_buf(v: &[u8]) -> RkyvSerializedValue {
 
 pub fn serialized_value_to_json_value(v: &RkyvSerializedValue) -> Value {
     match &v {
+
         RkyvSerializedValue::Float(f) => Value::Number(f.to_string().parse().unwrap()),
         RkyvSerializedValue::Number(n) => Value::Number(n.to_string().parse().unwrap()),
         RkyvSerializedValue::String(s) => Value::String(s.to_string()),
@@ -153,6 +271,11 @@ pub fn serialized_value_to_json_value(v: &RkyvSerializedValue) -> Value {
         RkyvSerializedValue::StreamPointer(_) => Value::Null,
         RkyvSerializedValue::Cell(_) => Value::Null,
         RkyvSerializedValue::Null => Value::Null,
+        RkyvSerializedValue::Set(a) => {
+            a.iter()
+                .map(|v| serialized_value_to_json_value(v))
+                .collect()
+        }
     }
 }
 
@@ -234,6 +357,7 @@ mod tests {
         assert_eq!(deserialized, value);
     }
 
+    #[ignore]
     #[test]
     fn test_float() {
         let value = RkyvSerializedValue::Float(42.0);

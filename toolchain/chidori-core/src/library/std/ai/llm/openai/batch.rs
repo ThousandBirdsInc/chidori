@@ -117,7 +117,8 @@ mod tests {
     #[tokio::test]
     async fn test_batch_completion() {
         let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
-        let model = OpenAIChatModel::new(api_key);
+        let API_URL_V1: &str = "https://api.openai.com/v1";
+        let model = OpenAIChatModel::new(API_URL_V1.to_string(), api_key);
         let chat_completion_req = ChatCompletionReq {
             model: "".to_string(),
             ..ChatCompletionReq::default()

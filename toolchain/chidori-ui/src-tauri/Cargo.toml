@@ -19,7 +19,6 @@ pyo3-build-config = "0.19.1"
 
 [dependencies]
 tauri = { version = "1.6.1", features = [ "dialog-open", "fs-all"] }
-
 serde.workspace = true
 serde_json.workspace = true
 serde_derive.workspace = true
@@ -28,7 +27,6 @@ chidori-core = { path = "../../chidori-core" }
 dirs = "5.0.1"
 target-lexicon = "0.12.14"
 petgraph.workspace = true
-diskmap = "0.2.0"
 rusqlite = { version = "0.29.0", features = ["bundled"] }
 notify-debouncer-full = "0.3.1"
 ts-rs = "7.1"

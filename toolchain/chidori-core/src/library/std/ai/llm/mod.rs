@@ -130,6 +130,7 @@ pub struct ChatCompletionRes {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EmbeddingReq {
+    content: String,
     model: String,
     frequency_penalty: Option<f32>,
     max_tokens: Option<i32>,
@@ -172,7 +173,7 @@ trait CompletionModel {
 
 #[async_trait]
 trait EmbeddingModel {
-    async fn embed(&self, chat_completion_req: ChatCompletionReq) -> Result<Vec<f32>, String>;
+    async fn embed(&self, embedding_req: EmbeddingReq) -> Result<Vec<f32>, String>;
 }
 
 
@@ -189,7 +190,6 @@ pub async fn ai_llm_run_completion_model(
 pub async fn ai_llm_run_embedding_model(
     execution_state: &ExecutionState,
     payload: RkyvSerializedValue,
-    role_blocks: Vec<(ChatModelRoles, Option<TemplateWithSource>)>,
     name: Option<String>,
     is_function_invocation: bool,
 ) -> RkyvSerializedValue {
@@ -231,14 +231,15 @@ pub async fn ai_llm_run_chat_model(
 
     // TODO: replace this to being fetched from configuration
     let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
-    let c = crate::library::std::ai::llm::openai::OpenAIChatModel::new(api_key);
+    let API_URL_V1: &str = "https://api.openai.com/v1";
+    let c = crate::library::std::ai::llm::openai::OpenAIChatModel::new(API_URL_V1.to_string(), api_key);
     let result = c.batch(ChatCompletionReq {
         model: "gpt-3.5-turbo".to_string(),
         template_messages,
         ..ChatCompletionReq::default()
     }).await;
     if let Ok(ChatCompletionRes { choices, .. }) = result {
-        // TODO: if invoked as a function don't nest this
+        // if invoked as a function don't nest the result in a named key, return the response as a direct string
         let mut result_map = HashMap::new();
         if !is_function_invocation {
             if let Some(name) = &name {

@@ -17,6 +17,9 @@ import json
 import os
 import requests
 
+def partition_html(text=""):
+    return text
+
 async def scrape_and_summarize_website(website):
     """Useful to scrape and summarize a website content"""
     url = f"https://chrome.browserless.io/content?token={os.environ['BROWSERLESS_API_KEY']}"

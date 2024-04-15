@@ -28,16 +28,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f26201604c87b1e01bd3d98f8d5d9a8fcbb815e8cedb41ffccbeb4bf593a35fe"
 
 [[package]]
-name = "advisory-lock"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6caee7d48f930f9ad3fc9546f8cbf843365da0c5b0ca4eee1d1ac3dd12d8f93"
-dependencies = [
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "aead"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -286,7 +276,6 @@ dependencies = [
  "chidori-core",
  "dirs 3.0.2",
  "dirs 5.0.1",
- "diskmap",
  "notify-debouncer-full",
  "petgraph",
  "pyo3-build-config 0.19.2",
@@ -3132,17 +3121,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "diskmap"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6422b0580b2542a6ba7fd39cf610480859586b1ccc2942d4eae39c0fdda2fec8"
-dependencies = [
- "advisory-lock",
- "serde",
- "serde_cbor",
-]
-
-[[package]]
 name = "dispatch"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4567,12 +4545,6 @@ dependencies = [
  "tokio-util",
  "tracing",
 ]
-
-[[package]]
-name = "half"
-version = "1.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b43ede17f21864e81be2fa654110bf1e793774238d86ef8555c37e6519c0403"
 
 [[package]]
 name = "halfbrown"
@@ -8979,8 +8951,6 @@ checksum = "388a1df253eca08550bef6c72392cfe7c30914bf41df5269b68cbd6ff8f570a3"
 [[package]]
 name = "serde"
 version = "1.0.197"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fb1c873e1b9b056a4dc4c0c198b24c3ffa059243875552b2bd0933b1aee4ce2"
 dependencies = [
  "serde_derive",
 ]
@@ -9016,20 +8986,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_cbor"
-version = "0.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bef2ebfde456fb76bbcf9f59315333decc4fda0b2b44b420243c11e0f5ec1f5"
-dependencies = [
- "half",
- "serde",
-]
-
-[[package]]
 name = "serde_derive"
 version = "1.0.197"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7eb0b34b42edc17f6b7cac84a52a1c5f0e1bb2227e997ca9011ea3dd34e8610b"
 dependencies = [
  "proc-macro2 1.0.79",
  "quote 1.0.36",
@@ -10282,8 +10240,6 @@ checksum = "e1fc403891a21bcfb7c37834ba66a547a8f402146eba7265b5a6d88059c9ff2f"
 [[package]]
 name = "tauri"
 version = "1.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f078117725e36d55d29fafcbb4b1e909073807ca328ae8deb8c0b3843aac0fed"
 dependencies = [
  "anyhow",
  "cocoa",
@@ -10315,7 +10271,7 @@ dependencies = [
  "tauri-macros",
  "tauri-runtime",
  "tauri-runtime-wry",
- "tauri-utils",
+ "tauri-utils 1.5.3",
  "tempfile",
  "thiserror",
  "tokio",
@@ -10340,7 +10296,7 @@ dependencies = [
  "semver 1.0.22",
  "serde",
  "serde_json",
- "tauri-utils",
+ "tauri-utils 1.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "tauri-winres",
  "walkdir",
 ]
@@ -10348,8 +10304,6 @@ dependencies = [
 [[package]]
 name = "tauri-codegen"
 version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1554c5857f65dbc377cefb6b97c8ac77b1cb2a90d30d3448114d5d6b48a77fc"
 dependencies = [
  "base64 0.21.7",
  "brotli 3.5.0",
@@ -10363,7 +10317,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tauri-utils",
+ "tauri-utils 1.5.3",
  "thiserror",
  "time",
  "uuid",
@@ -10373,22 +10327,18 @@ dependencies = [
 [[package]]
 name = "tauri-macros"
 version = "1.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "277abf361a3a6993ec16bcbb179de0d6518009b851090a01adfea12ac89fa875"
 dependencies = [
  "heck 0.4.1",
  "proc-macro2 1.0.79",
  "quote 1.0.36",
  "syn 1.0.109",
  "tauri-codegen",
- "tauri-utils",
+ "tauri-utils 1.5.3",
 ]
 
 [[package]]
 name = "tauri-runtime"
 version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf2d0652aa2891ff3e9caa2401405257ea29ab8372cce01f186a5825f1bd0e76"
 dependencies = [
  "gtk",
  "http 0.2.12",
@@ -10397,7 +10347,7 @@ dependencies = [
  "raw-window-handle",
  "serde",
  "serde_json",
- "tauri-utils",
+ "tauri-utils 1.5.3",
  "thiserror",
  "url",
  "uuid",
@@ -10408,8 +10358,6 @@ dependencies = [
 [[package]]
 name = "tauri-runtime-wry"
 version = "0.14.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "067c56fc153b3caf406d7cd6de4486c80d1d66c0f414f39e94cb2f5543f6445f"
 dependencies = [
  "cocoa",
  "gtk",
@@ -10417,7 +10365,7 @@ dependencies = [
  "rand 0.8.5",
  "raw-window-handle",
  "tauri-runtime",
- "tauri-utils",
+ "tauri-utils 1.5.3",
  "uuid",
  "webkit2gtk",
  "webview2-com",
@@ -10428,10 +10376,37 @@ dependencies = [
 [[package]]
 name = "tauri-utils"
 version = "1.5.3"
+dependencies = [
+ "brotli 3.5.0",
+ "ctor",
+ "dunce",
+ "glob",
+ "heck 0.4.1",
+ "html5ever",
+ "infer 0.13.0",
+ "json-patch",
+ "kuchikiki",
+ "log",
+ "memchr",
+ "phf 0.11.2",
+ "proc-macro2 1.0.79",
+ "quote 1.0.36",
+ "semver 1.0.22",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "thiserror",
+ "url",
+ "walkdir",
+ "windows-version",
+]
+
+[[package]]
+name = "tauri-utils"
+version = "1.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75ad0bbb31fccd1f4c56275d0a5c3abdf1f59999f72cb4ef8b79b4ed42082a21"
 dependencies = [
- "brotli 3.5.0",
  "ctor",
  "dunce",
  "glob",

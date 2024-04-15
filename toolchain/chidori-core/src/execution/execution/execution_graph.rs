@@ -44,7 +44,6 @@ pub type ExecutionNodeId = (usize, usize);
 #[derive(Debug, Clone)]
 pub struct MergedStateHistory(HashMap<usize, (ExecutionNodeId, Arc<RkyvSerializedValue>)>);
 
-
 impl serde::Serialize for MergedStateHistory {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where

@@ -99,7 +99,7 @@ impl InstancedEnvironment {
         }
 
         if let Some(sender) = self.runtime_event_sender.as_mut() {
-            sender.send(EventsFromRuntime::CellsUpdated(shared_state.cells.clone())).unwrap();
+            sender.send(EventsFromRuntime::CellsUpdated(serde_json::to_string(&shared_state.cells.clone()).unwrap())).unwrap();
         }
     }
 
@@ -131,7 +131,7 @@ impl InstancedEnvironment {
                             self.execution_head_state_id = id;
                             let merged_state = self.db.get_merged_state_history(&id);
                             let sender = self.runtime_event_sender.as_mut().unwrap();
-                            sender.send(EventsFromRuntime::ExecutionStateChange(merged_state)).unwrap();
+                            sender.send(EventsFromRuntime::ExecutionStateChange(serde_json::to_string(&merged_state).unwrap())).unwrap();
                         }
                     },
                     _ => {}
@@ -163,7 +163,7 @@ impl InstancedEnvironment {
         let ((state_id, state), outputs) = self.db.external_step_execution(self.execution_head_state_id).await;
         if let Some(sender) = self.runtime_event_sender.as_mut() {
             sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
-            sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
+            sender.send(EventsFromRuntime::ExecutionStateChange(serde_json::to_string(&self.db.get_merged_state_history(&state_id)).unwrap())).unwrap();
         }
         println!("Resulted in state with id {:?}", &state_id);
         self.execution_head_state_id = state_id;
@@ -176,7 +176,7 @@ impl InstancedEnvironment {
         println!("Upserting cell into state with id {:?}", &self.execution_head_state_id);
         let ((state_id, state), op_id) = self.db.mutate_graph(self.execution_head_state_id, cell, op_id);
         if let Some(sender) = self.runtime_event_sender.as_mut() {
-            sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
+            sender.send(EventsFromRuntime::ExecutionStateChange(serde_json::to_string(&self.db.get_merged_state_history(&state_id)).unwrap())).unwrap();
             sender.send(EventsFromRuntime::DefinitionGraphUpdated(state.get_dependency_graph_flattened())).unwrap();
             sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
         }
@@ -200,12 +200,36 @@ pub enum UserInteractionMessage {
 }
 
 
+// https://github.com/rust-lang/rust/issues/22750
+// TODO: we can't serialize these within the Tauri application due to some kind of issue
+//       with serde versions once we introduced a deeper dependency on Deno.
+//       we attempted the following patch to no avail:
+//
+//       [patch.crates-io]
+//       deno = {path = "../../deno/cli"}
+//       deno_runtime = {path = "../../deno/runtime"}
+//       serde = {path = "../../serde/serde" }
+//       serde_derive = {path = "../../serde/serde_derive" }
+//       tauri = {path = "../../tauri/core/tauri" }
+//
+// TODO: in each of these we resolved to the same serde version.
+//       we need to figure out how to resolve this issue, but to move forward
+//       for now we will serialize these to Strings on this side of the interface
+//       the original type of this object is as follows:
+//
+// #[derive(Clone, Debug, Serialize, Deserialize)]
+// pub enum EventsFromRuntime {
+//     DefinitionGraphUpdated(Vec<(OperationId, OperationId, Vec<DependencyReference>)>),
+//     ExecutionGraphUpdated(Vec<(ExecutionNodeId, ExecutionNodeId)>),
+//     ExecutionStateChange(MergedStateHistory),
+//     CellsUpdated(Vec<CellHolder>)
+// }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum EventsFromRuntime {
     DefinitionGraphUpdated(Vec<(OperationId, OperationId, Vec<DependencyReference>)>),
     ExecutionGraphUpdated(Vec<(ExecutionNodeId, ExecutionNodeId)>),
-    ExecutionStateChange(MergedStateHistory),
-    CellsUpdated(Vec<CellHolder>)
+    ExecutionStateChange(String),
+    CellsUpdated(String)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]

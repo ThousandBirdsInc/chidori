@@ -4,7 +4,6 @@
 mod dagre;
 
 use std::collections::HashSet;
-use diskmap::DiskMap;
 use std::ops::{Deref, DerefMut};
 use rusqlite::{Connection, Result};
 use std::path::{Path, PathBuf};
@@ -22,13 +21,12 @@ use chidori_core::cells::CellTypes;
 use crate::dagre::DagreLayout;
 use crate::dagre::{Data, Edge, Node, Rect};
 use notify_debouncer_full::{notify::{Watcher, RecommendedWatcher, RecursiveMode}, new_debouncer, DebounceEventResult, Debouncer, FileIdCache, FileIdMap};
+use serde::Serializer;
 use tauri::async_runtime::JoinHandle;
 use ts_rs::TS;
-use serde::Serialize;
-use chidori_core::execution::execution::execution_graph::{ExecutionNodeId, MergedStateHistory};
+use chidori_core::execution::execution::execution_graph::{ExecutionNodeId, MergedStateHistory, Serialize};
 use chidori_core::execution::primitives::identifiers::{DependencyReference, OperationId};
-use chidori_core::utils::telemetry::TraceEvents;
-
+use chidori_core::utils::telemetry::{trace_event_to_string, TraceEvents};
 
 // the payload type must implement `Serialize` and `Clone`.
 #[derive(Clone, serde::Serialize)]
@@ -61,7 +59,7 @@ struct InternalState {
 
 
 fn main() {
-    let config: DiskMap<String, String> = DiskMap::open_new("/tmp/chidori.db").unwrap();
+    // let config: DiskMap<String, String> = DiskMap::open_new("/tmp/chidori.db").unwrap();
 
     tauri::Builder::default()
         .setup(|app| {
@@ -114,8 +112,6 @@ fn main() {
                                     handle.emit_all("sync:definitionGraphState", Some(maintain_definition_graph(&state))).expect("Failed to emit");
                                 }
                                 EventsFromRuntime::CellsUpdated(state) => {
-                                    let state: Vec<CellHolder> = state;
-                                    serde_json::to_string(&state.first().unwrap());
                                     handle.emit_all("sync:cellsState", Some(state)).expect("Failed to emit");
                                 }
                                 _ => {}
@@ -143,7 +139,7 @@ fn main() {
                     match trace_event_receiver.recv() {
                         Ok(msg) => {
                             // println!("Received: {:?}", &msg);
-                            handle.emit_all("execution:events", Some(msg));
+                            handle.emit_all("execution:events", Some(trace_event_to_string(msg)));
                         }
                         Err(_) => {
                             println!("Channel closed");

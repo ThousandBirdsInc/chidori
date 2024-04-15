@@ -226,7 +226,7 @@ pub struct AsyncRPCCommunication {
 }
 
 impl AsyncRPCCommunication {
-    fn new() -> (AsyncRPCCommunication, tokio::sync::mpsc::UnboundedSender<(String, RkyvSerializedValue, tokio::sync::oneshot::Sender<RkyvSerializedValue>)>, oneshot::Receiver<Vec<String>>) {
+    pub(crate) fn new() -> (AsyncRPCCommunication, tokio::sync::mpsc::UnboundedSender<(String, RkyvSerializedValue, tokio::sync::oneshot::Sender<RkyvSerializedValue>)>, oneshot::Receiver<Vec<String>>) {
         let (callable_interface_sender, callable_interface_receiver) = oneshot::channel();
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let async_rpc_communication = AsyncRPCCommunication {

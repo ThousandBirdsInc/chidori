@@ -1,7 +1,7 @@
 # Summary
 
-[Introduction](README.md)
-
-- [My First Chapter](my-first-chapter.md)
-- [Nested example](nested/README.md)
-    - [Sub-chapter](nested/sub-chapter.md)
+- [Introduction](README.md)
+- [Architecture](ARCHITECTURE.md)
+- [Library](library/HOME.md)
+    - [AI](library/ai.md)
+- [Future Work](FUTURE_WORK.md)

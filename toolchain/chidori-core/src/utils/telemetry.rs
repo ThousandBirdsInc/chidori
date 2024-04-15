@@ -8,6 +8,7 @@ use tracing::subscriber::Interest;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing::field::{ValueSet, Visit, Field};
 use std::fmt::Debug;
+pub use serde::Serialize;
 
 struct MatchStrVisitor<'a> {
     field: &'a str,
@@ -57,6 +58,24 @@ pub enum TraceEvents{
     Enter(String),
     Exit(String),
     Close(String, u128),
+}
+
+// https://github.com/rust-lang/rust/issues/22750
+// TODO: we can't serialize these within the Tauri application due to some kind of issue
+//       with serde versions once we introduced a deeper dependency on Deno.
+//       we attempted the following patch to no avail:
+//
+//       [patch.crates-io]
+//       deno = {path = "../../deno/cli"}
+//       deno_runtime = {path = "../../deno/runtime"}
+//       serde = {path = "../../serde/serde" }
+//       serde_derive = {path = "../../serde/serde_derive" }
+//       tauri = {path = "../../tauri/core/tauri" }
+//
+// TODO: this function exists to perform serialization to strings on THIS side of the
+//       crate boundary, and then we can send the strings over to the Tauri side.
+pub fn trace_event_to_string(trace_event: TraceEvents) -> String {
+    serde_json::to_string(&trace_event).unwrap()
 }
 
 struct Timing {

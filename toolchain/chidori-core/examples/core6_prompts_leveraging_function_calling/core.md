@@ -40,7 +40,7 @@ import unittest
 
 class TestMarshalledValues(unittest.IsolatedAsyncioTestCase):
     async def test_run_prompt(self):
-        self.assertEqual(await run_prompt(5), 4)
+        self.assertEqual(await current_weather_in_sf(5), 4)
 
 unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
 ```

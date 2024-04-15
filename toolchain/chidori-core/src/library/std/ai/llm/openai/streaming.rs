@@ -16,7 +16,7 @@ use std::task::{Context, Poll};
 #[async_trait]
 impl ChatModelStream for OpenAIChatModel {
     async fn stream(&self, chat_completion_req: ChatCompletionReq) -> Result<LLMStream, String> {
-        let api_url = "https://api.openai.com/v1/chat/completions";
+        let api_url = &self.api_url;
         let client = Client::new();
         let response: Response = match client
             .post(api_url)
@@ -152,7 +152,8 @@ mod tests {
     async fn test_gpt_stream_raw_line() {
         dotenv::dotenv().ok();
         let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
-        let model = OpenAIChatModel::new(api_key);
+        let API_URL_V1: &str = "https://api.openai.com/v1";
+        let model = OpenAIChatModel::new(API_URL_V1.to_string(), api_key);
         let stream = model.stream(Default::default()).await.unwrap();
         let mut stream = Box::pin(stream);
         while let Some(value) = stream.next().await {

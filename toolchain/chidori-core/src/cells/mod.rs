@@ -103,7 +103,7 @@ bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: 
 #[ts(export, export_to = "package_node/types/")]
 pub(crate) struct MemoryCell {
     pub(crate) provider: SupportedMemoryProviders,
-    pub(crate) function_invocation: Option<String>,
+    pub(crate) embedding_function: String,
 }
 
 
