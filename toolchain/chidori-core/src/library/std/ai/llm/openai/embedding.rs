@@ -24,6 +24,7 @@ impl EmbeddingModel for OpenAIChatModel {
         let req = EmbeddingRequest {
             model,
             input: embedding_request.content,
+            dimensions: None,
             user: None,
         };
         self.client

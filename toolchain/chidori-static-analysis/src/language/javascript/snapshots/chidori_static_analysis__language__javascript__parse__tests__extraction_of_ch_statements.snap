@@ -1,0 +1,23 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+expression: context_stack_references
+---
+- - InCallExpression
+  - Attribute: configure
+  - Attribute: prompt
+  - IdentifierReferredTo:
+      - ch
+      - true
+  - Constant: default
+  - InCallExpression
+  - Attribute: llm
+  - IdentifierReferredTo:
+      - ch
+      - true
+- - InCallExpression
+  - Attribute: configure
+  - Attribute: prompt
+  - IdentifierReferredTo:
+      - ch
+      - true
+  - Constant: default

@@ -1,0 +1,47 @@
+---
+source: chidori-static-analysis/src/language/python/parse.rs
+description: "import unittest\n\nclass TestMarshalledValues(unittest.TestCase):\n    def test_addTwo(self):\n        self.assertEqual(addTwo(2), 4)\n\nunittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))\n\n"
+---
+- - InClass: TestMarshalledValues
+- - InClass: TestMarshalledValues
+  - InFunction: test_addTwo
+- - InClass: TestMarshalledValues
+  - InFunction: test_addTwo
+  - FunctionArguments
+  - IdentifierReferredTo:
+      - self
+      - false
+- - InClass: TestMarshalledValues
+  - InFunction: test_addTwo
+  - InCallExpression
+  - InCallExpression
+  - IdentifierReferredTo:
+      - addTwo
+      - false
+- - InClass: TestMarshalledValues
+  - InFunction: test_addTwo
+  - InCallExpression
+  - Attribute: assertEqual
+  - IdentifierReferredTo:
+      - self
+      - true
+- - InCallExpression
+  - InCallExpression
+  - IdentifierReferredTo:
+      - TestMarshalledValues
+      - true
+- - InCallExpression
+  - InCallExpression
+  - Attribute: loadTestsFromTestCase
+  - InCallExpression
+  - Attribute: TestLoader
+  - IdentifierReferredTo:
+      - unittest
+      - true
+- - InCallExpression
+  - Attribute: run
+  - InCallExpression
+  - Attribute: TextTestRunner
+  - IdentifierReferredTo:
+      - unittest
+      - true

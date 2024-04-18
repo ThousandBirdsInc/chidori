@@ -6,7 +6,6 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use std::collections::HashMap;
 
-// TODO: manage multiple independent named collections
 pub struct InMemoryVectorDbCollection {
     db: HashMap<usize, Value>,
     id_counter: usize,

@@ -27,6 +27,7 @@ pub use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde::ser::SerializeMap;
 use tokio::sync::oneshot::Receiver;
 use crate::cells::CellTypes;
+use crate::execution::primitives::operation::OperationFnOutput;
 
 // TODO: update all of these identifies to include a "space" they're within
 
@@ -285,7 +286,7 @@ impl ExecutionGraph {
         previous_state: &ExecutionStateEvaluation,
     ) -> (
         ((usize, usize), ExecutionStateEvaluation), // the resulting total state of this step
-        Vec<(usize, RkyvSerializedValue)>, // values emitted by operations during this step
+        Vec<(usize, OperationFnOutput)>, // values emitted by operations during this step
     ) {
         let previous_state = match previous_state {
             ExecutionStateEvaluation::Complete(state) => state,
@@ -327,7 +328,7 @@ impl ExecutionGraph {
         prev_execution_id: ExecutionNodeId,
     ) -> (
         ((usize, usize), ExecutionStateEvaluation), // the resulting total state of this step
-        Vec<(usize, RkyvSerializedValue)>, // values emitted by operations during this step
+        Vec<(usize, OperationFnOutput)>, // values emitted by operations during this step
     ) {
         let state = self.get_state_at_id(prev_execution_id);
         if let Some(state) = state {
@@ -341,7 +342,7 @@ impl ExecutionGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::primitives::operation::{InputSignature, OperationNode, OutputSignature};
+    use crate::execution::primitives::operation::{InputSignature, OperationFnOutput, OperationNode, OutputSignature};
     use crate::execution::primitives::serialized_value::{
         RkyvSerializedValue as RSV, RkyvSerializedValue,
     };
@@ -361,14 +362,14 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(1) }.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(1)) }.boxed()),
                 ),
                                                     None);
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(2) }.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(2)) }.boxed()),
                 ),
                                                     None);
         let (_, mut state) = state.upsert_operation(OperationNode::new(
@@ -382,7 +383,7 @@ mod tests {
                                     if let (Some(RSV::Number(a)), Some(RSV::Number(b))) =
                                         (args.get(&"0".to_string()), args.get(&"1".to_string()))
                                     {
-                                        return RSV::Number(a + b);
+                                        return OperationFnOutput::with_value(RSV::Number(a + b));
                                     }
                                 }
                             }
@@ -430,14 +431,14 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(0) }.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(0)) }.boxed()),
                 ),
                                                     None);
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(1) }.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(1)) }.boxed()),
                 ),
                                                     None);
         let mut state =
@@ -471,7 +472,7 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(0)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(0)) }.boxed()),
                 ),
                                                     None);
 
@@ -479,7 +480,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["0"]),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(1)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(1)) }.boxed()),
                 ),
                                                     None);
 
@@ -487,7 +488,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["0"]),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(2)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(2)) }.boxed()),
                 ),
                                                     None);
 
@@ -531,7 +532,7 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(0)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(0)) }.boxed()),
                 ),
                                                     None);
 
@@ -539,7 +540,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(1)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(1)) }.boxed()),
                 ),
                                                     None);
 
@@ -547,7 +548,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(2)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(2)) }.boxed()),
                 ),
                                                     None);
 
@@ -555,7 +556,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(3)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(3)) }.boxed()),
                 ),
                                                     None);
 
@@ -606,7 +607,7 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(0)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(0)) }.boxed()),
                 ),
                                                     None);
 
@@ -614,7 +615,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(1)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(1)) }.boxed()),
                 ),
                                                     None);
 
@@ -622,7 +623,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(2)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(2)) }.boxed()),
                 ),
                                                     None);
 
@@ -630,7 +631,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(3)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(3)) }.boxed()),
                 ),
                                                     None);
 
@@ -638,7 +639,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1", "2"]),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(4)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(4)) }.boxed()),
                 ),
                                                     None);
 
@@ -705,7 +706,7 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(1)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(1)) }.boxed()),
                 ),
                                                     None);
 
@@ -715,7 +716,7 @@ mod tests {
                 if let RSV::Object(m) = args {
                     if let RSV::Object(args) = m.get("args").unwrap() {
                         if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
-                            return RSV::Number(a + 1);
+                            return OperationFnOutput::with_value(RSV::Number(a + 1));
                         }
                     }
                 }
@@ -864,7 +865,7 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move {RSV::Number(1) }.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(1)) }.boxed()),
                 ),
                                                     None);
 
@@ -876,7 +877,7 @@ mod tests {
                     if let RSV::Object(args) = m.get("args").unwrap() {
                         if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
                             let plus = atomic_usize.fetch_add(1, Ordering::SeqCst);
-                            return RSV::Number(a + plus as i32);
+                            return OperationFnOutput::with_value(RSV::Number(a + plus as i32));
                         }
                     }
                 }
@@ -951,7 +952,7 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(0)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(0)) }.boxed()),
                 ),
                                                     None);
 
@@ -960,7 +961,7 @@ mod tests {
                 if let RSV::Object(m) = args {
                     if let RSV::Object(args) = m.get("args").unwrap() {
                         if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
-                            return RSV::Number(a + 1);
+                            return OperationFnOutput::with_value(RSV::Number(a + 1));
                         }
                     }
                 }
@@ -974,7 +975,7 @@ mod tests {
             if let RSV::Object(m) = args {
                 if let RSV::Object(args) = m.get("args").unwrap() {
                     if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
-                        return RSV::Number(a + 200);
+                        return OperationFnOutput::with_value(RSV::Number(a + 200));
                     }
                 }
             }
@@ -1061,7 +1062,7 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(0)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(0)) }.boxed()),
                 ),
                                                     None);
 
@@ -1069,7 +1070,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(1)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(1)) }.boxed()),
                 ),
                                                     None);
 
@@ -1077,7 +1078,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(2)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(2)) }.boxed()),
                 ),
                                                     None);
 
@@ -1085,7 +1086,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(3)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(3)) }.boxed()),
                 ),
                                                     None);
 
@@ -1093,7 +1094,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["1", "2"]),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { RSV::Number(4)}.boxed()),
+                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(4)) }.boxed()),
                 ),
                                                     None);
 

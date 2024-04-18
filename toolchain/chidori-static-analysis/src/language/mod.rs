@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub mod typechecker;
 pub mod javascript;
 pub mod python;
 
@@ -17,6 +18,7 @@ pub struct ReportItem {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReportTriggerableFunctions {
+    pub arguments: Vec<String>,
     // pub context_path: Vec<ContextPath>,
     // TODO: these need their own set of depended values
     // TODO: we need to extract signatures for triggerable functions
@@ -29,5 +31,4 @@ pub struct Report {
     pub cell_exposed_values: HashMap<String, ReportItem>,
     pub cell_depended_values: HashMap<String, ReportItem>,
     pub triggerable_functions: HashMap<String, ReportTriggerableFunctions>,
-    pub declared_functions: HashMap<String, ReportTriggerableFunctions>,
 }

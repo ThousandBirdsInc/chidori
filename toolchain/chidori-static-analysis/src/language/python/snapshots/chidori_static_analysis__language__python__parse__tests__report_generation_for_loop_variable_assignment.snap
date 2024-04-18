@@ -1,0 +1,62 @@
+---
+source: chidori-static-analysis/src/language/python/parse.rs
+description: "async def run_prompt(number_of_states):\n    out = \"\"\n    for state in (await get_states_first_letters(num=number_of_states)).split('\\n'):\n        out += await first_letter(state)\n    return \"demo\" + out\n    "
+---
+- - InFunction: run_prompt
+- - InFunction: run_prompt
+  - AssignmentToStatement
+  - IdentifierReferredTo:
+      - out
+      - false
+- - InFunction: run_prompt
+  - AssignmentFromStatement
+  - Constant: ""
+- - InFunction: run_prompt
+  - AssignmentToStatement
+  - IdentifierReferredTo:
+      - state
+      - false
+- - InFunction: run_prompt
+  - IdentifierReferredTo:
+      - state
+      - true
+- - InFunction: run_prompt
+  - InCallExpression
+  - Constant: "\n"
+- - InFunction: run_prompt
+  - InCallExpression
+  - Constant: "\n"
+  - Attribute: split
+  - InCallExpression
+  - IdentifierReferredTo:
+      - number_of_states
+      - true
+- - InFunction: run_prompt
+  - InCallExpression
+  - Constant: "\n"
+  - Attribute: split
+  - InCallExpression
+  - IdentifierReferredTo:
+      - get_states_first_letters
+      - false
+- - InFunction: run_prompt
+  - IdentifierReferredTo:
+      - out
+      - true
+- - InFunction: run_prompt
+  - InCallExpression
+  - IdentifierReferredTo:
+      - state
+      - true
+- - InFunction: run_prompt
+  - InCallExpression
+  - IdentifierReferredTo:
+      - first_letter
+      - false
+- - InFunction: run_prompt
+  - Constant: demo
+- - InFunction: run_prompt
+  - Constant: demo
+  - IdentifierReferredTo:
+      - out
+      - true

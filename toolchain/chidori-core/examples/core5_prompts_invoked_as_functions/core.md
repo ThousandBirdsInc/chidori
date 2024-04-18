@@ -4,7 +4,7 @@ This is a python function that is invoking a prompt by name, kwargs to this
 invocation are passed to the prompt. Prompts are async and return strings.
 ```python (run_prompt)
 def first_letter(s):
-    return s.replace("-", "").trim()[0]
+    return s.replace("-", "").strip()[0]
 
 async def run_prompt(number_of_states):
     out = ""
@@ -17,6 +17,7 @@ This is the prompt itself. The cell name is used to refer to the prompt output w
 by globally available values. The fn key is used to name the prompt in the context of a function invocation.
 ```prompt (states)
 ---
+model: gpt-3.5-turbo
 fn: get_states_first_letters
 ---
 List the first {{num}} US states to be added to the union.

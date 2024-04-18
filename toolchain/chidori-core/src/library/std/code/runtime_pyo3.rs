@@ -15,7 +15,7 @@ use std::sync::mpsc::{self, Sender};
 // use rustpython_vm::builtins::{PyBool, PyDict, PyInt, PyList, PyStr};
 
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::mem;
 use std::sync::{Arc, Mutex};
@@ -72,6 +72,14 @@ fn pyany_to_rkyv_serialized_value(p: &PyAny) -> RkyvSerializedValue {
                     map.insert(key_string, pyany_to_rkyv_serialized_value(value));
                 }
                 RkyvSerializedValue::Object(map)
+            }
+            "set" => {
+                let pyset = p.downcast::<PySet>().unwrap();
+                let mut set = HashSet::new();
+                for value in pyset {
+                    set.insert(pyany_to_rkyv_serialized_value(value));
+                }
+                RkyvSerializedValue::Set(set)
             }
             "NoneType" => {
                 RkyvSerializedValue::Null
@@ -440,7 +448,7 @@ fn create_function_shims(execution_state_handle: &Arc<Mutex<ExecutionState>>, re
     let function_names = {
         let execution_state_handle = execution_state_handle.clone();
         let mut exec_state = execution_state_handle.lock().unwrap();
-        exec_state.function_name_to_operation_id.keys().cloned().collect::<Vec<_>>()
+        exec_state.function_name_to_metadata.keys().cloned().collect::<Vec<_>>()
     };
     for function_name in function_names {
         if report
@@ -516,6 +524,13 @@ fn python_args_to_rkyv(args: &PyTuple, kwargs: Option<&PyDict>) -> Result<RkyvSe
         total_arg_payload
     }.build();
     Ok(total_arg_payload)
+}
+
+/// This allows for interaction with Rye and Uv which we use for managing
+/// dependencies and virtualenvs for our python code execution.
+fn python_dependency_management() {
+    // TODO: https://github.com/PyO3/pyo3/discussions/3726
+
 }
 
 

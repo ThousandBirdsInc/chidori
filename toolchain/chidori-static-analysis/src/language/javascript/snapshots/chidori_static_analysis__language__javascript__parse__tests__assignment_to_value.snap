@@ -1,0 +1,9 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const x = 1\n"
+---
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      - x
+      - false
+- - AssignmentFromStatement

@@ -1,5 +1,5 @@
 use crate::execution::primitives::identifiers::{DependencyReference, OperationId};
-use crate::execution::primitives::operation::OperationNode;
+use crate::execution::primitives::operation::{InputSignature, OperationFnOutput, OperationNode, OutputItemConfiguration};
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue};
 use im::{HashMap as ImHashMap, HashSet as ImHashSet};
 
@@ -97,7 +97,11 @@ impl Debug for ExecutionStateEvaluation {
 
 
 
-
+#[derive(Debug, Clone)]
+pub struct FunctionMetadata {
+    operation_id: usize,
+    pub(crate) input_signature: InputSignature,
+}
 
 
 // TODO: make this thread-safe
@@ -122,7 +126,7 @@ pub struct ExecutionState {
     /// This is a mapping of function names to operation ids. Function calls are dispatched to the associated
     /// OperationId that they are initialized by. When a function is invoked, it is dispatched to the operation
     /// node that initialized it where we re-use that OperationNode's runtime in order to invoke the function.
-    pub function_name_to_operation_id: ImHashMap<String, OperationId>,
+    pub function_name_to_metadata: ImHashMap<String, FunctionMetadata>,
 
     /// Note what keys have _ever_ been set, which is an optimization to avoid needing to do
     /// a complete historical traversal to verify that a value has been set.
@@ -206,7 +210,7 @@ impl ExecutionState {
             state: Default::default(),
             operation_name_to_id: Default::default(),
             operation_by_id: Default::default(),
-            function_name_to_operation_id: Default::default(),
+            function_name_to_metadata: Default::default(),
             has_been_set: Default::default(),
             dependency_map: Default::default(),
             execution_event_sender: None,
@@ -220,7 +224,7 @@ impl ExecutionState {
             state: Default::default(),
             operation_name_to_id: Default::default(),
             operation_by_id: Default::default(),
-            function_name_to_operation_id: Default::default(),
+            function_name_to_metadata: Default::default(),
             has_been_set: Default::default(),
             dependency_map: Default::default(),
             execution_event_sender: None,
@@ -307,6 +311,7 @@ impl ExecutionState {
             CellTypes::Prompt(c) => crate::cells::llm_prompt_cell::llm_prompt_cell(c),
             CellTypes::Web(c) => crate::cells::web_cell::web_cell(c),
             CellTypes::Template(c) => crate::cells::template_cell::template_cell(c),
+            CellTypes::Memory(c) => crate::cells::memory_cell::memory_cell(c)
         };
         op.attach_cell(cell);
         let (op_id, new_state) = self.upsert_operation(op, op_id);
@@ -382,7 +387,7 @@ impl ExecutionState {
             for (key, value) in output_signature.globals.iter() {
                 let insert_result = available_values.insert(key.clone(), id);
                 if insert_result.is_some() {
-                    panic!("Naming collision detected for value {}", key);
+                    panic!("Naming collision detected for value {} when storing op #{}", key, id);
                 }
             }
 
@@ -457,8 +462,16 @@ impl ExecutionState {
             let mut op_node = op
                 .lock()
                 .unwrap();
+
             for (function_name, function_config) in &op_node.signature.output_signature.functions {
-                self.function_name_to_operation_id.insert(function_name.clone(), id.clone());
+                self.function_name_to_metadata.insert(function_name.clone(), FunctionMetadata {
+                    operation_id: id.clone(),
+                    input_signature: if let OutputItemConfiguration::Function{ input_signature, .. } = function_config {
+                        input_signature.clone()
+                    } else {
+                        InputSignature::new()
+                    }
+                });
             }
         }
     }
@@ -473,8 +486,8 @@ impl ExecutionState {
         let mut state = self.clone();
         state.state_insert(usize::MAX, payload.clone());
 
-        let op = self.function_name_to_operation_id.get(function_name).map(|op_id| {
-            let op = state.operation_by_id.get(op_id).unwrap().lock().unwrap();
+        let op = self.function_name_to_metadata.get(function_name).map(|meta| {
+            let op = state.operation_by_id.get(&meta.operation_id).unwrap().lock().unwrap();
             op
         });
         let cell = &op.unwrap().cell.clone();
@@ -511,7 +524,7 @@ impl ExecutionState {
         let result = op.execute(&self, payload, None, None).await;
 
         // TODO: return the result, which we will use in the context of the parent function
-        (result, self.clone())
+        (result.output, self.clone())
     }
 
     // TODO: extend this with an "event", steps can occur as events are flushed based on a previous state we were in
@@ -519,7 +532,7 @@ impl ExecutionState {
     pub async fn step_execution(
         &self,
         sender: &Sender<(ExecutionNodeId, OperationId, RkyvSerializedValue)>
-    ) -> (ExecutionStateEvaluation, Vec<(usize, RkyvSerializedValue)>) {
+    ) -> (ExecutionStateEvaluation, Vec<(usize, OperationFnOutput)>) {
         let previous_state = self;
         let mut new_state = previous_state.clone();
         let mut operation_by_id = previous_state.operation_by_id.clone();
@@ -666,7 +679,7 @@ impl ExecutionState {
                 let result = op_node_execute.await;
                 println!("Executed node {} with result {:?}", operation_id, &result);
                 outputs.push((operation_id, result.clone()));
-                new_state.state_insert(operation_id, result);
+                new_state.state_insert(operation_id, result.output);
             }
         }
         new_state.state_consume_marked(marked_for_consumption);

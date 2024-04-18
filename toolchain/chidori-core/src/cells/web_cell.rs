@@ -1,7 +1,7 @@
 use futures_util::FutureExt;
 use tokio::runtime::Runtime;
 use crate::cells::WebserviceCell;
-use crate::execution::primitives::operation::{InputItemConfiguation, InputSignature, InputType, OperationNode, OutputSignature};
+use crate::execution::primitives::operation::{InputItemConfiguration, InputSignature, InputType, OperationFnOutput, OperationNode, OutputSignature};
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue as RKV};
 
 /// Web cells initialize HTTP handlers that can invoke other cells.
@@ -13,7 +13,7 @@ pub fn web_cell(cell: &WebserviceCell) -> OperationNode {
     for endpoint in endpoints {
         input_signature.globals.insert(
             endpoint.depended_function_identity.clone(),
-            InputItemConfiguation {
+            InputItemConfiguration {
                 ty: Some(InputType::String),
                 default: None,
             },
@@ -32,9 +32,11 @@ pub fn web_cell(cell: &WebserviceCell) -> OperationNode {
             let cell = cell.clone();
             async move {
                 let (join_handle, port) = crate::library::std::webserver::run_webservice(&cell, &x).await;
-                RkyvObjectBuilder::new()
-                    .insert_number("port", port as i32)
-                    .build()
+                OperationFnOutput::with_value(
+                    RkyvObjectBuilder::new()
+                        .insert_number("port", port as i32)
+                        .build()
+                )
             }.boxed()
         }),
     );

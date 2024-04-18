@@ -1,0 +1,32 @@
+---
+source: chidori-static-analysis/src/language/python/parse.rs
+expression: context_stack_references
+---
+- - InFunction: evaluate_agent
+- - InFunction: evaluate_agent
+  - FunctionArguments
+  - IdentifierReferredTo:
+      - ev
+      - false
+- - InFunction: evaluate_agent
+  - InCallExpression
+  - Constant: file_path
+- - InFunction: evaluate_agent
+  - InCallExpression
+  - Constant: file_path
+  - Attribute: file_path
+  - IdentifierReferredTo:
+      - ev
+      - true
+- - InFunction: evaluate_agent
+  - InCallExpression
+  - Constant: file_path
+  - Attribute: set
+  - IdentifierReferredTo:
+      - ch
+      - false
+- - InFunction: evaluate_agent
+  - InCallExpression
+  - IdentifierReferredTo:
+      - migration_agent
+      - false

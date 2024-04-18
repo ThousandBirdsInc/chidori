@@ -1,0 +1,35 @@
+---
+source: chidori-static-analysis/src/language/python/parse.rs
+description: "import random\n\ndef fun_name():\n    w = function_that_doesnt_exist()\n    v = 5\n    return v\n\nx = random.randint(0, 10)            "
+---
+- - InFunction: fun_name
+- - InFunction: fun_name
+  - AssignmentToStatement
+  - IdentifierReferredTo:
+      - w
+      - false
+- - InFunction: fun_name
+  - AssignmentFromStatement
+  - InCallExpression
+  - IdentifierReferredTo:
+      - function_that_doesnt_exist
+      - false
+- - InFunction: fun_name
+  - AssignmentToStatement
+  - IdentifierReferredTo:
+      - v
+      - false
+- - InFunction: fun_name
+  - IdentifierReferredTo:
+      - v
+      - true
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      - x
+      - false
+- - AssignmentFromStatement
+  - InCallExpression
+  - Attribute: randint
+  - IdentifierReferredTo:
+      - random
+      - true

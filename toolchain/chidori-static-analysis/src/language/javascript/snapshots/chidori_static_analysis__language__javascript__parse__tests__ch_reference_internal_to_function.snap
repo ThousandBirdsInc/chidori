@@ -1,0 +1,26 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+expression: context_stack_references
+---
+- - InFunction: evaluate_agent
+  - Params
+  - IdentifierReferredTo:
+      - ev
+      - false
+- - InFunction: evaluate_agent
+  - InCallExpression
+  - Attribute: set
+  - IdentifierReferredTo:
+      - ch
+      - false
+  - Constant: file_path
+  - Attribute: file_path
+  - IdentifierReferredTo:
+      - ev
+      - true
+- - InFunction: evaluate_agent
+  - InCallExpression
+  - IdentifierReferredTo:
+      - migration_agent
+      - false
+- - InFunction: evaluate_agent

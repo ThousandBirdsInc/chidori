@@ -16,24 +16,24 @@ use crate::execution::execution::ExecutionState;
 
 // args, kwargs, locals and their configurations
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum InputType {
     String,
     Function,
 }
 
-#[derive(Debug, Default)]
-pub struct InputItemConfiguation {
+#[derive(Debug, Default, Clone)]
+pub struct InputItemConfiguration {
     // TODO: should represent object and vec types
     pub ty: Option<InputType>,
     pub default: Option<RkyvSerializedValue>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InputSignature {
-    pub args: HashMap<String, InputItemConfiguation>,
-    pub kwargs: HashMap<String, InputItemConfiguation>,
-    pub globals: HashMap<String, InputItemConfiguation>,
+    pub args: HashMap<String, InputItemConfiguration>,
+    pub kwargs: HashMap<String, InputItemConfiguration>,
+    pub globals: HashMap<String, InputItemConfiguration>,
 }
 
 impl InputSignature {
@@ -48,7 +48,7 @@ impl InputSignature {
     pub fn from_args_list(args: Vec<&str>) -> Self {
         let mut args_map = HashMap::new();
         for (i, arg) in args.iter().enumerate() {
-            args_map.insert(format!("{}", i), InputItemConfiguation::default());
+            args_map.insert(format!("{}", i), InputItemConfiguration::default());
         }
         Self {
             args: args_map,
@@ -143,9 +143,14 @@ enum TriggerConfiguration {
 }
 
 #[derive(Debug, Default)]
-pub struct OutputItemConfiguation {
-    // TODO: should represent object and vec types
-    pub ty: Option<InputType>,
+pub enum OutputItemConfiguration {
+    Function {
+        input_signature: InputSignature,
+        emit_event: Vec<String>,
+        trigger_on: Vec<String>,
+    },
+    #[default]
+    Value
 }
 
 #[derive(Debug)]
@@ -157,8 +162,8 @@ pub struct OutputSignatureFunction {
 
 #[derive(Debug)]
 pub struct OutputSignature {
-    pub globals: HashMap<String, OutputItemConfiguation>,
-    pub functions: HashMap<String, OutputItemConfiguation>,
+    pub globals: HashMap<String, OutputItemConfiguration>,
+    pub functions: HashMap<String, OutputItemConfiguration>,
 }
 
 impl OutputSignature {
@@ -244,6 +249,25 @@ impl fmt::Debug for AsyncRPCCommunication {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct OperationFnOutput {
+    pub execution_state: Option<ExecutionState>,
+    pub output: RkyvSerializedValue,
+    pub stdout: Vec<String>,
+    pub stderr: Vec<String>
+}
+
+impl OperationFnOutput {
+    pub fn with_value(value: RkyvSerializedValue) -> Self {
+        Self {
+            execution_state: None,
+            output: value,
+            stdout: Vec::new(),
+            stderr: Vec::new()
+        }
+    }
+}
+
 /// OperationFn represents functions that can be executed on the graph
 /// they accept a byte array and return a new byte vector. This is to allow
 /// for the generic operation over any data type across any programming language.
@@ -266,7 +290,7 @@ pub type OperationFn = dyn Fn(
     RkyvSerializedValue,
     Option<Sender<((usize, usize), RkyvSerializedValue)>>,
     Option<AsyncRPCCommunication>
-) -> Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>> + Send;
+) -> Pin<Box<dyn Future<Output = OperationFnOutput> + Send>> + Send;
 
 // TODO: rather than dep_count operation node should have a specific dep mapping
 pub struct OperationNode {
@@ -354,7 +378,7 @@ impl Default for OperationNode {
             verified_at: 0,
             dirty: true,
             signature: Signature::new(),
-            operation: Box::new(|_, x, _, _| async move { x }.boxed()),
+            operation: Box::new(|_, x, _, _| async move { OperationFnOutput::with_value(x) }.boxed()),
             unresolved_dependencies: vec![],
             partial_application: Vec::new(),
         }
@@ -391,7 +415,7 @@ impl OperationNode {
         argument_payload: RkyvSerializedValue,
         intermediate_output_channel_tx: Option<Sender<((usize, usize), RkyvSerializedValue)>>,
         async_communication_channel: Option<AsyncRPCCommunication>,
-    ) -> Pin<Box<dyn Future<Output=RkyvSerializedValue> + Send>> {
+    ) -> Pin<Box<dyn Future<Output=OperationFnOutput> + Send>> {
         /// Receiver that we pass to the exec for it to capture oneshot RPC communication
         let exec = self.operation.deref();
         exec(state, argument_payload, intermediate_output_channel_tx, async_communication_channel)
@@ -409,14 +433,14 @@ mod tests {
     #[tokio::test]
     async fn test_execute_with_operation() {
         let operation: Box<OperationFn> =
-            Box::new(|_, context, _, _| { async move { RkyvSerializedValue::Boolean(true) }.boxed() });
+            Box::new(|_, context, _, _| { async move { OperationFnOutput::with_value(RkyvSerializedValue::Boolean(true)) }.boxed() });
 
         let mut node = OperationNode::default();
         node.operation = operation;
 
         let result = node.execute(&ExecutionState::new(), RkyvSerializedValue::Null, None, None).await;
 
-        assert_eq!(result, RkyvSerializedValue::Boolean(true));
+        assert_eq!(result.output, RkyvSerializedValue::Boolean(true));
     }
 
     #[test]
@@ -459,7 +483,7 @@ mod tests {
                         }
                     }
                 }).await;
-                RkyvSerializedValue::Null
+                OperationFnOutput::with_value(RkyvSerializedValue::Null)
             }.boxed()),
             unresolved_dependencies: vec![],
             partial_application: Vec::new(),

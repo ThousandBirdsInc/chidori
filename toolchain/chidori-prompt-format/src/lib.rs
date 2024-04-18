@@ -60,7 +60,7 @@ pub fn extract_roles_from_template(template: &str) -> JsValue {
 }
 
 pub fn extract_yaml_frontmatter_string(template: &str) -> (HashMap<String, String>, String) {
-    let result = crate::templating::templates::extract_frontmatter(&template).unwrap();
+    let result = crate::templating::templates::split_frontmatter(&template).unwrap();
     if result.0.is_empty() {
         return (HashMap::new(), result.1);
     }

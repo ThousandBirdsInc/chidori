@@ -1,0 +1,43 @@
+---
+source: chidori-static-analysis/src/language/python/parse.rs
+description: "@ch.on_event(\"new_file\")\n@ch.emit_as(\"file_created\")\ndef testing():\n    x = 2 + y\n    return x\n    "
+---
+- - InFunction: testing
+- - InFunction: testing
+  - InFunctionDecorator: 0
+  - InCallExpression
+  - Constant: new_file
+- - InFunction: testing
+  - InFunctionDecorator: 0
+  - InCallExpression
+  - Constant: new_file
+  - Attribute: on_event
+  - IdentifierReferredTo:
+      - ch
+      - false
+- - InFunction: testing
+  - InFunctionDecorator: 1
+  - InCallExpression
+  - Constant: file_created
+- - InFunction: testing
+  - InFunctionDecorator: 1
+  - InCallExpression
+  - Constant: file_created
+  - Attribute: emit_as
+  - IdentifierReferredTo:
+      - ch
+      - false
+- - InFunction: testing
+  - AssignmentToStatement
+  - IdentifierReferredTo:
+      - x
+      - false
+- - InFunction: testing
+  - AssignmentFromStatement
+  - IdentifierReferredTo:
+      - y
+      - false
+- - InFunction: testing
+  - IdentifierReferredTo:
+      - x
+      - true

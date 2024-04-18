@@ -179,7 +179,48 @@ impl std::cmp::PartialEq for RkyvSerializedValue {
 
 impl std::hash::Hash for RkyvSerializedValue {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        todo!()
+        match self {
+            RkyvSerializedValue::StreamPointer(pointer) => {
+                pointer.hash(state);
+            }
+            RkyvSerializedValue::FunctionPointer(cell_idx, func_name) => {
+                cell_idx.hash(state);
+                func_name.hash(state);
+            }
+            RkyvSerializedValue::Cell(cell_type) => {
+                unimplemented!();
+            }
+            RkyvSerializedValue::Set(set) => {
+                for item in set {
+                    item.hash(state);
+                }
+            }
+            RkyvSerializedValue::Float(f) => {
+                f.to_bits().hash(state);
+            }
+            RkyvSerializedValue::Number(n) => {
+                n.hash(state);
+            }
+            RkyvSerializedValue::String(s) => {
+                s.hash(state);
+            }
+            RkyvSerializedValue::Boolean(b) => {
+                b.hash(state);
+            }
+            RkyvSerializedValue::Null => {
+                0.hash(state); // Hash a constant for Null
+            }
+            RkyvSerializedValue::Array(arr) => {
+                for item in arr {
+                    item.hash(state);
+                }
+            }
+            RkyvSerializedValue::Object(obj) => {
+                let mut items: Vec<_> = obj.iter().collect();
+                items.sort_by_key(|item| item.0);
+                items.hash(state);
+            }
+        }
     }
 }
 

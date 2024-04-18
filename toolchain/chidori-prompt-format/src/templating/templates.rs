@@ -225,7 +225,7 @@ pub fn analyze_referenced_partials_inner<F>(
     }
 }
 
-pub fn extract_frontmatter(
+pub fn split_frontmatter(
     markdown: &str,
 ) -> std::result::Result<(String, String), Box<dyn std::error::Error>> {
     let mut front_matter = String::default();
@@ -670,7 +670,7 @@ Summarize content you are provided with for a second-grade student.
                 ---
                 actual body
             "};
-        let result = extract_frontmatter(&template_string);
+        let result = split_frontmatter(&template_string);
         match result {
             Ok((frontmatter, body)) => {
                 assert_eq!(frontmatter, "test: 1\ntwo: 2\n");

@@ -29,8 +29,6 @@ use crate::cells::{CellTypes, CodeCell, LLMPromptCell};
 use crate::execution::execution::ExecutionState;
 
 // TODO: need to override console.log
-// TODO: https://deno.com/blog/roll-your-own-javascript-runtime-pt2
-// TODO: validate suspension and resumption of execution based on a method that we provide
 
 
 fn serde_v8_to_rkyv(
@@ -291,7 +289,7 @@ fn create_function_shims(
     let function_names = {
         let execution_state_handle = execution_state_handle.clone();
         let mut exec_state = execution_state_handle.lock().unwrap();
-        exec_state.function_name_to_operation_id.keys().cloned().collect::<Vec<_>>()
+        exec_state.function_name_to_metadata.keys().cloned().collect::<Vec<_>>()
     };
     for function_name in function_names {
         if cell_depended_values.contains_key(&function_name) {
@@ -636,7 +634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_funtion_invocation() {
+    async fn test_function_invocation() {
         let source_code = String::from("function demonstrationAdd(a, b) { return a + b }");
         let args = RkyvObjectBuilder::new()
             .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 10).insert_number("1", 20))

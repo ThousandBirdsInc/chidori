@@ -1,0 +1,22 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "function main() {\n    bar() | foo() | baz()\n}\n"
+---
+- - InFunction: main
+  - Params
+- - InFunction: main
+  - InCallExpression
+  - IdentifierReferredTo:
+      - bar
+      - false
+- - InFunction: main
+  - InCallExpression
+  - IdentifierReferredTo:
+      - foo
+      - false
+- - InFunction: main
+  - InCallExpression
+  - IdentifierReferredTo:
+      - baz
+      - false
+- - InFunction: main

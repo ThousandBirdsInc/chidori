@@ -1,0 +1,43 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "function createDockerfile() {\n    useHook(() => {\n       ch.prompt(\"demo\");\n    }, [otherFunction]);\n    return prompt(\"prompts/create_dockerfile\")\n}\n"
+---
+- - InFunction: createDockerfile
+  - Params
+- - InFunction: createDockerfile
+  - InCallExpression
+  - IdentifierReferredTo:
+      - useHook
+      - false
+  - InAnonFunction
+  - Params
+- - InFunction: createDockerfile
+  - InCallExpression
+  - IdentifierReferredTo:
+      - useHook
+      - false
+  - InAnonFunction
+  - InCallExpression
+  - Attribute: prompt
+  - IdentifierReferredTo:
+      - ch
+      - false
+  - Constant: demo
+- - InFunction: createDockerfile
+  - InCallExpression
+  - IdentifierReferredTo:
+      - useHook
+      - false
+  - InAnonFunction
+- - InFunction: createDockerfile
+  - InCallExpression
+  - IdentifierReferredTo:
+      - useHook
+      - false
+- - InFunction: createDockerfile
+  - InCallExpression
+  - IdentifierReferredTo:
+      - prompt
+      - false
+  - Constant: prompts/create_dockerfile
+- - InFunction: createDockerfile

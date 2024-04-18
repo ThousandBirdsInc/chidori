@@ -1,0 +1,25 @@
+---
+source: chidori-static-analysis/src/language/python/parse.rs
+expression: context_stack_references
+---
+- - InCallExpression
+  - Constant: default
+- - InCallExpression
+  - Constant: default
+  - InCallExpression
+  - Constant: openai
+- - InCallExpression
+  - Constant: default
+  - InCallExpression
+  - Constant: openai
+  - Attribute: llm
+  - IdentifierReferredTo:
+      - ch
+      - false
+- - InCallExpression
+  - Constant: default
+  - Attribute: configure
+  - Attribute: prompt
+  - IdentifierReferredTo:
+      - ch
+      - false

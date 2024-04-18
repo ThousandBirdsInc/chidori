@@ -1,14 +1,14 @@
 # Demonstrating how a prompt is capable of generating source code and executing it
 
-```prompt (current_weather_in_sf)
+```prompt (gen_fib_sequence)
 ---
-fn: get_states_first_letters
-calling:
-  - run_prompt
-  - first_letter
+eject:
+  language: python
+  mode: replace
 ---
-List the first {{num}} US states to be added to the union.
-Return this as a `-` bulleted list with the name of the state on each line.
+Generate a function that returns the Fibonacci sequence up to the nth number. 
+The function should be named `fib_sequence` and should accept a single 
+argument `n` which is the number of Fibonacci numbers to generate.
 ```
 
 

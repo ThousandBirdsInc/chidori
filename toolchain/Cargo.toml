@@ -51,6 +51,7 @@ tracing-chrome = "0.7.1"
 tracing-flame = "0.2.0"
 bincode = "2.0.0-rc.3"
 petgraph = "0.6.3"
+insta = { version = "1.38.0", features = ["yaml", "redactions"] }
 
 [patch.crates-io]
 deno = {path = "../../deno/cli"}
@@ -58,3 +59,4 @@ deno_runtime = {path = "../../deno/runtime"}
 serde = {path = "../../serde/serde" }
 serde_derive = {path = "../../serde/serde_derive" }
 tauri = {path = "../../tauri/core/tauri" }
+#openai_api_rs = {path = "../../openai-api-rs" }

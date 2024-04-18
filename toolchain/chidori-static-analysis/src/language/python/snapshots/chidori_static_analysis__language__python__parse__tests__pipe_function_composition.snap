@@ -1,0 +1,20 @@
+---
+source: chidori-static-analysis/src/language/python/parse.rs
+description: "def main():\n    bar() | foo() | baz()\n"
+---
+- - InFunction: main
+- - InFunction: main
+  - InCallExpression
+  - IdentifierReferredTo:
+      - bar
+      - false
+- - InFunction: main
+  - InCallExpression
+  - IdentifierReferredTo:
+      - foo
+      - false
+- - InFunction: main
+  - InCallExpression
+  - IdentifierReferredTo:
+      - baz
+      - false

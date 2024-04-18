@@ -6,7 +6,6 @@ use deno_core::serde_json;
 use futures_util::stream::Stream;
 use openai_api_rs::v1::chat_completion::ChatCompletionMessage;
 use openai_api_rs::v1::chat_completion::ChatCompletionRequest;
-use openai_api_rs::v1::chat_completion::FunctionCall;
 use openai_api_rs::v1::chat_completion::MessageRole;
 use reqwest::{Client, Response};
 use serde_json::Value;
@@ -18,47 +17,13 @@ impl ChatModelStream for OpenAIChatModel {
     async fn stream(&self, chat_completion_req: ChatCompletionReq) -> Result<LLMStream, String> {
         let api_url = &self.api_url;
         let client = Client::new();
+        let mut req = Self::chat_completion_req_to_openai_req(&chat_completion_req);
+        req.stream = Some(true);
         let response: Response = match client
             .post(api_url)
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&ChatCompletionRequest {
-                model: chat_completion_req.model,
-                messages: chat_completion_req
-                    .template_messages
-                    .into_iter()
-                    .map(|m| ChatCompletionMessage {
-                        role: match m.role {
-                            llm::MessageRole::User => MessageRole::user,
-                            llm::MessageRole::System => MessageRole::system,
-                            llm::MessageRole::Assistant => MessageRole::assistant,
-                            llm::MessageRole::Function => MessageRole::function,
-                        },
-                        content: m.content,
-                        name: m.name,
-                        function_call: m.function_call.map(|f| FunctionCall {
-                            name: f.name,
-                            arguments: f.arguments,
-                        }),
-                    })
-                    .collect(),
-                tool_choice: None,
-                tools: None,
-                functions: None,
-                function_call: None,
-                temperature: chat_completion_req.temperature,
-                top_p: chat_completion_req.top_p,
-                n: None,
-                response_format: chat_completion_req.response_format,
-                stream: Some(true),
-                stop: None,
-                max_tokens: chat_completion_req.max_tokens,
-                presence_penalty: chat_completion_req.presence_penalty,
-                frequency_penalty: chat_completion_req.frequency_penalty,
-                logit_bias: chat_completion_req.logit_bias,
-                user: chat_completion_req.user,
-                seed: chat_completion_req.seed,
-            })
+            .json(&req)
             .send()
             .await
         {

@@ -23,6 +23,7 @@ pub enum ContextPath {
     InFunction(String),
     InAnonFunction,
     Params,
+    Param(String),
     InFunctionDecorator(usize),
     InCallExpression,
     ChName,
@@ -117,15 +118,11 @@ impl ASTWalkContext {
     fn enter_statement_function(&mut self, name: &ast::Ident) -> usize {
         let name = remove_hash_and_numbers(&name.to_string());
         self.context_stack.push(ContextPath::InFunction(name));
-        // self.context_stack_references
-        //     .push(self.context_stack.clone());
         self.context_stack.len()
     }
 
     fn enter_params(&mut self) -> usize {
         self.context_stack.push(ContextPath::Params);
-        // self.context_stack_references
-        //     .push(self.context_stack.clone());
         self.context_stack.len()
     }
 
@@ -162,7 +159,7 @@ impl ASTWalkContext {
         let name = remove_hash_and_numbers(&name.to_string());
         // TODO: we need to check if this is a local variable or not
         if self.var_exists(&name.to_string()) {
-            // true, the var exists in the local or global scope
+            // true, the var already exists in the local or global scope
             self.context_stack
                 .push(ContextPath::IdentifierReferredTo(name.to_string(), true));
         } else {
@@ -172,7 +169,7 @@ impl ASTWalkContext {
             if self.context_stack.contains(&ContextPath::Params) {
                 self.locals.insert(name.to_string());
                 self.context_stack
-                    .push(ContextPath::IdentifierReferredTo(name.to_string(), true));
+                    .push(ContextPath::IdentifierReferredTo(name.to_string(), false));
                 return;
             }
             self.context_stack
@@ -680,7 +677,6 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
     let mut exposed_values = HashMap::new();
     let mut depended_values = HashMap::new();
     let mut triggerable_functions = HashMap::new();
-    let mut declared_functions = HashMap::new();
     for context_path in context_paths {
         let mut encountered = vec![];
 
@@ -699,6 +695,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                     triggerable_functions
                         .entry(name.clone())
                         .or_insert_with(|| ReportTriggerableFunctions {
+                            arguments: vec![],
                             emit_event: vec![],
                             trigger_on: vec![],
                         });
@@ -727,6 +724,8 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                     let mut x = triggerable_functions
                         .entry(in_function_name.clone())
                         .or_insert_with(|| ReportTriggerableFunctions {
+
+                            arguments: vec![],
                             emit_event: vec![], // Initialize with an empty string or a default value
                             trigger_on: vec![],
                         });
@@ -788,7 +787,6 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
         cell_exposed_values: exposed_values,
         cell_depended_values: depended_values,
         triggerable_functions: triggerable_functions,
-        declared_functions: declared_functions,
     }
 }
 
@@ -807,28 +805,7 @@ mod tests {
             ch.prompt.configure("default", ch.llm({model: "openai"}))
             "#};
         let context_stack_references = extract_dependencies_js(js_source);
-        assert_eq!(
-            context_stack_references,
-            vec![
-                vec![
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute("configure".to_string()),
-                    ContextPath::Attribute("prompt".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), true),
-                    ContextPath::Constant("default".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute("llm".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), true)
-                ],
-                vec![
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute("configure".to_string()),
-                    ContextPath::Attribute("prompt".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), true),
-                    ContextPath::Constant("default".to_string())
-                ]
-            ]
-        );
+        insta::assert_yaml_snapshot!(context_stack_references);
     }
 
     #[test]
@@ -837,16 +814,12 @@ mod tests {
             const x = 1
             "#};
         let context_stack_references = extract_dependencies_js(js_source);
-        assert_eq!(
-            context_stack_references,
-            vec![
-                vec![
-                    ContextPath::AssignmentToStatement,
-                    ContextPath::IdentifierReferredTo("x".to_string(), false)
-                ],
-                vec![ContextPath::AssignmentFromStatement,]
-            ]
-        );
+        insta::with_settings!({
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
     }
 
     #[test]
@@ -857,22 +830,12 @@ mod tests {
             }
             "#};
         let context_stack_references = extract_dependencies_js(js_source);
-        assert_eq!(
-            context_stack_references,
-            vec![
-                vec![
-                    ContextPath::InFunction("createDockerfile".to_string()),
-                    ContextPath::Params
-                ],
-                vec![
-                    ContextPath::InFunction("createDockerfile".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo("prompt".to_string(), false),
-                    ContextPath::Constant("prompts/create_dockerfile".to_string())
-                ],
-                vec![ContextPath::InFunction("createDockerfile".to_string())],
-            ]
-        );
+        insta::with_settings!({
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
     }
 
     #[test]
@@ -886,50 +849,14 @@ mod tests {
             }
             "#};
         let context_stack_references = extract_dependencies_js(js_source);
-        assert_eq!(
-            context_stack_references,
-            vec![
-                vec![
-                    ContextPath::InFunction("createDockerfile".to_string()),
-                    ContextPath::Params
-                ],
-                vec![
-                    ContextPath::InFunction("createDockerfile".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo("useHook".to_string(), false),
-                    ContextPath::InAnonFunction,
-                    ContextPath::Params
-                ],
-                vec![
-                    ContextPath::InFunction("createDockerfile".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo("useHook".to_string(), false),
-                    ContextPath::InAnonFunction,
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute("prompt".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), false),
-                    ContextPath::Constant("demo".to_string())
-                ],
-                vec![
-                    ContextPath::InFunction("createDockerfile".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo("useHook".to_string(), false),
-                    ContextPath::InAnonFunction
-                ],
-                vec![
-                    ContextPath::InFunction("createDockerfile".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo("useHook".to_string(), false)
-                ],
-                vec![
-                    ContextPath::InFunction("createDockerfile".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo("prompt".to_string(), false),
-                    ContextPath::Constant("prompts/create_dockerfile".to_string())
-                ],
-                vec![ContextPath::InFunction("createDockerfile".to_string())],
-            ]
-        );
+
+        insta::with_settings!({
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
     }
 
     #[test]
@@ -941,29 +868,12 @@ mod tests {
             }
             "#};
         let context_stack_references = extract_dependencies_js(js_source);
-        assert_eq!(
-            context_stack_references,
-            vec![
-                vec![
-                    ContextPath::InFunction("migrationAgent".to_string()),
-                    ContextPath::Params
-                ],
-                vec![
-                    ContextPath::InFunction("migrationAgent".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute("register".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), false)
-                ],
-                vec![
-                    ContextPath::InFunction("migrationAgent".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute("set".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), false),
-                    ContextPath::Constant("bar".to_string())
-                ],
-                vec![ContextPath::InFunction("migrationAgent".to_string())],
-            ]
-        );
+        insta::with_settings!({
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
     }
 
     #[test]
@@ -977,49 +887,14 @@ mod tests {
             }
             "#};
         let context_stack_references = extract_dependencies_js(js_source);
-        assert_eq!(
-            context_stack_references,
-            vec![
-                vec![
-                    ContextPath::InFunction("dispatch_agent".to_string()),
-                    ContextPath::Params,
-                    ContextPath::IdentifierReferredTo("ev".to_string(), true)
-                ],
-                vec![
-                    ContextPath::InFunction("dispatch_agent".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute("onEvent".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), false),
-                    ContextPath::Constant("new_file".to_string())
-                ],
-                vec![
-                    ContextPath::InFunction("dispatch_agent".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute("emitAs".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), false),
-                    ContextPath::Constant("file_created".to_string())
-                ],
-                vec![
-                    ContextPath::InFunction("dispatch_agent".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute("emitAs".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), false),
-                    ContextPath::Constant("file_created".to_string()),
-                    ContextPath::Constant("multiple".to_string()),
-                    ContextPath::Constant("args".to_string())
-                ],
-                vec![
-                    ContextPath::InFunction("dispatch_agent".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute("set".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), false),
-                    ContextPath::Constant("file_path".to_string()),
-                    ContextPath::Attribute("file_path".to_string()),
-                    ContextPath::IdentifierReferredTo("ev".to_string(), true)
-                ],
-                vec![ContextPath::InFunction("dispatch_agent".to_string())],
-            ]
-        );
+
+        insta::with_settings!({
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
     }
 
     #[test]
@@ -1031,31 +906,14 @@ mod tests {
             }
             "#};
         let context_stack_references = extract_dependencies_js(js_source);
-        assert_eq!(
-            context_stack_references,
-            vec![
-                vec![
-                    ContextPath::InFunction("evaluate_agent".to_string()),
-                    ContextPath::Params,
-                    ContextPath::IdentifierReferredTo("ev".to_string(), true)
-                ],
-                vec![
-                    ContextPath::InFunction("evaluate_agent".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute("set".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), false),
-                    ContextPath::Constant("file_path".to_string()),
-                    ContextPath::Attribute("file_path".to_string()),
-                    ContextPath::IdentifierReferredTo("ev".to_string(), true)
-                ],
-                vec![
-                    ContextPath::InFunction("evaluate_agent".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo("migration_agent".to_string(), false)
-                ],
-                vec![ContextPath::InFunction("evaluate_agent".to_string())],
-            ]
-        );
+
+        insta::with_settings!({
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
     }
 
     #[test]
@@ -1067,27 +925,14 @@ mod tests {
             }
             "#};
         let context_stack_references = extract_dependencies_js(js_source);
-        assert_eq!(
-            context_stack_references,
-            vec![
-                vec![
-                    ContextPath::InFunction("setupPipeline".to_string()),
-                    ContextPath::Params,
-                    ContextPath::IdentifierReferredTo("x".to_string(), true)
-                ],
-                vec![
-                    ContextPath::InFunction("setupPipeline".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute("p".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), false),
-                    ContextPath::IdentifierReferredTo("create_dockerfile".to_string(), false)
-                ],
-                vec![
-                    ContextPath::InFunction("setupPipeline".to_string()),
-                    ContextPath::IdentifierReferredTo("x".to_string(), true)
-                ],
-            ]
-        );
+
+        insta::with_settings!({
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
     }
 
     #[test]
@@ -1101,33 +946,14 @@ mod tests {
             const v = subtract(x, 5);
             "#};
         let context_stack_references = extract_dependencies_js(js_source);
-        assert_eq!(
-            context_stack_references,
-            vec![
-                vec![
-                    ContextPath::InFunction("subtract".to_string()),
-                    ContextPath::Params,
-                    ContextPath::IdentifierReferredTo("a".to_string(), true),
-                    ContextPath::IdentifierReferredTo("b".to_string(), true)
-                ],
-                vec![
-                    ContextPath::InFunction("subtract".to_string()),
-                    ContextPath::IdentifierReferredTo("a".to_string(), true),
-                    ContextPath::IdentifierReferredTo("b".to_string(), true)
-                ],
-                vec![
-                    ContextPath::AssignmentToStatement,
-                    ContextPath::IdentifierReferredTo("v".to_string(), false)
-                ],
-                vec![
-                    ContextPath::AssignmentFromStatement,
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo("subtract".to_string(), true),
-                    ContextPath::IdentifierReferredTo("x".to_string(), false)
-                ],
-                vec![ContextPath::AssignmentFromStatement],
-            ]
-        );
+
+        insta::with_settings!({
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
     }
 
     #[test]
@@ -1138,7 +964,12 @@ mod tests {
             }
             "#};
         let context_stack_references = extract_dependencies_js(js_source);
-        assert_eq!(context_stack_references, vec![vec![ContextPath::ChName]]);
+        insta::with_settings!({
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
     }
 
     #[test]
@@ -1152,43 +983,12 @@ mod tests {
         }
             "#};
         let context_stack_references = extract_dependencies_js(js_source);
-        assert_eq!(
-            &context_stack_references,
-            &vec![
-                vec![
-                    ContextPath::InFunction("testing".to_string()),
-                    ContextPath::Params,
-                ],
-                vec![
-                    ContextPath::InFunction("testing".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute("onEvent".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), false),
-                    ContextPath::Constant("new_file".to_string()),
-                ],
-                vec![
-                    ContextPath::InFunction("testing".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute("emitAs".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), false),
-                    ContextPath::Constant("file_created".to_string())
-                ],
-                vec![
-                    ContextPath::InFunction("testing".to_string()),
-                    ContextPath::AssignmentToStatement,
-                    ContextPath::IdentifierReferredTo("x".to_string(), false)
-                ],
-                vec![
-                    ContextPath::InFunction("testing".to_string()),
-                    ContextPath::AssignmentFromStatement,
-                    ContextPath::IdentifierReferredTo("y".to_string(), false)
-                ],
-                vec![
-                    ContextPath::InFunction("testing".to_string()),
-                    ContextPath::IdentifierReferredTo("x".to_string(), true),
-                ],
-            ]
-        );
+        insta::with_settings!({
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
         let result = build_report(&context_stack_references);
         let report = Report {
             cell_exposed_values: std::collections::HashMap::new(), // No data provided, initializing as empty
@@ -1202,13 +1002,14 @@ mod tests {
                 map.insert(
                     "testing".to_string(),
                     ReportTriggerableFunctions {
+
+                        arguments: vec![],
                         emit_event: vec!["file_created".to_string()],
                         trigger_on: vec!["new_file".to_string()],
                     },
                 );
                 map
             },
-            declared_functions: std::collections::HashMap::new(), // No data provided, initializing as empty
         };
         assert_eq!(result, report);
     }
@@ -1227,57 +1028,13 @@ function fun_name() {
 x = random.randint(0, 10)
 "#};
         let context_stack_references = extract_dependencies_js(js_source);
-        assert_eq!(
-            &context_stack_references,
-            &vec![
-                vec![
-                    ContextPath::InFunction("fun_name".to_string()),
-                    ContextPath::Params,
-                ],
-                vec![
-                    ContextPath::InFunction("fun_name".to_string()),
-                    ContextPath::AssignmentToStatement,
-                    ContextPath::IdentifierReferredTo("w".to_string(), false),
-                ],
-                vec![
-                    ContextPath::InFunction("fun_name".to_string()),
-                    ContextPath::AssignmentFromStatement,
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo(
-                        "function_that_doesnt_exist".to_string(),
-                        false
-                    ),
-                ],
-                vec![
-                    ContextPath::InFunction("fun_name".to_string()),
-                    ContextPath::AssignmentFromStatement,
-                ],
-                vec![
-                    ContextPath::InFunction("fun_name".to_string()),
-                    ContextPath::AssignmentToStatement,
-                    ContextPath::IdentifierReferredTo("v".to_string(), false),
-                ],
-                vec![
-                    ContextPath::InFunction("fun_name".to_string()),
-                    ContextPath::AssignmentFromStatement,
-                ],
-                vec![
-                    ContextPath::InFunction("fun_name".to_string()),
-                    ContextPath::IdentifierReferredTo("v".to_string(), true),
-                ],
-                vec![
-                    ContextPath::AssignmentToStatement,
-                    ContextPath::IdentifierReferredTo("x".to_string(), false)
-                ],
-                vec![
-                    ContextPath::AssignmentFromStatement,
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute("randint".to_string()),
-                    ContextPath::IdentifierReferredTo("random".to_string(), true)
-                ],
-                vec![ContextPath::AssignmentFromStatement,],
-            ]
-        );
+        insta::with_settings!({
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+;
         let result = build_report(&context_stack_references);
         let report = Report {
             cell_exposed_values: {
@@ -1295,13 +1052,14 @@ x = random.randint(0, 10)
                 map.insert(
                     "fun_name".to_string(),
                     ReportTriggerableFunctions {
+
+                        arguments: vec![],
                         emit_event: vec![],
                         trigger_on: vec![],
                     },
                 );
                 map
             },
-            declared_functions: std::collections::HashMap::new(), // No data provided, initializing as empty
         };
         assert_eq!(result, report);
     }

@@ -1,7 +1,7 @@
 use std::time::Duration;
 use tonic::codegen::Body;
 use crate::cells::{MemoryCell, SupportedMemoryProviders};
-use crate::execution::primitives::operation::{AsyncRPCCommunication, InputItemConfiguation, InputSignature, InputType, OperationNode, OutputItemConfiguation, OutputSignature};
+use crate::execution::primitives::operation::{AsyncRPCCommunication, InputItemConfiguration, InputSignature, InputType, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
 use futures_util::FutureExt;
 use serde_json::json;
 use crate::execution::primitives::serialized_value::{json_value_to_serialized_value, RkyvSerializedValue, serialized_value_to_json_value};
@@ -16,24 +16,25 @@ pub fn memory_cell(cell: &MemoryCell) -> OperationNode {
             let mut input_signature = InputSignature::new();
             input_signature.globals.insert(
                 cell.embedding_function.clone(),
-                InputItemConfiguation {
+                InputItemConfiguration {
                     ty: Some(InputType::String),
                     default: None,
                 },
             );
 
             let triggerable_functions = vec![
-                ("insert", "insert",),
-                ("search", "search",)
+                "insert",
+                "search"
             ];
 
             let mut output_signature = OutputSignature::new();
-
-            for (key, value) in &triggerable_functions {
+            for key in &triggerable_functions {
                 output_signature.functions.insert(
                     key.to_string(),
-                    OutputItemConfiguation {
-                        ty: Some(InputType::Function),
+                    OutputItemConfiguration::Function {
+                        input_signature: InputSignature::new(),
+                        emit_event: vec![],
+                        trigger_on: vec![],
                     },
                 );
             }
@@ -57,12 +58,7 @@ pub fn memory_cell(cell: &MemoryCell) -> OperationNode {
                                     match key.as_str() {
                                         "insert" => {
                                             let (embedded_value, _) = s.dispatch(&embedding_function, value.clone()).await;
-                                            let mut embedding = vec![];
-                                            if let RkyvSerializedValue::Array(arr) = embedded_value {
-                                                arr.iter().for_each(|a| if let RkyvSerializedValue::Float(f) = a {
-                                                    embedding.push(f.clone());
-                                                });
-                                            }
+                                            let embedding = rkyv_to_vec_float(embedded_value);
                                             let contents = serialized_value_to_json_value(&value);
                                             let row = vec![(&embedding, contents)];
                                             db.insert("default".to_string(), &row);
@@ -70,12 +66,7 @@ pub fn memory_cell(cell: &MemoryCell) -> OperationNode {
                                         }
                                         "search" => {
                                             let (embedded_value, _) = s.dispatch(&embedding_function, value.clone()).await;
-                                            let mut embedding = vec![];
-                                            if let RkyvSerializedValue::Array(arr) = embedded_value {
-                                                arr.iter().for_each(|a| if let RkyvSerializedValue::Float(f) = a {
-                                                    embedding.push(f.clone());
-                                                });
-                                            }
+                                            let embedding = rkyv_to_vec_float(embedded_value);
                                             let results = db.search("default".to_string(), embedding, 5);
                                             let mut output = vec![];
                                             for (_, value) in results.iter() {
@@ -91,13 +82,27 @@ pub fn memory_cell(cell: &MemoryCell) -> OperationNode {
                                 }
                             }
                         }).await.unwrap();
-                        RkyvSerializedValue::Null
+                        OperationFnOutput::with_value(RkyvSerializedValue::Null)
                     }.boxed()
                 }),
             )
-        }
+        },
+        // SupportedMemoryProviders::Qdrant => {
+        //
+        // }
     }
 }
+
+fn rkyv_to_vec_float(embedded_value: RkyvSerializedValue) -> Vec<f32> {
+    let mut embedding = vec![];
+    if let RkyvSerializedValue::Array(arr) = embedded_value {
+        arr.iter().for_each(|a| if let RkyvSerializedValue::Float(f) = a {
+            embedding.push(f.clone());
+        });
+    }
+    embedding
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -123,6 +128,7 @@ mod test {
             function_invocation: None,
         }), Some(0));
         let op = memory_cell(&MemoryCell {
+            name: None,
             provider: SupportedMemoryProviders::InMemory,
             embedding_function: "fake_embedding".to_string(),
         });

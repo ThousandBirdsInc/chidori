@@ -1,0 +1,47 @@
+---
+source: chidori-core/src/library/std/ai/llm/mod.rs
+---
+- function:
+    name: demo
+    description: ~
+    parameters:
+      schema_type: object
+      properties: {}
+      required: ~
+  tool_type: function
+- function:
+    name: complex_args
+    description: ~
+    parameters:
+      schema_type: object
+      properties:
+        a:
+          schema_type: string
+          description: ~
+          enum_values: ~
+          properties: ~
+          required: ~
+          items: ~
+        b:
+          schema_type: string
+          description: ~
+          enum_values: ~
+          properties: ~
+          required: ~
+          items: ~
+        c:
+          schema_type: string
+          description: ~
+          enum_values: ~
+          properties: ~
+          required: ~
+          items: ~
+        d:
+          schema_type: string
+          description: ~
+          enum_values: ~
+          properties: ~
+          required: ~
+          items: ~
+      required: ~
+  tool_type: function

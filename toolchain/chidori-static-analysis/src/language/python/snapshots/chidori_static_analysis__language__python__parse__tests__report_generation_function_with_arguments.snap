@@ -1,0 +1,41 @@
+---
+source: chidori-static-analysis/src/language/python/parse.rs
+description: "async def complex_args_function(a, b, c=2, d=3):\n    return a + b + c + d\n    "
+---
+- - InFunction: complex_args_function
+- - InFunction: complex_args_function
+  - FunctionArguments
+  - IdentifierReferredTo:
+      - a
+      - false
+- - InFunction: complex_args_function
+  - FunctionArguments
+  - IdentifierReferredTo:
+      - b
+      - false
+- - InFunction: complex_args_function
+  - FunctionArguments
+  - IdentifierReferredTo:
+      - c
+      - false
+- - InFunction: complex_args_function
+  - FunctionArguments
+  - IdentifierReferredTo:
+      - d
+      - false
+- - InFunction: complex_args_function
+  - IdentifierReferredTo:
+      - a
+      - true
+- - InFunction: complex_args_function
+  - IdentifierReferredTo:
+      - b
+      - true
+- - InFunction: complex_args_function
+  - IdentifierReferredTo:
+      - c
+      - true
+- - InFunction: complex_args_function
+  - IdentifierReferredTo:
+      - d
+      - true

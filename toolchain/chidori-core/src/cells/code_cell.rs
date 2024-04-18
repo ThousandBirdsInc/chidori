@@ -2,7 +2,7 @@ use futures_util::FutureExt;
 use chidori_static_analysis::language::Report;
 use crate::cells::{CodeCell, SupportedLanguage};
 use crate::execution::execution::ExecutionState;
-use crate::execution::primitives::operation::{InputItemConfiguation, InputSignature, InputType, OperationNode, OutputItemConfiguation, OutputSignature};
+use crate::execution::primitives::operation::{InputItemConfiguration, InputSignature, InputType, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
 
 /// Code cells allow notebooks to evaluate source code in a variety of languages.
 #[tracing::instrument]
@@ -29,14 +29,18 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
                     // TODO: this needs to handle stdout and errors
                     let s = s.clone();
                     async move {
-                        crate::library::std::code::runtime_pyo3::source_code_run_python(
+                        let result = crate::library::std::code::runtime_pyo3::source_code_run_python(
                             &s,
                             &cell.source_code,
                             &x,
                             &cell.function_invocation,
-                        ).await
-                            .unwrap()
-                            .0
+                        ).await.unwrap();
+                        OperationFnOutput {
+                            execution_state: None,
+                            output: result.0,
+                            stdout: result.1,
+                            stderr: result.2,
+                        }
                     }.boxed()
                 }),
             )
@@ -45,7 +49,7 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
             cell.name.clone(),
             InputSignature::new(),
             OutputSignature::new(),
-            Box::new(|_, x, _, _| async move { x}.boxed()),
+            Box::new(|_, x, _, _| async move { OperationFnOutput::with_value(x) }.boxed()),
         ),
         SupportedLanguage::Deno => {
             let paths =
@@ -78,7 +82,7 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
                                 Err(e) => panic!("{:?}", e),
                             }
                         }).await.unwrap();
-                        result
+                        OperationFnOutput::with_value(result)
                     }.boxed()
                 }),
             )
@@ -91,7 +95,7 @@ fn signatures_from_report(report: &Report) -> (InputSignature, OutputSignature) 
     for (key, value) in &report.cell_depended_values {
         input_signature.globals.insert(
             key.clone(),
-            InputItemConfiguation {
+            InputItemConfiguration {
                 ty: Some(InputType::String),
                 default: None,
             },
@@ -102,17 +106,25 @@ fn signatures_from_report(report: &Report) -> (InputSignature, OutputSignature) 
     for (key, value) in &report.cell_exposed_values {
         output_signature.globals.insert(
             key.clone(),
-            OutputItemConfiguation {
-                ty: Some(InputType::String),
-            },
+            OutputItemConfiguration::Value,
         );
     }
 
     for (key, value) in &report.triggerable_functions {
+        let mut input_signature = InputSignature::new();
+        for (i, arg) in value.arguments.iter().enumerate() {
+            input_signature.args.insert(arg.clone(), InputItemConfiguration {
+                ty: Some(InputType::String),
+                default: None,
+            });
+        }
+
         output_signature.functions.insert(
             key.clone(),
-            OutputItemConfiguation {
-                ty: Some(InputType::Function),
+            OutputItemConfiguration::Function {
+                input_signature,
+                emit_event: vec![],
+                trigger_on: vec![],
             },
         );
     }

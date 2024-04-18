@@ -1,21 +1,16 @@
+use std::collections::HashMap;
 use async_trait::async_trait;
+use futures_util::TryStreamExt;
 
 use crate::library::std::ai::llm;
 use crate::library::std::ai::llm::openai::OpenAIChatModel;
-use crate::library::std::ai::llm::{ChatCompletionReq, ChatCompletionRes, ChatModelBatch};
+use crate::library::std::ai::llm::{ChatCompletionReq, ChatCompletionRes, ChatModelBatch, JSONSchemaDefine, JSONSchemaType, Tool, ToolChoiceType};
 
 use openai_api_rs::v1::chat_completion::{
-    ChatCompletionMessage, ChatCompletionRequest, FunctionCall, MessageRole,
+    ChatCompletionMessage, ChatCompletionRequest, MessageRole,
 };
-
-pub enum SupportedChatModel {
-    Gpt4,
-    Gpt40314,
-    Gpt432k,
-    Gpt432k0314,
-    Gpt35Turbo,
-    Gpt35Turbo0301,
-}
+use crate::cells::LLMPromptCellChatConfiguration;
+use crate::execution::primitives::serialized_value::json_value_to_serialized_value;
 
 #[async_trait]
 impl ChatModelBatch for OpenAIChatModel {
@@ -23,7 +18,7 @@ impl ChatModelBatch for OpenAIChatModel {
         &self,
         chat_completion_req: ChatCompletionReq,
     ) -> Result<ChatCompletionRes, String> {
-        let model = chat_completion_req.model;
+        let model = &chat_completion_req.config.model;
         if self.api_url == "https://api.openai.com/v1" {
             if !vec![
                 "gpt-4-1106-preview",
@@ -46,46 +41,12 @@ impl ChatModelBatch for OpenAIChatModel {
                 return Err(format!("Model {} is not supported", model));
             }
         }
-        let req = ChatCompletionRequest {
-            model,
-            messages: chat_completion_req
-                .template_messages
-                .into_iter()
-                .map(|m| ChatCompletionMessage {
-                    role: match m.role {
-                        llm::MessageRole::User => MessageRole::user,
-                        llm::MessageRole::System => MessageRole::system,
-                        llm::MessageRole::Assistant => MessageRole::assistant,
-                        llm::MessageRole::Function => MessageRole::function,
-                    },
-                    content: m.content,
-                    name: m.name,
-                    function_call: m.function_call.map(|f| FunctionCall {
-                        name: f.name,
-                        arguments: f.arguments,
-                    }),
-                })
-                .collect(),
-            tool_choice: None,
-            tools: None,
-            functions: None,
-            function_call: None,
-            temperature: chat_completion_req.temperature,
-            top_p: chat_completion_req.top_p,
-            n: None,
-            response_format: chat_completion_req.response_format,
-            stream: None,
-            stop: None,
-            max_tokens: chat_completion_req.max_tokens,
-            presence_penalty: chat_completion_req.presence_penalty,
-            frequency_penalty: chat_completion_req.frequency_penalty,
-            logit_bias: chat_completion_req.logit_bias,
-            user: chat_completion_req.user,
-            seed: chat_completion_req.seed,
-        };
+
+        let req = Self::chat_completion_req_to_openai_req(&chat_completion_req);
         self.client
             .chat_completion(req)
-            .map(|res| ChatCompletionRes {
+            .map(|res| {
+                ChatCompletionRes {
                 id: res.id,
                 object: res.object,
                 created: res.created,
@@ -98,6 +59,26 @@ impl ChatModelBatch for OpenAIChatModel {
                         index: 0,
                         logprobs: None,
                         finish_reason: "".to_string(),
+                        tool_calls: c.message.tool_calls.clone().map(|tool_calls| {
+                            tool_calls
+                                .iter()
+                                .map(|tool_call| {
+                                    llm::ChatCompletionToolCall {
+                                        id: tool_call.id.clone(),
+                                        ty: "function".to_string(),
+                                        function: llm::ChatCompletionToolCallFunction {
+                                            name: tool_call.function.name.clone(),
+                                            arguments: tool_call.function.arguments
+                                                .as_ref()
+                                                .map(|x| {dbg!(&x); x })
+                                                .map(|x| x.as_str())
+                                                .map(|x| serde_json::from_str(x).unwrap())
+                                                .map(|x| json_value_to_serialized_value(&x)),
+                                        }
+                                    }
+                                })
+                                .collect()
+                        }),
                     })
                     .collect(),
                 usage: llm::Usage {
@@ -105,10 +86,12 @@ impl ChatModelBatch for OpenAIChatModel {
                     completion_tokens: res.usage.completion_tokens,
                     total_tokens: res.usage.total_tokens,
                 },
-            })
+            }})
             .map_err(|e| e.message)
     }
 }
+
+
 
 #[cfg(test)]
 mod tests {
@@ -122,7 +105,6 @@ mod tests {
         let api_url_v1: &str = "https://api.openai.com/v1";
         let model = OpenAIChatModel::new(api_url_v1.to_string(), api_key);
         let chat_completion_req = ChatCompletionReq {
-            model: "".to_string(),
             ..ChatCompletionReq::default()
         };
         let result = model.batch(chat_completion_req).await;

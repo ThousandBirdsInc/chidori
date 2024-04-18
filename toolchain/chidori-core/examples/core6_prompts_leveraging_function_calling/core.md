@@ -1,37 +1,17 @@
 # Demonstrating how to leverage function calling in prompts
 
-```python (first_letter)
-def first_letter(s):
-    return s[0]
-```
-
-```python (math_demo)
-def do_some_math(a, b):
+```python (math_fn)
+def add_two_numbers(a, b):
       return a + b
 ```
 
-
-```javascript (jsdemo)
-function jsMath(a, b) {
-    return a + b;
-}
-```
-
-```typescript (tsdemo)
-function tsTypesafe(a: string, b: number) {
-    return a + b;
-}
-```
-
-```prompt (current_weather_in_sf)
+```prompt (add_population)
 ---
+model: gpt-3.5-turbo
 import:
-  - first_letter
-  - jsMath
-  - do_some_math
+  - add_two_numbers
 ---
-List the first {{num}} US states to be added to the union.
-Return this as a `-` bulleted list with the name of the state on each line.
+Add the population of {{state}} to the population of California
 ```
 
 
@@ -40,7 +20,7 @@ import unittest
 
 class TestMarshalledValues(unittest.IsolatedAsyncioTestCase):
     async def test_run_prompt(self):
-        self.assertEqual(await current_weather_in_sf(5), 4)
+        self.assertEqual(await add_population(state="Arizona"), 4)
 
 unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
 ```

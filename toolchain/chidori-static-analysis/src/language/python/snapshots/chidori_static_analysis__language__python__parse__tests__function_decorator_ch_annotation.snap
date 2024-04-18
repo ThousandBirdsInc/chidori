@@ -1,0 +1,22 @@
+---
+source: chidori-static-analysis/src/language/python/parse.rs
+description: "@ch.register()\ndef migration_agent():\n    ch.set(\"bar\", 1)\n"
+---
+- - InFunction: migration_agent
+- - InFunction: migration_agent
+  - InFunctionDecorator: 0
+  - InCallExpression
+  - Attribute: register
+  - IdentifierReferredTo:
+      - ch
+      - false
+- - InFunction: migration_agent
+  - InCallExpression
+  - Constant: bar
+- - InFunction: migration_agent
+  - InCallExpression
+  - Constant: bar
+  - Attribute: set
+  - IdentifierReferredTo:
+      - ch
+      - false

@@ -1,0 +1,51 @@
+---
+source: chidori-static-analysis/src/language/python/parse.rs
+description: "@ch.on_event(\"new_file\")\n@ch.emit_as(\"file_created\")\ndef dispatch_agent(ev):\n    ch.set(\"file_path\", ev.file_path)\n"
+---
+- - InFunction: dispatch_agent
+- - InFunction: dispatch_agent
+  - InFunctionDecorator: 0
+  - InCallExpression
+  - Constant: new_file
+- - InFunction: dispatch_agent
+  - InFunctionDecorator: 0
+  - InCallExpression
+  - Constant: new_file
+  - Attribute: on_event
+  - IdentifierReferredTo:
+      - ch
+      - false
+- - InFunction: dispatch_agent
+  - InFunctionDecorator: 1
+  - InCallExpression
+  - Constant: file_created
+- - InFunction: dispatch_agent
+  - InFunctionDecorator: 1
+  - InCallExpression
+  - Constant: file_created
+  - Attribute: emit_as
+  - IdentifierReferredTo:
+      - ch
+      - false
+- - InFunction: dispatch_agent
+  - FunctionArguments
+  - IdentifierReferredTo:
+      - ev
+      - false
+- - InFunction: dispatch_agent
+  - InCallExpression
+  - Constant: file_path
+- - InFunction: dispatch_agent
+  - InCallExpression
+  - Constant: file_path
+  - Attribute: file_path
+  - IdentifierReferredTo:
+      - ev
+      - true
+- - InFunction: dispatch_agent
+  - InCallExpression
+  - Constant: file_path
+  - Attribute: set
+  - IdentifierReferredTo:
+      - ch
+      - false

@@ -2,12 +2,13 @@ pub mod template_cell;
 pub mod code_cell;
 pub mod web_cell;
 pub mod llm_prompt_cell;
-mod memory_cell;
+pub mod memory_cell;
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use ts_rs::TS;
 use rkyv::{Archive, Deserialize, Serialize};
+use serde_json::Value;
 use crate::library::std::ai::llm::ChatModelBatch;
 
 #[derive(
@@ -226,6 +227,69 @@ pub enum SupportedModelProviders {
     OpenAI,
 }
 
+
+#[derive(
+Default,
+TS,
+Archive,
+serde::Serialize,
+serde::Deserialize,
+Serialize,
+Deserialize,
+Debug,
+PartialEq,
+Clone,
+)]
+#[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
+#[archive(check_bytes)]
+#[archive_attr(check_bytes(
+bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
+))]
+#[archive_attr(derive(Debug))]
+#[ts(export, export_to = "package_node/types/")]
+pub struct EjectionConfig {
+    pub language: String,
+    pub mode: String
+}
+
+#[derive(
+Default,
+TS,
+Archive,
+serde::Serialize,
+serde::Deserialize,
+Serialize,
+Deserialize,
+Debug,
+PartialEq,
+Clone,
+)]
+#[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
+#[archive(check_bytes)]
+#[archive_attr(check_bytes(
+bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
+))]
+#[archive_attr(derive(Debug))]
+#[ts(export, export_to = "package_node/types/")]
+pub struct LLMPromptCellChatConfiguration {
+    pub(crate) import: Option<Vec<String>>,
+
+    #[serde(rename = "fn")]
+    pub(crate) function_name: Option<String>,
+
+    pub model: String,
+    pub frequency_penalty: Option<f64>,
+    pub max_tokens: Option<i64>,
+    pub presence_penalty: Option<f64>,
+    pub stop: Option<Vec<String>>,
+    pub temperature: Option<f64>,
+    pub logit_bias: Option<HashMap<String, i32>>,
+    pub user: Option<String>,
+    pub seed: Option<i64>,
+    pub top_p: Option<f64>,
+    pub eject: Option<EjectionConfig>
+}
+
 #[derive(
     TS,
     Archive,
@@ -247,7 +311,7 @@ pub enum SupportedModelProviders {
 pub enum LLMPromptCell {
     Chat {
         function_invocation: bool,
-        configuration: HashMap<String, String>,
+        configuration: LLMPromptCellChatConfiguration,
         name: Option<String>,
         provider: SupportedModelProviders,
         req: String,

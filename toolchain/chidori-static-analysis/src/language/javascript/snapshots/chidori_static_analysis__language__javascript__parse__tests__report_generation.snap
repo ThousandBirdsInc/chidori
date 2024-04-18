@@ -1,0 +1,34 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "function testing() {\n    ch.onEvent(\"new_file\");\n    ch.emitAs(\"file_created\");\n    const x = 2 + y;\n    return x\n}\n    "
+---
+- - InFunction: testing
+  - Params
+- - InFunction: testing
+  - InCallExpression
+  - Attribute: onEvent
+  - IdentifierReferredTo:
+      - ch
+      - false
+  - Constant: new_file
+- - InFunction: testing
+  - InCallExpression
+  - Attribute: emitAs
+  - IdentifierReferredTo:
+      - ch
+      - false
+  - Constant: file_created
+- - InFunction: testing
+  - AssignmentToStatement
+  - IdentifierReferredTo:
+      - x
+      - false
+- - InFunction: testing
+  - AssignmentFromStatement
+  - IdentifierReferredTo:
+      - y
+      - false
+- - InFunction: testing
+  - IdentifierReferredTo:
+      - x
+      - true

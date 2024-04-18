@@ -1,0 +1,13 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "function createDockerfile() {\n    return prompt(\"prompts/create_dockerfile\")\n}\n"
+---
+- - InFunction: createDockerfile
+  - Params
+- - InFunction: createDockerfile
+  - InCallExpression
+  - IdentifierReferredTo:
+      - prompt
+      - false
+  - Constant: prompts/create_dockerfile
+- - InFunction: createDockerfile

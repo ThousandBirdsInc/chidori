@@ -11,6 +11,8 @@ use std::collections::HashSet;
 pub enum ContextPath {
     Initialized,
     InFunction(String),
+    FunctionArguments,
+    FunctionArgument(String),
     InClass(String),
     InFunctionDecorator(usize),
     InCallExpression,
@@ -100,6 +102,20 @@ impl ASTWalkContext {
         self.context_stack.len()
     }
 
+    fn enter_arguments(&mut self) -> usize {
+        self.context_stack
+            .push(ContextPath::FunctionArguments);
+        self.context_stack.len()
+    }
+
+    fn encounter_argument(&mut self, name: &Identifier) {
+        self.locals.insert(name.to_string());
+        self.context_stack
+            .push(ContextPath::FunctionArgument(name.to_string()));
+        self.context_stack_references
+            .push(self.context_stack.clone());
+    }
+
     fn enter_decorator_expression(&mut self, idx: &usize) -> usize {
         self.context_stack
             .push(ContextPath::InFunctionDecorator(idx.clone()));
@@ -128,6 +144,9 @@ impl ASTWalkContext {
                 .push(ContextPath::IdentifierReferredTo(name.to_string(), true));
         } else {
             if let Some(ContextPath::AssignmentToStatement) = self.context_stack.last() {
+                self.locals.insert(name.to_string());
+            }
+            if let Some(ContextPath::FunctionArguments) = self.context_stack.last() {
                 self.locals.insert(name.to_string());
             }
             self.context_stack
@@ -337,6 +356,7 @@ fn traverse_expression(expr: &ast::Expr, machine: &mut ASTWalkContext) {
 }
 
 pub fn extract_dependencies_python(source_code: &str) -> Vec<Vec<ContextPath>> {
+    // TODO: extract comments and associate them based on position relative to functions
     let ast = ast::Suite::parse(source_code, "<embedded>").unwrap();
     let mut machine = ASTWalkContext::default();
     traverse_statements(&ast, &mut machine);
@@ -381,7 +401,7 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                     traverse_expression(decorator, machine);
                     machine.pop_until(idx);
                 }
-                // TODO: make this less uniquely handled in the traversal
+                let args_idx = machine.enter_arguments();
                 for ast::ArgWithDefault {
                     range,
                     def,
@@ -390,9 +410,10 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                 } in &args.args
                 {
                     if let ast::Arg { arg, .. } = def {
-                        machine.locals.insert(arg.to_string());
+                        machine.encounter_named_reference(arg);
                     }
                 }
+                machine.pop_until(args_idx);
                 traverse_statements(body, machine);
                 machine.pop_until(idx);
                 machine.pop_local_context();
@@ -413,6 +434,7 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                     traverse_expression(decorator, machine);
                     machine.pop_until(idx);
                 }
+                let args_idx = machine.enter_arguments();
                 for ast::ArgWithDefault {
                     range,
                     def,
@@ -421,9 +443,10 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                 } in &args.args
                 {
                     if let ast::Arg { arg, .. } = def {
-                        machine.locals.insert(arg.to_string());
+                        machine.encounter_named_reference(arg);
                     }
                 }
+                machine.pop_until(args_idx);
                 traverse_statements(body, machine);
                 machine.pop_until(idx);
                 machine.pop_local_context();
@@ -473,7 +496,6 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                 orelse,
                 ..
             }) => {
-                // TODO: target needs to get declared in scope
                 let idx = machine.enter_assignment_to_statement();
                 traverse_expression(target, machine);
                 machine.pop_until(idx);
@@ -489,7 +511,9 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                 orelse,
                 ..
             }) => {
+                let idx = machine.enter_assignment_to_statement();
                 traverse_expression(target, machine);
+                machine.pop_until(idx);
                 traverse_expression(iter, machine);
                 traverse_statements(body, machine);
                 traverse_statements(orelse, machine);
@@ -612,11 +636,6 @@ def is_odd(i):
 }
 
 pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
-    // TODO: get all exposed values
-    // TODO: get all values referred to but are not available in a given context
-    // TODO: get all triggerable functions
-    // TODO: get all events that are emitted
-
     // TODO: triggerable functions should note what they are triggered by
     // TODO: for each of these we should store the context path that refers to them
     // TODO: context paths should include spans
@@ -624,10 +643,10 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
     let mut exposed_values = HashMap::new();
     let mut depended_values = HashMap::new();
     let mut triggerable_functions = HashMap::new();
-    let mut declared_functions = HashMap::new();
     for context_path in context_paths {
         let mut encountered = vec![];
         for (idx, context_path_unit) in context_path.iter().enumerate() {
+            // encountered is the reversed oreder of the context path
             encountered.push(context_path_unit);
 
             // If we've declared a top level function, it is exposed
@@ -636,12 +655,32 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                     triggerable_functions
                         .entry(name.clone())
                         .or_insert_with(|| ReportTriggerableFunctions {
+                            
                             // context_path: context_path.clone(),
+                            arguments: vec![],
                             emit_event: vec![],
                             trigger_on: vec![],
                         });
                 }
             }
+
+            if let ContextPath::FunctionArgument(name) = context_path_unit {
+                // traverse back through path until we hit the InFunction
+                let clone_path = context_path.clone();
+                for (idx, context_path_unit) in (clone_path.into_iter()).rev().enumerate() {
+                    if let ContextPath::InFunction(function_name) = context_path_unit {
+                        let mut x = triggerable_functions
+                            .entry(function_name.clone())
+                            .or_insert_with(|| ReportTriggerableFunctions {
+                                arguments: vec![],
+                                emit_event: vec![], // Initialize with an empty string or a default value
+                                trigger_on: vec![],
+                            });
+                        x.arguments.push(name.clone());
+                    }
+                }
+            }
+
 
             // Decorators set the emit event property for a function
             if &ContextPath::IdentifierReferredTo(String::from("ch"), false) == context_path_unit {
@@ -652,6 +691,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                                 let mut x = triggerable_functions
                                     .entry(name.clone())
                                     .or_insert_with(|| ReportTriggerableFunctions {
+                                        arguments: vec![],
                                         emit_event: vec![], // Initialize with an empty string or a default value
                                         trigger_on: vec![],
                                     });
@@ -671,6 +711,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                                 let mut x = triggerable_functions
                                     .entry(name.clone())
                                     .or_insert_with(|| ReportTriggerableFunctions {
+                                        arguments: vec![],
                                         emit_event: vec![], // Initialize with an empty string or a default value
                                         trigger_on: vec![],
                                     });
@@ -683,6 +724,48 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
 
             if let ContextPath::IdentifierReferredTo(identifier, false) = context_path_unit {
                 if identifier != &String::from("ch") {
+
+                    // If we encounter both FunctionArguments and InFunction, then this is a function argument
+                    if encountered.iter().any(|x| matches!(x, ContextPath::InFunction(_)))
+                        && encountered.iter().any(|x| matches!(x, ContextPath::FunctionArguments))
+                    {
+                        for context_path_unit in &encountered {
+                            if let ContextPath::InFunction(function_name) = context_path_unit {
+                                let mut x = triggerable_functions
+                                    .entry(function_name.clone())
+                                    .or_insert_with(|| ReportTriggerableFunctions {
+                                        arguments: vec![],
+                                        emit_event: vec![], // Initialize with an empty string or a default value
+                                        trigger_on: vec![],
+                                    });
+                                x.arguments.push(identifier.clone());
+                            }
+                        }
+                        continue;
+                    }
+
+
+                    // This is an exposed value if it does not occur inside the scope of a function
+                    if encountered
+                        .iter()
+                        .find(|x| {
+                            if let ContextPath::InFunction(_) = x {
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .is_none()
+                    {
+                        exposed_values.insert(
+                            identifier.clone(),
+                            ReportItem {
+                                // context_path: context_path.clone(),
+                            },
+                        );
+                        continue;
+                    }
+
                     // If this value is not being assigned to, then it is a dependency
                     if !encountered.contains(&&ContextPath::AssignmentToStatement) {
                         depended_values.insert(
@@ -691,26 +774,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                                 // context_path: context_path.clone(),
                             },
                         );
-                    } else {
-                        // This is an exposed value if it does not occur inside the scope of a function
-                        if encountered
-                            .iter()
-                            .find(|x| {
-                                if let ContextPath::InFunction(_) = x {
-                                    true
-                                } else {
-                                    false
-                                }
-                            })
-                            .is_none()
-                        {
-                            exposed_values.insert(
-                                identifier.clone(),
-                                ReportItem {
-                                    // context_path: context_path.clone(),
-                                },
-                            );
-                        }
+                        continue;
                     }
                 }
             }
@@ -734,7 +798,6 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
         cell_exposed_values: exposed_values,
         cell_depended_values: depended_values,
         triggerable_functions: triggerable_functions,
-        declared_functions: declared_functions,
     }
 }
 
@@ -751,36 +814,12 @@ mod tests {
             ch.prompt.configure("default", ch.llm(model="openai"))
             "#};
         let context_stack_references = extract_dependencies_python(python_source);
-        assert_eq!(
-            context_stack_references,
-            vec![
-                vec![
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant(String::from("default")),
-                ],
-                vec![
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant(String::from("default")),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant(String::from("openai")),
-                ],
-                vec![
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant(String::from("default")),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant(String::from("openai")),
-                    ContextPath::Attribute(String::from("llm")),
-                    ContextPath::IdentifierReferredTo(String::from("ch"), false),
-                ],
-                vec![
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant(String::from("default")),
-                    ContextPath::Attribute(String::from("configure")),
-                    ContextPath::Attribute(String::from("prompt")),
-                    ContextPath::IdentifierReferredTo(String::from("ch"), false),
-                ],
-            ]
-        );
+        insta::with_settings!({
+            description => python_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
     }
 
     #[test]
@@ -803,23 +842,12 @@ mod tests {
                 return prompt("prompts/create_dockerfile")
             "#};
         let context_stack_references = extract_dependencies_python(python_source);
-        assert_eq!(
-            context_stack_references,
-            vec![
-                vec![ContextPath::InFunction(String::from("create_dockerfile")),],
-                vec![
-                    ContextPath::InFunction(String::from("create_dockerfile")),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant(String::from("prompts/create_dockerfile")),
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("create_dockerfile")),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant(String::from("prompts/create_dockerfile")),
-                    ContextPath::IdentifierReferredTo(String::from("prompt"), false),
-                ],
-            ]
-        );
+        insta::with_settings!({
+            description => python_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
     }
 
     #[test]
@@ -830,31 +858,12 @@ mod tests {
                 ch.set("bar", 1)
             "#};
         let context_stack_references = extract_dependencies_python(python_source);
-        assert_eq!(
-            context_stack_references,
-            vec![
-                vec![ContextPath::InFunction(String::from("migration_agent")),],
-                vec![
-                    ContextPath::InFunction(String::from("migration_agent")),
-                    ContextPath::InFunctionDecorator(0),
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute(String::from("register")),
-                    ContextPath::IdentifierReferredTo(String::from("ch"), false),
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("migration_agent")),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant(String::from("bar")),
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("migration_agent")),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant(String::from("bar")),
-                    ContextPath::Attribute(String::from("set")),
-                    ContextPath::IdentifierReferredTo(String::from("ch"), false),
-                ]
-            ]
-        );
+        insta::with_settings!({
+            description => python_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
     }
 
     #[test]
@@ -866,59 +875,12 @@ mod tests {
                 ch.set("file_path", ev.file_path)
             "#};
         let context_stack_references = extract_dependencies_python(python_source);
-        assert_eq!(
-            context_stack_references,
-            vec![
-                vec![ContextPath::InFunction("dispatch_agent".to_string())],
-                vec![
-                    ContextPath::InFunction("dispatch_agent".to_string()),
-                    ContextPath::InFunctionDecorator(0),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant("new_file".to_string())
-                ],
-                vec![
-                    ContextPath::InFunction("dispatch_agent".to_string()),
-                    ContextPath::InFunctionDecorator(0),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant("new_file".to_string()),
-                    ContextPath::Attribute("on_event".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), false)
-                ],
-                vec![
-                    ContextPath::InFunction("dispatch_agent".to_string()),
-                    ContextPath::InFunctionDecorator(1),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant("file_created".to_string())
-                ],
-                vec![
-                    ContextPath::InFunction("dispatch_agent".to_string()),
-                    ContextPath::InFunctionDecorator(1),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant("file_created".to_string()),
-                    ContextPath::Attribute("emit_as".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), false)
-                ],
-                vec![
-                    ContextPath::InFunction("dispatch_agent".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant("file_path".to_string())
-                ],
-                vec![
-                    ContextPath::InFunction("dispatch_agent".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant("file_path".to_string()),
-                    ContextPath::Attribute("file_path".to_string()),
-                    ContextPath::IdentifierReferredTo("ev".to_string(), true)
-                ],
-                vec![
-                    ContextPath::InFunction("dispatch_agent".to_string()),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant("file_path".to_string()),
-                    ContextPath::Attribute("set".to_string()),
-                    ContextPath::IdentifierReferredTo("ch".to_string(), false)
-                ],
-            ]
-        );
+        insta::with_settings!({
+            description => python_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
     }
 
     #[test]
@@ -929,36 +891,12 @@ mod tests {
                 migration_agent()
             "#};
         let context_stack_references = extract_dependencies_python(python_source);
-        assert_eq!(
-            context_stack_references,
-            vec![
-                vec![ContextPath::InFunction(String::from("evaluate_agent")),],
-                vec![
-                    ContextPath::InFunction(String::from("evaluate_agent")),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant(String::from("file_path")),
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("evaluate_agent")),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant(String::from("file_path")),
-                    ContextPath::Attribute(String::from("file_path")),
-                    ContextPath::IdentifierReferredTo(String::from("ev"), true),
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("evaluate_agent")),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant(String::from("file_path")),
-                    ContextPath::Attribute(String::from("set")),
-                    ContextPath::IdentifierReferredTo(String::from("ch"), false),
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("evaluate_agent")),
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo(String::from("migration_agent"), false),
-                ]
-            ]
-        );
+        insta::with_settings!({
+            description => python_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
     }
 
     #[test]
@@ -969,30 +907,11 @@ mod tests {
                 return x
             "#};
         let context_stack_references = extract_dependencies_python(python_source);
-        assert_eq!(
-            context_stack_references,
-            vec![
-                vec![ContextPath::InFunction(String::from("setup_pipeline")),],
-                vec![
-                    ContextPath::InFunction(String::from("setup_pipeline")),
-                    ContextPath::InFunctionDecorator(0),
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo(String::from("create_dockerfile"), false),
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("setup_pipeline")),
-                    ContextPath::InFunctionDecorator(0),
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute(String::from("p")),
-                    ContextPath::IdentifierReferredTo(String::from("ch"), false),
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("setup_pipeline")),
-                    ContextPath::IdentifierReferredTo(String::from("x"), true),
-                ]
-            ]
-        );
+
+        insta::assert_yaml_snapshot!(context_stack_references);
+
     }
+
     #[test]
     fn test_classes_are_identified() {
         let python_source = indoc! { r#"
@@ -1006,50 +925,14 @@ mod tests {
 
             "#};
         let context_stack_references = extract_dependencies_python(python_source);
-        assert_eq!(
-            context_stack_references,
-            vec![
-                vec![ContextPath::InClass(String::from("TestMarshalledValues")),],
-                vec![
-                    ContextPath::InClass(String::from("TestMarshalledValues")),
-                    ContextPath::InFunction(String::from("test_addTwo")),
-                ],
-                vec![
-                    ContextPath::InClass(String::from("TestMarshalledValues")),
-                    ContextPath::InFunction(String::from("test_addTwo")),
-                    ContextPath::InCallExpression,
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo(String::from("addTwo"), false),
-                ],
-                vec![
-                    ContextPath::InClass(String::from("TestMarshalledValues")),
-                    ContextPath::InFunction(String::from("test_addTwo")),
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute(String::from("assertEqual")),
-                    ContextPath::IdentifierReferredTo(String::from("self"), true),
-                ],
-                vec![
-                    ContextPath::InCallExpression,
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo(String::from("TestMarshalledValues"), true),
-                ],
-                vec![
-                    ContextPath::InCallExpression,
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute(String::from("loadTestsFromTestCase")),
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute(String::from("TestLoader")),
-                    ContextPath::IdentifierReferredTo(String::from("unittest"), true),
-                ],
-                vec![
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute(String::from("run")),
-                    ContextPath::InCallExpression,
-                    ContextPath::Attribute(String::from("TextTestRunner")),
-                    ContextPath::IdentifierReferredTo(String::from("unittest"), true),
-                ],
-            ]
-        );
+
+        insta::with_settings!({
+            description => python_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
     }
 
 
@@ -1063,75 +946,7 @@ mod tests {
             return "demo" + out
             "#};
         let context_stack_references = extract_dependencies_python(python_source);
-        assert_eq!(
-            context_stack_references,
-            vec![
-                vec![ContextPath::InFunction(String::from("run_prompt"))],
-                vec![
-                    ContextPath::InFunction(String::from("run_prompt")),
-                    ContextPath::AssignmentToStatement,
-                    ContextPath::IdentifierReferredTo(String::from("out"), false)
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("run_prompt")),
-                    ContextPath::AssignmentFromStatement,
-                    ContextPath::Constant(String::new())
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("run_prompt")),
-                    ContextPath::AssignmentToStatement,
-                    ContextPath::IdentifierReferredTo(String::from("state"), false)
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("run_prompt")),
-                    ContextPath::IdentifierReferredTo(String::from("state"), true)
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("run_prompt")),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant(String::from("\n"))
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("run_prompt")),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant(String::from("\n")),
-                    ContextPath::Attribute(String::from("split")),
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo(String::from("number_of_states"), true)
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("run_prompt")),
-                    ContextPath::InCallExpression,
-                    ContextPath::Constant(String::from("\n")),
-                    ContextPath::Attribute(String::from("split")),
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo(String::from("get_states_first_letters"), false)
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("run_prompt")),
-                    ContextPath::IdentifierReferredTo(String::from("out"), true)
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("run_prompt")),
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo(String::from("state"), true)
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("run_prompt")),
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo(String::from("first_letter"), false)
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("run_prompt")),
-                    ContextPath::Constant(String::from("demo"))
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("run_prompt")),
-                    ContextPath::Constant(String::from("demo")),
-                    ContextPath::IdentifierReferredTo(String::from("out"), true)
-                ]
-            ]
-        );
+        insta::assert_yaml_snapshot!(context_stack_references);
     }
 
     #[test]
@@ -1141,27 +956,12 @@ mod tests {
                 bar() | foo() | baz()
             "#};
         let context_stack_references = extract_dependencies_python(python_source);
-        assert_eq!(
-            context_stack_references,
-            vec![
-                vec![ContextPath::InFunction(String::from("main")),],
-                vec![
-                    ContextPath::InFunction(String::from("main")),
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo(String::from("bar"), false),
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("main")),
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo(String::from("foo"), false),
-                ],
-                vec![
-                    ContextPath::InFunction(String::from("main")),
-                    ContextPath::InCallExpression,
-                    ContextPath::IdentifierReferredTo(String::from("baz"), false),
-                ],
-            ]
-        );
+        insta::with_settings!({
+            description => python_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
     }
 
     #[test]
@@ -1174,6 +974,12 @@ mod tests {
             return x
             "#};
         let context_stack_references = extract_dependencies_python(python_source);
+        insta::with_settings!({
+            description => python_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
         let result = build_report(&context_stack_references);
         let report = Report {
             cell_exposed_values: std::collections::HashMap::new(), // No data provided, initializing as empty
@@ -1196,14 +1002,15 @@ mod tests {
                 map.insert(
                     "testing".to_string(),
                     ReportTriggerableFunctions {
+                        
                         // context_path: vec![ContextPath::InFunction("testing".to_string())],
+                        arguments: vec![],
                         emit_event: vec!["file_created".to_string()],
                         trigger_on: vec!["new_file".to_string()],
                     },
                 );
                 map
             },
-            declared_functions: std::collections::HashMap::new(), // No data provided, initializing as empty
         };
 
         assert_eq!(result, report);
@@ -1222,6 +1029,12 @@ def fun_name():
 x = random.randint(0, 10)            
 "#};
         let context_stack_references = extract_dependencies_python(python_source);
+        insta::with_settings!({
+            description => python_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
         let result = build_report(&context_stack_references);
         let report = Report {
             cell_exposed_values: {
@@ -1229,10 +1042,6 @@ x = random.randint(0, 10)
                 map.insert(
                     "x".to_string(),
                     ReportItem {
-                        // context_path: vec![
-                        //     ContextPath::AssignmentToStatement,
-                        //     ContextPath::IdentifierReferredTo("x".to_string(), false),
-                        // ],
                     },
                 );
                 map
@@ -1242,15 +1051,6 @@ x = random.randint(0, 10)
                 map.insert(
                     "function_that_doesnt_exist".to_string(),
                     ReportItem {
-                        // context_path: vec![
-                        //     ContextPath::InFunction("fun_name".to_string()),
-                        //     ContextPath::AssignmentFromStatement,
-                        //     ContextPath::InCallExpression,
-                        //     ContextPath::IdentifierReferredTo(
-                        //         "function_that_doesnt_exist".to_string(),
-                        //         false,
-                        //     ),
-                        // ],
                     },
                 );
                 map
@@ -1260,15 +1060,52 @@ x = random.randint(0, 10)
                 map.insert(
                     "fun_name".to_string(),
                     ReportTriggerableFunctions {
+                        
                         // context_path: vec![ContextPath::InFunction("fun_name".to_string())],
+                        arguments: vec![],
                         emit_event: vec![],
                         trigger_on: vec![],
                     },
                 );
                 map
             },
-            declared_functions: std::collections::HashMap::new(), // No data provided, initializing as empty
         };
+        assert_eq!(result, report);
+    }
+
+    #[test]
+    fn test_report_generation_function_with_arguments() {
+        let python_source = indoc! { r#"
+        async def complex_args_function(a, b, c=2, d=3):
+            return a + b + c + d
+            "#};
+        let context_stack_references = extract_dependencies_python(python_source);
+        insta::with_settings!({
+            description => python_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+        let result = build_report(&context_stack_references);
+        let report = Report {
+            cell_exposed_values: std::collections::HashMap::new(), // No data provided, initializing as empty
+            cell_depended_values: std::collections::HashMap::new(),
+            triggerable_functions: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "complex_args_function".to_string(),
+                    ReportTriggerableFunctions {
+
+                        // context_path: vec![ContextPath::InFunction("testing".to_string())],
+                        arguments: vec!["a", "b", "c", "d"].into_iter().map(|a| a.to_string()).collect(),
+                        emit_event: vec![],
+                        trigger_on: vec![],
+                    },
+                );
+                map
+            },
+        };
+
         assert_eq!(result, report);
     }
 
@@ -1282,6 +1119,12 @@ x = random.randint(0, 10)
             return "demo" + out
             "#};
         let context_stack_references = extract_dependencies_python(python_source);
+        insta::with_settings!({
+            description => python_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
         let result = build_report(&context_stack_references);
         let report = Report {
             cell_exposed_values: std::collections::HashMap::new(), // No data provided, initializing as empty
@@ -1290,21 +1133,11 @@ x = random.randint(0, 10)
                 map.insert(
                     "get_states_first_letters".to_string(),
                     ReportItem {
-                        // context_path: vec![
-                        //     ContextPath::InFunction("testing".to_string()),
-                        //     ContextPath::AssignmentFromStatement,
-                        //     ContextPath::IdentifierReferredTo("y".to_string(), false),
-                        // ],
                     },
                 );
                 map.insert(
                     "first_letter".to_string(),
                     ReportItem {
-                        // context_path: vec![
-                        //     ContextPath::InFunction("testing".to_string()),
-                        //     ContextPath::AssignmentFromStatement,
-                        //     ContextPath::IdentifierReferredTo("y".to_string(), false),
-                        // ],
                     },
                 );
                 map
@@ -1314,14 +1147,15 @@ x = random.randint(0, 10)
                 map.insert(
                     "run_prompt".to_string(),
                     ReportTriggerableFunctions {
+                        
                         // context_path: vec![ContextPath::InFunction("testing".to_string())],
+                        arguments: vec![],
                         emit_event: vec![],
                         trigger_on: vec![],
                     },
                 );
                 map
             },
-            declared_functions: std::collections::HashMap::new(), // No data provided, initializing as empty
         };
 
         assert_eq!(result, report);
@@ -1339,6 +1173,12 @@ x = random.randint(0, 10)
             unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
             "#};
         let context_stack_references = extract_dependencies_python(python_source);
+        insta::with_settings!({
+            description => python_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
         let result = build_report(&context_stack_references);
         let report = Report {
             cell_exposed_values: std::collections::HashMap::new(), // No data provided, initializing as empty
@@ -1347,11 +1187,6 @@ x = random.randint(0, 10)
                 map.insert(
                     "addTwo".to_string(),
                     ReportItem {
-                        // context_path: vec![
-                        //     ContextPath::InFunction("testing".to_string()),
-                        //     ContextPath::AssignmentFromStatement,
-                        //     ContextPath::IdentifierReferredTo("y".to_string(), false),
-                        // ],
                     },
                 );
                 map
@@ -1361,13 +1196,13 @@ x = random.randint(0, 10)
                 map.insert(
                     "test_addTwo".to_string(),
                     ReportTriggerableFunctions {
+                        arguments: vec!["self".to_string()],
                         emit_event: vec![],
                         trigger_on: vec![],
                     },
                 );
                 map
             },
-            declared_functions: std::collections::HashMap::new(), // No data provided, initializing as empty
         };
 
         assert_eq!(result, report);

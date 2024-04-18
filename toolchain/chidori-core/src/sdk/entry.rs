@@ -17,6 +17,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread::sleep;
 use petgraph::graphmap::DiGraphMap;
 use serde::ser::SerializeMap;
+use crate::execution::primitives::operation::OperationFnOutput;
 use crate::utils::telemetry::{init_internal_telemetry, TraceEvents};
 
 
@@ -158,7 +159,7 @@ impl InstancedEnvironment {
 
     /// Increment the execution graph by one step
     #[tracing::instrument]
-    pub(crate) async fn step(&mut self) -> Vec<(usize, RkyvSerializedValue)> {
+    pub(crate) async fn step(&mut self) -> Vec<(usize, OperationFnOutput)> {
         println!("======================= Executing state with id {:?} ======================", self.execution_head_state_id);
         let ((state_id, state), outputs) = self.db.external_step_execution(self.execution_head_state_id).await;
         if let Some(sender) = self.runtime_event_sender.as_mut() {
@@ -427,7 +428,7 @@ mod tests {
     use crate::execution::primitives::serialized_value::RkyvObjectBuilder;
     use indoc::indoc;
     use tokio::runtime::Runtime;
-    use crate::cells::{CodeCell, LLMPromptCell, SupportedLanguage, SupportedModelProviders};
+    use crate::cells::{CodeCell, LLMPromptCell, LLMPromptCellChatConfiguration, SupportedLanguage, SupportedModelProviders};
     use crate::utils;
 
     #[tokio::test]
@@ -485,7 +486,7 @@ mod tests {
         assert_eq!(op_id_x, 0);
         let (_, op_id_y) = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
             function_invocation: false,
-            configuration: HashMap::new(),
+            configuration: LLMPromptCellChatConfiguration::default(),
             name: None,
             provider: SupportedModelProviders::OpenAI,
             req: "\
@@ -531,7 +532,7 @@ mod tests {
         assert_eq!(op_id_x, 0);
         let (_, op_id_y) = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
             function_invocation: false,
-            configuration: HashMap::new(),
+            configuration: LLMPromptCellChatConfiguration::default(),
             name: Some("generate_names".to_string()),
             provider: SupportedModelProviders::OpenAI,
             req: "\
@@ -803,7 +804,7 @@ mod tests {
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
         env.get_state().render_dependency_graph();
-        env.step().await;
+        dbg!(env.step().await);
     }
 
     #[tokio::test]
@@ -846,6 +847,63 @@ mod tests {
     async fn test_core5_prompts_invoked_as_functions() {
         let mut ee = Chidori::new();
         ee.load_md_directory(Path::new("./examples/core5_prompts_invoked_as_functions")).unwrap();
+        let mut env = ee.get_instance().unwrap();
+        env.reload_cells();
+        env.get_state().render_dependency_graph();
+        let out = env.step().await;
+        let out = env.step().await;
+        let out = env.step().await;
+        let out = env.step().await;
+        assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
+    }
+
+    #[tokio::test]
+    async fn test_core6_prompts_leveraging_function_calling() {
+        let mut ee = Chidori::new();
+        ee.load_md_directory(Path::new("./examples/core6_prompts_leveraging_function_calling")).unwrap();
+        let mut env = ee.get_instance().unwrap();
+        env.reload_cells();
+        env.get_state().render_dependency_graph();
+        let out = env.step().await;
+        let out = env.step().await;
+        let out = env.step().await;
+        let out = env.step().await;
+        let out = env.step().await;
+        assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
+    }
+
+    #[tokio::test]
+    async fn test_core7_rag_stateful_memory_cells() {
+        let mut ee = Chidori::new();
+        ee.load_md_directory(Path::new("./examples/core7_rag_stateful_memory_cells")).unwrap();
+        let mut env = ee.get_instance().unwrap();
+        env.reload_cells();
+        env.get_state().render_dependency_graph();
+        let out = env.step().await;
+        let out = env.step().await;
+        let out = env.step().await;
+        let out = env.step().await;
+        assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
+    }
+
+    #[tokio::test]
+    async fn test_core8_prompt_code_generation_and_execution() {
+        let mut ee = Chidori::new();
+        ee.load_md_directory(Path::new("./examples/core8_prompt_code_generation_and_execution")).unwrap();
+        let mut env = ee.get_instance().unwrap();
+        env.reload_cells();
+        env.get_state().render_dependency_graph();
+        let out = env.step().await;
+        let out = env.step().await;
+        let out = env.step().await;
+        let out = env.step().await;
+        assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
+    }
+
+    #[tokio::test]
+    async fn test_core9_multi_agent_simulation() {
+        let mut ee = Chidori::new();
+        ee.load_md_directory(Path::new("./examples/core9_multi_agent_simulation")).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
         env.get_state().render_dependency_graph();

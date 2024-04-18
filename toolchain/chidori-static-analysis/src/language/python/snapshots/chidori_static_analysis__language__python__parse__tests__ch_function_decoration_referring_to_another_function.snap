@@ -1,0 +1,27 @@
+---
+source: chidori-static-analysis/src/language/python/parse.rs
+expression: context_stack_references
+---
+- - InFunction: setup_pipeline
+- - InFunction: setup_pipeline
+  - InFunctionDecorator: 0
+  - InCallExpression
+  - IdentifierReferredTo:
+      - create_dockerfile
+      - false
+- - InFunction: setup_pipeline
+  - InFunctionDecorator: 0
+  - InCallExpression
+  - Attribute: p
+  - IdentifierReferredTo:
+      - ch
+      - false
+- - InFunction: setup_pipeline
+  - FunctionArguments
+  - IdentifierReferredTo:
+      - x
+      - false
+- - InFunction: setup_pipeline
+  - IdentifierReferredTo:
+      - x
+      - true

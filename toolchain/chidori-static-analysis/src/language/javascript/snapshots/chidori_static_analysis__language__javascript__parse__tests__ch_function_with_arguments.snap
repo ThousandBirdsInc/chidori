@@ -1,0 +1,32 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "function subtract(a, b) {\n    return a - b;\n}\n\n// Example usage\nconst v = subtract(x, 5);\n"
+---
+- - InFunction: subtract
+  - Params
+  - IdentifierReferredTo:
+      - a
+      - false
+  - IdentifierReferredTo:
+      - b
+      - false
+- - InFunction: subtract
+  - IdentifierReferredTo:
+      - a
+      - true
+  - IdentifierReferredTo:
+      - b
+      - true
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      - v
+      - false
+- - AssignmentFromStatement
+  - InCallExpression
+  - IdentifierReferredTo:
+      - subtract
+      - true
+  - IdentifierReferredTo:
+      - x
+      - false
+- - AssignmentFromStatement

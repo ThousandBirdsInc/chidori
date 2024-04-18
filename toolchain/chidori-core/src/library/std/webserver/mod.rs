@@ -120,10 +120,10 @@ pub async fn run_webservice(
                                 dbg!(&argument_payload);
                                 // invocation of the operation
                                 let result = op.execute(&ExecutionState::new(), argument_payload, None, None).await;
-                                if let RkyvSerializedValue::String(s) = &result {
+                                if let RkyvSerializedValue::String(s) = &result.output {
                                     (StatusCode::CREATED, Html(s.clone())).into_response()
                                 } else {
-                                    (StatusCode::CREATED, Json(serialized_value_to_json_value(&result))).into_response()
+                                    (StatusCode::CREATED, Json(serialized_value_to_json_value(&result.output))).into_response()
                                 }
                             }
                         }));
@@ -178,7 +178,7 @@ pub async fn run_webservice(
                                         .build(),
                                     None,
                                     None).await;
-                                (StatusCode::CREATED, Json(result))
+                                (StatusCode::CREATED, Json(result.output))
                             }
                         }));
                     }

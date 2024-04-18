@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use tonic::codegen::Body;
 use crate::cells::TemplateCell;
-use crate::execution::primitives::operation::{InputItemConfiguation, InputSignature, InputType, OperationNode, OutputItemConfiguation, OutputSignature};
+use crate::execution::primitives::operation::{InputItemConfiguration, InputSignature, InputType, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
 use crate::execution::primitives::serialized_value::{RkyvSerializedValue as RKV, serialized_value_to_json_value};
 
 use futures_util::FutureExt;
@@ -16,7 +16,7 @@ pub fn template_cell(cell: &TemplateCell) -> OperationNode {
     for (key, value) in &schema.items {
         input_signature.globals.insert(
             key.clone(),
-            InputItemConfiguation {
+            InputItemConfiguration {
                 ty: Some(InputType::String),
                 default: None,
             },
@@ -28,8 +28,10 @@ pub fn template_cell(cell: &TemplateCell) -> OperationNode {
     if let Some(name) = &cell.name {
         output_signature.functions.insert(
             name.clone(),
-            OutputItemConfiguation {
-                ty: Some(InputType::Function),
+            OutputItemConfiguration::Function {
+                input_signature: InputSignature::new(),
+                emit_event: vec![],
+                trigger_on: vec![],
             },
         );
     }
@@ -52,7 +54,7 @@ pub fn template_cell(cell: &TemplateCell) -> OperationNode {
                     serialized_value_to_json_value(&x)
                 };
                 let rendered = chidori_prompt_format::templating::templates::render_template_prompt(&body, &data, &HashMap::new()).unwrap();
-                RKV::String(rendered)
+                OperationFnOutput::with_value(RKV::String(rendered))
             }.boxed()
         }),
     )
@@ -74,6 +76,6 @@ mod test {
             std::collections::HashMap::new()
         );
         let output = op.execute(&ExecutionState::new(), input, None, None).await;
-        assert_eq!(output, crate::execution::primitives::serialized_value::RkyvSerializedValue::String("Hello, !".to_string()));
+        assert_eq!(output.output, crate::execution::primitives::serialized_value::RkyvSerializedValue::String("Hello, !".to_string()));
     }
 }

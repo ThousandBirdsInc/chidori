@@ -625,6 +625,12 @@ checksum = "23ce669cd6c8588f79e15cf450314f9638f967fc5770ff1c7c1deb0925ea7cfa"
 
 [[package]]
 name = "base64"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3441f0f7b02788e948e47f457ca01f1d7e6d92c693bc132c22b087d3141c03ff"
+
+[[package]]
+name = "base64"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
@@ -1052,6 +1058,7 @@ dependencies = [
  "http-body-util",
  "im",
  "indoc 1.0.9",
+ "insta",
  "log",
  "no_deadlocks",
  "num",
@@ -1150,6 +1157,7 @@ dependencies = [
  "anyhow",
  "console_error_panic_hook",
  "indoc 1.0.9",
+ "insta",
  "lazy_static",
  "rustpython-parser",
  "serde",
@@ -5251,6 +5259,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "insta"
+version = "1.38.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3eab73f58e59ca6526037208f0e98851159ec1633cf17b6cd2e1f2c3fd5d53cc"
+dependencies = [
+ "console",
+ "lazy_static",
+ "linked-hash-map",
+ "pest",
+ "pest_derive",
+ "serde",
+ "similar",
+]
+
+[[package]]
 name = "instant"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6078,6 +6101,7 @@ version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00a000cf8bbbfb123a9bdc66b61c2885a4bb038df4f2629884caafabeb76b0f9"
 dependencies = [
+ "base64 0.12.3",
  "log",
  "once_cell",
  "rustls 0.21.10",
@@ -6630,9 +6654,9 @@ dependencies = [
 
 [[package]]
 name = "openai-api-rs"
-version = "2.1.7"
+version = "4.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6290b87380dad483fd1d8a001d8dd125292657864fb37d8e4a57e432b006fc49"
+checksum = "7e5e092cc25a89159c9b95ab21a78bbc80abc3c52075a560d61b9fb154a12324"
 dependencies = [
  "minreq",
  "serde",
@@ -9274,6 +9298,12 @@ name = "simdutf8"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27f6278552951f1f2b8cf9da965d10969b2efdea95a6ec47987ab46edfe263a"
+
+[[package]]
+name = "similar"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa42c91313f1d05da9b26f267f931cf178d4aba455b4c4622dd7355eb80c6640"
 
 [[package]]
 name = "siphasher"

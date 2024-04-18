@@ -19,6 +19,7 @@ serde-wasm-bindgen = "0.4"
 indoc.workspace = true
 anyhow.workspace = true
 serde.workspace = true
+insta.workspace = true
 
 # Support for parsing typescript/javascript
 swc_common = {  version = "0.33.14", features = ["tty-emitter", "arbitrary"]}

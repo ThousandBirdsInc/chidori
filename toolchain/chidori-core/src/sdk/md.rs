@@ -9,7 +9,6 @@ use crate::cells::{CellTypes, CodeCell, LLMPromptCell, MemoryCell, SupportedLang
 pub struct MarkdownCodeBlock {
     tag: String,
     name: Option<String>,
-    configuration: HashMap<String, String>,
     body: String,
 }
 
@@ -38,7 +37,6 @@ pub(crate) fn extract_code_blocks(body: &str) -> Vec<MarkdownCodeBlock> {
             let mut lines = m.lines();
             let first_line = lines.next().unwrap_or_default();
             let rest: String = lines.collect::<Vec<&str>>().join("\n");
-            let extracted = extract_yaml_frontmatter_string(&rest);
 
             // Extract the name in parentheses from the first line
             let tag_and_name: Vec<&str> = first_line.split_whitespace().collect();
@@ -48,8 +46,7 @@ pub(crate) fn extract_code_blocks(body: &str) -> Vec<MarkdownCodeBlock> {
             MarkdownCodeBlock {
                 tag,
                 name,
-                configuration: extracted.0,
-                body: extracted.1,
+                body: rest,
             }
         })
         .collect()
@@ -97,6 +94,7 @@ pub fn load_folder(path: &Path) -> anyhow::Result<Vec<ParsedFile>> {
 }
 
 pub fn interpret_code_block(block: &MarkdownCodeBlock) -> Option<CellTypes> {
+    let (frontmatter, body) = chidori_prompt_format::templating::templates::split_frontmatter(&block.body).unwrap();
     match block.tag.as_str() {
         "python" | "javascript" => {
             let language = match block.tag.as_str() {
@@ -118,13 +116,13 @@ pub fn interpret_code_block(block: &MarkdownCodeBlock) -> Option<CellTypes> {
         })),
         "embedding" => Some(CellTypes::Prompt(LLMPromptCell::Embedding {
             function_invocation: false,
-            configuration: block.configuration.clone(),
+            configuration: serde_yaml::from_str(&frontmatter).unwrap(),
             name: block.name.clone(),
             req: block.body.clone(),
         })),
         "prompt" => Some(CellTypes::Prompt(LLMPromptCell::Chat {
             function_invocation: false,
-            configuration: block.configuration.clone(),
+            configuration: serde_yaml::from_str(&frontmatter).unwrap(),
             name: block.name.clone(),
             provider: SupportedModelProviders::OpenAI,
             req: block.body.clone(),
@@ -136,7 +134,7 @@ pub fn interpret_code_block(block: &MarkdownCodeBlock) -> Option<CellTypes> {
         "web" => Some(CellTypes::Web(WebserviceCell {
             name: block.name.clone(),
             configuration: block.body.clone(),
-            port: block.configuration.get("port").and_then(|p| p.parse::<u16>().ok()).or_else(|| Some(8080)).unwrap(),
+            port: serde_yaml::from_str::<HashMap<String,String>>(&frontmatter).unwrap().get("port").and_then(|p| p.parse::<u16>().ok()).or_else(|| Some(8080)).unwrap(),
         })),
         _ => None,
     }
@@ -186,7 +184,6 @@ mod test {
                 MarkdownCodeBlock {
                     tag: "python".to_string(),
                     name: None,
-                    configuration: Default::default(),
                     body: indoc! { r#"
                 y = 20
                 def add(a, b):
@@ -196,21 +193,21 @@ mod test {
                 MarkdownCodeBlock {
                     tag: "javascript".to_string(),
                     name: None,
-                    configuration: map,
                     body: indoc! { r#"
+                    ---
+                    a: 2
+                    ---
                     const x = add(2,2);"#}
                     .to_string(),
                 },
                 MarkdownCodeBlock {
                     tag: "prompt".to_string(),
                     name: Some("multi_prompt".to_string()),
-                    configuration: Default::default(),
                     body: "Multiply {y} times {x}".to_string(),
                 },
                 MarkdownCodeBlock {
                     tag: "html".to_string(),
                     name: Some("named_html".to_string()),
-                    configuration: Default::default(),
                     body: "<div>Example</div>".to_string(),
                 }
             ]

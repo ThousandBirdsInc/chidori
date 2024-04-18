@@ -1,0 +1,22 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "function setupPipeline(x) {\n    ch.p(create_dockerfile)\n    return x\n}\n"
+---
+- - InFunction: setupPipeline
+  - Params
+  - IdentifierReferredTo:
+      - x
+      - false
+- - InFunction: setupPipeline
+  - InCallExpression
+  - Attribute: p
+  - IdentifierReferredTo:
+      - ch
+      - false
+  - IdentifierReferredTo:
+      - create_dockerfile
+      - false
+- - InFunction: setupPipeline
+  - IdentifierReferredTo:
+      - x
+      - true

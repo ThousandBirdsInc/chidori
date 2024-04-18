@@ -59,3 +59,7 @@ We then execute the code in the order of the dependency graph.
 
 As LLMs become cheaper the entire behavior of this module can likely be replaced
 extracting these reports from source code should be trivial for most LLMs.
+
+
+# Development
+curl -LsSf https://insta.rs/install.sh | sh
