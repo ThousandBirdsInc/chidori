@@ -6,6 +6,6 @@
     <h3>Name: {cell.name}</h3>
     <p>Provider: {cell.provider}</p>
     <p>
-        {cell.req}
+        {JSON.stringify(cell)}
     </p>
 </div>

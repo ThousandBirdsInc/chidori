@@ -1,0 +1,24 @@
+---
+source: chidori-core/src/sdk/md.rs
+expression: v
+---
+- Memory:
+    name: stateful_memory
+    provider: InMemory
+    embedding_function: "---\nembedding_fn: rag\n---"
+- Embedding:
+    function_invocation: false
+    configuration:
+      model: facebook/rag-token-nq
+    name: rag
+    req: "{{message}}"
+- Code:
+    name: ~
+    language: PyO3
+    source_code: "def read_file_and_load_to_memory(file_path):\n    with open(file_path, 'r') as file:\n        content = file.read().split('\\n')  # Splits the content into lines\n        for line in content:\n            insert(message=line)\n    return content"
+    function_invocation: ~
+- Code:
+    name: entry
+    language: PyO3
+    source_code: "out = await read_file_and_load_to_memory(\"./\")"
+    function_invocation: ~

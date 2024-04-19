@@ -90,7 +90,6 @@ pub fn llm_prompt_cell(cell: &LLMPromptCell) -> OperationNode {
                         // TODO: this state should error? or what should this do
                         if configuration.function_name.is_some() && !is_function_invocation {
                             return async move { OperationFnOutput::with_value(RkyvSerializedValue::Null) }.boxed();
-
                         }
                         let s = s.clone();
                         let configuration = configuration.clone();

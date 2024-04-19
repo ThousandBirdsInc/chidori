@@ -7,7 +7,7 @@ use indoc::indoc;
 use petgraph::dot::Dot;
 use petgraph::graphmap::DiGraphMap;
 use petgraph::Direction;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::ops::{Deref};
@@ -107,14 +107,12 @@ pub struct FunctionMetadata {
 // TODO: make this thread-safe
 #[derive(Clone)]
 pub struct ExecutionState {
-
-    // TODO: update all operations to use this id instead of a separate representation
     pub(crate) op_counter: usize,
 
     // TODO: this is a channel sender to update the execution graph
     pub graph_sender: Option<Arc<Sender<(ExecutionState, tokio::sync::mpsc::Sender<String>)>>>,
 
-    pub exec_queue: Vec<usize>,
+    pub exec_queue: VecDeque<usize>,
 
     // TODO: call_stack is only ever a single coroutine at a time and instead its the stack of execution states being resolved?
     // pub call_stack: Arc<Mutex<Pin<Box<dyn Coroutine<Return=CoroutineYieldValue, Yield=CoroutineYieldValue>>>>>,
@@ -209,7 +207,7 @@ impl ExecutionState {
         ExecutionState {
             op_counter: 0,
             graph_sender: None,
-            exec_queue: vec![],
+            exec_queue: VecDeque::new(),
             state: Default::default(),
             operation_name_to_id: Default::default(),
             operation_by_id: Default::default(),
@@ -224,7 +222,7 @@ impl ExecutionState {
         ExecutionState {
             op_counter: 0,
             graph_sender: Some(graph_sender),
-            exec_queue: vec![],
+            exec_queue: VecDeque::new(),
             state: Default::default(),
             operation_name_to_id: Default::default(),
             operation_by_id: Default::default(),
@@ -551,7 +549,11 @@ impl ExecutionState {
         let operation_ids: Vec<OperationId> = operation_by_id.keys().copied().collect();
 
         // Every step, each operation consumes from its incoming edges.
+
         // TODO: use the exec queue here
+        // let mut exec_queue = self.exec_queue.clone();
+        // let next_operation_id = exec_queue.pop_front();
+
         'traverse_nodes: for operation_id in operation_ids {
 
             // We skip nodes that are currently locked due to long running execution
@@ -688,6 +690,9 @@ impl ExecutionState {
                 let result = op_node_execute.await;
                 println!("Executed node {} with result {:?}", operation_id, &result);
                 outputs.push((operation_id, result.clone()));
+                if let Some(s) = result.execution_state {
+                    new_state = s;
+                }
                 new_state.state_insert(operation_id, result.output);
             }
         }

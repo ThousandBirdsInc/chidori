@@ -1,0 +1,19 @@
+---
+source: chidori-core/src/sdk/md.rs
+expression: v
+---
+- Code:
+    name: ~
+    language: PyO3
+    source_code: "x = 20\nz = y * 20\ndef foo(x=20):\n    return \"bar\""
+    function_invocation: ~
+- Code:
+    name: ~
+    language: PyO3
+    source_code: y = x * 20
+    function_invocation: ~
+- Code:
+    name: ~
+    language: Deno
+    source_code: console.log(z)
+    function_invocation: ~
