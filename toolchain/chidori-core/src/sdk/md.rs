@@ -5,12 +5,14 @@ use std::collections::HashMap;
 use std::path::Path;
 use serde_derive::Serialize;
 use crate::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, SupportedMemoryProviders, SupportedModelProviders, TemplateCell, WebserviceCell};
+use chidori_static_analysis::language::TextRange;
 
 #[derive(PartialEq, Serialize, Debug)]
 pub struct MarkdownCodeBlock {
     pub tag: String,
     pub name: Option<String>,
     pub body: String,
+    pub range: TextRange,
 }
 
 pub struct ParsedFile {
@@ -21,36 +23,43 @@ pub struct ParsedFile {
 }
 
 pub(crate) fn extract_code_blocks(body: &str) -> Vec<MarkdownCodeBlock> {
-    let parts: Vec<&str> = body.split("```").collect();
-
     let mut code_blocks = Vec::new();
-    for (index, part) in parts.iter().enumerate() {
-        // Code blocks are at odd indices after splitting by ```
-        if index % 2 == 1 {
-            code_blocks.push(*part);
+    let mut start = 0;
+
+    // Iterate over each occurrence of backticks
+    while let Some(end) = body[start..].find("```") {
+        start += end + 3; // Move start to the character after the closing ```
+
+        if let Some(end_of_code) = body[start..].find("```") {
+            let code = &body[start..start + end_of_code].trim();
+
+            // Extract first line to separate tag and name
+            let mut lines = code.lines();
+            let first_line = lines.next().unwrap_or_default();
+            let rest: String = lines.collect::<Vec<&str>>().join("\n");
+
+            let tag_and_name: Vec<&str> = first_line.split_whitespace().collect();
+            let tag = tag_and_name.get(0).cloned().unwrap_or_default().to_string();
+            let name = tag_and_name.get(1).and_then(|n| n.strip_prefix('(').and_then(|n| n.strip_suffix(')'))).map(|n| n.to_string());
+
+            // Add the code block with the text range
+            code_blocks.push(MarkdownCodeBlock {
+                tag,
+                name,
+                body: rest,
+                range: TextRange {
+                    start,
+                    end: start + end_of_code
+                },
+            });
+
+            start += end_of_code + 3; // Move start to the character after the closing ```
+        } else {
+            break; // No closing backticks found, exit the loop
         }
     }
 
     code_blocks
-        .iter()
-        .map(|m| m.trim().to_string())
-        .map(|m| {
-            let mut lines = m.lines();
-            let first_line = lines.next().unwrap_or_default();
-            let rest: String = lines.collect::<Vec<&str>>().join("\n");
-
-            // Extract the name in parentheses from the first line
-            let tag_and_name: Vec<&str> = first_line.split_whitespace().collect();
-            let tag = tag_and_name.get(0).cloned().unwrap_or_default().to_string();
-            let name = tag_and_name.get(1).and_then(|n| n.strip_prefix('(').and_then(|n| n.strip_suffix(')').and_then(|n| Some(n.to_string()))));
-
-            MarkdownCodeBlock {
-                tag,
-                name,
-                body: rest,
-            }
-        })
-        .collect()
 }
 
 
@@ -264,39 +273,9 @@ mod test {
 
         let mut map = HashMap::new();
         map.insert("a".to_string(), "2".to_string());
-        assert_eq!(
-            extracted,
-            vec![
-                MarkdownCodeBlock {
-                    tag: "python".to_string(),
-                    name: None,
-                    body: indoc! { r#"
-                y = 20
-                def add(a, b):
-                    return a + b"#}
-                    .to_string(),
-                },
-                MarkdownCodeBlock {
-                    tag: "javascript".to_string(),
-                    name: None,
-                    body: indoc! { r#"
-                    ---
-                    a: 2
-                    ---
-                    const x = add(2,2);"#}
-                    .to_string(),
-                },
-                MarkdownCodeBlock {
-                    tag: "prompt".to_string(),
-                    name: Some("multi_prompt".to_string()),
-                    body: "Multiply {y} times {x}".to_string(),
-                },
-                MarkdownCodeBlock {
-                    tag: "html".to_string(),
-                    name: Some("named_html".to_string()),
-                    body: "<div>Example</div>".to_string(),
-                }
-            ]
-        );
+        insta::with_settings!({
+        }, {
+            insta::assert_yaml_snapshot!(extracted);
+        });
     }
 }

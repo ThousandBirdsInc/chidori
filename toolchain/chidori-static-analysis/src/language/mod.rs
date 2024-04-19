@@ -9,6 +9,12 @@ pub mod typechecker;
 pub mod javascript;
 pub mod python;
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextRange {
+    pub start: usize,
+    pub end: usize,
+}
+
 // TODO: implement a function that infers the language from the source code successfully parsing
 
 // TODO: it would be helpful if reports noted if a value is a global, an arg, or a kwarg

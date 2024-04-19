@@ -1,0 +1,28 @@
+---
+source: chidori-core/src/sdk/md.rs
+expression: extracted
+---
+- tag: python
+  name: ~
+  body: "y = 20\ndef add(a, b):\n    return a + b"
+  range:
+    start: 15
+    end: 61
+- tag: javascript
+  name: ~
+  body: "---\na: 2\n---\nconst x = add(2,2);"
+  range:
+    start: 69
+    end: 113
+- tag: prompt
+  name: multi_prompt
+  body: "Multiply {y} times {x}"
+  range:
+    start: 121
+    end: 166
+- tag: html
+  name: named_html
+  body: "<div>Example</div>"
+  range:
+    start: 174
+    end: 211
