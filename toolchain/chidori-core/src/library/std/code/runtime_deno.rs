@@ -97,7 +97,7 @@ async fn op_call_rust(
     } else {
         Some(kwargs)
     };
-    let result = func(args, kwargs).await;
+    let result = func(args, kwargs).await?;
     Ok(result)
 }
 
@@ -276,7 +276,7 @@ type InternalClosureFnMut = Box<
     dyn FnMut(
         Vec<RkyvSerializedValue>,
         Option<HashMap<String, RkyvSerializedValue>>,
-    ) -> Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>> + Send
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<RkyvSerializedValue>> + Send>> + Send
 >;
 
 fn create_function_shims(
@@ -306,8 +306,8 @@ fn create_function_shims(
                         std::mem::swap(&mut *exec_state, &mut v);
                         v
                     };
-                    let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload).await;
-                    return result;
+                    let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload).await?;
+                    return Ok(result);
                 }.boxed()
             });
             functions.push((function_name.clone(), closure_callable));
@@ -526,7 +526,7 @@ mod tests {
     use indoc::indoc;
 
     #[tokio::test]
-    async fn test_source_code_run_with_external_function_invocation() {
+    async fn test_source_code_run_with_external_function_invocation() -> anyhow::Result<()> {
         let source_code = String::from(r#"const y = await test_function(5, 5);"#);
 
         let mut state = ExecutionState::new();
@@ -541,7 +541,7 @@ mod tests {
                                 }),
                 function_invocation: None,
             },
-        ), Some(0));
+        ), Some(0))?;
         let result = source_code_run_deno(
             &state,
             &source_code,
@@ -556,6 +556,7 @@ mod tests {
                 vec![]
             )
         );
+        Ok(())
     }
 
     #[tokio::test]

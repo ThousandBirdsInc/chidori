@@ -1,11 +1,11 @@
-use crate::language::{Report, ReportItem, ReportTriggerableFunctions};
+use crate::language::{ChidoriStaticAnalysisError, Report, ReportItem, ReportTriggerableFunctions};
 use rustpython_parser::ast::{Constant, Expr, Identifier, Stmt};
 use rustpython_parser::{ast, Parse};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-// TODO: move to using the Ruff library here to break about functions into independent snippets
+// TODO: move to using the Ruff library here to break out functions into independent snippets
 
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum ContextPath {
@@ -30,9 +30,17 @@ pub struct FunctionContext {
     dependencies: Vec<Vec<ContextPath>>,
 }
 
-// TODO: we're building a filtered subset of the AST
-// TODO: what we can consider is evaluating the ast into the references
-// TODO: the context path is the accumulated state, when we pop it we evaluate it
+/// The ASTWalkContext structure represents the accumulated state during an Abstract Syntax Tree (AST) walk.
+///
+/// This context provides a way to track and evaluate references within the AST, allowing for filtered subsets of the AST to be built.
+///
+/// # Properties
+///
+/// * `context_stack_references`: A vector of vectors that stores the ContextPath values. Each inner vector represents a stack frame in the evaluation process.
+/// * `context_stack`: A vector that tracks the current context path.
+/// * `locals`: A set of strings representing local variables defined within the AST.
+/// * `local_contexts`: A vector of sets, where each set represents a separate local context.
+/// * `globals`: A set of strings representing global variables defined within the AST.
 #[derive(Default)]
 pub struct ASTWalkContext {
     pub context_stack_references: Vec<Vec<ContextPath>>,
@@ -393,13 +401,14 @@ fn extract_python_comments(code: &str) -> Vec<String> {
     comments
 }
 
-pub fn extract_dependencies_python(source_code: &str) -> Vec<Vec<ContextPath>> {
+
+pub fn extract_dependencies_python(source_code: &str) -> Result<Vec<Vec<ContextPath>>, ChidoriStaticAnalysisError> {
     // TODO: extract comments and associate them based on position relative to functions
     let mut comments = extract_python_comments(source_code);
-    let ast = ast::Suite::parse(source_code, "<embedded>").unwrap();
+    let ast = ast::Suite::parse(source_code, "<embedded>").map_err(|e| ChidoriStaticAnalysisError::Unknown)?;
     let mut machine = ASTWalkContext::default();
     traverse_statements(&ast, &mut machine);
-    machine.context_stack_references
+    Ok(machine.context_stack_references)
 }
 
 fn traverse_comprehension(comp: &ast::Comprehension, machine: &mut ASTWalkContext) {
@@ -663,15 +672,6 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
             }
         }
     }
-}
-
-fn example() {
-    let python_source = r#"
-def is_odd(i):
-  return bool(i & 1)
-"#;
-    let ast = ast::Suite::parse(python_source, "<embedded>");
-    assert!(ast.is_ok());
 }
 
 pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {

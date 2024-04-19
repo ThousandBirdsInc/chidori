@@ -1,4 +1,5 @@
 pub mod telemetry;
+mod error;
 
 use std::error::Error;
 use axum::handler::HandlerWithoutStateExt;

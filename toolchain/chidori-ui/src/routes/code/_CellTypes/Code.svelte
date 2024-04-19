@@ -10,7 +10,7 @@
         <h3 class="font-semibold text-gray-800">Language: <span class="">{cell.language}</span></h3>
     </div>
     <div class="p-4 bg-gray-100 rounded">
-        <CodeEditor initialText={cell.source_code} class="text-sm font-mono text-gray-700 bg-white p-2 rounded border border-gray-300 shadow-inner"/>
+        <CodeEditor initialText={cell.source_code}/>
     </div>
     {#if cell.function_invocation}
         <div class="mt-4">

@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use thiserror::Error;
 
 pub mod typechecker;
 pub mod javascript;
@@ -31,4 +32,12 @@ pub struct Report {
     pub cell_exposed_values: HashMap<String, ReportItem>,
     pub cell_depended_values: HashMap<String, ReportItem>,
     pub triggerable_functions: HashMap<String, ReportTriggerableFunctions>,
+}
+
+
+
+#[derive(Error, Debug)]
+pub enum ChidoriStaticAnalysisError {
+    #[error("unknown chidori analysis error")]
+    Unknown,
 }

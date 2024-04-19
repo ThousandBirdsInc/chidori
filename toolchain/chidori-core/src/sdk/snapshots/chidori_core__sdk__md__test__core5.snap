@@ -23,7 +23,6 @@ expression: v
         user: ~
         seed: ~
         top_p: ~
-        eject: ~
       name: states
       provider: OpenAI
       req: "List the first {{num}} US states to be added to the union.\nReturn this as a `-` bulleted list with the name of the state on each line."

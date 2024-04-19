@@ -4,13 +4,13 @@ use indoc::indoc;
 use std::collections::HashMap;
 use std::path::Path;
 use serde_derive::Serialize;
-use crate::cells::{CellTypes, CodeCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, SupportedMemoryProviders, SupportedModelProviders, TemplateCell, WebserviceCell};
+use crate::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, SupportedMemoryProviders, SupportedModelProviders, TemplateCell, WebserviceCell};
 
 #[derive(PartialEq, Serialize, Debug)]
 pub struct MarkdownCodeBlock {
-    tag: String,
-    name: Option<String>,
-    body: String,
+    pub tag: String,
+    pub name: Option<String>,
+    pub body: String,
 }
 
 pub struct ParsedFile {
@@ -122,6 +122,13 @@ pub fn interpret_code_block(block: &MarkdownCodeBlock) -> Option<CellTypes> {
             req: body,
         })),
         "prompt" => Some(CellTypes::Prompt(LLMPromptCell::Chat {
+            function_invocation: false,
+            configuration: serde_yaml::from_str(&frontmatter).unwrap(),
+            name: block.name.clone(),
+            provider: SupportedModelProviders::OpenAI,
+            req: body,
+        })),
+        "codegen" => Some(CellTypes::CodeGen(LLMCodeGenCell {
             function_invocation: false,
             configuration: serde_yaml::from_str(&frontmatter).unwrap(),
             name: block.name.clone(),

@@ -8,7 +8,7 @@ use futures_util::FutureExt;
 
 /// Template cells leverage the same tooling as LLM Prompt Cells, but are used for more general templating.
 #[tracing::instrument]
-pub fn template_cell(cell: &TemplateCell) -> OperationNode {
+pub fn template_cell(cell: &TemplateCell) -> anyhow::Result<OperationNode> {
     let schema =
         chidori_prompt_format::templating::templates::analyze_referenced_partials(&cell.body);
 
@@ -37,7 +37,7 @@ pub fn template_cell(cell: &TemplateCell) -> OperationNode {
     }
 
     let body = cell.body.clone();
-    OperationNode::new(
+    Ok(OperationNode::new(
         cell.name.clone(),
         input_signature,
         output_signature,
@@ -54,10 +54,10 @@ pub fn template_cell(cell: &TemplateCell) -> OperationNode {
                     serialized_value_to_json_value(&x)
                 };
                 let rendered = chidori_prompt_format::templating::templates::render_template_prompt(&body, &data, &HashMap::new()).unwrap();
-                OperationFnOutput::with_value(RKV::String(rendered))
+                Ok(OperationFnOutput::with_value(RKV::String(rendered)))
             }.boxed()
         }),
-    )
+    ))
 }
 
 
@@ -66,16 +66,17 @@ mod test {
     use crate::execution::execution::ExecutionState;
 
     #[tokio::test]
-    async fn test_template_cell() {
+    async fn test_template_cell() -> anyhow::Result<()> {
         let cell = crate::cells::TemplateCell {
             name: Some("test".to_string()),
             body: "Hello, {{ name }}!".to_string(),
         };
-        let op = crate::cells::template_cell::template_cell(&cell);
+        let op = crate::cells::template_cell::template_cell(&cell)?;
         let input = crate::execution::primitives::serialized_value::RkyvSerializedValue::Object(
             std::collections::HashMap::new()
         );
-        let output = op.execute(&ExecutionState::new(), input, None, None).await;
+        let output = op.execute(&ExecutionState::new(), input, None, None).await?;
         assert_eq!(output.output, crate::execution::primitives::serialized_value::RkyvSerializedValue::String("Hello, !".to_string()));
+        Ok(())
     }
 }

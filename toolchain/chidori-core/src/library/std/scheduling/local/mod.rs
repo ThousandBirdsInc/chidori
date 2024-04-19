@@ -64,7 +64,7 @@ pub async fn run_cron(
                                 _ => {
                                     unreachable!("Unsupported cell type");
                                 }
-                            };
+                            }.unwrap();
 
                             let mut argument_payload = RkyvObjectBuilder::new();
                             // if &arg_mapping.len() > &0 {

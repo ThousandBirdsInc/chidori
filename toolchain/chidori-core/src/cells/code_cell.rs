@@ -6,7 +6,7 @@ use crate::execution::primitives::operation::{InputItemConfiguration, InputSigna
 
 /// Code cells allow notebooks to evaluate source code in a variety of languages.
 #[tracing::instrument]
-pub fn code_cell(cell: &CodeCell) -> OperationNode {
+pub fn code_cell(cell: &CodeCell) -> anyhow::Result<OperationNode> {
     match cell.language {
         SupportedLanguage::PyO3 => {
             // TODO: all callable functions should be exposed as their own OperationNodes
@@ -14,13 +14,13 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
             let paths =
                 chidori_static_analysis::language::python::parse::extract_dependencies_python(
                     &cell.source_code,
-                );
+                )?;
             let report = chidori_static_analysis::language::python::parse::build_report(&paths);
 
             let (input_signature, output_signature) = signatures_from_report(&report);
 
             let cell = cell.clone();
-            OperationNode::new(
+            Ok(OperationNode::new(
                 cell.name.clone(),
                 input_signature,
                 output_signature,
@@ -35,22 +35,22 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
                             &x,
                             &cell.function_invocation,
                         ).await.unwrap();
-                        OperationFnOutput {
+                        Ok(OperationFnOutput {
                             execution_state: None,
                             output: result.0,
                             stdout: result.1,
                             stderr: result.2,
-                        }
+                        })
                     }.boxed()
                 }),
-            )
+            ))
         }
-        SupportedLanguage::Starlark => OperationNode::new(
+        SupportedLanguage::Starlark => Ok(OperationNode::new(
             cell.name.clone(),
             InputSignature::new(),
             OutputSignature::new(),
-            Box::new(|_, x, _, _| async move { OperationFnOutput::with_value(x) }.boxed()),
-        ),
+            Box::new(|_, x, _, _| async move { Ok(OperationFnOutput::with_value(x)) }.boxed()),
+        )),
         SupportedLanguage::Deno => {
             let paths =
                 chidori_static_analysis::language::javascript::parse::extract_dependencies_js(
@@ -61,7 +61,7 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
             let (input_signature, output_signature) = signatures_from_report(&report);
 
             let cell = cell.clone();
-            OperationNode::new(
+            Ok(OperationNode::new(
                 cell.name.clone(),
                 input_signature,
                 output_signature,
@@ -82,10 +82,10 @@ pub fn code_cell(cell: &CodeCell) -> OperationNode {
                                 Err(e) => panic!("{:?}", e),
                             }
                         }).await.unwrap();
-                        OperationFnOutput::with_value(result)
+                        Ok(OperationFnOutput::with_value(result))
                     }.boxed()
                 }),
-            )
+            ))
         }
     }
 }

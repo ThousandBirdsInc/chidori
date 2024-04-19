@@ -47,9 +47,17 @@ fn remove_hash_and_numbers(input: &str) -> String {
     }
 }
 
-// TODO: we're building a filtered subset of the AST
-// TODO: what we can consider is evaluating the ast into the references
-// TODO: the context path is the accumulated state, when we pop it we evaluate it
+/// The ASTWalkContext structure represents the accumulated state during an Abstract Syntax Tree (AST) walk.
+///
+/// This context provides a way to track and evaluate references within the AST, allowing for filtered subsets of the AST to be built.
+///
+/// # Properties
+///
+/// * `context_stack_references`: A vector of vectors that stores the ContextPath values. Each inner vector represents a stack frame in the evaluation process.
+/// * `context_stack`: A vector that tracks the current context path.
+/// * `locals`: A set of strings representing local variables defined within the AST.
+/// * `local_contexts`: A vector of sets, where each set represents a separate local context.
+/// * `globals`: A set of strings representing global variables defined within the AST.
 #[derive(Default)]
 pub struct ASTWalkContext {
     pub context_stack_references: Vec<Vec<ContextPath>>,

@@ -222,6 +222,17 @@ impl LoggingToChannel {
 }
 
 
+#[derive(Debug)]
+pub struct AnyhowErrWrapper(anyhow::Error);
+
+
+impl std::convert::From<AnyhowErrWrapper> for PyErr {
+    fn from(err: AnyhowErrWrapper) -> PyErr {
+        pyo3::exceptions::PyOSError::new_err(err.0.to_string())
+    }
+}
+
+
 pub async fn source_code_run_python(
     execution_state: &ExecutionState,
     source_code: &String,
@@ -233,7 +244,7 @@ pub async fn source_code_run_python(
     let (sender_stdout, receiver_stdout) = mpsc::channel();
     let (sender_stderr, receiver_stderr) = mpsc::channel();
 
-    let dependencies = extract_dependencies_python(&source_code);
+    let dependencies = extract_dependencies_python(&source_code)?;
     let report = build_report(&dependencies);
 
     let result =  Python::with_gil(|py| {
@@ -483,7 +494,7 @@ fn create_function_shims(execution_state_handle: &Arc<Mutex<ExecutionState>>, re
 
                     pyo3_asyncio::tokio::future_into_py(py, async move {
                         // TODO: await here, before we execute the dispatch, pausing before running the next operation
-                        let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload).await;
+                        let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload).await.map_err(|e| AnyhowErrWrapper(e))?;
                         // TODO: await here, after we execute the dispatch, pausing before running the next operation
                         PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result)))
                     }).map(|x| x.into())
@@ -650,7 +661,7 @@ def example(x):
     }
 
     #[tokio::test]
-    async fn test_execution_of_python_with_function_provided_via_cell() {
+    async fn test_execution_of_python_with_function_provided_via_cell() -> anyhow::Result<()> {
         let source_code = String::from(
             r#"
 a = 20 + await demo()
@@ -665,7 +676,7 @@ a = 20 + await demo()
                             return 100
                         "#}),
             function_invocation: None,
-        }), Some(0));
+        }), Some(0))?;
         let result = source_code_run_python(&state,
                                             &source_code,
             &RkyvObjectBuilder::new()
@@ -681,10 +692,11 @@ a = 20 + await demo()
                 vec![]
             )
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_running_async_function_dependency() {
+    async fn test_running_async_function_dependency() -> anyhow::Result<()> {
         let source_code = String::from(
             r#"
 data = await demo()
@@ -701,7 +713,7 @@ data = await demo()
                             return 100
                         "#}),
             function_invocation: None,
-        }), Some(0));
+        }), Some(0))?;
         let result = source_code_run_python(&state,
                                             &source_code,
             &RkyvObjectBuilder::new()
@@ -718,10 +730,11 @@ data = await demo()
                 vec![]
             )
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_chain_of_multiple_dependent_python_functions() {
+    async fn test_chain_of_multiple_dependent_python_functions() -> anyhow::Result<()> {
         // TODO: this should validate that we can invoke a function that depends on another function
         let source_code = String::from(
             r#"
@@ -739,7 +752,7 @@ data = await demo()
                             return 100 + await demo_second_function_call()
                         "#}),
             function_invocation: None,
-        }), Some(0));
+        }), Some(0))?;
         let (state, _) = state.update_op(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,
@@ -750,7 +763,7 @@ data = await demo()
                             return 100
                         "#}),
             function_invocation: None,
-        }), Some(1));
+        }), Some(1))?;
         let result = source_code_run_python(&state,
                                             &source_code,
             &RkyvObjectBuilder::new()
@@ -765,6 +778,7 @@ data = await demo()
                 vec![]
             )
         );
+        Ok(())
     }
 
 

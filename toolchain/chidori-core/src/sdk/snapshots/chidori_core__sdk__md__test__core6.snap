@@ -24,7 +24,6 @@ expression: v
         user: ~
         seed: ~
         top_p: ~
-        eject: ~
       name: add_population
       provider: OpenAI
       req: "Add the population of {{state}} to the population of California"

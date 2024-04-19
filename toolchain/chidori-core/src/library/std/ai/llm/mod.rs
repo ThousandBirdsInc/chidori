@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::env;
 use std::pin::Pin;
 use chidori_prompt_format::templating::templates::{ChatModelRoles, TemplateWithSource};
-use crate::cells::LLMPromptCellChatConfiguration;
+use crate::cells::{LLMCodeGenCellChatConfiguration, LLMPromptCellChatConfiguration};
 use crate::execution::execution::ExecutionState;
 use crate::execution::primitives::operation::InputSignature;
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue, serialized_value_to_json_value};
@@ -137,7 +137,6 @@ impl Default for ChatCompletionReq {
                 user: None,
                 seed: None,
                 top_p: None,
-                eject: None
             },
             template_messages: Vec::new(),
             tool_choice: None,
@@ -315,7 +314,7 @@ pub async fn ai_llm_run_chat_model(
     name: Option<String>,
     is_function_invocation: bool,
     configuration: LLMPromptCellChatConfiguration
-) -> (RkyvSerializedValue, Option<ExecutionState>) {
+) -> anyhow::Result<(RkyvSerializedValue, Option<ExecutionState>)> {
     let mut template_messages: Vec<TemplateMessage> = Vec::new();
     let data = template_data_payload_from_rkyv(&payload);
 
@@ -366,7 +365,7 @@ pub async fn ai_llm_run_chat_model(
                         if let Some(function_name) = tool_call.function.name {
                             let args = tool_call.function.arguments.unwrap_or(RkyvSerializedValue::Null);
                             let args = RkyvObjectBuilder::new().insert_value("kwargs", args).build();
-                            let (dispatch_result, _) = execution_state.dispatch(&function_name, args).await;
+                            let (dispatch_result, _) = execution_state.dispatch(&function_name, args).await?;
                             result_map.insert(function_name, dispatch_result);
                         }
                     }
@@ -391,32 +390,90 @@ pub async fn ai_llm_run_chat_model(
             }
         }
 
-        if let Some(RkyvSerializedValue::String(output_string)) = results.first() {
-            if let Some(ejection_config) = &configuration.eject {
-                let (new_execution_state, _) = execution_state.update_op(crate::cells::CellTypes::Code(crate::cells::CodeCell {
-                    name: None,
-                    language: match ejection_config.language.as_str() {
-                        "python" => crate::cells::SupportedLanguage::PyO3,
-                        "javascript" => crate::cells::SupportedLanguage::Deno,
-                        _ => crate::cells::SupportedLanguage::PyO3,
-                    },
-                    source_code: output_string.clone(),
-                    function_invocation: None,
-                }), None);
-                return (RkyvSerializedValue::String(output_string.clone()), Some(new_execution_state));
-            }
-        }
 
         let out = if results.len() == 1 {
             results[0].clone()
         } else {
             RkyvSerializedValue::Array(results)
         };
-        (out, None)
+        Ok((out, None))
     } else {
-        (RkyvSerializedValue::Null, None)
+        Ok((RkyvSerializedValue::Null, None))
     }
 }
+
+pub async fn ai_llm_code_generation_chat_model(
+    execution_state: &ExecutionState,
+    payload: RkyvSerializedValue,
+    role_blocks: Vec<(ChatModelRoles, Option<TemplateWithSource>)>,
+    name: Option<String>,
+    is_function_invocation: bool,
+    configuration: LLMCodeGenCellChatConfiguration
+) -> anyhow::Result<(RkyvSerializedValue, Option<ExecutionState>)> {
+    let mut template_messages: Vec<TemplateMessage> = Vec::new();
+    let data = template_data_payload_from_rkyv(&payload);
+
+    for (a, b) in &role_blocks.clone() {
+        template_messages.push(TemplateMessage {
+            role: match a {
+                ChatModelRoles::User => MessageRole::User,
+                ChatModelRoles::System => MessageRole::System,
+                ChatModelRoles::Assistant => MessageRole::Assistant,
+            },
+            content: chidori_prompt_format::templating::templates::render_template_prompt(&b.as_ref().unwrap().source, &data, &HashMap::new()).unwrap(),
+            name: None,
+            function_call: None,
+        });
+    }
+
+    // TODO: replace this to being fetched from configuration
+    let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
+    let api_url_v1: &str = "https://api.openai.com/v1";
+    let c = crate::library::std::ai::llm::openai::OpenAIChatModel::new(api_url_v1.to_string(), api_key);
+
+    let result = c.batch(ChatCompletionReq {
+        config: LLMPromptCellChatConfiguration {
+            import: None,
+            function_name: None,
+            model: configuration.model.clone(),
+            frequency_penalty: configuration.frequency_penalty.clone(),
+            max_tokens: configuration.max_tokens.clone(),
+            presence_penalty: configuration.presence_penalty.clone(),
+            stop: configuration.stop.clone(),
+            temperature: configuration.temperature.clone(),
+            logit_bias: configuration.logit_bias.clone(),
+            user: configuration.user.clone(),
+            seed: configuration.seed.clone(),
+            top_p: configuration.top_p.clone(),
+        },
+        template_messages,
+        tool_choice: None,
+        tools: None,
+    }).await;
+
+
+    if let Ok(ChatCompletionRes { choices, .. }) = result {
+        for choice in choices {
+            let text = choice.text.as_ref().unwrap().clone();
+            let new_execution_state = execution_state.clone();
+            let (new_execution_state, _) = new_execution_state.update_op(crate::cells::CellTypes::Code(crate::cells::CodeCell {
+                name: None,
+                language: match configuration.language.unwrap_or("python".to_string()).as_str() {
+                    "python" => crate::cells::SupportedLanguage::PyO3,
+                    "javascript" => crate::cells::SupportedLanguage::Deno,
+                    _ => crate::cells::SupportedLanguage::PyO3,
+                },
+                source_code: text.clone(),
+                function_invocation: None,
+            }), None)?;
+            return Ok((RkyvSerializedValue::String(text.clone()), Some(new_execution_state)));
+        }
+        Ok((RkyvSerializedValue::Null, None))
+    } else {
+        Ok((RkyvSerializedValue::Null, None))
+    }
+}
+
 
 pub fn infer_tool_usage_from_imports(execution_state: &ExecutionState, imports: &Option<Vec<String>>) -> Vec<Tool> {
     let mut tools = vec![];
@@ -465,7 +522,7 @@ mod test {
     use crate::library::std::ai::llm::infer_tool_usage_from_imports;
 
     #[tokio::test]
-    async fn test_tool_usage_inference() {
+    async fn test_tool_usage_inference() -> anyhow::Result<()> {
         let mut state = ExecutionState::new();
         let (mut state, _) = state.update_op(CellTypes::Code(CodeCell {
             name: None,
@@ -477,7 +534,7 @@ mod test {
                             return 100 + await demo_second_function_call()
                         "#}),
             function_invocation: None,
-        }), Some(0));
+        }), Some(0))?;
         let (mut state, _) = state.update_op(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,
@@ -486,7 +543,7 @@ mod test {
                             return a + b + c + d
                         "#}),
             function_invocation: None,
-        }), Some(0));
+        }), Some(0))?;
 
         insta::with_settings!({
             omit_expression => true
@@ -501,5 +558,6 @@ mod test {
                 }
             );
         });
+        Ok(())
     }
 }

@@ -290,7 +290,7 @@ pub type OperationFn = dyn Fn(
     RkyvSerializedValue,
     Option<Sender<((usize, usize), RkyvSerializedValue)>>,
     Option<AsyncRPCCommunication>
-) -> Pin<Box<dyn Future<Output = OperationFnOutput> + Send>> + Send;
+) -> Pin<Box<dyn Future<Output = anyhow::Result<OperationFnOutput>> + Send>> + Send;
 
 // TODO: rather than dep_count operation node should have a specific dep mapping
 pub struct OperationNode {
@@ -378,7 +378,7 @@ impl Default for OperationNode {
             verified_at: 0,
             dirty: true,
             signature: Signature::new(),
-            operation: Box::new(|_, x, _, _| async move { OperationFnOutput::with_value(x) }.boxed()),
+            operation: Box::new(|_, x, _, _| async move { Ok(OperationFnOutput::with_value(x)) }.boxed()),
             unresolved_dependencies: vec![],
             partial_application: Vec::new(),
         }
@@ -415,7 +415,7 @@ impl OperationNode {
         argument_payload: RkyvSerializedValue,
         intermediate_output_channel_tx: Option<Sender<((usize, usize), RkyvSerializedValue)>>,
         async_communication_channel: Option<AsyncRPCCommunication>,
-    ) -> Pin<Box<dyn Future<Output=OperationFnOutput> + Send>> {
+    ) -> Pin<Box<dyn Future<Output=anyhow::Result<OperationFnOutput>> + Send>> {
         /// Receiver that we pass to the exec for it to capture oneshot RPC communication
         let exec = self.operation.deref();
         exec(state, argument_payload, intermediate_output_channel_tx, async_communication_channel)
@@ -431,16 +431,17 @@ mod tests {
     // TODO: test manual evaluation of a composition of operations
 
     #[tokio::test]
-    async fn test_execute_with_operation() {
+    async fn test_execute_with_operation() -> anyhow::Result<()> {
         let operation: Box<OperationFn> =
-            Box::new(|_, context, _, _| { async move { OperationFnOutput::with_value(RkyvSerializedValue::Boolean(true)) }.boxed() });
+            Box::new(|_, context, _, _| { async move { Ok(OperationFnOutput::with_value(RkyvSerializedValue::Boolean(true))) }.boxed() });
 
         let mut node = OperationNode::default();
         node.operation = operation;
 
-        let result = node.execute(&ExecutionState::new(), RkyvSerializedValue::Null, None, None).await;
+        let result = node.execute(&ExecutionState::new(), RkyvSerializedValue::Null, None, None).await?;
 
         assert_eq!(result.output, RkyvSerializedValue::Boolean(true));
+        Ok(())
     }
 
     #[test]
@@ -483,7 +484,7 @@ mod tests {
                         }
                     }
                 }).await;
-                OperationFnOutput::with_value(RkyvSerializedValue::Null)
+                Ok(OperationFnOutput::with_value(RkyvSerializedValue::Null))
             }.boxed()),
             unresolved_dependencies: vec![],
             partial_application: Vec::new(),

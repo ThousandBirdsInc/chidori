@@ -307,20 +307,21 @@ impl ExecutionState {
         &self,
         cell: CellTypes,
         op_id: Option<usize>,
-    ) -> (ExecutionState, usize) {
+    ) -> anyhow::Result<(ExecutionState, usize)> {
         let mut op = match &cell {
             CellTypes::Code(c) => crate::cells::code_cell::code_cell(c),
             CellTypes::Prompt(c) => crate::cells::llm_prompt_cell::llm_prompt_cell(c),
             CellTypes::Embedding(c) => crate::cells::embedding_cell::llm_embedding_cell(c),
             CellTypes::Web(c) => crate::cells::web_cell::web_cell(c),
             CellTypes::Template(c) => crate::cells::template_cell::template_cell(c),
-            CellTypes::Memory(c) => crate::cells::memory_cell::memory_cell(c)
-        };
+            CellTypes::Memory(c) => crate::cells::memory_cell::memory_cell(c),
+            CellTypes::CodeGen(c) => crate::cells::code_gen_cell::code_gen_cell(c),
+        }?;
         op.attach_cell(cell);
         let (op_id, new_state) = self.upsert_operation(op, op_id);
         let mutations = Self::assign_dependencies_to_operations(&new_state);
         let final_state = new_state.apply_dependency_graph_mutations(mutations);
-        (final_state, op_id)
+        Ok((final_state, op_id))
     }
 
     fn assign_dependencies_to_operations(new_state: &ExecutionState) -> Vec<DependencyGraphMutation> {
@@ -462,27 +463,26 @@ impl ExecutionState {
 
     fn update_callable_functions(&mut self) {
         for (id, op) in &self.operation_by_id {
-            let mut op_node = op
-                .lock()
-                .unwrap();
-
-            for (function_name, function_config) in &op_node.signature.output_signature.functions {
-                self.function_name_to_metadata.insert(function_name.clone(), FunctionMetadata {
-                    operation_id: id.clone(),
-                    input_signature: if let OutputItemConfiguration::Function{ input_signature, .. } = function_config {
-                        input_signature.clone()
-                    } else {
-                        InputSignature::new()
-                    }
-                });
+            if let Ok(mut op_node) = op.try_lock() {
+                for (function_name, function_config) in &op_node.signature.output_signature.functions {
+                    self.function_name_to_metadata.insert(function_name.clone(), FunctionMetadata {
+                        operation_id: id.clone(),
+                        input_signature: if let OutputItemConfiguration::Function{ input_signature, .. } = function_config {
+                            input_signature.clone()
+                        } else {
+                            InputSignature::new()
+                        }
+                    });
+                }
             }
+
         }
     }
 
     /// Invoke a function made available by the execution state, this accepts arguments derived in the context
     /// of a parent function's scope. This targets a specific function by name that we've identified a dependence on.
     // TODO: this should create a coroutine that yields with the result of the function invocation
-    pub async fn dispatch(&self, function_name: &str, payload: RkyvSerializedValue) -> (RkyvSerializedValue, ExecutionState) {
+    pub async fn dispatch(&self, function_name: &str, payload: RkyvSerializedValue) -> anyhow::Result<(RkyvSerializedValue, ExecutionState)> {
         // TODO: this should return a closure that executes the code
 
         // Store the invocation payload into an execution state and record this before executing
@@ -503,22 +503,22 @@ impl ExecutionState {
                 let mut c = c.clone();
                 c.function_invocation =
                     Some(clone_function_name.to_string());
-                crate::cells::code_cell::code_cell(&c)
+                crate::cells::code_cell::code_cell(&c)?
             }
             CellTypes::Prompt(c) => {
                 let mut c = c.clone();
                 match c {
                     LLMPromptCell::Chat{ref mut function_invocation, ..} => {
                         *function_invocation = true;
-                        crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
+                        crate::cells::llm_prompt_cell::llm_prompt_cell(&c)?
                     }
                     _ => {
-                        crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
+                        crate::cells::llm_prompt_cell::llm_prompt_cell(&c)?
                     }
                 }
             }
             CellTypes::Embedding(c) => {
-                crate::cells::embedding_cell::llm_embedding_cell(&c)
+                crate::cells::embedding_cell::llm_embedding_cell(&c)?
             }
             _ => {
                 unreachable!("Unsupported cell type");
@@ -527,10 +527,10 @@ impl ExecutionState {
 
         // invocation of the operation
         // TODO: the total arg payload here does not include necessary function calls for this cell itself
-        let result = op.execute(&self, payload, None, None).await;
+        let result = op.execute(&self, payload, None, None).await?;
 
         // TODO: return the result, which we will use in the context of the parent function
-        (result.output, self.clone())
+        Ok((result.output, self.clone()))
     }
 
     // TODO: extend this with an "event", steps can occur as events are flushed based on a previous state we were in
@@ -538,7 +538,7 @@ impl ExecutionState {
     pub async fn step_execution(
         &self,
         sender: &Sender<(ExecutionNodeId, OperationId, RkyvSerializedValue)>
-    ) -> (ExecutionStateEvaluation, Vec<(usize, OperationFnOutput)>) {
+    ) -> anyhow::Result<(ExecutionStateEvaluation, Vec<(usize, OperationFnOutput)>)> {
         let previous_state = self;
         let mut new_state = previous_state.clone();
         let mut operation_by_id = previous_state.operation_by_id.clone();
@@ -687,7 +687,7 @@ impl ExecutionState {
                 // outputs.push((operation_id, result.clone()));
                 // new_state.state_insert(operation_id, result);
             } else {
-                let result = op_node_execute.await;
+                let result = op_node_execute.await?;
                 println!("Executed node {} with result {:?}", operation_id, &result);
                 outputs.push((operation_id, result.clone()));
                 if let Some(s) = result.execution_state {
@@ -697,7 +697,7 @@ impl ExecutionState {
             }
         }
         new_state.state_consume_marked(marked_for_consumption);
-        (ExecutionStateEvaluation::Complete(new_state), outputs)
+        Ok((ExecutionStateEvaluation::Complete(new_state), outputs))
     }
 }
 

@@ -35,6 +35,8 @@ rkyv.workspace = true
 reqwest.workspace = true
 bytes.workspace = true
 petgraph.workspace = true
+thiserror.workspace = true
+
 
 tokio-cron-scheduler = "0.10.0"
 axum = "0.7.4"

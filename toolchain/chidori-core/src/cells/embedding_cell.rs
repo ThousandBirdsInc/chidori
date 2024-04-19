@@ -4,7 +4,7 @@ use crate::execution::primitives::operation::{InputItemConfiguration, InputSigna
 use crate::library::std::ai::llm::ai_llm_run_embedding_model;
 
 #[tracing::instrument]
-pub fn llm_embedding_cell(cell: &LLMEmbeddingCell) -> OperationNode {
+pub fn llm_embedding_cell(cell: &LLMEmbeddingCell) -> anyhow::Result<OperationNode> {
     let LLMEmbeddingCell {
         function_invocation,
         configuration,
@@ -44,7 +44,7 @@ pub fn llm_embedding_cell(cell: &LLMEmbeddingCell) -> OperationNode {
     let template = template.expect("Must include template");
     let name = name.clone();
     let is_function_invocation = function_invocation.clone();
-    OperationNode::new(
+    Ok(OperationNode::new(
         name.clone(),
         input_signature,
         output_signature,
@@ -53,9 +53,8 @@ pub fn llm_embedding_cell(cell: &LLMEmbeddingCell) -> OperationNode {
             let name = name.clone();
             let s = s.clone();
             async move {
-                OperationFnOutput::with_value(ai_llm_run_embedding_model(&s, x, template, name.clone(), is_function_invocation).await)
+                Ok(OperationFnOutput::with_value(ai_llm_run_embedding_model(&s, x, template, name.clone(), is_function_invocation).await))
             }.boxed()
         }),
-    )
-
+    ))
 }

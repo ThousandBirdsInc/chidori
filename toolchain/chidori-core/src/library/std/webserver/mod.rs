@@ -107,7 +107,7 @@ pub async fn run_webservice(
                                     _ => {
                                         unreachable!("Unsupported cell type");
                                     }
-                                };
+                                }.unwrap();
 
                                 let mut argument_payload = RkyvObjectBuilder::new();
                                 // if &arg_mapping.len() > &0 {
@@ -119,7 +119,7 @@ pub async fn run_webservice(
 
                                 dbg!(&argument_payload);
                                 // invocation of the operation
-                                let result = op.execute(&ExecutionState::new(), argument_payload, None, None).await;
+                                let result = op.execute(&ExecutionState::new(), argument_payload, None, None).await.unwrap();
                                 if let RkyvSerializedValue::String(s) = &result.output {
                                     (StatusCode::CREATED, Html(s.clone())).into_response()
                                 } else {
@@ -160,7 +160,7 @@ pub async fn run_webservice(
                                     _ => {
                                         unreachable!("Unsupported cell type");
                                     }
-                                };
+                                }.unwrap();
 
                                 // invocation of the operation
                                 let mut argument_payload = RkyvObjectBuilder::new();
@@ -177,7 +177,7 @@ pub async fn run_webservice(
                                         .insert_object("args", argument_payload)
                                         .build(),
                                     None,
-                                    None).await;
+                                    None).await.unwrap();
                                 (StatusCode::CREATED, Json(result.output))
                             }
                         }));

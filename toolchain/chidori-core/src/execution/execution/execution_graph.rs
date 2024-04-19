@@ -284,18 +284,18 @@ impl ExecutionGraph {
         &mut self,
         prev_execution_id: ExecutionNodeId,
         previous_state: &ExecutionStateEvaluation,
-    ) -> (
+    ) -> anyhow::Result<(
         ((usize, usize), ExecutionStateEvaluation), // the resulting total state of this step
         Vec<(usize, OperationFnOutput)>, // values emitted by operations during this step
-    ) {
+    )> {
         let previous_state = match previous_state {
             ExecutionStateEvaluation::Complete(state) => state,
             ExecutionStateEvaluation::Executing(_) => panic!("Cannot step an execution state that is currently executing"),
         };
         // TODO: Execution can only be stepped when the previous state is complete
-        let (new_state, outputs) = previous_state.step_execution(&self.sender).await;
+        let (new_state, outputs) = previous_state.step_execution(&self.sender).await?;
         let resulting_state_id = self.progress_graph(prev_execution_id, new_state.clone());
-        ((resulting_state_id, new_state), outputs)
+        Ok(((resulting_state_id, new_state), outputs))
     }
 
 
@@ -305,18 +305,18 @@ impl ExecutionGraph {
         prev_execution_id: ExecutionNodeId,
         cell: CellTypes,
         op_id: Option<usize>,
-    ) -> (
+    ) -> anyhow::Result<(
         ((usize, usize), ExecutionState), // the resulting total state of this step
         usize, // id of the new operation
-    ) {
+    )> {
         let state = self.get_state_at_id(prev_execution_id);
         if let Some(state) = state {
             let (final_state, op_id2) = match &state {
-                ExecutionStateEvaluation::Complete(state1) => state1.update_op(cell, op_id),
+                ExecutionStateEvaluation::Complete(state1) => state1.update_op(cell, op_id)?,
                 ExecutionStateEvaluation::Executing(_) => panic!("Cannot mutate a graph that is currently executing"),
             };
             let resulting_state_id = self.progress_graph(prev_execution_id, ExecutionStateEvaluation::Complete(final_state.clone()));
-            ((resulting_state_id, final_state), op_id2)
+            Ok(((resulting_state_id, final_state), op_id2))
         } else {
             panic!("No state found for id {:?}", prev_execution_id);
         }
@@ -326,10 +326,10 @@ impl ExecutionGraph {
     pub async fn external_step_execution(
         &mut self,
         prev_execution_id: ExecutionNodeId,
-    ) -> (
+    ) -> anyhow::Result<(
         ((usize, usize), ExecutionStateEvaluation), // the resulting total state of this step
         Vec<(usize, OperationFnOutput)>, // values emitted by operations during this step
-    ) {
+    )> {
         let state = self.get_state_at_id(prev_execution_id);
         if let Some(state) = state {
             self.step_execution(prev_execution_id, &state).await
@@ -354,7 +354,7 @@ mod tests {
      */
 
     #[tokio::test]
-    async fn test_evaluation_single_node() {
+    async fn test_evaluation_single_node() -> anyhow::Result<()> {
         let mut db = ExecutionGraph::new();
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
@@ -362,14 +362,14 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(1)) }.boxed()),
+                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
                 ),
                                                     None);
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(2)) }.boxed()),
+                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(2))) }.boxed()),
                 ),
                                                     None);
         let (_, mut state) = state.upsert_operation(OperationNode::new(
@@ -383,7 +383,7 @@ mod tests {
                                     if let (Some(RSV::Number(a)), Some(RSV::Number(b))) =
                                         (args.get(&"0".to_string()), args.get(&"1".to_string()))
                                     {
-                                        return OperationFnOutput::with_value(RSV::Number(a + b));
+                                        return Ok(OperationFnOutput::with_value(RSV::Number(a + b)));
                                     }
                                 }
                             }
@@ -410,11 +410,12 @@ mod tests {
         state.state_insert(0, arg0);
         state.state_insert(1, arg1);
 
-        let ((_, new_state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state.clone())).await;
+        let ((_, new_state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state.clone())).await?;
 
         assert!(new_state.state_get(&2).is_some());
         let result = new_state.state_get(&2).unwrap();
         assert_eq!(result, &RSV::Number(3));
+        Ok(())
     }
 
     /*
@@ -423,7 +424,7 @@ mod tests {
      */
 
     #[tokio::test]
-    async fn test_traverse_single_node() {
+    async fn test_traverse_single_node() -> anyhow::Result<()> {
         let mut db = ExecutionGraph::new();
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
@@ -431,14 +432,14 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(0)) }.boxed()),
+                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(0))) }.boxed()),
                 ),
                                                     None);
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(1)) }.boxed()),
+                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
                 ),
                                                     None);
         let mut state =
@@ -447,15 +448,16 @@ mod tests {
                 depends_on: vec![(0, DependencyReference::Positional(0))],
             }]);
 
-        let ((_, new_state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state)).await;
+        let ((_, new_state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state)).await?;
         assert_eq!(
             new_state.state_get(&1).unwrap(),
             &RkyvSerializedValue::Number(1)
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_traverse_linear_chain() {
+    async fn test_traverse_linear_chain() -> anyhow::Result<()> {
         let mut db = ExecutionGraph::new();
 
         // Nodes are in this structure
@@ -472,7 +474,7 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(0)) }.boxed()),
+                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(0))) }.boxed()),
                 ),
                                                     None);
 
@@ -480,7 +482,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["0"]),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(1)) }.boxed()),
+                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
                 ),
                                                     None);
 
@@ -488,7 +490,7 @@ mod tests {
                     None,
                     InputSignature::from_args_list(vec!["0"]),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(2)) }.boxed()),
+                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(2))) }.boxed()),
                 ),
                                                     None);
 
@@ -503,19 +505,20 @@ mod tests {
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state)).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state)).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(state.state_get(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get(&2), None);
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), Some(&RSV::Number(2)));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_traverse_branching() {
+    async fn test_traverse_branching() -> anyhow::Result<()> {
         let mut db = ExecutionGraph::new();
 
         // Nodes are in this structure
@@ -528,37 +531,16 @@ mod tests {
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
 
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    InputSignature::new(),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(0)) }.boxed()),
-                ),
-                                                    None);
-
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    InputSignature::from_args_list(vec!["1"]),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(1)) }.boxed()),
-                ),
-                                                    None);
-
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    InputSignature::from_args_list(vec!["1"]),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(2)) }.boxed()),
-                ),
-                                                    None);
-
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    InputSignature::from_args_list(vec!["1"]),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(3)) }.boxed()),
-                ),
-                                                    None);
+        for x in 0..4 {
+            let (_, mut nstate) = state.upsert_operation(OperationNode::new(
+                        None,
+                        InputSignature::new(),
+                        OutputSignature::new(),
+                        Box::new(move |_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(x))) }.boxed()),
+                    ),
+                                                        None);
+            state = nstate
+        }
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
@@ -575,21 +557,22 @@ mod tests {
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state)).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state)).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(state.state_get(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), None);
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), Some(&RSV::Number(2)));
         assert_eq!(state.state_get(&3), Some(&RSV::Number(3)));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_traverse_branching_and_convergence() {
+    async fn test_traverse_branching_and_convergence() -> anyhow::Result<()> {
         let mut db = ExecutionGraph::new();
 
         // Nodes are in this structure
@@ -603,45 +586,16 @@ mod tests {
 
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    InputSignature::new(),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(0)) }.boxed()),
-                ),
-                                                    None);
-
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    InputSignature::from_args_list(vec!["1"]),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(1)) }.boxed()),
-                ),
-                                                    None);
-
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    InputSignature::from_args_list(vec!["1"]),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(2)) }.boxed()),
-                ),
-                                                    None);
-
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    InputSignature::from_args_list(vec!["1"]),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(3)) }.boxed()),
-                ),
-                                                    None);
-
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    InputSignature::from_args_list(vec!["1", "2"]),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(4)) }.boxed()),
-                ),
-                                                    None);
+        for x in 0..5 {
+            let (_, mut nstate) = state.upsert_operation(OperationNode::new(
+                        None,
+                        if x == 0 { InputSignature::new() } else if x == 4 {InputSignature::from_args_list(vec!["1", "2"]) } else { InputSignature::from_args_list(vec!["1"]) },
+                        OutputSignature::new(),
+                        Box::new(move |_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(x))) }.boxed()),
+                    ),
+                                                        None);
+            state = nstate
+        }
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
@@ -665,26 +619,27 @@ mod tests {
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state)).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state)).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(state.state_get(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get(&2), None);
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), Some(&RSV::Number(2)));
         assert_eq!(state.state_get(&3), Some(&RSV::Number(3)));
         assert_eq!(state.state_get(&4), None);
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), None);
         assert_eq!(state.state_get(&4), Some(&RSV::Number(4)));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_traverse_cycle() {
+    async fn test_traverse_cycle() -> anyhow::Result<()> {
         let mut db = ExecutionGraph::new();
 
         // Nodes are in this structure _with the following cycle_
@@ -706,7 +661,7 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(1)) }.boxed()),
+                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
                 ),
                                                     None);
 
@@ -716,7 +671,7 @@ mod tests {
                 if let RSV::Object(m) = args {
                     if let RSV::Object(args) = m.get("args").unwrap() {
                         if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
-                            return OperationFnOutput::with_value(RSV::Number(a + 1));
+                            return Ok(OperationFnOutput::with_value(RSV::Number(a + 1)));
                         }
                     }
                 }
@@ -792,62 +747,63 @@ mod tests {
         ]);
 
         // We expect to see the value at each node increment repeatedly.
-        let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state)).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state)).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
 
         assert_eq!(state.state_get(&1), Some(&RSV::Number(2)));
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), None);
         assert_eq!(state.state_get(&4), None);
         assert_eq!(state.state_get(&5), None);
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), Some(&RSV::Number(3)));
         assert_eq!(state.state_get(&3), None);
         assert_eq!(state.state_get(&4), None);
         assert_eq!(state.state_get(&5), None);
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), None);
         assert_eq!(state.state_get(&4), Some(&RSV::Number(4)));
         assert_eq!(state.state_get(&5), None);
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), Some(&RSV::Number(5)));
         assert_eq!(state.state_get(&4), None);
         assert_eq!(state.state_get(&5), Some(&RSV::Number(5)));
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(state.state_get(&1), Some(&RSV::Number(6)));
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), None);
         assert_eq!(state.state_get(&4), None);
         assert_eq!(state.state_get(&5), Some(&RSV::Number(5)));
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), Some(&RSV::Number(7)));
         assert_eq!(state.state_get(&3), None);
         assert_eq!(state.state_get(&4), None);
         assert_eq!(state.state_get(&5), Some(&RSV::Number(5)));
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), None);
         assert_eq!(state.state_get(&4), Some(&RSV::Number(8)));
         assert_eq!(state.state_get(&5), Some(&RSV::Number(5)));
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), Some(&RSV::Number(9)));
         assert_eq!(state.state_get(&4), None);
         assert_eq!(state.state_get(&5), Some(&RSV::Number(9)));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_branching_multiple_state_paths() {
+    async fn test_branching_multiple_state_paths() -> anyhow::Result<()> {
         let mut db = ExecutionGraph::new();
 
         // Nodes are in this structure
@@ -865,7 +821,7 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(1)) }.boxed()),
+                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
                 ),
                                                     None);
 
@@ -877,7 +833,7 @@ mod tests {
                     if let RSV::Object(args) = m.get("args").unwrap() {
                         if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
                             let plus = atomic_usize.fetch_add(1, Ordering::SeqCst);
-                            return OperationFnOutput::with_value(RSV::Number(a + plus as i32));
+                            return Ok(OperationFnOutput::with_value(RSV::Number(a + plus as i32)));
                         }
                     }
                 }
@@ -912,29 +868,30 @@ mod tests {
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state)).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state)).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
-        let ((x_state_id, x_state), _) = db.step_execution(state_id, &state).await;
+        let ((x_state_id, x_state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(x_state.state_get(&1), Some(&RSV::Number(1)));
         assert_eq!(x_state.state_get(&2), None);
 
-        let ((state_id, state), _) = db.step_execution(x_state_id.clone(), &x_state.clone()).await;
+        let ((state_id, state), _) = db.step_execution(x_state_id.clone(), &x_state.clone()).await?;
         assert_eq!(state_id.0, 0);
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), Some(&RSV::Number(2)));
 
         // When we re-evaluate from a previous point, we should get a new branch
-        let ((state_id, state), _) = db.step_execution(x_state_id.clone(), &x_state).await;
+        let ((state_id, state), _) = db.step_execution(x_state_id.clone(), &x_state).await?;
         // The state_id.0 being incremented indicates that we're on a new branch
         assert_eq!(state_id.0, 1);
         assert_eq!(state.state_get(&1), None);
         // Op 2 should re-evaluate to 3, since it's on a new branch but continuing to mutate the stateful counter
         assert_eq!(state.state_get(&2), Some(&RSV::Number(3)));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_mutation_of_the_dependency_graph_on_branches() {
+    async fn test_mutation_of_the_dependency_graph_on_branches() -> anyhow::Result<()> {
         let mut db = ExecutionGraph::new();
 
         // Nodes are in this structure
@@ -952,7 +909,7 @@ mod tests {
                     None,
                     InputSignature::new(),
                     OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(0)) }.boxed()),
+                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(0))) }.boxed()),
                 ),
                                                     None);
 
@@ -961,7 +918,7 @@ mod tests {
                 if let RSV::Object(m) = args {
                     if let RSV::Object(args) = m.get("args").unwrap() {
                         if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
-                            return OperationFnOutput::with_value(RSV::Number(a + 1));
+                            return Ok(OperationFnOutput::with_value(RSV::Number(a + 1)));
                         }
                     }
                 }
@@ -975,7 +932,7 @@ mod tests {
             if let RSV::Object(m) = args {
                 if let RSV::Object(args) = m.get("args").unwrap() {
                     if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
-                        return OperationFnOutput::with_value(RSV::Number(a + 200));
+                        return Ok(OperationFnOutput::with_value(RSV::Number(a + 200)));
                     }
                 }
             }
@@ -1010,13 +967,13 @@ mod tests {
             },
         ]);
 
-        let ((x_state_id, mut x_state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state)).await;
+        let ((x_state_id, mut x_state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state)).await?;
         assert_eq!(x_state.state_get(&1), None);
         assert_eq!(x_state.state_get(&2), None);
-        let ((state_id, state), _) = db.step_execution(x_state_id, &x_state.clone()).await;
+        let ((state_id, state), _) = db.step_execution(x_state_id, &x_state.clone()).await?;
         assert_eq!(state.state_get(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get(&2), None);
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), Some(&RSV::Number(2)));
 
@@ -1028,13 +985,14 @@ mod tests {
                 OutputSignature::new(),
                 Box::new(f_v2),
             ), Some(1));
-            let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state.clone())).await;
+            let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state.clone())).await?;
             assert_eq!(state.state_get(&1), Some(&RSV::Number(200)));
             assert_eq!(state.state_get(&2), None);
-            let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+            let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
             assert_eq!(state.state_get(&1), None);
             assert_eq!(state.state_get(&2), Some(&RSV::Number(201)));
         }
+        Ok(())
 
     }
 
@@ -1044,7 +1002,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_merging_traversed_state() {
+    async fn test_merging_traversed_state() -> anyhow::Result<()> {
         let mut db = ExecutionGraph::new();
 
         // Nodes are in this structure
@@ -1058,45 +1016,17 @@ mod tests {
 
         let mut state = ExecutionState::new();
         let state_id = (0, 0);
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    InputSignature::new(),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(0)) }.boxed()),
-                ),
-                                                    None);
 
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    InputSignature::from_args_list(vec!["1"]),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(1)) }.boxed()),
-                ),
-                                                    None);
-
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    InputSignature::from_args_list(vec!["1"]),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(2)) }.boxed()),
-                ),
-                                                    None);
-
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    InputSignature::from_args_list(vec!["1"]),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(3)) }.boxed()),
-                ),
-                                                    None);
-
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    InputSignature::from_args_list(vec!["1", "2"]),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { OperationFnOutput::with_value(RSV::Number(4)) }.boxed()),
-                ),
-                                                    None);
+        for x in 0..5 {
+            let (_, mut nstate) = state.upsert_operation(OperationNode::new(
+                None,
+                if x == 0 { InputSignature::new() } else if x == 4 {InputSignature::from_args_list(vec!["1", "2"]) } else { InputSignature::from_args_list(vec!["1"]) },
+                OutputSignature::new(),
+                Box::new(move |_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(x))) }.boxed()),
+            ),
+                                                         None);
+            state = nstate
+        }
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
@@ -1120,20 +1050,20 @@ mod tests {
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state)).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &ExecutionStateEvaluation::Complete(state)).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(state.state_get(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get(&2), None);
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), Some(&RSV::Number(2)));
         assert_eq!(state.state_get(&3), Some(&RSV::Number(3)));
         assert_eq!(state.state_get(&4), None);
 
         // This is the final state we're arriving at in execution
-        let ((state_id, state), _) = db.step_execution(state_id, &state).await;
+        let ((state_id, state), _) = db.step_execution(state_id, &state).await?;
         assert_eq!(state.state_get(&1), None);
         assert_eq!(state.state_get(&2), None);
         assert_eq!(state.state_get(&3), None);
@@ -1141,6 +1071,7 @@ mod tests {
 
         // TODO: convert this to an actual test
         // dbg!(db.get_merged_state_history(state_id));
+        Ok(())
     }
 
 }

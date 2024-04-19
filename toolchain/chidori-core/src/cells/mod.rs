@@ -4,6 +4,7 @@ pub mod web_cell;
 pub mod llm_prompt_cell;
 pub mod memory_cell;
 pub mod embedding_cell;
+pub mod code_gen_cell;
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -253,6 +254,9 @@ pub struct EjectionConfig {
     pub mode: String
 }
 
+
+
+
 #[derive(
 Default,
 TS,
@@ -288,7 +292,6 @@ pub struct LLMPromptCellChatConfiguration {
     pub user: Option<String>,
     pub seed: Option<i64>,
     pub top_p: Option<f64>,
-    pub eject: Option<EjectionConfig>
 }
 
 #[derive(
@@ -320,6 +323,70 @@ pub enum LLMPromptCell {
     Completion {
         req: String,
     },
+}
+
+
+#[derive(
+Default,
+TS,
+Archive,
+serde::Serialize,
+serde::Deserialize,
+Serialize,
+Deserialize,
+Debug,
+PartialEq,
+Clone,
+)]
+#[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
+#[archive(check_bytes)]
+#[archive_attr(check_bytes(
+bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
+))]
+#[archive_attr(derive(Debug))]
+#[ts(export, export_to = "package_node/types/")]
+pub struct LLMCodeGenCellChatConfiguration {
+    #[serde(rename = "fn")]
+    pub(crate) function_name: Option<String>,
+
+    pub model: String,
+    pub frequency_penalty: Option<f64>,
+    pub max_tokens: Option<i64>,
+    pub presence_penalty: Option<f64>,
+    pub stop: Option<Vec<String>>,
+    pub temperature: Option<f64>,
+    pub logit_bias: Option<HashMap<String, i32>>,
+    pub user: Option<String>,
+    pub seed: Option<i64>,
+    pub top_p: Option<f64>,
+
+    pub language: Option<String>,
+}
+
+#[derive(
+TS,
+Archive,
+serde::Serialize,
+serde::Deserialize,
+Serialize,
+Deserialize,
+Debug,
+PartialEq,
+Clone,
+)]
+#[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
+#[archive(check_bytes)]
+#[archive_attr(check_bytes(
+bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
+))]
+#[archive_attr(derive(Debug))]
+#[ts(export, export_to = "package_node/types/")]
+pub struct LLMCodeGenCell {
+    pub function_invocation: bool,
+    pub configuration: LLMCodeGenCellChatConfiguration,
+    pub name: Option<String>,
+    pub provider: SupportedModelProviders,
+    pub req: String,
 }
 
 
@@ -368,6 +435,7 @@ pub struct LLMEmbeddingCell {
 #[ts(export, export_to = "package_node/types/")]
 pub enum CellTypes {
     Code(CodeCell),
+    CodeGen(LLMCodeGenCell),
     Prompt(LLMPromptCell),
     Embedding(LLMEmbeddingCell),
     Web(WebserviceCell),
@@ -401,6 +469,7 @@ pub fn get_cell_name(cell: &CellTypes) -> &Option<String> {
         CellTypes::Web(c) => &c.name,
         CellTypes::Template(c) => &c.name,
         CellTypes::Memory(c) => &c.name,
-        CellTypes::Embedding(c) => &c.name
+        CellTypes::Embedding(c) => &c.name,
+        CellTypes::CodeGen(c) => &c.name
     }
 }

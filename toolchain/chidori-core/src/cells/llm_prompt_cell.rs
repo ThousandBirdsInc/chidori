@@ -13,7 +13,7 @@ use crate::library::std::ai::llm::ai_llm_run_embedding_model;
 
 /// LLM Prompt Cells allow notebooks to invoke language models to generate text.
 #[tracing::instrument]
-pub fn llm_prompt_cell(cell: &LLMPromptCell) -> OperationNode {
+pub fn llm_prompt_cell(cell: &LLMPromptCell) -> anyhow::Result<OperationNode> {
     match cell {
         LLMPromptCell::Chat {
             function_invocation,
@@ -80,7 +80,7 @@ pub fn llm_prompt_cell(cell: &LLMPromptCell) -> OperationNode {
             }
 
             match provider {
-                SupportedModelProviders::OpenAI => OperationNode::new(
+                SupportedModelProviders::OpenAI => Ok(OperationNode::new(
                     name.clone(),
                     input_signature,
                     output_signature,
@@ -89,7 +89,7 @@ pub fn llm_prompt_cell(cell: &LLMPromptCell) -> OperationNode {
                         let name = name.clone();
                         // TODO: this state should error? or what should this do
                         if configuration.function_name.is_some() && !is_function_invocation {
-                            return async move { OperationFnOutput::with_value(RkyvSerializedValue::Null) }.boxed();
+                            return async move { Ok(OperationFnOutput::with_value(RkyvSerializedValue::Null)) }.boxed();
                         }
                         let s = s.clone();
                         let configuration = configuration.clone();
@@ -101,23 +101,23 @@ pub fn llm_prompt_cell(cell: &LLMPromptCell) -> OperationNode {
                                 name,
                                 is_function_invocation,
                                 configuration.clone()
-                            ).await;
-                            OperationFnOutput {
+                            ).await?;
+                            Ok(OperationFnOutput {
                                 execution_state: state,
                                 output: value,
                                 stdout: vec![],
                                 stderr: vec![],
-                            }
+                            })
                         }.boxed()
                     }),
-                ),
+                )),
             }
         }
-        LLMPromptCell::Completion { .. } => OperationNode::new(
+        LLMPromptCell::Completion { .. } => Ok(OperationNode::new(
             None,
             InputSignature::new(),
             OutputSignature::new(),
-            Box::new(|_, x, _, _| async move { OperationFnOutput::with_value(x) }.boxed()),
-        ),
+            Box::new(|_, x, _, _| async move { Ok(OperationFnOutput::with_value(x)) }.boxed()),
+        )),
     }
 }

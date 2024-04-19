@@ -52,6 +52,7 @@ tracing-flame = "0.2.0"
 bincode = "2.0.0-rc.3"
 petgraph = "0.6.3"
 insta = { version = "1.38.0", features = ["yaml", "redactions"] }
+thiserror = "1.0.58"
 
 [patch.crates-io]
 deno = {path = "../../deno/cli"}

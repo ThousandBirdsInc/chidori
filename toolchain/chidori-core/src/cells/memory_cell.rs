@@ -10,7 +10,7 @@ use crate::library::std::ai::memory::in_memory::InMemoryVectorDb;
 /// Memory cells when first executed have no inputs. They initialize the connection to the memory store.
 /// Once initialized they become communicated with over the functions that they provide to the workspace.
 #[tracing::instrument]
-pub fn memory_cell(cell: &MemoryCell) -> OperationNode {
+pub fn memory_cell(cell: &MemoryCell) -> anyhow::Result<OperationNode> {
     match cell.provider {
         SupportedMemoryProviders::InMemory => {
             let mut input_signature = InputSignature::new();
@@ -39,7 +39,7 @@ pub fn memory_cell(cell: &MemoryCell) -> OperationNode {
                 );
             }
             let cell = cell.clone();
-            OperationNode::new(
+            Ok(OperationNode::new(
                 None,
                 input_signature,
                 output_signature,
@@ -57,7 +57,7 @@ pub fn memory_cell(cell: &MemoryCell) -> OperationNode {
                                 if let Ok((key, value, sender)) = async_rpccommunication.receiver.try_recv() {
                                     match key.as_str() {
                                         "insert" => {
-                                            let (embedded_value, _) = s.dispatch(&embedding_function, value.clone()).await;
+                                            let (embedded_value, _) = s.dispatch(&embedding_function, value.clone()).await?;
                                             let embedding = rkyv_to_vec_float(embedded_value);
                                             let contents = serialized_value_to_json_value(&value);
                                             let row = vec![(&embedding, contents)];
@@ -65,7 +65,7 @@ pub fn memory_cell(cell: &MemoryCell) -> OperationNode {
                                             sender.send(RkyvSerializedValue::String(String::from("Success"))).unwrap();
                                         }
                                         "search" => {
-                                            let (embedded_value, _) = s.dispatch(&embedding_function, value.clone()).await;
+                                            let (embedded_value, _) = s.dispatch(&embedding_function, value.clone()).await?;
                                             let embedding = rkyv_to_vec_float(embedded_value);
                                             let results = db.search("default".to_string(), embedding, 5);
                                             let mut output = vec![];
@@ -81,11 +81,12 @@ pub fn memory_cell(cell: &MemoryCell) -> OperationNode {
                                     tokio::time::sleep(Duration::from_millis(10)).await; // Sleep for 10 milliseconds
                                 }
                             }
+                            anyhow::Ok(())
                         }).await.unwrap();
-                        OperationFnOutput::with_value(RkyvSerializedValue::Null)
+                        Ok(OperationFnOutput::with_value(RkyvSerializedValue::Null))
                     }.boxed()
                 }),
-            )
+            ))
         },
         // SupportedMemoryProviders::Qdrant => {
         //
@@ -115,7 +116,7 @@ mod test {
     use crate::execution::primitives::serialized_value::RkyvSerializedValue;
 
     #[tokio::test]
-    async fn test_memory_cell() {
+    async fn test_memory_cell() -> anyhow::Result<()> {
         let (async_rpc_communication, rpc_sender, callable_interface_receiver) = AsyncRPCCommunication::new();
         let mut state = ExecutionState::new();
         let (mut state, _) = state.update_op(CellTypes::Code(CodeCell {
@@ -126,12 +127,12 @@ mod test {
                             return [0.1, 0.2, 0.3]
                         "#}),
             function_invocation: None,
-        }), Some(0));
+        }), Some(0))?;
         let op = memory_cell(&MemoryCell {
             name: None,
             provider: SupportedMemoryProviders::InMemory,
             embedding_function: "fake_embedding".to_string(),
-        });
+        })?;
         let ex = op.execute(&state, RkyvSerializedValue::Null, None, Some(async_rpc_communication));
         let join_handle = tokio::spawn(async move {
             ex.await;
@@ -146,5 +147,6 @@ mod test {
         rpc_sender.send(("search".to_string(), RkyvSerializedValue::String("Demo".to_string()), s)).unwrap();
         let result = r.await.unwrap();
         assert_eq!(result, RkyvSerializedValue::Array(vec![RkyvSerializedValue::String("Demonstration".to_string())]));
+        Ok(())
     }
 }

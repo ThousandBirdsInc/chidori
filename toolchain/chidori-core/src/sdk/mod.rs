@@ -1,2 +1,2 @@
 pub mod entry;
-mod md;
+pub mod md;
