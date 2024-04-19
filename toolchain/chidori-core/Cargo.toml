@@ -117,3 +117,5 @@ tonic-build = "0.9.2"
 target-lexicon = "0.12"
 dirs = "3.0"
 pyo3-build-config = "0.19.1"
+rye = {path = "/Users/coltonpierson/work/rye/rye"}
+anyhow = "1.0.82"

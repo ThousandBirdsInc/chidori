@@ -87,11 +87,14 @@ fn main() {
                 .expect("Failed to lock background_thread");
             let chidori = internal_state.chidori.clone();
             *background_thread_guard = Some(tauri::async_runtime::spawn(async move {
-                let mut chidori_guard = chidori.lock().unwrap();
-                let mut instance = chidori_guard.get_instance().unwrap();
-                // Drop the lock on chidori to avoid deadlock
-                drop(chidori_guard);
-                instance.run();
+                let mut instance = {
+                    let mut chidori_guard = chidori.lock().unwrap();
+                    let mut instance = chidori_guard.get_instance().unwrap();
+                    // Drop the lock on chidori to avoid deadlock
+                    drop(chidori_guard);
+                    instance
+                };
+                instance.run().await;
             }));
 
 
@@ -173,36 +176,40 @@ fn get_loaded_path(app_handle: AppHandle) -> String {
 }
 
 #[tauri::command]
-fn move_state_view_to_id(id: ExecutionNodeId, app_handle: AppHandle) {
+fn move_state_view_to_id(id: ExecutionNodeId, app_handle: AppHandle) -> Result<(), String> {
     let env = app_handle.state::<InternalState>();
     let env = env.chidori.lock().unwrap();
-    env.handle_user_action(UserInteractionMessage::RevertToState(Some(id)));
+    env.handle_user_action(UserInteractionMessage::RevertToState(Some(id))).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
-fn play(app_handle: AppHandle) {
+fn play(app_handle: AppHandle) -> Result<(), String>  {
     let env = app_handle.state::<InternalState>();
     let env = env.chidori.lock().unwrap();
-    env.handle_user_action(UserInteractionMessage::Play);
+    env.handle_user_action(UserInteractionMessage::Play).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
-fn pause(app_handle: AppHandle) {
+fn pause(app_handle: AppHandle) -> Result<(), String>  {
     let env = app_handle.state::<InternalState>();
     let env = env.chidori.lock().unwrap();
-    env.handle_user_action(UserInteractionMessage::Pause);
+    env.handle_user_action(UserInteractionMessage::Pause).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
-fn set_execution_id(app_handle: AppHandle, id: (usize, usize)) {
+fn set_execution_id(app_handle: AppHandle, id: (usize, usize)) -> Result<(), String>  {
     let env = app_handle.state::<InternalState>();
     let env = env.chidori.lock().unwrap();
-    env.handle_user_action(UserInteractionMessage::RevertToState(Some(id)));
+    env.handle_user_action(UserInteractionMessage::RevertToState(Some(id))).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 
 #[tauri::command]
-fn load_and_watch_directory(path: String, app_handle: AppHandle) {
+fn load_and_watch_directory(path: String, app_handle: AppHandle) -> Result<(), String>  {
     let internal_state = app_handle.state::<InternalState>();
     let chidori = internal_state.chidori.clone();
     let mut file_watch_guard = internal_state.file_watch.lock().expect("Failed to lock file_watch");
@@ -230,9 +237,11 @@ fn load_and_watch_directory(path: String, app_handle: AppHandle) {
     {
         let mut chidori_guard = chidori.lock().expect("Failed to lock chidori");
         dbg!("Loading directory");
-        chidori_guard.load_md_directory(Path::new(&path));
+        chidori_guard.load_md_directory(Path::new(&path)).map_err(|e| e.to_string())?;
     }
+    Ok(())
 }
+
 
 fn maintain_execution_graph(elements: &Vec<(ExecutionNodeId, ExecutionNodeId)>) -> String {
     let mut nodes = HashSet::new();

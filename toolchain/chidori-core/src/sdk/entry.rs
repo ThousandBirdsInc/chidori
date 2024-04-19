@@ -335,10 +335,11 @@ impl Chidori {
     }
 
     #[tracing::instrument]
-    pub fn handle_user_action(&self, action: UserInteractionMessage) {
+    pub fn handle_user_action(&self, action: UserInteractionMessage) -> anyhow::Result<()> {
         if let Some(tx) = &self.instanced_env_tx {
-            tx.send(action).unwrap();
+            tx.send(action)?;
         }
+        Ok(())
     }
 
     fn load_cells(&mut self, cells: Vec<CellTypes>) -> anyhow::Result<()>  {
@@ -376,7 +377,7 @@ impl Chidori {
         }
         self.shared_state.lock().unwrap().cells = new_cells_state;
         println!("Cells commit to shared state");
-        self.handle_user_action(UserInteractionMessage::ReloadCells);
+        self.handle_user_action(UserInteractionMessage::ReloadCells)?;
         Ok(())
     }
 
@@ -798,9 +799,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_core1_simple() {
+    async fn test_core1_simple_math() {
         let mut ee = Chidori::new();
-        ee.load_md_directory(Path::new("./examples/core1_simple")).unwrap();
+        ee.load_md_directory(Path::new("./examples/core1_simple_math")).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
         env.get_state().render_dependency_graph();

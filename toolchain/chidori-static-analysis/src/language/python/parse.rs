@@ -355,8 +355,47 @@ fn traverse_expression(expr: &ast::Expr, machine: &mut ASTWalkContext) {
     }
 }
 
+fn extract_python_comments(code: &str) -> Vec<String> {
+    let mut comments = Vec::new();
+    let mut current_block = Vec::new();
+    let lines = code.lines();
+
+    for line in lines {
+        let trimmed_line = line.trim();
+        if let Some(pos) = trimmed_line.find('#') {
+            let is_start_of_line = pos == 0;
+            let comment = trimmed_line[pos..].trim_start_matches('#').trim().to_string();
+
+            if !comment.is_empty() {
+                if is_start_of_line {
+                    current_block.push(comment);
+                } else {
+                    if !current_block.is_empty() {
+                        comments.push(current_block.join("\n"));
+                        current_block.clear();
+                    }
+                    comments.push(comment);
+                }
+            }
+        } else {
+            if !current_block.is_empty() {
+                comments.push(current_block.join("\n"));
+                current_block.clear();
+            }
+        }
+    }
+
+    // Add any remaining comments that may be in a block at the end of the code
+    if !current_block.is_empty() {
+        comments.push(current_block.join("\n"));
+    }
+
+    comments
+}
+
 pub fn extract_dependencies_python(source_code: &str) -> Vec<Vec<ContextPath>> {
     // TODO: extract comments and associate them based on position relative to functions
+    let mut comments = extract_python_comments(source_code);
     let ast = ast::Suite::parse(source_code, "<embedded>").unwrap();
     let mut machine = ASTWalkContext::default();
     traverse_statements(&ast, &mut machine);
@@ -748,22 +787,18 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                     // This is an exposed value if it does not occur inside the scope of a function
                     if encountered
                         .iter()
-                        .find(|x| {
-                            if let ContextPath::InFunction(_) = x {
-                                true
-                            } else {
-                                false
-                            }
-                        })
+                        .find(|x| matches!(x, ContextPath::InFunction(_)))
                         .is_none()
                     {
-                        exposed_values.insert(
-                            identifier.clone(),
-                            ReportItem {
-                                // context_path: context_path.clone(),
-                            },
-                        );
-                        continue;
+                        if encountered.contains(&&ContextPath::AssignmentToStatement) {
+                            exposed_values.insert(
+                                identifier.clone(),
+                                ReportItem {
+                                    // context_path: context_path.clone(),
+                                },
+                            );
+                            continue;
+                        }
                     }
 
                     // If this value is not being assigned to, then it is a dependency
@@ -934,6 +969,7 @@ mod tests {
         });
 
     }
+
 
 
     #[test]
@@ -1159,6 +1195,27 @@ x = random.randint(0, 10)
         };
 
         assert_eq!(result, report);
+    }
+
+    #[test]
+    fn test_reference_to_undeclared_function() {
+        let python_source = indoc! { r#"
+            out = await read_file_and_load_to_memory("./")
+            "#};
+        let context_stack_references = extract_dependencies_python(python_source);
+        insta::with_settings!({
+            description => python_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            description => python_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
     }
 
     #[test]

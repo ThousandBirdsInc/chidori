@@ -114,6 +114,8 @@ pub struct ExecutionState {
     // TODO: this is a channel sender to update the execution graph
     pub graph_sender: Option<Arc<Sender<(ExecutionState, tokio::sync::mpsc::Sender<String>)>>>,
 
+    pub exec_queue: Vec<usize>,
+
     // TODO: call_stack is only ever a single coroutine at a time and instead its the stack of execution states being resolved?
     // pub call_stack: Arc<Mutex<Pin<Box<dyn Coroutine<Return=CoroutineYieldValue, Yield=CoroutineYieldValue>>>>>,
 
@@ -207,6 +209,7 @@ impl ExecutionState {
         ExecutionState {
             op_counter: 0,
             graph_sender: None,
+            exec_queue: vec![],
             state: Default::default(),
             operation_name_to_id: Default::default(),
             operation_by_id: Default::default(),
@@ -221,6 +224,7 @@ impl ExecutionState {
         ExecutionState {
             op_counter: 0,
             graph_sender: Some(graph_sender),
+            exec_queue: vec![],
             state: Default::default(),
             operation_name_to_id: Default::default(),
             operation_by_id: Default::default(),
@@ -309,6 +313,7 @@ impl ExecutionState {
         let mut op = match &cell {
             CellTypes::Code(c) => crate::cells::code_cell::code_cell(c),
             CellTypes::Prompt(c) => crate::cells::llm_prompt_cell::llm_prompt_cell(c),
+            CellTypes::Embedding(c) => crate::cells::embedding_cell::llm_embedding_cell(c),
             CellTypes::Web(c) => crate::cells::web_cell::web_cell(c),
             CellTypes::Template(c) => crate::cells::template_cell::template_cell(c),
             CellTypes::Memory(c) => crate::cells::memory_cell::memory_cell(c)
@@ -514,6 +519,9 @@ impl ExecutionState {
                     }
                 }
             }
+            CellTypes::Embedding(c) => {
+                crate::cells::embedding_cell::llm_embedding_cell(&c)
+            }
             _ => {
                 unreachable!("Unsupported cell type");
             }
@@ -543,6 +551,7 @@ impl ExecutionState {
         let operation_ids: Vec<OperationId> = operation_by_id.keys().copied().collect();
 
         // Every step, each operation consumes from its incoming edges.
+        // TODO: use the exec queue here
         'traverse_nodes: for operation_id in operation_ids {
 
             // We skip nodes that are currently locked due to long running execution

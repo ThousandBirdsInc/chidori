@@ -1,0 +1,13 @@
+[project]
+name = "chidori-core"
+version = "1.0.0"
+description = ""
+authors = [{ name = "Colton Pierson", email = "colton@thousandbirds.ai" }]
+dependencies = [
+]
+readme = "README.md"
+requires-python = "== 3.11"
+
+[tool.rye]
+managed = true
+virtual = true

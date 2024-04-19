@@ -27,7 +27,7 @@ export async function syncDefinitionGraphState() {
 export async function syncExecutionGraphState() {
   const unlisten = await listen('sync:executionGraphState', (event) => {
     console.log('sync:executionGraphState', event.payload)
-    executionGraphState.set(event.payload)
+    executionGraphState.set(JSON.parse(event.payload))
   });
   return unlisten
 }
@@ -35,7 +35,7 @@ export async function syncExecutionGraphState() {
 export async function syncCellsState() {
   const unlisten = await listen('sync:cellsState', (event) => {
     console.log('sync:cellsState', event.payload)
-    cellsState.set(event.payload)
+    cellsState.set(JSON.parse(event.payload))
   });
   return unlisten
 }
@@ -43,7 +43,7 @@ export async function syncCellsState() {
 export async function syncObserveState() {
   const unlisten = await listen('sync:observeState', (event) => {
     console.log('sync:observeState', event.payload)
-    observeState.set(event.payload)
+    observeState.set(JSON.parse(event.payload))
   });
   return unlisten
 }

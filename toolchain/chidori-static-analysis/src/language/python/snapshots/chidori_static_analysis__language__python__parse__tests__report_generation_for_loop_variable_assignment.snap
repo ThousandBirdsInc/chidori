@@ -4,6 +4,11 @@ description: "async def run_prompt(number_of_states):\n    out = \"\"\n    for s
 ---
 - - InFunction: run_prompt
 - - InFunction: run_prompt
+  - FunctionArguments
+  - IdentifierReferredTo:
+      - number_of_states
+      - false
+- - InFunction: run_prompt
   - AssignmentToStatement
   - IdentifierReferredTo:
       - out

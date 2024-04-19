@@ -3,7 +3,7 @@ use chidori_prompt_format::extract_yaml_frontmatter_string;
 use indoc::indoc;
 use std::collections::HashMap;
 use std::path::Path;
-use crate::cells::{CellTypes, CodeCell, LLMPromptCell, MemoryCell, SupportedLanguage, SupportedMemoryProviders, SupportedModelProviders, TemplateCell, WebserviceCell};
+use crate::cells::{CellTypes, CodeCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, SupportedMemoryProviders, SupportedModelProviders, TemplateCell, WebserviceCell};
 
 #[derive(PartialEq, Debug)]
 pub struct MarkdownCodeBlock {
@@ -114,7 +114,7 @@ pub fn interpret_code_block(block: &MarkdownCodeBlock) -> Option<CellTypes> {
             provider: SupportedMemoryProviders::InMemory,
             embedding_function: block.body.clone(),
         })),
-        "embedding" => Some(CellTypes::Prompt(LLMPromptCell::Embedding {
+        "embedding" => Some(CellTypes::Embedding(LLMEmbeddingCell {
             function_invocation: false,
             configuration: serde_yaml::from_str(&frontmatter).unwrap(),
             name: block.name.clone(),

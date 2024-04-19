@@ -4,6 +4,11 @@ expression: context_stack_references
 ---
 - - InFunction: run_prompt
 - - InFunction: run_prompt
+  - FunctionArguments
+  - IdentifierReferredTo:
+      - number_of_states
+      - false
+- - InFunction: run_prompt
   - AssignmentToStatement
   - IdentifierReferredTo:
       - out

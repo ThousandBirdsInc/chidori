@@ -3,6 +3,8 @@
 Memory cells are an example of persistent stateful cells, once initially invoked they expose methods 
 to the rest of the environment that manipulate their internal state. Memory specifically exposes "insert" and
 "search" methods which are used to store and retrieve values respectively.
+
+We must assign an embedding_fn to the memory cell, in this case we're using an embedding cell to simplify the process.
 ```memory (stateful_memory)
 ---
 embedding_fn: rag
@@ -35,11 +37,5 @@ def read_file_and_load_to_memory(file_path):
 
 To demonstrate this functionality we're going to search for lines that match the embedding "test".
 ```python (entry)
-import unittest
-
-class TestMarshalledValues(unittest.IsolatedAsyncioTestCase):
-    async def test_run_prompt(self):
-        self.assertEqual(await read_file_and_load_to_memory("./"), 4)
-
-unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
+out = await read_file_and_load_to_memory("./")
 ```

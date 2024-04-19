@@ -5,8 +5,10 @@ def add_two_numbers(a, b):
       return a + b
 ```
 
+
 ```prompt (add_population)
 ---
+fn: add_population
 model: gpt-3.5-turbo
 import:
   - add_two_numbers

@@ -315,7 +315,7 @@ pub async fn ai_llm_run_chat_model(
     name: Option<String>,
     is_function_invocation: bool,
     configuration: LLMPromptCellChatConfiguration
-) -> RkyvSerializedValue {
+) -> (RkyvSerializedValue, Option<ExecutionState>) {
     let mut template_messages: Vec<TemplateMessage> = Vec::new();
     let data = template_data_payload_from_rkyv(&payload);
 
@@ -340,12 +340,9 @@ pub async fn ai_llm_run_chat_model(
     let c = crate::library::std::ai::llm::openai::OpenAIChatModel::new(api_url_v1.to_string(), api_key);
 
 
-    if let Some(ejection_config) = &configuration.eject {
-        // TODO: If the configuration is ejection, mutate the state with a new cell based on the return type
-    }
 
     let result = c.batch(ChatCompletionReq {
-        config: configuration,
+        config: configuration.clone(),
         template_messages,
         tool_choice: None,
         tools: if tools.is_empty() {
@@ -359,6 +356,8 @@ pub async fn ai_llm_run_chat_model(
     if let Ok(ChatCompletionRes { choices, .. }) = result {
         let mut results = vec![];
         for choice in choices {
+
+            // TODO: how do we handle tools in the case of reference as a function
             if choice.tool_calls.is_some() {
                 let mut result_map = HashMap::new();
                 for tool_call in choice.tool_calls.unwrap() {
@@ -371,34 +370,64 @@ pub async fn ai_llm_run_chat_model(
                         result_map.insert(function_name.clone(), dispatch_result);
                     }
                 }
-                results.push(RkyvSerializedValue::Object(result_map));
-            }
-
-            // if invoked as a function don't nest the result in a named key, return the response as a direct string
-            let mut result_map = HashMap::new();
-            if is_function_invocation {
-                results.push(RkyvSerializedValue::String(choice.text.as_ref().unwrap().clone()))
-            } else {
-                if let Some(name) = &name {
-                    if let Some(text) = &choice.text {
-                        result_map.insert(name.clone(), RkyvSerializedValue::String(text.clone()));
-                        results.push(RkyvSerializedValue::Object(result_map));
-                    } else {
-                        // TODO: dispatch the function executions
-                        results.push(RkyvSerializedValue::Null)
-                    }
+                if is_function_invocation {
+                    results.push(RkyvSerializedValue::Object(result_map));
                 } else {
-                    panic!("Unnamed function execution");
+                    if let Some(name) = &name {
+                        let result = RkyvObjectBuilder::new()
+                            .insert_value(&name, RkyvSerializedValue::Object(result_map))
+                            .build();
+                        results.push(result);
+                    }
+                }
+            } else {
+                let mut result_map = HashMap::new();
+                // if invoked as a function don't nest the result in a named key, return the response as a direct string
+                if is_function_invocation {
+                    results.push(RkyvSerializedValue::String(choice.text.as_ref().unwrap().clone()))
+                } else {
+                    if let Some(name) = &name {
+                        if let Some(text) = &choice.text {
+                            result_map.insert(name.clone(), RkyvSerializedValue::String(text.clone()));
+                            results.push(RkyvSerializedValue::Object(result_map));
+                        }
+                    } else {
+                        panic!("Unnamed function execution");
+                    }
+                }
+
+                if let Some(ejection_config) = &configuration.eject {
+                    // TODO: If the configuration is ejection, mutate the state with a new cell based on the return type
+                    let (new_execution_state, _) = execution_state.update_op(crate::cells::CellTypes::Code(crate::cells::CodeCell {
+                        name: None,
+                        language: match ejection_config.language.as_str() {
+                            "python" => crate::cells::SupportedLanguage::PyO3,
+                            "javascript" => crate::cells::SupportedLanguage::Deno,
+                            _ => crate::cells::SupportedLanguage::PyO3,
+                        },
+                        source_code: choice.text.as_ref().unwrap().clone(),
+                        function_invocation: None,
+                    }), None);
+
+                    let out = if results.len() == 1 {
+                        results[0].clone()
+                    } else {
+                        RkyvSerializedValue::Array(results)
+                    };
+                    return (out, Some(new_execution_state));
                 }
             }
+
         }
-        if results.len() == 1 {
+
+        let out = if results.len() == 1 {
             results[0].clone()
         } else {
             RkyvSerializedValue::Array(results)
-        }
+        };
+        (out, None)
     } else {
-        RkyvSerializedValue::Null
+        (RkyvSerializedValue::Null, None)
     }
 }
 

@@ -1,0 +1,17 @@
+---
+source: chidori-static-analysis/src/language/python/parse.rs
+description: "out = await read_file_and_load_to_memory(\"./\")\n"
+---
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      - out
+      - false
+- - AssignmentFromStatement
+  - InCallExpression
+  - Constant: "./"
+- - AssignmentFromStatement
+  - InCallExpression
+  - Constant: "./"
+  - IdentifierReferredTo:
+      - read_file_and_load_to_memory
+      - false
