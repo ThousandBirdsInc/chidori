@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::{Arc, mpsc, Mutex, MutexGuard};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::sleep;
+use chumsky::prelude::any;
 use petgraph::graphmap::DiGraphMap;
 use serde::ser::SerializeMap;
 use crate::execution::primitives::operation::OperationFnOutput;
@@ -43,7 +44,7 @@ pub struct InstancedEnvironment {
     execution_head_state_id: (usize, usize),
     playback_state: PlaybackState,
     runtime_event_sender: Option<Sender<EventsFromRuntime>>,
-    sender: Option<Sender<TraceEvents>>,
+    trace_event_sender: Option<Sender<TraceEvents>>,
     shared_state: Arc<Mutex<SharedState>>
 }
 
@@ -66,7 +67,7 @@ impl InstancedEnvironment {
             db,
             execution_head_state_id: state_id,
             runtime_event_sender: None,
-            sender: None,
+            trace_event_sender: None,
             playback_state,
             shared_state: Arc::new(Mutex::new(SharedState::new())),
         }
@@ -100,20 +101,28 @@ impl InstancedEnvironment {
         }
 
         if let Some(sender) = self.runtime_event_sender.as_mut() {
-            sender.send(EventsFromRuntime::CellsUpdated(serde_json::to_string(&shared_state.cells.clone()).unwrap())).unwrap();
+            sender.send(EventsFromRuntime::CellsUpdated(shared_state.cells.clone())).unwrap();
         }
         Ok(())
     }
 
+    // pub fn testing(&mut self, handle: tokio::runtime::Handle) -> anyhow::Result<()> {
+    //     handle.spawn(async move {
+    //         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    //         anyhow::Ok(())
+    //     });
+    //     anyhow::Ok(())
+    // }
+
     /// Entrypoint for execution of an instanced environment, handles messages from the host
-    #[tracing::instrument]
     pub async fn run(&mut self) -> anyhow::Result<()> {
         self.playback_state = PlaybackState::Paused;
 
         // Reload cells to make sure we're up to date
         self.reload_cells();
 
-        let _maybe_guard = self.sender.as_ref().map(|sender| {
+        let _maybe_guard = self.trace_event_sender.as_ref().map(|sender| {
+            tracing::subscriber::set_global_default(init_internal_telemetry(sender.clone()));
             tracing::subscriber::set_default(init_internal_telemetry(sender.clone()))
         });
         loop {
@@ -133,14 +142,14 @@ impl InstancedEnvironment {
                             self.execution_head_state_id = id;
                             let merged_state = self.db.get_merged_state_history(&id);
                             let sender = self.runtime_event_sender.as_mut().unwrap();
-                            sender.send(EventsFromRuntime::ExecutionStateChange(serde_json::to_string(&merged_state).unwrap())).unwrap();
+                            sender.send(EventsFromRuntime::ExecutionStateChange(merged_state)).unwrap();
                         }
                     },
                     _ => {}
                 }
             }
             if self.playback_state == PlaybackState::Paused {
-                sleep(std::time::Duration::from_millis(1000));
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
             } else {
                 let output = self.step().await?;
                 // If nothing happened, pause playback and wait for the user
@@ -166,7 +175,7 @@ impl InstancedEnvironment {
         let ((state_id, state), outputs) = self.db.external_step_execution(self.execution_head_state_id).await?;
         if let Some(sender) = self.runtime_event_sender.as_mut() {
             sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
-            sender.send(EventsFromRuntime::ExecutionStateChange(serde_json::to_string(&self.db.get_merged_state_history(&state_id)).unwrap())).unwrap();
+            sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
         }
         println!("Resulted in state with id {:?}", &state_id);
         self.execution_head_state_id = state_id;
@@ -179,7 +188,7 @@ impl InstancedEnvironment {
         println!("Upserting cell into state with id {:?}", &self.execution_head_state_id);
         let ((state_id, state), op_id) = self.db.mutate_graph(self.execution_head_state_id, cell, op_id)?;
         if let Some(sender) = self.runtime_event_sender.as_mut() {
-            sender.send(EventsFromRuntime::ExecutionStateChange(serde_json::to_string(&self.db.get_merged_state_history(&state_id)).unwrap())).unwrap();
+            sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
             sender.send(EventsFromRuntime::DefinitionGraphUpdated(state.get_dependency_graph_flattened())).unwrap();
             sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
         }
@@ -220,26 +229,19 @@ pub enum UserInteractionMessage {
 //       for now we will serialize these to Strings on this side of the interface
 //       the original type of this object is as follows:
 //
-// #[derive(Clone, Debug, Serialize, Deserialize)]
-// pub enum EventsFromRuntime {
-//     DefinitionGraphUpdated(Vec<(OperationId, OperationId, Vec<DependencyReference>)>),
-//     ExecutionGraphUpdated(Vec<(ExecutionNodeId, ExecutionNodeId)>),
-//     ExecutionStateChange(MergedStateHistory),
-//     CellsUpdated(Vec<CellHolder>)
-// }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum EventsFromRuntime {
     DefinitionGraphUpdated(Vec<(OperationId, OperationId, Vec<DependencyReference>)>),
     ExecutionGraphUpdated(Vec<(ExecutionNodeId, ExecutionNodeId)>),
-    ExecutionStateChange(String),
-    CellsUpdated(String)
+    ExecutionStateChange(MergedStateHistory),
+    CellsUpdated(Vec<CellHolder>)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct CellHolder {
-    cell: CellTypes,
-    op_id: Option<usize>,
-    applied_at: Option<ExecutionNodeId>,
+    pub cell: CellTypes,
+    pub op_id: Option<usize>,
+    pub applied_at: Option<ExecutionNodeId>,
     needs_update: bool
 }
 
@@ -418,7 +420,7 @@ impl Chidori {
             db,
             execution_head_state_id: state_id,
             runtime_event_sender: self.runtime_event_sender.clone(),
-            sender: self.trace_event_sender.clone(),
+            trace_event_sender: self.trace_event_sender.clone(),
             playback_state,
             shared_state: self.shared_state.clone(),
         })
@@ -427,11 +429,12 @@ impl Chidori {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use super::*;
     use crate::execution::primitives::serialized_value::RkyvObjectBuilder;
     use indoc::indoc;
     use tokio::runtime::Runtime;
-    use crate::cells::{CodeCell, LLMPromptCell, LLMPromptCellChatConfiguration, SupportedLanguage, SupportedModelProviders};
+    use crate::cells::{CodeCell, LLMPromptCell, LLMPromptCellChatConfiguration, SupportedLanguage, SupportedModelProviders, TextRange};
     use crate::utils;
 
     #[tokio::test]
@@ -444,7 +447,7 @@ mod tests {
                         x = 20
                         "#}),
             function_invocation: None,
-        }),
+        }, TextRange::default()),
                                            None)?;
         assert_eq!(op_id_x, 0);
         let (_, op_id_y) = env.upsert_cell(CellTypes::Code(CodeCell {
@@ -454,7 +457,7 @@ mod tests {
                         y = x + 1
                         "#}),
             function_invocation: None,
-        }),
+        }, TextRange::default()),
                                            None)?;
         assert_eq!(op_id_y, 1);
         // env.resolve_dependencies_from_input_signature();
@@ -485,7 +488,7 @@ mod tests {
                         x = "Here is a sample string"
                         "#}),
             function_invocation: None,
-        }),
+        }, TextRange::default()),
                                            None)?;
         assert_eq!(op_id_x, 0);
         let (_, op_id_y) = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
@@ -498,7 +501,7 @@ mod tests {
                       What is the first word of the following: {{x}}.
                     "
                 .to_string(),
-        }),
+        }, TextRange::default()),
                                            None)?;
         assert_eq!(op_id_y, 1);
         env.get_state().render_dependency_graph();
@@ -532,7 +535,7 @@ mod tests {
                         x = ch.prompt("generate_names", x="John")
                         "#}),
             function_invocation: None,
-        }),
+        }, TextRange::default()),
                                            None)?;
         assert_eq!(op_id_x, 0);
         let (_, op_id_y) = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
@@ -544,7 +547,7 @@ mod tests {
                       Generate names starting with {{x}}
                     "
                 .to_string(),
-        }),
+        }, TextRange::default()),
                                            None)?;
         assert_eq!(op_id_y, 1);
         env.get_state().render_dependency_graph();
@@ -574,7 +577,7 @@ mod tests {
                             return x + y
                         "#}),
             function_invocation: None,
-        }),
+        }, TextRange::default()),
                                       None)?;
         assert_eq!(id, 0);
         let (_, id) = env.upsert_cell(CellTypes::Code(CodeCell {
@@ -584,7 +587,7 @@ mod tests {
             source_code: String::from(indoc! { r#"
                         y = add(2, 3)
                         "#}),
-        }),
+        }, TextRange::default()),
                                       None)?;
         assert_eq!(id, 1);
         env.get_state().render_dependency_graph();
@@ -615,7 +618,7 @@ mod tests {
                             return x + y
                         "#}),
             function_invocation: None,
-        }),
+        }, TextRange::default()),
                                       None)?;
         assert_eq!(id, 0);
         let (_, id) = env.upsert_cell(CellTypes::Code(CodeCell {
@@ -625,7 +628,7 @@ mod tests {
             source_code: String::from(indoc! { r#"
                         const y = await add(2, 3);
                         "#}),
-        }),
+        }, TextRange::default()),
                                       None)?;
         assert_eq!(id, 1);
         env.get_state().render_dependency_graph();
@@ -808,25 +811,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_core1_simple_math() {
+    async fn test_core1_simple_math() -> anyhow::Result<()>{
         let mut ee = Chidori::new();
         ee.load_md_directory(Path::new("./examples/core1_simple_math")).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
         env.get_state().render_dependency_graph();
-        dbg!(env.step().await);
+        let out = env.step().await?;
+        assert_eq!(out[0].1.output, RkyvObjectBuilder::new().insert_number("x", 20).build());
+        let out = env.step().await?;
+        assert_eq!(out[0].1.output, RkyvObjectBuilder::new().insert_number("y", 400).build());
+        let out = env.step().await?;
+        assert_eq!(out[0].1.output, RkyvObjectBuilder::new().insert_number("zj", 420).build());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_core2_marshalling() {
+    async fn test_core2_marshalling() -> anyhow::Result<()> {
         let mut ee = Chidori::new();
         ee.load_md_directory(Path::new("./examples/core2_marshalling")).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
         env.get_state().render_dependency_graph();
-        env.step().await;
-        env.step().await;
+        let mut out = env.step().await?;
+        out.sort_by(|a, b| b.0.cmp(&a.0));
+        assert_eq!(out[0].0, 2);
+        assert_eq!(out[0].1.output, RkyvObjectBuilder::new()
+            .insert_object("y3", RkyvObjectBuilder::new()
+                .insert_number("a", 1)
+                .insert_number("b", 2)
+                .insert_number("c", 3)
+            )
+            .insert_value("y2", RkyvSerializedValue::Array(vec![
+                RkyvSerializedValue::Number(1),
+                RkyvSerializedValue::Number(2),
+                RkyvSerializedValue::Number(3),
+            ]))
+            .insert_number("y0", 1)
+            .insert_number("y5", 1)
+            .insert_value("y6", RkyvSerializedValue::Array(vec![
+                RkyvSerializedValue::Number(1),
+                RkyvSerializedValue::Number(2),
+                RkyvSerializedValue::Number(3),
+            ]))
+            .insert_value("y1", RkyvSerializedValue::String("string".to_string()))
+            .insert_value("y4", RkyvSerializedValue::Boolean(false))
+            .build());
+        assert_eq!(out[1].0, 0);
+        assert_eq!(out[1].1.output, RkyvObjectBuilder::new()
+            .insert_value("x2", RkyvSerializedValue::Array(vec![
+                RkyvSerializedValue::Number(1),
+                RkyvSerializedValue::Number(2),
+                RkyvSerializedValue::Number(3),
+            ]))
+            .insert_object("x3", RkyvObjectBuilder::new()
+                .insert_number("a", 1)
+                .insert_number("b", 2)
+                .insert_number("c", 3)
+            )
+            .insert_number("x0", 1)
+            .insert_value("x5", RkyvSerializedValue::Float(1.0))
+            .insert_value("x6", RkyvSerializedValue::Array(vec![
+                RkyvSerializedValue::Number(1),
+                RkyvSerializedValue::Number(2),
+                RkyvSerializedValue::Number(3),
+            ]))
+            .insert_value("x1", RkyvSerializedValue::String("string".to_string()))
+            .insert_value("x4", RkyvSerializedValue::Boolean(false))
+            .insert_value("x7", RkyvSerializedValue::Set(HashSet::from_iter(vec![
+                RkyvSerializedValue::String("c".to_string()),
+                RkyvSerializedValue::String("a".to_string()),
+                RkyvSerializedValue::String("b".to_string()),
+            ].iter().cloned())))
+            .build());
+        let mut out = env.step().await?;
+        assert_eq!(out[0].0, 3);
+        assert!(out[0].1.stderr.contains(&"OK".to_string()));
+        Ok(())
     }
+
 
     #[tokio::test]
     async fn test_core3_function_invocations() {
@@ -835,8 +898,8 @@ mod tests {
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
         env.get_state().render_dependency_graph();
-        env.step().await;
-        env.step().await;
+        dbg!(env.step().await);
+        dbg!(env.step().await);
         assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
     }
 

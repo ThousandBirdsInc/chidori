@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use tonic::codegen::Body;
-use crate::cells::TemplateCell;
+use crate::cells::{TemplateCell, TextRange};
 use crate::execution::primitives::operation::{InputItemConfiguration, InputSignature, InputType, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
 use crate::execution::primitives::serialized_value::{RkyvSerializedValue as RKV, serialized_value_to_json_value};
 
@@ -8,7 +8,7 @@ use futures_util::FutureExt;
 
 /// Template cells leverage the same tooling as LLM Prompt Cells, but are used for more general templating.
 #[tracing::instrument]
-pub fn template_cell(cell: &TemplateCell) -> anyhow::Result<OperationNode> {
+pub fn template_cell(cell: &TemplateCell, range: &TextRange) -> anyhow::Result<OperationNode> {
     let schema =
         chidori_prompt_format::templating::templates::analyze_referenced_partials(&cell.body);
 
@@ -63,6 +63,7 @@ pub fn template_cell(cell: &TemplateCell) -> anyhow::Result<OperationNode> {
 
 #[cfg(test)]
 mod test {
+    use crate::cells::TextRange;
     use crate::execution::execution::ExecutionState;
 
     #[tokio::test]
@@ -71,7 +72,7 @@ mod test {
             name: Some("test".to_string()),
             body: "Hello, {{ name }}!".to_string(),
         };
-        let op = crate::cells::template_cell::template_cell(&cell)?;
+        let op = crate::cells::template_cell::template_cell(&cell, &TextRange::default())?;
         let input = crate::execution::primitives::serialized_value::RkyvSerializedValue::Object(
             std::collections::HashMap::new()
         );

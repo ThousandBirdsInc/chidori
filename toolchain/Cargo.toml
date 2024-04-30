@@ -4,7 +4,7 @@ members = [
     "chidori-prompt-format",
     "chidori-im-rs",
     "chidori-static-analysis",
-    "chidori-ui/src-tauri",
+    "chidori-ui/src-tauri", "chidori-debugger",
 ]
 resolver = "2"
 

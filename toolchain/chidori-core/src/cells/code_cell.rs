@@ -1,12 +1,12 @@
 use futures_util::FutureExt;
 use chidori_static_analysis::language::Report;
-use crate::cells::{CodeCell, SupportedLanguage};
+use crate::cells::{CodeCell, SupportedLanguage, TextRange};
 use crate::execution::execution::ExecutionState;
 use crate::execution::primitives::operation::{InputItemConfiguration, InputSignature, InputType, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
 
 /// Code cells allow notebooks to evaluate source code in a variety of languages.
 #[tracing::instrument]
-pub fn code_cell(cell: &CodeCell) -> anyhow::Result<OperationNode> {
+pub fn code_cell(cell: &CodeCell, range: &TextRange) -> anyhow::Result<OperationNode> {
     match cell.language {
         SupportedLanguage::PyO3 => {
             // TODO: all callable functions should be exposed as their own OperationNodes
@@ -26,7 +26,6 @@ pub fn code_cell(cell: &CodeCell) -> anyhow::Result<OperationNode> {
                 output_signature,
                 Box::new(move |s, x, _, _| {
                     let cell = cell.clone();
-                    // TODO: this needs to handle stdout and errors
                     let s = s.clone();
                     async move {
                         let result = crate::library::std::code::runtime_pyo3::source_code_run_python(
@@ -34,7 +33,7 @@ pub fn code_cell(cell: &CodeCell) -> anyhow::Result<OperationNode> {
                             &cell.source_code,
                             &x,
                             &cell.function_invocation,
-                        ).await.unwrap();
+                        ).await?;
                         Ok(OperationFnOutput {
                             execution_state: None,
                             output: result.0,

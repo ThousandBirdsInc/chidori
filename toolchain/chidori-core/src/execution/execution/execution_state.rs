@@ -309,23 +309,23 @@ impl ExecutionState {
         op_id: Option<usize>,
     ) -> anyhow::Result<(ExecutionState, usize)> {
         let mut op = match &cell {
-            CellTypes::Code(c) => crate::cells::code_cell::code_cell(c),
-            CellTypes::Prompt(c) => crate::cells::llm_prompt_cell::llm_prompt_cell(c),
-            CellTypes::Embedding(c) => crate::cells::embedding_cell::llm_embedding_cell(c),
-            CellTypes::Web(c) => crate::cells::web_cell::web_cell(c),
-            CellTypes::Template(c) => crate::cells::template_cell::template_cell(c),
-            CellTypes::Memory(c) => crate::cells::memory_cell::memory_cell(c),
-            CellTypes::CodeGen(c) => crate::cells::code_gen_cell::code_gen_cell(c),
+            CellTypes::Code(c, r) => crate::cells::code_cell::code_cell(c, r),
+            CellTypes::Prompt(c, r) => crate::cells::llm_prompt_cell::llm_prompt_cell(c, r),
+            CellTypes::Embedding(c, r) => crate::cells::embedding_cell::llm_embedding_cell(c, r),
+            CellTypes::Web(c, r) => crate::cells::web_cell::web_cell(c, r),
+            CellTypes::Template(c, r) => crate::cells::template_cell::template_cell(c, r),
+            CellTypes::Memory(c, r) => crate::cells::memory_cell::memory_cell(c, r),
+            CellTypes::CodeGen(c, r) => crate::cells::code_gen_cell::code_gen_cell(c, r),
         }?;
         op.attach_cell(cell);
         let (op_id, new_state) = self.upsert_operation(op, op_id);
-        let mutations = Self::assign_dependencies_to_operations(&new_state);
+        let mutations = Self::assign_dependencies_to_operations(&new_state)?;
         let final_state = new_state.apply_dependency_graph_mutations(mutations);
         Ok((final_state, op_id))
     }
 
-    fn assign_dependencies_to_operations(new_state: &ExecutionState) -> Vec<DependencyGraphMutation> {
-        let (available_values, available_functions) = Self::get_possible_dependencies(new_state);
+    fn assign_dependencies_to_operations(new_state: &ExecutionState) -> anyhow::Result<Vec<DependencyGraphMutation>> {
+        let (available_values, available_functions) = Self::get_possible_dependencies(new_state)?;
 
         // TODO: we need to report on INVOKED functions - these functions are calls to
         //       functions with the locals assigned in a particular way. But then how do we handle compositions of these?
@@ -370,10 +370,10 @@ impl ExecutionState {
                 });
             }
         }
-        mutations
+        Ok(mutations)
     }
 
-    fn get_possible_dependencies(new_state: &ExecutionState) -> (HashMap<String, &OperationId>, HashMap<String, &OperationId>) {
+    fn get_possible_dependencies(new_state: &ExecutionState) -> anyhow::Result<(HashMap<String, &OperationId>, HashMap<String, &OperationId>)> {
         // TODO: when there is a dependency on a function invocation we need to
         //       instantiate a new instance of the function operation node.
         //       It itself is not part of the call graph until it has such a dependency.
@@ -391,18 +391,18 @@ impl ExecutionState {
             for (key, value) in output_signature.globals.iter() {
                 let insert_result = available_values.insert(key.clone(), id);
                 if insert_result.is_some() {
-                    panic!("Naming collision detected for value {} when storing op #{}", key, id);
+                    return Err(anyhow::Error::msg(format!("Naming collision detected for value {} when storing op #{}", key, id)));
                 }
             }
 
             for (key, value) in output_signature.functions.iter() {
                 let insert_result = available_functions.insert(key.clone(), id);
                 if insert_result.is_some() {
-                    panic!("Naming collision detected for value {}", key);
+                    return Err(anyhow::Error::msg(format!("Naming collision detected for value {}", key)));
                 }
             }
         }
-        (available_values, available_functions)
+        Ok((available_values, available_functions))
     }
 
     /// Inserts a new operation into the execution state, returning the operation id and the new state.
@@ -499,31 +499,33 @@ impl ExecutionState {
         // reconstruction of the cell
         let clone_function_name = function_name.to_string();
         let mut op = match cell {
-            CellTypes::Code(c) => {
+            CellTypes::Code(c, r) => {
                 let mut c = c.clone();
                 c.function_invocation =
                     Some(clone_function_name.to_string());
-                crate::cells::code_cell::code_cell(&c)?
+                crate::cells::code_cell::code_cell(&c, r)?
             }
-            CellTypes::Prompt(c) => {
+            CellTypes::Prompt(c, r) => {
                 let mut c = c.clone();
                 match c {
                     LLMPromptCell::Chat{ref mut function_invocation, ..} => {
                         *function_invocation = true;
-                        crate::cells::llm_prompt_cell::llm_prompt_cell(&c)?
+                        crate::cells::llm_prompt_cell::llm_prompt_cell(&c, r)?
                     }
                     _ => {
-                        crate::cells::llm_prompt_cell::llm_prompt_cell(&c)?
+                        crate::cells::llm_prompt_cell::llm_prompt_cell(&c, r)?
                     }
                 }
             }
-            CellTypes::Embedding(c) => {
-                crate::cells::embedding_cell::llm_embedding_cell(&c)?
+            CellTypes::Embedding(c, r) => {
+                crate::cells::embedding_cell::llm_embedding_cell(&c, r)?
             }
             _ => {
                 unreachable!("Unsupported cell type");
             }
         };
+
+        // pause_future_with_oneshot(payload, self.graph_sender.as_ref().unwrap().clone()).await;
 
         // invocation of the operation
         // TODO: the total arg payload here does not include necessary function calls for this cell itself

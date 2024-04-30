@@ -10,7 +10,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
 use futures_util::FutureExt;
 use tracing::{Level, span};
-use crate::cells::{CellTypes, CodeCell, SupportedLanguage};
+use crate::cells::{CellTypes, CodeCell, SupportedLanguage, TextRange};
 use crate::execution::execution::ExecutionState;
 
 
@@ -371,7 +371,7 @@ impl Default for OperationNode {
                 language: SupportedLanguage::PyO3,
                 source_code: "".to_string(),
                 function_invocation: None,
-            }),
+            }, TextRange::default()),
             purity: Purity::Pure,
             mutability: Mutability::Mutable,
             changed_at: 0,
@@ -463,7 +463,7 @@ mod tests {
                 language: SupportedLanguage::PyO3,
                 source_code: "".to_string(),
                 function_invocation: None,
-            }),
+            }, TextRange::default()),
             purity: Purity::Pure,
             mutability: Mutability::Mutable,
             changed_at: 0,

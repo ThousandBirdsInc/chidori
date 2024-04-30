@@ -1,10 +1,10 @@
 use futures_util::FutureExt;
-use crate::cells::{LLMEmbeddingCell, LLMPromptCell};
+use crate::cells::{LLMEmbeddingCell, LLMPromptCell, TextRange};
 use crate::execution::primitives::operation::{InputItemConfiguration, InputSignature, InputType, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
 use crate::library::std::ai::llm::ai_llm_run_embedding_model;
 
 #[tracing::instrument]
-pub fn llm_embedding_cell(cell: &LLMEmbeddingCell) -> anyhow::Result<OperationNode> {
+pub fn llm_embedding_cell(cell: &LLMEmbeddingCell, range: &TextRange) -> anyhow::Result<OperationNode> {
     let LLMEmbeddingCell {
         function_invocation,
         configuration,

@@ -42,8 +42,14 @@ pub struct Report {
 
 
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Serialize, Deserialize)]
 pub enum ChidoriStaticAnalysisError {
     #[error("unknown chidori analysis error")]
     Unknown,
 }
+
+// impl From<ChidoriStaticAnalysisError> for anyhow::Error {
+//     fn from(err: ChidoriStaticAnalysisError) -> Self {
+//         anyhow::Error::msg(err.to_string())
+//     }
+// }

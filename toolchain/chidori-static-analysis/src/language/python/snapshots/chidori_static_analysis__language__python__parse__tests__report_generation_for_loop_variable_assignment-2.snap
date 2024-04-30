@@ -1,0 +1,14 @@
+---
+source: chidori-static-analysis/src/language/python/parse.rs
+description: "async def run_prompt(number_of_states):\n    out = \"\"\n    for state in (await get_states_first_letters(num=number_of_states)).split('\\n'):\n        out += await first_letter(state)\n    return \"demo\" + out\n    "
+---
+cell_exposed_values: {}
+cell_depended_values:
+  first_letter: {}
+  get_states_first_letters: {}
+triggerable_functions:
+  run_prompt:
+    arguments:
+      - number_of_states
+    emit_event: []
+    trigger_on: []

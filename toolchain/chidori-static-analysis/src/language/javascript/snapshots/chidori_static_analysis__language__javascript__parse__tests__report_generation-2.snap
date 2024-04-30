@@ -1,0 +1,14 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "function testing() {\n    ch.onEvent(\"new_file\");\n    ch.emitAs(\"file_created\");\n    const x = 2 + y;\n    return x\n}\n    "
+---
+cell_exposed_values: {}
+cell_depended_values:
+  y: {}
+triggerable_functions:
+  testing:
+    arguments: []
+    emit_event:
+      - file_created
+    trigger_on:
+      - new_file

@@ -17,6 +17,7 @@ pub struct OpenAIChatModel {
 }
 
 impl OpenAIChatModel {
+    // TODO: remove api_key parameter, expect usage of a proxy
     pub fn new(api_url: String, api_key: String) -> Self {
         let client = Client::new_with_endpoint(api_url.clone(), api_key.clone());
         Self { api_url, client, api_key }

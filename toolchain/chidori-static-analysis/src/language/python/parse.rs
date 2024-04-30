@@ -405,7 +405,10 @@ fn extract_python_comments(code: &str) -> Vec<String> {
 pub fn extract_dependencies_python(source_code: &str) -> Result<Vec<Vec<ContextPath>>, ChidoriStaticAnalysisError> {
     // TODO: extract comments and associate them based on position relative to functions
     let mut comments = extract_python_comments(source_code);
-    let ast = ast::Suite::parse(source_code, "<embedded>").map_err(|e| ChidoriStaticAnalysisError::Unknown)?;
+    let ast = ast::Suite::parse(source_code, "<embedded>")
+        .map_err(|e| {
+            ChidoriStaticAnalysisError::Unknown
+        })?;
     let mut machine = ASTWalkContext::default();
     traverse_statements(&ast, &mut machine);
     Ok(machine.context_stack_references)
@@ -848,7 +851,7 @@ mod tests {
             
             ch.prompt.configure("default", ch.llm(model="openai"))
             "#};
-        let context_stack_references = extract_dependencies_python(python_source);
+        let context_stack_references = extract_dependencies_python(python_source).unwrap();
         insta::with_settings!({
             description => python_source,
             omit_expression => true
@@ -876,7 +879,7 @@ mod tests {
             def create_dockerfile():
                 return prompt("prompts/create_dockerfile")
             "#};
-        let context_stack_references = extract_dependencies_python(python_source);
+        let context_stack_references = extract_dependencies_python(python_source).unwrap();
         insta::with_settings!({
             description => python_source,
             omit_expression => true
@@ -892,7 +895,7 @@ mod tests {
             def migration_agent():
                 ch.set("bar", 1)
             "#};
-        let context_stack_references = extract_dependencies_python(python_source);
+        let context_stack_references = extract_dependencies_python(python_source).unwrap();
         insta::with_settings!({
             description => python_source,
             omit_expression => true
@@ -909,7 +912,7 @@ mod tests {
             def dispatch_agent(ev):
                 ch.set("file_path", ev.file_path)
             "#};
-        let context_stack_references = extract_dependencies_python(python_source);
+        let context_stack_references = extract_dependencies_python(python_source).unwrap();
         insta::with_settings!({
             description => python_source,
             omit_expression => true
@@ -925,7 +928,7 @@ mod tests {
                 ch.set("file_path", ev.file_path)
                 migration_agent()
             "#};
-        let context_stack_references = extract_dependencies_python(python_source);
+        let context_stack_references = extract_dependencies_python(python_source).unwrap();
         insta::with_settings!({
             description => python_source,
             omit_expression => true
@@ -941,7 +944,7 @@ mod tests {
             def setup_pipeline(x):
                 return x
             "#};
-        let context_stack_references = extract_dependencies_python(python_source);
+        let context_stack_references = extract_dependencies_python(python_source).unwrap();
 
         insta::assert_yaml_snapshot!(context_stack_references);
 
@@ -959,7 +962,7 @@ mod tests {
             unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
 
             "#};
-        let context_stack_references = extract_dependencies_python(python_source);
+        let context_stack_references = extract_dependencies_python(python_source).unwrap();
 
         insta::with_settings!({
             description => python_source,
@@ -981,7 +984,7 @@ mod tests {
                 out += await first_letter(state)
             return "demo" + out
             "#};
-        let context_stack_references = extract_dependencies_python(python_source);
+        let context_stack_references = extract_dependencies_python(python_source).unwrap();
         insta::assert_yaml_snapshot!(context_stack_references);
     }
 
@@ -991,7 +994,7 @@ mod tests {
             def main():
                 bar() | foo() | baz()
             "#};
-        let context_stack_references = extract_dependencies_python(python_source);
+        let context_stack_references = extract_dependencies_python(python_source).unwrap();
         insta::with_settings!({
             description => python_source,
             omit_expression => true
@@ -1009,7 +1012,7 @@ mod tests {
             x = 2 + y
             return x
             "#};
-        let context_stack_references = extract_dependencies_python(python_source);
+        let context_stack_references = extract_dependencies_python(python_source).unwrap();
         insta::with_settings!({
             description => python_source,
             omit_expression => true
@@ -1053,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn test_report_generation_with_import() {
+    fn test_report_generation_with_import() -> anyhow::Result<()> {
         let python_source = indoc! { r#"
 import random
 
@@ -1064,7 +1067,7 @@ def fun_name():
 
 x = random.randint(0, 10)            
 "#};
-        let context_stack_references = extract_dependencies_python(python_source);
+        let context_stack_references = extract_dependencies_python(python_source)?;
         insta::with_settings!({
             description => python_source,
             omit_expression => true
@@ -1107,15 +1110,16 @@ x = random.randint(0, 10)
             },
         };
         assert_eq!(result, report);
+        Ok(())
     }
 
     #[test]
-    fn test_report_generation_function_with_arguments() {
+    fn test_report_generation_function_with_arguments() -> anyhow::Result<()>  {
         let python_source = indoc! { r#"
         async def complex_args_function(a, b, c=2, d=3):
             return a + b + c + d
             "#};
-        let context_stack_references = extract_dependencies_python(python_source);
+        let context_stack_references = extract_dependencies_python(python_source)?;
         insta::with_settings!({
             description => python_source,
             omit_expression => true
@@ -1143,10 +1147,11 @@ x = random.randint(0, 10)
         };
 
         assert_eq!(result, report);
+        Ok(())
     }
 
     #[test]
-    fn test_report_generation_for_loop_variable_assignment() {
+    fn test_report_generation_for_loop_variable_assignment() -> anyhow::Result<()>  {
         let python_source = indoc! { r#"
         async def run_prompt(number_of_states):
             out = ""
@@ -1154,7 +1159,7 @@ x = random.randint(0, 10)
                 out += await first_letter(state)
             return "demo" + out
             "#};
-        let context_stack_references = extract_dependencies_python(python_source);
+        let context_stack_references = extract_dependencies_python(python_source)?;
         insta::with_settings!({
             description => python_source,
             omit_expression => true
@@ -1162,47 +1167,23 @@ x = random.randint(0, 10)
             insta::assert_yaml_snapshot!(context_stack_references);
         });
         let result = build_report(&context_stack_references);
-        let report = Report {
-            cell_exposed_values: std::collections::HashMap::new(), // No data provided, initializing as empty
-            cell_depended_values: {
-                let mut map = std::collections::HashMap::new();
-                map.insert(
-                    "get_states_first_letters".to_string(),
-                    ReportItem {
-                    },
-                );
-                map.insert(
-                    "first_letter".to_string(),
-                    ReportItem {
-                    },
-                );
-                map
-            },
-            triggerable_functions: {
-                let mut map = std::collections::HashMap::new();
-                map.insert(
-                    "run_prompt".to_string(),
-                    ReportTriggerableFunctions {
-                        
-                        // context_path: vec![ContextPath::InFunction("testing".to_string())],
-                        arguments: vec![],
-                        emit_event: vec![],
-                        trigger_on: vec![],
-                    },
-                );
-                map
-            },
-        };
 
-        assert_eq!(result, report);
+        insta::with_settings!({
+            description => python_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        Ok(())
     }
 
     #[test]
-    fn test_reference_to_undeclared_function() {
+    fn test_reference_to_undeclared_function() -> anyhow::Result<()> {
         let python_source = indoc! { r#"
             out = await read_file_and_load_to_memory("./")
             "#};
-        let context_stack_references = extract_dependencies_python(python_source);
+        let context_stack_references = extract_dependencies_python(python_source)?;
         insta::with_settings!({
             description => python_source,
             omit_expression => true
@@ -1216,10 +1197,11 @@ x = random.randint(0, 10)
         }, {
             insta::assert_yaml_snapshot!(result);
         });
+        Ok(())
     }
 
     #[test]
-    fn test_report_generation_with_class() {
+    fn test_report_generation_with_class() -> anyhow::Result<()>  {
         let python_source = indoc! { r#"
             import unittest
 
@@ -1229,7 +1211,7 @@ x = random.randint(0, 10)
 
             unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
             "#};
-        let context_stack_references = extract_dependencies_python(python_source);
+        let context_stack_references = extract_dependencies_python(python_source)?;
         insta::with_settings!({
             description => python_source,
             omit_expression => true
@@ -1263,5 +1245,6 @@ x = random.randint(0, 10)
         };
 
         assert_eq!(result, report);
+        Ok(())
     }
 }

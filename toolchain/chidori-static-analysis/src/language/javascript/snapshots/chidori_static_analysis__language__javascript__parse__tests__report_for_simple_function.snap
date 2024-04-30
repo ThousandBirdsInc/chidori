@@ -1,0 +1,13 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "function testing(x) {\n    return x\n}\n    "
+---
+- - InFunction: testing
+  - Params
+  - IdentifierReferredTo:
+      - x
+      - false
+- - InFunction: testing
+  - IdentifierReferredTo:
+      - x
+      - true

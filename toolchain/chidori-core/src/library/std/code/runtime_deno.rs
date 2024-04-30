@@ -504,16 +504,18 @@ pub async fn source_code_run_deno(
         &cli_options.permissions_options(),
     )?);
     // TODO: add custom extensions
-    let worker_factory = factory.create_cli_main_worker_factory().await?;
-    let mut worker = worker_factory
-        .create_custom_worker(
-            main_module,
-            permissions,
-            vec![ext],
-            Default::default(),
-        )
-        .await?;
-    let exit_code = worker.run().await?;
+    {
+        let worker_factory = factory.create_cli_main_worker_factory().await?;
+        let mut worker = worker_factory
+            .create_custom_worker(
+                main_module,
+                permissions,
+                vec![ext],
+                Default::default(),
+            )
+            .await?;
+        let exit_code = worker.run().await?;
+    }
     let mut my_op_state = my_op_state.lock().unwrap();
     Ok((my_op_state.output.clone().unwrap_or(RkyvSerializedValue::Null), vec![]))
 }
@@ -521,7 +523,7 @@ pub async fn source_code_run_deno(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cells::SupportedLanguage;
+    use crate::cells::{SupportedLanguage, TextRange};
     use crate::execution::primitives::serialized_value::RkyvObjectBuilder;
     use indoc::indoc;
 
@@ -540,8 +542,7 @@ mod tests {
                                 "#
                                 }),
                 function_invocation: None,
-            },
-        ), Some(0))?;
+            }, TextRange::default()), Some(0))?;
         let result = source_code_run_deno(
             &state,
             &source_code,

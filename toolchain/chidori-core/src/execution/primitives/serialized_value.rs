@@ -130,8 +130,11 @@ impl std::cmp::PartialEq for RkyvSerializedValue {
                     _ => unreachable!()
                 }
             }
-            RkyvSerializedValue::Float(_) => {
-                return false;
+            RkyvSerializedValue::Float(a) => {
+                match other {
+                    RkyvSerializedValue::Float(aa) => { a == aa }
+                    _ => unreachable!()
+                }
             }
             RkyvSerializedValue::Number(a) => {
                 match other {

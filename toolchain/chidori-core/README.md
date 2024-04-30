@@ -33,3 +33,5 @@ We also want to be able to annotate existing code with graph definitions, and th
 
 
 
+# Testing
+* Our LLM calls default to localhost:4000, our expectation is that users will leverage a tool such as LiteLLM's Proxy to manage their interaction with LLMs.

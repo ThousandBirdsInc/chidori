@@ -2,7 +2,7 @@ use chidori_prompt_format::templating::templates::{ChatModelRoles, TemplateWithS
 use std::collections::HashMap;
 use std::env;
 use tokio::runtime;
-use crate::cells::{LLMPromptCell, SupportedModelProviders};
+use crate::cells::{LLMPromptCell, SupportedModelProviders, TextRange};
 use crate::execution::primitives::operation::{InputItemConfiguration, InputSignature, InputType, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
 use crate::execution::primitives::serialized_value::{RkyvSerializedValue as RKV, RkyvSerializedValue, serialized_value_to_json_value};
 use futures_util::FutureExt;
@@ -13,7 +13,7 @@ use crate::library::std::ai::llm::ai_llm_run_embedding_model;
 
 /// LLM Prompt Cells allow notebooks to invoke language models to generate text.
 #[tracing::instrument]
-pub fn llm_prompt_cell(cell: &LLMPromptCell) -> anyhow::Result<OperationNode> {
+pub fn llm_prompt_cell(cell: &LLMPromptCell, range: &TextRange) -> anyhow::Result<OperationNode> {
     match cell {
         LLMPromptCell::Chat {
             function_invocation,

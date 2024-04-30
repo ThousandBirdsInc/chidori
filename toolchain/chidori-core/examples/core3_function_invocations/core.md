@@ -2,7 +2,7 @@
 
 ## Simple function calling across cells
 ### Demonstrates defining a function in python and calling it in javascript
-```python
+```python (python_add_two)
 def add_two(x):
     return x + 2
 ```
@@ -16,7 +16,7 @@ Deno.test("addition test", () => {
 ```
 
 ### Demonstrates defining a function in javascript and calling it in python
-```javascript
+```javascript (js_add_two)
 function addTwo(x) {
     return x + 2;
 }

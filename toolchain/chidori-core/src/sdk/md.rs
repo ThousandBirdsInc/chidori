@@ -4,8 +4,7 @@ use indoc::indoc;
 use std::collections::HashMap;
 use std::path::Path;
 use serde_derive::Serialize;
-use crate::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, SupportedMemoryProviders, SupportedModelProviders, TemplateCell, WebserviceCell};
-use chidori_static_analysis::language::TextRange;
+use crate::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, SupportedMemoryProviders, SupportedModelProviders, TemplateCell, TextRange, WebserviceCell};
 
 #[derive(PartialEq, Serialize, Debug)]
 pub struct MarkdownCodeBlock {
@@ -117,42 +116,42 @@ pub fn interpret_code_block(block: &MarkdownCodeBlock) -> Option<CellTypes> {
                 language,
                 source_code: block.body.clone(),
                 function_invocation: None,
-            }))
+            }, block.range.clone()))
         },
         "memory" => Some(CellTypes::Memory(MemoryCell {
             name: block.name.clone(),
             provider: SupportedMemoryProviders::InMemory,
             embedding_function: block.body.clone(),
-        })),
+        }, block.range.clone())),
         "embedding" => Some(CellTypes::Embedding(LLMEmbeddingCell {
             function_invocation: false,
             configuration: serde_yaml::from_str(&frontmatter).unwrap(),
             name: block.name.clone(),
             req: body,
-        })),
+        }, block.range.clone())),
         "prompt" => Some(CellTypes::Prompt(LLMPromptCell::Chat {
             function_invocation: false,
             configuration: serde_yaml::from_str(&frontmatter).unwrap(),
             name: block.name.clone(),
             provider: SupportedModelProviders::OpenAI,
             req: body,
-        })),
+        }, block.range.clone())),
         "codegen" => Some(CellTypes::CodeGen(LLMCodeGenCell {
             function_invocation: false,
             configuration: serde_yaml::from_str(&frontmatter).unwrap(),
             name: block.name.clone(),
             provider: SupportedModelProviders::OpenAI,
             req: body,
-        })),
+        }, block.range.clone())),
         "html" => Some(CellTypes::Template(TemplateCell {
             name: block.name.clone(),
             body: block.body.clone(),
-        })),
+        }, block.range.clone())),
         "web" => Some(CellTypes::Web(WebserviceCell {
             name: block.name.clone(),
             configuration: block.body.clone(),
             port: serde_yaml::from_str::<HashMap<String,String>>(&frontmatter).unwrap().get("port").and_then(|p| p.parse::<u16>().ok()).or_else(|| Some(8080)).unwrap(),
-        })),
+        }, block.range.clone())),
         _ => None,
     }
 }

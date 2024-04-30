@@ -30,6 +30,7 @@
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-static-analysis/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-old/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-ui/src-tauri/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-debugger/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/prompt-graph-core/target" />
       <excludeFolder url="file://$MODULE_DIR$/prompt-graph-exec/target" />

@@ -13,6 +13,7 @@ pydot = "^1.4.2"
 jupyterlab = "^4.0.2"
 aiohttp = "^3.8.5"
 asyncio = "^3.4.3"
+litellm = {extras = ["proxy"], version = "^1.35.19"}
 
 
 [build-system]

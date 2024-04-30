@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::env;
 use std::pin::Pin;
 use chidori_prompt_format::templating::templates::{ChatModelRoles, TemplateWithSource};
-use crate::cells::{LLMCodeGenCellChatConfiguration, LLMPromptCellChatConfiguration};
+use crate::cells::{LLMCodeGenCellChatConfiguration, LLMPromptCellChatConfiguration, TextRange};
 use crate::execution::execution::ExecutionState;
 use crate::execution::primitives::operation::InputSignature;
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue, serialized_value_to_json_value};
@@ -127,7 +127,8 @@ impl Default for ChatCompletionReq {
             config: LLMPromptCellChatConfiguration {
                 import: None,
                 function_name: None,
-                model: String::from("davinci"),
+                model: String::from("gpt-3.5-turbo"),
+                api_url: None,
                 frequency_penalty: None,
                 max_tokens: None,
                 presence_penalty: None,
@@ -334,9 +335,9 @@ pub async fn ai_llm_run_chat_model(
     let tools = infer_tool_usage_from_imports(execution_state, &configuration.import);
 
     // TODO: replace this to being fetched from configuration
-    let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
-    let api_url_v1: &str = "https://api.openai.com/v1";
-    let c = crate::library::std::ai::llm::openai::OpenAIChatModel::new(api_url_v1.to_string(), api_key);
+    // let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
+    let api_url_v1 = configuration.api_url.clone();
+    let c = crate::library::std::ai::llm::openai::OpenAIChatModel::new(api_url_v1.unwrap_or("http://localhost:4000/v1".to_string()), "".to_string());
 
 
 
@@ -426,16 +427,15 @@ pub async fn ai_llm_code_generation_chat_model(
         });
     }
 
-    // TODO: replace this to being fetched from configuration
-    let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
-    let api_url_v1: &str = "https://api.openai.com/v1";
-    let c = crate::library::std::ai::llm::openai::OpenAIChatModel::new(api_url_v1.to_string(), api_key);
+    let api_url_v1 = configuration.api_url.unwrap_or("http://localhost:4000/v1".to_string());
+    let c = crate::library::std::ai::llm::openai::OpenAIChatModel::new(api_url_v1, "".to_string());
 
     let result = c.batch(ChatCompletionReq {
         config: LLMPromptCellChatConfiguration {
             import: None,
             function_name: None,
             model: configuration.model.clone(),
+            api_url: None,
             frequency_penalty: configuration.frequency_penalty.clone(),
             max_tokens: configuration.max_tokens.clone(),
             presence_penalty: configuration.presence_penalty.clone(),
@@ -465,7 +465,7 @@ pub async fn ai_llm_code_generation_chat_model(
                 },
                 source_code: text.clone(),
                 function_invocation: None,
-            }), None)?;
+            }, TextRange::default()), None)?;
             return Ok((RkyvSerializedValue::String(text.clone()), Some(new_execution_state)));
         }
         Ok((RkyvSerializedValue::Null, None))
@@ -517,7 +517,7 @@ fn template_data_payload_from_rkyv(payload: &RkyvSerializedValue) -> Value {
 #[cfg(test)]
 mod test {
     use indoc::indoc;
-    use crate::cells::{CellTypes, CodeCell, LLMPromptCellChatConfiguration, SupportedLanguage};
+    use crate::cells::{CellTypes, CodeCell, LLMPromptCellChatConfiguration, SupportedLanguage, TextRange};
     use crate::execution::execution::ExecutionState;
     use crate::library::std::ai::llm::infer_tool_usage_from_imports;
 
@@ -534,7 +534,7 @@ mod test {
                             return 100 + await demo_second_function_call()
                         "#}),
             function_invocation: None,
-        }), Some(0))?;
+        }, TextRange::default()), Some(0))?;
         let (mut state, _) = state.update_op(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,
@@ -543,7 +543,7 @@ mod test {
                             return a + b + c + d
                         "#}),
             function_invocation: None,
-        }), Some(0))?;
+        }, TextRange::default()), Some(0))?;
 
         insta::with_settings!({
             omit_expression => true

@@ -1,4 +1,4 @@
-use crate::cells::{LLMCodeGenCell, LLMPromptCell, SupportedModelProviders};
+use crate::cells::{LLMCodeGenCell, LLMPromptCell, SupportedModelProviders, TextRange};
 use crate::execution::primitives::operation::{InputItemConfiguration, InputSignature, InputType, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
 use crate::execution::primitives::serialized_value::{RkyvSerializedValue as RKV, RkyvSerializedValue, serialized_value_to_json_value};
 use futures_util::FutureExt;
@@ -6,7 +6,7 @@ use futures_util::FutureExt;
 
 
 #[tracing::instrument]
-pub fn code_gen_cell(cell: &LLMCodeGenCell) -> anyhow::Result<OperationNode> {
+pub fn code_gen_cell(cell: &LLMCodeGenCell, range: &TextRange) -> anyhow::Result<OperationNode> {
     let LLMCodeGenCell {
         configuration,
         name,

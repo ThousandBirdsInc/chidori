@@ -8,6 +8,7 @@ use tracing::subscriber::Interest;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing::field::{ValueSet, Visit, Field};
 use std::fmt::Debug;
+use std::num::NonZero;
 pub use serde::Serialize;
 
 struct MatchStrVisitor<'a> {
@@ -46,6 +47,8 @@ pub enum TraceEvents{
     // TODO: add support for capturing the execution id that we're observing
     NewSpan{
         id: String,
+        thread_id: NonZero<u64>,
+        parent_id: Option<String>,
         weight: u128,
         name: String,
         target: String,
@@ -56,7 +59,9 @@ pub enum TraceEvents{
     Record,
     Event,
     Enter(String),
-    Exit(String),
+    // This means control of the span is temporarily released
+    Exit(String, u128),
+    // This means the span is entirely done
     Close(String, u128),
 }
 
@@ -112,9 +117,13 @@ impl<S> Layer<S> for CustomLayer
         //     ctx.span(id).unwrap().extensions_mut().insert(CustomLayerEnabled);
         // }
 
-        let weight = (Instant::now() - self.started_at).as_micros();
+        // This weight is the start timestamp of the span, not its duration
+        let weight = (Instant::now() - self.started_at).as_nanos();
+        let thread_id = std::thread::current().id().as_u64();
         self.sender.send(TraceEvents::NewSpan {
             id: format!("{:?}", id),
+            parent_id: span.parent().map(|p| format!("{:?}", p.id())),
+            thread_id,
             weight,
             name: metadata.name().to_string(),
             target: metadata.target().to_string(),
@@ -146,13 +155,12 @@ impl<S> Layer<S> for CustomLayer
 
     fn on_exit(&self, id: &tracing::span::Id, ctx: Context<'_, S>) {
         // Process exit span here
-        self.sender.send(TraceEvents::Exit(format!("{:?}", id))).unwrap();
+        let weight = (Instant::now() - self.started_at).as_nanos();
+        self.sender.send(TraceEvents::Exit(format!("{:?}", id), weight)).unwrap();
     }
 
     fn on_close(&self, id: tracing::span::Id, ctx: Context<'_, S>) {
-        let span = ctx.span(&id).unwrap();
-        let weight = (Instant::now() - self.started_at).as_micros();
-        // Process span close here
+        let weight = (Instant::now() - self.started_at).as_nanos();
         self.sender.send(TraceEvents::Close(format!("{:?}", id), weight)).unwrap();
     }
 }
@@ -195,6 +203,7 @@ impl<S, T> Layer<T> for ForwardingLayer<S>
 
 
 pub fn init_internal_telemetry(sender: Sender<TraceEvents>) -> impl Subscriber {
+    println!("Initializing internal telemetry");
     let custom_layer = CustomLayer::new(sender);
     let forwarding_layer = ForwardingLayer::new(tracing_subscriber::fmt::layer());
     let subscriber = tracing_subscriber::Registry::default()

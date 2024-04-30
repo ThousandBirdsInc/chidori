@@ -92,17 +92,17 @@ pub async fn run_webservice(
                                 // modify code cell to indicate execution of the target function
                                 // reconstruction of the cell
                                 let mut op = match &cell_clone {
-                                    CellTypes::Code(c) => {
+                                    CellTypes::Code(c, r) => {
                                         let mut c = c.clone();
                                         c.function_invocation =
                                             Some(function_name.clone());
-                                        crate::cells::code_cell::code_cell(&c)
+                                        crate::cells::code_cell::code_cell(&c, r)
                                     }
-                                    CellTypes::Prompt(c) => {
-                                        crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
+                                    CellTypes::Prompt(c, r) => {
+                                        crate::cells::llm_prompt_cell::llm_prompt_cell(&c, r)
                                     }
-                                    CellTypes::Template(c) => {
-                                        crate::cells::template_cell::template_cell(&c)
+                                    CellTypes::Template(c, r) => {
+                                        crate::cells::template_cell::template_cell(&c, r)
                                     }
                                     _ => {
                                         unreachable!("Unsupported cell type");
@@ -145,17 +145,17 @@ pub async fn run_webservice(
                                 // modify code cell to indicate execution of the target function
                                 // reconstruction of the cell
                                 let mut op = match &cell {
-                                    CellTypes::Code(c) => {
+                                    CellTypes::Code(c, r) => {
                                         let mut c = c.clone();
                                         c.function_invocation =
                                             Some(function_name.clone());
-                                        crate::cells::code_cell::code_cell(&c)
+                                        crate::cells::code_cell::code_cell(&c, r)
                                     },
-                                    CellTypes::Prompt(c) => {
-                                        crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
+                                    CellTypes::Prompt(c, r) => {
+                                        crate::cells::llm_prompt_cell::llm_prompt_cell(&c, r)
                                     },
-                                    CellTypes::Template(c) => {
-                                        crate::cells::template_cell::template_cell(&c)
+                                    CellTypes::Template(c, r) => {
+                                        crate::cells::template_cell::template_cell(&c, r)
                                     }
                                     _ => {
                                         unreachable!("Unsupported cell type");
@@ -230,7 +230,7 @@ mod tests {
     use indoc::indoc;
     use tokio::runtime::Runtime;
 
-    use crate::cells::{CellTypes, CodeCell, SupportedLanguage, WebserviceCell};
+    use crate::cells::{CellTypes, CodeCell, SupportedLanguage, TextRange, WebserviceCell};
 
     #[tokio::test]
     async fn test_webservice() {
@@ -253,7 +253,7 @@ mod tests {
                             return 100
                         "#}),
                     function_invocation: None,
-                }))))
+                }, TextRange::default()))))
             .build();
         let (server_handle , port) = crate::library::std::webserver::run_webservice(&configuration, &payload).await;
 
@@ -297,7 +297,7 @@ mod tests {
                             return a + b
                         "#}),
                     function_invocation: None,
-                }))))
+                }, TextRange::default()))))
             .build();
 
         let (server_handle, port) = crate::library::std::webserver::run_webservice(&configuration, &payload).await;
@@ -343,7 +343,7 @@ mod tests {
                             return {"x": a + b}
                         "#}),
                     function_invocation: None,
-                }))))
+                }, TextRange::default()))))
             .build();
 
         let (server_handle, port) = crate::library::std::webserver::run_webservice(&configuration, &payload).await;

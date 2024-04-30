@@ -1,0 +1,45 @@
+[package]
+name = "chidori-debugger"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+bevy = "0.13.2"
+bevy_utils = "0.13.2"
+bevy_egui = "0.27.0"
+bevy_rapier2d = { version = "*", features = [ "simd-stable", "debug-render-2d" ]}
+egui_extras = { version = "0.27.2" , features = ["syntect"]}
+bevy_cosmic_edit = { version = "0.19.0", features = ["multicam"] }
+rfd = "0.14.1"
+bytemuck = "1.15.0"
+rand = "0.8.5"
+petgraph-gen = "0.1.3"
+fdg = { git = "https://github.com/grantshandy/fdg.git", version = "1.0.0" }
+num = "0.4.0"
+tinyset = "0.4.10"
+
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_derive.workspace = true
+tokio.workspace = true
+futures.workspace = true
+petgraph.workspace = true
+
+syntect = "5.2.0"
+chidori-core = { path = "../chidori-core" }
+dirs = "5.0.1"
+target-lexicon = "0.12.14"
+rusqlite = { version = "0.29.0", features = ["bundled"] }
+notify-debouncer-full = "0.3.1"
+once_cell = "1.19.0"
+
+
+[build-dependencies]
+target-lexicon = "0.12"
+dirs = "3.0"
+pyo3-build-config = "0.19.1"

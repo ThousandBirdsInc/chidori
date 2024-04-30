@@ -752,6 +752,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                 }
             }
 
+            // TODO: this needs to be updated to be smilar to the python implemnetation
             if let ContextPath::IdentifierReferredTo(identifier, false) = context_path_unit {
                 if identifier != &String::from("ch") {
                     // If this value is not being assigned to, then it is a dependency
@@ -998,28 +999,35 @@ mod tests {
             insta::assert_yaml_snapshot!(context_stack_references);
         });
         let result = build_report(&context_stack_references);
-        let report = Report {
-            cell_exposed_values: std::collections::HashMap::new(), // No data provided, initializing as empty
-            cell_depended_values: {
-                let mut map = std::collections::HashMap::new();
-                map.insert("y".to_string(), ReportItem {});
-                map
-            },
-            triggerable_functions: {
-                let mut map = std::collections::HashMap::new();
-                map.insert(
-                    "testing".to_string(),
-                    ReportTriggerableFunctions {
+        insta::with_settings!({
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+    }
 
-                        arguments: vec![],
-                        emit_event: vec!["file_created".to_string()],
-                        trigger_on: vec!["new_file".to_string()],
-                    },
-                );
-                map
-            },
-        };
-        assert_eq!(result, report);
+    #[test]
+    fn test_report_for_simple_function() {
+        let js_source = indoc! { r#"
+        function testing(x) {
+            return x
+        }
+            "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
     }
 
     #[test]

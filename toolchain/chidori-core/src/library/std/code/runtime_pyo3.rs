@@ -360,9 +360,7 @@ asyncio.run(__wrapper())
         complete_code.push_str("\n");
 
         // Important: this is the point of initial execution of the source code
-        py.run(&complete_code, Some(globals), None).unwrap();
-
-
+        py.run(&complete_code, Some(globals), None)?;
 
         // With the source environment established, we can now invoke specific methods provided by this node
         return match function_invocation {
@@ -548,7 +546,7 @@ fn python_dependency_management() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cells::SupportedLanguage;
+    use crate::cells::{SupportedLanguage, TextRange};
     use crate::execution::primitives::serialized_value::RkyvObjectBuilder;
     use indoc::indoc;
 
@@ -676,7 +674,7 @@ a = 20 + await demo()
                             return 100
                         "#}),
             function_invocation: None,
-        }), Some(0))?;
+        }, TextRange::default()), Some(0))?;
         let result = source_code_run_python(&state,
                                             &source_code,
             &RkyvObjectBuilder::new()
@@ -713,7 +711,7 @@ data = await demo()
                             return 100
                         "#}),
             function_invocation: None,
-        }), Some(0))?;
+        }, TextRange::default()), Some(0))?;
         let result = source_code_run_python(&state,
                                             &source_code,
             &RkyvObjectBuilder::new()
@@ -752,7 +750,7 @@ data = await demo()
                             return 100 + await demo_second_function_call()
                         "#}),
             function_invocation: None,
-        }), Some(0))?;
+        }, TextRange::default()), Some(0))?;
         let (state, _) = state.update_op(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,
@@ -763,7 +761,7 @@ data = await demo()
                             return 100
                         "#}),
             function_invocation: None,
-        }), Some(1))?;
+        }, TextRange::default()), Some(1))?;
         let result = source_code_run_python(&state,
                                             &source_code,
             &RkyvObjectBuilder::new()
@@ -872,5 +870,45 @@ def example(x):
             &Some("example".to_string()),
         ).await;
         assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(2), vec![], vec![]));
+    }
+
+
+    #[tokio::test]
+    async fn test_error_handling_failure_to_parse() {
+        let source_code = String::from(
+            r#"
+```
+fn example():
+    return 42
+        "#,
+        );
+        let result = source_code_run_python(
+            &ExecutionState::new(),
+            &source_code,
+            &RkyvObjectBuilder::new()
+                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
+                .build(),
+            &Some("example".to_string()),
+        ).await;
+        assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(1), vec![], vec![]));
+    }
+
+
+    #[tokio::test]
+    async fn test_error_handling_exception_thrown() {
+        let source_code = String::from(
+            r#"
+raise ValueError("Raising a python error")
+        "#,
+        );
+        let result = source_code_run_python(
+            &ExecutionState::new(),
+            &source_code,
+            &RkyvObjectBuilder::new()
+                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
+                .build(),
+            &Some("example".to_string()),
+        ).await;
+        assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(1), vec![], vec![]));
     }
 }

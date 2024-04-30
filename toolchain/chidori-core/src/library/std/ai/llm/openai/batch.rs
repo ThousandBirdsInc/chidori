@@ -96,15 +96,18 @@ impl ChatModelBatch for OpenAIChatModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openai_api_rs::v1::api::Client;
-    use std::env;
+    use crate::library::std::ai::llm::TemplateMessage;
 
     #[tokio::test]
     async fn test_batch_completion() {
-        let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
-        let api_url_v1: &str = "https://api.openai.com/v1";
-        let model = OpenAIChatModel::new(api_url_v1.to_string(), api_key);
+        let model = crate::library::std::ai::llm::openai::OpenAIChatModel::new("http://localhost:4000/v1".to_string(), "".to_string());
         let chat_completion_req = ChatCompletionReq {
+            template_messages: vec![TemplateMessage {
+                role: llm::MessageRole::User,
+                content: "test message".to_string(),
+                name: None,
+                function_call: None,
+            }],
             ..ChatCompletionReq::default()
         };
         let result = model.batch(chat_completion_req).await;

@@ -40,7 +40,7 @@ pub async fn run_cron(
         let function_name = &job.function_identity;
         let value = our_functions_map.get(function_name).unwrap();
         if let RkyvSerializedValue::Cell(cell) = value.clone() {
-            if let CellTypes::Code(CodeCell { function_invocation, .. }) = &cell
+            if let CellTypes::Code(CodeCell { function_invocation, .. }, r) = &cell
             {
                 if subscribed_functions
                     .contains(function_name)
@@ -52,14 +52,14 @@ pub async fn run_cron(
                             // modify code cell to indicate execution of the target function
                             // reconstruction of the cell
                             let mut op = match &cell_clone {
-                                CellTypes::Code(c) => {
+                                CellTypes::Code(c, r) => {
                                     let mut c = c.clone();
                                     c.function_invocation =
                                         Some(function_name.clone());
-                                    crate::cells::code_cell::code_cell(&c)
+                                    crate::cells::code_cell::code_cell(&c, r)
                                 }
-                                CellTypes::Prompt(c) => {
-                                    crate::cells::llm_prompt_cell::llm_prompt_cell(&c)
+                                CellTypes::Prompt(c, r) => {
+                                    crate::cells::llm_prompt_cell::llm_prompt_cell(&c, r)
                                 }
                                 _ => {
                                     unreachable!("Unsupported cell type");

@@ -55,11 +55,11 @@ pub enum SupportedLanguage {
 ))]
 #[archive_attr(derive(Debug))]
 #[ts(export, export_to = "package_node/types/")]
-pub(crate) struct CodeCell {
-    pub(crate) name: Option<String>,
-    pub(crate) language: SupportedLanguage,
-    pub(crate) source_code: String,
-    pub(crate) function_invocation: Option<String>,
+pub struct CodeCell {
+    pub name: Option<String>,
+    pub language: SupportedLanguage,
+    pub source_code: String,
+    pub function_invocation: Option<String>,
 }
 
 
@@ -104,10 +104,10 @@ bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: 
 ))]
 #[archive_attr(derive(Debug))]
 #[ts(export, export_to = "package_node/types/")]
-pub(crate) struct MemoryCell {
-    pub(crate) name: Option<String>,
-    pub(crate) provider: SupportedMemoryProviders,
-    pub(crate) embedding_function: String,
+pub struct MemoryCell {
+    pub name: Option<String>,
+    pub provider: SupportedMemoryProviders,
+    pub embedding_function: String,
 }
 
 
@@ -129,9 +129,9 @@ bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: 
 ))]
 #[archive_attr(derive(Debug))]
 #[ts(export, export_to = "package_node/types/")]
-pub(crate) struct TemplateCell {
-    pub(crate) name: Option<String>,
-    pub(crate) body: String,
+pub struct TemplateCell {
+    pub name: Option<String>,
+    pub body: String,
 }
 
 #[derive(
@@ -152,11 +152,11 @@ bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: 
 ))]
 #[archive_attr(derive(Debug))]
 #[ts(export, export_to = "package_node/types/")]
-pub(crate) struct WebserviceCellEndpoint {
-    pub(crate) method: String,
-    pub(crate) route: String,
-    pub(crate) depended_function_identity: String,
-    pub(crate) arg_mapping: Vec<(String, String)>,
+pub struct WebserviceCellEndpoint {
+    pub method: String,
+    pub route: String,
+    pub depended_function_identity: String,
+    pub arg_mapping: Vec<(String, String)>,
 }
 
 #[derive(
@@ -177,10 +177,10 @@ bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: 
 ))]
 #[archive_attr(derive(Debug))]
 #[ts(export, export_to = "package_node/types/")]
-pub(crate) struct WebserviceCell {
-    pub(crate) name: Option<String>,
-    pub(crate) configuration: String,
-    pub(crate) port: u16,
+pub struct WebserviceCell {
+    pub name: Option<String>,
+    pub configuration: String,
+    pub port: u16,
 }
 
 
@@ -202,8 +202,8 @@ bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: 
 ))]
 #[archive_attr(derive(Debug))]
 #[ts(export, export_to = "package_node/types/")]
-pub(crate) struct ScheduleCell {
-    pub(crate) configuration: String,
+pub struct ScheduleCell {
+    pub configuration: String,
 }
 
 
@@ -283,6 +283,7 @@ pub struct LLMPromptCellChatConfiguration {
     pub(crate) function_name: Option<String>,
 
     pub model: String,
+    pub api_url: Option<String>,
     pub frequency_penalty: Option<f64>,
     pub max_tokens: Option<i64>,
     pub presence_penalty: Option<f64>,
@@ -347,8 +348,9 @@ bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: 
 #[ts(export, export_to = "package_node/types/")]
 pub struct LLMCodeGenCellChatConfiguration {
     #[serde(rename = "fn")]
-    pub(crate) function_name: Option<String>,
+    pub function_name: Option<String>,
 
+    pub api_url: Option<String>,
     pub model: String,
     pub frequency_penalty: Option<f64>,
     pub max_tokens: Option<i64>,
@@ -415,6 +417,31 @@ pub struct LLMEmbeddingCell {
     pub req: String,
 }
 
+
+#[derive(
+TS,
+Archive,
+serde::Serialize,
+serde::Deserialize,
+Serialize,
+Deserialize,
+Debug,
+PartialEq,
+Default,
+Clone,
+)]
+#[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
+#[archive(check_bytes)]
+#[archive_attr(check_bytes(
+bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
+))]
+#[archive_attr(derive(Debug))]
+#[ts(export, export_to = "package_node/types/")]
+pub struct TextRange {
+    pub start: usize,
+    pub end: usize,
+}
+
 #[derive(
     TS,
     Archive,
@@ -434,13 +461,13 @@ pub struct LLMEmbeddingCell {
 #[archive_attr(derive(Debug))]
 #[ts(export, export_to = "package_node/types/")]
 pub enum CellTypes {
-    Code(CodeCell),
-    CodeGen(LLMCodeGenCell),
-    Prompt(LLMPromptCell),
-    Embedding(LLMEmbeddingCell),
-    Web(WebserviceCell),
-    Template(TemplateCell),
-    Memory(MemoryCell),
+    Code(CodeCell, TextRange),
+    CodeGen(LLMCodeGenCell, TextRange),
+    Prompt(LLMPromptCell, TextRange),
+    Embedding(LLMEmbeddingCell, TextRange),
+    Web(WebserviceCell, TextRange),
+    Template(TemplateCell, TextRange),
+    Memory(MemoryCell, TextRange),
 }
 
 impl Eq for CellTypes {
@@ -461,15 +488,15 @@ impl Ord for CellTypes {
 
 pub fn get_cell_name(cell: &CellTypes) -> &Option<String> {
     match &cell {
-        CellTypes::Code(c) => &c.name,
-        CellTypes::Prompt(c) => match c {
+        CellTypes::Code(c, _) => &c.name,
+        CellTypes::Prompt(c, _) => match c {
             LLMPromptCell::Chat { name, .. } => name,
             LLMPromptCell::Completion { .. } => &None,
         },
-        CellTypes::Web(c) => &c.name,
-        CellTypes::Template(c) => &c.name,
-        CellTypes::Memory(c) => &c.name,
-        CellTypes::Embedding(c) => &c.name,
-        CellTypes::CodeGen(c) => &c.name
+        CellTypes::Web(c, _) => &c.name,
+        CellTypes::Template(c, _) => &c.name,
+        CellTypes::Memory(c, _) => &c.name,
+        CellTypes::Embedding(c, _) => &c.name,
+        CellTypes::CodeGen(c, _) => &c.name
     }
 }
