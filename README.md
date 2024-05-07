@@ -51,17 +51,17 @@ Check out [high level docs ](https://docs.thousandbirds.ai/3fe20a82965148c7a0b48
 - [Help us out!](#help-us-out)
 
 
-## 📖 Chidori
-Chidori is an open-source environment for building AI agents with simple and straight forward code.
+## 📖 Chidori V2
+Chidori is an open-source environment for building AI agents.
 You author code like you typically would with python or javascript, and we provide a layer for interfacing
-with the complexities of AI models in long running workflows.
+with the complexities of AI models in long-running workflows.
 
 It is currently in alpha, and is not yet ready for production use. We are continuing to make significant changes in response to feedback.
 
 - Built from the ground up for constructing agents
 - Runtime written in Rust supporting Python and Node.js out of the box
-- Build agents that actually work :emoji:
-- LLM caching to minimize cost during development
+- Build agents that actually work
+- Cache behaviors and resume from partially executed agents
 - Optimized for long-running AI workflows
 - Embedded code interpreter
 - Time travel debugging
@@ -83,25 +83,19 @@ require them.
 OPENAI_API_KEY=...
 ```
 
-### Examples
+## Examples
 
-In the table below are examples for Node.js, Python and Rust. You'll need to scroll horizontally to view each.
+The following examples show how to build a simple agent that fetches the top stories from Hacker News and call the OpenAI API to filter to AI related launches and then format that data into markdown.
 
-The following examples show how to build a simple agent that fetches the top stories from Hacker News and call
-the OpenAI API to filter to AI related launches and then format that data into markdown. Results from the example
-are pushed into the Chidori database and can be visualized using the prompt-graph-ui project. We'll update this example
-with a pattern that makes those results more accessible soon.
-
-
-Beginning here is an executable Chidori agent:
 ------
-<pre>
+
+### Beginning here is an example executable Chidori agent:
+
 Chidori agents can be a single file, or a collection of files structured as a typical Typescript or Python project. 
 The following example is a single file agent.
 
-```js
-const axios = require('axios');
-const {Chidori, GraphBuilder} = require("@1kbirds/chidori");
+```javascript (load_hacker_news)
+const axios = require('https://deno.land/x/axiod/mod.ts');
 
 class Story {
     constructor(title, url, score) {
@@ -111,99 +105,47 @@ class Story {
     }
 }
 
-const HN_URL_TOP_STORIES = "https://hacker-news.firebaseio.com/v0/topstories.json?print=pretty";
+const HN_URL_TOP_STORIES = "https://hacker-news.firebaseio.com/v0/topstories.json";
 
 function fetchStory(id) {
     return axios.get(`https://hacker-news.firebaseio.com/v0/item/${id}.json?print=pretty`)
         .then(response => response.data);
 }
 
-function fetchHN() {
-    return axios.get(HN_URL_TOP_STORIES)
-        .then(response => {
-            const storyIds = response.data;
-            const tasks = storyIds.slice(0, 30).map(id => fetchStory(id));  // Limit to 30 stories
-            return Promise.all(tasks)
-                .then(stories => {
-                    return stories.map(story => {
-                        const { title, url, score } = story;
-                        return new Story(title, url, score);
-                    });
-                });
+async function fetchHN() {
+    const stories = await axios.get(HN_URL_TOP_STORIES);
+    const storyIds = stories.data;
+    // only the first 30 
+    const tasks = storyIds.slice(0, 30).map(id => fetchStory(id));
+    return Promise.all(tasks)
+      .then(stories => {
+        return stories.map(story => {
+          const { title, url, score } = story;
+          return new Story(title, url, score);
         });
+      });
 }
-
-class ChidoriWorker {
-    constructor() {
-        this.c = new Chidori("0", "http://localhost:9800");  // Assuming this is a connection object, replaced with an empty object for now
-    }
-
-    async buildGraph() {
-        const g = new GraphBuilder();
-
-        const h = g.customNode({
-            name: "FetchTopHN",
-            nodeTypeName: "FetchTopHN",
-            output: "{ output: String }"
-        });
-
-        const hInterpret = g.promptNode({
-            name: "InterpretTheGroup",
-            template: `
-                Based on the following list of HackerNews threads,
-                filter this list to only launches of new AI projects: {{FetchTopHN.output}}
-            `
-        });
-        hInterpret.runWhen(g, h);
-
-        const hFormatAndRank = g.promptNode({
-            name: "FormatAndRank",
-            template: `
-                Format this list of new AI projects in markdown, ranking the most 
-                interesting projects from most interesting to least. 
-                
-                {{InterpretTheGroup.promptResult}}
-            `
-        });
-        hFormatAndRank.runWhen(g, hInterpret);
-
-        await g.commit(this.c, 0)
-    }
-
-    async run() {
-        // Construct the agent graph
-        await this.buildGraph();
-
-        // Start graph execution from the root
-        // Implement the functionality of the play function
-        await this.c.play(0, 0);
-
-        // Run the node execution loop
-        // Implement the functionality of the run_custom_node_loop function
-        await this.c.runCustomNodeLoop()
-    }
-}
-
-
-async function handleFetchHN(nodeWillExec, cb) {
-    const stories = await fetchHN();
-    // return JSON.stringify(stories);
-    return cb({ "output": JSON.stringify(stories) });
-    // return ;
-}
-
-async function main() {
-    let w = new ChidoriWorker();
-    await w.c.startServer(":memory:")
-    await w.c.registerCustomNodeHandle("FetchTopHN", handleFetchHN);
-    await w.run()
-}
-
-
-main();
 ```
-</pre>
 
+Prompt "interpret_the_group"
+```prompt (interpret_the_group)
+  Based on the following list of HackerNews threads,
+  filter this list to only launches of 
+  new AI projects: {{fetched_articles}}
+```
+
+Prompt "format_and_rank"
+```prompt (format_and_rank)
+Format this list of new AI projects in markdown, ranking the most 
+interesting projects from most interesting to least. 
+{{interpret_the_group}}
+```
+
+Using a python cell as our entrypoint, demonstrating inter-language execution:
+```python
+articles = await fetchHN()
+format_and_rank(articles=articles)
+```
 ------
 
 
@@ -228,17 +170,17 @@ Chidori comes with first-class support for code interpreter environments like [D
 * [x] Reactive subscriptions between nodes
 * [x] Branching and time travel debugging, reverting execution of a graph
 * [x] Node.js, Python, and Rust support for building and executing graphs
-* [ ] Simple local vector db for development
+* [x] Simple local vector db for development
 * [ ] Adding support for containerized nodes
 * [ ] Allowing filtering in node queries
 
 ### Medium term
-* [ ] Analysis tools for comparing executions
+* [x] Analysis tools for comparing executions
+* [x] Adding support for more vector databases
+* [x] Adding support for other LLM sources
+* [x] Adding support for more code interpreter environments
 * [ ] Agent re-evaluation with feedback
 * [ ] Definitive patterns for human in the loop agents
-* [ ] Adding support for more vector databases 
-* [ ] Adding support for other LLM sources
-* [ ] Adding support for more code interpreter environments
 
 
 ## Contributing

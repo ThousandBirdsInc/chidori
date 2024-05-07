@@ -15,8 +15,6 @@ pub struct TidyLayout {
     depth_to_y: Vec<Coord>,
 }
 
-const TEST: usize = 123123231;
-
 impl TidyLayout {
     pub fn new(parent_child_margin: Coord, peer_margin: Coord) -> Self {
         TidyLayout {

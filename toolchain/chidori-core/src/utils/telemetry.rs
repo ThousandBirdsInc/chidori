@@ -42,11 +42,12 @@ fn get_value_in_valueset(valueset: &ValueSet<'_>, field: &str) -> Option<String>
 //     visitor.matched
 // }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TraceEvents{
     // TODO: add support for capturing the execution id that we're observing
     NewSpan{
         id: String,
+        created_at: Instant,
         thread_id: NonZero<u64>,
         parent_id: Option<String>,
         weight: u128,
@@ -65,23 +66,6 @@ pub enum TraceEvents{
     Close(String, u128),
 }
 
-// https://github.com/rust-lang/rust/issues/22750
-// TODO: we can't serialize these within the Tauri application due to some kind of issue
-//       with serde versions once we introduced a deeper dependency on Deno.
-//       we attempted the following patch to no avail:
-//
-//       [patch.crates-io]
-//       deno = {path = "../../deno/cli"}
-//       deno_runtime = {path = "../../deno/runtime"}
-//       serde = {path = "../../serde/serde" }
-//       serde_derive = {path = "../../serde/serde_derive" }
-//       tauri = {path = "../../tauri/core/tauri" }
-//
-// TODO: this function exists to perform serialization to strings on THIS side of the
-//       crate boundary, and then we can send the strings over to the Tauri side.
-pub fn trace_event_to_string(trace_event: TraceEvents) -> String {
-    serde_json::to_string(&trace_event).unwrap()
-}
 
 struct Timing {
     started_at: Instant,
@@ -118,11 +102,13 @@ impl<S> Layer<S> for CustomLayer
         // }
 
         // This weight is the start timestamp of the span, not its duration
+        let created_at = Instant::now();
         let weight = (Instant::now() - self.started_at).as_nanos();
         let thread_id = std::thread::current().id().as_u64();
         self.sender.send(TraceEvents::NewSpan {
             id: format!("{:?}", id),
             parent_id: span.parent().map(|p| format!("{:?}", p.id())),
+            created_at,
             thread_id,
             weight,
             name: metadata.name().to_string(),
@@ -205,9 +191,12 @@ impl<S, T> Layer<T> for ForwardingLayer<S>
 pub fn init_internal_telemetry(sender: Sender<TraceEvents>) -> impl Subscriber {
     println!("Initializing internal telemetry");
     let custom_layer = CustomLayer::new(sender);
-    let forwarding_layer = ForwardingLayer::new(tracing_subscriber::fmt::layer());
+    let filter_layer = tracing_subscriber::EnvFilter::new("chidori_core=trace");
+    // let forwarding_layer = ForwardingLayer::new(tracing_subscriber::fmt::layer());
+
     let subscriber = tracing_subscriber::Registry::default()
-        .with(custom_layer)
-        .with(forwarding_layer);
+        .with(filter_layer)
+        // .with(forwarding_layer)
+        .with(custom_layer);
     subscriber
 }

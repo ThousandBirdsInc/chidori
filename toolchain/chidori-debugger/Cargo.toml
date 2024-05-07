@@ -12,7 +12,9 @@ bevy = "0.13.2"
 bevy_utils = "0.13.2"
 bevy_egui = "0.27.0"
 bevy_rapier2d = { version = "*", features = [ "simd-stable", "debug-render-2d" ]}
+bevy_prototype_lyon = "0.11.0"
 egui_extras = { version = "0.27.2" , features = ["syntect"]}
+egui_tiles = "0.8.0"
 bevy_cosmic_edit = { version = "0.19.0", features = ["multicam"] }
 rfd = "0.14.1"
 bytemuck = "1.15.0"

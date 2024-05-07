@@ -1,28 +1,45 @@
+#![feature(generic_nonzero)]
+
 mod util;
-mod editor;
+mod code;
 mod traces;
 mod graph;
 mod chidori;
 mod tokio_tasks;
 mod tidy_tree;
+mod chat;
+mod shader_trace;
 
+use bevy::core_pipeline::fxaa::FxaaPlugin;
+use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
+use bevy::ecs::schedule::LogLevel;
 use bevy::prelude::*;
 use bevy::input::keyboard::KeyboardInput;
+use bevy::log::{Level, LogPlugin};
 use bevy::render::render_resource::{Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages};
 use bevy::render::view::RenderLayers;
+use bevy::window::{PrimaryWindow, WindowResolution};
 use bevy_cosmic_edit::*;
 use bevy_egui::{EguiPlugin, egui, EguiContexts};
-use bevy_egui::egui::{FontData, FontDefinitions, FontFamily, FontId};
+use bevy_egui::egui::{Color32, FontData, FontDefinitions, FontFamily, FontId};
 use bevy_rapier2d::plugin::{NoUserData, RapierPhysicsPlugin};
 use bevy_rapier2d::prelude::RapierDebugRenderPlugin;
+use once_cell::sync::{Lazy, OnceCell};
+use tokio::runtime::Runtime;
 use chidori_core::sdk::entry::Chidori;
 use util::{change_active_editor_ui, deselect_editor_on_esc, print_editor_text};
+
+
+static DEVICE_SCALE: OnceCell<f32> = OnceCell::new();
+
+
 
 #[derive(Clone, Copy, Default, Eq, PartialEq, Debug, Hash, States)]
 enum GameState {
     Editor,
-    #[default]
     Traces,
+    Chat,
+    #[default]
     Graph,
 }
 
@@ -37,37 +54,15 @@ fn check_key_input(
     if keyboard_input.just_pressed(KeyCode::KeyT) {
         state.set(GameState::Traces);
     }
+    if keyboard_input.just_pressed(KeyCode::KeyC) {
+        state.set(GameState::Chat);
+    }
     if keyboard_input.just_pressed(KeyCode::KeyG) {
         state.set(GameState::Graph);
     }
 }
 
-fn main() {
-    App::new()
-        .add_plugins(DefaultPlugins
-            .set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: "Chidori Debugger".to_string(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            })
-        )
-        .add_plugins(RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(100.0))
-        .add_plugins(RapierDebugRenderPlugin::default())
-        .add_plugins(EguiPlugin)
-        .add_plugins(tokio_tasks::TokioTasksPlugin::default())
-        // Insert as resource the initial value for the settings resources
-        // .insert_resource(DisplayQuality::Medium)
-        // .insert_resource(Volume(7))
-        // Declare the game state, whose starting value is determined by the `Default` trait
-        .init_state::<GameState>()
-        .add_systems(Startup, setup)
-        .add_systems(Update, check_key_input)
-        // Adds the plugins for each state
-        .add_plugins((chidori::chidori_plugin, editor::editor_plugin, traces::trace_plugin, graph::graph_plugin))
-        .run();
-}
+
 
 fn setup(
     mut commands: Commands,
@@ -75,6 +70,7 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
 ) {
+
     let size = Extent3d {
         width: 512,
         height: 512,
@@ -145,8 +141,41 @@ fn setup(
         (bevy_egui::egui::TextStyle::Small, FontId::new(12.0, bevy_egui::egui::FontFamily::Proportional)),
     ]
         .into();
-    style.spacing.button_padding = egui::vec2(8.0, 8.0);
+    style.visuals.widgets.hovered.bg_stroke = bevy_egui::egui::Stroke::new(1.0, Color32::from_hex("#333333").unwrap());
+
+    style.spacing.button_padding = egui::vec2(8.0, 6.0);
     contexts.ctx_mut().set_style(style);
+}
 
-
+fn main() {
+    App::new()
+        .add_plugins((
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        // resolution: WindowResolution::new(500., 300.).with_scale_factor_override(2.0),
+                        title: "Chidori Debugger".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                // We disable the log plugin to avoid conflicts with the Chidori logger
+                .disable::<LogPlugin>()
+            ,
+            FrameTimeDiagnosticsPlugin,
+        ))
+        .add_plugins(RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(100.0))
+        // .add_plugins(RapierDebugRenderPlugin::default())
+        .add_plugins(EguiPlugin)
+        .add_plugins(tokio_tasks::TokioTasksPlugin::default())
+        // Insert as resource the initial value for the settings resources
+        // .insert_resource(DisplayQuality::Medium)
+        // .insert_resource(Volume(7))
+        // Declare the game state, whose starting value is determined by the `Default` trait
+        .init_state::<GameState>()
+        .add_systems(Startup, setup)
+        .add_systems(Update, check_key_input)
+        // Adds the plugins for each state
+        .add_plugins((chidori::chidori_plugin, code::editor_plugin, traces::trace_plugin, graph::graph_plugin))
+        .run();
 }

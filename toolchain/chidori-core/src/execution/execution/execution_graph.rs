@@ -45,30 +45,6 @@ pub type ExecutionNodeId = (usize, usize);
 #[derive(Debug, Clone)]
 pub struct MergedStateHistory(HashMap<usize, (ExecutionNodeId, Arc<RkyvSerializedValue>)>);
 
-impl serde::Serialize for MergedStateHistory {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-    {
-        let mut map = serializer.serialize_map(Some(self.0.len()))?;
-        for (k, v) in self.0.iter() {
-            map.serialize_entry(&k, &(v.0, &v.1.deref()))?;
-        }
-        map.end()
-    }
-}
-
-
-impl<'de> serde::Deserialize<'de> for MergedStateHistory {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-    {
-        unreachable!("ExecutionState cannot be deserialized.")
-    }
-}
-
-
 // TODO: every point in the execution graph should be a top level element in an execution stack
 //       but what about async functions?
 

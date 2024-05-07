@@ -4,7 +4,7 @@ members = [
     "chidori-prompt-format",
     "chidori-im-rs",
     "chidori-static-analysis",
-    "chidori-ui/src-tauri", "chidori-debugger",
+    "chidori-debugger",
 ]
 resolver = "2"
 
@@ -16,8 +16,8 @@ license = "MIT"
 homepage = "https://docs.thousandbirds.ai"
 repository = "https://github.com/ThousandBirdsInc/chidori"
 
-[profile.release]
-lto = true
+#[profile.release]
+#lto = false
 # Tell `rustc` to optimize for small code size.
 #opt-level = "s"
 

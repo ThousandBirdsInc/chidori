@@ -18,6 +18,7 @@ use std::thread::sleep;
 use chumsky::prelude::any;
 use petgraph::graphmap::DiGraphMap;
 use serde::ser::SerializeMap;
+use tracing::dispatcher::DefaultGuard;
 use crate::execution::primitives::operation::OperationFnOutput;
 use crate::utils::telemetry::{init_internal_telemetry, TraceEvents};
 
@@ -116,17 +117,15 @@ impl InstancedEnvironment {
 
     /// Entrypoint for execution of an instanced environment, handles messages from the host
     pub async fn run(&mut self) -> anyhow::Result<()> {
+        println!("Starting instanced environment");
         self.playback_state = PlaybackState::Paused;
 
         // Reload cells to make sure we're up to date
         self.reload_cells();
 
-        let _maybe_guard = self.trace_event_sender.as_ref().map(|sender| {
-            tracing::subscriber::set_global_default(init_internal_telemetry(sender.clone()));
-            tracing::subscriber::set_default(init_internal_telemetry(sender.clone()))
-        });
         loop {
             if let Ok(message) = self.env_rx.try_recv() {
+                println!("Received message from host: {:?}", message);
                 match message {
                     UserInteractionMessage::Play => {
                         self.playback_state = PlaybackState::Running;
@@ -137,12 +136,18 @@ impl InstancedEnvironment {
                     UserInteractionMessage::ReloadCells => {
                         self.reload_cells();
                     },
+                    UserInteractionMessage::FetchStateAt(id) => {
+                        let state = self.get_state_at(id);
+                        let sender = self.runtime_event_sender.as_mut().unwrap();
+                        sender.send(EventsFromRuntime::StateAtId(id, state)).unwrap();
+                    },
                     UserInteractionMessage::RevertToState(id) => {
                         if let Some(id) = id {
                             self.execution_head_state_id = id;
                             let merged_state = self.db.get_merged_state_history(&id);
                             let sender = self.runtime_event_sender.as_mut().unwrap();
                             sender.send(EventsFromRuntime::ExecutionStateChange(merged_state)).unwrap();
+                            sender.send(EventsFromRuntime::UpdateExecutionHead(id)).unwrap();
                         }
                     },
                     _ => {}
@@ -161,6 +166,13 @@ impl InstancedEnvironment {
         Ok(())
     }
 
+    pub fn get_state_at(&self, id: ExecutionNodeId) -> ExecutionState {
+        match self.db.get_state_at_id(id).unwrap() {
+            ExecutionStateEvaluation::Complete(s) => s,
+            ExecutionStateEvaluation::Executing(_) => ExecutionState::new()
+        }
+    }
+
     pub fn get_state(&self) -> ExecutionState {
         match self.db.get_state_at_id(self.execution_head_state_id).unwrap() {
             ExecutionStateEvaluation::Complete(s) => s,
@@ -176,6 +188,7 @@ impl InstancedEnvironment {
         if let Some(sender) = self.runtime_event_sender.as_mut() {
             sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
             sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
+            sender.send(EventsFromRuntime::UpdateExecutionHead(state_id)).unwrap();
         }
         println!("Resulted in state with id {:?}", &state_id);
         self.execution_head_state_id = state_id;
@@ -191,6 +204,7 @@ impl InstancedEnvironment {
             sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
             sender.send(EventsFromRuntime::DefinitionGraphUpdated(state.get_dependency_graph_flattened())).unwrap();
             sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
+            sender.send(EventsFromRuntime::UpdateExecutionHead(state_id)).unwrap();
         }
         self.execution_head_state_id = state_id;
         Ok((state_id, op_id))
@@ -207,6 +221,7 @@ pub enum UserInteractionMessage {
     UserAction(String),
     RevertToState(Option<(usize, usize)>),
     ReloadCells,
+    FetchStateAt(ExecutionNodeId),
     FetchCells,
     MutateCell
 }
@@ -229,12 +244,14 @@ pub enum UserInteractionMessage {
 //       for now we will serialize these to Strings on this side of the interface
 //       the original type of this object is as follows:
 //
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub enum EventsFromRuntime {
     DefinitionGraphUpdated(Vec<(OperationId, OperationId, Vec<DependencyReference>)>),
     ExecutionGraphUpdated(Vec<(ExecutionNodeId, ExecutionNodeId)>),
     ExecutionStateChange(MergedStateHistory),
-    CellsUpdated(Vec<CellHolder>)
+    CellsUpdated(Vec<CellHolder>),
+    StateAtId(ExecutionNodeId, ExecutionState),
+    UpdateExecutionHead(ExecutionNodeId)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
@@ -294,6 +311,8 @@ pub struct Chidori {
 
     shared_state: Arc<Mutex<SharedState>>,
     pub loaded_path: Option<String>,
+
+    tracing_guard: Option<DefaultGuard>
 }
 
 impl std::fmt::Debug for Chidori {
@@ -306,6 +325,7 @@ impl std::fmt::Debug for Chidori {
 impl Chidori {
     pub fn new() -> Self {
         Chidori {
+
             instanced_env_tx: None,
             runtime_event_sender: None,
             trace_event_sender: None,
@@ -314,10 +334,13 @@ impl Chidori {
                 cells: vec![],
                 latest_state: None,
             })),
+            tracing_guard: None,
         }
     }
 
     pub fn new_with_events(sender: Sender<TraceEvents>, runtime_event_sender: Sender<EventsFromRuntime>) -> Self {
+        tracing::subscriber::set_global_default(init_internal_telemetry(sender.clone())).expect("Failed to set global default");
+        let guard: DefaultGuard = tracing::subscriber::set_default(init_internal_telemetry(sender.clone()));
         Chidori {
             instanced_env_tx: None,
             runtime_event_sender: Some(runtime_event_sender),
@@ -327,6 +350,7 @@ impl Chidori {
                 cells: vec![],
                 latest_state: None,
             })),
+            tracing_guard: Some(guard)
         }
     }
 
@@ -415,6 +439,8 @@ impl Chidori {
         let mut db = ExecutionGraph::new();
         let state_id = (0, 0);
         let playback_state = PlaybackState::Paused;
+
+
         Ok(InstancedEnvironment {
             env_rx,
             db,
