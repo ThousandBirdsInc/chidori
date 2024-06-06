@@ -26,7 +26,7 @@ async function addTwo(x) {
 import unittest
 
 class TestMarshalledValues(unittest.TestCase):
-    async def test_addTwo(self):
+    async def test_asyncAddTwo(self):
         self.assertEqual(await addTwo(2), 4)
 
 unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))

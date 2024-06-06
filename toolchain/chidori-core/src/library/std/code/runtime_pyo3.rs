@@ -84,6 +84,9 @@ fn pyany_to_rkyv_serialized_value(p: &PyAny) -> RkyvSerializedValue {
             "NoneType" => {
                 RkyvSerializedValue::Null
             },
+            "Future" => {
+                RkyvSerializedValue::Null
+            },
             x @ _  => {
                 panic!("Py03 marshalling unsupported type: {}", x);
                 RkyvSerializedValue::Null
@@ -233,6 +236,7 @@ impl std::convert::From<AnyhowErrWrapper> for PyErr {
 }
 
 
+#[tracing::instrument]
 pub async fn source_code_run_python(
     execution_state: &ExecutionState,
     source_code: &String,
@@ -339,6 +343,12 @@ pub async fn source_code_run_python(
             }
             // Necessary to expose defined functions to the global scope from the inside of the __wrapper function
             for (name, report_item) in &report.triggerable_functions {
+                initial_source_code.push_str("\n");
+                initial_source_code.push_str(&format!(
+                    r#"chidori.set_value({exec_id}, "{name}", "function")"#,
+                    exec_id = exec_id,
+                    name = name
+                ));
                 initial_source_code.push_str("\n");
                 initial_source_code.push_str(&format!(
                     r#"globals()["{name}"] = {name}"#,
@@ -545,6 +555,7 @@ fn python_dependency_management() {
 
 #[cfg(test)]
 mod tests {
+    use chumsky::prelude::any;
     use super::*;
     use crate::cells::{SupportedLanguage, TextRange};
     use crate::execution::primitives::serialized_value::RkyvObjectBuilder;
@@ -781,7 +792,6 @@ data = await demo()
 
 
 
-    #[ignore]
     #[tokio::test]
     async fn test_running_sync_unit_test() {
         let source_code = String::from(
@@ -890,7 +900,12 @@ fn example():
                 .build(),
             &Some("example".to_string()),
         ).await;
-        assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(1), vec![], vec![]));
+        match result {
+            Ok(_) => {panic!("Must return error.")}
+            Err(e) => {
+                assert_eq!(e.to_string(), String::from("ValueError: Raising a python error"));
+            }
+        }
     }
 
 
@@ -909,6 +924,11 @@ raise ValueError("Raising a python error")
                 .build(),
             &Some("example".to_string()),
         ).await;
-        assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(1), vec![], vec![]));
+        match result {
+            Ok(_) => {panic!("Must return error.")}
+            Err(e) => {
+                assert_eq!(e.to_string(), String::from("ValueError: Raising a python error"));
+            }
+        }
     }
 }

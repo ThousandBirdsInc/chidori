@@ -30,7 +30,7 @@ import unittest
 
 class TestMarshalledValues(unittest.IsolatedAsyncioTestCase):
     async def test_run_prompt(self):
-        self.assertEqual(await run_prompt(5), "demoAAAAA")
+        self.assertEqual(await run_prompt(5), "demoDPNGC")
 
 unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
 ```

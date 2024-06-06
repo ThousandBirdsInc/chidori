@@ -1,7 +1,7 @@
 # Demonstrating RAG via stateful memory cells
 
 Memory cells are an example of persistent stateful cells, once initially invoked they expose methods 
-to the rest of the environment that manipulate their internal state. Memory specifically exposes "insert" and
+to the rest of the environment that allow manipulation of their internal state. Memory specifically exposes "insert" and
 "search" methods which are used to store and retrieve values respectively.
 
 We must assign an embedding_fn to the memory cell, in this case we're using an embedding cell to simplify the process.

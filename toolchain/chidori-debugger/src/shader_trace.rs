@@ -7,7 +7,7 @@ use bevy::ecs::system::SystemParamItem;
 use bevy::render::mesh::{GpuBufferInfo, MeshVertexBufferLayout};
 use bevy::core_pipeline::core_3d::Transparent3d;
 use bevy::render::render_resource::{Buffer, BufferInitDescriptor, BufferUsages, PipelineCache, RenderPipelineDescriptor, SpecializedMeshPipeline, SpecializedMeshPipelineError, SpecializedMeshPipelines, VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode};
-use bevy::render::view::ExtractedView;
+use bevy::render::view::{ExtractedView, RenderLayers};
 use bevy::asset::{AssetServer, Handle};
 use bevy::render::renderer::RenderDevice;
 use bytemuck::offset_of;
@@ -17,6 +17,7 @@ use bevy::app::{App, Plugin};
 use bevy::render::{Render, RenderApp, RenderSet};
 use bevy::core::{Pod, Zeroable};
 use bevy::math::Vec3;
+use crate::RENDER_LAYER_TRACE_VIEW;
 
 #[allow(clippy::too_many_arguments)]
 pub fn queue_custom(
@@ -27,17 +28,24 @@ pub fn queue_custom(
     pipeline_cache: Res<PipelineCache>,
     meshes: Res<RenderAssets<Mesh>>,
     render_mesh_instances: Res<RenderMeshInstances>,
-    material_meshes: Query<Entity, With<InstanceMaterialData>>,
-    mut views: Query<(&ExtractedView, &mut RenderPhase<Transparent3d>)>,
+    material_meshes: Query<(Entity, Option<&RenderLayers>), With<InstanceMaterialData>>,
+    mut views: Query<(&ExtractedView, &mut RenderPhase<Transparent3d>, Option<&RenderLayers>)>,
 ) {
     let draw_custom = transparent_3d_draw_functions.read().id::<DrawCustom>();
 
     let msaa_key = MeshPipelineKey::from_msaa_samples(msaa.samples());
 
-    for (view, mut transparent_phase) in &mut views {
+    for (view, mut transparent_phase, view_render_layers) in &mut views {
+        let Some(render_layers) = view_render_layers else {
+            continue;
+        };
+        // TODO: this could be made more generic but we currently only care about this in the context of our trace renderer
+        if !render_layers.intersects(&RenderLayers::layer(RENDER_LAYER_TRACE_VIEW)) {
+            continue;
+        }
         let view_key = msaa_key | MeshPipelineKey::from_hdr(view.hdr);
         let rangefinder = view.rangefinder3d();
-        for entity in &material_meshes {
+        for (entity, entity_render_layers) in &material_meshes {
             let Some(mesh_instance) = render_mesh_instances.get(&entity) else {
                 continue;
             };

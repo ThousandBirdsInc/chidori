@@ -455,6 +455,7 @@ pub async fn ai_llm_code_generation_chat_model(
     if let Ok(ChatCompletionRes { choices, .. }) = result {
         for choice in choices {
             let text = choice.text.as_ref().unwrap().clone();
+            println!("Code generation cell run with this prompt: {}", &text);
             let new_execution_state = execution_state.clone();
             let (new_execution_state, _) = new_execution_state.update_op(crate::cells::CellTypes::Code(crate::cells::CodeCell {
                 name: None,

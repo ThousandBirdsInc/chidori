@@ -24,14 +24,12 @@ repository = "https://github.com/ThousandBirdsInc/chidori"
 [workspace.dependencies]
 rkyv = {version = "0.7.42", features = ["validation"]}
 
-gluesql = "0.15.0"
 protobuf = "3.2.0"
-sqlparser = "0.34.0"
 anyhow = { version = "1.0", default-features = false }
 indoc = "1.0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_derive = "1"
-serde_json = "1.0.115"
+serde_json = "=1.0.115"
 tonic = "0.9"
 prost = "0.11"
 tokio = { version = "1", features = ["full", "tracing"] }
@@ -55,9 +53,8 @@ insta = { version = "1.38.0", features = ["yaml", "redactions"] }
 thiserror = "1.0.58"
 
 [patch.crates-io]
-deno = {path = "../../deno/cli"}
-deno_runtime = {path = "../../deno/runtime"}
-serde = {path = "../../serde/serde" }
-serde_derive = {path = "../../serde/serde_derive" }
-tauri = {path = "../../tauri/core/tauri" }
+deno = { git = "https://github.com/ThousandBirdsInc/deno", rev = "783f25180b82ae90fe21a9c0118c104da06db25c" }
+deno_runtime = { git = "https://github.com/ThousandBirdsInc/deno", rev = "783f25180b82ae90fe21a9c0118c104da06db25c" }
+#serde = {path = "../../serde/serde" }
+#serde_derive = {path = "../../serde/serde_derive" }
 #openai_api_rs = {path = "../../openai-api-rs" }

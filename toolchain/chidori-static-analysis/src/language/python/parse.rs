@@ -1067,7 +1067,7 @@ def fun_name():
 
 x = random.randint(0, 10)            
 "#};
-        let context_stack_references = extract_dependencies_python(python_source)?;
+        let context_stack_references = extract_dependencies_python(python_source).map_err(|e| anyhow::Error::msg(format!("{:?}", e)))?;
         insta::with_settings!({
             description => python_source,
             omit_expression => true
@@ -1119,7 +1119,7 @@ x = random.randint(0, 10)
         async def complex_args_function(a, b, c=2, d=3):
             return a + b + c + d
             "#};
-        let context_stack_references = extract_dependencies_python(python_source)?;
+        let context_stack_references = extract_dependencies_python(python_source).map_err(|e| anyhow::Error::msg(format!("{:?}", e)))?;
         insta::with_settings!({
             description => python_source,
             omit_expression => true
@@ -1159,7 +1159,7 @@ x = random.randint(0, 10)
                 out += await first_letter(state)
             return "demo" + out
             "#};
-        let context_stack_references = extract_dependencies_python(python_source)?;
+        let context_stack_references = extract_dependencies_python(python_source).map_err(|e| anyhow::Error::msg(format!("{:?}", e)))?;
         insta::with_settings!({
             description => python_source,
             omit_expression => true
@@ -1183,7 +1183,7 @@ x = random.randint(0, 10)
         let python_source = indoc! { r#"
             out = await read_file_and_load_to_memory("./")
             "#};
-        let context_stack_references = extract_dependencies_python(python_source)?;
+        let context_stack_references = extract_dependencies_python(python_source).map_err(|e| anyhow::Error::msg(format!("{:?}", e)))?;
         insta::with_settings!({
             description => python_source,
             omit_expression => true
@@ -1211,7 +1211,7 @@ x = random.randint(0, 10)
 
             unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
             "#};
-        let context_stack_references = extract_dependencies_python(python_source)?;
+        let context_stack_references = extract_dependencies_python(python_source).map_err(|e| anyhow::Error::msg(format!("{:?}", e)))?;
         insta::with_settings!({
             description => python_source,
             omit_expression => true

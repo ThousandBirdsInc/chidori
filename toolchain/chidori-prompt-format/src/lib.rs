@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use wasm_bindgen::prelude::*;
+pub use serde_json;
 
 use crate::templating::templates::{ChatModelRoles, PromptLibraryRecord, TemplateWithSource};
 use wasm_bindgen::prelude::*;

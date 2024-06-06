@@ -1,13 +1,12 @@
 ---
 source: chidori-static-analysis/src/language/javascript/parse.rs
-assertion_line: 1028
 description: "function testing(x) {\n    return x\n}\n    "
 ---
 cell_exposed_values: {}
-cell_depended_values:
-  x: {}
+cell_depended_values: {}
 triggerable_functions:
   testing:
-    arguments: []
+    arguments:
+      - x
     emit_event: []
     trigger_on: []

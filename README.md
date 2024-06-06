@@ -13,18 +13,10 @@ https://github.com/ThousandBirdsInc/chidori/assets/515757/6b088f7d-d8f7-4c7e-900
 <a href="https://crates.io/crates/chidori"><img alt="Cargo.io download" src="https://img.shields.io/crates/v/chidori" /></a>
 <a href="https://github.com/ThousandBirdsInc/chidori/blob/main/LICENSE"><img alt="Github License" src="https://img.shields.io/badge/License-MIT-green.svg" /></a>
 </p>
-
 <br />
-
-
-
-
-
 </div>
 
 Star us on Github! Join us on [Discord](https://discord.gg/CJwKsPSgew).
-
-Check out [high level docs ](https://docs.thousandbirds.ai/3fe20a82965148c7a0b480f7daf0aff6)
 
 ## Contents
 - [📖 Chidori](#-chidori)
@@ -56,7 +48,8 @@ Chidori is an open-source environment for building AI agents.
 You author code like you typically would with python or javascript, and we provide a layer for interfacing
 with the complexities of AI models in long-running workflows.
 
-It is currently in alpha, and is not yet ready for production use. We are continuing to make significant changes in response to feedback.
+We are continuing to make significant changes in response to feedback and iterating on different features.
+Feedback is greatly appreciated! Please add to our issue tracker.
 
 - Built from the ground up for constructing agents
 - Runtime written in Rust supporting Python and Node.js out of the box
@@ -66,44 +59,53 @@ It is currently in alpha, and is not yet ready for production use. We are contin
 - Embedded code interpreter
 - Time travel debugging
 
+I want to demonstrate a workflow where entirely arbitrary code can be used to build useful agents.
+Users should be able to leverage the entire surface areas of the langauges agents are defined within. My aspiration
+is that Chidori can be the best way to build agentic software.
+
+
 ## ⚡️ Getting Started
 
 ### Installation
-Chidori is available on [crates.io](https://crates.io/crates/chidori) and can be installed using cargo.
+Chidori is available on [crates.io](https://crates.io/crates/chidori) and can be installed using cargo. Our expected entrypoint for
+prototype development is `chidori-debugger` which wraps our runtime in a useful visual interface.
 
 ```bash
-cargo install chidori-core
+xcode-select --install
+brew install cmake
+brew install protobuf # needed for denokv-proto?, we don't explicitly need this
+brew install libiconv # not entirely sure why this is necessary WIP, I'll hunt this down
+brew install python@3.11
+cargo install chidori-debugger
 ```
+
+If you would prefer a different python interpreter you can set PYO3_PYTHON=python3.12 (or whichever version > 3.7) during
+your installation to change which is linked against.
 
 
 ### Environment Variables
-You will need to set the following environment variables if you depend on nodes that
-require them.
+Chidori's interactions with LLMs default to http://localhost:4000 to hook into LiteLLM's proxy.
+If you'd like to leverage gpt-3.5-turbo the included config file will support that.
 ```bash
 OPENAI_API_KEY=...
+litellm --config ./litellm_config.yaml
+rye sync
 ```
 
 ## Examples
 
-The following examples show how to build a simple agent that fetches the top stories from Hacker News and call the OpenAI API to filter to AI related launches and then format that data into markdown.
+The following example shows how to build a simple agent that fetches the top stories from Hacker News and call the OpenAI API to filter to AI related launches and then format that data into markdown.
 
 ------
 
 ### Beginning here is an example executable Chidori agent:
 
 Chidori agents can be a single file, or a collection of files structured as a typical Typescript or Python project. 
-The following example is a single file agent.
+The following example is a single file agent. Consider this similar to something like a jupyter/iPython notebook 
+represented as a markdown file.
 
 ```javascript (load_hacker_news)
 const axios = require('https://deno.land/x/axiod/mod.ts');
-
-class Story {
-    constructor(title, url, score) {
-        this.title = title;
-        this.url = url;
-        this.score = score;
-    }
-}
 
 const HN_URL_TOP_STORIES = "https://hacker-news.firebaseio.com/v0/topstories.json";
 
@@ -121,7 +123,7 @@ async function fetchHN() {
       .then(stories => {
         return stories.map(story => {
           const { title, url, score } = story;
-          return new Story(title, url, score);
+          return {title, url, score};
         });
       });
 }
@@ -149,7 +151,7 @@ format_and_rank(articles=articles)
 ------
 
 
-## 🤔 About
+## About
 
 ### Reactive Runtime
 At its core, Chidori brings a reactive runtime that orchestrates interactions between different agents and their components. The runtime is comprised of "nodes", which react to system changes they subscribe to, providing dynamic and responsive behavior in your AI systems.
@@ -186,25 +188,6 @@ Chidori comes with first-class support for code interpreter environments like [D
 ## Contributing
 This is an early open source release and we're looking for collaborators from the community. 
 A good place to start would be to join our [discord](https://discord.gg/CJwKsPSgew)!
-
-## FAQ
-
-### Why Another AI Framework?
-Chidori focuses on the specifics of how LLM+code execution operates rather than providing specific compositions of prompts. Other frameworks haven’t focused on this space, and it's an important one. We reduce accidental complexity in building systems for long-running agents; this helps developers build successful systems.
-
-### Why Chidori?
-Chidori is the name of the lightning blade technique used by Kakashi in the Naruto anime series.
-It also happens to [mean Thousand Birds in Japanese](https://en.wikipedia.org/wiki/Chidori), which is a nice coincidence.
-
-### Well then why Thousand Birds?
-Thousand Birds is a reference to flocks of birds (or a murmuration) and the emergent behavior that arises from their interactions.
-We think this is a good metaphor for the behavior of long running agents, the internal units of LLM execution within them, and the emergent behavior that arises from their interactions.
-
-### Why Rust?
-Rust is a great language for building systems, we like the type system and the guarantees provided by it.
-We also like the performance characteristics of Rust, and the ability to build a single binary that can be deployed anywhere.
-The Rust ecosystem makes it fairly easy to provide bindings to other languages, which is important for us to provide a good developer experience.
-
 
 ## Inspiration
 Our framework is inspired by the work of many others, including:

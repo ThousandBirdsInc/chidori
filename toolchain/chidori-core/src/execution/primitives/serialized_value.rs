@@ -25,6 +25,7 @@ pub enum RkyvSerializedValue {
     Cell(CellTypes),
 
     // TODO: add Embedding
+    // TODO: add Error
     Set(
 
         #[omit_bounds]
@@ -294,7 +295,7 @@ pub fn deserialize_from_buf(v: &[u8]) -> RkyvSerializedValue {
     arg1
 }
 
-pub fn serialized_value_to_json_value(v: &RkyvSerializedValue) -> Value {
+pub fn serialized_value_to_json_value(v: &RkyvSerializedValue) -> serde_json::Value {
     match &v {
 
         RkyvSerializedValue::Float(f) => Value::Number(f.to_string().parse().unwrap()),

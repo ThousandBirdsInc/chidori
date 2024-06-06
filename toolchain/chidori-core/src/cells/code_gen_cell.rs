@@ -68,6 +68,8 @@ pub fn code_gen_cell(cell: &LLMCodeGenCell, range: &TextRange) -> anyhow::Result
             input_signature,
             output_signature,
             Box::new(move |s, payload, _, _| {
+                let closure_span = tracing::span!(tracing::Level::INFO, "code_generation_cell");
+                let _enter = closure_span.enter();
                 let role_blocks = role_blocks.clone();
                 let name = name.clone();
                 if configuration.function_name.is_some() && !is_function_invocation {

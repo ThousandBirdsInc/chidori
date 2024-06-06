@@ -28,9 +28,8 @@ fn add_extension_module_link_args(triple: &Triple) -> io::Result<()> {
             writeln!(writer, "cargo:rustc-cdylib-link-arg=-undefined")?;
             writeln!(writer, "cargo:rustc-cdylib-link-arg=dynamic_lookup")?;
             writeln!(writer, "cargo:rustc-link-search=native=/opt/homebrew/Cellar/libiconv/1.17/lib")?;
-            writeln!(writer, "cargo:rustc-link-search=native=/opt/homebrew/Cellar/python@3.11/3.11.7_1/Frameworks/Python.framework/Versions/3.11/lib")?;
+            writeln!(writer, "cargo:rustc-link-search=native=/opt/homebrew/Cellar/python@3.11/3.11.9/Frameworks/Python.framework/Versions/3.11/lib")?;
             writeln!(writer, "cargo:rustc-link-lib=dylib=python3.11")?;
-
             println!("cargo:warning=Linking against Python 3.11");
 
             // Assuming the toolchain directory is part of the RUSTUP_HOME environment variable
@@ -69,7 +68,7 @@ fn add_extension_module_link_args(triple: &Triple) -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // TODO: use rye to install a static version of python
+    // TODO: use rye to install a static version of python and link against that to simplify installation
     // install_python().unwrap();
     let target_triple = env::var("TARGET").expect("TARGET was not set");
     let triple = Triple::from_str(&target_triple).expect("Invalid target triple");

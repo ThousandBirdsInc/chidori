@@ -1,141 +1,123 @@
 use bevy::app::{App, Startup, Update};
 use bevy::DefaultPlugins;
-use bevy::prelude::{ButtonBundle, Camera, Camera2dBundle, ClearColorConfig, Color, Commands, Component, default, in_state, IntoSystemConfigs, OnEnter, OnExit, Query, ResMut, Style, Val, Window, With};
+use bevy::input::ButtonInput;
+use bevy::prelude::{ButtonBundle, Camera, Camera2dBundle, ClearColorConfig, Color, Commands, Component, default, in_state, IntoSystemConfigs, KeyCode, Local, OnEnter, OnExit, Query, Res, ResMut, Resource, Style, Val, Window, With};
 use bevy::window::PrimaryWindow;
 use bevy_cosmic_edit::{Attrs, CosmicBuffer, CosmicColor, CosmicEditBundle, CosmicEditPlugin, CosmicFontConfig, CosmicFontSystem, CosmicPrimaryCamera, CosmicSource, Family, FocusedWidget, Metrics};
 use bevy_egui::{egui, EguiContexts};
 use bevy_egui::egui::{FontFamily, Frame, Margin};
 use egui_tiles::Tile;
 use chidori_core::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, TemplateCell, TextRange, WebserviceCell};
-use crate::chidori::{ChidoriCells, EguiTree};
+use crate::chidori::{ChidoriCells, EguiTree, EguiTreeIdentities};
 use crate::GameState;
 use crate::util::{change_active_editor_ui, deselect_editor_on_esc, despawn_screen, print_editor_text};
+use std::borrow::BorrowMut;
 
 #[derive(Component)]
 struct OnChatScreen;
 
+struct ChatMessage(String);
+
+#[derive(Default, Resource)]
+struct ChatHistory {
+    messages: Vec<ChatMessage>,
+}
+
+
+
 fn chat_update(
-    mut contexts: EguiContexts,
     q_window: Query<&Window, With<PrimaryWindow>>,
     mut tree: ResMut<EguiTree>,
-    mut cells: ResMut<ChidoriCells>
+    tree_identities: Res<EguiTreeIdentities>,
+    mut contexts: EguiContexts,
+    mut chat_history: ResMut<ChatHistory>,
+    mut input_text: Local<String>,
+    keyboard_input: Res<ButtonInput<KeyCode>>,
 ) {
-    let language = "python";
     let window = q_window.single();
-
+    let mut hide_all = false;
     let mut container_frame = Frame::default().outer_margin(Margin {
         left: 0.0,
         right: 0.0,
         top: 0.0,
         bottom: 0.0,
     });
-    tree.tree.tiles.iter().for_each(|(_, tile)| {
-        match tile {
-            Tile::Pane(p) => {
-                if &p.nr == &"Code" {
-                    if let Some(r) = p.rect {
-                        container_frame = container_frame.outer_margin(Margin {
-                            left: r.min.x,
-                            right: window.width() - r.max.x,
-                            top: r.min.y,
-                            bottom: window.height() - r.max.y,
-                        });
+    if let Some(chat_tile) = tree_identities.chat_tile {
+        if let Some(tile) = tree.tree.tiles.get(chat_tile) {
+            match tile {
+                Tile::Pane(p) => {
+                    if !tree.tree.active_tiles().contains(&chat_tile) {
+                        hide_all = true;
+                    } else {
+                        if let Some(r) = p.rect {
+                            container_frame = container_frame.outer_margin(Margin {
+                                left: r.min.x,
+                                right: window.width() - r.max.x,
+                                top: r.min.y,
+                                bottom: window.height() - r.max.y,
+                            });
+                        }
                     }
                 }
+                Tile::Container(_) => {}
             }
-            Tile::Container(_) => {}
         }
-    });
+    }
+    container_frame = container_frame.inner_margin(Margin::symmetric(10.0, 10.0));
 
+    if hide_all {
+        return;
+    }
 
+    let ctx = contexts.ctx_mut();
 
-    egui::CentralPanel::default().show(contexts.ctx_mut(), |ui| {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            let mut theme = egui_extras::syntax_highlighting::CodeTheme::dark();
-
-            let mut layouter = |ui: &egui::Ui, string: &str, wrap_width: f32| {
-                let mut layout_job =
-                    egui_extras::syntax_highlighting::highlight(ui.ctx(), &theme, string, language);
-                layout_job.wrap.max_width = wrap_width;
-
-                // Fix font size
-                for mut section in &mut layout_job.sections {
-                    section.format.font_id = egui::FontId::new(14.0, FontFamily::Monospace);
+    egui::CentralPanel::default().frame(container_frame).show(ctx, |ui| {
+        let mut frame = egui::Frame::default().inner_margin(Margin::symmetric(20.0, 20.0)).begin(ui);
+        {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for message in &chat_history.messages {
+                    ui.label(&message.0);
                 }
+            });
 
-                ui.fonts(|f| f.layout_job(layout_job))
-            };
-            for cell in &cells.inner {
-                match &cell.cell {
-                    CellTypes::Code(CodeCell { name, source_code, ..}, _) => {
-                        let mut s = source_code.clone();
-                        let mut frame = egui::Frame::default().inner_margin(16.0).begin(ui);
-                        {
-                            let mut ui = &mut frame.content_ui;
-                            ui.horizontal(|ui| {
-                                ui.label("Code");
-                                if let Some(name) = name {
-                                    ui.label(name);
-                                }
-                            });
-                            // Add widgets inside the frame
-                            ui.vertical(|ui| {
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut s)
-                                        .code_editor()
-                                        .lock_focus(true)
-                                        .desired_width(f32::INFINITY)
-                                        .layouter(&mut layouter),
-                                );
-                            });
-                        }
-                        frame.end(ui);
-                    }
-                    CellTypes::CodeGen(LLMCodeGenCell {..}, _) => {
-                    }
-                    CellTypes::Prompt(LLMPromptCell::Completion {..}   , _) => {
-                    }
-                    CellTypes::Prompt(LLMPromptCell::Chat {name, configuration, req, ..}   , _) => {
-                        let mut s = req.clone();
-                        let mut frame = egui::Frame::default().inner_margin(16.0).begin(ui);
-                        {
-                            let mut ui = &mut frame.content_ui;
-                            ui.horizontal(|ui| {
-                                ui.label("Prompt");
-                                if let Some(name) = name {
-                                    ui.label(name);
-                                }
-                            });
-                            // Add widgets inside the frame
-                            ui.vertical(|ui| {
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut s)
-                                        .code_editor()
-                                        .lock_focus(true)
-                                        .desired_width(f32::INFINITY)
-                                        .layouter(&mut layouter),
-                                );
-                            });
-                        }
-                        frame.end(ui);
-                    }
-                    CellTypes::Embedding(LLMEmbeddingCell {..}, _) => {}
-                    CellTypes::Web(WebserviceCell {..}, _) => {}
-                    CellTypes::Template(TemplateCell {..}, _) => {}
-                    CellTypes::Memory(MemoryCell {..}, _) => {}
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                let mut text_edit = egui::TextEdit::singleline(&mut *input_text)
+                    .hint_text("Type a message...")
+                    .desired_width(f32::INFINITY);
+                let response = ui.add(text_edit);
+                if ui.button("Send").clicked() {
+                    chat_history.messages.push(ChatMessage(input_text.clone()));
+                    input_text.clear();
                 }
+                if response.changed() {
+                    // …
+                }
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    // …
+                }
+            });
+
+
+            if keyboard_input.just_pressed(KeyCode::Enter) && !input_text.is_empty() {
+                chat_history.messages.push(ChatMessage(input_text.clone()));
+                input_text.clear();
             }
-        });
+        }
+        frame.end(ui);
     });
 }
 
+
 pub fn chat_plugin(app: &mut App) {
     app
-        .add_systems(OnExit(crate::GameState::Chat), despawn_screen::<OnChatScreen>)
+        .init_resource::<ChatHistory>()
+        .add_systems(OnExit(crate::GameState::Graph), despawn_screen::<OnChatScreen>)
         .add_systems(
             Update,
             (
                 chat_update
-            ).run_if(in_state(GameState::Chat)),
+            ).run_if(in_state(GameState::Graph)),
         );
 }

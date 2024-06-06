@@ -1,8 +1,0 @@
-version: "3"
-services:
-  example-nodejs-top-ai-launches-hn:
-    build: ./nodejs/top-ai-launches-hn
-  example-python-top-ai-launches-hn:
-    build: ./python/top-ai-launches-hn
-  example-rust-top-ai-launches-hn:
-    build: ./rust/top-ai-launches-hn

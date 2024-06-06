@@ -1,50 +1,39 @@
-use crate::util::{
-    change_active_editor_ui, deselect_editor_on_esc, despawn_screen, print_editor_text,
-};
-use crate::{tokio_tasks, GameState};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc::TryRecvError;
+use std::time::Duration;
+
 use bevy::app::{App, Startup, Update};
-use bevy::prelude::{
-    default, in_state, Commands, IntoSystemConfigs, NextState, OnEnter, OnExit, ResMut, Resource,
+use bevy::input::ButtonInput;
+use bevy::prelude::{Commands, default, KeyCode, NextState, Res, ResMut, Resource};
+use bevy_egui::{egui, EguiContexts};
+use bevy_egui::egui::{Color32, Frame, Id, Margin, Response, Visuals, Widget};
+use bevy_egui::egui::panel::TopBottomSide;
+use egui_tiles::{Tile, TileId};
+use notify_debouncer_full::{
+    DebounceEventResult,
+    Debouncer,
+    FileIdMap, new_debouncer, notify::{RecommendedWatcher, RecursiveMode, Watcher},
 };
-use bevy_cosmic_edit::{CosmicEditPlugin, CosmicFontConfig};
-use chidori_core::cells::CellTypes;
+
 use chidori_core::execution::execution::execution_graph::{
-    ExecutionNodeId, MergedStateHistory, Serialize,
+    ExecutionNodeId, MergedStateHistory,
 };
+use chidori_core::execution::execution::ExecutionState;
 use chidori_core::execution::primitives::identifiers::{DependencyReference, OperationId};
 use chidori_core::sdk::entry::{
-    CellHolder, Chidori, EventsFromRuntime, InstancedEnvironment, SharedState,
+    CellHolder, Chidori, EventsFromRuntime,
     UserInteractionMessage,
 };
-use chidori_core::utils::telemetry::TraceEvents;
-use notify_debouncer_full::{
-    new_debouncer,
-    notify::{RecommendedWatcher, RecursiveMode, Watcher},
-    DebounceEventResult, Debouncer, FileIdCache, FileIdMap,
-};
-use petgraph::graph::DiGraph;
-use petgraph::prelude::{DiGraphMap, NodeIndex};
-use serde::Serializer;
-use serde_json::json;
-use std::cell::RefCell;
-use std::collections::HashSet;
-use std::ops::{Deref, DerefMut};
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::TryRecvError;
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
-use std::{panic, process, thread};
-
-use bevy_egui::egui::panel::{Side, TopBottomSide};
-use bevy_egui::egui::{Button, Color32, Frame, Id, Margin, Response, Stroke, Visuals, Widget};
-use bevy_egui::{egui, EguiContexts, EguiPlugin};
-use chidori_core::execution::execution::ExecutionState;
 use chidori_core::tokio::task::JoinHandle;
-use egui_tiles::{TileId, Tiles};
-use std::collections::HashMap;
+use chidori_core::utils::telemetry::TraceEvents;
+
+use crate::{GameState, tokio_tasks};
 
 #[derive(Debug)]
 pub struct Pane {
+    pub tile_id: Option<TileId>,
     pub nr: String,
     pub rect: Option<egui::Rect>,
 }
@@ -52,36 +41,114 @@ pub struct Pane {
 struct TreeBehavior {}
 
 impl egui_tiles::Behavior<Pane> for TreeBehavior {
+    fn tab_bar_color(&self, visuals: &Visuals) -> Color32 {
+        Color32::from_hex("#1B1B1B").unwrap()
+    }
+    fn pane_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        tile_id: egui_tiles::TileId,
+        pane: &mut Pane,
+    ) -> egui_tiles::UiResponse {
+        pane.tile_id = Some(tile_id.clone());
+        pane.rect = Some(ui.max_rect());
+        egui_tiles::UiResponse::None
+    }
+
     fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {
         format!("{}", pane.nr).into()
     }
 
     fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
         egui_tiles::SimplificationOptions {
+            join_nested_linear_containers: true,
+            prune_single_child_tabs: true,
+            prune_empty_containers: true,
+            prune_single_child_containers: true,
+            prune_empty_tabs: true,
             all_panes_must_have_tabs: true,
             ..default()
         }
     }
+}
 
-    fn pane_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        _tile_id: egui_tiles::TileId,
-        pane: &mut Pane,
-    ) -> egui_tiles::UiResponse {
-        pane.rect = Some(ui.max_rect());
-        egui_tiles::UiResponse::None
-    }
+#[derive(Resource, Default)]
+pub struct EguiTreeIdentities {
+    pub code_tile: Option<TileId>,
+    pub logs_tile: Option<TileId>,
+    pub graph_tile: Option<TileId>,
+    pub traces_tile: Option<TileId>,
+    pub chat_tile: Option<TileId>,
 }
 
 #[derive(Resource)]
 pub struct EguiTree {
     pub tree: egui_tiles::Tree<Pane>,
-    pub code_tile: TileId,
-    pub logs_tile: TileId,
-    pub graph_tile: TileId,
-    pub traces_tile: TileId,
-    pub chat_tile: TileId,
+}
+
+fn keyboard_shortcut_tab_focus(
+    mut identities: ResMut<EguiTreeIdentities>,
+    mut tree: ResMut<EguiTree>,
+    button_input: Res<ButtonInput<KeyCode>>,
+) {
+    if button_input.pressed(KeyCode::SuperLeft) {
+        if button_input.just_pressed(KeyCode::KeyT) {
+            tree.tree.make_active(|id, _| {
+                id == identities.traces_tile.unwrap()
+            });
+        }
+        if button_input.just_pressed(KeyCode::KeyL) {
+            tree.tree.make_active(|id, _| {
+                id == identities.logs_tile.unwrap()
+            });
+        }
+        if button_input.just_pressed(KeyCode::KeyG) {
+            tree.tree.make_active(|id, _| {
+                id == identities.graph_tile.unwrap()
+            });
+        }
+        if button_input.just_pressed(KeyCode::KeyC) {
+            tree.tree.make_active(|id, _| {
+                id == identities.code_tile.unwrap()
+            });
+        }
+        if button_input.just_pressed(KeyCode::KeyH) {
+            tree.tree.make_active(|id, _| {
+                id == identities.chat_tile.unwrap()
+            });
+        }
+    }
+
+}
+
+
+fn maintain_egui_tree_identities(
+    mut identities: ResMut<EguiTreeIdentities>,
+    tree: ResMut<EguiTree>
+) {
+    tree.tree.tiles.iter().for_each(|(tile_id, tile)| {
+        match tile {
+            Tile::Pane(p) => {
+                if &p.nr == &"Code" {
+                    identities.code_tile = Some(tile_id.clone());
+                }
+                if &p.nr == &"Logs" {
+                    identities.logs_tile = Some(tile_id.clone());
+                }
+                if &p.nr == &"Graph" {
+                    identities.graph_tile = Some(tile_id.clone());
+                }
+                if &p.nr == &"Traces" {
+                    identities.traces_tile = Some(tile_id.clone());
+                }
+                if &p.nr == &"Chat" {
+                    identities.chat_tile = Some(tile_id.clone());
+                }
+            }
+            _ => {}
+        }
+    })
+
 }
 
 impl Default for EguiTree {
@@ -89,6 +156,7 @@ impl Default for EguiTree {
         let mut next_view_nr = 0;
         let mut gen_pane = |name: String| {
             let pane = Pane {
+                tile_id: None,
                 nr: name,
                 rect: None,
             };
@@ -98,26 +166,17 @@ impl Default for EguiTree {
 
         let mut tiles = egui_tiles::Tiles::default();
 
-        let mut tabs = vec![];
-        let code_tile = tiles.insert_pane(gen_pane(String::from("Code")));
-        let logs_tile = tiles.insert_pane(gen_pane(String::from("Logs")));
-        let graph_tile = tiles.insert_pane(gen_pane(String::from("Graph")));
-        let traces_tile = tiles.insert_pane(gen_pane(String::from("Traces")));
-        let chat_tile = tiles.insert_pane(gen_pane(String::from("Chat")));
-        tabs.push(code_tile.clone());
-        tabs.push(logs_tile.clone());
-        tabs.push(graph_tile.clone());
-        tabs.push(traces_tile.clone());
-        tabs.push(chat_tile.clone());
+        let tabs = vec![
+            tiles.insert_pane(gen_pane(String::from("Code"))),
+            tiles.insert_pane(gen_pane(String::from("Logs"))),
+            tiles.insert_pane(gen_pane(String::from("Graph"))),
+            tiles.insert_pane(gen_pane(String::from("Traces"))),
+            tiles.insert_pane(gen_pane(String::from("Chat")))
+        ];
         let root = tiles.insert_tab_tile(tabs);
 
         EguiTree {
             tree: egui_tiles::Tree::new("my_tree", root, tiles),
-            code_tile,
-            logs_tile,
-            graph_tile,
-            traces_tile,
-            chat_tile,
         }
     }
 }
@@ -165,6 +224,12 @@ pub struct ChidoriExecutionState {
     pub inner: Option<MergedStateHistory>,
 }
 
+
+#[derive(Resource, Default)]
+pub struct ChidoriLogMessages {
+    pub inner: Vec<String>,
+}
+
 #[derive(Resource)]
 pub struct ChidoriCells {
     pub inner: Vec<CellHolder>,
@@ -175,7 +240,7 @@ pub struct InternalState {
     watched_path: Mutex<Option<String>>,
     file_watch: Mutex<Option<Debouncer<RecommendedWatcher, FileIdMap>>>,
     background_thread: Mutex<Option<JoinHandle<()>>>,
-    chidori: Arc<Mutex<Chidori>>,
+    pub chidori: Arc<Mutex<Chidori>>,
     display_example_modal: bool,
 }
 
@@ -236,7 +301,7 @@ impl InternalState {
         let chidori = self.chidori.clone();
         {
             let mut chidori_guard = chidori.lock().expect("Failed to lock chidori");
-            chidori_guard.load_md_string(file);
+            chidori_guard.load_md_string(file).expect("Failed to load markdown string");
         }
         Ok(())
     }
@@ -258,7 +323,7 @@ impl InternalState {
                 }
                 let path_buf = PathBuf::from(&watcher_path);
                 let mut chidori_guard = watcher_chidori.lock().expect("Failed to lock chidori");
-                chidori_guard.load_md_directory(&path_buf);
+                chidori_guard.load_md_directory(&path_buf).expect("Failed to load markdown directory");
             },
         )
         .unwrap();
@@ -329,21 +394,15 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                     instance
                 };
 
-                // tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                // TODO: this indicates that its definitely something to do with between each crate
-                // Try running the instance
+                let await_ready = instance.wait_until_ready().await;
                 let result = instance.run().await;
-
                 match result {
                     Ok(_) => {
-                        // If the instance runs successfully, break out of the loop
-                        println!("Instance ran successfully.");
+                        panic!("Instance completed execution and closed successfully.");
                         break;
                     }
                     Err(e) => {
-                        // Log the error and prepare to retry
-                        println!("Error occurred: {}, retrying...", e);
-                        // The loop will continue, creating and running a new instance
+                        panic!("Error occurred: {}, retrying...", e);
                     }
                 }
             }
@@ -354,7 +413,7 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
         loop {
             match runtime_event_receiver.try_recv() {
                 Ok(msg) => {
-                    println!("Received: {:?}", &msg);
+                    println!("Received from runtime: {:?}", &msg);
                     match msg {
                         EventsFromRuntime::ExecutionGraphUpdated(state) => {
                             ctx.run_on_main_thread(move |ctx| {
@@ -419,11 +478,13 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                 Err(e) => match e {
                     TryRecvError::Empty => {}
                     TryRecvError::Disconnected => {
+                        println!("Runtime channel disconnected");
                         break;
                     }
                 },
             }
         }
+        println!("Runtime event loop ended");
     });
 
     runtime.spawn_background_task(|mut ctx| async move {
@@ -468,51 +529,7 @@ pub fn update_gui(
     mut state: ResMut<NextState<GameState>>,
 ) {
     if internal_state.display_example_modal {
-        egui::CentralPanel::default()
-            .frame(
-                Frame::default()
-                    .fill(Color32::from_hex("#222222").unwrap())
-                    .inner_margin(16.0)
-                    .outer_margin(100.0)
-                    .rounding(5.0),
-            )
-            .show(contexts.ctx_mut(), |ui| {
-                ui.heading("Chidori Debugger");
-                let mut frame = egui::Frame::default().inner_margin(16.0).begin(ui);
-                {
-                    let mut ui = &mut frame.content_ui;
-                    ui.style_mut().spacing.item_spacing = bevy_egui::egui::vec2(8.0, 12.0);
-                    ui.label("Examples");
-                    // Add widgets inside the frame
-                    ui.vertical(|ui| {
-                        ui.style_mut().spacing.item_spacing = bevy_egui::egui::vec2(8.0, 8.0);
-                        let buttons_text_load = vec![
-                            ("Core 1: Simple Math", EXAMPLES_CORE1),
-                            ("Core 2: Marshalling", EXAMPLES_CORE2),
-                            ("Core 3: Function Invocations", EXAMPLES_CORE3),
-                            ("Core 4: Async Function Invocations", EXAMPLES_CORE4),
-                            ("Core 5: Prompts Invoked as Functions", EXAMPLES_CORE5),
-                            (
-                                "Core 6: Prompts Leveraging Function Calling",
-                                EXAMPLES_CORE6,
-                            ),
-                            ("Core 7: Rag Stateful Memory Cells", EXAMPLES_CORE7),
-                            (
-                                "Core 8: Prompt Code Generation and Execution",
-                                EXAMPLES_CORE8,
-                            ),
-                            ("Core 9: Multi-Agent Simulation", EXAMPLES_CORE9),
-                        ];
-                        for button in buttons_text_load {
-                            let res = with_cursor(ui.button(button.0));
-                            if res.clicked() {
-                                internal_state.load_string(button.1);
-                            }
-                        }
-                    });
-                }
-                frame.end(ui);
-            });
+        render_example_selection_modal(&mut contexts, &mut internal_state);
     } else {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().outer_margin(Margin {
@@ -539,17 +556,8 @@ pub fn update_gui(
             {
                 let mut ui = &mut frame.content_ui;
                 ui.horizontal(|ui| {
-                    ui.style_mut().spacing.item_spacing = bevy_egui::egui::vec2(8.0, 8.0);
-                    if with_cursor(ui.button("Graph")).clicked() {
-                        state.set(GameState::Graph);
-                    }
                     ui.style_mut().spacing.item_spacing = bevy_egui::egui::vec2(32.0, 8.0);
-                    if with_cursor(ui.button("Traces")).clicked() {
-                        state.set(GameState::Traces);
-                    }
-                    ui.style_mut().spacing.item_spacing = bevy_egui::egui::vec2(8.0, 8.0);
-                    ui.style_mut().spacing.item_spacing = bevy_egui::egui::vec2(32.0, 8.0);
-                    if with_cursor(ui.button("📂 Open")).clicked() {
+                    if with_cursor(ui.button("Open")).clicked() {
                         // let sender = self.text_channel.0.clone();
                         runtime.spawn_background_task(|mut ctx| async move {
                             let task = rfd::AsyncFileDialog::new().pick_file();
@@ -563,10 +571,10 @@ pub fn update_gui(
                     }
                     ui.style_mut().spacing.item_spacing = bevy_egui::egui::vec2(8.0, 8.0);
 
-                    if with_cursor(ui.button("Play")).clicked() {
+                    if with_cursor(ui.button("Run")).clicked() {
                         internal_state.play();
                     }
-                    if with_cursor(ui.button("Pause")).clicked() {
+                    if with_cursor(ui.button("Stop")).clicked() {
                         internal_state.pause();
                     }
                 });
@@ -576,8 +584,57 @@ pub fn update_gui(
     );
 }
 
+fn render_example_selection_modal(mut contexts: &mut EguiContexts, mut internal_state: &mut ResMut<InternalState>) {
+    egui::CentralPanel::default()
+        .frame(
+            Frame::default()
+                .fill(Color32::from_hex("#222222").unwrap())
+                .inner_margin(16.0)
+                .outer_margin(100.0)
+                .rounding(5.0),
+        )
+        .show(contexts.ctx_mut(), |ui| {
+            ui.heading("Load Example:");
+            let mut frame = egui::Frame::default().inner_margin(16.0).begin(ui);
+            {
+                let mut ui = &mut frame.content_ui;
+                ui.style_mut().spacing.item_spacing = bevy_egui::egui::vec2(8.0, 12.0);
+                // Add widgets inside the frame
+                ui.vertical(|ui| {
+                    ui.style_mut().spacing.item_spacing = bevy_egui::egui::vec2(8.0, 8.0);
+                    let buttons_text_load = vec![
+                        ("Core 1: Simple Math", EXAMPLES_CORE1),
+                        ("Core 2: Marshalling", EXAMPLES_CORE2),
+                        ("Core 3: Function Invocations", EXAMPLES_CORE3),
+                        ("Core 4: Async Function Invocations", EXAMPLES_CORE4),
+                        ("Core 5: Prompts Invoked as Functions", EXAMPLES_CORE5),
+                        (
+                            "Core 6: Prompts Leveraging Function Calling",
+                            EXAMPLES_CORE6,
+                        ),
+                        ("Core 7: Rag Stateful Memory Cells", EXAMPLES_CORE7),
+                        (
+                            "Core 8: Prompt Code Generation and Execution",
+                            EXAMPLES_CORE8,
+                        ),
+                        ("Core 9: Multi-Agent Simulation", EXAMPLES_CORE9),
+                    ];
+                    for button in buttons_text_load {
+                        let res = with_cursor(ui.button(button.0));
+                        if res.clicked() {
+                            internal_state.load_string(button.1);
+                        }
+                    }
+                });
+            }
+            frame.end(ui);
+        });
+}
+
 pub fn chidori_plugin(app: &mut App) {
     app.init_resource::<EguiTree>()
-        .add_systems(Update, update_gui)
+        .init_resource::<EguiTreeIdentities>()
+        .init_resource::<ChidoriLogMessages>()
+        .add_systems(Update, (update_gui, maintain_egui_tree_identities))
         .add_systems(Startup, setup);
 }

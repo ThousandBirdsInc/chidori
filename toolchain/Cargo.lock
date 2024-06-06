@@ -1890,7 +1890,7 @@ dependencies = [
  "arrayvec",
  "cc",
  "cfg-if",
- "constant_time_eq 0.3.0",
+ "constant_time_eq",
 ]
 
 [[package]]
@@ -2274,7 +2274,6 @@ dependencies = [
  "petgraph",
  "priority-queue",
  "prost 0.11.9",
- "protobuf",
  "pyo3",
  "pyo3-asyncio",
  "pyo3-build-config 0.19.2",
@@ -2292,7 +2291,6 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "serde_yaml 0.9.34+deprecated",
- "sqlparser",
  "syn 1.0.109",
  "target-lexicon",
  "thiserror",
@@ -2305,12 +2303,10 @@ dependencies = [
  "tracing-chrome",
  "tracing-opentelemetry",
  "tracing-subscriber",
- "ts-rs",
  "typed-arena",
  "typescript-type-def",
  "uuid",
  "yaml-front-matter",
- "zip",
 ]
 
 [[package]]
@@ -2714,12 +2710,6 @@ name = "const_soft_float"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "87ca1caa64ef4ed453e68bb3db612e51cf1b2f5b871337f0fcab1c8f87cc3dff"
-
-[[package]]
-name = "constant_time_eq"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "245097e9a4535ee1e3e3931fcfcd55a796a44c643e8596ff6566d68f09b87bbc"
 
 [[package]]
 name = "constant_time_eq"
@@ -3260,6 +3250,7 @@ dependencies = [
 [[package]]
 name = "deno"
 version = "1.41.3"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "async-trait",
  "base32",
@@ -3403,6 +3394,7 @@ dependencies = [
 [[package]]
 name = "deno_broadcast_channel"
 version = "0.136.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "async-trait",
  "deno_core",
@@ -3413,6 +3405,7 @@ dependencies = [
 [[package]]
 name = "deno_cache"
 version = "0.74.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "async-trait",
  "deno_core",
@@ -3444,6 +3437,7 @@ dependencies = [
 [[package]]
 name = "deno_canvas"
 version = "0.11.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "deno_core",
  "deno_webgpu",
@@ -3473,6 +3467,7 @@ dependencies = [
 [[package]]
 name = "deno_console"
 version = "0.142.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "deno_core",
 ]
@@ -3518,6 +3513,7 @@ checksum = "a13951ea98c0a4c372f162d669193b4c9d991512de9f2381dd161027f34b26b1"
 [[package]]
 name = "deno_cron"
 version = "0.22.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3531,6 +3527,7 @@ dependencies = [
 [[package]]
 name = "deno_crypto"
 version = "0.156.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3606,6 +3603,7 @@ dependencies = [
 [[package]]
 name = "deno_fetch"
 version = "0.166.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "bytes",
  "data-url",
@@ -3624,6 +3622,7 @@ dependencies = [
 [[package]]
 name = "deno_ffi"
 version = "0.129.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "deno_core",
  "dlopen2",
@@ -3640,6 +3639,7 @@ dependencies = [
 [[package]]
 name = "deno_fs"
 version = "0.52.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "async-trait",
  "base32",
@@ -3690,6 +3690,7 @@ dependencies = [
 [[package]]
 name = "deno_http"
 version = "0.139.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "async-compression",
  "async-trait",
@@ -3726,6 +3727,7 @@ dependencies = [
 [[package]]
 name = "deno_io"
 version = "0.52.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "async-trait",
  "deno_core",
@@ -3741,6 +3743,7 @@ dependencies = [
 [[package]]
 name = "deno_kv"
 version = "0.50.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3813,6 +3816,7 @@ dependencies = [
 [[package]]
 name = "deno_napi"
 version = "0.72.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "deno_core",
  "libloading 0.7.4",
@@ -3834,6 +3838,7 @@ dependencies = [
 [[package]]
 name = "deno_net"
 version = "0.134.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "deno_core",
  "deno_tls",
@@ -3851,6 +3856,7 @@ dependencies = [
 [[package]]
 name = "deno_node"
 version = "0.79.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "aead-gcm-stream",
  "aes",
@@ -3952,6 +3958,7 @@ dependencies = [
 [[package]]
 name = "deno_permissions"
 version = "0.2.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "console_static_text",
  "deno_core",
@@ -3969,6 +3976,7 @@ dependencies = [
 [[package]]
 name = "deno_runtime"
 version = "0.150.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "console_static_text",
  "deno_ast",
@@ -4074,6 +4082,7 @@ dependencies = [
 [[package]]
 name = "deno_tls"
 version = "0.129.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "deno_core",
  "deno_native_certs",
@@ -4107,6 +4116,7 @@ dependencies = [
 [[package]]
 name = "deno_url"
 version = "0.142.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "deno_core",
  "serde",
@@ -4116,6 +4126,7 @@ dependencies = [
 [[package]]
 name = "deno_web"
 version = "0.173.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "async-trait",
  "base64-simd 0.8.0",
@@ -4133,6 +4144,7 @@ dependencies = [
 [[package]]
 name = "deno_webgpu"
 version = "0.109.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "deno_core",
  "raw-window-handle 0.5.2",
@@ -4144,6 +4156,7 @@ dependencies = [
 [[package]]
 name = "deno_webidl"
 version = "0.142.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "deno_core",
 ]
@@ -4151,6 +4164,7 @@ dependencies = [
 [[package]]
 name = "deno_websocket"
 version = "0.147.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "bytes",
  "deno_core",
@@ -4171,6 +4185,7 @@ dependencies = [
 [[package]]
 name = "deno_webstorage"
 version = "0.137.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "deno_core",
  "deno_web",
@@ -7853,6 +7868,7 @@ dependencies = [
 [[package]]
 name = "napi_sym"
 version = "0.72.0"
+source = "git+https://github.com/ThousandBirdsInc/deno?rev=783f25180b82ae90fe21a9c0118c104da06db25c#783f25180b82ae90fe21a9c0118c104da06db25c"
 dependencies = [
  "proc-macro2 1.0.79",
  "quote 1.0.36",
@@ -8773,17 +8789,6 @@ dependencies = [
 
 [[package]]
 name = "password-hash"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7676374caaee8a325c9e7a2ae557f216c5563a171d6997b0ef8a65af35147700"
-dependencies = [
- "base64ct",
- "rand_core 0.6.4",
- "subtle",
-]
-
-[[package]]
-name = "password-hash"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
@@ -8827,9 +8832,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83a0692ec44e4cf1ef28ca317f14f8f07da2d95ec3fa01f86e4467b725e60917"
 dependencies = [
  "digest 0.10.7",
- "hmac",
- "password-hash 0.4.2",
- "sha2",
 ]
 
 [[package]]
@@ -9473,26 +9475,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "213622a1460818959ac1181aaeb2dc9c7f63df720db7d788b3e24eacd1983e13"
 dependencies = [
  "prost 0.11.9",
-]
-
-[[package]]
-name = "protobuf"
-version = "3.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58678a64de2fced2bdec6bca052a6716a0efe692d6e3f53d1bda6a1def64cfc0"
-dependencies = [
- "once_cell",
- "protobuf-support",
- "thiserror",
-]
-
-[[package]]
-name = "protobuf-support"
-version = "3.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1ed294a835b0f30810e13616b1cd34943c6d1e84a8f3b0dcfe466d256c3e7e7"
-dependencies = [
- "thiserror",
 ]
 
 [[package]]
@@ -10793,7 +10775,7 @@ version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0516a385866c09368f0b5bcd1caff3366aace790fcd46e2bb032697bb172fd1f"
 dependencies = [
- "password-hash 0.5.0",
+ "password-hash",
  "pbkdf2 0.12.2",
  "salsa20",
  "sha2",
@@ -10923,7 +10905,9 @@ checksum = "388a1df253eca08550bef6c72392cfe7c30914bf41df5269b68cbd6ff8f570a3"
 
 [[package]]
 name = "serde"
-version = "1.0.197"
+version = "1.0.201"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "780f1cebed1629e4753a1a38a3c72d30b97ec044f0aef68cb26650a3c5cf363c"
 dependencies = [
  "serde_derive",
 ]
@@ -10960,7 +10944,9 @@ dependencies = [
 
 [[package]]
 name = "serde_derive"
-version = "1.0.197"
+version = "1.0.201"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5e405930b9796f1c00bee880d03fc7e0bb4b9a11afc776885ffe84320da2865"
 dependencies = [
  "proc-macro2 1.0.79",
  "quote 1.0.36",
@@ -11399,15 +11385,6 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
-]
-
-[[package]]
-name = "sqlparser"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37d3706eefb17039056234df6b566b0014f303f867f2656108334a55b8096f59"
-dependencies = [
- "log",
 ]
 
 [[package]]
@@ -12908,29 +12885,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
-name = "ts-rs"
-version = "7.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc2cae1fc5d05d47aa24b64f9a4f7cba24cdc9187a2084dd97ac57bef5eccae6"
-dependencies = [
- "thiserror",
- "ts-rs-macros",
-]
-
-[[package]]
-name = "ts-rs-macros"
-version = "7.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73f7f9b821696963053a89a7bd8b292dc34420aea8294d7b225274d488f3ec92"
-dependencies = [
- "Inflector",
- "proc-macro2 1.0.79",
- "quote 1.0.36",
- "syn 2.0.58",
- "termcolor",
-]
-
-[[package]]
 name = "ttf-parser"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13318,7 +13272,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a183cf7feeba97b4dd1c0d46788634f6221d87fa961b305bed08c851829efcc0"
 dependencies = [
  "getrandom 0.2.14",
+ "rand 0.8.5",
  "serde",
+ "uuid-macro-internal",
+]
+
+[[package]]
+name = "uuid-macro-internal"
+version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9881bea7cbe687e36c9ab3b778c36cd0487402e270304e8b1296d5085303c1a2"
+dependencies = [
+ "proc-macro2 1.0.79",
+ "quote 1.0.36",
+ "syn 2.0.58",
 ]
 
 [[package]]
@@ -14663,27 +14630,12 @@ version = "0.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "760394e246e4c28189f19d488c058bf16f564016aefac5d32bb1f3b51d5e9261"
 dependencies = [
- "aes",
  "byteorder",
  "bzip2",
- "constant_time_eq 0.1.5",
  "crc32fast",
  "crossbeam-utils",
  "flate2",
- "hmac",
- "pbkdf2 0.11.0",
- "sha1",
  "time",
- "zstd 0.11.2+zstd.1.5.2",
-]
-
-[[package]]
-name = "zstd"
-version = "0.11.2+zstd.1.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20cc960326ece64f010d2d2107537f26dc589a6573a316bd5b1dba685fa5fde4"
-dependencies = [
- "zstd-safe 5.0.2+zstd.1.5.2",
 ]
 
 [[package]]
@@ -14702,16 +14654,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d789b1514203a1120ad2429eae43a7bd32b90976a7bb8a05f7ec02fa88cc23a"
 dependencies = [
  "zstd-safe 7.1.0",
-]
-
-[[package]]
-name = "zstd-safe"
-version = "5.0.2+zstd.1.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d2a5585e04f9eea4b2a3d1eca508c4dee9592a89ef6f450c11719da0726f4db"
-dependencies = [
- "libc",
- "zstd-sys",
 ]
 
 [[package]]
@@ -14789,7 +14731,3 @@ dependencies = [
  "quote 1.0.36",
  "syn 1.0.109",
 ]
-
-[[patch.unused]]
-name = "tauri"
-version = "1.6.1"

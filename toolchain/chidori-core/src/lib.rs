@@ -2,7 +2,6 @@
 #![feature(is_sorted)]
 #![feature(thread_id_value)]
 #![feature(generic_nonzero)]
-extern crate protobuf;
 
 pub mod cells;
 pub mod execution;

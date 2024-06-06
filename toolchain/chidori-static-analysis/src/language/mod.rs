@@ -48,8 +48,5 @@ pub enum ChidoriStaticAnalysisError {
     Unknown,
 }
 
-// impl From<ChidoriStaticAnalysisError> for anyhow::Error {
-//     fn from(err: ChidoriStaticAnalysisError) -> Self {
-//         anyhow::Error::msg(err.to_string())
-//     }
-// }
+
+

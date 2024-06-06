@@ -756,23 +756,50 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
             if let ContextPath::IdentifierReferredTo(identifier, false) = context_path_unit {
                 if identifier != &String::from("ch") {
                     // If this value is not being assigned to, then it is a dependency
-                    if !encountered.contains(&&ContextPath::AssignmentToStatement) {
-                        depended_values.insert(identifier.clone(), ReportItem {});
-                    } else {
-                        // This is an exposed value if it does not occur inside the scope of a function
-                        if encountered
-                            .iter()
-                            .find(|x| {
-                                if let ContextPath::InFunction(_) = x {
-                                    true
-                                } else {
-                                    false
-                                }
-                            })
-                            .is_none()
-                        {
-                            exposed_values.insert(identifier.clone(), ReportItem {});
+
+                    if encountered.iter().any(|x| matches!(x, ContextPath::InFunction(_)))
+                        && encountered.iter().any(|x| matches!(x, ContextPath::Params))
+                    {
+                        for context_path_unit in &encountered {
+                            if let ContextPath::InFunction(function_name) = context_path_unit {
+                                let mut x = triggerable_functions
+                                    .entry(function_name.clone())
+                                    .or_insert_with(|| ReportTriggerableFunctions {
+                                        arguments: vec![],
+                                        emit_event: vec![], // Initialize with an empty string or a default value
+                                        trigger_on: vec![],
+                                    });
+                                x.arguments.push(identifier.clone());
+                            }
                         }
+                        continue;
+                    }
+
+                    // This is an exposed value if it does not occur inside the scope of a function
+                    if encountered
+                        .iter()
+                        .find(|x| matches!(x, ContextPath::InFunction(_)))
+                        .is_none()
+                    {
+                        if encountered.contains(&&ContextPath::AssignmentToStatement) {
+                            exposed_values.insert(
+                                identifier.clone(),
+                                ReportItem {
+                                    // context_path: context_path.clone(),
+                                },
+                            );
+                            continue;
+                        }
+                    }
+
+                    if !encountered.contains(&&ContextPath::AssignmentToStatement) {
+                        depended_values.insert(
+                            identifier.clone(),
+                            ReportItem {
+                                // context_path: context_path.clone(),
+                            },
+                        );
+                        continue;
                     }
                 }
             }

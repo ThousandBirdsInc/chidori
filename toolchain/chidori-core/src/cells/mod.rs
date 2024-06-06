@@ -8,13 +8,11 @@ pub mod code_gen_cell;
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use ts_rs::TS;
 use rkyv::{Archive, Deserialize, Serialize};
 use serde_json::Value;
 use crate::library::std::ai::llm::ChatModelBatch;
 
 #[derive(
-    TS,
     Archive,
     serde::Serialize,
     serde::Deserialize,
@@ -30,7 +28,6 @@ use crate::library::std::ai::llm::ChatModelBatch;
     bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
 ))]
 #[archive_attr(derive(Debug))]
-#[ts(export, export_to = "package_node/types/")]
 pub enum SupportedLanguage {
     PyO3,
     Starlark,
@@ -38,7 +35,6 @@ pub enum SupportedLanguage {
 }
 
 #[derive(
-    TS,
     Archive,
     serde::Serialize,
     serde::Deserialize,
@@ -54,7 +50,6 @@ pub enum SupportedLanguage {
     bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
 ))]
 #[archive_attr(derive(Debug))]
-#[ts(export, export_to = "package_node/types/")]
 pub struct CodeCell {
     pub name: Option<String>,
     pub language: SupportedLanguage,
@@ -64,7 +59,6 @@ pub struct CodeCell {
 
 
 #[derive(
-TS,
 Archive,
 serde::Serialize,
 serde::Deserialize,
@@ -80,14 +74,12 @@ Clone,
 bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
 ))]
 #[archive_attr(derive(Debug))]
-#[ts(export, export_to = "package_node/types/")]
 pub enum SupportedMemoryProviders {
     InMemory,
 }
 
 
 #[derive(
-TS,
 Archive,
 serde::Serialize,
 serde::Deserialize,
@@ -103,7 +95,6 @@ Clone,
 bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
 ))]
 #[archive_attr(derive(Debug))]
-#[ts(export, export_to = "package_node/types/")]
 pub struct MemoryCell {
     pub name: Option<String>,
     pub provider: SupportedMemoryProviders,
@@ -112,7 +103,6 @@ pub struct MemoryCell {
 
 
 #[derive(
-TS,
 Archive,
 serde::Serialize,
 serde::Deserialize,
@@ -128,14 +118,12 @@ Clone,
 bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
 ))]
 #[archive_attr(derive(Debug))]
-#[ts(export, export_to = "package_node/types/")]
 pub struct TemplateCell {
     pub name: Option<String>,
     pub body: String,
 }
 
 #[derive(
-TS,
 Archive,
 serde::Serialize,
 serde::Deserialize,
@@ -151,7 +139,6 @@ Clone,
 bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
 ))]
 #[archive_attr(derive(Debug))]
-#[ts(export, export_to = "package_node/types/")]
 pub struct WebserviceCellEndpoint {
     pub method: String,
     pub route: String,
@@ -160,7 +147,6 @@ pub struct WebserviceCellEndpoint {
 }
 
 #[derive(
-TS,
 Archive,
 serde::Serialize,
 serde::Deserialize,
@@ -176,7 +162,6 @@ Clone,
 bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
 ))]
 #[archive_attr(derive(Debug))]
-#[ts(export, export_to = "package_node/types/")]
 pub struct WebserviceCell {
     pub name: Option<String>,
     pub configuration: String,
@@ -185,7 +170,6 @@ pub struct WebserviceCell {
 
 
 #[derive(
-TS,
 Archive,
 serde::Serialize,
 serde::Deserialize,
@@ -201,14 +185,12 @@ Clone,
 bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
 ))]
 #[archive_attr(derive(Debug))]
-#[ts(export, export_to = "package_node/types/")]
 pub struct ScheduleCell {
     pub configuration: String,
 }
 
 
 #[derive(
-    TS,
     Archive,
     serde::Serialize,
     serde::Deserialize,
@@ -224,7 +206,6 @@ pub struct ScheduleCell {
     bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
 ))]
 #[archive_attr(derive(Debug))]
-#[ts(export, export_to = "package_node/types/")]
 pub enum SupportedModelProviders {
     OpenAI,
 }
@@ -232,7 +213,6 @@ pub enum SupportedModelProviders {
 
 #[derive(
 Default,
-TS,
 Archive,
 serde::Serialize,
 serde::Deserialize,
@@ -248,7 +228,6 @@ Clone,
 bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
 ))]
 #[archive_attr(derive(Debug))]
-#[ts(export, export_to = "package_node/types/")]
 pub struct EjectionConfig {
     pub language: String,
     pub mode: String
@@ -259,7 +238,6 @@ pub struct EjectionConfig {
 
 #[derive(
 Default,
-TS,
 Archive,
 serde::Serialize,
 serde::Deserialize,
@@ -275,7 +253,6 @@ Clone,
 bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
 ))]
 #[archive_attr(derive(Debug))]
-#[ts(export, export_to = "package_node/types/")]
 pub struct LLMPromptCellChatConfiguration {
     pub(crate) import: Option<Vec<String>>,
 
@@ -296,7 +273,6 @@ pub struct LLMPromptCellChatConfiguration {
 }
 
 #[derive(
-    TS,
     Archive,
     serde::Serialize,
     serde::Deserialize,
@@ -312,7 +288,6 @@ pub struct LLMPromptCellChatConfiguration {
     bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
 ))]
 #[archive_attr(derive(Debug))]
-#[ts(export, export_to = "package_node/types/")]
 pub enum LLMPromptCell {
     Chat {
         function_invocation: bool,
@@ -329,7 +304,6 @@ pub enum LLMPromptCell {
 
 #[derive(
 Default,
-TS,
 Archive,
 serde::Serialize,
 serde::Deserialize,
@@ -345,7 +319,6 @@ Clone,
 bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
 ))]
 #[archive_attr(derive(Debug))]
-#[ts(export, export_to = "package_node/types/")]
 pub struct LLMCodeGenCellChatConfiguration {
     #[serde(rename = "fn")]
     pub function_name: Option<String>,
@@ -366,7 +339,6 @@ pub struct LLMCodeGenCellChatConfiguration {
 }
 
 #[derive(
-TS,
 Archive,
 serde::Serialize,
 serde::Deserialize,
@@ -382,7 +354,6 @@ Clone,
 bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
 ))]
 #[archive_attr(derive(Debug))]
-#[ts(export, export_to = "package_node/types/")]
 pub struct LLMCodeGenCell {
     pub function_invocation: bool,
     pub configuration: LLMCodeGenCellChatConfiguration,
@@ -393,7 +364,6 @@ pub struct LLMCodeGenCell {
 
 
 #[derive(
-TS,
 Archive,
 serde::Serialize,
 serde::Deserialize,
@@ -409,7 +379,6 @@ Clone,
 bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
 ))]
 #[archive_attr(derive(Debug))]
-#[ts(export, export_to = "package_node/types/")]
 pub struct LLMEmbeddingCell {
     pub function_invocation: bool,
     pub configuration: HashMap<String, String>,
@@ -419,7 +388,6 @@ pub struct LLMEmbeddingCell {
 
 
 #[derive(
-TS,
 Archive,
 serde::Serialize,
 serde::Deserialize,
@@ -436,14 +404,12 @@ Clone,
 bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
 ))]
 #[archive_attr(derive(Debug))]
-#[ts(export, export_to = "package_node/types/")]
 pub struct TextRange {
     pub start: usize,
     pub end: usize,
 }
 
 #[derive(
-    TS,
     Archive,
     serde::Serialize,
     serde::Deserialize,
@@ -459,7 +425,6 @@ pub struct TextRange {
     bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
 ))]
 #[archive_attr(derive(Debug))]
-#[ts(export, export_to = "package_node/types/")]
 pub enum CellTypes {
     Code(CodeCell, TextRange),
     CodeGen(LLMCodeGenCell, TextRange),

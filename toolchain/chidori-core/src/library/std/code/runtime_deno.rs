@@ -28,8 +28,6 @@ use tokio::runtime::Runtime;
 use crate::cells::{CellTypes, CodeCell, LLMPromptCell};
 use crate::execution::execution::ExecutionState;
 
-// TODO: need to override console.log
-
 
 fn serde_v8_to_rkyv(
     mut scope: &mut HandleScope,
@@ -59,6 +57,8 @@ struct MyOpState {
     payload: RkyvSerializedValue,
     cell_depended_values: HashMap<String, String>,
     execution_state_handle: Arc<Mutex<ExecutionState>>,
+    stdout: Vec<String>,
+    stderr: Vec<String>,
     functions: HashMap<
         String,
         InternalClosureFnMut,
@@ -77,6 +77,34 @@ fn op_assert_eq(
         println!("Assertion failed @ {:?} != {:?}", a, b);
         Ok(RkyvSerializedValue::String("Failure".to_string()))
     }
+}
+
+#[op2]
+#[serde]
+fn op_console_log(
+    state: Rc<RefCell<OpState>>,
+    #[string] message: String,
+) -> Result<(), AnyError> {
+    let mut op_state = state.borrow_mut();
+    let mut my_op_state: &mut Arc<Mutex<MyOpState>> = (*op_state).borrow_mut();
+    let mut my_op_state = my_op_state.lock().unwrap();
+    my_op_state.stdout.push(message.clone());
+    println!("[Custom console.log] {:?}", message);
+    Ok(())
+}
+
+#[op2]
+#[serde]
+fn op_console_err(
+    state: Rc<RefCell<OpState>>,
+    #[string] message: String,
+) -> Result<(), AnyError> {
+    let mut op_state = state.borrow_mut();
+    let mut my_op_state: &mut Arc<Mutex<MyOpState>> = (*op_state).borrow_mut();
+    let mut my_op_state = my_op_state.lock().unwrap();
+    my_op_state.stderr.push(message.clone());
+    println!("[Custom console.err] {:?}", message);
+    Ok(())
 }
 
 
@@ -341,6 +369,7 @@ fn js_args_to_rkyv(args: Vec<RkyvSerializedValue>, kwargs: Option<HashMap<String
 }
 
 
+#[tracing::instrument]
 pub async fn source_code_run_deno(
     execution_state: &ExecutionState,
     source_code: &String,
@@ -349,6 +378,7 @@ pub async fn source_code_run_deno(
 ) -> anyhow::Result<(
     crate::execution::primitives::serialized_value::RkyvSerializedValue,
     Vec<String>,
+    Vec<String>
 )> {
     let dependencies = extract_dependencies_js(&source_code);
     let report = build_report(&dependencies);
@@ -360,8 +390,9 @@ pub async fn source_code_run_deno(
     });
 
     let execution_state_handle = Arc::new(Mutex::new(execution_state.clone()));
-    // TODO: this needs to capture stdout similar to how we do with python
     let my_op_state = Arc::new(Mutex::new(MyOpState {
+        stdout: vec![],
+        stderr: vec![],
         output: None,
         payload: payload.clone(),
         cell_depended_values,
@@ -378,7 +409,9 @@ pub async fn source_code_run_deno(
             op_assert_eq::DECL,
             op_save_result::DECL,
             op_save_result_object::DECL,
-            op_invoke_function::DECL
+            op_invoke_function::DECL,
+            op_console_log::DECL,
+            op_console_err::DECL,
         ]),
         op_state_fn: Some(Box::new(move |state| {
             state.put(my_op_state_clone);
@@ -395,6 +428,8 @@ pub async fn source_code_run_deno(
           const op_save_result_object =  Deno.core.ops.op_save_result_object;
           const op_save_result =  Deno.core.ops.op_save_result;
           const op_invoke_function =  Deno.core.ops.op_invoke_function;
+          const op_console_log =  Deno.core.ops.op_console_log;
+          const op_console_err =  Deno.core.ops.op_console_err;
 
           globalThis.op_invoke_function = op_invoke_function;
           globalThis.op_call_rust = op_call_rust;
@@ -405,10 +440,12 @@ pub async fn source_code_run_deno(
 
           globalThis.console = {
               log: (...args) => {
-              core.print(`[out]: ${argsToMessage(...args)}\n`, false);
+                  op_console_log(`[out]: ${argsToMessage(...args)}\n`);
+                  core.print(`[out]: ${argsToMessage(...args)}\n`, false);
               },
               error: (...args) => {
-              core.print(`[err]: ${argsToMessage(...args)}\n`, true);
+                  op_console_err(`[out]: ${argsToMessage(...args)}\n`);
+                  core.print(`[err]: ${argsToMessage(...args)}\n`, true);
               },
           };
 
@@ -471,6 +508,14 @@ pub async fn source_code_run_deno(
         source.push_str("export const chidoriResult = {};");
         source.push_str("\n");
         source.push_str(&source_code);
+        for (name, report_item) in &report.triggerable_functions {
+            source.push_str("\n");
+            source.push_str(&format!(
+                r#"chidoriResult["{name}"] = "function";"#,
+                name = name
+            ));
+            source.push_str("\n");
+        }
         for (name, report_item) in &report.cell_exposed_values {
             source.push_str("\n");
             source.push_str(&format!(
@@ -514,10 +559,14 @@ pub async fn source_code_run_deno(
                 Default::default(),
             )
             .await?;
+
         let exit_code = worker.run().await?;
     }
     let mut my_op_state = my_op_state.lock().unwrap();
-    Ok((my_op_state.output.clone().unwrap_or(RkyvSerializedValue::Null), vec![]))
+    let output = my_op_state.output.clone().unwrap_or(RkyvSerializedValue::Null);
+    let stdout = my_op_state.stdout.clone();
+    let stderr = my_op_state.stderr.clone();
+    Ok((output, stdout, stderr))
 }
 
 #[cfg(test)]
@@ -554,7 +603,8 @@ mod tests {
             result.unwrap(),
             (
                 RkyvObjectBuilder::new().insert_number("y", 10).build(),
-                vec![]
+                vec![],
+                vec![],
             )
         );
         Ok(())
@@ -580,7 +630,8 @@ mod tests {
             result.unwrap(),
             (
                 RkyvObjectBuilder::new().insert_number("z", 25).build(),
-                vec![]
+                vec![],
+                vec![],
             )
         );
     }
@@ -593,7 +644,8 @@ mod tests {
             result.unwrap(),
             (
                 RkyvObjectBuilder::new().insert_number("x", 42).build(),
-                vec![]
+                vec![],
+                vec![],
             )
         );
     }
@@ -618,7 +670,8 @@ mod tests {
                         RkyvObjectBuilder::new().insert_string("foo", "bar".to_string())
                     )
                     .build(),
-                vec![]
+                vec![],
+                vec![],
             )
         );
     }
@@ -630,7 +683,8 @@ mod tests {
             result.unwrap(),
             (
                 RkyvObjectBuilder::new().insert_number("x", 30).build(),
-                vec![]
+                vec![],
+                vec![],
             )
         );
     }
@@ -646,7 +700,28 @@ mod tests {
             result.unwrap(),
             (
                 RkyvSerializedValue::Number(30),
-                vec![]
+                vec![],
+                vec![],
+            )
+        );
+    }
+
+
+    #[tokio::test]
+    async fn test_console_log_console_err_behaviors() {
+        let source_code = String::from(r#"
+        console.log("testing, output");
+        console.error("testing, stderr");
+        "#);
+        let args = RkyvObjectBuilder::new()
+            .build();
+        let result = source_code_run_deno(&ExecutionState::new(), &source_code, &args, &None).await;
+        assert_eq!(
+            result.unwrap(),
+            (
+                RkyvObjectBuilder::new().build(),
+                vec![String::from("[out]: \"testing, output\"\n")],
+                vec![String::from("[out]: \"testing, stderr\"\n")],
             )
         );
     }

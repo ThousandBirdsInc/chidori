@@ -82,7 +82,7 @@ pub fn memory_cell(cell: &MemoryCell, range: &TextRange) -> anyhow::Result<Opera
                                 }
                             }
                             anyhow::Ok(())
-                        }).await.unwrap();
+                        }).await.unwrap().expect("TODO: panic message");
                         Ok(OperationFnOutput::with_value(RkyvSerializedValue::Null))
                     }.boxed()
                 }),

@@ -4,13 +4,11 @@ use std::collections::HashMap;
 use std::num::NonZero;
 use bevy::input::touchpad::TouchpadMagnify;
 use std::ops::Add;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use bevy::{
     prelude::*,
     render::{
         extract_component::ExtractComponent
-
-
         ,
         render_phase::{
             PhaseItem, RenderCommand
@@ -36,21 +34,22 @@ use bevy_rapier2d::plugin::RapierContext;
 use egui_tiles::Tile;
 use petgraph::prelude::{EdgeRef, NodeIndex, StableDiGraph, StableGraph};
 use chidori_core::utils::telemetry::TraceEvents;
-use crate::chidori::{ChidoriTraceEvents, EguiTree};
+use crate::chidori::{ChidoriTraceEvents, EguiTree, EguiTreeIdentities};
+use crate::{RENDER_LAYER_TRACE_MINIMAP, RENDER_LAYER_TRACE_TEXT, RENDER_LAYER_TRACE_VIEW};
 use crate::shader_trace::{CustomMaterialPlugin, InstanceData, InstanceMaterialData};
 use crate::util::despawn_screen;
 
 
 const RENDER_TEXT: bool = true;
 const HANDLE_COLLISIONS: bool = true;
-const SPAN_HEIGHT: f32 = 20.0;
+const SPAN_HEIGHT: f32 = 28.0;
 const CAMERA_SPACE_WIDTH: f32 = 1000.0;
 const MINIMAP_OFFSET: u32 = 0;
 const MINIMAP_HEIGHT: u32 = 100;
 const MINIMAP_HEIGHT_AND_OFFSET: u32 = MINIMAP_OFFSET + MINIMAP_HEIGHT;
 
 #[derive(Component)]
-struct MinimapTraceViewport;
+struct MinimapTraceViewportIndicator;
 
 #[derive(Component)]
 struct IdentifiedSpan {
@@ -65,7 +64,8 @@ struct TraceSpaceViewport {
     y: f32,
     horizontal_scale: f32, // scale of the view
     vertical_scale: f32,
-    max_vertical_extent: f32
+    max_vertical_extent: f32,
+    is_active: bool
 }
 
 fn update_trace_space_to_minimap_camera_configuration(
@@ -115,14 +115,11 @@ fn update_trace_space_to_camera_configuration(
     mut trace_space: ResMut<TraceSpaceViewport>,
     mut main_camera: Query<(&mut Projection, &mut Transform), (With<TraceCameraTraces>, Without<TraceCameraMinimap>, Without<TraceCameraTextAtlas>)>,
     mut minimap_camera: Query<(&mut Projection, &mut Transform), (With<TraceCameraMinimap>, Without<TraceCameraTraces>, Without<TraceCameraTextAtlas>)>,
-    mut minimap_trace_viewport: Query<(&mut Transform), (With<MinimapTraceViewport>, Without<TraceCameraTraces>, Without<TraceCameraMinimap>)>,
+    mut minimap_trace_viewport_indicator: Query<(&mut Transform), (With<MinimapTraceViewportIndicator>, Without<TraceCameraTraces>, Without<TraceCameraMinimap>)>,
 ) {
 
     let window = windows.single();
     let scale_factor = window.scale_factor();
-    let span_height = SPAN_HEIGHT * scale_factor;
-    let minimap_height_and_offset = MINIMAP_HEIGHT_AND_OFFSET * scale_factor as u32;
-    let minimap_offset = (MINIMAP_OFFSET * scale_factor as u32) as f32;
     let (trace_projection, mut trace_camera_transform) = main_camera.single_mut();
     let (mini_projection, mut mini_camera_transform) = minimap_camera.single_mut();
 
@@ -144,7 +141,6 @@ fn update_trace_space_to_camera_configuration(
     let trace_viewport_width = trace_projection.area.width();
     let trace_viewport_height = trace_projection.area.height();
     let viewport_width = mini_projection.area.width();
-    let viewport_height = mini_projection.area.height().max(trace_viewport_height);
 
     let left = camera_position.x - viewport_width / 2.0 + (trace_viewport_width / 2.0);
     let right = camera_position.x + viewport_width / 2.0 - (trace_viewport_width / 2.0);
@@ -156,7 +152,7 @@ fn update_trace_space_to_camera_configuration(
 
     trace_camera_transform.translation.x = trace_space.x;
     trace_camera_transform.translation.y = trace_space.y - (trace_space.vertical_scale * 0.5);
-    minimap_trace_viewport.iter_mut().for_each(|mut transform| {
+    minimap_trace_viewport_indicator.iter_mut().for_each(|mut transform| {
         transform.translation.x = trace_space.x;
         transform.translation.y = trace_camera_transform.translation.y;
         transform.scale.x = trace_space.horizontal_scale;
@@ -238,18 +234,34 @@ fn touchpad_gestures(
 }
 
 fn mouse_over_system(
+    mut trace_space: ResMut<TraceSpaceViewport>,
     q_mycoords: Query<&CursorWorldCoords, With<OnTraceScreen>>,
-    mut node_query: Query<(Entity, &Collider, &mut IdentifiedSpan), With<IdentifiedSpan>>,
+    mut node_query: Query<(Entity, &Collider, &mut IdentifiedSpan), (With<IdentifiedSpan>, Without<MinimapTraceViewportIndicator>)>,
+    mut minimap_trace_viewport_indicator: Query<(Entity, &Collider, &Handle<StandardMaterial>), (With<MinimapTraceViewportIndicator>, Without<IdentifiedSpan>)>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut gizmos: Gizmos,
     rapier_context: Res<RapierContext>,
     mut contexts: EguiContexts,
-    call_tree: Res<TracesCallTree>
+    call_tree: Res<TracesCallTree>,
+    last_click: Local<Option<Instant>>
 ) {
+    let double_click_threshold = Duration::from_millis(500);
+
+    if !trace_space.is_active {
+        return;
+    }
+
     let ctx = contexts.ctx_mut();
     let cursor = q_mycoords.single();
 
     for (_, collider, mut span) in node_query.iter_mut() {
         span.is_hovered = false;
+    }
+
+    for (_, _, material_handle) in minimap_trace_viewport_indicator.iter_mut() {
+        if let Some(mut mat) = materials.get_mut(material_handle) {
+            mat.base_color = Color::hsla(3.0, 1.0, 1.0, 0.8);
+        }
     }
 
     gizmos
@@ -264,7 +276,7 @@ fn mouse_over_system(
                 egui::containers::popup::show_tooltip_at_pointer(ctx, egui::Id::new("my_tooltip"), |ui| {
                     call_tree.inner.graph.node_weight(span.node_idx).map(|node| {
                         match &node.event {
-                            TraceEvents::NewSpan {name, location, line, thread_id, parent_id, ..} => {
+                            TraceEvents::NewSpan {name, location, line, thread_id, parent_id, execution_id, ..} => {
                                 ui.label(format!("{:?}", node.id));
                                 ui.label(format!("name: {}", name));
                                 ui.label(format!("location: {}", location));
@@ -273,13 +285,24 @@ fn mouse_over_system(
                                 ui.label(format!("parent_id: {:?}", parent_id));
                                 ui.label(format!("absolute_timestamp: {:?}", node.absolute_timestamp));
                                 ui.label(format!("parent_relative_timestamp: {:?}", node.adjusted_timestamp));
+                                ui.label(format!("total_duration {:?}", node.total_duration));
+                                ui.label(format!("depth {:?}", node.depth));
+                                if let Some(execution_id) = execution_id {
+                                    ui.label(format!("execution_id: {:?}", execution_id));
+                                }
                             }
                             _ => {}
                         }
                     });
                 });
-                // dbg!(&span.id);
             }
+
+            if let Ok((_, _, material_handle)) = minimap_trace_viewport_indicator.get_mut(entity) {
+                if let Some(mut mat) = materials.get_mut(material_handle) {
+                    mat.base_color = Color::hsla(3.0, 1.0, 1.0, 0.5);
+                }
+            }
+
             false
         }
     );
@@ -397,7 +420,11 @@ fn build_call_tree(events: Vec<TraceEvents>, collapse_gaps: bool) -> CallTree {
                 // If this is a top-level node, adjust its position to the end of the last top-level node
                 // If there is no completed top-level node, its adjustment is the start_time
                 if parent_id.is_none() {
-                    position_subtracted_by_x_amount = weight - last_top_level_trace_end;
+                    if weight >= last_top_level_trace_end {
+                        position_subtracted_by_x_amount = weight - last_top_level_trace_end;
+                    } else {
+                        position_subtracted_by_x_amount = 0;
+                    }
                     node.adjusted_timestamp = last_top_level_trace_end;
                 }
 
@@ -419,7 +446,7 @@ fn build_call_tree(events: Vec<TraceEvents>, collapse_gaps: bool) -> CallTree {
             }
             TraceEvents::Exit(id, weight) => {
                 if let Some(node) = graph.node_weight_mut(node_map[id].4) {
-                    node.total_duration += weight - node.absolute_timestamp;
+                    node.total_duration = weight - node.absolute_timestamp;
                     let endpoint_absolute = node.absolute_timestamp + node.total_duration;
                     let endpoint_adjusted = node.adjusted_timestamp + node.total_duration;
 
@@ -463,7 +490,8 @@ fn build_call_tree(events: Vec<TraceEvents>, collapse_gaps: bool) -> CallTree {
 
 
     let now = Instant::now();
-    // Set durations of anything incomplete to the current max time
+    // Set durations of anything incomplete to the current max time (the start of the instance to now)
+    // TODO: this results in a sort of flickering behavior that looks mediocre
     graph.node_weights_mut().for_each(|n| {
         if n.total_duration == 0 {
             n.total_duration = (n.created_at - now).as_nanos();
@@ -520,7 +548,7 @@ fn update_positions(
     mut commands: Commands,
     mut gizmos: Gizmos,
     asset_server: Res<AssetServer>,
-    mut query: Query<(&mut InstanceMaterialData,)>,
+    mut instance_material_data: Query<(&mut InstanceMaterialData,)>,
     mut span_to_text_mapping: ResMut<SpanToTextMapping>,
     mut q_text_elements: Query<(&Text, &mut Text2dBounds, &mut Transform), With<Text>>,
     mut q_span_identities: Query<(&IdentifiedSpan, &mut Collider, &mut Transform), (With<IdentifiedSpan>, Without<Text>)>,
@@ -530,6 +558,7 @@ fn update_positions(
     mut call_tree: ResMut<TracesCallTree>,
     windows: Query<&Window>,
 ) {
+
     let scale_factor = windows.single().scale_factor();
     let span_height = SPAN_HEIGHT * scale_factor;
     let font = asset_server.load("fonts/CommitMono-1.143/CommitMono-400-Regular.otf");
@@ -595,7 +624,7 @@ fn update_positions(
         }
     }
 
-    for (mut data,) in query.iter_mut() {
+    for (mut data,) in instance_material_data.iter_mut() {
         let mut instances = data.0.iter_mut().collect::<Vec<_>>();
         let mut idx = 0;
         let root_nodes: Vec<NodeIndex> = call_tree.node_indices()
@@ -613,12 +642,12 @@ fn update_positions(
                     // Filter rendering to only the currently viewed thread depth?
                     // Change the alpha transparency of increasing thread depth
 
-
                     // Scaled to 1000.0 unit width, offset to move from centered to left aligned
                     // let config_space_pos_x = scale_to_target(node.absolute_timestamp - startpoint_value, endpoint_value - startpoint_value, CAMERA_SPACE_WIDTH) - (CAMERA_SPACE_WIDTH / 2.0);
                     let config_space_pos_x = scale_to_target(node.adjusted_timestamp - 0, relative_endpoint - startpoint_value, CAMERA_SPACE_WIDTH) - (CAMERA_SPACE_WIDTH / 2.0);
                     let config_space_width = scale_to_target(node.total_duration, relative_endpoint - startpoint_value, CAMERA_SPACE_WIDTH);
                     let screen_space_pos_y = ((node.depth as f32) * -1.0 * span_height + span_height / 2.0) * node.thread_depth as f32;
+                    // let screen_space_pos_y = ((node.depth as f32) * -1.0 * span_height + span_height / 2.0) * 1.0 as f32;
                     max_vertical_extent = max_vertical_extent.max(screen_space_pos_y.abs() + span_height / 2.0);
                     instances[idx].color = color_for_bucket(node.color_bucket, (max_thread_depth - node.thread_depth) as f32 / *max_thread_depth as f32).as_rgba_f32();
                     instances[idx].width = config_space_width;
@@ -671,6 +700,7 @@ fn update_positions(
                                 TransformBundle::from_transform(Transform::from_translation(collision_pos)),
                                 Collider::cuboid(collision_width/2.0, text_space_height/2.0),
                                 Sensor,
+                                RenderLayers::layer(RENDER_LAYER_TRACE_VIEW),
                                 OnTraceScreen
                             )).id();
                             span_to_text_mapping.identity.insert(node.id.clone(), identity);
@@ -722,7 +752,7 @@ fn update_positions(
                                     id: node.id.clone(),
                                     is_hovered: false,
                                 },
-                                RenderLayers::layer(4),
+                                RenderLayers::layer(RENDER_LAYER_TRACE_TEXT),
                                 OnTraceScreen
                             )).id();
                             span_to_text_mapping.spans.insert(node.id.clone(), entity);
@@ -736,9 +766,71 @@ fn update_positions(
 }
 
 
+fn enforce_tiled_viewports(
+    mut trace_space: ResMut<TraceSpaceViewport>,
+    windows: Query<&Window>,
+    tree_identities: Res<EguiTreeIdentities>,
+    mut tree: ResMut<EguiTree>,
+    mut main_camera: Query<(&mut Camera, &mut Projection), (With<TraceCameraTraces>, Without<TraceCameraMinimap>, Without<TraceCameraTextAtlas>)>,
+    mut text_camera: Query<&mut Camera, (With<TraceCameraTextAtlas>, Without<TraceCameraMinimap>, Without<TraceCameraTraces>)>,
+    mut minimap_camera: Query<&mut Camera, (With<TraceCameraMinimap>, Without<TraceCameraTraces>, Without<TraceCameraTextAtlas>)>,
+) {
+    // TODO: specifically when the graph view is open the traces become misaligned
+    let window = windows.single();
+    let scale_factor = window.scale_factor() as u32;
+    let minimap_offset = MINIMAP_OFFSET * scale_factor;
+    let minimap_height = (MINIMAP_HEIGHT * scale_factor);
+    let minimap_height_and_offset = MINIMAP_HEIGHT_AND_OFFSET * scale_factor;
+    let (mut main_camera , mut projection) = main_camera.single_mut();
+    let mut text_camera = text_camera.single_mut();
+    let mut minimap_camera = minimap_camera.single_mut();
+
+    if let Some(traces_tile) = tree_identities.traces_tile {
+        if let Some(tile) = tree.tree.tiles.get(traces_tile) {
+            match tile {
+                Tile::Pane(p) => {
+                    if &p.nr == &"Traces" {
+                        if !tree.tree.active_tiles().contains(&traces_tile) {
+                            main_camera.is_active = false;
+                            text_camera.is_active = false;
+                            minimap_camera.is_active = false;
+                            trace_space.is_active = false;
+                        } else {
+                            trace_space.is_active = true;
+                            main_camera.is_active = true;
+                            text_camera.is_active = true;
+                            minimap_camera.is_active = true;
+                            if let Some(r) = p.rect {
+                                main_camera.viewport = Some(Viewport {
+                                    physical_position: UVec2::new(r.min.x as u32 * scale_factor, (r.min.y as u32 * scale_factor + minimap_height_and_offset)),
+                                    physical_size: UVec2::new(
+                                        r.width() as u32 * scale_factor,
+                                        r.height() as u32 * scale_factor - minimap_height_and_offset,
+                                    ),
+                                    ..default()
+                                });
+                                text_camera.viewport = main_camera.viewport.clone();
+                                minimap_camera.viewport = Some(Viewport {
+                                    physical_position: UVec2::new(r.min.x as u32 * scale_factor, (r.min.y as u32 * scale_factor + minimap_offset)),
+                                    physical_size: UVec2::new(
+                                        r.width() as u32 * scale_factor,
+                                        minimap_height,
+                                    ),
+                                    ..default()
+                                });
+                            }
+                        }
+                    }
+                }
+                Tile::Container(_) => {}
+            }
+        }
+    }
+
+}
+
 fn set_camera_viewports(
     windows: Query<&Window>,
-    mut tree: ResMut<EguiTree>,
     mut trace_space: ResMut<TraceSpaceViewport>,
     mut resize_events: EventReader<WindowResized>,
     mut main_camera: Query<(&mut Camera, &mut Projection), (With<TraceCameraTraces>, Without<TraceCameraMinimap>, Without<TraceCameraTextAtlas>)>,
@@ -753,36 +845,6 @@ fn set_camera_viewports(
     let (mut main_camera , mut projection) = main_camera.single_mut();
     let mut text_camera = text_camera.single_mut();
     let mut minimap_camera = minimap_camera.single_mut();
-
-    tree.tree.tiles.iter().for_each(|(_, tile)| {
-        match tile {
-            Tile::Pane(p) => {
-                if &p.nr == &"Traces" {
-                    if let Some(r) = p.rect {
-                        main_camera.viewport = Some(Viewport {
-                            physical_position: UVec2::new(r.min.x as u32, r.min.y as u32 + minimap_height_and_offset),
-                            physical_size: UVec2::new(
-                                r.width() as u32,
-                                r.height() as u32 - minimap_height_and_offset,
-                            ),
-                            ..default()
-                        });
-                        text_camera.viewport = main_camera.viewport.clone();
-                        minimap_camera.viewport = Some(Viewport {
-                            physical_position: UVec2::new(r.min.x as u32, r.min.y as u32 + minimap_offset),
-                            physical_size: UVec2::new(
-                                r.width() as u32,
-                                minimap_height,
-                            ),
-                            ..default()
-                        });
-                    }
-                }
-            }
-            Tile::Container(_) => {}
-        }
-    });
-
 
     // We need to dynamically resize the camera's viewports whenever the window size changes
     // so then each camera always takes up half the screen.
@@ -818,13 +880,9 @@ fn trace_setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut config_store: ResMut<GizmoConfigStore>,
 ) {
     let window = windows.single();
     let scale_factor = window.scale_factor();
-    let (config, _) = config_store.config_mut::<DefaultGizmoConfigGroup>();
-    config.line_width = 1.0;
-    config.render_layers = RenderLayers::layer(4);
 
     let minimap_offset = MINIMAP_OFFSET * scale_factor as u32;
     let minimap_height = (MINIMAP_HEIGHT as f32 * scale_factor) as u32;
@@ -847,7 +905,7 @@ fn trace_setup(
                 .collect(),
 
         ),
-        RenderLayers::layer(3),
+        RenderLayers::layer(RENDER_LAYER_TRACE_VIEW),
         // NOTE: Frustum culling is done based on the Aabb of the Mesh and the GlobalTransform.
         // As the cube is at the origin, if its Aabb moves outside the view frustum, all the
         // instanced cubes will be culled.
@@ -889,7 +947,7 @@ fn trace_setup(
         },
         TraceCameraTraces,
         OnTraceScreen,
-        RenderLayers::layer(3)
+        RenderLayers::layer(RENDER_LAYER_TRACE_VIEW)
     ));
 
     // Text rendering camera
@@ -912,7 +970,7 @@ fn trace_setup(
         },
         OnTraceScreen,
         TraceCameraTextAtlas,
-        RenderLayers::layer(4)
+        RenderLayers::layer(RENDER_LAYER_TRACE_TEXT)
     ));
 
     // Minimap camera
@@ -945,37 +1003,24 @@ fn trace_setup(
         },
         TraceCameraMinimap,
         OnTraceScreen,
-        RenderLayers::from_layers(&[3, 5])
-    ));
-
-    commands.spawn((
-        PbrBundle {
-            mesh: meshes.add(Mesh::from(Rectangle::new(1.0, 1.0))).into(),
-            material: materials.add(Color::hsla(3.0, 1.0, 1.0, 0.5)),
-            transform: Transform::from_xyz(0.0, -50.0, -1.0),
-            ..default()
-        },
-        RenderLayers::layer(5),
-        MinimapTraceViewport,
-        NoFrustumCulling,
-        OnTraceScreen,
+        RenderLayers::from_layers(&[RENDER_LAYER_TRACE_VIEW, RENDER_LAYER_TRACE_MINIMAP])
     ));
 
     // Minimap viewport indicator
-    // commands.spawn((
-    //     Camera2dBundle {
-    //         camera: Camera {
-    //             order: 5,
-    //             ..default()
-    //         },
-    //         transform: Transform::from_xyz(0.0, 0.0, 1.0).looking_at(Vec3::ZERO, Vec3::Y),
-    //         ..default()
-    //     },
-    //     OnTraceScreen,
-    //     TraceCameraMinimapDraw,
-    //     RenderLayers::layer(5)
-    // ));
-
+    commands.spawn((
+        PbrBundle {
+            mesh: meshes.add(Mesh::from(Rectangle::new(1.0, 1.0))).into(),
+            material: materials.add(Color::hsla(3.0, 1.0, 1.0, 0.8)),
+            transform: Transform::from_xyz(0.0, -50.0, -1.0),
+            ..default()
+        },
+        RenderLayers::layer(RENDER_LAYER_TRACE_MINIMAP),
+        MinimapTraceViewportIndicator,
+        Collider::cuboid(0.5, 0.5),
+        Sensor,
+        NoFrustumCulling,
+        OnTraceScreen,
+    ));
 
     commands.spawn((CursorWorldCoords(Vec2::ZERO), OnTraceScreen));
 
@@ -990,6 +1035,7 @@ fn trace_setup(
         horizontal_scale: CAMERA_SPACE_WIDTH,
         vertical_scale: (window.resolution.physical_height() - minimap_height_and_offset) as f32,
         max_vertical_extent: SPAN_HEIGHT * scale_factor,
+        is_active: false
     });
     
 }
@@ -1010,8 +1056,8 @@ pub fn trace_plugin(app: &mut App) {
     app
         .init_resource::<TracesCallTree>()
         .add_plugins((CustomMaterialPlugin, ))
-        .add_systems(OnEnter(crate::GameState::Traces), (trace_setup,))
-        .add_systems(OnExit(crate::GameState::Traces), despawn_screen::<OnTraceScreen>)
+        .add_systems(OnEnter(crate::GameState::Graph), (trace_setup,))
+        .add_systems(OnExit(crate::GameState::Graph), despawn_screen::<OnTraceScreen>)
         .add_systems(Update, (
             maintain_call_tree,
             update_trace_space_to_minimap_camera_configuration,
@@ -1022,6 +1068,7 @@ pub fn trace_plugin(app: &mut App) {
             mouse_over_system,
             mouse_pan,
             touchpad_gestures,
-            set_camera_viewports
-        ).run_if(in_state(crate::GameState::Traces)));
+            set_camera_viewports,
+            enforce_tiled_viewports
+        ).run_if(in_state(crate::GameState::Graph)));
 }

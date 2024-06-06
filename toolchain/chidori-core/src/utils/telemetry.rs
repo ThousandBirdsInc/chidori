@@ -200,3 +200,14 @@ pub fn init_internal_telemetry(sender: Sender<TraceEvents>) -> impl Subscriber {
         .with(custom_layer);
     subscriber
 }
+
+pub fn init_test_telemetry() -> impl Subscriber {
+    println!("Initializing internal telemetry");
+    let filter_layer = tracing_subscriber::EnvFilter::new("chidori_core=trace");
+    let forwarding_layer = ForwardingLayer::new(tracing_subscriber::fmt::layer());
+
+    let subscriber = tracing_subscriber::Registry::default()
+        .with(filter_layer)
+        .with(forwarding_layer);
+    subscriber
+}

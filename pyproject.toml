@@ -1,21 +1,23 @@
-[tool.poetry]
-name = "python-poetry"
+[project]
+name = "chidori"
 version = "0.1.0"
-description = ""
-authors = []
+description = "Add your description here"
+dependencies = [
+    "litellm[proxy]>=1.37.17",
+]
 readme = "README.md"
-
-[tool.poetry.dependencies]
-python = "^3.10"
-numpy = "^1.24.1"
-maturin = "1.1.0"
-pydot = "^1.4.2"
-jupyterlab = "^4.0.2"
-aiohttp = "^3.8.5"
-asyncio = "^3.4.3"
-litellm = {extras = ["proxy"], version = "^1.35.19"}
-
+requires-python = ">= 3.8"
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.rye]
+managed = true
+dev-dependencies = []
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chidori"]

@@ -217,14 +217,14 @@ enum Mutability {
 
 
 
-/// This is an object that is passed to OperationNode OperationFn that allows
+/// This is an object that is passed to OperationNode's OperationFn that allows
 /// them to expose an interactive internal environment. This is used to provide
-/// mutable internal state within the execution of the OperationNode.
+/// mutable internal state within the execution of an OperationNode.
 ///
 /// It provides:
-///    - oneshot for the node to expose its callable interface to the execution graph without completing execution
-///    - receiver for the node to receive messages from the execution graph
-///         - the receiver is sent tuples of inputs and a oneshot sender to reply with its output
+///    - a oneshot for the node to expose its callable interface to the execution graph without completing execution
+///    - a receiver for the node to receive messages from the execution graph
+///         - the receiver is sent tuples of inputs and a oneshot sender to perform a one-off reply with its output
 pub struct AsyncRPCCommunication {
     pub(crate) callable_interface_sender: oneshot::Sender<Vec<String>>,
     pub(crate) receiver: tokio::sync::mpsc::UnboundedReceiver<(String, RkyvSerializedValue, oneshot::Sender<RkyvSerializedValue>)>,

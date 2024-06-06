@@ -9,8 +9,6 @@ use crate::execution::primitives::operation::{InputItemConfiguration, InputSigna
 pub fn code_cell(cell: &CodeCell, range: &TextRange) -> anyhow::Result<OperationNode> {
     match cell.language {
         SupportedLanguage::PyO3 => {
-            // TODO: all callable functions should be exposed as their own OperationNodes
-            //       these can be depended on throughout the graph as their own cells.
             let paths =
                 chidori_static_analysis::language::python::parse::extract_dependencies_python(
                     &cell.source_code,
@@ -25,6 +23,8 @@ pub fn code_cell(cell: &CodeCell, range: &TextRange) -> anyhow::Result<Operation
                 input_signature,
                 output_signature,
                 Box::new(move |s, x, _, _| {
+                    let closure_span = tracing::span!(tracing::Level::INFO, "pyo3_code_cell");
+                    let _enter = closure_span.enter();
                     let cell = cell.clone();
                     let s = s.clone();
                     async move {
@@ -64,24 +64,32 @@ pub fn code_cell(cell: &CodeCell, range: &TextRange) -> anyhow::Result<Operation
                 cell.name.clone(),
                 input_signature,
                 output_signature,
-                Box::new(move |_, x, _, _| {
-                    // TODO: this needs to handle stdout and errors
+                Box::new(move |s, x, _, _| {
+                    let closure_span = tracing::span!(tracing::Level::INFO, "deno_code_cell");
+                    let _enter = closure_span.enter();
+                    let s = s.clone();
                     let cell = cell.clone();
                     async move {
                         let result = tokio::task::spawn_blocking(move || {
                             let runtime = tokio::runtime::Runtime::new().unwrap();
                             let result = runtime.block_on(crate::library::std::code::runtime_deno::source_code_run_deno(
-                                &ExecutionState::new(),
+                                &s,
                                 &cell.source_code,
                                 &x,
                                 &cell.function_invocation,
                             ));
                             match result {
-                                Ok(v) => v.0,
+                                Ok(v) =>
+                                    Ok(OperationFnOutput {
+                                        execution_state: None,
+                                        output: v.0,
+                                        stdout: v.1,
+                                        stderr: v.2,
+                                    }),
                                 Err(e) => panic!("{:?}", e),
                             }
                         }).await.unwrap();
-                        Ok(OperationFnOutput::with_value(result))
+                        result
                     }.boxed()
                 }),
             ))

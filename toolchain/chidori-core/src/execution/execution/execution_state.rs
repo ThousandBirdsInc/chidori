@@ -25,8 +25,9 @@ use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 use futures_util::FutureExt;
 use tokio::runtime::Runtime;
+use tokio::sync::oneshot::error::TryRecvError;
 use crate::cells::{CellTypes, CodeCell, get_cell_name, LLMPromptCell};
-use crate::execution::execution::execution_graph::ExecutionNodeId;
+use crate::execution::execution::execution_graph::{ExecutionGraphSendPayload, ExecutionNodeId};
 
 pub enum OperationExecutionStatusOption {
     Running,
@@ -77,9 +78,16 @@ pub enum ExecutionStateEvaluation {
 }
 
 impl ExecutionStateEvaluation {
-    pub fn state_get(&self, operation_id: &OperationId) -> Option<&RkyvSerializedValue> {
+    pub fn state_get(&self, operation_id: &OperationId) -> Option<&OperationFnOutput> {
         match self {
             ExecutionStateEvaluation::Complete(ref state) => state.state_get(operation_id),
+            ExecutionStateEvaluation::Executing(ref future_state) => unreachable!("Cannot get state from a future state"),
+        }
+    }
+
+    pub fn state_get_value(&self, operation_id: &OperationId) -> Option<&RkyvSerializedValue> {
+        match self {
+            ExecutionStateEvaluation::Complete(ref state) => state.state_get(operation_id).map(|o| &o.output),
             ExecutionStateEvaluation::Executing(ref future_state) => unreachable!("Cannot get state from a future state"),
         }
     }
@@ -108,16 +116,23 @@ pub struct FunctionMetadata {
 #[derive(Clone)]
 pub struct ExecutionState {
     pub(crate) op_counter: usize,
+    pub parent_state_id: ExecutionNodeId,
 
-    // TODO: this is a channel sender to update the execution graph
-    pub graph_sender: Option<Arc<Sender<(ExecutionState, tokio::sync::mpsc::Sender<String>)>>>,
+    pub evaluating_id: usize,
+    pub evaluating_name: Option<String>,
+    pub evaluating_fn: Option<String>,
+    pub operation_mutation: Option<CellTypes>,
+
+    // Channel sender used to update the execution graph and resume execution
+    pub graph_sender: Option<Arc<tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>>>,
 
     pub exec_queue: VecDeque<usize>,
+    pub marked_for_consumption: HashSet<usize>,
 
     // TODO: call_stack is only ever a single coroutine at a time and instead its the stack of execution states being resolved?
     // pub call_stack: Arc<Mutex<Pin<Box<dyn Coroutine<Return=CoroutineYieldValue, Yield=CoroutineYieldValue>>>>>,
 
-    pub state: ImHashMap<usize, Arc<RkyvSerializedValue>>,
+    pub state: ImHashMap<usize, Arc<OperationFnOutput>>,
 
     pub operation_name_to_id: ImHashMap<String, OperationId>,
 
@@ -192,22 +207,45 @@ fn render_map_as_table(exec_state: &ExecutionState) -> String {
 }
 
 /// This causes the current async loop to pause until we send a signal over the oneshot sender returned
-async fn pause_future_with_oneshot(value: RkyvSerializedValue, sender: Sender<(RkyvSerializedValue, tokio::sync::oneshot::Sender<()>)>) -> Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>> {
-    let (oneshot_sender, oneshot_receiver) = tokio::sync::oneshot::channel();
+async fn pause_future_with_oneshot(state: ExecutionState, sender: &tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>) -> Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>> {
+    println!("============= should pause =============");
+    let (oneshot_sender, mut oneshot_receiver) = tokio::sync::oneshot::channel();
     let future = async move {
-        oneshot_receiver.await.expect("Failed to receive oneshot signal");
+        println!("Should be pending oneshot signal");
+        loop {
+            match oneshot_receiver.try_recv() {
+                Ok(_) => {
+                    break;
+                }
+                Err(TryRecvError::Empty) => {
+                }
+                Err(TryRecvError::Closed) => {
+                    // TODO: error instead of just continuing
+                    println!("Error during oneshot pause.");
+                    break;
+                }
+            }
+            // let recv = oneshot_receiver.await.expect("Failed to receive oneshot signal");
+        }
+        println!("Continuing from oneshot signal");
         RkyvSerializedValue::Null
     };
-    sender.send((value, oneshot_sender)).expect("Failed to send oneshot signal");
+    sender.send((state, oneshot_sender)).await.expect("Failed to send oneshot signal");
     Box::pin(future)
 }
 
 impl ExecutionState {
     pub fn new() -> Self {
         ExecutionState {
+            parent_state_id: (0,0),
             op_counter: 0,
+            evaluating_id: 0,
+            evaluating_name: None,
+            evaluating_fn: None,
+            operation_mutation: None,
             graph_sender: None,
             exec_queue: VecDeque::new(),
+            marked_for_consumption: HashSet::new(),
             state: Default::default(),
             operation_name_to_id: Default::default(),
             operation_by_id: Default::default(),
@@ -218,11 +256,17 @@ impl ExecutionState {
         }
     }
 
-    pub fn with_graph_sender(graph_sender: Arc<Sender<(ExecutionState, tokio::sync::mpsc::Sender<String>)>>) -> Self {
+    pub fn with_graph_sender(parent_state_id: ExecutionNodeId, graph_sender: Arc<tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>>) -> Self {
         ExecutionState {
+            parent_state_id,
             op_counter: 0,
+            evaluating_id: 0,
+            evaluating_name: None,
+            evaluating_fn: None,
+            operation_mutation: None,
             graph_sender: Some(graph_sender),
             exec_queue: VecDeque::new(),
+            marked_for_consumption: HashSet::new(),
             state: Default::default(),
             operation_name_to_id: Default::default(),
             operation_by_id: Default::default(),
@@ -237,8 +281,12 @@ impl ExecutionState {
         return self.has_been_set.len() == self.operation_by_id.len()
     }
 
-    pub fn state_get(&self, operation_id: &OperationId) -> Option<&RkyvSerializedValue> {
+    pub fn state_get(&self, operation_id: &OperationId) -> Option<&OperationFnOutput> {
         self.state.get(operation_id).map(|x| x.as_ref())
+    }
+
+    pub fn state_get_value(&self, operation_id: &OperationId) -> Option<&RkyvSerializedValue> {
+        self.state.get(operation_id).map(|x| x.as_ref()).map(|o| &o.output)
     }
 
     pub fn check_if_previously_set(&self, operation_id: &OperationId) -> bool {
@@ -246,14 +294,14 @@ impl ExecutionState {
     }
 
     #[tracing::instrument]
-    pub fn state_consume_marked(&mut self, marked_for_consumption: HashSet<usize>) {
-        for key in marked_for_consumption.clone().into_iter() {
-            self.state.remove(&key);
+    pub fn state_consume_marked(&mut self, marked_for_consumption: &HashSet<usize>) {
+        for key in marked_for_consumption.iter() {
+            self.state.remove(key);
         }
     }
 
     #[tracing::instrument]
-    pub fn state_insert(&mut self, operation_id: OperationId, value: RkyvSerializedValue) {
+    pub fn state_insert(&mut self, operation_id: OperationId, value: OperationFnOutput) {
         self.state.insert(operation_id, Arc::new(value));
         self.has_been_set.insert(operation_id);
     }
@@ -281,11 +329,13 @@ impl ExecutionState {
         );
     }
 
+    #[tracing::instrument]
     pub fn get_dependency_graph_flattened(&self) -> Vec<(OperationId, OperationId, Vec<DependencyReference>)> {
         let edges = self.get_dependency_graph();
         edges.all_edges().map(|x| (x.0, x.1, x.2.clone())).collect()
     }
 
+    #[tracing::instrument]
     pub fn get_dependency_graph(&self) -> DiGraphMap<OperationId, Vec<DependencyReference>> {
         let mut graph = DiGraphMap::new();
         for (node, value) in self.dependency_map.clone().into_iter() {
@@ -303,6 +353,7 @@ impl ExecutionState {
         graph
     }
 
+    #[tracing::instrument]
     pub fn update_op(
         &self,
         cell: CellTypes,
@@ -317,13 +368,15 @@ impl ExecutionState {
             CellTypes::Memory(c, r) => crate::cells::memory_cell::memory_cell(c, r),
             CellTypes::CodeGen(c, r) => crate::cells::code_gen_cell::code_gen_cell(c, r),
         }?;
-        op.attach_cell(cell);
+        op.attach_cell(cell.clone());
         let (op_id, new_state) = self.upsert_operation(op, op_id);
         let mutations = Self::assign_dependencies_to_operations(&new_state)?;
-        let final_state = new_state.apply_dependency_graph_mutations(mutations);
+        let mut final_state = new_state.apply_dependency_graph_mutations(mutations);
+        final_state.operation_mutation = Some(cell);
         Ok((final_state, op_id))
     }
 
+    #[tracing::instrument]
     fn assign_dependencies_to_operations(new_state: &ExecutionState) -> anyhow::Result<Vec<DependencyGraphMutation>> {
         let (available_values, available_functions) = Self::get_possible_dependencies(new_state)?;
 
@@ -373,6 +426,7 @@ impl ExecutionState {
         Ok(mutations)
     }
 
+    #[tracing::instrument]
     fn get_possible_dependencies(new_state: &ExecutionState) -> anyhow::Result<(HashMap<String, &OperationId>, HashMap<String, &OperationId>)> {
         // TODO: when there is a dependency on a function invocation we need to
         //       instantiate a new instance of the function operation node.
@@ -427,6 +481,7 @@ impl ExecutionState {
 
         s.operation_by_id.insert(op_id, Arc::new(Mutex::new(operation_node)));
         s.update_callable_functions();
+        s.exec_queue.push_back(op_id);
         (op_id, s)
     }
 
@@ -461,6 +516,7 @@ impl ExecutionState {
         s
     }
 
+    #[tracing::instrument]
     fn update_callable_functions(&mut self) {
         for (id, op) in &self.operation_by_id {
             if let Ok(mut op_node) = op.try_lock() {
@@ -482,18 +538,30 @@ impl ExecutionState {
     /// Invoke a function made available by the execution state, this accepts arguments derived in the context
     /// of a parent function's scope. This targets a specific function by name that we've identified a dependence on.
     // TODO: this should create a coroutine that yields with the result of the function invocation
+    #[tracing::instrument]
     pub async fn dispatch(&self, function_name: &str, payload: RkyvSerializedValue) -> anyhow::Result<(RkyvSerializedValue, ExecutionState)> {
-        // TODO: this should return a closure that executes the code
+        println!("Running dispatch {:?}", function_name);
 
         // Store the invocation payload into an execution state and record this before executing
         let mut state = self.clone();
-        state.state_insert(usize::MAX, payload.clone());
 
-        let op = self.function_name_to_metadata.get(function_name).map(|meta| {
-            let op = state.operation_by_id.get(&meta.operation_id).unwrap().lock().unwrap();
-            op
+        let meta = self.function_name_to_metadata.get(function_name).map(|meta| {
+            meta
+        }).expect("Failed to find named function");
+
+        state.state_insert(usize::MAX, OperationFnOutput {
+            execution_state: None,
+            output: payload.clone(),
+            stdout: vec![],
+            stderr: vec![],
         });
-        let cell = &op.unwrap().cell.clone();
+
+        let op = state.operation_by_id.get(&meta.operation_id).unwrap().lock().unwrap();
+        let op_name = op.name.clone();
+        let cell = &op.cell.clone();
+        state.evaluating_fn = Some(function_name.to_string());
+        state.evaluating_id = meta.operation_id;
+        state.evaluating_name = op_name;
 
         // modify code cell to indicate execution of the target function
         // reconstruction of the cell
@@ -525,13 +593,28 @@ impl ExecutionState {
             }
         };
 
-        // pause_future_with_oneshot(payload, self.graph_sender.as_ref().unwrap().clone()).await;
+        // When we receive a message from the graph_sender, execution of this coroutine will resume.
+        if let Some(graph_sender) = self.graph_sender.as_ref() {
+            let s = graph_sender.clone();
+            let result = pause_future_with_oneshot(self.clone(), &s).await;
+            let recv = result.await;
+        }
 
         // invocation of the operation
         // TODO: the total arg payload here does not include necessary function calls for this cell itself
         let result = op.execute(&self, payload, None, None).await?;
+        dbg!(&result);
 
-        // TODO: return the result, which we will use in the context of the parent function
+        // TODO: Add result into a new execution state
+
+        // TODO: capture the value of the output
+        if let Some(graph_sender) = self.graph_sender.as_ref() {
+            let s = graph_sender.clone();
+            let result = pause_future_with_oneshot(self.clone(), &s).await;
+            let recv = result.await;
+        }
+
+        // Return the result, to be used in the context of the parent function
         Ok((result.output, self.clone()))
     }
 
@@ -539,35 +622,58 @@ impl ExecutionState {
     #[tracing::instrument]
     pub async fn step_execution(
         &self,
-        sender: &Sender<(ExecutionNodeId, OperationId, RkyvSerializedValue)>
+        previous_state_id: ExecutionNodeId,
+        sender: &tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>
     ) -> anyhow::Result<(ExecutionStateEvaluation, Vec<(usize, OperationFnOutput)>)> {
         let previous_state = self;
         let mut new_state = previous_state.clone();
+        new_state.parent_state_id = previous_state_id;
+        new_state.operation_mutation = None;
         let mut operation_by_id = previous_state.operation_by_id.clone();
         let dependency_graph = previous_state.get_dependency_graph();
-        let mut marked_for_consumption = HashSet::new();
+        let mut marked_for_consumption = self.marked_for_consumption.clone();
 
         let mut outputs = vec![];
-        let operation_ids: Vec<OperationId> = operation_by_id.keys().copied().collect();
 
-        // Every step, each operation consumes from its incoming edges.
-
-        // TODO: use the exec queue here
-        // let mut exec_queue = self.exec_queue.clone();
-        // let next_operation_id = exec_queue.pop_front();
-
-        'traverse_nodes: for operation_id in operation_ids {
+        // We handle a sorted queue of operations to evaluate, giving a deterministic order
+        // to how our operations and run, and executing only a single operation each tick.
+        // We churn through the queue in this ordering until we have a valid node to evaluate.
+        // TODO: if all nodes are visited and none can be evaluated we should break
+        let mut exec_queue = self.exec_queue.clone();
+        let (
+            op_node,
+            next_operation_id,
+            args,
+            kwargs,
+            globals,
+            functions
+        ) = 'traverse_nodes: loop {
+            println!("Looping step execution, traverse nodes {:?}", &exec_queue);
+            let next_operation_id = if let Some(next_operation_id) = exec_queue.pop_front() {
+                next_operation_id
+            } else {
+                // if all operations have been evaluated during this step_execution and none progressed
+                // to execution, consume all marked values, complete the execution state with empty output.
+                new_state.state_consume_marked(&marked_for_consumption);
+                let mut operation_ids: Vec<OperationId> = operation_by_id.keys().copied().collect();
+                operation_ids.sort();
+                exec_queue.extend(operation_ids.iter());
+                new_state.exec_queue = exec_queue;
+                return Ok((ExecutionStateEvaluation::Complete(new_state), outputs));
+            };
+            println!("Looping step execution, traverse nodes {:?}", next_operation_id);
 
             // We skip nodes that are currently locked due to long running execution
             // TODO: we can regenerate async nodes if necessary by creating them from their original cells
             let mut op_node = operation_by_id
-                .get_mut(&operation_id)
+                .get_mut(&next_operation_id)
                 .unwrap()
                 .lock()
                 .unwrap();
 
             println!("============================================================");
-            println!("Evaluating operation {}: {:?}", operation_id, op_node.name);
+            println!("Evaluating operation {}: {:?}", next_operation_id, op_node.name);
+            // TODO: add to the execution state the id and name of the executed operation (and function name)
 
             let signature = &op_node.signature.input_signature;
 
@@ -581,31 +687,33 @@ impl ExecutionState {
 
             // Ops with 0 deps should only execute once, by do execute by default
             if signature.is_empty() {
-                if previous_state.check_if_previously_set(&operation_id) {
+                if previous_state.check_if_previously_set(&next_operation_id) {
+                    // TODO: don't continue if we've visited the whole set
                     continue 'traverse_nodes;
                 }
             }
 
             // Fetch the values from the previous execution cycle for each edge on this node
             for (from, _to, argument_indices) in
-            dependency_graph.edges_directed(operation_id, Direction::Incoming)
+            dependency_graph.edges_directed(next_operation_id, Direction::Incoming)
             {
                 println!("Argument indices: {:?}", argument_indices);
                 // TODO: we don't need a value from previous state for function invocation dependencies
                 if let Some(output) = previous_state.state_get(&from) {
+                    let output_value = &output.output;
                     marked_for_consumption.insert(from.clone());
 
                     // TODO: we can implement prioritization between different values here
                     for argument_index in argument_indices {
                         match argument_index {
                             DependencyReference::Positional(pos) => {
-                                args.insert(format!("{}", pos), output.clone());
+                                args.insert(format!("{}", pos), output_value.clone());
                             }
                             DependencyReference::Keyword(kw) => {
-                                kwargs.insert(kw.clone(), output.clone());
+                                kwargs.insert(kw.clone(), output_value.clone());
                             }
                             DependencyReference::Global(name) => {
-                                if let RkyvSerializedValue::Object(value) = output {
+                                if let RkyvSerializedValue::Object(value) = &output.output {
                                     globals.insert(name.clone(), value.get(name).unwrap().clone());
                                 }
                             }
@@ -635,70 +743,86 @@ impl ExecutionState {
                 continue 'traverse_nodes;
             }
 
-            // TODO: all functions that are referred to that we know are not yet defined are populated with a shim,
-            //       that shim goes to our lookup based on our function invocation dependencies.
+            break (
+                op_node,
+                next_operation_id,
+                args,
+                kwargs,
+                globals,
+                functions
+            );
+        };
+        new_state.exec_queue = exec_queue;
 
-            // Construct the arguments for the given operation
-            let argument_payload: RkyvSerializedValue = RkyvSerializedValue::Object(HashMap::from_iter(vec![
-                ("args".to_string(), RkyvSerializedValue::Object(args)),
-                ("kwargs".to_string(), RkyvSerializedValue::Object(kwargs)),
-                ("globals".to_string(), RkyvSerializedValue::Object(globals)),
-                (
-                    "functions".to_string(),
-                    RkyvSerializedValue::Object(functions),
-                ),
-            ]));
+        // TODO: all functions that are referred to that we know are not yet defined are populated with a shim,
+        //       that shim goes to our lookup based on our function invocation dependencies.
 
-            // Execute the operation
-            // TODO: support async/parallel execution
-            println!("Executing node {} ({:?}) with payload {:?}", operation_id, op_node.name, argument_payload);
-            let op_node_execute = op_node.execute(&self, argument_payload, None, None);
-            if op_node.is_long_running_background_thread {
-                let sender_clone = sender.clone();
-                let (oneshot_sender, oneshot_receiver) = tokio::sync::oneshot::channel();
+        // Construct the arguments for the given operation
+        let argument_payload: RkyvSerializedValue = RkyvSerializedValue::Object(HashMap::from_iter(vec![
+            ("args".to_string(), RkyvSerializedValue::Object(args)),
+            ("kwargs".to_string(), RkyvSerializedValue::Object(kwargs)),
+            ("globals".to_string(), RkyvSerializedValue::Object(globals)),
+            (
+                "functions".to_string(),
+                RkyvSerializedValue::Object(functions),
+            ),
+        ]));
 
-                // Run the target long running function in a background thread
-                tokio::spawn(async move {
-                    // This is another thread that handles annotating these events with additional metadata (operationId)
-                    let (internal_sender, internal_receiver) = mpsc::channel();
-                    std::thread::spawn(move || {
-                        loop {
-                            match internal_receiver.try_recv() {
-                                Ok((prev_execution_id, value)) => {
-                                    sender_clone.send((prev_execution_id, operation_id, value)).unwrap();
-                                },
-                                Err(mpsc::TryRecvError::Empty) => {
-                                    // No messages available, take this time to sleep a bit
-                                    std::thread::sleep(Duration::from_millis(10)); // Sleep for 10 milliseconds
-                                },
-                                Err(mpsc::TryRecvError::Disconnected) => {
-                                    // Handle the case where the sender has disconnected and no more messages will be received
-                                    break; // or handle it according to your application logic
-                                },
-                            }
-                        }
-                    });
+        // Execute the operation
+        // TODO: support async/parallel execution
+        println!("Executing node {} ({:?}) with payload {:?}", next_operation_id, op_node.name, argument_payload);
+        new_state.evaluating_fn = None;
+        new_state.evaluating_id = next_operation_id;
+        new_state.evaluating_name = op_node.name.clone();
+        let op_node_execute = op_node.execute(&self, argument_payload, None, None);
+        if op_node.is_long_running_background_thread {
+            let sender_clone = sender.clone();
+            let (oneshot_sender, oneshot_receiver) = tokio::sync::oneshot::channel();
 
-                    // Long-running execution
-                    dbg!("Long-running execution");
-                    let _ = op_node_execute.await;
-                    dbg!("Completed");
-                    let _ = oneshot_sender.send(());
-                });
-                oneshot_receiver.await.expect("Failed to receive oneshot signal");
-                // outputs.push((operation_id, result.clone()));
-                // new_state.state_insert(operation_id, result);
-            } else {
-                let result = op_node_execute.await?;
-                println!("Executed node {} with result {:?}", operation_id, &result);
-                outputs.push((operation_id, result.clone()));
-                if let Some(s) = result.execution_state {
-                    new_state = s;
-                }
-                new_state.state_insert(operation_id, result.output);
-            }
+            // Run the target long running function in a background thread
+            tokio::spawn(async move {
+                // This is another thread that handles annotating these events with additional metadata (operationId)
+                // let (internal_sender, internal_receiver) = mpsc::channel();
+                // std::thread::spawn(move || {
+                //     loop {
+                //         match internal_receiver.try_recv() {
+                //             Ok((execution_state, continue_oneshot)) => {
+                //             // Ok((prev_execution_id, value)) => {
+                //                 // sender_clone.send((prev_execution_id, next_operation_id, value)).unwrap();
+                //             },
+                //             Err(mpsc::TryRecvError::Empty) => {
+                //                 // No messages available, take this time to sleep a bit
+                //                 std::thread::sleep(Duration::from_millis(10)); // Sleep for 10 milliseconds
+                //             },
+                //             Err(mpsc::TryRecvError::Disconnected) => {
+                //                 // Handle the case where the sender has disconnected and no more messages will be received
+                //                 break; // or handle it according to your application logic
+                //             },
+                //         }
+                //     }
+                // });
+
+                // Long-running execution
+                dbg!("Long-running execution");
+                let _ = op_node_execute.await;
+                dbg!("Completed");
+                let _ = oneshot_sender.send(());
+            });
+            oneshot_receiver.await.expect("Failed to receive oneshot signal");
+            // outputs.push((operation_id, result.clone()));
+            // new_state.state_insert(operation_id, result);
+        } else {
+            let result = op_node_execute.await?;
+            println!("Executed node {} with result {:?}", next_operation_id, &result);
+            outputs.push((next_operation_id, result.clone()));
+
+            // TODO: support overriding execution state entirely
+            // if let Some(s) = result.execution_state {
+            //     new_state = s;
+            // }
+            new_state.state_insert(next_operation_id, result);
         }
-        new_state.state_consume_marked(marked_for_consumption);
+        new_state.marked_for_consumption = marked_for_consumption;
         Ok((ExecutionStateEvaluation::Complete(new_state), outputs))
     }
 }
@@ -712,9 +836,15 @@ mod tests {
         let mut exec_state = ExecutionState::new();
         let operation_id = 1;
         let value = RkyvSerializedValue::Number(1);
+        let value = OperationFnOutput {
+            execution_state: None,
+            output: value,
+            stdout: vec![],
+            stderr: vec![],
+        };
         exec_state.state_insert(operation_id, value.clone());
 
-        assert_eq!(exec_state.state_get(&operation_id).unwrap(), &value);
+        assert_eq!(exec_state.state_get_value(&operation_id).unwrap(), &value.output);
         assert!(exec_state.check_if_previously_set(&operation_id));
     }
 

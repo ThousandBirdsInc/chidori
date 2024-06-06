@@ -19,6 +19,7 @@ use chumsky::prelude::any;
 use petgraph::graphmap::DiGraphMap;
 use serde::ser::SerializeMap;
 use tracing::dispatcher::DefaultGuard;
+use tracing::Span;
 use crate::execution::primitives::operation::OperationFnOutput;
 use crate::utils::telemetry::{init_internal_telemetry, TraceEvents};
 
@@ -107,25 +108,40 @@ impl InstancedEnvironment {
         Ok(())
     }
 
-    // pub fn testing(&mut self, handle: tokio::runtime::Handle) -> anyhow::Result<()> {
-    //     handle.spawn(async move {
-    //         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-    //         anyhow::Ok(())
-    //     });
-    //     anyhow::Ok(())
-    // }
+    pub async fn shutdown(&mut self) {
+        println!("Shutting down Chidori runtime.");
+        self.db.shutdown().await;
+    }
+
+
+    // #[tracing::instrument]
+    pub async fn wait_until_ready(&mut self) -> anyhow::Result<()> {
+        println!("Awaiting initialization of the execution coordinator");
+        self.db.execution_depth_orchestration_initialized_notify.notified().await;
+        Ok(())
+    }
 
     /// Entrypoint for execution of an instanced environment, handles messages from the host
+    ///
+    ///
+    ///
+    // #[tracing::instrument]
     pub async fn run(&mut self) -> anyhow::Result<()> {
         println!("Starting instanced environment");
         self.playback_state = PlaybackState::Paused;
 
         // Reload cells to make sure we're up to date
-        self.reload_cells();
+        self.reload_cells()?;
+
+        // Get the current span ID
+        // let current_span_id = Span::current().id().expect("There is no current span");
 
         loop {
+            println!("Looping UserInteraction");
+            // let closure_span = tracing::span!(parent: &current_span_id, tracing::Level::INFO, "execution_instance_loop");
+            // let _enter = closure_span.enter();
             if let Ok(message) = self.env_rx.try_recv() {
-                println!("Received message from host: {:?}", message);
+                println!("Received message from user: {:?}", message);
                 match message {
                     UserInteractionMessage::Play => {
                         self.playback_state = PlaybackState::Running;
@@ -134,7 +150,7 @@ impl InstancedEnvironment {
                         self.playback_state = PlaybackState::Paused;
                     },
                     UserInteractionMessage::ReloadCells => {
-                        self.reload_cells();
+                        self.reload_cells()?;
                     },
                     UserInteractionMessage::FetchStateAt(id) => {
                         let state = self.get_state_at(id);
@@ -150,15 +166,21 @@ impl InstancedEnvironment {
                             sender.send(EventsFromRuntime::UpdateExecutionHead(id)).unwrap();
                         }
                     },
+                    UserInteractionMessage::Shutdown => {
+                        self.shutdown().await;
+                    }
                     _ => {}
                 }
             }
+
             if self.playback_state == PlaybackState::Paused {
+                println!("Playback paused, waiting 1000ms");
                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
             } else {
                 let output = self.step().await?;
                 // If nothing happened, pause playback and wait for the user
                 if output.is_empty() {
+                    println!("Playback paused, awaiting input from user");
                     self.playback_state = PlaybackState::Paused;
                 }
             }
@@ -191,6 +213,9 @@ impl InstancedEnvironment {
             sender.send(EventsFromRuntime::UpdateExecutionHead(state_id)).unwrap();
         }
         println!("Resulted in state with id {:?}", &state_id);
+        let mut shared_state = self.shared_state.lock().unwrap();
+        shared_state.execution_state_head_id = state_id;
+        shared_state.execution_id_to_evaluation.insert(state_id, state);
         self.execution_head_state_id = state_id;
         Ok(outputs)
     }
@@ -202,10 +227,15 @@ impl InstancedEnvironment {
         let ((state_id, state), op_id) = self.db.mutate_graph(self.execution_head_state_id, cell, op_id)?;
         if let Some(sender) = self.runtime_event_sender.as_mut() {
             sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
-            sender.send(EventsFromRuntime::DefinitionGraphUpdated(state.get_dependency_graph_flattened())).unwrap();
+            if let ExecutionStateEvaluation::Complete(s) = &state {
+                sender.send(EventsFromRuntime::DefinitionGraphUpdated(s.get_dependency_graph_flattened())).unwrap();
+            }
             sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
             sender.send(EventsFromRuntime::UpdateExecutionHead(state_id)).unwrap();
         }
+        let mut shared_state = self.shared_state.lock().unwrap();
+        shared_state.execution_state_head_id = state_id;
+        shared_state.execution_id_to_evaluation.insert(state_id, state);
         self.execution_head_state_id = state_id;
         Ok((state_id, op_id))
     }
@@ -223,7 +253,8 @@ pub enum UserInteractionMessage {
     ReloadCells,
     FetchStateAt(ExecutionNodeId),
     FetchCells,
-    MutateCell
+    MutateCell,
+    Shutdown
 }
 
 
@@ -264,6 +295,8 @@ pub struct CellHolder {
 
 #[derive(Debug)]
 pub struct SharedState {
+    pub execution_id_to_evaluation: HashMap<ExecutionNodeId, ExecutionStateEvaluation>,
+    execution_state_head_id: ExecutionNodeId,
     latest_state: Option<ExecutionState>,
     cells: Vec<CellHolder>,
 }
@@ -277,7 +310,7 @@ impl Serialize for SharedState {
         let mut state = serializer.serialize_map(None)?;
         if let Some(map) = &self.latest_state {
             for (k, v) in &map.state {
-                state.serialize_entry(&k, v.deref())?; // Dereference `Arc` to serialize the value inside
+                state.serialize_entry(&k, &v.deref().output)?; // Dereference `Arc` to serialize the value inside
             }
         }
         state.end()
@@ -287,6 +320,8 @@ impl Serialize for SharedState {
 impl SharedState {
     fn new() -> Self {
         SharedState {
+            execution_id_to_evaluation: Default::default(),
+            execution_state_head_id: (0, 0),
             latest_state: None,
             cells: vec![],
         }
@@ -325,12 +360,13 @@ impl std::fmt::Debug for Chidori {
 impl Chidori {
     pub fn new() -> Self {
         Chidori {
-
             instanced_env_tx: None,
             runtime_event_sender: None,
             trace_event_sender: None,
             loaded_path: None,
             shared_state: Arc::new(Mutex::new(SharedState {
+                execution_id_to_evaluation: Default::default(),
+                execution_state_head_id: (0, 0),
                 cells: vec![],
                 latest_state: None,
             })),
@@ -347,6 +383,8 @@ impl Chidori {
             trace_event_sender: Some(sender),
             loaded_path: None,
             shared_state: Arc::new(Mutex::new(SharedState {
+                execution_id_to_evaluation: Default::default(),
+                execution_state_head_id: (0, 0),
                 cells: vec![],
                 latest_state: None,
             })),
@@ -439,8 +477,6 @@ impl Chidori {
         let mut db = ExecutionGraph::new();
         let state_id = (0, 0);
         let playback_state = PlaybackState::Paused;
-
-
         Ok(InstancedEnvironment {
             env_rx,
             db,
@@ -462,6 +498,7 @@ mod tests {
     use tokio::runtime::Runtime;
     use crate::cells::{CodeCell, LLMPromptCell, LLMPromptCellChatConfiguration, SupportedLanguage, SupportedModelProviders, TextRange};
     use crate::utils;
+    use crate::utils::telemetry::init_test_telemetry;
 
     #[tokio::test]
     async fn test_execute_cells_with_global_dependency() -> anyhow::Result<()> {
@@ -490,14 +527,15 @@ mod tests {
         env.get_state().render_dependency_graph();
         env.step().await;
         assert_eq!(
-            env.get_state().state_get(&op_id_x),
+            env.get_state().state_get_value(&op_id_x),
             Some(&RkyvObjectBuilder::new().insert_number("x", 20).build())
         );
-        assert_eq!(env.get_state().state_get(&op_id_y), None);
+        assert_eq!(env.get_state().state_get_value(&op_id_y), None);
         env.step().await;
-        assert_eq!(env.get_state().state_get(&op_id_x), None);
+        assert_eq!(env.get_state().state_get_value(&op_id_x),
+            Some(&RkyvObjectBuilder::new().insert_number("x", 20).build()));
         assert_eq!(
-            env.get_state().state_get(&op_id_y),
+            env.get_state().state_get_value(&op_id_y),
             Some(&RkyvObjectBuilder::new().insert_number("y", 21).build())
         );
         Ok(())
@@ -517,10 +555,14 @@ mod tests {
         }, TextRange::default()),
                                            None)?;
         assert_eq!(op_id_x, 0);
+        let mut config = LLMPromptCellChatConfiguration {
+            model: "gpt-3.5-turbo".into(),
+            ..Default::default()
+        };
         let (_, op_id_y) = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
             function_invocation: false,
-            configuration: LLMPromptCellChatConfiguration::default(),
-            name: None,
+            configuration: config,
+            name: Some("example".into()),
             provider: SupportedModelProviders::OpenAI,
             req: "\
                       Say only a single word. Give no additional explanation.
@@ -531,34 +573,54 @@ mod tests {
                                            None)?;
         assert_eq!(op_id_y, 1);
         env.get_state().render_dependency_graph();
-        env.step().await;
+        let out = env.step().await;
         assert_eq!(
-            env.get_state().state_get(&op_id_x),
+            out.as_ref().unwrap().first().unwrap().0,
+            0
+        );
+        assert_eq!(
+            out.as_ref().unwrap().first().unwrap().1.output,
+            RkyvObjectBuilder::new()
+                .insert_string("x", "Here is a sample string".to_string())
+                .build()
+        );
+        assert_eq!(
+            env.get_state().state_get_value(&op_id_x),
             Some(
                 &RkyvObjectBuilder::new()
                     .insert_string("x", "Here is a sample string".to_string())
                     .build()
             )
         );
-        assert_eq!(env.get_state().state_get(&op_id_y), None);
-        env.step().await;
-        assert_eq!(env.get_state().state_get(&op_id_x), None);
+        let out = env.step().await;
         assert_eq!(
-            env.get_state().state_get(&op_id_y),
-            Some(&RKV::String("Here".to_string()))
+            out.as_ref().unwrap().first().unwrap().0,
+            1
+        );
+        assert_eq!(
+            out.as_ref().unwrap().first().unwrap().1.output,
+            RkyvObjectBuilder::new()
+                .insert_string("example", "Here".to_string())
+                .build()
+        );
+        assert_eq!(
+            env.get_state().state_get_value(&op_id_y),
+            Some(&RkyvObjectBuilder::new()
+                    .insert_string("example", "Here".to_string())
+                    .build())
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_execute_cells_via_prompt_calling_api() -> anyhow::Result<()> {
+    async fn test_execute_cells_prompts_as_functions() -> anyhow::Result<()> {
         let mut env = InstancedEnvironment::new();
         let (_, op_id_x) = env.upsert_cell(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
                         import chidori as ch
-                        x = ch.prompt("generate_names", x="John")
+                        y = generate_names(x="John")
                         "#}),
             function_invocation: None,
         }, TextRange::default()),
@@ -577,24 +639,26 @@ mod tests {
                                            None)?;
         assert_eq!(op_id_y, 1);
         env.get_state().render_dependency_graph();
-        env.step().await;
+        dbg!(env.step().await);
         assert_eq!(
-            env.get_state().state_get(&op_id_x),
+            env.get_state().state_get_value(&op_id_x),
             Some(&RkyvObjectBuilder::new().insert_number("x", 20).build())
         );
-        assert_eq!(env.get_state().state_get(&op_id_y), None);
+        assert_eq!(env.get_state().state_get_value(&op_id_y), None);
         env.step().await;
-        assert_eq!(env.get_state().state_get(&op_id_x), None);
+        assert_eq!(env.get_state().state_get_value(&op_id_x), None);
         assert_eq!(
-            env.get_state().state_get(&op_id_y),
+            env.get_state().state_get_value(&op_id_y),
             Some(&RkyvObjectBuilder::new().insert_number("y", 21).build())
         );
         Ok(())
     }
 
-    #[tokio::test]
+    // #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_execute_cells_invoking_a_function() -> anyhow::Result<()> {
         let mut env = InstancedEnvironment::new();
+        env.wait_until_ready().await.unwrap();
         let (_, id) = env.upsert_cell(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,
@@ -611,7 +675,7 @@ mod tests {
             function_invocation: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
-                        y = add(2, 3)
+                        y = await add(2, 3)
                         "#}),
         }, TextRange::default()),
                                       None)?;
@@ -620,22 +684,26 @@ mod tests {
         env.step().await;
         // Empty object from the function declaration
         assert_eq!(
-            env.get_state().state_get(&0),
-            Some(&RkyvObjectBuilder::new().build())
+            env.get_state().state_get_value(&0),
+            Some(&RkyvObjectBuilder::new().insert_string("add", String::from("function")).build())
         );
-        assert_eq!(env.get_state().state_get(&1), None);
+        assert_eq!(env.get_state().state_get_value(&1), None);
         env.step().await;
-        assert_eq!(env.get_state().state_get(&0), None);
+        assert_eq!(env.get_state().state_get_value(&0),
+                   Some(&RkyvObjectBuilder::new().insert_string("add", String::from("function")).build())
+            );
         assert_eq!(
-            env.get_state().state_get(&1),
+            env.get_state().state_get_value(&1),
             Some(&RkyvObjectBuilder::new().insert_number("y", 5).build())
         );
+        env.shutdown().await;
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_execute_inter_runtime_code() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_execute_inter_runtime_code_plain() -> anyhow::Result<()> {
         let mut env = InstancedEnvironment::new();
+        env.wait_until_ready().await.unwrap();
         let (_, id) = env.upsert_cell(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,
@@ -661,16 +729,20 @@ mod tests {
         env.step().await;
         // Function declaration cell
         assert_eq!(
-            env.get_state().state_get(&0),
-            Some(&RkyvObjectBuilder::new().build())
+            env.get_state().state_get_value(&0),
+            Some(&RkyvObjectBuilder::new().insert_string("add", String::from("function")).build())
         );
-        assert_eq!(env.get_state().state_get(&1), None);
+        assert_eq!(env.get_state().state_get_value(&1),
+                   None);
         env.step().await;
-        assert_eq!(env.get_state().state_get(&0), None);
+        assert_eq!(env.get_state().state_get_value(&0),
+                   Some(&RkyvObjectBuilder::new().insert_string("add", String::from("function")).build())
+        );
         assert_eq!(
-            env.get_state().state_get(&1),
+            env.get_state().state_get_value(&1),
             Some(&RkyvObjectBuilder::new().insert_number("y", 5).build())
         );
+        env.shutdown().await;
         Ok(())
     }
 
@@ -680,13 +752,13 @@ mod tests {
         ee.load_md_string(indoc! { r#"
             ```python
             v = 40
-            def sqrr(x):
+            def squared_value(x):
                 return x * x
             ```
 
             ```python
             y = v * 20
-            z = sqrr(y)
+            z = await squared_value(y)
             ```
             "#
             }).unwrap();
@@ -696,21 +768,27 @@ mod tests {
         env.step().await;
         // Function declaration cell
         assert_eq!(
-            env.get_state().state_get(&0),
+            env.get_state().state_get_value(&0),
+            Some(&RkyvObjectBuilder::new()
+                .insert_number("v", 40)
+                .insert_string("squared_value", "function".to_string())
+                .build())
+        );
+        assert_eq!(env.get_state().state_get_value(&1), None);
+        env.step().await;
+        assert_eq!(env.get_state().state_get_value(&0),
             Some(&RkyvObjectBuilder::new().insert_number("v", 40).build())
         );
-        assert_eq!(env.get_state().state_get(&1), None);
-        env.step().await;
-        assert_eq!(env.get_state().state_get(&0), None);
         assert_eq!(
-            env.get_state().state_get(&1),
+            env.get_state().state_get_value(&1),
             Some(&RkyvObjectBuilder::new().insert_number("z", 640000).insert_number("y", 800).build())
         );
+        env.shutdown().await;
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_execute_inter_runtime_code_md() {
+    async fn test_execute_inter_runtime_code_with_markdown() {
         let mut ee = Chidori::new();
         ee.load_md_string(indoc! { r#"
             ```python
@@ -719,13 +797,13 @@ mod tests {
             ```
 
             ```javascript
-            ---
-            a: 2
-            ---
             const y = add(2, 3);
             ```
 
             ```prompt (multi_prompt)
+            ---
+            model: gpt-3.5-turbo
+            ---
             Multiply {y} times {x}
             ```
             "#
@@ -737,14 +815,14 @@ mod tests {
         env.step().await;
         // Function declaration cell
         assert_eq!(
-            env.get_state().state_get(&0),
+            env.get_state().state_get_value(&0),
             Some(&RkyvObjectBuilder::new().build())
         );
-        assert_eq!(env.get_state().state_get(&1), None);
+        assert_eq!(env.get_state().state_get_value(&1), None);
         env.step().await;
-        assert_eq!(env.get_state().state_get(&0), None);
+        assert_eq!(env.get_state().state_get_value(&0), None);
         assert_eq!(
-            env.get_state().state_get(&1),
+            env.get_state().state_get_value(&1),
             Some(&RkyvObjectBuilder::new().insert_number("y", 5).build())
         );
     }
@@ -860,31 +938,8 @@ mod tests {
         env.reload_cells();
         env.get_state().render_dependency_graph();
         let mut out = env.step().await?;
-        out.sort_by(|a, b| b.0.cmp(&a.0));
-        assert_eq!(out[0].0, 2);
+        assert_eq!(out[0].0, 0);
         assert_eq!(out[0].1.output, RkyvObjectBuilder::new()
-            .insert_object("y3", RkyvObjectBuilder::new()
-                .insert_number("a", 1)
-                .insert_number("b", 2)
-                .insert_number("c", 3)
-            )
-            .insert_value("y2", RkyvSerializedValue::Array(vec![
-                RkyvSerializedValue::Number(1),
-                RkyvSerializedValue::Number(2),
-                RkyvSerializedValue::Number(3),
-            ]))
-            .insert_number("y0", 1)
-            .insert_number("y5", 1)
-            .insert_value("y6", RkyvSerializedValue::Array(vec![
-                RkyvSerializedValue::Number(1),
-                RkyvSerializedValue::Number(2),
-                RkyvSerializedValue::Number(3),
-            ]))
-            .insert_value("y1", RkyvSerializedValue::String("string".to_string()))
-            .insert_value("y4", RkyvSerializedValue::Boolean(false))
-            .build());
-        assert_eq!(out[1].0, 0);
-        assert_eq!(out[1].1.output, RkyvObjectBuilder::new()
             .insert_value("x2", RkyvSerializedValue::Array(vec![
                 RkyvSerializedValue::Number(1),
                 RkyvSerializedValue::Number(2),
@@ -911,6 +966,29 @@ mod tests {
             ].iter().cloned())))
             .build());
         let mut out = env.step().await?;
+        assert_eq!(out[0].0, 2);
+        assert_eq!(out[0].1.output, RkyvObjectBuilder::new()
+            .insert_object("y3", RkyvObjectBuilder::new()
+                .insert_number("a", 1)
+                .insert_number("b", 2)
+                .insert_number("c", 3)
+            )
+            .insert_value("y2", RkyvSerializedValue::Array(vec![
+                RkyvSerializedValue::Number(1),
+                RkyvSerializedValue::Number(2),
+                RkyvSerializedValue::Number(3),
+            ]))
+            .insert_number("y0", 1)
+            .insert_number("y5", 1)
+            .insert_value("y6", RkyvSerializedValue::Array(vec![
+                RkyvSerializedValue::Number(1),
+                RkyvSerializedValue::Number(2),
+                RkyvSerializedValue::Number(3),
+            ]))
+            .insert_value("y1", RkyvSerializedValue::String("string".to_string()))
+            .insert_value("y4", RkyvSerializedValue::Boolean(false))
+            .build());
+        let mut out = env.step().await?;
         assert_eq!(out[0].0, 3);
         assert!(out[0].1.stderr.contains(&"OK".to_string()));
         Ok(())
@@ -926,6 +1004,8 @@ mod tests {
         env.get_state().render_dependency_graph();
         dbg!(env.step().await);
         dbg!(env.step().await);
+        dbg!(env.step().await);
+        dbg!(env.step().await);
         assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
     }
 
@@ -936,8 +1016,10 @@ mod tests {
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
         env.get_state().render_dependency_graph();
-        env.step().await;
-        env.step().await;
+        dbg!(env.step().await);
+        dbg!(env.step().await);
+        dbg!(env.step().await);
+        dbg!(env.step().await);
         assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
     }
 
