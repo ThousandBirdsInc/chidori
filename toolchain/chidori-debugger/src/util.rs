@@ -1,8 +1,9 @@
 // Common functions for examples
 use bevy::{prelude::*, window::PrimaryWindow};
 use bevy_cosmic_edit::*;
-use bevy_egui::egui;
-use bevy_egui::egui::{Color32, FontFamily, Margin, RichText, Ui};
+use egui;
+use egui::{Color32, FontFamily, Margin, RichText, Ui};
+use crate::egui_json_tree::value::{BaseValueType, ExpandableType, JsonTreeValue, ToJsonTreeValue};
 use chidori_core::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, TemplateCell, WebserviceCell};
 use chidori_core::execution::primitives::serialized_value::RkyvSerializedValue;
 
@@ -98,9 +99,9 @@ pub fn despawn_screen<T: Component>(to_despawn: Query<Entity, With<T>>, mut comm
 pub fn egui_logs(ui: &mut Ui, value: &Vec<String>) {
     if !value.is_empty() {
         let max_rect = ui.max_rect();
-        let clip_rect = bevy_egui::egui::Rect::from_min_max(
+        let clip_rect = egui::Rect::from_min_max(
             max_rect.min,
-            max_rect.min + bevy_egui::egui::vec2(max_rect.width(), 10000.0), // 50.0 is the height of the clipping area
+            max_rect.min + egui::vec2(max_rect.width(), 10000.0), // 50.0 is the height of the clipping area
         );
         ui.set_clip_rect(clip_rect);
         ui.vertical(|ui| {
@@ -120,9 +121,9 @@ pub fn egui_logs(ui: &mut Ui, value: &Vec<String>) {
 pub fn egui_rkyv(ui: &mut Ui, value: &RkyvSerializedValue, with_clip: bool) {
     if with_clip {
         let max_rect = ui.max_rect();
-        let clip_rect = bevy_egui::egui::Rect::from_min_max(
+        let clip_rect = egui::Rect::from_min_max(
             max_rect.min,
-            max_rect.min +bevy_egui::egui::vec2(max_rect.width(), 10000.0), // 50.0 is the height of the clipping area
+            max_rect.min + egui::vec2(max_rect.width(), 10000.0), // 50.0 is the height of the clipping area
         );
         ui.set_clip_rect(clip_rect);
     }
@@ -174,7 +175,7 @@ pub fn egui_rkyv(ui: &mut Ui, value: &RkyvSerializedValue, with_clip: bool) {
 }
 
 pub fn egui_label(ui: &mut Ui, text: &str) {
-    let frame = bevy_egui::egui::Frame::none()
+    let frame = egui::Frame::none()
         .inner_margin(Margin::symmetric(1.0, 8.0))
         .fill(egui::Color32::TRANSPARENT) // Optional: to make the frame transparent
         .show(ui, |ui| {
@@ -235,7 +236,7 @@ pub fn egui_render_cell_read(ui: &mut Ui, cell: &CellTypes) {
                     if let Some(name) = name {
                         egui_label(ui, name);
                     }
-                    ui.with_layout(egui::Layout::right_to_left(bevy_egui::egui::Align::TOP), |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                         if ui.button("Open").clicked() {
                             // TODO:
                             println!("Should open file");
@@ -267,7 +268,7 @@ pub fn egui_render_cell_read(ui: &mut Ui, cell: &CellTypes) {
                     if let Some(name) = name {
                         egui_label(ui, name);
                     }
-                    ui.with_layout(egui::Layout::right_to_left(bevy_egui::egui::Align::TOP), |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                         if ui.button("Open").clicked() {
                             // TODO:
                             println!("Should open file");
@@ -311,7 +312,7 @@ pub fn egui_render_cell_read(ui: &mut Ui, cell: &CellTypes) {
                     if let Some(name) = name {
                         egui_label(ui, name);
                     }
-                    ui.with_layout(egui::Layout::right_to_left(bevy_egui::egui::Align::TOP), |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                         if ui.button("Open").clicked() {
                             // TODO:
                             println!("Should open file");
@@ -344,7 +345,7 @@ pub fn egui_render_cell_read(ui: &mut Ui, cell: &CellTypes) {
                     if let Some(name) = name {
                         egui_label(ui, name);
                     }
-                    ui.with_layout(egui::Layout::right_to_left(bevy_egui::egui::Align::TOP), |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                         if ui.button("Open").clicked() {
                             // TODO:
                             println!("Should open file");
@@ -373,7 +374,7 @@ pub fn egui_render_cell_read(ui: &mut Ui, cell: &CellTypes) {
                     if let Some(name) = name {
                         egui_label(ui, name);
                     }
-                    ui.with_layout(egui::Layout::right_to_left(bevy_egui::egui::Align::TOP), |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                         if ui.button("Open").clicked() {
                             // TODO:
                             println!("Should open file");
@@ -394,5 +395,65 @@ pub fn egui_render_cell_read(ui: &mut Ui, cell: &CellTypes) {
             frame.end(ui);
         }
         CellTypes::Memory(MemoryCell { .. }, _) => {}
+    }
+}
+
+
+
+
+impl ToJsonTreeValue for RkyvSerializedValue {
+    fn to_json_tree_value(&self) -> JsonTreeValue {
+        match self {
+            RkyvSerializedValue::StreamPointer(_) => JsonTreeValue::Base(&"null", BaseValueType::Null),
+            RkyvSerializedValue::FunctionPointer(_, _) => JsonTreeValue::Base(&"null", BaseValueType::Null),
+            RkyvSerializedValue::Cell(c) => {
+                match c {
+                    CellTypes::Code(c, _) => { JsonTreeValue::Base(&c.source_code, BaseValueType::String)}
+                    CellTypes::CodeGen(c, _) => { JsonTreeValue::Base(&c.req, BaseValueType::String)}
+                    CellTypes::Prompt(c, _) => {
+                        match c {
+                            LLMPromptCell::Chat { req, .. } => { JsonTreeValue::Base(req, BaseValueType::String)}
+                            LLMPromptCell::Completion { req, .. } => { JsonTreeValue::Base(req, BaseValueType::String)}
+                        }
+                    }
+                    CellTypes::Embedding(c, _) => { JsonTreeValue::Base(&c.req, BaseValueType::String)}
+                    CellTypes::Web(c, _) => { JsonTreeValue::Base(&c.configuration, BaseValueType::String)}
+                    CellTypes::Template(c, _) => { JsonTreeValue::Base(&c.body, BaseValueType::String)}
+                    CellTypes::Memory(c, _) => { JsonTreeValue::Base(&c.embedding_function, BaseValueType::String)}
+                }
+            },
+            RkyvSerializedValue::Set(set) => JsonTreeValue::Expandable(
+                set.iter()
+                    .enumerate()
+                    .map(|(idx, elem)| (idx.to_string(), elem as &dyn ToJsonTreeValue))
+                    .collect(),
+                ExpandableType::Array,
+            ),
+            RkyvSerializedValue::Float(n) => JsonTreeValue::Base(n, BaseValueType::Number),
+            RkyvSerializedValue::Boolean(b) => JsonTreeValue::Base(b, BaseValueType::Bool),
+            RkyvSerializedValue::Number(n) => JsonTreeValue::Base(n, BaseValueType::Number),
+            RkyvSerializedValue::String(s) => JsonTreeValue::Base(s, BaseValueType::String),
+            RkyvSerializedValue::Null => JsonTreeValue::Base(&"null", BaseValueType::Null),
+            RkyvSerializedValue::Array(arr) => JsonTreeValue::Expandable(
+                arr.iter()
+                    .enumerate()
+                    .map(|(idx, elem)| (idx.to_string(), elem as &dyn ToJsonTreeValue))
+                    .collect(),
+                ExpandableType::Array,
+            ),
+            RkyvSerializedValue::Object(obj) => JsonTreeValue::Expandable(
+                obj.iter()
+                    .map(|(key, val)| (key.to_owned(), val as &dyn ToJsonTreeValue))
+                    .collect(),
+                ExpandableType::Object,
+            ),
+        }
+    }
+
+    fn is_expandable(&self) -> bool {
+        matches!(
+            self,
+            RkyvSerializedValue::Object(_) | RkyvSerializedValue::Set(_) | RkyvSerializedValue::Array(_)
+        )
     }
 }

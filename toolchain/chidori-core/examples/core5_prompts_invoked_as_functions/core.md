@@ -2,7 +2,7 @@
 
 This is a python function that is invoking a prompt by name, kwargs to this
 invocation are passed to the prompt. Prompts are async and return strings.
-```python (run_prompt)
+```python (run_prompt_cell)
 def first_letter(s):
     return s.replace("-", "").strip()[0]
 

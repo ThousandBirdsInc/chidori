@@ -10,3 +10,4 @@ pub mod sdk;
 pub mod utils;
 
 pub use tokio;
+pub use uuid;

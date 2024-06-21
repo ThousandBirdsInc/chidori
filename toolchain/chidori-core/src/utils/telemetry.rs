@@ -9,7 +9,10 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing::field::{ValueSet, Visit, Field};
 use std::fmt::Debug;
 use std::num::NonZero;
+use std::str::FromStr;
 pub use serde::Serialize;
+use uuid::Uuid;
+use crate::execution::execution::execution_graph::ExecutionNodeId;
 
 struct MatchStrVisitor<'a> {
     field: &'a str,
@@ -55,7 +58,7 @@ pub enum TraceEvents{
         target: String,
         location: String,
         line: String,
-        execution_id: Option<(usize, usize)>
+        execution_id: Option<ExecutionNodeId>
     },
     Record,
     Event,
@@ -116,10 +119,8 @@ impl<S> Layer<S> for CustomLayer
             location: metadata.file().unwrap().to_string(),
             line: metadata.line().unwrap().to_string(),
             execution_id: get_value_in_valueset(attrs.values(), "prev_execution_id").map(|s| {
-                let mut parts = s.trim_matches(|c| c == '(' || c == ')').split(',');
-                let first = parts.next().unwrap().trim().parse().unwrap();
-                let second = parts.next().unwrap().trim().parse().unwrap();
-                (first, second)
+                // TODO: test this
+                Uuid::from_str(&s).unwrap_or(Uuid::nil())
             })
         }).unwrap();
     }

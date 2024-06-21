@@ -11,13 +11,14 @@ use bevy::prelude::{
     Assets, Circle, Color, Commands, Component, default, in_state,
     IntoSystemConfigs, Mesh, OnEnter, OnExit, ResMut, Transform,
 };
-use bevy::render::render_resource::{AsBindGroup, ShaderRef};
+use bevy::render::render_resource::{AsBindGroup, Extent3d, ShaderRef, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages};
 use bevy::render::view::{NoFrustumCulling, RenderLayers};
 use bevy::tasks::futures_lite::StreamExt;
 use bevy::utils::petgraph::stable_graph::GraphIndex;
 use bevy::window::{PrimaryWindow, WindowResized};
-use bevy_egui::egui::{Color32, Order, Pos2, RichText, Ui};
-use bevy_egui::{egui, EguiContexts};
+use egui::{Color32, Order, Pos2, Rgba, RichText, Ui};
+use crate::bevy_egui::{EguiContext, EguiContexts, EguiManagedTextures, EguiRenderOutput, EguiRenderTarget};
+use egui;
 use bevy_rapier2d::geometry::Collider;
 use bevy_rapier2d::pipeline::QueryFilter;
 use bevy_rapier2d::plugin::RapierContext;
@@ -32,10 +33,16 @@ use petgraph::prelude::StableGraph;
 use petgraph::visit::Walker;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::Path;
 use std::ptr::NonNull;
 use bevy::render::camera::{ScalingMode, Viewport};
+use bevy::render::render_asset::RenderAssetUsages;
+use crate::egui_json_tree::JsonTree;
 use egui_tiles::Tile;
+use image::{ImageBuffer, RgbaImage};
 use chidori_core::execution::execution::execution_state::ExecutionStateEvaluation;
+use uuid::Uuid;
+use chidori_core::execution::primitives::serialized_value::RkyvSerializedValue;
 
 #[derive(Resource, Default)]
 struct SelectedEntity {
@@ -86,6 +93,31 @@ enum CameraStateValue {
 #[derive(Component)]
 struct CameraState {
     state: CameraStateValue
+}
+
+#[derive(Default)]
+enum InteractionLockValue {
+    Panning,
+    #[default]
+    None
+}
+
+#[derive(Resource, Default)]
+struct InteractionLock {
+    inner: InteractionLockValue
+}
+
+
+// TODO: support graph traversal by id in the graph
+fn keyboard_navigate_to_parent(
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    mut graph_res: ResMut<GraphResource>,
+    mut node_query: Query<
+        (Entity, &GraphIdx),
+        (With<GraphIdx>, Without<GraphIdxPair>),
+    >,
+) {
+
 }
 
 
@@ -179,12 +211,24 @@ fn mouse_pan(
     mut q_camera: Query<(&mut Projection, &mut Transform, &mut CameraState), (With<OnGraphScreen>, Without<GraphMinimapCamera>, Without<GraphIdxPair>, Without<GraphIdx>)>,
     buttons: Res<ButtonInput<MouseButton>>,
     mut motion_evr: EventReader<MouseMotion>,
+    // node_query: Query<
+    //     (Entity, &Transform, &GraphIdx, &EguiRenderTarget),
+    //     (With<GraphIdx>, Without<GraphIdxPair>),
+    // >,
+    // rapier_context: Res<RapierContext>,
 ) {
+
     let (projection, mut camera_transform, mut camera_state) = q_camera.single_mut();
+    let mut projection = match projection.into_inner() {
+        Projection::Perspective(_) => {
+            unreachable!("This should be orthographic")
+        }
+        Projection::Orthographic(ref mut o) => o,
+    };
     if buttons.pressed(MouseButton::Left) {
         for ev in motion_evr.read() {
-            camera_transform.translation.x -= ev.delta.x;
-            camera_transform.translation.y += ev.delta.y;
+            camera_transform.translation.x += ev.delta.x * projection.scale;
+            camera_transform.translation.y -= ev.delta.y * projection.scale;
         }
         camera_state.state = CameraStateValue::Free;
     }
@@ -196,11 +240,25 @@ fn mouse_scroll_events(
     mut scroll_evr: EventReader<MouseWheel>,
     mut q_camera: Query<(&mut Projection, &mut Transform, &mut CameraState), (With<OnGraphScreen> , Without<GraphMinimapCamera>, Without<GraphIdxPair>, Without<GraphIdx>)>,
     keyboard_input: Res<ButtonInput<KeyCode>>,
+    q_mycoords: Query<&CursorWorldCoords, With<OnGraphScreen>>,
+    node_query: Query<
+        (Entity, &Transform, &GraphIdx, &EguiRenderTarget),
+        (With<GraphIdx>, Without<GraphIdxPair>),
+    >,
 ) {
     if !graph_resource.is_active {
         return;
     }
+
+    for (_, _, mut gidx, mut egui_render_target) in node_query.iter() {
+        if egui_render_target.is_focused && egui_render_target.image.is_some() {
+            return;
+        }
+    }
+
+
     let (projection, mut camera_transform, mut camera_state) = q_camera.single_mut();
+    let mut coords = q_mycoords.single();
 
     if keyboard_input.just_pressed(KeyCode::Enter) {
         camera_state.state = CameraStateValue::Locked;
@@ -215,10 +273,12 @@ fn mouse_scroll_events(
 
     for ev in scroll_evr.read() {
         if keyboard_input.pressed(KeyCode::SuperLeft) {
-            // projection.scale = (projection.scale + ev.y).clamp(0.5, 1000.0);
-            // let mut style: egui::Style = (*ctx.style()).clone();
-            // style.text_styles.get_mut(&egui::TextStyle::Body).unwrap().size -= ev.y;
-            // ctx.set_style(style);
+            let zoom_factor = (projection.scale + ev.y).clamp(1.0, 1000.0) / projection.scale;
+
+            camera_transform.translation.x = coords.0.x - zoom_factor * (coords.0.x - camera_transform.translation.x);
+            camera_transform.translation.y = coords.0.y - zoom_factor * (coords.0.y - camera_transform.translation.y);
+
+            projection.scale = (projection.scale + ev.y).clamp(1.0, 1000.0);
         } else {
             camera_state.state = CameraStateValue::Free;
             camera_transform.translation.x -= ev.x * projection.scale;
@@ -229,7 +289,7 @@ fn mouse_scroll_events(
 }
 
 fn touchpad_gestures(
-    mut q_camera: Query<(&mut Projection, &GlobalTransform), With<OnGraphScreen>>,
+    mut q_camera: Query<(&mut Projection, &GlobalTransform), (With<OnGraphScreen>, Without<GraphMinimapCamera>)>,
     mut evr_touchpad_magnify: EventReader<TouchpadMagnify>,
 ) {
     let (projection, camera_transform) = q_camera.single_mut();
@@ -240,7 +300,57 @@ fn touchpad_gestures(
         Projection::Orthographic(ref mut o) => o,
     };
     for ev_magnify in evr_touchpad_magnify.read() {
-        projection.scale += ev_magnify.0;
+        projection.scale -= ev_magnify.0;
+    }
+}
+
+
+fn compute_transform_matrix(
+    mut contexts: EguiContexts,
+    mut q_egui_render_target: Query<(&mut EguiRenderTarget, &Transform), (With<EguiRenderTarget>, Without<Window>)>,
+    q_window: Query<&Window, With<PrimaryWindow>>,
+    q_camera: Query<(&Camera, &GlobalTransform), (Without<GraphMinimapCamera>,  With<OnGraphScreen>)>,
+) {
+    let (camera, camera_transform) = q_camera.single();
+    let window = q_window.single();
+    let scale_factor = window.scale_factor();
+    let viewport_pos = if let Some(viewport) = &camera.viewport {
+        Vec2::new(viewport.physical_position.x as f32 / scale_factor, viewport.physical_position.y as f32 / scale_factor)
+    } else {
+        Vec2::ZERO
+    };
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+    // Transform from the viewport offset into the world coordinates
+    let Some(world_cursor_pos) = camera
+        .viewport_to_world(camera_transform, cursor - viewport_pos)
+        .map(|r| r.origin.truncate()) else {
+        return;
+    };
+
+    for (mut egui_render_target , element_transform) in q_egui_render_target.iter_mut() {
+
+        // Translate the element then revert the camera position relative to it
+        let world_space_to_local_space = (
+            // Mat4::from_translation(Vec3::new(0.0, (camera_transform.translation().y -element_transform.translation.y) * 2.0, 0.0))
+                 Mat4::from_translation(vec3(element_transform.scale.x * -0.5, element_transform.scale.y * -0.5, 0.0))
+                * Mat4::from_translation(element_transform.translation)
+        ).inverse();
+
+        let mut local_cursor_pos = world_space_to_local_space
+            .transform_point3(world_cursor_pos.extend(0.0))
+            .truncate();
+
+        local_cursor_pos.y = element_transform.scale.y - local_cursor_pos.y;
+
+        // let Some(screen_cursor_pos) = camera
+        //     .world_to_viewport(camera_transform, world_cursor_pos.extend(0.0)) else {
+        //     return;
+        // };
+
+
+        egui_render_target.cursor_position = Some(local_cursor_pos);
     }
 }
 
@@ -289,11 +399,10 @@ fn egui_execution_state(ui: &mut Ui, execution_state: &ExecutionState) {
             egui_render_cell_read(ui, cell);
         }
         for (key, value) in execution_state.state.iter() {
-            ui.horizontal(|ui| {
-                ui.label(format!("{:?}", key));
-                ui.separator();
-                util::egui_rkyv(ui, &value.output, false);
-            });
+            let response = JsonTree::new(format!("{:?}", key), &value.output)
+                // .default_expand(DefaultExpand::SearchResults(&self.search_input))
+                .show(ui);
+            // util::egui_rkyv(ui, &value.output, false);
         }
     });
 }
@@ -325,7 +434,7 @@ fn mouse_over_system(
     q_mycoords: Query<&CursorWorldCoords, With<OnGraphScreen>>,
     mut selected_entity: ResMut<SelectedEntity>,
     mut node_query: Query<
-        (Entity, &Transform, &mut GraphIdx),
+        (Entity, &Transform, &mut GraphIdx, &mut EguiRenderTarget),
         (With<GraphIdx>, Without<GraphIdxPair>),
     >,
     mut gizmos: Gizmos,
@@ -344,8 +453,9 @@ fn mouse_over_system(
     let (camera, camera_transform) = q_camera.single();
     let cursor = q_mycoords.single();
 
-    for (_, _, mut gidx) in node_query.iter_mut() {
+    for (_, _, mut gidx, mut egui_render_target) in node_query.iter_mut() {
         gidx.is_hovered = false;
+        egui_render_target.is_focused = false;
     }
 
     gizmos
@@ -359,8 +469,9 @@ fn mouse_over_system(
     let point = Vec2::new(cursor.0.x, cursor.0.y);
     let filter = QueryFilter::default();
     rapier_context.intersections_with_point(point, filter, |entity| {
-        if let Ok((_, t, mut gidx)) = node_query.get_mut(entity) {
+        if let Ok((_, t, mut gidx, mut egui_render_target)) = node_query.get_mut(entity) {
             gidx.is_hovered = true;
+            egui_render_target.is_focused = true;
 
             if buttons.just_pressed(MouseButton::Left) {
                 gidx.is_selected = true;
@@ -368,11 +479,11 @@ fn mouse_over_system(
             }
         }
 
-        false
+        true
     });
 
     // Deselect others
-    for (entity, _, mut gidx) in node_query.iter_mut() {
+    for (entity, _, mut gidx, _) in node_query.iter_mut() {
         if Some(entity) != selected_entity.id {
             gidx.is_selected = false;
         }
@@ -429,26 +540,55 @@ struct EdgePairIdToEntity {
     mapping: HashMap<(usize, usize), Entity>,
 }
 
+fn save_image_to_png(image: &Image) {
+    let width = image.texture_descriptor.size.width;
+    let height = image.texture_descriptor.size.height;
+    let data = &image.data;
+    let img_buffer = RgbaImage::from_raw(width, height, data.clone()).expect("Failed to create image buffer");
+    img_buffer.save(Path::new("./outputimage.png")).expect("Failed to save image");
+}
+
+fn update_node_textures_as_available(
+    mut node_query: Query<
+        (Entity, &Handle<RoundedRectMaterial>, &EguiRenderTarget),
+        (With<GraphIdx>, Without<GraphIdxPair>),
+    >,
+    mut egui_managed_textures: ResMut<EguiManagedTextures>,
+    mut materials_custom: ResMut<Assets<RoundedRectMaterial>>,
+    mut images: Res<Assets<Image>>,
+) {
+    for (e, mat, o) in node_query.iter_mut() {
+        if let Some(mut mat) = materials_custom.get_mut(mat) {
+            if let Some(t) = &o.image {
+                let img = images.get(t).unwrap();
+                // save_image_to_png(img);
+            }
+            // mat.color_texture = o.texture_handle.clone();
+        }
+    }
+
+}
+
 
 fn update_alternate_graph_system(
     q_window: Query<&Window, With<PrimaryWindow>>,
     mut commands: Commands,
-    mut contexts: EguiContexts,
     mut graph_resource: ResMut<GraphResource>,
     mut edge_pair_id_to_entity: ResMut<EdgePairIdToEntity>,
     mut node_id_to_entity: ResMut<NodeIdToEntity>,
     mut node_query: Query<
-        (Entity, &mut Transform, &GraphIdx),
+        (Entity, &mut Transform, &GraphIdx, &mut EguiContext),
         (With<GraphIdx>, Without<GraphIdxPair>),
     >,
     mut edge_query: Query<
         (Entity, &mut Transform, &GraphIdxPair),
         (With<GraphIdxPair>, Without<GraphIdx>),
     >,
+    mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut materials_custom: ResMut<Assets<CustomMaterial>>,
+    mut materials_custom: ResMut<Assets<RoundedRectMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
-    q_camera: Query<(&Camera, &GlobalTransform), (With<OnGraphScreen>, Without<GraphMinimapCamera>)>,
+    q_camera: Query<(Entity, &Camera, &GlobalTransform), (With<OnGraphScreen>, Without<GraphMinimapCamera>)>,
     mut node_index_to_entity: Local<HashMap<usize, Entity>>,
     exec_id_to_state: ResMut<crate::chidori::ChidoriExecutionIdsToStates>,
     internal_state: ResMut<crate::chidori::InternalState>,
@@ -459,7 +599,7 @@ fn update_alternate_graph_system(
     }
     let window = q_window.single();
     let scale_factor = window.scale_factor() as f32;
-    let (camera, camera_transform) = q_camera.single();
+    let (camera_entity, camera, camera_transform) = q_camera.single();
     let viewport_pos = if let Some(viewport) = camera.viewport.as_ref() {
         viewport.physical_position
     } else {
@@ -470,51 +610,14 @@ fn update_alternate_graph_system(
     } else {
         UVec2::new(0, 0)
     };
-    let ctx = contexts.ctx_mut();
     let mut topo = petgraph::visit::Topo::new(&graph_resource.graph);
     let mut node_mapping: HashMap<NodeIndex, NonNull<crate::tidy_tree::Node>> = HashMap::new();
     let mut tidy = TidyLayout::new(200., 200.);
     let mut root = crate::tidy_tree::Node::new(0, 10., 10.);
     while let Some(x) = topo.next(&graph_resource.graph) {
         if let Some(node) = &graph_resource.graph.node_weight(x) {
-
-            // Mock the layout of these elements to determine the resulting sizing
-            let mut width = 100.0;
-            let mut height = 100.0;
-
-            // TODO: we offset this slightly because it appears to be affecting our navigation UI
-            //       when it is positioned at 0,0 regardless of its interactable configuration
-            egui::Area::new(format!("{:?}", node.0).into())
-                .fixed_pos(Pos2::new(0.0, 100.0))
-                .default_pos(Pos2::new(0.0, 0.0))
-                .order(Order::Background)
-                .movable(false)
-                .interactable(false)
-                .enabled(false)
-                .constrain(false)
-                .show(ctx, |ui| {
-                    // Save the current clip rect
-                    let original_clip_rect = ui.clip_rect();
-
-                    // Create a large clip rect to force rendering, but move it entirely offscreen
-                    let large_clip_rect = egui::Rect::from_min_max(Pos2::new(8000.0, 8000.0), Pos2::new(20000.0, 20000.0));
-                    ui.set_clip_rect(large_clip_rect);
-
-                    let mut frame = egui::Frame::default().outer_margin(16.0).rounding(6.0).begin(ui);
-                    {
-                        render_node(&node.0, &exec_id_to_state.inner, &internal_state, true, ui);
-                    }
-                    frame.end(ui);
-
-                    // Restore the original clip rect
-                    ui.set_clip_rect(original_clip_rect);
-
-                    let rect = ui.min_rect();
-                    width = rect.width();
-                    height = rect.height();
-            });
-
-
+            let mut width = 600.0;
+            let mut height = 300.0;
             let tree_node = crate::tidy_tree::Node::new(x.index(), (width) as f64, (height) as f64);
             let mut parents = &mut graph_resource
                 .graph
@@ -547,7 +650,7 @@ fn update_alternate_graph_system(
                 .next()
                 .and_then(|parent| node_id_to_entity.mapping.get(&parent))
                 .and_then(|entity| {
-                    if let Ok((_, mut transform, _)) = node_query.get_mut(*entity) {
+                    if let Ok((_, mut transform, _, _)) = node_query.get_mut(*entity) {
                         Some(transform.translation.truncate())
                     } else {
                         None
@@ -557,11 +660,39 @@ fn update_alternate_graph_system(
             if let Some(n) = node_mapping.get(&idx) {
                 unsafe {
                     let n = n.as_ref();
+                    let width = n.width.to_f32().unwrap() + 20.0;
+                    let height = n.height.to_f32().unwrap() + 20.0;
                     let entity = node_id_to_entity.mapping.entry(idx).or_insert_with(|| {
-                        let node_material = materials_custom.add(CustomMaterial {
+                        // This is the texture that will be rendered to.
+                        // TODO: needs to be greater than the bounds of the target (enforce this)
+                        let size = Extent3d {
+                            width: (width * window.scale_factor()) as u32,
+                            height: (height * window.scale_factor()) as u32,
+                            depth_or_array_layers: 1,
+                        };
+                        let mut image = Image {
+                            texture_descriptor: TextureDescriptor {
+                                label: None,
+                                dimension: TextureDimension::D2,
+                                format: TextureFormat::Bgra8UnormSrgb,
+                                mip_level_count: 1,
+                                sample_count: 1,
+                                usage: TextureUsages::TEXTURE_BINDING
+                                    | TextureUsages::COPY_DST
+                                    | TextureUsages::RENDER_ATTACHMENT,
+                                view_formats: &[],
+                                size
+                            },
+                            ..default()
+                        };
+                        image.resize(size);
+                        let image_handle = images.add(image);
+
+                        let node_material = materials_custom.add(RoundedRectMaterial {
                             width: 1.0,
                             height: 1.0,
-                            color: Vec4::new(1.0, 1.0, 1.0, 0.9),
+                            color_texture: Some(image_handle.clone()),
+                            base_color: Vec4::new(1.0, 1.0, 1.0, 1.0),
                             alpha_mode: AlphaMode::Blend,
                         });
 
@@ -579,6 +710,11 @@ fn update_alternate_graph_system(
                                 is_hovered: false,
                                 is_selected: false,
                             },
+                            EguiRenderTarget {
+                                image: Some(image_handle),
+                                inner_scale_factor: window.scale_factor(),
+                                ..default()
+                            },
                             Sensor,
                             Collider::cuboid(0.5, 0.5),
                             RenderLayers::layer(RENDER_LAYER_GRAPH_VIEW),
@@ -588,49 +724,33 @@ fn update_alternate_graph_system(
                         entity.id()
                     });
 
-                    if let Ok((entity, mut transform, gidx)) = node_query.get_mut(*entity) {
+                    if let Ok((entity, mut transform, gidx, mut egui_ctx)) = node_query.get_mut(*entity) {
+                        let egui_ctx = egui_ctx.into_inner();
+                        let mouse_position = egui_ctx.mouse_position.clone();
+                        let ctx = egui_ctx.get_mut();
                         // TODO: working theory is that positioning the elements is affecting the camera which is affecting the trace camera
                         //       the trace camera is still be affected by other camera values
-                        transform.translation = Vec3::new(n.x.to_f32().unwrap(), -n.y.to_f32().unwrap(), -1.0);
-                        transform.scale =  vec3(n.width.to_f32().unwrap() + 20.0, n.height.to_f32().unwrap() + 20.0, 1.0);
+                        transform.translation = transform.translation.lerp(Vec3::new(n.x.to_f32().unwrap(), -n.y.to_f32().unwrap(), -1.0), 0.1);
+                        transform.scale =  vec3(width, height, 1.0);
 
-                        // Draw text on top of these elements
-                        if let Some(mut pos) = camera.world_to_viewport(camera_transform, transform.translation) {
-                            let camera_viewport_pos = if let Some(viewport) = camera.viewport.as_ref() {
-                                viewport.physical_position.clone()
-                            } else {
-                                UVec2::new(0,0)
-                            };
-                            pos += vec2(camera_viewport_pos.x as f32 / scale_factor, camera_viewport_pos.y as f32 / scale_factor);
-                            egui::Area::new(format!("{:?}", entity).into())
-                                .fixed_pos(Pos2::new(pos.x, pos.y)).show(ctx, |ui| {
 
-                                let original_clip_rect = ui.clip_rect();
+                        // Draw text within these elements
+                        egui::Area::new(format!("{:?}", entity).into())
+                            .fixed_pos(Pos2::new(0.0, 0.0)).show(ctx, |ui| {
 
-                                let viewport_max = viewport_pos + viewport_size;
-                                // Create a large clip rect to force rendering, but move it entirely offscreen
-                                let large_clip_rect = egui::Rect::from_min_max(Pos2::new(
-                                    viewport_pos.x as f32 / scale_factor, viewport_pos.y as f32 / scale_factor
-                                ), Pos2::new(viewport_max.x as f32, viewport_max.y as f32));
-                                ui.set_clip_rect(large_clip_rect);
-
-                                let mut frame = egui::Frame::default().outer_margin(16.0).rounding(6.0).begin(ui);
-                                {
-                                    render_node(&node.0, &exec_id_to_state.inner, &internal_state, gidx.is_selected, ui);
-                                }
-                                frame.end(ui);
-
-                                // Restore the original clip rect
-                                ui.set_clip_rect(original_clip_rect);
-                            });
-                        }
-                        transform.translation.x += n.width.to_f32().unwrap() / 2.0;
-                        transform.translation.y -= n.height.to_f32().unwrap() / 2.0;
+                            ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
+                            let mut frame = egui::Frame::default().fill(Color32::from_hex("#eeeeee").unwrap()).inner_margin(16.0).rounding(6.0).begin(ui);
+                            {
+                                let mut ui = &mut frame.content_ui;
+                                render_node(&node.0, &exec_id_to_state.inner, &internal_state, gidx.is_selected, ui);
+                            }
+                            frame.end(ui);
+                        });
                     }
 
                     n.children.iter().for_each(|child| {
                         let parent_pos = if let Some(entity ) = node_index_to_entity.get(&n.id) {
-                            if let Ok((entity, mut transform, gidx)) = node_query.get(*entity) {
+                            if let Ok((entity, mut transform, gidx, _)) = node_query.get(*entity) {
                                 transform.translation.truncate()
                             } else {
                                 return;
@@ -639,7 +759,7 @@ fn update_alternate_graph_system(
                             return;
                         };
                         let child_pos = if let Some(entity ) = node_index_to_entity.get(&child.id) {
-                            if let Ok((entity, mut transform, gidx)) = node_query.get(*entity) {
+                            if let Ok((entity, mut transform, gidx, _)) = node_query.get(*entity) {
                                 transform.translation.truncate()
                             } else {
                                 return;
@@ -703,7 +823,7 @@ fn render_node(
         .max_width(700.0)
         .max_height(400.0)
         .show(ui, |ui| {
-            if node == &(0, 0) {
+            if *node == chidori_core::uuid::Uuid::nil() {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Initialization...").color(Color32::BLACK));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
@@ -716,13 +836,14 @@ fn render_node(
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                         if ui.button(RichText::new("Revert to this State").color(Color32::from_hex("#dddddd").unwrap())).clicked() {
+                            println!("We would like to revert to {:?}", node);
                             let _ = internal_state.set_execution_id(*node);
                         }
                     });
                 });
 
 
-                if let Some(state) = internal_state.chidori.lock().unwrap().get_shared_state().execution_id_to_evaluation.get(&node) {
+                if let Some(state) = internal_state.chidori.lock().unwrap().get_shared_state().execution_id_to_evaluation.lock().unwrap().get(&node) {
                     if let ExecutionStateEvaluation::Complete(state) = state {
                         egui_execution_state(ui, state);
                     }
@@ -826,19 +947,25 @@ fn enforce_tiled_viewports(
 
 // This struct defines the data that will be passed to your shader
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
-struct CustomMaterial {
+struct RoundedRectMaterial {
     #[uniform(0)]
     pub width: f32,
     #[uniform(1)]
     pub height: f32,
-    #[uniform(2)]
-    pub color: Vec4,
+
+    #[texture(2)]
+    #[sampler(3)]
+    color_texture: Option<Handle<Image>>,
+
+    #[uniform(4)]
+    pub base_color: Vec4,
+
     alpha_mode: AlphaMode,
 }
 
 /// The Material trait is very configurable, but comes with sensible defaults for all methods.
 /// You only need to implement functions for features that need non-default behavior. See the Material api docs for details!
-impl Material for CustomMaterial {
+impl Material for RoundedRectMaterial {
     fn fragment_shader() -> ShaderRef {
         "shaders/rounded_rect.wgsl".into()
     }
@@ -851,10 +978,10 @@ impl Material for CustomMaterial {
 
 fn update_node_materials(
     mut node_query: Query<
-        (Entity, &Transform, &mut GraphIdx, &Handle<CustomMaterial>),
+        (Entity, &Transform, &mut GraphIdx, &Handle<RoundedRectMaterial>),
         (With<GraphIdx>, Without<GraphIdxPair>),
     >,
-    mut materials_custom: ResMut<Assets<CustomMaterial>>,
+    mut materials_custom: ResMut<Assets<RoundedRectMaterial>>,
 ) {
     for (_, t, _, mh) in node_query.iter_mut() {
         if let Some(mat) = materials_custom.get_mut(mh) {
@@ -866,14 +993,14 @@ fn update_node_materials(
 
 fn update_cursor_materials(
     mut execution_head_cursor: Query<
-        (Entity, &mut Transform, &Handle<CustomMaterial>),
+        (Entity, &mut Transform, &Handle<RoundedRectMaterial>),
         (With<ExecutionHeadCursor>, Without<GraphIdx>, Without<ExecutionSelectionCursor>, Without<GraphMainCamera>),
     >,
     mut execution_selection_cursor: Query<
-        (Entity, &mut Transform, &Handle<CustomMaterial>),
+        (Entity, &mut Transform, &Handle<RoundedRectMaterial>),
         (With<ExecutionSelectionCursor>, Without<GraphIdx>, Without<ExecutionHeadCursor>, Without<GraphMainCamera>),
     >,
-    mut materials: ResMut<Assets<CustomMaterial>>
+    mut materials: ResMut<Assets<RoundedRectMaterial>>
 ) {
 
     let (_, t, mh) = execution_head_cursor.single_mut();
@@ -895,7 +1022,7 @@ fn graph_setup(
     mut execution_graph: ResMut<ChidoriExecutionGraph>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials_standard: ResMut<Assets<StandardMaterial>>,
-    mut materials_custom: ResMut<Assets<CustomMaterial>>,
+    mut materials_custom: ResMut<Assets<RoundedRectMaterial>>,
 ) {
     let window = windows.single();
     let scale_factor = window.scale_factor();
@@ -904,17 +1031,19 @@ fn graph_setup(
     // config.line_width = 1.0;
     // config.render_layers = RenderLayers::layer(RENDER_LAYER_GRAPH_VIEW);
 
-    let cursor_selection_material = materials_custom.add(CustomMaterial {
+    let cursor_selection_material = materials_custom.add(RoundedRectMaterial {
         width: 1.0,
         height: 1.0,
-        color: Vec4::new(0.565, 1.00, 0.882, 1.00),
+        color_texture: None,
+        base_color: Vec4::new(0.565, 1.00, 0.882, 1.00),
         alpha_mode: AlphaMode::Blend,
     });
 
-    let cursor_head_material = materials_custom.add(CustomMaterial {
+    let cursor_head_material = materials_custom.add(RoundedRectMaterial {
         width: 1.0,
         height: 1.0,
-        color: Vec4::new(0.882, 0.00392, 0.357, 1.0),
+        color_texture: None,
+        base_color: Vec4::new(0.882, 0.00392, 0.357, 1.0),
         alpha_mode: AlphaMode::Blend,
     });
 
@@ -1046,7 +1175,8 @@ pub fn graph_plugin(app: &mut App) {
     app.init_resource::<NodeIdToEntity>()
         .init_resource::<EdgePairIdToEntity>()
         .init_resource::<SelectedEntity>()
-        .add_plugins(MaterialPlugin::<CustomMaterial>::default())
+        .init_resource::<InteractionLock>()
+        .add_plugins(MaterialPlugin::<RoundedRectMaterial>::default())
         .add_systems(OnEnter(crate::GameState::Graph), graph_setup)
         .add_systems(
             OnExit(crate::GameState::Graph),
@@ -1055,14 +1185,16 @@ pub fn graph_plugin(app: &mut App) {
         .add_systems(
             Update,
             (
+                // update_node_textures_as_available,
+                compute_transform_matrix,
                 mouse_pan,
                 set_camera_viewports,
                 update_minimap_camera_configuration,
                 update_trace_space_to_camera_configuration,
                 camera_follow_selection_head,
                 node_cursor_handling,
-                // touchpad_gestures,
-                update_alternate_graph_system,
+                touchpad_gestures,
+                update_alternate_graph_system.after(mouse_scroll_events),
                 update_graph_system,
                 my_cursor_system,
                 mouse_scroll_events,

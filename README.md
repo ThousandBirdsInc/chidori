@@ -45,7 +45,7 @@ Star us on Github! Join us on [Discord](https://discord.gg/CJwKsPSgew).
 
 ## 📖 Chidori V2
 Chidori is an open-source environment for building AI agents.
-You author code like you typically would with python or javascript, and we provide a layer for interfacing
+You author code with python or javascript, and we provide a layer for interfacing
 with the complexities of AI models in long-running workflows.
 
 We are continuing to make significant changes in response to feedback and iterating on different features.
@@ -57,7 +57,7 @@ Feedback is greatly appreciated! Please add to our issue tracker.
 - Cache behaviors and resume from partially executed agents
 - Optimized for long-running AI workflows
 - Embedded code interpreter
-- Time travel debugging
+- Time travel debugging (with actual reversion)
 
 I want to demonstrate a workflow where entirely arbitrary code can be used to build useful agents.
 Users should be able to leverage the entire surface areas of the langauges agents are defined within. My aspiration
@@ -174,7 +174,6 @@ Chidori comes with first-class support for code interpreter environments like [D
 * [x] Node.js, Python, and Rust support for building and executing graphs
 * [x] Simple local vector db for development
 * [ ] Adding support for containerized nodes
-* [ ] Allowing filtering in node queries
 
 ### Medium term
 * [x] Analysis tools for comparing executions
@@ -201,3 +200,8 @@ Thousand Birds is under the MIT license. See the [LICENSE](LICENSE) for more inf
 
 ## Help us out!
 Please star the github repo and give us feedback in [discord](https://discord.gg/CJwKsPSgew)!
+
+
+
+TODO:
+https://meatfighter.com/ascii-silhouettify/

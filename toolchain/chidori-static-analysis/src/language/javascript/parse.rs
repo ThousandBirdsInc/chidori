@@ -1,7 +1,7 @@
 extern crate swc_ecma_parser;
 
 use crate::language::javascript::parse::ContextPath::Constant;
-use crate::language::python;
+use crate::language::{InternalCallGraph, python};
 use crate::language::{Report, ReportItem, ReportTriggerableFunctions};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -780,6 +780,12 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                         .iter()
                         .find(|x| matches!(x, ContextPath::InFunction(_)))
                         .is_none()
+                        &&
+                         encountered
+                            .iter()
+                            .find(|x| matches!(x, ContextPath::InAnonFunction))
+                            .is_none()
+
                     {
                         if encountered.contains(&&ContextPath::AssignmentToStatement) {
                             exposed_values.insert(
@@ -820,6 +826,9 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
     depended_values.retain(|value,_ | !js_built_ins.contains(value.as_str()));
 
     Report {
+        internal_call_graph: InternalCallGraph {
+            graph: Default::default(),
+        },
         cell_exposed_values: exposed_values,
         cell_depended_values: depended_values,
         triggerable_functions: triggerable_functions,
@@ -1058,6 +1067,47 @@ mod tests {
     }
 
     #[test]
+    fn test_report_generation_deno_test_framework() {
+        let js_source = indoc! { r#"
+        import { assertEquals } from "https://deno.land/std@0.221.0/assert/mod.ts";
+
+        Deno.test("addition test", async () => {
+            const result = await add_two(2);
+            console.log(result);
+            assertEquals(result, 4);
+        });
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+        ;
+        let result = build_report(&context_stack_references);
+        let report = Report {
+            internal_call_graph: InternalCallGraph {
+                graph: Default::default(),
+            },
+            cell_exposed_values: {
+                let mut map = std::collections::HashMap::new();
+                map
+            },
+            cell_depended_values: {
+                let mut map = std::collections::HashMap::new();
+                map.insert("add_two".to_string(), ReportItem {});
+                map
+            },
+            triggerable_functions: {
+                let mut map = std::collections::HashMap::new();
+                map
+            },
+        };
+        assert_eq!(result, report);
+    }
+
+    #[test]
     fn test_report_generation_with_import() {
         let js_source = indoc! { r#"
 import { random } from "random"
@@ -1077,9 +1127,13 @@ x = random.randint(0, 10)
         }, {
             insta::assert_yaml_snapshot!(context_stack_references);
         });
-;
+        ;
         let result = build_report(&context_stack_references);
         let report = Report {
+
+            internal_call_graph: InternalCallGraph {
+                graph: Default::default(),
+            },
             cell_exposed_values: {
                 let mut map = std::collections::HashMap::new();
                 map.insert("x".to_string(), ReportItem {});

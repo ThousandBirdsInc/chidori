@@ -1,4 +1,4 @@
-use crate::cells::CellTypes;
+use crate::cells::{CellTypes, LLMPromptCell};
 use rkyv::{
     archived_root, check_archived_root,
     ser::{serializers::AllocSerializer, Serializer},
@@ -297,7 +297,6 @@ pub fn deserialize_from_buf(v: &[u8]) -> RkyvSerializedValue {
 
 pub fn serialized_value_to_json_value(v: &RkyvSerializedValue) -> serde_json::Value {
     match &v {
-
         RkyvSerializedValue::Float(f) => Value::Number(f.to_string().parse().unwrap()),
         RkyvSerializedValue::Number(n) => Value::Number(n.to_string().parse().unwrap()),
         RkyvSerializedValue::String(s) => Value::String(s.to_string()),
@@ -380,6 +379,8 @@ impl<'de> SerdeDeserialize<'de> for RkyvSerializedValue {
         Ok(json_value_to_serialized_value(&value)) // Use your existing function
     }
 }
+
+
 
 #[cfg(test)]
 mod tests {

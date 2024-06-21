@@ -1,0 +1,85 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "import { assertEquals } from \"https://deno.land/std@0.221.0/assert/mod.ts\";\n\nDeno.test(\"addition test\", async () => {\n    const result = await add_two(2);\n    console.log(result);\n    assertEquals(result, 4);\n});\n"
+---
+- - InCallExpression
+  - Attribute: test
+  - IdentifierReferredTo:
+      - Deno
+      - false
+  - Constant: addition test
+  - InAnonFunction
+  - Params
+- - InCallExpression
+  - Attribute: test
+  - IdentifierReferredTo:
+      - Deno
+      - false
+  - Constant: addition test
+  - InAnonFunction
+  - AssignmentToStatement
+  - IdentifierReferredTo:
+      - result
+      - false
+- - InCallExpression
+  - Attribute: test
+  - IdentifierReferredTo:
+      - Deno
+      - false
+  - Constant: addition test
+  - InAnonFunction
+  - AssignmentFromStatement
+  - InCallExpression
+  - IdentifierReferredTo:
+      - add_two
+      - false
+- - InCallExpression
+  - Attribute: test
+  - IdentifierReferredTo:
+      - Deno
+      - false
+  - Constant: addition test
+  - InAnonFunction
+  - AssignmentFromStatement
+- - InCallExpression
+  - Attribute: test
+  - IdentifierReferredTo:
+      - Deno
+      - false
+  - Constant: addition test
+  - InAnonFunction
+  - InCallExpression
+  - Attribute: log
+  - IdentifierReferredTo:
+      - console
+      - false
+  - IdentifierReferredTo:
+      - result
+      - true
+- - InCallExpression
+  - Attribute: test
+  - IdentifierReferredTo:
+      - Deno
+      - false
+  - Constant: addition test
+  - InAnonFunction
+  - InCallExpression
+  - IdentifierReferredTo:
+      - assertEquals
+      - true
+  - IdentifierReferredTo:
+      - result
+      - true
+- - InCallExpression
+  - Attribute: test
+  - IdentifierReferredTo:
+      - Deno
+      - false
+  - Constant: addition test
+  - InAnonFunction
+- - InCallExpression
+  - Attribute: test
+  - IdentifierReferredTo:
+      - Deno
+      - false
+  - Constant: addition test

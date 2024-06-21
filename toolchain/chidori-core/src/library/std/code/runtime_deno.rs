@@ -331,9 +331,11 @@ fn create_function_shims(
                     let mut new_exec_state = {
                         let mut exec_state = execution_state_handle.lock().unwrap();
                         let mut v = exec_state.clone();
+                        // get a new execution state
                         std::mem::swap(&mut *exec_state, &mut v);
                         v
                     };
+                    println!("Deno expecting to call dispatch");
                     let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload).await?;
                     return Ok(result);
                 }.boxed()

@@ -7,15 +7,17 @@ use std::time::Duration;
 use bevy::app::{App, Startup, Update};
 use bevy::input::ButtonInput;
 use bevy::prelude::{Commands, default, KeyCode, NextState, Res, ResMut, Resource};
-use bevy_egui::{egui, EguiContexts};
-use bevy_egui::egui::{Color32, Frame, Id, Margin, Response, Visuals, Widget};
-use bevy_egui::egui::panel::TopBottomSide;
+use crate::bevy_egui::{EguiContexts};
+use egui;
+use egui::{Color32, Frame, Id, Margin, Response, RichText, vec2, Visuals, Widget};
+use egui::panel::TopBottomSide;
 use egui_tiles::{Tile, TileId};
 use notify_debouncer_full::{
     DebounceEventResult,
     Debouncer,
     FileIdMap, new_debouncer, notify::{RecommendedWatcher, RecursiveMode, Watcher},
 };
+use chidori_core::uuid::Uuid;
 
 use chidori_core::execution::execution::execution_graph::{
     ExecutionNodeId, MergedStateHistory,
@@ -275,6 +277,14 @@ impl InternalState {
         Ok(())
     }
 
+
+    pub fn step(&self) -> anyhow::Result<(), String> {
+        let env = self.chidori.lock().unwrap();
+        env.handle_user_action(UserInteractionMessage::Step)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn play(&self) -> anyhow::Result<(), String> {
         let env = self.chidori.lock().unwrap();
         env.handle_user_action(UserInteractionMessage::Play)
@@ -289,7 +299,7 @@ impl InternalState {
         Ok(())
     }
 
-    pub fn set_execution_id(&self, id: (usize, usize)) -> anyhow::Result<(), String> {
+    pub fn set_execution_id(&self, id: ExecutionNodeId) -> anyhow::Result<(), String> {
         let env = self.chidori.lock().unwrap();
         env.handle_user_action(UserInteractionMessage::RevertToState(Some(id)))
             .map_err(|e| e.to_string())?;
@@ -355,7 +365,7 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
     commands.insert_resource(ChidoriTraceEvents { inner: vec![] });
     commands.insert_resource(ChidoriExecutionGraph {
         inner: vec![],
-        current_execution_head: (0, 0),
+        current_execution_head: Uuid::nil(),
     });
     commands.insert_resource(ChidoriExecutionIdsToStates {
         inner: HashMap::new(),
@@ -547,7 +557,7 @@ pub fn update_gui(
     egui::TopBottomPanel::new(TopBottomSide::Top, Id::new("top_panel")).show(
         contexts.ctx_mut(),
         |ui| {
-            ui.style_mut().spacing.item_spacing = bevy_egui::egui::vec2(8.0, 8.0);
+            ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
             // ui.text_edit_multiline(&mut text);
             // a simple button opening the dialog
             let mut frame = egui::Frame::default()
@@ -556,7 +566,7 @@ pub fn update_gui(
             {
                 let mut ui = &mut frame.content_ui;
                 ui.horizontal(|ui| {
-                    ui.style_mut().spacing.item_spacing = bevy_egui::egui::vec2(32.0, 8.0);
+                    ui.style_mut().spacing.item_spacing = egui::vec2(32.0, 8.0);
                     if with_cursor(ui.button("Open")).clicked() {
                         // let sender = self.text_channel.0.clone();
                         runtime.spawn_background_task(|mut ctx| async move {
@@ -569,13 +579,16 @@ pub fn update_gui(
                             }
                         });
                     }
-                    ui.style_mut().spacing.item_spacing = bevy_egui::egui::vec2(8.0, 8.0);
+                    ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
 
                     if with_cursor(ui.button("Run")).clicked() {
                         internal_state.play();
                     }
                     if with_cursor(ui.button("Stop")).clicked() {
                         internal_state.pause();
+                    }
+                    if with_cursor(ui.button("Step")).clicked() {
+                        internal_state.step();
                     }
                 });
             }
@@ -594,37 +607,47 @@ fn render_example_selection_modal(mut contexts: &mut EguiContexts, mut internal_
                 .rounding(5.0),
         )
         .show(contexts.ctx_mut(), |ui| {
-            ui.heading("Load Example:");
+            ui.heading("Chidori");
+            ui.add_space(12.0);
             let mut frame = egui::Frame::default().inner_margin(16.0).begin(ui);
             {
                 let mut ui = &mut frame.content_ui;
-                ui.style_mut().spacing.item_spacing = bevy_egui::egui::vec2(8.0, 12.0);
+                ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 12.0);
                 // Add widgets inside the frame
-                ui.vertical(|ui| {
-                    ui.style_mut().spacing.item_spacing = bevy_egui::egui::vec2(8.0, 8.0);
-                    let buttons_text_load = vec![
-                        ("Core 1: Simple Math", EXAMPLES_CORE1),
-                        ("Core 2: Marshalling", EXAMPLES_CORE2),
-                        ("Core 3: Function Invocations", EXAMPLES_CORE3),
-                        ("Core 4: Async Function Invocations", EXAMPLES_CORE4),
-                        ("Core 5: Prompts Invoked as Functions", EXAMPLES_CORE5),
-                        (
-                            "Core 6: Prompts Leveraging Function Calling",
-                            EXAMPLES_CORE6,
-                        ),
-                        ("Core 7: Rag Stateful Memory Cells", EXAMPLES_CORE7),
-                        (
-                            "Core 8: Prompt Code Generation and Execution",
-                            EXAMPLES_CORE8,
-                        ),
-                        ("Core 9: Multi-Agent Simulation", EXAMPLES_CORE9),
-                    ];
-                    for button in buttons_text_load {
-                        let res = with_cursor(ui.button(button.0));
-                        if res.clicked() {
-                            internal_state.load_string(button.1);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label("Load Example:");
+                        ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
+                        let buttons_text_load = vec![
+                            ("Core 1: Simple Math", EXAMPLES_CORE1),
+                            ("Core 2: Marshalling", EXAMPLES_CORE2),
+                            ("Core 3: Function Invocations", EXAMPLES_CORE3),
+                            ("Core 4: Async Function Invocations", EXAMPLES_CORE4),
+                            ("Core 5: Prompts Invoked as Functions", EXAMPLES_CORE5),
+                            (
+                                "Core 6: Prompts Leveraging Function Calling",
+                                EXAMPLES_CORE6,
+                            ),
+                            ("Core 7: Rag Stateful Memory Cells", EXAMPLES_CORE7),
+                            (
+                                "Core 8: Prompt Code Generation and Execution",
+                                EXAMPLES_CORE8,
+                            ),
+                            ("Core 9: Multi-Agent Simulation", EXAMPLES_CORE9),
+                        ];
+                        for button in buttons_text_load {
+                            let res = with_cursor(ui.button(button.0));
+                            if res.clicked() {
+                                internal_state.load_string(button.1);
+                            }
                         }
-                    }
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        egui::Image::new(egui::include_image!("../assets/images/tblogo-white.png"))
+                            .fit_to_exact_size(vec2(512.0, 512.0))
+                            .rounding(5.0)
+                            .ui(ui);
+                    });
                 });
             }
             frame.end(ui);

@@ -484,26 +484,15 @@ fn create_function_shims(execution_state_handle: &Arc<Mutex<ExecutionState>>, re
                     let total_arg_payload = python_args_to_rkyv(args, kwargs)?;
                     let clone_function_name = clone_function_name.clone();
                     let py = args.py();
-
                     // All function calls across cells are forced to be async
-                    // TODO: clone the execution state, sending it to the execution graph and use the dispatch method to execute the code
-                    // TODO: we want to fetch the execution state at the time this function is called
-                    // TODO: this needs an Arc to something that holds our latest execution state
-
-                    // TODO: replace the execution state here and notify the execution graph that we have a new execution state generated
-                    //       HOW do we do this in a transactional way?
                     let mut new_exec_state = {
                         let mut exec_state = execution_state_handle.lock().unwrap();
                         let mut new_exec_state = exec_state.clone();
                         std::mem::swap(&mut *exec_state, &mut new_exec_state);
                         new_exec_state
                     };
-                    // TODO: update the state with the args we're about to execute
-
                     pyo3_asyncio::tokio::future_into_py(py, async move {
-                        // TODO: await here, before we execute the dispatch, pausing before running the next operation
                         let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload).await.map_err(|e| AnyhowErrWrapper(e))?;
-                        // TODO: await here, after we execute the dispatch, pausing before running the next operation
                         PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result)))
                     }).map(|x| x.into())
                 },

@@ -20,6 +20,7 @@ use petgraph::graphmap::DiGraphMap;
 use serde::ser::SerializeMap;
 use tracing::dispatcher::DefaultGuard;
 use tracing::Span;
+use uuid::Uuid;
 use crate::execution::primitives::operation::OperationFnOutput;
 use crate::utils::telemetry::{init_internal_telemetry, TraceEvents};
 
@@ -31,6 +32,7 @@ type Func = fn(RKV) -> RKV;
 #[derive(PartialEq, Debug)]
 enum PlaybackState {
     Paused,
+    Step,
     Running,
 }
 
@@ -43,7 +45,7 @@ enum PlaybackState {
 pub struct InstancedEnvironment {
     env_rx: Receiver<UserInteractionMessage>,
     pub db: ExecutionGraph,
-    execution_head_state_id: (usize, usize),
+    execution_head_state_id: ExecutionNodeId,
     playback_state: PlaybackState,
     runtime_event_sender: Option<Sender<EventsFromRuntime>>,
     trace_event_sender: Option<Sender<TraceEvents>>,
@@ -60,7 +62,7 @@ impl std::fmt::Debug for InstancedEnvironment {
 impl InstancedEnvironment {
     fn new() -> InstancedEnvironment {
         let mut db = ExecutionGraph::new();
-        let state_id = (0, 0);
+        let state_id = Uuid::nil();
         let playback_state = PlaybackState::Paused;
         // TODO: handle this better, this just makes our tests pass until its resolved
         let (tx, rx) = mpsc::channel();
@@ -143,10 +145,15 @@ impl InstancedEnvironment {
             if let Ok(message) = self.env_rx.try_recv() {
                 println!("Received message from user: {:?}", message);
                 match message {
+                    UserInteractionMessage::Step => {
+                        self.playback_state = PlaybackState::Step;
+                    },
                     UserInteractionMessage::Play => {
+                        self.get_state().render_dependency_graph();
                         self.playback_state = PlaybackState::Running;
                     },
                     UserInteractionMessage::Pause => {
+                        self.get_state().render_dependency_graph();
                         self.playback_state = PlaybackState::Paused;
                     },
                     UserInteractionMessage::ReloadCells => {
@@ -173,15 +180,23 @@ impl InstancedEnvironment {
                 }
             }
 
-            if self.playback_state == PlaybackState::Paused {
-                println!("Playback paused, waiting 1000ms");
-                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-            } else {
-                let output = self.step().await?;
-                // If nothing happened, pause playback and wait for the user
-                if output.is_empty() {
-                    println!("Playback paused, awaiting input from user");
+            match self.playback_state {
+                PlaybackState::Step => {
+                    let output = self.step().await?;
                     self.playback_state = PlaybackState::Paused;
+                }
+                PlaybackState::Paused => {
+                    println!("Playback paused, waiting 1000ms");
+                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                }
+                PlaybackState::Running => {
+                    let output = self.step().await?;
+                    // TODO: we want to pause when nothing is happening, so how do we know nothing is happening
+                    // If nothing happened, pause playback and wait for the user
+                    if output.is_empty() {
+                        println!("Playback paused, awaiting input from user");
+                        self.playback_state = PlaybackState::Paused;
+                    }
                 }
             }
         }
@@ -191,14 +206,14 @@ impl InstancedEnvironment {
     pub fn get_state_at(&self, id: ExecutionNodeId) -> ExecutionState {
         match self.db.get_state_at_id(id).unwrap() {
             ExecutionStateEvaluation::Complete(s) => s,
-            ExecutionStateEvaluation::Executing(_) => ExecutionState::new()
+            ExecutionStateEvaluation::Executing(_) => panic!("get_state_at, failed, still executing")
         }
     }
 
     pub fn get_state(&self) -> ExecutionState {
         match self.db.get_state_at_id(self.execution_head_state_id).unwrap() {
             ExecutionStateEvaluation::Complete(s) => s,
-            ExecutionStateEvaluation::Executing(_) => ExecutionState::new()
+            ExecutionStateEvaluation::Executing(_) => panic!("get_state, failed, still executing")
         }
     }
 
@@ -215,7 +230,7 @@ impl InstancedEnvironment {
         println!("Resulted in state with id {:?}", &state_id);
         let mut shared_state = self.shared_state.lock().unwrap();
         shared_state.execution_state_head_id = state_id;
-        shared_state.execution_id_to_evaluation.insert(state_id, state);
+        shared_state.execution_id_to_evaluation.lock().unwrap().insert(state_id, state);
         self.execution_head_state_id = state_id;
         Ok(outputs)
     }
@@ -226,16 +241,17 @@ impl InstancedEnvironment {
         println!("Upserting cell into state with id {:?}", &self.execution_head_state_id);
         let ((state_id, state), op_id) = self.db.mutate_graph(self.execution_head_state_id, cell, op_id)?;
         if let Some(sender) = self.runtime_event_sender.as_mut() {
-            sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
             if let ExecutionStateEvaluation::Complete(s) = &state {
+                println!("Upsert cell result parent_id {:?} and id {:?}", &s.parent_state_id, &s.id);
                 sender.send(EventsFromRuntime::DefinitionGraphUpdated(s.get_dependency_graph_flattened())).unwrap();
             }
+            sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
             sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
             sender.send(EventsFromRuntime::UpdateExecutionHead(state_id)).unwrap();
         }
         let mut shared_state = self.shared_state.lock().unwrap();
         shared_state.execution_state_head_id = state_id;
-        shared_state.execution_id_to_evaluation.insert(state_id, state);
+        shared_state.execution_id_to_evaluation.lock().unwrap().insert(state_id, state);
         self.execution_head_state_id = state_id;
         Ok((state_id, op_id))
     }
@@ -249,12 +265,13 @@ pub enum UserInteractionMessage {
     Play,
     Pause,
     UserAction(String),
-    RevertToState(Option<(usize, usize)>),
+    RevertToState(Option<ExecutionNodeId>),
     ReloadCells,
     FetchStateAt(ExecutionNodeId),
     FetchCells,
     MutateCell,
-    Shutdown
+    Shutdown,
+    Step,
 }
 
 
@@ -295,7 +312,7 @@ pub struct CellHolder {
 
 #[derive(Debug)]
 pub struct SharedState {
-    pub execution_id_to_evaluation: HashMap<ExecutionNodeId, ExecutionStateEvaluation>,
+    pub execution_id_to_evaluation: Arc<Mutex<HashMap<ExecutionNodeId, ExecutionStateEvaluation>>>,
     execution_state_head_id: ExecutionNodeId,
     latest_state: Option<ExecutionState>,
     cells: Vec<CellHolder>,
@@ -321,7 +338,7 @@ impl SharedState {
     fn new() -> Self {
         SharedState {
             execution_id_to_evaluation: Default::default(),
-            execution_state_head_id: (0, 0),
+            execution_state_head_id: Uuid::nil(),
             latest_state: None,
             cells: vec![],
         }
@@ -366,7 +383,7 @@ impl Chidori {
             loaded_path: None,
             shared_state: Arc::new(Mutex::new(SharedState {
                 execution_id_to_evaluation: Default::default(),
-                execution_state_head_id: (0, 0),
+                execution_state_head_id: Uuid::nil(),
                 cells: vec![],
                 latest_state: None,
             })),
@@ -384,7 +401,7 @@ impl Chidori {
             loaded_path: None,
             shared_state: Arc::new(Mutex::new(SharedState {
                 execution_id_to_evaluation: Default::default(),
-                execution_state_head_id: (0, 0),
+                execution_state_head_id: Uuid::nil(),
                 cells: vec![],
                 latest_state: None,
             })),
@@ -453,6 +470,7 @@ impl Chidori {
             .iter()
             .filter_map(|block| interpret_code_block(block))
             .for_each(|block| { cells.push(block); });
+        cells.sort();
         self.loaded_path = Some("raw_text".to_string());
         self.load_cells(cells)
     }
@@ -468,6 +486,7 @@ impl Chidori {
             }
         }
         self.loaded_path = Some(path.to_str().unwrap().to_string());
+        cells.sort();
         self.load_cells(cells)
     }
 
@@ -475,8 +494,14 @@ impl Chidori {
         let (instanced_env_tx, env_rx) = mpsc::channel();
         self.instanced_env_tx = Some(instanced_env_tx);
         let mut db = ExecutionGraph::new();
-        let state_id = (0, 0);
+        let state_id = Uuid::nil();
         let playback_state = PlaybackState::Paused;
+
+
+        let mut shared_state = self.shared_state.lock().unwrap();
+        shared_state.execution_id_to_evaluation = db.execution_node_id_to_state.clone();
+
+        // TODO: override the current state_id
         Ok(InstancedEnvironment {
             env_rx,
             db,
@@ -995,50 +1020,77 @@ mod tests {
     }
 
 
-    #[tokio::test]
-    async fn test_core3_function_invocations() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_core3_function_invocations() -> anyhow::Result<()> {
         let mut ee = Chidori::new();
         ee.load_md_directory(Path::new("./examples/core3_function_invocations")).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
         env.get_state().render_dependency_graph();
+        let mut out = env.step().await?;
+        assert_eq!(out[0].0, 0);
+        assert_eq!(out[0].1.output, RkyvObjectBuilder::new().insert_string("add_two", "function".to_string()).build());
+
+        // TODO: there's nothing to test on this instance but that's an issue
         dbg!(env.step().await);
-        dbg!(env.step().await);
-        dbg!(env.step().await);
-        dbg!(env.step().await);
+
+        let mut out = env.step().await?;
+        assert_eq!(out[0].0, 2);
+        assert_eq!(out[0].1.output, RkyvObjectBuilder::new().insert_string("addTwo", "function".to_string()).build());
+        let mut out = env.step().await?;
+        assert_eq!(out[0].0, 3);
+        assert_eq!(out[0].1.stderr.contains(&"OK".to_string()), true);
         assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
+        env.shutdown().await;
+        Ok(())
     }
 
-    #[tokio::test]
-    async fn test_core4_async_function_invocations() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_core4_async_function_invocations() -> anyhow::Result<()> {
         let mut ee = Chidori::new();
         ee.load_md_directory(Path::new("./examples/core4_async_function_invocations")).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
         env.get_state().render_dependency_graph();
+        let mut out = env.step().await?;
+        assert_eq!(out[0].0, 0);
+        assert_eq!(out[0].1.output, RkyvObjectBuilder::new().insert_string("add_two", "function".to_string()).build());
+
+        // TODO: there's nothing to test on this instance but that's an issue
         dbg!(env.step().await);
-        dbg!(env.step().await);
-        dbg!(env.step().await);
-        dbg!(env.step().await);
+
+        let mut out = env.step().await?;
+        assert_eq!(out[0].0, 2);
+        assert_eq!(out[0].1.output, RkyvObjectBuilder::new().insert_string("addTwo", "function".to_string()).build());
+        let mut out = env.step().await?;
+        assert_eq!(out[0].0, 3);
+        assert_eq!(out[0].1.stderr.contains(&"OK".to_string()), true);
         assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
+        env.shutdown().await;
+        Ok(())
     }
 
 
-    #[tokio::test]
-    async fn test_core5_prompts_invoked_as_functions() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_core5_prompts_invoked_as_functions() -> anyhow::Result<()>  {
         let mut ee = Chidori::new();
         ee.load_md_directory(Path::new("./examples/core5_prompts_invoked_as_functions")).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
         env.get_state().render_dependency_graph();
         let out = env.step().await;
+        dbg!(out);
         let out = env.step().await;
+        dbg!(out);
         let out = env.step().await;
+        dbg!(out);
         let out = env.step().await;
         assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
+        env.shutdown().await;
+        Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_core6_prompts_leveraging_function_calling() {
         let mut ee = Chidori::new();
         ee.load_md_directory(Path::new("./examples/core6_prompts_leveraging_function_calling")).unwrap();
@@ -1053,7 +1105,7 @@ mod tests {
         assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_core7_rag_stateful_memory_cells() {
         let mut ee = Chidori::new();
         ee.load_md_directory(Path::new("./examples/core7_rag_stateful_memory_cells")).unwrap();
@@ -1067,7 +1119,7 @@ mod tests {
         assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_core8_prompt_code_generation_and_execution() {
         let mut ee = Chidori::new();
         ee.load_md_directory(Path::new("./examples/core8_prompt_code_generation_and_execution")).unwrap();
@@ -1081,7 +1133,7 @@ mod tests {
         assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_core9_multi_agent_simulation() {
         let mut ee = Chidori::new();
         ee.load_md_directory(Path::new("./examples/core9_multi_agent_simulation")).unwrap();

@@ -3,6 +3,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use petgraph::graph::DiGraph;
+use petgraph::graphmap::DiGraphMap;
+use petgraph::visit::EdgeRef;
 use thiserror::Error;
 
 pub mod typechecker;
@@ -33,8 +37,84 @@ pub struct ReportTriggerableFunctions {
     pub trigger_on: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct InternalCallGraph {
+    graph: DiGraph<String, ()>
+}
+
+impl Serialize for InternalCallGraph {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+    {
+        let mut adjacency_list = HashMap::new();
+        for node in self.graph.node_indices() {
+            let edges = self.graph.edges(node)
+                .map(|edge| edge.target().index())
+                .collect::<Vec<_>>();
+            adjacency_list.insert(self.graph[node].clone(), edges);
+        }
+        adjacency_list.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for InternalCallGraph {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+    {
+        let adjacency_list: HashMap<String, Vec<usize>> = HashMap::deserialize(deserializer)?;
+        let mut graph = DiGraph::new();
+        let mut node_indices = HashMap::new();
+
+        // Add nodes
+        for node in adjacency_list.keys() {
+            let index = graph.add_node(node.clone());
+            node_indices.insert(node.clone(), index);
+        }
+
+        // Add edges
+        for (node, edges) in adjacency_list {
+            let source_index = node_indices[&node];
+            for target_index in edges {
+                if let Some(&target_node_index) = node_indices.values().find(|&&idx| idx.index() == target_index) {
+                    graph.add_edge(source_index, target_node_index, ());
+                }
+            }
+        }
+
+        Ok(InternalCallGraph { graph })
+    }
+}
+
+impl PartialEq for InternalCallGraph {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare the graphs for equality
+        self.graph.node_indices().all(|n| {
+            self.graph[n] == other.graph[n]
+        }) && self.graph.edge_indices().all(|e| {
+            self.graph.edge_endpoints(e) == other.graph.edge_endpoints(e)
+        })
+    }
+}
+
+impl Eq for InternalCallGraph {}
+
+impl Hash for InternalCallGraph {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Hash the nodes and edges of the graph
+        for node in self.graph.node_indices() {
+            self.graph[node].hash(state);
+        }
+        for edge in self.graph.edge_indices() {
+            self.graph.edge_endpoints(edge).hash(state);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Report {
+    pub internal_call_graph: InternalCallGraph,
     pub cell_exposed_values: HashMap<String, ReportItem>,
     pub cell_depended_values: HashMap<String, ReportItem>,
     pub triggerable_functions: HashMap<String, ReportTriggerableFunctions>,

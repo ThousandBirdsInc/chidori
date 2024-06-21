@@ -4,8 +4,8 @@ description: "async def run_prompt(number_of_states):\n    out = \"\"\n    for s
 ---
 cell_exposed_values: {}
 cell_depended_values:
-  first_letter: {}
   get_states_first_letters: {}
+  first_letter: {}
 triggerable_functions:
   run_prompt:
     arguments:

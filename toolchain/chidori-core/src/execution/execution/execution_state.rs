@@ -26,8 +26,9 @@ use tokio::sync::oneshot;
 use futures_util::FutureExt;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot::error::TryRecvError;
+use uuid::Uuid;
 use crate::cells::{CellTypes, CodeCell, get_cell_name, LLMPromptCell};
-use crate::execution::execution::execution_graph::{ExecutionGraphSendPayload, ExecutionNodeId};
+use crate::execution::execution::execution_graph::{ExecutionGraphSendPayload, ExecutionNodeId, get_execution_id};
 
 pub enum OperationExecutionStatusOption {
     Running,
@@ -116,6 +117,7 @@ pub struct FunctionMetadata {
 #[derive(Clone)]
 pub struct ExecutionState {
     pub(crate) op_counter: usize,
+    pub id: ExecutionNodeId,
     pub parent_state_id: ExecutionNodeId,
 
     pub evaluating_id: usize,
@@ -133,6 +135,7 @@ pub struct ExecutionState {
     // pub call_stack: Arc<Mutex<Pin<Box<dyn Coroutine<Return=CoroutineYieldValue, Yield=CoroutineYieldValue>>>>>,
 
     pub state: ImHashMap<usize, Arc<OperationFnOutput>>,
+    pub fresh_values: Vec<usize>,
 
     pub operation_name_to_id: ImHashMap<String, OperationId>,
 
@@ -197,7 +200,6 @@ fn render_map_as_table(exec_state: &ExecutionState) -> String {
     //                 r"
     //             | {} | {:?} |"
     //             ),
-    //             key, val.lock().as_deref(),
     //         ));
     //     }
     // }
@@ -207,7 +209,7 @@ fn render_map_as_table(exec_state: &ExecutionState) -> String {
 }
 
 /// This causes the current async loop to pause until we send a signal over the oneshot sender returned
-async fn pause_future_with_oneshot(state: ExecutionState, sender: &tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>) -> Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>> {
+async fn pause_future_with_oneshot(execution_state_evaluation: ExecutionStateEvaluation, sender: &tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>) -> Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>> {
     println!("============= should pause =============");
     let (oneshot_sender, mut oneshot_receiver) = tokio::sync::oneshot::channel();
     let future = async move {
@@ -230,14 +232,16 @@ async fn pause_future_with_oneshot(state: ExecutionState, sender: &tokio::sync::
         println!("Continuing from oneshot signal");
         RkyvSerializedValue::Null
     };
-    sender.send((state, oneshot_sender)).await.expect("Failed to send oneshot signal");
+    sender.send((execution_state_evaluation, oneshot_sender)).await.expect("Failed to send oneshot signal");
     Box::pin(future)
 }
 
 impl ExecutionState {
     pub fn new() -> Self {
         ExecutionState {
-            parent_state_id: (0,0),
+
+            id: Uuid::new_v4(),
+            parent_state_id: Uuid::nil(),
             op_counter: 0,
             evaluating_id: 0,
             evaluating_name: None,
@@ -247,6 +251,7 @@ impl ExecutionState {
             exec_queue: VecDeque::new(),
             marked_for_consumption: HashSet::new(),
             state: Default::default(),
+            fresh_values: vec![],
             operation_name_to_id: Default::default(),
             operation_by_id: Default::default(),
             function_name_to_metadata: Default::default(),
@@ -258,6 +263,8 @@ impl ExecutionState {
 
     pub fn with_graph_sender(parent_state_id: ExecutionNodeId, graph_sender: Arc<tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>>) -> Self {
         ExecutionState {
+
+            id: Uuid::nil(),
             parent_state_id,
             op_counter: 0,
             evaluating_id: 0,
@@ -268,6 +275,7 @@ impl ExecutionState {
             exec_queue: VecDeque::new(),
             marked_for_consumption: HashSet::new(),
             state: Default::default(),
+            fresh_values: vec![],
             operation_name_to_id: Default::default(),
             operation_by_id: Default::default(),
             function_name_to_metadata: Default::default(),
@@ -275,6 +283,14 @@ impl ExecutionState {
             dependency_map: Default::default(),
             execution_event_sender: None,
         }
+    }
+
+    pub fn clone_with_new_id(&self) -> Self {
+        let mut new = self.clone();
+        new.parent_state_id = new.id;
+        new.fresh_values = vec![];
+        new.id = get_execution_id();
+        new
     }
 
     pub fn have_all_operations_been_set_at_least_once(&self) -> bool {
@@ -369,7 +385,8 @@ impl ExecutionState {
             CellTypes::CodeGen(c, r) => crate::cells::code_gen_cell::code_gen_cell(c, r),
         }?;
         op.attach_cell(cell.clone());
-        let (op_id, new_state) = self.upsert_operation(op, op_id);
+        let new_state = self.clone_with_new_id();
+        let (op_id, new_state) = new_state.upsert_operation(op, op_id);
         let mutations = Self::assign_dependencies_to_operations(&new_state)?;
         let mut final_state = new_state.apply_dependency_graph_mutations(mutations);
         final_state.operation_mutation = Some(cell);
@@ -543,7 +560,7 @@ impl ExecutionState {
         println!("Running dispatch {:?}", function_name);
 
         // Store the invocation payload into an execution state and record this before executing
-        let mut state = self.clone();
+        let mut state = self.clone_with_new_id();
 
         let meta = self.function_name_to_metadata.get(function_name).map(|meta| {
             meta
@@ -593,41 +610,41 @@ impl ExecutionState {
             }
         };
 
+        let mut before_execution_state = state.clone();
+        let mut after_execution_state = state.clone_with_new_id();
         // When we receive a message from the graph_sender, execution of this coroutine will resume.
         if let Some(graph_sender) = self.graph_sender.as_ref() {
             let s = graph_sender.clone();
-            let result = pause_future_with_oneshot(self.clone(), &s).await;
+            let result = pause_future_with_oneshot(ExecutionStateEvaluation::Complete(before_execution_state.clone()), &s).await;
             let recv = result.await;
         }
 
         // invocation of the operation
         // TODO: the total arg payload here does not include necessary function calls for this cell itself
-        let result = op.execute(&self, payload, None, None).await?;
-        dbg!(&result);
+        let result = op.execute(&before_execution_state, payload, None, None).await?;
+        after_execution_state.state_insert(usize::MAX, result.clone());
 
         // TODO: Add result into a new execution state
 
         // TODO: capture the value of the output
         if let Some(graph_sender) = self.graph_sender.as_ref() {
             let s = graph_sender.clone();
-            let result = pause_future_with_oneshot(self.clone(), &s).await;
+            let result = pause_future_with_oneshot(ExecutionStateEvaluation::Complete(after_execution_state.clone()), &s).await;
             let recv = result.await;
         }
 
         // Return the result, to be used in the context of the parent function
-        Ok((result.output, self.clone()))
+        Ok((result.output, after_execution_state))
     }
 
     // TODO: extend this with an "event", steps can occur as events are flushed based on a previous state we were in
     #[tracing::instrument]
     pub async fn step_execution(
         &self,
-        previous_state_id: ExecutionNodeId,
         sender: &tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>
     ) -> anyhow::Result<(ExecutionStateEvaluation, Vec<(usize, OperationFnOutput)>)> {
         let previous_state = self;
-        let mut new_state = previous_state.clone();
-        new_state.parent_state_id = previous_state_id;
+        let mut new_state = previous_state.clone_with_new_id();
         new_state.operation_mutation = None;
         let mut operation_by_id = previous_state.operation_by_id.clone();
         let dependency_graph = previous_state.get_dependency_graph();
@@ -638,7 +655,6 @@ impl ExecutionState {
         // We handle a sorted queue of operations to evaluate, giving a deterministic order
         // to how our operations and run, and executing only a single operation each tick.
         // We churn through the queue in this ordering until we have a valid node to evaluate.
-        // TODO: if all nodes are visited and none can be evaluated we should break
         let mut exec_queue = self.exec_queue.clone();
         let (
             op_node,
@@ -649,6 +665,7 @@ impl ExecutionState {
             functions
         ) = 'traverse_nodes: loop {
             println!("Looping step execution, traverse nodes {:?}", &exec_queue);
+
             let next_operation_id = if let Some(next_operation_id) = exec_queue.pop_front() {
                 next_operation_id
             } else {
@@ -659,6 +676,8 @@ impl ExecutionState {
                 operation_ids.sort();
                 exec_queue.extend(operation_ids.iter());
                 new_state.exec_queue = exec_queue;
+                // continue;
+                // TODO: don't return
                 return Ok((ExecutionStateEvaluation::Complete(new_state), outputs));
             };
             println!("Looping step execution, traverse nodes {:?}", next_operation_id);

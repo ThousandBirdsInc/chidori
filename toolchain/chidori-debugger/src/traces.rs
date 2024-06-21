@@ -27,7 +27,7 @@ use bevy::sprite::Anchor;
 use bevy::text::{BreakLineOn, Text2dBounds};
 use bevy::utils::petgraph::visit::Walker;
 use bevy::window::{PrimaryWindow, WindowResized};
-use bevy_egui::{egui, EguiContexts};
+use crate::bevy_egui::{egui, EguiContexts};
 use bevy_rapier2d::geometry::{Collider, Sensor};
 use bevy_rapier2d::pipeline::QueryFilter;
 use bevy_rapier2d::plugin::RapierContext;

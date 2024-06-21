@@ -5,8 +5,9 @@ use bevy::prelude::{ButtonBundle, Camera, Camera2dBundle, ClearColorConfig, Colo
 use bevy::render::camera::Viewport;
 use bevy::window::PrimaryWindow;
 use bevy_cosmic_edit::{Attrs, CosmicBuffer, CosmicColor, CosmicEditBundle, CosmicEditPlugin, CosmicFontConfig, CosmicFontSystem, CosmicPrimaryCamera, CosmicSource, Family, FocusedWidget, Metrics};
-use bevy_egui::{egui, EguiContexts};
-use bevy_egui::egui::{Color32, FontFamily, Frame, Margin};
+use crate::bevy_egui::{EguiContexts};
+use egui;
+use egui::{Color32, FontFamily, Frame, Margin, Pos2};
 use egui_tiles::Tile;
 use chidori_core::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, TemplateCell, TextRange, WebserviceCell};
 use crate::chidori::{ChidoriCells, ChidoriExecutionState, EguiTree, EguiTreeIdentities};
@@ -64,6 +65,7 @@ fn editor_update(
     //    current execution status/quantity
     //    add a "Step" button
 
+
     egui::CentralPanel::default().frame(container_frame).show(contexts.ctx_mut(), |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let mut theme = egui_extras::syntax_highlighting::CodeTheme::dark();
@@ -104,7 +106,7 @@ fn editor_update(
                                 if let Some(name) = name {
                                     egui_label(ui, name);
                                 }
-                                ui.with_layout(egui::Layout::right_to_left(bevy_egui::egui::Align::TOP), |ui| {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                                     if ui.button("Open").clicked() {
                                         // TODO:
                                         println!("Should open file");
@@ -154,7 +156,7 @@ fn editor_update(
                                 if let Some(name) = name {
                                     egui_label(ui, name);
                                 }
-                                ui.with_layout(egui::Layout::right_to_left(bevy_egui::egui::Align::TOP), |ui| {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                                     if ui.button("Open").clicked() {
                                         // TODO:
                                         println!("Should open file");
@@ -204,7 +206,7 @@ fn editor_update(
                                 if let Some(name) = name {
                                     egui_label(ui, name);
                                 }
-                                ui.with_layout(egui::Layout::right_to_left(bevy_egui::egui::Align::TOP), |ui| {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                                     if ui.button("Open").clicked() {
                                         // TODO:
                                         println!("Should open file");
@@ -254,7 +256,7 @@ fn editor_update(
                                 if let Some(name) = name {
                                     egui_label(ui, name);
                                 }
-                                ui.with_layout(egui::Layout::right_to_left(bevy_egui::egui::Align::TOP), |ui| {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                                     if ui.button("Open").clicked() {
                                         // TODO:
                                         println!("Should open file");
@@ -301,7 +303,7 @@ fn editor_update(
                                 if let Some(name) = name {
                                     egui_label(ui, name);
                                 }
-                                ui.with_layout(egui::Layout::right_to_left(bevy_egui::egui::Align::TOP), |ui| {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                                     if ui.button("Open").clicked() {
                                         // TODO:
                                         println!("Should open file");

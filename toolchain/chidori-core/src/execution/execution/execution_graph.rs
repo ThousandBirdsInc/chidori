@@ -28,6 +28,7 @@ use serde::ser::SerializeMap;
 use tokio::signal;
 use tokio::sync::Notify;
 use tokio::sync::oneshot::Receiver;
+use uuid::Uuid;
 use crate::cells::CellTypes;
 use crate::execution::primitives::operation::OperationFnOutput;
 
@@ -41,7 +42,7 @@ type EdgeIdentity = (OperationId, OperationId, DependencyReference);
 // TODO: add a globally incrementing counter to this so that there can never be identity collisions
 
 // TODO: (branch, depth, counter)
-pub type ExecutionNodeId = (usize, usize);
+pub type ExecutionNodeId = Uuid;
 
 
 #[derive(Debug, Clone)]
@@ -58,7 +59,7 @@ pub struct MergedStateHistory(pub HashMap<usize, (ExecutionNodeId, Arc<Operation
 //       steps we take within a given counter. but then those can nest even further.
 //
 
-pub type ExecutionGraphSendPayload = (ExecutionState, tokio::sync::oneshot::Sender<()>);
+pub type ExecutionGraphSendPayload = (ExecutionStateEvaluation, tokio::sync::oneshot::Sender<()>);
 
 
 /// This models the network of reactive relationships between different components.
@@ -82,7 +83,7 @@ pub struct ExecutionGraph {
     execution_graph: Arc<Mutex<DiGraphMap<ExecutionNodeId, ExecutionStateEvaluation>>>,
 
     // TODO: move to just using the digraph for this
-    execution_node_id_to_state: Arc<Mutex<HashMap<ExecutionNodeId, ExecutionStateEvaluation>>>,
+    pub(crate) execution_node_id_to_state: Arc<Mutex<HashMap<ExecutionNodeId, ExecutionStateEvaluation>>>,
 
     /// Sender channel for sending messages to the execution graph
     graph_mutation_sender: tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>,
@@ -107,25 +108,8 @@ impl std::fmt::Debug for ExecutionGraph {
 /// iterative execution of the same branch. Branch in contrast increments when
 /// we re-evaluate a node that head already previously been evaluated - creating a
 /// new line of execution.
-fn get_execution_id(
-    execution_graph: &mut DiGraphMap<ExecutionNodeId, ExecutionStateEvaluation>,
-    prev_execution_id: ExecutionNodeId,
-) -> (usize, usize) {
-    let edges = execution_graph
-        .edges_directed(prev_execution_id, Direction::Outgoing);
-
-    // Get the greatest id value from the edges leaving the previous execution state
-    if let Some((_, max_to, _)) =
-        edges.max_by(|(_, a_to, _), (_, b_to, _)| (a_to.0).cmp(&(b_to.0)))
-    {
-        // Create an edge in the execution graph from the previous state to this new one
-        let id = (max_to.0 + 1, prev_execution_id.1 + 1);
-        id
-    } else {
-        // Create an edge in the execution graph from the previous state to this new one
-        let id = (prev_execution_id.0, prev_execution_id.1 + 1);
-        id
-    }
+pub fn get_execution_id() -> Uuid {
+    Uuid::new_v4()
 }
 
 impl ExecutionGraph {
@@ -139,8 +123,9 @@ impl ExecutionGraph {
         let mut state_id_to_state = HashMap::new();
 
         // Initialization of the execution graph at 0,0
-        state_id_to_state.insert((0, 0), ExecutionStateEvaluation::Complete(ExecutionState::with_graph_sender(
-            (0,0),
+        let init_id = Uuid::nil();
+        state_id_to_state.insert(init_id, ExecutionStateEvaluation::Complete(ExecutionState::with_graph_sender(
+            init_id,
             Arc::new(sender.clone())
         )));
 
@@ -160,7 +145,7 @@ impl ExecutionGraph {
         // Kick off a background thread that listens for events from async operations
         // These events inject additional state into the execution graph on new branches
         // Those branches will continue to evaluate independently.
-        println!("should initialize oneshot thread");
+        println!("Initializing execution depth thread.");
         let handle = tokio::spawn(async move {
             // Signal that the task has started
             initialization_notify_clone.notify_one();
@@ -171,7 +156,18 @@ impl ExecutionGraph {
                             Ok((resulting_execution_state, oneshot)) => {
                                 println!("==== Received dispatch event {:?}", resulting_execution_state);
 
-                                // TODO: Push this into the system
+                                // Pushing this state into the graph
+                                // TODO: need to push this into execution_id_to_evaluation
+                                let mut execution_graph = execution_graph_clone.lock().unwrap();
+                                let mut state_id_to_state = state_id_to_state_clone.lock().unwrap();
+                                let s = resulting_execution_state.clone();
+                                if let ExecutionStateEvaluation::Complete(state) = resulting_execution_state {
+                                    println!("Adding to execution state!!!! {:?}", state.id);
+                                    let resulting_state_id = state.id;
+                                    state_id_to_state.deref_mut().insert(resulting_state_id.clone(), s.clone());
+                                    execution_graph.deref_mut()
+                                        .add_edge(state.parent_state_id, resulting_state_id.clone(), s);
+                                }
 
 
                                 oneshot.send(()).unwrap();
@@ -215,7 +211,6 @@ impl ExecutionGraph {
                 }
             }
         });
-        println!("handle {:?}", &handle);
         ExecutionGraph {
             cancellation_notify,
             execution_depth_orchestration_initialized_notify: initialization_notify,
@@ -253,7 +248,7 @@ impl ExecutionGraph {
         let execution_graph = self.execution_graph.lock();
         let graph = execution_graph.as_ref().unwrap();
         let mut dfs = Dfs::new(graph.deref(), endpoint.clone());
-        let root = (0, 0);
+        let root = Uuid::nil();
         let mut queue = vec![endpoint.clone()];
         while let Some(node) = dfs.next(graph.deref()) {
             if node == root {
@@ -286,10 +281,16 @@ impl ExecutionGraph {
         // if we re-evaluate execution at a given node, we get a new execution branch.
         let mut execution_graph = self.execution_graph.lock().unwrap();
         let mut state_id_to_state = self.execution_node_id_to_state.lock().unwrap();
-        let resulting_state_id = get_execution_id(execution_graph.deref_mut(), prev_execution_id);
+        // let resulting_state_id = get_execution_id();
+        let (parent_id, resulting_state_id ) = match &new_state {
+            ExecutionStateEvaluation::Complete(state) => {
+                (state.parent_state_id, state.id)
+            },
+            ExecutionStateEvaluation::Executing(_) => panic!("Cannot progress an execution state that is currently executing"),
+        };
         state_id_to_state.deref_mut().insert(resulting_state_id.clone(), new_state.clone());
         execution_graph.deref_mut()
-            .add_edge(prev_execution_id, resulting_state_id.clone(), new_state.clone());
+            .add_edge(parent_id, resulting_state_id.clone(), new_state.clone());
         resulting_state_id
     }
 
@@ -307,7 +308,7 @@ impl ExecutionGraph {
         prev_execution_id: ExecutionNodeId,
         previous_state: &ExecutionStateEvaluation,
     ) -> anyhow::Result<(
-        ((usize, usize), ExecutionStateEvaluation), // the resulting total state of this step
+        (ExecutionNodeId, ExecutionStateEvaluation), // the resulting total state of this step
         Vec<(usize, OperationFnOutput)>, // values emitted by operations during this step
     )> {
         let previous_state = match previous_state {
@@ -315,7 +316,7 @@ impl ExecutionGraph {
             ExecutionStateEvaluation::Executing(_) => panic!("Cannot step an execution state that is currently executing"),
         };
         // TODO: Execution can only be stepped when the previous state is complete
-        let (new_state, outputs) = previous_state.step_execution(prev_execution_id, &self.graph_mutation_sender).await?;
+        let (new_state, outputs) = previous_state.step_execution(&self.graph_mutation_sender).await?;
         let resulting_state_id = self.progress_graph(prev_execution_id, new_state.clone());
         Ok(((resulting_state_id, new_state), outputs))
     }
@@ -328,16 +329,20 @@ impl ExecutionGraph {
         cell: CellTypes,
         op_id: Option<usize>,
     ) -> anyhow::Result<(
-        ((usize, usize), ExecutionStateEvaluation), // the resulting total state of this step
+        (ExecutionNodeId, ExecutionStateEvaluation), // the resulting total state of this step
         usize, // id of the new operation
     )> {
         let state = self.get_state_at_id(prev_execution_id);
         if let Some(state) = state {
             let (final_state, op_id2) = match &state {
-                ExecutionStateEvaluation::Complete(state1) => state1.update_op(cell, op_id)?,
+                ExecutionStateEvaluation::Complete(state1) => {
+                    println!("Capturing state of the mutate graph operation parent {:?}, id {:?}", state1.parent_state_id, state1.id);
+                    state1.update_op(cell, op_id)?
+                },
                 ExecutionStateEvaluation::Executing(_) => panic!("Cannot mutate a graph that is currently executing"),
             };
             let eval = ExecutionStateEvaluation::Complete(final_state.clone());
+            println!("Capturing final_state of the mutate graph operation parent {:?}, id {:?}", final_state.parent_state_id, final_state.id);
             let resulting_state_id = self.progress_graph(prev_execution_id, eval.clone());
             Ok(((resulting_state_id, eval), op_id2))
         } else {
@@ -350,7 +355,7 @@ impl ExecutionGraph {
         &mut self,
         prev_execution_id: ExecutionNodeId,
     ) -> anyhow::Result<(
-        ((usize, usize), ExecutionStateEvaluation), // the resulting total state of this step
+        (ExecutionNodeId, ExecutionStateEvaluation), // the resulting total state of this step
         Vec<(usize, OperationFnOutput)>, // values emitted by operations during this step
     )> {
         let state = self.get_state_at_id(prev_execution_id);
@@ -381,7 +386,7 @@ mod tests {
     async fn test_evaluation_single_node() -> anyhow::Result<()> {
         let mut db = ExecutionGraph::new();
         let mut state = ExecutionState::new();
-        let state_id = (0, 0);
+        let state_id = Uuid::nil();
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     InputSignature::new(),
@@ -461,7 +466,7 @@ mod tests {
     async fn test_traverse_single_node() -> anyhow::Result<()> {
         let mut db = ExecutionGraph::new();
         let mut state = ExecutionState::new();
-        let state_id = (0, 0);
+        let state_id = Uuid::nil();
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     InputSignature::new(),
@@ -507,7 +512,7 @@ mod tests {
         //    2
 
         let mut state = ExecutionState::new();
-        let state_id = (0, 0);
+        let state_id = Uuid::nil();
 
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
@@ -587,7 +592,7 @@ mod tests {
         //  2   3
 
         let mut state = ExecutionState::new();
-        let state_id = (0, 0);
+        let state_id = Uuid::nil();
 
         for x in 0..4 {
             let (_, mut nstate) = state.upsert_operation(OperationNode::new(
@@ -651,7 +656,7 @@ mod tests {
         //    4
 
         let mut state = ExecutionState::new();
-        let state_id = (0, 0);
+        let state_id = Uuid::nil();
         for x in 0..5 {
             let (_, mut nstate) = state.upsert_operation(OperationNode::new(
                         None,
@@ -720,7 +725,7 @@ mod tests {
         //    5
 
         let mut state = ExecutionState::new();
-        let state_id = (0, 0);
+        let state_id = Uuid::nil();
 
         // We start with the number 1 at node 0
         let (_, mut state) = state.upsert_operation(OperationNode::new(
@@ -880,7 +885,7 @@ mod tests {
         //    2
 
         let mut state = ExecutionState::new();
-        let state_id = (0, 0);
+        let state_id = Uuid::nil();
 
         // We start with the number 1 at node 0
         let (_, mut state) = state.upsert_operation(OperationNode::new(
@@ -942,14 +947,14 @@ mod tests {
         assert_eq!(x_state.state_get_value(&2), None);
 
         let ((state_id, state), _) = db.step_execution_with_previous_state(x_state_id.clone(), &x_state.clone()).await?;
-        assert_eq!(state_id.0, 0);
+        assert_eq!(state_id, Uuid::nil());
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
 
         // When we re-evaluate from a previous point, we should get a new branch
         let ((state_id, state), _) = db.step_execution_with_previous_state(x_state_id.clone(), &x_state).await?;
         // The state_id.0 being incremented indicates that we're on a new branch
-        assert_eq!(state_id.0, 1);
+        // TODO: test some structural indiciation of what branch we're on
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
         // Op 2 should re-evaluate to 3, since it's on a new branch but continuing to mutate the stateful counter
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(3)));
@@ -968,7 +973,7 @@ mod tests {
         //    2
 
         let mut state = ExecutionState::new();
-        let state_id = (0, 0);
+        let state_id = Uuid::nil();
 
         // We start with the number 0 at node 0
         let (_, mut state) = state.upsert_operation(OperationNode::new(
@@ -1081,7 +1086,7 @@ mod tests {
         //    4
 
         let mut state = ExecutionState::new();
-        let state_id = (0, 0);
+        let state_id = Uuid::nil();
 
         for x in 0..5 {
             let (_, mut nstate) = state.upsert_operation(OperationNode::new(

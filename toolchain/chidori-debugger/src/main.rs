@@ -10,6 +10,8 @@ mod tidy_tree;
 mod chat;
 mod logs;
 mod shader_trace;
+mod bevy_egui;
+mod egui_json_tree;
 
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
 use bevy::prelude::*;
@@ -17,8 +19,8 @@ use bevy::log::{Level, LogPlugin};
 use bevy::render::render_resource::{Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages};
 use bevy::render::view::{Layer, RenderLayers};
 use bevy_cosmic_edit::*;
-use bevy_egui::{EguiPlugin, egui, EguiContexts};
-use bevy_egui::egui::{Color32, FontData, FontDefinitions, FontFamily, FontId};
+use crate::bevy_egui::{EguiPlugin, egui, EguiContexts};
+use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId};
 use bevy_rapier2d::plugin::{NoUserData, RapierPhysicsPlugin};
 use bevy_rapier2d::render::RapierDebugRenderPlugin;
 use once_cell::sync::{Lazy, OnceCell};
@@ -83,6 +85,11 @@ fn setup(
     //     },
     //     RenderLayers::layer(RENDER_LAYER_ROOT_CAMERA)));
 
+
+    // style_egui_context(contexts);
+}
+
+pub fn style_egui_context(ctx: &mut egui::Context ) {
     let mut fonts = FontDefinitions::default();
 
     fonts.font_data.insert("CommitMono".to_owned(),
@@ -95,10 +102,11 @@ fn setup(
         .insert(0, "CommitMono".to_owned());
 
 
+    egui_extras::install_image_loaders(ctx);
 
-    contexts.ctx_mut().set_fonts(fonts);
+    ctx.set_fonts(fonts);
 
-    let mut style = (*contexts.ctx_mut().style()).clone();
+    let mut style = (*ctx.style()).clone();
     style.text_styles = [
         (bevy_egui::egui::TextStyle::Heading, FontId::new(24.0, bevy_egui::egui::FontFamily::Proportional)),
         (bevy_egui::egui::TextStyle::Body, FontId::new(14.0, bevy_egui::egui::FontFamily::Proportional)),
@@ -109,7 +117,7 @@ fn setup(
         .into();
     style.visuals.widgets.hovered.bg_stroke = bevy_egui::egui::Stroke::new(1.0, Color32::from_hex("#333333").unwrap());
     style.spacing.button_padding = egui::vec2(8.0, 6.0);
-    contexts.ctx_mut().set_style(style);
+    ctx.set_style(style);
 }
 
 fn main() {

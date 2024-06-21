@@ -11,6 +11,7 @@ use tokio::sync::oneshot;
 use futures_util::FutureExt;
 use tracing::{Level, span};
 use crate::cells::{CellTypes, CodeCell, SupportedLanguage, TextRange};
+use crate::execution::execution::execution_graph::ExecutionNodeId;
 use crate::execution::execution::ExecutionState;
 
 
@@ -288,7 +289,7 @@ impl OperationFnOutput {
 pub type OperationFn = dyn Fn(
     &ExecutionState,
     RkyvSerializedValue,
-    Option<Sender<((usize, usize), RkyvSerializedValue)>>,
+    Option<Sender<(ExecutionNodeId, RkyvSerializedValue)>>,
     Option<AsyncRPCCommunication>
 ) -> Pin<Box<dyn Future<Output = anyhow::Result<OperationFnOutput>> + Send>> + Send;
 
@@ -413,7 +414,7 @@ impl OperationNode {
         &self,
         state: &ExecutionState,
         argument_payload: RkyvSerializedValue,
-        intermediate_output_channel_tx: Option<Sender<((usize, usize), RkyvSerializedValue)>>,
+        intermediate_output_channel_tx: Option<Sender<(ExecutionNodeId, RkyvSerializedValue)>>,
         async_communication_channel: Option<AsyncRPCCommunication>,
     ) -> Pin<Box<dyn Future<Output=anyhow::Result<OperationFnOutput>> + Send>> {
         /// Receiver that we pass to the exec for it to capture oneshot RPC communication

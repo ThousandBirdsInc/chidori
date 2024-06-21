@@ -1,4 +1,4 @@
-use crate::language::{ChidoriStaticAnalysisError, Report, ReportItem, ReportTriggerableFunctions};
+use crate::language::{ChidoriStaticAnalysisError, InternalCallGraph, Report, ReportItem, ReportTriggerableFunctions};
 use rustpython_parser::ast::{Constant, Expr, Identifier, Stmt};
 use rustpython_parser::{ast, Parse};
 use serde::{Deserialize, Serialize};
@@ -833,6 +833,9 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
     depended_values.retain(|value,_ | !py_built_ins.contains(value.as_str()));
 
     Report {
+        internal_call_graph: InternalCallGraph {
+            graph: Default::default(),
+        },
         cell_exposed_values: exposed_values,
         cell_depended_values: depended_values,
         triggerable_functions: triggerable_functions,
@@ -1021,6 +1024,10 @@ mod tests {
         });
         let result = build_report(&context_stack_references);
         let report = Report {
+
+            internal_call_graph: InternalCallGraph {
+                graph: Default::default(),
+            },
             cell_exposed_values: std::collections::HashMap::new(), // No data provided, initializing as empty
             cell_depended_values: {
                 let mut map = std::collections::HashMap::new();
@@ -1076,6 +1083,10 @@ x = random.randint(0, 10)
         });
         let result = build_report(&context_stack_references);
         let report = Report {
+
+            internal_call_graph: InternalCallGraph {
+                graph: Default::default(),
+            },
             cell_exposed_values: {
                 let mut map = std::collections::HashMap::new();
                 map.insert(
@@ -1128,6 +1139,10 @@ x = random.randint(0, 10)
         });
         let result = build_report(&context_stack_references);
         let report = Report {
+
+            internal_call_graph: InternalCallGraph {
+                graph: Default::default(),
+            },
             cell_exposed_values: std::collections::HashMap::new(), // No data provided, initializing as empty
             cell_depended_values: std::collections::HashMap::new(),
             triggerable_functions: {
@@ -1220,6 +1235,10 @@ x = random.randint(0, 10)
         });
         let result = build_report(&context_stack_references);
         let report = Report {
+
+            internal_call_graph: InternalCallGraph {
+                graph: Default::default(),
+            },
             cell_exposed_values: std::collections::HashMap::new(), // No data provided, initializing as empty
             cell_depended_values: {
                 let mut map = std::collections::HashMap::new();

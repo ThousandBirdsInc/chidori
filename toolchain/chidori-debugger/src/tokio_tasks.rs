@@ -11,6 +11,7 @@ use chidori_core::tokio::runtime::EnterGuard;
 
 static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     chidori_core::tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
         .enable_all() // Ensures that I/O and time facilities are enabled
         .build()
         .unwrap() // Handling errors in a real application might need more care

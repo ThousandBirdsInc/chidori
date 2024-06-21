@@ -11,7 +11,9 @@ def add_two(x):
 import { assertEquals } from "https://deno.land/std@0.221.0/assert/mod.ts";
 
 Deno.test("addition test", async () => {
-    assertEquals(await add_two(2), 4);
+    const result = await add_two(2);
+    console.log(result);
+    assertEquals(result, 4);
 });
 ```
 
