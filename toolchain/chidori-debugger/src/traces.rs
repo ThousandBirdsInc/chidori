@@ -97,7 +97,7 @@ fn color_for_bucket(t: f32, a: f32) -> Color {
     let C_d = 0.1;
     let L_0 = 0.2;
     let L_d = 0.1;
-    let x = triangle_wave(30.0 * t);
+    let x = triangle_wave(10.0 * t);
     let H = 360.0 * (0.9 * t);
     let C = C_0 + C_d * x;
     let L = L_0 - L_d * x;
@@ -108,6 +108,7 @@ fn color_for_bucket(t: f32, a: f32) -> Color {
         alpha: a,
     }
 }
+
 
 
 fn update_trace_space_to_camera_configuration(
@@ -484,7 +485,7 @@ fn build_call_tree(events: Vec<TraceEvents>, collapse_gaps: bool) -> CallTree {
     vec_keys.sort_by_key(|(idx, key)| key.clone());
     for (i, v ) in vec_keys.iter().enumerate() {
         graph.node_weight_mut(v.0).map(|node| {
-            node.color_bucket = ((255. * i as f32) / vec_keys.len() as f32).floor();
+            node.color_bucket = ((i as f32) / vec_keys.len() as f32);
         });
     }
 
@@ -640,7 +641,6 @@ fn update_positions(
                     idx += 1;
 
                     // Filter rendering to only the currently viewed thread depth?
-                    // Change the alpha transparency of increasing thread depth
 
                     // Scaled to 1000.0 unit width, offset to move from centered to left aligned
                     // let config_space_pos_x = scale_to_target(node.absolute_timestamp - startpoint_value, endpoint_value - startpoint_value, CAMERA_SPACE_WIDTH) - (CAMERA_SPACE_WIDTH / 2.0);
@@ -649,7 +649,7 @@ fn update_positions(
                     let screen_space_pos_y = ((node.depth as f32) * -1.0 * span_height + span_height / 2.0) * node.thread_depth as f32;
                     // let screen_space_pos_y = ((node.depth as f32) * -1.0 * span_height + span_height / 2.0) * 1.0 as f32;
                     max_vertical_extent = max_vertical_extent.max(screen_space_pos_y.abs() + span_height / 2.0);
-                    instances[idx].color = color_for_bucket(node.color_bucket, (max_thread_depth - node.thread_depth) as f32 / *max_thread_depth as f32).as_rgba_f32();
+                    instances[idx].color = color_for_bucket(node.color_bucket, 1.0).as_rgba_f32();
                     instances[idx].width = config_space_width;
                     instances[idx].position.x = config_space_pos_x + (config_space_width / 2.0);
                     instances[idx].position.y = screen_space_pos_y;

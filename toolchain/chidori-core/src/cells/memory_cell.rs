@@ -118,7 +118,7 @@ mod test {
     #[tokio::test]
     async fn test_memory_cell() -> anyhow::Result<()> {
         let (async_rpc_communication, rpc_sender, callable_interface_receiver) = AsyncRPCCommunication::new();
-        let mut state = ExecutionState::new();
+        let mut state = ExecutionState::new_with_random_id();
         let (mut state, _) = state.update_op(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,

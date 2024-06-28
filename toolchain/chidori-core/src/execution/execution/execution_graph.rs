@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use crate::execution::execution::execution_state::{DependencyGraphMutation, ExecutionState, ExecutionStateEvaluation};
 use std::fmt;
 use std::fmt::Debug;
@@ -11,6 +11,7 @@ use std::sync::{Mutex};
 // use no_deadlocks::Mutex;
 use std::thread::{JoinHandle};
 use std::time::Duration;
+use anyhow::anyhow;
 use futures_util::FutureExt;
 
 use crate::execution::primitives::identifiers::{DependencyReference, OperationId};
@@ -91,6 +92,11 @@ pub struct ExecutionGraph {
     pub execution_depth_orchestration_handle: tokio::task::JoinHandle<()>,
     pub execution_depth_orchestration_initialized_notify: Arc<Notify>,
     pub cancellation_notify: Arc<Notify>,
+
+    /// This is a queue of chat messages applied to our execution system
+    /// execution states maintain a value that indicates the head location within this queue
+    /// that they've processed thus far.
+    pub chat_message_queue: Vec<String>,
 }
 
 impl std::fmt::Debug for ExecutionGraph {
@@ -124,16 +130,16 @@ impl ExecutionGraph {
 
         // Initialization of the execution graph at 0,0
         let init_id = Uuid::nil();
-        state_id_to_state.insert(init_id, ExecutionStateEvaluation::Complete(ExecutionState::with_graph_sender(
+        let state =
+        state_id_to_state.insert(init_id, ExecutionStateEvaluation::Complete(ExecutionState::new_with_graph_sender(
             init_id,
             Arc::new(sender.clone())
         )));
 
-        let mut state_id_to_state = Arc::new(Mutex::new(state_id_to_state));
-
         let mut execution_graph = Arc::new(Mutex::new(DiGraphMap::new()));
-
         let execution_graph_clone = execution_graph.clone();
+
+        let mut state_id_to_state = Arc::new(Mutex::new(state_id_to_state));
         let state_id_to_state_clone = state_id_to_state.clone();
 
         let initialization_notify = Arc::new(Notify::new());
@@ -212,12 +218,14 @@ impl ExecutionGraph {
             }
         });
         ExecutionGraph {
+            
             cancellation_notify,
             execution_depth_orchestration_initialized_notify: initialization_notify,
             execution_depth_orchestration_handle: handle,
             execution_node_id_to_state: state_id_to_state,
             execution_graph,
             graph_mutation_sender: sender,
+            chat_message_queue: vec![],
         }
     }
 
@@ -253,18 +261,18 @@ impl ExecutionGraph {
         while let Some(node) = dfs.next(graph.deref()) {
             if node == root {
                 break;
-            } else {
-                for predecessor in graph.neighbors_directed(node, Direction::Incoming) {
-                    if !dfs.discovered.is_visited(&predecessor) {
-                        queue.push(predecessor);
-                        dfs.stack.push(predecessor);
-                    }
+            }
+            for predecessor in graph.neighbors_directed(node, Direction::Incoming) {
+                if !dfs.discovered.is_visited(&predecessor) {
+                    queue.push(predecessor);
+                    dfs.stack.push(predecessor);
                 }
             }
         }
 
         let mut merged_state = HashMap::new();
         for predecessor in queue {
+            println!("Getting state {:?}", &predecessor);
             let state = self.get_state_at_id(predecessor).unwrap();
             if let ExecutionStateEvaluation::Complete(state) = state {
                 for (k, v) in state.state.iter() {
@@ -276,7 +284,16 @@ impl ExecutionGraph {
     }
 
     #[tracing::instrument]
-    fn progress_graph(&mut self, prev_execution_id: ExecutionNodeId, new_state: ExecutionStateEvaluation) -> ExecutionNodeId {
+    pub async fn push_message(
+        &mut self,
+        message: String,
+    ) -> anyhow::Result<()> {
+        self.chat_message_queue.push(message);
+        Ok(())
+    }
+
+    #[tracing::instrument]
+    fn progress_graph(&mut self, new_state: ExecutionStateEvaluation) -> ExecutionNodeId {
         // The edge from this node is the greatest branching id + 1
         // if we re-evaluate execution at a given node, we get a new execution branch.
         let mut execution_graph = self.execution_graph.lock().unwrap();
@@ -288,6 +305,7 @@ impl ExecutionGraph {
             },
             ExecutionStateEvaluation::Executing(_) => panic!("Cannot progress an execution state that is currently executing"),
         };
+        println!("Inserting into graph {:?}", &resulting_state_id);
         state_id_to_state.deref_mut().insert(resulting_state_id.clone(), new_state.clone());
         execution_graph.deref_mut()
             .add_edge(parent_id, resulting_state_id.clone(), new_state.clone());
@@ -305,7 +323,6 @@ impl ExecutionGraph {
     #[tracing::instrument]
     pub async fn step_execution_with_previous_state(
         &mut self,
-        prev_execution_id: ExecutionNodeId,
         previous_state: &ExecutionStateEvaluation,
     ) -> anyhow::Result<(
         (ExecutionNodeId, ExecutionStateEvaluation), // the resulting total state of this step
@@ -315,9 +332,8 @@ impl ExecutionGraph {
             ExecutionStateEvaluation::Complete(state) => state,
             ExecutionStateEvaluation::Executing(_) => panic!("Cannot step an execution state that is currently executing"),
         };
-        // TODO: Execution can only be stepped when the previous state is complete
         let (new_state, outputs) = previous_state.step_execution(&self.graph_mutation_sender).await?;
-        let resulting_state_id = self.progress_graph(prev_execution_id, new_state.clone());
+        let resulting_state_id = self.progress_graph(new_state.clone());
         Ok(((resulting_state_id, new_state), outputs))
     }
 
@@ -332,22 +348,24 @@ impl ExecutionGraph {
         (ExecutionNodeId, ExecutionStateEvaluation), // the resulting total state of this step
         usize, // id of the new operation
     )> {
-        let state = self.get_state_at_id(prev_execution_id);
-        if let Some(state) = state {
-            let (final_state, op_id2) = match &state {
-                ExecutionStateEvaluation::Complete(state1) => {
-                    println!("Capturing state of the mutate graph operation parent {:?}, id {:?}", state1.parent_state_id, state1.id);
-                    state1.update_op(cell, op_id)?
-                },
-                ExecutionStateEvaluation::Executing(_) => panic!("Cannot mutate a graph that is currently executing"),
-            };
-            let eval = ExecutionStateEvaluation::Complete(final_state.clone());
-            println!("Capturing final_state of the mutate graph operation parent {:?}, id {:?}", final_state.parent_state_id, final_state.id);
-            let resulting_state_id = self.progress_graph(prev_execution_id, eval.clone());
-            Ok(((resulting_state_id, eval), op_id2))
-        } else {
-            panic!("No state found for id {:?}", prev_execution_id);
-        }
+        let state = self.get_state_at_id(prev_execution_id)
+            .ok_or_else(|| anyhow!("No state found for id {:?}", prev_execution_id))?;
+        let (final_state, op_id) = match state {
+            ExecutionStateEvaluation::Complete(state) => {
+                println!( "Capturing state of the mutate graph operation parent {:?}, id {:?}", state.parent_state_id, state.id);
+                let state = state.clone_with_new_id();
+                state.update_op(cell, op_id)?
+            },
+            ExecutionStateEvaluation::Executing(_) => {
+                return Err(anyhow!("Cannot mutate a graph that is currently executing"))
+            },
+        };
+
+        let eval = ExecutionStateEvaluation::Complete(final_state.clone());
+        println!("Capturing final_state of the mutate graph operation parent {:?}, id {:?}", final_state.parent_state_id, final_state.id);
+
+        let resulting_state_id = self.progress_graph(eval.clone());
+        Ok(((resulting_state_id, eval), op_id))
     }
 
     #[tracing::instrument]
@@ -360,7 +378,7 @@ impl ExecutionGraph {
     )> {
         let state = self.get_state_at_id(prev_execution_id);
         if let Some(state) = state {
-            self.step_execution_with_previous_state(prev_execution_id, &state).await
+            self.step_execution_with_previous_state(&state).await
         } else {
             panic!("No state found for id {:?}", prev_execution_id);
         }
@@ -385,7 +403,7 @@ mod tests {
     #[tokio::test]
     async fn test_evaluation_single_node() -> anyhow::Result<()> {
         let mut db = ExecutionGraph::new();
-        let mut state = ExecutionState::new();
+        let mut state = ExecutionState::new_with_random_id();
         let state_id = Uuid::nil();
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
@@ -449,7 +467,7 @@ mod tests {
             stderr: vec![],
         });
 
-        let ((_, new_state), _) = db.step_execution_with_previous_state(state_id, &ExecutionStateEvaluation::Complete(state.clone())).await?;
+        let ((_, new_state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state.clone())).await?;
 
         assert!(new_state.state_get_value(&2).is_some());
         let result = new_state.state_get_value(&2).unwrap();
@@ -465,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn test_traverse_single_node() -> anyhow::Result<()> {
         let mut db = ExecutionGraph::new();
-        let mut state = ExecutionState::new();
+        let mut state = ExecutionState::new_with_random_id();
         let state_id = Uuid::nil();
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
@@ -487,12 +505,12 @@ mod tests {
                 depends_on: vec![(0, DependencyReference::Positional(0))],
             }]);
 
-        let ((_, new_state), _) = db.step_execution_with_previous_state(state_id, &ExecutionStateEvaluation::Complete(state)).await?;
+        let ((_, new_state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
         assert_eq!(
             new_state.state_get_value(&0).unwrap(),
             &RkyvSerializedValue::Number(0)
         );
-        let ((_, new_state), _) = db.step_execution_with_previous_state(state_id, &new_state).await?;
+        let ((_, new_state), _) = db.step_execution_with_previous_state(&new_state).await?;
         assert_eq!(
             new_state.state_get_value(&1).unwrap(),
             &RkyvSerializedValue::Number(1)
@@ -511,7 +529,7 @@ mod tests {
         //    |
         //    2
 
-        let mut state = ExecutionState::new();
+        let mut state = ExecutionState::new_with_random_id();
         let state_id = Uuid::nil();
 
         let (_, mut state) = state.upsert_operation(OperationNode::new(
@@ -549,28 +567,28 @@ mod tests {
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &ExecutionStateEvaluation::Complete(state)).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), None);
         if let ExecutionStateEvaluation::Complete(s) = &state {
             assert_eq!(s.marked_for_consumption, HashSet::new());
             assert_eq!(s.exec_queue, VecDeque::from(vec![1,2]));
         }
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get_value(&2), None);
         if let ExecutionStateEvaluation::Complete(s) = &state {
             assert_eq!(s.marked_for_consumption, HashSet::from_iter(vec![0]));
             assert_eq!(s.exec_queue, VecDeque::from(vec![2]));
         }
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
         if let ExecutionStateEvaluation::Complete(s) = &state {
             assert_eq!(s.marked_for_consumption, HashSet::from_iter(vec![1, 0]));
             assert_eq!(s.exec_queue, VecDeque::from(vec![]));
         }
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
         if let ExecutionStateEvaluation::Complete(s) = &state {
@@ -591,7 +609,7 @@ mod tests {
         //   / \
         //  2   3
 
-        let mut state = ExecutionState::new();
+        let mut state = ExecutionState::new_with_random_id();
         let state_id = Uuid::nil();
 
         for x in 0..4 {
@@ -620,22 +638,22 @@ mod tests {
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &ExecutionStateEvaluation::Complete(state)).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get_value(&2), None);
         assert_eq!(state.state_get_value(&3), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
         assert_eq!(state.state_get_value(&3), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
         assert_eq!(state.state_get_value(&3), Some(&RSV::Number(3)));
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
         assert_eq!(state.state_get_value(&3), Some(&RSV::Number(3)));
@@ -655,7 +673,7 @@ mod tests {
         //   \ /
         //    4
 
-        let mut state = ExecutionState::new();
+        let mut state = ExecutionState::new_with_random_id();
         let state_id = Uuid::nil();
         for x in 0..5 {
             let (_, mut nstate) = state.upsert_operation(OperationNode::new(
@@ -690,18 +708,18 @@ mod tests {
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &ExecutionStateEvaluation::Complete(state)).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get_value(&2), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
         assert_eq!(state.state_get_value(&3), Some(&RSV::Number(3)));
         assert_eq!(state.state_get_value(&4), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), None);
         assert_eq!(state.state_get_value(&3), None);
@@ -724,7 +742,7 @@ mod tests {
         //    |
         //    5
 
-        let mut state = ExecutionState::new();
+        let mut state = ExecutionState::new_with_random_id();
         let state_id = Uuid::nil();
 
         // We start with the number 1 at node 0
@@ -818,53 +836,53 @@ mod tests {
         ]);
 
         // We expect to see the value at each node increment repeatedly.
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &ExecutionStateEvaluation::Complete(state)).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
 
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(2)));
         assert_eq!(state.state_get_value(&2), None);
         assert_eq!(state.state_get_value(&3), None);
         assert_eq!(state.state_get_value(&4), None);
         assert_eq!(state.state_get_value(&5), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(3)));
         assert_eq!(state.state_get_value(&3), None);
         assert_eq!(state.state_get_value(&4), None);
         assert_eq!(state.state_get_value(&5), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), None);
         assert_eq!(state.state_get_value(&3), None);
         assert_eq!(state.state_get_value(&4), Some(&RSV::Number(4)));
         assert_eq!(state.state_get_value(&5), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), None);
         assert_eq!(state.state_get_value(&3), Some(&RSV::Number(5)));
         assert_eq!(state.state_get_value(&4), None);
         assert_eq!(state.state_get_value(&5), Some(&RSV::Number(5)));
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(6)));
         assert_eq!(state.state_get_value(&2), None);
         assert_eq!(state.state_get_value(&3), None);
         assert_eq!(state.state_get_value(&4), None);
         assert_eq!(state.state_get_value(&5), Some(&RSV::Number(5)));
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(7)));
         assert_eq!(state.state_get_value(&3), None);
         assert_eq!(state.state_get_value(&4), None);
         assert_eq!(state.state_get_value(&5), Some(&RSV::Number(5)));
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), None);
         assert_eq!(state.state_get_value(&3), None);
         assert_eq!(state.state_get_value(&4), Some(&RSV::Number(8)));
         assert_eq!(state.state_get_value(&5), Some(&RSV::Number(5)));
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), None);
         assert_eq!(state.state_get_value(&3), Some(&RSV::Number(9)));
@@ -884,7 +902,7 @@ mod tests {
         //    |
         //    2
 
-        let mut state = ExecutionState::new();
+        let mut state = ExecutionState::new_with_random_id();
         let state_id = Uuid::nil();
 
         // We start with the number 1 at node 0
@@ -939,20 +957,20 @@ mod tests {
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &ExecutionStateEvaluation::Complete(state)).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), None);
-        let ((x_state_id, x_state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((x_state_id, x_state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(x_state.state_get_value(&1), Some(&RSV::Number(1)));
         assert_eq!(x_state.state_get_value(&2), None);
 
-        let ((state_id, state), _) = db.step_execution_with_previous_state(x_state_id.clone(), &x_state.clone()).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&x_state.clone()).await?;
         assert_eq!(state_id, Uuid::nil());
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
 
         // When we re-evaluate from a previous point, we should get a new branch
-        let ((state_id, state), _) = db.step_execution_with_previous_state(x_state_id.clone(), &x_state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&x_state).await?;
         // The state_id.0 being incremented indicates that we're on a new branch
         // TODO: test some structural indiciation of what branch we're on
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
@@ -972,7 +990,7 @@ mod tests {
         //    |
         //    2
 
-        let mut state = ExecutionState::new();
+        let mut state = ExecutionState::new_with_random_id();
         let state_id = Uuid::nil();
 
         // We start with the number 0 at node 0
@@ -1038,13 +1056,13 @@ mod tests {
             },
         ]);
 
-        let ((x_state_id, mut x_state), _) = db.step_execution_with_previous_state(state_id, &ExecutionStateEvaluation::Complete(state)).await?;
+        let ((x_state_id, mut x_state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
         assert_eq!(x_state.state_get_value(&1), None);
         assert_eq!(x_state.state_get_value(&2), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(x_state_id, &x_state.clone()).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&x_state.clone()).await?;
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get_value(&2), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
 
@@ -1056,10 +1074,10 @@ mod tests {
                 OutputSignature::new(),
                 Box::new(f_v2),
             ), Some(1));
-            let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &ExecutionStateEvaluation::Complete(state.clone())).await?;
+            let ((state_id, state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state.clone())).await?;
             assert_eq!(state.state_get_value(&1), Some(&RSV::Number(200)));
             assert_eq!(state.state_get_value(&2), None);
-            let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+            let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
             assert_eq!(state.state_get_value(&1), Some(&RSV::Number(200)));
             assert_eq!(state.state_get_value(&2), Some(&RSV::Number(201)));
         }
@@ -1085,7 +1103,7 @@ mod tests {
         //   \ /
         //    4
 
-        let mut state = ExecutionState::new();
+        let mut state = ExecutionState::new_with_random_id();
         let state_id = Uuid::nil();
 
         for x in 0..5 {
@@ -1121,26 +1139,26 @@ mod tests {
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &ExecutionStateEvaluation::Complete(state)).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get_value(&2), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
         assert_eq!(state.state_get_value(&3), None);
         assert_eq!(state.state_get_value(&4), None);
 
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
         assert_eq!(state.state_get_value(&3), Some(&RSV::Number(3)));
         assert_eq!(state.state_get_value(&4), None);
 
         // This is the final state we're arriving at in execution
-        let ((state_id, state), _) = db.step_execution_with_previous_state(state_id, &state).await?;
+        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
         assert_eq!(state.state_get_value(&3), Some(&RSV::Number(3)));

@@ -1,4 +1,4 @@
-# Demonstrating how a prompt is capable of generating source code and executing it
+# Demonstrating how a prompt is capable of generating source code and immediately executing it
 
 ```codegen (gen_fib_sequence)
 ---
@@ -7,7 +7,7 @@ language: python
 ---
 Generate a function that returns the Fibonacci sequence up to the nth number. 
 The function should be named `fib_sequence` and should accept a single 
-argument `n` which is the number of Fibonacci numbers to generate.
+argument `n` which is the amount of the Fibonacci sequence to generate.
 ```
 
 

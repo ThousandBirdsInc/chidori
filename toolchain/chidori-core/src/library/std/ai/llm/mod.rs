@@ -13,6 +13,7 @@ use crate::execution::execution::ExecutionState;
 use crate::execution::primitives::operation::InputSignature;
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue, serialized_value_to_json_value};
 use crate::library::std::ai::llm::openai::OpenAIChatModel;
+use crate::sdk::md::interpret_code_block;
 
 #[derive(Debug)]
 pub enum LLMErrors {
@@ -334,8 +335,6 @@ pub async fn ai_llm_run_chat_model(
 
     let tools = infer_tool_usage_from_imports(execution_state, &configuration.import);
 
-    // TODO: replace this to being fetched from configuration
-    // let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
     let api_url_v1 = configuration.api_url.clone();
     let c = crate::library::std::ai::llm::openai::OpenAIChatModel::new(api_url_v1.unwrap_or("http://localhost:4000/v1".to_string()), "".to_string());
 
@@ -455,18 +454,21 @@ pub async fn ai_llm_code_generation_chat_model(
     if let Ok(ChatCompletionRes { choices, .. }) = result {
         for choice in choices {
             let text = choice.text.as_ref().unwrap().clone();
-            println!("Code generation cell run with this prompt: {}", &text);
-            let new_execution_state = execution_state.clone();
-            let (new_execution_state, _) = new_execution_state.update_op(crate::cells::CellTypes::Code(crate::cells::CodeCell {
-                name: None,
-                language: match configuration.language.unwrap_or("python".to_string()).as_str() {
-                    "python" => crate::cells::SupportedLanguage::PyO3,
-                    "javascript" => crate::cells::SupportedLanguage::Deno,
-                    _ => crate::cells::SupportedLanguage::PyO3,
-                },
-                source_code: text.clone(),
-                function_invocation: None,
-            }, TextRange::default()), None)?;
+            println!("Code generation cell run, returning this payload: {}", &text);
+            let mut new_execution_state = execution_state.clone();
+
+            let mut cells = vec![];
+            crate::sdk::md::extract_code_blocks(&text)
+                .iter()
+                .filter_map(|block| interpret_code_block(block))
+                .for_each(|block| { cells.push(block); });
+            cells.sort();
+
+            for cell in cells {
+                let (s, _) = new_execution_state.update_op(cell, None)?;
+                new_execution_state = s;
+            }
+
             return Ok((RkyvSerializedValue::String(text.clone()), Some(new_execution_state)));
         }
         Ok((RkyvSerializedValue::Null, None))
@@ -524,7 +526,7 @@ mod test {
 
     #[tokio::test]
     async fn test_tool_usage_inference() -> anyhow::Result<()> {
-        let mut state = ExecutionState::new();
+        let mut state = ExecutionState::new_with_random_id();
         let (mut state, _) = state.update_op(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,

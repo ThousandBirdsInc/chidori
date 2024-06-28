@@ -1,4 +1,4 @@
-use crate::language::{ChidoriStaticAnalysisError, InternalCallGraph, Report, ReportItem, ReportTriggerableFunctions};
+use crate::language::{ChidoriStaticAnalysisError, InternalCallGraph, Report, ReportItem, ReportTriggerableFunctions, TextRange};
 use rustpython_parser::ast::{Constant, Expr, Identifier, Stmt};
 use rustpython_parser::{ast, Parse};
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use std::collections::HashSet;
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum ContextPath {
     Initialized,
-    InFunction(String),
+    InFunction(String, TextRange),
     FunctionArguments,
     FunctionArgument(String),
     InClass(String),
@@ -102,9 +102,9 @@ impl ASTWalkContext {
         self.context_stack.len()
     }
 
-    fn enter_statement_function(&mut self, name: &Identifier) -> usize {
+    fn enter_statement_function(&mut self, name: &Identifier, text_range: TextRange) -> usize {
         self.context_stack
-            .push(ContextPath::InFunction(name.to_string()));
+            .push(ContextPath::InFunction(name.to_string(), text_range));
         self.context_stack_references
             .push(self.context_stack.clone());
         self.context_stack.len()
@@ -200,7 +200,6 @@ fn traverse_expression(expr: &ast::Expr, machine: &mut ASTWalkContext) {
             traverse_expression(value, machine);
         }
         ast::Expr::BinOp(expr) => {
-            // dbg!(expr);
             let ast::ExprBinOp { left, right, .. } = expr;
             traverse_expression(left, machine);
             traverse_expression(right, machine);
@@ -441,12 +440,16 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                 decorator_list,
                 name,
                 args,
+                range,
                 ..
             }) => {
                 machine.globals.insert(name.to_string());
                 // TODO: this does include typeparams
                 machine.new_local_context();
-                let idx = machine.enter_statement_function(name);
+                let idx = machine.enter_statement_function(name, TextRange {
+                    start: range.start().to_usize(),
+                    end: range.end().to_usize()
+                });
                 for (i, decorator) in decorator_list.iter().enumerate() {
                     let idx = machine.enter_decorator_expression(&i);
                     traverse_expression(decorator, machine);
@@ -475,11 +478,15 @@ pub fn traverse_statements(statements: &[ast::Stmt], machine: &mut ASTWalkContex
                 decorator_list,
                 name,
                 args,
+                range,
                 ..
             }) => {
                 machine.globals.insert(name.to_string());
                 machine.new_local_context();
-                let idx = machine.enter_statement_function(name);
+                let idx = machine.enter_statement_function(name, TextRange {
+                    start: range.start().to_usize(),
+                    end: range.end().to_usize()
+                });
                 for (i, decorator) in decorator_list.iter().enumerate() {
                     let idx = machine.enter_decorator_expression(&i);
                     traverse_expression(decorator, machine);
@@ -692,7 +699,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
             encountered.push(context_path_unit);
 
             // If we've declared a top level function, it is exposed
-            if let ContextPath::InFunction(name) = context_path_unit {
+            if let ContextPath::InFunction(name, _) = context_path_unit {
                 if !triggerable_functions.contains_key(name) {
                     triggerable_functions
                         .entry(name.clone())
@@ -710,7 +717,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                 // traverse back through path until we hit the InFunction
                 let clone_path = context_path.clone();
                 for (idx, context_path_unit) in (clone_path.into_iter()).rev().enumerate() {
-                    if let ContextPath::InFunction(function_name) = context_path_unit {
+                    if let ContextPath::InFunction(function_name, _) = context_path_unit {
                         let mut x = triggerable_functions
                             .entry(function_name.clone())
                             .or_insert_with(|| ReportTriggerableFunctions {
@@ -729,7 +736,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                 if ContextPath::Attribute(String::from("emit_as")) == context_path[idx - 1] {
                     if let ContextPath::Constant(const_name) = &context_path[idx - 2] {
                         if let ContextPath::InFunctionDecorator(_) = context_path[idx - 4] {
-                            if let ContextPath::InFunction(name) = &context_path[idx - 5] {
+                            if let ContextPath::InFunction(name, _) = &context_path[idx - 5] {
                                 let mut x = triggerable_functions
                                     .entry(name.clone())
                                     .or_insert_with(|| ReportTriggerableFunctions {
@@ -749,7 +756,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                 if ContextPath::Attribute(String::from("on_event")) == context_path[idx - 1] {
                     if let ContextPath::Constant(const_name) = &context_path[idx - 2] {
                         if let ContextPath::InFunctionDecorator(_) = context_path[idx - 4] {
-                            if let ContextPath::InFunction(name) = &context_path[idx - 5] {
+                            if let ContextPath::InFunction(name, _) = &context_path[idx - 5] {
                                 let mut x = triggerable_functions
                                     .entry(name.clone())
                                     .or_insert_with(|| ReportTriggerableFunctions {
@@ -768,11 +775,11 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                 if identifier != &String::from("ch") {
 
                     // If we encounter both FunctionArguments and InFunction, then this is a function argument
-                    if encountered.iter().any(|x| matches!(x, ContextPath::InFunction(_)))
+                    if encountered.iter().any(|x| matches!(x, ContextPath::InFunction(_, _)))
                         && encountered.iter().any(|x| matches!(x, ContextPath::FunctionArguments))
                     {
                         for context_path_unit in &encountered {
-                            if let ContextPath::InFunction(function_name) = context_path_unit {
+                            if let ContextPath::InFunction(function_name, _) = context_path_unit {
                                 let mut x = triggerable_functions
                                     .entry(function_name.clone())
                                     .or_insert_with(|| ReportTriggerableFunctions {
@@ -790,7 +797,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                     // This is an exposed value if it does not occur inside the scope of a function
                     if encountered
                         .iter()
-                        .find(|x| matches!(x, ContextPath::InFunction(_)))
+                        .find(|x| matches!(x, ContextPath::InFunction(_, _)))
                         .is_none()
                     {
                         if encountered.contains(&&ContextPath::AssignmentToStatement) {

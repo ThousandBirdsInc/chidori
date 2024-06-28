@@ -165,6 +165,7 @@ fn invoke(py: Python, arg: PyObject) -> PyResult<PyObject> {
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use dashmap::DashMap;
+use regex::Regex;
 
 static SOURCE_CODE_RUN_COUNTER: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
 static CURRENT_PYTHON_EXECUTION_ID: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
@@ -254,7 +255,6 @@ pub async fn source_code_run_python(
     let result =  Python::with_gil(|py| {
         // TODO: this was causing a deadlock
         // let current_event_loop = pyo3_asyncio::tokio::get_current_loop(py);
-
         // Initialize our event loop if one is not already established
         // let event_loop = if current_event_loop.is_err() {
         //     let asyncio = py.import("asyncio")?;
@@ -329,6 +329,9 @@ pub async fn source_code_run_python(
             .lines()
             .any(|line| line.contains("asyncio.run") || line.contains("unittest.IsolatedAsyncioTestCase") || line.contains("loadTestsFromTestCase"));
 
+        // TODO: how do we then map these back to their originals
+        // let (mut initial_source_code, map_of_renamed_fns_to_original ) = rename_triggerable_functions(&report, &initial_source_code);
+
         let mut complete_code = if does_contain_async_runtime {
             // If we have an async function, we don't need to wrap it in an async function
             initial_source_code
@@ -343,12 +346,16 @@ pub async fn source_code_run_python(
             }
             // Necessary to expose defined functions to the global scope from the inside of the __wrapper function
             for (name, report_item) in &report.triggerable_functions {
+
+                // Declare in our output what functions were defined by this run.
                 initial_source_code.push_str("\n");
                 initial_source_code.push_str(&format!(
                     r#"chidori.set_value({exec_id}, "{name}", "function")"#,
                     exec_id = exec_id,
                     name = name
                 ));
+
+                // Assign a mapping of functions declared within the module to a global map
                 initial_source_code.push_str("\n");
                 initial_source_code.push_str(&format!(
                     r#"globals()["{name}"] = {name}"#,
@@ -356,6 +363,7 @@ pub async fn source_code_run_python(
                 ));
             }
             let indent_all_source_code = initial_source_code.lines().map(|line| format!("    {}", line)).collect::<Vec<_>>().join("\n");
+
             // Wrap all of our code in a top level async wrapper
             format!(r#"
 import asyncio
@@ -368,6 +376,10 @@ asyncio.run(__wrapper())
         complete_code.push_str("\n");
         complete_code.push_str("import sys\nsys.stdout.flush()\nsys.stderr.flush()");
         complete_code.push_str("\n");
+
+
+        // TODO:
+
 
         // Important: this is the point of initial execution of the source code
         py.run(&complete_code, Some(globals), None)?;
@@ -460,6 +472,51 @@ asyncio.run(__wrapper())
     }
 }
 
+
+// fn create_internal_proxy_shims(execution_state_handle: &Arc<Mutex<ExecutionState>>, map_of_renamed_fns_to_original: HashMap<String, String>, py: Python, globals: &PyDict) -> Result<(), Error> {
+//     // Create shims for the functions declared within this file, when a hashed reference to a function is invoked, we invoke the actual function internally.
+//
+//     let function_names = {
+//         let execution_state_handle = execution_state_handle.clone();
+//         let mut exec_state = execution_state_handle.lock().unwrap();
+//         exec_state.function_name_to_metadata.keys().cloned().collect::<Vec<_>>()
+//     };
+//     for function_name in function_names {
+//         if report
+//             .cell_depended_values
+//             .contains_key(&function_name)
+//         {
+//             let clone_function_name = function_name.clone();
+//             let execution_state_handle = execution_state_handle.clone();
+//             let closure_callable = PyCFunction::new_closure(
+//                 py,
+//                 None, // name
+//                 None, // doc
+//                 move |args: &PyTuple, kwargs: Option<&PyDict>| -> PyResult<PyObject> {
+//                     let total_arg_payload = python_args_to_rkyv(args, kwargs)?;
+//                     let clone_function_name = clone_function_name.clone();
+//                     let py = args.py();
+//                     // All function calls across cells are forced to be async
+//                     let mut new_exec_state = {
+//                         let mut exec_state = execution_state_handle.lock().unwrap();
+//                         let mut new_exec_state = exec_state.clone();
+//                         std::mem::swap(&mut *exec_state, &mut new_exec_state);
+//                         new_exec_state
+//                     };
+//                     pyo3_asyncio::tokio::future_into_py(py, async move {
+//                         let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload).await.map_err(|e| AnyhowErrWrapper(e))?;
+//                         PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result)))
+//                     }).map(|x| x.into())
+//                 },
+//             )?;
+//             // TODO: this should get something that identifies some kind of signal
+//             //       for how to fetch the execution state
+//             globals.set_item(function_name.clone(), closure_callable);
+//         }
+//     }
+//     Ok(())
+// }
+
 fn create_function_shims(execution_state_handle: &Arc<Mutex<ExecutionState>>, report: &Report, py: Python, globals: &PyDict) -> Result<(), Error> {
     // Create shims for functions that are referred to, we look at what functions are being provided
     // and create shims for matches between the function name provided and the identifiers referred to.
@@ -538,8 +595,62 @@ fn python_args_to_rkyv(args: &PyTuple, kwargs: Option<&PyDict>) -> Result<RkyvSe
 /// dependencies and virtualenvs for our python code execution.
 fn python_dependency_management() {
     // TODO: https://github.com/PyO3/pyo3/discussions/3726
-
 }
+
+fn replace_identifier(code: &str, old_identifier: &str, new_identifier: &str) -> String {
+    let pattern = format!(r"(?<![a-zA-Z0-9_]){}(?![a-zA-Z0-9_])", regex::escape(old_identifier));
+    let re = fancy_regex::Regex::new(&pattern).unwrap();
+    re.replace_all(code, new_identifier).to_string()
+}
+
+use sha1::{Sha1, Digest};
+
+fn hash_to_python_method_name(input: &str) -> String {
+    // Create a SHA1 object
+    let mut hasher = Sha1::new();
+
+    // Write input string to it
+    hasher.update(input.as_bytes());
+
+    // Read hash digest and consume hasher
+    let result = hasher.finalize();
+
+    // Convert hash to hex string
+    let hex_result = result
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect::<String>();
+
+    // Ensure it starts with a valid character (underscore if necessary)
+    let mut valid_method_name = if hex_result.chars().next().unwrap().is_numeric() {
+        format!("_{}", hex_result)
+    } else {
+        hex_result
+    };
+
+    // Replace any invalid characters with an underscore
+    valid_method_name = valid_method_name.replace(|c: char| !c.is_alphanumeric(), "_");
+
+    // Truncate to a reasonable length for a method name (e.g., 30 characters)
+    valid_method_name.truncate(30);
+
+    valid_method_name
+}
+
+fn rename_triggerable_functions(report: &Report, code: &str) -> (String, HashMap<String, String>) {
+    let mut hash_map = HashMap::new();
+    let mut new_code = code.to_string();
+    for (func_name, _) in &report.triggerable_functions {
+        let hashed_name = hash_to_python_method_name(func_name);
+        hash_map.insert(hashed_name.clone(), func_name.clone());
+        new_code = replace_identifier(&new_code, func_name, &hashed_name);
+        // Update the code in your Report or related structures if needed
+        // For example, updating a map of code snippets:
+        // report.triggerable_functions.get_mut(func_name).unwrap().code = new_code;
+    }
+    (new_code, hash_map)
+}
+
 
 
 #[cfg(test)]
@@ -549,6 +660,7 @@ mod tests {
     use crate::cells::{SupportedLanguage, TextRange};
     use crate::execution::primitives::serialized_value::RkyvObjectBuilder;
     use indoc::indoc;
+    use chidori_static_analysis::language::{InternalCallGraph, ReportTriggerableFunctions};
 
     //     #[tokio::test]
     //     async fn test_source_code_run_py_success() {
@@ -577,7 +689,7 @@ x = 12 + y
 li = [x, y]
         "#,
         );
-        let result = source_code_run_python(&ExecutionState::new(), &source_code, &RkyvSerializedValue::Null, &None).await;
+        let result = source_code_run_python(&ExecutionState::new_with_random_id(), &source_code, &RkyvSerializedValue::Null, &None).await;
         assert_eq!(
             result.unwrap(),
             (
@@ -606,7 +718,7 @@ li = [x, y]
 print("testing")
         "#,
         );
-        let result = source_code_run_python(&ExecutionState::new(), &source_code, &RkyvSerializedValue::Null, &None).await;
+        let result = source_code_run_python(&ExecutionState::new_with_random_id(), &source_code, &RkyvSerializedValue::Null, &None).await;
         assert_eq!(
             result.unwrap(),
             (
@@ -629,10 +741,10 @@ def example():
     return a
         "#,
         );
-        let result = source_code_run_python(&ExecutionState::new(),
+        let result = source_code_run_python(&ExecutionState::new_with_random_id(),
                                             &source_code,
-            &RkyvSerializedValue::Null,
-            &Some("example".to_string()),
+                                            &RkyvSerializedValue::Null,
+                                            &Some("example".to_string()),
         ).await;
         assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(20), vec![], vec![]));
     }
@@ -648,12 +760,12 @@ def example(x):
     return a
         "#,
         );
-        let result = source_code_run_python(&ExecutionState::new(),
+        let result = source_code_run_python(&ExecutionState::new_with_random_id(),
                                             &source_code,
-            &RkyvObjectBuilder::new()
+                                            &RkyvObjectBuilder::new()
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
-            &Some("example".to_string()),
+                                            &Some("example".to_string()),
         ).await;
         assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(25), vec![], vec![]));
     }
@@ -665,7 +777,7 @@ def example(x):
 a = 20 + await demo()
         "#,
         );
-        let mut state = ExecutionState::new();
+        let mut state = ExecutionState::new_with_random_id();
         let (state, _) = state.update_op(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,
@@ -700,7 +812,7 @@ a = 20 + await demo()
 data = await demo()
         "#,
         );
-        let mut state = ExecutionState::new();
+        let mut state = ExecutionState::new_with_random_id();
         let (state, _) = state.update_op(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,
@@ -739,7 +851,7 @@ data = await demo()
 data = await demo()
         "#,
         );
-        let mut state = ExecutionState::new();
+        let mut state = ExecutionState::new_with_random_id();
         let (mut state, _) = state.update_op(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,
@@ -797,12 +909,12 @@ class TestMarshalledValues(unittest.TestCase):
 unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
         "#,
         );
-        let result = source_code_run_python(&ExecutionState::new(),
+        let result = source_code_run_python(&ExecutionState::new_with_random_id(),
                                             &source_code,
-            &RkyvObjectBuilder::new()
+                                            &RkyvObjectBuilder::new()
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
-            &None,
+                                            &None,
         ).await;
         let (result, _, stderr) = result.unwrap();
         assert_eq!(stderr.iter().filter(|x| x.contains("Ran 1 test")).count(), 1);
@@ -827,12 +939,12 @@ class TestMarshalledValues(unittest.IsolatedAsyncioTestCase):
 unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
         "#,
         );
-        let result = source_code_run_python(&ExecutionState::new(),
+        let result = source_code_run_python(&ExecutionState::new_with_random_id(),
                                             &source_code,
-            &RkyvObjectBuilder::new()
+                                            &RkyvObjectBuilder::new()
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
-            &None,
+                                            &None,
         ).await;
         let (result, _, stderr) = result.unwrap();
         dbg!(&stderr);
@@ -853,20 +965,20 @@ def example(x):
     return a
         "#,
         );
-        let result = source_code_run_python(&ExecutionState::new(),
+        let result = source_code_run_python(&ExecutionState::new_with_random_id(),
                                             &source_code,
-            &RkyvObjectBuilder::new()
+                                            &RkyvObjectBuilder::new()
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
-            &Some("example".to_string()),
+                                            &Some("example".to_string()),
         ).await;
         assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(1), vec![], vec![]));
-        let result = source_code_run_python(&ExecutionState::new(),
+        let result = source_code_run_python(&ExecutionState::new_with_random_id(),
                                             &source_code,
-            &RkyvObjectBuilder::new()
+                                            &RkyvObjectBuilder::new()
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
-            &Some("example".to_string()),
+                                            &Some("example".to_string()),
         ).await;
         assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(2), vec![], vec![]));
     }
@@ -882,7 +994,7 @@ fn example():
         "#,
         );
         let result = source_code_run_python(
-            &ExecutionState::new(),
+            &ExecutionState::new_with_random_id(),
             &source_code,
             &RkyvObjectBuilder::new()
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
@@ -906,7 +1018,7 @@ raise ValueError("Raising a python error")
         "#,
         );
         let result = source_code_run_python(
-            &ExecutionState::new(),
+            &ExecutionState::new_with_random_id(),
             &source_code,
             &RkyvObjectBuilder::new()
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
@@ -920,4 +1032,100 @@ raise ValueError("Raising a python error")
             }
         }
     }
+
+    #[tokio::test]
+    async fn test_identifier_replacement() {
+        let test_cases = vec![
+            ("x", "y", "def func(x): return x", "def func(y): return y"),
+            ("func", "new_func", "def func(): pass\nfunc()", "def new_func(): pass\nnew_func()"),
+            ("var", "variable", "var = 5\nvar_name = 10", "variable = 5\nvar_name = 10"),
+            ("_private", "_hidden", "_private = 1\nnot_private = 2", "_hidden = 1\nnot_private = 2"),
+            ("MAX_VALUE", "MAXIMUM", "MAX_VALUE = 100\nMAX_VALUE_LIMIT = 200", "MAXIMUM = 100\nMAX_VALUE_LIMIT = 200"),
+            ("i", "index", "for i in range(10): print(i)", "for index in range(10): print(index)"),
+            ("data", "info", "data = [1, 2, 3]\nmore_data = [4, 5, 6]", "info = [1, 2, 3]\nmore_data = [4, 5, 6]"),
+            ("calculate", "compute", "def calculate(x): return calculate(x-1)", "def compute(x): return compute(x-1)"),
+            ("temp", "temporary", "temp = 98.6\ntemperature = 100", "temporary = 98.6\ntemperature = 100"),
+            ("log", "logger", "import log\nlog.info('message')", "import logger\nlogger.info('message')"),
+            ("str", "string", "str_value = str(42)", "str_value = string(42)"),
+            ("dict", "dictionary", "my_dict = dict()\ndict_obj = {}", "my_dict = dictionary()\ndict_obj = {}"),
+            ("print", "display", "print('Hello')\nprinter = None", "display('Hello')\nprinter = None"),
+            ("sum", "total", "sum([1, 2, 3])\nsum_up = lambda x: x", "total([1, 2, 3])\nsum_up = lambda x: x"),
+            ("Exception", "Error", "raise Exception('error')\nExceptionHandler", "raise Error('error')\nExceptionHandler"),
+        ];
+
+        for (old, new, input, expected) in test_cases {
+            let result = replace_identifier(input, old, new);
+            assert_eq!(result, expected, "Failed to replace '{}' with '{}'", old, new);
+        }
+
+    }
+
+    #[test]
+    fn test_hash_to_python_method_name() {
+        let python_method_name = "example_method_name";
+        let hashed_name = hash_to_python_method_name(python_method_name);
+
+        // Verify that the hashed name is deterministic and meets requirements
+        assert_eq!(hashed_name, "_c1ee8297ec2117c3a1f2de2c07eea2");
+    }
+
+    #[test]
+    fn test_hash_to_python_method_name_numeric_start() {
+        let python_method_name = "123example_method_name";
+        let hashed_name = hash_to_python_method_name(python_method_name);
+
+        // Verify that the hashed name starts with an underscore if the hash starts with a digit
+        assert!(hashed_name.starts_with('_'));
+    }
+
+    #[test]
+    fn test_hash_to_python_method_name_length() {
+        let python_method_name = "a_very_long_method_name_that_exceeds_thirty_characters";
+        let hashed_name = hash_to_python_method_name(python_method_name);
+
+        // Verify that the hashed name is truncated to 30 characters
+        assert!(hashed_name.len() <= 30);
+    }
+
+    use super::*;
+
+    #[test]
+    fn test_rename_triggerable_functions() {
+        // Prepare a dummy Report with some triggerable functions
+        let mut report = Report {
+            internal_call_graph: InternalCallGraph::default(),
+            cell_exposed_values: HashMap::new(),
+            cell_depended_values: HashMap::new(),
+            triggerable_functions: {
+                let mut map = HashMap::new();
+                map.insert("example_function".to_string(), ReportTriggerableFunctions::default());
+                map.insert("another_function".to_string(), ReportTriggerableFunctions::default());
+                map
+            },
+        };
+
+        let code = r#"
+def example_function():
+    pass
+
+def another_function():
+    pass
+"#;
+
+        let (new_code, hash_map ) = rename_triggerable_functions(&report, code);
+        let example_function_renamed = hash_to_python_method_name("example_function");
+        let another_function_renamed = hash_to_python_method_name("another_function");
+        assert_eq!(new_code,
+                   format!(r#"
+def {}():
+    pass
+
+def {}():
+    pass
+"#, example_function_renamed, another_function_renamed));
+
+        assert_eq!(hash_map.get(&hash_to_python_method_name("example_function")).unwrap(), "example_function");
+        assert_eq!(hash_map.get(&hash_to_python_method_name("another_function")).unwrap(), "another_function");
+    }
+
 }

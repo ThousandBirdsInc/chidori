@@ -1,7 +1,7 @@
 use bevy::app::{App, Startup, Update};
 use bevy::DefaultPlugins;
 use bevy::math::UVec2;
-use bevy::prelude::{ButtonBundle, Camera, Camera2dBundle, ClearColorConfig, Color, Commands, Component, default, in_state, IntoSystemConfigs, OnEnter, OnExit, Query, Res, ResMut, Style, Val, Window, With};
+use bevy::prelude::{ButtonBundle, Camera, Camera2dBundle, ClearColorConfig, Color, Commands, Component, default, in_state, IntoSystemConfigs, Local, OnEnter, OnExit, Query, Res, ResMut, Style, Val, Window, With};
 use bevy::render::camera::Viewport;
 use bevy::window::PrimaryWindow;
 use bevy_cosmic_edit::{Attrs, CosmicBuffer, CosmicColor, CosmicEditBundle, CosmicEditPlugin, CosmicFontConfig, CosmicFontSystem, CosmicPrimaryCamera, CosmicSource, Family, FocusedWidget, Metrics};
@@ -23,7 +23,8 @@ fn editor_update(
     q_window: Query<&Window, With<PrimaryWindow>>,
     mut execution_state: Res<ChidoriExecutionState>,
     mut tree: ResMut<EguiTree>,
-    mut cells: ResMut<ChidoriCells>
+    mut cells: ResMut<ChidoriCells>,
+    mut state_vs_editor_cells: Local<bool>
 ) {
     let window = q_window.single();
     let mut hide_all = false;
@@ -69,9 +70,15 @@ fn editor_update(
     egui::CentralPanel::default().frame(container_frame).show(contexts.ctx_mut(), |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let mut theme = egui_extras::syntax_highlighting::CodeTheme::dark();
-            for cell in &cells.inner {
-                let op_id = cell.op_id;
-                match &cell.cell {
+            let state_vs_editor_cells_c = state_vs_editor_cells.clone();
+            ui.toggle_value(&mut state_vs_editor_cells, if state_vs_editor_cells_c == false { "View Editor Cells" } else { "View Cells at Current State"});
+            let cells: Vec<(Option<usize>, &CellTypes)> = if !*state_vs_editor_cells {
+                cells.editor_cells.iter().map(|c| (c.op_id, &c.cell)).collect()
+            } else {
+                cells.state_cells.iter().map(|c| (Some(0), c)).collect()
+            };
+            for (op_id, cell) in cells {
+                match &cell {
                     CellTypes::Code(CodeCell { name, source_code, language, .. }, _) => {
                         let language_string = match language {
                             SupportedLanguage::PyO3 => "python",

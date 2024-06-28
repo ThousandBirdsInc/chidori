@@ -35,6 +35,7 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::ptr::NonNull;
+use std::time::{Duration, Instant};
 use bevy::render::camera::{ScalingMode, Viewport};
 use bevy::render::render_asset::RenderAssetUsages;
 use crate::egui_json_tree::JsonTree;
@@ -227,8 +228,8 @@ fn mouse_pan(
     };
     if buttons.pressed(MouseButton::Left) {
         for ev in motion_evr.read() {
-            camera_transform.translation.x += ev.delta.x * projection.scale;
-            camera_transform.translation.y -= ev.delta.y * projection.scale;
+            camera_transform.translation.x -= ev.delta.x * projection.scale;
+            camera_transform.translation.y += ev.delta.y * projection.scale;
         }
         camera_state.state = CameraStateValue::Free;
     }
@@ -245,15 +246,32 @@ fn mouse_scroll_events(
         (Entity, &Transform, &GraphIdx, &EguiRenderTarget),
         (With<GraphIdx>, Without<GraphIdxPair>),
     >,
+    mut focus_start: Local<Option<Instant>>,
 ) {
     if !graph_resource.is_active {
         return;
     }
 
+    let mut should_return = false;
+    let mut an_element_is_in_focus = false;
     for (_, _, mut gidx, mut egui_render_target) in node_query.iter() {
         if egui_render_target.is_focused && egui_render_target.image.is_some() {
-            return;
+            an_element_is_in_focus = true;
+            if let Some(start_time) = *focus_start {
+                if start_time.elapsed() > Duration::from_millis(100) {
+                    should_return = true;
+                    break;
+                }
+            } else {
+                *focus_start = Some(Instant::now());
+            }
         }
+    }
+    if !an_element_is_in_focus {
+        *focus_start = None;
+    }
+    if should_return {
+        return;
     }
 
 
@@ -395,9 +413,20 @@ fn egui_execution_state(ui: &mut Ui, execution_state: &ExecutionState) {
             })
         });
 
+
         if let Some(cell) = &execution_state.operation_mutation {
+            ui.label("Cell Mutation:");
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                // ui.vertical(|ui| {
+                //     ui.label(format!("Operation Id: {:?}", execution_state.evaluating_id));
+                // })
+            });
             egui_render_cell_read(ui, cell);
         }
+
+
+        ui.label("Output:");
         for (key, value) in execution_state.state.iter() {
             let response = JsonTree::new(format!("{:?}", key), &value.output)
                 // .default_expand(DefaultExpand::SearchResults(&self.search_input))
@@ -566,7 +595,6 @@ fn update_node_textures_as_available(
             // mat.color_texture = o.texture_handle.clone();
         }
     }
-
 }
 
 
@@ -731,7 +759,6 @@ fn update_alternate_graph_system(
                         // TODO: working theory is that positioning the elements is affecting the camera which is affecting the trace camera
                         //       the trace camera is still be affected by other camera values
                         transform.translation = transform.translation.lerp(Vec3::new(n.x.to_f32().unwrap(), -n.y.to_f32().unwrap(), -1.0), 0.1);
-                        transform.scale =  vec3(width, height, 1.0);
 
 
                         // Draw text within these elements
@@ -746,6 +773,8 @@ fn update_alternate_graph_system(
                             }
                             frame.end(ui);
                         });
+                        let used_rect = ctx.used_rect();
+                        transform.scale =  vec3(used_rect.width(), used_rect.height(), 1.0);
                     }
 
                     n.children.iter().for_each(|child| {
@@ -826,6 +855,7 @@ fn render_node(
             if *node == chidori_core::uuid::Uuid::nil() {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Initialization...").color(Color32::BLACK));
+                    ui.label(RichText::new(node.to_string()).color(Color32::BLACK));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                         if ui.button(RichText::new("Revert to this State").color(Color32::from_hex("#dddddd").unwrap())).clicked() {
                             let _ = internal_state.set_execution_id(*node);
@@ -834,6 +864,7 @@ fn render_node(
                 });
             } else {
                 ui.horizontal(|ui| {
+                    ui.label(RichText::new(node.to_string()).color(Color32::BLACK));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                         if ui.button(RichText::new("Revert to this State").color(Color32::from_hex("#dddddd").unwrap())).clicked() {
                             println!("We would like to revert to {:?}", node);

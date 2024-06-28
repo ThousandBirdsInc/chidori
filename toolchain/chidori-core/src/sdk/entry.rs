@@ -83,7 +83,7 @@ impl InstancedEnvironment {
         println!("Reloading cells");
         let cells_to_upsert: Vec<_> = {
             let shared_state = self.shared_state.lock().unwrap();
-            shared_state.cells.iter().map(|cell| cell.clone()).collect()
+            shared_state.editor_cells.iter().map(|cell| cell.clone()).collect()
         };
 
         let mut ids = vec![];
@@ -97,7 +97,7 @@ impl InstancedEnvironment {
         }
 
         let mut shared_state = self.shared_state.lock().unwrap();
-        for (i, cell) in shared_state.cells.iter_mut().enumerate() {
+        for (i, cell) in shared_state.editor_cells.iter_mut().enumerate() {
             let (applied_at, op_id) = ids[i];
             cell.applied_at = Some(applied_at);
             cell.op_id = Some(op_id);
@@ -105,7 +105,7 @@ impl InstancedEnvironment {
         }
 
         if let Some(sender) = self.runtime_event_sender.as_mut() {
-            sender.send(EventsFromRuntime::CellsUpdated(shared_state.cells.clone())).unwrap();
+            sender.send(EventsFromRuntime::CellsUpdated(shared_state.editor_cells.clone())).unwrap();
         }
         Ok(())
     }
@@ -171,12 +171,29 @@ impl InstancedEnvironment {
                             let sender = self.runtime_event_sender.as_mut().unwrap();
                             sender.send(EventsFromRuntime::ExecutionStateChange(merged_state)).unwrap();
                             sender.send(EventsFromRuntime::UpdateExecutionHead(id)).unwrap();
+
+                            if let Some(ExecutionStateEvaluation::Complete(state)) = self.db.get_state_at_id(self.execution_head_state_id) {
+                                let mut cells = vec![];
+                                // TODO: keep a separate mapping of cells so we don't need to lock operations
+                                for k in state.operation_by_id.values() {
+                                    let op = k.lock().unwrap();
+                                    cells.push(op.cell.clone());
+                                }
+                                let mut ss = self.shared_state.lock().unwrap();
+                                ss.at_execution_state_cells = cells.clone();
+                                sender.send(EventsFromRuntime::ExecutionStateCellsViewUpdated(cells)).unwrap();
+                            }
                         }
                     },
                     UserInteractionMessage::Shutdown => {
                         self.shutdown().await;
                     }
-                    _ => {}
+                    UserInteractionMessage::UserAction(_) => {}
+                    UserInteractionMessage::FetchCells => {}
+                    UserInteractionMessage::MutateCell => {}
+                    UserInteractionMessage::ChatMessage(msg) => {
+                        self.db.push_message(msg).await?;
+                    }
                 }
             }
 
@@ -217,21 +234,36 @@ impl InstancedEnvironment {
         }
     }
 
+    fn push_update_to_client(&mut self, state_id: &ExecutionNodeId, state: ExecutionStateEvaluation) {
+        if let Some(sender) = self.runtime_event_sender.as_mut() {
+            if let ExecutionStateEvaluation::Complete(s) = &state {
+                // TODO: if there are cells we want to update the shared state with those
+                sender.send(EventsFromRuntime::DefinitionGraphUpdated(s.get_dependency_graph_flattened())).unwrap();
+                let mut cells = vec![];
+                // TODO: keep a separate mapping of cells so we don't need to lock operations
+                for k in s.operation_by_id.values() {
+                    let op = k.lock().unwrap();
+                    cells.push(op.cell.clone());
+                }
+                sender.send(EventsFromRuntime::ExecutionStateCellsViewUpdated(cells)).unwrap();
+            }
+            sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
+            sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
+            sender.send(EventsFromRuntime::UpdateExecutionHead(*state_id)).unwrap();
+        }
+        println!("Resulted in state with id {:?}", &state_id);
+        let mut shared_state = self.shared_state.lock().unwrap();
+        shared_state.execution_state_head_id = *state_id;
+        shared_state.execution_id_to_evaluation.lock().unwrap().insert(*state_id, state);
+        self.execution_head_state_id = *state_id;
+    }
+
     /// Increment the execution graph by one step
     #[tracing::instrument]
     pub(crate) async fn step(&mut self) -> anyhow::Result<Vec<(usize, OperationFnOutput)>> {
         println!("======================= Executing state with id {:?} ======================", self.execution_head_state_id);
         let ((state_id, state), outputs) = self.db.external_step_execution(self.execution_head_state_id).await?;
-        if let Some(sender) = self.runtime_event_sender.as_mut() {
-            sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
-            sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
-            sender.send(EventsFromRuntime::UpdateExecutionHead(state_id)).unwrap();
-        }
-        println!("Resulted in state with id {:?}", &state_id);
-        let mut shared_state = self.shared_state.lock().unwrap();
-        shared_state.execution_state_head_id = state_id;
-        shared_state.execution_id_to_evaluation.lock().unwrap().insert(state_id, state);
-        self.execution_head_state_id = state_id;
+        self.push_update_to_client(&state_id, state);
         Ok(outputs)
     }
 
@@ -240,19 +272,7 @@ impl InstancedEnvironment {
     pub fn upsert_cell(&mut self, cell: CellTypes, op_id: Option<usize>) -> anyhow::Result<(ExecutionNodeId, usize)> {
         println!("Upserting cell into state with id {:?}", &self.execution_head_state_id);
         let ((state_id, state), op_id) = self.db.mutate_graph(self.execution_head_state_id, cell, op_id)?;
-        if let Some(sender) = self.runtime_event_sender.as_mut() {
-            if let ExecutionStateEvaluation::Complete(s) = &state {
-                println!("Upsert cell result parent_id {:?} and id {:?}", &s.parent_state_id, &s.id);
-                sender.send(EventsFromRuntime::DefinitionGraphUpdated(s.get_dependency_graph_flattened())).unwrap();
-            }
-            sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
-            sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
-            sender.send(EventsFromRuntime::UpdateExecutionHead(state_id)).unwrap();
-        }
-        let mut shared_state = self.shared_state.lock().unwrap();
-        shared_state.execution_state_head_id = state_id;
-        shared_state.execution_id_to_evaluation.lock().unwrap().insert(state_id, state);
-        self.execution_head_state_id = state_id;
+        self.push_update_to_client(&state_id, state);
         Ok((state_id, op_id))
     }
 
@@ -272,6 +292,7 @@ pub enum UserInteractionMessage {
     MutateCell,
     Shutdown,
     Step,
+    ChatMessage(String)
 }
 
 
@@ -299,7 +320,9 @@ pub enum EventsFromRuntime {
     ExecutionStateChange(MergedStateHistory),
     CellsUpdated(Vec<CellHolder>),
     StateAtId(ExecutionNodeId, ExecutionState),
-    UpdateExecutionHead(ExecutionNodeId)
+    UpdateExecutionHead(ExecutionNodeId),
+    ReceivedChatMessage(String),
+    ExecutionStateCellsViewUpdated(Vec<CellTypes>),
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
@@ -315,7 +338,8 @@ pub struct SharedState {
     pub execution_id_to_evaluation: Arc<Mutex<HashMap<ExecutionNodeId, ExecutionStateEvaluation>>>,
     execution_state_head_id: ExecutionNodeId,
     latest_state: Option<ExecutionState>,
-    cells: Vec<CellHolder>,
+    editor_cells: Vec<CellHolder>,
+    at_execution_state_cells: Vec<CellTypes>,
 }
 
 
@@ -340,7 +364,8 @@ impl SharedState {
             execution_id_to_evaluation: Default::default(),
             execution_state_head_id: Uuid::nil(),
             latest_state: None,
-            cells: vec![],
+            editor_cells: vec![],
+            at_execution_state_cells: vec![],
         }
     }
 }
@@ -384,7 +409,8 @@ impl Chidori {
             shared_state: Arc::new(Mutex::new(SharedState {
                 execution_id_to_evaluation: Default::default(),
                 execution_state_head_id: Uuid::nil(),
-                cells: vec![],
+                editor_cells: vec![],
+                at_execution_state_cells: vec![],
                 latest_state: None,
             })),
             tracing_guard: None,
@@ -402,7 +428,10 @@ impl Chidori {
             shared_state: Arc::new(Mutex::new(SharedState {
                 execution_id_to_evaluation: Default::default(),
                 execution_state_head_id: Uuid::nil(),
-                cells: vec![],
+                editor_cells: vec![],
+
+                at_execution_state_cells: vec![],
+
                 latest_state: None,
             })),
             tracing_guard: Some(guard)
@@ -428,7 +457,7 @@ impl Chidori {
     fn load_cells(&mut self, cells: Vec<CellTypes>) -> anyhow::Result<()>  {
         // TODO: this overrides the entire shared state object
         let cell_name_map = {
-            let previous_cells = &self.shared_state.lock().unwrap().cells;
+            let previous_cells = &self.shared_state.lock().unwrap().editor_cells;
             previous_cells.iter().map(|cell| {
                 let name = get_cell_name(&cell.cell);
                 (name.clone(), cell.clone())
@@ -458,7 +487,7 @@ impl Chidori {
                 });
             }
         }
-        self.shared_state.lock().unwrap().cells = new_cells_state;
+        self.shared_state.lock().unwrap().editor_cells = new_cells_state;
         println!("Cells commit to shared state");
         self.handle_user_action(UserInteractionMessage::ReloadCells)?;
         Ok(())

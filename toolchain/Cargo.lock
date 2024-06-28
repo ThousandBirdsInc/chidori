@@ -2219,6 +2219,7 @@ dependencies = [
  "dirs 5.0.1",
  "dotenv",
  "env_logger 0.10.0",
+ "fancy-regex 0.13.0",
  "fantoccini",
  "futures",
  "futures-util",
@@ -2258,6 +2259,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "serde_yaml 0.9.34+deprecated",
+ "sha1",
  "syn 1.0.109",
  "target-lexicon",
  "thiserror",
@@ -5142,6 +5144,17 @@ checksum = "b95f7c0680e4142284cf8b22c14a476e87d61b004a3a0861872b32ef7ead40a2"
 dependencies = [
  "bit-set",
  "regex",
+]
+
+[[package]]
+name = "fancy-regex"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "531e46835a22af56d1e3b66f04844bed63158bc094a628bec1d321d9b4c44bf2"
+dependencies = [
+ "bit-set",
+ "regex-automata 0.4.6",
+ "regex-syntax 0.8.3",
 ]
 
 [[package]]

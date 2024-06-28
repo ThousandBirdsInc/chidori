@@ -1,7 +1,7 @@
 extern crate swc_ecma_parser;
 
 use crate::language::javascript::parse::ContextPath::Constant;
-use crate::language::{InternalCallGraph, python};
+use crate::language::{InternalCallGraph, python, TextRange};
 use crate::language::{Report, ReportItem, ReportTriggerableFunctions};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -10,6 +10,7 @@ use swc_common::{
     errors::{ColorConfig, Handler},
     FileName, FilePathMapping, SourceMap,
 };
+use swc_common::source_map::Pos;
 use swc_ecma_ast as ast;
 use swc_ecma_ast::{
     BlockStmtOrExpr, Callee, Decl, Expr, FnDecl, ForHead, Ident, ImportSpecifier, Lit, MemberProp,
@@ -20,7 +21,7 @@ use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum ContextPath {
     Initialized,
-    InFunction(String),
+    InFunction(String, TextRange),
     InAnonFunction,
     Params,
     Param(String),
@@ -123,9 +124,9 @@ impl ASTWalkContext {
         self.context_stack.len()
     }
 
-    fn enter_statement_function(&mut self, name: &ast::Ident) -> usize {
+    fn enter_statement_function(&mut self, name: &ast::Ident, range: TextRange) -> usize {
         let name = remove_hash_and_numbers(&name.to_string());
-        self.context_stack.push(ContextPath::InFunction(name));
+        self.context_stack.push(ContextPath::InFunction(name, range));
         self.context_stack.len()
     }
 
@@ -589,8 +590,11 @@ fn traverse_stmt(stmt: &Stmt, machine: &mut ASTWalkContext) {
                 ident, function, ..
             }) => {
                 machine.insert_local(ident);
-                let idx = machine.enter_statement_function(ident);
-                let ast::Function { params, body, .. } = &**function;
+                let ast::Function { params, body, span, .. } = &**function;
+                let idx = machine.enter_statement_function(ident, TextRange {
+                    start: span.lo.to_usize(),
+                    end: span.hi.to_usize(),
+                });
                 let params_idx = machine.enter_params();
                 for param in params {
                     traverse_pat(&param.pat, machine);
@@ -642,28 +646,31 @@ pub fn extract_dependencies_js(source: &str) -> Vec<Vec<ContextPath>> {
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
     let fm = cm.new_source_file(FileName::Custom("test.js".into()), source.to_string());
-    let lexer = Lexer::new(
-        // We want to parse ecmascript
-        Syntax::Es(Default::default()),
-        // EsVersion defaults to es5
-        Default::default(),
-        StringInput::from(&*fm),
-        None,
-    );
 
-    let mut parser = Parser::new_from(lexer);
+    let parse_module = |syntax: Syntax| {
+        let lexer = Lexer::new(
+            syntax,
+            Default::default(),
+            StringInput::from(&*fm),
+            None,
+        );
 
-    for e in parser.take_errors() {
-        e.into_diagnostic(&handler).emit();
-    }
+        let mut parser = Parser::new_from(lexer);
 
-    let module = parser
-        .parse_module()
+        for e in parser.take_errors() {
+            e.into_diagnostic(&handler).emit();
+        }
+
+        parser.parse_module()
+    };
+
+    let module = parse_module(Syntax::Es(Default::default()))
+        .or_else(|_| parse_module(Syntax::Typescript(Default::default())))
         .map_err(|mut e| {
             // Unrecoverable fatal error occurred
             e.into_diagnostic(&handler).emit()
         })
-        .expect("failed to parse module");
+        .expect("failed to parse module as either ECMAScript or TypeScript");
 
     for item in module.body {
         traverse_module(item, &mut machine);
@@ -697,7 +704,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
             encountered.push(context_path_unit);
 
             // If we've declared a top level function, it is exposed
-            if let ContextPath::InFunction(name) = context_path_unit {
+            if let ContextPath::InFunction(name, _) = context_path_unit {
                 in_function = Some(name);
                 if !triggerable_functions.contains_key(name) {
                     triggerable_functions
@@ -757,11 +764,11 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                 if identifier != &String::from("ch") {
                     // If this value is not being assigned to, then it is a dependency
 
-                    if encountered.iter().any(|x| matches!(x, ContextPath::InFunction(_)))
+                    if encountered.iter().any(|x| matches!(x, ContextPath::InFunction(_, _)))
                         && encountered.iter().any(|x| matches!(x, ContextPath::Params))
                     {
                         for context_path_unit in &encountered {
-                            if let ContextPath::InFunction(function_name) = context_path_unit {
+                            if let ContextPath::InFunction(function_name, _) = context_path_unit {
                                 let mut x = triggerable_functions
                                     .entry(function_name.clone())
                                     .or_insert_with(|| ReportTriggerableFunctions {
@@ -778,7 +785,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                     // This is an exposed value if it does not occur inside the scope of a function
                     if encountered
                         .iter()
-                        .find(|x| matches!(x, ContextPath::InFunction(_)))
+                        .find(|x| matches!(x, ContextPath::InFunction(_, _)))
                         .is_none()
                         &&
                          encountered

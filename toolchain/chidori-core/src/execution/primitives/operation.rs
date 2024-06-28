@@ -439,7 +439,7 @@ mod tests {
         let mut node = OperationNode::default();
         node.operation = operation;
 
-        let result = node.execute(&ExecutionState::new(), RkyvSerializedValue::Null, None, None).await?;
+        let result = node.execute(&ExecutionState::new_with_random_id(), RkyvSerializedValue::Null, None, None).await?;
 
         assert_eq!(result.output, RkyvSerializedValue::Boolean(true));
         Ok(())
@@ -448,7 +448,7 @@ mod tests {
     #[test]
     fn test_execute_without_operation() {
         let mut node = OperationNode::default();
-        node.execute(&ExecutionState::new(), RkyvSerializedValue::Boolean(true), None, None); // should not panic
+        node.execute(&ExecutionState::new_with_random_id(), RkyvSerializedValue::Boolean(true), None, None); // should not panic
     }
 
     /// Demonstrates mutable internal execution of a closure and an RPC interface for interacting with it
@@ -490,7 +490,7 @@ mod tests {
             unresolved_dependencies: vec![],
             partial_application: Vec::new(),
         };
-        let ex = op.execute(&ExecutionState::new(), RkyvSerializedValue::Boolean(true), None, Some(async_rpc_communication));
+        let ex = op.execute(&ExecutionState::new_with_random_id(), RkyvSerializedValue::Boolean(true), None, Some(async_rpc_communication));
         let join_handle = tokio::spawn(async move {
             ex.await;
         });

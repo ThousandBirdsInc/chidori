@@ -13,7 +13,7 @@ pub mod typechecker;
 pub mod javascript;
 pub mod python;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Eq, Hash)]
 pub struct TextRange {
     pub start: usize,
     pub end: usize,
@@ -27,7 +27,7 @@ pub struct ReportItem {
     // pub context_path: Vec<ContextPath>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReportTriggerableFunctions {
     pub arguments: Vec<String>,
     // pub context_path: Vec<ContextPath>,
@@ -37,8 +37,8 @@ pub struct ReportTriggerableFunctions {
     pub trigger_on: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-struct InternalCallGraph {
+#[derive(Debug, Default, Clone)]
+pub struct InternalCallGraph {
     graph: DiGraph<String, ()>
 }
 

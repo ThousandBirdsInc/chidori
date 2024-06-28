@@ -571,6 +571,23 @@ pub async fn source_code_run_deno(
     Ok((output, stdout, stderr))
 }
 
+fn replace_identifier(code: &str, old_identifier: &str, new_identifier: &str) -> String {
+    let pattern = if old_identifier.starts_with('$') {
+        format!(r"(^|[^a-zA-Z0-9_$])({})(?![a-zA-Z0-9_$])", regex::escape(old_identifier))
+    } else {
+        format!(r"(?<![a-zA-Z0-9_$]){}(?![a-zA-Z0-9_$])", regex::escape(old_identifier))
+    };
+    let re = fancy_regex::Regex::new(&pattern).unwrap();
+    re.replace_all(code, |caps: &fancy_regex::Captures| {
+        if old_identifier.starts_with('$') {
+            format!("{}{}", caps.get(1).map_or("", |m| m.as_str()), new_identifier)
+        } else {
+            new_identifier.to_string()
+        }
+    }).to_string()
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,7 +599,7 @@ mod tests {
     async fn test_source_code_run_with_external_function_invocation() -> anyhow::Result<()> {
         let source_code = String::from(r#"const y = await test_function(5, 5);"#);
 
-        let mut state = ExecutionState::new();
+        let mut state = ExecutionState::new_with_random_id();
         let (state, _) = state.update_op(CellTypes::Code(
             crate::cells::CodeCell {
                 name: None,
@@ -616,7 +633,7 @@ mod tests {
     async fn test_source_code_run_globals_set_by_payload() {
         let source_code = String::from("const z = a + b;");
         let result = source_code_run_deno(
-            &ExecutionState::new(),
+            &ExecutionState::new_with_random_id(),
             &source_code,
             &RkyvObjectBuilder::new()
                 .insert_object(
@@ -641,7 +658,7 @@ mod tests {
     #[tokio::test]
     async fn test_source_code_run_deno_success() {
         let source_code = String::from("const x = 42;");
-        let result = source_code_run_deno(&ExecutionState::new(), &source_code, &RkyvSerializedValue::Null, &None).await;
+        let result = source_code_run_deno(&ExecutionState::new_with_random_id(), &source_code, &RkyvSerializedValue::Null, &None).await;
         assert_eq!(
             result.unwrap(),
             (
@@ -655,14 +672,14 @@ mod tests {
     #[tokio::test]
     async fn test_source_code_run_deno_failure() {
         let source_code = String::from("throw new Error('Test Error');");
-        let result = source_code_run_deno(&ExecutionState::new(), &source_code, &RkyvSerializedValue::Null, &None).await;
+        let result = source_code_run_deno(&ExecutionState::new_with_random_id(), &source_code, &RkyvSerializedValue::Null, &None).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_source_code_run_deno_json_serialization() {
         let source_code = String::from("const obj  = {foo: 'bar'};");
-        let result = source_code_run_deno(&ExecutionState::new(), &source_code, &RkyvSerializedValue::Null, &None).await;
+        let result = source_code_run_deno(&ExecutionState::new_with_random_id(), &source_code, &RkyvSerializedValue::Null, &None).await;
         assert_eq!(
             result.unwrap(),
             (
@@ -680,7 +697,7 @@ mod tests {
     #[tokio::test]
     async fn test_source_code_run_deno_expose_global_variables() {
         let source_code = String::from("const x = 30;");
-        let result = source_code_run_deno(&ExecutionState::new(), &source_code, &RkyvSerializedValue::Null, &None).await;
+        let result = source_code_run_deno(&ExecutionState::new_with_random_id(), &source_code, &RkyvSerializedValue::Null, &None).await;
         assert_eq!(
             result.unwrap(),
             (
@@ -697,7 +714,7 @@ mod tests {
         let args = RkyvObjectBuilder::new()
             .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 10).insert_number("1", 20))
             .build();
-        let result = source_code_run_deno(&ExecutionState::new(), &source_code, &args, &Some("demonstrationAdd".to_string())).await;
+        let result = source_code_run_deno(&ExecutionState::new_with_random_id(), &source_code, &args, &Some("demonstrationAdd".to_string())).await;
         assert_eq!(
             result.unwrap(),
             (
@@ -717,13 +734,146 @@ mod tests {
         "#);
         let args = RkyvObjectBuilder::new()
             .build();
-        let result = source_code_run_deno(&ExecutionState::new(), &source_code, &args, &None).await;
+        let result = source_code_run_deno(&ExecutionState::new_with_random_id(), &source_code, &args, &None).await;
         assert_eq!(
             result.unwrap(),
             (
                 RkyvObjectBuilder::new().build(),
                 vec![String::from("[out]: \"testing, output\"\n")],
                 vec![String::from("[out]: \"testing, stderr\"\n")],
+            )
+        );
+    }
+
+    #[test]
+    fn test_identifier_replacement() {
+        let test_cases = vec![
+            ("x", "y", "function func(x) { return x; }", "function func(y) { return y; }"),
+            ("func", "newFunc", "function func() {}; func();", "function newFunc() {}; newFunc();"),
+            ("_private", "_hidden", "let _private = 1; let not_private = 2;", "let _hidden = 1; let not_private = 2;"),
+            ("MAX_VALUE", "MAXIMUM", "const MAX_VALUE = 100; const MAX_VALUE_LIMIT = 200;", "const MAXIMUM = 100; const MAX_VALUE_LIMIT = 200;"),
+            ("i", "index", "for (let i = 0; i < 10; i++) { console.log(i); }", "for (let index = 0; index < 10; index++) { console.log(index); }"),
+            ("data", "info", "let data = [1, 2, 3]; let moreData = [4, 5, 6];", "let info = [1, 2, 3]; let moreData = [4, 5, 6];"),
+            ("calculate", "compute", "function calculate(x) { return calculate(x-1); }", "function compute(x) { return compute(x-1); }"),
+            ("temp", "temporary", "let temp = 98.6; let temperature = 100;", "let temporary = 98.6; let temperature = 100;"),
+            ("log", "logger", "import { log } from 'util'; log.info('message');", "import { logger } from 'util'; logger.info('message');"),
+            ("String", "Str", "let strValue = String(42);", "let strValue = Str(42);"),
+            ("Object", "Dict", "let myObj = new Object(); let obj = {};", "let myObj = new Dict(); let obj = {};"),
+            ("console", "logger", "console.log('Hello'); let printer = null;", "logger.log('Hello'); let printer = null;"),
+            ("Math", "MathUtils", "Math.sum([1, 2, 3]); let mathOp = x => x;", "MathUtils.sum([1, 2, 3]); let mathOp = x => x;"),
+            ("Error", "Exception", "throw new Error('error'); class ErrorHandler {}", "throw new Exception('error'); class ErrorHandler {}"),
+            ("$scope", "$state", "function ctrl($scope) { $scope.value = 10; }", "function ctrl($state) { $state.value = 10; }"),
+        ];
+
+        for (old, new, input, expected) in test_cases {
+            let result = replace_identifier(input, old, new);
+            assert_eq!(result, expected, "Failed to replace '{}' with '{}'", old, new);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_typescript_basic() {
+        let source_code = String::from("const x: number = 42;");
+        let result = source_code_run_deno(&ExecutionState::new_with_random_id(), &source_code, &RkyvSerializedValue::Null, &None).await;
+        assert_eq!(
+            result.unwrap(),
+            (
+                RkyvObjectBuilder::new().insert_number("x", 42).build(),
+                vec![],
+                vec![],
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_typescript_interface() {
+        let source_code = String::from(r#"
+        interface Person {
+            name: string;
+            age: number;
+        }
+        const person: Person = { name: "Alice", age: 30 };
+    "#);
+        let result = source_code_run_deno(&ExecutionState::new_with_random_id(), &source_code, &RkyvSerializedValue::Null, &None).await;
+        assert_eq!(
+            result.unwrap(),
+            (
+                RkyvObjectBuilder::new()
+                    .insert_object(
+                        "person",
+                        RkyvObjectBuilder::new()
+                            .insert_string("name", "Alice".to_string())
+                            .insert_number("age", 30)
+                    )
+                    .build(),
+                vec![],
+                vec![],
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_typescript_generics() {
+        let source_code = String::from(r#"
+        function identity<T>(arg: T): T {
+            return arg;
+        }
+        const result = identity<string>("TypeScript");
+    "#);
+        let result = source_code_run_deno(&ExecutionState::new_with_random_id(), &source_code, &RkyvSerializedValue::Null, &None).await;
+        assert_eq!(
+            result.unwrap(),
+            (
+                RkyvObjectBuilder::new()
+                    .insert_string("identity", "function".to_string())
+                    .insert_string("result", "TypeScript".to_string())
+                    .build(),
+                vec![],
+                vec![],
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_typescript_async_await() {
+        let source_code = String::from(r#"
+        async function fetchData(): Promise<string> {
+            return new Promise(resolve => setTimeout(() => resolve("Data"), 100));
+        }
+        const data = await fetchData();
+    "#);
+        let result = source_code_run_deno(&ExecutionState::new_with_random_id(), &source_code, &RkyvSerializedValue::Null, &None).await;
+        assert_eq!(
+            result.unwrap(),
+            (
+                RkyvObjectBuilder::new()
+                    .insert_string("data", "Data".to_string())
+                    .build(),
+                vec![],
+                vec![],
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_typescript_enum() {
+        let source_code = String::from(r#"
+        enum Color {
+            Red,
+            Green,
+            Blue,
+        }
+        const selectedColor: Color = Color.Green;
+    "#);
+        let result = source_code_run_deno(&ExecutionState::new_with_random_id(), &source_code, &RkyvSerializedValue::Null, &None).await;
+        assert_eq!(
+            result.unwrap(),
+            (
+                RkyvObjectBuilder::new()
+                    .insert_number("selectedColor", 1)
+                    .build(),
+                vec![],
+                vec![],
             )
         );
     }

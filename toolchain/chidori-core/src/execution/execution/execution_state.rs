@@ -120,25 +120,37 @@ pub struct ExecutionState {
     pub id: ExecutionNodeId,
     pub parent_state_id: ExecutionNodeId,
 
+    pub chat_message_queue_head: usize,
+
     pub evaluating_id: usize,
     pub evaluating_name: Option<String>,
     pub evaluating_fn: Option<String>,
+
+    /// CellType applied, by a state that is mutating cell definitions
     pub operation_mutation: Option<CellTypes>,
 
-    // Channel sender used to update the execution graph and resume execution
+    /// Channel sender used to update the execution graph and resume execution
     pub graph_sender: Option<Arc<tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>>>,
 
+    /// Queue of operations to evaluate
     pub exec_queue: VecDeque<usize>,
+
+    /// State values that we've marked to resolve as consumed, clearing the state
     pub marked_for_consumption: HashSet<usize>,
 
     // TODO: call_stack is only ever a single coroutine at a time and instead its the stack of execution states being resolved?
     // pub call_stack: Arc<Mutex<Pin<Box<dyn Coroutine<Return=CoroutineYieldValue, Yield=CoroutineYieldValue>>>>>,
 
+    /// Map of operation_id -> output value of that operation
     pub state: ImHashMap<usize, Arc<OperationFnOutput>>,
+
+    /// Values that were introduced specifically by this state being evaluated, used to identity most recent changes
     pub fresh_values: Vec<usize>,
 
+    /// Map of name of operation -> operation_id
     pub operation_name_to_id: ImHashMap<String, OperationId>,
 
+    /// Map of operation_id -> OperationNode definition
     pub operation_by_id: ImHashMap<OperationId, Arc<Mutex<OperationNode>>>,
 
     /// This is a mapping of function names to operation ids. Function calls are dispatched to the associated
@@ -170,40 +182,15 @@ impl std::fmt::Debug for ExecutionState {
 
 fn render_map_as_table(exec_state: &ExecutionState) -> String {
     let mut table = String::from("\n --- state ----");
-    table.push_str(indoc!(
-        r"
-            | Key | Value |
-            |---|---|"
-    ));
+    table.push_str(indoc!(r"
+        | Key | Value |
+        |---|---|"));
     for key in exec_state.state.keys() {
         if let Some(val) = exec_state.state_get(key) {
-            table.push_str(&format!(
-                indoc!(
-                    r"
-                | {} | {:?} |"
-                ),
-                key, val,
-            ));
+            table.push_str(&format!(indoc!(r"| {} | {:?} |" ), key, val));
         }
     }
     table.push_str("\n");
-    // table.push_str("\n ---- operations ---- ");
-    // table.push_str(indoc!(
-    //     r"
-    //         | Key | Value |
-    //         |---|---|"
-    // ));
-    // for key in exec_state.operation_by_id.keys() {
-    //     if let Some(val) = exec_state.operation_by_id.get(key) {
-    //         table.push_str(&format!(
-    //             indoc!(
-    //                 r"
-    //             | {} | {:?} |"
-    //             ),
-    //         ));
-    //     }
-    // }
-    // table.push_str("\n");
 
     table
 }
@@ -236,10 +223,9 @@ async fn pause_future_with_oneshot(execution_state_evaluation: ExecutionStateEva
     Box::pin(future)
 }
 
-impl ExecutionState {
-    pub fn new() -> Self {
+impl Default for ExecutionState {
+    fn default() -> Self {
         ExecutionState {
-
             id: Uuid::new_v4(),
             parent_state_id: Uuid::nil(),
             op_counter: 0,
@@ -258,30 +244,24 @@ impl ExecutionState {
             has_been_set: Default::default(),
             dependency_map: Default::default(),
             execution_event_sender: None,
+            chat_message_queue_head: 0,
+        }
+    }
+}
+
+impl ExecutionState {
+    pub fn new_with_random_id() -> Self {
+        ExecutionState {
+            ..Self::default()
         }
     }
 
-    pub fn with_graph_sender(parent_state_id: ExecutionNodeId, graph_sender: Arc<tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>>) -> Self {
+    pub fn new_with_graph_sender(parent_state_id: ExecutionNodeId, graph_sender: Arc<tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>>) -> Self {
         ExecutionState {
-
             id: Uuid::nil(),
             parent_state_id,
-            op_counter: 0,
-            evaluating_id: 0,
-            evaluating_name: None,
-            evaluating_fn: None,
-            operation_mutation: None,
             graph_sender: Some(graph_sender),
-            exec_queue: VecDeque::new(),
-            marked_for_consumption: HashSet::new(),
-            state: Default::default(),
-            fresh_values: vec![],
-            operation_name_to_id: Default::default(),
-            operation_by_id: Default::default(),
-            function_name_to_metadata: Default::default(),
-            has_been_set: Default::default(),
-            dependency_map: Default::default(),
-            execution_event_sender: None,
+            ..Self::default()
         }
     }
 
@@ -289,7 +269,7 @@ impl ExecutionState {
         let mut new = self.clone();
         new.parent_state_id = new.id;
         new.fresh_values = vec![];
-        new.id = get_execution_id();
+        new.id = Uuid::new_v4();
         new
     }
 
@@ -385,7 +365,7 @@ impl ExecutionState {
             CellTypes::CodeGen(c, r) => crate::cells::code_gen_cell::code_gen_cell(c, r),
         }?;
         op.attach_cell(cell.clone());
-        let new_state = self.clone_with_new_id();
+        let new_state = self.clone();
         let (op_id, new_state) = new_state.upsert_operation(op, op_id);
         let mutations = Self::assign_dependencies_to_operations(&new_state)?;
         let mut final_state = new_state.apply_dependency_graph_mutations(mutations);
@@ -408,7 +388,8 @@ impl ExecutionState {
         // For each destination cell, we inspect their input signatures and accumulate the
         // mutation operations that we need to apply to the dependency graph.
         for (destination_cell_id, op) in new_state.operation_by_id.iter() {
-            let operation = op.lock().unwrap();
+            // The currently running operation will be locked and will fail this condition, but we're not updating it.
+            let Ok(operation) = op.try_lock() else { continue; };
             let input_signature = &operation.signature.input_signature;
             let mut accum = vec![];
             for (value_name, value) in input_signature.globals.iter() {
@@ -456,7 +437,9 @@ impl ExecutionState {
 
         // For all reported cells, add their exposed values to the available values
         for (id, op) in new_state.operation_by_id.iter() {
-            let output_signature = &op.lock().unwrap().signature.output_signature;
+            // The currently running operation will be locked and will fail this condition, but we're not updating it.
+            let Ok(op_lock) = op.try_lock() else { continue; };
+            let output_signature = &op_lock.signature.output_signature;
 
             // Store values that are available as globals
             for (key, value) in output_signature.globals.iter() {
@@ -793,7 +776,7 @@ impl ExecutionState {
         new_state.evaluating_fn = None;
         new_state.evaluating_id = next_operation_id;
         new_state.evaluating_name = op_node.name.clone();
-        let op_node_execute = op_node.execute(&self, argument_payload, None, None);
+        let op_node_execute = op_node.execute(&new_state, argument_payload, None, None);
         if op_node.is_long_running_background_thread {
             let sender_clone = sender.clone();
             let (oneshot_sender, oneshot_receiver) = tokio::sync::oneshot::channel();
@@ -836,9 +819,9 @@ impl ExecutionState {
             outputs.push((next_operation_id, result.clone()));
 
             // TODO: support overriding execution state entirely
-            // if let Some(s) = result.execution_state {
-            //     new_state = s;
-            // }
+            if let Some(s) = &result.execution_state {
+                new_state = s.clone();
+            }
             new_state.state_insert(next_operation_id, result);
         }
         new_state.marked_for_consumption = marked_for_consumption;
@@ -852,7 +835,7 @@ mod tests {
 
     #[test]
     fn test_state_insert_and_get_value() {
-        let mut exec_state = ExecutionState::new();
+        let mut exec_state = ExecutionState::new_with_random_id();
         let operation_id = 1;
         let value = RkyvSerializedValue::Number(1);
         let value = OperationFnOutput {
@@ -869,7 +852,7 @@ mod tests {
 
     #[test]
     fn test_dependency_graph_mutation() {
-        let mut exec_state = ExecutionState::new();
+        let mut exec_state = ExecutionState::new_with_random_id();
         let operation_id = 1;
         let depends_on = vec![(2, DependencyReference::Positional(0))];
         let mutation = DependencyGraphMutation::Create {
@@ -886,7 +869,7 @@ mod tests {
 
     #[test]
     fn test_dependency_graph_deletion() {
-        let mut exec_state = ExecutionState::new();
+        let mut exec_state = ExecutionState::new_with_random_id();
         let operation_id = 1;
         let depends_on = vec![(2, DependencyReference::Positional(0))];
         let create_mutation = DependencyGraphMutation::Create {
@@ -905,7 +888,7 @@ mod tests {
 
     #[test]
     fn test_async_execution_at_a_state() {
-        let mut exec_state = ExecutionState::new();
+        let mut exec_state = ExecutionState::new_with_random_id();
         let operation_id = 1;
         let depends_on = vec![(2, DependencyReference::Positional(0))];
         let create_mutation = DependencyGraphMutation::Create {

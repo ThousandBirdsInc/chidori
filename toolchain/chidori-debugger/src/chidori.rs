@@ -17,6 +17,7 @@ use notify_debouncer_full::{
     Debouncer,
     FileIdMap, new_debouncer, notify::{RecommendedWatcher, RecursiveMode, Watcher},
 };
+use chidori_core::cells::CellTypes;
 use chidori_core::uuid::Uuid;
 
 use chidori_core::execution::execution::execution_graph::{
@@ -234,7 +235,8 @@ pub struct ChidoriLogMessages {
 
 #[derive(Resource)]
 pub struct ChidoriCells {
-    pub inner: Vec<CellHolder>,
+    pub editor_cells: Vec<CellHolder>,
+    pub state_cells: Vec<CellTypes>,
 }
 
 #[derive(Resource)]
@@ -373,7 +375,7 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
 
     commands.insert_resource(ChidoriDefinitionGraph { inner: vec![] });
     commands.insert_resource(ChidoriExecutionState { inner: None });
-    commands.insert_resource(ChidoriCells { inner: vec![] });
+    commands.insert_resource(ChidoriCells { editor_cells: vec![], state_cells: vec![] });
 
     let (trace_event_sender, trace_event_receiver) = std::sync::mpsc::channel();
     let (runtime_event_sender, runtime_event_receiver) = std::sync::mpsc::channel();
@@ -468,7 +470,7 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                         EventsFromRuntime::CellsUpdated(state) => {
                             ctx.run_on_main_thread(move |ctx| {
                                 if let Some(mut s) = ctx.world.get_resource_mut::<ChidoriCells>() {
-                                    s.inner = state;
+                                    s.editor_cells = state;
                                 }
                             })
                             .await;
@@ -482,6 +484,16 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                                 }
                             })
                             .await;
+                        }
+                        EventsFromRuntime::ReceivedChatMessage(_) => {}
+                        EventsFromRuntime::ExecutionStateCellsViewUpdated(cells) => {
+                            ctx.run_on_main_thread(move |ctx| {
+                                if let Some(mut s) = ctx.world.get_resource_mut::<ChidoriCells>() {
+                                    s.state_cells = cells;
+                                }
+                            })
+                                .await;
+
                         }
                     }
                 }

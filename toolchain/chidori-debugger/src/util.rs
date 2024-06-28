@@ -259,12 +259,24 @@ pub fn egui_render_cell_read(ui: &mut Ui, cell: &CellTypes) {
             frame.end(ui);
         }
         CellTypes::CodeGen(LLMCodeGenCell { name, req, .. }, _) => {
+            let mut layouter = |ui: &egui::Ui, text_string: &str, wrap_width: f32| {
+                let mut layout_job =
+                    egui_extras::syntax_highlighting::highlight(ui.ctx(), &theme, text_string, "md");
+                layout_job.wrap.max_width = wrap_width;
+
+                // Fix font size
+                for mut section in &mut layout_job.sections {
+                    section.format.font_id = egui::FontId::new(14.0, FontFamily::Monospace);
+                }
+
+                ui.fonts(|f| f.layout_job(layout_job))
+            };
             let mut s = req.clone();
             let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(16.0).inner_margin(16.0).rounding(6.0).begin(ui);
             {
                 let mut ui = &mut frame.content_ui;
                 ui.horizontal(|ui| {
-                    egui_label(ui, "Prompt");
+                    egui_label(ui, "Code Gen Prompt");
                     if let Some(name) = name {
                         egui_label(ui, name);
                     }
@@ -283,6 +295,7 @@ pub fn egui_render_cell_read(ui: &mut Ui, cell: &CellTypes) {
                             .lock_focus(true)
                             .desired_width(f32::INFINITY)
                             .margin(Margin::symmetric(8.0, 8.0))
+                            .layouter(&mut layouter)
                     );
                     ui.add_space(10.0);
                 });
