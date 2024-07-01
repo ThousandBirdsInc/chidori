@@ -2,11 +2,11 @@ use crate::cells::{LLMCodeGenCell, LLMPromptCell, SupportedModelProviders, TextR
 use crate::execution::primitives::operation::{InputItemConfiguration, InputSignature, InputType, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
 use crate::execution::primitives::serialized_value::{RkyvSerializedValue as RKV, RkyvSerializedValue, serialized_value_to_json_value};
 use futures_util::FutureExt;
-
+use crate::execution::execution::execution_graph::ExecutionNodeId;
 
 
 #[tracing::instrument]
-pub fn code_gen_cell(cell: &LLMCodeGenCell, range: &TextRange) -> anyhow::Result<OperationNode> {
+pub fn code_gen_cell(execution_state_id: ExecutionNodeId, cell: &LLMCodeGenCell, range: &TextRange) -> anyhow::Result<OperationNode> {
     let LLMCodeGenCell {
         configuration,
         name,
@@ -65,6 +65,7 @@ pub fn code_gen_cell(cell: &LLMCodeGenCell, range: &TextRange) -> anyhow::Result
     match provider {
         SupportedModelProviders::OpenAI => Ok(OperationNode::new(
             name.clone(),
+            execution_state_id,
             input_signature,
             output_signature,
             Box::new(move |s, payload, _, _| {

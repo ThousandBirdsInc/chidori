@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use tokio_cron_scheduler::{Job, JobScheduler, JobSchedulerError};
+use uuid::Uuid;
 use crate::cells::{CellTypes, CodeCell, ScheduleCell};
 use crate::execution::execution::ExecutionState;
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue};
@@ -56,10 +57,10 @@ pub async fn run_cron(
                                     let mut c = c.clone();
                                     c.function_invocation =
                                         Some(function_name.clone());
-                                    crate::cells::code_cell::code_cell(&c, r)
+                                    crate::cells::code_cell::code_cell(Uuid::nil(), &c, r)
                                 }
                                 CellTypes::Prompt(c, r) => {
-                                    crate::cells::llm_prompt_cell::llm_prompt_cell(&c, r)
+                                    crate::cells::llm_prompt_cell::llm_prompt_cell(Uuid::nil(), &c, r)
                                 }
                                 _ => {
                                     unreachable!("Unsupported cell type");

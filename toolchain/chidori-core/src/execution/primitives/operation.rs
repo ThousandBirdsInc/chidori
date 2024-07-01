@@ -10,6 +10,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
 use futures_util::FutureExt;
 use tracing::{Level, span};
+use uuid::Uuid;
 use crate::cells::{CellTypes, CodeCell, SupportedLanguage, TextRange};
 use crate::execution::execution::execution_graph::ExecutionNodeId;
 use crate::execution::execution::ExecutionState;
@@ -297,6 +298,7 @@ pub type OperationFn = dyn Fn(
 pub struct OperationNode {
     pub(crate) id: usize,
     pub(crate) name: Option<String>,
+    pub created_at_state_id: ExecutionNodeId,
 
     /// Should this operation run in a background thread
     pub is_long_running_background_thread: bool,
@@ -366,6 +368,7 @@ impl Default for OperationNode {
         OperationNode {
             id: 0,
             name: None,
+            created_at_state_id: Uuid::nil(),
             is_long_running_background_thread: false,
             cell: CellTypes::Code(CodeCell {
                 name: None,
@@ -389,11 +392,13 @@ impl Default for OperationNode {
 impl OperationNode {
     pub(crate) fn new(
         name: Option<String>,
+        created_at: ExecutionNodeId,
         input_signature: InputSignature,
         output_signature: OutputSignature,
         f: Box<OperationFn>,
     ) -> Self {
         let mut node = OperationNode::default();
+        node.created_at_state_id = created_at;
         node.signature.input_signature = input_signature;
         node.signature.output_signature = output_signature;
         node.operation = f;
@@ -456,6 +461,7 @@ mod tests {
     async fn test_async_communication_rpc() {
         let (async_rpc_communication, rpc_sender, callable_interface_receiver) = AsyncRPCCommunication::new();
         let op = OperationNode {
+            created_at_state_id: Uuid::nil(),
             id: 0,
             name: None,
             is_long_running_background_thread: false,

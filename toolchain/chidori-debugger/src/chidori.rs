@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 use std::time::Duration;
 
 use bevy::app::{App, Startup, Update};
 use bevy::input::ButtonInput;
-use bevy::prelude::{Commands, default, KeyCode, NextState, Res, ResMut, Resource};
+use bevy::prelude::{Commands, default, KeyCode, Local, NextState, Res, ResMut, Resource};
 use crate::bevy_egui::{EguiContexts};
 use egui;
-use egui::{Color32, Frame, Id, Margin, Response, RichText, vec2, Visuals, Widget};
+use egui::{Color32, FontFamily, Frame, Id, Margin, Response, RichText, vec2, Visuals, Widget};
 use egui::panel::TopBottomSide;
 use egui_tiles::{Tile, TileId};
 use notify_debouncer_full::{
@@ -33,6 +33,8 @@ use chidori_core::tokio::task::JoinHandle;
 use chidori_core::utils::telemetry::TraceEvents;
 
 use crate::{GameState, tokio_tasks};
+
+const RECV_RUNTIME_EVENT_TIMEOUT_MS: u64 = 100;
 
 #[derive(Debug)]
 pub struct Pane {
@@ -236,7 +238,7 @@ pub struct ChidoriLogMessages {
 #[derive(Resource)]
 pub struct ChidoriCells {
     pub editor_cells: Vec<CellHolder>,
-    pub state_cells: Vec<CellTypes>,
+    pub state_cells: Vec<CellHolder>,
 }
 
 #[derive(Resource)]
@@ -423,7 +425,7 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
 
     runtime.spawn_background_task(|mut ctx| async move {
         loop {
-            match runtime_event_receiver.try_recv() {
+            match runtime_event_receiver.recv_timeout(Duration::from_millis(RECV_RUNTIME_EVENT_TIMEOUT_MS)) {
                 Ok(msg) => {
                     println!("Received from runtime: {:?}", &msg);
                     match msg {
@@ -498,8 +500,8 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                     }
                 }
                 Err(e) => match e {
-                    TryRecvError::Empty => {}
-                    TryRecvError::Disconnected => {
+                    RecvTimeoutError::Timeout => {}
+                    RecvTimeoutError::Disconnected => {
                         println!("Runtime channel disconnected");
                         break;
                     }
@@ -549,15 +551,118 @@ pub fn update_gui(
     runtime: ResMut<tokio_tasks::TokioTasksRuntime>,
     mut internal_state: ResMut<InternalState>,
     mut state: ResMut<NextState<GameState>>,
+    mut displayed_example_desc: Local<Option<(String, String, String)>>
 ) {
     if internal_state.display_example_modal {
-        render_example_selection_modal(&mut contexts, &mut internal_state);
+        let mut contexts1 = &mut contexts;
+        let mut internal_state1 = &mut internal_state;
+        egui::CentralPanel::default()
+            .frame(
+                Frame::default()
+                    .fill(Color32::from_hex("#222222").unwrap())
+                    .inner_margin(16.0)
+                    .outer_margin(100.0)
+                    .rounding(16.0),
+            )
+            .show(contexts1.ctx_mut(), |ui| {
+                ui.add_space(12.0);
+                let mut frame = egui::Frame::default().inner_margin(16.0).begin(ui);
+                {
+                    let mut ui = &mut frame.content_ui;
+                    ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 12.0);
+                    // Add widgets inside the frame
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label("Load Example:");
+                            ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
+                            let buttons_text_load = vec![
+                                ("Core 1: Simple Math", EXAMPLES_CORE1, "Demonstrates simple arithmetic between cells, and that values can be passed between Python and JavaScript runtimes."),
+                                ("Core 2: Marshalling", EXAMPLES_CORE2, "All of the types that we can successfully pass between runtimes and that are preserved by our execution engine."),
+                                ("Core 3: Function Invocations", EXAMPLES_CORE3, "Demonstrates what function execution looks like when using Chidori. Explore how states are preserved and the ability to revert between them with re-execution."),
+                                ("Core 4: Async Function Invocations", EXAMPLES_CORE4, "Function invocations default to being asynchronous."),
+                                ("Core 5: Prompts Invoked as Functions", EXAMPLES_CORE5, "We treat prompts as first class resources, this demonstrates how prompts are invokable as functions."),
+                                (
+                                    "Core 6: Prompts Leveraging Function Calling",
+                                    EXAMPLES_CORE6, "Prompts may import functions and invoke those in order to accomplish their instructions."
+
+                                ),
+                                ("Core 7: Rag Stateful Memory Cells", EXAMPLES_CORE7, "Cells preserve their internal state, we provide a specialized API for embeddings which demonstrates this behavior, exposing functions for interacting with that state."),
+                                (
+                                    "Core 8: Prompt Code Generation and Execution",
+                                    EXAMPLES_CORE8, "Chidori is designed for L4-L5 agents, new behaviors can be generated on the fly via code generation."
+                                ),
+                                ("Core 9: Multi-Agent Simulation", EXAMPLES_CORE9, "desc"),
+                            ];
+                            let mut is_a_button_hovered = false;
+                            for button in buttons_text_load {
+                                let res = with_cursor(ui.button(button.0));
+                                if res.hovered() {
+                                    is_a_button_hovered = true;
+                                    *displayed_example_desc = Some((button.0.to_string(), button.1.to_string(), button.2.to_string()));
+                                }
+                                if res.clicked() {
+                                    internal_state1.load_string(button.1);
+                                }
+                            }
+                            if is_a_button_hovered == false {
+                                *displayed_example_desc = None;
+                            }
+                        });
+
+                        if let Some((title, code, desc)) = &*displayed_example_desc {
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                                let mut frame = egui::Frame::default().outer_margin(Margin::symmetric(64.0, 0.0)).inner_margin(64.0).rounding(6.0).fill(Color32::from_hex("#111111").unwrap()).begin(ui);
+                                {
+                                    let mut ui = &mut frame.content_ui;
+                                    let mut code_mut = code.to_string();
+                                    ui.set_max_width(800.0);
+                                    ui.label(title);
+                                    ui.add_space(16.0);
+                                    ui.label(desc);
+                                    ui.add_space(16.0);
+                                    egui::ScrollArea::new([false, true]) // Horizontal: false, Vertical: true
+                                        .max_width(800.0)
+                                        .max_height(600.0)
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                egui::TextEdit::multiline(&mut code_mut)
+                                                    .font(egui::FontId::new(14.0, FontFamily::Monospace))
+                                                    .code_editor()
+                                                    .lock_focus(true)
+                                                    .desired_width(f32::INFINITY)
+                                                    .margin(Margin::symmetric(8.0, 8.0))
+
+                                            );
+                                        });
+                                }
+                                frame.end(ui);
+                            });
+                        }
+
+                        // ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                        //     ui.add_space(ui.available_height() / 2.0 - 256.0); // Center vertically
+                        //     egui::Image::new(egui::include_image!("../assets/images/tblogo-white.png"))
+                        //         .fit_to_exact_size(vec2(512.0, 512.0))
+                        //         .rounding(5.0)
+                        //         .ui(ui);
+                        // });
+
+                        // ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        //     egui::Image::new(egui::include_image!("../assets/images/tblogo-white.png"))
+                        //         .fit_to_exact_size(vec2(512.0, 512.0))
+                        //         .rounding(5.0)
+                        //         .ui(ui);
+                        // });
+                    });
+                }
+                frame.end(ui);
+            });
     } else {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().outer_margin(Margin {
                 left: 0.0,
                 right: 0.0,
-                top: 40.0,
+                top: 48.0,
                 bottom: 0.0,
             }))
             .show(contexts.ctx_mut(), |ui| {
@@ -573,7 +678,7 @@ pub fn update_gui(
             // ui.text_edit_multiline(&mut text);
             // a simple button opening the dialog
             let mut frame = egui::Frame::default()
-                .inner_margin(Margin::symmetric(8.0, 4.0))
+                .inner_margin(Margin::symmetric(8.0, 8.0))
                 .begin(ui);
             {
                 let mut ui = &mut frame.content_ui;
@@ -591,6 +696,7 @@ pub fn update_gui(
                             }
                         });
                     }
+                    ui.add_space(8.0);
                     ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
 
                     if with_cursor(ui.button("Run")).clicked() {
@@ -603,67 +709,11 @@ pub fn update_gui(
                         internal_state.step();
                     }
                 });
+
             }
             frame.end(ui);
         },
     );
-}
-
-fn render_example_selection_modal(mut contexts: &mut EguiContexts, mut internal_state: &mut ResMut<InternalState>) {
-    egui::CentralPanel::default()
-        .frame(
-            Frame::default()
-                .fill(Color32::from_hex("#222222").unwrap())
-                .inner_margin(16.0)
-                .outer_margin(100.0)
-                .rounding(5.0),
-        )
-        .show(contexts.ctx_mut(), |ui| {
-            ui.heading("Chidori");
-            ui.add_space(12.0);
-            let mut frame = egui::Frame::default().inner_margin(16.0).begin(ui);
-            {
-                let mut ui = &mut frame.content_ui;
-                ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 12.0);
-                // Add widgets inside the frame
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label("Load Example:");
-                        ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
-                        let buttons_text_load = vec![
-                            ("Core 1: Simple Math", EXAMPLES_CORE1),
-                            ("Core 2: Marshalling", EXAMPLES_CORE2),
-                            ("Core 3: Function Invocations", EXAMPLES_CORE3),
-                            ("Core 4: Async Function Invocations", EXAMPLES_CORE4),
-                            ("Core 5: Prompts Invoked as Functions", EXAMPLES_CORE5),
-                            (
-                                "Core 6: Prompts Leveraging Function Calling",
-                                EXAMPLES_CORE6,
-                            ),
-                            ("Core 7: Rag Stateful Memory Cells", EXAMPLES_CORE7),
-                            (
-                                "Core 8: Prompt Code Generation and Execution",
-                                EXAMPLES_CORE8,
-                            ),
-                            ("Core 9: Multi-Agent Simulation", EXAMPLES_CORE9),
-                        ];
-                        for button in buttons_text_load {
-                            let res = with_cursor(ui.button(button.0));
-                            if res.clicked() {
-                                internal_state.load_string(button.1);
-                            }
-                        }
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        egui::Image::new(egui::include_image!("../assets/images/tblogo-white.png"))
-                            .fit_to_exact_size(vec2(512.0, 512.0))
-                            .rounding(5.0)
-                            .ui(ui);
-                    });
-                });
-            }
-            frame.end(ui);
-        });
 }
 
 pub fn chidori_plugin(app: &mut App) {

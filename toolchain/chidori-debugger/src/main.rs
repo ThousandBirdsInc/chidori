@@ -18,9 +18,11 @@ use bevy::prelude::*;
 use bevy::log::{Level, LogPlugin};
 use bevy::render::render_resource::{Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages};
 use bevy::render::view::{Layer, RenderLayers};
+use bevy::window::{PrimaryWindow, WindowMode, WindowResolution};
+use bevy::winit::WinitWindows;
 use bevy_cosmic_edit::*;
 use crate::bevy_egui::{EguiPlugin, egui, EguiContexts};
-use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId};
+use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Rounding};
 use bevy_rapier2d::plugin::{NoUserData, RapierPhysicsPlugin};
 use bevy_rapier2d::render::RapierDebugRenderPlugin;
 use once_cell::sync::{Lazy, OnceCell};
@@ -117,7 +119,29 @@ pub fn style_egui_context(ctx: &mut egui::Context ) {
         .into();
     style.visuals.widgets.hovered.bg_stroke = bevy_egui::egui::Stroke::new(1.0, Color32::from_hex("#333333").unwrap());
     style.spacing.button_padding = egui::vec2(8.0, 6.0);
+    style.visuals.widgets.inactive.rounding = Rounding::same(4.0);
+    style.visuals.widgets.active.rounding = Rounding::same(4.0);
+
     ctx.set_style(style);
+}
+
+fn set_window_size(
+    mut windows: Query<(Entity, &mut Window), With<PrimaryWindow>>,
+    winit_windows: NonSend<WinitWindows>,
+) {
+    let (e, mut window )= windows.single_mut();
+    let scale_factor = window.scale_factor();
+
+    if let Some(winit_window) = winit_windows.get_window(e) {
+        winit_window.set_blur(true);
+        if let Some(monitor) = winit_window.current_monitor() {
+            let size = monitor.size();
+            window.resolution.set(size.width as f32 / scale_factor, size.height as f32 / scale_factor);
+        }
+    }
+
+    if let Some(monitor) = winit_windows.get_window(e).and_then(|w| w.current_monitor()) {
+    }
 }
 
 fn main() {
@@ -128,6 +152,9 @@ fn main() {
                     primary_window: Some(Window {
                         // resolution: WindowResolution::new(500., 300.).with_scale_factor_override(2.0),
                         title: "Chidori Debugger".to_string(),
+                        mode: WindowMode::Windowed,
+                        position: WindowPosition::At(IVec2::ZERO),
+                        resizable: true,
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -146,7 +173,7 @@ fn main() {
         // .insert_resource(Volume(7))
         // Declare the game state, whose starting value is determined by the `Default` trait
         .init_state::<GameState>()
-        .add_systems(Startup, setup)
+        .add_systems(Startup, (setup, set_window_size))
         .add_systems(Update, check_key_input)
         // Adds the plugins for each state
         .add_plugins((chidori::chidori_plugin, code::editor_plugin, traces::trace_plugin, graph::graph_plugin, chat::chat_plugin, logs::logs_plugin))

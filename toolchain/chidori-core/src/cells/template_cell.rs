@@ -5,10 +5,11 @@ use crate::execution::primitives::operation::{InputItemConfiguration, InputSigna
 use crate::execution::primitives::serialized_value::{RkyvSerializedValue as RKV, serialized_value_to_json_value};
 
 use futures_util::FutureExt;
+use crate::execution::execution::execution_graph::ExecutionNodeId;
 
 /// Template cells leverage the same tooling as LLM Prompt Cells, but are used for more general templating.
 #[tracing::instrument]
-pub fn template_cell(cell: &TemplateCell, range: &TextRange) -> anyhow::Result<OperationNode> {
+pub fn template_cell(execution_state_id: ExecutionNodeId, cell: &TemplateCell, range: &TextRange) -> anyhow::Result<OperationNode> {
     let schema =
         chidori_prompt_format::templating::templates::analyze_referenced_partials(&cell.body);
 
@@ -39,6 +40,7 @@ pub fn template_cell(cell: &TemplateCell, range: &TextRange) -> anyhow::Result<O
     let body = cell.body.clone();
     Ok(OperationNode::new(
         cell.name.clone(),
+        execution_state_id,
         input_signature,
         output_signature,
         Box::new(move |_, x, _, _| {
@@ -63,6 +65,7 @@ pub fn template_cell(cell: &TemplateCell, range: &TextRange) -> anyhow::Result<O
 
 #[cfg(test)]
 mod test {
+    use uuid::Uuid;
     use crate::cells::TextRange;
     use crate::execution::execution::ExecutionState;
 
@@ -72,7 +75,7 @@ mod test {
             name: Some("test".to_string()),
             body: "Hello, {{ name }}!".to_string(),
         };
-        let op = crate::cells::template_cell::template_cell(&cell, &TextRange::default())?;
+        let op = crate::cells::template_cell::template_cell(Uuid::nil(), &cell, &TextRange::default())?;
         let input = crate::execution::primitives::serialized_value::RkyvSerializedValue::Object(
             std::collections::HashMap::new()
         );

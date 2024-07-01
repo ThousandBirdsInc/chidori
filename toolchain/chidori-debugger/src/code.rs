@@ -24,7 +24,7 @@ fn editor_update(
     mut execution_state: Res<ChidoriExecutionState>,
     mut tree: ResMut<EguiTree>,
     mut cells: ResMut<ChidoriCells>,
-    mut state_vs_editor_cells: Local<bool>
+    mut viewing_watched_file_cells: Local<bool>
 ) {
     let window = q_window.single();
     let mut hide_all = false;
@@ -34,7 +34,7 @@ fn editor_update(
         right: 0.0,
         top: 0.0,
         bottom: 0.0,
-    });
+    }).inner_margin(16.0);
     if let Some(code_tile) = tree_identities.code_tile {
         if let Some(tile) = tree.tree.tiles.get(code_tile) {
             match tile {
@@ -70,43 +70,54 @@ fn editor_update(
     egui::CentralPanel::default().frame(container_frame).show(contexts.ctx_mut(), |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let mut theme = egui_extras::syntax_highlighting::CodeTheme::dark();
-            let state_vs_editor_cells_c = state_vs_editor_cells.clone();
-            ui.toggle_value(&mut state_vs_editor_cells, if state_vs_editor_cells_c == false { "View Editor Cells" } else { "View Cells at Current State"});
-            let cells: Vec<(Option<usize>, &CellTypes)> = if !*state_vs_editor_cells {
-                cells.editor_cells.iter().map(|c| (c.op_id, &c.cell)).collect()
+            let cells = if *viewing_watched_file_cells {
+                cells.editor_cells.iter()
             } else {
-                cells.state_cells.iter().map(|c| (Some(0), c)).collect()
+                cells.state_cells.iter()
             };
-            for (op_id, cell) in cells {
-                match &cell {
-                    CellTypes::Code(CodeCell { name, source_code, language, .. }, _) => {
-                        let language_string = match language {
-                            SupportedLanguage::PyO3 => "python",
-                            SupportedLanguage::Starlark => "starlark",
-                            SupportedLanguage::Deno => "javascript/typescript"
-                        };
-                        let mut layouter = |ui: &egui::Ui, text_string: &str, wrap_width: f32| {
-                            let syntax_language = match language {
-                                SupportedLanguage::PyO3 => "py",
-                                SupportedLanguage::Starlark => "py",
-                                SupportedLanguage::Deno => "js"
+
+            ui.horizontal(|ui| {
+                if ui.radio(*viewing_watched_file_cells, "View Editor Cells").clicked() {
+                    *viewing_watched_file_cells = true;
+                }
+                if ui.radio(!*viewing_watched_file_cells, "View Cells at Current State").clicked() {
+                    *viewing_watched_file_cells = false;
+                }
+            });
+
+            for cell_holder in cells {
+                let op_id = cell_holder.op_id;
+
+                let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(Margin::symmetric(8.0, 16.0)).inner_margin(16.0).rounding(6.0).begin(ui);
+                {
+                    let mut ui = &mut frame.content_ui;
+
+                    match &cell_holder.cell {
+                        CellTypes::Code(CodeCell { name, source_code, language, ..}, _) => {
+                            let language_string = match language {
+                                SupportedLanguage::PyO3 => "python",
+                                SupportedLanguage::Starlark => "starlark",
+                                SupportedLanguage::Deno => "javascript/typescript"
                             };
-                            let mut layout_job =
-                                egui_extras::syntax_highlighting::highlight(ui.ctx(), &theme, text_string, syntax_language);
-                            layout_job.wrap.max_width = wrap_width;
+                            let mut layouter = |ui: &egui::Ui, text_string: &str, wrap_width: f32| {
+                                let syntax_language = match language {
+                                    SupportedLanguage::PyO3 => "py",
+                                    SupportedLanguage::Starlark => "py",
+                                    SupportedLanguage::Deno => "js"
+                                };
+                                let mut layout_job =
+                                    egui_extras::syntax_highlighting::highlight(ui.ctx(), &theme, text_string, syntax_language);
+                                layout_job.wrap.max_width = wrap_width;
 
-                            // Fix font size
-                            for mut section in &mut layout_job.sections {
-                                section.format.font_id = egui::FontId::new(14.0, FontFamily::Monospace);
-                            }
+                                // Fix font size
+                                for mut section in &mut layout_job.sections {
+                                    section.format.font_id = egui::FontId::new(14.0, FontFamily::Monospace);
+                                }
 
-                            ui.fonts(|f| f.layout_job(layout_job))
-                        };
+                                ui.fonts(|f| f.layout_job(layout_job))
+                            };
 
-                        let mut s = source_code.clone();
-                        let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(16.0).inner_margin(16.0).rounding(6.0).begin(ui);
-                        {
-                            let mut ui = &mut frame.content_ui;
+                            let mut s = source_code.clone();
                             ui.horizontal(|ui| {
                                 egui_label(ui, "Code");
                                 egui_label(ui, language_string);
@@ -151,13 +162,8 @@ fn editor_update(
                                 }
                             });
                         }
-                        frame.end(ui);
-                    }
-                    CellTypes::CodeGen(LLMCodeGenCell { name, req, .. }, _) => {
-                        let mut s = req.clone();
-                        let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(16.0).inner_margin(16.0).rounding(6.0).begin(ui);
-                        {
-                            let mut ui = &mut frame.content_ui;
+                        CellTypes::CodeGen(LLMCodeGenCell { name, req, .. }, _) => {
+                            let mut s = req.clone();
                             ui.horizontal(|ui| {
                                 egui_label(ui, "Prompt");
                                 if let Some(name) = name {
@@ -200,14 +206,10 @@ fn editor_update(
                                 }
                             });
                         }
-                        frame.end(ui);
-                    }
-                    CellTypes::Prompt(LLMPromptCell::Completion { .. }, _) => {}
-                    CellTypes::Prompt(LLMPromptCell::Chat { name, configuration, req, .. }, _) => {
-                        let mut s = req.clone();
-                        let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(16.0).inner_margin(16.0).begin(ui);
-                        {
-                            let mut ui = &mut frame.content_ui;
+                        CellTypes::Prompt(LLMPromptCell::Completion { .. }, _) => {}
+                        CellTypes::Prompt(LLMPromptCell::Chat { name, configuration, req, .. }, _) => {
+                            let mut s = req.clone();
+                            let mut cfg = serde_yaml::to_string(&configuration.clone()).unwrap();
                             ui.horizontal(|ui| {
                                 egui_label(ui, "Prompt");
                                 if let Some(name) = name {
@@ -222,6 +224,15 @@ fn editor_update(
                             });
                             // Add widgets inside the frame
                             ui.vertical(|ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut cfg)
+                                        .font(egui::FontId::new(14.0, FontFamily::Monospace))
+                                        .code_editor()
+                                        .lock_focus(true)
+                                        .desired_width(f32::INFINITY)
+                                        .margin(Margin::symmetric(8.0, 8.0))
+                                );
+                                ui.add_space(10.0);
                                 ui.add(
                                     egui::TextEdit::multiline(&mut s)
                                         .code_editor()
@@ -250,14 +261,9 @@ fn editor_update(
                                 }
                             });
                         }
-                        frame.end(ui);
-                    }
-                    CellTypes::Embedding(LLMEmbeddingCell { .. }, _) => {}
-                    CellTypes::Web(WebserviceCell { name, configuration, .. }, _) => {
-                        let mut s = configuration.clone();
-                        let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(16.0).inner_margin(16.0).begin(ui);
-                        {
-                            let mut ui = &mut frame.content_ui;
+                        CellTypes::Embedding(LLMEmbeddingCell { .. }, _) => {}
+                        CellTypes::Web(WebserviceCell { name, configuration, .. }, _) => {
+                            let mut s = configuration.clone();
                             ui.horizontal(|ui| {
                                 egui_label(ui, "Prompt");
                                 if let Some(name) = name {
@@ -298,13 +304,8 @@ fn editor_update(
                                 }
                             });
                         }
-                        frame.end(ui);
-                    }
-                    CellTypes::Template(TemplateCell { name, body }, _) => {
-                        let mut s = body.clone();
-                        let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(16.0).inner_margin(16.0).begin(ui);
-                        {
-                            let mut ui = &mut frame.content_ui;
+                        CellTypes::Template(TemplateCell { name, body }, _) => {
+                            let mut s = body.clone();
                             ui.horizontal(|ui| {
                                 egui_label(ui, "Prompt");
                                 if let Some(name) = name {
@@ -346,10 +347,11 @@ fn editor_update(
                                 }
                             });
                         }
-                        frame.end(ui);
+                        CellTypes::Memory(MemoryCell { .. }, _) => {}
                     }
-                    CellTypes::Memory(MemoryCell { .. }, _) => {}
+
                 }
+                frame.end(ui);
             }
         });
     });

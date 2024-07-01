@@ -1,12 +1,13 @@
 use futures_util::FutureExt;
 use tokio::runtime::Runtime;
 use crate::cells::{TextRange, WebserviceCell};
+use crate::execution::execution::execution_graph::ExecutionNodeId;
 use crate::execution::primitives::operation::{InputItemConfiguration, InputSignature, InputType, OperationFnOutput, OperationNode, OutputSignature};
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue as RKV};
 
 /// Web cells initialize HTTP handlers that can invoke other cells.
 #[tracing::instrument]
-pub fn web_cell(cell: &WebserviceCell, range: &TextRange) -> anyhow::Result<OperationNode> {
+pub fn web_cell(execution_state_id: ExecutionNodeId, cell: &WebserviceCell, range: &TextRange) -> anyhow::Result<OperationNode> {
     let endpoints = crate::library::std::webserver::parse_configuration_string(&cell.configuration);
 
     let mut input_signature = InputSignature::new();
@@ -25,6 +26,7 @@ pub fn web_cell(cell: &WebserviceCell, range: &TextRange) -> anyhow::Result<Oper
     let cell = cell.clone();
     let mut op_node = OperationNode::new(
         cell.name.clone(),
+        execution_state_id,
         input_signature,
         output_signature,
         Box::new(move |_, x, _, _| {

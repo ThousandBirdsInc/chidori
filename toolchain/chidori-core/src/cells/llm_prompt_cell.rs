@@ -6,6 +6,7 @@ use crate::cells::{LLMPromptCell, SupportedModelProviders, TextRange};
 use crate::execution::primitives::operation::{InputItemConfiguration, InputSignature, InputType, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
 use crate::execution::primitives::serialized_value::{RkyvSerializedValue as RKV, RkyvSerializedValue, serialized_value_to_json_value};
 use futures_util::FutureExt;
+use crate::execution::execution::execution_graph::ExecutionNodeId;
 use crate::execution::execution::ExecutionState;
 use crate::library::std::ai::llm::ai_llm_run_embedding_model;
 
@@ -13,7 +14,7 @@ use crate::library::std::ai::llm::ai_llm_run_embedding_model;
 
 /// LLM Prompt Cells allow notebooks to invoke language models to generate text.
 #[tracing::instrument]
-pub fn llm_prompt_cell(cell: &LLMPromptCell, range: &TextRange) -> anyhow::Result<OperationNode> {
+pub fn llm_prompt_cell(execution_state_id: ExecutionNodeId, cell: &LLMPromptCell, range: &TextRange) -> anyhow::Result<OperationNode> {
     match cell {
         LLMPromptCell::Chat {
             function_invocation,
@@ -82,6 +83,7 @@ pub fn llm_prompt_cell(cell: &LLMPromptCell, range: &TextRange) -> anyhow::Resul
             match provider {
                 SupportedModelProviders::OpenAI => Ok(OperationNode::new(
                     name.clone(),
+                    execution_state_id,
                     input_signature,
                     output_signature,
                     Box::new(move |s, payload, _, _| {
@@ -115,6 +117,7 @@ pub fn llm_prompt_cell(cell: &LLMPromptCell, range: &TextRange) -> anyhow::Resul
         }
         LLMPromptCell::Completion { .. } => Ok(OperationNode::new(
             None,
+            execution_state_id,
             InputSignature::new(),
             OutputSignature::new(),
             Box::new(|_, x, _, _| async move { Ok(OperationFnOutput::with_value(x)) }.boxed()),

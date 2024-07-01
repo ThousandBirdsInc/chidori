@@ -4,13 +4,14 @@ use crate::cells::{MemoryCell, SupportedMemoryProviders, TextRange};
 use crate::execution::primitives::operation::{AsyncRPCCommunication, InputItemConfiguration, InputSignature, InputType, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
 use futures_util::FutureExt;
 use serde_json::json;
+use crate::execution::execution::execution_graph::ExecutionNodeId;
 use crate::execution::primitives::serialized_value::{json_value_to_serialized_value, RkyvSerializedValue, serialized_value_to_json_value};
 use crate::library::std::ai::memory::in_memory::InMemoryVectorDb;
 
 /// Memory cells when first executed have no inputs. They initialize the connection to the memory store.
 /// Once initialized they become communicated with over the functions that they provide to the workspace.
 #[tracing::instrument]
-pub fn memory_cell(cell: &MemoryCell, range: &TextRange) -> anyhow::Result<OperationNode> {
+pub fn memory_cell(execution_state_id: ExecutionNodeId, cell: &MemoryCell, range: &TextRange) -> anyhow::Result<OperationNode> {
     match cell.provider {
         SupportedMemoryProviders::InMemory => {
             let mut input_signature = InputSignature::new();
@@ -41,6 +42,7 @@ pub fn memory_cell(cell: &MemoryCell, range: &TextRange) -> anyhow::Result<Opera
             let cell = cell.clone();
             Ok(OperationNode::new(
                 None,
+                execution_state_id,
                 input_signature,
                 output_signature,
                 Box::new(move |s, x, _, async_rpccommunication| {
@@ -110,6 +112,7 @@ mod test {
     use std::time::Duration;
     use futures_util::FutureExt;
     use indoc::indoc;
+    use uuid::Uuid;
     use crate::cells::{CellTypes, CodeCell, SupportedLanguage, TextRange};
     use crate::execution::execution::ExecutionState;
     use crate::execution::primitives::operation::{AsyncRPCCommunication, OperationNode, Signature};
@@ -128,11 +131,12 @@ mod test {
                         "#}),
             function_invocation: None,
         }, TextRange::default()), Some(0))?;
-        let op = memory_cell(&MemoryCell {
-            name: None,
-            provider: SupportedMemoryProviders::InMemory,
-            embedding_function: "fake_embedding".to_string(),
-        }, &TextRange::default())?;
+        let op = memory_cell(
+            Uuid::nil(), &MemoryCell {
+                        name: None,
+                        provider: SupportedMemoryProviders::InMemory,
+                        embedding_function: "fake_embedding".to_string(),
+                    }, &TextRange::default())?;
         let ex = op.execute(&state, RkyvSerializedValue::Null, None, Some(async_rpc_communication));
         let join_handle = tokio::spawn(async move {
             ex.await;

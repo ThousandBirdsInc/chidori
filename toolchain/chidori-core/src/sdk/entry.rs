@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::{Arc, mpsc, Mutex, MutexGuard};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::sleep;
+use std::time::Duration;
 use chumsky::prelude::any;
 use petgraph::graphmap::DiGraphMap;
 use serde::ser::SerializeMap;
@@ -26,6 +27,10 @@ use crate::utils::telemetry::{init_internal_telemetry, TraceEvents};
 
 
 /// This is an SDK for building execution graphs. It is designed to be used interactively.
+///
+
+
+const USER_INTERACTION_RECEIVER_TIMEOUT_MS: u64 = 500;
 
 type Func = fn(RKV) -> RKV;
 
@@ -92,14 +97,14 @@ impl InstancedEnvironment {
                 ids.push(self.upsert_cell(cell_holder.cell.clone(), cell_holder.op_id)?);
             } else {
                 // TODO: remove these unwraps and handle this better
-                ids.push((cell_holder.applied_at.unwrap(), cell_holder.op_id.unwrap()));
+                ids.push((cell_holder.applied_at, cell_holder.op_id.unwrap()));
             }
         }
 
         let mut shared_state = self.shared_state.lock().unwrap();
         for (i, cell) in shared_state.editor_cells.iter_mut().enumerate() {
             let (applied_at, op_id) = ids[i];
-            cell.applied_at = Some(applied_at);
+            cell.applied_at = applied_at.clone();
             cell.op_id = Some(op_id);
             cell.needs_update = false;
         }
@@ -142,18 +147,20 @@ impl InstancedEnvironment {
             println!("Looping UserInteraction");
             // let closure_span = tracing::span!(parent: &current_span_id, tracing::Level::INFO, "execution_instance_loop");
             // let _enter = closure_span.enter();
-            if let Ok(message) = self.env_rx.try_recv() {
+
+
+            if let Ok(message) = self.env_rx.recv_timeout(Duration::from_millis(USER_INTERACTION_RECEIVER_TIMEOUT_MS)) {
                 println!("Received message from user: {:?}", message);
                 match message {
                     UserInteractionMessage::Step => {
                         self.playback_state = PlaybackState::Step;
                     },
                     UserInteractionMessage::Play => {
-                        self.get_state().render_dependency_graph();
+                        self.get_state_at_current_execution_head().render_dependency_graph();
                         self.playback_state = PlaybackState::Running;
                     },
                     UserInteractionMessage::Pause => {
-                        self.get_state().render_dependency_graph();
+                        self.get_state_at_current_execution_head().render_dependency_graph();
                         self.playback_state = PlaybackState::Paused;
                     },
                     UserInteractionMessage::ReloadCells => {
@@ -177,7 +184,12 @@ impl InstancedEnvironment {
                                 // TODO: keep a separate mapping of cells so we don't need to lock operations
                                 for k in state.operation_by_id.values() {
                                     let op = k.lock().unwrap();
-                                    cells.push(op.cell.clone());
+                                    cells.push(CellHolder {
+                                        cell: op.cell.clone(),
+                                        op_id: Some(op.id.clone()),
+                                        applied_at: op.created_at_state_id.clone(),
+                                        needs_update: false,
+                                    });
                                 }
                                 let mut ss = self.shared_state.lock().unwrap();
                                 ss.at_execution_state_cells = cells.clone();
@@ -223,14 +235,16 @@ impl InstancedEnvironment {
     pub fn get_state_at(&self, id: ExecutionNodeId) -> ExecutionState {
         match self.db.get_state_at_id(id).unwrap() {
             ExecutionStateEvaluation::Complete(s) => s,
-            ExecutionStateEvaluation::Executing(_) => panic!("get_state_at, failed, still executing")
+            ExecutionStateEvaluation::Executing(_) => panic!("get_state_at, failed, still executing"),
+            ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
         }
     }
 
-    pub fn get_state(&self) -> ExecutionState {
+    pub fn get_state_at_current_execution_head(&self) -> ExecutionState {
         match self.db.get_state_at_id(self.execution_head_state_id).unwrap() {
             ExecutionStateEvaluation::Complete(s) => s,
-            ExecutionStateEvaluation::Executing(_) => panic!("get_state, failed, still executing")
+            ExecutionStateEvaluation::Executing(_) => panic!("get_state, failed, still executing"),
+            ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
         }
     }
 
@@ -243,7 +257,12 @@ impl InstancedEnvironment {
                 // TODO: keep a separate mapping of cells so we don't need to lock operations
                 for k in s.operation_by_id.values() {
                     let op = k.lock().unwrap();
-                    cells.push(op.cell.clone());
+                    cells.push(CellHolder {
+                        cell: op.cell.clone(),
+                        op_id: Some(op.id.clone()),
+                        applied_at: op.created_at_state_id.clone(),
+                        needs_update: false,
+                    });
                 }
                 sender.send(EventsFromRuntime::ExecutionStateCellsViewUpdated(cells)).unwrap();
             }
@@ -322,14 +341,14 @@ pub enum EventsFromRuntime {
     StateAtId(ExecutionNodeId, ExecutionState),
     UpdateExecutionHead(ExecutionNodeId),
     ReceivedChatMessage(String),
-    ExecutionStateCellsViewUpdated(Vec<CellTypes>),
+    ExecutionStateCellsViewUpdated(Vec<CellHolder>),
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct CellHolder {
     pub cell: CellTypes,
     pub op_id: Option<usize>,
-    pub applied_at: Option<ExecutionNodeId>,
+    pub applied_at: ExecutionNodeId,
     needs_update: bool
 }
 
@@ -339,7 +358,7 @@ pub struct SharedState {
     execution_state_head_id: ExecutionNodeId,
     latest_state: Option<ExecutionState>,
     editor_cells: Vec<CellHolder>,
-    at_execution_state_cells: Vec<CellTypes>,
+    at_execution_state_cells: Vec<CellHolder>,
 }
 
 
@@ -471,7 +490,7 @@ impl Chidori {
                 if prev_cell.cell != cell {
                     new_cells_state.push(CellHolder {
                         cell,
-                        applied_at: None,
+                        applied_at: Uuid::nil(),
                         op_id: prev_cell.op_id,
                         needs_update: true
                     });
@@ -481,7 +500,7 @@ impl Chidori {
             } else {
                 new_cells_state.push(CellHolder {
                     cell,
-                    applied_at: None,
+                    applied_at: Uuid::nil(),
                     op_id: None,
                     needs_update: true
                 });
@@ -578,18 +597,18 @@ mod tests {
                                            None)?;
         assert_eq!(op_id_y, 1);
         // env.resolve_dependencies_from_input_signature();
-        env.get_state().render_dependency_graph();
+        env.get_state_at_current_execution_head().render_dependency_graph();
         env.step().await;
         assert_eq!(
-            env.get_state().state_get_value(&op_id_x),
+            env.get_state_at_current_execution_head().state_get_value(&op_id_x),
             Some(&RkyvObjectBuilder::new().insert_number("x", 20).build())
         );
-        assert_eq!(env.get_state().state_get_value(&op_id_y), None);
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&op_id_y), None);
         env.step().await;
-        assert_eq!(env.get_state().state_get_value(&op_id_x),
-            Some(&RkyvObjectBuilder::new().insert_number("x", 20).build()));
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&op_id_x),
+                   Some(&RkyvObjectBuilder::new().insert_number("x", 20).build()));
         assert_eq!(
-            env.get_state().state_get_value(&op_id_y),
+            env.get_state_at_current_execution_head().state_get_value(&op_id_y),
             Some(&RkyvObjectBuilder::new().insert_number("y", 21).build())
         );
         Ok(())
@@ -626,7 +645,7 @@ mod tests {
         }, TextRange::default()),
                                            None)?;
         assert_eq!(op_id_y, 1);
-        env.get_state().render_dependency_graph();
+        env.get_state_at_current_execution_head().render_dependency_graph();
         let out = env.step().await;
         assert_eq!(
             out.as_ref().unwrap().first().unwrap().0,
@@ -639,7 +658,7 @@ mod tests {
                 .build()
         );
         assert_eq!(
-            env.get_state().state_get_value(&op_id_x),
+            env.get_state_at_current_execution_head().state_get_value(&op_id_x),
             Some(
                 &RkyvObjectBuilder::new()
                     .insert_string("x", "Here is a sample string".to_string())
@@ -658,7 +677,7 @@ mod tests {
                 .build()
         );
         assert_eq!(
-            env.get_state().state_get_value(&op_id_y),
+            env.get_state_at_current_execution_head().state_get_value(&op_id_y),
             Some(&RkyvObjectBuilder::new()
                     .insert_string("example", "Here".to_string())
                     .build())
@@ -692,17 +711,17 @@ mod tests {
         }, TextRange::default()),
                                            None)?;
         assert_eq!(op_id_y, 1);
-        env.get_state().render_dependency_graph();
+        env.get_state_at_current_execution_head().render_dependency_graph();
         dbg!(env.step().await);
         assert_eq!(
-            env.get_state().state_get_value(&op_id_x),
+            env.get_state_at_current_execution_head().state_get_value(&op_id_x),
             Some(&RkyvObjectBuilder::new().insert_number("x", 20).build())
         );
-        assert_eq!(env.get_state().state_get_value(&op_id_y), None);
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&op_id_y), None);
         env.step().await;
-        assert_eq!(env.get_state().state_get_value(&op_id_x), None);
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&op_id_x), None);
         assert_eq!(
-            env.get_state().state_get_value(&op_id_y),
+            env.get_state_at_current_execution_head().state_get_value(&op_id_y),
             Some(&RkyvObjectBuilder::new().insert_number("y", 21).build())
         );
         Ok(())
@@ -734,20 +753,20 @@ mod tests {
         }, TextRange::default()),
                                       None)?;
         assert_eq!(id, 1);
-        env.get_state().render_dependency_graph();
+        env.get_state_at_current_execution_head().render_dependency_graph();
         env.step().await;
         // Empty object from the function declaration
         assert_eq!(
-            env.get_state().state_get_value(&0),
+            env.get_state_at_current_execution_head().state_get_value(&0),
             Some(&RkyvObjectBuilder::new().insert_string("add", String::from("function")).build())
         );
-        assert_eq!(env.get_state().state_get_value(&1), None);
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&1), None);
         env.step().await;
-        assert_eq!(env.get_state().state_get_value(&0),
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&0),
                    Some(&RkyvObjectBuilder::new().insert_string("add", String::from("function")).build())
             );
         assert_eq!(
-            env.get_state().state_get_value(&1),
+            env.get_state_at_current_execution_head().state_get_value(&1),
             Some(&RkyvObjectBuilder::new().insert_number("y", 5).build())
         );
         env.shutdown().await;
@@ -779,21 +798,21 @@ mod tests {
         }, TextRange::default()),
                                       None)?;
         assert_eq!(id, 1);
-        env.get_state().render_dependency_graph();
+        env.get_state_at_current_execution_head().render_dependency_graph();
         env.step().await;
         // Function declaration cell
         assert_eq!(
-            env.get_state().state_get_value(&0),
+            env.get_state_at_current_execution_head().state_get_value(&0),
             Some(&RkyvObjectBuilder::new().insert_string("add", String::from("function")).build())
         );
-        assert_eq!(env.get_state().state_get_value(&1),
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&1),
                    None);
         env.step().await;
-        assert_eq!(env.get_state().state_get_value(&0),
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&0),
                    Some(&RkyvObjectBuilder::new().insert_string("add", String::from("function")).build())
         );
         assert_eq!(
-            env.get_state().state_get_value(&1),
+            env.get_state_at_current_execution_head().state_get_value(&1),
             Some(&RkyvObjectBuilder::new().insert_number("y", 5).build())
         );
         env.shutdown().await;
@@ -818,23 +837,23 @@ mod tests {
             }).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
-        env.get_state().render_dependency_graph();
+        env.get_state_at_current_execution_head().render_dependency_graph();
         env.step().await;
         // Function declaration cell
         assert_eq!(
-            env.get_state().state_get_value(&0),
+            env.get_state_at_current_execution_head().state_get_value(&0),
             Some(&RkyvObjectBuilder::new()
                 .insert_number("v", 40)
                 .insert_string("squared_value", "function".to_string())
                 .build())
         );
-        assert_eq!(env.get_state().state_get_value(&1), None);
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&1), None);
         env.step().await;
-        assert_eq!(env.get_state().state_get_value(&0),
-            Some(&RkyvObjectBuilder::new().insert_number("v", 40).build())
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&0),
+                   Some(&RkyvObjectBuilder::new().insert_number("v", 40).build())
         );
         assert_eq!(
-            env.get_state().state_get_value(&1),
+            env.get_state_at_current_execution_head().state_get_value(&1),
             Some(&RkyvObjectBuilder::new().insert_number("z", 640000).insert_number("y", 800).build())
         );
         env.shutdown().await;
@@ -863,20 +882,20 @@ mod tests {
             "#
             }).unwrap();
         let mut env = ee.get_instance().unwrap();
-        let s = env.get_state();
+        let s = env.get_state_at_current_execution_head();
         env.reload_cells();
         s.render_dependency_graph();
         env.step().await;
         // Function declaration cell
         assert_eq!(
-            env.get_state().state_get_value(&0),
+            env.get_state_at_current_execution_head().state_get_value(&0),
             Some(&RkyvObjectBuilder::new().build())
         );
-        assert_eq!(env.get_state().state_get_value(&1), None);
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&1), None);
         env.step().await;
-        assert_eq!(env.get_state().state_get_value(&0), None);
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&0), None);
         assert_eq!(
-            env.get_state().state_get_value(&1),
+            env.get_state_at_current_execution_head().state_get_value(&1),
             Some(&RkyvObjectBuilder::new().insert_number("y", 5).build())
         );
     }
@@ -903,7 +922,7 @@ mod tests {
             }).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
-        env.get_state().render_dependency_graph();
+        env.get_state_at_current_execution_head().render_dependency_graph();
 
         // This will initialize the service
         env.step().await;
@@ -946,7 +965,7 @@ mod tests {
             }).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
-        env.get_state().render_dependency_graph();
+        env.get_state_at_current_execution_head().render_dependency_graph();
 
         // This will initialize the service
         env.step().await;
@@ -974,7 +993,7 @@ mod tests {
         ee.load_md_directory(Path::new("./examples/core1_simple_math")).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
-        env.get_state().render_dependency_graph();
+        env.get_state_at_current_execution_head().render_dependency_graph();
         let out = env.step().await?;
         assert_eq!(out[0].1.output, RkyvObjectBuilder::new().insert_number("x", 20).build());
         let out = env.step().await?;
@@ -990,7 +1009,7 @@ mod tests {
         ee.load_md_directory(Path::new("./examples/core2_marshalling")).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
-        env.get_state().render_dependency_graph();
+        env.get_state_at_current_execution_head().render_dependency_graph();
         let mut out = env.step().await?;
         assert_eq!(out[0].0, 0);
         assert_eq!(out[0].1.output, RkyvObjectBuilder::new()
@@ -1055,7 +1074,7 @@ mod tests {
         ee.load_md_directory(Path::new("./examples/core3_function_invocations")).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
-        env.get_state().render_dependency_graph();
+        env.get_state_at_current_execution_head().render_dependency_graph();
         let mut out = env.step().await?;
         assert_eq!(out[0].0, 0);
         assert_eq!(out[0].1.output, RkyvObjectBuilder::new().insert_string("add_two", "function".to_string()).build());
@@ -1069,7 +1088,7 @@ mod tests {
         let mut out = env.step().await?;
         assert_eq!(out[0].0, 3);
         assert_eq!(out[0].1.stderr.contains(&"OK".to_string()), true);
-        assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
+        assert_eq!(env.get_state_at_current_execution_head().have_all_operations_been_set_at_least_once(), true);
         env.shutdown().await;
         Ok(())
     }
@@ -1080,7 +1099,7 @@ mod tests {
         ee.load_md_directory(Path::new("./examples/core4_async_function_invocations")).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
-        env.get_state().render_dependency_graph();
+        env.get_state_at_current_execution_head().render_dependency_graph();
         let mut out = env.step().await?;
         assert_eq!(out[0].0, 0);
         assert_eq!(out[0].1.output, RkyvObjectBuilder::new().insert_string("add_two", "function".to_string()).build());
@@ -1094,7 +1113,7 @@ mod tests {
         let mut out = env.step().await?;
         assert_eq!(out[0].0, 3);
         assert_eq!(out[0].1.stderr.contains(&"OK".to_string()), true);
-        assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
+        assert_eq!(env.get_state_at_current_execution_head().have_all_operations_been_set_at_least_once(), true);
         env.shutdown().await;
         Ok(())
     }
@@ -1106,7 +1125,7 @@ mod tests {
         ee.load_md_directory(Path::new("./examples/core5_prompts_invoked_as_functions")).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
-        env.get_state().render_dependency_graph();
+        env.get_state_at_current_execution_head().render_dependency_graph();
         let out = env.step().await;
         dbg!(out);
         let out = env.step().await;
@@ -1114,7 +1133,7 @@ mod tests {
         let out = env.step().await;
         dbg!(out);
         let out = env.step().await;
-        assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
+        assert_eq!(env.get_state_at_current_execution_head().have_all_operations_been_set_at_least_once(), true);
         env.shutdown().await;
         Ok(())
     }
@@ -1125,13 +1144,13 @@ mod tests {
         ee.load_md_directory(Path::new("./examples/core6_prompts_leveraging_function_calling")).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
-        env.get_state().render_dependency_graph();
+        env.get_state_at_current_execution_head().render_dependency_graph();
         let out = env.step().await;
         let out = env.step().await;
         let out = env.step().await;
         let out = env.step().await;
         let out = env.step().await;
-        assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
+        assert_eq!(env.get_state_at_current_execution_head().have_all_operations_been_set_at_least_once(), true);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1140,12 +1159,12 @@ mod tests {
         ee.load_md_directory(Path::new("./examples/core7_rag_stateful_memory_cells")).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
-        env.get_state().render_dependency_graph();
+        env.get_state_at_current_execution_head().render_dependency_graph();
         let out = env.step().await;
         let out = env.step().await;
         let out = env.step().await;
         let out = env.step().await;
-        assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
+        assert_eq!(env.get_state_at_current_execution_head().have_all_operations_been_set_at_least_once(), true);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1154,12 +1173,12 @@ mod tests {
         ee.load_md_directory(Path::new("./examples/core8_prompt_code_generation_and_execution")).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
-        env.get_state().render_dependency_graph();
+        env.get_state_at_current_execution_head().render_dependency_graph();
         let out = env.step().await;
         let out = env.step().await;
         let out = env.step().await;
         let out = env.step().await;
-        assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
+        assert_eq!(env.get_state_at_current_execution_head().have_all_operations_been_set_at_least_once(), true);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1168,12 +1187,12 @@ mod tests {
         ee.load_md_directory(Path::new("./examples/core9_multi_agent_simulation")).unwrap();
         let mut env = ee.get_instance().unwrap();
         env.reload_cells();
-        env.get_state().render_dependency_graph();
+        env.get_state_at_current_execution_head().render_dependency_graph();
         let out = env.step().await;
         let out = env.step().await;
         let out = env.step().await;
         let out = env.step().await;
-        assert_eq!(env.get_state().have_all_operations_been_set_at_least_once(), true);
+        assert_eq!(env.get_state_at_current_execution_head().have_all_operations_been_set_at_least_once(), true);
     }
 }
 

@@ -87,7 +87,8 @@ struct GraphMainCamera;
 struct GraphMinimapCamera;
 
 enum CameraStateValue {
-    Locked,
+    LockedOnSelection,
+    LockedOnExecHead,
     Free
 }
 
@@ -110,16 +111,94 @@ struct InteractionLock {
 
 
 // TODO: support graph traversal by id in the graph
-fn keyboard_navigate_to_parent(
-    keyboard_input: Res<ButtonInput<KeyCode>>,
-    mut graph_res: ResMut<GraphResource>,
-    mut node_query: Query<
-        (Entity, &GraphIdx),
-        (With<GraphIdx>, Without<GraphIdxPair>),
-    >,
-) {
 
+#[derive(Resource, Default)]
+struct SelectedNode(Option<NodeIndex>);
+
+
+#[derive(Default)]
+struct KeyboardNavigationState {
+    last_move: f32,
+    move_cooldown: f32,
 }
+
+fn keyboard_navigate_graph(
+    time: Res<Time>,
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    mut q_camera: Query<(&mut Projection, &mut Transform, &mut CameraState), (With<OnGraphScreen> , Without<GraphMinimapCamera>, Without<GraphIdxPair>, Without<GraphIdx>)>,
+    mut graph_res: ResMut<GraphResource>,
+    mut selected_node: Local<SelectedNode>,
+    mut node_query: Query<(Entity, &mut Transform, &GraphIdx)>,
+    mut keyboard_nav_state: Local<KeyboardNavigationState>,
+    mut selected_entity: ResMut<SelectedEntity>,
+) {
+    // Add a cooldown to prevent too rapid movement
+    if time.elapsed_seconds() - keyboard_nav_state.last_move < keyboard_nav_state.move_cooldown {
+        return;
+    }
+
+    let current_node = if let Some(node) = selected_node.0 {
+        node
+    } else {
+        // If no node is selected, select the first node
+        if let Some(node) = graph_res.graph.node_indices().next() {
+            selected_node.0 = Some(node);
+            node
+        } else {
+            return; // No nodes in the graph
+        }
+    };
+
+    let mut new_selection = None;
+
+    if keyboard_input.just_pressed(KeyCode::ArrowUp) {
+        // Move to parent
+        new_selection = graph_res.graph
+            .neighbors_directed(current_node, petgraph::Direction::Incoming)
+            .next();
+    } else if keyboard_input.just_pressed(KeyCode::ArrowDown) {
+        // Move to first child
+        new_selection = graph_res.graph
+            .neighbors_directed(current_node, petgraph::Direction::Outgoing)
+            .next();
+    } else if keyboard_input.just_pressed(KeyCode::ArrowLeft) {
+        // Move to previous sibling
+        if let Some(parent) = graph_res.graph.neighbors_directed(current_node, petgraph::Direction::Incoming).next() {
+            let siblings: Vec<_> = graph_res.graph.neighbors_directed(parent, petgraph::Direction::Outgoing).collect();
+            if let Some(current_index) = siblings.iter().position(|&node| node == current_node) {
+                new_selection = siblings.get(current_index.checked_sub(1).unwrap_or(siblings.len() - 1)).cloned();
+            }
+        }
+    } else if keyboard_input.just_pressed(KeyCode::ArrowRight) {
+        // Move to next sibling
+        if let Some(parent) = graph_res.graph.neighbors_directed(current_node, petgraph::Direction::Incoming).next() {
+            let siblings: Vec<_> = graph_res.graph.neighbors_directed(parent, petgraph::Direction::Outgoing).collect();
+            if let Some(current_index) = siblings.iter().position(|&node| node == current_node) {
+                new_selection = siblings.get((current_index + 1) % siblings.len()).cloned();
+            }
+        }
+    }
+
+    let (projection, mut camera_transform, mut camera_state) = q_camera.single_mut();
+
+    if let Some(new_node) = new_selection {
+        selected_node.0 = Some(new_node);
+        keyboard_nav_state.last_move = time.elapsed_seconds();
+        keyboard_nav_state.move_cooldown = 0.1;
+        camera_state.state = CameraStateValue::LockedOnSelection;
+
+        // Update the transform of the selected node (e.g., to highlight it)
+        let (node , _)= &graph_res.graph[new_node];
+        node_query
+            .iter()
+            .for_each(|(e, node_transform, graph_idx)| {
+                if graph_idx.execution_id == *node {
+                    selected_entity.id = Some(e);
+                }
+            });
+    }
+}
+
 
 
 fn update_minimap_camera_configuration(
@@ -189,22 +268,11 @@ fn set_camera_viewports(
     // so then each camera always takes up half the screen.
     // A resize_event is sent when the window is first created, allowing us to reuse this system for initial setup.
     for resize_event in resize_events.read() {
-        // main_camera.viewport = Some(Viewport {
-        //     physical_position: UVec2::new(0, minimap_height_and_offset),
-        //     physical_size: UVec2::new(
-        //         window.resolution.physical_width(),
-        //         window.resolution.physical_height() - minimap_height_and_offset,
-        //     ),
-        //     ..default()
-        // });
-        // minimap_camera.viewport = Some(Viewport {
-        //     physical_position: UVec2::new(0, minimap_offset),
-        //     physical_size: UVec2::new(
-        //         window.resolution.physical_width(),
-        //         minimap_height,
-        //     ),
-        //     ..default()
-        // });
+        minimap_camera.viewport = Some(Viewport {
+            physical_position: UVec2::new((window.width() * scale_factor) as u32 - (300 * scale_factor as u32), 0),
+            physical_size: UVec2::new((300 * scale_factor as u32), (window.height() * scale_factor) as u32),
+            ..default()
+        });
     }
 }
 
@@ -217,7 +285,12 @@ fn mouse_pan(
     //     (With<GraphIdx>, Without<GraphIdxPair>),
     // >,
     // rapier_context: Res<RapierContext>,
+
+    graph_resource: Res<GraphResource>,
 ) {
+    if !graph_resource.is_active {
+        return;
+    }
 
     let (projection, mut camera_transform, mut camera_state) = q_camera.single_mut();
     let mut projection = match projection.into_inner() {
@@ -254,6 +327,8 @@ fn mouse_scroll_events(
 
     let mut should_return = false;
     let mut an_element_is_in_focus = false;
+
+    // Prevent scroll panning when we're hovering over an element
     for (_, _, mut gidx, mut egui_render_target) in node_query.iter() {
         if egui_render_target.is_focused && egui_render_target.image.is_some() {
             an_element_is_in_focus = true;
@@ -279,7 +354,7 @@ fn mouse_scroll_events(
     let mut coords = q_mycoords.single();
 
     if keyboard_input.just_pressed(KeyCode::Enter) {
-        camera_state.state = CameraStateValue::Locked;
+        camera_state.state = CameraStateValue::LockedOnExecHead;
     }
 
     let mut projection = match projection.into_inner() {
@@ -439,10 +514,10 @@ fn egui_execution_state(ui: &mut Ui, execution_state: &ExecutionState) {
 fn camera_follow_selection_head(
     mut q_camera: Query<(&Camera, &mut Transform, &CameraState), (With<OnGraphScreen>,  With<GraphMainCamera>, Without<ExecutionSelectionCursor>, Without<GraphMinimapCamera>)>,
     execution_graph: ResMut<crate::chidori::ChidoriExecutionGraph>,
-    // mut execution_selection_query: Query<
-    //     (Entity, &mut Transform),
-    //     (With<ExecutionSelectionCursor>, Without<GraphIdx>, Without<ExecutionHeadCursor>),
-    // >,
+    mut execution_selection_query: Query<
+        (Entity, &mut Transform),
+        (With<ExecutionSelectionCursor>, Without<GraphIdx>, Without<ExecutionHeadCursor>),
+    >,
     mut execution_head_cursor: Query<
         (Entity, &mut Transform),
         (With<ExecutionHeadCursor>, Without<GraphIdx>, Without<ExecutionSelectionCursor>, Without<GraphMainCamera>),
@@ -450,7 +525,13 @@ fn camera_follow_selection_head(
 ) {
     let (camera, mut camera_transform, camera_state) = q_camera.single_mut();
     let (_, mut t) = execution_head_cursor.single_mut();
-    if matches!(camera_state.state, CameraStateValue::Locked) {
+    if matches!(camera_state.state, CameraStateValue::LockedOnExecHead) {
+        camera_transform.translation.x = t.translation.x;
+        camera_transform.translation.y = t.translation.y;
+    }
+
+    let (_, mut t) = execution_selection_query.single_mut();
+    if matches!(camera_state.state, CameraStateValue::LockedOnSelection) {
         camera_transform.translation.x = t.translation.x;
         camera_transform.translation.y = t.translation.y;
     }
@@ -1094,10 +1175,11 @@ fn graph_setup(
         },
         OnGraphScreen,
         GraphMainCamera,
-        CameraState { state: CameraStateValue::Locked },
+        CameraState { state: CameraStateValue::LockedOnExecHead },
         RenderLayers::layer(RENDER_LAYER_GRAPH_VIEW),
     ));
 
+    // Minimap camera
     commands.spawn((
         Camera3dBundle {
             transform: Transform::from_xyz(0.0, 0.0, 1.0).looking_at(Vec3::ZERO, Vec3::Y),
@@ -1119,7 +1201,7 @@ fn graph_setup(
         },
         OnGraphScreen,
         GraphMinimapCamera,
-        CameraState { state: CameraStateValue::Locked },
+        CameraState { state: CameraStateValue::LockedOnExecHead },
         RenderLayers::from_layers(&[RENDER_LAYER_GRAPH_VIEW, RENDER_LAYER_GRAPH_MINIMAP])
     ));
 
@@ -1217,6 +1299,7 @@ pub fn graph_plugin(app: &mut App) {
             Update,
             (
                 // update_node_textures_as_available,
+                keyboard_navigate_graph,
                 compute_transform_matrix,
                 mouse_pan,
                 set_camera_viewports,

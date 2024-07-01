@@ -74,6 +74,7 @@ impl Future for FutureExecutionState {
 
 #[derive(Clone)]
 pub enum ExecutionStateEvaluation {
+    Error,
     Complete(ExecutionState),
     Executing(Arc<FutureExecutionState>)
 }
@@ -83,6 +84,7 @@ impl ExecutionStateEvaluation {
         match self {
             ExecutionStateEvaluation::Complete(ref state) => state.state_get(operation_id),
             ExecutionStateEvaluation::Executing(ref future_state) => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
         }
     }
 
@@ -90,6 +92,7 @@ impl ExecutionStateEvaluation {
         match self {
             ExecutionStateEvaluation::Complete(ref state) => state.state_get(operation_id).map(|o| &o.output),
             ExecutionStateEvaluation::Executing(ref future_state) => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
         }
     }
 }
@@ -99,6 +102,7 @@ impl Debug for ExecutionStateEvaluation {
         match self {
             ExecutionStateEvaluation::Complete(ref state) => f.debug_tuple("Complete").field(state).finish(),
             ExecutionStateEvaluation::Executing(ref future_state) => f.debug_tuple("Executing").field(&format!("Future state evaluating")).finish(),
+            ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
         }
     }
 }
@@ -356,13 +360,13 @@ impl ExecutionState {
         op_id: Option<usize>,
     ) -> anyhow::Result<(ExecutionState, usize)> {
         let mut op = match &cell {
-            CellTypes::Code(c, r) => crate::cells::code_cell::code_cell(c, r),
-            CellTypes::Prompt(c, r) => crate::cells::llm_prompt_cell::llm_prompt_cell(c, r),
-            CellTypes::Embedding(c, r) => crate::cells::embedding_cell::llm_embedding_cell(c, r),
-            CellTypes::Web(c, r) => crate::cells::web_cell::web_cell(c, r),
-            CellTypes::Template(c, r) => crate::cells::template_cell::template_cell(c, r),
-            CellTypes::Memory(c, r) => crate::cells::memory_cell::memory_cell(c, r),
-            CellTypes::CodeGen(c, r) => crate::cells::code_gen_cell::code_gen_cell(c, r),
+            CellTypes::Code(c, r) => crate::cells::code_cell::code_cell(self.id.clone(), c, r),
+            CellTypes::Prompt(c, r) => crate::cells::llm_prompt_cell::llm_prompt_cell(self.id.clone(), c, r),
+            CellTypes::Embedding(c, r) => crate::cells::embedding_cell::llm_embedding_cell(self.id.clone(), c, r),
+            CellTypes::Web(c, r) => crate::cells::web_cell::web_cell(self.id.clone(), c, r),
+            CellTypes::Template(c, r) => crate::cells::template_cell::template_cell(self.id.clone(), c, r),
+            CellTypes::Memory(c, r) => crate::cells::memory_cell::memory_cell(self.id.clone(), c, r),
+            CellTypes::CodeGen(c, r) => crate::cells::code_gen_cell::code_gen_cell(self.id.clone(), c, r),
         }?;
         op.attach_cell(cell.clone());
         let new_state = self.clone();
@@ -426,12 +430,6 @@ impl ExecutionState {
 
     #[tracing::instrument]
     fn get_possible_dependencies(new_state: &ExecutionState) -> anyhow::Result<(HashMap<String, &OperationId>, HashMap<String, &OperationId>)> {
-        // TODO: when there is a dependency on a function invocation we need to
-        //       instantiate a new instance of the function operation node.
-        //       It itself is not part of the call graph until it has such a dependency.
-
-        // TODO: Store trigger-able functions that may be passed as values as well
-
         let mut available_values = HashMap::new();
         let mut available_functions = HashMap::new();
 
@@ -571,22 +569,22 @@ impl ExecutionState {
                 let mut c = c.clone();
                 c.function_invocation =
                     Some(clone_function_name.to_string());
-                crate::cells::code_cell::code_cell(&c, r)?
+                crate::cells::code_cell::code_cell(Uuid::nil(), &c, r)?
             }
             CellTypes::Prompt(c, r) => {
                 let mut c = c.clone();
                 match c {
                     LLMPromptCell::Chat{ref mut function_invocation, ..} => {
                         *function_invocation = true;
-                        crate::cells::llm_prompt_cell::llm_prompt_cell(&c, r)?
+                        crate::cells::llm_prompt_cell::llm_prompt_cell(Uuid::nil(), &c, r)?
                     }
                     _ => {
-                        crate::cells::llm_prompt_cell::llm_prompt_cell(&c, r)?
+                        crate::cells::llm_prompt_cell::llm_prompt_cell(Uuid::nil(), &c, r)?
                     }
                 }
             }
             CellTypes::Embedding(c, r) => {
-                crate::cells::embedding_cell::llm_embedding_cell(&c, r)?
+                crate::cells::embedding_cell::llm_embedding_cell(Uuid::nil(), &c, r)?
             }
             _ => {
                 unreachable!("Unsupported cell type");

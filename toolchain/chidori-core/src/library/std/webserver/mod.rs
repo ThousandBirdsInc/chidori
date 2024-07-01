@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::task::JoinHandle;
 use tonic::IntoRequest;
+use uuid::Uuid;
 use crate::cells::{CellTypes, CodeCell, WebserviceCell, WebserviceCellEndpoint};
 use crate::execution::execution::ExecutionState;
 use crate::execution::primitives::serialized_value::{json_value_to_serialized_value, RkyvObjectBuilder, RkyvSerializedValue, serialized_value_to_json_value};
@@ -96,13 +97,13 @@ pub async fn run_webservice(
                                         let mut c = c.clone();
                                         c.function_invocation =
                                             Some(function_name.clone());
-                                        crate::cells::code_cell::code_cell(&c, r)
+                                        crate::cells::code_cell::code_cell(Uuid::nil(), &c, r)
                                     }
                                     CellTypes::Prompt(c, r) => {
-                                        crate::cells::llm_prompt_cell::llm_prompt_cell(&c, r)
+                                        crate::cells::llm_prompt_cell::llm_prompt_cell(Uuid::nil(), &c, r)
                                     }
                                     CellTypes::Template(c, r) => {
-                                        crate::cells::template_cell::template_cell(&c, r)
+                                        crate::cells::template_cell::template_cell(Uuid::nil(), &c, r)
                                     }
                                     _ => {
                                         unreachable!("Unsupported cell type");
@@ -149,13 +150,13 @@ pub async fn run_webservice(
                                         let mut c = c.clone();
                                         c.function_invocation =
                                             Some(function_name.clone());
-                                        crate::cells::code_cell::code_cell(&c, r)
+                                        crate::cells::code_cell::code_cell(Uuid::nil(), &c, r)
                                     },
                                     CellTypes::Prompt(c, r) => {
-                                        crate::cells::llm_prompt_cell::llm_prompt_cell(&c, r)
+                                        crate::cells::llm_prompt_cell::llm_prompt_cell(Uuid::nil(), &c, r)
                                     },
                                     CellTypes::Template(c, r) => {
-                                        crate::cells::template_cell::template_cell(&c, r)
+                                        crate::cells::template_cell::template_cell(Uuid::nil(), &c, r)
                                     }
                                     _ => {
                                         unreachable!("Unsupported cell type");

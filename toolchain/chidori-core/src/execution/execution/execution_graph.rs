@@ -304,6 +304,7 @@ impl ExecutionGraph {
                 (state.parent_state_id, state.id)
             },
             ExecutionStateEvaluation::Executing(_) => panic!("Cannot progress an execution state that is currently executing"),
+            ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
         };
         println!("Inserting into graph {:?}", &resulting_state_id);
         state_id_to_state.deref_mut().insert(resulting_state_id.clone(), new_state.clone());
@@ -331,6 +332,7 @@ impl ExecutionGraph {
         let previous_state = match previous_state {
             ExecutionStateEvaluation::Complete(state) => state,
             ExecutionStateEvaluation::Executing(_) => panic!("Cannot step an execution state that is currently executing"),
+            ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
         };
         let (new_state, outputs) = previous_state.step_execution(&self.graph_mutation_sender).await?;
         let resulting_state_id = self.progress_graph(new_state.clone());
@@ -359,6 +361,9 @@ impl ExecutionGraph {
             ExecutionStateEvaluation::Executing(_) => {
                 return Err(anyhow!("Cannot mutate a graph that is currently executing"))
             },
+
+            ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
+
         };
 
         let eval = ExecutionStateEvaluation::Complete(final_state.clone());
@@ -407,6 +412,7 @@ mod tests {
         let state_id = Uuid::nil();
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::new(),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
@@ -414,6 +420,7 @@ mod tests {
                                                     None);
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::new(),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(2))) }.boxed()),
@@ -421,6 +428,7 @@ mod tests {
                                                     None);
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::from_args_list(vec!["a", "b"]),
                     OutputSignature::new(),
                     Box::new(|_, args, _, _| {
@@ -487,6 +495,7 @@ mod tests {
         let state_id = Uuid::nil();
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::new(),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(0))) }.boxed()),
@@ -494,6 +503,7 @@ mod tests {
                                                     None);
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::new(),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
@@ -534,6 +544,7 @@ mod tests {
 
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::new(),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(0))) }.boxed()),
@@ -542,6 +553,7 @@ mod tests {
 
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::from_args_list(vec!["0"]),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
@@ -550,6 +562,7 @@ mod tests {
 
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::from_args_list(vec!["0"]),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(2))) }.boxed()),
@@ -615,6 +628,7 @@ mod tests {
         for x in 0..4 {
             let (_, mut nstate) = state.upsert_operation(OperationNode::new(
                         None,
+                        Uuid::nil(),
                         InputSignature::new(),
                         OutputSignature::new(),
                         Box::new(move |_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(x))) }.boxed()),
@@ -678,6 +692,7 @@ mod tests {
         for x in 0..5 {
             let (_, mut nstate) = state.upsert_operation(OperationNode::new(
                         None,
+                        Uuid::nil(),
                         if x == 0 { InputSignature::new() } else if x == 4 {InputSignature::from_args_list(vec!["1", "2"]) } else { InputSignature::from_args_list(vec!["1"]) },
                         OutputSignature::new(),
                         Box::new(move |_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(x))) }.boxed()),
@@ -748,6 +763,7 @@ mod tests {
         // We start with the number 1 at node 0
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::new(),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
@@ -771,6 +787,7 @@ mod tests {
 
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
                     Box::new(f1),
@@ -779,6 +796,7 @@ mod tests {
 
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
                     Box::new(f1),
@@ -787,6 +805,7 @@ mod tests {
 
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
                     Box::new(f1),
@@ -795,6 +814,7 @@ mod tests {
 
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
                     Box::new(f1),
@@ -803,6 +823,7 @@ mod tests {
 
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
                     Box::new(f1),
@@ -908,6 +929,7 @@ mod tests {
         // We start with the number 1 at node 0
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::new(),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
@@ -933,6 +955,7 @@ mod tests {
 
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::from_args_list(vec!["0"]),
                     OutputSignature::new(),
                     Box::new(f_side_effect),
@@ -940,6 +963,7 @@ mod tests {
                                                     None);
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::from_args_list(vec!["0"]),
                     OutputSignature::new(),
                     Box::new(f_side_effect),
@@ -996,6 +1020,7 @@ mod tests {
         // We start with the number 0 at node 0
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::new(),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(0))) }.boxed()),
@@ -1032,6 +1057,7 @@ mod tests {
 
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::from_args_list(vec!["0"]),
                     OutputSignature::new(),
                     Box::new(f_v1),
@@ -1039,6 +1065,7 @@ mod tests {
                                                     None);
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
+                    Uuid::nil(),
                     InputSignature::from_args_list(vec!["0"]),
                     OutputSignature::new(),
                     Box::new(f_v1),
@@ -1070,6 +1097,7 @@ mod tests {
         if let ExecutionStateEvaluation::Complete(x_state) = x_state {
             let (_, mut state) = x_state.upsert_operation(OperationNode::new(
                 None,
+                Uuid::nil(),
                 InputSignature::from_args_list(vec!["0"]),
                 OutputSignature::new(),
                 Box::new(f_v2),
@@ -1109,6 +1137,7 @@ mod tests {
         for x in 0..5 {
             let (_, mut nstate) = state.upsert_operation(OperationNode::new(
                 None,
+                Uuid::nil(),
                 if x == 0 { InputSignature::new() } else if x == 4 {InputSignature::from_args_list(vec!["1", "2"]) } else { InputSignature::from_args_list(vec!["1"]) },
                 OutputSignature::new(),
                 Box::new(move |_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(x))) }.boxed()),

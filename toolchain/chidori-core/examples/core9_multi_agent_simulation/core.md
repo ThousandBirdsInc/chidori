@@ -4,6 +4,7 @@ This example is based on [this crewAI example](https://github.com/joaomdmoura/cr
 
 ```prompt (researcher)
 ---
+model: gpt-3.5-turbo
 fn: scrape_and_summarize_website_researcher
 ---
 Role: Principal Researcher
@@ -87,6 +88,7 @@ def search_internet(query):
 
 ```prompt (researcher)
 ---
+model: gpt-3.5-turbo
 import:
     - search_internet
     - scrape_and_summarize_website
@@ -98,6 +100,7 @@ Backstory: An expert in analyzing travel data to pick ideal destinations
 
 ```prompt (local_expert)
 ---
+model: gpt-3.5-turbo
 import:
     - search_internet
     - scrape_and_summarize_website
@@ -110,6 +113,7 @@ Backstory: A knowledgable local guide with extensive information about the city,
 
 ```prompt (travel_concierge)
 ---
+model: gpt-3.5-turbo
 import:
     - search_internet
     - scrape_and_summarize_website

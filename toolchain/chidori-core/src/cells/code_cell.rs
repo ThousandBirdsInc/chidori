@@ -1,12 +1,13 @@
 use futures_util::FutureExt;
 use chidori_static_analysis::language::Report;
 use crate::cells::{CodeCell, SupportedLanguage, TextRange};
+use crate::execution::execution::execution_graph::ExecutionNodeId;
 use crate::execution::execution::ExecutionState;
 use crate::execution::primitives::operation::{InputItemConfiguration, InputSignature, InputType, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
 
 /// Code cells allow notebooks to evaluate source code in a variety of languages.
 #[tracing::instrument]
-pub fn code_cell(cell: &CodeCell, range: &TextRange) -> anyhow::Result<OperationNode> {
+pub fn code_cell(execution_state_id: ExecutionNodeId, cell: &CodeCell, range: &TextRange) -> anyhow::Result<OperationNode> {
     match cell.language {
         SupportedLanguage::PyO3 => {
             let paths =
@@ -20,6 +21,7 @@ pub fn code_cell(cell: &CodeCell, range: &TextRange) -> anyhow::Result<Operation
             let cell = cell.clone();
             Ok(OperationNode::new(
                 cell.name.clone(),
+                execution_state_id,
                 input_signature,
                 output_signature,
                 Box::new(move |s, x, _, _| {
@@ -46,6 +48,7 @@ pub fn code_cell(cell: &CodeCell, range: &TextRange) -> anyhow::Result<Operation
         }
         SupportedLanguage::Starlark => Ok(OperationNode::new(
             cell.name.clone(),
+            execution_state_id,
             InputSignature::new(),
             OutputSignature::new(),
             Box::new(|_, x, _, _| async move { Ok(OperationFnOutput::with_value(x)) }.boxed()),
@@ -62,6 +65,7 @@ pub fn code_cell(cell: &CodeCell, range: &TextRange) -> anyhow::Result<Operation
             let cell = cell.clone();
             Ok(OperationNode::new(
                 cell.name.clone(),
+                execution_state_id,
                 input_signature,
                 output_signature,
                 Box::new(move |s, x, _, _| {
