@@ -4,6 +4,7 @@ use indoc::indoc;
 use std::collections::HashMap;
 use std::path::Path;
 use serde_derive::Serialize;
+use thiserror::Error;
 use crate::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, SupportedMemoryProviders, SupportedModelProviders, TemplateCell, TextRange, WebserviceCell};
 
 #[derive(PartialEq, Serialize, Debug)]
@@ -102,9 +103,22 @@ pub fn load_folder(path: &Path) -> anyhow::Result<Vec<ParsedFile>> {
     Ok(res)
 }
 
-pub fn interpret_code_block(block: &MarkdownCodeBlock) -> Option<CellTypes> {
-    let (frontmatter, body) = chidori_prompt_format::templating::templates::split_frontmatter(&block.body).unwrap();
-    match block.tag.as_str() {
+#[derive(Error, Debug)]
+pub enum InterpretError {
+    #[error("Failed to split frontmatter: {0}")]
+    FrontmatterSplitError(String),
+    #[error("Failed to deserialize YAML: {0}")]
+    YamlDeserializeError(#[from] serde_yaml::Error),
+    #[error("Failed to parse port number")]
+    PortParseError,
+}
+
+
+pub fn interpret_code_block(block: &MarkdownCodeBlock) -> Result<Option<CellTypes>, InterpretError> {
+    let (frontmatter, body) = chidori_prompt_format::templating::templates::split_frontmatter(&block.body)
+        .map_err(|e| InterpretError::FrontmatterSplitError(e.to_string()))?;
+
+    Ok(match block.tag.as_str() {
         "python" | "javascript" => {
             let language = match block.tag.as_str() {
                 "python" => SupportedLanguage::PyO3,
@@ -125,20 +139,20 @@ pub fn interpret_code_block(block: &MarkdownCodeBlock) -> Option<CellTypes> {
         }, block.range.clone())),
         "embedding" => Some(CellTypes::Embedding(LLMEmbeddingCell {
             function_invocation: false,
-            configuration: serde_yaml::from_str(&frontmatter).unwrap(),
+            configuration: serde_yaml::from_str(&frontmatter)?,
             name: block.name.clone(),
             req: body,
         }, block.range.clone())),
         "prompt" => Some(CellTypes::Prompt(LLMPromptCell::Chat {
             function_invocation: false,
-            configuration: serde_yaml::from_str(&frontmatter).unwrap(),
+            configuration: serde_yaml::from_str(&frontmatter)?,
             name: block.name.clone(),
             provider: SupportedModelProviders::OpenAI,
             req: body,
         }, block.range.clone())),
         "codegen" => Some(CellTypes::CodeGen(LLMCodeGenCell {
             function_invocation: false,
-            configuration: serde_yaml::from_str(&frontmatter).unwrap(),
+            configuration: serde_yaml::from_str(&frontmatter)?,
             name: block.name.clone(),
             provider: SupportedModelProviders::OpenAI,
             req: body,
@@ -147,13 +161,21 @@ pub fn interpret_code_block(block: &MarkdownCodeBlock) -> Option<CellTypes> {
             name: block.name.clone(),
             body: block.body.clone(),
         }, block.range.clone())),
-        "web" => Some(CellTypes::Web(WebserviceCell {
-            name: block.name.clone(),
-            configuration: block.body.clone(),
-            port: serde_yaml::from_str::<HashMap<String,String>>(&frontmatter).unwrap().get("port").and_then(|p| p.parse::<u16>().ok()).or_else(|| Some(8080)).unwrap(),
-        }, block.range.clone())),
+        "web" => {
+            let config: HashMap<String, String> = serde_yaml::from_str(&frontmatter)?;
+            let port = config.get("port")
+                .and_then(|p| p.parse::<u16>().ok())
+                .or(Some(8080))
+                .ok_or(InterpretError::PortParseError)?;
+
+            Some(CellTypes::Web(WebserviceCell {
+                name: block.name.clone(),
+                configuration: block.body.clone(),
+                port,
+            }, block.range.clone()))
+        },
         _ => None,
-    }
+    })
 }
 
 
@@ -169,7 +191,7 @@ mod test {
     fn test_core1() {
         let contents = fs::read_to_string("./examples/core1_simple_math/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().map(interpret_code_block).collect();
+        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().filter_map(interpret_code_block).collect();
         insta::with_settings!({
         }, {
             insta::assert_yaml_snapshot!(v);
@@ -180,7 +202,7 @@ mod test {
     fn test_core2() {
         let contents = fs::read_to_string("./examples/core2_marshalling/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().map(interpret_code_block).collect();
+        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().filter_map(interpret_code_block).collect();
         insta::with_settings!({
         }, {
             insta::assert_yaml_snapshot!(v);
@@ -191,7 +213,7 @@ mod test {
     fn test_core3() {
         let contents = fs::read_to_string("./examples/core3_function_invocations/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().map(interpret_code_block).collect();
+        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().filter_map(interpret_code_block).collect();
         insta::with_settings!({
         }, {
             insta::assert_yaml_snapshot!(v);
@@ -202,7 +224,7 @@ mod test {
     fn test_core4() {
         let contents = fs::read_to_string("./examples/core4_async_function_invocations/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().map(interpret_code_block).collect();
+        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().filter_map(interpret_code_block).collect();
         insta::with_settings!({
         }, {
             insta::assert_yaml_snapshot!(v);
@@ -213,7 +235,7 @@ mod test {
     fn test_core5() {
         let contents = fs::read_to_string("./examples/core5_prompts_invoked_as_functions/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().map(interpret_code_block).collect();
+        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().filter_map(interpret_code_block).collect();
         insta::with_settings!({
         }, {
             insta::assert_yaml_snapshot!(v);
@@ -224,7 +246,7 @@ mod test {
     fn test_core6() {
         let contents = fs::read_to_string("./examples/core6_prompts_leveraging_function_calling/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().map(interpret_code_block).collect();
+        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().filter_map(interpret_code_block).collect();
         insta::with_settings!({
         }, {
             insta::assert_yaml_snapshot!(v);
@@ -235,7 +257,7 @@ mod test {
     fn test_core7() {
         let contents = fs::read_to_string("./examples/core7_rag_stateful_memory_cells/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().map(interpret_code_block).collect();
+        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().filter_map(interpret_code_block).collect();
         insta::with_settings!({
         }, {
             insta::assert_yaml_snapshot!(v);

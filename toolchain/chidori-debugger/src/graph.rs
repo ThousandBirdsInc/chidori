@@ -52,7 +52,7 @@ struct SelectedEntity {
 
 #[derive(Resource)]
 struct GraphResource {
-    graph: ForceGraph<f32, 2, ExecutionNodeId, ()>,
+    graph: StableGraph<ExecutionNodeId, ()>,
     hash_graph: u64,
     node_ids: HashMap<ExecutionNodeId, NodeIndex>,
     is_active: bool
@@ -188,7 +188,7 @@ fn keyboard_navigate_graph(
         camera_state.state = CameraStateValue::LockedOnSelection;
 
         // Update the transform of the selected node (e.g., to highlight it)
-        let (node , _)= &graph_res.graph[new_node];
+        let node = &graph_res.graph[new_node];
         node_query
             .iter()
             .for_each(|(e, node_transform, graph_idx)| {
@@ -488,6 +488,24 @@ fn egui_execution_state(ui: &mut Ui, execution_state: &ExecutionState) {
             })
         });
 
+        ui.label("Exec Stack:");
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            ui.vertical(|ui| {
+                for item in &execution_state.stack {
+                    ui.label(format!("{:?}", item));
+                }
+            })
+        });
+
+
+
+        if let Some(args) = &execution_state.evaluating_arguments {
+            ui.label("Evaluating With Arguments");
+            let response = JsonTree::new(format!("evaluating_args"), args)
+                // .default_expand(DefaultExpand::SearchResults(&self.search_input))
+                .show(ui);
+        }
 
         if let Some(cell) = &execution_state.operation_mutation {
             ui.label("Cell Mutation:");
@@ -500,13 +518,14 @@ fn egui_execution_state(ui: &mut Ui, execution_state: &ExecutionState) {
             egui_render_cell_read(ui, cell);
         }
 
-
-        ui.label("Output:");
-        for (key, value) in execution_state.state.iter() {
-            let response = JsonTree::new(format!("{:?}", key), &value.output)
-                // .default_expand(DefaultExpand::SearchResults(&self.search_input))
-                .show(ui);
-            // util::egui_rkyv(ui, &value.output, false);
+        if !execution_state.state.is_empty() {
+            ui.label("Output:");
+            for (key, value) in execution_state.state.iter() {
+                let response = JsonTree::new(format!("{:?}", key), &value.output)
+                    // .default_expand(DefaultExpand::SearchResults(&self.search_input))
+                    .show(ui);
+                // util::egui_rkyv(ui, &value.output, false);
+            }
         }
     });
 }
@@ -699,7 +718,7 @@ fn update_alternate_graph_system(
     mut meshes: ResMut<Assets<Mesh>>,
     q_camera: Query<(Entity, &Camera, &GlobalTransform), (With<OnGraphScreen>, Without<GraphMinimapCamera>)>,
     mut node_index_to_entity: Local<HashMap<usize, Entity>>,
-    exec_id_to_state: ResMut<crate::chidori::ChidoriExecutionIdsToStates>,
+    mut node_image_texture_cache: Local<HashMap<String, egui::TextureHandle>>,
     internal_state: ResMut<crate::chidori::InternalState>,
 ) {
     // TODO: something in this logic is affecting the trace rendering
@@ -719,10 +738,10 @@ fn update_alternate_graph_system(
     } else {
         UVec2::new(0, 0)
     };
-    let mut topo = petgraph::visit::Topo::new(&graph_resource.graph);
     let mut node_mapping: HashMap<NodeIndex, NonNull<crate::tidy_tree::Node>> = HashMap::new();
     let mut tidy = TidyLayout::new(200., 200.);
     let mut root = crate::tidy_tree::Node::new(0, 10., 10.);
+    let mut topo = petgraph::visit::Topo::new(&graph_resource.graph);
     while let Some(x) = topo.next(&graph_resource.graph) {
         if let Some(node) = &graph_resource.graph.node_weight(x) {
             let mut width = 600.0;
@@ -814,7 +833,7 @@ fn update_alternate_graph_system(
                             },
                             GraphIdx {
                                 loading: false,
-                                execution_id: node.0,
+                                execution_id: **node,
                                 id: idx.index(),
                                 is_hovered: false,
                                 is_selected: false,
@@ -841,7 +860,6 @@ fn update_alternate_graph_system(
                         //       the trace camera is still be affected by other camera values
                         transform.translation = transform.translation.lerp(Vec3::new(n.x.to_f32().unwrap(), -n.y.to_f32().unwrap(), -1.0), 0.1);
 
-
                         // Draw text within these elements
                         egui::Area::new(format!("{:?}", entity).into())
                             .fixed_pos(Pos2::new(0.0, 0.0)).show(ctx, |ui| {
@@ -850,7 +868,90 @@ fn update_alternate_graph_system(
                             let mut frame = egui::Frame::default().fill(Color32::from_hex("#eeeeee").unwrap()).inner_margin(16.0).rounding(6.0).begin(ui);
                             {
                                 let mut ui = &mut frame.content_ui;
-                                render_node(&node.0, &exec_id_to_state.inner, &internal_state, gidx.is_selected, ui);
+                                let node1 = *node;
+                                let original_style = (*ui.ctx().style()).clone();
+
+                                let mut style = original_style.clone();
+                                style.visuals.override_text_color = Some(Color32::BLACK);
+                                ui.set_style(style);
+
+                                egui::ScrollArea::new([false, true]) // Horizontal: false, Vertical: true
+                                    .max_width(700.0)
+                                    .max_height(400.0)
+                                    .show(ui, |ui| {
+                                        if *node1 == chidori_core::uuid::Uuid::nil() {
+                                            ui.horizontal(|ui| {
+                                                ui.label(RichText::new("Initialization...").color(Color32::BLACK));
+                                                ui.label(RichText::new(node1.to_string()).color(Color32::BLACK));
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                                    if ui.button(RichText::new("Revert to this State").color(Color32::from_hex("#dddddd").unwrap())).clicked() {
+                                                        let _ = internal_state.set_execution_id(*node1);
+                                                    }
+                                                });
+                                            });
+                                        } else {
+                                            ui.horizontal(|ui| {
+                                                ui.label(RichText::new(node1.to_string()).color(Color32::BLACK));
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                                    if ui.button(RichText::new("Revert to this State").color(Color32::from_hex("#dddddd").unwrap())).clicked() {
+                                                        println!("We would like to revert to {:?}", node1);
+                                                        let _ = internal_state.set_execution_id(*node1);
+                                                    }
+                                                });
+                                            });
+
+
+                                            if let Some(state) = internal_state.chidori.lock().unwrap().get_shared_state().execution_id_to_evaluation.lock().unwrap().get(&node1) {
+                                                if let ExecutionStateEvaluation::Complete(state) = state {
+                                                    for (key, value) in state.state.iter() {
+                                                        let image_paths = crate::util::find_matching_strings(&value.output, r"(?i)\.(png|jpe?g)$");
+                                                        for (img_path, object_path_to_img) in image_paths {
+                                                            let texture = if let Some(cached_texture) = node_image_texture_cache.get(&img_path) {
+                                                                cached_texture.clone()
+                                                            } else {
+                                                                // Load the image
+                                                                let img = image::io::Reader::open(&img_path)
+                                                                    .expect("Failed to open image")
+                                                                    .decode()
+                                                                    .expect("Failed to decode image");
+
+                                                                // Convert the image to egui::ColorImage
+                                                                let size = [img.width() as _, img.height() as _];
+                                                                let image_buffer = img.to_rgba8();
+                                                                let pixels = image_buffer.as_flat_samples();
+                                                                let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                                                    size,
+                                                                    pixels.as_slice(),
+                                                                );
+
+                                                                // Create the texture
+                                                                let texture = ui.ctx().load_texture(
+                                                                    &img_path,
+                                                                    color_image,
+                                                                    egui::TextureOptions::default()
+                                                                );
+
+                                                                // Cache the texture
+                                                                node_image_texture_cache.insert(img_path.clone(), texture.clone());
+
+                                                                texture
+                                                            };
+
+                                                            // Display the image
+                                                            ui.add(egui::Image::new(&texture));
+                                                        }
+                                                    }
+
+
+                                                    egui_execution_state(ui, state);
+                                                }
+                                            } else {
+                                                // internal_state.get_execution_state_at_id(*node);
+                                            }
+                                        }
+                                    });
+
+                                ui.set_style(original_style);
                             }
                             frame.end(ui);
                         });
@@ -916,59 +1017,6 @@ fn update_alternate_graph_system(
     }
 }
 
-fn render_node(
-    node: &ExecutionNodeId,
-    exec_id_to_state: &HashMap<ExecutionNodeId, ExecutionState>,
-    internal_state: &crate::chidori::InternalState,
-    enable_scrolling: bool,
-    ui: &mut Ui
-) {
-    let original_style = (*ui.ctx().style()).clone();
-
-    let mut style = original_style.clone();
-    style.visuals.override_text_color = Some(Color32::BLACK);
-    ui.set_style(style);
-
-    egui::ScrollArea::new([false, true]) // Horizontal: false, Vertical: true
-        .max_width(700.0)
-        .max_height(400.0)
-        .show(ui, |ui| {
-            if *node == chidori_core::uuid::Uuid::nil() {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Initialization...").color(Color32::BLACK));
-                    ui.label(RichText::new(node.to_string()).color(Color32::BLACK));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                        if ui.button(RichText::new("Revert to this State").color(Color32::from_hex("#dddddd").unwrap())).clicked() {
-                            let _ = internal_state.set_execution_id(*node);
-                        }
-                    });
-                });
-            } else {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(node.to_string()).color(Color32::BLACK));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                        if ui.button(RichText::new("Revert to this State").color(Color32::from_hex("#dddddd").unwrap())).clicked() {
-                            println!("We would like to revert to {:?}", node);
-                            let _ = internal_state.set_execution_id(*node);
-                        }
-                    });
-                });
-
-
-                if let Some(state) = internal_state.chidori.lock().unwrap().get_shared_state().execution_id_to_evaluation.lock().unwrap().get(&node) {
-                    if let ExecutionStateEvaluation::Complete(state) = state {
-                        egui_execution_state(ui, state);
-                    }
-                } else {
-                    // internal_state.get_execution_state_at_id(*node);
-                }
-            }
-        });
-
-    ui.set_style(original_style);
-    return;
-}
-
 fn update_graph_system(
     mut graph_res: ResMut<GraphResource>,
     mut execution_graph: ResMut<ChidoriExecutionGraph>,
@@ -986,10 +1034,8 @@ fn update_graph_system(
                 .or_insert_with(|| dataset.add_node(b.clone()));
             dataset.add_edge(node_index_a, node_index_b, ());
         }
-        let mut graph: ForceGraph<f32, 2, ExecutionNodeId, ()> =
-            fdg::init_force_graph_uniform(dataset, 30.0);
         graph_res.node_ids = node_ids;
-        graph_res.graph = graph;
+        graph_res.graph = dataset;
         graph_res.hash_graph = hash_graph(&execution_graph.inner);
     }
 }
@@ -1270,11 +1316,9 @@ fn graph_setup(
     //         .or_insert_with(|| dataset.add_node(b.clone()));
     //     dataset.add_edge(node_index_a, node_index_b, ());
     // }
-    let mut graph: ForceGraph<f32, 2, ExecutionNodeId, ()> =
-        fdg::init_force_graph_uniform(dataset, 30.0);
     commands.spawn((CursorWorldCoords(vec2(0.0, 0.0)), OnGraphScreen));
     commands.insert_resource(GraphResource {
-        graph,
+        graph: dataset,
         hash_graph: hash_graph(&execution_graph.inner),
         node_ids,
         is_active: false

@@ -11,6 +11,7 @@ use egui::{Color32, FontFamily, Frame, Margin, Pos2};
 use egui_tiles::Tile;
 use chidori_core::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, TemplateCell, TextRange, WebserviceCell};
 use crate::chidori::{ChidoriCells, ChidoriExecutionState, EguiTree, EguiTreeIdentities};
+use crate::egui_json_tree::JsonTree;
 use crate::GameState;
 use crate::util::{change_active_editor_ui, deselect_editor_on_esc, despawn_screen, egui_label, egui_logs, egui_rkyv, print_editor_text};
 
@@ -150,7 +151,9 @@ fn editor_update(
                                             }
                                             ui.push_id((exec_id, op_id), |ui| {
                                                 ui.collapsing("Values", |ui| {
-                                                    egui_rkyv(ui, &o.output, true);
+                                                    let response = JsonTree::new(format!("{} {} evaluating_args", exec_id, op_id), &o.output)
+                                                        // .default_expand(DefaultExpand::SearchResults(&self.search_input))
+                                                        .show(ui);
                                                 });
                                                 ui.collapsing("Logs", |ui| {
                                                     egui_logs(ui, &o.stdout);
@@ -194,7 +197,9 @@ fn editor_update(
                                             }
                                             ui.push_id((exec_id, op_id), |ui| {
                                                 ui.collapsing("Values", |ui| {
-                                                    egui_rkyv(ui, &o.output, true);
+                                                    let response = JsonTree::new(format!("{} {} values", exec_id, op_id), &o.output)
+                                                        // .default_expand(DefaultExpand::SearchResults(&self.search_input))
+                                                        .show(ui);
                                                 });
                                                 ui.collapsing("Logs", |ui| {
                                                     egui_logs(ui, &o.stdout);

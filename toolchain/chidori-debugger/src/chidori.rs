@@ -685,14 +685,30 @@ pub fn update_gui(
                 ui.horizontal(|ui| {
                     ui.style_mut().spacing.item_spacing = egui::vec2(32.0, 8.0);
                     if with_cursor(ui.button("Open")).clicked() {
+                        internal_state.display_example_modal = false;
                         // let sender = self.text_channel.0.clone();
                         runtime.spawn_background_task(|mut ctx| async move {
-                            let task = rfd::AsyncFileDialog::new().pick_file();
-                            let file = task.await;
-                            if let Some(file) = file {
-                                let text = file.read().await;
-                                // let _ = sender.send(String::from_utf8_lossy(&text).to_string());
-                                // ctx.request_repaint();
+                            let task = rfd::AsyncFileDialog::new().pick_folder();
+                            let folder = task.await;
+                            if let Some(folder) = folder {
+                                let path = folder.path().to_string_lossy().to_string();
+                                ctx.run_on_main_thread(move |ctx| {
+                                    if let Some(mut internal_state) =
+                                        ctx.world.get_resource_mut::<InternalState>()
+                                    {
+                                        match internal_state.load_and_watch_directory(path) {
+                                            Ok(()) => {
+                                                // Directory loaded and watched successfully
+                                                println!("Directory loaded and being watched successfully");
+                                            },
+                                            Err(e) => {
+                                                // Handle the error
+                                                eprintln!("Error loading and watching directory: {}", e);
+                                            }
+                                        }
+                                    }
+                                })
+                                    .await;
                             }
                         });
                     }

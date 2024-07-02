@@ -2,7 +2,9 @@
 use bevy::{prelude::*, window::PrimaryWindow};
 use bevy_cosmic_edit::*;
 use egui;
-use egui::{Color32, FontFamily, Margin, RichText, Ui};
+use egui::{Color32, FontFamily, FontId, Frame, Margin, RichText, Ui};
+use egui_extras::syntax_highlighting;
+use egui_extras::syntax_highlighting::CodeTheme;
 use crate::egui_json_tree::value::{BaseValueType, ExpandableType, JsonTreeValue, ToJsonTreeValue};
 use chidori_core::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, TemplateCell, WebserviceCell};
 use chidori_core::execution::primitives::serialized_value::RkyvSerializedValue;
@@ -199,216 +201,98 @@ pub fn egui_label(ui: &mut Ui, text: &str) {
 //     });
 // }
 
+
 pub fn egui_render_cell_read(ui: &mut Ui, cell: &CellTypes) {
-    let mut theme = egui_extras::syntax_highlighting::CodeTheme::dark();
+    let theme = CodeTheme::dark();
+
     match cell {
         CellTypes::Code(CodeCell { name, source_code, language, .. }, _) => {
-            let language_string = match language {
-                SupportedLanguage::PyO3 => "python",
-                SupportedLanguage::Starlark => "starlark",
-                SupportedLanguage::Deno => "javascript/typescript"
-            };
-            let mut layouter = |ui: &egui::Ui, text_string: &str, wrap_width: f32| {
-                let syntax_language = match language {
-                    SupportedLanguage::PyO3 => "py",
-                    SupportedLanguage::Starlark => "py",
-                    SupportedLanguage::Deno => "js"
-                };
-                let mut layout_job =
-                    egui_extras::syntax_highlighting::highlight(ui.ctx(), &theme, text_string, syntax_language);
-                layout_job.wrap.max_width = wrap_width;
-
-                // Fix font size
-                for mut section in &mut layout_job.sections {
-                    section.format.font_id = egui::FontId::new(14.0, FontFamily::Monospace);
-                }
-
-                ui.fonts(|f| f.layout_job(layout_job))
-            };
-
-            let mut s = source_code.clone();
-            let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(16.0).inner_margin(16.0).rounding(6.0).begin(ui);
-            {
-                let mut ui = &mut frame.content_ui;
-                ui.horizontal(|ui| {
-                    egui_label(ui, "Code");
-                    egui_label(ui, language_string);
-                    if let Some(name) = name {
-                        egui_label(ui, name);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        if ui.button("Open").clicked() {
-                            // TODO:
-                            println!("Should open file");
-                        }
-                    });
-                });
-                ui.vertical(|ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut s)
-                            .font(egui::FontId::new(14.0, FontFamily::Monospace))
-                            .code_editor()
-                            .lock_focus(true)
-                            .desired_width(f32::INFINITY)
-                            .margin(Margin::symmetric(8.0, 8.0))
-                            .layouter(&mut layouter),
-                    );
-                    ui.add_space(10.0);
-                });
-            }
-            frame.end(ui);
+            render_code_cell(ui, name, source_code, language, &theme);
         }
         CellTypes::CodeGen(LLMCodeGenCell { name, req, .. }, _) => {
-            let mut layouter = |ui: &egui::Ui, text_string: &str, wrap_width: f32| {
-                let mut layout_job =
-                    egui_extras::syntax_highlighting::highlight(ui.ctx(), &theme, text_string, "md");
-                layout_job.wrap.max_width = wrap_width;
-
-                // Fix font size
-                for mut section in &mut layout_job.sections {
-                    section.format.font_id = egui::FontId::new(14.0, FontFamily::Monospace);
-                }
-
-                ui.fonts(|f| f.layout_job(layout_job))
-            };
-            let mut s = req.clone();
-            let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(16.0).inner_margin(16.0).rounding(6.0).begin(ui);
-            {
-                let mut ui = &mut frame.content_ui;
-                ui.horizontal(|ui| {
-                    egui_label(ui, "Code Gen Prompt");
-                    if let Some(name) = name {
-                        egui_label(ui, name);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        if ui.button("Open").clicked() {
-                            // TODO:
-                            println!("Should open file");
-                        }
-                    });
-                });
-                // Add widgets inside the frame
-                ui.vertical(|ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut s)
-                            .code_editor()
-                            .lock_focus(true)
-                            .desired_width(f32::INFINITY)
-                            .margin(Margin::symmetric(8.0, 8.0))
-                            .layouter(&mut layouter)
-                    );
-                    ui.add_space(10.0);
-                });
-            }
-            frame.end(ui);
+            render_text_cell(ui, name, req, "Code Gen Prompt", "md", &theme);
         }
-        CellTypes::Prompt(LLMPromptCell::Completion { .. }, _) => {}
-        CellTypes::Prompt(LLMPromptCell::Chat { name, configuration, req, .. }, _) => {
-            let mut layouter = |ui: &egui::Ui, text_string: &str, wrap_width: f32| {
-                let mut layout_job =
-                    egui_extras::syntax_highlighting::highlight(ui.ctx(), &theme, text_string, "md");
-                layout_job.wrap.max_width = wrap_width;
-
-                // Fix font size
-                for mut section in &mut layout_job.sections {
-                    section.format.font_id = egui::FontId::new(14.0, FontFamily::Monospace);
-                }
-
-                ui.fonts(|f| f.layout_job(layout_job))
-            };
-            let mut s = req.clone();
-            let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(16.0).inner_margin(16.0).begin(ui);
-            {
-                let mut ui = &mut frame.content_ui;
-                ui.horizontal(|ui| {
-                    egui_label(ui, "Prompt");
-                    if let Some(name) = name {
-                        egui_label(ui, name);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        if ui.button("Open").clicked() {
-                            // TODO:
-                            println!("Should open file");
-                        }
-                    });
-                });
-                // Add widgets inside the frame
-                ui.vertical(|ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut s)
-                            .code_editor()
-                            .lock_focus(true)
-                            .desired_width(f32::INFINITY)
-                            .margin(Margin::symmetric(8.0, 8.0))
-                            .layouter(&mut layouter),
-                    );
-                    ui.add_space(10.0);
-                });
-            }
-            frame.end(ui);
+        CellTypes::Prompt(LLMPromptCell::Chat { name, req, .. }, _) => {
+            render_text_cell(ui, name, req, "Prompt", "md", &theme);
         }
-        CellTypes::Embedding(LLMEmbeddingCell { .. }, _) => {}
         CellTypes::Web(WebserviceCell { name, configuration, .. }, _) => {
-            let mut s = configuration.clone();
-            let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(16.0).inner_margin(16.0).begin(ui);
-            {
-                let mut ui = &mut frame.content_ui;
-                ui.horizontal(|ui| {
-                    egui_label(ui, "Prompt");
-                    if let Some(name) = name {
-                        egui_label(ui, name);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        if ui.button("Open").clicked() {
-                            // TODO:
-                            println!("Should open file");
-                        }
-                    });
-                });
-                // Add widgets inside the frame
-                ui.vertical(|ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut s)
-                            .code_editor()
-                            .lock_focus(true)
-                            .desired_width(f32::INFINITY)
-                    );
-                });
-            }
-            frame.end(ui);
+            render_text_cell(ui, name, configuration, "Prompt", "", &theme);
         }
         CellTypes::Template(TemplateCell { name, body }, _) => {
-            let mut s = body.clone();
-            let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(16.0).inner_margin(16.0).begin(ui);
-            {
-                let mut ui = &mut frame.content_ui;
-                ui.horizontal(|ui| {
-                    egui_label(ui, "Prompt");
-                    if let Some(name) = name {
-                        egui_label(ui, name);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        if ui.button("Open").clicked() {
-                            // TODO:
-                            println!("Should open file");
-                        }
-                    });
-                });
-                // Add widgets inside the frame
-                ui.vertical(|ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut s)
-                            .code_editor()
-                            .lock_focus(true)
-                            .margin(Margin::symmetric(8.0, 8.0))
-                            .desired_width(f32::INFINITY)
-                    );
-                });
-            }
-            frame.end(ui);
+            render_text_cell(ui, name, body, "Prompt", "", &theme);
         }
+        CellTypes::Prompt(LLMPromptCell::Completion { .. }, _) |
+        CellTypes::Embedding(LLMEmbeddingCell { .. }, _) |
         CellTypes::Memory(MemoryCell { .. }, _) => {}
     }
+}
+
+fn render_code_cell(ui: &mut Ui, name: &Option<String>, source_code: &str, language: &SupportedLanguage, theme: &CodeTheme) {
+    let (language_string, syntax_language) = match language {
+        SupportedLanguage::PyO3 => ("python", "py"),
+        SupportedLanguage::Starlark => ("starlark", "py"),
+        SupportedLanguage::Deno => ("javascript/typescript", "js"),
+    };
+
+    render_frame(ui, "Code", Some(language_string), name, source_code, theme, syntax_language);
+}
+
+fn render_text_cell(ui: &mut Ui, name: &Option<String>, text: &str, label: &str, syntax: &str, theme: &CodeTheme) {
+    render_frame(ui, label, None, name, text, theme, syntax);
+}
+
+fn render_frame(ui: &mut Ui, label: &str, extra_label: Option<&str>, name: &Option<String>, text: &str, theme: &CodeTheme, syntax: &str) {
+    let mut frame = Frame::default()
+        .fill(Color32::from_hex("#222222").unwrap())
+        .outer_margin(16.0)
+        .inner_margin(16.0)
+        .rounding(6.0)
+        .begin(ui);
+
+    let content_ui = &mut frame.content_ui;
+    content_ui.horizontal(|ui| {
+        egui_label(ui, label);
+        if let Some(extra) = extra_label {
+            egui_label(ui, extra);
+        }
+        if let Some(name) = name {
+            egui_label(ui, name);
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+            if ui.button("Open").clicked() {
+                println!("Should open file");
+            }
+        });
+    });
+
+    let mut s = text.to_string();
+    content_ui.vertical(|ui| {
+        let mut layouter = |ui: &egui::Ui, text_string: &str, wrap_width: f32| {
+            let mut layout_job =
+                egui_extras::syntax_highlighting::highlight(ui.ctx(), &theme, text_string, syntax);
+            layout_job.wrap.max_width = wrap_width;
+
+            // Fix font size
+            for mut section in &mut layout_job.sections {
+                section.format.font_id = egui::FontId::new(14.0, FontFamily::Monospace);
+            }
+
+            ui.fonts(|f| f.layout_job(layout_job))
+        };
+
+        ui.add(
+            egui::TextEdit::multiline(&mut s)
+                .font(FontId::new(14.0, FontFamily::Monospace))
+                .code_editor()
+                .lock_focus(true)
+                .desired_width(f32::INFINITY)
+                .margin(Margin::symmetric(8.0, 8.0))
+                .layouter(&mut layouter),
+        );
+        ui.add_space(10.0);
+    });
+
+    frame.end(ui);
 }
 
 
@@ -468,5 +352,155 @@ impl ToJsonTreeValue for RkyvSerializedValue {
             self,
             RkyvSerializedValue::Object(_) | RkyvSerializedValue::Set(_) | RkyvSerializedValue::Array(_)
         )
+    }
+}
+
+
+
+use regex::Regex;
+
+fn traverse_rkyv_serialized_value(
+    value: &RkyvSerializedValue,
+    pattern: &Regex,
+    path: Vec<String>,
+    results: &mut Vec<(String, Vec<String>)>,
+) {
+    match value {
+        RkyvSerializedValue::String(s) => {
+            if pattern.is_match(s) {
+                results.push((s.clone(), path));
+            }
+        }
+        RkyvSerializedValue::Array(arr) => {
+            for (index, item) in arr.iter().enumerate() {
+                let mut new_path = path.clone();
+                new_path.push(index.to_string());
+                traverse_rkyv_serialized_value(item, pattern, new_path, results);
+            }
+        }
+        RkyvSerializedValue::Object(obj) => {
+            for (key, val) in obj.iter() {
+                let mut new_path = path.clone();
+                new_path.push(key.clone());
+                traverse_rkyv_serialized_value(val, pattern, new_path, results);
+            }
+        }
+        RkyvSerializedValue::Set(set) => {
+            for (index, item) in set.iter().enumerate() {
+                let mut new_path = path.clone();
+                new_path.push(format!("Set[{}]", index));
+                traverse_rkyv_serialized_value(item, pattern, new_path, results);
+            }
+        }
+        _ => {} // Other variants don't contain nested RkyvSerializedValues or Strings
+    }
+}
+
+// Helper function to initiate the traversal
+pub fn find_matching_strings(
+    value: &RkyvSerializedValue,
+    pattern: &str,
+) -> Vec<(String, Vec<String>)> {
+    let regex = Regex::new(pattern).expect("Invalid regex pattern");
+    let mut results = Vec::new();
+    traverse_rkyv_serialized_value(value, &regex, Vec::new(), &mut results);
+    results
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn test_simple_string_match() {
+        let value = RkyvSerializedValue::String("Hello, world!".to_string());
+        let results = find_matching_strings(&value, r"^Hello");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "Hello, world!");
+        assert_eq!(results[0].1, Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_array_match() {
+        let value = RkyvSerializedValue::Array(vec![
+            RkyvSerializedValue::String("foo".to_string()),
+            RkyvSerializedValue::String("bar".to_string()),
+            RkyvSerializedValue::String("baz".to_string()),
+        ]);
+        let results = find_matching_strings(&value, r"^ba");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "bar");
+        assert_eq!(results[0].1, vec!["1"]);
+        assert_eq!(results[1].0, "baz");
+        assert_eq!(results[1].1, vec!["2"]);
+    }
+
+    #[test]
+    fn test_nested_object_match() {
+        let mut inner_obj = HashMap::new();
+        inner_obj.insert("key".to_string(), RkyvSerializedValue::String("value".to_string()));
+
+        let mut outer_obj = HashMap::new();
+        outer_obj.insert("nested".to_string(), RkyvSerializedValue::Object(inner_obj));
+        outer_obj.insert("sibling".to_string(), RkyvSerializedValue::String("hello".to_string()));
+
+        let value = RkyvSerializedValue::Object(outer_obj);
+        let results = find_matching_strings(&value, r"value|hello");
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&("value".to_string(), vec!["nested".to_string(), "key".to_string()])));
+        assert!(results.contains(&("hello".to_string(), vec!["sibling".to_string()])));
+    }
+
+    #[test]
+    fn test_set_match() {
+        let mut set = HashSet::new();
+        set.insert(RkyvSerializedValue::String("apple".to_string()));
+        set.insert(RkyvSerializedValue::String("banana".to_string()));
+        set.insert(RkyvSerializedValue::String("cherry".to_string()));
+
+        let value = RkyvSerializedValue::Set(set);
+        let results = find_matching_strings(&value, r"^[ab]");
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|(s, p)| s == "apple" && p[0].starts_with("Set[") && p[0].ends_with("]")));
+        assert!(results.iter().any(|(s, p)| s == "banana" && p[0].starts_with("Set[") && p[0].ends_with("]")));
+    }
+
+    #[test]
+    fn test_no_match() {
+        let value = RkyvSerializedValue::Object(HashMap::from([
+            ("key1".to_string(), RkyvSerializedValue::Number(42)),
+            ("key2".to_string(), RkyvSerializedValue::Boolean(true)),
+        ]));
+        let results = find_matching_strings(&value, r"nonexistent");
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_complex_nested_structure() {
+        let mut inner_set = HashSet::new();
+        inner_set.insert(RkyvSerializedValue::String("set_item1".to_string()));
+        inner_set.insert(RkyvSerializedValue::String("set_item2".to_string()));
+
+        let mut inner_obj = HashMap::new();
+        inner_obj.insert("inner_key".to_string(), RkyvSerializedValue::String("inner_value".to_string()));
+
+        let value = RkyvSerializedValue::Object(HashMap::from([
+            ("array".to_string(), RkyvSerializedValue::Array(vec![
+                RkyvSerializedValue::String("array_item1".to_string()),
+                RkyvSerializedValue::String("array_item2".to_string()),
+            ])),
+            ("set".to_string(), RkyvSerializedValue::Set(inner_set)),
+            ("object".to_string(), RkyvSerializedValue::Object(inner_obj)),
+        ]));
+
+        let results = find_matching_strings(&value, r"item|inner");
+        assert_eq!(results.len(), 5);
+        assert!(results.contains(&("array_item1".to_string(), vec!["array".to_string(), "0".to_string()])));
+        assert!(results.contains(&("array_item2".to_string(), vec!["array".to_string(), "1".to_string()])));
+        assert!(results.iter().any(|(s, p)| s == "set_item1" && p[0] == "set" && p[1].starts_with("Set[") && p[1].ends_with("]")));
+        assert!(results.iter().any(|(s, p)| s == "set_item2" && p[0] == "set" && p[1].starts_with("Set[") && p[1].ends_with("]")));
+        assert!(results.contains(&("inner_value".to_string(), vec!["object".to_string(), "inner_key".to_string()])));
     }
 }

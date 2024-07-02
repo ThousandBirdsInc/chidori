@@ -460,7 +460,7 @@ pub async fn ai_llm_code_generation_chat_model(
             let mut cells = vec![];
             crate::sdk::md::extract_code_blocks(&text)
                 .iter()
-                .filter_map(|block| interpret_code_block(block))
+                .filter_map(|block| interpret_code_block(block).unwrap())
                 .for_each(|block| { cells.push(block); });
             cells.sort();
 

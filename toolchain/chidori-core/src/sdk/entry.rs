@@ -516,7 +516,7 @@ impl Chidori {
         let mut cells = vec![];
         crate::sdk::md::extract_code_blocks(s)
             .iter()
-            .filter_map(|block| interpret_code_block(block))
+            .filter_map(|block| interpret_code_block(block).unwrap())
             .for_each(|block| { cells.push(block); });
         cells.sort();
         self.loaded_path = Some("raw_text".to_string());
@@ -528,7 +528,7 @@ impl Chidori {
         let mut cells = vec![];
         for file in files {
             for block in file.result {
-                if let Some(block) = interpret_code_block(&block) {
+                if let Some(block) = interpret_code_block(&block).unwrap() {
                     cells.push(block);
                 }
             }

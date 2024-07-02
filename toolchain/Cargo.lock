@@ -2320,6 +2320,7 @@ dependencies = [
  "petgraph-gen",
  "pyo3-build-config 0.19.2",
  "rand 0.8.5",
+ "regex",
  "rfd",
  "rusqlite",
  "serde",

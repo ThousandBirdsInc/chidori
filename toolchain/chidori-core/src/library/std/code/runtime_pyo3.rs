@@ -346,6 +346,7 @@ pub async fn source_code_run_python(
             }
             // Necessary to expose defined functions to the global scope from the inside of the __wrapper function
             for (name, report_item) in &report.triggerable_functions {
+                // TODO: we can rename functions to their hashed identities here, swapping them
 
                 // Declare in our output what functions were defined by this run.
                 initial_source_code.push_str("\n");

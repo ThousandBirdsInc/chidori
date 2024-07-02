@@ -122,6 +122,7 @@ pub struct FunctionMetadata {
 pub struct ExecutionState {
     pub(crate) op_counter: usize,
     pub id: ExecutionNodeId,
+    pub stack: VecDeque<ExecutionNodeId>,
     pub parent_state_id: ExecutionNodeId,
 
     pub chat_message_queue_head: usize,
@@ -129,6 +130,7 @@ pub struct ExecutionState {
     pub evaluating_id: usize,
     pub evaluating_name: Option<String>,
     pub evaluating_fn: Option<String>,
+    pub evaluating_arguments: Option<RkyvSerializedValue>,
 
     /// CellType applied, by a state that is mutating cell definitions
     pub operation_mutation: Option<CellTypes>,
@@ -149,7 +151,7 @@ pub struct ExecutionState {
     pub state: ImHashMap<usize, Arc<OperationFnOutput>>,
 
     /// Values that were introduced specifically by this state being evaluated, used to identity most recent changes
-    pub fresh_values: Vec<usize>,
+    pub fresh_values: HashSet<usize>,
 
     /// Map of name of operation -> operation_id
     pub operation_name_to_id: ImHashMap<String, OperationId>,
@@ -231,17 +233,19 @@ impl Default for ExecutionState {
     fn default() -> Self {
         ExecutionState {
             id: Uuid::new_v4(),
+            stack: Default::default(),
             parent_state_id: Uuid::nil(),
             op_counter: 0,
             evaluating_id: 0,
             evaluating_name: None,
             evaluating_fn: None,
+            evaluating_arguments: None,
             operation_mutation: None,
             graph_sender: None,
             exec_queue: VecDeque::new(),
             marked_for_consumption: HashSet::new(),
             state: Default::default(),
-            fresh_values: vec![],
+            fresh_values: Default::default(),
             operation_name_to_id: Default::default(),
             operation_by_id: Default::default(),
             function_name_to_metadata: Default::default(),
@@ -272,7 +276,7 @@ impl ExecutionState {
     pub fn clone_with_new_id(&self) -> Self {
         let mut new = self.clone();
         new.parent_state_id = new.id;
-        new.fresh_values = vec![];
+        new.fresh_values = HashSet::new();
         new.id = Uuid::new_v4();
         new
     }
@@ -542,17 +546,11 @@ impl ExecutionState {
 
         // Store the invocation payload into an execution state and record this before executing
         let mut state = self.clone_with_new_id();
+        state.stack.push_back(self.id);
 
         let meta = self.function_name_to_metadata.get(function_name).map(|meta| {
             meta
         }).expect("Failed to find named function");
-
-        state.state_insert(usize::MAX, OperationFnOutput {
-            execution_state: None,
-            output: payload.clone(),
-            stdout: vec![],
-            stderr: vec![],
-        });
 
         let op = state.operation_by_id.get(&meta.operation_id).unwrap().lock().unwrap();
         let op_name = op.name.clone();
@@ -560,6 +558,7 @@ impl ExecutionState {
         state.evaluating_fn = Some(function_name.to_string());
         state.evaluating_id = meta.operation_id;
         state.evaluating_name = op_name;
+        state.evaluating_arguments = Some(payload.clone());
 
         // modify code cell to indicate execution of the target function
         // reconstruction of the cell
@@ -592,7 +591,6 @@ impl ExecutionState {
         };
 
         let mut before_execution_state = state.clone();
-        let mut after_execution_state = state.clone_with_new_id();
         // When we receive a message from the graph_sender, execution of this coroutine will resume.
         if let Some(graph_sender) = self.graph_sender.as_ref() {
             let s = graph_sender.clone();
@@ -603,6 +601,8 @@ impl ExecutionState {
         // invocation of the operation
         // TODO: the total arg payload here does not include necessary function calls for this cell itself
         let result = op.execute(&before_execution_state, payload, None, None).await?;
+        let mut after_execution_state = state.clone_with_new_id();
+        after_execution_state.stack.pop_back();
         after_execution_state.state_insert(usize::MAX, result.clone());
 
         // TODO: Add result into a new execution state
