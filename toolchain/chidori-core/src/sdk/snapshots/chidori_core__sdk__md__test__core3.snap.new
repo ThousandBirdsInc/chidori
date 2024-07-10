@@ -1,0 +1,33 @@
+---
+source: chidori-core/src/sdk/md.rs
+assertion_line: 228
+expression: v
+---
+- Code:
+    - name: python_add_two
+      language: PyO3
+      source_code: "def add_two(x):\n    return x + 2"
+      function_invocation: ~
+    - start: 237
+      end: 294
+- Code:
+    - name: ~
+      language: Deno
+      source_code: "import { assertEquals } from \"https://deno.land/std@0.221.0/assert/mod.ts\";\n\nDeno.test(\"addition test\", async () => {\n    const result = await add_two(2);\n    console.log(result);\n    assertEquals(result, 4);\n});"
+      function_invocation: ~
+    - start: 302
+      end: 526
+- Code:
+    - name: js_add_two
+      language: Deno
+      source_code: "function addTwo(x) {\n    return x + 2;\n}"
+      function_invocation: ~
+    - start: 610
+      end: 675
+- Code:
+    - name: ~
+      language: PyO3
+      source_code: "import unittest\n\nclass TestMarshalledValues(unittest.TestCase):\n    async def test_addTwo(self):\n        self.assertEqual(await addTwo(2), 4)\n\nunittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))"
+      function_invocation: ~
+    - start: 683
+      end: 930

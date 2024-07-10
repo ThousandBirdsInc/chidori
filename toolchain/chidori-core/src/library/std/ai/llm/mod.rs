@@ -365,7 +365,7 @@ pub async fn ai_llm_run_chat_model(
                         if let Some(function_name) = tool_call.function.name {
                             let args = tool_call.function.arguments.unwrap_or(RkyvSerializedValue::Null);
                             let args = RkyvObjectBuilder::new().insert_value("kwargs", args).build();
-                            let (dispatch_result, _) = execution_state.dispatch(&function_name, args).await?;
+                            let (dispatch_result, _) = execution_state.dispatch(&function_name, args, None).await?;
                             result_map.insert(function_name, dispatch_result);
                         }
                     }

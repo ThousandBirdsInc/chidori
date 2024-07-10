@@ -5,20 +5,7 @@ use std::num::NonZero;
 use bevy::input::touchpad::TouchpadMagnify;
 use std::ops::Add;
 use std::time::{Duration, Instant};
-use bevy::{
-    prelude::*,
-    render::{
-        extract_component::ExtractComponent
-        ,
-        render_phase::{
-            PhaseItem, RenderCommand
-            ,
-        }
-        ,
-        render_resource::*
-        , view::NoFrustumCulling,
-    },
-};
+use bevy::{ prelude::*, render::{ extract_component::ExtractComponent , render_phase::{ PhaseItem, RenderCommand , } , render_resource::* , view::NoFrustumCulling, }, };
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::math::{vec2, vec3};
 use bevy::render::camera::{ScalingMode, Viewport};
@@ -32,6 +19,7 @@ use bevy_rapier2d::geometry::{Collider, Sensor};
 use bevy_rapier2d::pipeline::QueryFilter;
 use bevy_rapier2d::plugin::RapierContext;
 use egui_tiles::Tile;
+use petgraph::graph::DiGraph;
 use petgraph::prelude::{EdgeRef, NodeIndex, StableDiGraph, StableGraph};
 use chidori_core::utils::telemetry::TraceEvents;
 use crate::chidori::{ChidoriTraceEvents, EguiTree, EguiTreeIdentities};
@@ -309,54 +297,58 @@ fn mouse_over_system(
     );
 }
 
-
 #[derive(Debug, Clone)]
 struct CallNode {
     id: String,
     created_at: Instant,
     depth: usize,
     thread_depth: usize,
-    absolute_timestamp: u128,
+    render_lane: usize,
     adjusted_timestamp: u128,
+    absolute_timestamp: u128,
     total_duration: u128,
     event: TraceEvents,
-    color_bucket: f32
+    color_bucket: f32,
 }
 
 #[derive(Debug)]
 struct CallTree {
     max_thread_depth: usize,
+    max_render_lane: usize,
+    relative_endpoint: u128,
     startpoint: u128,
     endpoint: u128,
-    relative_endpoint: u128,
-    graph: StableGraph<CallNode, ()>
+    graph: DiGraph<CallNode, ()>,
 }
 
 impl Default for CallTree {
     fn default() -> Self {
         Self {
             max_thread_depth: 0,
+            max_render_lane: 0,
             startpoint: 0,
             endpoint: 0,
             relative_endpoint: 0,
-            graph: StableGraph::new()
+            graph: DiGraph::new()
         }
     }
 
 }
 
 
+
+
 fn build_call_tree(events: Vec<TraceEvents>, collapse_gaps: bool) -> CallTree {
-    // (depth, position_adjustment, thread_id, thread_depth, node_idx)
-    let mut node_map: HashMap<String, (usize, u128, NonZero<u64>, usize, NodeIndex)> = HashMap::new();
-    let mut graph = StableDiGraph::new();
+    let mut node_map: HashMap<String, (u128, NonZero<u64>, NodeIndex)> = HashMap::new();
+    let mut graph: DiGraph<CallNode, ()> = DiGraph::new();
     let mut max_thread_depth = 1;
+    let mut max_render_lane = 0;
     let mut endpoint = 0;
     let mut relative_endpoint = 0;
     let mut startpoint = u128::MAX;
+    let mut render_lanes: HashMap<String, Vec<(u128, u128)>> = HashMap::new(); // Track occupied time ranges for each parent span
     let mut last_top_level_trace_end = 0;
 
-    // iteration through events in received order
     for event in events {
         match &event {
             e @ TraceEvents::NewSpan {
@@ -373,12 +365,14 @@ fn build_call_tree(events: Vec<TraceEvents>, collapse_gaps: bool) -> CallTree {
                     created_at: created_at.clone(),
                     depth: 1,
                     thread_depth: 1,
-                    adjusted_timestamp: 0,
+                    render_lane: 1,
+                    adjusted_timestamp: weight,
                     absolute_timestamp: weight,
                     total_duration: 0,
                     event: e.clone(),
                     color_bucket: 0.,
                 };
+
                 if weight < startpoint {
                     startpoint = weight;
                 }
@@ -386,33 +380,49 @@ fn build_call_tree(events: Vec<TraceEvents>, collapse_gaps: bool) -> CallTree {
                     endpoint = weight;
                 }
 
-                // Assign depth of this trace event vs its parent
-                let mut depth = 1;
+                // Assign depth and thread_depth
                 if let Some(parent_id) = parent_id {
-                    if let Some((parent_depth, _, _, _, _)) = node_map.get(parent_id) {
-                        depth = parent_depth + 1;
-                        node.depth = depth;
-                    }
-                }
-
-
-                let mut our_thread_depth = 1;
-                if let Some(parent_id) = parent_id {
-                    if let Some((parent_depth, _, parent_thread_id, parent_thread_depth, _)) = node_map.get_mut(parent_id) {
-                        // if this is not the same thread as our parent, increase depth by one
-                        if thread_id != parent_thread_id {
-                            *parent_thread_depth += 1;
+                    if let Some((_, _, parent_idx)) = node_map.get(parent_id) {
+                        if let Some(parent) = graph.node_weight(*parent_idx) {
+                            node.depth = parent.depth + 1;
+                            if let TraceEvents::NewSpan {thread_id: parent_thread_id, ..} = parent.event {
+                                if thread_id != &parent_thread_id {
+                                    node.thread_depth = parent.thread_depth + 1;
+                                } else {
+                                    node.thread_depth = parent.thread_depth;
+                                }
+                            }
+                            max_thread_depth = max_thread_depth.max(node.thread_depth);
                         }
-                        our_thread_depth = *parent_thread_depth;
-                        node.thread_depth = *parent_thread_depth;
-                        max_thread_depth = max_thread_depth.max(*parent_thread_depth);
                     }
                 }
+
+                // Assign render_lane for non-overlapping rendering
+                let parent_key = parent_id.clone().unwrap_or_else(|| "root".to_string());
+                let parent_lanes = render_lanes.entry(parent_key).or_insert_with(Vec::new);
+
+                // Find the first available lane within the parent's span
+                let mut available_lane = 1;
+                'outer: loop {
+                    for &(start, end) in parent_lanes.iter() {
+                        if weight >= start && weight < end {
+                            available_lane += 1;
+                            continue 'outer;
+                        }
+                    }
+                    break;
+                }
+
+                node.render_lane = available_lane;
+                parent_lanes.push((weight, weight)); // We'll update the end time when we process the Exit event
+
+                max_render_lane = max_render_lane.max(node.render_lane);
+
 
                 let mut position_subtracted_by_x_amount: u128 = 0;
                 // If this is a child node, adjusted position is its absolute position - the parent's adjustment
                 if let Some(parent_id) = parent_id {
-                    if let Some((_, parent_adjustment_to_position, _, _, _)) = node_map.get(parent_id) {
+                    if let Some((parent_adjustment_to_position, _, _)) = node_map.get(parent_id) {
                         position_subtracted_by_x_amount = *parent_adjustment_to_position;
                         node.adjusted_timestamp = weight - parent_adjustment_to_position;
                     }
@@ -429,81 +439,91 @@ fn build_call_tree(events: Vec<TraceEvents>, collapse_gaps: bool) -> CallTree {
                     node.adjusted_timestamp = last_top_level_trace_end;
                 }
 
-                // Store the relative endpoint of the trace as our extent if it is the max
                 relative_endpoint = relative_endpoint.max(node.adjusted_timestamp);
 
-                // Create the node and insert into the node_map
-                let node_id = graph.add_node(node);
-                node_map.insert(id.clone(), (depth, position_subtracted_by_x_amount, *thread_id, our_thread_depth, node_id));
+                // Add node to graph and node_map
+                let node_idx = graph.add_node(node);
+                node_map.insert(id.clone(), (position_subtracted_by_x_amount, *thread_id, node_idx));
 
-                // Add an edge between parent and child
+                // node_map.insert(id.clone(), node_idx);
+
+                // Add edge between parent and child
                 if let Some(parent_id) = parent_id {
-                    if let Some((_, _, _, _, parent)) = node_map.get(parent_id) {
-                        graph.add_edge(*parent, node_id, ());
+                    if let Some((_, _, parent_idx)) = node_map.get(parent_id) {
+                        graph.add_edge(*parent_idx, node_idx, ());
                     }
                 }
-            }
-            TraceEvents::Enter(id) => {
             }
             TraceEvents::Exit(id, weight) => {
-                if let Some(node) = graph.node_weight_mut(node_map[id].4) {
-                    node.total_duration = weight - node.absolute_timestamp;
-                    let endpoint_absolute = node.absolute_timestamp + node.total_duration;
-                    let endpoint_adjusted = node.adjusted_timestamp + node.total_duration;
+                if let Some((_, _, node_idx)) = node_map.get(id) {
+                    if let Some(node) = graph.node_weight_mut(*node_idx) {
+                        node.total_duration = weight - node.absolute_timestamp;
+                        let endpoint_absolute = node.absolute_timestamp + node.total_duration;
+                        let endpoint_adjusted = node.adjusted_timestamp + node.total_duration;
 
-                    // If this is a top-level node, update the last top-level trace end
-                    if node.depth == 1 {
-                        last_top_level_trace_end = endpoint_adjusted;
-                    }
+                        // If this is a top-level node, update the last top-level trace end
+                        if node.depth == 1 {
+                            last_top_level_trace_end = endpoint_adjusted;
+                        }
 
-                    relative_endpoint = endpoint_adjusted;
+                        // Update render lane end time
+                        if let TraceEvents::NewSpan { parent_id: event_parent_id, ..} = &node.event {
+                            if let Some(parent_id) = event_parent_id {
+                                if let Some(lanes) = render_lanes.get_mut(parent_id) {
+                                    if let Some(lane) = lanes.get_mut(node.render_lane) {
+                                        lane.1 = *weight;
+                                    }
+                                }
+                            } else if let Some(lanes) = render_lanes.get_mut("root") {
+                                if let Some(lane) = lanes.get_mut(node.render_lane) {
+                                    lane.1 = *weight;
+                                }
+                            }
+                        }
 
-                    if endpoint_absolute > endpoint {
-                        endpoint = endpoint_absolute;
+                        relative_endpoint = relative_endpoint.max(endpoint_adjusted);
+                        endpoint = endpoint.max(endpoint_absolute);
                     }
                 }
             }
-            TraceEvents::Close(id, weight) => {
-                // If the node is at the top of the stack
-            }
-            TraceEvents::Record => {}
-            TraceEvents::Event => {}
+            _ => {}
         }
     }
 
-    let mut vec_keys = vec![];
-    for idx in graph.node_indices() {
-        if let Some(call_node) = graph.node_weight(idx) {
-            match &call_node.event {
-                TraceEvents::NewSpan { name, location, line, thread_id, parent_id, .. } => {
-                    vec_keys.push((idx, format!("{}{}", location, name)));
-                }
-                _ => {}
+    // Assign color buckets (unchanged)
+    let mut vec_keys: Vec<_> = graph.node_indices().collect();
+    vec_keys.sort_by_key(|&idx| {
+        if let Some(node) = graph.node_weight(idx) {
+            match &node.event {
+                TraceEvents::NewSpan { name, location, .. } => format!("{}{}", location, name),
+                _ => String::new(),
             }
-        }
-    }
-    vec_keys.sort_by_key(|(idx, key)| key.clone());
-    for (i, v ) in vec_keys.iter().enumerate() {
-        graph.node_weight_mut(v.0).map(|node| {
-            node.color_bucket = ((i as f32) / vec_keys.len() as f32);
-        });
-    }
-
-
-    let now = Instant::now();
-    // Set durations of anything incomplete to the current max time (the start of the instance to now)
-    // TODO: this results in a sort of flickering behavior that looks mediocre
-    graph.node_weights_mut().for_each(|n| {
-        if n.total_duration == 0 {
-            n.total_duration = (n.created_at - now).as_nanos();
+        } else {
+            String::new()
         }
     });
+
+    for (i, idx) in vec_keys.iter().enumerate() {
+        if let Some(node) = graph.node_weight_mut(*idx) {
+            node.color_bucket = (i as f32) / (vec_keys.len() as f32);
+        }
+    }
+
+    // Set durations for incomplete traces
+    let now = Instant::now();
+    for node in graph.node_weights_mut() {
+        if node.total_duration == 0 {
+            node.total_duration = (now - node.created_at).as_nanos();
+        }
+    }
+
     CallTree {
         max_thread_depth,
+        max_render_lane,
         relative_endpoint,
         startpoint,
         endpoint,
-        graph
+        graph,
     }
 }
 
@@ -542,7 +562,8 @@ fn maintain_call_tree(
     mut traces: ResMut<ChidoriTraceEvents>,
     mut call_tree: ResMut<TracesCallTree>,
 ) {
-    call_tree.inner = build_call_tree(traces.inner.clone(), false);
+    let tree = build_call_tree(traces.inner.clone(), false);
+    call_tree.inner = tree;
 }
 
 fn update_positions(
@@ -590,6 +611,7 @@ fn update_positions(
 
     let CallTree {
         max_thread_depth,
+        max_render_lane,
         relative_endpoint,
         startpoint: startpoint_value,
         endpoint: endpoint_value,
@@ -646,7 +668,9 @@ fn update_positions(
                     // let config_space_pos_x = scale_to_target(node.absolute_timestamp - startpoint_value, endpoint_value - startpoint_value, CAMERA_SPACE_WIDTH) - (CAMERA_SPACE_WIDTH / 2.0);
                     let config_space_pos_x = scale_to_target(node.adjusted_timestamp - 0, relative_endpoint - startpoint_value, CAMERA_SPACE_WIDTH) - (CAMERA_SPACE_WIDTH / 2.0);
                     let config_space_width = scale_to_target(node.total_duration, relative_endpoint - startpoint_value, CAMERA_SPACE_WIDTH);
-                    let screen_space_pos_y = ((node.depth as f32) * -1.0 * span_height + span_height / 2.0) * node.thread_depth as f32;
+                    let screen_space_pos_y = ((node.depth as f32) * (node.render_lane as f32) * -1.0 * span_height + span_height / 2.0) * node.thread_depth as f32;
+
+                    // let screen_space_pos_y = ((node.depth as f32) * -1.0 * span_height + span_height / 2.0) * node.thread_depth as f32;
                     // let screen_space_pos_y = ((node.depth as f32) * -1.0 * span_height + span_height / 2.0) * 1.0 as f32;
                     max_vertical_extent = max_vertical_extent.max(screen_space_pos_y.abs() + span_height / 2.0);
                     instances[idx].color = color_for_bucket(node.color_bucket, 1.0).as_rgba_f32();
@@ -1071,4 +1095,192 @@ pub fn trace_plugin(app: &mut App) {
             set_camera_viewports,
             enforce_tiled_viewports
         ).run_if(in_state(crate::GameState::Graph)));
+}
+
+use std::num::NonZeroU64;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_span(id: &str, parent_id: Option<&str>, thread_id: u64, weight: u128) -> TraceEvents {
+        TraceEvents::NewSpan {
+            id: id.to_string(),
+            created_at: Instant::now(),
+            thread_id: NonZeroU64::new(thread_id).unwrap(),
+            parent_id: parent_id.map(String::from),
+            weight,
+            name: "test_span".to_string(),
+            target: "test_target".to_string(),
+            location: "test_location".to_string(),
+            line: "1".to_string(),
+            execution_id: None,
+        }
+    }
+
+    fn create_exit(id: &str, weight: u128) -> TraceEvents {
+        TraceEvents::Exit(id.to_string(), weight)
+    }
+
+    #[test]
+    fn test_single_span() {
+        let events = vec![
+            create_span("1", None, 1, 0),
+            create_exit("1", 100),
+        ];
+
+        let tree = build_call_tree(events, false);
+
+        assert_eq!(tree.max_thread_depth, 1);
+        assert_eq!(tree.max_render_lane, 0);
+        assert_eq!(tree.startpoint, 0);
+        assert_eq!(tree.endpoint, 100);
+        assert_eq!(tree.graph.node_count(), 1);
+    }
+
+    #[test]
+    fn test_nested_spans() {
+        let events = vec![
+            create_span("1", None, 1, 0),
+            create_span("2", Some("1"), 1, 10),
+            create_exit("2", 50),
+            create_exit("1", 100),
+        ];
+
+        let tree = build_call_tree(events, false);
+
+        assert_eq!(tree.max_thread_depth, 1);
+        assert_eq!(tree.max_render_lane, 0);
+        assert_eq!(tree.startpoint, 0);
+        assert_eq!(tree.endpoint, 100);
+        assert_eq!(tree.graph.node_count(), 2);
+    }
+
+    #[test]
+    fn test_multiple_threads() {
+        let events = vec![
+            create_span("1", None, 1, 0),
+            create_span("2", None, 2, 10),
+            create_exit("2", 50),
+            create_exit("1", 100),
+        ];
+
+        let tree = build_call_tree(events, false);
+
+        assert_eq!(tree.max_thread_depth, 1);
+        assert_eq!(tree.max_render_lane, 1);
+        assert_eq!(tree.startpoint, 0);
+        assert_eq!(tree.endpoint, 100);
+        assert_eq!(tree.graph.node_count(), 2);
+    }
+
+    #[test]
+    fn test_overlapping_spans() {
+        let events = vec![
+            create_span("1", None, 1, 0),
+            create_span("2", Some("1"), 1, 10),
+            create_span("3", Some("1"), 1, 20),
+            create_exit("2", 30),
+            create_exit("3", 40),
+            create_exit("1", 100),
+        ];
+
+        let tree = build_call_tree(events, false);
+
+        assert_eq!(tree.max_thread_depth, 1);
+        assert_eq!(tree.max_render_lane, 1);
+        assert_eq!(tree.startpoint, 0);
+        assert_eq!(tree.endpoint, 100);
+        assert_eq!(tree.graph.node_count(), 3);
+    }
+
+    #[test]
+    fn test_complex_scenario() {
+        let events = vec![
+            create_span("1", None, 1, 0),
+            create_span("2", Some("1"), 1, 10),
+            create_span("3", Some("2"), 1, 20),
+            create_span("4", None, 2, 30),
+            create_exit("3", 40),
+            create_span("5", Some("2"), 1, 50),
+            create_exit("5", 60),
+            create_exit("2", 70),
+            create_span("6", Some("1"), 1, 80),
+            create_exit("4", 90),
+            create_exit("6", 95),
+            create_exit("1", 100),
+        ];
+
+        let tree = build_call_tree(events, false);
+
+        assert_eq!(tree.max_thread_depth, 2);
+        assert_eq!(tree.max_render_lane, 2);
+        assert_eq!(tree.startpoint, 0);
+        assert_eq!(tree.endpoint, 100);
+        assert_eq!(tree.graph.node_count(), 6);
+    }
+
+    #[test]
+    fn test_incomplete_spans() {
+        let events = vec![
+            create_span("1", None, 1, 0),
+            create_span("2", Some("1"), 1, 10),
+            create_exit("1", 100),
+        ];
+
+        let tree = build_call_tree(events, false);
+
+        assert_eq!(tree.max_thread_depth, 1);
+        assert_eq!(tree.max_render_lane, 0);
+        assert_eq!(tree.startpoint, 0);
+        assert_eq!(tree.endpoint, 100);
+        assert_eq!(tree.graph.node_count(), 2);
+
+        // Check that the incomplete span has a non-zero duration
+        let node_2 = tree.graph.node_indices()
+            .find(|&idx| tree.graph[idx].id == "2")
+            .expect("Node 2 should exist");
+        assert!(tree.graph[node_2].total_duration > 0);
+    }
+
+    #[test]
+    fn test_color_bucket_assignment() {
+        let events = vec![
+            create_span("1", None, 1, 0),
+            create_span("2", None, 2, 10),
+            create_span("3", None, 3, 20),
+            create_exit("1", 30),
+            create_exit("2", 40),
+            create_exit("3", 50),
+        ];
+
+        let tree = build_call_tree(events, false);
+
+        assert_eq!(tree.graph.node_count(), 3);
+
+        let color_buckets: Vec<f32> = tree.graph.node_indices()
+            .map(|idx| tree.graph[idx].color_bucket)
+            .collect();
+
+        // Check that color buckets are assigned and in the range [0, 1]
+        assert!(color_buckets.iter().all(|&c| c >= 0.0 && c <= 1.0));
+
+        // Check that color buckets are unique (within a small epsilon for float comparison)
+        let epsilon = 1e-6;
+        for (i, &bucket1) in color_buckets.iter().enumerate() {
+            for (j, &bucket2) in color_buckets.iter().enumerate() {
+                if i != j {
+                    assert!((bucket1 - bucket2).abs() > epsilon,
+                            "Color buckets should be unique, but found similar values: {} and {}", bucket1, bucket2);
+                }
+            }
+        }
+
+        // Check that color buckets are evenly distributed
+        color_buckets.windows(2).for_each(|w| {
+            let diff = w[1] - w[0];
+            assert!((diff - 0.5).abs() < epsilon,
+                    "Color buckets should be evenly distributed, but found difference: {}", diff);
+        });
+    }
 }

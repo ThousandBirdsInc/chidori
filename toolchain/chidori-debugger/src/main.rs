@@ -12,6 +12,7 @@ mod logs;
 mod shader_trace;
 mod bevy_egui;
 mod egui_json_tree;
+mod tree_grouping;
 
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
 use bevy::prelude::*;

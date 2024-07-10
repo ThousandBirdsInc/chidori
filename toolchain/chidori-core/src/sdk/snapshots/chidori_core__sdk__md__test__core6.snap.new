@@ -1,0 +1,32 @@
+---
+source: chidori-core/src/sdk/md.rs
+assertion_line: 270
+expression: v
+---
+- Code:
+    - name: math_fn
+      language: PyO3
+      source_code: "def add_two_numbers(a, b):\n      return a + b"
+      function_invocation: ~
+    - start: 64
+      end: 127
+- Prompt:
+    - Chat:
+        function_invocation: false
+        configuration:
+          import:
+            - add_two_numbers
+          fn: add_population
+          model: gpt-3.5-turbo
+        name: add_population
+        provider: OpenAI
+        req: "Add the population of {{state}} to the population of California"
+    - start: 136
+      end: 300
+- Code:
+    - name: entry
+      language: PyO3
+      source_code: "import unittest\n\nclass TestMarshalledValues(unittest.IsolatedAsyncioTestCase):\n    async def test_run_prompt(self):\n        self.assertEqual(await add_population(state=\"Arizona\"), 4)\n\nunittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))"
+      function_invocation: ~
+    - start: 309
+      end: 605

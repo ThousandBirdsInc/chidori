@@ -8,7 +8,7 @@ use crate::execution::primitives::serialized_value::{
 };
 use crate::sdk::md::{interpret_code_block, load_folder};
 use serde::{Deserialize, Serialize, Serializer};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::{fmt, thread};
 use std::ops::Deref;
 use std::path::Path;
@@ -237,6 +237,7 @@ impl InstancedEnvironment {
             ExecutionStateEvaluation::Complete(s) => s,
             ExecutionStateEvaluation::Executing(_) => panic!("get_state_at, failed, still executing"),
             ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
         }
     }
 
@@ -245,6 +246,7 @@ impl InstancedEnvironment {
             ExecutionStateEvaluation::Complete(s) => s,
             ExecutionStateEvaluation::Executing(_) => panic!("get_state, failed, still executing"),
             ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
         }
     }
 
@@ -335,7 +337,7 @@ pub enum UserInteractionMessage {
 #[derive(Clone, Debug)]
 pub enum EventsFromRuntime {
     DefinitionGraphUpdated(Vec<(OperationId, OperationId, Vec<DependencyReference>)>),
-    ExecutionGraphUpdated(Vec<(ExecutionNodeId, ExecutionNodeId)>),
+    ExecutionGraphUpdated((Vec<(ExecutionNodeId, ExecutionNodeId)>, HashSet<ExecutionNodeId>)),
     ExecutionStateChange(MergedStateHistory),
     CellsUpdated(Vec<CellHolder>),
     StateAtId(ExecutionNodeId, ExecutionState),

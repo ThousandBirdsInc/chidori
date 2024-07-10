@@ -88,6 +88,7 @@ pub fn code_gen_cell(execution_state_id: ExecutionNodeId, cell: &LLMCodeGenCell,
                         configuration.clone()
                     ).await?;
                     Ok(OperationFnOutput {
+                        has_error: false,
                         execution_state: state,
                         output: value,
                         stdout: vec![],

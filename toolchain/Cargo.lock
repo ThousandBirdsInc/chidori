@@ -2287,6 +2287,7 @@ dependencies = [
  "typed-arena",
  "typescript-type-def",
  "uuid",
+ "which 4.4.2",
  "yaml-front-matter",
 ]
 

@@ -25,6 +25,7 @@ use futures_util::FutureExt;
 use pyo3::{Py, PyAny};
 use pyo3::types::{IntoPyDict, PyTuple};
 use tokio::runtime::Runtime;
+use tracing::Span;
 use crate::cells::{CellTypes, CodeCell, LLMPromptCell};
 use crate::execution::execution::ExecutionState;
 
@@ -53,6 +54,7 @@ fn serde_v8_to_rkyv(
 }
 
 struct MyOpState {
+    parent_span_id: Option<tracing::Id>,
     output: Option<RkyvSerializedValue>,
     payload: RkyvSerializedValue,
     cell_depended_values: HashMap<String, String>,
@@ -279,7 +281,7 @@ fn op_set_globals<'scope>(
     // TODO: differentiate async vs sync functions
     let mut js_code = String::new();
     for (function_name, function) in
-    create_function_shims(&my_op_state.execution_state_handle, &my_op_state.cell_depended_values).unwrap()
+    create_function_shims(&my_op_state.execution_state_handle, &my_op_state.cell_depended_values, my_op_state.parent_span_id.clone()).unwrap()
     {
         my_op_state
             .functions
@@ -310,6 +312,7 @@ type InternalClosureFnMut = Box<
 fn create_function_shims(
     execution_state_handle: &Arc<Mutex<ExecutionState>>,
     cell_depended_values: &HashMap<String, String>,
+    parent_span_id: Option<tracing::Id>,
 ) -> Result<Vec<(String, InternalClosureFnMut)>, ()> {
     let mut functions = Vec::new();
     // Create shims for functions that are referred to, we look at what functions are being provided
@@ -323,9 +326,11 @@ fn create_function_shims(
         if cell_depended_values.contains_key(&function_name) {
             let clone_function_name = function_name.clone();
             let execution_state_handle = execution_state_handle.clone();
+            let parent_span_id = parent_span_id.clone();
             let closure_callable: InternalClosureFnMut  = Box::new(move |args: Vec<RkyvSerializedValue>, kwargs: Option<HashMap<String, RkyvSerializedValue>>| {
                 let clone_function_name = clone_function_name.clone();
                 let execution_state_handle = execution_state_handle.clone();
+                let parent_span_id = parent_span_id.clone();
                 async move {
                     let total_arg_payload = js_args_to_rkyv(args, kwargs);
                     let mut new_exec_state = {
@@ -336,7 +341,7 @@ fn create_function_shims(
                         v
                     };
                     println!("Deno expecting to call dispatch");
-                    let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload).await?;
+                    let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload, parent_span_id.clone()).await?;
                     return Ok(result);
                 }.boxed()
             });
@@ -382,6 +387,10 @@ pub async fn source_code_run_deno(
     Vec<String>,
     Vec<String>
 )> {
+
+    // Capture the current span's ID
+    let current_span_id = Span::current().id();
+
     let dependencies = extract_dependencies_js(&source_code);
     let report = build_report(&dependencies);
 
@@ -393,6 +402,7 @@ pub async fn source_code_run_deno(
 
     let execution_state_handle = Arc::new(Mutex::new(execution_state.clone()));
     let my_op_state = Arc::new(Mutex::new(MyOpState {
+        parent_span_id: current_span_id,
         stdout: vec![],
         stderr: vec![],
         output: None,

@@ -406,7 +406,12 @@ pub fn extract_dependencies_python(source_code: &str) -> Result<Vec<Vec<ContextP
     let mut comments = extract_python_comments(source_code);
     let ast = ast::Suite::parse(source_code, "<embedded>")
         .map_err(|e| {
-            ChidoriStaticAnalysisError::Unknown
+            ChidoriStaticAnalysisError::ParseError {
+                msg: e.error.to_string(),
+                offset: e.offset.to_u32(),
+                source_path: e.source_path,
+                source_code: source_code.to_string(),
+            }
         })?;
     let mut machine = ASTWalkContext::default();
     traverse_statements(&ast, &mut machine);

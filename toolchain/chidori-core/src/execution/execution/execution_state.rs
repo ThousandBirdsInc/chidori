@@ -74,17 +74,24 @@ impl Future for FutureExecutionState {
 
 #[derive(Clone)]
 pub enum ExecutionStateEvaluation {
+    /// An exception was thrown
     Error,
+    /// An eval function indicated that we should return
+    EvalFailure,
+    /// Execution complete
     Complete(ExecutionState),
+    /// Execution in progress
     Executing(Arc<FutureExecutionState>)
 }
 
 impl ExecutionStateEvaluation {
     pub fn state_get(&self, operation_id: &OperationId) -> Option<&OperationFnOutput> {
         match self {
+
             ExecutionStateEvaluation::Complete(ref state) => state.state_get(operation_id),
             ExecutionStateEvaluation::Executing(ref future_state) => unreachable!("Cannot get state from a future state"),
             ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
         }
     }
 
@@ -93,6 +100,7 @@ impl ExecutionStateEvaluation {
             ExecutionStateEvaluation::Complete(ref state) => state.state_get(operation_id).map(|o| &o.output),
             ExecutionStateEvaluation::Executing(ref future_state) => unreachable!("Cannot get state from a future state"),
             ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
         }
     }
 }
@@ -103,6 +111,7 @@ impl Debug for ExecutionStateEvaluation {
             ExecutionStateEvaluation::Complete(ref state) => f.debug_tuple("Complete").field(state).finish(),
             ExecutionStateEvaluation::Executing(ref future_state) => f.debug_tuple("Executing").field(&format!("Future state evaluating")).finish(),
             ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
         }
     }
 }
@@ -464,7 +473,7 @@ impl ExecutionState {
     /// Inserts a new operation into the execution state, returning the operation id and the new state.
     /// That operation can then be referred to by its id.
     #[tracing::instrument]
-    pub fn upsert_operation(&self, operation_node: OperationNode, op_id: Option<usize>) -> (usize, Self) {
+    pub fn upsert_operation(&self, mut operation_node: OperationNode, op_id: Option<usize>) -> (usize, Self) {
         let mut s = self.clone();
         let op_id = if let Some(op_id) = op_id {
             op_id
@@ -480,6 +489,7 @@ impl ExecutionState {
                     new_id
                 })
         };
+        operation_node.id = op_id;
 
         s.operation_by_id.insert(op_id, Arc::new(Mutex::new(operation_node)));
         s.update_callable_functions();
@@ -540,8 +550,8 @@ impl ExecutionState {
     /// Invoke a function made available by the execution state, this accepts arguments derived in the context
     /// of a parent function's scope. This targets a specific function by name that we've identified a dependence on.
     // TODO: this should create a coroutine that yields with the result of the function invocation
-    #[tracing::instrument]
-    pub async fn dispatch(&self, function_name: &str, payload: RkyvSerializedValue) -> anyhow::Result<(RkyvSerializedValue, ExecutionState)> {
+    #[tracing::instrument(parent = parent_span_id.clone(), skip(self, payload))]
+    pub async fn dispatch(&self, function_name: &str, payload: RkyvSerializedValue, parent_span_id: Option<tracing::Id>) -> anyhow::Result<(RkyvSerializedValue, ExecutionState)> {
         println!("Running dispatch {:?}", function_name);
 
         // Store the invocation payload into an execution state and record this before executing
@@ -604,6 +614,7 @@ impl ExecutionState {
         let mut after_execution_state = state.clone_with_new_id();
         after_execution_state.stack.pop_back();
         after_execution_state.state_insert(usize::MAX, result.clone());
+        after_execution_state.fresh_values.insert(usize::MAX);
 
         // TODO: Add result into a new execution state
 
@@ -714,7 +725,8 @@ impl ExecutionState {
                             }
                             DependencyReference::Global(name) => {
                                 if let RkyvSerializedValue::Object(value) = &output.output {
-                                    globals.insert(name.clone(), value.get(name).unwrap().clone());
+                                    dbg!(&value);
+                                    globals.insert(name.clone(), value.get(name).expect(&format!("Expected value with name: {:?} to be available", name)).clone());
                                 }
                             }
                             DependencyReference::FunctionInvocation(name) => {
@@ -815,6 +827,7 @@ impl ExecutionState {
             let result = op_node_execute.await?;
             println!("Executed node {} with result {:?}", next_operation_id, &result);
             outputs.push((next_operation_id, result.clone()));
+            new_state.fresh_values.insert(next_operation_id);
 
             // TODO: support overriding execution state entirely
             if let Some(s) = &result.execution_state {
@@ -837,6 +850,7 @@ mod tests {
         let operation_id = 1;
         let value = RkyvSerializedValue::Number(1);
         let value = OperationFnOutput {
+            has_error: false,
             execution_state: None,
             output: value,
             stdout: vec![],

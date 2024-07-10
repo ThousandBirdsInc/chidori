@@ -9,7 +9,7 @@ use egui;
 use egui::{FontFamily, Frame, Margin};
 use egui_tiles::Tile;
 use chidori_core::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, TemplateCell, TextRange, WebserviceCell};
-use crate::chidori::{ChidoriCells, EguiTree, EguiTreeIdentities};
+use crate::chidori::{ChidoriCells, ChidoriLogMessages, EguiTree, EguiTreeIdentities};
 use crate::GameState;
 use crate::util::{change_active_editor_ui, deselect_editor_on_esc, despawn_screen, print_editor_text};
 use std::borrow::BorrowMut;
@@ -30,6 +30,7 @@ fn logs_update(
     tree_identities: Res<EguiTreeIdentities>,
     mut contexts: EguiContexts,
     mut logs_history: ResMut<LogsHistory>,
+    mut log_messages: ResMut<ChidoriLogMessages>,
     mut input_text: Local<String>,
     keyboard_input: Res<ButtonInput<KeyCode>>,
 ) {
@@ -73,11 +74,10 @@ fn logs_update(
     egui::CentralPanel::default().frame(container_frame).show(ctx, |ui| {
         let mut frame = egui::Frame::default().inner_margin(Margin::symmetric(20.0, 20.0)).begin(ui);
         {
-            ui.horizontal(|ui| {
+            ui.vertical(|ui| {
                 ui.label("Search:");
                 let mut text_edit = egui::TextEdit::singleline(&mut *input_text)
-                    .hint_text("Type a message...")
-                    .desired_width(300.0);
+                    .hint_text("Type a message...");
                 let response = ui.add(text_edit);
                 if ui.button("Send").clicked() {
                     logs_history.messages.push(LogsMessage(input_text.clone()));
@@ -92,15 +92,17 @@ fn logs_update(
             });
 
 
-            if keyboard_input.just_pressed(KeyCode::Enter) && !input_text.is_empty() {
-                logs_history.messages.push(LogsMessage(input_text.clone()));
-                input_text.clear();
-            }
+            // if keyboard_input.just_pressed(KeyCode::Enter) && !input_text.is_empty() {
+            //     logs_history.messages.push(LogsMessage(input_text.clone()));
+            //     input_text.clear();
+            // }
             ui.separator();
 
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for message in &logs_history.messages {
-                    ui.label(&message.0);
+                for message in &log_messages.inner {
+                    let formatted_message = message.replace("\\n", "\n");
+                    ui.label(formatted_message);
+                    ui.add_space(5.0);
                 }
             });
         }

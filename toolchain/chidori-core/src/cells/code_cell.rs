@@ -35,8 +35,11 @@ pub fn code_cell(execution_state_id: ExecutionNodeId, cell: &CodeCell, range: &T
                             &cell.source_code,
                             &x,
                             &cell.function_invocation,
+                            &None,
+                            &None,
                         ).await?;
                         Ok(OperationFnOutput {
+                            has_error: false,
                             execution_state: None,
                             output: result.0,
                             stdout: result.1,
@@ -85,6 +88,7 @@ pub fn code_cell(execution_state_id: ExecutionNodeId, cell: &CodeCell, range: &T
                             match result {
                                 Ok(v) =>
                                     Ok(OperationFnOutput {
+                                        has_error: false,
                                         execution_state: None,
                                         output: v.0,
                                         stdout: v.1,

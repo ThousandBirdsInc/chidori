@@ -59,7 +59,7 @@ pub fn memory_cell(execution_state_id: ExecutionNodeId, cell: &MemoryCell, range
                                 if let Ok((key, value, sender)) = async_rpccommunication.receiver.try_recv() {
                                     match key.as_str() {
                                         "insert" => {
-                                            let (embedded_value, _) = s.dispatch(&embedding_function, value.clone()).await?;
+                                            let (embedded_value, _) = s.dispatch(&embedding_function, value.clone(), None).await?;
                                             let embedding = rkyv_to_vec_float(embedded_value);
                                             let contents = serialized_value_to_json_value(&value);
                                             let row = vec![(&embedding, contents)];
@@ -67,7 +67,7 @@ pub fn memory_cell(execution_state_id: ExecutionNodeId, cell: &MemoryCell, range
                                             sender.send(RkyvSerializedValue::String(String::from("Success"))).unwrap();
                                         }
                                         "search" => {
-                                            let (embedded_value, _) = s.dispatch(&embedding_function, value.clone()).await?;
+                                            let (embedded_value, _) = s.dispatch(&embedding_function, value.clone(), None).await?;
                                             let embedding = rkyv_to_vec_float(embedded_value);
                                             let results = db.search("default".to_string(), embedding, 5);
                                             let mut output = vec![];

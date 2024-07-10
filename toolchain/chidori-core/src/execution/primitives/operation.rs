@@ -251,8 +251,10 @@ impl fmt::Debug for AsyncRPCCommunication {
     }
 }
 
+
 #[derive(Debug, Clone)]
 pub struct OperationFnOutput {
+    pub has_error: bool,
     pub execution_state: Option<ExecutionState>,
     pub output: RkyvSerializedValue,
     pub stdout: Vec<String>,
@@ -262,6 +264,7 @@ pub struct OperationFnOutput {
 impl OperationFnOutput {
     pub fn with_value(value: RkyvSerializedValue) -> Self {
         Self {
+            has_error: false,
             execution_state: None,
             output: value,
             stdout: Vec::new(),

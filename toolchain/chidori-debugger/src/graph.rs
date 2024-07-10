@@ -31,7 +31,7 @@ use num::ToPrimitive;
 use petgraph::data::DataMap;
 use petgraph::prelude::StableGraph;
 use petgraph::visit::Walker;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::ptr::NonNull;
@@ -44,6 +44,7 @@ use image::{ImageBuffer, RgbaImage};
 use chidori_core::execution::execution::execution_state::ExecutionStateEvaluation;
 use uuid::Uuid;
 use chidori_core::execution::primitives::serialized_value::RkyvSerializedValue;
+use crate::tree_grouping::group_tree;
 
 #[derive(Resource, Default)]
 struct SelectedEntity {
@@ -52,11 +53,25 @@ struct SelectedEntity {
 
 #[derive(Resource)]
 struct GraphResource {
-    graph: StableGraph<ExecutionNodeId, ()>,
+    execution_graph: StableGraph<ExecutionNodeId, ()>,
     hash_graph: u64,
     node_ids: HashMap<ExecutionNodeId, NodeIndex>,
-    is_active: bool
+    grouped_nodes: HashMap<ExecutionNodeId, StableGraph<ExecutionNodeId, ()>>,
+    is_active: bool,
 }
+
+
+// impl FromWorld for GraphResource {
+//     fn from_world(world: &mut World) -> Self {
+//         GraphResource {
+//             execution_graph: Default::default(),
+//             hash_graph: 0,
+//             node_ids: Default::default(),
+//             grouped_nodes: Default::default(),
+//             is_active: false,
+//         }
+//     }
+// }
 
 #[derive(Component)]
 struct GraphIdx {
@@ -89,7 +104,7 @@ struct GraphMinimapCamera;
 enum CameraStateValue {
     LockedOnSelection,
     LockedOnExecHead,
-    Free
+    Free(f32, f32)
 }
 
 #[derive(Component)]
@@ -141,7 +156,7 @@ fn keyboard_navigate_graph(
         node
     } else {
         // If no node is selected, select the first node
-        if let Some(node) = graph_res.graph.node_indices().next() {
+        if let Some(node) = graph_res.execution_graph.node_indices().next() {
             selected_node.0 = Some(node);
             node
         } else {
@@ -153,26 +168,26 @@ fn keyboard_navigate_graph(
 
     if keyboard_input.just_pressed(KeyCode::ArrowUp) {
         // Move to parent
-        new_selection = graph_res.graph
+        new_selection = graph_res.execution_graph
             .neighbors_directed(current_node, petgraph::Direction::Incoming)
             .next();
     } else if keyboard_input.just_pressed(KeyCode::ArrowDown) {
         // Move to first child
-        new_selection = graph_res.graph
+        new_selection = graph_res.execution_graph
             .neighbors_directed(current_node, petgraph::Direction::Outgoing)
             .next();
     } else if keyboard_input.just_pressed(KeyCode::ArrowLeft) {
         // Move to previous sibling
-        if let Some(parent) = graph_res.graph.neighbors_directed(current_node, petgraph::Direction::Incoming).next() {
-            let siblings: Vec<_> = graph_res.graph.neighbors_directed(parent, petgraph::Direction::Outgoing).collect();
+        if let Some(parent) = graph_res.execution_graph.neighbors_directed(current_node, petgraph::Direction::Incoming).next() {
+            let siblings: Vec<_> = graph_res.execution_graph.neighbors_directed(parent, petgraph::Direction::Outgoing).collect();
             if let Some(current_index) = siblings.iter().position(|&node| node == current_node) {
                 new_selection = siblings.get(current_index.checked_sub(1).unwrap_or(siblings.len() - 1)).cloned();
             }
         }
     } else if keyboard_input.just_pressed(KeyCode::ArrowRight) {
         // Move to next sibling
-        if let Some(parent) = graph_res.graph.neighbors_directed(current_node, petgraph::Direction::Incoming).next() {
-            let siblings: Vec<_> = graph_res.graph.neighbors_directed(parent, petgraph::Direction::Outgoing).collect();
+        if let Some(parent) = graph_res.execution_graph.neighbors_directed(current_node, petgraph::Direction::Incoming).next() {
+            let siblings: Vec<_> = graph_res.execution_graph.neighbors_directed(parent, petgraph::Direction::Outgoing).collect();
             if let Some(current_index) = siblings.iter().position(|&node| node == current_node) {
                 new_selection = siblings.get((current_index + 1) % siblings.len()).cloned();
             }
@@ -188,7 +203,7 @@ fn keyboard_navigate_graph(
         camera_state.state = CameraStateValue::LockedOnSelection;
 
         // Update the transform of the selected node (e.g., to highlight it)
-        let node = &graph_res.graph[new_node];
+        let node = &graph_res.execution_graph[new_node];
         node_query
             .iter()
             .for_each(|(e, node_transform, graph_idx)| {
@@ -300,11 +315,13 @@ fn mouse_pan(
         Projection::Orthographic(ref mut o) => o,
     };
     if buttons.pressed(MouseButton::Left) {
+        let mut camera_x = camera_transform.translation.x;
+        let mut camera_y = camera_transform.translation.y;
         for ev in motion_evr.read() {
-            camera_transform.translation.x -= ev.delta.x * projection.scale;
-            camera_transform.translation.y += ev.delta.y * projection.scale;
+            camera_x -= ev.delta.x * projection.scale;
+            camera_y += ev.delta.y * projection.scale;
         }
-        camera_state.state = CameraStateValue::Free;
+        camera_state.state = CameraStateValue::Free(camera_x, camera_y);
     }
 }
 
@@ -364,19 +381,21 @@ fn mouse_scroll_events(
         Projection::Orthographic(ref mut o) => o,
     };
 
+    let mut camera_x = camera_transform.translation.x;
+    let mut camera_y = camera_transform.translation.y;
     for ev in scroll_evr.read() {
         if keyboard_input.pressed(KeyCode::SuperLeft) {
             let zoom_factor = (projection.scale + ev.y).clamp(1.0, 1000.0) / projection.scale;
-
             camera_transform.translation.x = coords.0.x - zoom_factor * (coords.0.x - camera_transform.translation.x);
             camera_transform.translation.y = coords.0.y - zoom_factor * (coords.0.y - camera_transform.translation.y);
-
             projection.scale = (projection.scale + ev.y).clamp(1.0, 1000.0);
         } else {
-            camera_state.state = CameraStateValue::Free;
-            camera_transform.translation.x -= ev.x * projection.scale;
-            camera_transform.translation.y += ev.y * projection.scale;
+            camera_x -= ev.x * projection.scale;
+            camera_y += ev.y * projection.scale;
         }
+    }
+    if !keyboard_input.pressed(KeyCode::SuperLeft) {
+        camera_state.state = CameraStateValue::Free(camera_x, camera_y);
     }
 
 }
@@ -481,7 +500,9 @@ fn egui_execution_state(ui: &mut Ui, execution_state: &ExecutionState) {
             ui.add_space(10.0);
             ui.vertical(|ui| {
                 ui.label(format!("Operation Id: {:?}", execution_state.evaluating_id));
-                ui.label(format!("Cell Name: {:?}", execution_state.evaluating_name.as_ref().unwrap_or(&String::from("Unnamed"))));
+                if let Some(evaluating_name) = execution_state.evaluating_name.as_ref() {
+                    ui.label(format!("Cell Name: {:?}", evaluating_name));
+                }
                 if let Some(evaluating_fn) = &execution_state.evaluating_fn {
                     ui.label(format!("Function Invoked: {:?}", evaluating_fn));
                 }
@@ -521,10 +542,12 @@ fn egui_execution_state(ui: &mut Ui, execution_state: &ExecutionState) {
         if !execution_state.state.is_empty() {
             ui.label("Output:");
             for (key, value) in execution_state.state.iter() {
-                let response = JsonTree::new(format!("{:?}", key), &value.output)
-                    // .default_expand(DefaultExpand::SearchResults(&self.search_input))
-                    .show(ui);
-                // util::egui_rkyv(ui, &value.output, false);
+                if execution_state.fresh_values.contains(key) {
+                    let response = JsonTree::new(format!("{:?}", key), &value.output)
+                        // .default_expand(DefaultExpand::SearchResults(&self.search_input))
+                        .show(ui);
+                    // util::egui_rkyv(ui, &value.output, false);
+                }
             }
         }
     });
@@ -544,6 +567,9 @@ fn camera_follow_selection_head(
 ) {
     let (camera, mut camera_transform, camera_state) = q_camera.single_mut();
     let (_, mut t) = execution_head_cursor.single_mut();
+    let mut camera_x = camera_transform.translation.x;
+    let mut camera_y = camera_transform.translation.y;
+
     if matches!(camera_state.state, CameraStateValue::LockedOnExecHead) {
         camera_transform.translation.x = t.translation.x;
         camera_transform.translation.y = t.translation.y;
@@ -553,6 +579,11 @@ fn camera_follow_selection_head(
     if matches!(camera_state.state, CameraStateValue::LockedOnSelection) {
         camera_transform.translation.x = t.translation.x;
         camera_transform.translation.y = t.translation.y;
+    }
+
+    if let CameraStateValue::Free(x, y) = camera_state.state {
+        camera_transform.translation.x = x;
+        camera_transform.translation.y = y;
     }
 }
 
@@ -698,7 +729,7 @@ fn update_node_textures_as_available(
 }
 
 
-fn update_alternate_graph_system(
+fn update_graph_system_renderer(
     q_window: Query<&Window, With<PrimaryWindow>>,
     mut commands: Commands,
     mut graph_resource: ResMut<GraphResource>,
@@ -726,29 +757,46 @@ fn update_alternate_graph_system(
         return;
     }
     let window = q_window.single();
-    let scale_factor = window.scale_factor() as f32;
-    let (camera_entity, camera, camera_transform) = q_camera.single();
-    let viewport_pos = if let Some(viewport) = camera.viewport.as_ref() {
-        viewport.physical_position
-    } else {
-        UVec2::new(0, 0)
-    };
-    let viewport_size = if let Some(viewport) = camera.viewport.as_ref() {
-        viewport.physical_size
-    } else {
-        UVec2::new(0, 0)
-    };
+    let (_, camera, _) = q_camera.single();
     let mut node_mapping: HashMap<NodeIndex, NonNull<crate::tidy_tree::Node>> = HashMap::new();
     let mut tidy = TidyLayout::new(200., 200.);
     let mut root = crate::tidy_tree::Node::new(0, 10., 10.);
-    let mut topo = petgraph::visit::Topo::new(&graph_resource.graph);
-    while let Some(x) = topo.next(&graph_resource.graph) {
-        if let Some(node) = &graph_resource.graph.node_weight(x) {
+
+
+    // For each subgraph group
+    // Grouping background
+    if false {
+        let cursor_selection_material = materials_custom.add(RoundedRectMaterial {
+            width: 1.0,
+            height: 1.0,
+            color_texture: None,
+            base_color: Vec4::new(0.565, 1.00, 0.882, 1.00),
+            alpha_mode: AlphaMode::Blend,
+        });
+        let entity_selection_head = commands.spawn((
+            MaterialMeshBundle {
+                mesh: meshes.add(Mesh::from(Rectangle::new(1.0, 1.0))),
+                material: cursor_selection_material.clone(),
+                transform: Transform::from_xyz(0.0, 5.0, -3.0),
+                ..Default::default()
+            },
+            RenderLayers::layer(RENDER_LAYER_GRAPH_VIEW),
+            ExecutionSelectionCursor,
+            OnGraphScreen
+        ));
+    }
+
+
+
+    // Construct the tidy_tree from a topo traversal of the graph
+    let mut topo = petgraph::visit::Topo::new(&graph_resource.execution_graph);
+    while let Some(x) = topo.next(&graph_resource.execution_graph) {
+        if let Some(node) = &graph_resource.execution_graph.node_weight(x) {
             let mut width = 600.0;
             let mut height = 300.0;
             let tree_node = crate::tidy_tree::Node::new(x.index(), (width) as f64, (height) as f64);
             let mut parents = &mut graph_resource
-                .graph
+                .execution_graph
                 .neighbors_directed(x, petgraph::Direction::Incoming);
             // Only a single parent ever occurs
             if let Some(parent) = &mut parents.next() {
@@ -768,11 +816,13 @@ fn update_alternate_graph_system(
 
     tidy.layout(&mut root);
 
-    let mut topo = petgraph::visit::Topo::new(&graph_resource.graph);
-    while let Some(idx) = topo.next(&graph_resource.graph) {
-        if let Some(node) = &graph_resource.graph.node_weight(idx) {
+    // Traverse the graph again, and render the elements of the graph based on their layout in the tidy_tree
+    // This traverses the graph and then gets the position of the elements in the tree from their identity
+    let mut topo = petgraph::visit::Topo::new(&graph_resource.execution_graph);
+    while let Some(idx) = topo.next(&graph_resource.execution_graph) {
+        if let Some(node) = &graph_resource.execution_graph.node_weight(idx) {
             let mut parents = &mut graph_resource
-                .graph
+                .execution_graph
                 .neighbors_directed(idx, petgraph::Direction::Incoming);
             let parent_pos = parents
                 .next()
@@ -854,11 +904,9 @@ fn update_alternate_graph_system(
 
                     if let Ok((entity, mut transform, gidx, mut egui_ctx)) = node_query.get_mut(*entity) {
                         let egui_ctx = egui_ctx.into_inner();
-                        let mouse_position = egui_ctx.mouse_position.clone();
                         let ctx = egui_ctx.get_mut();
-                        // TODO: working theory is that positioning the elements is affecting the camera which is affecting the trace camera
-                        //       the trace camera is still be affected by other camera values
-                        transform.translation = transform.translation.lerp(Vec3::new(n.x.to_f32().unwrap(), -n.y.to_f32().unwrap(), -1.0), 0.1);
+
+                        transform.translation = transform.translation.lerp(Vec3::new(n.x.to_f32().unwrap(), -n.y.to_f32().unwrap(), -1.0), 0.5);
 
                         // Draw text within these elements
                         egui::Area::new(format!("{:?}", entity).into())
@@ -1017,15 +1065,16 @@ fn update_alternate_graph_system(
     }
 }
 
-fn update_graph_system(
+fn update_graph_system_data_structures(
     mut graph_res: ResMut<GraphResource>,
     mut execution_graph: ResMut<ChidoriExecutionGraph>,
 ) {
     // If the execution graph has changed, clear the graph and reconstruct it
-    if graph_res.hash_graph != hash_graph(&execution_graph.inner) {
+    if graph_res.hash_graph != hash_graph(&execution_graph.execution_graph) {
         let mut dataset = StableGraph::new();
         let mut node_ids = HashMap::new();
-        for (a, b) in &execution_graph.inner {
+        // for (a, b) in &execution_graph.stack_graph
+        for (a, b) in &execution_graph.execution_graph {
             let node_index_a = *node_ids
                 .entry(a.clone())
                 .or_insert_with(|| dataset.add_node(a.clone()));
@@ -1035,8 +1084,13 @@ fn update_graph_system(
             dataset.add_edge(node_index_a, node_index_b, ());
         }
         graph_res.node_ids = node_ids;
-        graph_res.graph = dataset;
-        graph_res.hash_graph = hash_graph(&execution_graph.inner);
+
+        let (dataset, grouped_tree) = group_tree(&dataset, &execution_graph.grouped_nodes);
+
+        graph_res.execution_graph = dataset;
+        graph_res.grouped_nodes = grouped_tree;
+        graph_res.hash_graph = hash_graph(&execution_graph.execution_graph);
+
     }
 }
 
@@ -1059,7 +1113,6 @@ struct ExecutionHeadCursor;
 struct ExecutionSelectionCursor;
 
 
-// TODO: capture the clip area we want to enforce for the egui elements
 fn enforce_tiled_viewports(
     mut graph_resource: ResMut<GraphResource>,
     tree_identities: Res<EguiTreeIdentities>,
@@ -1307,21 +1360,13 @@ fn graph_setup(
 
     let mut dataset = StableGraph::new();
     let mut node_ids = HashMap::new();
-    // for (a, b) in &execution_graph.inner {
-    //     let node_index_a = *node_ids
-    //         .entry(a.clone())
-    //         .or_insert_with(|| dataset.add_node(a.clone()));
-    //     let node_index_b = *node_ids
-    //         .entry(b.clone())
-    //         .or_insert_with(|| dataset.add_node(b.clone()));
-    //     dataset.add_edge(node_index_a, node_index_b, ());
-    // }
     commands.spawn((CursorWorldCoords(vec2(0.0, 0.0)), OnGraphScreen));
     commands.insert_resource(GraphResource {
-        graph: dataset,
-        hash_graph: hash_graph(&execution_graph.inner),
+        execution_graph: dataset,
+        hash_graph: hash_graph(&execution_graph.execution_graph),
         node_ids,
-        is_active: false
+        grouped_nodes: Default::default(),
+        is_active: false,
     });
 }
 
@@ -1352,8 +1397,8 @@ pub fn graph_plugin(app: &mut App) {
                 camera_follow_selection_head,
                 node_cursor_handling,
                 touchpad_gestures,
-                update_alternate_graph_system.after(mouse_scroll_events),
-                update_graph_system,
+                update_graph_system_renderer.after(mouse_scroll_events),
+                update_graph_system_data_structures,
                 my_cursor_system,
                 mouse_scroll_events,
                 mouse_over_system,

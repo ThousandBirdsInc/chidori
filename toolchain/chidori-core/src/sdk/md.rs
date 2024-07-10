@@ -15,6 +15,12 @@ pub struct MarkdownCodeBlock {
     pub range: TextRange,
 }
 
+enum CodeResource {
+    Python,
+    Js,
+    Markdown
+}
+
 pub struct ParsedFile {
     // filename: Box<PathBuf>,
     // code: String,
@@ -96,6 +102,21 @@ pub fn load_folder(path: &Path) -> anyhow::Result<Vec<ParsedFile>> {
         }
 
         if metadata.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
+            let parsed_file = parse_markdown_file(&path);
+            res.push(parsed_file);
+        }
+
+        if metadata.is_file() && path.extension().and_then(|s| s.to_str()) == Some("py") {
+            let parsed_file = parse_markdown_file(&path);
+            res.push(parsed_file);
+        }
+
+        if metadata.is_file() && path.extension().and_then(|s| s.to_str()) == Some("js") {
+            let parsed_file = parse_markdown_file(&path);
+            res.push(parsed_file);
+        }
+
+        if metadata.is_file() && path.extension().and_then(|s| s.to_str()) == Some("ts") {
             let parsed_file = parse_markdown_file(&path);
             res.push(parsed_file);
         }
@@ -191,7 +212,10 @@ mod test {
     fn test_core1() {
         let contents = fs::read_to_string("./examples/core1_simple_math/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().filter_map(interpret_code_block).collect();
+        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
+            .iter()
+            .flat_map(|block| interpret_code_block(block).ok())
+            .collect();
         insta::with_settings!({
         }, {
             insta::assert_yaml_snapshot!(v);
@@ -202,7 +226,10 @@ mod test {
     fn test_core2() {
         let contents = fs::read_to_string("./examples/core2_marshalling/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().filter_map(interpret_code_block).collect();
+        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
+            .iter()
+            .flat_map(|block| interpret_code_block(block).ok())
+            .collect();
         insta::with_settings!({
         }, {
             insta::assert_yaml_snapshot!(v);
@@ -213,7 +240,10 @@ mod test {
     fn test_core3() {
         let contents = fs::read_to_string("./examples/core3_function_invocations/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().filter_map(interpret_code_block).collect();
+        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
+            .iter()
+            .flat_map(|block| interpret_code_block(block).ok())
+            .collect();
         insta::with_settings!({
         }, {
             insta::assert_yaml_snapshot!(v);
@@ -224,7 +254,10 @@ mod test {
     fn test_core4() {
         let contents = fs::read_to_string("./examples/core4_async_function_invocations/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().filter_map(interpret_code_block).collect();
+        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
+            .iter()
+            .flat_map(|block| interpret_code_block(block).ok())
+            .collect();
         insta::with_settings!({
         }, {
             insta::assert_yaml_snapshot!(v);
@@ -235,7 +268,10 @@ mod test {
     fn test_core5() {
         let contents = fs::read_to_string("./examples/core5_prompts_invoked_as_functions/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().filter_map(interpret_code_block).collect();
+        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
+            .iter()
+            .flat_map(|block| interpret_code_block(block).ok())
+            .collect();
         insta::with_settings!({
         }, {
             insta::assert_yaml_snapshot!(v);
@@ -246,7 +282,10 @@ mod test {
     fn test_core6() {
         let contents = fs::read_to_string("./examples/core6_prompts_leveraging_function_calling/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().filter_map(interpret_code_block).collect();
+        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
+            .iter()
+            .flat_map(|block| interpret_code_block(block).ok())
+            .collect();
         insta::with_settings!({
         }, {
             insta::assert_yaml_snapshot!(v);
@@ -257,7 +296,10 @@ mod test {
     fn test_core7() {
         let contents = fs::read_to_string("./examples/core7_rag_stateful_memory_cells/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents).iter().filter_map(interpret_code_block).collect();
+        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
+            .iter()
+            .flat_map(|block| interpret_code_block(block).ok())
+            .collect();
         insta::with_settings!({
         }, {
             insta::assert_yaml_snapshot!(v);

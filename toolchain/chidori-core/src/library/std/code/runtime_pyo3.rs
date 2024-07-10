@@ -17,7 +17,7 @@ use std::sync::mpsc::{self, Sender};
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::mem;
+use std::{env, mem};
 use std::sync::{Arc, Mutex};
 use anyhow::Error;
 use once_cell::sync::OnceCell;
@@ -27,6 +27,59 @@ use chidori_static_analysis::language::Report;
 // use rustpython_vm::PyObjectRef;
 use crate::cells::{CellTypes, CodeCell, LLMPromptCell};
 use crate::execution::execution::ExecutionState;
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use anyhow::{Result, anyhow};
+
+fn install_dependencies_from_requirements(requirements_dir: &str, venv_path: &str) -> Result<()> {
+    let requirements_path = Path::new(requirements_dir).join("requirements.txt");
+
+    if !requirements_path.exists() {
+        return Err(anyhow!("requirements.txt not found in the specified directory"));
+    }
+
+    let uv_path = which::which("uv").map_err(|_| anyhow!("uv not found in PATH"))?;
+
+    // Use 'uv pip sync' to install dependencies
+    let status = Command::new(uv_path)
+        .arg("pip")
+        .arg("sync")
+        .arg(requirements_path)
+        .arg("--virtualenv")
+        .arg(venv_path)
+        .status()?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("Failed to install dependencies from requirements.txt"))
+    }
+}
+
+fn get_or_create_default_venv() -> anyhow::Result<PathBuf> {
+    let home_dir = env::var("HOME").or_else(|_| env::var("USERPROFILE"))?;
+    let default_venv_dir = PathBuf::from(home_dir).join(".chidori_venvs");
+
+    if !default_venv_dir.exists() {
+        std::fs::create_dir_all(&default_venv_dir)?;
+    }
+
+    let venv_name = format!("chidori_venv_{}", Uuid::new_v4());
+    let venv_path = default_venv_dir.join(venv_name);
+
+    let uv_path = which::which("uv").map_err(|_| anyhow::anyhow!("uv not found in PATH"))?;
+    let status = Command::new(uv_path)
+        .arg("venv")
+        .arg(&venv_path)
+        .status()?;
+
+    if !status.success() {
+        return Err(anyhow::anyhow!("Failed to create default virtualenv"));
+    }
+
+    Ok(venv_path)
+}
 
 
 fn pyany_to_rkyv_serialized_value(p: &PyAny) -> RkyvSerializedValue {
@@ -165,6 +218,7 @@ fn invoke(py: Python, arg: PyObject) -> PyResult<PyObject> {
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use dashmap::DashMap;
+use log::info;
 use regex::Regex;
 
 static SOURCE_CODE_RUN_COUNTER: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
@@ -243,8 +297,41 @@ pub async fn source_code_run_python(
     source_code: &String,
     payload: &RkyvSerializedValue,
     function_invocation: &Option<String>,
+    virtualenv_path: &Option<String>,
+    requirements_dir: &Option<String>,
 ) -> anyhow::Result<(RkyvSerializedValue, Vec<String>, Vec<String>)> {
+
+    // Capture the current span's ID
+    let current_span_id = Span::current().id();
+
+    info!("Invoking source_code_run_python");
+
     let exec_id = increment_source_code_run_counter();
+
+    // Ensure virtualenv exists or create it
+    let venv_path = if let Some(venv_path) = &virtualenv_path {
+        PathBuf::from(venv_path)
+    } else {
+        let default_venv = get_or_create_default_venv()?;
+        default_venv
+    };
+
+    if !venv_path.exists() {
+        let uv_path = which::which("uv").map_err(|_| anyhow::anyhow!("uv not found in PATH"))?;
+        let status = Command::new(uv_path)
+            .arg("venv")
+            .arg(&venv_path)
+            .status()?;
+        if !status.success() {
+            return Err(anyhow::anyhow!("Failed to create virtualenv"));
+        }
+    }
+
+    // Install dependencies from requirements.txt if specified
+    if let Some(req_dir) = &requirements_dir {
+        install_dependencies_from_requirements(req_dir, venv_path.to_str().unwrap())?;
+    }
+
     pyo3::prepare_freethreaded_python();
     let (sender_stdout, receiver_stdout) = mpsc::channel();
     let (sender_stderr, receiver_stderr) = mpsc::channel();
@@ -268,10 +355,25 @@ pub async fn source_code_run_python(
         // Configure locals and globals passed to evaluation
         let globals = PyDict::new(py);
         let execution_state = Arc::new(Mutex::new(execution_state.clone()));
-        create_function_shims(&execution_state, &report, py, globals)?;
+        create_function_shims(&execution_state, &report, py, globals, current_span_id)?;
 
 
         let sys = py.import("sys")?;
+
+        // Add virtualenv path to sys.path
+        let site_packages_path = venv_path
+            .join("lib")
+            .join("python3.11")  // Adjust this version as needed
+            .join("site-packages");
+
+        if site_packages_path.exists() {
+            let current_path: Vec<String> = sys.getattr("path")?.extract()?;
+            let mut new_path = vec![site_packages_path.to_str().unwrap().to_string()];
+            new_path.extend(current_path);
+            sys.setattr("path", new_path)?;
+        } else {
+            return Err(anyhow::anyhow!("Virtualenv site-packages not found: {:?}", site_packages_path));
+        }
 
         // Create Chidori module if it doesn't already exist
         let py_modules = sys.getattr("modules")?;
@@ -329,13 +431,12 @@ pub async fn source_code_run_python(
             .lines()
             .any(|line| line.contains("asyncio.run") || line.contains("unittest.IsolatedAsyncioTestCase") || line.contains("loadTestsFromTestCase"));
 
-        // TODO: how do we then map these back to their originals
-        // let (mut initial_source_code, map_of_renamed_fns_to_original ) = rename_triggerable_functions(&report, &initial_source_code);
-
         let mut complete_code = if does_contain_async_runtime {
             // If we have an async function, we don't need to wrap it in an async function
             initial_source_code
         } else {
+
+
             for (name, report_item) in &report.cell_exposed_values {
                 initial_source_code.push_str("\n");
                 initial_source_code.push_str(&format!(
@@ -346,7 +447,14 @@ pub async fn source_code_run_python(
             }
             // Necessary to expose defined functions to the global scope from the inside of the __wrapper function
             for (name, report_item) in &report.triggerable_functions {
-                // TODO: we can rename functions to their hashed identities here, swapping them
+
+                // TODO: Rename functions to their wrapped and hashed version
+                // initial_source_code.push_str(&format!(
+                //     r#"{name} = {hashed_name}"#,
+                //     name = name,
+                //     hashed_name = hash_to_python_method_name(name)
+                // ));
+
 
                 // Declare in our output what functions were defined by this run.
                 initial_source_code.push_str("\n");
@@ -364,7 +472,6 @@ pub async fn source_code_run_python(
                 ));
             }
             let indent_all_source_code = initial_source_code.lines().map(|line| format!("    {}", line)).collect::<Vec<_>>().join("\n");
-
             // Wrap all of our code in a top level async wrapper
             format!(r#"
 import asyncio
@@ -377,10 +484,6 @@ asyncio.run(__wrapper())
         complete_code.push_str("\n");
         complete_code.push_str("import sys\nsys.stdout.flush()\nsys.stderr.flush()");
         complete_code.push_str("\n");
-
-
-        // TODO:
-
 
         // Important: this is the point of initial execution of the source code
         py.run(&complete_code, Some(globals), None)?;
@@ -518,7 +621,7 @@ asyncio.run(__wrapper())
 //     Ok(())
 // }
 
-fn create_function_shims(execution_state_handle: &Arc<Mutex<ExecutionState>>, report: &Report, py: Python, globals: &PyDict) -> Result<(), Error> {
+fn create_function_shims(execution_state_handle: &Arc<Mutex<ExecutionState>>, report: &Report, py: Python, globals: &PyDict, parent_span_id: Option<tracing::Id>) -> Result<(), Error> {
     // Create shims for functions that are referred to, we look at what functions are being provided
     // and create shims for matches between the function name provided and the identifiers referred to.
 
@@ -534,6 +637,9 @@ fn create_function_shims(execution_state_handle: &Arc<Mutex<ExecutionState>>, re
         {
             let clone_function_name = function_name.clone();
             let execution_state_handle = execution_state_handle.clone();
+
+            let parent_span_id = parent_span_id.clone();
+
             let closure_callable = PyCFunction::new_closure(
                 py,
                 None, // name
@@ -541,6 +647,7 @@ fn create_function_shims(execution_state_handle: &Arc<Mutex<ExecutionState>>, re
                 move |args: &PyTuple, kwargs: Option<&PyDict>| -> PyResult<PyObject> {
                     let total_arg_payload = python_args_to_rkyv(args, kwargs)?;
                     let clone_function_name = clone_function_name.clone();
+                    let parent_span_id = parent_span_id.clone();
                     let py = args.py();
                     // All function calls across cells are forced to be async
                     let mut new_exec_state = {
@@ -550,7 +657,7 @@ fn create_function_shims(execution_state_handle: &Arc<Mutex<ExecutionState>>, re
                         new_exec_state
                     };
                     pyo3_asyncio::tokio::future_into_py(py, async move {
-                        let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload).await.map_err(|e| AnyhowErrWrapper(e))?;
+                        let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload, parent_span_id.clone()).await.map_err(|e| AnyhowErrWrapper(e))?;
                         PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result)))
                     }).map(|x| x.into())
                 },
@@ -605,6 +712,8 @@ fn replace_identifier(code: &str, old_identifier: &str, new_identifier: &str) ->
 }
 
 use sha1::{Sha1, Digest};
+use tracing::Span;
+use uuid::Uuid;
 
 fn hash_to_python_method_name(input: &str) -> String {
     // Create a SHA1 object
@@ -690,7 +799,7 @@ x = 12 + y
 li = [x, y]
         "#,
         );
-        let result = source_code_run_python(&ExecutionState::new_with_random_id(), &source_code, &RkyvSerializedValue::Null, &None).await;
+        let result = source_code_run_python(&ExecutionState::new_with_random_id(), &source_code, &RkyvSerializedValue::Null, &None, &None, &None).await;
         assert_eq!(
             result.unwrap(),
             (
@@ -719,7 +828,7 @@ li = [x, y]
 print("testing")
         "#,
         );
-        let result = source_code_run_python(&ExecutionState::new_with_random_id(), &source_code, &RkyvSerializedValue::Null, &None).await;
+        let result = source_code_run_python(&ExecutionState::new_with_random_id(), &source_code, &RkyvSerializedValue::Null, &None, &None, &None).await;
         assert_eq!(
             result.unwrap(),
             (
@@ -746,6 +855,8 @@ def example():
                                             &source_code,
                                             &RkyvSerializedValue::Null,
                                             &Some("example".to_string()),
+                                            &None,
+                                            &None,
         ).await;
         assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(20), vec![], vec![]));
     }
@@ -767,6 +878,8 @@ def example(x):
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
                                             &Some("example".to_string()),
+                                            &None,
+                                            &None,
         ).await;
         assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(25), vec![], vec![]));
     }
@@ -790,10 +903,12 @@ a = 20 + await demo()
         }, TextRange::default()), Some(0))?;
         let result = source_code_run_python(&state,
                                             &source_code,
-            &RkyvObjectBuilder::new()
-                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
-                .build(),
-            &None,
+                                            &RkyvObjectBuilder::new()
+                                                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
+                                                .build(),
+                                            &None,
+                                            &None,
+                                            &None,
         ).await;
         assert_eq!(
             result.unwrap(),
@@ -827,11 +942,13 @@ data = await demo()
         }, TextRange::default()), Some(0))?;
         let result = source_code_run_python(&state,
                                             &source_code,
-            &RkyvObjectBuilder::new()
-                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
+                                            &RkyvObjectBuilder::new()
+                                                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
 
-                .build(),
-            &None,
+                                                .build(),
+                                            &None,
+                                            &None,
+                                            &None,
         ).await;
         assert_eq!(
             result.unwrap(),
@@ -877,9 +994,11 @@ data = await demo()
         }, TextRange::default()), Some(1))?;
         let result = source_code_run_python(&state,
                                             &source_code,
-            &RkyvObjectBuilder::new()
-                .build(),
-            &None,
+                                            &RkyvObjectBuilder::new()
+                                                .build(),
+                                            &None,
+                                            &None,
+                                            &None,
         ).await;
         assert_eq!(
             result.unwrap(),
@@ -916,6 +1035,8 @@ unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMa
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
                                             &None,
+                                            &None,
+                                            &None,
         ).await;
         let (result, _, stderr) = result.unwrap();
         assert_eq!(stderr.iter().filter(|x| x.contains("Ran 1 test")).count(), 1);
@@ -946,6 +1067,8 @@ unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMa
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
                                             &None,
+                                            &None,
+                                            &None,
         ).await;
         let (result, _, stderr) = result.unwrap();
         dbg!(&stderr);
@@ -972,6 +1095,8 @@ def example(x):
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
                                             &Some("example".to_string()),
+                                            &None,
+                                            &None,
         ).await;
         assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(1), vec![], vec![]));
         let result = source_code_run_python(&ExecutionState::new_with_random_id(),
@@ -980,6 +1105,8 @@ def example(x):
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
                                             &Some("example".to_string()),
+                                            &None,
+                                            &None,
         ).await;
         assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(2), vec![], vec![]));
     }
@@ -1001,6 +1128,8 @@ fn example():
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
             &Some("example".to_string()),
+            &None,
+            &None,
         ).await;
         match result {
             Ok(_) => {panic!("Must return error.")}
@@ -1025,6 +1154,8 @@ raise ValueError("Raising a python error")
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
             &Some("example".to_string()),
+            &None,
+            &None,
         ).await;
         match result {
             Ok(_) => {panic!("Must return error.")}

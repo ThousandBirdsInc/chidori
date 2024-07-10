@@ -4,7 +4,7 @@ use std::env;
 use tokio::runtime;
 use crate::cells::{LLMPromptCell, SupportedModelProviders, TextRange};
 use crate::execution::primitives::operation::{InputItemConfiguration, InputSignature, InputType, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
-use crate::execution::primitives::serialized_value::{RkyvSerializedValue as RKV, RkyvSerializedValue, serialized_value_to_json_value};
+use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue as RKV, RkyvSerializedValue, serialized_value_to_json_value};
 use futures_util::FutureExt;
 use crate::execution::execution::execution_graph::ExecutionNodeId;
 use crate::execution::execution::ExecutionState;
@@ -91,7 +91,11 @@ pub fn llm_prompt_cell(execution_state_id: ExecutionNodeId, cell: &LLMPromptCell
                         let name = name.clone();
                         // TODO: this state should error? or what should this do
                         if configuration.function_name.is_some() && !is_function_invocation {
-                            return async move { Ok(OperationFnOutput::with_value(RkyvSerializedValue::Null)) }.boxed();
+                            // Return the declared name of the function
+                            let fn_name = configuration.function_name.as_ref().unwrap().clone();
+                            return async move { Ok(OperationFnOutput::with_value(RkyvObjectBuilder::new().insert_string(&fn_name, "function".to_string())
+                                .build()
+                            )) }.boxed();
                         }
                         let s = s.clone();
                         let configuration = configuration.clone();
@@ -105,6 +109,7 @@ pub fn llm_prompt_cell(execution_state_id: ExecutionNodeId, cell: &LLMPromptCell
                                 configuration.clone()
                             ).await?;
                             Ok(OperationFnOutput {
+                                has_error: false,
                                 execution_state: state,
                                 output: value,
                                 stdout: vec![],

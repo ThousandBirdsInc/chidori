@@ -124,8 +124,15 @@ pub struct Report {
 
 #[derive(Error, Debug, Serialize, Deserialize)]
 pub enum ChidoriStaticAnalysisError {
-    #[error("unknown chidori analysis error")]
+    #[error("Unknown chidori analysis error")]
     Unknown,
+    #[error("Parse error at offset {offset} in {source_path}: {msg}. Source: {source_code}")]
+    ParseError {
+        msg: String,
+        offset: u32,
+        source_path: String,
+        source_code: String
+    },
 }
 
 

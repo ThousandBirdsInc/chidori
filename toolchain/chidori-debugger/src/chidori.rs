@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
@@ -202,6 +202,12 @@ const EXAMPLES_CORE8: &str =
     include_str!("../../chidori-core/examples/core8_prompt_code_generation_and_execution/core.md");
 const EXAMPLES_CORE9: &str =
     include_str!("../../chidori-core/examples/core9_multi_agent_simulation/core.md");
+const EXAMPLES_CORE10: &str =
+    include_str!("../../chidori-core/examples/core10_concurrency/core.md");
+const EXAMPLES_CORE11: &str =
+    include_str!("../../chidori-core/examples/core11_hono/core.md");
+const EXAMPLES_CORE12: &str =
+    include_str!("../../chidori-core/examples/core12_dependency_management/core.md");
 
 #[derive(Resource)]
 pub struct ChidoriTraceEvents {
@@ -215,7 +221,8 @@ pub struct ChidoriExecutionIdsToStates {
 
 #[derive(Resource)]
 pub struct ChidoriExecutionGraph {
-    pub inner: Vec<(ExecutionNodeId, ExecutionNodeId)>,
+    pub execution_graph: Vec<(ExecutionNodeId, ExecutionNodeId)>,
+    pub grouped_nodes: HashSet<ExecutionNodeId>,
     pub current_execution_head: ExecutionNodeId,
 }
 
@@ -228,6 +235,7 @@ pub struct ChidoriDefinitionGraph {
 pub struct ChidoriExecutionState {
     pub inner: Option<MergedStateHistory>,
 }
+
 
 
 #[derive(Resource, Default)]
@@ -368,7 +376,8 @@ impl InternalState {
 fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>) {
     commands.insert_resource(ChidoriTraceEvents { inner: vec![] });
     commands.insert_resource(ChidoriExecutionGraph {
-        inner: vec![],
+        execution_graph: vec![],
+        grouped_nodes: Default::default(),
         current_execution_head: Uuid::nil(),
     });
     commands.insert_resource(ChidoriExecutionIdsToStates {
@@ -427,14 +436,24 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
         loop {
             match runtime_event_receiver.recv_timeout(Duration::from_millis(RECV_RUNTIME_EVENT_TIMEOUT_MS)) {
                 Ok(msg) => {
-                    println!("Received from runtime: {:?}", &msg);
+                    // println!("Received from runtime: {:?}", &msg);
+                    let msg_to_logs = msg.clone();
+                    ctx.run_on_main_thread(move |ctx| {
+                        if let Some(mut s) =
+                            ctx.world.get_resource_mut::<ChidoriLogMessages>()
+                        {
+                            s.inner.push(format!("Received from runtime: {:?}", &msg_to_logs));
+                        }
+                    })
+                        .await;
                     match msg {
                         EventsFromRuntime::ExecutionGraphUpdated(state) => {
                             ctx.run_on_main_thread(move |ctx| {
                                 if let Some(mut s) =
                                     ctx.world.get_resource_mut::<ChidoriExecutionGraph>()
                                 {
-                                    s.inner = state;
+                                    s.execution_graph = state.0;
+                                    s.grouped_nodes = state.1;
                                 }
                             })
                             .await;
@@ -577,12 +596,12 @@ pub fn update_gui(
                             ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
                             let buttons_text_load = vec![
                                 ("Core 1: Simple Math", EXAMPLES_CORE1, "Demonstrates simple arithmetic between cells, and that values can be passed between Python and JavaScript runtimes."),
-                                ("Core 2: Marshalling", EXAMPLES_CORE2, "All of the types that we can successfully pass between runtimes and that are preserved by our execution engine."),
-                                ("Core 3: Function Invocations", EXAMPLES_CORE3, "Demonstrates what function execution looks like when using Chidori. Explore how states are preserved and the ability to revert between them with re-execution."),
-                                ("Core 4: Async Function Invocations", EXAMPLES_CORE4, "Function invocations default to being asynchronous."),
-                                ("Core 5: Prompts Invoked as Functions", EXAMPLES_CORE5, "We treat prompts as first class resources, this demonstrates how prompts are invokable as functions."),
+                                ("Core 2: Marshalling Values", EXAMPLES_CORE2, "All of the types that we can successfully pass between runtimes and that are preserved by our execution engine."),
+                                ("Core 3: Invoking Functions", EXAMPLES_CORE3, "Demonstrates what function execution looks like when using Chidori. Explore how states are preserved and the ability to revert between them with re-execution."),
+                                ("Core 4: Invoking Async Functions", EXAMPLES_CORE4, "Function invocations default to being asynchronous."),
+                                ("Core 5: Invoking Prompts as Functions", EXAMPLES_CORE5, "We treat prompts as first class resources, this demonstrates how prompts are invokable as functions."),
                                 (
-                                    "Core 6: Prompts Leveraging Function Calling",
+                                    "Core 6: Using Function Calling in Prompts",
                                     EXAMPLES_CORE6, "Prompts may import functions and invoke those in order to accomplish their instructions."
 
                                 ),
@@ -592,6 +611,9 @@ pub fn update_gui(
                                     EXAMPLES_CORE8, "Chidori is designed for L4-L5 agents, new behaviors can be generated on the fly via code generation."
                                 ),
                                 ("Core 9: Multi-Agent Simulation", EXAMPLES_CORE9, "desc"),
+                                ("Core 10: Concurrency", EXAMPLES_CORE10, "desc"),
+                                ("Core 11: Hono Web Service", EXAMPLES_CORE11, "desc"),
+                                ("Core 12: Dependency Management", EXAMPLES_CORE12, "desc"),
                             ];
                             let mut is_a_button_hovered = false;
                             for button in buttons_text_load {

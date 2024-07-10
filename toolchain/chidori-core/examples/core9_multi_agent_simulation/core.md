@@ -8,7 +8,7 @@ model: gpt-3.5-turbo
 fn: scrape_and_summarize_website_researcher
 ---
 Role: Principal Researcher
-Goal: Do amazing researches and summaries based on the content you are working with
+Goal: Do amazing research and produce summaries based on the content you are working with
 Backstory: You're a Principal Researcher at a big company and you need to do a research about a given topic.
 {{task}}
 ```
@@ -86,7 +86,7 @@ def search_internet(query):
 ```
 
 
-```prompt (researcher)
+```prompt (city_selection_expert)
 ---
 model: gpt-3.5-turbo
 import:
@@ -124,59 +124,46 @@ Goal: Create the most amazing travel iterinaries within budget and packing sugge
 Backstory: Specialist in travel planning an logistics with decades of experience
 ```
 
-```python
- def __init__(self, origin, cities, date_range, interests):
-    self.cities = cities
-    self.origin = origin
-    self.interests = interests
-    self.date_range = date_range
+```javascript
+const { Hono } = require('hono');
+const bodyParser = require('body-parser');
 
-  def run(self):
-    agents = TripAgents()
-    tasks = TripTasks()
+const app = new Hono();
 
-    city_selector_agent = agents.city_selection_agent()
-    local_expert_agent = agents.local_expert()
-    travel_concierge_agent = agents.travel_concierge()
+// Middleware to parse form data
+app.use('/submit', bodyParser.urlencoded({ extended: true }));
 
-    identify_task = tasks.identify_task(
-      city_selector_agent,
-      self.origin,
-      self.cities,
-      self.interests,
-      self.date_range
-    )
-    gather_task = tasks.gather_task(
-      local_expert_agent,
-      self.origin,
-      self.interests,
-      self.date_range
-    )
-    plan_task = tasks.plan_task(
-      travel_concierge_agent, 
-      self.origin,
-      self.interests,
-      self.date_range
-    )
+app.get('/', (c) => {
+  const form = `
+    <h1>Welcome to Trip Planner Crew</h1>
+    <form action="/submit" method="post">
+      <label>From where will you be traveling from?</label><br>
+      <input type="text" name="origin"><br>
+      <label>What are the cities options you are interested in visiting?</label><br>
+      <input type="text" name="cities"><br>
+      <label>What is the date range you are interested in traveling?</label><br>
+      <input type="text" name="date_range"><br>
+      <label>What are some of your high level interests and hobbies?</label><br>
+      <input type="text" name="interests"><br>
+      <button type="submit">Submit</button>
+    </form>
+  `;
+  return c.html(form);
+});
 
-if __name__ == "__main__":
-    print("## Welcome to Trip Planner Crew")
-    print('-------------------------------')
-    location = input(
-        dedent("""
-      From where will you be traveling from?
-    """))
-    cities = input(
-        dedent("""
-      What are the cities options you are interested in visiting?
-    """))
-    date_range = input(
-        dedent("""
-      What is the date range you are interested in traveling?
-    """))
-    interests = input(
-        dedent("""
-      What are some of your high level interests and hobbies?
-    """))
+app.post('/submit', (c) => {
+  const { origin, cities, date_range, interests } = c.req.body;
+  const response = `
+    <h2>Trip Details</h2>
+    <p><strong>Origin:</strong> ${origin}</p>
+    <p><strong>Cities:</strong> ${cities}</p>
+    <p><strong>Date Range:</strong> ${date_range}</p>
+    <p><strong>Interests:</strong> ${interests}</p>
+  `;
+  return c.html(response);
+});
 
+app.listen(3000, () => {
+  console.log('Server running on http://localhost:3000');
+});
 ```
