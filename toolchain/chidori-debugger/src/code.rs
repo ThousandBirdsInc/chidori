@@ -146,6 +146,7 @@ fn render_operation_output(execution_state: &&mut Res<ChidoriExecutionState>, op
     if let Some(state) = &execution_state.inner {
         if let Some(op_id) = &op_id {
             if let Some((exec_id, o)) = state.0.get(op_id) {
+                if ui.button(format!("Go To Most Recent Execution")).clicked() {}
                 if ui.button(format!("Revert to: {:?} {:?}", exec_id, op_id)).clicked() {}
                 ui.push_id((exec_id, op_id), |ui| {
                     ui.collapsing("Values", |ui| {

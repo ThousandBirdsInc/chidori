@@ -735,6 +735,8 @@ pub fn update_gui(
                         });
                     }
                     ui.add_space(8.0);
+                    if with_cursor(ui.button("Examples")).clicked() {
+                    }
                     ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
 
                     if with_cursor(ui.button("Run")).clicked() {

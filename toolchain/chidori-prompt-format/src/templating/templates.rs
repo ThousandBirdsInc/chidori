@@ -673,7 +673,7 @@ Summarize content you are provided with for a second-grade student.
         let result = split_frontmatter(&template_string);
         match result {
             Ok((frontmatter, body)) => {
-                assert_eq!(frontmatter, "test: 1\ntwo: 2\n");
+                assert_eq!(frontmatter, "test: 1\ntwo: 2");
                 assert_eq!(body, "actual body");
             }
             Err(_) => {

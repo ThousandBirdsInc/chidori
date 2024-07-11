@@ -52,12 +52,12 @@ We are continuing to make significant changes in response to feedback and iterat
 Feedback is greatly appreciated! Please add to our issue tracker.
 
 - Built from the ground up for constructing agents
-- Runtime written in Rust supporting Python and Node.js out of the box
-- Build agents that actually work
+- Runtime written in Rust supporting Python and JavaScript
 - Cache behaviors and resume from partially executed agents
 - Optimized for long-running AI workflows
 - Embedded code interpreter
-- Time travel debugging (with actual reversion)
+- Time travel debugging
+- Create and navigate tree-searching workflows
 
 I want to demonstrate a workflow where entirely arbitrary code can be used to build useful agents.
 Users should be able to leverage the entire surface areas of the langauges agents are defined within. My aspiration
@@ -73,8 +73,8 @@ prototype development is `chidori-debugger` which wraps our runtime in a useful 
 ```bash
 xcode-select --install
 brew install cmake
-brew install protobuf # needed for denokv-proto?, we don't explicitly need this
-brew install libiconv # not entirely sure why this is necessary WIP, I'll hunt this down
+brew install protobuf # We're working on eliminating this dependency
+brew install libiconv # We're investigating if this is necessary or can be removed
 brew install python@3.11
 cargo install chidori-debugger
 ```
@@ -154,17 +154,25 @@ format_and_rank(articles=articles)
 ## About
 
 ### Reactive Runtime
-At its core, Chidori brings a reactive runtime that orchestrates interactions between different agents and their components. The runtime is comprised of "nodes", which react to system changes they subscribe to, providing dynamic and responsive behavior in your AI systems.
-Nodes can encompass code, prompts, vector databases, custom code, services, or even complete systems. 
+At its core, Chidori brings a reactive runtime that orchestrates interactions between different agents and their components. 
+Chidori accepts arbitrary Python or JavaScript code, taking over brokering and execution of it to allow for interruptions and reactivity.
+This allows you to get the benefits of these runtime behaviors while leveraging the patterns you're already familiar with.
 
 ### Monitoring and Observability
-Chidori ensures comprehensive monitoring and observability of your agents. We record all the inputs and outputs emitted by nodes, enabling us to explain precisely what led to what, enhancing your debugging experience and understanding of the system’s production behavior.
+Chidori ensures comprehensive monitoring and observability of your agents. We record all the inputs and outputs emitted by functions throughout the execution of your agent, enabling us to explain precisely what led to what, enhancing your debugging experience and understanding of the system’s production behavior.
 
 ### Branching and Time-Travel
 With Chidori, you can take snapshots of your system and explore different possible outcomes from that point (branching), or rewind the system to a previous state (time-travel). This functionality improves error handling, debugging, and system robustness by offering alternative pathways and do-overs.
 
 ### Code Interpreter Environments
-Chidori comes with first-class support for code interpreter environments like [Deno](https://deno.land/) or [Starlark](https://github.com/bazelbuild/starlark/blob/master/spec.md). You can execute code directly within your system, providing quick startup, ease of use, and secure execution. We're continually working on additional safeguards against running untrusted code, with containerized nodes support coming soon.
+Chidori comes with first-class support for code interpretation for both Python and JavaScript. You can execute code directly within your system, providing quick startup, ease of use, and secure execution. We're continually working on additional safeguards against running untrusted code, with containerized environment support coming soon.
+
+### Code Generation During Evaluation
+With our execution graph, preservation of state, and tools for debugging - Chidori is an exceptional environment for generating code during the evaluation of your agent.
+You can use this to leverage LLMs to achieve more generalized behavior and to evolve your agents over time.
+
+
+
 
 ## 🛣️ Roadmap
 
