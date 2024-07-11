@@ -2,18 +2,30 @@
 source: chidori-static-analysis/src/language/python/parse.rs
 description: "def main():\n    bar() | foo() | baz()\n"
 ---
-- - InFunction: main
-- - InFunction: main
+- - InFunction:
+      - main
+      - start: 0
+        end: 37
+- - InFunction:
+      - main
+      - start: 0
+        end: 37
   - InCallExpression
   - IdentifierReferredTo:
       - bar
       - false
-- - InFunction: main
+- - InFunction:
+      - main
+      - start: 0
+        end: 37
   - InCallExpression
   - IdentifierReferredTo:
       - foo
       - false
-- - InFunction: main
+- - InFunction:
+      - main
+      - start: 0
+        end: 37
   - InCallExpression
   - IdentifierReferredTo:
       - baz

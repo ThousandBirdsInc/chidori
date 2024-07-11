@@ -2,16 +2,25 @@
 source: chidori-static-analysis/src/language/javascript/parse.rs
 description: "function createDockerfile() {\n    useHook(() => {\n       ch.prompt(\"demo\");\n    }, [otherFunction]);\n    return prompt(\"prompts/create_dockerfile\")\n}\n"
 ---
-- - InFunction: createDockerfile
+- - InFunction:
+      - createDockerfile
+      - start: 1
+        end: 150
   - Params
-- - InFunction: createDockerfile
+- - InFunction:
+      - createDockerfile
+      - start: 1
+        end: 150
   - InCallExpression
   - IdentifierReferredTo:
       - useHook
       - false
   - InAnonFunction
   - Params
-- - InFunction: createDockerfile
+- - InFunction:
+      - createDockerfile
+      - start: 1
+        end: 150
   - InCallExpression
   - IdentifierReferredTo:
       - useHook
@@ -23,21 +32,33 @@ description: "function createDockerfile() {\n    useHook(() => {\n       ch.prom
       - ch
       - false
   - Constant: demo
-- - InFunction: createDockerfile
+- - InFunction:
+      - createDockerfile
+      - start: 1
+        end: 150
   - InCallExpression
   - IdentifierReferredTo:
       - useHook
       - false
   - InAnonFunction
-- - InFunction: createDockerfile
+- - InFunction:
+      - createDockerfile
+      - start: 1
+        end: 150
   - InCallExpression
   - IdentifierReferredTo:
       - useHook
       - false
-- - InFunction: createDockerfile
+- - InFunction:
+      - createDockerfile
+      - start: 1
+        end: 150
   - InCallExpression
   - IdentifierReferredTo:
       - prompt
       - false
   - Constant: prompts/create_dockerfile
-- - InFunction: createDockerfile
+- - InFunction:
+      - createDockerfile
+      - start: 1
+        end: 150

@@ -2,29 +2,50 @@
 source: chidori-static-analysis/src/language/javascript/parse.rs
 description: "import { random } from \"random\"\n\nfunction fun_name() {\n    const w = function_that_doesnt_exist()\n    const v = 5\n    return v\n}\n\nx = random.randint(0, 10)"
 ---
-- - InFunction: fun_name
+- - InFunction:
+      - fun_name
+      - start: 34
+        end: 129
   - Params
-- - InFunction: fun_name
+- - InFunction:
+      - fun_name
+      - start: 34
+        end: 129
   - AssignmentToStatement
   - IdentifierReferredTo:
       - w
       - false
-- - InFunction: fun_name
+- - InFunction:
+      - fun_name
+      - start: 34
+        end: 129
   - AssignmentFromStatement
   - InCallExpression
   - IdentifierReferredTo:
       - function_that_doesnt_exist
       - false
-- - InFunction: fun_name
+- - InFunction:
+      - fun_name
+      - start: 34
+        end: 129
   - AssignmentFromStatement
-- - InFunction: fun_name
+- - InFunction:
+      - fun_name
+      - start: 34
+        end: 129
   - AssignmentToStatement
   - IdentifierReferredTo:
       - v
       - false
-- - InFunction: fun_name
+- - InFunction:
+      - fun_name
+      - start: 34
+        end: 129
   - AssignmentFromStatement
-- - InFunction: fun_name
+- - InFunction:
+      - fun_name
+      - start: 34
+        end: 129
   - IdentifierReferredTo:
       - v
       - true

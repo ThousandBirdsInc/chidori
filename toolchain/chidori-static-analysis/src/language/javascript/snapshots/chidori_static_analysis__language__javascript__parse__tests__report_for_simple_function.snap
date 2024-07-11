@@ -2,12 +2,18 @@
 source: chidori-static-analysis/src/language/javascript/parse.rs
 description: "function testing(x) {\n    return x\n}\n    "
 ---
-- - InFunction: testing
+- - InFunction:
+      - testing
+      - start: 1
+        end: 37
   - Params
   - IdentifierReferredTo:
       - x
       - false
-- - InFunction: testing
+- - InFunction:
+      - testing
+      - start: 1
+        end: 37
   - IdentifierReferredTo:
       - x
       - true

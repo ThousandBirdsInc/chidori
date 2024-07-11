@@ -2,6 +2,7 @@
 source: chidori-static-analysis/src/language/javascript/parse.rs
 description: "function testing(x) {\n    return x\n}\n    "
 ---
+internal_call_graph: {}
 cell_exposed_values: {}
 cell_depended_values: {}
 triggerable_functions:

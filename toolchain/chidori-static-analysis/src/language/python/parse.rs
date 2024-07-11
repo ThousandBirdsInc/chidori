@@ -1188,6 +1188,7 @@ x = random.randint(0, 10)
             "#};
         let context_stack_references = extract_dependencies_python(python_source).map_err(|e| anyhow::Error::msg(format!("{:?}", e)))?;
         insta::with_settings!({
+            sort_maps => true,
             description => python_source,
             omit_expression => true
         }, {
@@ -1196,6 +1197,7 @@ x = random.randint(0, 10)
         let result = build_report(&context_stack_references);
 
         insta::with_settings!({
+            sort_maps => true,
             description => python_source,
             omit_expression => true
         }, {

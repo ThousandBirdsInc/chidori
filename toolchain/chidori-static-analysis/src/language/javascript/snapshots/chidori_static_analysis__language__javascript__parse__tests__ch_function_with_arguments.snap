@@ -2,7 +2,10 @@
 source: chidori-static-analysis/src/language/javascript/parse.rs
 description: "function subtract(a, b) {\n    return a - b;\n}\n\n// Example usage\nconst v = subtract(x, 5);\n"
 ---
-- - InFunction: subtract
+- - InFunction:
+      - subtract
+      - start: 1
+        end: 46
   - Params
   - IdentifierReferredTo:
       - a
@@ -10,7 +13,10 @@ description: "function subtract(a, b) {\n    return a - b;\n}\n\n// Example usag
   - IdentifierReferredTo:
       - b
       - false
-- - InFunction: subtract
+- - InFunction:
+      - subtract
+      - start: 1
+        end: 46
   - IdentifierReferredTo:
       - a
       - true

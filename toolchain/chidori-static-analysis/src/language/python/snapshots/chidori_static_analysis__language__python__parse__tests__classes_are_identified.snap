@@ -4,22 +4,34 @@ description: "import unittest\n\nclass TestMarshalledValues(unittest.TestCase):\
 ---
 - - InClass: TestMarshalledValues
 - - InClass: TestMarshalledValues
-  - InFunction: test_addTwo
+  - InFunction:
+      - test_addTwo
+      - start: 68
+        end: 129
 - - InClass: TestMarshalledValues
-  - InFunction: test_addTwo
+  - InFunction:
+      - test_addTwo
+      - start: 68
+        end: 129
   - FunctionArguments
   - IdentifierReferredTo:
       - self
       - false
 - - InClass: TestMarshalledValues
-  - InFunction: test_addTwo
+  - InFunction:
+      - test_addTwo
+      - start: 68
+        end: 129
   - InCallExpression
   - InCallExpression
   - IdentifierReferredTo:
       - addTwo
       - false
 - - InClass: TestMarshalledValues
-  - InFunction: test_addTwo
+  - InFunction:
+      - test_addTwo
+      - start: 68
+        end: 129
   - InCallExpression
   - Attribute: assertEqual
   - IdentifierReferredTo:

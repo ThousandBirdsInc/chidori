@@ -1,31 +1,49 @@
 ---
 source: chidori-static-analysis/src/language/python/parse.rs
-expression: context_stack_references
+description: "def evaluate_agent(ev):\n    ch.set(\"file_path\", ev.file_path)\n    migration_agent()\n"
 ---
-- - InFunction: evaluate_agent
-- - InFunction: evaluate_agent
+- - InFunction:
+      - evaluate_agent
+      - start: 0
+        end: 83
+- - InFunction:
+      - evaluate_agent
+      - start: 0
+        end: 83
   - FunctionArguments
   - IdentifierReferredTo:
       - ev
       - false
-- - InFunction: evaluate_agent
+- - InFunction:
+      - evaluate_agent
+      - start: 0
+        end: 83
   - InCallExpression
   - Constant: file_path
-- - InFunction: evaluate_agent
+- - InFunction:
+      - evaluate_agent
+      - start: 0
+        end: 83
   - InCallExpression
   - Constant: file_path
   - Attribute: file_path
   - IdentifierReferredTo:
       - ev
       - true
-- - InFunction: evaluate_agent
+- - InFunction:
+      - evaluate_agent
+      - start: 0
+        end: 83
   - InCallExpression
   - Constant: file_path
   - Attribute: set
   - IdentifierReferredTo:
       - ch
       - false
-- - InFunction: evaluate_agent
+- - InFunction:
+      - evaluate_agent
+      - start: 0
+        end: 83
   - InCallExpression
   - IdentifierReferredTo:
       - migration_agent

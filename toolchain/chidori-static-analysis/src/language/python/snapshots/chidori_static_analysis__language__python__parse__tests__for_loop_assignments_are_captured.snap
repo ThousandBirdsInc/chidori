@@ -2,33 +2,57 @@
 source: chidori-static-analysis/src/language/python/parse.rs
 expression: context_stack_references
 ---
-- - InFunction: run_prompt
-- - InFunction: run_prompt
+- - InFunction:
+      - run_prompt
+      - start: 0
+        end: 202
+- - InFunction:
+      - run_prompt
+      - start: 0
+        end: 202
   - FunctionArguments
   - IdentifierReferredTo:
       - number_of_states
       - false
-- - InFunction: run_prompt
+- - InFunction:
+      - run_prompt
+      - start: 0
+        end: 202
   - AssignmentToStatement
   - IdentifierReferredTo:
       - out
       - false
-- - InFunction: run_prompt
+- - InFunction:
+      - run_prompt
+      - start: 0
+        end: 202
   - AssignmentFromStatement
   - Constant: ""
-- - InFunction: run_prompt
+- - InFunction:
+      - run_prompt
+      - start: 0
+        end: 202
   - AssignmentToStatement
   - IdentifierReferredTo:
       - state
       - false
-- - InFunction: run_prompt
+- - InFunction:
+      - run_prompt
+      - start: 0
+        end: 202
   - IdentifierReferredTo:
       - state
       - true
-- - InFunction: run_prompt
+- - InFunction:
+      - run_prompt
+      - start: 0
+        end: 202
   - InCallExpression
   - Constant: "\n"
-- - InFunction: run_prompt
+- - InFunction:
+      - run_prompt
+      - start: 0
+        end: 202
   - InCallExpression
   - Constant: "\n"
   - Attribute: split
@@ -36,7 +60,10 @@ expression: context_stack_references
   - IdentifierReferredTo:
       - number_of_states
       - true
-- - InFunction: run_prompt
+- - InFunction:
+      - run_prompt
+      - start: 0
+        end: 202
   - InCallExpression
   - Constant: "\n"
   - Attribute: split
@@ -44,23 +71,38 @@ expression: context_stack_references
   - IdentifierReferredTo:
       - get_states_first_letters
       - false
-- - InFunction: run_prompt
+- - InFunction:
+      - run_prompt
+      - start: 0
+        end: 202
   - IdentifierReferredTo:
       - out
       - true
-- - InFunction: run_prompt
+- - InFunction:
+      - run_prompt
+      - start: 0
+        end: 202
   - InCallExpression
   - IdentifierReferredTo:
       - state
       - true
-- - InFunction: run_prompt
+- - InFunction:
+      - run_prompt
+      - start: 0
+        end: 202
   - InCallExpression
   - IdentifierReferredTo:
       - first_letter
       - false
-- - InFunction: run_prompt
+- - InFunction:
+      - run_prompt
+      - start: 0
+        end: 202
   - Constant: demo
-- - InFunction: run_prompt
+- - InFunction:
+      - run_prompt
+      - start: 0
+        end: 202
   - Constant: demo
   - IdentifierReferredTo:
       - out

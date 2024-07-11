@@ -1,13 +1,19 @@
 ---
 source: chidori-static-analysis/src/language/javascript/parse.rs
-expression: context_stack_references
+description: "function evaluate_agent(ev) {\n    ch.set(\"file_path\", ev.file_path)\n    migration_agent()\n}\n"
 ---
-- - InFunction: evaluate_agent
+- - InFunction:
+      - evaluate_agent
+      - start: 1
+        end: 92
   - Params
   - IdentifierReferredTo:
       - ev
       - false
-- - InFunction: evaluate_agent
+- - InFunction:
+      - evaluate_agent
+      - start: 1
+        end: 92
   - InCallExpression
   - Attribute: set
   - IdentifierReferredTo:
@@ -18,9 +24,15 @@ expression: context_stack_references
   - IdentifierReferredTo:
       - ev
       - true
-- - InFunction: evaluate_agent
+- - InFunction:
+      - evaluate_agent
+      - start: 1
+        end: 92
   - InCallExpression
   - IdentifierReferredTo:
       - migration_agent
       - false
-- - InFunction: evaluate_agent
+- - InFunction:
+      - evaluate_agent
+      - start: 1
+        end: 92

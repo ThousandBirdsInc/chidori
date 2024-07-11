@@ -2,12 +2,21 @@
 source: chidori-static-analysis/src/language/python/parse.rs
 description: "@ch.on_event(\"new_file\")\n@ch.emit_as(\"file_created\")\ndef dispatch_agent(ev):\n    ch.set(\"file_path\", ev.file_path)\n"
 ---
-- - InFunction: dispatch_agent
-- - InFunction: dispatch_agent
+- - InFunction:
+      - dispatch_agent
+      - start: 53
+        end: 114
+- - InFunction:
+      - dispatch_agent
+      - start: 53
+        end: 114
   - InFunctionDecorator: 0
   - InCallExpression
   - Constant: new_file
-- - InFunction: dispatch_agent
+- - InFunction:
+      - dispatch_agent
+      - start: 53
+        end: 114
   - InFunctionDecorator: 0
   - InCallExpression
   - Constant: new_file
@@ -15,11 +24,17 @@ description: "@ch.on_event(\"new_file\")\n@ch.emit_as(\"file_created\")\ndef dis
   - IdentifierReferredTo:
       - ch
       - false
-- - InFunction: dispatch_agent
+- - InFunction:
+      - dispatch_agent
+      - start: 53
+        end: 114
   - InFunctionDecorator: 1
   - InCallExpression
   - Constant: file_created
-- - InFunction: dispatch_agent
+- - InFunction:
+      - dispatch_agent
+      - start: 53
+        end: 114
   - InFunctionDecorator: 1
   - InCallExpression
   - Constant: file_created
@@ -27,22 +42,34 @@ description: "@ch.on_event(\"new_file\")\n@ch.emit_as(\"file_created\")\ndef dis
   - IdentifierReferredTo:
       - ch
       - false
-- - InFunction: dispatch_agent
+- - InFunction:
+      - dispatch_agent
+      - start: 53
+        end: 114
   - FunctionArguments
   - IdentifierReferredTo:
       - ev
       - false
-- - InFunction: dispatch_agent
+- - InFunction:
+      - dispatch_agent
+      - start: 53
+        end: 114
   - InCallExpression
   - Constant: file_path
-- - InFunction: dispatch_agent
+- - InFunction:
+      - dispatch_agent
+      - start: 53
+        end: 114
   - InCallExpression
   - Constant: file_path
   - Attribute: file_path
   - IdentifierReferredTo:
       - ev
       - true
-- - InFunction: dispatch_agent
+- - InFunction:
+      - dispatch_agent
+      - start: 53
+        end: 114
   - InCallExpression
   - Constant: file_path
   - Attribute: set

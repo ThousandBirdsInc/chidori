@@ -2,26 +2,38 @@
 source: chidori-static-analysis/src/language/javascript/parse.rs
 description: "function dispatch_agent(ev) {\n    ch.onEvent(\"new_file\")\n    ch.emitAs(\"file_created\")\n    ch.emitAs(\"file_created\", \"multiple\", \"args\")\n    ch.set(\"file_path\", ev.file_path)\n}\n"
 ---
-- - InFunction: dispatch_agent
+- - InFunction:
+      - dispatch_agent
+      - start: 1
+        end: 177
   - Params
   - IdentifierReferredTo:
       - ev
       - false
-- - InFunction: dispatch_agent
+- - InFunction:
+      - dispatch_agent
+      - start: 1
+        end: 177
   - InCallExpression
   - Attribute: onEvent
   - IdentifierReferredTo:
       - ch
       - false
   - Constant: new_file
-- - InFunction: dispatch_agent
+- - InFunction:
+      - dispatch_agent
+      - start: 1
+        end: 177
   - InCallExpression
   - Attribute: emitAs
   - IdentifierReferredTo:
       - ch
       - false
   - Constant: file_created
-- - InFunction: dispatch_agent
+- - InFunction:
+      - dispatch_agent
+      - start: 1
+        end: 177
   - InCallExpression
   - Attribute: emitAs
   - IdentifierReferredTo:
@@ -30,7 +42,10 @@ description: "function dispatch_agent(ev) {\n    ch.onEvent(\"new_file\")\n    c
   - Constant: file_created
   - Constant: multiple
   - Constant: args
-- - InFunction: dispatch_agent
+- - InFunction:
+      - dispatch_agent
+      - start: 1
+        end: 177
   - InCallExpression
   - Attribute: set
   - IdentifierReferredTo:
@@ -41,4 +56,7 @@ description: "function dispatch_agent(ev) {\n    ch.onEvent(\"new_file\")\n    c
   - IdentifierReferredTo:
       - ev
       - true
-- - InFunction: dispatch_agent
+- - InFunction:
+      - dispatch_agent
+      - start: 1
+        end: 177

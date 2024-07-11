@@ -2,11 +2,20 @@
 source: chidori-static-analysis/src/language/python/parse.rs
 description: "def create_dockerfile():\n    return prompt(\"prompts/create_dockerfile\")\n"
 ---
-- - InFunction: create_dockerfile
-- - InFunction: create_dockerfile
+- - InFunction:
+      - create_dockerfile
+      - start: 0
+        end: 71
+- - InFunction:
+      - create_dockerfile
+      - start: 0
+        end: 71
   - InCallExpression
   - Constant: prompts/create_dockerfile
-- - InFunction: create_dockerfile
+- - InFunction:
+      - create_dockerfile
+      - start: 0
+        end: 71
   - InCallExpression
   - Constant: prompts/create_dockerfile
   - IdentifierReferredTo:

@@ -2,19 +2,31 @@
 source: chidori-static-analysis/src/language/javascript/parse.rs
 description: "function migrationAgent() {\n    ch.register();\n    ch.set(\"bar\", 1);\n}\n"
 ---
-- - InFunction: migrationAgent
+- - InFunction:
+      - migrationAgent
+      - start: 1
+        end: 71
   - Params
-- - InFunction: migrationAgent
+- - InFunction:
+      - migrationAgent
+      - start: 1
+        end: 71
   - InCallExpression
   - Attribute: register
   - IdentifierReferredTo:
       - ch
       - false
-- - InFunction: migrationAgent
+- - InFunction:
+      - migrationAgent
+      - start: 1
+        end: 71
   - InCallExpression
   - Attribute: set
   - IdentifierReferredTo:
       - ch
       - false
   - Constant: bar
-- - InFunction: migrationAgent
+- - InFunction:
+      - migrationAgent
+      - start: 1
+        end: 71
