@@ -3,6 +3,7 @@ use petgraph::Direction;
 use std::collections::{HashMap, HashSet, VecDeque};
 use petgraph::prelude::StableGraph;
 use chidori_core::execution::execution::execution_graph::ExecutionNodeId;
+use chidori_core::uuid::Uuid;
 // Example structure tree:
 //
 // A
@@ -20,9 +21,23 @@ use chidori_core::execution::execution::execution_graph::ExecutionNodeId;
 pub fn group_tree(
     original_tree: &StableGraph<ExecutionNodeId, (), petgraph::Directed>,
     groups: &HashSet<ExecutionNodeId>,
-) -> (StableGraph<ExecutionNodeId, (), petgraph::Directed>, HashMap<ExecutionNodeId, StableGraph<ExecutionNodeId, (), petgraph::Directed>>) {
+) -> (
+    StableGraph<ExecutionNodeId, (), petgraph::Directed>,
+    HashMap<ExecutionNodeId, StableGraph<ExecutionNodeId, (), petgraph::Directed>>,
+    StableGraph<ExecutionNodeId, (), petgraph::Directed>,
+) {
     let mut modified_tree = StableGraph::new();
     let mut grouped_trees: HashMap<ExecutionNodeId, StableGraph<ExecutionNodeId, (), petgraph::Directed>> = HashMap::new();
+    let mut group_dependency_graph = StableGraph::new();
+
+    // Add Uuid::nil root node to group_dependency_graph
+    let root_node_id = chidori_core::uuid::Uuid::nil();
+    group_dependency_graph.add_node(root_node_id);
+
+    // Initialize group_dependency_graph with nodes from groups
+    for &group_id in groups {
+        group_dependency_graph.add_node(group_id);
+    }
 
     // Function to process a subtree
     fn process_subtree(
@@ -31,9 +46,39 @@ pub fn group_tree(
         groups: &HashSet<ExecutionNodeId>,
         current_graph: &mut StableGraph<ExecutionNodeId, (), petgraph::Directed>,
         grouped_trees: &mut HashMap<ExecutionNodeId, StableGraph<ExecutionNodeId, (), petgraph::Directed>>,
+        group_dependency_graph: &mut StableGraph<ExecutionNodeId, (), petgraph::Directed>,
+        parent_group: Option<ExecutionNodeId>,
     ) -> NodeIndex {
         let node_id = original_tree[node];
         let current_node = current_graph.add_node(node_id);
+
+
+        // If this node is a group and has a parent group, add an edge in the dependency graph
+        if groups.contains(&node_id) {
+            let parent_group_id = parent_group.unwrap_or(Uuid::nil());
+
+            // Ensure both nodes exist in the group_dependency_graph
+            if !group_dependency_graph.node_indices().any(|n| group_dependency_graph[n] == node_id) {
+                group_dependency_graph.add_node(node_id);
+            }
+            if !group_dependency_graph.node_indices().any(|n| group_dependency_graph[n] == parent_group_id) {
+                group_dependency_graph.add_node(parent_group_id);
+            }
+
+            // Find the indices of the nodes
+            let parent_index = group_dependency_graph.node_indices()
+                .find(|&n| group_dependency_graph[n] == parent_group_id)
+                .expect("Parent node should exist in group_dependency_graph");
+            let child_index = group_dependency_graph.node_indices()
+                .find(|&n| group_dependency_graph[n] == node_id)
+                .expect("Child node should exist in group_dependency_graph");
+
+            // Add edge if it doesn't exist
+            if !group_dependency_graph.edges_connecting(parent_index, child_index).next().is_some() {
+                group_dependency_graph.add_edge(parent_index, child_index, ());
+            }
+        }
+
 
         let mut queue = VecDeque::new();
         queue.push_back((node, current_node));
@@ -48,7 +93,7 @@ pub fn group_tree(
 
                     if !grouped_trees.contains_key(&child_id) {
                         let mut child_subgraph = StableGraph::new();
-                        process_subtree(child, original_tree, groups, &mut child_subgraph, grouped_trees);
+                        process_subtree(child, original_tree, groups, &mut child_subgraph, grouped_trees, group_dependency_graph, Some(node_id));
                         grouped_trees.insert(child_id, child_subgraph);
                     }
                 } else {
@@ -69,18 +114,19 @@ pub fn group_tree(
         if groups.contains(&root_id) {
             // If the root is a group, create a single-node modified tree
             modified_tree.add_node(root_id);
+            group_dependency_graph.add_node(root_id);
 
             // Create the subgraph for the root group
             let mut root_subgraph = StableGraph::new();
-            process_subtree(root, original_tree, groups, &mut root_subgraph, &mut grouped_trees);
+            process_subtree(root, original_tree, groups, &mut root_subgraph, &mut grouped_trees, &mut group_dependency_graph, None);
             grouped_trees.insert(root_id, root_subgraph);
         } else {
             // If the root is not a group, process the tree normally
-            process_subtree(root, original_tree, groups, &mut modified_tree, &mut grouped_trees);
+            process_subtree(root, original_tree, groups, &mut modified_tree, &mut grouped_trees, &mut group_dependency_graph, None);
         }
     }
 
-    (modified_tree, grouped_trees)
+    (modified_tree, grouped_trees, group_dependency_graph)
 }
 
 #[cfg(test)]
@@ -89,11 +135,11 @@ mod tests {
     use petgraph::graph::{Graph, NodeIndex};
     use petgraph::Direction;
     use std::collections::{HashMap, HashSet};
-    use uuid::{ExecutionNodeId, Uuid};
+    use uuid::{Uuid};
     use chidori_core::execution::execution::execution_graph::ExecutionNodeId;
 
     fn create_uuid() -> ExecutionNodeId {
-        Uuid::new_v4()
+        chidori_core::uuid::Uuid::new_v4()
     }
 
     fn assert_tree_structure(tree: &StableGraph<ExecutionNodeId, (), petgraph::Directed>, expected_edges: &[(ExecutionNodeId, ExecutionNodeId)]) {
@@ -103,6 +149,19 @@ mod tests {
                     .filter(|&n| tree[n] == *source)
                     .any(|n| tree.neighbors(n).any(|m| tree[m] == *target)),
                 "Edge from {:?} to {:?} not found",
+                source,
+                target
+            );
+        }
+    }
+
+    fn assert_dependency_graph(graph: &StableGraph<ExecutionNodeId, (), petgraph::Directed>, expected_edges: &[(ExecutionNodeId, ExecutionNodeId)]) {
+        for (source, target) in expected_edges {
+            assert!(
+                graph.node_indices()
+                    .filter(|&n| graph[n] == *source)
+                    .any(|n| graph.neighbors(n).any(|m| graph[m] == *target)),
+                "Dependency edge from {:?} to {:?} not found",
                 source,
                 target
             );
@@ -132,7 +191,7 @@ mod tests {
 
         let groups = vec![a].into_iter().collect();
 
-        let (modified_tree, grouped_trees) = group_tree(&original_tree, &groups);
+        let (modified_tree, grouped_trees, dependency_graph) = group_tree(&original_tree, &groups);
 
         assert_eq!(modified_tree.node_count(), 1);
         assert_eq!(modified_tree.edge_count(), 0);
@@ -145,6 +204,11 @@ mod tests {
         assert_eq!(a_tree.node_count(), 3);
         assert_eq!(a_tree.edge_count(), 2);
         assert_tree_structure(a_tree, &[(a, b), (a, c)]);
+
+        // Check dependency graph
+        assert_eq!(dependency_graph.node_count(), 3);
+        assert_eq!(dependency_graph.edge_count(), 1);
+        assert!(dependency_graph.node_weights().any(|&node| node == a));
     }
 
     #[test]
@@ -182,7 +246,7 @@ mod tests {
 
         let groups = vec![b, c].into_iter().collect();
 
-        let (modified_tree, grouped_trees) = group_tree(&original_tree, &groups);
+        let (modified_tree, grouped_trees, dependency_graph) = group_tree(&original_tree, &groups);
 
         assert_eq!(modified_tree.node_count(), 3);
         assert_eq!(modified_tree.edge_count(), 2);
@@ -201,6 +265,12 @@ mod tests {
         assert_eq!(c_tree.node_count(), 2);
         assert_eq!(c_tree.edge_count(), 1);
         assert_tree_structure(c_tree, &[(c, f)]);
+
+        // Check dependency graph
+        assert_eq!(dependency_graph.node_count(), 4);
+        assert_eq!(dependency_graph.edge_count(), 2);
+        assert!(dependency_graph.node_weights().any(|&node| node == b));
+        assert!(dependency_graph.node_weights().any(|&node| node == c));
     }
 
     #[test]
@@ -234,7 +304,7 @@ mod tests {
 
         let groups = vec![b].into_iter().collect();
 
-        let (modified_tree, grouped_trees) = group_tree(&original_tree, &groups);
+        let (modified_tree, grouped_trees, dependency_graph) = group_tree(&original_tree, &groups);
 
         assert_eq!(modified_tree.node_count(), 4);
         assert_eq!(modified_tree.edge_count(), 3);
@@ -247,6 +317,11 @@ mod tests {
         assert_eq!(b_tree.node_count(), 2);
         assert_eq!(b_tree.edge_count(), 1);
         assert_tree_structure(b_tree, &[(b, e)]);
+
+        // Check dependency graph
+        assert_eq!(dependency_graph.node_count(), 3);
+        assert_eq!(dependency_graph.edge_count(), 1);
+        assert!(dependency_graph.node_weights().any(|&node| node == b));
     }
 
     #[test]
@@ -296,7 +371,7 @@ mod tests {
 
         let groups = vec![a, c].into_iter().collect();
 
-        let (modified_tree, grouped_trees) = group_tree(&original_tree, &groups);
+        let (modified_tree, grouped_trees, dependency_graph) = group_tree(&original_tree, &groups);
 
         // Check the modified tree
         assert_eq!(modified_tree.node_count(), 1);
@@ -335,6 +410,11 @@ mod tests {
         // Verify that F is only in C's subgraph
         assert!(c_tree.node_weights().any(|&w| w == f), "F should be in C's subgraph");
         assert!(!a_tree.node_weights().any(|&w| w == f), "F should not be in A's subgraph");
+
+        // Check dependency graph
+        assert_eq!(dependency_graph.node_count(), 4);
+        assert_eq!(dependency_graph.edge_count(), 2);
+        assert_dependency_graph(&dependency_graph, &[(a, c)]);
     }
 }
 

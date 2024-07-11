@@ -10712,6 +10712,7 @@ dependencies = [
 [[package]]
 name = "rye"
 version = "0.32.0"
+source = "git+https://github.com/ThousandBirdsInc/rye?rev=b9b0f4ff12b2da35a70049e14f8a05c76caa2242#b9b0f4ff12b2da35a70049e14f8a05c76caa2242"
 dependencies = [
  "age",
  "anyhow",

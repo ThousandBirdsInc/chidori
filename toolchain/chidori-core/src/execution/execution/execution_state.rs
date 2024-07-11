@@ -234,7 +234,7 @@ async fn pause_future_with_oneshot(execution_state_evaluation: ExecutionStateEva
         println!("Continuing from oneshot signal");
         RkyvSerializedValue::Null
     };
-    sender.send((execution_state_evaluation, oneshot_sender)).await.expect("Failed to send oneshot signal");
+    sender.send((execution_state_evaluation, Some(oneshot_sender))).await.expect("Failed to send oneshot signal");
     Box::pin(future)
 }
 

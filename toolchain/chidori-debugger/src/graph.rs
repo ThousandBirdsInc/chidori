@@ -54,6 +54,7 @@ struct SelectedEntity {
 #[derive(Resource)]
 struct GraphResource {
     execution_graph: StableGraph<ExecutionNodeId, ()>,
+    group_dependency_graph: StableGraph<ExecutionNodeId, ()>,
     hash_graph: u64,
     node_ids: HashMap<ExecutionNodeId, NodeIndex>,
     grouped_nodes: HashMap<ExecutionNodeId, StableGraph<ExecutionNodeId, ()>>,
@@ -758,9 +759,6 @@ fn update_graph_system_renderer(
     }
     let window = q_window.single();
     let (_, camera, _) = q_camera.single();
-    let mut node_mapping: HashMap<NodeIndex, NonNull<crate::tidy_tree::Node>> = HashMap::new();
-    let mut tidy = TidyLayout::new(200., 200.);
-    let mut root = crate::tidy_tree::Node::new(0, 10., 10.);
 
 
     // For each subgraph group
@@ -787,34 +785,23 @@ fn update_graph_system_renderer(
     }
 
 
-
     // Construct the tidy_tree from a topo traversal of the graph
-    let mut topo = petgraph::visit::Topo::new(&graph_resource.execution_graph);
-    while let Some(x) = topo.next(&graph_resource.execution_graph) {
-        if let Some(node) = &graph_resource.execution_graph.node_weight(x) {
-            let mut width = 600.0;
-            let mut height = 300.0;
-            let tree_node = crate::tidy_tree::Node::new(x.index(), (width) as f64, (height) as f64);
-            let mut parents = &mut graph_resource
-                .execution_graph
-                .neighbors_directed(x, petgraph::Direction::Incoming);
-            // Only a single parent ever occurs
-            if let Some(parent) = &mut parents.next() {
-                if let Some(parent) = node_mapping.get_mut(parent) {
-                    unsafe {
-                        let parent = parent.as_mut();
-                        let node = parent.append_child(tree_node);
-                        node_mapping.insert(x, node);
-                    }
-                }
-            } else {
-                let node = root.append_child(tree_node);
-                node_mapping.insert(x, node);
-            }
-        }
+    let execution_graph = &graph_resource.execution_graph;
+    let grouped_nodes = &graph_resource.grouped_nodes;
+    let group_dep_graph = &graph_resource.group_dependency_graph;
+    let mut group_layouts = HashMap::new();
+    for (id, group_graph) in grouped_nodes {
+        let mut tidy = TidyLayout::new(200., 200.);
+        let mut root = crate::tidy_tree::Node::new(0, 10., 10.);
+        let node_mapping = generate_tree_layout(&mut tidy, &mut root, &group_graph);
+        group_layouts.insert(id, (tidy, root, node_mapping));
     }
 
-    tidy.layout(&mut root);
+    // TODO: traverse the group dep graph, allocating nodes
+
+    let mut tidy = TidyLayout::new(200., 200.);
+    let mut root = crate::tidy_tree::Node::new(0, 10., 10.);
+    let node_mapping = generate_tree_layout(&mut tidy, &mut root, &execution_graph);
 
     // Traverse the graph again, and render the elements of the graph based on their layout in the tidy_tree
     // This traverses the graph and then gets the position of the elements in the tree from their identity
@@ -843,9 +830,10 @@ fn update_graph_system_renderer(
                     let entity = node_id_to_entity.mapping.entry(idx).or_insert_with(|| {
                         // This is the texture that will be rendered to.
                         // TODO: needs to be greater than the bounds of the target (enforce this)
+                        let scale_factor = window.scale_factor();
                         let size = Extent3d {
-                            width: (width * window.scale_factor()) as u32,
-                            height: (height * window.scale_factor()) as u32,
+                            width: (width * scale_factor) as u32,
+                            height: (height * scale_factor) as u32,
                             depth_or_array_layers: 1,
                         };
                         let mut image = Image {
@@ -865,7 +853,6 @@ fn update_graph_system_renderer(
                         };
                         image.resize(size);
                         let image_handle = images.add(image);
-
                         let node_material = materials_custom.add(RoundedRectMaterial {
                             width: 1.0,
                             height: 1.0,
@@ -890,7 +877,7 @@ fn update_graph_system_renderer(
                             },
                             EguiRenderTarget {
                                 image: Some(image_handle),
-                                inner_scale_factor: window.scale_factor(),
+                                inner_scale_factor: scale_factor,
                                 ..default()
                             },
                             Sensor,
@@ -1065,6 +1052,48 @@ fn update_graph_system_renderer(
     }
 }
 
+fn generate_tree_layout(tidy: &mut TidyLayout, mut root: &mut crate::tidy_tree::Node, execution_graph: &&StableGraph<ExecutionNodeId, ()>) -> HashMap<NodeIndex, NonNull<crate::tidy_tree::Node>> {
+    let mut node_mapping: HashMap<NodeIndex, NonNull<crate::tidy_tree::Node>> = HashMap::new();
+    let mut topo = petgraph::visit::Topo::new(&execution_graph);
+    while let Some(x) = topo.next(&execution_graph) {
+        if let Some(node) = &execution_graph.node_weight(x) {
+            let mut width = 600.0;
+            let mut height = 300.0;
+            let tree_node = crate::tidy_tree::Node::new(x.index(), (width) as f64, (height) as f64);
+            let mut parents = &mut execution_graph
+                .neighbors_directed(x, petgraph::Direction::Incoming);
+            // Only a single parent ever occurs
+            if let Some(parent) = &mut parents.next() {
+                if let Some(parent) = node_mapping.get_mut(parent) {
+                    unsafe {
+                        let parent = parent.as_mut();
+                        let node = parent.append_child(tree_node);
+                        node_mapping.insert(x, node);
+                    }
+                }
+            } else {
+                let node = root.append_child(tree_node);
+                node_mapping.insert(x, node);
+            }
+        }
+    }
+
+    tidy.layout(&mut root);
+    let mut max_y: f32 = 0.0;
+    let mut max_x: f32 = 0.0;
+    let mut min_x: f32 = 0.0;
+    for node in node_mapping.values() {
+        unsafe {
+            let node = node.as_ref();
+            max_x = max_x.max(node.x.to_f32().unwrap());
+            min_x = min_x.min(node.x.to_f32().unwrap());
+            max_y = max_y.max(node.y.to_f32().unwrap());
+        }
+    }
+
+    node_mapping
+}
+
 fn update_graph_system_data_structures(
     mut graph_res: ResMut<GraphResource>,
     mut execution_graph: ResMut<ChidoriExecutionGraph>,
@@ -1085,10 +1114,11 @@ fn update_graph_system_data_structures(
         }
         graph_res.node_ids = node_ids;
 
-        let (dataset, grouped_tree) = group_tree(&dataset, &execution_graph.grouped_nodes);
+        let (grouped_dataset, grouped_tree, group_dep_graph) = group_tree(&dataset, &execution_graph.grouped_nodes);
 
-        graph_res.execution_graph = dataset;
+        graph_res.execution_graph = grouped_dataset;
         graph_res.grouped_nodes = grouped_tree;
+        graph_res.group_dependency_graph = group_dep_graph;
         graph_res.hash_graph = hash_graph(&execution_graph.execution_graph);
 
     }
@@ -1363,6 +1393,7 @@ fn graph_setup(
     commands.spawn((CursorWorldCoords(vec2(0.0, 0.0)), OnGraphScreen));
     commands.insert_resource(GraphResource {
         execution_graph: dataset,
+        group_dependency_graph: Default::default(),
         hash_graph: hash_graph(&execution_graph.execution_graph),
         node_ids,
         grouped_nodes: Default::default(),

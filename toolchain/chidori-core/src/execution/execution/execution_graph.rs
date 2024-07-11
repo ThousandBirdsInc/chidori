@@ -60,7 +60,7 @@ pub struct MergedStateHistory(pub HashMap<usize, (ExecutionNodeId, Arc<Operation
 //       steps we take within a given counter. but then those can nest even further.
 //
 
-pub type ExecutionGraphSendPayload = (ExecutionStateEvaluation, tokio::sync::oneshot::Sender<()>);
+pub type ExecutionGraphSendPayload = (ExecutionStateEvaluation, Option<tokio::sync::oneshot::Sender<()>>);
 
 pub type ExecutionGraphDiGraphSet = DiGraphMap<ExecutionNodeId, ExecutionStateEvaluation>;
 
@@ -172,16 +172,27 @@ impl ExecutionGraph {
                                 let mut execution_graph = execution_graph_clone.lock().unwrap();
                                 let mut state_id_to_state = state_id_to_state_clone.lock().unwrap();
                                 let s = resulting_execution_state.clone();
-                                if let ExecutionStateEvaluation::Complete(state) = resulting_execution_state {
-                                    println!("Adding to execution state!!!! {:?}", state.id);
-                                    let resulting_state_id = state.id;
-                                    state_id_to_state.deref_mut().insert(resulting_state_id.clone(), s.clone());
-                                    execution_graph.deref_mut()
-                                        .add_edge(state.parent_state_id, resulting_state_id.clone(), s);
+
+                                match resulting_execution_state {
+                                    ExecutionStateEvaluation::Error => {}
+                                    ExecutionStateEvaluation::EvalFailure => {}
+                                    ExecutionStateEvaluation::Complete(state) => {
+                                        println!("Adding to execution state!!!! {:?}", state.id);
+                                        let resulting_state_id = state.id;
+                                        state_id_to_state.deref_mut().insert(resulting_state_id.clone(), s.clone());
+                                        execution_graph.deref_mut()
+                                            .add_edge(state.parent_state_id, resulting_state_id.clone(), s);
+                                    }
+                                    ExecutionStateEvaluation::Executing(_) => {
+
+                                    }
                                 }
+
                                 // Resume execution
                                 // TODO: currently if this is not sent and the oneshot is dropped at the end of this, invocations will fail
-                                oneshot.send(()).unwrap();
+                                if let Some(oneshot) = oneshot {
+                                    oneshot.send(()).unwrap();
+                                }
                             },
                             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                                 // No messages available
