@@ -73,9 +73,12 @@ prototype development is `chidori-debugger` which wraps our runtime in a useful 
 ```bash
 xcode-select --install
 brew install cmake
-brew install protobuf # We're working on eliminating this dependency
-brew install libiconv # We're investigating if this is necessary or can be removed
+# We are working on eliminating this dependency
+brew install protobuf 
+ # We are investigating if this is necessary or can be removed
+brew install libiconv
 brew install python@3.11
+brew install uv
 cargo install chidori-debugger
 ```
 

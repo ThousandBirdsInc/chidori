@@ -3,22 +3,30 @@ source: chidori-core/src/sdk/md.rs
 expression: v
 ---
 - Code:
-    name: ~
-    language: PyO3
-    source_code: "async def add_two(x):\n    return x + 2"
-    function_invocation: ~
+    - name: ~
+      language: PyO3
+      source_code: "async def add_two(x):\n    return x + 2"
+      function_invocation: ~
+    - start: 237
+      end: 283
 - Code:
-    name: ~
-    language: Deno
-    source_code: "import { assertEquals } from \"https://deno.land/std@0.221.0/assert/mod.ts\";\n\nDeno.test(\"async addition test\", async () => {\n    assertEquals(await add_two(2), 4);\n});"
-    function_invocation: ~
+    - name: ~
+      language: Deno
+      source_code: "import { assertEquals } from \"https://deno.land/std@0.221.0/assert/mod.ts\";\n\nDeno.test(\"async addition test\", async () => {\n    assertEquals(await add_two(2), 4);\n});"
+      function_invocation: ~
+    - start: 291
+      end: 469
 - Code:
-    name: ~
-    language: Deno
-    source_code: "async function addTwo(x) {\n    return x + 2;\n}"
-    function_invocation: ~
+    - name: ~
+      language: Deno
+      source_code: "async function addTwo(x) {\n    return x + 2;\n}"
+      function_invocation: ~
+    - start: 553
+      end: 611
 - Code:
-    name: ~
-    language: PyO3
-    source_code: "import unittest\n\nclass TestMarshalledValues(unittest.TestCase):\n    async def test_addTwo(self):\n        self.assertEqual(await addTwo(2), 4)\n\nunittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))"
-    function_invocation: ~
+    - name: ~
+      language: PyO3
+      source_code: "import unittest\n\nclass TestMarshalledValues(unittest.TestCase):\n    async def test_asyncAddTwo(self):\n        self.assertEqual(await addTwo(2), 4)\n\nunittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))"
+      function_invocation: ~
+    - start: 619
+      end: 871

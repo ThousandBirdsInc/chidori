@@ -537,7 +537,7 @@ mod test {
                             return 100 + await demo_second_function_call()
                         "#}),
             function_invocation: None,
-        }, TextRange::default()), Some(0))?;
+        }, TextRange::default()), None)?;
         let (mut state, _) = state.update_op(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,
@@ -546,7 +546,7 @@ mod test {
                             return a + b + c + d
                         "#}),
             function_invocation: None,
-        }, TextRange::default()), Some(0))?;
+        }, TextRange::default()), None)?;
 
         insta::with_settings!({
             omit_expression => true

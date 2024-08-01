@@ -13,6 +13,7 @@ use tracing::{Level, span};
 use uuid::Uuid;
 use crate::cells::{CellTypes, CodeCell, SupportedLanguage, TextRange};
 use crate::execution::execution::execution_graph::ExecutionNodeId;
+use crate::execution::execution::execution_state::OperationInputs;
 use crate::execution::execution::ExecutionState;
 
 
@@ -49,7 +50,7 @@ impl InputSignature {
 
     pub fn from_args_list(args: Vec<&str>) -> Self {
         let mut args_map = HashMap::new();
-        for (i, arg) in args.iter().enumerate() {
+        for (i, _) in args.iter().enumerate() {
             args_map.insert(format!("{}", i), InputItemConfiguration::default());
         }
         Self {
@@ -66,12 +67,13 @@ impl InputSignature {
     #[tracing::instrument]
     pub fn check_input_against_signature(
         &self,
-        args: &HashMap<String, RkyvSerializedValue>,
-        kwargs: &HashMap<String, RkyvSerializedValue>,
-        globals: &HashMap<String, RkyvSerializedValue>,
-        functions: &HashMap<String, RkyvSerializedValue>,
+        inputs: &OperationInputs,
     ) -> bool {
         let mut missing_keys = HashSet::new();
+        let args = &inputs.args;
+        let kwargs = &inputs.kwargs;
+        let globals = &inputs.globals;
+        let functions = &inputs.functions;
 
         // Validate args
         for (key, config) in &self.args {
@@ -108,10 +110,11 @@ impl InputSignature {
     #[tracing::instrument]
     pub fn prepopulate_defaults(
         &self,
-        args: &mut HashMap<String, RkyvSerializedValue>,
-        kwargs: &mut HashMap<String, RkyvSerializedValue>,
-        globals: &mut HashMap<String, RkyvSerializedValue>,
+        inputs: &mut OperationInputs,
     ) {
+        let mut args = &mut inputs.args;
+        let mut kwargs = &mut inputs.kwargs;
+        let mut globals = &mut inputs.globals;
         // Prepopulate args defaults
         for (key, config) in &self.args {
             if let Some(default) = &config.default {
@@ -138,7 +141,7 @@ impl InputSignature {
 }
 
 #[derive(Debug)]
-enum TriggerConfiguration {
+pub enum TriggerConfiguration {
     OnChange,
     OnEvent,
     Manual,

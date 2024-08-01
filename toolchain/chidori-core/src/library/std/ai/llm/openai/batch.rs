@@ -45,6 +45,7 @@ impl ChatModelBatch for OpenAIChatModel {
         let req = Self::chat_completion_req_to_openai_req(&chat_completion_req);
         self.client
             .chat_completion(req)
+            .await
             .map(|res| {
                 ChatCompletionRes {
                 id: res.id,
@@ -87,7 +88,7 @@ impl ChatModelBatch for OpenAIChatModel {
                     total_tokens: res.usage.total_tokens,
                 },
             }})
-            .map_err(|e| e.message)
+            .map_err(|e| e.to_string())
     }
 }
 

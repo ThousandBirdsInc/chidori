@@ -3,6 +3,7 @@ use crate::execution::primitives::operation::{InputSignature, OperationFnOutput,
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue};
 use im::{HashMap as ImHashMap, HashSet as ImHashSet};
 
+use indexmap::set::IndexSet;
 use indoc::indoc;
 use petgraph::dot::Dot;
 use petgraph::graphmap::DiGraphMap;
@@ -13,7 +14,7 @@ use std::fmt::{Debug, Formatter};
 use std::ops::{Deref};
 use std::sync::{Arc, mpsc};
 // use std::sync::{Mutex};
-use no_deadlocks::Mutex;
+use no_deadlocks::{Mutex, MutexGuard};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -24,6 +25,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 use futures_util::FutureExt;
+use log::info;
+use sha1::digest::typenum::op;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot::error::TryRecvError;
 use uuid::Uuid;
@@ -134,7 +137,7 @@ pub struct ExecutionState {
     pub stack: VecDeque<ExecutionNodeId>,
     pub parent_state_id: ExecutionNodeId,
 
-    pub chat_message_queue_head: usize,
+    pub external_event_queue_head: usize,
 
     pub evaluating_id: usize,
     pub evaluating_name: Option<String>,
@@ -150,9 +153,6 @@ pub struct ExecutionState {
     /// Queue of operations to evaluate
     pub exec_queue: VecDeque<usize>,
 
-    /// State values that we've marked to resolve as consumed, clearing the state
-    pub marked_for_consumption: HashSet<usize>,
-
     // TODO: call_stack is only ever a single coroutine at a time and instead its the stack of execution states being resolved?
     // pub call_stack: Arc<Mutex<Pin<Box<dyn Coroutine<Return=CoroutineYieldValue, Yield=CoroutineYieldValue>>>>>,
 
@@ -160,7 +160,7 @@ pub struct ExecutionState {
     pub state: ImHashMap<usize, Arc<OperationFnOutput>>,
 
     /// Values that were introduced specifically by this state being evaluated, used to identity most recent changes
-    pub fresh_values: HashSet<usize>,
+    pub fresh_values: IndexSet<usize>,
 
     /// Map of name of operation -> operation_id
     pub operation_name_to_id: ImHashMap<String, OperationId>,
@@ -180,13 +180,17 @@ pub struct ExecutionState {
     /// Dependency graph of the computable elements in the graph
     ///
     /// The dependency graph is a directed graph where the nodes are the ids of the operations and the
-    /// weights are the index of the input of the next operation.
+    /// weights are the index of the input of the next operation. This is represented as the Key
+    /// is the Operation that is consuming from the Operations indicated by the Value.
     ///
     /// The usize::MAX index is a no-op that indicates that the operation is ready to run, an execution
     /// order dependency rather than a value dependency.
-    dependency_map: ImHashMap<OperationId, HashSet<(OperationId, DependencyReference)>>,
+    dependency_map: ImHashMap<OperationId, IndexSet<(OperationId, DependencyReference)>>,
+
+    value_freshness_map: ImHashMap<OperationId, usize>,
 
     execution_event_sender: Option<mpsc::Sender<OperationExecutionStatus>>,
+    pub exec_counter: usize,
 }
 
 impl std::fmt::Debug for ExecutionState {
@@ -241,6 +245,7 @@ async fn pause_future_with_oneshot(execution_state_evaluation: ExecutionStateEva
 impl Default for ExecutionState {
     fn default() -> Self {
         ExecutionState {
+            exec_counter: 0,
             id: Uuid::new_v4(),
             stack: Default::default(),
             parent_state_id: Uuid::nil(),
@@ -252,7 +257,6 @@ impl Default for ExecutionState {
             operation_mutation: None,
             graph_sender: None,
             exec_queue: VecDeque::new(),
-            marked_for_consumption: HashSet::new(),
             state: Default::default(),
             fresh_values: Default::default(),
             operation_name_to_id: Default::default(),
@@ -260,9 +264,39 @@ impl Default for ExecutionState {
             function_name_to_metadata: Default::default(),
             has_been_set: Default::default(),
             dependency_map: Default::default(),
+            value_freshness_map: Default::default(),
             execution_event_sender: None,
-            chat_message_queue_head: 0,
+            external_event_queue_head: 0,
         }
+    }
+}
+
+// New struct to encapsulate operation inputs
+#[derive(Debug, Clone)]
+pub struct OperationInputs {
+    pub(crate) args: HashMap<String, RkyvSerializedValue>,
+    pub(crate) kwargs: HashMap<String, RkyvSerializedValue>,
+    pub(crate) globals: HashMap<String, RkyvSerializedValue>,
+    pub(crate) functions: HashMap<String, RkyvSerializedValue>,
+}
+
+impl OperationInputs {
+    fn new() -> Self {
+        Self {
+            args: HashMap::new(),
+            kwargs: HashMap::new(),
+            globals: HashMap::new(),
+            functions: HashMap::new(),
+        }
+    }
+
+    fn to_serialized_value(&self) -> RkyvSerializedValue {
+        RkyvSerializedValue::Object(HashMap::from_iter(vec![
+            ("args".to_string(), RkyvSerializedValue::Object(self.args.clone())),
+            ("kwargs".to_string(), RkyvSerializedValue::Object(self.kwargs.clone())),
+            ("globals".to_string(), RkyvSerializedValue::Object(self.globals.clone())),
+            ("functions".to_string(), RkyvSerializedValue::Object(self.functions.clone())),
+        ]))
     }
 }
 
@@ -285,8 +319,9 @@ impl ExecutionState {
     pub fn clone_with_new_id(&self) -> Self {
         let mut new = self.clone();
         new.parent_state_id = new.id;
-        new.fresh_values = HashSet::new();
+        new.fresh_values = IndexSet::new();
         new.id = Uuid::new_v4();
+        new.exec_counter += 1;
         new
     }
 
@@ -304,13 +339,6 @@ impl ExecutionState {
 
     pub fn check_if_previously_set(&self, operation_id: &OperationId) -> bool {
         self.has_been_set.contains(operation_id)
-    }
-
-    #[tracing::instrument]
-    pub fn state_consume_marked(&mut self, marked_for_consumption: &HashSet<usize>) {
-        for key in marked_for_consumption.iter() {
-            self.state.remove(key);
-        }
     }
 
     #[tracing::instrument]
@@ -511,17 +539,19 @@ impl ExecutionState {
                     operation_id,
                     depends_on,
                 } => {
+                    s.value_freshness_map.insert(operation_id, 0);
                     if let Some(e) = s.dependency_map.get_mut(&operation_id) {
                         e.clear();
                         e.extend(depends_on.into_iter());
                     } else {
                         s.dependency_map
                             .entry(operation_id)
-                            .or_insert(HashSet::from_iter(depends_on.into_iter()));
+                            .or_insert(IndexSet::from_iter(depends_on.into_iter()));
                     }
                 }
                 DependencyGraphMutation::Delete { operation_id } => {
-                    s.dependency_map.remove(&operation_id);
+                    s.value_freshness_map.remove(&operation_id);
+                    s.dependency_map.remove(&operation_id) ;
                 }
             }
         }
@@ -530,20 +560,24 @@ impl ExecutionState {
 
     #[tracing::instrument]
     fn update_callable_functions(&mut self) {
-        for (id, op) in &self.operation_by_id {
-            if let Ok(mut op_node) = op.try_lock() {
-                for (function_name, function_config) in &op_node.signature.output_signature.functions {
-                    self.function_name_to_metadata.insert(function_name.clone(), FunctionMetadata {
-                        operation_id: id.clone(),
-                        input_signature: if let OutputItemConfiguration::Function{ input_signature, .. } = function_config {
-                            input_signature.clone()
-                        } else {
-                            InputSignature::new()
-                        }
-                    });
-                }
-            }
+        // Ensure no stale data exists
+        self.function_name_to_metadata.clear();
 
+        for (id, op) in &self.operation_by_id {
+            let Ok(op_node) = op.try_lock() else { continue };
+            self.function_name_to_metadata.extend(
+                op_node.signature.output_signature.functions.iter().map(|(name, config)| {
+                    let input_signature = match config {
+                        OutputItemConfiguration::Function { input_signature, .. } => input_signature.clone(),
+                        _ => InputSignature::new(),
+                    };
+
+                    (name.clone(), FunctionMetadata {
+                        operation_id: id.clone(),
+                        input_signature,
+                    })
+                })
+            );
         }
     }
 
@@ -629,220 +663,198 @@ impl ExecutionState {
         Ok((result.output, after_execution_state))
     }
 
-    // TODO: extend this with an "event", steps can occur as events are flushed based on a previous state we were in
+    fn get_operation_node(&self, operation_id: OperationId) -> anyhow::Result<MutexGuard<OperationNode>> {
+        self.operation_by_id
+            .get(&operation_id)
+            .ok_or_else(|| anyhow::anyhow!("Operation not found"))?
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock operation node"))
+    }
+
+    fn update_state(
+        &self,
+        new_state: &mut ExecutionState,
+        next_operation_id: OperationId,
+        result: OperationFnOutput,
+    ) {
+        if let Some(s) = &result.execution_state {
+            *new_state = s.clone();
+        }
+        new_state.fresh_values.insert(next_operation_id);
+        new_state.state_insert(next_operation_id, result);
+        new_state.value_freshness_map.insert(next_operation_id, self.exec_counter);
+    }
+
+    async fn execute_operation(
+        &self,
+        new_state: &mut ExecutionState,
+        mut op_node: MutexGuard<'_, OperationNode>,
+        next_operation_id: OperationId,
+        inputs: OperationInputs,
+    ) -> anyhow::Result<OperationFnOutput> {
+        let argument_payload = inputs.to_serialized_value();
+
+        new_state.evaluating_fn = None;
+        new_state.evaluating_id = next_operation_id;
+        new_state.evaluating_name = op_node.name.clone();
+
+        op_node.execute(new_state, argument_payload, None, None).await
+    }
+
+    fn prepare_operation_inputs(
+        &self,
+        signature: &InputSignature,
+        operation_id: OperationId,
+        dependency_graph: DiGraphMap<OperationId, Vec<DependencyReference>>,
+    ) -> anyhow::Result<OperationInputs> {
+        let mut inputs = OperationInputs::new();
+
+        signature.prepopulate_defaults(&mut inputs);
+
+        for (from, _, argument_indices) in dependency_graph.edges_directed(operation_id, Direction::Incoming) {
+            if let Some(output) = self.state_get(&from) {
+                let output_value = &output.output;
+
+                for argument_index in argument_indices {
+                    match argument_index {
+                        DependencyReference::Positional(pos) => {
+                            inputs.args.insert(pos.to_string(), output_value.clone());
+                        }
+                        DependencyReference::Keyword(kw) => {
+                            inputs.kwargs.insert(kw.clone(), output_value.clone());
+                        }
+                        DependencyReference::Global(name) => {
+                            if let RkyvSerializedValue::Object(value) = &output.output {
+                                inputs.globals.insert(name.clone(), value.get(name).ok_or_else(|| anyhow::anyhow!("Expected value with name: {:?} to be available", name))?.clone());
+                            }
+                        }
+                        DependencyReference::FunctionInvocation(name) => {
+                            let op = self.operation_by_id.get(&from).ok_or_else(|| anyhow::anyhow!("Operation must exist"))?.lock().map_err(|_| anyhow::anyhow!("Failed to lock operation"))?;
+                            inputs.functions.insert(name.clone(), RkyvSerializedValue::Cell(op.cell.clone()));
+                        }
+                        DependencyReference::Ordering => {}
+                    }
+                }
+                ();
+            }
+        }
+
+        Ok(inputs)
+    }
+
+
+    fn process_next_operation(
+        &self,
+        exec_queue: &mut VecDeque<OperationId>,
+    ) -> anyhow::Result<Option<(MutexGuard<OperationNode>, OperationId, OperationInputs)>> {
+        let next_operation_id = match exec_queue.pop_front() {
+            Some(id) => id,
+            None => {
+                // Continue to loop after refreshing the queue
+                return Ok(None);
+            }
+        };
+
+        let mut op_node = self.get_operation_node(next_operation_id)?;
+        let signature = &op_node.signature.input_signature;
+
+        // If the signature has no dependencies and the operation has been run once, skip it.
+        if signature.is_empty() {
+            if self.check_if_previously_set(&next_operation_id) {
+                println!("Zero dep operation already set, continuing");
+                return Ok(None)
+            }
+        }
+
+
+        let dependency_graph = self.get_dependency_graph();
+
+        // If none of the inputs are more fresh than our own operation freshness, skip this node
+        // TODO: order appears to matter here, and it shouldn't
+        if !signature.is_empty() {
+            let our_freshness = self.value_freshness_map.get(&next_operation_id).copied().unwrap_or(0);
+            dbg!((&next_operation_id, &our_freshness));
+            dbg!(signature);
+            let any_more_fresh = dependency_graph
+                .edges_directed(next_operation_id, Direction::Incoming)
+                .any(|(from, _, _)| {
+                    let their_freshness = self.value_freshness_map.get(&from).copied().unwrap_or(0);
+                    dbg!((from, their_freshness));
+                    their_freshness >= our_freshness
+                });
+            if !any_more_fresh {
+                println!("None more fresh, continuing");
+                return Ok(None);
+            }
+        }
+
+        let inputs = self.prepare_operation_inputs(signature, next_operation_id, dependency_graph)?;
+
+        if !signature.check_input_against_signature(&inputs) {
+            println!("Signature validation failed continuing");
+            return Ok(None);
+        }
+
+        Ok(Some((op_node, next_operation_id, inputs)))
+    }
+
+    fn initialize_new_state(&self) -> ExecutionState {
+        let mut new_state = self.clone_with_new_id();
+        new_state.operation_mutation = None;
+        new_state
+    }
+
+
     #[tracing::instrument]
     pub async fn step_execution(
         &self,
         sender: &tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>
     ) -> anyhow::Result<(ExecutionStateEvaluation, Vec<(usize, OperationFnOutput)>)> {
-        let previous_state = self;
-        let mut new_state = previous_state.clone_with_new_id();
-        new_state.operation_mutation = None;
-        let mut operation_by_id = previous_state.operation_by_id.clone();
-        let dependency_graph = previous_state.get_dependency_graph();
-        let mut marked_for_consumption = self.marked_for_consumption.clone();
-
+        let mut new_state = self.initialize_new_state();
         let mut outputs = vec![];
-
-        // We handle a sorted queue of operations to evaluate, giving a deterministic order
-        // to how our operations and run, and executing only a single operation each tick.
-        // We churn through the queue in this ordering until we have a valid node to evaluate.
         let mut exec_queue = self.exec_queue.clone();
-        let (
-            op_node,
-            next_operation_id,
-            args,
-            kwargs,
-            globals,
-            functions
-        ) = 'traverse_nodes: loop {
-            println!("Looping step execution, traverse nodes {:?}", &exec_queue);
 
-            let next_operation_id = if let Some(next_operation_id) = exec_queue.pop_front() {
-                next_operation_id
-            } else {
-                // if all operations have been evaluated during this step_execution and none progressed
-                // to execution, consume all marked values, complete the execution state with empty output.
-                new_state.state_consume_marked(&marked_for_consumption);
-                let mut operation_ids: Vec<OperationId> = operation_by_id.keys().copied().collect();
-                operation_ids.sort();
-                exec_queue.extend(operation_ids.iter());
-                new_state.exec_queue = exec_queue;
-                // continue;
-                // TODO: don't return
-                return Ok((ExecutionStateEvaluation::Complete(new_state), outputs));
-            };
-            println!("Looping step execution, traverse nodes {:?}", next_operation_id);
-
-            // We skip nodes that are currently locked due to long running execution
-            // TODO: we can regenerate async nodes if necessary by creating them from their original cells
-            let mut op_node = operation_by_id
-                .get_mut(&next_operation_id)
-                .unwrap()
-                .lock()
-                .unwrap();
-
-            println!("============================================================");
-            println!("Evaluating operation {}: {:?}", next_operation_id, op_node.name);
-            // TODO: add to the execution state the id and name of the executed operation (and function name)
-
-            let signature = &op_node.signature.input_signature;
-
-            let mut args = HashMap::new();
-            let mut kwargs = HashMap::new();
-            let mut globals = HashMap::new();
-            let mut functions = HashMap::new();
-            signature.prepopulate_defaults(&mut args, &mut kwargs, &mut globals);
-
-            // TODO: state should contain an event queue as well as the stateful globals
-
-            // Ops with 0 deps should only execute once, by do execute by default
-            if signature.is_empty() {
-                if previous_state.check_if_previously_set(&next_operation_id) {
-                    // TODO: don't continue if we've visited the whole set
-                    continue 'traverse_nodes;
+        // TODO: if none are fresh we loop infinitely right now
+        //       when nothing is fresh nd we've visited every available node we should break the loop
+        loop {
+            println!("looping {:?}", self.exec_queue);
+            match self.process_next_operation(&mut exec_queue) {
+                Ok(Some((op_node, next_operation_id, inputs))) => {
+                    let result = self.execute_operation(
+                        &mut new_state,
+                        op_node,
+                        next_operation_id,
+                        inputs,
+                    ).await?;
+                    outputs.push((next_operation_id, result.clone()));
+                    self.update_state(&mut new_state, next_operation_id, result);
+                    new_state.exec_queue = exec_queue;
+                    return Ok((ExecutionStateEvaluation::Complete(new_state), outputs));
                 }
-            }
-
-            // Fetch the values from the previous execution cycle for each edge on this node
-            for (from, _to, argument_indices) in
-            dependency_graph.edges_directed(next_operation_id, Direction::Incoming)
-            {
-                println!("Argument indices: {:?}", argument_indices);
-                // TODO: we don't need a value from previous state for function invocation dependencies
-                if let Some(output) = previous_state.state_get(&from) {
-                    let output_value = &output.output;
-                    marked_for_consumption.insert(from.clone());
-
-                    // TODO: we can implement prioritization between different values here
-                    for argument_index in argument_indices {
-                        match argument_index {
-                            DependencyReference::Positional(pos) => {
-                                args.insert(format!("{}", pos), output_value.clone());
-                            }
-                            DependencyReference::Keyword(kw) => {
-                                kwargs.insert(kw.clone(), output_value.clone());
-                            }
-                            DependencyReference::Global(name) => {
-                                if let RkyvSerializedValue::Object(value) = &output.output {
-                                    dbg!(&value);
-                                    globals.insert(name.clone(), value.get(name).expect(&format!("Expected value with name: {:?} to be available", name)).clone());
-                                }
-                            }
-                            DependencyReference::FunctionInvocation(name) => {
-                                let op = self
-                                    .operation_by_id
-                                    .get(&from)
-                                    .expect("Operation must exist")
-                                    .lock()
-                                    .unwrap();
-                                functions.insert(
-                                    name.clone(),
-                                    RkyvSerializedValue::Cell(op.cell.clone()),
-                                );
-                            }
-                            // if the dependency is of Ordering type, then this is an execution order dependency
-                            DependencyReference::Ordering => {
-                                // TODO: enforce that dependency executes if it has only an ordering dependence
-                            }
-                        }
+                Ok(None) => {
+                    // There was no operation to evaluate, if the queue is empty reload it, but stop execution until we call step again
+                    if exec_queue.is_empty() {
+                        let mut operation_ids: Vec<OperationId> = self.operation_by_id.keys().copied().collect();
+                        operation_ids.sort();
+                        exec_queue.extend(operation_ids.iter());
+                        new_state.exec_queue = exec_queue;
+                        return Ok((ExecutionStateEvaluation::Complete(new_state), outputs));
+                    } else {
+                        continue;
                     }
                 }
+                Err(e) => return Err(e),
             }
-
-            // Some of the required arguments are not yet available, continue to the next node
-            if !signature.check_input_against_signature(&args, &kwargs, &globals, &functions) {
-                continue 'traverse_nodes;
-            }
-
-            break (
-                op_node,
-                next_operation_id,
-                args,
-                kwargs,
-                globals,
-                functions
-            );
-        };
-        new_state.exec_queue = exec_queue;
-
-        // TODO: all functions that are referred to that we know are not yet defined are populated with a shim,
-        //       that shim goes to our lookup based on our function invocation dependencies.
-
-        // Construct the arguments for the given operation
-        let argument_payload: RkyvSerializedValue = RkyvSerializedValue::Object(HashMap::from_iter(vec![
-            ("args".to_string(), RkyvSerializedValue::Object(args)),
-            ("kwargs".to_string(), RkyvSerializedValue::Object(kwargs)),
-            ("globals".to_string(), RkyvSerializedValue::Object(globals)),
-            (
-                "functions".to_string(),
-                RkyvSerializedValue::Object(functions),
-            ),
-        ]));
-
-        // Execute the operation
-        // TODO: support async/parallel execution
-        println!("Executing node {} ({:?}) with payload {:?}", next_operation_id, op_node.name, argument_payload);
-        new_state.evaluating_fn = None;
-        new_state.evaluating_id = next_operation_id;
-        new_state.evaluating_name = op_node.name.clone();
-        let op_node_execute = op_node.execute(&new_state, argument_payload, None, None);
-        if op_node.is_long_running_background_thread {
-            let sender_clone = sender.clone();
-            let (oneshot_sender, oneshot_receiver) = tokio::sync::oneshot::channel();
-
-            // Run the target long running function in a background thread
-            tokio::spawn(async move {
-                // This is another thread that handles annotating these events with additional metadata (operationId)
-                // let (internal_sender, internal_receiver) = mpsc::channel();
-                // std::thread::spawn(move || {
-                //     loop {
-                //         match internal_receiver.try_recv() {
-                //             Ok((execution_state, continue_oneshot)) => {
-                //             // Ok((prev_execution_id, value)) => {
-                //                 // sender_clone.send((prev_execution_id, next_operation_id, value)).unwrap();
-                //             },
-                //             Err(mpsc::TryRecvError::Empty) => {
-                //                 // No messages available, take this time to sleep a bit
-                //                 std::thread::sleep(Duration::from_millis(10)); // Sleep for 10 milliseconds
-                //             },
-                //             Err(mpsc::TryRecvError::Disconnected) => {
-                //                 // Handle the case where the sender has disconnected and no more messages will be received
-                //                 break; // or handle it according to your application logic
-                //             },
-                //         }
-                //     }
-                // });
-
-                // Long-running execution
-                dbg!("Long-running execution");
-                let _ = op_node_execute.await;
-                dbg!("Completed");
-                let _ = oneshot_sender.send(());
-            });
-            oneshot_receiver.await.expect("Failed to receive oneshot signal");
-            // outputs.push((operation_id, result.clone()));
-            // new_state.state_insert(operation_id, result);
-        } else {
-            let result = op_node_execute.await?;
-            println!("Executed node {} with result {:?}", next_operation_id, &result);
-            outputs.push((next_operation_id, result.clone()));
-            new_state.fresh_values.insert(next_operation_id);
-
-            // TODO: support overriding execution state entirely
-            if let Some(s) = &result.execution_state {
-                new_state = s.clone();
-            }
-            new_state.state_insert(next_operation_id, result);
         }
-        new_state.marked_for_consumption = marked_for_consumption;
-        Ok((ExecutionStateEvaluation::Complete(new_state), outputs))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cells::{CellTypes, SupportedLanguage, TextRange};
+    use crate::cells::CodeCell;
+    use crate::execution::primitives::operation::{InputItemConfiguration, InputType, OutputSignature, Signature, TriggerConfiguration};
 
     #[test]
     fn test_state_insert_and_get_value() {
@@ -875,7 +887,7 @@ mod tests {
         exec_state = exec_state.apply_dependency_graph_mutations(vec![mutation]);
         assert_eq!(
             exec_state.dependency_map.get(&operation_id),
-            Some(&HashSet::from_iter(depends_on.into_iter()))
+            Some(&IndexSet::from_iter(depends_on.into_iter()))
         );
     }
 
@@ -908,6 +920,161 @@ mod tests {
             depends_on,
         };
         exec_state = exec_state.apply_dependency_graph_mutations(vec![create_mutation]);
+    }
+
+    #[test]
+    fn test_clone_with_new_id() {
+        let original = ExecutionState::new_with_random_id();
+        let cloned = original.clone_with_new_id();
+
+        assert_ne!(original.id, cloned.id);
+        assert_eq!(original.id, cloned.parent_state_id);
+        assert_eq!(original.exec_counter + 1, cloned.exec_counter);
+        assert!(cloned.fresh_values.is_empty());
+    }
+
+    #[test]
+    fn test_update_op() {
+        let state = ExecutionState::new_with_random_id();
+        let cell = CellTypes::Code(CodeCell {
+            name: Some(String::from("a")),
+            language: SupportedLanguage::PyO3,
+            source_code: String::from("y = x + 1"),
+            function_invocation: None,
+        }, Default::default());
+        
+        let (new_state, op_id) = state.update_op(cell.clone(), None).unwrap();
+        
+        assert!(new_state.operation_by_id.contains_key(&op_id));
+        assert_eq!(new_state.operation_mutation, Some(cell));
+    }
+
+    #[test]
+    fn test_upsert_operation() {
+        let state = ExecutionState::new_with_random_id();
+        let op_node = OperationNode::default();
+        
+        let (op_id, new_state) = state.upsert_operation(op_node, None);
+        
+        assert!(new_state.operation_by_id.contains_key(&op_id));
+        assert_eq!(new_state.op_counter, state.op_counter + 1);
+        assert!(new_state.exec_queue.contains(&op_id));
+    }
+
+    #[test]
+    fn test_apply_dependency_graph_mutations() {
+        let state = ExecutionState::new_with_random_id();
+        let mutations = vec![
+            DependencyGraphMutation::Create {
+                operation_id: 1,
+                depends_on: vec![(2, DependencyReference::Positional(0))],
+            },
+            DependencyGraphMutation::Create {
+                operation_id: 2,
+                depends_on: vec![(3, DependencyReference::Global("x".to_string()))],
+            },
+            DependencyGraphMutation::Create {
+                operation_id: 3,
+                depends_on: vec![],
+            },
+        ];
+        
+        let new_state = state.apply_dependency_graph_mutations(mutations);
+        
+        assert!(new_state.dependency_map.contains_key(&1));
+        assert!(new_state.dependency_map.contains_key(&2));
+        assert!(new_state.value_freshness_map.contains_key(&2));
+        assert!(new_state.value_freshness_map.contains_key(&3));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch() {
+        let mut state = ExecutionState::new_with_random_id();
+        let mut op_node = OperationNode::default();
+        op_node.cell = CellTypes::Code(CodeCell {
+            name: None,
+            language: SupportedLanguage::PyO3,
+            source_code: "def test_fn(): return 2".to_string(),
+            function_invocation: None,
+        }, TextRange::default());
+
+        let (op_id, mut new_state) = state.upsert_operation(op_node, None);
+        
+        new_state.function_name_to_metadata.insert("test_fn".to_string(), FunctionMetadata {
+            operation_id: op_id,
+            input_signature: InputSignature::new(),
+        });
+        
+        let payload = RkyvSerializedValue::Null;
+        let (result, _) = new_state.dispatch("test_fn", payload, None).await.unwrap();
+        
+        assert_eq!(result, RkyvSerializedValue::Number(2));
+    }
+
+    #[test]
+    fn test_get_dependency_graph() {
+        let mut state = ExecutionState::new_with_random_id();
+        state.dependency_map.insert(1, IndexSet::from_iter(vec![(2, DependencyReference::Positional(0))]));
+        state.dependency_map.insert(2, IndexSet::from_iter(vec![(3, DependencyReference::Global("x".to_string()))]));
+        
+        let graph = state.get_dependency_graph();
+        
+        assert!(graph.contains_edge(2, 1));
+        assert!(graph.contains_edge(3, 2));
+    }
+
+    #[test]
+    fn test_input_signature_check() {
+        let mut exec_state = ExecutionState::new_with_random_id();
+        
+        // Create an operation with a specific input signature
+        let mut op = OperationNode::default();
+        op.signature = Signature {
+            trigger_on: TriggerConfiguration::OnChange,
+            input_signature: InputSignature {
+                args: HashMap::from([("0".to_string(), InputItemConfiguration {
+                    ty: Some(InputType::String),
+                    default: None,
+                })]),
+                kwargs: HashMap::from([("kwarg1".to_string(), InputItemConfiguration {
+                    ty: Some(InputType::String),
+                    default: None,
+                })]),
+                globals: HashMap::from([("global1".to_string(), InputItemConfiguration {
+                    ty: Some(InputType::String),
+                    default: None,
+                })]),
+            },
+            output_signature: OutputSignature {
+                globals: HashMap::new(),
+                functions: HashMap::new(),
+            },
+        };
+        
+        let (op_id, exec_state) = exec_state.upsert_operation(op, None);
+        
+        // Prepare inputs
+        let mut inputs = OperationInputs::new();
+        inputs.args.insert("0".to_string(), RkyvSerializedValue::String("value1".to_string()));
+        inputs.kwargs.insert("kwarg1".to_string(), RkyvSerializedValue::Number(42));
+        inputs.globals.insert("global1".to_string(), RkyvSerializedValue::Boolean(true));
+        
+        // Get the operation node
+        let op_node = exec_state.get_operation_node(op_id).unwrap();
+        
+        // Check if the inputs match the signature
+        let signature = &op_node.signature.input_signature;
+        assert!(signature.check_input_against_signature(&inputs));
+        
+        // Test with missing required input
+        let mut incomplete_inputs = inputs.clone();
+        incomplete_inputs.args.clear();
+        assert!(!signature.check_input_against_signature(&incomplete_inputs));
+        
+        // Test with extra input
+        let mut extra_inputs = inputs.clone();
+        extra_inputs.kwargs.insert("extra_kwarg".to_string(), RkyvSerializedValue::Null);
+        assert!(signature.check_input_against_signature(&extra_inputs));
     }
 }
 

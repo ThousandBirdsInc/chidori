@@ -4,7 +4,9 @@ members = [
     "chidori-prompt-format",
     "chidori-im-rs",
     "chidori-static-analysis",
-    "chidori-debugger", "chidori-tsne", "chidori-optimizer-dsp",
+    "chidori-debugger",
+    "chidori-tsne",
+    "chidori-optimizer-dsp",
 ]
 resolver = "2"
 
@@ -37,7 +39,7 @@ env_logger = "0.10.0"
 log = "0.4.16"
 futures = "0.3.15"
 bytes = "1.0.1"
-reqwest = { version = "0.11.20", features = ["json", "stream"]}
+reqwest = { version = "0.12.5", features = ["json", "stream"]}
 futures-core = "0.3"
 tokio-stream = "0.1"
 ulid = "1.0.0"
@@ -61,8 +63,8 @@ features = [
 ]
 
 [patch.crates-io]
-deno = { git = "https://github.com/ThousandBirdsInc/deno", rev = "783f25180b82ae90fe21a9c0118c104da06db25c" }
-deno_runtime = { git = "https://github.com/ThousandBirdsInc/deno", rev = "783f25180b82ae90fe21a9c0118c104da06db25c" }
+deno = { git = "https://github.com/ThousandBirdsInc/deno", rev = "e7f2e968826ea6da8cf65387a13ea61672c7ea5c" }
+deno_runtime = { git = "https://github.com/ThousandBirdsInc/deno", rev = "e7f2e968826ea6da8cf65387a13ea61672c7ea5c" }
 rye = { git = "https://github.com/ThousandBirdsInc/rye", rev = "b9b0f4ff12b2da35a70049e14f8a05c76caa2242"}
 #serde = {path = "../../serde/serde" }
 #serde_derive = {path = "../../serde/serde_derive" }

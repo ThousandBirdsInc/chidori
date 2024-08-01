@@ -29,23 +29,22 @@ impl EmbeddingModel for OpenAIChatModel {
         };
         self.client
             .embedding(req)
+            .await
             .map(|res| res.data.first().unwrap().embedding.clone())
-            .map_err(|e| e.message)
+            .map_err(|e| e.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openai_api_rs::v1::api::Client;
     use std::env;
     use crate::library::std::ai::llm::EmbeddingReq;
 
     #[tokio::test]
     async fn test_openai_embedding() {
-        let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
-        let api_url_v1: &str = "https://api.openai.com/v1";
-        let model = OpenAIChatModel::new(api_url_v1.to_string(), api_key);
+        // let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
+        let model = crate::library::std::ai::llm::openai::OpenAIChatModel::new("http://localhost:4000/v1".to_string(), "".to_string());
         let result = model.embed(EmbeddingReq {
             content: "".to_string(),
             model: "text-embedding-3-small".to_string(),

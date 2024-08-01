@@ -34,6 +34,7 @@
       <sourceFolder url="file://$MODULE_DIR$/media/chidori-optimizer-dsp/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-optimizer-dsp/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-tsne/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-im-petgraph/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/prompt-graph-core/target" />
       <excludeFolder url="file://$MODULE_DIR$/prompt-graph-exec/target" />

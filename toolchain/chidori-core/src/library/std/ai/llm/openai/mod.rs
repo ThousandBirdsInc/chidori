@@ -3,7 +3,7 @@ pub mod streaming;
 mod embedding;
 
 use std::collections::HashMap;
-use openai_api_rs::v1::api::Client;
+use openai_api_rs::v1::api::OpenAIClient;
 use std::env;
 use openai_api_rs::v1::chat_completion::{ChatCompletionMessage, ChatCompletionRequest, MessageRole};
 use crate::cells::LLMPromptCellChatConfiguration;
@@ -13,19 +13,20 @@ use crate::library::std::ai::llm::{ChatCompletionReq, JSONSchemaDefine, JSONSche
 pub struct OpenAIChatModel {
     api_url: String,
     api_key: String,
-    client: Client,
+    client: OpenAIClient,
 }
 
 impl OpenAIChatModel {
     // TODO: remove api_key parameter, expect usage of a proxy
     pub fn new(api_url: String, api_key: String) -> Self {
-        let client = Client::new_with_endpoint(api_url.clone(), api_key.clone());
+        let client = OpenAIClient::new_with_endpoint(api_url.clone(), api_key.clone());
         Self { api_url, client, api_key }
     }
 
     pub fn chat_completion_req_to_openai_req(chat_completion_req: &ChatCompletionReq) -> ChatCompletionRequest {
         let config = &chat_completion_req.config;
         ChatCompletionRequest {
+
             model: config.model.clone(),
             messages: chat_completion_req
                 .template_messages
@@ -39,6 +40,8 @@ impl OpenAIChatModel {
                     },
                     content: openai_api_rs::v1::chat_completion::Content::Text(m.content.clone()),
                     name: m.name.clone(),
+                    tool_calls: None,
+                    tool_call_id: None,
                 })
                 .collect(),
             tool_choice: chat_completion_req.tool_choice.clone().map(our_tool_choice_to_openai),
@@ -55,6 +58,7 @@ impl OpenAIChatModel {
             logit_bias: config.logit_bias.clone(),
             user: config.user.clone(),
             seed: config.seed,
+            parallel_tool_calls: None,
         }
     }
 

@@ -28,7 +28,7 @@ fn add_extension_module_link_args(triple: &Triple) -> io::Result<()> {
             writeln!(writer, "cargo:rustc-cdylib-link-arg=-undefined")?;
             writeln!(writer, "cargo:rustc-cdylib-link-arg=dynamic_lookup")?;
             writeln!(writer, "cargo:rustc-link-search=native=/opt/homebrew/Cellar/libiconv/1.17/lib")?;
-            writeln!(writer, "cargo:rustc-link-search=native=/opt/homebrew/Cellar/python@3.11/3.11.9/Frameworks/Python.framework/Versions/3.11/lib")?;
+            writeln!(writer, "cargo:rustc-link-search=native=/opt/homebrew/Cellar/python@3.11/3.11.9_1/Frameworks/Python.framework/Versions/3.11/lib")?;
             writeln!(writer, "cargo:rustc-link-lib=dylib=python3.11")?;
             println!("cargo:warning=Linking against Python 3.11");
 

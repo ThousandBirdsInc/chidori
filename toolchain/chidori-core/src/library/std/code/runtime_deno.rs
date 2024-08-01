@@ -858,6 +858,7 @@ mod tests {
             (
                 RkyvObjectBuilder::new()
                     .insert_string("data", "Data".to_string())
+                    .insert_string("fetchData", "function".to_string())
                     .build(),
                 vec![],
                 vec![],

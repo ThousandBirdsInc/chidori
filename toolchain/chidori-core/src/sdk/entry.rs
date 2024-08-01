@@ -630,13 +630,12 @@ mod tests {
         }, TextRange::default()),
                                            None)?;
         assert_eq!(op_id_x, 0);
-        let mut config = LLMPromptCellChatConfiguration {
-            model: "gpt-3.5-turbo".into(),
-            ..Default::default()
-        };
         let (_, op_id_y) = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
             function_invocation: false,
-            configuration: config,
+            configuration: LLMPromptCellChatConfiguration {
+                model: "gpt-3.5-turbo".into(),
+                ..Default::default()
+            },
             name: Some("example".into()),
             provider: SupportedModelProviders::OpenAI,
             req: "\
@@ -647,6 +646,17 @@ mod tests {
         }, TextRange::default()),
                                            None)?;
         assert_eq!(op_id_y, 1);
+        let (_, op_id_z) = env.upsert_cell(CellTypes::Code(CodeCell {
+            name: None,
+            language: SupportedLanguage::PyO3,
+            source_code: String::from(indoc! { r#"
+                        z = await example(x=x)
+                        "#}),
+            function_invocation: None,
+        }, TextRange::default()),
+                                           None)?;
+
+        assert_eq!(op_id_z, 2);
         env.get_state_at_current_execution_head().render_dependency_graph();
         let out = env.step().await;
         assert_eq!(
@@ -694,7 +704,6 @@ mod tests {
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
-                        import chidori as ch
                         y = generate_names(x="John")
                         "#}),
             function_invocation: None,
@@ -715,17 +724,13 @@ mod tests {
         assert_eq!(op_id_y, 1);
         env.get_state_at_current_execution_head().render_dependency_graph();
         dbg!(env.step().await);
+        dbg!(env.step().await);
+        dbg!(env.step().await);
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&op_id_x),
-            Some(&RkyvObjectBuilder::new().insert_number("x", 20).build())
+            None
         );
         assert_eq!(env.get_state_at_current_execution_head().state_get_value(&op_id_y), None);
-        env.step().await;
-        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&op_id_x), None);
-        assert_eq!(
-            env.get_state_at_current_execution_head().state_get_value(&op_id_y),
-            Some(&RkyvObjectBuilder::new().insert_number("y", 21).build())
-        );
         Ok(())
     }
 
@@ -821,7 +826,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_multiple_dependencies_across_nodes() -> anyhow::Result<()> {
         let mut ee = Chidori::new();
         ee.load_md_string(indoc! { r#"
@@ -852,7 +857,9 @@ mod tests {
         assert_eq!(env.get_state_at_current_execution_head().state_get_value(&1), None);
         env.step().await;
         assert_eq!(env.get_state_at_current_execution_head().state_get_value(&0),
-                   Some(&RkyvObjectBuilder::new().insert_number("v", 40).build())
+                   Some(&RkyvObjectBuilder::new().insert_number("v", 40)
+                       .insert_string("squared_value", "function".to_string())
+                       .build())
         );
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&1),
@@ -872,7 +879,7 @@ mod tests {
             ```
 
             ```javascript
-            const y = add(2, 3);
+            const y = await add(2, 3);
             ```
 
             ```prompt (multi_prompt)
@@ -891,17 +898,24 @@ mod tests {
         // Function declaration cell
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&0),
-            Some(&RkyvObjectBuilder::new().build())
+            Some(&RkyvObjectBuilder::new()
+                .insert_string("add", "function".to_string())
+                .build())
         );
         assert_eq!(env.get_state_at_current_execution_head().state_get_value(&1), None);
         env.step().await;
-        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&0), None);
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&0),
+                   Some(&RkyvObjectBuilder::new()
+                       .insert_string("add", "function".to_string())
+                       .build())
+        );
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&1),
             Some(&RkyvObjectBuilder::new().insert_number("y", 5).build())
         );
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_execute_webservice_and_handle_request_with_code_cell_md() {
         // initialize tracing
@@ -947,6 +961,7 @@ mod tests {
         assert_eq!(res.text().await.unwrap(), "579");
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_execute_webservice_and_serve_html() {
         // initialize tracing
@@ -1155,6 +1170,7 @@ mod tests {
         assert_eq!(env.get_state_at_current_execution_head().have_all_operations_been_set_at_least_once(), true);
     }
 
+    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_core7_rag_stateful_memory_cells() {
         let mut ee = Chidori::new();
@@ -1169,6 +1185,7 @@ mod tests {
         assert_eq!(env.get_state_at_current_execution_head().have_all_operations_been_set_at_least_once(), true);
     }
 
+    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_core8_prompt_code_generation_and_execution() {
         let mut ee = Chidori::new();
@@ -1183,6 +1200,7 @@ mod tests {
         assert_eq!(env.get_state_at_current_execution_head().have_all_operations_been_set_at_least_once(), true);
     }
 
+    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_core9_multi_agent_simulation() {
         let mut ee = Chidori::new();

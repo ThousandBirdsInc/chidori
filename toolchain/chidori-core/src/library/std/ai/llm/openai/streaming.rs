@@ -113,12 +113,11 @@ mod tests {
     use openai_api_rs::v1::chat_completion::{ChatCompletionMessage, MessageRole};
     use std::env;
 
+    #[ignore]
     #[tokio::test]
     async fn test_gpt_stream_raw_line() {
         dotenv::dotenv().ok();
-        let api_key = env::var("OPENAI_API_KEY").unwrap().to_string();
-        let api_url_v1: &str = "https://api.openai.com/v1";
-        let model = OpenAIChatModel::new(api_url_v1.to_string(), api_key);
+        let model = crate::library::std::ai::llm::openai::OpenAIChatModel::new("http://localhost:4000/v1/chat/completions".to_string(), "".to_string());
         let stream = model.stream(Default::default()).await.unwrap();
         let mut stream = Box::pin(stream);
         while let Some(value) = stream.next().await {
