@@ -31,37 +31,35 @@ Star us on Github! Join us on [Discord](https://discord.gg/CJwKsPSgew).
   - [Code Interpreter Environments](#code-interpreter-environments)
 - [🛣️ Roadmap](#️-roadmap)
   - [Short term](#short-term)
-  - [Med term](#med-term)
+  - [Medium term](#med-term)
 - [Contributing](#contributing)
-- [FAQ](#faq)
-  - [Why Another AI Framework?](#why-another-ai-framework)
-  - [Why Chidori?](#why-chidori)
-  - [Well then why Thousand Birds?](#well-then-why-thousand-birds)
-  - [Why Rust?](#why-rust)
 - [Inspiration](#inspiration)
 - [License](#license)
 - [Help us out!](#help-us-out)
 
 
 ## 📖 Chidori V2
-Chidori is an open-source environment for building AI agents.
+Chidori is an open-source orchestrator, runtime, and IDE for building software in symbiosis with modern AI tools.
+It is especially catered towards building AI agents by providing solutions to the following problems:
+
+- How do we understand what an agent is doing and how it got into a given state?
+- How can we pause execution and then resume after human review?
+- Handling the accidental complexity of state-space exploration
+
 You author code with python or javascript, and we provide a layer for interfacing
-with the complexities of AI models in long-running workflows.
+with the complexities of AI models in long-running workflows. We have avoided the need for declaring a new language 
+or SDK in order to provide these capabilities, you can leverage software patterns you're already familiar with.
+
+Features:
+
+- Runtime written in Rust, supporting Python and JavaScript code execution
+- Cache behaviors and resume from partially executed agents
+- Time travel debugging, revert to prior states of execution
+- Visual debugging environment, visualize and manipulate the graph of states your code has executed through.
+- Create and navigate tree-searching code execution workflows
 
 We are continuing to make significant changes in response to feedback and iterating on different features.
 Feedback is greatly appreciated! Please add to our issue tracker.
-
-- Built from the ground up for constructing agents
-- Runtime written in Rust supporting Python and JavaScript
-- Cache behaviors and resume from partially executed agents
-- Optimized for long-running AI workflows
-- Embedded code interpreter
-- Time travel debugging
-- Create and navigate tree-searching workflows
-
-I want to demonstrate a workflow where entirely arbitrary code can be used to build useful agents.
-Users should be able to leverage the entire surface areas of the langauges agents are defined within. My aspiration
-is that Chidori can be the best way to build agentic software.
 
 
 ## ⚡️ Getting Started
@@ -73,12 +71,18 @@ prototype development is `chidori-debugger` which wraps our runtime in a useful 
 ```bash
 xcode-select --install
 brew install cmake
-# We are working on eliminating this dependency
+
+# Protobuf is depended upon by denokv, which we in turn currently depend on
 brew install protobuf 
- # We are investigating if this is necessary or can be removed
+
+# We are investigating if this is necessary or can be removed
 brew install libiconv
+
 brew install python@3.11
+
+# Chidori uses uv for handling python dependencies 
 brew install uv
+
 cargo install chidori-debugger
 ```
 
@@ -86,13 +90,13 @@ If you would prefer a different python interpreter you can set PYO3_PYTHON=pytho
 your installation to change which is linked against.
 
 
-### Environment Variables
+### Setting Up The Runtime Environment
 Chidori's interactions with LLMs default to http://localhost:4000 to hook into LiteLLM's proxy.
 If you'd like to leverage gpt-3.5-turbo the included config file will support that.
+You will need to install `pip install litellm[proxy]` in order to run the below:
 ```bash
-OPENAI_API_KEY=...
+export OPENAI_API_KEY=...
 litellm --config ./litellm_config.yaml
-rye sync
 ```
 
 ## Examples
@@ -106,6 +110,8 @@ The following example shows how to build a simple agent that fetches the top sto
 Chidori agents can be a single file, or a collection of files structured as a typical Typescript or Python project. 
 The following example is a single file agent. Consider this similar to something like a jupyter/iPython notebook 
 represented as a markdown file.
+
+<pre>
 
 ```javascript (load_hacker_news)
 const axios = require('https://deno.land/x/axiod/mod.ts');
@@ -151,6 +157,7 @@ Using a python cell as our entrypoint, demonstrating inter-language execution:
 articles = await fetchHN()
 format_and_rank(articles=articles)
 ```
+</pre>
 ------
 
 
@@ -211,8 +218,3 @@ Thousand Birds is under the MIT license. See the [LICENSE](LICENSE) for more inf
 
 ## Help us out!
 Please star the github repo and give us feedback in [discord](https://discord.gg/CJwKsPSgew)!
-
-
-
-TODO:
-https://meatfighter.com/ascii-silhouettify/
