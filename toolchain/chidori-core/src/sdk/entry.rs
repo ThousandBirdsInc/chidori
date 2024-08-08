@@ -235,7 +235,7 @@ impl InstancedEnvironment {
     pub fn get_state_at(&self, id: ExecutionNodeId) -> ExecutionState {
         match self.db.get_state_at_id(id).unwrap() {
             ExecutionStateEvaluation::Complete(s) => s,
-            ExecutionStateEvaluation::Executing(_) => panic!("get_state_at, failed, still executing"),
+            ExecutionStateEvaluation::Executing(..) => panic!("get_state_at, failed, still executing"),
             ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
             ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
         }
@@ -244,7 +244,7 @@ impl InstancedEnvironment {
     pub fn get_state_at_current_execution_head(&self) -> ExecutionState {
         match self.db.get_state_at_id(self.execution_head_state_id).unwrap() {
             ExecutionStateEvaluation::Complete(s) => s,
-            ExecutionStateEvaluation::Executing(_) => panic!("get_state, failed, still executing"),
+            ExecutionStateEvaluation::Executing(..) => panic!("get_state, failed, still executing"),
             ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
             ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
         }
@@ -351,7 +351,7 @@ pub struct CellHolder {
     pub cell: CellTypes,
     pub op_id: Option<usize>,
     pub applied_at: ExecutionNodeId,
-    needs_update: bool
+    pub needs_update: bool
 }
 
 #[derive(Debug)]
@@ -488,18 +488,22 @@ impl Chidori {
         let mut new_cells_state = vec![];
         for cell in cells {
             let name = get_cell_name(&cell);
-            if let Some(prev_cell) = cell_name_map.get(&name) {
-                if prev_cell.cell != cell {
+            // If the named cell exists in our map already
+            if let Some(existing_cell_instance) = cell_name_map.get(&name) {
+                // If it's not the same cell, replace it
+                if existing_cell_instance.cell != cell {
                     new_cells_state.push(CellHolder {
                         cell,
                         applied_at: Uuid::nil(),
-                        op_id: prev_cell.op_id,
+                        op_id: existing_cell_instance.op_id,
                         needs_update: true
                     });
                 } else {
-                    new_cells_state.push(prev_cell.clone());
+                    // It's the same cell so just push our existing state
+                    new_cells_state.push(existing_cell_instance.clone());
                 }
             } else {
+                // This is a new cell, so we push it with a null applied at
                 new_cells_state.push(CellHolder {
                     cell,
                     applied_at: Uuid::nil(),

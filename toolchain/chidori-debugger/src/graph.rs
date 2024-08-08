@@ -937,48 +937,51 @@ fn update_graph_system_renderer(
 
 
                                             if let Some(state) = internal_state.chidori.lock().unwrap().get_shared_state().execution_id_to_evaluation.lock().unwrap().get(&node1) {
-                                                if let ExecutionStateEvaluation::Complete(state) = state {
-                                                    for (key, value) in state.state.iter() {
-                                                        let image_paths = crate::util::find_matching_strings(&value.output, r"(?i)\.(png|jpe?g)$");
-                                                        for (img_path, object_path_to_img) in image_paths {
-                                                            let texture = if let Some(cached_texture) = node_image_texture_cache.get(&img_path) {
-                                                                cached_texture.clone()
-                                                            } else {
-                                                                // Load the image
-                                                                let img = image::io::Reader::open(&img_path)
-                                                                    .expect("Failed to open image")
-                                                                    .decode()
-                                                                    .expect("Failed to decode image");
+                                                match state {
+                                                    ExecutionStateEvaluation::Error => {}
+                                                    ExecutionStateEvaluation::EvalFailure => {}
+                                                    ExecutionStateEvaluation::Complete(state) | ExecutionStateEvaluation::Executing(state) => {
+                                                        for (key, value) in state.state.iter() {
+                                                            let image_paths = crate::util::find_matching_strings(&value.output, r"(?i)\.(png|jpe?g)$");
+                                                            for (img_path, object_path_to_img) in image_paths {
+                                                                let texture = if let Some(cached_texture) = node_image_texture_cache.get(&img_path) {
+                                                                    cached_texture.clone()
+                                                                } else {
+                                                                    // Load the image
+                                                                    let img = image::io::Reader::open(&img_path)
+                                                                        .expect("Failed to open image")
+                                                                        .decode()
+                                                                        .expect("Failed to decode image");
 
-                                                                // Convert the image to egui::ColorImage
-                                                                let size = [img.width() as _, img.height() as _];
-                                                                let image_buffer = img.to_rgba8();
-                                                                let pixels = image_buffer.as_flat_samples();
-                                                                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                                                    size,
-                                                                    pixels.as_slice(),
-                                                                );
+                                                                    // Convert the image to egui::ColorImage
+                                                                    let size = [img.width() as _, img.height() as _];
+                                                                    let image_buffer = img.to_rgba8();
+                                                                    let pixels = image_buffer.as_flat_samples();
+                                                                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                                                        size,
+                                                                        pixels.as_slice(),
+                                                                    );
 
-                                                                // Create the texture
-                                                                let texture = ui.ctx().load_texture(
-                                                                    &img_path,
-                                                                    color_image,
-                                                                    egui::TextureOptions::default()
-                                                                );
+                                                                    // Create the texture
+                                                                    let texture = ui.ctx().load_texture(
+                                                                        &img_path,
+                                                                        color_image,
+                                                                        egui::TextureOptions::default()
+                                                                    );
 
-                                                                // Cache the texture
-                                                                node_image_texture_cache.insert(img_path.clone(), texture.clone());
+                                                                    // Cache the texture
+                                                                    node_image_texture_cache.insert(img_path.clone(), texture.clone());
 
-                                                                texture
-                                                            };
+                                                                    texture
+                                                                };
 
-                                                            // Display the image
-                                                            ui.add(egui::Image::new(&texture));
+                                                                // Display the image
+                                                                ui.add(egui::Image::new(&texture));
+                                                            }
                                                         }
+
+                                                        egui_execution_state(ui, state);
                                                     }
-
-
-                                                    egui_execution_state(ui, state);
                                                 }
                                             } else {
                                                 // internal_state.get_execution_state_at_id(*node);

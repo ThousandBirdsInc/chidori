@@ -44,11 +44,11 @@ It is especially catered towards building AI agents by providing solutions to th
 
 - How do we understand what an agent is doing and how it got into a given state?
 - How can we pause execution and then resume after human review?
-- Handling the accidental complexity of state-space exploration
+- How do we handle the accidental complexity of state-space exploration, evaluating and reverting execution throughout our software?
 
-You author code with python or javascript, and we provide a layer for interfacing
+When using Chidori, you author code with python or javascript, and we provide a layer for interfacing
 with the complexities of AI models in long-running workflows. We have avoided the need for declaring a new language 
-or SDK in order to provide these capabilities, you can leverage software patterns you're already familiar with.
+or SDK in order to provide these capabilities, you can leverage software patterns that you are already familiar with.
 
 Features:
 

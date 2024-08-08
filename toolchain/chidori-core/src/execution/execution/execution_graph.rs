@@ -183,7 +183,7 @@ impl ExecutionGraph {
                                         execution_graph.deref_mut()
                                             .add_edge(state.parent_state_id, resulting_state_id.clone(), s);
                                     }
-                                    ExecutionStateEvaluation::Executing(_) => {
+                                    ExecutionStateEvaluation::Executing(..) => {
 
                                     }
                                 }
@@ -235,7 +235,7 @@ impl ExecutionGraph {
             match ev {
                 ExecutionStateEvaluation::EvalFailure => {},
                 ExecutionStateEvaluation::Error => {}
-                ExecutionStateEvaluation::Executing(s) => {
+                ExecutionStateEvaluation::Executing(..) => {
                 }
                 ExecutionStateEvaluation::Complete(s) => {
                     if !s.stack.is_empty() {
@@ -312,11 +312,14 @@ impl ExecutionGraph {
             ExecutionStateEvaluation::Complete(state) => {
                 (state.parent_state_id, state.id)
             },
-            ExecutionStateEvaluation::Executing(_) => panic!("Cannot progress an execution state that is currently executing"),
+            ExecutionStateEvaluation::Executing(state) =>
+                (state.parent_state_id, state.id)
+,
             ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
             ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
         };
         println!("Inserting into graph {:?}", &resulting_state_id);
+        // TODO: if state already exists how to handle
         state_id_to_state.deref_mut().insert(resulting_state_id.clone(), new_state.clone());
         execution_graph.deref_mut()
             .add_edge(parent_id, resulting_state_id.clone(), new_state.clone());
@@ -341,11 +344,13 @@ impl ExecutionGraph {
     )> {
         let previous_state = match previous_state {
             ExecutionStateEvaluation::Complete(state) => state,
-            ExecutionStateEvaluation::Executing(_) => panic!("Cannot step an execution state that is currently executing"),
+            ExecutionStateEvaluation::Executing(..) => panic!("Cannot step an execution state that is currently executing"),
             ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
             ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
         };
-        let (new_state, outputs) = previous_state.step_execution(&self.graph_mutation_sender).await?;
+        let eval_state = previous_state.determine_next_operation()?;
+        // TODO: update graph with representation that we're inside of executing something
+        let (new_state, outputs) = previous_state.step_execution(eval_state).await?;
         // TODO: this should receive the Executing state and await the connected future
         let resulting_state_id = self.progress_graph(new_state.clone());
         // Once the future is then resolved we update the state in the graph
@@ -371,7 +376,7 @@ impl ExecutionGraph {
                 let state = state.clone_with_new_id();
                 state.update_op(cell, op_id)?
             },
-            ExecutionStateEvaluation::Executing(_) => {
+            ExecutionStateEvaluation::Executing(..) => {
                 return Err(anyhow!("Cannot mutate a graph that is currently executing"))
             },
 
@@ -614,12 +619,6 @@ mod tests {
         if let ExecutionStateEvaluation::Complete(s) = &state {
             assert_eq!(s.exec_queue, VecDeque::from(vec![]));
         }
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
-        if let ExecutionStateEvaluation::Complete(s) = &state {
-            assert_eq!(s.exec_queue, VecDeque::from(vec![0,1,2]));
-        }
         db.shutdown().await;
         Ok(())
     }
@@ -676,10 +675,6 @@ mod tests {
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
         assert_eq!(state.state_get_value(&3), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
-        assert_eq!(state.state_get_value(&3), Some(&RSV::Number(3)));
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
@@ -761,7 +756,6 @@ mod tests {
         Ok(())
     }
 
-    // TODO: this is actually incorrect, what's going on?
     #[tokio::test]
     async fn test_traverse_cycle() -> anyhow::Result<()> {
         let mut db = ExecutionGraph::new();
@@ -908,49 +902,30 @@ mod tests {
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(2)));
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(3)));
-        assert_eq!(state.state_get_value(&3), None);
+        assert_eq!(state.state_get_value(&3), Some(&RSV::Number(5)));
         assert_eq!(state.state_get_value(&4), Some(&RSV::Number(4)));
         assert_eq!(state.state_get_value(&5), Some(&RSV::Number(5)));
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(2)));
+        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(6)));
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(3)));
         assert_eq!(state.state_get_value(&3), Some(&RSV::Number(5)));
         assert_eq!(state.state_get_value(&4), Some(&RSV::Number(4)));
         assert_eq!(state.state_get_value(&5), Some(&RSV::Number(5)));
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(2)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(3)));
+        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(6)));
+        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(7)));
         assert_eq!(state.state_get_value(&3), Some(&RSV::Number(5)));
         assert_eq!(state.state_get_value(&4), Some(&RSV::Number(4)));
         assert_eq!(state.state_get_value(&5), Some(&RSV::Number(5)));
-        // TODO: the value of &1 here appears to be non-deterministic
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         if let ExecutionStateEvaluation::Complete(s) = &state {
             s.render_dependency_graph();
         }
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(6)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(3)));
-        assert_eq!(state.state_get_value(&3), Some(&RSV::Number(5)));
-        assert_eq!(state.state_get_value(&4), Some(&RSV::Number(4)));
-        assert_eq!(state.state_get_value(&5), Some(&RSV::Number(5)));
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(6)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(7)));
-        assert_eq!(state.state_get_value(&3), Some(&RSV::Number(5)));
-        assert_eq!(state.state_get_value(&4), Some(&RSV::Number(4)));
-        assert_eq!(state.state_get_value(&5), Some(&RSV::Number(5)));
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(6)));
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(7)));
         assert_eq!(state.state_get_value(&3), Some(&RSV::Number(5)));
         assert_eq!(state.state_get_value(&4), Some(&RSV::Number(8)));
         assert_eq!(state.state_get_value(&5), Some(&RSV::Number(5)));
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(6)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(7)));
-        assert_eq!(state.state_get_value(&3), Some(&RSV::Number(5)));
-        assert_eq!(state.state_get_value(&4), Some(&RSV::Number(8)));
-        assert_eq!(state.state_get_value(&5), Some(&RSV::Number(9)));
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         assert_eq!(state.state_get_value(&1), Some(&RSV::Number(6)));
         assert_eq!(state.state_get_value(&2), Some(&RSV::Number(7)));

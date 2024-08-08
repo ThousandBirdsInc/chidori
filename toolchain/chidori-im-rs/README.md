@@ -4,10 +4,6 @@ Our primary modification is to modify the HashMap implementation to support stre
 to durable storage in an efficient manner. In this context of Chidori this is how we're handling
 the storage of the state of the system.
 
-
-
-
-
 The original README.md is below.
 
 ------------------------------------------------------------------------------------------------------------------------

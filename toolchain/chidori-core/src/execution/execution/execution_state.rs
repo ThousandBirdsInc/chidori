@@ -23,6 +23,7 @@ use serde::ser::{SerializeMap, SerializeStruct};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use anyhow::Error;
 use tokio::sync::oneshot;
 use futures_util::FutureExt;
 use log::info;
@@ -84,7 +85,7 @@ pub enum ExecutionStateEvaluation {
     /// Execution complete
     Complete(ExecutionState),
     /// Execution in progress
-    Executing(Arc<FutureExecutionState>)
+    Executing(ExecutionState)
 }
 
 impl ExecutionStateEvaluation {
@@ -92,7 +93,7 @@ impl ExecutionStateEvaluation {
         match self {
 
             ExecutionStateEvaluation::Complete(ref state) => state.state_get(operation_id),
-            ExecutionStateEvaluation::Executing(ref future_state) => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::Executing(..) => unreachable!("Cannot get state from a future state"),
             ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
             ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
         }
@@ -101,7 +102,7 @@ impl ExecutionStateEvaluation {
     pub fn state_get_value(&self, operation_id: &OperationId) -> Option<&RkyvSerializedValue> {
         match self {
             ExecutionStateEvaluation::Complete(ref state) => state.state_get(operation_id).map(|o| &o.output),
-            ExecutionStateEvaluation::Executing(ref future_state) => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::Executing(..) => unreachable!("Cannot get state from a future state"),
             ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
             ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
         }
@@ -112,7 +113,7 @@ impl Debug for ExecutionStateEvaluation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ExecutionStateEvaluation::Complete(ref state) => f.debug_tuple("Complete").field(state).finish(),
-            ExecutionStateEvaluation::Executing(ref future_state) => f.debug_tuple("Executing").field(&format!("Future state evaluating")).finish(),
+            ExecutionStateEvaluation::Executing(..) => f.debug_tuple("Executing").field(&format!("Future state evaluating")).finish(),
             ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
             ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
         }
@@ -238,7 +239,7 @@ async fn pause_future_with_oneshot(execution_state_evaluation: ExecutionStateEva
         println!("Continuing from oneshot signal");
         RkyvSerializedValue::Null
     };
-    sender.send((execution_state_evaluation, Some(oneshot_sender))).await.expect("Failed to send oneshot signal");
+    sender.send((execution_state_evaluation, Some(oneshot_sender))).await.expect("Failed to send oneshot signal to the graph receiver");
     Box::pin(future)
 }
 
@@ -596,9 +597,13 @@ impl ExecutionState {
             meta
         }).expect("Failed to find named function");
 
-        let op = state.operation_by_id.get(&meta.operation_id).unwrap().lock().unwrap();
-        let op_name = op.name.clone();
-        let cell = &op.cell.clone();
+        let op_name;
+        let cell;
+        {
+            let op = state.operation_by_id.get(&meta.operation_id).unwrap().lock().unwrap();
+            op_name = op.name.clone();
+            cell = op.cell.clone();
+        }
         state.evaluating_fn = Some(function_name.to_string());
         state.evaluating_id = meta.operation_id;
         state.evaluating_name = op_name;
@@ -612,22 +617,22 @@ impl ExecutionState {
                 let mut c = c.clone();
                 c.function_invocation =
                     Some(clone_function_name.to_string());
-                crate::cells::code_cell::code_cell(Uuid::nil(), &c, r)?
+                crate::cells::code_cell::code_cell(Uuid::nil(), &c, &r)?
             }
             CellTypes::Prompt(c, r) => {
                 let mut c = c.clone();
                 match c {
                     LLMPromptCell::Chat{ref mut function_invocation, ..} => {
                         *function_invocation = true;
-                        crate::cells::llm_prompt_cell::llm_prompt_cell(Uuid::nil(), &c, r)?
+                        crate::cells::llm_prompt_cell::llm_prompt_cell(Uuid::nil(), &c, &r)?
                     }
                     _ => {
-                        crate::cells::llm_prompt_cell::llm_prompt_cell(Uuid::nil(), &c, r)?
+                        crate::cells::llm_prompt_cell::llm_prompt_cell(Uuid::nil(), &c, &r)?
                     }
                 }
             }
             CellTypes::Embedding(c, r) => {
-                crate::cells::embedding_cell::llm_embedding_cell(Uuid::nil(), &c, r)?
+                crate::cells::embedding_cell::llm_embedding_cell(Uuid::nil(), &c, &r)?
             }
             _ => {
                 unreachable!("Unsupported cell type");
@@ -638,13 +643,15 @@ impl ExecutionState {
         // When we receive a message from the graph_sender, execution of this coroutine will resume.
         if let Some(graph_sender) = self.graph_sender.as_ref() {
             let s = graph_sender.clone();
-            let result = pause_future_with_oneshot(ExecutionStateEvaluation::Complete(before_execution_state.clone()), &s).await;
-            let recv = result.await;
+            let result = pause_future_with_oneshot(ExecutionStateEvaluation::Executing(before_execution_state.clone()), &s).await;
+            let _recv = result.await;
         }
 
         // invocation of the operation
         // TODO: the total arg payload here does not include necessary function calls for this cell itself
-        let result = op.execute(&before_execution_state, payload, None, None).await?;
+        /// Receiver that we pass to the exec for it to capture oneshot RPC communication
+        let exec = op.operation.deref();
+        let result = exec(&before_execution_state, payload, None, None).await?;
         let mut after_execution_state = state.clone_with_new_id();
         after_execution_state.stack.pop_back();
         after_execution_state.state_insert(usize::MAX, result.clone());
@@ -656,7 +663,7 @@ impl ExecutionState {
         if let Some(graph_sender) = self.graph_sender.as_ref() {
             let s = graph_sender.clone();
             let result = pause_future_with_oneshot(ExecutionStateEvaluation::Complete(after_execution_state.clone()), &s).await;
-            let recv = result.await;
+            let _recv = result.await;
         }
 
         // Return the result, to be used in the context of the parent function
@@ -746,7 +753,7 @@ impl ExecutionState {
     fn process_next_operation(
         &self,
         exec_queue: &mut VecDeque<OperationId>,
-    ) -> anyhow::Result<Option<(MutexGuard<OperationNode>, OperationId, OperationInputs)>> {
+    ) -> anyhow::Result<Option<(Option<String>, OperationId, OperationInputs)>> {
         let next_operation_id = match exec_queue.pop_front() {
             Some(id) => id,
             None => {
@@ -756,6 +763,7 @@ impl ExecutionState {
         };
 
         let mut op_node = self.get_operation_node(next_operation_id)?;
+        let name = op_node.name.clone();
         let signature = &op_node.signature.input_signature;
 
         // If the signature has no dependencies and the operation has been run once, skip it.
@@ -795,7 +803,7 @@ impl ExecutionState {
             return Ok(None);
         }
 
-        Ok(Some((op_node, next_operation_id, inputs)))
+        Ok(Some((name, next_operation_id, inputs)))
     }
 
     fn initialize_new_state(&self) -> ExecutionState {
@@ -806,46 +814,65 @@ impl ExecutionState {
 
 
     #[tracing::instrument]
-    pub async fn step_execution(
+    pub fn determine_next_operation(
         &self,
-        sender: &tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>
-    ) -> anyhow::Result<(ExecutionStateEvaluation, Vec<(usize, OperationFnOutput)>)> {
-        let mut new_state = self.initialize_new_state();
-        let mut outputs = vec![];
+    ) -> anyhow::Result<ExecutionStateEvaluation> {
         let mut exec_queue = self.exec_queue.clone();
-
-        // TODO: if none are fresh we loop infinitely right now
-        //       when nothing is fresh nd we've visited every available node we should break the loop
+        let operation_count = self.operation_by_id.keys().count();
+        let mut count_loops = 0;
         loop {
             println!("looping {:?}", self.exec_queue);
+            count_loops += 1;
+            if count_loops >= operation_count * 2 {
+                return Err(Error::msg("Looped through all operations without detecting an execution"));
+            }
             match self.process_next_operation(&mut exec_queue) {
-                Ok(Some((op_node, next_operation_id, inputs))) => {
-                    let result = self.execute_operation(
-                        &mut new_state,
-                        op_node,
-                        next_operation_id,
-                        inputs,
-                    ).await?;
-                    outputs.push((next_operation_id, result.clone()));
-                    self.update_state(&mut new_state, next_operation_id, result);
+                Ok(Some((op_node_name, next_operation_id, inputs))) => {
+                    let mut new_state = self.initialize_new_state();
+                    new_state.evaluating_fn = None;
+                    new_state.evaluating_id = next_operation_id;
+                    new_state.evaluating_name = op_node_name;
+                    new_state.evaluating_arguments = Some(inputs.to_serialized_value());
                     new_state.exec_queue = exec_queue;
-                    return Ok((ExecutionStateEvaluation::Complete(new_state), outputs));
+                    return Ok(ExecutionStateEvaluation::Executing(new_state));
                 }
                 Ok(None) => {
-                    // There was no operation to evaluate, if the queue is empty reload it, but stop execution until we call step again
+                    // There was no operation to evaluate
+                    // If the queue is empty we reload it and continue looping
                     if exec_queue.is_empty() {
                         let mut operation_ids: Vec<OperationId> = self.operation_by_id.keys().copied().collect();
                         operation_ids.sort();
                         exec_queue.extend(operation_ids.iter());
-                        new_state.exec_queue = exec_queue;
-                        return Ok((ExecutionStateEvaluation::Complete(new_state), outputs));
-                    } else {
-                        continue;
                     }
+                    continue;
                 }
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    #[tracing::instrument]
+    pub async fn step_execution(
+        &self,
+        eval: ExecutionStateEvaluation,
+    ) -> anyhow::Result<(ExecutionStateEvaluation, Vec<(usize, OperationFnOutput)>)> {
+        let mut outputs = vec![];
+        let ExecutionStateEvaluation::Executing(mut new_state) = eval else {
+            return Err(Error::msg("attempting to step invalid state"));
+        };
+        // Send this event to the graph so that we can update in progress execution
+        if let Some(graph_sender) = self.graph_sender.as_ref() {
+            let s = graph_sender.clone();
+            let result = pause_future_with_oneshot(ExecutionStateEvaluation::Executing(new_state.clone()), &s).await;
+            let _recv = result.await;
+        }
+        let op_node = self.get_operation_node(new_state.evaluating_id)?;
+        let args = new_state.evaluating_arguments.take().unwrap();
+        let next_operation_id = new_state.evaluating_id.clone();
+        let result = op_node.execute(&mut new_state, args, None, None).await?;
+        outputs.push((next_operation_id, result.clone()));
+        self.update_state(&mut new_state, next_operation_id, result);
+        return Ok((ExecutionStateEvaluation::Complete(new_state), outputs));
     }
 }
 

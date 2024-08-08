@@ -287,7 +287,7 @@ pub fn process_input_system(
 
     for event in keyboard_input_events {
         for ctx_params in context_params.contexts.iter_mut() {
-            if !(ctx_params.egui_render_target.is_focused && ctx_params.egui_render_target.image.is_some()) || ctx_params.egui_render_target_entity != event.window {
+            if !(ctx_params.egui_render_target.is_focused && ctx_params.egui_render_target.image.is_some()) && ctx_params.egui_render_target_entity != event.window {
                 continue;
             }
             let mut window_context = ctx_params;

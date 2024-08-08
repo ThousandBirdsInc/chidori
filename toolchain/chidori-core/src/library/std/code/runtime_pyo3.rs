@@ -32,6 +32,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use anyhow::{Result, anyhow};
 
+use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use dashmap::DashMap;
+use log::info;
+use regex::Regex;
+
+use sha1::{Sha1, Digest};
+use tracing::Span;
+use uuid::Uuid;
+
+static SOURCE_CODE_RUN_COUNTER: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
+static CURRENT_PYTHON_EXECUTION_ID: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
+
 fn install_dependencies_from_requirements(requirements_dir: &str, venv_path: &str) -> Result<()> {
     let requirements_path = Path::new(requirements_dir).join("requirements.txt");
 
@@ -214,16 +227,6 @@ fn invoke(py: Python, arg: PyObject) -> PyResult<PyObject> {
 }
 
 
-
-use once_cell::sync::Lazy;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use dashmap::DashMap;
-use log::info;
-use regex::Regex;
-
-static SOURCE_CODE_RUN_COUNTER: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
-static CURRENT_PYTHON_EXECUTION_ID: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
-
 fn set_current_python_execution_id(id: usize) {
     CURRENT_PYTHON_EXECUTION_ID.store(id, Ordering::SeqCst);
 }
@@ -355,7 +358,8 @@ pub async fn source_code_run_python(
         // Configure locals and globals passed to evaluation
         let globals = PyDict::new(py);
         let execution_state = Arc::new(Mutex::new(execution_state.clone()));
-        create_function_shims(&execution_state, &report, py, globals, current_span_id)?;
+        create_external_function_shims(&execution_state, &report, py, globals, current_span_id.clone())?;
+        create_internal_proxy_shims(&execution_state, &report, py, globals, current_span_id)?;
 
 
         let sys = py.import("sys")?;
@@ -458,13 +462,23 @@ sys.stderr.flush()
             // Necessary to expose defined functions to the global scope from the inside of the __wrapper function
             for (name, report_item) in &report.triggerable_functions {
 
-                // TODO: Rename functions to their wrapped and hashed version
-                // initial_source_code.push_str(&format!(
-                //     r#"{name} = {hashed_name}"#,
-                //     name = name,
-                //     hashed_name = hash_to_python_method_name(name)
-                // ));
+                // Re-assign functions to their HashA instance - these are where we hold
+                // on to the initial definitions of the functions for inbound function calls.
+                initial_source_code.push_str("\n");
+                initial_source_code.push_str(&format!(
+                    r#"{hashed_name} = {name}"#,
+                    name = name,
+                    hashed_name = hash_to_python_method_name(name)
+                ));
 
+                // The twice hashed (HashB) instance is assigned to the original function name,
+                // internal references to the function invoke this.
+                initial_source_code.push_str("\n");
+                initial_source_code.push_str(&format!(
+                    r#"{name} = {twice_hashed_name}"#,
+                    name = name,
+                    twice_hashed_name = hash_to_python_method_name(&hash_to_python_method_name(name))
+                ));
 
                 // Declare in our output what functions were defined by this run.
                 initial_source_code.push_str("\n");
@@ -478,7 +492,7 @@ sys.stderr.flush()
                 initial_source_code.push_str("\n");
                 initial_source_code.push_str(&format!(
                     r#"globals()["{name}"] = {name}"#,
-                    name = name
+                    name = hash_to_python_method_name(name)
                 ));
             }
             let indent_all_source_code = initial_source_code.lines().map(|line| format!("    {}", line)).collect::<Vec<_>>().join("\n");
@@ -512,6 +526,12 @@ asyncio.run(__wrapper())
                 })
             }
             Some(name) => {
+                // Function invocations refer to the function hashed _once_ this is the reference
+                // to the original definition of the function.
+                let name = hash_to_python_method_name(&name);
+                // TODO: name should be the hashed representation rather than the original name?
+                // This is calling to the not proxied version, so it is the Hash A instance of the function
+                // otherwise we're in a loop of external dispatches
                 let local = globals.get_item(name)?;
                 if let Some(py_func) = local {
                     // Call the function
@@ -586,51 +606,48 @@ asyncio.run(__wrapper())
 }
 
 
-// fn create_internal_proxy_shims(execution_state_handle: &Arc<Mutex<ExecutionState>>, map_of_renamed_fns_to_original: HashMap<String, String>, py: Python, globals: &PyDict) -> Result<(), Error> {
-//     // Create shims for the functions declared within this file, when a hashed reference to a function is invoked, we invoke the actual function internally.
-//
-//     let function_names = {
-//         let execution_state_handle = execution_state_handle.clone();
-//         let mut exec_state = execution_state_handle.lock().unwrap();
-//         exec_state.function_name_to_metadata.keys().cloned().collect::<Vec<_>>()
-//     };
-//     for function_name in function_names {
-//         if report
-//             .cell_depended_values
-//             .contains_key(&function_name)
-//         {
-//             let clone_function_name = function_name.clone();
-//             let execution_state_handle = execution_state_handle.clone();
-//             let closure_callable = PyCFunction::new_closure(
-//                 py,
-//                 None, // name
-//                 None, // doc
-//                 move |args: &PyTuple, kwargs: Option<&PyDict>| -> PyResult<PyObject> {
-//                     let total_arg_payload = python_args_to_rkyv(args, kwargs)?;
-//                     let clone_function_name = clone_function_name.clone();
-//                     let py = args.py();
-//                     // All function calls across cells are forced to be async
-//                     let mut new_exec_state = {
-//                         let mut exec_state = execution_state_handle.lock().unwrap();
-//                         let mut new_exec_state = exec_state.clone();
-//                         std::mem::swap(&mut *exec_state, &mut new_exec_state);
-//                         new_exec_state
-//                     };
-//                     pyo3_asyncio::tokio::future_into_py(py, async move {
-//                         let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload).await.map_err(|e| AnyhowErrWrapper(e))?;
-//                         PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result)))
-//                     }).map(|x| x.into())
-//                 },
-//             )?;
-//             // TODO: this should get something that identifies some kind of signal
-//             //       for how to fetch the execution state
-//             globals.set_item(function_name.clone(), closure_callable);
-//         }
-//     }
-//     Ok(())
-// }
+fn create_internal_proxy_shims(execution_state_handle: &Arc<Mutex<ExecutionState>>, report: &Report, py: Python, globals: &PyDict, parent_span_id: Option<tracing::Id>) -> Result<(), Error> {
+    // Create shims for the functions declared within this file,
+    // when a hashed reference to a function is invoked, we invoke the actual function internally
+    // but through our dispatch system, producing execution states.
 
-fn create_function_shims(execution_state_handle: &Arc<Mutex<ExecutionState>>, report: &Report, py: Python, globals: &PyDict, parent_span_id: Option<tracing::Id>) -> Result<(), Error> {
+    // map_of_renamed_fns_to_original: HashMap<String, String>
+    for (function_name, triggerable_function) in &report.triggerable_functions {
+        let clone_function_name = function_name.clone();
+        let execution_state_handle = execution_state_handle.clone();
+        let parent_span_id = parent_span_id.clone();
+        let closure_callable = PyCFunction::new_closure(
+            py,
+            None, // name
+            None, // doc
+            move |args: &PyTuple, kwargs: Option<&PyDict>| -> PyResult<PyObject> {
+                let total_arg_payload = python_args_to_rkyv(args, kwargs)?;
+                let clone_function_name = clone_function_name.clone();
+                let parent_span_id = parent_span_id.clone();
+                let py = args.py();
+                let mut new_exec_state = {
+                    let mut exec_state = execution_state_handle.lock().unwrap();
+                    let mut new_exec_state = exec_state.clone();
+                    std::mem::swap(&mut *exec_state, &mut new_exec_state);
+                    new_exec_state
+                };
+                // All function calls across cells are forced to be async
+                pyo3_asyncio::tokio::future_into_py(py, async move {
+                    let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload, parent_span_id.clone()).await.map_err(|e| AnyhowErrWrapper(e))?;
+                    // TODO: assign this execution state to the current so that as we continue to execute this is now where we're progressing from
+                    PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result)))
+                }).map(|x| x.into())
+            },
+        )?;
+
+        // Internal proxy shims are assigned to the function name hashed _twice_
+        let renamed_function = hash_to_python_method_name(&hash_to_python_method_name(&function_name));
+        globals.set_item(renamed_function, closure_callable);
+    }
+    Ok(())
+}
+
+fn create_external_function_shims(execution_state_handle: &Arc<Mutex<ExecutionState>>, report: &Report, py: Python, globals: &PyDict, parent_span_id: Option<tracing::Id>) -> Result<(), Error> {
     // Create shims for functions that are referred to, we look at what functions are being provided
     // and create shims for matches between the function name provided and the identifiers referred to.
 
@@ -658,15 +675,16 @@ fn create_function_shims(execution_state_handle: &Arc<Mutex<ExecutionState>>, re
                     let clone_function_name = clone_function_name.clone();
                     let parent_span_id = parent_span_id.clone();
                     let py = args.py();
-                    // All function calls across cells are forced to be async
                     let mut new_exec_state = {
                         let mut exec_state = execution_state_handle.lock().unwrap();
                         let mut new_exec_state = exec_state.clone();
                         std::mem::swap(&mut *exec_state, &mut new_exec_state);
                         new_exec_state
                     };
+                    // All function calls across cells are forced to be async
                     pyo3_asyncio::tokio::future_into_py(py, async move {
                         let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload, parent_span_id.clone()).await.map_err(|e| AnyhowErrWrapper(e))?;
+                        // TODO: assign this execution state to the current so that as we continue to execute this is now where we're progressing from
                         PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result)))
                     }).map(|x| x.into())
                 },
@@ -720,10 +738,6 @@ fn replace_identifier(code: &str, old_identifier: &str, new_identifier: &str) ->
     re.replace_all(code, new_identifier).to_string()
 }
 
-use sha1::{Sha1, Digest};
-use tracing::Span;
-use uuid::Uuid;
-
 fn hash_to_python_method_name(input: &str) -> String {
     // Create a SHA1 object
     let mut hasher = Sha1::new();
@@ -774,13 +788,18 @@ fn rename_triggerable_functions(report: &Report, code: &str) -> (String, HashMap
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
     use chumsky::prelude::any;
     use super::*;
     use crate::cells::{SupportedLanguage, TextRange};
     use crate::execution::primitives::serialized_value::RkyvObjectBuilder;
     use indoc::indoc;
+    use tokio::sync::Notify;
     use chidori_static_analysis::language::{InternalCallGraph, ReportTriggerableFunctions};
-
+    use crate::execution::execution::execution_graph::ExecutionGraphSendPayload;
+    use crate::execution::execution::execution_state::ExecutionStateEvaluation;
+    use crate::execution::primitives::operation::OperationFnOutput;
+    use crate::execution::primitives::serialized_value::ArchivedRkyvSerializedValue::Number;
     //     #[tokio::test]
     //     async fn test_source_code_run_py_success() {
     //         let source_code = String::from(
@@ -932,11 +951,6 @@ a = 20 + await demo()
 
     #[tokio::test]
     async fn test_running_async_function_dependency() -> anyhow::Result<()> {
-        let source_code = String::from(
-            r#"
-data = await demo()
-        "#,
-        );
         let mut state = ExecutionState::new_with_random_id();
         let (state, _) = state.update_op(CellTypes::Code(CodeCell {
             name: None,
@@ -950,7 +964,7 @@ data = await demo()
             function_invocation: None,
         }, TextRange::default()), Some(0))?;
         let result = source_code_run_python(&state,
-                                            &source_code,
+                                            &String::from( r#"data = await demo()"#, ),
                                             &RkyvObjectBuilder::new()
                                                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
 
@@ -1020,6 +1034,130 @@ data = await demo()
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_internal_function_invocation_chain_with_observability() -> anyhow::Result<()> {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<ExecutionGraphSendPayload>(1028);
+        let mut state_a = ExecutionState::new_with_graph_sender(Uuid::nil(), Arc::new(sender.clone()));
+        let (state, _) = state_a.update_op(CellTypes::Code(CodeCell {
+            name: None,
+            language: SupportedLanguage::PyO3,
+            source_code: String::from(indoc! {r#"
+                        import asyncio
+                        async def function_a():
+                            await asyncio.sleep(1)
+                            return 100
+
+                        async def function_b():
+                            await asyncio.sleep(1)
+                            return 100 + await function_a()
+
+                        async def function_c():
+                            await asyncio.sleep(1)
+                            return 100 + await function_b()
+                        "#}),
+            function_invocation: None,
+        }, TextRange::default()), Some(0))?;
+        let source_code = String::from(
+            r#"data = await function_c()"#,
+        );
+        let received_events = Arc::new(Mutex::new(Vec::new()));
+        let received_events_clone = Arc::clone(&received_events);
+
+
+        let cancellation_notify = Arc::new(Notify::new());
+        let cancellation_notify_clone = cancellation_notify.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                        match receiver.try_recv() {
+                            Ok((resulting_execution_state, oneshot)) => {
+                                println!("Received event");
+                                received_events_clone.lock().unwrap().push(resulting_execution_state.clone());
+                                if let Some(oneshot) = oneshot {
+                                    oneshot.send(()).unwrap();
+                                }
+                            },
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                                // No messages available
+                            },
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                println!("===== Was DC'd");
+                                // Handle the case where the sender has disconnected and no more messages will be received
+                                break; // or handle it according to your application logic
+                            }
+                        }
+                    }
+                    _ = cancellation_notify_clone.notified() => {
+                        println!("Task is notified to stop");
+                        return;
+                    }
+                }
+
+            }
+        });
+        let result = source_code_run_python(&state,
+                                            &source_code,
+                                            &RkyvObjectBuilder::new()
+                                                .build(),
+                                            &None,
+                                            &None,
+                                            &None,
+        ).await;
+        cancellation_notify.notify_one();
+        assert_eq!(
+            result.unwrap(),
+            (
+                RkyvObjectBuilder::new().insert_number("data", 300).build(),
+                vec![],
+                vec![]
+            )
+        );
+
+        // Assertions for the received events
+        let events = received_events.lock().unwrap();
+        assert!(!events.is_empty(), "Should have received execution events for each function call");
+
+        // Check for specific events (adjust based on your expected execution flow)
+        assert!(events.iter().any(|e| matches!(e, ExecutionStateEvaluation::Executing(..))),
+                "Should have received at least one Executing event");
+
+        // Helper function to check OperationFnOutput
+        fn check_operation_output(output: &Arc<OperationFnOutput>, expected_value: i64) -> bool {
+            match output.as_ref() {
+                OperationFnOutput { has_error: false, execution_state: None, output: output_value, stdout, stderr } => {
+                    matches!(output_value, RkyvSerializedValue::Number(n) if *n == expected_value as i32)
+                        && stdout.is_empty()
+                        && stderr.is_empty()
+                },
+                _ => false
+            }
+        }
+
+        // Check for Complete events
+        assert!(
+            matches!(events[3], ExecutionStateEvaluation::Complete(ref state) if {
+        state.state.values().next().map_or(false, |output| check_operation_output(output, 100))
+    }),
+            "First Complete event should have output 100"
+        );
+
+        assert!(
+            matches!(events[4], ExecutionStateEvaluation::Complete(ref state) if {
+        state.state.values().next().map_or(false, |output| check_operation_output(output, 200))
+    }),
+            "Second Complete event should have output 200"
+        );
+
+        assert!(
+            matches!(events[5], ExecutionStateEvaluation::Complete(ref state) if {
+        state.state.values().next().map_or(false, |output| check_operation_output(output, 300))
+    }),
+            "Third Complete event should have output 300"
+        );
+
+        Ok(())
+    }
 
 
     #[ignore]

@@ -1,3 +1,4 @@
+use std::slice::IterMut;
 use bevy::app::{App, Startup, Update};
 use bevy::DefaultPlugins;
 use bevy::math::UVec2;
@@ -10,7 +11,8 @@ use egui;
 use egui::{Color32, FontFamily, Frame, Margin, Pos2, Ui};
 use egui_extras::syntax_highlighting::CodeTheme;
 use egui_tiles::Tile;
-use chidori_core::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, LLMPromptCellChatConfiguration, MemoryCell, SupportedLanguage, TemplateCell, TextRange, WebserviceCell};
+use chidori_core::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, LLMPromptCellChatConfiguration, MemoryCell, SupportedLanguage, SupportedModelProviders, TemplateCell, TextRange, WebserviceCell};
+use chidori_core::sdk::entry::CellHolder;
 use crate::chidori::{ChidoriCells, ChidoriExecutionState, EguiTree, EguiTreeIdentities};
 use crate::egui_json_tree::JsonTree;
 use crate::GameState;
@@ -25,7 +27,7 @@ fn editor_update(
     q_window: Query<&Window, With<PrimaryWindow>>,
     mut execution_state: Res<ChidoriExecutionState>,
     mut tree: ResMut<EguiTree>,
-    mut cells: ResMut<ChidoriCells>,
+    mut chidori_cells: ResMut<ChidoriCells>,
     mut viewing_watched_file_cells: Local<bool>
 ) {
     let window = q_window.single();
@@ -63,13 +65,14 @@ fn editor_update(
         return;
     }
 
+    // TODO: make sure that editor and state cells are always rendered in the same order
     egui::CentralPanel::default().frame(container_frame).show(contexts.ctx_mut(), |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let mut theme = egui_extras::syntax_highlighting::CodeTheme::dark();
             let cells = if *viewing_watched_file_cells {
-                cells.editor_cells.iter()
+                chidori_cells.editor_cells.iter_mut()
             } else {
-                cells.state_cells.iter()
+                chidori_cells.state_cells.iter_mut()
             };
 
             ui.horizontal(|ui| {
@@ -81,13 +84,14 @@ fn editor_update(
                 }
             });
 
-            for cell_holder in cells {
+            for mut cell_holder in cells {
                 let op_id = cell_holder.op_id;
 
                 let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(Margin::symmetric(8.0, 16.0)).inner_margin(16.0).rounding(6.0).begin(ui);
                 {
                     let mut ui = &mut frame.content_ui;
-                    match &cell_holder.cell {
+                    let applied_at = &cell_holder.applied_at;
+                    match &mut cell_holder.cell {
                         CellTypes::Code(CodeCell { name, source_code, language, ..}, _) => {
                             render_code_cell(&mut execution_state, &mut theme, &op_id, ui, name, source_code, language);
                         }
@@ -96,7 +100,7 @@ fn editor_update(
                         }
                         CellTypes::Prompt(LLMPromptCell::Completion { .. }, _) => {}
                         CellTypes::Prompt(LLMPromptCell::Chat { name, configuration, req, .. }, _) => {
-                            render_prompt_cell(&mut execution_state, &op_id, ui, name, &configuration, req);
+                            render_prompt_cell(&mut execution_state, &op_id, ui, name, configuration, req);
                         }
                         CellTypes::Embedding(LLMEmbeddingCell { .. }, _) => {}
                         CellTypes::Web(WebserviceCell { name, configuration, .. }, _) => {
@@ -111,12 +115,21 @@ fn editor_update(
                 }
                 frame.end(ui);
             }
+
+            if chidori_cells.editor_cells.len() > 0 {
+                let mut frame = egui::Frame::default().fill(Color32::from_hex("#111111").unwrap()).outer_margin(Margin::symmetric(8.0, 16.0)).inner_margin(16.0).rounding(6.0).begin(ui);
+                {
+                    let mut ui = &mut frame.content_ui;
+                    render_new_cell_interface(&mut execution_state, ui, &mut chidori_cells);
+                }
+                frame.end(ui);
+            }
+
         });
     });
 }
 
-fn render_template_cell(execution_state: &mut Res<ChidoriExecutionState>, op_id: &Option<usize>, mut ui: &mut Ui, name: &Option<String>, body: &String) {
-    let mut s = body.clone();
+fn render_template_cell(execution_state: &mut Res<ChidoriExecutionState>, op_id: &Option<usize>, mut ui: &mut Ui, name: &Option<String>, mut body: &mut String) {
     ui.horizontal(|ui| {
         egui_label(ui, "Prompt");
         if let Some(name) = name {
@@ -132,7 +145,7 @@ fn render_template_cell(execution_state: &mut Res<ChidoriExecutionState>, op_id:
     // Add widgets inside the frame
     ui.vertical(|ui| {
         ui.add(
-            egui::TextEdit::multiline(&mut s)
+            egui::TextEdit::multiline(body)
                 .code_editor()
                 .lock_focus(true)
                 .margin(Margin::symmetric(8.0, 8.0))
@@ -189,8 +202,7 @@ fn render_web_service_cell(execution_state: &mut Res<ChidoriExecutionState>, op_
     });
 }
 
-fn render_prompt_cell(execution_state: &mut Res<ChidoriExecutionState>, op_id: &Option<usize>, mut ui: &mut Ui, name: &Option<String>, configuration: &&LLMPromptCellChatConfiguration, req: &String) {
-    let mut s = req.clone();
+fn render_prompt_cell(execution_state: &mut Res<ChidoriExecutionState>, op_id: &Option<usize>, mut ui: &mut Ui, name: &Option<String>, configuration: &mut LLMPromptCellChatConfiguration, mut req: &mut String) {
     let mut cfg = serde_yaml::to_string(&configuration.clone()).unwrap();
     ui.horizontal(|ui| {
         egui_label(ui, "Prompt");
@@ -216,7 +228,7 @@ fn render_prompt_cell(execution_state: &mut Res<ChidoriExecutionState>, op_id: &
         );
         ui.add_space(10.0);
         ui.add(
-            egui::TextEdit::multiline(&mut s)
+            egui::TextEdit::multiline(req)
                 .code_editor()
                 .lock_focus(true)
                 .margin(Margin::symmetric(8.0, 8.0))
@@ -259,7 +271,7 @@ fn render_code_gen_cell(execution_state: &mut Res<ChidoriExecutionState>, op_id:
     });
 }
 
-fn render_code_cell(execution_state: &mut Res<ChidoriExecutionState>, theme: &mut CodeTheme, op_id: &Option<usize>, mut ui: &mut Ui, name: &Option<String>, source_code: &String, language: &SupportedLanguage) {
+fn render_code_cell(execution_state: &mut Res<ChidoriExecutionState>, theme: &mut CodeTheme, op_id: &Option<usize>, mut ui: &mut Ui, name: &Option<String>, mut source_code: &mut String, language: &SupportedLanguage) {
     let language_string = match language {
         SupportedLanguage::PyO3 => "python",
         SupportedLanguage::Starlark => "starlark",
@@ -284,7 +296,6 @@ fn render_code_cell(execution_state: &mut Res<ChidoriExecutionState>, theme: &mu
         ui.fonts(|f| f.layout_job(layout_job))
     };
 
-    let mut s = source_code.clone();
     ui.horizontal(|ui| {
         egui_label(ui, "Code");
         egui_label(ui, language_string);
@@ -300,7 +311,7 @@ fn render_code_cell(execution_state: &mut Res<ChidoriExecutionState>, theme: &mu
     });
     ui.vertical(|ui| {
         ui.add(
-            egui::TextEdit::multiline(&mut s)
+            egui::TextEdit::multiline(source_code)
                 .font(egui::FontId::new(14.0, FontFamily::Monospace))
                 .code_editor()
                 .lock_focus(true)
@@ -311,6 +322,54 @@ fn render_code_cell(execution_state: &mut Res<ChidoriExecutionState>, theme: &mu
         ui.add_space(10.0);
         render_operation_output(&execution_state, &op_id, ui);
     });
+}
+
+fn render_new_cell_interface(
+    execution_state: &mut Res<ChidoriExecutionState>,
+    mut ui: &mut Ui,
+    x: &mut ResMut<ChidoriCells>
+) {
+    ui.horizontal(|ui| {
+        egui_label(ui, "New Cell");
+    });
+    if ui.button("Add Code Cell").clicked() {
+        x.editor_cells.push(CellHolder {
+            cell: CellTypes::Code(CodeCell {
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "".to_string(),
+                function_invocation: None,
+            }, TextRange::default()),
+            op_id: None,
+            applied_at: Default::default(),
+            needs_update: false,
+        })
+    }
+    if ui.button("Add Prompt Cell").clicked() {
+        x.editor_cells.push(CellHolder {
+            cell: CellTypes::Prompt(LLMPromptCell::Chat {
+                function_invocation: false,
+                configuration: Default::default(),
+                name: None,
+                provider: SupportedModelProviders::OpenAI,
+                req: "".to_string(),
+            }, TextRange::default()),
+            op_id: None,
+            applied_at: Default::default(),
+            needs_update: false,
+        })
+    }
+    if ui.button("Add Template Cell").clicked() {
+        x.editor_cells.push(CellHolder {
+            cell: CellTypes::Template(TemplateCell {
+                name: None,
+                body: "".to_string(),
+            }, TextRange::default()),
+            op_id: None,
+            applied_at: Default::default(),
+            needs_update: false,
+        })
+    }
 }
 
 pub fn editor_plugin(app: &mut App) {

@@ -330,7 +330,7 @@ pub struct OperationNode {
     pub(crate) signature: Signature,
 
     /// The operation function itself
-    operation: Box<OperationFn>,
+    pub(crate) operation: Box<OperationFn>,
 
     /// Dependencies of this node
     pub(crate) unresolved_dependencies: Vec<usize>,
