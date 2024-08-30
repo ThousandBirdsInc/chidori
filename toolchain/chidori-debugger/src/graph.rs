@@ -1,7 +1,7 @@
 use crate::chidori::{ChidoriExecutionGraph, EguiTree, EguiTreeIdentities};
 use crate::tidy_tree::{Layout, TidyLayout};
 use crate::util::{despawn_screen, egui_render_cell_read};
-use crate::{GameState, RENDER_LAYER_GRAPH_MINIMAP, RENDER_LAYER_GRAPH_VIEW, RENDER_LAYER_TRACE_MINIMAP, RENDER_LAYER_TRACE_VIEW, util};
+use crate::{chidori, GameState, RENDER_LAYER_GRAPH_MINIMAP, RENDER_LAYER_GRAPH_VIEW, RENDER_LAYER_TRACE_MINIMAP, RENDER_LAYER_TRACE_VIEW, util};
 use bevy::app::{App, Update};
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::input::touchpad::TouchpadMagnify;
@@ -143,27 +143,52 @@ fn keyboard_navigate_graph(
     keyboard_input: Res<ButtonInput<KeyCode>>,
     mut q_camera: Query<(&mut Projection, &mut Transform, &mut CameraState), (With<OnGraphScreen> , Without<GraphMinimapCamera>, Without<GraphIdxPair>, Without<GraphIdx>)>,
     mut graph_res: ResMut<GraphResource>,
+    execution_graph: Res<ChidoriExecutionGraph>,
     mut selected_node: Local<SelectedNode>,
     mut node_query: Query<(Entity, &mut Transform, &GraphIdx)>,
     mut keyboard_nav_state: Local<KeyboardNavigationState>,
     mut selected_entity: ResMut<SelectedEntity>,
 ) {
+    if !graph_res.is_active {
+        return;
+    }
     // Add a cooldown to prevent too rapid movement
     if time.elapsed_seconds() - keyboard_nav_state.last_move < keyboard_nav_state.move_cooldown {
         return;
     }
-
+    let (projection, mut camera_transform, mut camera_state) = q_camera.single_mut();
     let current_node = if let Some(node) = selected_node.0 {
         node
     } else {
         // If no node is selected, select the first node
         if let Some(node) = graph_res.execution_graph.node_indices().next() {
-            selected_node.0 = Some(node);
+            let head = execution_graph.current_execution_head;
+            let mut is_execution_head = false;
+            node_query
+                .iter()
+                .for_each(|(e, node_transform, graph_idx)| {
+                    if graph_idx.execution_id == head {
+                        is_execution_head = true;
+                        selected_entity.id = Some(e);
+                    }
+                });
+            keyboard_nav_state.last_move = time.elapsed_seconds();
+            keyboard_nav_state.move_cooldown = 0.1;
+            camera_state.state = CameraStateValue::LockedOnSelection;
+            if !is_execution_head {
+                selected_node.0 = Some(node);
+            } else {
+                if let Some(head) = graph_res.node_ids.get(&head) {
+                    selected_node.0 = Some(*head);
+                }
+                return;
+            }
             node
         } else {
             return; // No nodes in the graph
         }
     };
+
 
     let mut new_selection = None;
 
@@ -195,7 +220,6 @@ fn keyboard_navigate_graph(
         }
     }
 
-    let (projection, mut camera_transform, mut camera_state) = q_camera.single_mut();
 
     if let Some(new_node) = new_selection {
         selected_node.0 = Some(new_node);
@@ -395,9 +419,10 @@ fn mouse_scroll_events(
             camera_y += ev.y * projection.scale;
         }
     }
-    if !keyboard_input.pressed(KeyCode::SuperLeft) {
-        camera_state.state = CameraStateValue::Free(camera_x, camera_y);
-    }
+    // if !keyboard_input.pressed(KeyCode::SuperLeft) {
+    //     println!("Camera graph free");
+    //     camera_state.state = CameraStateValue::Free(camera_x, camera_y);
+    // }
 
 }
 
@@ -556,7 +581,7 @@ fn egui_execution_state(ui: &mut Ui, execution_state: &ExecutionState) {
 
 fn camera_follow_selection_head(
     mut q_camera: Query<(&Camera, &mut Transform, &CameraState), (With<OnGraphScreen>,  With<GraphMainCamera>, Without<ExecutionSelectionCursor>, Without<GraphMinimapCamera>)>,
-    execution_graph: ResMut<crate::chidori::ChidoriExecutionGraph>,
+    execution_graph: Res<crate::chidori::ChidoriExecutionGraph>,
     mut execution_selection_query: Query<
         (Entity, &mut Transform),
         (With<ExecutionSelectionCursor>, Without<GraphIdx>, Without<ExecutionHeadCursor>),
@@ -666,7 +691,7 @@ fn node_cursor_handling(
         (Entity, &Transform, &GraphIdx),
         (With<GraphIdx>, Without<ExecutionHeadCursor>, Without<ExecutionSelectionCursor>),
     >,
-    execution_graph: ResMut<crate::chidori::ChidoriExecutionGraph>,
+    execution_graph: Res<crate::chidori::ChidoriExecutionGraph>,
 ) {
     node_query
         .iter_mut()
@@ -677,16 +702,13 @@ fn node_cursor_handling(
                 t.translation.y = node_transform.translation.y;
                 t.scale = node_transform.scale + 16.0;
                 t.translation.z = -3.0;
-                return;
-            } else {
-                if Some(entity) == selected_entity.id {
-                    let (_, mut t) = execution_selection_query.single_mut();
-                    t.translation.x = node_transform.translation.x;
-                    t.translation.y = node_transform.translation.y;
-                    t.scale = node_transform.scale + 10.0;
-                    t.translation.z = -2.0;
-                    return;
-                }
+            }
+            if Some(entity) == selected_entity.id {
+                let (_, mut t) = execution_selection_query.single_mut();
+                t.translation.x = node_transform.translation.x;
+                t.translation.y = node_transform.translation.y;
+                t.scale = node_transform.scale + 10.0;
+                t.translation.z = -2.0;
             }
         });
 }
@@ -938,9 +960,16 @@ fn update_graph_system_renderer(
 
                                             if let Some(state) = internal_state.chidori.lock().unwrap().get_shared_state().execution_id_to_evaluation.lock().unwrap().get(&node1) {
                                                 match state {
-                                                    ExecutionStateEvaluation::Error => {}
-                                                    ExecutionStateEvaluation::EvalFailure => {}
-                                                    ExecutionStateEvaluation::Complete(state) | ExecutionStateEvaluation::Executing(state) => {
+                                                    ExecutionStateEvaluation::Error(_) => {
+                                                        ui.label("Error");
+                                                    }
+                                                    ExecutionStateEvaluation::EvalFailure(_) => {
+                                                        ui.label("Eval Failure");
+                                                    }
+                                                    ExecutionStateEvaluation::Executing(state) => {
+                                                        ui.label("Executing");
+                                                    }
+                                                    ExecutionStateEvaluation::Complete(state)=> {
                                                         for (key, value) in state.state.iter() {
                                                             let image_paths = crate::util::find_matching_strings(&value.output, r"(?i)\.(png|jpe?g)$");
                                                             for (img_path, object_path_to_img) in image_paths {
@@ -984,6 +1013,7 @@ fn update_graph_system_renderer(
                                                     }
                                                 }
                                             } else {
+                                                ui.label("No evaluation recorded");
                                                 // internal_state.get_execution_state_at_id(*node);
                                             }
                                         }
@@ -1055,7 +1085,11 @@ fn update_graph_system_renderer(
     }
 }
 
-fn generate_tree_layout(tidy: &mut TidyLayout, mut root: &mut crate::tidy_tree::Node, execution_graph: &&StableGraph<ExecutionNodeId, ()>) -> HashMap<NodeIndex, NonNull<crate::tidy_tree::Node>> {
+fn generate_tree_layout(
+    tidy: &mut TidyLayout,
+    mut root: &mut crate::tidy_tree::Node,
+    execution_graph: &&StableGraph<ExecutionNodeId, ()>
+) -> HashMap<NodeIndex, NonNull<crate::tidy_tree::Node>> {
     let mut node_mapping: HashMap<NodeIndex, NonNull<crate::tidy_tree::Node>> = HashMap::new();
     let mut topo = petgraph::visit::Topo::new(&execution_graph);
     while let Some(x) = topo.next(&execution_graph) {
@@ -1099,27 +1133,18 @@ fn generate_tree_layout(tidy: &mut TidyLayout, mut root: &mut crate::tidy_tree::
 
 fn update_graph_system_data_structures(
     mut graph_res: ResMut<GraphResource>,
-    mut execution_graph: ResMut<ChidoriExecutionGraph>,
+    execution_graph: Res<ChidoriExecutionGraph>,
 ) {
     // If the execution graph has changed, clear the graph and reconstruct it
     if graph_res.hash_graph != hash_graph(&execution_graph.execution_graph) {
-        let mut dataset = StableGraph::new();
-        let mut node_ids = HashMap::new();
-        // for (a, b) in &execution_graph.stack_graph
-        for (a, b) in &execution_graph.execution_graph {
-            let node_index_a = *node_ids
-                .entry(a.clone())
-                .or_insert_with(|| dataset.add_node(a.clone()));
-            let node_index_b = *node_ids
-                .entry(b.clone())
-                .or_insert_with(|| dataset.add_node(b.clone()));
-            dataset.add_edge(node_index_a, node_index_b, ());
-        }
+        let (dataset, node_ids) = execution_graph.construct_stablegraph_from_chidori_execution_graph();
         graph_res.node_ids = node_ids;
 
         let (grouped_dataset, grouped_tree, group_dep_graph) = group_tree(&dataset, &execution_graph.grouped_nodes);
 
-        graph_res.execution_graph = grouped_dataset;
+        // TODO: handle support for displaying groups
+        // graph_res.execution_graph = grouped_dataset;
+        graph_res.execution_graph = dataset;
         graph_res.grouped_nodes = grouped_tree;
         graph_res.group_dependency_graph = group_dep_graph;
         graph_res.hash_graph = hash_graph(&execution_graph.execution_graph);
@@ -1263,7 +1288,7 @@ fn graph_setup(
     windows: Query<&Window>,
     mut config_store: ResMut<GizmoConfigStore>,
     mut commands: Commands,
-    mut execution_graph: ResMut<ChidoriExecutionGraph>,
+    execution_graph: Res<ChidoriExecutionGraph>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials_standard: ResMut<Assets<StandardMaterial>>,
     mut materials_custom: ResMut<Assets<RoundedRectMaterial>>,

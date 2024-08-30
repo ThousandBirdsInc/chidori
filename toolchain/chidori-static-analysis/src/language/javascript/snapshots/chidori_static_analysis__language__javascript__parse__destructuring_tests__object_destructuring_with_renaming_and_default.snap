@@ -1,0 +1,15 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const { c: renamed, d = 'default' } = { c: 3 };\n"
+---
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: renamed
+      in_scope: false
+      exposed: true
+  - IdentifierReferredTo:
+      name: d
+      in_scope: false
+      exposed: true
+  - Constant: default
+- - AssignmentFromStatement

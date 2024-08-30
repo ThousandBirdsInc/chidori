@@ -6,33 +6,40 @@ description: "function subtract(a, b) {\n    return a - b;\n}\n\n// Example usag
       - subtract
       - start: 1
         end: 46
-  - Params
+  - FunctionArguments
   - IdentifierReferredTo:
-      - a
-      - false
+      name: a
+      in_scope: false
+      exposed: true
   - IdentifierReferredTo:
-      - b
-      - false
+      name: b
+      in_scope: false
+      exposed: true
 - - InFunction:
       - subtract
       - start: 1
         end: 46
   - IdentifierReferredTo:
-      - a
-      - true
+      name: a
+      in_scope: true
+      exposed: true
   - IdentifierReferredTo:
-      - b
-      - true
+      name: b
+      in_scope: true
+      exposed: true
 - - AssignmentToStatement
   - IdentifierReferredTo:
-      - v
-      - false
+      name: v
+      in_scope: false
+      exposed: true
 - - AssignmentFromStatement
   - InCallExpression
   - IdentifierReferredTo:
-      - subtract
-      - true
+      name: subtract
+      in_scope: true
+      exposed: true
   - IdentifierReferredTo:
-      - x
-      - false
+      name: x
+      in_scope: false
+      exposed: true
 - - AssignmentFromStatement

@@ -1,0 +1,9 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const pairs = [{a: 1, b:2}];\nfor (const {a, b} of pairs) {\n    console.log(a, b);\n}\n"
+---
+internal_call_graph: {}
+cell_exposed_values:
+  pairs: {}
+cell_depended_values: {}
+triggerable_functions: {}

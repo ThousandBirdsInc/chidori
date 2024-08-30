@@ -5,6 +5,7 @@ use crate::language::{InternalCallGraph, python, TextRange};
 use crate::language::{Report, ReportItem, ReportTriggerableFunctions};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::env::var;
 use swc_common::sync::Lrc;
 use swc_common::{
     errors::{ColorConfig, Handler},
@@ -12,34 +13,9 @@ use swc_common::{
 };
 use swc_common::source_map::Pos;
 use swc_ecma_ast as ast;
-use swc_ecma_ast::{
-    BlockStmtOrExpr, Callee, Decl, Expr, FnDecl, ForHead, Ident, ImportSpecifier, Lit, MemberProp,
-    ModuleDecl, ModuleItem, Pat, PatOrExpr, Stmt,
-};
+use swc_ecma_ast::{BlockStmtOrExpr, Callee, Decl, Expr, FnDecl, ForHead, Ident, ImportSpecifier, Lit, MemberProp, ModuleDecl, ModuleItem, Pat, PatOrExpr, PropName, Stmt};
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
-
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
-pub enum ContextPath {
-    Initialized,
-    InFunction(String, TextRange),
-    InAnonFunction,
-    Params,
-    Param(String),
-    InFunctionDecorator(usize),
-    InCallExpression,
-    ChName,
-    AssignmentToStatement,
-    AssignmentFromStatement,
-    // bool = true (is locally defined)
-    IdentifierReferredTo(String, bool),
-    Attribute(String),
-    Constant(String),
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct FunctionContext {
-    dependencies: Vec<Vec<ContextPath>>,
-}
+use crate::language::ContextPath;
 
 fn remove_hash_and_numbers(input: &str) -> String {
     match input.find('#') {
@@ -104,17 +80,18 @@ impl ASTWalkContext {
     }
 
     fn pop_local_context(&mut self) {
-        self.local_contexts.pop();
-
         // Clearing the existing locals
         self.locals.clear();
 
-        // Union of all remaining hashsetss in local_contexts
+        // Union of all remaining hashsets in local_contexts
+        // restoring the parent local context
         self.locals.extend(
             self.local_contexts
                 .iter()
                 .flat_map(|context| context.iter().cloned()),
         );
+
+        self.local_contexts.pop();
     }
 
     fn enter_anonymous_function(&mut self) -> usize {
@@ -131,7 +108,7 @@ impl ASTWalkContext {
     }
 
     fn enter_params(&mut self) -> usize {
-        self.context_stack.push(ContextPath::Params);
+        self.context_stack.push(ContextPath::FunctionArguments);
         self.context_stack.len()
     }
 
@@ -164,25 +141,51 @@ impl ASTWalkContext {
     }
 
     fn encounter_named_reference(&mut self, name: &ast::Ident) {
-        // TODO: we can't pop named references because they can be used during patterns which apply to attributes
         let name = remove_hash_and_numbers(&name.to_string());
-        // TODO: we need to check if this is a local variable or not
-        if self.var_exists(&name.to_string()) {
+        let mut var_exists = false;
+        if self.globals.contains(&name.to_string()) {
+            var_exists = true;
+        }
+        if self.locals.contains(&name.to_string()) {
+            var_exists = true;
+        }
+        for local_context in self.local_contexts.iter().rev() {
+            if local_context.contains(&name.to_string()) {
+                var_exists = true;
+            }
+        }
+
+        if var_exists {
             // true, the var already exists in the local or global scope
             self.context_stack
-                .push(ContextPath::IdentifierReferredTo(name.to_string(), true));
+                .push(ContextPath::IdentifierReferredTo{
+                    name: name.to_string(),
+                    in_scope: true,
+                    exposed: self.local_contexts.len() == 0
+                });
         } else {
-            if let Some(ContextPath::AssignmentToStatement) = self.context_stack.last() {
+            if self.context_stack.contains(&ContextPath::AssignmentToStatement) {
                 self.locals.insert(name.to_string());
             }
-            if self.context_stack.contains(&ContextPath::Params) {
+            // if let Some(ContextPath::AssignmentToStatement) = self.context_stack.last() {
+            //     self.locals.insert(name.to_string());
+            // }
+            if self.context_stack.contains(&ContextPath::FunctionArguments) {
                 self.locals.insert(name.to_string());
                 self.context_stack
-                    .push(ContextPath::IdentifierReferredTo(name.to_string(), false));
+                    .push(ContextPath::IdentifierReferredTo{
+                        name: name.to_string(),
+                        in_scope: false,
+                        exposed: self.local_contexts.len() == 0
+                });
                 return;
             }
             self.context_stack
-                .push(ContextPath::IdentifierReferredTo(name.to_string(), false));
+                .push(ContextPath::IdentifierReferredTo{
+                    name: name.to_string(),
+                    in_scope: false,
+                    exposed: self.local_contexts.len() == 0
+                });
         }
     }
 
@@ -252,6 +255,18 @@ fn traverse_module(module: ModuleItem, machine: &mut ASTWalkContext) {
     }
 }
 
+fn traverse_prop_name(prop_name: &PropName, machine: &mut ASTWalkContext) {
+    match prop_name {
+        PropName::Ident(name) => {
+            // machine.encounter_named_reference(name);
+        }
+        PropName::Str(_) => {}
+        PropName::Num(_) => {}
+        PropName::Computed(_) => {}
+        PropName::BigInt(_) => {}
+    }
+}
+
 fn traverse_pat(pat: &ast::Pat, machine: &mut ASTWalkContext) {
     match pat {
         Pat::Ident(ast::BindingIdent { id, .. }) => {
@@ -271,9 +286,13 @@ fn traverse_pat(pat: &ast::Pat, machine: &mut ASTWalkContext) {
             for prop in props {
                 match prop {
                     ast::ObjectPatProp::KeyValue(ast::KeyValuePatProp { key, value, .. }) => {
+                        // Key to access
+                        traverse_prop_name(key, machine);
+                        // Assignment patterns
                         traverse_pat(value, machine);
                     }
                     ast::ObjectPatProp::Assign(ast::AssignPatProp { key, value, .. }) => {
+                        machine.encounter_named_reference(key);
                         if let Some(value) = value {
                             traverse_expr(value, machine);
                         }
@@ -330,11 +349,14 @@ fn traverse_expr(expr: &ast::Expr, machine: &mut ASTWalkContext) {
         }
         Expr::Member(ast::MemberExpr { obj, prop, .. }) => {
             match prop {
-                MemberProp::Ident(id) => machine.enter_attr(id),
-                MemberProp::PrivateName(ast::PrivateName { id, .. }) => machine.enter_attr(id),
+                MemberProp::Ident(id) => {
+                    machine.enter_attr(id);
+                },
+                MemberProp::PrivateName(ast::PrivateName { id, .. }) => {
+                    machine.enter_attr(id);
+                }
                 MemberProp::Computed(ast::ComputedPropName { expr, .. }) => {
                     // TODO: handle computed prop name
-                    unimplemented!("computed prop name");
                 }
             };
             traverse_expr(&obj, machine);
@@ -394,6 +416,7 @@ fn traverse_expr(expr: &ast::Expr, machine: &mut ASTWalkContext) {
         }
         Expr::Arrow(ast::ArrowExpr { params, body, .. }) => {
             let idx = machine.enter_anonymous_function();
+            machine.new_local_context();
             let params_idx = machine.enter_params();
             for param in params {
                 traverse_pat(param, machine);
@@ -407,6 +430,7 @@ fn traverse_expr(expr: &ast::Expr, machine: &mut ASTWalkContext) {
                     traverse_stmts(&block.stmts, machine);
                 }
             }
+            machine.pop_local_context();
             machine.pop_until(idx);
         }
         Expr::Class(ast::ClassExpr { class, .. }) => {
@@ -499,12 +523,16 @@ fn traverse_stmt(stmt: &Stmt, machine: &mut ASTWalkContext) {
             traverse_stmts(&block.stmts, machine);
         }
         Stmt::While(ast::WhileStmt { test, body, .. }) => {
+            machine.new_local_context();
             traverse_expr(&test, machine);
             traverse_stmt(&body, machine);
+            machine.pop_local_context();
         }
         Stmt::DoWhile(ast::DoWhileStmt { test, body, .. }) => {
+            machine.new_local_context();
             traverse_expr(&test, machine);
             traverse_stmt(&body, machine);
+            machine.pop_local_context();
         }
         Stmt::For(ast::ForStmt {
             init,
@@ -513,9 +541,20 @@ fn traverse_stmt(stmt: &Stmt, machine: &mut ASTWalkContext) {
             update,
             ..
         }) => {
+            machine.new_local_context();
             if let Some(init) = init {
                 match init {
-                    ast::VarDeclOrExpr::VarDecl(_) => {}
+                    ast::VarDeclOrExpr::VarDecl(x) => {
+                        let ast::VarDecl { decls, .. } = &**x;
+                        for decl in decls {
+                            let idx = machine.enter_assignment_to_statement();
+                            traverse_pat(&decl.name, machine);
+                            machine.pop_until(idx);
+                            if let Some(init) = &decl.init {
+                                traverse_expr(&init, machine);
+                            }
+                        }
+                    }
                     ast::VarDeclOrExpr::Expr(expr) => {
                         traverse_expr(&expr, machine);
                     }
@@ -528,61 +567,25 @@ fn traverse_stmt(stmt: &Stmt, machine: &mut ASTWalkContext) {
                 traverse_expr(&update, machine);
             }
             traverse_stmt(&body, machine);
+            machine.pop_local_context();
         }
         Stmt::ForIn(ast::ForInStmt {
             left, right, body, ..
         }) => {
-            match left {
-                ForHead::VarDecl(x) => {
-                    let ast::VarDecl { decls, .. } = &**x;
-                    for decl in decls {
-                        if let Some(init) = &decl.init {
-                            traverse_expr(&init, machine);
-                        }
-                    }
-                }
-                ForHead::UsingDecl(x) => {
-                    let ast::UsingDecl { decls, .. } = &**x;
-                    for decl in decls {
-                        if let Some(init) = &decl.init {
-                            traverse_expr(&init, machine);
-                        }
-                    }
-                }
-                ForHead::Pat(x) => {
-                    traverse_pat(&x, machine);
-                }
-            }
+            machine.new_local_context();
+            traverse_for_statement(machine, left);
             traverse_expr(&right, machine);
             traverse_stmt(&body, machine);
+            machine.pop_local_context();
         }
         Stmt::ForOf(ast::ForOfStmt {
             left, right, body, ..
         }) => {
-            // TODO: For loop declarations need to be added to locals
-            match left {
-                ForHead::VarDecl(x) => {
-                    let ast::VarDecl { decls, .. } = &**x;
-                    for decl in decls {
-                        if let Some(init) = &decl.init {
-                            traverse_expr(&init, machine);
-                        }
-                    }
-                }
-                ForHead::UsingDecl(x) => {
-                    let ast::UsingDecl { decls, .. } = &**x;
-                    for decl in decls {
-                        if let Some(init) = &decl.init {
-                            traverse_expr(&init, machine);
-                        }
-                    }
-                }
-                ForHead::Pat(x) => {
-                    traverse_pat(&x, machine);
-                }
-            }
+            machine.new_local_context();
+            traverse_for_statement(machine, left);
             traverse_expr(&right, machine);
             traverse_stmt(&body, machine);
+            machine.pop_local_context();
         }
         Stmt::Decl(decl) => match decl {
             Decl::Class(_) => {}
@@ -621,7 +624,9 @@ fn traverse_stmt(stmt: &Stmt, machine: &mut ASTWalkContext) {
             Decl::Using(v) => {
                 let ast::UsingDecl { decls, .. } = &**v;
                 for decl in decls {
+                    let idx = machine.enter_assignment_to_statement();
                     traverse_pat(&decl.name, machine);
+                    machine.pop_until(idx);
                     if let Some(init) = &decl.init {
                         traverse_expr(&init, machine);
                     }
@@ -632,6 +637,36 @@ fn traverse_stmt(stmt: &Stmt, machine: &mut ASTWalkContext) {
             Decl::TsEnum(_) => {}
             Decl::TsModule(_) => {}
         },
+    }
+}
+
+fn traverse_for_statement(machine: &mut ASTWalkContext, left: &ForHead) {
+    match left {
+        ForHead::VarDecl(x) => {
+            let ast::VarDecl { decls, .. } = &**x;
+            for decl in decls {
+                let idx = machine.enter_assignment_to_statement();
+                traverse_pat(&decl.name, machine);
+                machine.pop_until(idx);
+                if let Some(init) = &decl.init {
+                    traverse_expr(&init, machine);
+                }
+            }
+        }
+        ForHead::UsingDecl(x) => {
+            let ast::UsingDecl { decls, .. } = &**x;
+            for decl in decls {
+                let idx = machine.enter_assignment_to_statement();
+                traverse_pat(&decl.name, machine);
+                machine.pop_until(idx);
+                if let Some(init) = &decl.init {
+                    traverse_expr(&init, machine);
+                }
+            }
+        }
+        ForHead::Pat(x) => {
+            traverse_pat(&x, machine);
+        }
     }
 }
 
@@ -680,15 +715,6 @@ pub fn extract_dependencies_js(source: &str) -> Vec<Vec<ContextPath>> {
 
 
 pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
-    // TODO: get all exposed values
-    // TODO: get all values referred to but are not available in a given context
-    // TODO: get all triggerable functions
-    // TODO: get all events that are emitted
-
-    // TODO: triggerable functions should note what they are triggered by
-    // TODO: for each of these we should store the context path that refers to them
-    // TODO: context paths should include spans
-    // TODO: for each of these we should store their type if its available
     let mut exposed_values = HashMap::new();
     let mut depended_values = HashMap::new();
     let mut triggerable_functions = HashMap::new();
@@ -697,7 +723,6 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
 
         let mut in_function: Option<&String> = None;
         let mut in_call_expression = false;
-        let mut in_ch_call = false;
         let mut attribute_path = vec![];
 
         for (idx, context_path_unit) in context_path.iter().enumerate() {
@@ -728,13 +753,6 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                     }
                 }
 
-                // Decorators set the emit event property for a function
-                if &ContextPath::IdentifierReferredTo(String::from("ch"), false)
-                    == context_path_unit
-                {
-                    in_ch_call = true;
-                }
-
                 if context_path.len() - 1 == idx {
                     let mut x = triggerable_functions
                         .entry(in_function_name.clone())
@@ -759,54 +777,43 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                 }
             }
 
-            // TODO: this needs to be updated to be smilar to the python implemnetation
-            if let ContextPath::IdentifierReferredTo(identifier, false) = context_path_unit {
-                if identifier != &String::from("ch") {
-                    // If this value is not being assigned to, then it is a dependency
+            // TODO: this needs to be updated to be similar to the python implementation
+            if let ContextPath::IdentifierReferredTo{name: identifier, exposed, in_scope: false} = context_path_unit {
+                // If this value is not being assigned to, then it is a dependency
 
-                    if encountered.iter().any(|x| matches!(x, ContextPath::InFunction(_, _)))
-                        && encountered.iter().any(|x| matches!(x, ContextPath::Params))
-                    {
-                        for context_path_unit in &encountered {
-                            if let ContextPath::InFunction(function_name, _) = context_path_unit {
-                                let mut x = triggerable_functions
-                                    .entry(function_name.clone())
-                                    .or_insert_with(|| ReportTriggerableFunctions {
-                                        arguments: vec![],
-                                        emit_event: vec![], // Initialize with an empty string or a default value
-                                        trigger_on: vec![],
-                                    });
-                                x.arguments.push(identifier.clone());
-                            }
+                if encountered.iter().any(|x| matches!(x, ContextPath::InFunction(_, _)))
+                    && encountered.iter().any(|x| matches!(x, ContextPath::FunctionArguments))
+                {
+                    for context_path_unit in &encountered {
+                        if let ContextPath::InFunction(function_name, _) = context_path_unit {
+                            let mut x = triggerable_functions
+                                .entry(function_name.clone())
+                                .or_insert_with(|| ReportTriggerableFunctions {
+                                    arguments: vec![],
+                                    emit_event: vec![], // Initialize with an empty string or a default value
+                                    trigger_on: vec![],
+                                });
+                            x.arguments.push(identifier.clone());
                         }
-                        continue;
                     }
+                    continue;
+                }
 
-                    // This is an exposed value if it does not occur inside the scope of a function
-                    if encountered
+                // This is an exposed value if it does not occur inside the scope of a function
+                if encountered
+                    .iter()
+                    .find(|x| matches!(x, ContextPath::InFunction(_, _)))
+                    .is_none()
+                    &&
+                    encountered
                         .iter()
-                        .find(|x| matches!(x, ContextPath::InFunction(_, _)))
+                        .find(|x| matches!(x, ContextPath::InAnonFunction))
                         .is_none()
-                        &&
-                         encountered
-                            .iter()
-                            .find(|x| matches!(x, ContextPath::InAnonFunction))
-                            .is_none()
+                    && *exposed
 
-                    {
-                        if encountered.contains(&&ContextPath::AssignmentToStatement) {
-                            exposed_values.insert(
-                                identifier.clone(),
-                                ReportItem {
-                                    // context_path: context_path.clone(),
-                                },
-                            );
-                            continue;
-                        }
-                    }
-
-                    if !encountered.contains(&&ContextPath::AssignmentToStatement) {
-                        depended_values.insert(
+                {
+                    if encountered.contains(&&ContextPath::AssignmentToStatement) {
+                        exposed_values.insert(
                             identifier.clone(),
                             ReportItem {
                                 // context_path: context_path.clone(),
@@ -814,6 +821,16 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                         );
                         continue;
                     }
+                }
+
+                if !encountered.contains(&&ContextPath::AssignmentToStatement) && !encountered.contains(&&ContextPath::FunctionArguments) {
+                    depended_values.insert(
+                        identifier.clone(),
+                        ReportItem {
+                            // context_path: context_path.clone(),
+                        },
+                    );
+                    continue;
                 }
             }
         }
@@ -1166,5 +1183,935 @@ x = random.randint(0, 10)
             },
         };
         assert_eq!(result, report);
+    }
+
+    #[test]
+    fn test_report_generation_with_object_destructuring() {
+        let js_source = indoc! { r#"
+        const { a, b } = someObject;
+        const { c: renamed } = anotherObject;
+
+        function processValues({ x, y }) {
+            return x + y;
+        }
+
+        const result = processValues({ x: a, y: b });
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+    }
+}
+
+#[cfg(test)]
+mod destructuring_tests {
+    use super::*;
+    use indoc::indoc;
+
+    #[test]
+    fn test_basic_object_destructuring() {
+        let js_source = indoc! { r#"
+            const { a, b } = { a: 1, b: 2 };
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_object_destructuring_with_renaming_and_default() {
+        let js_source = indoc! { r#"
+            const { c: renamed, d = 'default' } = { c: 3 };
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_nested_object_destructuring() {
+        let js_source = indoc! { r#"
+            const { e: { f } } = { e: { f: 4 } };
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_basic_array_destructuring() {
+        let js_source = indoc! { r#"
+            const [g, h] = [5, 6];
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_array_destructuring_with_gaps() {
+        let js_source = indoc! { r#"
+            const [i, , j] = [7, 8, 9];
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_array_destructuring_with_rest() {
+        let js_source = indoc! { r#"
+            const [k, ...rest] = [10, 11, 12];
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_mixed_destructuring() {
+        let js_source = indoc! { r#"
+            const { l, m: [n, o] } = { l: 13, m: [14, 15] };
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_destructuring_in_function_parameters() {
+        let js_source = indoc! { r#"
+            function printPerson({ name, age = 30 }) {
+                console.log(`${name} is ${age} years old`);
+            }
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_destructuring_with_computed_property_names() {
+        let js_source = indoc! { r#"
+            const key = 'p';
+            const { [key]: value } = { p: 16 };
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_complex_nested_destructuring() {
+        let js_source = indoc! { r#"
+            const { q: { r: [s, { t }] } } = { q: { r: [17, { t: 18 }] } };
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_object_destructuring_with_rest_properties() {
+        let js_source = indoc! { r#"
+            const { u, ...others } = { u: 19, v: 20, w: 21 };
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_destructuring_in_for_of_loops() {
+        let js_source = indoc! { r#"
+            const items = [{ id: 1, name: 'Item 1' }, { id: 2, name: 'Item 2' }];
+            for (const { id, name } of items) {
+                console.log(`${id}: ${name}`);
+            }
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_destructuring_with_alias_and_default_value() {
+        let js_source = indoc! { r#"
+            const { x: newX = 100 } = {};
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_array_destructuring_with_default_values() {
+        let js_source = indoc! { r#"
+            const [y = 200, z = 300] = [22];
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_destructuring_returned_arrays() {
+        let js_source = indoc! { r#"
+            function returnArray() {
+                return [1, 2, 3];
+            }
+            const [first, ...restArray] = returnArray();
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_variable_swapping_with_destructuring() {
+        let js_source = indoc! { r#"
+            let aa = 'first', bb = 'second';
+            [aa, bb] = [bb, aa];
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+}
+
+#[cfg(test)]
+mod for_loop_tests {
+    use super::*;
+    use indoc::indoc;
+
+    #[test]
+    fn test_traditional_for_loop() {
+        let js_source = indoc! { r#"
+            for (let i = 0; i < 5; i++) {
+                console.log(i);
+            }
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_for_of_loop_with_array() {
+        let js_source = indoc! { r#"
+            const array = [1, 2, 3, 4, 5];
+            for (const item of array) {
+                console.log(item);
+            }
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_for_in_loop_with_object() {
+        let js_source = indoc! { r#"
+            const obj = { a: 1, b: 2, c: 3 };
+            for (const key in obj) {
+                console.log(key, obj[key]);
+            }
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_for_loop_with_multiple_declarations() {
+        let js_source = indoc! { r#"
+            for (let i = 0, j = 10; i < j; i++, j--) {
+                console.log(i, j);
+            }
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_for_loop_with_break_statement() {
+        let js_source = indoc! { r#"
+            for (let i = 0; i < 10; i++) {
+                if (i === 5) break;
+                console.log(i);
+            }
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_for_loop_with_continue_statement() {
+        let js_source = indoc! { r#"
+            for (let i = 0; i < 10; i++) {
+                if (i % 2 === 0) continue;
+                console.log(i);
+            }
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_nested_for_loops() {
+        let js_source = indoc! { r#"
+            for (let i = 0; i < 3; i++) {
+                for (let j = 0; j < 3; j++) {
+                    console.log(i, j);
+                }
+            }
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_for_loop_with_let_declaration() {
+        let js_source = indoc! { r#"
+            for (let i = 0; i < 5; i++) {
+                let x = i * 2;
+                console.log(x);
+            }
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_for_loop_with_const_declaration() {
+        let js_source = indoc! { r#"
+            for (let i = 0; i < 5; i++) {
+                const y = i * 2;
+                console.log(y);
+            }
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_for_loop_with_var_declaration() {
+        let js_source = indoc! { r#"
+            for (var i = 0; i < 5; i++) {
+                var z = i * 2;
+                console.log(z);
+            }
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_for_of_loop_with_destructuring() {
+        let js_source = indoc! { r#"
+            const pairs = [[1, 'one'], [2, 'two'], [3, 'three']];
+            for (const [num, word] of pairs) {
+                console.log(num, word);
+            }
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+
+    #[test]
+    fn test_for_of_loop_with_object_destructuring() {
+        let js_source = indoc! { r#"
+            const pairs = [{a: 1, b:2}];
+            for (const {a, b} of pairs) {
+                console.log(a, b);
+            }
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(context_stack_references);
+        });
+
+        let result = build_report(&context_stack_references);
+        insta::with_settings!({
+            sort_maps => true,
+            description => js_source,
+            omit_expression => true
+        }, {
+            insta::assert_yaml_snapshot!(result);
+        });
+
+        result;
+    }
+}
+
+
+
+#[cfg(test)]
+mod anonymous_function_tests {
+    use super::*;
+    use indoc::indoc;
+
+    #[test]
+    fn test_basic_anonymous_function() {
+        let js_source = indoc! { r#"
+            const func = function(x, y) {
+                return x + y;
+            };
+            func(1, 2);
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        let result = build_report(&context_stack_references);
+
+        assert!(result.cell_depended_values.is_empty(), "Anonymous function parameters should not be depended upon");
+        assert!(result.cell_exposed_values.contains_key("func"), "The function should be exposed");
+    }
+
+    #[test]
+    fn test_arrow_function() {
+        let js_source = indoc! { r#"
+            const arrowFunc = (a, b) => a * b;
+            arrowFunc(3, 4);
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        let result = build_report(&context_stack_references);
+
+        assert!(result.cell_depended_values.is_empty(), "Arrow function parameters should not be depended upon");
+        assert!(result.cell_exposed_values.contains_key("arrowFunc"), "The arrow function should be exposed");
+    }
+
+    #[test]
+    fn test_iife() {
+        let js_source = indoc! { r#"
+            (function(x) {
+                console.log(x);
+            })(5);
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        let result = build_report(&context_stack_references);
+
+        assert!(result.cell_depended_values.is_empty(), "IIFE parameters should not be depended upon");
+    }
+
+    #[test]
+    fn test_function_as_argument() {
+        let js_source = indoc! { r#"
+            function higherOrder(callback) {
+                callback(10);
+            }
+            higherOrder(function(num) {
+                return num * 2;
+            });
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        let result = build_report(&context_stack_references);
+
+        assert!(!result.cell_depended_values.contains_key("num"), "Callback parameter should not be depended upon");
+        assert!(result.triggerable_functions.contains_key("higherOrder"), "The higher-order function should be exposed");
+    }
+
+    #[test]
+    fn test_nested_anonymous_functions() {
+        let js_source = indoc! { r#"
+            const nestedFunc = function(x) {
+                return function(y) {
+                    return x + y;
+                };
+            };
+            nestedFunc(5)(3);
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        let result = build_report(&context_stack_references);
+
+        assert!(result.cell_depended_values.is_empty(), "Nested anonymous function parameters should not be depended upon");
+        assert!(result.cell_exposed_values.contains_key("nestedFunc"), "The outer function should be exposed");
+    }
+
+    #[test]
+    fn test_anonymous_function_with_destructuring() {
+        let js_source = indoc! { r#"
+            const destructuringFunc = function({ a, b }) {
+                return a + b;
+            };
+            destructuringFunc({ a: 1, b: 2 });
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        let result = build_report(&context_stack_references);
+
+        assert!(result.cell_depended_values.is_empty(), "Destructured parameters should not be depended upon");
+        assert!(result.cell_exposed_values.contains_key("destructuringFunc"), "The function should be exposed");
+    }
+
+    #[test]
+    fn test_anonymous_function_in_object() {
+        let js_source = indoc! { r#"
+            const obj = {
+                method: function(x) {
+                    return x * x;
+                }
+            };
+            obj.method(4);
+        "#};
+        let context_stack_references = extract_dependencies_js(js_source);
+        let result = build_report(&context_stack_references);
+
+        assert!(result.cell_depended_values.is_empty(), "Object method parameters should not be depended upon");
+        assert!(result.cell_exposed_values.contains_key("obj"), "The object should be exposed");
     }
 }

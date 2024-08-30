@@ -3,13 +3,13 @@
 This is a python function that is invoking a prompt by name, kwargs to this
 invocation are passed to the prompt. Prompts are async and return strings.
 ```python (run_prompt_cell)
-def first_letter(s):
+async def first_letter(s):
     return s.replace("-", "").strip()[0]
 
 async def run_prompt(number_of_states):
     out = ""
     for state in (await get_states_first_letters(num=number_of_states)).split('\n'):
-        out += first_letter(state)
+        out += await first_letter(state)
     return "demo" + out
 ```
 

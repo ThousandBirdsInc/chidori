@@ -1,67 +1,34 @@
 ---
 source: chidori-static-analysis/src/language/python/parse.rs
-description: "@ch.on_event(\"new_file\")\n@ch.emit_as(\"file_created\")\ndef testing():\n    x = 2 + y\n    return x\n    "
+description: "def testing():\n    x = 2 + y\n    return x\n    "
 ---
 - - InFunction:
       - testing
-      - start: 53
-        end: 94
+      - start: 0
+        end: 41
 - - InFunction:
       - testing
-      - start: 53
-        end: 94
-  - InFunctionDecorator: 0
-  - InCallExpression
-  - Constant: new_file
-- - InFunction:
-      - testing
-      - start: 53
-        end: 94
-  - InFunctionDecorator: 0
-  - InCallExpression
-  - Constant: new_file
-  - Attribute: on_event
-  - IdentifierReferredTo:
-      - ch
-      - false
-- - InFunction:
-      - testing
-      - start: 53
-        end: 94
-  - InFunctionDecorator: 1
-  - InCallExpression
-  - Constant: file_created
-- - InFunction:
-      - testing
-      - start: 53
-        end: 94
-  - InFunctionDecorator: 1
-  - InCallExpression
-  - Constant: file_created
-  - Attribute: emit_as
-  - IdentifierReferredTo:
-      - ch
-      - false
-- - InFunction:
-      - testing
-      - start: 53
-        end: 94
+      - start: 0
+        end: 41
   - AssignmentToStatement
   - IdentifierReferredTo:
-      - x
-      - false
+      name: x
+      in_scope: false
+      exposed: false
 - - InFunction:
       - testing
-      - start: 53
-        end: 94
+      - start: 0
+        end: 41
   - AssignmentFromStatement
   - IdentifierReferredTo:
-      - y
-      - false
+      name: y
+      in_scope: false
+      exposed: false
 - - InFunction:
       - testing
-      - start: 53
-        end: 94
+      - start: 0
+        end: 41
   - IdentifierReferredTo:
-      - x
-      - true
+      name: x
+      in_scope: true
+      exposed: false

@@ -1,0 +1,18 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const { l, m: [n, o] } = { l: 13, m: [14, 15] };\n"
+---
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: l
+      in_scope: false
+      exposed: true
+  - IdentifierReferredTo:
+      name: n
+      in_scope: false
+      exposed: true
+  - IdentifierReferredTo:
+      name: o
+      in_scope: false
+      exposed: true
+- - AssignmentFromStatement

@@ -22,8 +22,9 @@ description: "@ch.on_event(\"new_file\")\n@ch.emit_as(\"file_created\")\ndef dis
   - Constant: new_file
   - Attribute: on_event
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: false
 - - InFunction:
       - dispatch_agent
       - start: 53
@@ -40,16 +41,18 @@ description: "@ch.on_event(\"new_file\")\n@ch.emit_as(\"file_created\")\ndef dis
   - Constant: file_created
   - Attribute: emit_as
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: false
 - - InFunction:
       - dispatch_agent
       - start: 53
         end: 114
   - FunctionArguments
   - IdentifierReferredTo:
-      - ev
-      - false
+      name: ev
+      in_scope: false
+      exposed: false
 - - InFunction:
       - dispatch_agent
       - start: 53
@@ -64,8 +67,9 @@ description: "@ch.on_event(\"new_file\")\n@ch.emit_as(\"file_created\")\ndef dis
   - Constant: file_path
   - Attribute: file_path
   - IdentifierReferredTo:
-      - ev
-      - true
+      name: ev
+      in_scope: true
+      exposed: false
 - - InFunction:
       - dispatch_agent
       - start: 53
@@ -74,5 +78,6 @@ description: "@ch.on_event(\"new_file\")\n@ch.emit_as(\"file_created\")\ndef dis
   - Constant: file_path
   - Attribute: set
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: false

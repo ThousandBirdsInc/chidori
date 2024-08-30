@@ -6,31 +6,34 @@ description: "function main() {\n    bar() | foo() | baz()\n}\n"
       - main
       - start: 1
         end: 46
-  - Params
+  - FunctionArguments
 - - InFunction:
       - main
       - start: 1
         end: 46
   - InCallExpression
   - IdentifierReferredTo:
-      - bar
-      - false
+      name: bar
+      in_scope: false
+      exposed: true
 - - InFunction:
       - main
       - start: 1
         end: 46
   - InCallExpression
   - IdentifierReferredTo:
-      - foo
-      - false
+      name: foo
+      in_scope: false
+      exposed: true
 - - InFunction:
       - main
       - start: 1
         end: 46
   - InCallExpression
   - IdentifierReferredTo:
-      - baz
-      - false
+      name: baz
+      in_scope: false
+      exposed: true
 - - InFunction:
       - main
       - start: 1

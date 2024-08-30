@@ -4,31 +4,9 @@ use rustpython_parser::{ast, Parse};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
+use crate::language::ContextPath;
 
-// TODO: move to using the Ruff library here to break out functions into independent snippets
 
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
-pub enum ContextPath {
-    Initialized,
-    InFunction(String, TextRange),
-    FunctionArguments,
-    FunctionArgument(String),
-    InClass(String),
-    InFunctionDecorator(usize),
-    InCallExpression,
-    ChName,
-    AssignmentToStatement,
-    AssignmentFromStatement,
-    // bool = true (is locally defined)
-    IdentifierReferredTo(String, bool),
-    Attribute(String),
-    Constant(String),
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct FunctionContext {
-    dependencies: Vec<Vec<ContextPath>>,
-}
 
 /// The ASTWalkContext structure represents the accumulated state during an Abstract Syntax Tree (AST) walk.
 ///
@@ -149,8 +127,13 @@ impl ASTWalkContext {
         if self.var_exists(&name.to_string()) {
             // true, the var exists in the local or global scope
             self.context_stack
-                .push(ContextPath::IdentifierReferredTo(name.to_string(), true));
+                .push(ContextPath::IdentifierReferredTo{
+                    name: name.to_string(),
+                    in_scope: true,
+                    exposed: false
+                });
         } else {
+            // TODO: this might not be last due to pattern assignments
             if let Some(ContextPath::AssignmentToStatement) = self.context_stack.last() {
                 self.locals.insert(name.to_string());
             }
@@ -158,7 +141,11 @@ impl ASTWalkContext {
                 self.locals.insert(name.to_string());
             }
             self.context_stack
-                .push(ContextPath::IdentifierReferredTo(name.to_string(), false));
+                .push(ContextPath::IdentifierReferredTo{
+                    name: name.to_string(),
+                    in_scope: false,
+                    exposed: false
+                });
         }
         self.context_stack_references
             .push(self.context_stack.clone());
@@ -700,7 +687,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
     for context_path in context_paths {
         let mut encountered = vec![];
         for (idx, context_path_unit) in context_path.iter().enumerate() {
-            // encountered is the reversed oreder of the context path
+            // encountered is the reversed order of the context path
             encountered.push(context_path_unit);
 
             // If we've declared a top level function, it is exposed
@@ -718,6 +705,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                 }
             }
 
+            // Function arguments get assigned to the triggerable function
             if let ContextPath::FunctionArgument(name) = context_path_unit {
                 // traverse back through path until we hit the InFunction
                 let clone_path = context_path.clone();
@@ -735,90 +723,35 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                 }
             }
 
-
-            // Decorators set the emit event property for a function
-            if &ContextPath::IdentifierReferredTo(String::from("ch"), false) == context_path_unit {
-                if ContextPath::Attribute(String::from("emit_as")) == context_path[idx - 1] {
-                    if let ContextPath::Constant(const_name) = &context_path[idx - 2] {
-                        if let ContextPath::InFunctionDecorator(_) = context_path[idx - 4] {
-                            if let ContextPath::InFunction(name, _) = &context_path[idx - 5] {
-                                let mut x = triggerable_functions
-                                    .entry(name.clone())
-                                    .or_insert_with(|| ReportTriggerableFunctions {
-                                        arguments: vec![],
-                                        emit_event: vec![], // Initialize with an empty string or a default value
-                                        trigger_on: vec![],
-                                    });
-                                x.emit_event.push(const_name.clone());
-                            }
+            // If an identifier is referred to, and it has not been assigned to earlier during our interpreting
+            if let ContextPath::IdentifierReferredTo{name: identifier, exposed: false, in_scope: false} = context_path_unit {
+                // If we encounter both FunctionArguments and InFunction, then this is a function argument
+                if encountered.iter().any(|x| matches!(x, ContextPath::InFunction(_, _)))
+                    && encountered.iter().any(|x| matches!(x, ContextPath::FunctionArguments))
+                {
+                    for context_path_unit in &encountered {
+                        if let ContextPath::InFunction(function_name, _) = context_path_unit {
+                            let mut x = triggerable_functions
+                                .entry(function_name.clone())
+                                .or_insert_with(|| ReportTriggerableFunctions {
+                                    arguments: vec![],
+                                    emit_event: vec![], // Initialize with an empty string or a default value
+                                    trigger_on: vec![],
+                                });
+                            x.arguments.push(identifier.clone());
                         }
                     }
+                    continue;
                 }
-            }
 
-            // Decorators set the emit event property for a function
-            if &ContextPath::IdentifierReferredTo(String::from("ch"), false) == context_path_unit {
-                if ContextPath::Attribute(String::from("on_event")) == context_path[idx - 1] {
-                    if let ContextPath::Constant(const_name) = &context_path[idx - 2] {
-                        if let ContextPath::InFunctionDecorator(_) = context_path[idx - 4] {
-                            if let ContextPath::InFunction(name, _) = &context_path[idx - 5] {
-                                let mut x = triggerable_functions
-                                    .entry(name.clone())
-                                    .or_insert_with(|| ReportTriggerableFunctions {
-                                        arguments: vec![],
-                                        emit_event: vec![], // Initialize with an empty string or a default value
-                                        trigger_on: vec![],
-                                    });
-                                x.trigger_on.push(const_name.clone());
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let ContextPath::IdentifierReferredTo(identifier, false) = context_path_unit {
-                if identifier != &String::from("ch") {
-
-                    // If we encounter both FunctionArguments and InFunction, then this is a function argument
-                    if encountered.iter().any(|x| matches!(x, ContextPath::InFunction(_, _)))
-                        && encountered.iter().any(|x| matches!(x, ContextPath::FunctionArguments))
-                    {
-                        for context_path_unit in &encountered {
-                            if let ContextPath::InFunction(function_name, _) = context_path_unit {
-                                let mut x = triggerable_functions
-                                    .entry(function_name.clone())
-                                    .or_insert_with(|| ReportTriggerableFunctions {
-                                        arguments: vec![],
-                                        emit_event: vec![], // Initialize with an empty string or a default value
-                                        trigger_on: vec![],
-                                    });
-                                x.arguments.push(identifier.clone());
-                            }
-                        }
-                        continue;
-                    }
-
-
-                    // This is an exposed value if it does not occur inside the scope of a function
-                    if encountered
-                        .iter()
-                        .find(|x| matches!(x, ContextPath::InFunction(_, _)))
-                        .is_none()
-                    {
-                        if encountered.contains(&&ContextPath::AssignmentToStatement) {
-                            exposed_values.insert(
-                                identifier.clone(),
-                                ReportItem {
-                                    // context_path: context_path.clone(),
-                                },
-                            );
-                            continue;
-                        }
-                    }
-
-                    // If this value is not being assigned to, then it is a dependency
-                    if !encountered.contains(&&ContextPath::AssignmentToStatement) {
-                        depended_values.insert(
+                // This is an exposed value if it does not occur inside the scope of a function
+                if encountered
+                    .iter()
+                    .find(|x| matches!(x, ContextPath::InFunction(_, _)))
+                    .is_none()
+                {
+                    if encountered.contains(&&ContextPath::AssignmentToStatement) {
+                        exposed_values.insert(
                             identifier.clone(),
                             ReportItem {
                                 // context_path: context_path.clone(),
@@ -826,6 +759,17 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
                         );
                         continue;
                     }
+                }
+
+                // If this value is not being assigned to, then it is a dependency
+                if !encountered.contains(&&ContextPath::AssignmentToStatement) {
+                    depended_values.insert(
+                        identifier.clone(),
+                        ReportItem {
+                            // context_path: context_path.clone(),
+                        },
+                    );
+                    continue;
                 }
             }
         }
@@ -1021,8 +965,6 @@ mod tests {
     #[test]
     fn test_report_generation() {
         let python_source = indoc! { r#"
-        @ch.on_event("new_file")
-        @ch.emit_as("file_created")
         def testing():
             x = 2 + y
             return x
@@ -1063,8 +1005,8 @@ mod tests {
                         
                         // context_path: vec![ContextPath::InFunction("testing".to_string())],
                         arguments: vec![],
-                        emit_event: vec!["file_created".to_string()],
-                        trigger_on: vec!["new_file".to_string()],
+                        emit_event: vec![],
+                        trigger_on: vec![],
                     },
                 );
                 map

@@ -1,0 +1,10 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const { u, ...others } = { u: 19, v: 20, w: 21 };\n"
+---
+internal_call_graph: {}
+cell_exposed_values:
+  others: {}
+  u: {}
+cell_depended_values: {}
+triggerable_functions: {}

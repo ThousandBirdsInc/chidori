@@ -1,0 +1,14 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const [y = 200, z = 300] = [22];\n"
+---
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: y
+      in_scope: false
+      exposed: true
+  - IdentifierReferredTo:
+      name: z
+      in_scope: false
+      exposed: true
+- - AssignmentFromStatement

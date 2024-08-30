@@ -1,0 +1,28 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "let aa = 'first', bb = 'second';\n[aa, bb] = [bb, aa];\n"
+---
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: aa
+      in_scope: false
+      exposed: true
+- - AssignmentFromStatement
+  - Constant: first
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: bb
+      in_scope: false
+      exposed: true
+- - AssignmentFromStatement
+  - Constant: second
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: aa
+      in_scope: true
+      exposed: true
+  - IdentifierReferredTo:
+      name: bb
+      in_scope: true
+      exposed: true
+- - AssignmentFromStatement

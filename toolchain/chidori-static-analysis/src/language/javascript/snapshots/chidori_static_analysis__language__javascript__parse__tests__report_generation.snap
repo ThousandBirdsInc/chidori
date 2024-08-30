@@ -6,7 +6,7 @@ description: "function testing() {\n    ch.onEvent(\"new_file\");\n    ch.emitAs
       - testing
       - start: 1
         end: 116
-  - Params
+  - FunctionArguments
 - - InFunction:
       - testing
       - start: 1
@@ -14,8 +14,9 @@ description: "function testing() {\n    ch.onEvent(\"new_file\");\n    ch.emitAs
   - InCallExpression
   - Attribute: onEvent
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: true
   - Constant: new_file
 - - InFunction:
       - testing
@@ -24,8 +25,9 @@ description: "function testing() {\n    ch.onEvent(\"new_file\");\n    ch.emitAs
   - InCallExpression
   - Attribute: emitAs
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: true
   - Constant: file_created
 - - InFunction:
       - testing
@@ -33,20 +35,23 @@ description: "function testing() {\n    ch.onEvent(\"new_file\");\n    ch.emitAs
         end: 116
   - AssignmentToStatement
   - IdentifierReferredTo:
-      - x
-      - false
+      name: x
+      in_scope: false
+      exposed: true
 - - InFunction:
       - testing
       - start: 1
         end: 116
   - AssignmentFromStatement
   - IdentifierReferredTo:
-      - y
-      - false
+      name: y
+      in_scope: false
+      exposed: true
 - - InFunction:
       - testing
       - start: 1
         end: 116
   - IdentifierReferredTo:
-      - x
-      - true
+      name: x
+      in_scope: true
+      exposed: true

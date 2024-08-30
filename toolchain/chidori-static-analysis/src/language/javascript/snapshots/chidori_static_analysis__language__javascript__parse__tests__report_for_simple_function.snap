@@ -6,14 +6,16 @@ description: "function testing(x) {\n    return x\n}\n    "
       - testing
       - start: 1
         end: 37
-  - Params
+  - FunctionArguments
   - IdentifierReferredTo:
-      - x
-      - false
+      name: x
+      in_scope: false
+      exposed: true
 - - InFunction:
       - testing
       - start: 1
         end: 37
   - IdentifierReferredTo:
-      - x
-      - true
+      name: x
+      in_scope: true
+      exposed: true

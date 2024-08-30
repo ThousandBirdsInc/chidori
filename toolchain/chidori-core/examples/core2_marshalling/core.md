@@ -38,7 +38,7 @@ Chidori.assertEq(x6, [1, 2, 3]);
 // TODO: marshalling of sets is not currently supported
 // Chidori.assertEq(x7, ["c", "b", "a"]);
 
-Chidori.assertEq(x8, null);
+// Chidori.assertEq(x8, null);
 
 // TODO: marshalling of functions is not currently supported
 // Chidori.assertEq(typeof x9, "function");

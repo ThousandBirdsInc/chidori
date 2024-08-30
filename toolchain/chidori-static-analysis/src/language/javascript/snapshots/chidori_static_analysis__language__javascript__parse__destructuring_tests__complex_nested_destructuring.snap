@@ -1,0 +1,14 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const { q: { r: [s, { t }] } } = { q: { r: [17, { t: 18 }] } };\n"
+---
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: s
+      in_scope: false
+      exposed: true
+  - IdentifierReferredTo:
+      name: t
+      in_scope: false
+      exposed: true
+- - AssignmentFromStatement

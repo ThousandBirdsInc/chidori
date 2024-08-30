@@ -5,6 +5,7 @@ description: "function testing() {\n    ch.onEvent(\"new_file\");\n    ch.emitAs
 internal_call_graph: {}
 cell_exposed_values: {}
 cell_depended_values:
+  ch: {}
   y: {}
 triggerable_functions:
   testing:

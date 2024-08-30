@@ -41,7 +41,7 @@ pub fn code_cell(execution_state_id: ExecutionNodeId, cell: &CodeCell, range: &T
                         Ok(OperationFnOutput {
                             has_error: false,
                             execution_state: None,
-                            output: result.0,
+                            output: result.0.unwrap(),
                             stdout: result.1,
                             stderr: result.2,
                         })

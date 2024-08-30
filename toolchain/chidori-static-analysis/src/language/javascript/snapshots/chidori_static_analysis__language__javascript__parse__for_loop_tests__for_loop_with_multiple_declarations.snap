@@ -1,0 +1,44 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "for (let i = 0, j = 10; i < j; i++, j--) {\n    console.log(i, j);\n}\n"
+---
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: i
+      in_scope: false
+      exposed: false
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: j
+      in_scope: false
+      exposed: false
+- - IdentifierReferredTo:
+      name: i
+      in_scope: true
+      exposed: false
+  - IdentifierReferredTo:
+      name: j
+      in_scope: true
+      exposed: false
+  - IdentifierReferredTo:
+      name: i
+      in_scope: true
+      exposed: false
+  - IdentifierReferredTo:
+      name: j
+      in_scope: true
+      exposed: false
+  - InCallExpression
+  - Attribute: log
+  - IdentifierReferredTo:
+      name: console
+      in_scope: false
+      exposed: false
+  - IdentifierReferredTo:
+      name: i
+      in_scope: true
+      exposed: false
+  - IdentifierReferredTo:
+      name: j
+      in_scope: true
+      exposed: false

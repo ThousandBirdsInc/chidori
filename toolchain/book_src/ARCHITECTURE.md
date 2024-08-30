@@ -4,10 +4,10 @@
 
 Chidori consists of the following crates:
 
-- `chidori-core` contains our orchestator and runtime.
+- `chidori-core` contains our orchestrator and runtime.
 - `chidori-debugger` contains a UI for visualizing and debugging Chidori executed programs.
 - `chidori-im-rs` contains a fork of im-rs to add support for persisting these data structures to disk.
-- `chidori-prompt-format` implements handlbars-like templating with support for tracing composition
+- `chidori-prompt-format` implements handlebars-like templating with support for tracing composition
 - `chidori-static-analysis` implements our parsing and extraction of control-flow from Python and TypeScript source code
 - `chidori-optimizer-dsp` (IGNORE) - not yet implemented, in the future we'd like to support DSPy-like optimization
 - `chidori-tsne` (IGNORE) - not yet implemented, in the future we'd like to add support for visualizing embeddings within our debugger

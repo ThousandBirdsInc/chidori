@@ -6,18 +6,21 @@ expression: context_stack_references
   - Attribute: configure
   - Attribute: prompt
   - IdentifierReferredTo:
-      - ch
-      - true
+      name: ch
+      in_scope: true
+      exposed: true
   - Constant: default
   - InCallExpression
   - Attribute: llm
   - IdentifierReferredTo:
-      - ch
-      - true
+      name: ch
+      in_scope: true
+      exposed: true
 - - InCallExpression
   - Attribute: configure
   - Attribute: prompt
   - IdentifierReferredTo:
-      - ch
-      - true
+      name: ch
+      in_scope: true
+      exposed: true
   - Constant: default

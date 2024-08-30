@@ -1,6 +1,6 @@
 ---
 source: chidori-static-analysis/src/language/python/parse.rs
-expression: context_stack_references
+description: "from chidori.core import ch\n\nch.prompt.configure(\"default\", ch.llm(model=\"openai\"))\n"
 ---
 - - InCallExpression
   - Constant: default
@@ -14,12 +14,14 @@ expression: context_stack_references
   - Constant: openai
   - Attribute: llm
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: false
 - - InCallExpression
   - Constant: default
   - Attribute: configure
   - Attribute: prompt
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: false

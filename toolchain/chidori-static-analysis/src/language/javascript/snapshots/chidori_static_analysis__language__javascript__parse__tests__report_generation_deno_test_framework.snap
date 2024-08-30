@@ -5,81 +5,95 @@ description: "import { assertEquals } from \"https://deno.land/std@0.221.0/asser
 - - InCallExpression
   - Attribute: test
   - IdentifierReferredTo:
-      - Deno
-      - false
+      name: Deno
+      in_scope: false
+      exposed: true
   - Constant: addition test
   - InAnonFunction
-  - Params
+  - FunctionArguments
 - - InCallExpression
   - Attribute: test
   - IdentifierReferredTo:
-      - Deno
-      - false
+      name: Deno
+      in_scope: false
+      exposed: true
   - Constant: addition test
   - InAnonFunction
   - AssignmentToStatement
   - IdentifierReferredTo:
-      - result
-      - false
+      name: result
+      in_scope: false
+      exposed: false
 - - InCallExpression
   - Attribute: test
   - IdentifierReferredTo:
-      - Deno
-      - false
+      name: Deno
+      in_scope: false
+      exposed: true
   - Constant: addition test
   - InAnonFunction
   - AssignmentFromStatement
   - InCallExpression
   - IdentifierReferredTo:
-      - add_two
-      - false
+      name: add_two
+      in_scope: false
+      exposed: false
 - - InCallExpression
   - Attribute: test
   - IdentifierReferredTo:
-      - Deno
-      - false
+      name: Deno
+      in_scope: false
+      exposed: true
   - Constant: addition test
   - InAnonFunction
   - AssignmentFromStatement
 - - InCallExpression
   - Attribute: test
   - IdentifierReferredTo:
-      - Deno
-      - false
+      name: Deno
+      in_scope: false
+      exposed: true
   - Constant: addition test
   - InAnonFunction
   - InCallExpression
   - Attribute: log
   - IdentifierReferredTo:
-      - console
-      - false
+      name: console
+      in_scope: false
+      exposed: false
   - IdentifierReferredTo:
-      - result
-      - true
+      name: result
+      in_scope: true
+      exposed: false
 - - InCallExpression
   - Attribute: test
   - IdentifierReferredTo:
-      - Deno
-      - false
+      name: Deno
+      in_scope: false
+      exposed: true
   - Constant: addition test
   - InAnonFunction
   - InCallExpression
   - IdentifierReferredTo:
-      - assertEquals
-      - true
+      name: assertEquals
+      in_scope: true
+      exposed: false
   - IdentifierReferredTo:
-      - result
-      - true
+      name: result
+      in_scope: true
+      exposed: false
 - - InCallExpression
   - Attribute: test
   - IdentifierReferredTo:
-      - Deno
-      - false
+      name: Deno
+      in_scope: false
+      exposed: true
   - Constant: addition test
   - InAnonFunction
 - - InCallExpression
   - Attribute: test
   - IdentifierReferredTo:
-      - Deno
-      - false
+      name: Deno
+      in_scope: false
+      exposed: true
   - Constant: addition test

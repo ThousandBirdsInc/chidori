@@ -12,8 +12,9 @@ description: "def evaluate_agent(ev):\n    ch.set(\"file_path\", ev.file_path)\n
         end: 83
   - FunctionArguments
   - IdentifierReferredTo:
-      - ev
-      - false
+      name: ev
+      in_scope: false
+      exposed: false
 - - InFunction:
       - evaluate_agent
       - start: 0
@@ -28,8 +29,9 @@ description: "def evaluate_agent(ev):\n    ch.set(\"file_path\", ev.file_path)\n
   - Constant: file_path
   - Attribute: file_path
   - IdentifierReferredTo:
-      - ev
-      - true
+      name: ev
+      in_scope: true
+      exposed: false
 - - InFunction:
       - evaluate_agent
       - start: 0
@@ -38,13 +40,15 @@ description: "def evaluate_agent(ev):\n    ch.set(\"file_path\", ev.file_path)\n
   - Constant: file_path
   - Attribute: set
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: false
 - - InFunction:
       - evaluate_agent
       - start: 0
         end: 83
   - InCallExpression
   - IdentifierReferredTo:
-      - migration_agent
-      - false
+      name: migration_agent
+      in_scope: false
+      exposed: false

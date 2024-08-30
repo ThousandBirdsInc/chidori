@@ -6,31 +6,34 @@ description: "function createDockerfile() {\n    useHook(() => {\n       ch.prom
       - createDockerfile
       - start: 1
         end: 150
-  - Params
+  - FunctionArguments
 - - InFunction:
       - createDockerfile
       - start: 1
         end: 150
   - InCallExpression
   - IdentifierReferredTo:
-      - useHook
-      - false
+      name: useHook
+      in_scope: false
+      exposed: true
   - InAnonFunction
-  - Params
+  - FunctionArguments
 - - InFunction:
       - createDockerfile
       - start: 1
         end: 150
   - InCallExpression
   - IdentifierReferredTo:
-      - useHook
-      - false
+      name: useHook
+      in_scope: false
+      exposed: true
   - InAnonFunction
   - InCallExpression
   - Attribute: prompt
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: false
   - Constant: demo
 - - InFunction:
       - createDockerfile
@@ -38,8 +41,9 @@ description: "function createDockerfile() {\n    useHook(() => {\n       ch.prom
         end: 150
   - InCallExpression
   - IdentifierReferredTo:
-      - useHook
-      - false
+      name: useHook
+      in_scope: false
+      exposed: true
   - InAnonFunction
 - - InFunction:
       - createDockerfile
@@ -47,16 +51,18 @@ description: "function createDockerfile() {\n    useHook(() => {\n       ch.prom
         end: 150
   - InCallExpression
   - IdentifierReferredTo:
-      - useHook
-      - false
+      name: useHook
+      in_scope: false
+      exposed: true
 - - InFunction:
       - createDockerfile
       - start: 1
         end: 150
   - InCallExpression
   - IdentifierReferredTo:
-      - prompt
-      - false
+      name: prompt
+      in_scope: false
+      exposed: true
   - Constant: prompts/create_dockerfile
 - - InFunction:
       - createDockerfile

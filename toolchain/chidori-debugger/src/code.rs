@@ -13,7 +13,8 @@ use egui_extras::syntax_highlighting::CodeTheme;
 use egui_tiles::Tile;
 use chidori_core::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, LLMPromptCellChatConfiguration, MemoryCell, SupportedLanguage, SupportedModelProviders, TemplateCell, TextRange, WebserviceCell};
 use chidori_core::sdk::entry::CellHolder;
-use crate::chidori::{ChidoriCells, ChidoriExecutionState, EguiTree, EguiTreeIdentities};
+
+use crate::chidori::{ChidoriCells, ChidoriExecutionGraph, ChidoriExecutionState, EguiTree, EguiTreeIdentities};
 use crate::egui_json_tree::JsonTree;
 use crate::GameState;
 use crate::util::{change_active_editor_ui, deselect_editor_on_esc, despawn_screen, egui_label, egui_logs, egui_rkyv, print_editor_text};
@@ -25,7 +26,8 @@ fn editor_update(
     mut contexts: EguiContexts,
     tree_identities: Res<EguiTreeIdentities>,
     q_window: Query<&Window, With<PrimaryWindow>>,
-    mut execution_state: Res<ChidoriExecutionState>,
+    execution_state: Res<ChidoriExecutionState>,
+    execution_graph: Res<ChidoriExecutionGraph>,
     mut tree: ResMut<EguiTree>,
     mut chidori_cells: ResMut<ChidoriCells>,
     mut viewing_watched_file_cells: Local<bool>
@@ -65,7 +67,7 @@ fn editor_update(
         return;
     }
 
-    // TODO: make sure that editor and state cells are always rendered in the same order
+
     egui::CentralPanel::default().frame(container_frame).show(contexts.ctx_mut(), |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let mut theme = egui_extras::syntax_highlighting::CodeTheme::dark();
@@ -89,29 +91,41 @@ fn editor_update(
 
                 let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(Margin::symmetric(8.0, 16.0)).inner_margin(16.0).rounding(6.0).begin(ui);
                 {
-                    let mut ui = &mut frame.content_ui;
-                    let applied_at = &cell_holder.applied_at;
+                    let ui = &mut frame.content_ui;
+                    let mut exists_in_current_tree = false;
+                    if let Some(applied_at) = &cell_holder.applied_at {
+                        ui.label(format!("{:?}", applied_at));
+                        exists_in_current_tree = execution_graph.exists_in_current_tree(applied_at);
+                    } else {
+                        ui.label("Needs Update");
+                    }
                     match &mut cell_holder.cell {
-                        CellTypes::Code(CodeCell { name, source_code, language, ..}, _) => {
-                            render_code_cell(&mut execution_state, &mut theme, &op_id, ui, name, source_code, language);
+                        CellTypes::Code(_, ..) => {
+                            render_code_cell(
+                                &execution_state,
+                                &mut theme,
+                                &op_id,
+                                ui,
+                                cell_holder,
+                                exists_in_current_tree
+                            );
                         }
-                        CellTypes::CodeGen(LLMCodeGenCell { name, req, .. }, _) => {
-                            render_code_gen_cell(&mut execution_state, &op_id, ui, name, req);
+                        CellTypes::CodeGen(..) => {
+                            render_code_gen_cell(&execution_state, &op_id, ui, cell_holder, exists_in_current_tree);
                         }
                         CellTypes::Prompt(LLMPromptCell::Completion { .. }, _) => {}
-                        CellTypes::Prompt(LLMPromptCell::Chat { name, configuration, req, .. }, _) => {
-                            render_prompt_cell(&mut execution_state, &op_id, ui, name, configuration, req);
+                        CellTypes::Prompt(LLMPromptCell::Chat {..}, _) => {
+                            render_prompt_cell(&execution_state, &op_id, ui, cell_holder, exists_in_current_tree);
                         }
                         CellTypes::Embedding(LLMEmbeddingCell { .. }, _) => {}
-                        CellTypes::Web(WebserviceCell { name, configuration, .. }, _) => {
-                            render_web_service_cell(&mut execution_state, &op_id, ui, name, configuration);
+                        CellTypes::Web(..) => {
+                            render_web_service_cell(&execution_state, &op_id, ui, cell_holder, exists_in_current_tree);
                         }
-                        CellTypes::Template(TemplateCell { name, body }, _) => {
-                            render_template_cell(&mut execution_state, &op_id, ui, name, body);
+                        CellTypes::Template(..) => {
+                            render_template_cell(&execution_state, &op_id, ui, cell_holder, exists_in_current_tree);
                         }
                         CellTypes::Memory(MemoryCell { .. }, _) => {}
                     }
-
                 }
                 frame.end(ui);
             }
@@ -120,7 +134,7 @@ fn editor_update(
                 let mut frame = egui::Frame::default().fill(Color32::from_hex("#111111").unwrap()).outer_margin(Margin::symmetric(8.0, 16.0)).inner_margin(16.0).rounding(6.0).begin(ui);
                 {
                     let mut ui = &mut frame.content_ui;
-                    render_new_cell_interface(&mut execution_state, ui, &mut chidori_cells);
+                    render_new_cell_interface(&execution_state, ui, &mut chidori_cells);
                 }
                 frame.end(ui);
             }
@@ -129,37 +143,43 @@ fn editor_update(
     });
 }
 
-fn render_template_cell(execution_state: &mut Res<ChidoriExecutionState>, op_id: &Option<usize>, mut ui: &mut Ui, name: &Option<String>, mut body: &mut String) {
+fn render_template_cell(execution_state: &ChidoriExecutionState, op_id: &Option<usize>, mut ui: &mut Ui, cell_holder: &mut CellHolder, exists_in_current_tree: bool) {
+    let CellTypes::Template(TemplateCell { name, body }, _) = &mut cell_holder.cell else { panic!("Must be template cell")};
     ui.horizontal(|ui| {
         egui_label(ui, "Prompt");
         if let Some(name) = name {
             egui_label(ui, name);
         }
+        render_applied_status(ui, exists_in_current_tree);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
             if ui.button("Open").clicked() {
-                // TODO:
                 println!("Should open file");
             }
         });
     });
     // Add widgets inside the frame
     ui.vertical(|ui| {
-        ui.add(
+        if ui.add(
             egui::TextEdit::multiline(body)
                 .code_editor()
                 .lock_focus(true)
                 .margin(Margin::symmetric(8.0, 8.0))
                 .desired_width(f32::INFINITY)
-        );
+        ).changed() {
+            cell_holder.needs_update = true;
+            cell_holder.applied_at = None;
+        }
         render_operation_output(&execution_state, &op_id, ui);
     });
 }
 
-fn render_operation_output(execution_state: &&mut Res<ChidoriExecutionState>, op_id: &&Option<usize>, ui: &mut Ui) {
+fn render_operation_output(execution_state: &ChidoriExecutionState, op_id: &&Option<usize>, ui: &mut Ui) {
     if let Some(state) = &execution_state.inner {
         if let Some(op_id) = &op_id {
             if let Some((exec_id, o)) = state.0.get(op_id) {
-                if ui.button(format!("Go To Most Recent Execution")).clicked() {}
+                if ui.button(format!("Go To Most Recent Execution")).clicked() {
+                    // TODO: move visualized head of graph to this point
+                }
                 if ui.button(format!("Revert to: {:?} {:?}", exec_id, op_id)).clicked() {}
                 ui.push_id((exec_id, op_id), |ui| {
                     ui.collapsing("Values", |ui| {
@@ -176,13 +196,15 @@ fn render_operation_output(execution_state: &&mut Res<ChidoriExecutionState>, op
     }
 }
 
-fn render_web_service_cell(execution_state: &mut Res<ChidoriExecutionState>, op_id: &Option<usize>, mut ui: &mut Ui, name: &Option<String>, configuration: &String) {
+fn render_web_service_cell(execution_state: &ChidoriExecutionState, op_id: &Option<usize>, mut ui: &mut Ui, cell_holder: &mut CellHolder, exists_in_current_tree: bool) {
+    let CellTypes::Web(WebserviceCell { name, configuration, .. }, _) = &mut cell_holder.cell else {panic!("Must be web cell")};
     let mut s = configuration.clone();
     ui.horizontal(|ui| {
         egui_label(ui, "Prompt");
         if let Some(name) = name {
             egui_label(ui, name);
         }
+        render_applied_status(ui, exists_in_current_tree);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
             if ui.button("Open").clicked() {
                 // TODO:
@@ -192,23 +214,29 @@ fn render_web_service_cell(execution_state: &mut Res<ChidoriExecutionState>, op_
     });
     // Add widgets inside the frame
     ui.vertical(|ui| {
-        ui.add(
+        if ui.add(
             egui::TextEdit::multiline(&mut s)
                 .code_editor()
                 .lock_focus(true)
                 .desired_width(f32::INFINITY)
-        );
+        ).changed() {
+            // TODO: this is causing us to lose focus of the element
+            cell_holder.needs_update = true;
+            cell_holder.applied_at = None;
+        }
         render_operation_output(&execution_state, &op_id, ui);
     });
 }
 
-fn render_prompt_cell(execution_state: &mut Res<ChidoriExecutionState>, op_id: &Option<usize>, mut ui: &mut Ui, name: &Option<String>, configuration: &mut LLMPromptCellChatConfiguration, mut req: &mut String) {
+fn render_prompt_cell(execution_state: &ChidoriExecutionState, op_id: &Option<usize>, mut ui: &mut Ui, cell_holder: &mut CellHolder, exists_in_current_tree: bool) {
+    let CellTypes::Prompt(LLMPromptCell::Chat { name, configuration, req, .. }, _) = &mut cell_holder.cell else {panic!("Must be llm prompt cell")};
     let mut cfg = serde_yaml::to_string(&configuration.clone()).unwrap();
     ui.horizontal(|ui| {
         egui_label(ui, "Prompt");
         if let Some(name) = name {
             egui_label(ui, name);
         }
+        render_applied_status(ui, exists_in_current_tree);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
             if ui.button("Open").clicked() {
                 // TODO:
@@ -218,22 +246,28 @@ fn render_prompt_cell(execution_state: &mut Res<ChidoriExecutionState>, op_id: &
     });
     // Add widgets inside the frame
     ui.vertical(|ui| {
-        ui.add(
+        if ui.add(
             egui::TextEdit::multiline(&mut cfg)
                 .font(egui::FontId::new(14.0, FontFamily::Monospace))
                 .code_editor()
                 .lock_focus(true)
                 .desired_width(f32::INFINITY)
                 .margin(Margin::symmetric(8.0, 8.0))
-        );
+        ).changed() {
+            cell_holder.needs_update = true;
+            cell_holder.applied_at = None;
+        }
         ui.add_space(10.0);
-        ui.add(
+        if ui.add(
             egui::TextEdit::multiline(req)
                 .code_editor()
                 .lock_focus(true)
                 .margin(Margin::symmetric(8.0, 8.0))
                 .desired_width(f32::INFINITY)
-        );
+        ).changed() {
+            cell_holder.needs_update = true;
+            cell_holder.applied_at = None;
+        }
         ui.add_space(10.0);
 
         render_operation_output(&execution_state, &op_id, ui);
@@ -241,13 +275,21 @@ fn render_prompt_cell(execution_state: &mut Res<ChidoriExecutionState>, op_id: &
     });
 }
 
-fn render_code_gen_cell(execution_state: &mut Res<ChidoriExecutionState>, op_id: &Option<usize>, mut ui: &mut Ui, name: &Option<String>, req: &String) {
+fn render_code_gen_cell(
+    execution_state: &ChidoriExecutionState,
+    op_id: &Option<usize>,
+    mut ui: &mut Ui,
+    mut cell_holder: &mut CellHolder,
+    exists_in_current_tree: bool
+) {
+    let CellTypes::CodeGen(LLMCodeGenCell { name, req, .. }, _) = &mut cell_holder.cell else { panic!("Must be code gen cell") };
     let mut s = req.clone();
     ui.horizontal(|ui| {
         egui_label(ui, "Prompt");
         if let Some(name) = name {
             egui_label(ui, name);
         }
+        render_applied_status(ui, exists_in_current_tree);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
             if ui.button("Open").clicked() {
                 // TODO:
@@ -257,13 +299,16 @@ fn render_code_gen_cell(execution_state: &mut Res<ChidoriExecutionState>, op_id:
     });
     // Add widgets inside the frame
     ui.vertical(|ui| {
-        ui.add(
+        if ui.add(
             egui::TextEdit::multiline(&mut s)
                 .code_editor()
                 .lock_focus(true)
                 .desired_width(f32::INFINITY)
                 .margin(Margin::symmetric(8.0, 8.0))
-        );
+        ).changed() {
+            cell_holder.needs_update = true;
+            cell_holder.applied_at = None;
+        }
         ui.add_space(10.0);
 
         render_operation_output(&execution_state, &op_id, ui);
@@ -271,11 +316,38 @@ fn render_code_gen_cell(execution_state: &mut Res<ChidoriExecutionState>, op_id:
     });
 }
 
-fn render_code_cell(execution_state: &mut Res<ChidoriExecutionState>, theme: &mut CodeTheme, op_id: &Option<usize>, mut ui: &mut Ui, name: &Option<String>, mut source_code: &mut String, language: &SupportedLanguage) {
+fn render_applied_status(mut ui: &mut Ui, exists_in_current_tree: bool) {
+    if exists_in_current_tree {
+        egui_label(ui, "Applied");
+    } else {
+        ui.button("Push Update");
+    }
+}
+
+fn render_code_cell(
+    execution_state: &ChidoriExecutionState,
+    theme: &mut CodeTheme,
+    op_id: &Option<usize>,
+    mut ui: &mut Ui,
+    mut cell_holder: &mut CellHolder,
+    exists_in_current_tree: bool
+) {
+    let CellTypes::Code(CodeCell { name, source_code, language, ..}, _) = &mut cell_holder.cell else { panic!("Mut be cell_holder") };
     let language_string = match language {
         SupportedLanguage::PyO3 => "python",
         SupportedLanguage::Starlark => "starlark",
         SupportedLanguage::Deno => "javascript/typescript"
+    };
+
+    let report = match language {
+        SupportedLanguage::PyO3 | SupportedLanguage::Starlark => {
+            let d = chidori_core::chidori_static_analysis::language::python::parse::extract_dependencies_python(&source_code).unwrap();
+            chidori_core::chidori_static_analysis::language::python::parse::build_report(&d)
+        },
+        SupportedLanguage::Deno => {
+            let d = chidori_core::chidori_static_analysis::language::javascript::parse::extract_dependencies_js(&source_code);
+            chidori_core::chidori_static_analysis::language::javascript::parse::build_report(&d)
+        }
     };
 
     let mut layouter = |ui: &egui::Ui, text_string: &str, wrap_width: f32| {
@@ -298,6 +370,7 @@ fn render_code_cell(execution_state: &mut Res<ChidoriExecutionState>, theme: &mu
 
     ui.horizontal(|ui| {
         egui_label(ui, "Code");
+        render_applied_status(ui, exists_in_current_tree);
         egui_label(ui, language_string);
         if let Some(name) = name {
             egui_label(ui, name);
@@ -310,7 +383,7 @@ fn render_code_cell(execution_state: &mut Res<ChidoriExecutionState>, theme: &mu
         });
     });
     ui.vertical(|ui| {
-        ui.add(
+        if ui.add(
             egui::TextEdit::multiline(source_code)
                 .font(egui::FontId::new(14.0, FontFamily::Monospace))
                 .code_editor()
@@ -318,14 +391,24 @@ fn render_code_cell(execution_state: &mut Res<ChidoriExecutionState>, theme: &mu
                 .desired_width(f32::INFINITY)
                 .margin(Margin::symmetric(8.0, 8.0))
                 .layouter(&mut layouter),
-        );
+        ).changed() {
+            cell_holder.needs_update = true;
+            cell_holder.applied_at = None;
+        }
         ui.add_space(10.0);
         render_operation_output(&execution_state, &op_id, ui);
+        ui.add_space(10.0);
+        ui.push_id((op_id, 0), |ui| {
+            ui.collapsing("Report", |ui| {
+                let response = JsonTree::new(format!("{:?} report", op_id), &serde_json::json!(&report))
+                    .show(ui);
+            });
+        });
     });
 }
 
 fn render_new_cell_interface(
-    execution_state: &mut Res<ChidoriExecutionState>,
+    execution_state: &ChidoriExecutionState,
     mut ui: &mut Ui,
     x: &mut ResMut<ChidoriCells>
 ) {

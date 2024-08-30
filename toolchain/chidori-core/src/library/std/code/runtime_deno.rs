@@ -24,7 +24,7 @@ use deno_runtime::permissions::{Permissions, PermissionsContainer};
 use futures_util::FutureExt;
 use pyo3::{Py, PyAny};
 use pyo3::types::{IntoPyDict, PyTuple};
-use tokio::runtime::Runtime;
+use tokio::runtime::{Builder, Runtime};
 use tracing::Span;
 use crate::cells::{CellTypes, CodeCell, LLMPromptCell};
 use crate::execution::execution::ExecutionState;
@@ -387,52 +387,57 @@ pub async fn source_code_run_deno(
     Vec<String>,
     Vec<String>
 )> {
+    let execution_state = execution_state.clone();
+    let source_code = source_code.clone();
+    let function_invocation = function_invocation.clone();
+    let payload = payload.clone();
+    tokio::task::spawn_blocking(move || {
+        let source_code = source_code.clone();
+        // Capture the current span's ID
+        let current_span_id = Span::current().id();
 
-    // Capture the current span's ID
-    let current_span_id = Span::current().id();
+        let dependencies = extract_dependencies_js(&source_code);
+        let report = build_report(&dependencies);
 
-    let dependencies = extract_dependencies_js(&source_code);
-    let report = build_report(&dependencies);
+        // A list of function names this block of code is depending on existing
+        let mut cell_depended_values = HashMap::new();
+        report.cell_depended_values.iter().for_each(|(k, _)| {
+            cell_depended_values.insert(k.clone(), k.clone());
+        });
 
-    // A list of function names this block of code is depending on existing
-    let mut cell_depended_values = HashMap::new();
-    report.cell_depended_values.iter().for_each(|(k, _)| {
-        cell_depended_values.insert(k.clone(), k.clone());
-    });
+        let execution_state_handle = Arc::new(Mutex::new(execution_state.clone()));
+        let my_op_state = Arc::new(Mutex::new(MyOpState {
+            parent_span_id: current_span_id,
+            stdout: vec![],
+            stderr: vec![],
+            output: None,
+            payload: payload.clone(),
+            cell_depended_values,
+            functions: Default::default(),
+            execution_state_handle
+        }));
 
-    let execution_state_handle = Arc::new(Mutex::new(execution_state.clone()));
-    let my_op_state = Arc::new(Mutex::new(MyOpState {
-        parent_span_id: current_span_id,
-        stdout: vec![],
-        stderr: vec![],
-        output: None,
-        payload: payload.clone(),
-        cell_depended_values,
-        functions: Default::default(),
-        execution_state_handle
-    }));
-
-    let my_op_state_clone = my_op_state.clone();
-    let ext = Extension {
-        name: "my_ext",
-        ops: std::borrow::Cow::Borrowed(&[
-            op_set_globals::DECL,
-            op_call_rust::DECL,
-            op_assert_eq::DECL,
-            op_save_result::DECL,
-            op_save_result_object::DECL,
-            op_invoke_function::DECL,
-            op_console_log::DECL,
-            op_console_err::DECL,
-        ]),
-        op_state_fn: Some(Box::new(move |state| {
-            state.put(my_op_state_clone);
-        })),
-        js_files: {
-            const JS: &'static [::deno_core::ExtensionFileSource] = &[
-                ::deno_core::ExtensionFileSource::loaded_from_memory_during_snapshot("ext:bench_setup/setup.js", {
-                    const C: ::deno_core::v8::OneByteConst =
-                        ::deno_core::FastStaticString::create_external_onebyte_const(r#"
+        let my_op_state_clone = my_op_state.clone();
+        let ext = Extension {
+            name: "my_ext",
+            ops: std::borrow::Cow::Borrowed(&[
+                op_set_globals::DECL,
+                op_call_rust::DECL,
+                op_assert_eq::DECL,
+                op_save_result::DECL,
+                op_save_result_object::DECL,
+                op_invoke_function::DECL,
+                op_console_log::DECL,
+                op_console_err::DECL,
+            ]),
+            op_state_fn: Some(Box::new(move |state| {
+                state.put(my_op_state_clone);
+            })),
+            js_files: {
+                const JS: &'static [::deno_core::ExtensionFileSource] = &[
+                    ::deno_core::ExtensionFileSource::loaded_from_memory_during_snapshot("ext:bench_setup/setup.js", {
+                        const C: ::deno_core::v8::OneByteConst =
+                            ::deno_core::FastStaticString::create_external_onebyte_const(r#"
       ((globalThis) => {
           const { core } = Deno;
           const { ops } = core;
@@ -479,106 +484,121 @@ pub async fn source_code_run_deno(
 
           ops.op_set_globals();
       })(globalThis);"#.as_bytes());
-                    unsafe { std::mem::transmute::<_, ::deno_core::FastStaticString>(&C) }
-                })
-            ];
-            ::std::borrow::Cow::Borrowed(JS)
-        },
-        ..Default::default()
-    };
+                        unsafe { std::mem::transmute::<_, ::deno_core::FastStaticString>(&C) }
+                    })
+                ];
+                ::std::borrow::Cow::Borrowed(JS)
+            },
+            ..Default::default()
+        };
 
-    // let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    // let snapshot_path = out_dir.join("RUNJS_SNAPSHOT.bin");
-    // let snapshot = deno_core::snapshot_util::create_snapshot(
-    //     deno_core::snapshot_util::CreateSnapshotOptions {
-    //         cargo_manifest_dir: env!("CARGO_MANIFEST_DIR"),
-    //         snapshot_path,
-    //         startup_snapshot: None,
-    //         skip_op_registration: false,
-    //         extensions: vec![ext],
-    //         compression_cb: None,
-    //         with_runtime_cb: None,
-    //     }
-    // );
+        // let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+        // let snapshot_path = out_dir.join("RUNJS_SNAPSHOT.bin");
+        // let snapshot = deno_core::snapshot_util::create_snapshot(
+        //     deno_core::snapshot_util::CreateSnapshotOptions {
+        //         cargo_manifest_dir: env!("CARGO_MANIFEST_DIR"),
+        //         snapshot_path,
+        //         startup_snapshot: None,
+        //         skip_op_registration: false,
+        //         extensions: vec![ext],
+        //         compression_cb: None,
+        //         with_runtime_cb: None,
+        //     }
+        // );
 
 
-    // Set global variables, provide specialized ops
-    let source = if let Some(func_name) = function_invocation {
-        let mut source = String::new();
-        source.push_str("\n");
-        source.push_str(&source_code);
-        source.push_str("\n");
-        source.push_str(&format!(
-            r#"Chidori.saveValue(op_invoke_function({name}));"#,
-            name = func_name
-        ));
-        source.push_str("\n");
-        source
-    } else {
-        let mut source = String::new();
-        source.push_str("\n");
-        source.push_str("export const chidoriResult = {};");
-        source.push_str("\n");
-        source.push_str(&source_code);
-        for (name, report_item) in &report.triggerable_functions {
+        // Set global variables, provide specialized ops
+        let source = if let Some(func_name) = function_invocation {
+            let mut source = String::new();
+            source.push_str("\n");
+            source.push_str(&source_code);
             source.push_str("\n");
             source.push_str(&format!(
-                r#"chidoriResult["{name}"] = "function";"#,
-                name = name
+                r#"Chidori.saveValue(op_invoke_function({name}));"#,
+                name = func_name
             ));
             source.push_str("\n");
-        }
-        for (name, report_item) in &report.cell_exposed_values {
+            source
+        } else {
+            let mut source = String::new();
             source.push_str("\n");
-            source.push_str(&format!(
-                r#"chidoriResult["{name}"] = {name};"#,
-                name = name
-            ));
+            source.push_str("export const chidoriResult = {};");
             source.push_str("\n");
-        }
-        source.push_str("\n");
-        source.push_str("Chidori.saveOutput(chidoriResult);");
-        source.push_str("\n");
-        source
-    };
+            source.push_str(&source_code);
+            for (name, report_item) in &report.triggerable_functions {
+                source.push_str("\n");
+                source.push_str(&format!(
+                    r#"chidoriResult["{name}"] = "function";"#,
+                    name = name
+                ));
+                source.push_str("\n");
+            }
+            for (name, report_item) in &report.cell_exposed_values {
+                source.push_str("\n");
+                source.push_str(&format!(
+                    r#"chidoriResult["{name}"] = {name};"#,
+                    name = name
+                ));
+                source.push_str("\n");
+            }
+            source.push_str("\n");
+            source.push_str("Chidori.saveOutput(chidoriResult);");
+            source.push_str("\n");
+            source
+        };
 
 
-    let flags = deno::args::Flags::default();
-    let factory = deno::factory::CliFactory::from_flags(flags)?;
-    let cli_options = factory.cli_options();
-    let file_fetcher = factory.file_fetcher()?;
-    let main_module = cli_options.resolve_main_module()?;
+        let mut flags = deno::args::Flags::default();
+        // TODO: give user control over this in configuration
+        flags.allow_net = Some(vec![]);
+        let factory = deno::factory::CliFactory::from_flags(flags)?;
+        let cli_options = factory.cli_options();
+        let file_fetcher = factory.file_fetcher()?;
+        let main_module = cli_options.resolve_main_module()?;
 
-    // Save a fake file into file fetcher cache
-    // to allow module access by TS compiler.
-    file_fetcher.insert_memory_files(File {
-        specifier: main_module.clone(),
-        maybe_headers: None,
-        source: source.clone().into_bytes().into(),
-    });
+        // Save a fake file into file fetcher cache
+        // to allow module access by TS compiler.
+        file_fetcher.insert_memory_files(File {
+            specifier: main_module.clone(),
+            maybe_headers: None,
+            source: source.clone().into_bytes().into(),
+        });
 
-    let permissions = PermissionsContainer::new(Permissions::from_options(
-        &cli_options.permissions_options(),
-    )?);
-    // TODO: add custom extensions
-    {
-        let worker_factory = factory.create_cli_main_worker_factory().await?;
-        let mut worker = worker_factory
-            .create_custom_worker(
-                main_module,
-                permissions,
-                vec![ext],
-                Default::default(),
-            )
-            .await?;
+        let permissions = PermissionsContainer::new(Permissions::from_options(
+            &cli_options.permissions_options(),
+        )?);
 
-        let exit_code = worker.run().await?;
-    }
-    let mut my_op_state = my_op_state.lock().unwrap();
-    let output = my_op_state.output.clone().unwrap_or(RkyvSerializedValue::Null);
-    let stdout = my_op_state.stdout.clone();
-    let stderr = my_op_state.stderr.clone();
-    Ok((output, stdout, stderr))
+        // Create a single-threaded runtime
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create Tokio runtime");
+
+        // Use the newly created single-threaded runtime to run our async code
+        runtime.block_on(async {
+            // TODO: add custom extensions
+            let worker_factory = factory.create_cli_main_worker_factory().await?;
+            let mut worker = worker_factory
+                .create_custom_worker(
+                    main_module,
+                    permissions,
+                    vec![ext],
+                    Default::default(),
+                )
+                .await?;
+
+            let exit_code = worker.run().await?;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let mut my_op_state = my_op_state.lock().unwrap();
+        let output = my_op_state.output.clone().unwrap_or(RkyvSerializedValue::Null);
+        let stdout = my_op_state.stdout.clone();
+        let stderr = my_op_state.stderr.clone();
+        Ok((output, stdout, stderr))
+    })
+        .await
+        .unwrap()
 }
 
 fn replace_identifier(code: &str, old_identifier: &str, new_identifier: &str) -> String {

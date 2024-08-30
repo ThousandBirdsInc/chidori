@@ -11,3 +11,4 @@ pub mod utils;
 
 pub use tokio;
 pub use uuid;
+pub use chidori_static_analysis;

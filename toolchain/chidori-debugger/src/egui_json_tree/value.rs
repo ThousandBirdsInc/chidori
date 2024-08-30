@@ -41,7 +41,6 @@ pub trait ToJsonTreeValue {
 
 const NULL_STR: &str = "null";
 
-#[cfg(feature = "serde_json")]
 impl ToJsonTreeValue for serde_json::Value {
     fn to_json_tree_value(&self) -> JsonTreeValue {
         match self {

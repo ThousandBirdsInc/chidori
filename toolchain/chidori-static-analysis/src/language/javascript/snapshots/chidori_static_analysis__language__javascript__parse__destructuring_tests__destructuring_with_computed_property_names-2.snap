@@ -1,0 +1,10 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const key = 'p';\nconst { [key]: value } = { p: 16 };\n"
+---
+internal_call_graph: {}
+cell_exposed_values:
+  key: {}
+  value: {}
+cell_depended_values: {}
+triggerable_functions: {}

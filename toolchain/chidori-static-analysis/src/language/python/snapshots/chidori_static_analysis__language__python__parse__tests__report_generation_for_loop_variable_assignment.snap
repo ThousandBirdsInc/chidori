@@ -12,16 +12,18 @@ description: "async def run_prompt(number_of_states):\n    out = \"\"\n    for s
         end: 202
   - FunctionArguments
   - IdentifierReferredTo:
-      - number_of_states
-      - false
+      name: number_of_states
+      in_scope: false
+      exposed: false
 - - InFunction:
       - run_prompt
       - start: 0
         end: 202
   - AssignmentToStatement
   - IdentifierReferredTo:
-      - out
-      - false
+      name: out
+      in_scope: false
+      exposed: false
 - - InFunction:
       - run_prompt
       - start: 0
@@ -34,15 +36,17 @@ description: "async def run_prompt(number_of_states):\n    out = \"\"\n    for s
         end: 202
   - AssignmentToStatement
   - IdentifierReferredTo:
-      - state
-      - false
+      name: state
+      in_scope: false
+      exposed: false
 - - InFunction:
       - run_prompt
       - start: 0
         end: 202
   - IdentifierReferredTo:
-      - state
-      - true
+      name: state
+      in_scope: true
+      exposed: false
 - - InFunction:
       - run_prompt
       - start: 0
@@ -58,8 +62,9 @@ description: "async def run_prompt(number_of_states):\n    out = \"\"\n    for s
   - Attribute: split
   - InCallExpression
   - IdentifierReferredTo:
-      - number_of_states
-      - true
+      name: number_of_states
+      in_scope: true
+      exposed: false
 - - InFunction:
       - run_prompt
       - start: 0
@@ -69,31 +74,35 @@ description: "async def run_prompt(number_of_states):\n    out = \"\"\n    for s
   - Attribute: split
   - InCallExpression
   - IdentifierReferredTo:
-      - get_states_first_letters
-      - false
+      name: get_states_first_letters
+      in_scope: false
+      exposed: false
 - - InFunction:
       - run_prompt
       - start: 0
         end: 202
   - IdentifierReferredTo:
-      - out
-      - true
-- - InFunction:
-      - run_prompt
-      - start: 0
-        end: 202
-  - InCallExpression
-  - IdentifierReferredTo:
-      - state
-      - true
+      name: out
+      in_scope: true
+      exposed: false
 - - InFunction:
       - run_prompt
       - start: 0
         end: 202
   - InCallExpression
   - IdentifierReferredTo:
-      - first_letter
-      - false
+      name: state
+      in_scope: true
+      exposed: false
+- - InFunction:
+      - run_prompt
+      - start: 0
+        end: 202
+  - InCallExpression
+  - IdentifierReferredTo:
+      name: first_letter
+      in_scope: false
+      exposed: false
 - - InFunction:
       - run_prompt
       - start: 0
@@ -105,5 +114,6 @@ description: "async def run_prompt(number_of_states):\n    out = \"\"\n    for s
         end: 202
   - Constant: demo
   - IdentifierReferredTo:
-      - out
-      - true
+      name: out
+      in_scope: true
+      exposed: false

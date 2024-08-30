@@ -12,8 +12,9 @@ description: "import random\n\ndef fun_name():\n    w = function_that_doesnt_exi
         end: 90
   - AssignmentToStatement
   - IdentifierReferredTo:
-      - w
-      - false
+      name: w
+      in_scope: false
+      exposed: false
 - - InFunction:
       - fun_name
       - start: 15
@@ -21,30 +22,35 @@ description: "import random\n\ndef fun_name():\n    w = function_that_doesnt_exi
   - AssignmentFromStatement
   - InCallExpression
   - IdentifierReferredTo:
-      - function_that_doesnt_exist
-      - false
+      name: function_that_doesnt_exist
+      in_scope: false
+      exposed: false
 - - InFunction:
       - fun_name
       - start: 15
         end: 90
   - AssignmentToStatement
   - IdentifierReferredTo:
-      - v
-      - false
+      name: v
+      in_scope: false
+      exposed: false
 - - InFunction:
       - fun_name
       - start: 15
         end: 90
   - IdentifierReferredTo:
-      - v
-      - true
+      name: v
+      in_scope: true
+      exposed: false
 - - AssignmentToStatement
   - IdentifierReferredTo:
-      - x
-      - false
+      name: x
+      in_scope: false
+      exposed: false
 - - AssignmentFromStatement
   - InCallExpression
   - Attribute: randint
   - IdentifierReferredTo:
-      - random
-      - true
+      name: random
+      in_scope: true
+      exposed: false

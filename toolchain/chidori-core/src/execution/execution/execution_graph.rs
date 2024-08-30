@@ -174,17 +174,27 @@ impl ExecutionGraph {
                                 let s = resulting_execution_state.clone();
 
                                 match resulting_execution_state {
-                                    ExecutionStateEvaluation::Error => {}
-                                    ExecutionStateEvaluation::EvalFailure => {}
+                                    ExecutionStateEvaluation::Error(id) => {
+                                        state_id_to_state.deref_mut().insert(id.clone(), s.clone());
+                                    }
+                                    ExecutionStateEvaluation::EvalFailure(id) => {
+                                        state_id_to_state.deref_mut().insert(id.clone(), s.clone());
+                                    }
                                     ExecutionStateEvaluation::Complete(state) => {
-                                        println!("Adding to execution state!!!! {:?}", state.id);
+                                        // println!("Adding to execution state!!!! {:?}", state.id);
                                         let resulting_state_id = state.id;
                                         state_id_to_state.deref_mut().insert(resulting_state_id.clone(), s.clone());
                                         execution_graph.deref_mut()
                                             .add_edge(state.parent_state_id, resulting_state_id.clone(), s);
                                     }
-                                    ExecutionStateEvaluation::Executing(..) => {
-
+                                    ExecutionStateEvaluation::Executing(state) => {
+                                        let resulting_state_id = state.id;
+                                        if let Some(ExecutionStateEvaluation::Complete(_)) = state_id_to_state.deref().get(&resulting_state_id) {
+                                        } else {
+                                            state_id_to_state.deref_mut().insert(resulting_state_id.clone(), s.clone());
+                                            execution_graph.deref_mut()
+                                                .add_edge(state.parent_state_id, resulting_state_id.clone(), s);
+                                        }
                                     }
                                 }
 
@@ -233,9 +243,9 @@ impl ExecutionGraph {
         let mut grouped_nodes = HashSet::new();
         for (source, target, ev) in execution_graph.deref().all_edges() {
             match ev {
-                ExecutionStateEvaluation::EvalFailure => {},
-                ExecutionStateEvaluation::Error => {}
-                ExecutionStateEvaluation::Executing(..) => {
+                ExecutionStateEvaluation::EvalFailure(_) => {},
+                ExecutionStateEvaluation::Error(_) => {}
+                ExecutionStateEvaluation::Executing(s) => {
                 }
                 ExecutionStateEvaluation::Complete(s) => {
                     if !s.stack.is_empty() {
@@ -315,8 +325,8 @@ impl ExecutionGraph {
             ExecutionStateEvaluation::Executing(state) =>
                 (state.parent_state_id, state.id)
 ,
-            ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
-            ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
         };
         println!("Inserting into graph {:?}", &resulting_state_id);
         // TODO: if state already exists how to handle
@@ -345,8 +355,8 @@ impl ExecutionGraph {
         let previous_state = match previous_state {
             ExecutionStateEvaluation::Complete(state) => state,
             ExecutionStateEvaluation::Executing(..) => panic!("Cannot step an execution state that is currently executing"),
-            ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
-            ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
         };
         let eval_state = previous_state.determine_next_operation()?;
         // TODO: update graph with representation that we're inside of executing something
@@ -380,8 +390,8 @@ impl ExecutionGraph {
                 return Err(anyhow!("Cannot mutate a graph that is currently executing"))
             },
 
-            ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
-            ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
 
         };
 

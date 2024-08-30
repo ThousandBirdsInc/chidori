@@ -14,8 +14,9 @@ description: "@ch.register()\ndef migration_agent():\n    ch.set(\"bar\", 1)\n"
   - InCallExpression
   - Attribute: register
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: false
 - - InFunction:
       - migration_agent
       - start: 15
@@ -30,5 +31,6 @@ description: "@ch.register()\ndef migration_agent():\n    ch.set(\"bar\", 1)\n"
   - Constant: bar
   - Attribute: set
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: false

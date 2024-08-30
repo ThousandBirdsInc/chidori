@@ -1,0 +1,29 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "function returnArray() {\n    return [1, 2, 3];\n}\nconst [first, ...restArray] = returnArray();\n"
+---
+- - InFunction:
+      - returnArray
+      - start: 1
+        end: 49
+  - FunctionArguments
+- - InFunction:
+      - returnArray
+      - start: 1
+        end: 49
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: first
+      in_scope: false
+      exposed: true
+  - IdentifierReferredTo:
+      name: restArray
+      in_scope: false
+      exposed: true
+- - AssignmentFromStatement
+  - InCallExpression
+  - IdentifierReferredTo:
+      name: returnArray
+      in_scope: true
+      exposed: true
+- - AssignmentFromStatement

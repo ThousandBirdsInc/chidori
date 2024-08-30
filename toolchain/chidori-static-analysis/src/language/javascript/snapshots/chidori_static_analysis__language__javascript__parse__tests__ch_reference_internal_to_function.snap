@@ -6,10 +6,11 @@ description: "function evaluate_agent(ev) {\n    ch.set(\"file_path\", ev.file_p
       - evaluate_agent
       - start: 1
         end: 92
-  - Params
+  - FunctionArguments
   - IdentifierReferredTo:
-      - ev
-      - false
+      name: ev
+      in_scope: false
+      exposed: true
 - - InFunction:
       - evaluate_agent
       - start: 1
@@ -17,21 +18,24 @@ description: "function evaluate_agent(ev) {\n    ch.set(\"file_path\", ev.file_p
   - InCallExpression
   - Attribute: set
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: true
   - Constant: file_path
   - Attribute: file_path
   - IdentifierReferredTo:
-      - ev
-      - true
+      name: ev
+      in_scope: true
+      exposed: true
 - - InFunction:
       - evaluate_agent
       - start: 1
         end: 92
   - InCallExpression
   - IdentifierReferredTo:
-      - migration_agent
-      - false
+      name: migration_agent
+      in_scope: false
+      exposed: true
 - - InFunction:
       - evaluate_agent
       - start: 1

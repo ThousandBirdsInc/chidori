@@ -1,0 +1,17 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const key = 'p';\nconst { [key]: value } = { p: 16 };\n"
+---
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: key
+      in_scope: false
+      exposed: true
+- - AssignmentFromStatement
+  - Constant: p
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: value
+      in_scope: false
+      exposed: true
+- - AssignmentFromStatement

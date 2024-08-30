@@ -6,9 +6,6 @@ import { serve } from 'https://deno.land/std@0.145.0/http/server.ts';
 
 const app = new Hono();
 
-// Middleware to parse form data
-app.use('/submit', bodyParser.urlencoded({ extended: true }));
-
 app.get('/', (c) => {
   const form = `
     <h1>Welcome to Trip Planner Crew</h1>

@@ -1,0 +1,14 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const [i, , j] = [7, 8, 9];\n"
+---
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: i
+      in_scope: false
+      exposed: true
+  - IdentifierReferredTo:
+      name: j
+      in_scope: false
+      exposed: true
+- - AssignmentFromStatement

@@ -6,15 +6,16 @@ description: "function createDockerfile() {\n    return prompt(\"prompts/create_
       - createDockerfile
       - start: 1
         end: 79
-  - Params
+  - FunctionArguments
 - - InFunction:
       - createDockerfile
       - start: 1
         end: 79
   - InCallExpression
   - IdentifierReferredTo:
-      - prompt
-      - false
+      name: prompt
+      in_scope: false
+      exposed: true
   - Constant: prompts/create_dockerfile
 - - InFunction:
       - createDockerfile

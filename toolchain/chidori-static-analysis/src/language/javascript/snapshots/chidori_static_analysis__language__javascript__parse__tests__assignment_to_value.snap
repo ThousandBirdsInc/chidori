@@ -4,6 +4,7 @@ description: "const x = 1\n"
 ---
 - - AssignmentToStatement
   - IdentifierReferredTo:
-      - x
-      - false
+      name: x
+      in_scope: false
+      exposed: true
 - - AssignmentFromStatement

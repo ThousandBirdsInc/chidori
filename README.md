@@ -43,18 +43,18 @@ Chidori is an open-source orchestrator, runtime, and IDE for building software i
 It is especially catered towards building AI agents by providing solutions to the following problems:
 
 - How do we understand what an agent is doing and how it got into a given state?
-- How can we pause execution and then resume after human review?
+- How can we pause execution and then resume after interaction with a human?
 - How do we handle the accidental complexity of state-space exploration, evaluating and reverting execution throughout our software?
 
-When using Chidori, you author code with python or javascript, and we provide a layer for interfacing
+When using Chidori, you author code with python or javascript, we provide a layer for interfacing
 with the complexities of AI models in long-running workflows. We have avoided the need for declaring a new language 
-or SDK in order to provide these capabilities, you can leverage software patterns that you are already familiar with.
+or SDK in order to provide these capabilities so that you can leverage software patterns that you are already familiar with.
 
 Features:
 
 - Runtime written in Rust, supporting Python and JavaScript code execution
-- Cache behaviors and resume from partially executed agents
-- Time travel debugging, revert to prior states of execution
+- The ability to cache behaviors and resume from partially executed agents
+- Time travel debugging, execution of the program can be reverted to prior states
 - Visual debugging environment, visualize and manipulate the graph of states your code has executed through.
 - Create and navigate tree-searching code execution workflows
 
@@ -70,23 +70,22 @@ prototype development is `chidori-debugger` which wraps our runtime in a useful 
 
 ```bash
 xcode-select --install
-brew install cmake
 
+# These dependencies are necessary for a successful build
+brew install \ 
+  cmake \
 # Protobuf is depended upon by denokv, which we in turn currently depend on
-brew install protobuf 
-
+  protobuf \
 # We are investigating if this is necessary or can be removed
-brew install libiconv
-
-brew install python@3.11
-
+  libiconv \
+  python@3.11 \
 # Chidori uses uv for handling python dependencies 
-brew install uv
+  uv
 
 cargo install chidori-debugger
 ```
 
-If you would prefer a different python interpreter you can set PYO3_PYTHON=python3.12 (or whichever version > 3.7) during
+If you prefer to use a different python interpreter you can set PYO3_PYTHON=python3.12 (or whichever version > 3.7) during
 your installation to change which is linked against.
 
 
@@ -95,8 +94,9 @@ Chidori's interactions with LLMs default to http://localhost:4000 to hook into L
 If you'd like to leverage gpt-3.5-turbo the included config file will support that.
 You will need to install `pip install litellm[proxy]` in order to run the below:
 ```bash
+uv sync
 export OPENAI_API_KEY=...
-litellm --config ./litellm_config.yaml
+uv run litellm --config ./litellm_config.yaml
 ```
 
 ## Examples
@@ -214,7 +214,7 @@ Our framework is inspired by the work of many others, including:
 * [Langchain](https://www.langchain.com) - developing tools and patterns for building with LLMs
 
 ## License
-Thousand Birds is under the MIT license. See the [LICENSE](LICENSE) for more information.
+Chidori is under the MIT license. See the [LICENSE](LICENSE) for more information.
 
 ## Help us out!
-Please star the github repo and give us feedback in [discord](https://discord.gg/CJwKsPSgew)!
+Please star the GitHub repo and give us feedback in [discord](https://discord.gg/CJwKsPSgew)!

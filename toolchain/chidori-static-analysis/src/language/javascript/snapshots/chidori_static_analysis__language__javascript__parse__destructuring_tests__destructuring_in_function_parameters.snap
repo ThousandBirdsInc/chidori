@@ -1,0 +1,39 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "function printPerson({ name, age = 30 }) {\n    console.log(`${name} is ${age} years old`);\n}\n"
+---
+- - InFunction:
+      - printPerson
+      - start: 1
+        end: 93
+  - FunctionArguments
+  - IdentifierReferredTo:
+      name: name
+      in_scope: false
+      exposed: true
+  - IdentifierReferredTo:
+      name: age
+      in_scope: false
+      exposed: true
+- - InFunction:
+      - printPerson
+      - start: 1
+        end: 93
+  - InCallExpression
+  - Attribute: log
+  - IdentifierReferredTo:
+      name: console
+      in_scope: false
+      exposed: true
+  - IdentifierReferredTo:
+      name: name
+      in_scope: true
+      exposed: true
+  - IdentifierReferredTo:
+      name: age
+      in_scope: true
+      exposed: true
+- - InFunction:
+      - printPerson
+      - start: 1
+        end: 93

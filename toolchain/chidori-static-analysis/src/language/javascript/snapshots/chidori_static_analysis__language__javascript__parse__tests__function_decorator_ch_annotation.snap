@@ -6,7 +6,7 @@ description: "function migrationAgent() {\n    ch.register();\n    ch.set(\"bar\
       - migrationAgent
       - start: 1
         end: 71
-  - Params
+  - FunctionArguments
 - - InFunction:
       - migrationAgent
       - start: 1
@@ -14,8 +14,9 @@ description: "function migrationAgent() {\n    ch.register();\n    ch.set(\"bar\
   - InCallExpression
   - Attribute: register
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: true
 - - InFunction:
       - migrationAgent
       - start: 1
@@ -23,8 +24,9 @@ description: "function migrationAgent() {\n    ch.register();\n    ch.set(\"bar\
   - InCallExpression
   - Attribute: set
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: true
   - Constant: bar
 - - InFunction:
       - migrationAgent

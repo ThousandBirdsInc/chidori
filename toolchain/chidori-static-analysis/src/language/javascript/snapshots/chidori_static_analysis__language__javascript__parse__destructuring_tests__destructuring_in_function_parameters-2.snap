@@ -1,0 +1,14 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "function printPerson({ name, age = 30 }) {\n    console.log(`${name} is ${age} years old`);\n}\n"
+---
+internal_call_graph: {}
+cell_exposed_values: {}
+cell_depended_values: {}
+triggerable_functions:
+  printPerson:
+    arguments:
+      - name
+      - age
+    emit_event: []
+    trigger_on: []

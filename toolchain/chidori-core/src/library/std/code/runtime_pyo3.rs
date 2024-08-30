@@ -39,8 +39,9 @@ use log::info;
 use regex::Regex;
 
 use sha1::{Sha1, Digest};
-use tracing::Span;
+use tracing::{Id, Span};
 use uuid::Uuid;
+use crate::execution::execution::execution_state::ExecutionStateErrors;
 
 static SOURCE_CODE_RUN_COUNTER: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
 static CURRENT_PYTHON_EXECUTION_ID: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
@@ -302,7 +303,7 @@ pub async fn source_code_run_python(
     function_invocation: &Option<String>,
     virtualenv_path: &Option<String>,
     requirements_dir: &Option<String>,
-) -> anyhow::Result<(RkyvSerializedValue, Vec<String>, Vec<String>)> {
+) -> anyhow::Result<(Result<RkyvSerializedValue, ExecutionStateErrors>, Vec<String>, Vec<String>)> {
 
     // Capture the current span's ID
     let current_span_id = Span::current().id();
@@ -517,19 +518,19 @@ asyncio.run(__wrapper())
                 py.allow_threads(move || {
                     Ok(Box::pin(async move {
                         let output_c = PYTHON_OUTPUT_MAP.clone();
-                        if let Some((k, output_c)) = output_c.remove(&exec_id) {
+                        Ok(if let Some((k, output_c)) = output_c.remove(&exec_id) {
                             RkyvSerializedValue::Object(output_c.into_iter().collect())
                         } else {
                             RkyvSerializedValue::Object(HashMap::new())
-                        }
-                    }) as Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>>)
+                        })
+                    }) as Pin<Box<dyn Future<Output = Result<RkyvSerializedValue, ExecutionStateErrors>> + Send>>)
                 })
             }
             Some(name) => {
                 // Function invocations refer to the function hashed _once_ this is the reference
                 // to the original definition of the function.
                 let name = hash_to_python_method_name(&name);
-                // TODO: name should be the hashed representation rather than the original name?
+
                 // This is calling to the not proxied version, so it is the Hash A instance of the function
                 // otherwise we're in a loop of external dispatches
                 let local = globals.get_item(name)?;
@@ -570,21 +571,23 @@ asyncio.run(__wrapper())
                         // If the function is a coroutine, we need to await it
                         let f = pyo3_asyncio::tokio::into_future(result)?;
                         Ok(Box::pin(async move {
-                            // TODO: these should return Result so that we don't unwrap here
-                            let py_any = &f.await.unwrap();
-                            Python::with_gil(|py| {
+                            let py_any = &f.await.map_err(|e| {
+                                dbg!(&e);
+                                ExecutionStateErrors::Unknown(e.to_string())
+                            })?;
+                            Ok(Python::with_gil(|py| {
                                 let py_any: &PyAny = py_any.as_ref(py);
                                 pyany_to_rkyv_serialized_value(py_any)
-                            })
-                        }) as Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>>)
+                            }))
+                        }) as Pin<Box<dyn Future<Output = Result<RkyvSerializedValue, ExecutionStateErrors>> + Send>>)
                     } else {
                         let result: PyObject = result.into_py(py);
                         Ok(Box::pin(async move {
-                            Python::with_gil(|py| {
+                            Ok(Python::with_gil(|py| {
                                 let py_any: &PyAny = result.as_ref(py);
                                 pyany_to_rkyv_serialized_value(py_any)
-                            })
-                        }) as Pin<Box<dyn Future<Output=RkyvSerializedValue> + Send>>)
+                            }))
+                        }) as Pin<Box<dyn Future<Output=Result<RkyvSerializedValue, ExecutionStateErrors>> + Send>>)
                     }
                 } else {
                     Err(anyhow::anyhow!("Function not found"))
@@ -616,35 +619,40 @@ fn create_internal_proxy_shims(execution_state_handle: &Arc<Mutex<ExecutionState
         let clone_function_name = function_name.clone();
         let execution_state_handle = execution_state_handle.clone();
         let parent_span_id = parent_span_id.clone();
-        let closure_callable = PyCFunction::new_closure(
-            py,
-            None, // name
-            None, // doc
-            move |args: &PyTuple, kwargs: Option<&PyDict>| -> PyResult<PyObject> {
-                let total_arg_payload = python_args_to_rkyv(args, kwargs)?;
-                let clone_function_name = clone_function_name.clone();
-                let parent_span_id = parent_span_id.clone();
-                let py = args.py();
-                let mut new_exec_state = {
-                    let mut exec_state = execution_state_handle.lock().unwrap();
-                    let mut new_exec_state = exec_state.clone();
-                    std::mem::swap(&mut *exec_state, &mut new_exec_state);
-                    new_exec_state
-                };
-                // All function calls across cells are forced to be async
-                pyo3_asyncio::tokio::future_into_py(py, async move {
-                    let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload, parent_span_id.clone()).await.map_err(|e| AnyhowErrWrapper(e))?;
-                    // TODO: assign this execution state to the current so that as we continue to execute this is now where we're progressing from
-                    PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result)))
-                }).map(|x| x.into())
-            },
-        )?;
+        let closure_callable = create_python_dispatch_closure(py, clone_function_name, execution_state_handle, parent_span_id)?;
 
         // Internal proxy shims are assigned to the function name hashed _twice_
         let renamed_function = hash_to_python_method_name(&hash_to_python_method_name(&function_name));
         globals.set_item(renamed_function, closure_callable);
     }
     Ok(())
+}
+
+fn create_python_dispatch_closure(py: Python, clone_function_name: String, execution_state_handle: Arc<Mutex<ExecutionState>>, parent_span_id: Option<Id>) -> Result<&PyCFunction, Error> {
+    let closure_callable = PyCFunction::new_closure(
+        py,
+        None, // name
+        None, // doc
+        move |args: &PyTuple, kwargs: Option<&PyDict>| -> PyResult<PyObject> {
+            let total_arg_payload = python_args_to_rkyv(args, kwargs)?;
+            let clone_function_name = clone_function_name.clone();
+            let parent_span_id = parent_span_id.clone();
+            let py = args.py();
+            let mut new_exec_state = {
+                let mut exec_state = execution_state_handle.lock().unwrap();
+                let mut new_exec_state = exec_state.clone();
+                std::mem::swap(&mut *exec_state, &mut new_exec_state);
+                new_exec_state
+            };
+            // All function calls across cells are forced to be async
+            pyo3_asyncio::tokio::future_into_py(py, async move {
+                let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload, parent_span_id.clone()).await.map_err(|e| AnyhowErrWrapper(e))?;
+                // TODO: assign this execution state to the current so that as we continue to execute this is now where we're progressing from
+                PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result)))
+            }).map(|x| x.into())
+        },
+    )?;
+    Ok(closure_callable)
 }
 
 fn create_external_function_shims(execution_state_handle: &Arc<Mutex<ExecutionState>>, report: &Report, py: Python, globals: &PyDict, parent_span_id: Option<tracing::Id>) -> Result<(), Error> {
@@ -665,30 +673,7 @@ fn create_external_function_shims(execution_state_handle: &Arc<Mutex<ExecutionSt
             let execution_state_handle = execution_state_handle.clone();
 
             let parent_span_id = parent_span_id.clone();
-
-            let closure_callable = PyCFunction::new_closure(
-                py,
-                None, // name
-                None, // doc
-                move |args: &PyTuple, kwargs: Option<&PyDict>| -> PyResult<PyObject> {
-                    let total_arg_payload = python_args_to_rkyv(args, kwargs)?;
-                    let clone_function_name = clone_function_name.clone();
-                    let parent_span_id = parent_span_id.clone();
-                    let py = args.py();
-                    let mut new_exec_state = {
-                        let mut exec_state = execution_state_handle.lock().unwrap();
-                        let mut new_exec_state = exec_state.clone();
-                        std::mem::swap(&mut *exec_state, &mut new_exec_state);
-                        new_exec_state
-                    };
-                    // All function calls across cells are forced to be async
-                    pyo3_asyncio::tokio::future_into_py(py, async move {
-                        let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload, parent_span_id.clone()).await.map_err(|e| AnyhowErrWrapper(e))?;
-                        // TODO: assign this execution state to the current so that as we continue to execute this is now where we're progressing from
-                        PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result)))
-                    }).map(|x| x.into())
-                },
-            )?;
+            let closure_callable = create_python_dispatch_closure(py, clone_function_name, execution_state_handle, parent_span_id)?;
             // TODO: this should get something that identifies some kind of signal
             //       for how to fetch the execution state
             globals.set_item(function_name.clone(), closure_callable);
@@ -831,7 +816,7 @@ li = [x, y]
         assert_eq!(
             result.unwrap(),
             (
-                RkyvSerializedValue::Object(HashMap::from_iter(vec![
+                Ok(RkyvSerializedValue::Object(HashMap::from_iter(vec![
                     ("y".to_string(), RkyvSerializedValue::Number(42),),
                     ("x".to_string(), RkyvSerializedValue::Number(54),),
                     (
@@ -841,7 +826,7 @@ li = [x, y]
                             RkyvSerializedValue::Number(42)
                         ]),
                     )
-                ])),
+                ]))),
                 vec![],
                 vec![]
             )
@@ -860,7 +845,7 @@ print("testing")
         assert_eq!(
             result.unwrap(),
             (
-                RkyvSerializedValue::Object(HashMap::from_iter(vec![])),
+                Ok(RkyvSerializedValue::Object(HashMap::from_iter(vec![]))),
                 vec![String::from("testing"), String::from("\n")],
                 vec![]
             )
@@ -886,7 +871,7 @@ def example():
                                             &None,
                                             &None,
         ).await;
-        assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(20), vec![], vec![]));
+        assert_eq!(result.unwrap(), (Ok(RkyvSerializedValue::Number(20)), vec![], vec![]));
     }
 
     #[tokio::test]
@@ -909,7 +894,7 @@ def example(x):
                                             &None,
                                             &None,
         ).await;
-        assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(25), vec![], vec![]));
+        assert_eq!(result.unwrap(), (Ok(RkyvSerializedValue::Number(25)), vec![], vec![]));
     }
 
     #[tokio::test]
@@ -941,7 +926,7 @@ a = 20 + await demo()
         assert_eq!(
             result.unwrap(),
             (
-                RkyvObjectBuilder::new().insert_number("a", 120).build(),
+                Ok(RkyvObjectBuilder::new().insert_number("a", 120).build()),
                 vec![],
                 vec![]
             )
@@ -976,7 +961,7 @@ a = 20 + await demo()
         assert_eq!(
             result.unwrap(),
             (
-                RkyvObjectBuilder::new().insert_number("data", 100).build(),
+                Ok(RkyvObjectBuilder::new().insert_number("data", 100).build()),
                 vec![],
                 vec![]
             )
@@ -1026,7 +1011,7 @@ data = await demo()
         assert_eq!(
             result.unwrap(),
             (
-                RkyvObjectBuilder::new().insert_number("data", 200).build(),
+                Ok(RkyvObjectBuilder::new().insert_number("data", 200).build()),
                 vec![],
                 vec![]
             )
@@ -1096,19 +1081,20 @@ data = await demo()
 
             }
         });
-        let result = source_code_run_python(&state,
-                                            &source_code,
-                                            &RkyvObjectBuilder::new()
-                                                .build(),
-                                            &None,
-                                            &None,
-                                            &None,
+        let result = source_code_run_python(
+            &state,
+            &source_code,
+            &RkyvObjectBuilder::new()
+                .build(),
+            &None,
+            &None,
+            &None,
         ).await;
         cancellation_notify.notify_one();
         assert_eq!(
             result.unwrap(),
             (
-                RkyvObjectBuilder::new().insert_number("data", 300).build(),
+                Ok(RkyvObjectBuilder::new().insert_number("data", 300).build()),
                 vec![],
                 vec![]
             )
@@ -1248,7 +1234,7 @@ def example(x):
                                             &None,
                                             &None,
         ).await;
-        assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(1), vec![], vec![]));
+        assert_eq!(result.unwrap(), (Ok(RkyvSerializedValue::Number(1)), vec![], vec![]));
         let result = source_code_run_python(&ExecutionState::new_with_random_id(),
                                             &source_code,
                                             &RkyvObjectBuilder::new()
@@ -1258,7 +1244,7 @@ def example(x):
                                             &None,
                                             &None,
         ).await;
-        assert_eq!(result.unwrap(), (RkyvSerializedValue::Number(2), vec![], vec![]));
+        assert_eq!(result.unwrap(), (Ok(RkyvSerializedValue::Number(2)), vec![], vec![]));
     }
 
 

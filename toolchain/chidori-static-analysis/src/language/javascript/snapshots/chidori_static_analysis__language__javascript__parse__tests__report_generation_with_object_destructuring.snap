@@ -1,0 +1,65 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const { a, b } = someObject;\nconst { c: renamed } = anotherObject;\n\nfunction processValues({ x, y }) {\n    return x + y;\n}\n\nconst result = processValues({ x: a, y: b });\n"
+---
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: a
+      in_scope: false
+      exposed: true
+  - IdentifierReferredTo:
+      name: b
+      in_scope: false
+      exposed: true
+- - AssignmentFromStatement
+  - IdentifierReferredTo:
+      name: someObject
+      in_scope: false
+      exposed: true
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: renamed
+      in_scope: false
+      exposed: true
+- - AssignmentFromStatement
+  - IdentifierReferredTo:
+      name: anotherObject
+      in_scope: false
+      exposed: true
+- - InFunction:
+      - processValues
+      - start: 69
+        end: 123
+  - FunctionArguments
+  - IdentifierReferredTo:
+      name: x
+      in_scope: false
+      exposed: true
+  - IdentifierReferredTo:
+      name: y
+      in_scope: false
+      exposed: true
+- - InFunction:
+      - processValues
+      - start: 69
+        end: 123
+  - IdentifierReferredTo:
+      name: x
+      in_scope: true
+      exposed: true
+  - IdentifierReferredTo:
+      name: y
+      in_scope: true
+      exposed: true
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: result
+      in_scope: false
+      exposed: true
+- - AssignmentFromStatement
+  - InCallExpression
+  - IdentifierReferredTo:
+      name: processValues
+      in_scope: true
+      exposed: true
+- - AssignmentFromStatement

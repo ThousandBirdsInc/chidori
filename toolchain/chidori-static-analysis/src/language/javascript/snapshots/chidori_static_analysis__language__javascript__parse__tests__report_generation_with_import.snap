@@ -6,15 +6,16 @@ description: "import { random } from \"random\"\n\nfunction fun_name() {\n    co
       - fun_name
       - start: 34
         end: 129
-  - Params
+  - FunctionArguments
 - - InFunction:
       - fun_name
       - start: 34
         end: 129
   - AssignmentToStatement
   - IdentifierReferredTo:
-      - w
-      - false
+      name: w
+      in_scope: false
+      exposed: true
 - - InFunction:
       - fun_name
       - start: 34
@@ -22,8 +23,9 @@ description: "import { random } from \"random\"\n\nfunction fun_name() {\n    co
   - AssignmentFromStatement
   - InCallExpression
   - IdentifierReferredTo:
-      - function_that_doesnt_exist
-      - false
+      name: function_that_doesnt_exist
+      in_scope: false
+      exposed: true
 - - InFunction:
       - fun_name
       - start: 34
@@ -35,8 +37,9 @@ description: "import { random } from \"random\"\n\nfunction fun_name() {\n    co
         end: 129
   - AssignmentToStatement
   - IdentifierReferredTo:
-      - v
-      - false
+      name: v
+      in_scope: false
+      exposed: true
 - - InFunction:
       - fun_name
       - start: 34
@@ -47,16 +50,19 @@ description: "import { random } from \"random\"\n\nfunction fun_name() {\n    co
       - start: 34
         end: 129
   - IdentifierReferredTo:
-      - v
-      - true
+      name: v
+      in_scope: true
+      exposed: true
 - - AssignmentToStatement
   - IdentifierReferredTo:
-      - x
-      - false
+      name: x
+      in_scope: false
+      exposed: true
 - - AssignmentFromStatement
   - InCallExpression
   - Attribute: randint
   - IdentifierReferredTo:
-      - random
-      - true
+      name: random
+      in_scope: true
+      exposed: true
 - - AssignmentFromStatement

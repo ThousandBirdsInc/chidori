@@ -1,0 +1,10 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const { c: renamed, d = 'default' } = { c: 3 };\n"
+---
+internal_call_graph: {}
+cell_exposed_values:
+  d: {}
+  renamed: {}
+cell_depended_values: {}
+triggerable_functions: {}

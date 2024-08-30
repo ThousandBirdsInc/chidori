@@ -1,0 +1,9 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const obj = { a: 1, b: 2, c: 3 };\nfor (const key in obj) {\n    console.log(key, obj[key]);\n}\n"
+---
+internal_call_graph: {}
+cell_exposed_values:
+  obj: {}
+cell_depended_values: {}
+triggerable_functions: {}

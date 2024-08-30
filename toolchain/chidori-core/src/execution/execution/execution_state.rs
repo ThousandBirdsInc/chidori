@@ -76,12 +76,22 @@ impl Future for FutureExecutionState {
     }
 }
 
+#[derive(thiserror::Error, Debug, PartialOrd, PartialEq)]
+pub enum ExecutionStateErrors {
+    #[error("the execution of this graph has reached a fixed point and will not continue without outside influence")]
+    NoFurtherExecutionDetected,
+    #[error("an unexpected error has occurred during the evaluation of state {0}")]
+    CellExecutionUnexpectedFailure(ExecutionNodeId, String),
+    #[error("unknown execution state error")]
+    Unknown(String),
+}
+
 #[derive(Clone)]
 pub enum ExecutionStateEvaluation {
     /// An exception was thrown
-    Error,
+    Error(ExecutionNodeId),
     /// An eval function indicated that we should return
-    EvalFailure,
+    EvalFailure(ExecutionNodeId),
     /// Execution complete
     Complete(ExecutionState),
     /// Execution in progress
@@ -94,8 +104,8 @@ impl ExecutionStateEvaluation {
 
             ExecutionStateEvaluation::Complete(ref state) => state.state_get(operation_id),
             ExecutionStateEvaluation::Executing(..) => unreachable!("Cannot get state from a future state"),
-            ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
-            ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
         }
     }
 
@@ -103,8 +113,8 @@ impl ExecutionStateEvaluation {
         match self {
             ExecutionStateEvaluation::Complete(ref state) => state.state_get(operation_id).map(|o| &o.output),
             ExecutionStateEvaluation::Executing(..) => unreachable!("Cannot get state from a future state"),
-            ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
-            ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
         }
     }
 }
@@ -114,8 +124,8 @@ impl Debug for ExecutionStateEvaluation {
         match self {
             ExecutionStateEvaluation::Complete(ref state) => f.debug_tuple("Complete").field(state).finish(),
             ExecutionStateEvaluation::Executing(..) => f.debug_tuple("Executing").field(&format!("Future state evaluating")).finish(),
-            ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
-            ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
         }
     }
 }
@@ -652,14 +662,15 @@ impl ExecutionState {
         /// Receiver that we pass to the exec for it to capture oneshot RPC communication
         let exec = op.operation.deref();
         let result = exec(&before_execution_state, payload, None, None).await?;
-        let mut after_execution_state = state.clone_with_new_id();
+
+        // Add result into a new execution state
+        let mut after_execution_state = state.clone();
         after_execution_state.stack.pop_back();
         after_execution_state.state_insert(usize::MAX, result.clone());
         after_execution_state.fresh_values.insert(usize::MAX);
 
-        // TODO: Add result into a new execution state
 
-        // TODO: capture the value of the output
+        // Capture the value of the output
         if let Some(graph_sender) = self.graph_sender.as_ref() {
             let s = graph_sender.clone();
             let result = pause_future_with_oneshot(ExecutionStateEvaluation::Complete(after_execution_state.clone()), &s).await;
@@ -778,16 +789,12 @@ impl ExecutionState {
         let dependency_graph = self.get_dependency_graph();
 
         // If none of the inputs are more fresh than our own operation freshness, skip this node
-        // TODO: order appears to matter here, and it shouldn't
         if !signature.is_empty() {
             let our_freshness = self.value_freshness_map.get(&next_operation_id).copied().unwrap_or(0);
-            dbg!((&next_operation_id, &our_freshness));
-            dbg!(signature);
             let any_more_fresh = dependency_graph
                 .edges_directed(next_operation_id, Direction::Incoming)
                 .any(|(from, _, _)| {
                     let their_freshness = self.value_freshness_map.get(&from).copied().unwrap_or(0);
-                    dbg!((from, their_freshness));
                     their_freshness >= our_freshness
                 });
             if !any_more_fresh {
@@ -799,7 +806,7 @@ impl ExecutionState {
         let inputs = self.prepare_operation_inputs(signature, next_operation_id, dependency_graph)?;
 
         if !signature.check_input_against_signature(&inputs) {
-            println!("Signature validation failed continuing");
+            println!("Signature validation failed, continuing");
             return Ok(None);
         }
 

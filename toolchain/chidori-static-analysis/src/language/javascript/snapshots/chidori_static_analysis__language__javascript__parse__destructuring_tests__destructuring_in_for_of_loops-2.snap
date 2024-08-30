@@ -1,0 +1,9 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const items = [{ id: 1, name: 'Item 1' }, { id: 2, name: 'Item 2' }];\nfor (const { id, name } of items) {\n    console.log(`${id}: ${name}`);\n}\n"
+---
+internal_call_graph: {}
+cell_exposed_values:
+  items: {}
+cell_depended_values: {}
+triggerable_functions: {}

@@ -13,8 +13,9 @@ expression: context_stack_references
   - InFunctionDecorator: 0
   - InCallExpression
   - IdentifierReferredTo:
-      - create_dockerfile
-      - false
+      name: create_dockerfile
+      in_scope: false
+      exposed: false
 - - InFunction:
       - setup_pipeline
       - start: 25
@@ -23,20 +24,23 @@ expression: context_stack_references
   - InCallExpression
   - Attribute: p
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: false
 - - InFunction:
       - setup_pipeline
       - start: 25
         end: 60
   - FunctionArguments
   - IdentifierReferredTo:
-      - x
-      - false
+      name: x
+      in_scope: false
+      exposed: false
 - - InFunction:
       - setup_pipeline
       - start: 25
         end: 60
   - IdentifierReferredTo:
-      - x
-      - true
+      name: x
+      in_scope: true
+      exposed: false

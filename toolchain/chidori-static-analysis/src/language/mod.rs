@@ -121,6 +121,29 @@ pub struct Report {
 }
 
 
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub enum ContextPath {
+    Initialized,
+    InFunction(String, TextRange),
+    InAnonFunction,
+    FunctionArguments,
+    FunctionArgument(String),
+    InClass(String),
+    InFunctionDecorator(usize),
+    InCallExpression,
+    ChName,
+    AssignmentToStatement,
+    AssignmentFromStatement,
+    // bool = true (is locally defined)
+    IdentifierReferredTo {
+        name: String,
+        in_scope: bool,
+        exposed: bool
+    },
+    Attribute(String),
+    Constant(String),
+}
+
 
 #[derive(Error, Debug, Serialize, Deserialize)]
 pub enum ChidoriStaticAnalysisError {

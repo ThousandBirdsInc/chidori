@@ -1,0 +1,20 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const { a, b } = someObject;\nconst { c: renamed } = anotherObject;\n\nfunction processValues({ x, y }) {\n    return x + y;\n}\n\nconst result = processValues({ x: a, y: b });\n"
+---
+internal_call_graph: {}
+cell_exposed_values:
+  a: {}
+  b: {}
+  renamed: {}
+  result: {}
+cell_depended_values:
+  anotherObject: {}
+  someObject: {}
+triggerable_functions:
+  processValues:
+    arguments:
+      - x
+      - y
+    emit_event: []
+    trigger_on: []

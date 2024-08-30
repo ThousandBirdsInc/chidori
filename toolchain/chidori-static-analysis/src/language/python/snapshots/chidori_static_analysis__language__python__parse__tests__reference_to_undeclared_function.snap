@@ -4,8 +4,9 @@ description: "out = await read_file_and_load_to_memory(\"./\")\n"
 ---
 - - AssignmentToStatement
   - IdentifierReferredTo:
-      - out
-      - false
+      name: out
+      in_scope: false
+      exposed: false
 - - AssignmentFromStatement
   - InCallExpression
   - Constant: "./"
@@ -13,5 +14,6 @@ description: "out = await read_file_and_load_to_memory(\"./\")\n"
   - InCallExpression
   - Constant: "./"
   - IdentifierReferredTo:
-      - read_file_and_load_to_memory
-      - false
+      name: read_file_and_load_to_memory
+      in_scope: false
+      exposed: false

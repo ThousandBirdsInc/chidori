@@ -1,0 +1,14 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "function returnArray() {\n    return [1, 2, 3];\n}\nconst [first, ...restArray] = returnArray();\n"
+---
+internal_call_graph: {}
+cell_exposed_values:
+  first: {}
+  restArray: {}
+cell_depended_values: {}
+triggerable_functions:
+  returnArray:
+    arguments: []
+    emit_event: []
+    trigger_on: []

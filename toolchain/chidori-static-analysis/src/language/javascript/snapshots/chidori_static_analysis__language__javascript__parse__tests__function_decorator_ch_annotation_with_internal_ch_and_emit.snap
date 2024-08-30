@@ -6,10 +6,11 @@ description: "function dispatch_agent(ev) {\n    ch.onEvent(\"new_file\")\n    c
       - dispatch_agent
       - start: 1
         end: 177
-  - Params
+  - FunctionArguments
   - IdentifierReferredTo:
-      - ev
-      - false
+      name: ev
+      in_scope: false
+      exposed: true
 - - InFunction:
       - dispatch_agent
       - start: 1
@@ -17,8 +18,9 @@ description: "function dispatch_agent(ev) {\n    ch.onEvent(\"new_file\")\n    c
   - InCallExpression
   - Attribute: onEvent
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: true
   - Constant: new_file
 - - InFunction:
       - dispatch_agent
@@ -27,8 +29,9 @@ description: "function dispatch_agent(ev) {\n    ch.onEvent(\"new_file\")\n    c
   - InCallExpression
   - Attribute: emitAs
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: true
   - Constant: file_created
 - - InFunction:
       - dispatch_agent
@@ -37,8 +40,9 @@ description: "function dispatch_agent(ev) {\n    ch.onEvent(\"new_file\")\n    c
   - InCallExpression
   - Attribute: emitAs
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: true
   - Constant: file_created
   - Constant: multiple
   - Constant: args
@@ -49,13 +53,15 @@ description: "function dispatch_agent(ev) {\n    ch.onEvent(\"new_file\")\n    c
   - InCallExpression
   - Attribute: set
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: true
   - Constant: file_path
   - Attribute: file_path
   - IdentifierReferredTo:
-      - ev
-      - true
+      name: ev
+      in_scope: true
+      exposed: true
 - - InFunction:
       - dispatch_agent
       - start: 1

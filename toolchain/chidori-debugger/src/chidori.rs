@@ -1,15 +1,16 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
 use bevy::app::{App, Startup, Update};
 use bevy::input::ButtonInput;
 use bevy::prelude::{Commands, default, KeyCode, Local, NextState, Res, ResMut, Resource};
-use crate::bevy_egui::{EguiContexts};
+use crate::bevy_egui::EguiContexts;
 use egui;
-use egui::{Color32, FontFamily, Frame, Id, Margin, Response, RichText, vec2, Visuals, Widget};
+use egui::{Color32, FontFamily, Frame, Id, Margin, Response, Visuals, Widget};
 use egui::panel::TopBottomSide;
 use egui_tiles::{Tile, TileId};
 use notify_debouncer_full::{
@@ -17,7 +18,6 @@ use notify_debouncer_full::{
     Debouncer,
     FileIdMap, new_debouncer, notify::{RecommendedWatcher, RecursiveMode, Watcher},
 };
-use chidori_core::cells::CellTypes;
 use chidori_core::uuid::Uuid;
 
 use chidori_core::execution::execution::execution_graph::{
@@ -31,7 +31,8 @@ use chidori_core::sdk::entry::{
 };
 use chidori_core::tokio::task::JoinHandle;
 use chidori_core::utils::telemetry::TraceEvents;
-
+use petgraph::prelude::StableGraph;
+use petgraph::graph::NodeIndex;
 use crate::{GameState, tokio_tasks};
 
 const RECV_RUNTIME_EVENT_TIMEOUT_MS: u64 = 100;
@@ -224,6 +225,66 @@ pub struct ChidoriExecutionGraph {
     pub execution_graph: Vec<(ExecutionNodeId, ExecutionNodeId)>,
     pub grouped_nodes: HashSet<ExecutionNodeId>,
     pub current_execution_head: ExecutionNodeId,
+}
+
+impl Default for ChidoriExecutionGraph {
+    fn default() -> Self {
+        ChidoriExecutionGraph {
+            execution_graph: vec![],
+            grouped_nodes: Default::default(),
+            current_execution_head: Uuid::nil(),
+        }
+    }
+}
+
+fn hash_graph(input: &Vec<(ExecutionNodeId, ExecutionNodeId)>) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    input.hash(&mut hasher);
+    hasher.finish()
+}
+
+impl ChidoriExecutionGraph {
+    pub fn construct_stablegraph_from_chidori_execution_graph(&self) -> (StableGraph<ExecutionNodeId, ()>, HashMap<ExecutionNodeId, NodeIndex>) {
+        let execution_graph = &self.execution_graph;
+        let mut dataset = StableGraph::new();
+        let mut node_ids = HashMap::new();
+        // for (a, b) in &execution_graph.stack_graph
+        for (a, b) in execution_graph {
+            let node_index_a = *node_ids
+                .entry(a.clone())
+                .or_insert_with(|| dataset.add_node(a.clone()));
+            let node_index_b = *node_ids
+                .entry(b.clone())
+                .or_insert_with(|| dataset.add_node(b.clone()));
+            dataset.add_edge(node_index_a, node_index_b, ());
+        }
+        (dataset, node_ids)
+    }
+
+
+    pub fn exists_in_current_tree(&self, n: &ExecutionNodeId) -> bool {
+        let h = self.current_execution_head;
+        let (graph, nodes) = self.construct_stablegraph_from_chidori_execution_graph();
+        if let Some(h_idx) = nodes.get(&h) {
+            let mut current = *h_idx;
+            let mut current_weight = graph.node_weight(current);
+            while current_weight != Some(&Uuid::nil()) {
+                current_weight = graph.node_weight(current);
+                if current_weight == Some(n) {
+                    return true;
+                }
+                // Get the parent of the current node
+                if let Some(parent) = graph.neighbors_directed(current, petgraph::Direction::Incoming).next() {
+                    current = parent;
+                } else {
+                    // If there's no parent, we've reached the root
+                    break;
+                }
+            }
+        }
+
+        false
+    }
 }
 
 #[derive(Resource)]
@@ -491,7 +552,11 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                         EventsFromRuntime::CellsUpdated(state) => {
                             ctx.run_on_main_thread(move |ctx| {
                                 if let Some(mut s) = ctx.world.get_resource_mut::<ChidoriCells>() {
-                                    s.editor_cells = state;
+                                    let mut sort_cells = state.clone();
+                                    sort_cells.sort_by(|a, b| {
+                                        a.op_id.cmp(&b.op_id)
+                                    });
+                                    s.editor_cells = sort_cells;
                                 }
                             })
                             .await;
@@ -510,7 +575,11 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                         EventsFromRuntime::ExecutionStateCellsViewUpdated(cells) => {
                             ctx.run_on_main_thread(move |ctx| {
                                 if let Some(mut s) = ctx.world.get_resource_mut::<ChidoriCells>() {
-                                    s.state_cells = cells;
+                                    let mut sort_cells = cells.clone();
+                                    sort_cells.sort_by(|a, b| {
+                                        a.op_id.cmp(&b.op_id)
+                                    });
+                                    s.state_cells = sort_cells;
                                 }
                             })
                                 .await;
@@ -763,3 +832,4 @@ pub fn chidori_plugin(app: &mut App) {
         .add_systems(Update, (update_gui, maintain_egui_tree_identities))
         .add_systems(Startup, setup);
 }
+

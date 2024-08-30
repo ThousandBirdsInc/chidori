@@ -1,0 +1,33 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const obj = { a: 1, b: 2, c: 3 };\nfor (const key in obj) {\n    console.log(key, obj[key]);\n}\n"
+---
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: obj
+      in_scope: false
+      exposed: true
+- - AssignmentFromStatement
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: key
+      in_scope: false
+      exposed: false
+- - IdentifierReferredTo:
+      name: obj
+      in_scope: true
+      exposed: false
+  - InCallExpression
+  - Attribute: log
+  - IdentifierReferredTo:
+      name: console
+      in_scope: false
+      exposed: false
+  - IdentifierReferredTo:
+      name: key
+      in_scope: true
+      exposed: false
+  - IdentifierReferredTo:
+      name: obj
+      in_scope: true
+      exposed: false

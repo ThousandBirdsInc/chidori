@@ -15,8 +15,9 @@ description: "import unittest\n\nclass TestMarshalledValues(unittest.TestCase):\
         end: 129
   - FunctionArguments
   - IdentifierReferredTo:
-      - self
-      - false
+      name: self
+      in_scope: false
+      exposed: false
 - - InClass: TestMarshalledValues
   - InFunction:
       - test_addTwo
@@ -25,8 +26,9 @@ description: "import unittest\n\nclass TestMarshalledValues(unittest.TestCase):\
   - InCallExpression
   - InCallExpression
   - IdentifierReferredTo:
-      - addTwo
-      - false
+      name: addTwo
+      in_scope: false
+      exposed: false
 - - InClass: TestMarshalledValues
   - InFunction:
       - test_addTwo
@@ -35,25 +37,29 @@ description: "import unittest\n\nclass TestMarshalledValues(unittest.TestCase):\
   - InCallExpression
   - Attribute: assertEqual
   - IdentifierReferredTo:
-      - self
-      - true
+      name: self
+      in_scope: true
+      exposed: false
 - - InCallExpression
   - InCallExpression
   - IdentifierReferredTo:
-      - TestMarshalledValues
-      - true
+      name: TestMarshalledValues
+      in_scope: true
+      exposed: false
 - - InCallExpression
   - InCallExpression
   - Attribute: loadTestsFromTestCase
   - InCallExpression
   - Attribute: TestLoader
   - IdentifierReferredTo:
-      - unittest
-      - true
+      name: unittest
+      in_scope: true
+      exposed: false
 - - InCallExpression
   - Attribute: run
   - InCallExpression
   - Attribute: TextTestRunner
   - IdentifierReferredTo:
-      - unittest
-      - true
+      name: unittest
+      in_scope: true
+      exposed: false

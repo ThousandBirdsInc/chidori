@@ -19,5 +19,6 @@ description: "def create_dockerfile():\n    return prompt(\"prompts/create_docke
   - InCallExpression
   - Constant: prompts/create_dockerfile
   - IdentifierReferredTo:
-      - prompt
-      - false
+      name: prompt
+      in_scope: false
+      exposed: false

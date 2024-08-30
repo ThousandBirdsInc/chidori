@@ -1,0 +1,8 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "for (let i = 0; i < 10; i++) {\n    if (i % 2 === 0) continue;\n    console.log(i);\n}\n"
+---
+internal_call_graph: {}
+cell_exposed_values: {}
+cell_depended_values: {}
+triggerable_functions: {}

@@ -12,21 +12,24 @@ description: "def main():\n    bar() | foo() | baz()\n"
         end: 37
   - InCallExpression
   - IdentifierReferredTo:
-      - bar
-      - false
+      name: bar
+      in_scope: false
+      exposed: false
 - - InFunction:
       - main
       - start: 0
         end: 37
   - InCallExpression
   - IdentifierReferredTo:
-      - foo
-      - false
+      name: foo
+      in_scope: false
+      exposed: false
 - - InFunction:
       - main
       - start: 0
         end: 37
   - InCallExpression
   - IdentifierReferredTo:
-      - baz
-      - false
+      name: baz
+      in_scope: false
+      exposed: false

@@ -1,0 +1,14 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const { a, b } = { a: 1, b: 2 };\n"
+---
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: a
+      in_scope: false
+      exposed: true
+  - IdentifierReferredTo:
+      name: b
+      in_scope: false
+      exposed: true
+- - AssignmentFromStatement

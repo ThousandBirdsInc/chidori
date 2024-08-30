@@ -1,0 +1,31 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "for (let i = 0; i < 10; i++) {\n    if (i % 2 === 0) continue;\n    console.log(i);\n}\n"
+---
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: i
+      in_scope: false
+      exposed: false
+- - IdentifierReferredTo:
+      name: i
+      in_scope: true
+      exposed: false
+  - IdentifierReferredTo:
+      name: i
+      in_scope: true
+      exposed: false
+  - IdentifierReferredTo:
+      name: i
+      in_scope: true
+      exposed: false
+  - InCallExpression
+  - Attribute: log
+  - IdentifierReferredTo:
+      name: console
+      in_scope: false
+      exposed: false
+  - IdentifierReferredTo:
+      name: i
+      in_scope: true
+      exposed: false

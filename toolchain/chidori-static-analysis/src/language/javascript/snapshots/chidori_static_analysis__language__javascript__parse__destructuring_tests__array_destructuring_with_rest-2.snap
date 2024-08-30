@@ -1,0 +1,10 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const [k, ...rest] = [10, 11, 12];\n"
+---
+internal_call_graph: {}
+cell_exposed_values:
+  k: {}
+  rest: {}
+cell_depended_values: {}
+triggerable_functions: {}

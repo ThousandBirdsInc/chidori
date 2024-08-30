@@ -1,0 +1,29 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const array = [1, 2, 3, 4, 5];\nfor (const item of array) {\n    console.log(item);\n}\n"
+---
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: array
+      in_scope: false
+      exposed: true
+- - AssignmentFromStatement
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: item
+      in_scope: false
+      exposed: false
+- - IdentifierReferredTo:
+      name: array
+      in_scope: true
+      exposed: false
+  - InCallExpression
+  - Attribute: log
+  - IdentifierReferredTo:
+      name: console
+      in_scope: false
+      exposed: false
+  - IdentifierReferredTo:
+      name: item
+      in_scope: true
+      exposed: false

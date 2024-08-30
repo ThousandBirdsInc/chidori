@@ -97,14 +97,14 @@ impl InstancedEnvironment {
                 ids.push(self.upsert_cell(cell_holder.cell.clone(), cell_holder.op_id)?);
             } else {
                 // TODO: remove these unwraps and handle this better
-                ids.push((cell_holder.applied_at, cell_holder.op_id.unwrap()));
+                ids.push((cell_holder.applied_at.unwrap(), cell_holder.op_id.unwrap()));
             }
         }
 
         let mut shared_state = self.shared_state.lock().unwrap();
         for (i, cell) in shared_state.editor_cells.iter_mut().enumerate() {
             let (applied_at, op_id) = ids[i];
-            cell.applied_at = applied_at.clone();
+            cell.applied_at = Some(applied_at.clone());
             cell.op_id = Some(op_id);
             cell.needs_update = false;
         }
@@ -187,7 +187,7 @@ impl InstancedEnvironment {
                                     cells.push(CellHolder {
                                         cell: op.cell.clone(),
                                         op_id: Some(op.id.clone()),
-                                        applied_at: op.created_at_state_id.clone(),
+                                        applied_at: Some(op.created_at_state_id.clone()),
                                         needs_update: false,
                                     });
                                 }
@@ -236,8 +236,8 @@ impl InstancedEnvironment {
         match self.db.get_state_at_id(id).unwrap() {
             ExecutionStateEvaluation::Complete(s) => s,
             ExecutionStateEvaluation::Executing(..) => panic!("get_state_at, failed, still executing"),
-            ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
-            ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
         }
     }
 
@@ -245,8 +245,8 @@ impl InstancedEnvironment {
         match self.db.get_state_at_id(self.execution_head_state_id).unwrap() {
             ExecutionStateEvaluation::Complete(s) => s,
             ExecutionStateEvaluation::Executing(..) => panic!("get_state, failed, still executing"),
-            ExecutionStateEvaluation::Error => unreachable!("Cannot get state from a future state"),
-            ExecutionStateEvaluation::EvalFailure => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
         }
     }
 
@@ -262,7 +262,7 @@ impl InstancedEnvironment {
                     cells.push(CellHolder {
                         cell: op.cell.clone(),
                         op_id: Some(op.id.clone()),
-                        applied_at: op.created_at_state_id.clone(),
+                        applied_at: Some(op.created_at_state_id.clone()),
                         needs_update: false,
                     });
                 }
@@ -350,7 +350,7 @@ pub enum EventsFromRuntime {
 pub struct CellHolder {
     pub cell: CellTypes,
     pub op_id: Option<usize>,
-    pub applied_at: ExecutionNodeId,
+    pub applied_at: Option<ExecutionNodeId>,
     pub needs_update: bool
 }
 
@@ -494,7 +494,7 @@ impl Chidori {
                 if existing_cell_instance.cell != cell {
                     new_cells_state.push(CellHolder {
                         cell,
-                        applied_at: Uuid::nil(),
+                        applied_at: None,
                         op_id: existing_cell_instance.op_id,
                         needs_update: true
                     });
@@ -506,7 +506,7 @@ impl Chidori {
                 // This is a new cell, so we push it with a null applied at
                 new_cells_state.push(CellHolder {
                     cell,
-                    applied_at: Uuid::nil(),
+                    applied_at: None,
                     op_id: None,
                     needs_update: true
                 });

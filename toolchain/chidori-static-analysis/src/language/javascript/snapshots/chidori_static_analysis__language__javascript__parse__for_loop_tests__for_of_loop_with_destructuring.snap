@@ -1,0 +1,37 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "const pairs = [[1, 'one'], [2, 'two'], [3, 'three']];\nfor (const [num, word] of pairs) {\n    console.log(num, word);\n}\n"
+---
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: pairs
+      in_scope: false
+      exposed: true
+- - AssignmentFromStatement
+- - AssignmentToStatement
+  - IdentifierReferredTo:
+      name: num
+      in_scope: false
+      exposed: false
+  - IdentifierReferredTo:
+      name: word
+      in_scope: false
+      exposed: false
+- - IdentifierReferredTo:
+      name: pairs
+      in_scope: true
+      exposed: false
+  - InCallExpression
+  - Attribute: log
+  - IdentifierReferredTo:
+      name: console
+      in_scope: false
+      exposed: false
+  - IdentifierReferredTo:
+      name: num
+      in_scope: true
+      exposed: false
+  - IdentifierReferredTo:
+      name: word
+      in_scope: true
+      exposed: false

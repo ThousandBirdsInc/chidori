@@ -6,10 +6,11 @@ description: "function setupPipeline(x) {\n    ch.p(create_dockerfile)\n    retu
       - setupPipeline
       - start: 1
         end: 71
-  - Params
+  - FunctionArguments
   - IdentifierReferredTo:
-      - x
-      - false
+      name: x
+      in_scope: false
+      exposed: true
 - - InFunction:
       - setupPipeline
       - start: 1
@@ -17,15 +18,18 @@ description: "function setupPipeline(x) {\n    ch.p(create_dockerfile)\n    retu
   - InCallExpression
   - Attribute: p
   - IdentifierReferredTo:
-      - ch
-      - false
+      name: ch
+      in_scope: false
+      exposed: true
   - IdentifierReferredTo:
-      - create_dockerfile
-      - false
+      name: create_dockerfile
+      in_scope: false
+      exposed: true
 - - InFunction:
       - setupPipeline
       - start: 1
         end: 71
   - IdentifierReferredTo:
-      - x
-      - true
+      name: x
+      in_scope: true
+      exposed: true

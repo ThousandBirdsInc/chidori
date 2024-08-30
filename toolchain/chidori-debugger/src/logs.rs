@@ -29,8 +29,8 @@ fn logs_update(
     mut tree: ResMut<EguiTree>,
     tree_identities: Res<EguiTreeIdentities>,
     mut contexts: EguiContexts,
-    mut logs_history: ResMut<LogsHistory>,
-    mut log_messages: ResMut<ChidoriLogMessages>,
+    logs_history: Res<LogsHistory>,
+    log_messages: Res<ChidoriLogMessages>,
     mut input_text: Local<String>,
     keyboard_input: Res<ButtonInput<KeyCode>>,
 ) {
@@ -75,14 +75,9 @@ fn logs_update(
         let mut frame = egui::Frame::default().inner_margin(Margin::symmetric(20.0, 20.0)).begin(ui);
         {
             ui.vertical(|ui| {
-                ui.label("Search:");
                 let mut text_edit = egui::TextEdit::singleline(&mut *input_text)
-                    .hint_text("Type a message...");
+                    .hint_text("Search...");
                 let response = ui.add(text_edit);
-                if ui.button("Send").clicked() {
-                    logs_history.messages.push(LogsMessage(input_text.clone()));
-                    input_text.clear();
-                }
                 if response.changed() {
                     // …
                 }

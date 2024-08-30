@@ -1,0 +1,10 @@
+---
+source: chidori-static-analysis/src/language/javascript/parse.rs
+description: "let aa = 'first', bb = 'second';\n[aa, bb] = [bb, aa];\n"
+---
+internal_call_graph: {}
+cell_exposed_values:
+  aa: {}
+  bb: {}
+cell_depended_values: {}
+triggerable_functions: {}
