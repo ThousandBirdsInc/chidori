@@ -4,7 +4,6 @@ members = [
     "chidori-prompt-format",
     "chidori-static-analysis",
     "chidori-debugger",
-    "chidori-tsne",
 ]
 resolver = "2"
 

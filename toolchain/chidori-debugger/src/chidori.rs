@@ -661,6 +661,41 @@ pub fn update_gui(
                     // Add widgets inside the frame
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
+                            ui.label("New Notebook:");
+                            let res = with_cursor(ui.button("Create New Notebook"));
+                            if res.clicked() {
+                                internal_state1.display_example_modal = false;
+                            }
+                            ui.add_space(16.0);
+                            ui.label("Load Existing Project");
+                            let res = with_cursor(ui.button("Load From Folder"));
+                            if res.clicked() {
+                                runtime.spawn_background_task(|mut ctx| async move {
+                                    let task = rfd::AsyncFileDialog::new().pick_folder();
+                                    let folder = task.await;
+                                    if let Some(folder) = folder {
+                                        let path = folder.path().to_string_lossy().to_string();
+                                        ctx.run_on_main_thread(move |ctx| {
+                                            if let Some(mut internal_state) =
+                                                ctx.world.get_resource_mut::<InternalState>()
+                                            {
+                                                match internal_state.load_and_watch_directory(path) {
+                                                    Ok(()) => {
+                                                        // Directory loaded and watched successfully
+                                                        println!("Directory loaded and being watched successfully");
+                                                    },
+                                                    Err(e) => {
+                                                        // Handle the error
+                                                        eprintln!("Error loading and watching directory: {}", e);
+                                                    }
+                                                }
+                                            }
+                                        })
+                                            .await;
+                                    }
+                                });
+                            }
+                            ui.add_space(16.0);
                             ui.label("Load Example:");
                             ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
                             let buttons_text_load = vec![
@@ -732,13 +767,6 @@ pub fn update_gui(
 
                         // ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                         //     ui.add_space(ui.available_height() / 2.0 - 256.0); // Center vertically
-                        //     egui::Image::new(egui::include_image!("../assets/images/tblogo-white.png"))
-                        //         .fit_to_exact_size(vec2(512.0, 512.0))
-                        //         .rounding(5.0)
-                        //         .ui(ui);
-                        // });
-
-                        // ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         //     egui::Image::new(egui::include_image!("../assets/images/tblogo-white.png"))
                         //         .fit_to_exact_size(vec2(512.0, 512.0))
                         //         .rounding(5.0)

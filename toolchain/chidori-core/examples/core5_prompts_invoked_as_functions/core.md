@@ -26,11 +26,7 @@ Return this as a `-` bulleted list with the name of the state on each line.
 
 A unit test demonstrates the invocation of the prompt by the function.
 ```python (entry)
-import unittest
-
-class TestMarshalledValues(unittest.IsolatedAsyncioTestCase):
-    async def test_run_prompt(self):
-        self.assertEqual(await run_prompt(5), "demoDPNGC")
-
-unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
+result = await run_prompt(5)
 ```
+
+

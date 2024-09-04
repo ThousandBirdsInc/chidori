@@ -122,4 +122,4 @@ anyhow = "1.0.82"
 
 
 [package.metadata.pyo3]
-python = "/opt/homebrew/bin/python3.11"
+python = "/opt/homebrew/bin/python3.12"

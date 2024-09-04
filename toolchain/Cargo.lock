@@ -2381,10 +2381,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "chidori-tsne"
-version = "0.2.1"
-
-[[package]]
 name = "chrono"
 version = "0.4.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"

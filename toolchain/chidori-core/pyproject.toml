@@ -6,7 +6,7 @@ authors = [{ name = "Colton Pierson", email = "colton@thousandbirds.ai" }]
 dependencies = [
 ]
 readme = "README.md"
-requires-python = "== 3.11"
+requires-python = "== 3.12"
 
 [tool.rye]
 managed = true

@@ -78,7 +78,7 @@ brew install \
   protobuf \
 # We are investigating if this is necessary or can be removed
   libiconv \
-  python@3.11 \
+  python@3.12 \
 # Chidori uses uv for handling python dependencies 
   uv
 

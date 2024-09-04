@@ -178,7 +178,7 @@ impl ExecutionGraph {
                     _ = tokio::time::sleep(Duration::from_millis(10)) => {
                         match receiver.try_recv() {
                             Ok((resulting_execution_state, oneshot)) => {
-                                println!("==== Received dispatch event {:?}", resulting_execution_state);
+                                println!("==== Execution Graph received dispatch event {:?}", resulting_execution_state);
 
                                 let s = resulting_execution_state.clone();
                                 match &resulting_execution_state {
@@ -366,7 +366,7 @@ impl ExecutionGraph {
             ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
             ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
         };
-        println!("Inserting into graph {:?}", &resulting_state_id);
+        println!("Resulting state received from progress_graph {:?}", &resulting_state_id);
         // TODO: if state already exists how to handle
         state_id_to_state.deref_mut().insert(resulting_state_id.clone(), new_state.clone());
         execution_graph.deref_mut()
@@ -390,11 +390,10 @@ impl ExecutionGraph {
         (ExecutionNodeId, ExecutionStateEvaluation), // the resulting total state of this step
         Vec<(usize, OperationFnOutput)>, // values emitted by operations during this step
     )> {
+        println!("step_execution_with_previous_state");
         let previous_state = match previous_state {
             ExecutionStateEvaluation::Complete(state) => state,
-            ExecutionStateEvaluation::Executing(..) => panic!("Cannot step an execution state that is still executing"),
-            ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
-            ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
+            _ => { panic!("Stepping execution should only occur against completed states") }
         };
         let eval_state = previous_state.determine_next_operation()?;
         let (new_state, outputs) = previous_state.step_execution(eval_state).await?;
@@ -444,6 +443,7 @@ impl ExecutionGraph {
         (ExecutionNodeId, ExecutionStateEvaluation), // the resulting total state of this step
         Vec<(usize, OperationFnOutput)>, // values emitted by operations during this step
     )> {
+        println!("external_step_execution");
         let state = self.get_state_at_id(prev_execution_id);
         if let Some(state) = state {
             self.step_execution_with_previous_state(&state).await

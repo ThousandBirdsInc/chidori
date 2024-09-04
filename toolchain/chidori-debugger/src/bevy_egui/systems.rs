@@ -123,11 +123,9 @@ pub fn process_input_system(
         }
     });
 
-
     // TODO: get the contexts that are currently applicable to push events to:
     //   iterate through render targets for any that are in focus and if not, fall back to the
     //   currently focusedwindow (always included)
-
 
     let mut keyboard_input_events = Vec::new();
     for event in input_events.ev_keyboard_input.read() {

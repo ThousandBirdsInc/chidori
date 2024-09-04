@@ -13,6 +13,8 @@ import { assertEquals } from "https://deno.land/std@0.221.0/assert/mod.ts";
 Deno.test("async addition test", async () => {
     assertEquals(await add_two(2), 4);
 });
+
+const resultJs = await add_two(2)
 ```
 
 ### Demonstrates defining a function in javascript and calling it in python

@@ -42,6 +42,16 @@ Chidori.assertEq(x6, [1, 2, 3]);
 
 // TODO: marshalling of functions is not currently supported
 // Chidori.assertEq(typeof x9, "function");
+
+
+// These will appear in the UI
+const jsX0 = x0;
+const jsX1 = x1;
+const jsX2 = x2;
+const jsX3 = x3;
+const jsX4 = x4;
+const jsX5 = x5;
+const jsX6 = x6;
 ```
 
 
@@ -83,5 +93,15 @@ class TestMarshalledValues(unittest.TestCase):
         self.assertEqual(y6, [1,2,3])
 
 unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
+
+
+# These will appear in the UI
+pyY0 = y0
+pyY1 = y1
+pyY2 = y2
+pyY3 = y3
+pyY4 = y4
+pyY5 = y5
+pyY6 = y6
 ```
 

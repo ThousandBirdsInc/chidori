@@ -1,5 +1,5 @@
 use crate::execution::execution::execution_graph::{ExecutionGraph, ExecutionNodeId, MergedStateHistory};
-use crate::execution::execution::execution_state::{ExecutionState, ExecutionStateEvaluation};
+use crate::execution::execution::execution_state::{ExecutionState, ExecutionStateEvaluation, OperationExecutionStatus};
 use crate::execution::execution::DependencyGraphMutation;
 use crate::cells::{CellTypes, get_cell_name, LLMPromptCell};
 use crate::execution::primitives::identifiers::{DependencyReference, OperationId};
@@ -216,7 +216,7 @@ impl InstancedEnvironment {
 
             tokio::select! {
                 Some(event) = self.execution_event_rx.recv() => {
-                    println!("Got an execution event {:?}", &event);
+                    println!("InstancedEnvironment received an execution event {:?}", &event);
                     self.handle_execution_event(event).await?;
                 }
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {
@@ -277,12 +277,13 @@ impl InstancedEnvironment {
                 sender.send(EventsFromRuntime::DefinitionGraphUpdated(s.get_dependency_graph_flattened())).unwrap();
                 let mut cells = vec![];
                 // TODO: keep a separate mapping of cells so we don't need to lock operations
-                for k in s.operation_by_id.values() {
-                    let op = k.lock().unwrap();
+                // TODO: if this operation is still running we can't acquire this lock
+                for (op_id, cell ) in s.cells_by_id.iter() {
                     cells.push(CellHolder {
-                        cell: op.cell.clone(),
-                        op_id: Some(op.id.clone()),
-                        applied_at: Some(op.created_at_state_id.clone()),
+                        cell: cell.clone(),
+                        op_id: Some(op_id.clone()),
+                        // TODO: this should be op.created_at_state_id.clone() from the associated op
+                        applied_at: Some(Uuid::new_v4()),
                         needs_update: false,
                     });
                 }

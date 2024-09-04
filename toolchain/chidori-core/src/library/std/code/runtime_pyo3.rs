@@ -295,6 +295,9 @@ impl std::convert::From<AnyhowErrWrapper> for PyErr {
 }
 
 
+
+
+
 #[tracing::instrument]
 pub async fn source_code_run_python(
     execution_state: &ExecutionState,
@@ -308,7 +311,7 @@ pub async fn source_code_run_python(
     // Capture the current span's ID
     let current_span_id = Span::current().id();
 
-    info!("Invoking source_code_run_python");
+    println!("Invoking source_code_run_python");
 
     let exec_id = increment_source_code_run_counter();
 
@@ -345,16 +348,16 @@ pub async fn source_code_run_python(
 
     let result =  Python::with_gil(|py| {
         // TODO: this was causing a deadlock
-        // let current_event_loop = pyo3_asyncio::tokio::get_current_loop(py);
+        let current_event_loop = pyo3_asyncio::tokio::get_current_loop(py);
         // Initialize our event loop if one is not already established
-        // let event_loop = if current_event_loop.is_err() {
-        //     let asyncio = py.import("asyncio")?;
-        //     let event_loop = asyncio.call_method0("new_event_loop")?;
-        //     asyncio.call_method1("set_event_loop", (event_loop,))?;
-        //     event_loop
-        // } else {
-        //     current_event_loop.unwrap()
-        // };
+        let event_loop = if current_event_loop.is_err() {
+            let asyncio = py.import("asyncio")?;
+            let event_loop = asyncio.call_method0("new_event_loop")?;
+            asyncio.call_method1("set_event_loop", (event_loop,))?;
+            event_loop
+        } else {
+            current_event_loop.unwrap()
+        };
 
         // Configure locals and globals passed to evaluation
         let globals = PyDict::new(py);
@@ -441,6 +444,7 @@ sys.stderr.set_exec_id({exec_id})
             .any(|line| line.contains("asyncio.run") || line.contains("unittest.IsolatedAsyncioTestCase") || line.contains("loadTestsFromTestCase"));
 
         let mut complete_code = if does_contain_async_runtime {
+            println!("Executing python with 'does_contain_async_runtime' ");
             // If we have an async function, we don't need to wrap it in an async function
             format!(r#"
 import chidori
@@ -450,7 +454,7 @@ sys.stdout.flush()
 sys.stderr.flush()
         "#, initial_source_code)
         } else {
-
+            println!("Executing python with 'no async runtime' ");
 
             for (name, report_item) in &report.cell_exposed_values {
                 initial_source_code.push_str("\n");
@@ -566,17 +570,39 @@ asyncio.run(__wrapper())
                     let args = PyTuple::new(py, &args);
                     let kwargs = kwargs.into_iter().into_py_dict(py);
 
-                    let result = py_func.call(args, Some(kwargs))?;
+                    println!("calling the function");
+                    let result = py_func.call(args, Some(kwargs)).map_err(|e| {
+                        dbg!(&e);
+                        e
+                    })?;
+                    println!("after calling the function");
                     if result.get_type().name().unwrap() == "coroutine" {
                         // If the function is a coroutine, we need to await it
-                        let f = pyo3_asyncio::tokio::into_future(result)?;
+                        println!("before into future for python coroutine");
+                        let is_running = event_loop.call_method0("is_running")?.extract::<bool>()?;
+                        let (fut, result, needs_await) = if !is_running {
+                            // If not running, run the event loop
+                            let py_any = event_loop.call_method1("run_until_complete", (result,))?;
+                            (None, Some(py_any.into_py(py)), false)
+                        } else {
+                            // If already running, prepare to use pyo3_asyncio
+                            println!("Event loop is already running, using pyo3_asyncio");
+                            let future = pyo3_asyncio::tokio::into_future(result)?;
+                            (Some(future), None, true)
+                        };
+
+
+                        // let f = pyo3_asyncio::tokio::into_future(result)?;
                         Ok(Box::pin(async move {
-                            let py_any = &f.await.map_err(|e| {
-                                dbg!(&e);
-                                ExecutionStateErrors::Unknown(e.to_string())
-                            })?;
+                            println!("waiting the python coroutine");
+                            let final_result = if let Some(fut) = fut {
+                                fut.await.map_err(|e| ExecutionStateErrors::Unknown(e.to_string()))?
+                            } else {
+                                result.unwrap()
+                            };
+
                             Ok(Python::with_gil(|py| {
-                                let py_any: &PyAny = py_any.as_ref(py);
+                                let py_any: &PyAny = final_result.as_ref(py);
                                 pyany_to_rkyv_serialized_value(py_any)
                             }))
                         }) as Pin<Box<dyn Future<Output = Result<RkyvSerializedValue, ExecutionStateErrors>> + Send>>)
@@ -597,7 +623,9 @@ asyncio.run(__wrapper())
     });
     match result {
         Ok(result) => {
+            println!("about to await result");
             let awaited_result = result.await;
+            println!("after awaited result");
             let (_, output_stdout) = PYTHON_LOGGING_BUFFER_STDOUT.remove(&exec_id).unwrap_or((0, vec![]));
             let (_, output_stderr) = PYTHON_LOGGING_BUFFER_STDERR.remove(&exec_id).unwrap_or((0, vec![]));
             Ok((awaited_result, output_stdout, output_stderr))

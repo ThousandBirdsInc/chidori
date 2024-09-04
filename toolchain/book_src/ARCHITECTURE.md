@@ -8,7 +8,6 @@ Chidori consists of the following crates:
 - `chidori-debugger` contains a UI for visualizing and debugging Chidori executed programs.
 - `chidori-prompt-format` implements handlebars-like templating with support for tracing composition
 - `chidori-static-analysis` implements our parsing and extraction of control-flow from Python and TypeScript source code
-- `chidori-tsne` (IGNORE) - not yet implemented, in the future we'd like to add support for visualizing embeddings within our debugger
 
 
 ### Chidori Core

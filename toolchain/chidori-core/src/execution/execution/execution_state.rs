@@ -84,7 +84,7 @@ pub enum ExecutionStateErrors {
     CellExecutionUnexpectedFailure(ExecutionNodeId, String),
     #[error("unknown execution state error")]
     Unknown(String),
-    #[error("anyhow error")]
+    #[error("Anyhow Error: {0}")]
     AnyhowError(String),
 }
 
@@ -131,7 +131,7 @@ impl Debug for ExecutionStateEvaluation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ExecutionStateEvaluation::Complete(ref state) => f.debug_tuple("Complete").field(state).finish(),
-            ExecutionStateEvaluation::Executing(..) => f.debug_tuple("Executing").field(&format!("Future state evaluating")).finish(),
+            ExecutionStateEvaluation::Executing(ref state) => f.debug_tuple("Executing").field(state).finish(),
             ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
             ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
         }
@@ -187,6 +187,9 @@ pub struct ExecutionState {
     /// Map of operation_id -> OperationNode definition
     pub operation_by_id: ImHashMap<OperationId, Arc<Mutex<OperationNode>>>,
 
+    /// Map of operation_id -> Cell definition
+    pub cells_by_id: ImHashMap<OperationId, CellTypes>,
+
     /// This is a mapping of function names to operation ids. Function calls are dispatched to the associated
     /// OperationId that they are initialized by. When a function is invoked, it is dispatched to the operation
     /// node that initialized it where we re-use that OperationNode's runtime in order to invoke the function.
@@ -225,8 +228,8 @@ fn render_map_as_table(exec_state: &ExecutionState) -> String {
         |---|---|"));
     for key in exec_state.state.keys() {
         if let Some(val) = exec_state.state_get(key) {
-            table.push_str(&format!(indoc!(r"
-| {} | {:?} |" ), key, val));
+            table.push_str(&format!(indoc!(r"| {} | {:?} |" ), key, val));
+            table.push_str("\n");
         }
     }
     table.push_str("\n");
@@ -255,7 +258,7 @@ async fn pause_future_with_oneshot(execution_state_evaluation: ExecutionStateEva
             }
             // let recv = oneshot_receiver.await.expect("Failed to receive oneshot signal");
         }
-        println!("Continuing from oneshot signal");
+        println!("============= should resume =============");
         RkyvSerializedValue::Null
     };
     sender.send((execution_state_evaluation, Some(oneshot_sender))).await.expect("Failed to send oneshot signal to the graph receiver");
@@ -281,6 +284,7 @@ impl Default for ExecutionState {
             fresh_values: Default::default(),
             operation_name_to_id: Default::default(),
             operation_by_id: Default::default(),
+            cells_by_id: Default::default(),
             function_name_to_metadata: Default::default(),
             has_been_set: Default::default(),
             dependency_map: Default::default(),
@@ -537,7 +541,7 @@ impl ExecutionState {
                 })
         };
         operation_node.id = op_id;
-
+        s.cells_by_id.insert(op_id, operation_node.cell.clone());
         s.operation_by_id.insert(op_id, Arc::new(Mutex::new(operation_node)));
         s.update_callable_functions();
         s.exec_queue.push_back(op_id);
@@ -836,7 +840,7 @@ impl ExecutionState {
         let operation_count = self.operation_by_id.keys().count();
         let mut count_loops = 0;
         loop {
-            println!("looping {:?}", self.exec_queue);
+            println!("looping {:?} {:?}", self.exec_queue, count_loops);
             count_loops += 1;
             if count_loops >= operation_count * 2 {
                 return Err(Error::msg("Looped through all operations without detecting an execution"));

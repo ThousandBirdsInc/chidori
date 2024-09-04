@@ -383,7 +383,7 @@ pub async fn source_code_run_deno(
     payload: &RkyvSerializedValue,
     function_invocation: &Option<String>,
 ) -> anyhow::Result<(
-    crate::execution::primitives::serialized_value::RkyvSerializedValue,
+    Result<RkyvSerializedValue, ExecutionStateErrors>,
     Vec<String>,
     Vec<String>
 )> {
@@ -419,7 +419,7 @@ pub async fn source_code_run_deno(
 
         let my_op_state_clone = my_op_state.clone();
         let ext = Extension {
-            name: "my_ext",
+            name: "chidori_ext",
             ops: std::borrow::Cow::Borrowed(&[
                 op_set_globals::DECL,
                 op_call_rust::DECL,
@@ -435,18 +435,19 @@ pub async fn source_code_run_deno(
             })),
             js_files: {
                 const JS: &'static [::deno_core::ExtensionFileSource] = &[
-                    ::deno_core::ExtensionFileSource::loaded_from_memory_during_snapshot("ext:bench_setup/setup.js", {
+                    ::deno_core::ExtensionFileSource::loaded_from_memory_during_snapshot("ext:chidori_setup/setup.js", {
                         const C: ::deno_core::v8::OneByteConst =
                             ::deno_core::FastStaticString::create_external_onebyte_const(r#"
       ((globalThis) => {
           const { core } = Deno;
           const { ops } = core;
+          const op_assert_eq = Deno.core.ops.ops_assert_eq;
           const op_call_rust = Deno.core.ops.op_call_rust;
-          const op_save_result_object =  Deno.core.ops.op_save_result_object;
-          const op_save_result =  Deno.core.ops.op_save_result;
-          const op_invoke_function =  Deno.core.ops.op_invoke_function;
-          const op_console_log =  Deno.core.ops.op_console_log;
-          const op_console_err =  Deno.core.ops.op_console_err;
+          const op_save_result_object = Deno.core.ops.op_save_result_object;
+          const op_save_result = Deno.core.ops.op_save_result;
+          const op_invoke_function = Deno.core.ops.op_invoke_function;
+          const op_console_log = Deno.core.ops.op_console_log;
+          const op_console_err = Deno.core.ops.op_console_err;
 
           globalThis.op_invoke_function = op_invoke_function;
           globalThis.op_call_rust = op_call_rust;
@@ -468,7 +469,7 @@ pub async fn source_code_run_deno(
 
           globalThis.Chidori = {
               assertEq: (a, b) => {
-                  return ops.op_assert_eq(a, b);
+                  return a == b;
               },
               saveValue: (val) => {
                   op_save_result(val);
@@ -550,7 +551,8 @@ pub async fn source_code_run_deno(
 
         let mut flags = deno::args::Flags::default();
         // TODO: give user control over this in configuration
-        flags.allow_net = Some(vec![]);
+        // TODO: allow_net is causing this to block our execution entirely
+        // flags.allow_net = Some(vec![]);
         let factory = deno::factory::CliFactory::from_flags(flags)?;
         let cli_options = factory.cli_options();
         let file_fetcher = factory.file_fetcher()?;
@@ -576,7 +578,6 @@ pub async fn source_code_run_deno(
 
         // Use the newly created single-threaded runtime to run our async code
         runtime.block_on(async {
-            // TODO: add custom extensions
             let worker_factory = factory.create_cli_main_worker_factory().await?;
             let mut worker = worker_factory
                 .create_custom_worker(
@@ -589,10 +590,14 @@ pub async fn source_code_run_deno(
 
             let exit_code = worker.run().await?;
             Ok::<(), anyhow::Error>(())
-        });
+        }).map_err(|e| {
+            dbg!(&e);
+            e
+        })?;
+        // TODO: map error
 
         let mut my_op_state = my_op_state.lock().unwrap();
-        let output = my_op_state.output.clone().unwrap_or(RkyvSerializedValue::Null);
+        let output = Ok(my_op_state.output.clone().unwrap_or(RkyvSerializedValue::Null));
         let stdout = my_op_state.stdout.clone();
         let stderr = my_op_state.stderr.clone();
         Ok((output, stdout, stderr))

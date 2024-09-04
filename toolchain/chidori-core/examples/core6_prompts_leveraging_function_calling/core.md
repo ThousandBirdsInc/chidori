@@ -6,10 +6,10 @@ def add_two_numbers(a, b):
 ```
 
 
-```prompt (add_population)
+```prompt (declare_add_population)
 ---
-fn: add_population
 model: gpt-3.5-turbo
+fn: add_population
 import:
   - add_two_numbers
 ---
