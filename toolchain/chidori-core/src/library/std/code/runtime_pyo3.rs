@@ -30,7 +30,7 @@ use crate::execution::execution::ExecutionState;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow};
 
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -46,7 +46,7 @@ use crate::execution::execution::execution_state::ExecutionStateErrors;
 static SOURCE_CODE_RUN_COUNTER: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
 static CURRENT_PYTHON_EXECUTION_ID: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
 
-fn install_dependencies_from_requirements(requirements_dir: &str, venv_path: &str) -> Result<()> {
+fn install_dependencies_from_requirements(requirements_dir: &str, venv_path: &str) -> anyhow::Result<()> {
     let requirements_path = Path::new(requirements_dir).join("requirements.txt");
 
     if !requirements_path.exists() {
@@ -648,7 +648,8 @@ fn create_python_dispatch_closure(py: Python, clone_function_name: String, execu
             pyo3_asyncio::tokio::future_into_py(py, async move {
                 let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload, parent_span_id.clone()).await.map_err(|e| AnyhowErrWrapper(e))?;
                 // TODO: assign this execution state to the current so that as we continue to execute this is now where we're progressing from
-                PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result)))
+                // TODO: this should not be an unwrap and should instead propagate the error
+                PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result.unwrap())))
             }).map(|x| x.into())
         },
     )?;
@@ -1112,7 +1113,7 @@ data = await demo()
         fn check_operation_output(output: &Arc<OperationFnOutput>, expected_value: i64) -> bool {
             match output.as_ref() {
                 OperationFnOutput { has_error: false, execution_state: None, output: output_value, stdout, stderr } => {
-                    matches!(output_value, RkyvSerializedValue::Number(n) if *n == expected_value as i32)
+                    matches!(output_value, Ok(RkyvSerializedValue::Number(n)) if *n == expected_value as i32)
                         && stdout.is_empty()
                         && stderr.is_empty()
                 },

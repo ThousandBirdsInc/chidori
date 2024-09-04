@@ -1,0 +1,33 @@
+---
+source: chidori-core/src/sdk/md.rs
+assertion_line: 222
+expression: v
+---
+- Code:
+    - name: ~
+      language: PyO3
+      source_code: "x0 = 1\nx1 = \"string\"\nx2 = [1, 2, 3]\nx3 = {\"a\": 1, \"b\": 2, \"c\": 3}\nx4 = False\nx5 = 1.0\nx6 = (1, 2, 3)\nx7 = {\"a\", \"b\", \"c\"}\n\n# def example(x):\n#     return x\n\n# TODO: marshalling of functions is not currently supported\n# x8 = example\n\n# TODO: marshalling of classes is not currently supported\n# class ClassExample:\n#     def __init__(self, x):\n#         self.x = x\n#         \n# x9 = ClassExample"
+      function_invocation: ~
+    - start: 162
+      end: 564
+- Code:
+    - name: ~
+      language: Deno
+      source_code: "Chidori.assertEq(x0, 1);\nChidori.assertEq(x1, \"string\");\nChidori.assertEq(x2, [1,2,3]);\nChidori.assertEq(x3, {\"a\": 1, \"b\": 2, \"c\": 3});\nChidori.assertEq(x4, false);\nChidori.assertEq(x5, 1.0);\nChidori.assertEq(x6, [1, 2, 3]);\n\n// TODO: marshalling of sets is not currently supported\n// Chidori.assertEq(x7, [\"c\", \"b\", \"a\"]);\n\n// Chidori.assertEq(x8, null);\n\n// TODO: marshalling of functions is not currently supported\n// Chidori.assertEq(typeof x9, \"function\");"
+      function_invocation: ~
+    - start: 572
+      end: 1045
+- Code:
+    - name: ~
+      language: Deno
+      source_code: "const y0 = 1;\nconst y1 = \"string\";\nconst y2 = [1, 2, 3];\nconst y3 = {a: 1, b: 2, c: 3};\nconst y4 = false;\nconst y5 = 1.0;\nconst y6 = [1, 2, 3];\n// TODO: marshalling of sets is not currently supported\n// const y7 = new Set([\"a\", \"b\", \"c\"]);\n\n// TODO: marshalling of functions is not currently supported\n// const y8 = (y) => y;\n\n// TODO: marshalling of classes is not currently supported\n// class ClassExample {\n//    constructor(y) {\n//        this.y = y;\n//    }\n//};\n//const y9 = ClassExample;"
+      function_invocation: ~
+    - start: 1098
+      end: 1604
+- Code:
+    - name: ~
+      language: PyO3
+      source_code: "import unittest\n\nclass TestMarshalledValues(unittest.TestCase):\n    def test_all(self):\n        self.assertEqual(y0, 1)\n        self.assertEqual(y1, \"string\")\n        self.assertEqual(y2, [1,2,3])\n        self.assertEqual(y3, {\"a\": 1, \"b\": 2, \"c\": 3})\n        self.assertEqual(y4, False)\n        self.assertEqual(y5, 1.0)\n        self.assertEqual(y6, [1,2,3])\n\nunittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))"
+      function_invocation: ~
+    - start: 1612
+      end: 2077

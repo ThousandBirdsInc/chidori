@@ -60,7 +60,7 @@ pub fn memory_cell(execution_state_id: ExecutionNodeId, cell: &MemoryCell, range
                                     match key.as_str() {
                                         "insert" => {
                                             let (embedded_value, _) = s.dispatch(&embedding_function, value.clone(), None).await?;
-                                            let embedding = rkyv_to_vec_float(embedded_value);
+                                            let embedding = rkyv_to_vec_float(embedded_value.unwrap());
                                             let contents = serialized_value_to_json_value(&value);
                                             let row = vec![(&embedding, contents)];
                                             db.insert("default".to_string(), &row);
@@ -68,7 +68,7 @@ pub fn memory_cell(execution_state_id: ExecutionNodeId, cell: &MemoryCell, range
                                         }
                                         "search" => {
                                             let (embedded_value, _) = s.dispatch(&embedding_function, value.clone(), None).await?;
-                                            let embedding = rkyv_to_vec_float(embedded_value);
+                                            let embedding = rkyv_to_vec_float(embedded_value.unwrap());
                                             let results = db.search("default".to_string(), embedding, 5);
                                             let mut output = vec![];
                                             for (_, value) in results.iter() {

@@ -569,7 +569,7 @@ fn egui_execution_state(ui: &mut Ui, execution_state: &ExecutionState) {
             ui.label("Output:");
             for (key, value) in execution_state.state.iter() {
                 if execution_state.fresh_values.contains(key) {
-                    let response = JsonTree::new(format!("{:?}", key), &value.output)
+                    let response = JsonTree::new(format!("{:?}", key), &value.output.clone().unwrap())
                         // .default_expand(DefaultExpand::SearchResults(&self.search_input))
                         .show(ui);
                     // util::egui_rkyv(ui, &value.output, false);
@@ -971,7 +971,7 @@ fn update_graph_system_renderer(
                                                     }
                                                     ExecutionStateEvaluation::Complete(state)=> {
                                                         for (key, value) in state.state.iter() {
-                                                            let image_paths = crate::util::find_matching_strings(&value.output, r"(?i)\.(png|jpe?g)$");
+                                                            let image_paths = crate::util::find_matching_strings(&value.output.clone().unwrap(), r"(?i)\.(png|jpe?g)$");
                                                             for (img_path, object_path_to_img) in image_paths {
                                                                 let texture = if let Some(cached_texture) = node_image_texture_cache.get(&img_path) {
                                                                     cached_texture.clone()

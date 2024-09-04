@@ -9,6 +9,7 @@ use std::env;
 use std::pin::Pin;
 use chidori_prompt_format::templating::templates::{ChatModelRoles, TemplateWithSource};
 use crate::cells::{LLMCodeGenCellChatConfiguration, LLMPromptCellChatConfiguration, TextRange};
+use crate::execution::execution::execution_state::ExecutionStateErrors;
 use crate::execution::execution::ExecutionState;
 use crate::execution::primitives::operation::InputSignature;
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue, serialized_value_to_json_value};
@@ -316,7 +317,7 @@ pub async fn ai_llm_run_chat_model(
     name: Option<String>,
     is_function_invocation: bool,
     configuration: LLMPromptCellChatConfiguration
-) -> anyhow::Result<(RkyvSerializedValue, Option<ExecutionState>)> {
+) -> anyhow::Result<(Result<RkyvSerializedValue, ExecutionStateErrors>, Option<ExecutionState>)> {
     let mut template_messages: Vec<TemplateMessage> = Vec::new();
     let data = template_data_payload_from_rkyv(&payload);
 
@@ -366,7 +367,10 @@ pub async fn ai_llm_run_chat_model(
                             let args = tool_call.function.arguments.unwrap_or(RkyvSerializedValue::Null);
                             let args = RkyvObjectBuilder::new().insert_value("kwargs", args).build();
                             let (dispatch_result, _) = execution_state.dispatch(&function_name, args, None).await?;
-                            result_map.insert(function_name, dispatch_result);
+                            if !dispatch_result.is_ok() {
+                                return Ok((dispatch_result, None));
+                            }
+                            result_map.insert(function_name, dispatch_result.unwrap());
                         }
                     }
                     let result = if is_function_invocation {
@@ -396,9 +400,9 @@ pub async fn ai_llm_run_chat_model(
         } else {
             RkyvSerializedValue::Array(results)
         };
-        Ok((out, None))
+        Ok((Ok(out), None))
     } else {
-        Ok((RkyvSerializedValue::Null, None))
+        Ok((Ok(RkyvSerializedValue::Null), None))
     }
 }
 

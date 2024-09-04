@@ -24,6 +24,8 @@ use tracing::Span;
 use uuid::Uuid;
 use crate::execution::primitives::operation::OperationFnOutput;
 use crate::utils::telemetry::{init_internal_telemetry, TraceEvents};
+use tokio::sync::mpsc::{Sender as TokioSender, Receiver as TokioReceiver};
+use crate::execution::execution::execution_graph::ExecutionEvent;
 
 
 /// This is an SDK for building execution graphs. It is designed to be used interactively.
@@ -54,7 +56,8 @@ pub struct InstancedEnvironment {
     playback_state: PlaybackState,
     runtime_event_sender: Option<Sender<EventsFromRuntime>>,
     trace_event_sender: Option<Sender<TraceEvents>>,
-    shared_state: Arc<Mutex<SharedState>>
+    shared_state: Arc<Mutex<SharedState>>,
+    execution_event_rx: TokioReceiver<ExecutionEvent>,
 }
 
 impl std::fmt::Debug for InstancedEnvironment {
@@ -66,11 +69,12 @@ impl std::fmt::Debug for InstancedEnvironment {
 
 impl InstancedEnvironment {
     fn new() -> InstancedEnvironment {
+        let (tx, rx) = mpsc::channel();
         let mut db = ExecutionGraph::new();
+        let execution_event_rx = db.take_execution_event_receiver();
         let state_id = Uuid::nil();
         let playback_state = PlaybackState::Paused;
-        // TODO: handle this better, this just makes our tests pass until its resolved
-        let (tx, rx) = mpsc::channel();
+
         InstancedEnvironment {
             env_rx: rx,
             db,
@@ -79,6 +83,7 @@ impl InstancedEnvironment {
             trace_event_sender: None,
             playback_state,
             shared_state: Arc::new(Mutex::new(SharedState::new())),
+            execution_event_rx,
         }
     }
 
@@ -137,7 +142,7 @@ impl InstancedEnvironment {
         println!("Starting instanced environment");
         self.playback_state = PlaybackState::Paused;
 
-        // Reload cells to make sure we're up to date
+        // Reload cells to make sure we're up-to-date
         self.reload_cells()?;
 
         // Get the current span ID
@@ -209,6 +214,15 @@ impl InstancedEnvironment {
                 }
             }
 
+            tokio::select! {
+                Some(event) = self.execution_event_rx.recv() => {
+                    println!("Got an execution event {:?}", &event);
+                    self.handle_execution_event(event).await?;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                }
+            }
+
             match self.playback_state {
                 PlaybackState::Step => {
                     let output = self.step().await?;
@@ -229,6 +243,12 @@ impl InstancedEnvironment {
                 }
             }
         }
+        Ok(())
+    }
+
+    async fn handle_execution_event(&mut self, event: ExecutionEvent) -> anyhow::Result<()> {
+        let ExecutionEvent { id, evaluation } = event;
+        self.push_update_to_client(&id, evaluation);
         Ok(())
     }
 
@@ -272,11 +292,21 @@ impl InstancedEnvironment {
             sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
             sender.send(EventsFromRuntime::UpdateExecutionHead(*state_id)).unwrap();
         }
-        println!("Resulted in state with id {:?}", &state_id);
+        println!("Resulted in state with id {:?}, {:?}", &state_id, &state);
         let mut shared_state = self.shared_state.lock().unwrap();
-        shared_state.execution_state_head_id = *state_id;
-        shared_state.execution_id_to_evaluation.lock().unwrap().insert(*state_id, state);
-        self.execution_head_state_id = *state_id;
+        // Only completed states update execution heads
+        if let ExecutionStateEvaluation::Complete(_) = &state {
+            shared_state.execution_state_head_id = *state_id;
+            self.execution_head_state_id = *state_id;
+        }
+        shared_state.execution_id_to_evaluation.lock().unwrap()
+            .entry(*state_id)
+            .and_modify(|existing_state| {
+                if !matches!(existing_state, ExecutionStateEvaluation::Complete(_)) {
+                    *existing_state = state.clone();
+                }
+            })
+            .or_insert(state);
     }
 
     /// Increment the execution graph by one step
@@ -548,14 +578,13 @@ impl Chidori {
         let (instanced_env_tx, env_rx) = mpsc::channel();
         self.instanced_env_tx = Some(instanced_env_tx);
         let mut db = ExecutionGraph::new();
+        let execution_event_rx = db.take_execution_event_receiver();
         let state_id = Uuid::nil();
         let playback_state = PlaybackState::Paused;
-
 
         let mut shared_state = self.shared_state.lock().unwrap();
         shared_state.execution_id_to_evaluation = db.execution_node_id_to_state.clone();
 
-        // TODO: override the current state_id
         Ok(InstancedEnvironment {
             env_rx,
             db,
@@ -564,6 +593,7 @@ impl Chidori {
             trace_event_sender: self.trace_event_sender.clone(),
             playback_state,
             shared_state: self.shared_state.clone(),
+            execution_event_rx,
         })
     }
 }
@@ -607,15 +637,15 @@ mod tests {
         env.step().await;
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&op_id_x),
-            Some(&RkyvObjectBuilder::new().insert_number("x", 20).build())
+            Some(&Ok(RkyvObjectBuilder::new().insert_number("x", 20).build()))
         );
         assert_eq!(env.get_state_at_current_execution_head().state_get_value(&op_id_y), None);
         env.step().await;
         assert_eq!(env.get_state_at_current_execution_head().state_get_value(&op_id_x),
-                   Some(&RkyvObjectBuilder::new().insert_number("x", 20).build()));
+                   Some(&Ok(RkyvObjectBuilder::new().insert_number("x", 20).build())));
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&op_id_y),
-            Some(&RkyvObjectBuilder::new().insert_number("y", 21).build())
+            Some(&Ok(RkyvObjectBuilder::new().insert_number("y", 21).build()))
         );
         Ok(())
     }
@@ -669,16 +699,16 @@ mod tests {
         );
         assert_eq!(
             out.as_ref().unwrap().first().unwrap().1.output,
-            RkyvObjectBuilder::new()
+            Ok(RkyvObjectBuilder::new()
                 .insert_string("x", "Here is a sample string".to_string())
-                .build()
+                .build())
         );
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&op_id_x),
             Some(
-                &RkyvObjectBuilder::new()
+                &Ok(RkyvObjectBuilder::new()
                     .insert_string("x", "Here is a sample string".to_string())
-                    .build()
+                    .build())
             )
         );
         let out = env.step().await;
@@ -688,15 +718,15 @@ mod tests {
         );
         assert_eq!(
             out.as_ref().unwrap().first().unwrap().1.output,
-            RkyvObjectBuilder::new()
+            Ok(RkyvObjectBuilder::new()
                 .insert_string("example", "Here".to_string())
-                .build()
+                .build())
         );
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&op_id_y),
-            Some(&RkyvObjectBuilder::new()
+            Some(&Ok(RkyvObjectBuilder::new()
                     .insert_string("example", "Here".to_string())
-                    .build())
+                    .build()))
         );
         Ok(())
     }
@@ -769,16 +799,16 @@ mod tests {
         // Empty object from the function declaration
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&0),
-            Some(&RkyvObjectBuilder::new().insert_string("add", String::from("function")).build())
+            Some(&Ok(RkyvObjectBuilder::new().insert_string("add", String::from("function")).build()))
         );
         assert_eq!(env.get_state_at_current_execution_head().state_get_value(&1), None);
         env.step().await;
         assert_eq!(env.get_state_at_current_execution_head().state_get_value(&0),
-                   Some(&RkyvObjectBuilder::new().insert_string("add", String::from("function")).build())
+                   Some(&Ok(RkyvObjectBuilder::new().insert_string("add", String::from("function")).build()))
             );
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&1),
-            Some(&RkyvObjectBuilder::new().insert_number("y", 5).build())
+            Some(&Ok(RkyvObjectBuilder::new().insert_number("y", 5).build()))
         );
         env.shutdown().await;
         Ok(())
@@ -814,17 +844,17 @@ mod tests {
         // Function declaration cell
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&0),
-            Some(&RkyvObjectBuilder::new().insert_string("add", String::from("function")).build())
+            Some(&Ok(RkyvObjectBuilder::new().insert_string("add", String::from("function")).build()))
         );
         assert_eq!(env.get_state_at_current_execution_head().state_get_value(&1),
                    None);
         env.step().await;
         assert_eq!(env.get_state_at_current_execution_head().state_get_value(&0),
-                   Some(&RkyvObjectBuilder::new().insert_string("add", String::from("function")).build())
+                   Some(&Ok(RkyvObjectBuilder::new().insert_string("add", String::from("function")).build()))
         );
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&1),
-            Some(&RkyvObjectBuilder::new().insert_number("y", 5).build())
+            Some(&Ok(RkyvObjectBuilder::new().insert_number("y", 5).build()))
         );
         env.shutdown().await;
         Ok(())
@@ -853,21 +883,21 @@ mod tests {
         // Function declaration cell
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&0),
-            Some(&RkyvObjectBuilder::new()
+            Some(&Ok(RkyvObjectBuilder::new()
                 .insert_number("v", 40)
                 .insert_string("squared_value", "function".to_string())
-                .build())
+                .build()))
         );
         assert_eq!(env.get_state_at_current_execution_head().state_get_value(&1), None);
         env.step().await;
         assert_eq!(env.get_state_at_current_execution_head().state_get_value(&0),
-                   Some(&RkyvObjectBuilder::new().insert_number("v", 40)
+                   Some(&Ok(RkyvObjectBuilder::new().insert_number("v", 40)
                        .insert_string("squared_value", "function".to_string())
-                       .build())
+                       .build()))
         );
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&1),
-            Some(&RkyvObjectBuilder::new().insert_number("z", 640000).insert_number("y", 800).build())
+            Some(&Ok(RkyvObjectBuilder::new().insert_number("z", 640000).insert_number("y", 800).build()))
         );
         env.shutdown().await;
         Ok(())
@@ -902,20 +932,20 @@ mod tests {
         // Function declaration cell
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&0),
-            Some(&RkyvObjectBuilder::new()
+            Some(&Ok(RkyvObjectBuilder::new()
                 .insert_string("add", "function".to_string())
-                .build())
+                .build()))
         );
         assert_eq!(env.get_state_at_current_execution_head().state_get_value(&1), None);
         env.step().await;
         assert_eq!(env.get_state_at_current_execution_head().state_get_value(&0),
-                   Some(&RkyvObjectBuilder::new()
+                   Some(&Ok(RkyvObjectBuilder::new()
                        .insert_string("add", "function".to_string())
-                       .build())
+                       .build()))
         );
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&1),
-            Some(&RkyvObjectBuilder::new().insert_number("y", 5).build())
+            Some(&Ok(RkyvObjectBuilder::new().insert_number("y", 5).build()))
         );
     }
 
@@ -1016,11 +1046,11 @@ mod tests {
         env.reload_cells();
         env.get_state_at_current_execution_head().render_dependency_graph();
         let out = env.step().await?;
-        assert_eq!(out[0].1.output, RkyvObjectBuilder::new().insert_number("x", 20).build());
+        assert_eq!(out[0].1.output, Ok(RkyvObjectBuilder::new().insert_number("x", 20).build()));
         let out = env.step().await?;
-        assert_eq!(out[0].1.output, RkyvObjectBuilder::new().insert_number("y", 400).build());
+        assert_eq!(out[0].1.output, Ok(RkyvObjectBuilder::new().insert_number("y", 400).build()));
         let out = env.step().await?;
-        assert_eq!(out[0].1.output, RkyvObjectBuilder::new().insert_number("zj", 420).build());
+        assert_eq!(out[0].1.output, Ok(RkyvObjectBuilder::new().insert_number("zj", 420).build()));
         Ok(())
     }
 
@@ -1033,7 +1063,7 @@ mod tests {
         env.get_state_at_current_execution_head().render_dependency_graph();
         let mut out = env.step().await?;
         assert_eq!(out[0].0, 0);
-        assert_eq!(out[0].1.output, RkyvObjectBuilder::new()
+        assert_eq!(out[0].1.output, Ok(RkyvObjectBuilder::new()
             .insert_value("x2", RkyvSerializedValue::Array(vec![
                 RkyvSerializedValue::Number(1),
                 RkyvSerializedValue::Number(2),
@@ -1058,10 +1088,10 @@ mod tests {
                 RkyvSerializedValue::String("a".to_string()),
                 RkyvSerializedValue::String("b".to_string()),
             ].iter().cloned())))
-            .build());
+            .build()));
         let mut out = env.step().await?;
         assert_eq!(out[0].0, 2);
-        assert_eq!(out[0].1.output, RkyvObjectBuilder::new()
+        assert_eq!(out[0].1.output, Ok(RkyvObjectBuilder::new()
             .insert_object("y3", RkyvObjectBuilder::new()
                 .insert_number("a", 1)
                 .insert_number("b", 2)
@@ -1081,7 +1111,7 @@ mod tests {
             ]))
             .insert_value("y1", RkyvSerializedValue::String("string".to_string()))
             .insert_value("y4", RkyvSerializedValue::Boolean(false))
-            .build());
+            .build()));
         let mut out = env.step().await?;
         assert_eq!(out[0].0, 3);
         assert!(out[0].1.stderr.contains(&"OK".to_string()));
@@ -1098,14 +1128,14 @@ mod tests {
         env.get_state_at_current_execution_head().render_dependency_graph();
         let mut out = env.step().await?;
         assert_eq!(out[0].0, 0);
-        assert_eq!(out[0].1.output, RkyvObjectBuilder::new().insert_string("add_two", "function".to_string()).build());
+        assert_eq!(out[0].1.output, Ok(RkyvObjectBuilder::new().insert_string("add_two", "function".to_string()).build()));
 
         // TODO: there's nothing to test on this instance but that's an issue
         dbg!(env.step().await);
 
         let mut out = env.step().await?;
         assert_eq!(out[0].0, 2);
-        assert_eq!(out[0].1.output, RkyvObjectBuilder::new().insert_string("addTwo", "function".to_string()).build());
+        assert_eq!(out[0].1.output, Ok(RkyvObjectBuilder::new().insert_string("addTwo", "function".to_string()).build()));
         let mut out = env.step().await?;
         assert_eq!(out[0].0, 3);
         assert_eq!(out[0].1.stderr.contains(&"OK".to_string()), true);
@@ -1123,14 +1153,14 @@ mod tests {
         env.get_state_at_current_execution_head().render_dependency_graph();
         let mut out = env.step().await?;
         assert_eq!(out[0].0, 0);
-        assert_eq!(out[0].1.output, RkyvObjectBuilder::new().insert_string("add_two", "function".to_string()).build());
+        assert_eq!(out[0].1.output, Ok(RkyvObjectBuilder::new().insert_string("add_two", "function".to_string()).build()));
 
         // TODO: there's nothing to test on this instance but that's an issue
         dbg!(env.step().await);
 
         let mut out = env.step().await?;
         assert_eq!(out[0].0, 2);
-        assert_eq!(out[0].1.output, RkyvObjectBuilder::new().insert_string("addTwo", "function".to_string()).build());
+        assert_eq!(out[0].1.output, Ok(RkyvObjectBuilder::new().insert_string("addTwo", "function".to_string()).build()));
         let mut out = env.step().await?;
         assert_eq!(out[0].0, 3);
         assert_eq!(out[0].1.stderr.contains(&"OK".to_string()), true);

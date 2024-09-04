@@ -90,7 +90,7 @@ pub fn code_gen_cell(execution_state_id: ExecutionNodeId, cell: &LLMCodeGenCell,
                     Ok(OperationFnOutput {
                         has_error: false,
                         execution_state: state,
-                        output: value,
+                        output: Ok(value),
                         stdout: vec![],
                         stderr: vec![],
                     })

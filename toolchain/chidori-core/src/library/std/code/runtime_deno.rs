@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use anyhow::Result;
 use deno_core::error::AnyError;
 use deno_core::{Extension, ExtensionFileSource, ExtensionFileSourceCode, FastString, JsRuntime, ModuleSpecifier, Op, op2, OpState, PollEventLoopOptions, RuntimeOptions, serde_json, serde_v8, v8};
 use deno;
@@ -27,6 +26,7 @@ use pyo3::types::{IntoPyDict, PyTuple};
 use tokio::runtime::{Builder, Runtime};
 use tracing::Span;
 use crate::cells::{CellTypes, CodeCell, LLMPromptCell};
+use crate::execution::execution::execution_state::ExecutionStateErrors;
 use crate::execution::execution::ExecutionState;
 
 
@@ -306,7 +306,7 @@ type InternalClosureFnMut = Box<
     dyn FnMut(
         Vec<RkyvSerializedValue>,
         Option<HashMap<String, RkyvSerializedValue>>,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<RkyvSerializedValue>> + Send>> + Send
+    ) -> Pin<Box<dyn Future<Output = Result<RkyvSerializedValue, ExecutionStateErrors>> + Send>> + Send
 >;
 
 fn create_function_shims(
@@ -342,7 +342,7 @@ fn create_function_shims(
                     };
                     println!("Deno expecting to call dispatch");
                     let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload, parent_span_id.clone()).await?;
-                    return Ok(result);
+                    return result;
                 }.boxed()
             });
             functions.push((function_name.clone(), closure_callable));

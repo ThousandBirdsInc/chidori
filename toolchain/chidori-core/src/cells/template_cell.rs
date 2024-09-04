@@ -80,7 +80,7 @@ mod test {
             std::collections::HashMap::new()
         );
         let output = op.execute(&ExecutionState::new_with_random_id(), input, None, None).await?;
-        assert_eq!(output.output, crate::execution::primitives::serialized_value::RkyvSerializedValue::String("Hello, !".to_string()));
+        assert_eq!(output.output, Ok(crate::execution::primitives::serialized_value::RkyvSerializedValue::String("Hello, !".to_string())));
         Ok(())
     }
 }

@@ -13,7 +13,7 @@ use tracing::{Level, span};
 use uuid::Uuid;
 use crate::cells::{CellTypes, CodeCell, SupportedLanguage, TextRange};
 use crate::execution::execution::execution_graph::ExecutionNodeId;
-use crate::execution::execution::execution_state::OperationInputs;
+use crate::execution::execution::execution_state::{ExecutionStateErrors, OperationInputs};
 use crate::execution::execution::ExecutionState;
 
 
@@ -259,7 +259,7 @@ impl fmt::Debug for AsyncRPCCommunication {
 pub struct OperationFnOutput {
     pub has_error: bool,
     pub execution_state: Option<ExecutionState>,
-    pub output: RkyvSerializedValue,
+    pub output: Result<RkyvSerializedValue, ExecutionStateErrors>,
     pub stdout: Vec<String>,
     pub stderr: Vec<String>
 }
@@ -269,7 +269,7 @@ impl OperationFnOutput {
         Self {
             has_error: false,
             execution_state: None,
-            output: value,
+            output: Ok(value),
             stdout: Vec::new(),
             stderr: Vec::new()
         }
@@ -452,7 +452,7 @@ mod tests {
 
         let result = node.execute(&ExecutionState::new_with_random_id(), RkyvSerializedValue::Null, None, None).await?;
 
-        assert_eq!(result.output, RkyvSerializedValue::Boolean(true));
+        assert_eq!(result.output, Ok(RkyvSerializedValue::Boolean(true)));
         Ok(())
     }
 

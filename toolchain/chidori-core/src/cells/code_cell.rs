@@ -38,10 +38,11 @@ pub fn code_cell(execution_state_id: ExecutionNodeId, cell: &CodeCell, range: &T
                             &None,
                             &None,
                         ).await?;
+                        // TODO: don't unwrap the output result here
                         Ok(OperationFnOutput {
                             has_error: false,
                             execution_state: None,
-                            output: result.0.unwrap(),
+                            output: result.0,
                             stdout: result.1,
                             stderr: result.2,
                         })
@@ -90,7 +91,7 @@ pub fn code_cell(execution_state_id: ExecutionNodeId, cell: &CodeCell, range: &T
                                     Ok(OperationFnOutput {
                                         has_error: false,
                                         execution_state: None,
-                                        output: v.0,
+                                        output: Ok(v.0),
                                         stdout: v.1,
                                         stderr: v.2,
                                     }),

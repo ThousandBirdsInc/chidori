@@ -32,6 +32,7 @@ use tokio::sync::oneshot::Receiver;
 use uuid::Uuid;
 use crate::cells::CellTypes;
 use crate::execution::primitives::operation::OperationFnOutput;
+use tokio::sync::mpsc::{Sender, channel};
 
 // TODO: update all of these identifies to include a "space" they're within
 
@@ -99,6 +100,9 @@ pub struct ExecutionGraph {
     /// execution states maintain a value that indicates the head location within this queue
     /// that they've processed thus far.
     pub chat_message_queue: Vec<String>,
+
+    execution_event_sender: Sender<ExecutionEvent>,
+    execution_event_receiver: Option<tokio::sync::mpsc::Receiver<ExecutionEvent>>,
 }
 
 impl std::fmt::Debug for ExecutionGraph {
@@ -120,9 +124,13 @@ pub fn get_execution_id() -> Uuid {
     Uuid::new_v4()
 }
 
+#[derive(Debug, Clone)]
+pub struct ExecutionEvent {
+    pub id: ExecutionNodeId,
+    pub evaluation: ExecutionStateEvaluation
+}
+
 impl ExecutionGraph {
-    /// Initialize a new reactivity database. This will create a default input and output node,
-    /// graphs default to being the unit function x -> x.
     #[tracing::instrument]
     pub fn new() -> Self {
         println!("Initializing ExecutionGraph");
@@ -132,7 +140,6 @@ impl ExecutionGraph {
 
         // Initialization of the execution graph at Uuid::nil - this is always the root of the execution graph
         let init_id = Uuid::nil();
-        let state =
         state_id_to_state.insert(init_id, ExecutionStateEvaluation::Complete(ExecutionState::new_with_graph_sender(
             init_id,
             Arc::new(sender.clone())
@@ -154,6 +161,11 @@ impl ExecutionGraph {
         let cancellation_notify = Arc::new(Notify::new());
         let cancellation_notify_clone = cancellation_notify.clone();
 
+
+        // Channel for execution_events
+        let (execution_event_tx, execution_event_rx) = channel::<ExecutionEvent>(100);
+        let execution_event_tx_clone = execution_event_tx.clone();
+
         // Kick off a background thread that listens for events from async operations
         // These events inject additional state into the execution graph on new branches
         // Those branches will continue to evaluate independently.
@@ -168,10 +180,29 @@ impl ExecutionGraph {
                             Ok((resulting_execution_state, oneshot)) => {
                                 println!("==== Received dispatch event {:?}", resulting_execution_state);
 
+                                let s = resulting_execution_state.clone();
+                                match &resulting_execution_state {
+                                    ExecutionStateEvaluation::Error(id) => {
+                                        execution_event_tx_clone.send(ExecutionEvent{id: id.clone(), evaluation: s.clone()}).await;
+                                    }
+                                    ExecutionStateEvaluation::EvalFailure(id) => {
+                                        execution_event_tx_clone.send(ExecutionEvent{id: id.clone(), evaluation: s.clone()}).await;
+                                    }
+                                    ExecutionStateEvaluation::Complete(state) => {
+                                        // println!("Adding to execution state!!!! {:?}", state.id);
+                                        let resulting_state_id = state.id;
+                                        execution_event_tx_clone.send(ExecutionEvent{id: resulting_state_id.clone(), evaluation: s.clone()}).await;
+                                    }
+                                    ExecutionStateEvaluation::Executing(state) => {
+                                        let resulting_state_id = state.id;
+                                        execution_event_tx_clone.send(ExecutionEvent{id: resulting_state_id.clone(), evaluation: s.clone()}).await;
+                                    }
+                                }
+
+
                                 // Pushing this state into the graph
                                 let mut execution_graph = execution_graph_clone.lock().unwrap();
                                 let mut state_id_to_state = state_id_to_state_clone.lock().unwrap();
-                                let s = resulting_execution_state.clone();
 
                                 match resulting_execution_state {
                                     ExecutionStateEvaluation::Error(id) => {
@@ -221,8 +252,7 @@ impl ExecutionGraph {
                 }
             }
         });
-        ExecutionGraph {
-            
+        let graph = ExecutionGraph {
             cancellation_notify,
             execution_depth_orchestration_initialized_notify: initialization_notify,
             execution_depth_orchestration_handle: handle,
@@ -230,7 +260,15 @@ impl ExecutionGraph {
             execution_graph,
             graph_mutation_sender: sender,
             chat_message_queue: vec![],
-        }
+            execution_event_sender: execution_event_tx,
+            execution_event_receiver: Some(execution_event_rx)
+        };
+
+        graph
+    }
+
+    pub fn take_execution_event_receiver(&mut self) -> tokio::sync::mpsc::Receiver<ExecutionEvent> {
+        self.execution_event_receiver.take().expect("Execution event receiver may only be taken once by a new owner")
     }
 
     pub async fn shutdown(&mut self) {
@@ -354,19 +392,15 @@ impl ExecutionGraph {
     )> {
         let previous_state = match previous_state {
             ExecutionStateEvaluation::Complete(state) => state,
-            ExecutionStateEvaluation::Executing(..) => panic!("Cannot step an execution state that is currently executing"),
+            ExecutionStateEvaluation::Executing(..) => panic!("Cannot step an execution state that is still executing"),
             ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
             ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
         };
         let eval_state = previous_state.determine_next_operation()?;
-        // TODO: update graph with representation that we're inside of executing something
         let (new_state, outputs) = previous_state.step_execution(eval_state).await?;
-        // TODO: this should receive the Executing state and await the connected future
         let resulting_state_id = self.progress_graph(new_state.clone());
-        // Once the future is then resolved we update the state in the graph
         Ok(((resulting_state_id, new_state), outputs))
     }
-
 
     #[tracing::instrument]
     pub fn mutate_graph(
@@ -494,14 +528,14 @@ mod tests {
         state.state_insert(0, OperationFnOutput {
             has_error: false,
             execution_state: None,
-            output: arg0,
+            output: Ok(arg0),
             stdout: vec![],
             stderr: vec![],
         });
         state.state_insert(1, OperationFnOutput {
             has_error: false,
             execution_state: None,
-            output: arg1,
+            output: Ok(arg1),
             stdout: vec![],
             stderr: vec![],
         });
@@ -510,7 +544,7 @@ mod tests {
 
         assert!(new_state.state_get_value(&2).is_some());
         let result = new_state.state_get_value(&2).unwrap();
-        assert_eq!(result, &RSV::Number(3));
+        assert_eq!(result, &Ok(RSV::Number(3)));
         Ok(())
     }
 
@@ -549,12 +583,12 @@ mod tests {
         let ((_, new_state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
         assert_eq!(
             new_state.state_get_value(&0).unwrap(),
-            &RkyvSerializedValue::Number(0)
+            &Ok(RkyvSerializedValue::Number(0))
         );
         let ((_, new_state), _) = db.step_execution_with_previous_state(&new_state).await?;
         assert_eq!(
             new_state.state_get_value(&1).unwrap(),
-            &RkyvSerializedValue::Number(1)
+            &Ok(RkyvSerializedValue::Number(1))
         );
         Ok(())
     }
@@ -618,14 +652,14 @@ mod tests {
             assert_eq!(s.exec_queue, VecDeque::from(vec![1,2]));
         }
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
         assert_eq!(state.state_get_value(&2), None);
         if let ExecutionStateEvaluation::Complete(s) = &state {
             assert_eq!(s.exec_queue, VecDeque::from(vec![2]));
         }
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
         if let ExecutionStateEvaluation::Complete(s) = &state {
             assert_eq!(s.exec_queue, VecDeque::from(vec![]));
         }
@@ -678,17 +712,17 @@ mod tests {
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), None);
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
         assert_eq!(state.state_get_value(&2), None);
         assert_eq!(state.state_get_value(&3), None);
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
         assert_eq!(state.state_get_value(&3), None);
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
-        assert_eq!(state.state_get_value(&3), Some(&RSV::Number(3)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(3))));
         db.shutdown().await;
         Ok(())
     }
@@ -746,23 +780,23 @@ mod tests {
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), None);
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
         assert_eq!(state.state_get_value(&2), None);
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
         assert_eq!(state.state_get_value(&3), None);
         assert_eq!(state.state_get_value(&4), None);
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
-        assert_eq!(state.state_get_value(&3), Some(&RSV::Number(3)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(3))));
         assert_eq!(state.state_get_value(&4), None);
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
-        assert_eq!(state.state_get_value(&3), Some(&RSV::Number(3)));
-        assert_eq!(state.state_get_value(&4), Some(&RSV::Number(4)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(3))));
+        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(4))));
         Ok(())
     }
 
@@ -886,68 +920,68 @@ mod tests {
         assert_eq!(state.state_get_value(&2), None);
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
 
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(2)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(2))));
         assert_eq!(state.state_get_value(&2), None);
         assert_eq!(state.state_get_value(&3), None);
         assert_eq!(state.state_get_value(&4), None);
         assert_eq!(state.state_get_value(&5), None);
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(2)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(3)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(3))));
         assert_eq!(state.state_get_value(&3), None);
         assert_eq!(state.state_get_value(&4), None);
         assert_eq!(state.state_get_value(&5), None);
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(2)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(3)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(3))));
         assert_eq!(state.state_get_value(&3), None);
-        assert_eq!(state.state_get_value(&4), Some(&RSV::Number(4)));
+        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(4))));
         assert_eq!(state.state_get_value(&5), None);
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(2)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(3)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(3))));
         assert_eq!(state.state_get_value(&3), None);
-        assert_eq!(state.state_get_value(&4), Some(&RSV::Number(4)));
-        assert_eq!(state.state_get_value(&5), Some(&RSV::Number(5)));
+        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(4))));
+        assert_eq!(state.state_get_value(&5), Some(&Ok(RSV::Number(5))));
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(2)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(3)));
-        assert_eq!(state.state_get_value(&3), Some(&RSV::Number(5)));
-        assert_eq!(state.state_get_value(&4), Some(&RSV::Number(4)));
-        assert_eq!(state.state_get_value(&5), Some(&RSV::Number(5)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(3))));
+        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(5))));
+        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(4))));
+        assert_eq!(state.state_get_value(&5), Some(&Ok(RSV::Number(5))));
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(6)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(3)));
-        assert_eq!(state.state_get_value(&3), Some(&RSV::Number(5)));
-        assert_eq!(state.state_get_value(&4), Some(&RSV::Number(4)));
-        assert_eq!(state.state_get_value(&5), Some(&RSV::Number(5)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(6))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(3))));
+        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(5))));
+        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(4))));
+        assert_eq!(state.state_get_value(&5), Some(&Ok(RSV::Number(5))));
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(6)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(7)));
-        assert_eq!(state.state_get_value(&3), Some(&RSV::Number(5)));
-        assert_eq!(state.state_get_value(&4), Some(&RSV::Number(4)));
-        assert_eq!(state.state_get_value(&5), Some(&RSV::Number(5)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(6))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(7))));
+        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(5))));
+        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(4))));
+        assert_eq!(state.state_get_value(&5), Some(&Ok(RSV::Number(5))));
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
         if let ExecutionStateEvaluation::Complete(s) = &state {
             s.render_dependency_graph();
         }
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(6)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(7)));
-        assert_eq!(state.state_get_value(&3), Some(&RSV::Number(5)));
-        assert_eq!(state.state_get_value(&4), Some(&RSV::Number(8)));
-        assert_eq!(state.state_get_value(&5), Some(&RSV::Number(5)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(6))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(7))));
+        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(5))));
+        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(8))));
+        assert_eq!(state.state_get_value(&5), Some(&Ok(RSV::Number(5))));
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(6)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(7)));
-        assert_eq!(state.state_get_value(&3), Some(&RSV::Number(5)));
-        assert_eq!(state.state_get_value(&4), Some(&RSV::Number(8)));
-        assert_eq!(state.state_get_value(&5), Some(&RSV::Number(9)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(6))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(7))));
+        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(5))));
+        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(8))));
+        assert_eq!(state.state_get_value(&5), Some(&Ok(RSV::Number(9))));
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(6)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(7)));
-        assert_eq!(state.state_get_value(&3), Some(&RSV::Number(9)));
-        assert_eq!(state.state_get_value(&4), Some(&RSV::Number(8)));
-        assert_eq!(state.state_get_value(&5), Some(&RSV::Number(9)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(6))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(7))));
+        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(9))));
+        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(8))));
+        assert_eq!(state.state_get_value(&5), Some(&Ok(RSV::Number(9))));
         Ok(())
     }
 
@@ -1024,20 +1058,20 @@ mod tests {
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), None);
         let ((x_state_id, x_state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(x_state.state_get_value(&1), Some(&RSV::Number(1)));
+        assert_eq!(x_state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
         assert_eq!(x_state.state_get_value(&2), None);
 
         let ((state_id, state), _) = db.step_execution_with_previous_state(&x_state.clone()).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
 
         // When we re-evaluate from a previous point, we should get a new branch
         let ((state_id, state), _) = db.step_execution_with_previous_state(&x_state).await?;
         // The state_id.0 being incremented indicates that we're on a new branch
         // TODO: test some structural indiciation of what branch we're on
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
         // Op 2 should re-evaluate to 3, since it's on a new branch but continuing to mutate the stateful counter
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(3)));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(3))));
         Ok(())
     }
 
@@ -1125,11 +1159,11 @@ mod tests {
         assert_eq!(x_state.state_get_value(&1), None);
         assert_eq!(x_state.state_get_value(&2), None);
         let ((state_id, state), _) = db.step_execution_with_previous_state(&x_state.clone()).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
         assert_eq!(state.state_get_value(&2), None);
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
 
         // Change the definition of the operation "1" to add 200 instead of 1, then re-evaluate
         if let ExecutionStateEvaluation::Complete(x_state) = x_state {
@@ -1141,11 +1175,11 @@ mod tests {
                 Box::new(f_v2),
             ), Some(1));
             let ((state_id, state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state.clone())).await?;
-            assert_eq!(state.state_get_value(&1), Some(&RSV::Number(200)));
+            assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(200))));
             assert_eq!(state.state_get_value(&2), None);
             let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-            assert_eq!(state.state_get_value(&1), Some(&RSV::Number(200)));
-            assert_eq!(state.state_get_value(&2), Some(&RSV::Number(201)));
+            assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(200))));
+            assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(201))));
         }
         Ok(())
 
@@ -1210,26 +1244,26 @@ mod tests {
         assert_eq!(state.state_get_value(&1), None);
         assert_eq!(state.state_get_value(&2), None);
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
         assert_eq!(state.state_get_value(&2), None);
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
         assert_eq!(state.state_get_value(&3), None);
         assert_eq!(state.state_get_value(&4), None);
 
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
-        assert_eq!(state.state_get_value(&3), Some(&RSV::Number(3)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(3))));
         assert_eq!(state.state_get_value(&4), None);
 
         // This is the final state we're arriving at in execution
         let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&RSV::Number(1)));
-        assert_eq!(state.state_get_value(&2), Some(&RSV::Number(2)));
-        assert_eq!(state.state_get_value(&3), Some(&RSV::Number(3)));
-        assert_eq!(state.state_get_value(&4), Some(&RSV::Number(4)));
+        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(3))));
+        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(4))));
 
         // TODO: convert this to an actual test
         // dbg!(db.get_merged_state_history(state_id));

@@ -215,9 +215,6 @@ pub fn egui_render_cell_read(ui: &mut Ui, cell: &CellTypes) {
         CellTypes::Prompt(LLMPromptCell::Chat { name, req, .. }, _) => {
             render_text_cell(ui, name, req, "Prompt", "md", &theme);
         }
-        CellTypes::Web(WebserviceCell { name, configuration, .. }, _) => {
-            render_text_cell(ui, name, configuration, "Prompt", "", &theme);
-        }
         CellTypes::Template(TemplateCell { name, body }, _) => {
             render_text_cell(ui, name, body, "Prompt", "", &theme);
         }
@@ -314,7 +311,6 @@ impl ToJsonTreeValue for RkyvSerializedValue {
                         }
                     }
                     CellTypes::Embedding(c, _) => { JsonTreeValue::Base(&c.req, BaseValueType::String)}
-                    CellTypes::Web(c, _) => { JsonTreeValue::Base(&c.configuration, BaseValueType::String)}
                     CellTypes::Template(c, _) => { JsonTreeValue::Base(&c.body, BaseValueType::String)}
                     CellTypes::Memory(c, _) => { JsonTreeValue::Base(&c.embedding_function, BaseValueType::String)}
                 }

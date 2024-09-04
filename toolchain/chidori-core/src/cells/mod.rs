@@ -1,6 +1,5 @@
 pub mod template_cell;
 pub mod code_cell;
-pub mod web_cell;
 pub mod llm_prompt_cell;
 pub mod memory_cell;
 pub mod embedding_cell;
@@ -443,7 +442,6 @@ pub enum CellTypes {
     CodeGen(LLMCodeGenCell, TextRange),
     Prompt(LLMPromptCell, TextRange),
     Embedding(LLMEmbeddingCell, TextRange),
-    Web(WebserviceCell, TextRange),
     Template(TemplateCell, TextRange),
     Memory(MemoryCell, TextRange),
 }
@@ -471,7 +469,6 @@ pub fn get_cell_name(cell: &CellTypes) -> &Option<String> {
             LLMPromptCell::Chat { name, .. } => name,
             LLMPromptCell::Completion { .. } => &None,
         },
-        CellTypes::Web(c, _) => &c.name,
         CellTypes::Template(c, _) => &c.name,
         CellTypes::Memory(c, _) => &c.name,
         CellTypes::Embedding(c, _) => &c.name,

@@ -76,7 +76,7 @@ impl Future for FutureExecutionState {
     }
 }
 
-#[derive(thiserror::Error, Debug, PartialOrd, PartialEq)]
+#[derive(thiserror::Error, Debug, PartialOrd, PartialEq, Clone, Serialize)]
 pub enum ExecutionStateErrors {
     #[error("the execution of this graph has reached a fixed point and will not continue without outside influence")]
     NoFurtherExecutionDetected,
@@ -84,6 +84,14 @@ pub enum ExecutionStateErrors {
     CellExecutionUnexpectedFailure(ExecutionNodeId, String),
     #[error("unknown execution state error")]
     Unknown(String),
+    #[error("anyhow error")]
+    AnyhowError(String),
+}
+
+impl From<anyhow::Error> for ExecutionStateErrors {
+    fn from(err: anyhow::Error) -> Self {
+        ExecutionStateErrors::AnyhowError(err.to_string())
+    }
 }
 
 #[derive(Clone)]
@@ -109,7 +117,7 @@ impl ExecutionStateEvaluation {
         }
     }
 
-    pub fn state_get_value(&self, operation_id: &OperationId) -> Option<&RkyvSerializedValue> {
+    pub fn state_get_value(&self, operation_id: &OperationId) -> Option<&Result<RkyvSerializedValue, ExecutionStateErrors>> {
         match self {
             ExecutionStateEvaluation::Complete(ref state) => state.state_get(operation_id).map(|o| &o.output),
             ExecutionStateEvaluation::Executing(..) => unreachable!("Cannot get state from a future state"),
@@ -217,7 +225,8 @@ fn render_map_as_table(exec_state: &ExecutionState) -> String {
         |---|---|"));
     for key in exec_state.state.keys() {
         if let Some(val) = exec_state.state_get(key) {
-            table.push_str(&format!(indoc!(r"| {} | {:?} |" ), key, val));
+            table.push_str(&format!(indoc!(r"
+| {} | {:?} |" ), key, val));
         }
     }
     table.push_str("\n");
@@ -344,7 +353,7 @@ impl ExecutionState {
         self.state.get(operation_id).map(|x| x.as_ref())
     }
 
-    pub fn state_get_value(&self, operation_id: &OperationId) -> Option<&RkyvSerializedValue> {
+    pub fn state_get_value(&self, operation_id: &OperationId) -> Option<&Result<RkyvSerializedValue, ExecutionStateErrors>> {
         self.state.get(operation_id).map(|x| x.as_ref()).map(|o| &o.output)
     }
 
@@ -415,7 +424,6 @@ impl ExecutionState {
             CellTypes::Code(c, r) => crate::cells::code_cell::code_cell(self.id.clone(), c, r),
             CellTypes::Prompt(c, r) => crate::cells::llm_prompt_cell::llm_prompt_cell(self.id.clone(), c, r),
             CellTypes::Embedding(c, r) => crate::cells::embedding_cell::llm_embedding_cell(self.id.clone(), c, r),
-            CellTypes::Web(c, r) => crate::cells::web_cell::web_cell(self.id.clone(), c, r),
             CellTypes::Template(c, r) => crate::cells::template_cell::template_cell(self.id.clone(), c, r),
             CellTypes::Memory(c, r) => crate::cells::memory_cell::memory_cell(self.id.clone(), c, r),
             CellTypes::CodeGen(c, r) => crate::cells::code_gen_cell::code_gen_cell(self.id.clone(), c, r),
@@ -596,7 +604,7 @@ impl ExecutionState {
     /// of a parent function's scope. This targets a specific function by name that we've identified a dependence on.
     // TODO: this should create a coroutine that yields with the result of the function invocation
     #[tracing::instrument(parent = parent_span_id.clone(), skip(self, payload))]
-    pub async fn dispatch(&self, function_name: &str, payload: RkyvSerializedValue, parent_span_id: Option<tracing::Id>) -> anyhow::Result<(RkyvSerializedValue, ExecutionState)> {
+    pub async fn dispatch(&self, function_name: &str, payload: RkyvSerializedValue, parent_span_id: Option<tracing::Id>) -> anyhow::Result<(Result<RkyvSerializedValue, ExecutionStateErrors>, ExecutionState)> {
         println!("Running dispatch {:?}", function_name);
 
         // Store the invocation payload into an execution state and record this before executing
@@ -736,13 +744,13 @@ impl ExecutionState {
                 for argument_index in argument_indices {
                     match argument_index {
                         DependencyReference::Positional(pos) => {
-                            inputs.args.insert(pos.to_string(), output_value.clone());
+                            inputs.args.insert(pos.to_string(), output_value.clone().unwrap());
                         }
                         DependencyReference::Keyword(kw) => {
-                            inputs.kwargs.insert(kw.clone(), output_value.clone());
+                            inputs.kwargs.insert(kw.clone(), output_value.clone().unwrap());
                         }
                         DependencyReference::Global(name) => {
-                            if let RkyvSerializedValue::Object(value) = &output.output {
+                            if let RkyvSerializedValue::Object(value) = &output.output.clone().unwrap() {
                                 inputs.globals.insert(name.clone(), value.get(name).ok_or_else(|| anyhow::anyhow!("Expected value with name: {:?} to be available", name))?.clone());
                             }
                         }
@@ -898,7 +906,7 @@ mod tests {
         let value = OperationFnOutput {
             has_error: false,
             execution_state: None,
-            output: value,
+            output: Ok(value),
             stdout: vec![],
             stderr: vec![],
         };
@@ -1042,7 +1050,7 @@ mod tests {
         let payload = RkyvSerializedValue::Null;
         let (result, _) = new_state.dispatch("test_fn", payload, None).await.unwrap();
         
-        assert_eq!(result, RkyvSerializedValue::Number(2));
+        assert_eq!(result.unwrap(), RkyvSerializedValue::Number(2));
     }
 
     #[test]

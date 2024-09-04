@@ -182,19 +182,6 @@ pub fn interpret_code_block(block: &MarkdownCodeBlock) -> Result<Option<CellType
             name: block.name.clone(),
             body: block.body.clone(),
         }, block.range.clone())),
-        "web" => {
-            let config: HashMap<String, String> = serde_yaml::from_str(&frontmatter)?;
-            let port = config.get("port")
-                .and_then(|p| p.parse::<u16>().ok())
-                .or(Some(8080))
-                .ok_or(InterpretError::PortParseError)?;
-
-            Some(CellTypes::Web(WebserviceCell {
-                name: block.name.clone(),
-                configuration: block.body.clone(),
-                port,
-            }, block.range.clone()))
-        },
         _ => None,
     })
 }

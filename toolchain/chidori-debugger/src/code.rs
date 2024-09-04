@@ -118,9 +118,6 @@ fn editor_update(
                             render_prompt_cell(&execution_state, &op_id, ui, cell_holder, exists_in_current_tree);
                         }
                         CellTypes::Embedding(LLMEmbeddingCell { .. }, _) => {}
-                        CellTypes::Web(..) => {
-                            render_web_service_cell(&execution_state, &op_id, ui, cell_holder, exists_in_current_tree);
-                        }
                         CellTypes::Template(..) => {
                             render_template_cell(&execution_state, &op_id, ui, cell_holder, exists_in_current_tree);
                         }
@@ -183,7 +180,7 @@ fn render_operation_output(execution_state: &ChidoriExecutionState, op_id: &&Opt
                 if ui.button(format!("Revert to: {:?} {:?}", exec_id, op_id)).clicked() {}
                 ui.push_id((exec_id, op_id), |ui| {
                     ui.collapsing("Values", |ui| {
-                        let response = JsonTree::new(format!("{} {} values", exec_id, op_id), &o.output)
+                        let response = JsonTree::new(format!("{} {} values", exec_id, op_id), &o.output.clone().unwrap())
                             .show(ui);
                     });
                     ui.collapsing("Logs", |ui| {
@@ -196,37 +193,7 @@ fn render_operation_output(execution_state: &ChidoriExecutionState, op_id: &&Opt
     }
 }
 
-fn render_web_service_cell(execution_state: &ChidoriExecutionState, op_id: &Option<usize>, mut ui: &mut Ui, cell_holder: &mut CellHolder, exists_in_current_tree: bool) {
-    let CellTypes::Web(WebserviceCell { name, configuration, .. }, _) = &mut cell_holder.cell else {panic!("Must be web cell")};
-    let mut s = configuration.clone();
-    ui.horizontal(|ui| {
-        egui_label(ui, "Prompt");
-        if let Some(name) = name {
-            egui_label(ui, name);
-        }
-        render_applied_status(ui, exists_in_current_tree);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-            if ui.button("Open").clicked() {
-                // TODO:
-                println!("Should open file");
-            }
-        });
-    });
-    // Add widgets inside the frame
-    ui.vertical(|ui| {
-        if ui.add(
-            egui::TextEdit::multiline(&mut s)
-                .code_editor()
-                .lock_focus(true)
-                .desired_width(f32::INFINITY)
-        ).changed() {
-            // TODO: this is causing us to lose focus of the element
-            cell_holder.needs_update = true;
-            cell_holder.applied_at = None;
-        }
-        render_operation_output(&execution_state, &op_id, ui);
-    });
-}
+
 
 fn render_prompt_cell(execution_state: &ChidoriExecutionState, op_id: &Option<usize>, mut ui: &mut Ui, cell_holder: &mut CellHolder, exists_in_current_tree: bool) {
     let CellTypes::Prompt(LLMPromptCell::Chat { name, configuration, req, .. }, _) = &mut cell_holder.cell else {panic!("Must be llm prompt cell")};
