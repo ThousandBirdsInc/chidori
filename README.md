@@ -60,10 +60,6 @@ Features:
 - Visual debugging environment, visualize and manipulate the graph of states your code has executed through.
 - Create and navigate tree-searching code execution workflows
 
-We are continuing to make significant changes in response to feedback and iterating on different features.
-Feedback is greatly appreciated! Please add to our issue tracker.
-
-
 ## ⚡️ Getting Started
 
 ### Installation
@@ -219,4 +215,4 @@ Our framework is inspired by the work of many others, including:
 Chidori is under the MIT license. See the [LICENSE](LICENSE) for more information.
 
 ## Help us out!
-Please star the GitHub repo and give us feedback in [discord](https://discord.gg/CJwKsPSgew)!
+Please star the GitHub repo and join our [discord](https://discord.gg/CJwKsPSgew)!
