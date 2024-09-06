@@ -19,7 +19,7 @@ https://github.com/ThousandBirdsInc/chidori/assets/515757/6b088f7d-d8f7-4c7e-900
 Star us on Github! Join us on [Discord](https://discord.gg/CJwKsPSgew).
 
 ## Contents
-- [📖 Chidori](#-chidori)
+- [📖 Chidori V2](#-chidori-v2)
 - [⚡️ Getting Started](#️-getting-started)
   - [Installation](#installation)
   - [Environment Variables](#environment-variables)

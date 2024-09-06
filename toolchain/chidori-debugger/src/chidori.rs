@@ -670,6 +670,7 @@ pub fn update_gui(
                             ui.label("Load Existing Project");
                             let res = with_cursor(ui.button("Load From Folder"));
                             if res.clicked() {
+                                internal_state1.display_example_modal = false;
                                 runtime.spawn_background_task(|mut ctx| async move {
                                     let task = rfd::AsyncFileDialog::new().pick_folder();
                                     let folder = task.await;
@@ -709,13 +710,13 @@ pub fn update_gui(
                                     EXAMPLES_CORE6, "Prompts may import functions and invoke those in order to accomplish their instructions."
 
                                 ),
-                                ("Core 7: Rag Stateful Memory Cells", EXAMPLES_CORE7, "Cells preserve their internal state, we provide a specialized API for embeddings which demonstrates this behavior, exposing functions for interacting with that state."),
+                                ("Core 7: Chat With PDF Clone", EXAMPLES_CORE7, "Cells preserve their internal state, we provide a specialized API for embeddings which demonstrates this behavior, exposing functions for interacting with that state."),
                                 (
-                                    "Core 8: Prompt Code Generation and Execution",
+                                    "Core 8: Anthropic Artifacts Clone",
                                     EXAMPLES_CORE8, "Chidori is designed for L4-L5 agents, new behaviors can be generated on the fly via code generation."
                                 ),
-                                ("Core 9: Multi-Agent Simulation", EXAMPLES_CORE9, "desc"),
-                                ("Core 10: Concurrency", EXAMPLES_CORE10, "desc"),
+                                ("Core 9: Multi-Agent Social Experiment", EXAMPLES_CORE9, "desc"),
+                                ("Core 10: Demonstrating Our Execution Concurrency", EXAMPLES_CORE10, "desc"),
                                 ("Core 11: Hono Web Service", EXAMPLES_CORE11, "desc"),
                                 ("Core 12: Dependency Management", EXAMPLES_CORE12, "desc"),
                             ];

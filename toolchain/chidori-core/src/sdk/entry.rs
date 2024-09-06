@@ -1,5 +1,5 @@
 use crate::execution::execution::execution_graph::{ExecutionGraph, ExecutionNodeId, MergedStateHistory};
-use crate::execution::execution::execution_state::{ExecutionState, ExecutionStateEvaluation, OperationExecutionStatus};
+use crate::execution::execution::execution_state::{ExecutionState, ExecutionStateErrors, ExecutionStateEvaluation, OperationExecutionStatus};
 use crate::execution::execution::DependencyGraphMutation;
 use crate::cells::{CellTypes, get_cell_name, LLMPromptCell};
 use crate::execution::primitives::identifiers::{DependencyReference, OperationId};
@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::{fmt, thread};
 use std::ops::Deref;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::{Arc, mpsc, Mutex, MutexGuard};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::sleep;
@@ -42,6 +43,7 @@ enum PlaybackState {
     Step,
     Running,
 }
+
 
 // TODO: set up a channel between the host and the instance
 //     so that we can send events to instances while they run on another thread
@@ -148,70 +150,17 @@ impl InstancedEnvironment {
         // Get the current span ID
         // let current_span_id = Span::current().id().expect("There is no current span");
 
+
+
         loop {
-            println!("Looping UserInteraction");
+            // println!("Looping UserInteraction");
             // let closure_span = tracing::span!(parent: &current_span_id, tracing::Level::INFO, "execution_instance_loop");
             // let _enter = closure_span.enter();
 
-
+            // Handle user interactions first for responsiveness
             if let Ok(message) = self.env_rx.recv_timeout(Duration::from_millis(USER_INTERACTION_RECEIVER_TIMEOUT_MS)) {
                 println!("Received message from user: {:?}", message);
-                match message {
-                    UserInteractionMessage::Step => {
-                        self.playback_state = PlaybackState::Step;
-                    },
-                    UserInteractionMessage::Play => {
-                        self.get_state_at_current_execution_head().render_dependency_graph();
-                        self.playback_state = PlaybackState::Running;
-                    },
-                    UserInteractionMessage::Pause => {
-                        self.get_state_at_current_execution_head().render_dependency_graph();
-                        self.playback_state = PlaybackState::Paused;
-                    },
-                    UserInteractionMessage::ReloadCells => {
-                        self.reload_cells()?;
-                    },
-                    UserInteractionMessage::FetchStateAt(id) => {
-                        let state = self.get_state_at(id);
-                        let sender = self.runtime_event_sender.as_mut().unwrap();
-                        sender.send(EventsFromRuntime::StateAtId(id, state)).unwrap();
-                    },
-                    UserInteractionMessage::RevertToState(id) => {
-                        if let Some(id) = id {
-                            self.execution_head_state_id = id;
-                            let merged_state = self.db.get_merged_state_history(&id);
-                            let sender = self.runtime_event_sender.as_mut().unwrap();
-                            sender.send(EventsFromRuntime::ExecutionStateChange(merged_state)).unwrap();
-                            sender.send(EventsFromRuntime::UpdateExecutionHead(id)).unwrap();
-
-                            if let Some(ExecutionStateEvaluation::Complete(state)) = self.db.get_state_at_id(self.execution_head_state_id) {
-                                let mut cells = vec![];
-                                // TODO: keep a separate mapping of cells so we don't need to lock operations
-                                for k in state.operation_by_id.values() {
-                                    let op = k.lock().unwrap();
-                                    cells.push(CellHolder {
-                                        cell: op.cell.clone(),
-                                        op_id: Some(op.id.clone()),
-                                        applied_at: Some(op.created_at_state_id.clone()),
-                                        needs_update: false,
-                                    });
-                                }
-                                let mut ss = self.shared_state.lock().unwrap();
-                                ss.at_execution_state_cells = cells.clone();
-                                sender.send(EventsFromRuntime::ExecutionStateCellsViewUpdated(cells)).unwrap();
-                            }
-                        }
-                    },
-                    UserInteractionMessage::Shutdown => {
-                        self.shutdown().await;
-                    }
-                    UserInteractionMessage::UserAction(_) => {}
-                    UserInteractionMessage::FetchCells => {}
-                    UserInteractionMessage::MutateCell => {}
-                    UserInteractionMessage::ChatMessage(msg) => {
-                        self.db.push_message(msg).await?;
-                    }
-                }
+                self.handle_user_interaction_message(message).await?;
             }
 
             tokio::select! {
@@ -223,24 +172,104 @@ impl InstancedEnvironment {
                 }
             }
 
-            match self.playback_state {
-                PlaybackState::Step => {
-                    let output = self.step().await?;
-                    self.playback_state = PlaybackState::Paused;
-                }
-                PlaybackState::Paused => {
-                    println!("Playback paused, waiting 1000ms");
-                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                }
-                PlaybackState::Running => {
-                    let output = self.step().await?;
-                    // TODO: we want to pause when nothing is happening, so how do we know nothing is happening
-                    // If nothing happened, pause playback and wait for the user
-                    if output.is_empty() {
-                        println!("Playback paused, awaiting input from user");
-                        self.playback_state = PlaybackState::Paused;
+
+
+            tokio::select! {
+                Some(output) = self.conditional_poll_playback_steps() => {
+                    match self.playback_state {
+                        PlaybackState::Step => {
+                            self.playback_state = PlaybackState::Paused;
+                        }
+                        PlaybackState::Paused => {
+                            // TODO: add to conditional?
+                            println!("Playback paused");
+                        }
+                        PlaybackState::Running => {
+                            // TODO: we want to pause when nothing is happening, so how do we know nothing is happening
+                            // If nothing happened, pause playback and wait for the user
+                            if output?.is_empty() {
+                                println!("Playback paused, awaiting input from user");
+                                self.playback_state = PlaybackState::Paused;
+                            }
+                        }
                     }
                 }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                }
+            };
+
+        }
+        Ok(())
+    }
+    async fn conditional_poll_playback_steps(&mut self) -> Option<anyhow::Result<Vec<(usize, OperationFnOutput)>>> {
+        match self.playback_state {
+            PlaybackState::Step => {
+                Some(self.step().await)
+            }
+            PlaybackState::Paused => {
+                None
+            }
+            PlaybackState::Running => {
+                Some(self.step().await)
+            }
+        }
+    }
+
+    async fn handle_user_interaction_message(&mut self, message: UserInteractionMessage) -> Result<(), anyhow::Error> {
+        match message {
+            UserInteractionMessage::Step => {
+                self.playback_state = PlaybackState::Step;
+            },
+            UserInteractionMessage::Play => {
+                self.get_state_at_current_execution_head().render_dependency_graph();
+                self.playback_state = PlaybackState::Running;
+            },
+            UserInteractionMessage::Pause => {
+                self.get_state_at_current_execution_head().render_dependency_graph();
+                self.playback_state = PlaybackState::Paused;
+            },
+            UserInteractionMessage::ReloadCells => {
+                self.reload_cells()?;
+            },
+            UserInteractionMessage::FetchStateAt(id) => {
+                let state = self.get_state_at(id);
+                let sender = self.runtime_event_sender.as_mut().unwrap();
+                sender.send(EventsFromRuntime::StateAtId(id, state)).unwrap();
+            },
+            UserInteractionMessage::RevertToState(id) => {
+                if let Some(id) = id {
+                    self.execution_head_state_id = id;
+                    let merged_state = self.db.get_merged_state_history(&id);
+                    let sender = self.runtime_event_sender.as_mut().unwrap();
+                    sender.send(EventsFromRuntime::ExecutionStateChange(merged_state)).unwrap();
+                    sender.send(EventsFromRuntime::UpdateExecutionHead(id)).unwrap();
+
+                    if let Some(ExecutionStateEvaluation::Complete(state)) = self.db.get_state_at_id(self.execution_head_state_id) {
+                        let mut cells = vec![];
+                        // TODO: keep a separate mapping of cells so we don't need to lock operations
+                        for k in state.operation_by_id.values() {
+                            let op = k.lock().unwrap();
+                            cells.push(CellHolder {
+                                cell: op.cell.clone(),
+                                op_id: Some(op.id.clone()),
+                                applied_at: Some(op.created_at_state_id.clone()),
+                                needs_update: false,
+                            });
+                        }
+                        let mut ss = self.shared_state.lock().unwrap();
+                        ss.at_execution_state_cells = cells.clone();
+                        sender.send(EventsFromRuntime::ExecutionStateCellsViewUpdated(cells)).unwrap();
+                    }
+                }
+            },
+            UserInteractionMessage::Shutdown => {
+                self.shutdown().await;
+            }
+            UserInteractionMessage::UserAction(_) => {}
+            UserInteractionMessage::FetchCells => {}
+            UserInteractionMessage::MutateCell => {}
+            UserInteractionMessage::ChatMessage(msg) => {
+                self.db.push_message(msg).await?;
             }
         }
         Ok(())

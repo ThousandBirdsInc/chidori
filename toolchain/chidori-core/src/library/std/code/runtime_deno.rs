@@ -552,7 +552,8 @@ pub async fn source_code_run_deno(
         let mut flags = deno::args::Flags::default();
         // TODO: give user control over this in configuration
         // TODO: allow_net is causing this to block our execution entirely
-        // flags.allow_net = Some(vec![]);
+        flags.allow_net = Some(vec![]);
+        flags.allow_env = Some(vec![]);
         let factory = deno::factory::CliFactory::from_flags(flags)?;
         let cli_options = factory.cli_options();
         let file_fetcher = factory.file_fetcher()?;
@@ -594,6 +595,7 @@ pub async fn source_code_run_deno(
             dbg!(&e);
             e
         })?;
+        println!("After the runtime block on in source_code_run_deno");
         // TODO: map error
 
         let mut my_op_state = my_op_state.lock().unwrap();
@@ -656,7 +658,7 @@ mod tests {
         assert_eq!(
             result.unwrap(),
             (
-                RkyvObjectBuilder::new().insert_number("y", 10).build(),
+                Ok(RkyvObjectBuilder::new().insert_number("y", 10).build()),
                 vec![],
                 vec![],
             )
@@ -683,7 +685,7 @@ mod tests {
         assert_eq!(
             result.unwrap(),
             (
-                RkyvObjectBuilder::new().insert_number("z", 25).build(),
+                Ok(RkyvObjectBuilder::new().insert_number("z", 25).build()),
                 vec![],
                 vec![],
             )
@@ -697,7 +699,7 @@ mod tests {
         assert_eq!(
             result.unwrap(),
             (
-                RkyvObjectBuilder::new().insert_number("x", 42).build(),
+                Ok(RkyvObjectBuilder::new().insert_number("x", 42).build()),
                 vec![],
                 vec![],
             )
@@ -718,12 +720,12 @@ mod tests {
         assert_eq!(
             result.unwrap(),
             (
-                RkyvObjectBuilder::new()
+                Ok(RkyvObjectBuilder::new()
                     .insert_object(
                         "obj",
                         RkyvObjectBuilder::new().insert_string("foo", "bar".to_string())
                     )
-                    .build(),
+                    .build()),
                 vec![],
                 vec![],
             )
@@ -736,7 +738,7 @@ mod tests {
         assert_eq!(
             result.unwrap(),
             (
-                RkyvObjectBuilder::new().insert_number("x", 30).build(),
+                Ok(RkyvObjectBuilder::new().insert_number("x", 30).build()),
                 vec![],
                 vec![],
             )
@@ -753,7 +755,7 @@ mod tests {
         assert_eq!(
             result.unwrap(),
             (
-                RkyvSerializedValue::Number(30),
+                Ok(RkyvSerializedValue::Number(30)),
                 vec![],
                 vec![],
             )
@@ -773,7 +775,7 @@ mod tests {
         assert_eq!(
             result.unwrap(),
             (
-                RkyvObjectBuilder::new().build(),
+                Ok(RkyvObjectBuilder::new().build()),
                 vec![String::from("[out]: \"testing, output\"\n")],
                 vec![String::from("[out]: \"testing, stderr\"\n")],
             )
@@ -813,7 +815,7 @@ mod tests {
         assert_eq!(
             result.unwrap(),
             (
-                RkyvObjectBuilder::new().insert_number("x", 42).build(),
+                Ok(RkyvObjectBuilder::new().insert_number("x", 42).build()),
                 vec![],
                 vec![],
             )
@@ -833,14 +835,14 @@ mod tests {
         assert_eq!(
             result.unwrap(),
             (
-                RkyvObjectBuilder::new()
+                Ok(RkyvObjectBuilder::new()
                     .insert_object(
                         "person",
                         RkyvObjectBuilder::new()
                             .insert_string("name", "Alice".to_string())
                             .insert_number("age", 30)
                     )
-                    .build(),
+                    .build()),
                 vec![],
                 vec![],
             )
@@ -859,10 +861,10 @@ mod tests {
         assert_eq!(
             result.unwrap(),
             (
-                RkyvObjectBuilder::new()
+                Ok(RkyvObjectBuilder::new()
                     .insert_string("identity", "function".to_string())
                     .insert_string("result", "TypeScript".to_string())
-                    .build(),
+                    .build()),
                 vec![],
                 vec![],
             )
@@ -881,10 +883,10 @@ mod tests {
         assert_eq!(
             result.unwrap(),
             (
-                RkyvObjectBuilder::new()
+                Ok(RkyvObjectBuilder::new()
                     .insert_string("data", "Data".to_string())
                     .insert_string("fetchData", "function".to_string())
-                    .build(),
+                    .build()),
                 vec![],
                 vec![],
             )
@@ -905,9 +907,9 @@ mod tests {
         assert_eq!(
             result.unwrap(),
             (
-                RkyvObjectBuilder::new()
+                Ok(RkyvObjectBuilder::new()
                     .insert_number("selectedColor", 1)
-                    .build(),
+                    .build()),
                 vec![],
                 vec![],
             )

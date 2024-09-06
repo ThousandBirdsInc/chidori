@@ -844,7 +844,7 @@ pub fn build_report(context_paths: &Vec<Vec<ContextPath>>) -> Report {
         "RegExp", "Set", "SharedArrayBuffer", "String", "Symbol", "SyntaxError", "TypeError",
         "URIError", "Uint8Array", "Uint8ClampedArray", "Uint16Array", "Uint32Array", "WeakMap",
         "WeakSet", "decodeURI", "decodeURIComponent", "encodeURI", "encodeURIComponent", "escape",
-        "eval", "isFinite", "isNaN", "parseFloat", "parseInt", "unescape", "uneval", "setTimeout", "setInterval", "console"
+        "eval", "isFinite", "isNaN", "parseFloat", "parseInt", "unescape", "uneval", "setTimeout", "setInterval", "console", "process"
     ].iter().cloned().collect();
 
     depended_values.retain(|value,_ | !js_built_ins.contains(value.as_str()));

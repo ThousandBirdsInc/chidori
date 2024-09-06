@@ -21,9 +21,10 @@ enum CodeResource {
     Markdown
 }
 
+#[derive(Debug)]
 pub struct ParsedFile {
-    // filename: Box<PathBuf>,
-    // code: String,
+    filename: Option<Box<std::path::PathBuf>>,
+    code: Option<String>,
     num_lines: usize,
     pub(crate) result: Vec<MarkdownCodeBlock>,
 }
@@ -72,8 +73,8 @@ pub(crate) fn extract_code_blocks(body: &str) -> Vec<MarkdownCodeBlock> {
 fn parse_markdown_file(filename: &Path) -> ParsedFile {
     match std::fs::read_to_string(filename) {
         Err(e) => ParsedFile {
-            // filename: Box::new(filename.to_path_buf()),
-            // code: "".to_owned(),
+            filename: Some(Box::new(filename.to_path_buf())),
+            code: Some("".to_owned()),
             num_lines: 0,
             result: vec![],
         },
@@ -81,8 +82,8 @@ fn parse_markdown_file(filename: &Path) -> ParsedFile {
             let num_lines = source.lines().count();
             let result = extract_code_blocks(&source);
             ParsedFile {
-                // filename: Box::new(filename.to_path_buf()),
-                // code: source.to_string(),
+                filename: Some(Box::new(filename.to_path_buf())),
+                code: Some(source.to_string()),
                 num_lines,
                 result,
             }
@@ -140,10 +141,10 @@ pub fn interpret_code_block(block: &MarkdownCodeBlock) -> Result<Option<CellType
         .map_err(|e| InterpretError::FrontmatterSplitError(e.to_string()))?;
 
     Ok(match block.tag.as_str() {
-        "python" | "javascript" => {
+        "python" | "javascript" | "py" | "js" | "ts" | "typescript" => {
             let language = match block.tag.as_str() {
-                "python" => SupportedLanguage::PyO3,
-                "javascript" => SupportedLanguage::Deno,
+                "python" | "py" => SupportedLanguage::PyO3,
+                "javascript" | "js" | "typescript" | "ts" => SupportedLanguage::Deno,
                 _ => unreachable!(), // Given the outer match, this branch should never be reached
             };
             Some(CellTypes::Code(CodeCell {
