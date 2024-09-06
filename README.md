@@ -1,6 +1,7 @@
 
 
-[![Watch the video](https://github.com/ThousandBirdsInc/chidori/blob/main/media/ChidoriPanel.png?raw=true)](https://github.com/ThousandBirdsInc/chidori/assets/515757/6b088f7d-d8f7-4c7e-9006-4360ae40d1de)
+[//]: # ([![Demo Video]&#40;https://github.com/ThousandBirdsInc/chidori/blob/main/media/ChidoriPanel.png?raw=true&#41;]&#40;https://github.com/ThousandBirdsInc/chidori/assets/515757/6b088f7d-d8f7-4c7e-9006-4360ae40d1de&#41;)
+[![Demo Video](https://github.com/ThousandBirdsInc/chidori/blob/main/media/ChidoriPanel.png?raw=true)]()
 
 <div align="center">
 
