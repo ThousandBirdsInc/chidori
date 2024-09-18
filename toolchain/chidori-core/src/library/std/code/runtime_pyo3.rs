@@ -677,7 +677,14 @@ fn create_python_dispatch_closure(py: Python, clone_function_name: String, execu
                 let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload, parent_span_id.clone()).await.map_err(|e| AnyhowErrWrapper(e))?;
                 // TODO: assign this execution state to the current so that as we continue to execute this is now where we're progressing from
                 // TODO: this should not be an unwrap and should instead propagate the error
-                PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result.unwrap())))
+                match result {
+                    Ok(result) => {
+                        PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result)))
+                    }
+                    Err(e) => {
+                        Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!("{:}", e)))
+                    }
+                }
             }).map(|x| x.into())
         },
     )?;

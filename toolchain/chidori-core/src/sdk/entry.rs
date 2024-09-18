@@ -95,29 +95,33 @@ impl InstancedEnvironment {
         println!("Reloading cells");
         let cells_to_upsert: Vec<_> = {
             let shared_state = self.shared_state.lock().unwrap();
-            shared_state.editor_cells.iter().map(|cell| cell.clone()).collect()
+            shared_state.editor_cells.values().map(|cell| cell.clone()).collect()
         };
 
+        // unlock shared_state
         let mut ids = vec![];
         for cell_holder in cells_to_upsert {
             if cell_holder.needs_update {
-                ids.push(self.upsert_cell(cell_holder.cell.clone(), cell_holder.op_id)?);
+                ids.push((self.upsert_cell(cell_holder.cell.clone(), cell_holder.op_id)?, cell_holder));
             } else {
                 // TODO: remove these unwraps and handle this better
-                ids.push((cell_holder.applied_at.unwrap(), cell_holder.op_id.unwrap()));
+                ids.push(((cell_holder.applied_at.unwrap(), cell_holder.op_id), cell_holder));
             }
         }
 
+        // lock again and update
         let mut shared_state = self.shared_state.lock().unwrap();
-        for (i, cell) in shared_state.editor_cells.iter_mut().enumerate() {
-            let (applied_at, op_id) = ids[i];
-            cell.applied_at = Some(applied_at.clone());
-            cell.op_id = Some(op_id);
-            cell.needs_update = false;
+        for ((applied_at, op_id), cell_holder) in ids {
+            shared_state.editor_cells.insert(op_id, cell_holder);
+            shared_state.editor_cells.entry(op_id).and_modify(|cell| {
+                cell.applied_at = Some(applied_at.clone());
+                cell.op_id = op_id;
+                cell.needs_update = false;
+            });
         }
 
         if let Some(sender) = self.runtime_event_sender.as_mut() {
-            sender.send(EventsFromRuntime::CellsUpdated(shared_state.editor_cells.clone())).unwrap();
+            sender.send(EventsFromRuntime::EditorCellsUpdated(shared_state.editor_cells.clone())).unwrap();
         }
         Ok(())
     }
@@ -187,9 +191,16 @@ impl InstancedEnvironment {
                         PlaybackState::Running => {
                             // TODO: we want to pause when nothing is happening, so how do we know nothing is happening
                             // If nothing happened, pause playback and wait for the user
-                            if output?.is_empty() {
-                                println!("Playback paused, awaiting input from user");
-                                self.playback_state = PlaybackState::Paused;
+                            match output {
+                                anyhow::Result::Ok(o)  => {
+                                    if o.is_empty() {
+                                        println!("Playback paused, awaiting input from user");
+                                        self.playback_state = PlaybackState::Paused;
+                                    }
+                                }
+                                anyhow::Result::Err(_)  => {
+                                    self.playback_state = PlaybackState::Paused;
+                                }
                             }
                         }
                     }
@@ -201,7 +212,8 @@ impl InstancedEnvironment {
         }
         Ok(())
     }
-    async fn conditional_poll_playback_steps(&mut self) -> Option<anyhow::Result<Vec<(usize, OperationFnOutput)>>> {
+
+    async fn conditional_poll_playback_steps(&mut self) -> Option<anyhow::Result<Vec<(OperationId, OperationFnOutput)>>> {
         match self.playback_state {
             PlaybackState::Step => {
                 Some(self.step().await)
@@ -247,12 +259,11 @@ impl InstancedEnvironment {
                     if let Some(ExecutionStateEvaluation::Complete(state)) = self.db.get_state_at_id(self.execution_head_state_id) {
                         let mut cells = vec![];
                         // TODO: keep a separate mapping of cells so we don't need to lock operations
-                        for k in state.operation_by_id.values() {
-                            let op = k.lock().unwrap();
+                        for (id, cell) in state.cells_by_id.iter() {
                             cells.push(CellHolder {
-                                cell: op.cell.clone(),
-                                op_id: Some(op.id.clone()),
-                                applied_at: Some(op.created_at_state_id.clone()),
+                                cell: cell.clone(),
+                                op_id: id.clone(),
+                                applied_at: None,
                                 needs_update: false,
                             });
                         }
@@ -267,7 +278,20 @@ impl InstancedEnvironment {
             }
             UserInteractionMessage::UserAction(_) => {}
             UserInteractionMessage::FetchCells => {}
-            UserInteractionMessage::MutateCell => {}
+            UserInteractionMessage::MutateCell(cell_holder) => {
+                println!("Mutating individual cell");
+                let (applied_at, op_id) = self.upsert_cell(cell_holder.cell.clone(), cell_holder.op_id)?;
+                let mut shared_state = self.shared_state.lock().unwrap();
+                shared_state.editor_cells.insert(op_id, cell_holder);
+                shared_state.editor_cells.entry(op_id).and_modify(|cell| {
+                    cell.applied_at = Some(applied_at.clone());
+                    cell.op_id = op_id;
+                    cell.needs_update = false;
+                });
+                if let Some(sender) = self.runtime_event_sender.as_mut() {
+                    sender.send(EventsFromRuntime::EditorCellsUpdated(shared_state.editor_cells.clone())).unwrap();
+                }
+            }
             UserInteractionMessage::ChatMessage(msg) => {
                 self.db.push_message(msg).await?;
             }
@@ -284,8 +308,8 @@ impl InstancedEnvironment {
     pub fn get_state_at(&self, id: ExecutionNodeId) -> ExecutionState {
         match self.db.get_state_at_id(id).unwrap() {
             ExecutionStateEvaluation::Complete(s) => s,
-            ExecutionStateEvaluation::Executing(..) => panic!("get_state_at, failed, still executing"),
-            ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::Executing(s) => s,
+            ExecutionStateEvaluation::Error(s) => s,
             ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
         }
     }
@@ -293,8 +317,8 @@ impl InstancedEnvironment {
     pub fn get_state_at_current_execution_head(&self) -> ExecutionState {
         match self.db.get_state_at_id(self.execution_head_state_id).unwrap() {
             ExecutionStateEvaluation::Complete(s) => s,
-            ExecutionStateEvaluation::Executing(..) => panic!("get_state, failed, still executing"),
-            ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::Executing(s) => s,
+            ExecutionStateEvaluation::Error(s) => s,
             ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
         }
     }
@@ -310,7 +334,7 @@ impl InstancedEnvironment {
                 for (op_id, cell ) in s.cells_by_id.iter() {
                     cells.push(CellHolder {
                         cell: cell.clone(),
-                        op_id: Some(op_id.clone()),
+                        op_id: op_id.clone(),
                         // TODO: this should be op.created_at_state_id.clone() from the associated op
                         applied_at: Some(Uuid::new_v4()),
                         needs_update: false,
@@ -341,7 +365,7 @@ impl InstancedEnvironment {
 
     /// Increment the execution graph by one step
     #[tracing::instrument]
-    pub(crate) async fn step(&mut self) -> anyhow::Result<Vec<(usize, OperationFnOutput)>> {
+    pub(crate) async fn step(&mut self) -> anyhow::Result<Vec<(OperationId, OperationFnOutput)>> {
         println!("======================= Executing state with id {:?} ======================", self.execution_head_state_id);
         let ((state_id, state), outputs) = self.db.external_step_execution(self.execution_head_state_id).await?;
         self.push_update_to_client(&state_id, state);
@@ -350,7 +374,7 @@ impl InstancedEnvironment {
 
     /// Add a cell into the execution graph
     #[tracing::instrument]
-    pub fn upsert_cell(&mut self, cell: CellTypes, op_id: Option<usize>) -> anyhow::Result<(ExecutionNodeId, usize)> {
+    pub fn upsert_cell(&mut self, cell: CellTypes, op_id: OperationId) -> anyhow::Result<(ExecutionNodeId, OperationId)> {
         println!("Upserting cell into state with id {:?}", &self.execution_head_state_id);
         let ((state_id, state), op_id) = self.db.mutate_graph(self.execution_head_state_id, cell, op_id)?;
         self.push_update_to_client(&state_id, state);
@@ -370,7 +394,7 @@ pub enum UserInteractionMessage {
     ReloadCells,
     FetchStateAt(ExecutionNodeId),
     FetchCells,
-    MutateCell,
+    MutateCell(CellHolder),
     Shutdown,
     Step,
     ChatMessage(String)
@@ -399,7 +423,7 @@ pub enum EventsFromRuntime {
     DefinitionGraphUpdated(Vec<(OperationId, OperationId, Vec<DependencyReference>)>),
     ExecutionGraphUpdated((Vec<(ExecutionNodeId, ExecutionNodeId)>, HashSet<ExecutionNodeId>)),
     ExecutionStateChange(MergedStateHistory),
-    CellsUpdated(Vec<CellHolder>),
+    EditorCellsUpdated(HashMap<OperationId, CellHolder>),
     StateAtId(ExecutionNodeId, ExecutionState),
     UpdateExecutionHead(ExecutionNodeId),
     ReceivedChatMessage(String),
@@ -409,7 +433,7 @@ pub enum EventsFromRuntime {
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct CellHolder {
     pub cell: CellTypes,
-    pub op_id: Option<usize>,
+    pub op_id: OperationId,
     pub applied_at: Option<ExecutionNodeId>,
     pub needs_update: bool
 }
@@ -419,7 +443,7 @@ pub struct SharedState {
     pub execution_id_to_evaluation: Arc<Mutex<HashMap<ExecutionNodeId, ExecutionStateEvaluation>>>,
     execution_state_head_id: ExecutionNodeId,
     latest_state: Option<ExecutionState>,
-    editor_cells: Vec<CellHolder>,
+    editor_cells: HashMap<OperationId, CellHolder>,
     at_execution_state_cells: Vec<CellHolder>,
 }
 
@@ -445,7 +469,7 @@ impl SharedState {
             execution_id_to_evaluation: Default::default(),
             execution_state_head_id: Uuid::nil(),
             latest_state: None,
-            editor_cells: vec![],
+            editor_cells: Default::default(),
             at_execution_state_cells: vec![],
         }
     }
@@ -490,7 +514,7 @@ impl Chidori {
             shared_state: Arc::new(Mutex::new(SharedState {
                 execution_id_to_evaluation: Default::default(),
                 execution_state_head_id: Uuid::nil(),
-                editor_cells: vec![],
+                editor_cells: Default::default(),
                 at_execution_state_cells: vec![],
                 latest_state: None,
             })),
@@ -509,7 +533,7 @@ impl Chidori {
             shared_state: Arc::new(Mutex::new(SharedState {
                 execution_id_to_evaluation: Default::default(),
                 execution_state_head_id: Uuid::nil(),
-                editor_cells: vec![],
+                editor_cells: Default::default(),
 
                 at_execution_state_cells: vec![],
 
@@ -539,20 +563,20 @@ impl Chidori {
         // TODO: this overrides the entire shared state object
         let cell_name_map = {
             let previous_cells = &self.shared_state.lock().unwrap().editor_cells;
-            previous_cells.iter().map(|cell| {
+            previous_cells.values().map(|cell| {
                 let name = get_cell_name(&cell.cell);
                 (name.clone(), cell.clone())
             }).collect::<HashMap<_, _>>()
         };
 
-        let mut new_cells_state = vec![];
+        let mut new_cells_state = HashMap::new();
         for cell in cells {
             let name = get_cell_name(&cell);
             // If the named cell exists in our map already
             if let Some(existing_cell_instance) = cell_name_map.get(&name) {
                 // If it's not the same cell, replace it
                 if existing_cell_instance.cell != cell {
-                    new_cells_state.push(CellHolder {
+                    new_cells_state.insert(existing_cell_instance.op_id, CellHolder {
                         cell,
                         applied_at: None,
                         op_id: existing_cell_instance.op_id,
@@ -560,14 +584,15 @@ impl Chidori {
                     });
                 } else {
                     // It's the same cell so just push our existing state
-                    new_cells_state.push(existing_cell_instance.clone());
+                    new_cells_state.insert(existing_cell_instance.op_id, existing_cell_instance.clone());
                 }
             } else {
                 // This is a new cell, so we push it with a null applied at
-                new_cells_state.push(CellHolder {
+                let id = Uuid::new_v4();
+                new_cells_state.insert(id, CellHolder {
                     cell,
                     applied_at: None,
-                    op_id: None,
+                    op_id: id,
                     needs_update: true
                 });
             }

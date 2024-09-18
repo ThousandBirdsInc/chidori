@@ -316,7 +316,7 @@ pub struct InternalState {
     file_watch: Mutex<Option<Debouncer<RecommendedWatcher, FileIdMap>>>,
     background_thread: Mutex<Option<JoinHandle<()>>>,
     pub chidori: Arc<Mutex<Chidori>>,
-    display_example_modal: bool,
+    pub display_example_modal: bool,
 }
 
 impl InternalState {
@@ -376,6 +376,16 @@ impl InternalState {
         let env = self.chidori.lock().unwrap();
         env.handle_user_action(UserInteractionMessage::RevertToState(Some(id)))
             .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn update_cell(&self, cell_holder: CellHolder) -> anyhow::Result<(), String> {
+        let chidori = self.chidori.clone();
+        {
+            let mut chidori_guard = chidori.lock().expect("Failed to lock chidori");
+            chidori_guard.handle_user_action(UserInteractionMessage::MutateCell(cell_holder))
+                .map_err(|e| e.to_string())?;
+        }
         Ok(())
     }
 
@@ -486,7 +496,7 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                         break;
                     }
                     Err(e) => {
-                        panic!("Error occurred: {}, retrying...", e);
+                        println!("Error occurred: {}, retrying...", e);
                     }
                 }
             }
@@ -549,10 +559,10 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                             })
                             .await;
                         }
-                        EventsFromRuntime::CellsUpdated(state) => {
+                        EventsFromRuntime::EditorCellsUpdated(state) => {
                             ctx.run_on_main_thread(move |ctx| {
                                 if let Some(mut s) = ctx.world.get_resource_mut::<ChidoriCells>() {
-                                    let mut sort_cells = state.clone();
+                                    let mut sort_cells: Vec<CellHolder> = state.values().cloned().collect();
                                     sort_cells.sort_by(|a, b| {
                                         a.op_id.cmp(&b.op_id)
                                     });
@@ -647,7 +657,6 @@ pub fn update_gui(
         egui::CentralPanel::default()
             .frame(
                 Frame::default()
-                    .fill(Color32::from_hex("#222222").unwrap())
                     .inner_margin(16.0)
                     .outer_margin(100.0)
                     .rounding(16.0),
@@ -738,7 +747,7 @@ pub fn update_gui(
 
                         if let Some((title, code, desc)) = &*displayed_example_desc {
                             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                                let mut frame = egui::Frame::default().outer_margin(Margin::symmetric(64.0, 0.0)).inner_margin(64.0).rounding(6.0).fill(Color32::from_hex("#111111").unwrap()).begin(ui);
+                                let mut frame = egui::Frame::default().outer_margin(Margin::symmetric(64.0, 0.0)).inner_margin(64.0).rounding(6.0).begin(ui);
                                 {
                                     let mut ui = &mut frame.content_ui;
                                     let mut code_mut = code.to_string();

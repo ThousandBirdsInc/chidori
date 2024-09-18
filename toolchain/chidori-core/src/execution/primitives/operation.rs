@@ -15,8 +15,7 @@ use crate::cells::{CellTypes, CodeCell, SupportedLanguage, TextRange};
 use crate::execution::execution::execution_graph::ExecutionNodeId;
 use crate::execution::execution::execution_state::{ExecutionStateErrors, OperationInputs};
 use crate::execution::execution::ExecutionState;
-
-
+use crate::execution::primitives::identifiers::OperationId;
 // args, kwargs, locals and their configurations
 
 #[derive(Debug, Clone)]
@@ -302,7 +301,7 @@ pub type OperationFn = dyn Fn(
 
 // TODO: rather than dep_count operation node should have a specific dep mapping
 pub struct OperationNode {
-    pub(crate) id: usize,
+    pub(crate) id: OperationId,
     pub(crate) name: Option<String>,
     pub created_at_state_id: ExecutionNodeId,
 
@@ -372,7 +371,7 @@ impl fmt::Debug for OperationNode {
 impl Default for OperationNode {
     fn default() -> Self {
         OperationNode {
-            id: 0,
+            id: Uuid::nil(),
             name: None,
             created_at_state_id: Uuid::nil(),
             is_long_running_background_thread: false,

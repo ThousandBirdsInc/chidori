@@ -15,6 +15,7 @@ use swc_common::source_map::Pos;
 use swc_ecma_ast as ast;
 use swc_ecma_ast::{BlockStmtOrExpr, Callee, Decl, Expr, FnDecl, ForHead, Ident, ImportSpecifier, Lit, MemberProp, ModuleDecl, ModuleItem, Pat, PatOrExpr, PropName, Stmt};
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
+use crate::language::ChidoriStaticAnalysisError;
 use crate::language::ContextPath;
 
 fn remove_hash_and_numbers(input: &str) -> String {
@@ -676,7 +677,7 @@ fn traverse_stmts(stmts: &[Stmt], machine: &mut ASTWalkContext) {
     }
 }
 
-pub fn extract_dependencies_js(source: &str) -> Vec<Vec<ContextPath>> {
+pub fn extract_dependencies_js(source: &str) -> Result<Vec<Vec<ContextPath>>, ChidoriStaticAnalysisError> {
     let mut machine = ASTWalkContext::new();
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
@@ -703,14 +704,27 @@ pub fn extract_dependencies_js(source: &str) -> Vec<Vec<ContextPath>> {
         .or_else(|_| parse_module(Syntax::Typescript(Default::default())))
         .map_err(|mut e| {
             // Unrecoverable fatal error occurred
-            e.into_diagnostic(&handler).emit()
-        })
-        .expect("failed to parse module as either ECMAScript or TypeScript");
+            e
+            // e.into_diagnostic(&handler).emit()
+        });
 
-    for item in module.body {
-        traverse_module(item, &mut machine);
+    match module {
+        Ok(module) => {
+            for item in module.body {
+                traverse_module(item, &mut machine);
+            }
+            Ok(machine.context_stack_references)
+        },
+        Err(e) => {
+            Err(ChidoriStaticAnalysisError::ParseError {
+                msg: format!("{:?}", e),
+                offset: 0,
+                source_path: "".to_string(),
+                source_code: "".to_string(),
+            })
+
+        }
     }
-    machine.context_stack_references
 }
 
 
@@ -873,7 +887,7 @@ mod tests {
 
             ch.prompt.configure("default", ch.llm({model: "openai"}))
             "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::assert_yaml_snapshot!(context_stack_references);
     }
 
@@ -882,7 +896,7 @@ mod tests {
         let js_source = indoc! { r#"
             const x = 1
             "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             description => js_source,
             omit_expression => true
@@ -898,7 +912,7 @@ mod tests {
                 return prompt("prompts/create_dockerfile")
             }
             "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             description => js_source,
             omit_expression => true
@@ -917,7 +931,7 @@ mod tests {
                 return prompt("prompts/create_dockerfile")
             }
             "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
 
         insta::with_settings!({
             description => js_source,
@@ -936,7 +950,7 @@ mod tests {
                 ch.set("bar", 1);
             }
             "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             description => js_source,
             omit_expression => true
@@ -955,7 +969,7 @@ mod tests {
                 ch.set("file_path", ev.file_path)
             }
             "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
 
         insta::with_settings!({
             description => js_source,
@@ -974,7 +988,7 @@ mod tests {
                 migration_agent()
             }
             "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
 
         insta::with_settings!({
             description => js_source,
@@ -993,7 +1007,7 @@ mod tests {
                 return x
             }
             "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
 
         insta::with_settings!({
             description => js_source,
@@ -1014,7 +1028,7 @@ mod tests {
             // Example usage
             const v = subtract(x, 5);
             "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
 
         insta::with_settings!({
             description => js_source,
@@ -1032,7 +1046,7 @@ mod tests {
                 bar() | foo() | baz()
             }
             "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             description => js_source,
             omit_expression => true
@@ -1051,7 +1065,7 @@ mod tests {
             return x
         }
             "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             description => js_source,
             omit_expression => true
@@ -1074,7 +1088,7 @@ mod tests {
             return x
         }
             "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             description => js_source,
             omit_expression => true
@@ -1101,7 +1115,7 @@ mod tests {
             assertEquals(result, 4);
         });
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             description => js_source,
             omit_expression => true
@@ -1144,7 +1158,7 @@ function fun_name() {
 
 x = random.randint(0, 10)
 "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             description => js_source,
             omit_expression => true
@@ -1197,7 +1211,7 @@ x = random.randint(0, 10)
 
         const result = processValues({ x: a, y: b });
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             description => js_source,
             omit_expression => true
@@ -1226,7 +1240,7 @@ mod destructuring_tests {
         let js_source = indoc! { r#"
             const { a, b } = { a: 1, b: 2 };
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1252,7 +1266,7 @@ mod destructuring_tests {
         let js_source = indoc! { r#"
             const { c: renamed, d = 'default' } = { c: 3 };
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1278,7 +1292,7 @@ mod destructuring_tests {
         let js_source = indoc! { r#"
             const { e: { f } } = { e: { f: 4 } };
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1304,7 +1318,7 @@ mod destructuring_tests {
         let js_source = indoc! { r#"
             const [g, h] = [5, 6];
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1330,7 +1344,7 @@ mod destructuring_tests {
         let js_source = indoc! { r#"
             const [i, , j] = [7, 8, 9];
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1356,7 +1370,7 @@ mod destructuring_tests {
         let js_source = indoc! { r#"
             const [k, ...rest] = [10, 11, 12];
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1382,7 +1396,7 @@ mod destructuring_tests {
         let js_source = indoc! { r#"
             const { l, m: [n, o] } = { l: 13, m: [14, 15] };
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1410,7 +1424,7 @@ mod destructuring_tests {
                 console.log(`${name} is ${age} years old`);
             }
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1437,7 +1451,7 @@ mod destructuring_tests {
             const key = 'p';
             const { [key]: value } = { p: 16 };
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1463,7 +1477,7 @@ mod destructuring_tests {
         let js_source = indoc! { r#"
             const { q: { r: [s, { t }] } } = { q: { r: [17, { t: 18 }] } };
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1489,7 +1503,7 @@ mod destructuring_tests {
         let js_source = indoc! { r#"
             const { u, ...others } = { u: 19, v: 20, w: 21 };
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1518,7 +1532,7 @@ mod destructuring_tests {
                 console.log(`${id}: ${name}`);
             }
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1544,7 +1558,7 @@ mod destructuring_tests {
         let js_source = indoc! { r#"
             const { x: newX = 100 } = {};
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1570,7 +1584,7 @@ mod destructuring_tests {
         let js_source = indoc! { r#"
             const [y = 200, z = 300] = [22];
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1599,7 +1613,7 @@ mod destructuring_tests {
             }
             const [first, ...restArray] = returnArray();
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1626,7 +1640,7 @@ mod destructuring_tests {
             let aa = 'first', bb = 'second';
             [aa, bb] = [bb, aa];
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1660,7 +1674,7 @@ mod for_loop_tests {
                 console.log(i);
             }
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1689,7 +1703,7 @@ mod for_loop_tests {
                 console.log(item);
             }
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1718,7 +1732,7 @@ mod for_loop_tests {
                 console.log(key, obj[key]);
             }
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1746,7 +1760,7 @@ mod for_loop_tests {
                 console.log(i, j);
             }
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1775,7 +1789,7 @@ mod for_loop_tests {
                 console.log(i);
             }
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1804,7 +1818,7 @@ mod for_loop_tests {
                 console.log(i);
             }
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1834,7 +1848,7 @@ mod for_loop_tests {
                 }
             }
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1863,7 +1877,7 @@ mod for_loop_tests {
                 console.log(x);
             }
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1892,7 +1906,7 @@ mod for_loop_tests {
                 console.log(y);
             }
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1921,7 +1935,7 @@ mod for_loop_tests {
                 console.log(z);
             }
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1950,7 +1964,7 @@ mod for_loop_tests {
                 console.log(num, word);
             }
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -1979,7 +1993,7 @@ mod for_loop_tests {
                 console.log(a, b);
             }
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         insta::with_settings!({
             sort_maps => true,
             description => js_source,
@@ -2016,7 +2030,7 @@ mod anonymous_function_tests {
             };
             func(1, 2);
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         let result = build_report(&context_stack_references);
 
         assert!(result.cell_depended_values.is_empty(), "Anonymous function parameters should not be depended upon");
@@ -2029,7 +2043,7 @@ mod anonymous_function_tests {
             const arrowFunc = (a, b) => a * b;
             arrowFunc(3, 4);
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         let result = build_report(&context_stack_references);
 
         assert!(result.cell_depended_values.is_empty(), "Arrow function parameters should not be depended upon");
@@ -2043,7 +2057,7 @@ mod anonymous_function_tests {
                 console.log(x);
             })(5);
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         let result = build_report(&context_stack_references);
 
         assert!(result.cell_depended_values.is_empty(), "IIFE parameters should not be depended upon");
@@ -2059,7 +2073,7 @@ mod anonymous_function_tests {
                 return num * 2;
             });
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         let result = build_report(&context_stack_references);
 
         assert!(!result.cell_depended_values.contains_key("num"), "Callback parameter should not be depended upon");
@@ -2076,7 +2090,7 @@ mod anonymous_function_tests {
             };
             nestedFunc(5)(3);
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         let result = build_report(&context_stack_references);
 
         assert!(result.cell_depended_values.is_empty(), "Nested anonymous function parameters should not be depended upon");
@@ -2091,7 +2105,7 @@ mod anonymous_function_tests {
             };
             destructuringFunc({ a: 1, b: 2 });
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         let result = build_report(&context_stack_references);
 
         assert!(result.cell_depended_values.is_empty(), "Destructured parameters should not be depended upon");
@@ -2108,7 +2122,7 @@ mod anonymous_function_tests {
             };
             obj.method(4);
         "#};
-        let context_stack_references = extract_dependencies_js(js_source);
+        let context_stack_references = extract_dependencies_js(js_source).unwrap();
         let result = build_report(&context_stack_references);
 
         assert!(result.cell_depended_values.is_empty(), "Object method parameters should not be depended upon");

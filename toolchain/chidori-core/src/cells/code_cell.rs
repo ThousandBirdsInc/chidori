@@ -61,7 +61,7 @@ pub fn code_cell(execution_state_id: ExecutionNodeId, cell: &CodeCell, range: &T
             let paths =
                 chidori_static_analysis::language::javascript::parse::extract_dependencies_js(
                     &cell.source_code,
-                );
+                )?;
             let report = chidori_static_analysis::language::javascript::parse::build_report(&paths);
 
             let (input_signature, output_signature) = signatures_from_report(&report);

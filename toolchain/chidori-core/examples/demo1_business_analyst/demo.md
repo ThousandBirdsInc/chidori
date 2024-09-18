@@ -4,47 +4,23 @@ We use Astral rather than Playwright for Deno support
 https://astral.deno.dev/guides/navigation/
 
 ```ts
+// Import Astral
 import { launch } from "https://deno.land/x/astral/mod.ts";
 
+// Launch the browser
+const browser = await launch();
 
-// Connect to remote endpoint
-const browser = await launch({
-    wsEndpoint: `wss://connect.browserbase.com?apiKey=${Deno.env.get("BROWSERBASE_API_KEY")}`
-});
-
-// Do stuff
-// Open the webpage
+// Open a new page
 const page = await browser.newPage("https://deno.land");
 
-// Click the search button
-const button = await page.$("button");
-await button!.click();
+// Take a screenshot of the page and save that to disk
+// TODO: doing this in a closure so we don't attempt to serialize the output, we don't support binary arrays yet
+(async () => {
+    const screenshot = await page.screenshot();
+    Deno.writeFileSync("screenshot.png", screenshot);
+})()
 
-// Type in the search input
-const input = await page.$("#search-input");
-await input!.type("pyro", { delay: 1000 });
-
-// Wait for the search results to come back
-await page.waitForNetworkIdle({ idleConnections: 0, idleTime: 1000 });
-
-// Click the 'pyro' link
-const xLink = await page.$("a.justify-between:nth-child(1)");
-await Promise.all([
-    xLink!.click(),
-    page.waitForNavigation(),
-]);
-
-// Click the link to 'pyro.deno.dev'
-const dLink = await page.$(
-    ".markdown-body > p:nth-child(8) > a:nth-child(1)",
-);
-await Promise.all([
-    dLink!.click(),
-    page.waitForNavigation(),
-]);
-
-
-// Close connection
+// Close the browser
 await browser.close();
 ```
 

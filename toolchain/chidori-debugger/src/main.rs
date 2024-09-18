@@ -26,6 +26,7 @@ use crate::bevy_egui::{EguiPlugin, egui, EguiContexts};
 use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Rounding};
 use bevy_rapier2d::plugin::{NoUserData, RapierPhysicsPlugin};
 use bevy_rapier2d::render::RapierDebugRenderPlugin;
+use egui::style::{HandleShape, NumericColorSpace};
 use once_cell::sync::{Lazy, OnceCell};
 
 
@@ -92,8 +93,173 @@ fn setup(
     // style_egui_context(contexts);
 }
 
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub struct Theme {
+    pub is_dark_mode: bool,
+    pub background: Color32,
+    pub foreground: Color32,
+    pub card: Color32,
+    pub card_foreground: Color32,
+    pub popover: Color32,
+    pub popover_foreground: Color32,
+    pub primary: Color32,
+    pub primary_foreground: Color32,
+    pub secondary: Color32,
+    pub secondary_foreground: Color32,
+    pub muted: Color32,
+    pub muted_foreground: Color32,
+    pub accent: Color32,
+    pub accent_foreground: Color32,
+    pub destructive: Color32,
+    pub destructive_foreground: Color32,
+    pub border: Color32,
+    pub input: Color32,
+    pub ring: Color32,
+    pub chart_1: Color32,
+    pub chart_2: Color32,
+    pub chart_3: Color32,
+    pub chart_4: Color32,
+    pub chart_5: Color32,
+}
+
+impl Theme {
+    pub fn new(is_dark_mode: bool) -> Self {
+        if is_dark_mode {
+            Theme {
+                is_dark_mode: true,
+                background: Color32::from_rgb(12, 10, 9),          // #0c0a09
+                foreground: Color32::from_rgb(242, 242, 242),      // #f2f2f2
+                card: Color32::from_rgb(26, 26, 26),               // #1a1a1a
+                card_foreground: Color32::from_rgb(242, 242, 242), // #f2f2f2
+                popover: Color32::from_rgb(23, 23, 23),            // #171717
+                popover_foreground: Color32::from_rgb(242, 242, 242), // #f2f2f2
+                primary: Color32::from_rgb(225, 29, 72),           // #e11d48
+                primary_foreground: Color32::from_rgb(255, 241, 242), // #fff1f2
+                secondary: Color32::from_rgb(38, 38, 38),          // #262626
+                secondary_foreground: Color32::from_rgb(250, 250, 250), // #fafafa
+                muted: Color32::from_rgb(38, 38, 38),              // #262626
+                muted_foreground: Color32::from_rgb(161, 161, 170),   // #a1a1aa
+                accent: Color32::from_rgb(42, 42, 42),             // #2a2a2a
+                accent_foreground: Color32::from_rgb(250, 250, 250), // #fafafa
+                destructive: Color32::from_rgb(220, 38, 38),        // #dc2626
+                destructive_foreground: Color32::from_rgb(255, 241, 242), // #fff1f2
+                border: Color32::from_rgb(38, 38, 38),             // #262626
+                input: Color32::from_rgb(38, 38, 38),              // #262626
+                ring: Color32::from_rgb(225, 29, 72),              // #e11d48
+                chart_1: Color32::from_rgb(59, 130, 246),          // #3b82f6
+                chart_2: Color32::from_rgb(16, 185, 129),          // #10b981
+                chart_3: Color32::from_rgb(245, 158, 11),          // #f59e0b
+                chart_4: Color32::from_rgb(139, 92, 246),          // #8b5cf6
+                chart_5: Color32::from_rgb(236, 72, 153),          // #ec4899
+            }
+        } else {
+            Theme {
+                is_dark_mode: false,
+                background: Color32::from_rgb(255, 255, 255),      // #ffffff
+                foreground: Color32::from_rgb(9, 9, 11),           // #09090b
+                card: Color32::from_rgb(255, 255, 255),            // #ffffff
+                card_foreground: Color32::from_rgb(9, 9, 11),      // #09090b
+                popover: Color32::from_rgb(255, 255, 255),         // #ffffff
+                popover_foreground: Color32::from_rgb(9, 9, 11),   // #09090b
+                primary: Color32::from_rgb(225, 29, 72),           // #e11d48
+                primary_foreground: Color32::from_rgb(255, 241, 242), // #fff1f2
+                secondary: Color32::from_rgb(243, 243, 245),       // #f3f3f5
+                secondary_foreground: Color32::from_rgb(24, 24, 27), // #18181b
+                muted: Color32::from_rgb(243, 243, 245),           // #f3f3f5
+                muted_foreground: Color32::from_rgb(113, 113, 121),  // #717179
+                accent: Color32::from_rgb(243, 243, 245),          // #f3f3f5
+                accent_foreground: Color32::from_rgb(24, 24, 27),    // #18181b
+                destructive: Color32::from_rgb(239, 68, 68),       // #ef4444
+                destructive_foreground: Color32::from_rgb(250, 250, 250), // #fafafa
+                border: Color32::from_rgb(228, 228, 231),          // #e4e4e7
+                input: Color32::from_rgb(228, 228, 231),           // #e4e4e7
+                ring: Color32::from_rgb(225, 29, 72),              // #e11d48
+                chart_1: Color32::from_rgb(231, 110, 79),          // #e76e4f
+                chart_2: Color32::from_rgb(42, 157, 144),          // #2a9d90
+                chart_3: Color32::from_rgb(39, 71, 84),            // #274754
+                chart_4: Color32::from_rgb(232, 196, 104),         // #e8c468
+                chart_5: Color32::from_rgb(244, 164, 98),          // #f4a462
+            }
+        }
+    }
+
+    fn make_widget_visual(
+        &self,
+        old: egui::style::WidgetVisuals,
+        bg_fill: Color32,
+    ) -> egui::style::WidgetVisuals {
+        egui::style::WidgetVisuals {
+            bg_fill,
+            weak_bg_fill: bg_fill,
+            bg_stroke: egui::Stroke {
+                color: self.border,
+                ..old.bg_stroke
+            },
+            fg_stroke: egui::Stroke {
+                color: self.foreground,
+                ..old.fg_stroke
+            },
+            ..old
+        }
+    }
+
+    pub fn visuals(&self, old: egui::Visuals) -> egui::Visuals {
+        egui::Visuals {
+            override_text_color: Some(self.foreground),
+            hyperlink_color: self.primary,
+            faint_bg_color: self.secondary,
+            extreme_bg_color: self.background,
+            code_bg_color: self.card,
+            warn_fg_color: self.destructive,
+            error_fg_color: self.destructive,
+            window_fill: self.background,
+            panel_fill: self.card,
+            window_stroke: egui::Stroke {
+                color: self.border,
+                ..old.window_stroke
+            },
+            widgets: egui::style::Widgets {
+                noninteractive: self.make_widget_visual(old.widgets.noninteractive, self.background),
+                inactive: self.make_widget_visual(old.widgets.inactive, self.secondary),
+                hovered: self.make_widget_visual(old.widgets.hovered, self.muted),
+                active: self.make_widget_visual(old.widgets.active, self.accent),
+                open: self.make_widget_visual(old.widgets.open, self.secondary),
+            },
+            selection: egui::style::Selection {
+                bg_fill: self.primary.linear_multiply(0.2),
+                stroke: egui::Stroke {
+                    color: self.primary,
+                    ..old.selection.stroke
+                },
+            },
+            window_shadow: egui::epaint::Shadow {
+                color: self.background,
+                ..old.window_shadow
+            },
+            popup_shadow: egui::epaint::Shadow {
+                color: self.background,
+                ..old.popup_shadow
+            },
+            dark_mode: self.is_dark_mode,
+            ..old
+        }
+    }
+}
+
+pub fn set_theme(ctx: &egui::Context, is_dark_mode: bool) {
+    let theme = Theme::new(is_dark_mode);
+    let old = ctx.style().visuals.clone();
+    ctx.set_visuals(theme.visuals(old));
+}
+
+
+
+
 pub fn style_egui_context(ctx: &mut egui::Context ) {
     let mut fonts = FontDefinitions::default();
+
+    set_theme(ctx, true);
 
     fonts.font_data.insert("CommitMono".to_owned(),
                            FontData::from_static(include_bytes!("../assets/fonts/CommitMono-1.143/CommitMono-400-Regular.otf"))); // .ttf and .otf supported
@@ -118,7 +284,7 @@ pub fn style_egui_context(ctx: &mut egui::Context ) {
         (bevy_egui::egui::TextStyle::Small, FontId::new(12.0, bevy_egui::egui::FontFamily::Proportional)),
     ]
         .into();
-    style.visuals.widgets.hovered.bg_stroke = bevy_egui::egui::Stroke::new(1.0, Color32::from_hex("#333333").unwrap());
+    // style.visuals.widgets.hovered.bg_stroke = bevy_egui::egui::Stroke::new(1.0, Color32::from_hex("#333333").unwrap());
     style.spacing.button_padding = egui::vec2(8.0, 6.0);
     style.visuals.widgets.inactive.rounding = Rounding::same(4.0);
     style.visuals.widgets.active.rounding = Rounding::same(4.0);

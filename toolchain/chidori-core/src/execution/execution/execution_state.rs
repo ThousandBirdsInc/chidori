@@ -82,7 +82,7 @@ pub enum ExecutionStateErrors {
     NoFurtherExecutionDetected,
     #[error("an unexpected error has occurred during the evaluation of state {0}")]
     CellExecutionUnexpectedFailure(ExecutionNodeId, String),
-    #[error("unknown execution state error")]
+    #[error("unknown execution state error: {0}")]
     Unknown(String),
     #[error("Anyhow Error: {0}")]
     AnyhowError(String),
@@ -97,7 +97,7 @@ impl From<anyhow::Error> for ExecutionStateErrors {
 #[derive(Clone)]
 pub enum ExecutionStateEvaluation {
     /// An exception was thrown
-    Error(ExecutionNodeId),
+    Error(ExecutionState),
     /// An eval function indicated that we should return
     EvalFailure(ExecutionNodeId),
     /// Execution complete
@@ -132,7 +132,7 @@ impl Debug for ExecutionStateEvaluation {
         match self {
             ExecutionStateEvaluation::Complete(ref state) => f.debug_tuple("Complete").field(state).finish(),
             ExecutionStateEvaluation::Executing(ref state) => f.debug_tuple("Executing").field(state).finish(),
-            ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
+            ExecutionStateEvaluation::Error(ref state) => f.debug_tuple("Error").field(state).finish(),
             ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
         }
     }
@@ -143,7 +143,7 @@ impl Debug for ExecutionStateEvaluation {
 
 #[derive(Debug, Clone)]
 pub struct FunctionMetadata {
-    operation_id: usize,
+    operation_id: OperationId,
     pub(crate) input_signature: InputSignature,
 }
 
@@ -158,7 +158,7 @@ pub struct ExecutionState {
 
     pub external_event_queue_head: usize,
 
-    pub evaluating_id: usize,
+    pub evaluating_id: OperationId,
     pub evaluating_name: Option<String>,
     pub evaluating_fn: Option<String>,
     pub evaluating_arguments: Option<RkyvSerializedValue>,
@@ -170,16 +170,16 @@ pub struct ExecutionState {
     pub graph_sender: Option<Arc<tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>>>,
 
     /// Queue of operations to evaluate
-    pub exec_queue: VecDeque<usize>,
+    pub exec_queue: VecDeque<OperationId>,
 
     // TODO: call_stack is only ever a single coroutine at a time and instead its the stack of execution states being resolved?
     // pub call_stack: Arc<Mutex<Pin<Box<dyn Coroutine<Return=CoroutineYieldValue, Yield=CoroutineYieldValue>>>>>,
 
     /// Map of operation_id -> output value of that operation
-    pub state: ImHashMap<usize, Arc<OperationFnOutput>>,
+    pub state: ImHashMap<OperationId, Arc<OperationFnOutput>>,
 
     /// Values that were introduced specifically by this state being evaluated, used to identity most recent changes
-    pub fresh_values: IndexSet<usize>,
+    pub fresh_values: IndexSet<OperationId>,
 
     /// Map of name of operation -> operation_id
     pub operation_name_to_id: ImHashMap<String, OperationId>,
@@ -197,7 +197,7 @@ pub struct ExecutionState {
 
     /// Note what keys have _ever_ been set, which is an optimization to avoid needing to do
     /// a complete historical traversal to verify that a value has been set.
-    pub has_been_set: ImHashSet<usize>,
+    pub has_been_set: ImHashSet<OperationId>,
 
     /// Dependency graph of the computable elements in the graph
     ///
@@ -273,7 +273,7 @@ impl Default for ExecutionState {
             stack: Default::default(),
             parent_state_id: Uuid::nil(),
             op_counter: 0,
-            evaluating_id: 0,
+            evaluating_id: Uuid::nil(),
             evaluating_name: None,
             evaluating_fn: None,
             evaluating_arguments: None,
@@ -422,8 +422,8 @@ impl ExecutionState {
     pub fn update_op(
         &self,
         cell: CellTypes,
-        op_id: Option<usize>,
-    ) -> anyhow::Result<(ExecutionState, usize)> {
+        op_id: OperationId,
+    ) -> anyhow::Result<(ExecutionState, OperationId)> {
         let mut op = match &cell {
             CellTypes::Code(c, r) => crate::cells::code_cell::code_cell(self.id.clone(), c, r),
             CellTypes::Prompt(c, r) => crate::cells::llm_prompt_cell::llm_prompt_cell(self.id.clone(), c, r),
@@ -524,22 +524,17 @@ impl ExecutionState {
     /// Inserts a new operation into the execution state, returning the operation id and the new state.
     /// That operation can then be referred to by its id.
     #[tracing::instrument]
-    pub fn upsert_operation(&self, mut operation_node: OperationNode, op_id: Option<usize>) -> (usize, Self) {
+    pub fn upsert_operation(&self, mut operation_node: OperationNode, op_id: OperationId) -> (OperationId, Self) {
         let mut s = self.clone();
-        let op_id = if let Some(op_id) = op_id {
-            op_id
-        } else {
-            operation_node.name.as_ref()
-                .and_then(|name| s.operation_name_to_id.get(name).copied())
-                .unwrap_or_else(|| {
-                    let new_id = s.op_counter;
-                    s.op_counter += 1;
-                    if let Some(name) = &operation_node.name {
-                        s.operation_name_to_id.insert(name.clone(), new_id);
-                    }
-                    new_id
-                })
-        };
+        operation_node.name.as_ref()
+            .and_then(|name| s.operation_name_to_id.get(name).copied())
+            .unwrap_or_else(|| {
+                let new_id = Uuid::new_v4();
+                if let Some(name) = &operation_node.name {
+                    s.operation_name_to_id.insert(name.clone(), op_id);
+                }
+                new_id
+            });
         operation_node.id = op_id;
         s.cells_by_id.insert(op_id, operation_node.cell.clone());
         s.operation_by_id.insert(op_id, Arc::new(Mutex::new(operation_node)));
@@ -678,15 +673,20 @@ impl ExecutionState {
         // Add result into a new execution state
         let mut after_execution_state = state.clone();
         after_execution_state.stack.pop_back();
-        after_execution_state.state_insert(usize::MAX, result.clone());
-        after_execution_state.fresh_values.insert(usize::MAX);
+        after_execution_state.state_insert(Uuid::nil(), result.clone());
+        after_execution_state.fresh_values.insert(Uuid::nil());
 
+        // TODO: if result is an error, return an error instead and then pause
 
-        // Capture the value of the output
         if let Some(graph_sender) = self.graph_sender.as_ref() {
             let s = graph_sender.clone();
-            let result = pause_future_with_oneshot(ExecutionStateEvaluation::Complete(after_execution_state.clone()), &s).await;
-            let _recv = result.await;
+            if result.output.is_err() {
+                let result = pause_future_with_oneshot(ExecutionStateEvaluation::Error(after_execution_state.clone()), &s).await;
+                let _recv = result.await;
+            } else {
+                let result = pause_future_with_oneshot(ExecutionStateEvaluation::Complete(after_execution_state.clone()), &s).await;
+                let _recv = result.await;
+            }
         }
 
         // Return the result, to be used in the context of the parent function
@@ -874,7 +874,7 @@ impl ExecutionState {
     pub async fn step_execution(
         &self,
         eval: ExecutionStateEvaluation,
-    ) -> anyhow::Result<(ExecutionStateEvaluation, Vec<(usize, OperationFnOutput)>)> {
+    ) -> anyhow::Result<(ExecutionStateEvaluation, Vec<(OperationId, OperationFnOutput)>)> {
         let mut outputs = vec![];
         let ExecutionStateEvaluation::Executing(mut new_state) = eval else {
             return Err(Error::msg("attempting to step invalid state"));

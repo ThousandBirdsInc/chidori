@@ -668,7 +668,8 @@ fn update_positions(
                     // let config_space_pos_x = scale_to_target(node.absolute_timestamp - startpoint_value, endpoint_value - startpoint_value, CAMERA_SPACE_WIDTH) - (CAMERA_SPACE_WIDTH / 2.0);
                     let config_space_pos_x = scale_to_target(node.adjusted_timestamp - 0, relative_endpoint - startpoint_value, CAMERA_SPACE_WIDTH) - (CAMERA_SPACE_WIDTH / 2.0);
                     let config_space_width = scale_to_target(node.total_duration, relative_endpoint - startpoint_value, CAMERA_SPACE_WIDTH);
-                    let screen_space_pos_y = ((node.depth as f32) * (node.render_lane as f32) * -1.0 * span_height + span_height / 2.0) * node.thread_depth as f32;
+                    let screen_space_pos_y = ((node.depth as f32) * (node.render_lane as f32) * -1.0 * span_height + span_height / 2.0);
+                    // let screen_space_pos_y = ((node.depth as f32) * (node.render_lane as f32) * -1.0 * span_height + span_height / 2.0) * node.thread_depth as f32;
 
                     // let screen_space_pos_y = ((node.depth as f32) * -1.0 * span_height + span_height / 2.0) * node.thread_depth as f32;
                     // let screen_space_pos_y = ((node.depth as f32) * -1.0 * span_height + span_height / 2.0) * 1.0 as f32;

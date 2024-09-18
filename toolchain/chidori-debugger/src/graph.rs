@@ -16,7 +16,7 @@ use bevy::render::view::{NoFrustumCulling, RenderLayers};
 use bevy::tasks::futures_lite::StreamExt;
 use bevy::utils::petgraph::stable_graph::GraphIndex;
 use bevy::window::{PrimaryWindow, WindowResized};
-use egui::{Color32, Order, Pos2, Rgba, RichText, Ui};
+use egui::{Color32, Order, Pos2, Rgba, RichText, Stroke, Ui};
 use crate::bevy_egui::{EguiContext, EguiContexts, EguiManagedTextures, EguiRenderOutput, EguiRenderTarget};
 use egui;
 use bevy_rapier2d::geometry::Collider;
@@ -32,6 +32,7 @@ use petgraph::data::DataMap;
 use petgraph::prelude::StableGraph;
 use petgraph::visit::Walker;
 use std::collections::{HashMap, HashSet};
+use std::fmt::format;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::ptr::NonNull;
@@ -41,7 +42,7 @@ use bevy::render::render_asset::RenderAssetUsages;
 use crate::egui_json_tree::JsonTree;
 use egui_tiles::Tile;
 use image::{ImageBuffer, RgbaImage};
-use chidori_core::execution::execution::execution_state::ExecutionStateEvaluation;
+use chidori_core::execution::execution::execution_state::{ExecutionStateErrors, ExecutionStateEvaluation};
 use uuid::Uuid;
 use chidori_core::execution::primitives::serialized_value::RkyvSerializedValue;
 use crate::tree_grouping::group_tree;
@@ -569,9 +570,16 @@ fn egui_execution_state(ui: &mut Ui, execution_state: &ExecutionState) {
             ui.label("Output:");
             for (key, value) in execution_state.state.iter() {
                 if execution_state.fresh_values.contains(key) {
-                    let response = JsonTree::new(format!("{:?}", key), &value.output.clone().unwrap())
-                        // .default_expand(DefaultExpand::SearchResults(&self.search_input))
-                        .show(ui);
+                    match &value.output.clone() {
+                        Ok(o) => {
+                            let response = JsonTree::new(format!("{:?}", key), o)
+                                // .default_expand(DefaultExpand::SearchResults(&self.search_input))
+                                .show(ui);
+                        }
+                        Err(e) => {
+                            ui.label(format!("{:?}", e));
+                        }
+                    }
                     // util::egui_rkyv(ui, &value.output, false);
                 }
             }
@@ -947,27 +955,41 @@ fn update_graph_system_renderer(
                                                 });
                                             });
                                         } else {
-                                            ui.horizontal(|ui| {
-                                                ui.label(RichText::new(node1.to_string()).color(Color32::BLACK));
-                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                                                    if ui.button(RichText::new("Revert to this State").color(Color32::from_hex("#dddddd").unwrap())).clicked() {
-                                                        println!("We would like to revert to {:?}", node1);
-                                                        let _ = internal_state.set_execution_id(*node1);
-                                                    }
-                                                });
-                                            });
 
 
                                             if let Some(state) = internal_state.chidori.lock().unwrap().get_shared_state().execution_id_to_evaluation.lock().unwrap().get(&node1) {
+
+                                                if !matches!(state, ExecutionStateEvaluation::Executing(_)) {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new(node1.to_string()).color(Color32::BLACK));
+                                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                                            if ui.button(RichText::new("Revert to this State").color(Color32::from_hex("#dddddd").unwrap())).clicked() {
+                                                                println!("We would like to revert to {:?}", node1);
+                                                                let _ = internal_state.set_execution_id(*node1);
+                                                            }
+                                                        });
+                                                    });
+                                                }
+
                                                 match state {
-                                                    ExecutionStateEvaluation::Error(_) => {
-                                                        ui.label("Error");
+                                                    ExecutionStateEvaluation::Error(state) => {
+                                                        let mut frame = egui::Frame::default().fill(Color32::from_hex("#eeeeee").unwrap()).stroke(Stroke {
+                                                            width: 1.0,
+                                                            color: Color32::from_hex("#ff0000").unwrap(),
+                                                        }).inner_margin(16.0).rounding(6.0).begin(ui);
+                                                        {
+                                                            let mut ui = &mut frame.content_ui;
+                                                            ui.label("Error");
+                                                            egui_execution_state(ui, state);
+                                                        }
+                                                        frame.end(ui);
                                                     }
                                                     ExecutionStateEvaluation::EvalFailure(_) => {
                                                         ui.label("Eval Failure");
                                                     }
                                                     ExecutionStateEvaluation::Executing(state) => {
                                                         ui.label("Executing");
+                                                        egui_execution_state(ui, state);
                                                     }
                                                     ExecutionStateEvaluation::Complete(state)=> {
                                                         for (key, value) in state.state.iter() {

@@ -48,7 +48,7 @@ pub type ExecutionNodeId = Uuid;
 
 
 #[derive(Debug, Clone)]
-pub struct MergedStateHistory(pub HashMap<usize, (ExecutionNodeId, Arc<OperationFnOutput>)>);
+pub struct MergedStateHistory(pub HashMap<OperationId, (ExecutionNodeId, Arc<OperationFnOutput>)>);
 
 // TODO: every point in the execution graph should be a top level element in an execution stack
 //       but what about async functions?
@@ -182,8 +182,9 @@ impl ExecutionGraph {
 
                                 let s = resulting_execution_state.clone();
                                 match &resulting_execution_state {
-                                    ExecutionStateEvaluation::Error(id) => {
-                                        execution_event_tx_clone.send(ExecutionEvent{id: id.clone(), evaluation: s.clone()}).await;
+                                    ExecutionStateEvaluation::Error(state) => {
+                                        let resulting_state_id = state.id;
+                                        execution_event_tx_clone.send(ExecutionEvent{id: resulting_state_id.clone(), evaluation: s.clone()}).await;
                                     }
                                     ExecutionStateEvaluation::EvalFailure(id) => {
                                         execution_event_tx_clone.send(ExecutionEvent{id: id.clone(), evaluation: s.clone()}).await;
@@ -205,8 +206,11 @@ impl ExecutionGraph {
                                 let mut state_id_to_state = state_id_to_state_clone.lock().unwrap();
 
                                 match resulting_execution_state {
-                                    ExecutionStateEvaluation::Error(id) => {
-                                        state_id_to_state.deref_mut().insert(id.clone(), s.clone());
+                                    ExecutionStateEvaluation::Error(state) => {
+                                        let resulting_state_id = state.id;
+                                        state_id_to_state.deref_mut().insert(resulting_state_id.clone(), s.clone());
+                                        execution_graph.deref_mut()
+                                            .add_edge(state.parent_state_id, resulting_state_id.clone(), s);
                                     }
                                     ExecutionStateEvaluation::EvalFailure(id) => {
                                         state_id_to_state.deref_mut().insert(id.clone(), s.clone());
@@ -388,7 +392,7 @@ impl ExecutionGraph {
         previous_state: &ExecutionStateEvaluation,
     ) -> anyhow::Result<(
         (ExecutionNodeId, ExecutionStateEvaluation), // the resulting total state of this step
-        Vec<(usize, OperationFnOutput)>, // values emitted by operations during this step
+        Vec<(OperationId, OperationFnOutput)>, // values emitted by operations during this step
     )> {
         println!("step_execution_with_previous_state");
         let previous_state = match previous_state {
@@ -406,10 +410,10 @@ impl ExecutionGraph {
         &mut self,
         prev_execution_id: ExecutionNodeId,
         cell: CellTypes,
-        op_id: Option<usize>,
+        op_id: OperationId,
     ) -> anyhow::Result<(
         (ExecutionNodeId, ExecutionStateEvaluation), // the resulting total state of this step
-        usize, // id of the new operation
+        OperationId, // id of the new operation
     )> {
         let state = self.get_state_at_id(prev_execution_id)
             .ok_or_else(|| anyhow!("No state found for id {:?}", prev_execution_id))?;
@@ -441,7 +445,7 @@ impl ExecutionGraph {
         prev_execution_id: ExecutionNodeId,
     ) -> anyhow::Result<(
         (ExecutionNodeId, ExecutionStateEvaluation), // the resulting total state of this step
-        Vec<(usize, OperationFnOutput)>, // values emitted by operations during this step
+        Vec<(OperationId, OperationFnOutput)>, // values emitted by operations during this step
     )> {
         println!("external_step_execution");
         let state = self.get_state_at_id(prev_execution_id);

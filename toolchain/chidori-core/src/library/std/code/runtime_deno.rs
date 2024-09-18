@@ -144,6 +144,20 @@ fn op_save_result<'scope>(
     Ok(())
 }
 
+// TODO: template to implement array storage
+// #[op2]
+// fn op_transfer_arraybuffer<'a>(
+//     scope: &mut v8::HandleScope<'a>,
+//     ab: &v8::ArrayBuffer,
+// ) -> Result<v8::Local<'a, v8::ArrayBuffer>, AnyError> {
+//     if !ab.is_detachable() {
+//         return Err(type_error("ArrayBuffer is not detachable"));
+//     }
+//     let bs = ab.get_backing_store();
+//     ab.detach(None);
+//     Ok(v8::ArrayBuffer::with_backing_store(scope, &bs))
+// }
+
 #[op2]
 #[serde]
 fn op_save_result_object<'scope>(
@@ -396,7 +410,7 @@ pub async fn source_code_run_deno(
         // Capture the current span's ID
         let current_span_id = Span::current().id();
 
-        let dependencies = extract_dependencies_js(&source_code);
+        let dependencies = extract_dependencies_js(&source_code)?;
         let report = build_report(&dependencies);
 
         // A list of function names this block of code is depending on existing
@@ -554,6 +568,9 @@ pub async fn source_code_run_deno(
         // TODO: allow_net is causing this to block our execution entirely
         flags.allow_net = Some(vec![]);
         flags.allow_env = Some(vec![]);
+        flags.allow_read = Some(vec![]);
+        flags.allow_write = Some(vec![]);
+        flags.allow_run = Some(vec![]);
         let factory = deno::factory::CliFactory::from_flags(flags)?;
         let cli_options = factory.cli_options();
         let file_fetcher = factory.file_fetcher()?;
