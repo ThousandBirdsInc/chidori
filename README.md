@@ -18,7 +18,7 @@
 <br />
 </div>
 
-Star us on Github! Join us on [Discord](https://discord.gg/CJwKsPSgew).
+Star us on GitHub! Join us on [Discord](https://discord.gg/CJwKsPSgew).
 
 ## Contents
 - [📖 Chidori V2](#-chidori-v2)
