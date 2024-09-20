@@ -694,6 +694,7 @@ impl ExecutionState {
     }
 
     fn get_operation_node(&self, operation_id: OperationId) -> anyhow::Result<MutexGuard<OperationNode>> {
+        println!("Getting operation node");
         self.operation_by_id
             .get(&operation_id)
             .ok_or_else(|| anyhow::anyhow!("Operation not found"))?
@@ -773,7 +774,7 @@ impl ExecutionState {
     }
 
 
-    fn process_next_operation(
+    fn select_next_operation_to_evalute(
         &self,
         exec_queue: &mut VecDeque<OperationId>,
     ) -> anyhow::Result<Option<(Option<String>, OperationId, OperationInputs)>> {
@@ -845,7 +846,7 @@ impl ExecutionState {
             if count_loops >= operation_count * 2 {
                 return Err(Error::msg("Looped through all operations without detecting an execution"));
             }
-            match self.process_next_operation(&mut exec_queue) {
+            match self.select_next_operation_to_evalute(&mut exec_queue) {
                 Ok(Some((op_node_name, next_operation_id, inputs))) => {
                     let mut new_state = self.initialize_new_state();
                     new_state.evaluating_fn = None;
@@ -885,12 +886,17 @@ impl ExecutionState {
             let result = pause_future_with_oneshot(ExecutionStateEvaluation::Executing(new_state.clone()), &s).await;
             let _recv = result.await;
         }
+        println!("step_execution, getting operation node {:?}", &new_state.evaluating_id);
         let op_node = self.get_operation_node(new_state.evaluating_id)?;
+        println!("step_execution, completed getting operation node {:?}", &new_state.evaluating_id);
         let args = new_state.evaluating_arguments.take().unwrap();
         let next_operation_id = new_state.evaluating_id.clone();
+        println!("step_execution about to run op_node.execute");
         let result = op_node.execute(&mut new_state, args, None, None).await?;
+        println!("step_execution after op_node.execute");
         outputs.push((next_operation_id, result.clone()));
         self.update_state(&mut new_state, next_operation_id, result);
+        println!("step_execution about to complete, after update_state");
         return Ok((ExecutionStateEvaluation::Complete(new_state), outputs));
     }
 }

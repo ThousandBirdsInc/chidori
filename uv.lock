@@ -390,10 +390,14 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "litellm", extra = ["proxy"] },
+    { name = "pydantic" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "litellm", extras = ["proxy"], specifier = ">=1.37.17" }]
+requires-dist = [
+    { name = "litellm", extras = ["proxy"], specifier = ">=1.37.17" },
+    { name = "pydantic", specifier = ">=2.8.2" },
+]
 
 [[package]]
 name = "click"

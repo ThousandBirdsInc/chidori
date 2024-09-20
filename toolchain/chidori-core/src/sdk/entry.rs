@@ -8,7 +8,7 @@ use crate::execution::primitives::serialized_value::{
 };
 use crate::sdk::md::{interpret_code_block, load_folder};
 use serde::{Deserialize, Serialize, Serializer};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::{fmt, thread};
 use std::ops::Deref;
 use std::path::Path;
@@ -18,6 +18,9 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread::sleep;
 use std::time::Duration;
 use chumsky::prelude::any;
+use dashmap::DashMap;
+use futures_util::future::{BoxFuture, select_all};
+use futures_util::{FutureExt, StreamExt};
 use petgraph::graphmap::DiGraphMap;
 use serde::ser::SerializeMap;
 use tracing::dispatcher::DefaultGuard;
@@ -154,18 +157,19 @@ impl InstancedEnvironment {
         // Get the current span ID
         // let current_span_id = Span::current().id().expect("There is no current span");
 
-
-
+        let mut executing_states = DashMap::new();
+        let mut loop_remaining_futures = vec![];
         loop {
             // println!("Looping UserInteraction");
             // let closure_span = tracing::span!(parent: &current_span_id, tracing::Level::INFO, "execution_instance_loop");
             // let _enter = closure_span.enter();
 
             // Handle user interactions first for responsiveness
-            if let Ok(message) = self.env_rx.recv_timeout(Duration::from_millis(USER_INTERACTION_RECEIVER_TIMEOUT_MS)) {
+            if let Ok(message) = self.env_rx.try_recv() {
                 println!("Received message from user: {:?}", message);
                 self.handle_user_interaction_message(message).await?;
             }
+
 
             tokio::select! {
                 Some(event) = self.execution_event_rx.recv() => {
@@ -176,58 +180,123 @@ impl InstancedEnvironment {
                 }
             }
 
+            // TODO: what if we're somehow contending over resources, and that's why the fast polling makes this fail
+
+            let mut should_pause = false;;
+            let mut timeout_future_available = false;
+            {
+
+                // println!("execution_state count {:?}", executing_states);
+
+                let state = if let Some(state) = self.db.get_state_at_id(self.execution_head_state_id) { state } else {
+                    println!("failed to get state for the target id {:?}", self.execution_head_state_id);
+                    return Err(anyhow::format_err!("failed to get state for the target id {:?}", self.execution_head_state_id));
+                };
+
+                let exec_head = self.execution_head_state_id;
+                let get_conditional_polling_step = match self.playback_state {
+                    PlaybackState::Step => {
+                        self.playback_state = PlaybackState::Paused;
+                        Some((exec_head, ExecutionGraph::immutable_external_step_execution(exec_head, state)))
+                    }
+                    PlaybackState::Paused => {
+                        None
+                    }
+                    PlaybackState::Running => {
+                        Some((exec_head, ExecutionGraph::immutable_external_step_execution(exec_head, state)))
+                    }
+                };
+
+                if let Some((executing_from_source_state_id, step)) = get_conditional_polling_step {
+
+                    let mut futures_vec: Vec<
+                        Pin<Box<dyn futures::Future<Output = Option<anyhow::Result<(ExecutionNodeId, ExecutionStateEvaluation, Vec<(Uuid, OperationFnOutput)>)>>> + Send>>,
+                    > = loop_remaining_futures;
+
+                    // Only add a step iteration if we're not currently executing the given state
+                    if !executing_states.contains_key(&executing_from_source_state_id) {
+                        println!("Will eval step, inserting eval state {:?}", &executing_from_source_state_id);
+                        executing_states.insert(executing_from_source_state_id, true);
+                        let fut_with_some = step.map(move |res| Some(res)).boxed();
+                        futures_vec.push(fut_with_some);
+                    }
+
+                    // TODO: when we decrease the timeout of the sleep, we start to fail to progress execution
+                    // This is intended to be 10ms but due to the above bug, we're set to 2000ms
+                    // My current theory is that looping more often causes contention over
+                    // some resource that causes evaluation to slow to a halt
+                    // Add a 2000ms timeout future
+                    if !timeout_future_available {
+                        let timeout_future = tokio::time::sleep(Duration::from_millis(2000)).then(|_| {
+                            // Return a special result to indicate timeout
+                            futures::future::ready(None)
+                        });
+                        futures_vec.push(timeout_future.boxed());
+                        timeout_future_available = true;
+                    }
+
+                    let futures_vec_len = futures_vec.len();
+
+                    let (completed_result, _completed_index, remaining_futures) = select_all(futures_vec).await;
+                    println!("completed_result {:?}", completed_result);
+                    loop_remaining_futures = remaining_futures;
+                    println!("loop_remaining_futures count {:?}", loop_remaining_futures.len());
+
+                    // for fut in remaining_futures {
+                    //     // Extract the identifier and future
+                    //     // let (id, fut) = fut;
+                    //     // We need to re-box the future
+                    //     execution_futures.push_back(fut);
+                    // }
 
 
-            tokio::select! {
-                Some(output) = self.conditional_poll_playback_steps() => {
-                    match self.playback_state {
-                        PlaybackState::Step => {
-                            self.playback_state = PlaybackState::Paused;
-                        }
-                        PlaybackState::Paused => {
-                            // TODO: add to conditional?
-                            println!("Playback paused");
-                        }
-                        PlaybackState::Running => {
-                            // TODO: we want to pause when nothing is happening, so how do we know nothing is happening
-                            // If nothing happened, pause playback and wait for the user
-                            match output {
-                                anyhow::Result::Ok(o)  => {
-                                    if o.is_empty() {
-                                        println!("Playback paused, awaiting input from user");
-                                        self.playback_state = PlaybackState::Paused;
-                                    }
+                    match completed_result {
+                        Some(anyhow::Result::Ok((resolved_id, new_state, o)))  => {
+                            println!("Got completed result {:?}", &resolved_id);
+
+                            // TODO: remove from the dashmap when we see the parent_id here
+                            match &new_state {
+                                ExecutionStateEvaluation::Error(s) => {
+                                    println!("Got result {:?}, {:?}", resolved_id, new_state);
+                                    executing_states.remove(&resolved_id);
                                 }
-                                anyhow::Result::Err(_)  => {
-                                    self.playback_state = PlaybackState::Paused;
+                                ExecutionStateEvaluation::EvalFailure(_) => {}
+                                ExecutionStateEvaluation::Complete(s) => {
+                                    println!("Got result {:?}, {:?}", resolved_id, new_state);
+                                    executing_states.remove(&resolved_id);
+                                }
+                                ExecutionStateEvaluation::Executing(s) => {
+                                    println!("Still executing result {:?}, {:?}", resolved_id, new_state);
                                 }
                             }
+                            let resulting_state_id = self.db.progress_graph(new_state.clone());
+                            self.push_update_to_client(&resulting_state_id, new_state);
+                            if o.is_empty() {
+                                println!("Playback paused, awaiting input from user");
+                                should_pause = true;
+                            }
+                        }
+                        Some(anyhow::Result::Err(_))  => {
+                            println!("Error should pause");
+                            should_pause = true;
+                        }
+                        None => {
+                            timeout_future_available = false;
+                            println!("Loop timeout, continuing");
                         }
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                }
-            };
-
+            }
+            if should_pause {
+                self.playback_state = PlaybackState::Paused;
+            }
         }
+        unreachable!("We've exited the run loop");
         Ok(())
     }
 
-    async fn conditional_poll_playback_steps(&mut self) -> Option<anyhow::Result<Vec<(OperationId, OperationFnOutput)>>> {
-        match self.playback_state {
-            PlaybackState::Step => {
-                Some(self.step().await)
-            }
-            PlaybackState::Paused => {
-                None
-            }
-            PlaybackState::Running => {
-                Some(self.step().await)
-            }
-        }
-    }
-
     async fn handle_user_interaction_message(&mut self, message: UserInteractionMessage) -> Result<(), anyhow::Error> {
+        println!("Received user interaction message");
         match message {
             UserInteractionMessage::Step => {
                 self.playback_state = PlaybackState::Step;
@@ -249,16 +318,20 @@ impl InstancedEnvironment {
                 sender.send(EventsFromRuntime::StateAtId(id, state)).unwrap();
             },
             UserInteractionMessage::RevertToState(id) => {
+                println!("=== 0");
                 if let Some(id) = id {
                     self.execution_head_state_id = id;
+                    println!("=== A");
                     let merged_state = self.db.get_merged_state_history(&id);
                     let sender = self.runtime_event_sender.as_mut().unwrap();
                     sender.send(EventsFromRuntime::ExecutionStateChange(merged_state)).unwrap();
                     sender.send(EventsFromRuntime::UpdateExecutionHead(id)).unwrap();
+                    println!("=== B");
 
                     if let Some(ExecutionStateEvaluation::Complete(state)) = self.db.get_state_at_id(self.execution_head_state_id) {
                         let mut cells = vec![];
                         // TODO: keep a separate mapping of cells so we don't need to lock operations
+                        println!("=== C");
                         for (id, cell) in state.cells_by_id.iter() {
                             cells.push(CellHolder {
                                 cell: cell.clone(),
@@ -267,9 +340,11 @@ impl InstancedEnvironment {
                                 needs_update: false,
                             });
                         }
+                        println!("=== D");
                         let mut ss = self.shared_state.lock().unwrap();
                         ss.at_execution_state_cells = cells.clone();
                         sender.send(EventsFromRuntime::ExecutionStateCellsViewUpdated(cells)).unwrap();
+                        println!("=== E");
                     }
                 }
             },
@@ -324,6 +399,7 @@ impl InstancedEnvironment {
     }
 
     fn push_update_to_client(&mut self, state_id: &ExecutionNodeId, state: ExecutionStateEvaluation) {
+        println!("Resulted in state with id {:?}, {:?}", &state_id, &state);
         if let Some(sender) = self.runtime_event_sender.as_mut() {
             if let ExecutionStateEvaluation::Complete(s) = &state {
                 // TODO: if there are cells we want to update the shared state with those
@@ -346,14 +422,14 @@ impl InstancedEnvironment {
             sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
             sender.send(EventsFromRuntime::UpdateExecutionHead(*state_id)).unwrap();
         }
-        println!("Resulted in state with id {:?}, {:?}", &state_id, &state);
+
         let mut shared_state = self.shared_state.lock().unwrap();
         // Only completed states update execution heads
         if let ExecutionStateEvaluation::Complete(_) = &state {
             shared_state.execution_state_head_id = *state_id;
             self.execution_head_state_id = *state_id;
         }
-        shared_state.execution_id_to_evaluation.lock().unwrap()
+        shared_state.execution_id_to_evaluation
             .entry(*state_id)
             .and_modify(|existing_state| {
                 if !matches!(existing_state, ExecutionStateEvaluation::Complete(_)) {
@@ -371,6 +447,8 @@ impl InstancedEnvironment {
         self.push_update_to_client(&state_id, state);
         Ok(outputs)
     }
+
+
 
     /// Add a cell into the execution graph
     #[tracing::instrument]
@@ -440,7 +518,7 @@ pub struct CellHolder {
 
 #[derive(Debug)]
 pub struct SharedState {
-    pub execution_id_to_evaluation: Arc<Mutex<HashMap<ExecutionNodeId, ExecutionStateEvaluation>>>,
+    pub execution_id_to_evaluation: Arc<DashMap<ExecutionNodeId, ExecutionStateEvaluation>>,
     execution_state_head_id: ExecutionNodeId,
     latest_state: Option<ExecutionState>,
     editor_cells: HashMap<OperationId, CellHolder>,

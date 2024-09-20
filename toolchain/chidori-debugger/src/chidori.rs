@@ -33,6 +33,7 @@ use chidori_core::tokio::task::JoinHandle;
 use chidori_core::utils::telemetry::TraceEvents;
 use petgraph::prelude::StableGraph;
 use petgraph::graph::NodeIndex;
+use chidori_core::execution::execution::execution_state::ExecutionStateEvaluation;
 use crate::{GameState, tokio_tasks};
 
 const RECV_RUNTIME_EVENT_TIMEOUT_MS: u64 = 100;
@@ -328,26 +329,26 @@ impl InternalState {
         env.loaded_path.as_ref().unwrap().to_string()
     }
 
-    pub fn move_state_view_to_id(&self, id: ExecutionNodeId) -> anyhow::Result<(), String> {
-        let env = self.chidori.lock().unwrap();
-        env.handle_user_action(UserInteractionMessage::RevertToState(Some(id)))
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    pub fn get_current_execution_head(&self) -> anyhow::Result<(), String> {
-        let env = self.chidori.lock().unwrap();
-        Ok(())
-    }
+    // pub fn move_state_view_to_id(&self, id: ExecutionNodeId) -> anyhow::Result<(), String> {
+    //     let env = self.chidori.lock().unwrap();
+    //     env.handle_user_action(UserInteractionMessage::RevertToState(Some(id)))
+    //         .map_err(|e| e.to_string())?;
+    //     Ok(())
+    // }
 
     pub fn get_execution_state_at_id(
         &self,
-        execution_node_id: ExecutionNodeId,
-    ) -> anyhow::Result<(), String> {
-        let env = self.chidori.lock().unwrap();
-        env.handle_user_action(UserInteractionMessage::FetchStateAt(execution_node_id))
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        execution_node_id: &ExecutionNodeId,
+    ) -> Option<ExecutionStateEvaluation> {
+        // TODO: this is like 3 locks just to get the current state - maybe we should cache these?
+        let chidori = self.chidori.lock().unwrap();
+        let eval = {
+            let shared_state = chidori.get_shared_state();
+            let exec = shared_state.execution_id_to_evaluation.clone();
+            let eval = exec.get(&execution_node_id).map(|x| x.clone());
+            eval
+        };
+        eval
     }
 
 
@@ -373,16 +374,24 @@ impl InternalState {
     }
 
     pub fn set_execution_id(&self, id: ExecutionNodeId) -> anyhow::Result<(), String> {
-        let env = self.chidori.lock().unwrap();
-        env.handle_user_action(UserInteractionMessage::RevertToState(Some(id)))
-            .map_err(|e| e.to_string())?;
+        // TODO: we're failing to lock chidori
+        println!("=== lock chidori");
+        let chidori = self.chidori.clone();
+        {
+            let chidori_guard = chidori.lock().expect("Failed to lock chidori");
+            println!("=== handle user action Revert");
+            chidori_guard.handle_user_action(UserInteractionMessage::RevertToState(Some(id)))
+                .map_err(|e| e.to_string())?;
+
+        }
+        println!("=== set execution id, drop the lock");
         Ok(())
     }
 
     pub fn update_cell(&self, cell_holder: CellHolder) -> anyhow::Result<(), String> {
         let chidori = self.chidori.clone();
         {
-            let mut chidori_guard = chidori.lock().expect("Failed to lock chidori");
+            let chidori_guard = chidori.lock().expect("Failed to lock chidori");
             chidori_guard.handle_user_action(UserInteractionMessage::MutateCell(cell_holder))
                 .map_err(|e| e.to_string())?;
         }

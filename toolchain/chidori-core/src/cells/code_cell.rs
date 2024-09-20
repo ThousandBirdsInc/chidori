@@ -78,12 +78,14 @@ pub fn code_cell(execution_state_id: ExecutionNodeId, cell: &CodeCell, range: &T
                     let s = s.clone();
                     let cell = cell.clone();
                     async move {
+                        println!("Should be running source_code_run_deno");
                         let result = crate::library::std::code::runtime_deno::source_code_run_deno(
                             &s,
                             &cell.source_code,
                             &x,
                             &cell.function_invocation,
                         ).await?;
+                        println!("After the evaluation of running source_code_run_deno");
                         Ok(OperationFnOutput {
                             has_error: false,
                             execution_state: None,

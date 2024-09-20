@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 dependencies = [
     "litellm[proxy]>=1.37.17",
+    "pydantic>=2.8.2",
 ]
 readme = "README.md"
 requires-python = ">= 3.8"

@@ -956,9 +956,8 @@ fn update_graph_system_renderer(
                                             });
                                         } else {
 
-
-                                            if let Some(state) = internal_state.chidori.lock().unwrap().get_shared_state().execution_id_to_evaluation.lock().unwrap().get(&node1) {
-
+                                            if let Some(state) = internal_state.get_execution_state_at_id(&node1) {
+                                                let state = &state;
                                                 if !matches!(state, ExecutionStateEvaluation::Executing(_)) {
                                                     ui.horizontal(|ui| {
                                                         ui.label(RichText::new(node1.to_string()).color(Color32::BLACK));

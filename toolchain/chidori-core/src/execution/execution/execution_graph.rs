@@ -12,6 +12,7 @@ use std::sync::{Mutex};
 use std::thread::{JoinHandle};
 use std::time::Duration;
 use anyhow::anyhow;
+use dashmap::DashMap;
 use futures_util::FutureExt;
 
 use crate::execution::primitives::identifiers::{DependencyReference, OperationId};
@@ -87,7 +88,7 @@ pub struct ExecutionGraph {
     execution_graph: Arc<Mutex<ExecutionGraphDiGraphSet>>,
 
     // TODO: move to just using the digraph for this
-    pub(crate) execution_node_id_to_state: Arc<Mutex<HashMap<ExecutionNodeId, ExecutionStateEvaluation>>>,
+    pub(crate) execution_node_id_to_state: Arc<DashMap<ExecutionNodeId, ExecutionStateEvaluation>>,
 
     /// Sender channel for sending messages to the execution graph
     graph_mutation_sender: tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>,
@@ -136,7 +137,7 @@ impl ExecutionGraph {
         println!("Initializing ExecutionGraph");
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<ExecutionGraphSendPayload>(1028);
 
-        let mut state_id_to_state = HashMap::new();
+        let mut state_id_to_state = DashMap::new();
 
         // Initialization of the execution graph at Uuid::nil - this is always the root of the execution graph
         let init_id = Uuid::nil();
@@ -150,7 +151,7 @@ impl ExecutionGraph {
         let execution_graph_clone = execution_graph.clone();
 
         // Mapping of state_ids to state
-        let mut state_id_to_state = Arc::new(Mutex::new(state_id_to_state));
+        let mut state_id_to_state = Arc::new(state_id_to_state);
         let state_id_to_state_clone = state_id_to_state.clone();
 
         // Notification of successful startup
@@ -203,30 +204,30 @@ impl ExecutionGraph {
 
                                 // Pushing this state into the graph
                                 let mut execution_graph = execution_graph_clone.lock().unwrap();
-                                let mut state_id_to_state = state_id_to_state_clone.lock().unwrap();
+                                let mut state_id_to_state = state_id_to_state_clone.clone();
 
                                 match resulting_execution_state {
                                     ExecutionStateEvaluation::Error(state) => {
                                         let resulting_state_id = state.id;
-                                        state_id_to_state.deref_mut().insert(resulting_state_id.clone(), s.clone());
+                                        state_id_to_state.insert(resulting_state_id.clone(), s.clone());
                                         execution_graph.deref_mut()
                                             .add_edge(state.parent_state_id, resulting_state_id.clone(), s);
                                     }
                                     ExecutionStateEvaluation::EvalFailure(id) => {
-                                        state_id_to_state.deref_mut().insert(id.clone(), s.clone());
+                                        state_id_to_state.insert(id.clone(), s.clone());
                                     }
                                     ExecutionStateEvaluation::Complete(state) => {
                                         // println!("Adding to execution state!!!! {:?}", state.id);
                                         let resulting_state_id = state.id;
-                                        state_id_to_state.deref_mut().insert(resulting_state_id.clone(), s.clone());
+                                        state_id_to_state.insert(resulting_state_id.clone(), s.clone());
                                         execution_graph.deref_mut()
                                             .add_edge(state.parent_state_id, resulting_state_id.clone(), s);
                                     }
                                     ExecutionStateEvaluation::Executing(state) => {
                                         let resulting_state_id = state.id;
-                                        if let Some(ExecutionStateEvaluation::Complete(_)) = state_id_to_state.deref().get(&resulting_state_id) {
+                                        if let Some(ExecutionStateEvaluation::Complete(_)) = state_id_to_state.get(&resulting_state_id).map(|x| x.clone()) {
                                         } else {
-                                            state_id_to_state.deref_mut().insert(resulting_state_id.clone(), s.clone());
+                                            state_id_to_state.insert(resulting_state_id.clone(), s.clone());
                                             execution_graph.deref_mut()
                                                 .add_edge(state.parent_state_id, resulting_state_id.clone(), s);
                                         }
@@ -310,8 +311,8 @@ impl ExecutionGraph {
     }
 
     pub fn get_state_at_id(&self, id: ExecutionNodeId) -> Option<ExecutionStateEvaluation> {
-        let state_id_to_state = self.execution_node_id_to_state.lock().unwrap();
-        state_id_to_state.get(&id).cloned()
+        let state_id_to_state = self.execution_node_id_to_state.clone();
+        state_id_to_state.get(&id).map(|x| x.clone())
     }
 
     #[tracing::instrument]
@@ -336,7 +337,6 @@ impl ExecutionGraph {
 
         let mut merged_state = HashMap::new();
         for predecessor in queue {
-            println!("Getting state {:?}", &predecessor);
             let state = self.get_state_at_id(predecessor).unwrap();
             if let ExecutionStateEvaluation::Complete(state) = state {
                 for (k, v) in state.state.iter() {
@@ -357,9 +357,9 @@ impl ExecutionGraph {
     }
 
     #[tracing::instrument]
-    fn progress_graph(&mut self, new_state: ExecutionStateEvaluation) -> ExecutionNodeId {
+    pub fn progress_graph(&mut self, new_state: ExecutionStateEvaluation) -> ExecutionNodeId {
         let mut execution_graph = self.execution_graph.lock().unwrap();
-        let mut state_id_to_state = self.execution_node_id_to_state.lock().unwrap();
+        let mut state_id_to_state = self.execution_node_id_to_state.clone();
         let (parent_id, resulting_state_id ) = match &new_state {
             ExecutionStateEvaluation::Complete(state) => {
                 (state.parent_state_id, state.id)
@@ -372,7 +372,7 @@ impl ExecutionGraph {
         };
         println!("Resulting state received from progress_graph {:?}", &resulting_state_id);
         // TODO: if state already exists how to handle
-        state_id_to_state.deref_mut().insert(resulting_state_id.clone(), new_state.clone());
+        state_id_to_state.insert(resulting_state_id.clone(), new_state.clone());
         execution_graph.deref_mut()
             .add_edge(parent_id, resulting_state_id.clone(), new_state.clone());
         resulting_state_id
@@ -454,6 +454,25 @@ impl ExecutionGraph {
         } else {
             panic!("No state found for id {:?}", prev_execution_id);
         }
+    }
+
+    #[tracing::instrument]
+    pub async fn immutable_external_step_execution(
+        source_id: ExecutionNodeId,
+        state: ExecutionStateEvaluation,
+    ) -> anyhow::Result<(
+        ExecutionNodeId,
+        ExecutionStateEvaluation, // the resulting total state of this step
+        Vec<(OperationId, OperationFnOutput)>, // values emitted by operations during this step
+    )> {
+        println!("step_execution_with_previous_state {:?} {:?}", &source_id, &state);
+        let previous_state = match &state {
+            ExecutionStateEvaluation::Complete(state1) => state1,
+            _ => { panic!("Stepping execution should only occur against completed states") }
+        };
+        let eval_state = previous_state.determine_next_operation()?;
+        let (new_state, outputs) = previous_state.step_execution(eval_state).await?;
+        Ok((source_id, new_state, outputs))
     }
 }
 
