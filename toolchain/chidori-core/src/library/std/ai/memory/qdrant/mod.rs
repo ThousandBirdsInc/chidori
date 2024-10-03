@@ -94,14 +94,15 @@ impl<C: WrappedQdrantClient + Send + Sync> VectorDatabase<C> for MemoryQdrant<C>
         collection_name: String,
         id: u64,
         vector: Vec<f32>,
-        payload: Option<serde_json::Value>,
+        payload: Option<chidori_prompt_format::serde_json::Value>,
     ) -> Result<(), VectorDbError> {
         // Additional payload handling here if needed
         let points = vec![PointStruct::new(
             PointId::from(id),
             Vectors::from(vector.to_vec()),
             if let Some(payload) = payload {
-                payload.try_into().unwrap()
+                //TODO: payload.try_into().unwrap()
+                Payload::default()
             } else {
                 Payload::default()
             },

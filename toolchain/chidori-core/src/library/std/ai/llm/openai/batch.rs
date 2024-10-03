@@ -36,9 +36,9 @@ impl ChatModelBatch for OpenAIChatModel {
                 "gpt-3.5-turbo-1106",
                 "gpt-3.5-turbo-16k-0613",
             ]
-                .contains(&model.as_str())
+                .contains(&model.as_ref().unwrap_or(&String::from("gpt-3.5-turbo")).as_str())
             {
-                return Err(format!("Model {} is not supported", model));
+                return Err(format!("Model {:?} is not supported", model));
             }
         }
 

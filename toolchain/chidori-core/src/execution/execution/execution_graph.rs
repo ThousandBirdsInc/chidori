@@ -405,6 +405,19 @@ impl ExecutionGraph {
         Ok(((resulting_state_id, new_state), outputs))
     }
 
+    pub async fn execute_operation_in_isolation(&self, cell: &CellTypes, args: RkyvSerializedValue) -> anyhow::Result<OperationFnOutput> {
+        // TODO: we want a code cell that depends on the target cell
+
+        // TODO: treat the repl as a two cell instances, one being the original cell, two being the evaluator
+        // TODO: need to fetch functions that we depend on from other cells
+        let mut new_state = ExecutionState::default();
+        let mut op_node = new_state.get_operation_from_cell_type(cell)?;
+        op_node.attach_cell(cell.clone());
+        new_state.evaluating_cell = Some(op_node.cell.clone());
+        let result = op_node.execute(&mut new_state, args, None, None).await?;
+        Ok(result)
+    }
+
     #[tracing::instrument]
     pub fn mutate_graph(
         &mut self,
@@ -421,7 +434,7 @@ impl ExecutionGraph {
             ExecutionStateEvaluation::Complete(state) => {
                 println!( "Capturing state of the mutate graph operation parent {:?}, id {:?}", state.parent_state_id, state.id);
                 let state = state.clone_with_new_id();
-                state.update_op(cell, op_id)?
+                state.update_operation(cell, op_id)?
             },
             ExecutionStateEvaluation::Executing(..) => {
                 return Err(anyhow!("Cannot mutate a graph that is currently executing"))
@@ -503,7 +516,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
                 ),
-                                                    None);
+                                                    Uuid::nil());
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
@@ -511,7 +524,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(2))) }.boxed()),
                 ),
-                                                    None);
+                                                    Uuid::nil());
         let (_, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),

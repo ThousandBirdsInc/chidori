@@ -26,8 +26,7 @@ impl OpenAIChatModel {
     pub fn chat_completion_req_to_openai_req(chat_completion_req: &ChatCompletionReq) -> ChatCompletionRequest {
         let config = &chat_completion_req.config;
         ChatCompletionRequest {
-
-            model: config.model.clone(),
+            model: config.model.as_ref().unwrap_or(&String::from("gpt-3.5-turbo")).clone(),
             messages: chat_completion_req
                 .template_messages
                 .iter()

@@ -38,15 +38,20 @@ fn fragment(
         let adjusted_uv = vec2<f32>(uv.x * aspect_ratio, uv.y);
 
 
-        let target_width = 620.0;
-        let target_height = 320.0;
-        let target_aspect_ratio = target_width / target_height;
+//        let target_width = 620.0;
+//        let target_height = 320.0;
+//        let target_aspect_ratio = target_width / target_height;
 
         // Calculate scale factors for the UV adjustment
-        let scale_x =  width / target_width;
-        let scale_y = height / target_height;
+//        let scale_x =  width / target_width;
+//        let scale_y = height / target_height;
 
-        let adjusted_uv_target = vec2<f32>(uv.x * scale_x, uv.y * scale_y);
+//        let adjusted_uv_target = vec2<f32>(uv.x * scale_x, uv.y * scale_y);
+        let adjusted_uv_target = vec2<f32>(uv.x, uv.y);
+
+
+        var texture_color = textureSample(material_color_texture, material_color_sampler, adjusted_uv_target);
+        let color = vec4<f32>(texture_color.rgb * texture_color.a, texture_color.a);
 
         let border_radius = corner_radius / min(width, height);
         let dist = sdRoundedBox(adjusted_uv + vec2(-0.5 * aspect_ratio, -0.5), vec2<f32>(0.5 * aspect_ratio, 0.5), vec4<f32>(border_radius, border_radius, border_radius, border_radius));
@@ -54,11 +59,9 @@ fn fragment(
         let smooth_dist = smoothstep(0.0, aa, dist);
         if smooth_dist > 0.0 {
             let v = 1.0 - smooth_dist; // Invert for anti-aliasing effect
-            return vec4<f32>(base_color.rgb, v); // Set alpha to 1.0 for visibility
+            return vec4<f32>(color.rgb, v); // Set alpha to 1.0 for visibility
         }
 
-        var texture_color = textureSample(material_color_texture, material_color_sampler, adjusted_uv_target);
-        let color = base_color * vec4<f32>(texture_color.rgb * texture_color.a, texture_color.a);
         if texture_color.a == 0.0 {
             return base_color;
         }

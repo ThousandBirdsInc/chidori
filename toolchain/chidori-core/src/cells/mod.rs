@@ -33,6 +33,27 @@ pub enum SupportedLanguage {
     Deno,
 }
 
+
+#[derive(
+    Archive,
+    serde::Serialize,
+    serde::Deserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    PartialEq,
+    Clone,
+)]
+#[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
+#[archive(check_bytes)]
+#[archive_attr(check_bytes(
+    bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
+))]
+#[archive_attr(derive(Debug))]
+pub struct BackingFileReference {
+    path: String
+}
+
 #[derive(
     Archive,
     serde::Serialize,
@@ -50,6 +71,7 @@ pub enum SupportedLanguage {
 ))]
 #[archive_attr(derive(Debug))]
 pub struct CodeCell {
+    pub backing_file_reference: Option<BackingFileReference>,
     pub name: Option<String>,
     pub language: SupportedLanguage,
     pub source_code: String,
@@ -118,6 +140,7 @@ bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: 
 ))]
 #[archive_attr(derive(Debug))]
 pub struct TemplateCell {
+    pub backing_file_reference: Option<BackingFileReference>,
     pub name: Option<String>,
     pub body: String,
 }
@@ -260,7 +283,7 @@ pub struct LLMPromptCellChatConfiguration {
     #[serde(rename = "fn")]
     pub(crate) function_name: Option<String>,
 
-    pub model: String,
+    pub model: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_url: Option<String>,
@@ -302,10 +325,12 @@ pub struct LLMPromptCellChatConfiguration {
 #[archive_attr(derive(Debug))]
 pub enum LLMPromptCell {
     Chat {
+        backing_file_reference: Option<BackingFileReference>,
         function_invocation: bool,
         configuration: LLMPromptCellChatConfiguration,
         name: Option<String>,
         provider: SupportedModelProviders,
+        complete_body: String,
         req: String,
     },
     Completion {
@@ -336,7 +361,7 @@ pub struct LLMCodeGenCellChatConfiguration {
     pub function_name: Option<String>,
 
     pub api_url: Option<String>,
-    pub model: String,
+    pub model: Option<String>,
     pub frequency_penalty: Option<f64>,
     pub max_tokens: Option<i64>,
     pub presence_penalty: Option<f64>,
@@ -367,6 +392,7 @@ bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: 
 ))]
 #[archive_attr(derive(Debug))]
 pub struct LLMCodeGenCell {
+    pub backing_file_reference: Option<BackingFileReference>,
     pub function_invocation: bool,
     pub configuration: LLMCodeGenCellChatConfiguration,
     pub name: Option<String>,

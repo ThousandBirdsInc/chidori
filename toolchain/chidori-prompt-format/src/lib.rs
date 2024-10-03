@@ -79,7 +79,7 @@ pub fn extract_yaml_frontmatter(template: &str) -> JsValue {
 
 #[wasm_bindgen]
 pub fn analyze_referenced_partials(template: &str) -> JsValue {
-    let schema = crate::templating::templates::analyze_referenced_partials(&template);
+    let schema = crate::templating::templates::analyze_referenced_partials(&template).unwrap();
     serde_wasm_bindgen::to_value(&schema)
         .map_err(|e| JsValue::from_str(&e.to_string()))
         .unwrap()

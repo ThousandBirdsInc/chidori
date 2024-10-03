@@ -125,13 +125,13 @@ pub enum BlockContextElement {
     With(String),
 }
 
-pub fn analyze_referenced_partials(template: &str) -> SchemaItem {
-    let template = Template::compile(template).unwrap();
+pub fn analyze_referenced_partials(template: &str) -> anyhow::Result<SchemaItem> {
+    let template = Template::compile(template).map_err(|e| anyhow::Error::msg(e.to_string()) )?;
     let mut reference_paths = vec![];
     analyze_referenced_partials_inner(&template, &mut reference_paths, vec![], &|s: &str| {
         Some(String::new())
     });
-    referenced_variable_list_to_schema(reference_paths)
+    Ok(referenced_variable_list_to_schema(reference_paths))
 }
 
 /// Traverse over every partial template in a Template (which can be a set of template partials) and validate that each

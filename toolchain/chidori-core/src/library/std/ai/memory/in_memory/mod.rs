@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 pub struct InMemoryVectorDbCollection {
-    db: HashMap<usize, Value>,
+    db: HashMap<usize, chidori_prompt_format::serde_json::Value>,
     id_counter: usize,
     hnsw: Hnsw<f32, DistDot>,
 }
@@ -51,7 +51,7 @@ impl InMemoryVectorDb {
         );
     }
 
-    pub fn insert(&mut self, collection_name: String, data: &Vec<(&Vec<f32>, Value)>) {
+    pub fn insert(&mut self, collection_name: String, data: &Vec<(&Vec<f32>, chidori_prompt_format::serde_json::Value)>) {
         // usize is the id
         let collection = self.collections.get_mut(&collection_name).unwrap();
         let mut insert_set = vec![];
@@ -68,7 +68,7 @@ impl InMemoryVectorDb {
         collection_name: String,
         data: Vec<f32>,
         num_neighbors: usize,
-    ) -> Vec<(Neighbour, Value)> {
+    ) -> Vec<(Neighbour, chidori_prompt_format::serde_json::Value)> {
         let collection = self.collections.get_mut(&collection_name).unwrap();
         collection.hnsw.set_searching_mode(true);
         let mut results = vec![];
@@ -109,7 +109,7 @@ impl VectorDatabase<InMemoryVectorDb> for MemoryInMemory {
         collection_name: String,
         _id: u64,
         vector: Vec<f32>,
-        payload: Option<serde_json::Value>,
+        payload: Option<chidori_prompt_format::serde_json::Value>,
     ) -> Result<(), VectorDbError> {
         self.client
             .insert(collection_name, &vec![(&vector, payload.unwrap())]);

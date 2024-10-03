@@ -15,7 +15,7 @@ use crate::execution::execution::ExecutionState;
 use crate::execution::primitives::operation::InputSignature;
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue, serialized_value_to_json_value};
 use crate::library::std::ai::llm::openai::OpenAIChatModel;
-use crate::sdk::md::interpret_code_block;
+use crate::sdk::md::interpret_markdown_code_block;
 
 #[derive(Debug)]
 pub enum LLMErrors {
@@ -130,7 +130,7 @@ impl Default for ChatCompletionReq {
             config: LLMPromptCellChatConfiguration {
                 import: None,
                 function_name: None,
-                model: String::from("gpt-3.5-turbo"),
+                model: Some(String::from("gpt-3.5-turbo")),
                 api_url: None,
                 frequency_penalty: None,
                 max_tokens: None,
@@ -386,7 +386,8 @@ pub async fn ai_llm_run_chat_model(
                         let result = if is_function_invocation {
                             RkyvSerializedValue::String(choice.text.as_ref().unwrap().clone())
                         } else {
-                            let name = name.as_ref().unwrap();
+                            let default_name = String::from("name");
+                            let name = name.as_ref().unwrap_or(&default_name);
                             let text = choice.text.as_ref().unwrap().clone();
                             result_map.insert(name.clone(), RkyvSerializedValue::String(text));
                             RkyvSerializedValue::Object(result_map)
@@ -468,12 +469,12 @@ pub async fn ai_llm_code_generation_chat_model(
             let mut cells = vec![];
             crate::sdk::md::extract_code_blocks(&text)
                 .iter()
-                .filter_map(|block| interpret_code_block(block).unwrap())
+                .filter_map(|block| interpret_markdown_code_block(block).unwrap())
                 .for_each(|block| { cells.push(block); });
             cells.sort();
 
             for cell in cells {
-                let (s, _) = new_execution_state.update_op(cell, Uuid::new_v4())?;
+                let (s, _) = new_execution_state.update_operation(cell, Uuid::new_v4())?;
                 new_execution_state = s;
             }
 
@@ -509,7 +510,7 @@ pub fn infer_tool_usage_from_imports(execution_state: &ExecutionState, imports: 
     tools
 }
 
-fn template_data_payload_from_rkyv(payload: &RkyvSerializedValue) -> Value {
+fn template_data_payload_from_rkyv(payload: &RkyvSerializedValue) -> chidori_prompt_format::serde_json::Value {
     let data = if let RkyvSerializedValue::Object(ref m) = payload {
         if let Some(m) = m.get("globals") {
             serialized_value_to_json_value(m)
@@ -535,7 +536,7 @@ mod test {
     #[tokio::test]
     async fn test_tool_usage_inference() -> anyhow::Result<()> {
         let mut state = ExecutionState::new_with_random_id();
-        let (mut state, _) = state.update_op(CellTypes::Code(CodeCell {
+        let (mut state, _) = state.update_operation(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! {r#"
@@ -546,7 +547,7 @@ mod test {
                         "#}),
             function_invocation: None,
         }, TextRange::default()), None)?;
-        let (mut state, _) = state.update_op(CellTypes::Code(CodeCell {
+        let (mut state, _) = state.update_operation(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! {r#"

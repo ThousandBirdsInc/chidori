@@ -13,6 +13,7 @@ mod shader_trace;
 mod bevy_egui;
 mod egui_json_tree;
 mod tree_grouping;
+mod json_editor;
 
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
 use bevy::prelude::*;
@@ -23,7 +24,7 @@ use bevy::window::{PrimaryWindow, WindowMode, WindowResolution};
 use bevy::winit::WinitWindows;
 use bevy_cosmic_edit::*;
 use crate::bevy_egui::{EguiPlugin, egui, EguiContexts};
-use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Rounding};
+use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Rounding, Stroke};
 use bevy_rapier2d::plugin::{NoUserData, RapierPhysicsPlugin};
 use bevy_rapier2d::render::RapierDebugRenderPlugin;
 use egui::style::{HandleShape, NumericColorSpace};
@@ -94,12 +95,13 @@ fn setup(
 }
 
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash)]
 pub struct Theme {
     pub is_dark_mode: bool,
     pub background: Color32,
     pub foreground: Color32,
     pub card: Color32,
+    pub card_border: Stroke,
     pub card_foreground: Color32,
     pub popover: Color32,
     pub popover_foreground: Color32,
@@ -121,6 +123,7 @@ pub struct Theme {
     pub chart_3: Color32,
     pub chart_4: Color32,
     pub chart_5: Color32,
+    pub radius: usize,
 }
 
 impl Theme {
@@ -128,15 +131,19 @@ impl Theme {
         if is_dark_mode {
             Theme {
                 is_dark_mode: true,
-                background: Color32::from_rgb(12, 10, 9),          // #0c0a09
+                background: Color32::from_rgb(9, 9, 11),          // #09090B
                 foreground: Color32::from_rgb(242, 242, 242),      // #f2f2f2
-                card: Color32::from_rgb(26, 26, 26),               // #1a1a1a
+                card: Color32::from_rgb(28, 25, 23),               // #1C1917
+                card_border: Stroke {
+                    width: 0.5,
+                    color: Color32::from_rgb(39, 39, 32),
+                },
                 card_foreground: Color32::from_rgb(242, 242, 242), // #f2f2f2
                 popover: Color32::from_rgb(23, 23, 23),            // #171717
                 popover_foreground: Color32::from_rgb(242, 242, 242), // #f2f2f2
                 primary: Color32::from_rgb(225, 29, 72),           // #e11d48
                 primary_foreground: Color32::from_rgb(255, 241, 242), // #fff1f2
-                secondary: Color32::from_rgb(38, 38, 38),          // #262626
+                secondary: Color32::from_rgb(12, 10, 9),          // #0C0A09
                 secondary_foreground: Color32::from_rgb(250, 250, 250), // #fafafa
                 muted: Color32::from_rgb(38, 38, 38),              // #262626
                 muted_foreground: Color32::from_rgb(161, 161, 170),   // #a1a1aa
@@ -152,6 +159,7 @@ impl Theme {
                 chart_3: Color32::from_rgb(245, 158, 11),          // #f59e0b
                 chart_4: Color32::from_rgb(139, 92, 246),          // #8b5cf6
                 chart_5: Color32::from_rgb(236, 72, 153),          // #ec4899
+                radius: 8
             }
         } else {
             Theme {
@@ -159,6 +167,10 @@ impl Theme {
                 background: Color32::from_rgb(255, 255, 255),      // #ffffff
                 foreground: Color32::from_rgb(9, 9, 11),           // #09090b
                 card: Color32::from_rgb(255, 255, 255),            // #ffffff
+                card_border: Stroke {
+                    width: 0.5,
+                    color: Color32::from_rgb(39, 39, 32),
+                },
                 card_foreground: Color32::from_rgb(9, 9, 11),      // #09090b
                 popover: Color32::from_rgb(255, 255, 255),         // #ffffff
                 popover_foreground: Color32::from_rgb(9, 9, 11),   // #09090b
@@ -180,6 +192,7 @@ impl Theme {
                 chart_3: Color32::from_rgb(39, 71, 84),            // #274754
                 chart_4: Color32::from_rgb(232, 196, 104),         // #e8c468
                 chart_5: Color32::from_rgb(244, 164, 98),          // #f4a462
+                radius: 8
             }
         }
     }
@@ -229,7 +242,7 @@ impl Theme {
             selection: egui::style::Selection {
                 bg_fill: self.primary.linear_multiply(0.2),
                 stroke: egui::Stroke {
-                    color: self.primary,
+                    color:  Color32::from_rgb(84, 221, 255),
                     ..old.selection.stroke
                 },
             },
@@ -254,6 +267,18 @@ pub fn set_theme(ctx: &egui::Context, is_dark_mode: bool) {
 }
 
 
+#[derive(Resource)]
+struct CurrentTheme {
+    theme: Theme,
+}
+
+impl Default for CurrentTheme {
+    fn default() -> Self {
+        CurrentTheme {
+            theme: Theme::new(true)
+        }
+    }
+}
 
 
 pub fn style_egui_context(ctx: &mut egui::Context ) {
@@ -336,7 +361,7 @@ fn main() {
         .add_plugins(EguiPlugin)
         .add_plugins(tokio_tasks::TokioTasksPlugin::default())
         // Insert as resource the initial value for the settings resources
-        // .insert_resource(DisplayQuality::Medium)
+        .insert_resource(CurrentTheme::default())
         // .insert_resource(Volume(7))
         // Declare the game state, whose starting value is determined by the `Default` trait
         .init_state::<GameState>()

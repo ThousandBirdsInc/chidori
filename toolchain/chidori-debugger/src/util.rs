@@ -1,3 +1,4 @@
+use std::fmt::format;
 // Common functions for examples
 use bevy::{prelude::*, window::PrimaryWindow};
 use bevy_cosmic_edit::*;
@@ -5,7 +6,7 @@ use egui;
 use egui::{Color32, FontFamily, FontId, Frame, Margin, RichText, Ui};
 use egui_extras::syntax_highlighting;
 use egui_extras::syntax_highlighting::CodeTheme;
-use crate::egui_json_tree::value::{BaseValueType, ExpandableType, JsonTreeValue, ToJsonTreeValue};
+use egui_json_tree::value::{BaseValueType, ExpandableType, JsonTreeValue, ToJsonTreeValue};
 use chidori_core::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, TemplateCell, WebserviceCell};
 use chidori_core::execution::primitives::serialized_value::RkyvSerializedValue;
 
@@ -201,10 +202,80 @@ pub fn egui_label(ui: &mut Ui, text: &str) {
 //     });
 // }
 
+fn arguments_to_string(args: &RkyvSerializedValue) -> String {
+    let mut result = String::new();
+    let mut args = args.clone();
+    if let RkyvSerializedValue::Object(mut o) = args {
+        if let Some(args) = o.get("args") {
+            if let RkyvSerializedValue::Object(args) = args {
+                for i in 0..=64 {
+                    if let Some(x) = args.get(&i.to_string()) {
+                        result.push_str(&serialized_value_to_json_value(&x).to_string());
+                        result.push_str(",");
+                        result.push_str("\n");
+                    }
+                }
+            }
+        }
+        if let Some(kwargs) = o.get("kwargs") {
+            if let RkyvSerializedValue::Object(kwargs) = kwargs {
+                for (k, v) in kwargs.iter() {
+                    result.push_str(k);
+                    result.push_str("=");
+                    result.push_str(&serialized_value_to_json_value(&v).to_string());
+                    result.push_str(",");
+                    result.push_str("\n");
+                }
+            }
+        }
+    }
+    if result.ends_with('\n') {
+        result.pop();
+    }
+    if result.ends_with(',') {
+        result.pop();
+    }
+    result
+}
 
-pub fn egui_render_cell_read(ui: &mut Ui, cell: &CellTypes) {
+pub fn egui_render_cell_function_evaluation(ui: &mut Ui, state: &ExecutionState) {
     let theme = CodeTheme::dark();
 
+    // if let Some(args) = &state.evaluating_arguments {
+    //     ui.label("Evaluating With Arguments");
+    // }
+    if let Some(evaluating_fn) = &state.evaluating_fn {
+        let mut s = format!(r#"{evaluating_fn}({args})"#,
+                            evaluating_fn = &evaluating_fn,
+                            args = &state.evaluating_arguments.as_ref().map_or("".to_string() , arguments_to_string ));
+
+        let mut layouter = |ui: &egui::Ui, text_string: &str, wrap_width: f32| {
+            let mut layout_job =
+                egui_extras::syntax_highlighting::highlight(ui.ctx(), &theme, text_string, "py");
+            layout_job.wrap.max_width = wrap_width;
+
+            // Fix font size
+            for mut section in &mut layout_job.sections {
+                section.format.font_id = egui::FontId::new(14.0, FontFamily::Monospace);
+            }
+
+            ui.fonts(|f| f.layout_job(layout_job))
+        };
+
+        ui.add(
+            egui::TextEdit::multiline(&mut s)
+                .font(FontId::new(14.0, FontFamily::Monospace))
+                .code_editor()
+                .lock_focus(true)
+                .desired_width(f32::INFINITY)
+                .margin(Margin::symmetric(8.0, 8.0))
+                .layouter(&mut layouter),
+        );
+    }
+}
+
+pub fn egui_render_cell_read(ui: &mut Ui, cell: &CellTypes, state: &ExecutionState) {
+    let theme = CodeTheme::dark();
     match cell {
         CellTypes::Code(CodeCell { name, source_code, language, .. }, _) => {
             render_code_cell(ui, name, source_code, language, &theme);
@@ -215,7 +286,7 @@ pub fn egui_render_cell_read(ui: &mut Ui, cell: &CellTypes) {
         CellTypes::Prompt(LLMPromptCell::Chat { name, req, .. }, _) => {
             render_text_cell(ui, name, req, "Prompt", "md", &theme);
         }
-        CellTypes::Template(TemplateCell { name, body }, _) => {
+        CellTypes::Template(TemplateCell { name, body, .. }, _) => {
             render_text_cell(ui, name, body, "Prompt", "", &theme);
         }
         CellTypes::Prompt(LLMPromptCell::Completion { .. }, _) |
@@ -240,10 +311,10 @@ fn render_text_cell(ui: &mut Ui, name: &Option<String>, text: &str, label: &str,
 
 fn render_frame(ui: &mut Ui, label: &str, extra_label: Option<&str>, name: &Option<String>, text: &str, theme: &CodeTheme, syntax: &str) {
     let mut frame = Frame::default()
-        .fill(Color32::from_hex("#222222").unwrap())
-        .outer_margin(16.0)
-        .inner_margin(16.0)
-        .rounding(6.0)
+        // .fill(Color32::from_hex("#222222").unwrap())
+        // .outer_margin(16.0)
+        // .inner_margin(16.0)
+        // .rounding(6.0)
         .begin(ui);
 
     let content_ui = &mut frame.content_ui;
@@ -255,11 +326,11 @@ fn render_frame(ui: &mut Ui, label: &str, extra_label: Option<&str>, name: &Opti
         if let Some(name) = name {
             egui_label(ui, name);
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-            if ui.button("Open").clicked() {
-                println!("Should open file");
-            }
-        });
+        // ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+        //     if ui.button("Open").clicked() {
+        //         println!("Should open file");
+        //     }
+        // });
     });
 
     let mut s = text.to_string();
@@ -295,65 +366,68 @@ fn render_frame(ui: &mut Ui, label: &str, extra_label: Option<&str>, name: &Opti
 
 
 
-impl ToJsonTreeValue for RkyvSerializedValue {
-    fn to_json_tree_value(&self) -> JsonTreeValue {
-        match self {
-            RkyvSerializedValue::StreamPointer(_) => JsonTreeValue::Base(&"null", BaseValueType::Null),
-            RkyvSerializedValue::FunctionPointer(_, _) => JsonTreeValue::Base(&"null", BaseValueType::Null),
-            RkyvSerializedValue::Cell(c) => {
-                match c {
-                    CellTypes::Code(c, _) => { JsonTreeValue::Base(&c.source_code, BaseValueType::String)}
-                    CellTypes::CodeGen(c, _) => { JsonTreeValue::Base(&c.req, BaseValueType::String)}
-                    CellTypes::Prompt(c, _) => {
-                        match c {
-                            LLMPromptCell::Chat { req, .. } => { JsonTreeValue::Base(req, BaseValueType::String)}
-                            LLMPromptCell::Completion { req, .. } => { JsonTreeValue::Base(req, BaseValueType::String)}
-                        }
-                    }
-                    CellTypes::Embedding(c, _) => { JsonTreeValue::Base(&c.req, BaseValueType::String)}
-                    CellTypes::Template(c, _) => { JsonTreeValue::Base(&c.body, BaseValueType::String)}
-                    CellTypes::Memory(c, _) => { JsonTreeValue::Base(&c.embedding_function, BaseValueType::String)}
-                }
-            },
-            RkyvSerializedValue::Set(set) => JsonTreeValue::Expandable(
-                set.iter()
-                    .enumerate()
-                    .map(|(idx, elem)| (idx.to_string(), elem as &dyn ToJsonTreeValue))
-                    .collect(),
-                ExpandableType::Array,
-            ),
-            RkyvSerializedValue::Float(n) => JsonTreeValue::Base(n, BaseValueType::Number),
-            RkyvSerializedValue::Boolean(b) => JsonTreeValue::Base(b, BaseValueType::Bool),
-            RkyvSerializedValue::Number(n) => JsonTreeValue::Base(n, BaseValueType::Number),
-            RkyvSerializedValue::String(s) => JsonTreeValue::Base(s, BaseValueType::String),
-            RkyvSerializedValue::Null => JsonTreeValue::Base(&"null", BaseValueType::Null),
-            RkyvSerializedValue::Array(arr) => JsonTreeValue::Expandable(
-                arr.iter()
-                    .enumerate()
-                    .map(|(idx, elem)| (idx.to_string(), elem as &dyn ToJsonTreeValue))
-                    .collect(),
-                ExpandableType::Array,
-            ),
-            RkyvSerializedValue::Object(obj) => JsonTreeValue::Expandable(
-                obj.iter()
-                    .map(|(key, val)| (key.to_owned(), val as &dyn ToJsonTreeValue))
-                    .collect(),
-                ExpandableType::Object,
-            ),
-        }
-    }
-
-    fn is_expandable(&self) -> bool {
-        matches!(
-            self,
-            RkyvSerializedValue::Object(_) | RkyvSerializedValue::Set(_) | RkyvSerializedValue::Array(_)
-        )
-    }
-}
+// impl ToJsonTreeValue for RkyvSerializedValue {
+//     fn to_json_tree_value(&self) -> JsonTreeValue {
+//         match self {
+//             RkyvSerializedValue::StreamPointer(_) => JsonTreeValue::Base(&"null", BaseValueType::Null),
+//             RkyvSerializedValue::FunctionPointer(_, _) => JsonTreeValue::Base(&"null", BaseValueType::Null),
+//             RkyvSerializedValue::Cell(c) => {
+//                 match c {
+//                     CellTypes::Code(c, _) => { JsonTreeValue::Base(&c.source_code, BaseValueType::String)}
+//                     CellTypes::CodeGen(c, _) => { JsonTreeValue::Base(&c.req, BaseValueType::String)}
+//                     CellTypes::Prompt(c, _) => {
+//                         match c {
+//                             LLMPromptCell::Chat { req, .. } => { JsonTreeValue::Base(req, BaseValueType::String)}
+//                             LLMPromptCell::Completion { req, .. } => { JsonTreeValue::Base(req, BaseValueType::String)}
+//                         }
+//                     }
+//                     CellTypes::Embedding(c, _) => { JsonTreeValue::Base(&c.req, BaseValueType::String)}
+//                     CellTypes::Template(c, _) => { JsonTreeValue::Base(&c.body, BaseValueType::String)}
+//                     CellTypes::Memory(c, _) => { JsonTreeValue::Base(&c.embedding_function, BaseValueType::String)}
+//                 }
+//             },
+//             RkyvSerializedValue::Set(set) => JsonTreeValue::Expandable(
+//                 set.iter()
+//                     .enumerate()
+//                     .map(|(idx, elem)| (idx.to_string(), elem as &dyn ToJsonTreeValue))
+//                     .collect(),
+//                 ExpandableType::Array,
+//             ),
+//             RkyvSerializedValue::Float(n) => JsonTreeValue::Base(n, BaseValueType::Number),
+//             RkyvSerializedValue::Boolean(b) => JsonTreeValue::Base(b, BaseValueType::Bool),
+//             RkyvSerializedValue::Number(n) => JsonTreeValue::Base(n, BaseValueType::Number),
+//             RkyvSerializedValue::String(s) => JsonTreeValue::Base(s, BaseValueType::String),
+//             RkyvSerializedValue::Null => JsonTreeValue::Base(&"null", BaseValueType::Null),
+//             RkyvSerializedValue::Array(arr) => JsonTreeValue::Expandable(
+//                 arr.iter()
+//                     .enumerate()
+//                     .map(|(idx, elem)| (idx.to_string(), elem as &dyn ToJsonTreeValue))
+//                     .collect(),
+//                 ExpandableType::Array,
+//             ),
+//             RkyvSerializedValue::Object(obj) => JsonTreeValue::Expandable(
+//                 obj.iter()
+//                     .map(|(key, val)| (key.to_owned(), val as &dyn ToJsonTreeValue))
+//                     .collect(),
+//                 ExpandableType::Object,
+//             ),
+//         }
+//     }
+//
+//     fn is_expandable(&self) -> bool {
+//         matches!(
+//             self,
+//             RkyvSerializedValue::Object(_) | RkyvSerializedValue::Set(_) | RkyvSerializedValue::Array(_)
+//         )
+//     }
+// }
 
 
 
 use regex::Regex;
+use serde_json::Value;
+use chidori_core::execution::execution::ExecutionState;
+use crate::egui_json_tree::JsonTree;
 
 fn traverse_rkyv_serialized_value(
     value: &RkyvSerializedValue,
@@ -401,6 +475,34 @@ pub fn find_matching_strings(
     let mut results = Vec::new();
     traverse_rkyv_serialized_value(value, &regex, Vec::new(), &mut results);
     results
+}
+
+pub fn serialized_value_to_json_value(v: &RkyvSerializedValue) -> serde_json::Value {
+    match &v {
+        RkyvSerializedValue::Float(f) => Value::Number(f.to_string().parse().unwrap()),
+        RkyvSerializedValue::Number(n) => Value::Number(n.to_string().parse().unwrap()),
+        RkyvSerializedValue::String(s) => Value::String(s.to_string()),
+        RkyvSerializedValue::Boolean(b) => Value::Bool(*b),
+        RkyvSerializedValue::Array(a) => Value::Array(
+            a.iter()
+                .map(|v| serialized_value_to_json_value(v))
+                .collect(),
+        ),
+        RkyvSerializedValue::Object(a) => Value::Object(
+            a.iter()
+                .map(|(k, v)| (k.clone(), serialized_value_to_json_value(v)))
+                .collect(),
+        ),
+        RkyvSerializedValue::FunctionPointer(_, _) => Value::Null,
+        RkyvSerializedValue::StreamPointer(_) => Value::Null,
+        RkyvSerializedValue::Cell(_) => Value::Null,
+        RkyvSerializedValue::Null => Value::Null,
+        RkyvSerializedValue::Set(a) => {
+            a.iter()
+                .map(|v| serialized_value_to_json_value(v))
+                .collect()
+        }
+    }
 }
 
 

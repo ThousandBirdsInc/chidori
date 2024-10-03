@@ -21,6 +21,7 @@ use bevy::{
 use std::marker::PhantomData;
 use bevy::math::Vec3;
 use egui;
+use egui::Modifiers;
 
 #[allow(missing_docs)]
 #[derive(SystemParam)]
@@ -255,12 +256,30 @@ pub fn process_input_system(
                 window_context
                     .egui_input
                     .events
-                    .push(egui::Event::Scroll(egui::vec2(delta.x + delta.y, 0.0)));
+                    .push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(delta.x + delta.y, 0.0),
+                        modifiers: Modifiers {
+                            alt,
+                            ctrl,
+                            shift,
+                            mac_cmd,
+                            command,
+                        }});
             } else {
                 window_context
                     .egui_input
                     .events
-                    .push(egui::Event::Scroll(delta));
+                    .push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta,
+                        modifiers: Modifiers {
+                            alt,
+                            ctrl,
+                            shift,
+                            mac_cmd,
+                            command,
+                        }});
             }
         }
     }

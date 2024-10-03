@@ -11,13 +11,13 @@ repository.workspace = true
 objc = "0.2"
 winit = "=0.29.15"
 bevy = "0.13.2"
-egui = { version = "0.27.2", default-features = false, features = ["bytemuck"] }
+egui = { version = "0.28.1", default-features = false, features = ["bytemuck"] }
 image = { version = "0.24", features = ["jpeg", "png"] }
 bevy_utils = "0.13.2"
 bevy_rapier2d = { version = "*", features = [ "simd-stable", "debug-render-2d" ]}
 bevy_prototype_lyon = "0.11.0"
-egui_extras = { version = "0.27.2" , features = ["syntect", "all_loaders"]}
-egui_tiles = "0.8.0"
+egui_extras = { version = "0.28.1" , features = ["syntect", "all_loaders"]}
+egui_tiles = "0.9.1"
 bevy_cosmic_edit = { version = "0.19.0", features = ["multicam"] }
 rfd = "0.14.1"
 bytemuck = "1.15.0"
@@ -26,7 +26,9 @@ petgraph-gen = "0.1.3"
 fdg = { git = "https://github.com/grantshandy/fdg.git", version = "1.0.0" }
 num = "0.4.0"
 tinyset = "0.4.10"
+egui_json_tree = "0.6.0"
 
+dashmap = "5.5.3"
 anyhow.workspace = true
 serde.workspace = true
 serde_json = "=1.0.115"

@@ -48,7 +48,7 @@ pub trait VectorDatabase<C> {
         collection_name: String,
         id: u64,
         vector: Vec<f32>,
-        payload: Option<serde_json::Value>,
+        payload: Option<chidori_prompt_format::serde_json::Value>,
     ) -> Result<(), VectorDbError>;
 
     // Queries the database by vector

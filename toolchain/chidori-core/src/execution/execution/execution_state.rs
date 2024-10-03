@@ -162,6 +162,7 @@ pub struct ExecutionState {
     pub evaluating_name: Option<String>,
     pub evaluating_fn: Option<String>,
     pub evaluating_arguments: Option<RkyvSerializedValue>,
+    pub evaluating_cell: Option<CellTypes>,
 
     /// CellType applied, by a state that is mutating cell definitions
     pub operation_mutation: Option<CellTypes>,
@@ -268,6 +269,7 @@ async fn pause_future_with_oneshot(execution_state_evaluation: ExecutionStateEva
 impl Default for ExecutionState {
     fn default() -> Self {
         ExecutionState {
+            
             exec_counter: 0,
             id: Uuid::new_v4(),
             stack: Default::default(),
@@ -277,6 +279,7 @@ impl Default for ExecutionState {
             evaluating_name: None,
             evaluating_fn: None,
             evaluating_arguments: None,
+            evaluating_cell: None,
             operation_mutation: None,
             graph_sender: None,
             exec_queue: VecDeque::new(),
@@ -418,13 +421,8 @@ impl ExecutionState {
         graph
     }
 
-    #[tracing::instrument]
-    pub fn update_op(
-        &self,
-        cell: CellTypes,
-        op_id: OperationId,
-    ) -> anyhow::Result<(ExecutionState, OperationId)> {
-        let mut op = match &cell {
+    pub fn get_operation_from_cell_type(&self, cell: &CellTypes) -> anyhow::Result<OperationNode> {
+        let op = match cell {
             CellTypes::Code(c, r) => crate::cells::code_cell::code_cell(self.id.clone(), c, r),
             CellTypes::Prompt(c, r) => crate::cells::llm_prompt_cell::llm_prompt_cell(self.id.clone(), c, r),
             CellTypes::Embedding(c, r) => crate::cells::embedding_cell::llm_embedding_cell(self.id.clone(), c, r),
@@ -432,6 +430,16 @@ impl ExecutionState {
             CellTypes::Memory(c, r) => crate::cells::memory_cell::memory_cell(self.id.clone(), c, r),
             CellTypes::CodeGen(c, r) => crate::cells::code_gen_cell::code_gen_cell(self.id.clone(), c, r),
         }?;
+        Ok(op)
+    }
+
+    #[tracing::instrument]
+    pub fn update_operation(
+        &self,
+        cell: CellTypes,
+        op_id: OperationId,
+    ) -> anyhow::Result<(ExecutionState, OperationId)> {
+        let mut op = self.get_operation_from_cell_type(&cell)?;
         op.attach_cell(cell.clone());
         let new_state = self.clone();
         let (op_id, new_state) = new_state.upsert_operation(op, op_id);
@@ -621,6 +629,7 @@ impl ExecutionState {
             op_name = op.name.clone();
             cell = op.cell.clone();
         }
+        state.evaluating_cell = Some(cell.clone());
         state.evaluating_fn = Some(function_name.to_string());
         state.evaluating_id = meta.operation_id;
         state.evaluating_name = op_name;
@@ -693,7 +702,7 @@ impl ExecutionState {
         Ok((result.output, after_execution_state))
     }
 
-    fn get_operation_node(&self, operation_id: OperationId) -> anyhow::Result<MutexGuard<OperationNode>> {
+    pub fn get_operation_node(&self, operation_id: OperationId) -> anyhow::Result<MutexGuard<OperationNode>> {
         println!("Getting operation node");
         self.operation_by_id
             .get(&operation_id)
@@ -715,22 +724,22 @@ impl ExecutionState {
         new_state.state_insert(next_operation_id, result);
         new_state.value_freshness_map.insert(next_operation_id, self.exec_counter);
     }
-
-    async fn execute_operation(
-        &self,
-        new_state: &mut ExecutionState,
-        mut op_node: MutexGuard<'_, OperationNode>,
-        next_operation_id: OperationId,
-        inputs: OperationInputs,
-    ) -> anyhow::Result<OperationFnOutput> {
-        let argument_payload = inputs.to_serialized_value();
-
-        new_state.evaluating_fn = None;
-        new_state.evaluating_id = next_operation_id;
-        new_state.evaluating_name = op_node.name.clone();
-
-        op_node.execute(new_state, argument_payload, None, None).await
-    }
+    //
+    // async fn execute_operation(
+    //     &self,
+    //     new_state: &mut ExecutionState,
+    //     mut op_node: MutexGuard<'_, OperationNode>,
+    //     next_operation_id: OperationId,
+    //     inputs: OperationInputs,
+    // ) -> anyhow::Result<OperationFnOutput> {
+    //     let argument_payload = inputs.to_serialized_value();
+    //
+    //     new_state.evaluating_fn = None;
+    //     new_state.evaluating_id = next_operation_id;
+    //     new_state.evaluating_name = op_node.name.clone();
+    //
+    //     op_node.execute(new_state, argument_payload, None, None).await
+    // }
 
     fn prepare_operation_inputs(
         &self,
@@ -888,6 +897,7 @@ impl ExecutionState {
         }
         println!("step_execution, getting operation node {:?}", &new_state.evaluating_id);
         let op_node = self.get_operation_node(new_state.evaluating_id)?;
+        new_state.evaluating_cell = Some(op_node.cell.clone());
         println!("step_execution, completed getting operation node {:?}", &new_state.evaluating_id);
         let args = new_state.evaluating_arguments.take().unwrap();
         let next_operation_id = new_state.evaluating_id.clone();
@@ -995,7 +1005,7 @@ mod tests {
             function_invocation: None,
         }, Default::default());
         
-        let (new_state, op_id) = state.update_op(cell.clone(), None).unwrap();
+        let (new_state, op_id) = state.update_operation(cell.clone(), None).unwrap();
         
         assert!(new_state.operation_by_id.contains_key(&op_id));
         assert_eq!(new_state.operation_mutation, Some(cell));

@@ -262,7 +262,7 @@ fn mouse_over_system(
         point, filter, |entity| {
             if let Ok((_, _, mut span)) = node_query.get_mut(entity) {
                 span.is_hovered = true;
-                egui::containers::popup::show_tooltip_at_pointer(ctx, egui::Id::new("my_tooltip"), |ui| {
+                egui::containers::popup::show_tooltip_at_pointer(ctx, egui::LayerId::new(Order::Foreground, egui::Id::new("my_tooltiplayer")), egui::Id::new("my_tooltip"), |ui| {
                     call_tree.inner.graph.node_weight(span.node_idx).map(|node| {
                         match &node.event {
                             TraceEvents::NewSpan {name, location, line, thread_id, parent_id, execution_id, ..} => {
@@ -947,7 +947,7 @@ fn trace_setup(
         Camera3dBundle {
             camera: Camera {
                 order: 2,
-                clear_color: ClearColorConfig::Custom(Color::rgba(0.1, 0.1, 0.1, 1.0)),
+                clear_color: ClearColorConfig::Custom(Color::rgba(0.035, 0.035, 0.043, 1.0)),
                 viewport: Some(Viewport {
                     physical_position: UVec2::new(0, minimap_height_and_offset),
                     physical_size: UVec2::new(
@@ -1099,6 +1099,7 @@ pub fn trace_plugin(app: &mut App) {
 }
 
 use std::num::NonZeroU64;
+use egui::Order;
 
 #[cfg(test)]
 mod tests {

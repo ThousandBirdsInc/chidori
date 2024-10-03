@@ -1,7 +1,7 @@
-use crate::chidori::{ChidoriExecutionGraph, EguiTree, EguiTreeIdentities};
+use crate::chidori::{ChidoriExecutionGraph, EguiTree, EguiTreeIdentities, InternalState};
 use crate::tidy_tree::{Layout, TidyLayout};
-use crate::util::{despawn_screen, egui_render_cell_read};
-use crate::{chidori, GameState, RENDER_LAYER_GRAPH_MINIMAP, RENDER_LAYER_GRAPH_VIEW, RENDER_LAYER_TRACE_MINIMAP, RENDER_LAYER_TRACE_VIEW, util};
+use crate::util::{despawn_screen, egui_render_cell_function_evaluation, egui_render_cell_read, serialized_value_to_json_value};
+use crate::{chidori, CurrentTheme, GameState, RENDER_LAYER_GRAPH_MINIMAP, RENDER_LAYER_GRAPH_VIEW, RENDER_LAYER_TRACE_MINIMAP, RENDER_LAYER_TRACE_VIEW, Theme, util};
 use bevy::app::{App, Update};
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::input::touchpad::TouchpadMagnify;
@@ -39,7 +39,8 @@ use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 use bevy::render::camera::{ScalingMode, Viewport};
 use bevy::render::render_asset::RenderAssetUsages;
-use crate::egui_json_tree::JsonTree;
+use dashmap::DashMap;
+use egui_json_tree::JsonTree;
 use egui_tiles::Tile;
 use image::{ImageBuffer, RgbaImage};
 use chidori_core::execution::execution::execution_state::{ExecutionStateErrors, ExecutionStateEvaluation};
@@ -58,6 +59,7 @@ struct GraphResource {
     group_dependency_graph: StableGraph<ExecutionNodeId, ()>,
     hash_graph: u64,
     node_ids: HashMap<ExecutionNodeId, NodeIndex>,
+    node_dimensions: DashMap<ExecutionNodeId, (f32, f32)>,
     grouped_nodes: HashMap<ExecutionNodeId, StableGraph<ExecutionNodeId, ()>>,
     is_active: bool,
 }
@@ -398,6 +400,7 @@ fn mouse_scroll_events(
 
     if keyboard_input.just_pressed(KeyCode::Enter) {
         camera_state.state = CameraStateValue::LockedOnExecHead;
+        return;
     }
 
     let mut projection = match projection.into_inner() {
@@ -412,16 +415,17 @@ fn mouse_scroll_events(
     for ev in scroll_evr.read() {
         if keyboard_input.pressed(KeyCode::SuperLeft) {
             let zoom_factor = (projection.scale + ev.y).clamp(1.0, 1000.0) / projection.scale;
-            camera_transform.translation.x = coords.0.x - zoom_factor * (coords.0.x - camera_transform.translation.x);
-            camera_transform.translation.y = coords.0.y - zoom_factor * (coords.0.y - camera_transform.translation.y);
+            camera_x = coords.0.x - zoom_factor * (coords.0.x - camera_transform.translation.x);
+            camera_y = coords.0.y - zoom_factor * (coords.0.y - camera_transform.translation.y);
+            camera_state.state = CameraStateValue::Free(camera_x, camera_y);
             projection.scale = (projection.scale + ev.y).clamp(1.0, 1000.0);
         } else {
             camera_x -= ev.x * projection.scale;
-            camera_y += ev.y * projection.scale;
+            camera_y += (ev.y * 2.0) * projection.scale;
+            camera_state.state = CameraStateValue::Free(camera_x, camera_y);
         }
     }
     // if !keyboard_input.pressed(KeyCode::SuperLeft) {
-    //     println!("Camera graph free");
     //     camera_state.state = CameraStateValue::Free(camera_x, camera_y);
     // }
 
@@ -444,13 +448,13 @@ fn touchpad_gestures(
 }
 
 
-fn compute_transform_matrix(
+fn compute_egui_transform_matrix(
     mut contexts: EguiContexts,
     mut q_egui_render_target: Query<(&mut EguiRenderTarget, &Transform), (With<EguiRenderTarget>, Without<Window>)>,
     q_window: Query<&Window, With<PrimaryWindow>>,
-    q_camera: Query<(&Camera, &GlobalTransform), (Without<GraphMinimapCamera>,  With<OnGraphScreen>)>,
+    q_camera: Query<(&Projection, &Camera, &GlobalTransform), (Without<GraphMinimapCamera>,  With<OnGraphScreen>)>,
 ) {
-    let (camera, camera_transform) = q_camera.single();
+    let (projection, camera, camera_transform) = q_camera.single();
     let window = q_window.single();
     let scale_factor = window.scale_factor();
     let viewport_pos = if let Some(viewport) = &camera.viewport {
@@ -458,6 +462,17 @@ fn compute_transform_matrix(
     } else {
         Vec2::ZERO
     };
+    let mut projection = match projection {
+        Projection::Perspective(_) => {
+            unreachable!("This should be orthographic")
+        }
+        Projection::Orthographic(o) => o,
+    };
+    // Attempting to reduce lag at large zooms
+    // if projection.scale > 50.0 {
+    //     println!("above threshold");
+    //     return;
+    // }
     let Some(cursor) = window.cursor_position() else {
         return;
     };
@@ -520,39 +535,77 @@ fn my_cursor_system(
     }
 }
 
-fn egui_execution_state(ui: &mut Ui, execution_state: &ExecutionState) {
+fn egui_execution_state(ui: &mut Ui, internal_state: &InternalState, execution_state: &ExecutionState, current_theme: &Theme) {
     ui.vertical(|ui| {
         ui.label("Evaluated:");
         ui.horizontal(|ui| {
             ui.add_space(10.0);
             ui.vertical(|ui| {
-                ui.label(format!("Operation Id: {:?}", execution_state.evaluating_id));
+                if internal_state.debug_mode {
+                    ui.label(format!("Operation Id: {:?}", execution_state.evaluating_id));
+                }
                 if let Some(evaluating_name) = execution_state.evaluating_name.as_ref() {
                     ui.label(format!("Cell Name: {:?}", evaluating_name));
                 }
-                if let Some(evaluating_fn) = &execution_state.evaluating_fn {
-                    ui.label(format!("Function Invoked: {:?}", evaluating_fn));
+                // if let Some(evaluating_fn) = &execution_state.evaluating_fn {
+                //     ui.label(format!("Function Invoked: {:?}", evaluating_fn));
+                // }
+                egui_render_cell_function_evaluation(ui, execution_state);
+                if !execution_state.state.is_empty() {
+                    ui.label("Output:");
+                    // let mut frame = egui::Frame::default()
+                    //     .fill(current_theme.background).stroke(current_theme.card_border).inner_margin(16.0).rounding(6.0).begin(ui);
+                    // {
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        for (key, value) in execution_state.state.iter() {
+                            if execution_state.fresh_values.contains(key) {
+                                match &value.output.clone() {
+                                    Ok(o) => {
+                                        let response = JsonTree::new(format!("{:?}", key), &serialized_value_to_json_value(&o))
+                                            // .default_expand(DefaultExpand::SearchResults(&self.search_input))
+                                            .show(ui);
+                                    }
+                                    Err(e) => {
+                                        ui.label(format!("{:?}", e));
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    // }
+                    // frame.end(ui);
                 }
             })
         });
 
-        ui.label("Exec Stack:");
-        ui.horizontal(|ui| {
-            ui.add_space(10.0);
-            ui.vertical(|ui| {
-                for item in &execution_state.stack {
-                    ui.label(format!("{:?}", item));
-                }
-            })
-        });
 
 
+        if let Some(cell) = &execution_state.evaluating_cell {
+            egui::CollapsingHeader::new("Cell Definition")
+                .show(ui, |ui| {
+                    egui_render_cell_read(ui, cell, execution_state);
+                });
+        }
 
-        if let Some(args) = &execution_state.evaluating_arguments {
-            ui.label("Evaluating With Arguments");
-            let response = JsonTree::new(format!("evaluating_args"), args)
-                // .default_expand(DefaultExpand::SearchResults(&self.search_input))
-                .show(ui);
+        if internal_state.debug_mode {
+            if !execution_state.stack.is_empty() {
+                ui.label("Exec Stack:");
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    ui.vertical(|ui| {
+                        for item in &execution_state.stack {
+                            ui.label(format!("{:?}", item));
+                        }
+                    })
+                });
+            }
+            if let Some(args) = &execution_state.evaluating_arguments {
+                ui.label("Evaluating With Arguments");
+                let response = JsonTree::new(format!("evaluating_args"), &serialized_value_to_json_value(&args))
+                    // .default_expand(DefaultExpand::SearchResults(&self.search_input))
+                    .show(ui);
+            }
         }
 
         if let Some(cell) = &execution_state.operation_mutation {
@@ -563,27 +616,10 @@ fn egui_execution_state(ui: &mut Ui, execution_state: &ExecutionState) {
                 //     ui.label(format!("Operation Id: {:?}", execution_state.evaluating_id));
                 // })
             });
-            egui_render_cell_read(ui, cell);
+            egui_render_cell_read(ui, cell, execution_state);
         }
 
-        if !execution_state.state.is_empty() {
-            ui.label("Output:");
-            for (key, value) in execution_state.state.iter() {
-                if execution_state.fresh_values.contains(key) {
-                    match &value.output.clone() {
-                        Ok(o) => {
-                            let response = JsonTree::new(format!("{:?}", key), o)
-                                // .default_expand(DefaultExpand::SearchResults(&self.search_input))
-                                .show(ui);
-                        }
-                        Err(e) => {
-                            ui.label(format!("{:?}", e));
-                        }
-                    }
-                    // util::egui_rkyv(ui, &value.output, false);
-                }
-            }
-        }
+
     });
 }
 
@@ -766,8 +802,9 @@ fn update_graph_system_renderer(
     mut graph_resource: ResMut<GraphResource>,
     mut edge_pair_id_to_entity: ResMut<EdgePairIdToEntity>,
     mut node_id_to_entity: ResMut<NodeIdToEntity>,
+    current_theme: Res<CurrentTheme>,
     mut node_query: Query<
-        (Entity, &mut Transform, &GraphIdx, &mut EguiContext),
+        (Entity, &mut Transform, &GraphIdx, &mut EguiContext, &mut EguiRenderTarget, &Handle<RoundedRectMaterial>),
         (With<GraphIdx>, Without<GraphIdxPair>),
     >,
     mut edge_query: Query<
@@ -816,6 +853,7 @@ fn update_graph_system_renderer(
 
 
     // Construct the tidy_tree from a topo traversal of the graph
+    // TODO: grouping is currently unused
     let execution_graph = &graph_resource.execution_graph;
     let grouped_nodes = &graph_resource.grouped_nodes;
     let group_dep_graph = &graph_resource.group_dependency_graph;
@@ -823,7 +861,7 @@ fn update_graph_system_renderer(
     for (id, group_graph) in grouped_nodes {
         let mut tidy = TidyLayout::new(200., 200.);
         let mut root = crate::tidy_tree::Node::new(0, 10., 10.);
-        let node_mapping = generate_tree_layout(&mut tidy, &mut root, &group_graph);
+        let node_mapping = generate_tree_layout(&mut tidy, &mut root, &group_graph, &graph_resource.node_dimensions);
         group_layouts.insert(id, (tidy, root, node_mapping));
     }
 
@@ -831,7 +869,7 @@ fn update_graph_system_renderer(
 
     let mut tidy = TidyLayout::new(200., 200.);
     let mut root = crate::tidy_tree::Node::new(0, 10., 10.);
-    let node_mapping = generate_tree_layout(&mut tidy, &mut root, &execution_graph);
+    let node_mapping = generate_tree_layout(&mut tidy, &mut root, &execution_graph, &graph_resource.node_dimensions);
 
     // Traverse the graph again, and render the elements of the graph based on their layout in the tidy_tree
     // This traverses the graph and then gets the position of the elements in the tree from their identity
@@ -841,11 +879,13 @@ fn update_graph_system_renderer(
             let mut parents = &mut graph_resource
                 .execution_graph
                 .neighbors_directed(idx, petgraph::Direction::Incoming);
+
+            // Get position of the node's parent
             let parent_pos = parents
                 .next()
                 .and_then(|parent| node_id_to_entity.mapping.get(&parent))
                 .and_then(|entity| {
-                    if let Ok((_, mut transform, _, _)) = node_query.get_mut(*entity) {
+                    if let Ok((_, mut transform, _, _, _, _)) = node_query.get_mut(*entity) {
                         Some(transform.translation.truncate())
                     } else {
                         None
@@ -854,16 +894,19 @@ fn update_graph_system_renderer(
 
             if let Some(n) = node_mapping.get(&idx) {
                 unsafe {
+                    // Create the appropriately sized egui render target texture
                     let n = n.as_ref();
-                    let width = n.width.to_f32().unwrap() + 20.0;
-                    let height = n.height.to_f32().unwrap() + 20.0;
+                    let width = n.width.to_f32().unwrap();
+                    let height = n.height.to_f32().unwrap();
                     let entity = node_id_to_entity.mapping.entry(idx).or_insert_with(|| {
                         // This is the texture that will be rendered to.
                         // TODO: needs to be greater than the bounds of the target (enforce this)
                         let scale_factor = window.scale_factor();
+                        let scaled_width = (width * scale_factor) as u32;
+                        let scaled_height = (height * scale_factor) as u32;
                         let size = Extent3d {
-                            width: (width * scale_factor) as u32,
-                            height: (height * scale_factor) as u32,
+                            width: scaled_width,
+                            height: scaled_height,
                             depth_or_array_layers: 1,
                         };
                         let mut image = Image {
@@ -887,7 +930,7 @@ fn update_graph_system_renderer(
                             width: 1.0,
                             height: 1.0,
                             color_texture: Some(image_handle.clone()),
-                            base_color: Vec4::new(1.0, 1.0, 1.0, 1.0),
+                            base_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
                             alpha_mode: AlphaMode::Blend,
                         });
 
@@ -895,7 +938,7 @@ fn update_graph_system_renderer(
                             MaterialMeshBundle {
                                 mesh: meshes.add(Mesh::from(Rectangle::new(1.0, 1.0))),
                                 material: node_material,
-                                transform: Transform::from_xyz(parent_pos.x, parent_pos.y, -1.0),
+                                transform: Transform::from_xyz(parent_pos.x, parent_pos.y, -1.0).with_scale(vec3(width, height, 1.0)),
                                 ..Default::default()
                             },
                             GraphIdx {
@@ -906,6 +949,8 @@ fn update_graph_system_renderer(
                                 is_selected: false,
                             },
                             EguiRenderTarget {
+                                inner_physical_width: scaled_width,
+                                inner_physical_height: scaled_height,
                                 image: Some(image_handle),
                                 inner_scale_factor: scale_factor,
                                 ..default()
@@ -919,10 +964,72 @@ fn update_graph_system_renderer(
                         entity.id()
                     });
 
-                    if let Ok((entity, mut transform, gidx, mut egui_ctx)) = node_query.get_mut(*entity) {
+                    // Check if dimensions have changed for existing entries
+                    if let Ok((_, mut transform, _, _, mut egui_render_target, material_handle)) = node_query.get_mut(*entity) {
+                        let current_image = egui_render_target.image.as_ref();
+                        let dimensions_changed = current_image.map_or(true, |image| {
+                            let texture = images.get(image).unwrap();
+                            texture.texture_descriptor.size.width != (width * window.scale_factor()) as u32 ||
+                                texture.texture_descriptor.size.height != (height * window.scale_factor()) as u32
+                        });
+
+                        if dimensions_changed {
+                            // Create new image with updated dimensions
+                            let scale_factor = window.scale_factor();
+                            let scaled_width = (width * scale_factor) as u32;
+                            let scaled_height = (height * scale_factor) as u32;
+                            let size = Extent3d {
+                                width: scaled_width,
+                                height: scaled_height,
+                                depth_or_array_layers: 1,
+                            };
+                            let mut image = Image {
+                                texture_descriptor: TextureDescriptor {
+                                    label: None,
+                                    dimension: TextureDimension::D2,
+                                    format: TextureFormat::Bgra8UnormSrgb,
+                                    mip_level_count: 1,
+                                    sample_count: 1,
+                                    usage: TextureUsages::TEXTURE_BINDING
+                                        | TextureUsages::COPY_DST
+                                        | TextureUsages::RENDER_ATTACHMENT,
+                                    view_formats: &[],
+                                    size
+                                },
+                                ..default()
+                            };
+                            image.resize(size);
+                            let image_handle = images.add(image);
+
+                            // Create new EguiRenderTarget, this avoids issues swapping the image target underneath rendering
+                            // which otherwise resulted in scissor rect errors.
+                            let new_egui_render_target = EguiRenderTarget {
+                                inner_physical_width: scaled_width,
+                                inner_physical_height: scaled_height,
+                                image: Some(image_handle.clone()),
+                                inner_scale_factor: scale_factor,
+                                ..default()
+                            };
+
+                            // Replace the old EguiRenderTarget with the new one
+                            commands.entity(*entity).remove::<EguiRenderTarget>()
+                                .insert(new_egui_render_target);
+
+                            // Update material with new texture
+                            let mut material = materials_custom.get_mut(material_handle).unwrap();
+                            material.color_texture = Some(image_handle);
+
+                            transform.scale.x = scaled_width as f32;
+                            transform.scale.y = scaled_height as f32;
+                        }
+                    }
+
+
+                    if let Ok((entity, mut transform, gidx, mut egui_ctx, _, _)) = node_query.get_mut(*entity) {
                         let egui_ctx = egui_ctx.into_inner();
                         let ctx = egui_ctx.get_mut();
 
+                        // Position the node according to its tidytree layout
                         transform.translation = transform.translation.lerp(Vec3::new(n.x.to_f32().unwrap(), -n.y.to_f32().unwrap(), -1.0), 0.5);
 
                         // Draw text within these elements
@@ -930,127 +1037,141 @@ fn update_graph_system_renderer(
                             .fixed_pos(Pos2::new(0.0, 0.0)).show(ctx, |ui| {
 
                             ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
-                            let mut frame = egui::Frame::default().fill(Color32::from_hex("#eeeeee").unwrap()).inner_margin(16.0).rounding(6.0).begin(ui);
+                            let mut frame = egui::Frame::default().fill(current_theme.theme.card).stroke(current_theme.theme.card_border).inner_margin(16.0).rounding(6.0).begin(ui);
                             {
                                 let mut ui = &mut frame.content_ui;
                                 let node1 = *node;
                                 let original_style = (*ui.ctx().style()).clone();
 
                                 let mut style = original_style.clone();
-                                style.visuals.override_text_color = Some(Color32::BLACK);
+                                // style.visuals.override_text_color = Some(Color32::BLACK);
                                 ui.set_style(style);
 
-                                egui::ScrollArea::new([false, true]) // Horizontal: false, Vertical: true
-                                    .max_width(700.0)
-                                    .max_height(400.0)
-                                    .show(ui, |ui| {
-                                        if *node1 == chidori_core::uuid::Uuid::nil() {
+
+
+                                if *node1 == chidori_core::uuid::Uuid::nil() {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Initialization...");
+                                        if internal_state.debug_mode {
+                                            ui.label(node1.to_string());
+                                        }
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                            if ui.button(RichText::new("Revert to this State").color(Color32::from_hex("#dddddd").unwrap())).clicked() {
+                                                let _ = internal_state.set_execution_id(*node1);
+                                            }
+                                        });
+                                    });
+                                } else {
+
+                                    if let Some(state) = internal_state.get_execution_state_at_id(&node1) {
+                                        let state = &state;
+                                        if !matches!(state, ExecutionStateEvaluation::Executing(_)) {
                                             ui.horizontal(|ui| {
-                                                ui.label(RichText::new("Initialization...").color(Color32::BLACK));
-                                                ui.label(RichText::new(node1.to_string()).color(Color32::BLACK));
+                                                if internal_state.debug_mode {
+                                                    ui.label(node1.to_string());
+                                                }
                                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                                                    if ui.button(RichText::new("Revert to this State").color(Color32::from_hex("#dddddd").unwrap())).clicked() {
+                                                    if ui.button("Revert to this State").clicked() {
+                                                        println!("We would like to revert to {:?}", node1);
                                                         let _ = internal_state.set_execution_id(*node1);
                                                     }
                                                 });
                                             });
-                                        } else {
+                                        }
 
-                                            if let Some(state) = internal_state.get_execution_state_at_id(&node1) {
-                                                let state = &state;
-                                                if !matches!(state, ExecutionStateEvaluation::Executing(_)) {
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(RichText::new(node1.to_string()).color(Color32::BLACK));
-                                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                                                            if ui.button(RichText::new("Revert to this State").color(Color32::from_hex("#dddddd").unwrap())).clicked() {
-                                                                println!("We would like to revert to {:?}", node1);
-                                                                let _ = internal_state.set_execution_id(*node1);
-                                                            }
-                                                        });
-                                                    });
+                                        match state {
+                                            ExecutionStateEvaluation::Error(state) => {
+                                                let mut frame = egui::Frame::default().fill(current_theme.theme.card).stroke(Stroke {
+                                                    width: 0.5,
+                                                    color: Color32::from_hex("#ff0000").unwrap(),
+                                                }).inner_margin(16.0).rounding(6.0).begin(ui);
+                                                {
+                                                    let mut ui = &mut frame.content_ui;
+                                                    ui.label("Error");
+                                                    egui_execution_state(ui, &internal_state, state, &current_theme.theme);
+                                                }
+                                                frame.end(ui);
+                                            }
+                                            ExecutionStateEvaluation::EvalFailure(_) => {
+                                                ui.label("Eval Failure");
+                                            }
+                                            ExecutionStateEvaluation::Executing(state) => {
+                                                ui.label("Executing");
+                                                egui_execution_state(ui, &internal_state, state,  &current_theme.theme);
+                                            }
+                                            ExecutionStateEvaluation::Complete(state)=> {
+                                                for (key, value) in state.state.iter() {
+                                                    let image_paths = crate::util::find_matching_strings(&value.output.clone().unwrap(), r"(?i)\.(png|jpe?g)$");
+                                                    for (img_path, object_path_to_img) in image_paths {
+                                                        let texture = if let Some(cached_texture) = node_image_texture_cache.get(&img_path) {
+                                                            cached_texture.clone()
+                                                        } else {
+                                                            // Load the image
+                                                            let img = image::io::Reader::open(&img_path)
+                                                                .expect("Failed to open image")
+                                                                .decode()
+                                                                .expect("Failed to decode image");
+
+                                                            // Convert the image to egui::ColorImage
+                                                            let size = [img.width() as _, img.height() as _];
+                                                            let image_buffer = img.to_rgba8();
+                                                            let pixels = image_buffer.as_flat_samples();
+                                                            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                                                size,
+                                                                pixels.as_slice(),
+                                                            );
+
+                                                            // Create the texture
+                                                            let texture = ui.ctx().load_texture(
+                                                                &img_path,
+                                                                color_image,
+                                                                egui::TextureOptions::default()
+                                                            );
+
+                                                            // Cache the texture
+                                                            node_image_texture_cache.insert(img_path.clone(), texture.clone());
+
+                                                            texture
+                                                        };
+
+                                                        // Display the image
+                                                        ui.add(egui::Image::new(&texture));
+                                                    }
                                                 }
 
-                                                match state {
-                                                    ExecutionStateEvaluation::Error(state) => {
-                                                        let mut frame = egui::Frame::default().fill(Color32::from_hex("#eeeeee").unwrap()).stroke(Stroke {
-                                                            width: 1.0,
-                                                            color: Color32::from_hex("#ff0000").unwrap(),
-                                                        }).inner_margin(16.0).rounding(6.0).begin(ui);
-                                                        {
-                                                            let mut ui = &mut frame.content_ui;
-                                                            ui.label("Error");
-                                                            egui_execution_state(ui, state);
-                                                        }
-                                                        frame.end(ui);
-                                                    }
-                                                    ExecutionStateEvaluation::EvalFailure(_) => {
-                                                        ui.label("Eval Failure");
-                                                    }
-                                                    ExecutionStateEvaluation::Executing(state) => {
-                                                        ui.label("Executing");
-                                                        egui_execution_state(ui, state);
-                                                    }
-                                                    ExecutionStateEvaluation::Complete(state)=> {
-                                                        for (key, value) in state.state.iter() {
-                                                            let image_paths = crate::util::find_matching_strings(&value.output.clone().unwrap(), r"(?i)\.(png|jpe?g)$");
-                                                            for (img_path, object_path_to_img) in image_paths {
-                                                                let texture = if let Some(cached_texture) = node_image_texture_cache.get(&img_path) {
-                                                                    cached_texture.clone()
-                                                                } else {
-                                                                    // Load the image
-                                                                    let img = image::io::Reader::open(&img_path)
-                                                                        .expect("Failed to open image")
-                                                                        .decode()
-                                                                        .expect("Failed to decode image");
-
-                                                                    // Convert the image to egui::ColorImage
-                                                                    let size = [img.width() as _, img.height() as _];
-                                                                    let image_buffer = img.to_rgba8();
-                                                                    let pixels = image_buffer.as_flat_samples();
-                                                                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                                                        size,
-                                                                        pixels.as_slice(),
-                                                                    );
-
-                                                                    // Create the texture
-                                                                    let texture = ui.ctx().load_texture(
-                                                                        &img_path,
-                                                                        color_image,
-                                                                        egui::TextureOptions::default()
-                                                                    );
-
-                                                                    // Cache the texture
-                                                                    node_image_texture_cache.insert(img_path.clone(), texture.clone());
-
-                                                                    texture
-                                                                };
-
-                                                                // Display the image
-                                                                ui.add(egui::Image::new(&texture));
-                                                            }
-                                                        }
-
-                                                        egui_execution_state(ui, state);
-                                                    }
-                                                }
-                                            } else {
-                                                ui.label("No evaluation recorded");
-                                                // internal_state.get_execution_state_at_id(*node);
+                                                egui_execution_state(ui, &internal_state, state,  &current_theme.theme);
                                             }
                                         }
-                                    });
+                                    } else {
+                                        ui.label("No evaluation recorded");
+                                        // internal_state.get_execution_state_at_id(*node);
+                                    }
+                                }
+
+
+                            // egui::ScrollArea::new([false, true]) // Horizontal: false, Vertical: true
+                            //         .max_width(700.0)
+                            //         .max_height(400.0)
+                            //         .show(ui, |ui| {
+                            //         });
 
                                 ui.set_style(original_style);
                             }
                             frame.end(ui);
                         });
+
                         let used_rect = ctx.used_rect();
-                        transform.scale =  vec3(used_rect.width(), used_rect.height(), 1.0);
+                        // let width = used_rect.width().max(600.0);
+                        // let height = used_rect.height().max(300.0);
+                        let width = used_rect.width();
+                        let height = used_rect.height();
+                        graph_resource.node_dimensions.insert(*node.clone(), (width, height));
+                        transform.scale = vec3(width, height, 1.0);
                     }
 
                     n.children.iter().for_each(|child| {
                         let parent_pos = if let Some(entity ) = node_index_to_entity.get(&n.id) {
-                            if let Ok((entity, mut transform, gidx, _)) = node_query.get(*entity) {
+                            if let Ok((entity, mut transform, gidx, _, _, _)) = node_query.get(*entity) {
                                 transform.translation.truncate()
                             } else {
                                 return;
@@ -1059,7 +1180,7 @@ fn update_graph_system_renderer(
                             return;
                         };
                         let child_pos = if let Some(entity ) = node_index_to_entity.get(&child.id) {
-                            if let Ok((entity, mut transform, gidx, _)) = node_query.get(*entity) {
+                            if let Ok((entity, mut transform, gidx, _, _, _)) = node_query.get(*entity) {
                                 transform.translation.truncate()
                             } else {
                                 return;
@@ -1109,14 +1230,16 @@ fn update_graph_system_renderer(
 fn generate_tree_layout(
     tidy: &mut TidyLayout,
     mut root: &mut crate::tidy_tree::Node,
-    execution_graph: &&StableGraph<ExecutionNodeId, ()>
+    execution_graph: &&StableGraph<ExecutionNodeId, ()>,
+    node_dimensions: &DashMap<ExecutionNodeId, (f32, f32)>
 ) -> HashMap<NodeIndex, NonNull<crate::tidy_tree::Node>> {
     let mut node_mapping: HashMap<NodeIndex, NonNull<crate::tidy_tree::Node>> = HashMap::new();
     let mut topo = petgraph::visit::Topo::new(&execution_graph);
     while let Some(x) = topo.next(&execution_graph) {
         if let Some(node) = &execution_graph.node_weight(x) {
-            let mut width = 600.0;
-            let mut height = 300.0;
+            let dims = node_dimensions.entry(**node).or_insert((600.0, 300.0));
+            let mut width = dims.0;
+            let mut height = dims.1;
             let tree_node = crate::tidy_tree::Node::new(x.index(), (width) as f64, (height) as f64);
             let mut parents = &mut execution_graph
                 .neighbors_directed(x, petgraph::Direction::Incoming);
@@ -1342,7 +1465,7 @@ fn graph_setup(
             transform: Transform::from_xyz(0.0, 0.0, 1.0).looking_at(Vec3::ZERO, Vec3::Y),
             camera: Camera {
                 order: 1,
-                clear_color: ClearColorConfig::Custom(Color::rgba(0.1, 0.1, 0.1, 1.0)),
+                clear_color: ClearColorConfig::Custom(Color::rgba(0.035, 0.035, 0.043, 1.0)),
                 ..default()
             },
             projection: OrthographicProjection {
@@ -1445,6 +1568,7 @@ fn graph_setup(
         group_dependency_graph: Default::default(),
         hash_graph: hash_graph(&execution_graph.execution_graph),
         node_ids,
+        node_dimensions: Default::default(),
         grouped_nodes: Default::default(),
         is_active: false,
     });
@@ -1469,7 +1593,7 @@ pub fn graph_plugin(app: &mut App) {
             (
                 // update_node_textures_as_available,
                 keyboard_navigate_graph,
-                compute_transform_matrix,
+                compute_egui_transform_matrix,
                 mouse_pan,
                 set_camera_viewports,
                 update_minimap_camera_configuration,

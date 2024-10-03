@@ -126,7 +126,7 @@ Backstory: Specialist in travel planning an logistics with decades of experience
 
 ```javascript
 const { Hono } = require('hono');
-const bodyParser = require('body-parser');
+import * as bodyParser from "https://deno.land/x/body_parser@v0.0.1/mod.ts";
 
 const app = new Hono();
 

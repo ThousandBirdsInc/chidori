@@ -30,7 +30,7 @@ pub fn llm_embedding_cell(execution_state_id: ExecutionNodeId, cell: &LLMEmbeddi
 
     // We only require the globals to be passed in if the user has not specified this prompt as a function
     if configuration.get("fn").is_none() {
-        for (key, value) in &schema.items {
+        for (key, value) in &schema.unwrap().items {
             input_signature.globals.insert(
                 key.clone(),
                 InputItemConfiguration {

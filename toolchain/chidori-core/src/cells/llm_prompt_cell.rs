@@ -2,7 +2,7 @@ use chidori_prompt_format::templating::templates::{ChatModelRoles, TemplateWithS
 use std::collections::HashMap;
 use std::env;
 use tokio::runtime;
-use crate::cells::{LLMPromptCell, SupportedModelProviders, TextRange};
+use crate::cells::{LLMPromptCell, LLMPromptCellChatConfiguration, SupportedModelProviders, TextRange};
 use crate::execution::primitives::operation::{InputItemConfiguration, InputSignature, InputType, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue as RKV, RkyvSerializedValue, serialized_value_to_json_value};
 use futures_util::FutureExt;
@@ -18,12 +18,15 @@ pub fn llm_prompt_cell(execution_state_id: ExecutionNodeId, cell: &LLMPromptCell
     match cell {
         LLMPromptCell::Chat {
             function_invocation,
-            configuration,
             name,
             provider,
-            req,
+            complete_body,
             ..
         } => {
+            let (frontmatter, req) = chidori_prompt_format::templating::templates::split_frontmatter(&complete_body).map_err(|e| {
+                anyhow::Error::msg(e.to_string())
+            })?;
+            let configuration: LLMPromptCellChatConfiguration = serde_yaml::from_str(&frontmatter)?;
             let schema =
                 chidori_prompt_format::templating::templates::analyze_referenced_partials(&&req);
             let role_blocks =
@@ -49,7 +52,7 @@ pub fn llm_prompt_cell(execution_state_id: ExecutionNodeId, cell: &LLMPromptCell
             let mut input_signature = InputSignature::new();
             // We only require the globals to be passed in if the user has not specified this prompt as a function
             if configuration.function_name.is_none() {
-                for (key, value) in &schema.items {
+                for (key, value) in &schema.unwrap().items {
                     input_signature.globals.insert(
                         key.clone(),
                         InputItemConfiguration {

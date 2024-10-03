@@ -1,5 +1,5 @@
 use std::path::Path;
-use chidori_core::sdk::entry::{Chidori};
+use chidori_core::sdk::chidori::Chidori;
 fn main() {
     let current_file = env!("CARGO_MANIFEST_DIR");
     let current_file_path = Path::new(current_file);

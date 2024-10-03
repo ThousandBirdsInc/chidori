@@ -5,7 +5,7 @@ use rkyv::{
     Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
-use serde_json::Value;
+use chidori_prompt_format::serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hasher;
 
@@ -295,7 +295,7 @@ pub fn deserialize_from_buf(v: &[u8]) -> RkyvSerializedValue {
     arg1
 }
 
-pub fn serialized_value_to_json_value(v: &RkyvSerializedValue) -> serde_json::Value {
+pub fn serialized_value_to_json_value(v: &RkyvSerializedValue) -> chidori_prompt_format::serde_json::Value {
     match &v {
         RkyvSerializedValue::Float(f) => Value::Number(f.to_string().parse().unwrap()),
         RkyvSerializedValue::Number(n) => Value::Number(n.to_string().parse().unwrap()),
@@ -361,7 +361,7 @@ impl SerdeSerialize for RkyvSerializedValue {
         S: serde::Serializer,
     {
         // Convert self to a serde_json::Value and then serialize that
-        let value = serialized_value_to_json_value(self); // Use your existing function
+        let value = serialized_value_to_json_value(self);
         value.serialize(serializer)
     }
 }
@@ -376,7 +376,7 @@ impl<'de> SerdeDeserialize<'de> for RkyvSerializedValue {
         let value = SerdeDeserialize::deserialize(deserializer)?;
 
         // Convert the serde_json::Value to RkyvSerializedValue
-        Ok(json_value_to_serialized_value(&value)) // Use your existing function
+        Ok(json_value_to_serialized_value(&value))
     }
 }
 

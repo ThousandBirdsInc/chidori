@@ -376,6 +376,19 @@ impl Node for EguiNode {
 
         let mut vertex_offset: u32 = 0;
         for draw_command in &self.draw_commands {
+
+            // Fetch the current render target dimensions for each draw command
+            let render_target_width = render_target.physical_width();
+            let render_target_height = render_target.physical_height();
+
+            let (cmd_x, cmd_y, cmd_w, cmd_h) = draw_command.clipping_zone;
+
+            // Check if the draw command is completely outside the render target
+            if cmd_x as u32 >= render_target_width || cmd_y as u32 >= render_target_height {
+                vertex_offset += draw_command.vertices_count as u32;
+                continue;
+            }
+
             if draw_command.clipping_zone.0 < render_target.physical_width()
                 && draw_command.clipping_zone.1 < render_target.physical_height()
             {
@@ -387,22 +400,35 @@ impl Node for EguiNode {
                     }
                 };
 
-                render_pass.set_bind_group(1, texture_bind_group, &[]);
+                let scissor_x = cmd_x.min(render_target_width - 1);
+                let scissor_y = cmd_y.min(render_target_height - 1);
+                let scissor_w = cmd_w.min(render_target_width.saturating_sub(scissor_x));
+                let scissor_h = cmd_h.min(render_target_height.saturating_sub(scissor_y));
 
-                render_pass.set_scissor_rect(
-                    draw_command.clipping_zone.0,
-                    draw_command.clipping_zone.1,
-                    draw_command.clipping_zone.2.min(
-                        render_target
-                            .physical_width()
-                            .saturating_sub(draw_command.clipping_zone.0),
-                    ),
-                    draw_command.clipping_zone.3.min(
-                        render_target
-                            .physical_width()
-                            .saturating_sub(draw_command.clipping_zone.1),
-                    ),
-                );
+                // Skip if the scissor rect has no area
+                if scissor_w == 0 || scissor_h == 0 {
+                    vertex_offset += draw_command.vertices_count as u32;
+                    continue;
+                }
+
+                let texture_bind_group = match bind_groups.get(&draw_command.egui_texture) {
+                    Some(texture_resource) => texture_resource,
+                    None => {
+                        vertex_offset = draw_command.vertices_count as u32;
+                        continue;
+                    }
+                };
+
+                // Double-check dimensions before setting scissor rect
+                if scissor_x < render_target_width && scissor_y < render_target_height &&
+                    scissor_w > 0 && scissor_h > 0 &&
+                    scissor_x + scissor_w <= render_target_width &&
+                    scissor_y  + scissor_h <= render_target_height {
+                    // dbg!(draw_command.clipping_zone, render_target.physical_width(), render_target.physical_height(), (scissor_x, scissor_y, scissor_w, scissor_h));
+                    render_pass.set_scissor_rect(scissor_x, scissor_y, scissor_w, scissor_h);
+                }
+
+                render_pass.set_bind_group(1, texture_bind_group, &[]);
 
                 render_pass.draw_indexed(
                     vertex_offset..(vertex_offset + draw_command.vertices_count as u32),

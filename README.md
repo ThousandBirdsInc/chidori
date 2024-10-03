@@ -13,12 +13,12 @@
 <a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="Current Build Status" src="https://img.shields.io/github/actions/workflow/status/ThousandBirdsInc/chidori/push.yml" /></a>
 <a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/ThousandBirdsInc/chidori" /></a>
 <a href="https://crates.io/crates/chidori"><img alt="Cargo.io download" src="https://img.shields.io/crates/v/chidori" /></a>
-<a href="https://github.com/ThousandBirdsInc/chidori/blob/main/LICENSE"><img alt="Github License" src="https://img.shields.io/badge/License-MIT-green.svg" /></a>
+<a href="https://github.com/ThousandBirdsInc/chidori/blob/main/LICENSE"><img alt="GitHub License" src="https://img.shields.io/badge/License-MIT-green.svg" /></a>
 </p>
 <br />
 </div>
 
-Star us on Github! Join us on [Discord](https://discord.gg/CJwKsPSgew).
+Star us on GitHub! Join us on [Discord](https://discord.gg/CJwKsPSgew).
 
 ## Contents
 - [📖 Chidori V2](#-chidori-v2)

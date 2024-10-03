@@ -10,7 +10,7 @@ use bevy::input::ButtonInput;
 use bevy::prelude::{Commands, default, KeyCode, Local, NextState, Res, ResMut, Resource};
 use crate::bevy_egui::EguiContexts;
 use egui;
-use egui::{Color32, FontFamily, Frame, Id, Margin, Response, Visuals, Widget};
+use egui::{Color32, FontFamily, Frame, Id, Margin, Response, Vec2b, Visuals, Widget};
 use egui::panel::TopBottomSide;
 use egui_tiles::{Tile, TileId};
 use notify_debouncer_full::{
@@ -26,7 +26,7 @@ use chidori_core::execution::execution::execution_graph::{
 use chidori_core::execution::execution::ExecutionState;
 use chidori_core::execution::primitives::identifiers::{DependencyReference, OperationId};
 use chidori_core::sdk::entry::{
-    CellHolder, Chidori, EventsFromRuntime,
+    CellHolder, EventsFromRuntime,
     UserInteractionMessage,
 };
 use chidori_core::tokio::task::JoinHandle;
@@ -34,7 +34,8 @@ use chidori_core::utils::telemetry::TraceEvents;
 use petgraph::prelude::StableGraph;
 use petgraph::graph::NodeIndex;
 use chidori_core::execution::execution::execution_state::ExecutionStateEvaluation;
-use crate::{GameState, tokio_tasks};
+use chidori_core::sdk::chidori::Chidori;
+use crate::{CurrentTheme, GameState, tokio_tasks};
 
 const RECV_RUNTIME_EVENT_TIMEOUT_MS: u64 = 100;
 
@@ -45,12 +46,16 @@ pub struct Pane {
     pub rect: Option<egui::Rect>,
 }
 
-struct TreeBehavior {}
+struct TreeBehavior<'a> {
+    current_theme: &'a CurrentTheme
+}
 
-impl egui_tiles::Behavior<Pane> for TreeBehavior {
-    fn tab_bar_color(&self, visuals: &Visuals) -> Color32 {
-        Color32::from_hex("#1B1B1B").unwrap()
-    }
+impl<'a> egui_tiles::Behavior<Pane> for TreeBehavior<'a> {
+
+    // fn tab_bar_color(&self, visuals: &Visuals) -> Color32 {
+    //     self.current_theme.theme.card
+    // }
+
     fn pane_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -62,7 +67,7 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior {
         egui_tiles::UiResponse::None
     }
 
-    fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {
+    fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::widget_text::WidgetText {
         format!("{}", pane.nr).into()
     }
 
@@ -313,6 +318,7 @@ pub struct ChidoriCells {
 
 #[derive(Resource)]
 pub struct InternalState {
+    pub debug_mode: bool,
     watched_path: Mutex<Option<String>>,
     file_watch: Mutex<Option<Debouncer<RecommendedWatcher, FileIdMap>>>,
     background_thread: Mutex<Option<JoinHandle<()>>>,
@@ -471,6 +477,7 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
     let (trace_event_sender, trace_event_receiver) = std::sync::mpsc::channel();
     let (runtime_event_sender, runtime_event_receiver) = std::sync::mpsc::channel();
     let mut internal_state = InternalState {
+        debug_mode: false,
         chidori: Arc::new(Mutex::new(Chidori::new_with_events(
             trace_event_sender,
             runtime_event_sender,
@@ -658,6 +665,7 @@ pub fn update_gui(
     runtime: ResMut<tokio_tasks::TokioTasksRuntime>,
     mut internal_state: ResMut<InternalState>,
     mut state: ResMut<NextState<GameState>>,
+    mut theme: Res<CurrentTheme>,
     mut displayed_example_desc: Local<Option<(String, String, String)>>
 ) {
     if internal_state.display_example_modal {
@@ -666,9 +674,11 @@ pub fn update_gui(
         egui::CentralPanel::default()
             .frame(
                 Frame::default()
+                    .fill(theme.theme.card)
+                    .stroke(theme.theme.card_border)
                     .inner_margin(16.0)
                     .outer_margin(100.0)
-                    .rounding(16.0),
+                    .rounding(theme.theme.radius as f32),
             )
             .show(contexts1.ctx_mut(), |ui| {
                 ui.add_space(12.0);
@@ -738,20 +748,34 @@ pub fn update_gui(
                                 ("Core 11: Hono Web Service", EXAMPLES_CORE11, "desc"),
                                 ("Core 12: Dependency Management", EXAMPLES_CORE12, "desc"),
                             ];
-                            let mut is_a_button_hovered = false;
-                            for button in buttons_text_load {
-                                let res = with_cursor(ui.button(button.0));
-                                if res.hovered() {
-                                    is_a_button_hovered = true;
-                                    *displayed_example_desc = Some((button.0.to_string(), button.1.to_string(), button.2.to_string()));
+
+
+                            egui::ScrollArea::vertical().min_scrolled_height(400.0).show(ui, |ui| {
+                                let mut frame = egui::Frame::default().outer_margin(Margin {
+                                    left: 0.0,
+                                    right: 40.0,
+                                    top: 0.0,
+                                    bottom: 0.0,
+                                }).rounding(6.0).begin(ui);
+                                {
+                                    let mut ui = &mut frame.content_ui;
+                                    let mut is_a_button_hovered = false;
+                                    for button in buttons_text_load {
+                                        let res = with_cursor(ui.button(button.0));
+                                        if res.hovered() {
+                                            is_a_button_hovered = true;
+                                            *displayed_example_desc = Some((button.0.to_string(), button.1.to_string(), button.2.to_string()));
+                                        }
+                                        if res.clicked() {
+                                            internal_state1.load_string(button.1);
+                                        }
+                                    }
+                                    if is_a_button_hovered == false {
+                                        *displayed_example_desc = None;
+                                    }
                                 }
-                                if res.clicked() {
-                                    internal_state1.load_string(button.1);
-                                }
-                            }
-                            if is_a_button_hovered == false {
-                                *displayed_example_desc = None;
-                            }
+                                frame.end(ui);
+                            });
                         });
 
                         if let Some((title, code, desc)) = &*displayed_example_desc {
@@ -804,7 +828,9 @@ pub fn update_gui(
                 bottom: 0.0,
             }))
             .show(contexts.ctx_mut(), |ui| {
-                let mut behavior = TreeBehavior {};
+                let mut behavior = TreeBehavior {
+                    current_theme: &theme
+                };
                 egui_tree.tree.ui(&mut behavior, ui);
             });
     }
@@ -864,6 +890,12 @@ pub fn update_gui(
                     if with_cursor(ui.button("Step")).clicked() {
                         internal_state.step();
                     }
+                    ui.add_space(8.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                        if with_cursor(ui.button("UI Debug Mode")).clicked() {
+                            internal_state.debug_mode = !internal_state.debug_mode;
+                        }
+                    });
                 });
 
             }

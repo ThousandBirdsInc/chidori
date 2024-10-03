@@ -376,6 +376,7 @@ impl Default for OperationNode {
             created_at_state_id: Uuid::nil(),
             is_long_running_background_thread: false,
             cell: CellTypes::Code(CodeCell {
+                backing_file_reference: None,
                 name: None,
                 language: SupportedLanguage::PyO3,
                 source_code: "".to_string(),

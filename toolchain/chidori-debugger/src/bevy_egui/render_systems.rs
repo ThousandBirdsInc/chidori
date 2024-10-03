@@ -16,6 +16,7 @@ use bevy::{
     },
     utils::HashMap,
 };
+use bevy_rapier2d::parry::partitioning::IndexedData;
 
 /// Extracted Egui settings.
 #[derive(Resource, Deref, DerefMut, Default)]
@@ -92,9 +93,11 @@ pub fn setup_new_windows_render_system(
 
         render_graph.add_node(egui_pass.clone(), new_node);
 
-        render_graph.add_node_edge(bevy::render::graph::CameraDriverLabel, egui_pass);
+        // render_graph.add_node_edge(bevy::render::graph::CameraDriverLabel, egui_pass);
+        let result = render_graph.try_add_node_edge(bevy::render::graph::CameraDriverLabel, egui_pass);
     }
 }
+
 
 /// Describes the transform buffer.
 #[derive(Resource, Default)]

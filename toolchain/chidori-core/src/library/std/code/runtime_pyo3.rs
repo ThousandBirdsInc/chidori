@@ -941,7 +941,7 @@ a = 20 + await demo()
         "#,
         );
         let mut state = ExecutionState::new_with_random_id();
-        let (state, _) = state.update_op(CellTypes::Code(CodeCell {
+        let (state, _) = state.update_operation(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! {r#"
@@ -973,7 +973,7 @@ a = 20 + await demo()
     #[tokio::test]
     async fn test_running_async_function_dependency() -> anyhow::Result<()> {
         let mut state = ExecutionState::new_with_random_id();
-        let (state, _) = state.update_op(CellTypes::Code(CodeCell {
+        let (state, _) = state.update_operation(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! {r#"
@@ -1014,7 +1014,7 @@ data = await demo()
         "#,
         );
         let mut state = ExecutionState::new_with_random_id();
-        let (mut state, _) = state.update_op(CellTypes::Code(CodeCell {
+        let (mut state, _) = state.update_operation(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! {r#"
@@ -1025,7 +1025,7 @@ data = await demo()
                         "#}),
             function_invocation: None,
         }, TextRange::default()), Some(0))?;
-        let (state, _) = state.update_op(CellTypes::Code(CodeCell {
+        let (state, _) = state.update_operation(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! {r#"
@@ -1059,7 +1059,7 @@ data = await demo()
     async fn test_internal_function_invocation_chain_with_observability() -> anyhow::Result<()> {
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<ExecutionGraphSendPayload>(1028);
         let mut state_a = ExecutionState::new_with_graph_sender(Uuid::nil(), Arc::new(sender.clone()));
-        let (state, _) = state_a.update_op(CellTypes::Code(CodeCell {
+        let (state, _) = state_a.update_operation(CellTypes::Code(CodeCell {
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! {r#"

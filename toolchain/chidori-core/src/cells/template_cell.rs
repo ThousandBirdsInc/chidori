@@ -14,7 +14,7 @@ pub fn template_cell(execution_state_id: ExecutionNodeId, cell: &TemplateCell, r
         chidori_prompt_format::templating::templates::analyze_referenced_partials(&cell.body);
 
     let mut input_signature = InputSignature::new();
-    for (key, value) in &schema.items {
+    for (key, value) in &schema.unwrap().items {
         input_signature.globals.insert(
             key.clone(),
             InputItemConfiguration {
@@ -72,6 +72,7 @@ mod test {
     #[tokio::test]
     async fn test_template_cell() -> anyhow::Result<()> {
         let cell = crate::cells::TemplateCell {
+            backing_file_reference: None,
             name: Some("test".to_string()),
             body: "Hello, {{ name }}!".to_string(),
         };

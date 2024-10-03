@@ -72,7 +72,7 @@ pub fn memory_cell(execution_state_id: ExecutionNodeId, cell: &MemoryCell, range
                                             let results = db.search("default".to_string(), embedding, 5);
                                             let mut output = vec![];
                                             for (_, value) in results.iter() {
-                                                let value = json_value_to_serialized_value(&value);
+                                                let value = json_value_to_serialized_value(value);
                                                 output.push(value);
                                             }
                                             sender.send(RkyvSerializedValue::Array(output)).unwrap();
@@ -122,7 +122,8 @@ mod test {
     async fn test_memory_cell() -> anyhow::Result<()> {
         let (async_rpc_communication, rpc_sender, callable_interface_receiver) = AsyncRPCCommunication::new();
         let mut state = ExecutionState::new_with_random_id();
-        let (mut state, _) = state.update_op(CellTypes::Code(CodeCell {
+        let (mut state, _) = state.update_operation(CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! {r#"
@@ -130,7 +131,7 @@ mod test {
                             return [0.1, 0.2, 0.3]
                         "#}),
             function_invocation: None,
-        }, TextRange::default()), Some(0))?;
+        }, TextRange::default()), Uuid::nil())?;
         let op = memory_cell(
             Uuid::nil(), &MemoryCell {
                         name: None,
