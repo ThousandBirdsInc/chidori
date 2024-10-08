@@ -62,7 +62,6 @@ features = [
 [patch.crates-io]
 deno = { git = "https://github.com/ThousandBirdsInc/deno", rev = "e7f2e968826ea6da8cf65387a13ea61672c7ea5c" }
 deno_runtime = { git = "https://github.com/ThousandBirdsInc/deno", rev = "e7f2e968826ea6da8cf65387a13ea61672c7ea5c" }
-rye = { git = "https://github.com/ThousandBirdsInc/rye", rev = "b9b0f4ff12b2da35a70049e14f8a05c76caa2242"}
 #serde = {path = "../../serde/serde" }
 #serde_derive = {path = "../../serde/serde_derive" }
 #openai_api_rs = {path = "../../openai-api-rs" }

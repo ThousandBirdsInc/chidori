@@ -3,23 +3,23 @@ use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
-use rye::lock::LockOptions;
+// use rye::lock::LockOptions;
 use target_lexicon::{OperatingSystem, Triple};
-use rye::sync::{sync, SyncMode, SyncOptions};
-use rye::utils::CommandOutput;
+// use rye::sync::{sync, SyncMode, SyncOptions};
+// use rye::utils::CommandOutput;
 
-fn install_python() -> Result<(), anyhow::Error> {
-    rye::platform::init();
-    sync(SyncOptions {
-        output: CommandOutput::Quiet,
-        dev: true,
-        mode: SyncMode::PythonOnly,
-        force: false,
-        no_lock: false,
-        lock_options: LockOptions::default(),
-        pyproject: Some(PathBuf::from("./pyproject.toml")),
-    })
-}
+// fn install_python() -> Result<(), anyhow::Error> {
+//     rye::platform::init();
+//     sync(SyncOptions {
+//         output: CommandOutput::Quiet,
+//         dev: true,
+//         mode: SyncMode::PythonOnly,
+//         force: false,
+//         no_lock: false,
+//         lock_options: LockOptions::default(),
+//         pyproject: Some(PathBuf::from("./pyproject.toml")),
+//     })
+// }
 
 fn add_extension_module_link_args(triple: &Triple) -> io::Result<()> {
     let mut writer = io::stdout();
