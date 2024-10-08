@@ -1,5 +1,5 @@
 use crate::chidori::{ChidoriExecutionGraph, EguiTree, EguiTreeIdentities, InternalState};
-use crate::tidy_tree::{Layout, TidyLayout};
+use crate::tidy_tree::{Layout, TidyLayout, TreeGraph};
 use crate::util::{despawn_screen, egui_render_cell_function_evaluation, egui_render_cell_read, serialized_value_to_json_value};
 use crate::{chidori, CurrentTheme, GameState, RENDER_LAYER_GRAPH_MINIMAP, RENDER_LAYER_GRAPH_VIEW, RENDER_LAYER_TRACE_MINIMAP, RENDER_LAYER_TRACE_VIEW, Theme, util};
 use bevy::app::{App, Update};
@@ -62,6 +62,8 @@ struct GraphResource {
     node_dimensions: DashMap<ExecutionNodeId, (f32, f32)>,
     grouped_nodes: HashMap<ExecutionNodeId, StableGraph<ExecutionNodeId, ()>>,
     is_active: bool,
+    layout_graph: Option<TreeGraph>,
+    is_layout_dirty: bool
 }
 
 
@@ -419,6 +421,9 @@ fn mouse_scroll_events(
             camera_y = coords.0.y - zoom_factor * (coords.0.y - camera_transform.translation.y);
             camera_state.state = CameraStateValue::Free(camera_x, camera_y);
             projection.scale = (projection.scale + ev.y).clamp(1.0, 1000.0);
+            // apply immediately to prevent jitter
+            camera_transform.translation.y = camera_y;
+            camera_transform.translation.x = camera_x;
         } else {
             camera_x -= ev.x * projection.scale;
             camera_y += (ev.y * 2.0) * projection.scale;
@@ -857,19 +862,25 @@ fn update_graph_system_renderer(
     let execution_graph = &graph_resource.execution_graph;
     let grouped_nodes = &graph_resource.grouped_nodes;
     let group_dep_graph = &graph_resource.group_dependency_graph;
-    let mut group_layouts = HashMap::new();
+    // let mut group_layouts = HashMap::new();
     for (id, group_graph) in grouped_nodes {
-        let mut tidy = TidyLayout::new(200., 200.);
-        let mut root = crate::tidy_tree::Node::new(0, 10., 10.);
-        let node_mapping = generate_tree_layout(&mut tidy, &mut root, &group_graph, &graph_resource.node_dimensions);
-        group_layouts.insert(id, (tidy, root, node_mapping));
+        let node_mapping = generate_tree_layout(&group_graph, &graph_resource.node_dimensions);
+        // group_layouts.insert(id, (tidy, root, node_mapping));
     }
 
     // TODO: traverse the group dep graph, allocating nodes
 
-    let mut tidy = TidyLayout::new(200., 200.);
-    let mut root = crate::tidy_tree::Node::new(0, 10., 10.);
-    let node_mapping = generate_tree_layout(&mut tidy, &mut root, &execution_graph, &graph_resource.node_dimensions);
+    if graph_resource.is_layout_dirty {
+        let tree_graph = generate_tree_layout(&execution_graph, &graph_resource.node_dimensions);
+        graph_resource.layout_graph = Some(tree_graph);
+        graph_resource.is_layout_dirty = false;
+    }
+    let tree_graph = if let Some(tree_graph) = &graph_resource.layout_graph {
+        tree_graph
+    } else {
+        panic!("Missing tree graph");
+    };
+    let mut flag_layout_is_dirtied = false;
 
     // Traverse the graph again, and render the elements of the graph based on their layout in the tidy_tree
     // This traverses the graph and then gets the position of the elements in the tree from their identity
@@ -892,15 +903,87 @@ fn update_graph_system_renderer(
                     }
                 }).unwrap_or(vec2(0.0, 0.0));
 
-            if let Some(n) = node_mapping.get(&idx) {
-                unsafe {
-                    // Create the appropriately sized egui render target texture
-                    let n = n.as_ref();
-                    let width = n.width.to_f32().unwrap();
-                    let height = n.height.to_f32().unwrap();
-                    let entity = node_id_to_entity.mapping.entry(idx).or_insert_with(|| {
-                        // This is the texture that will be rendered to.
-                        // TODO: needs to be greater than the bounds of the target (enforce this)
+            if let Some((n_idx, n)) = tree_graph.get_from_external_id(&idx.index()) {
+                // Create the appropriately sized egui render target texture
+                let width = n.width.to_f32().unwrap();
+                let height = n.height.to_f32().unwrap();
+                let entity = node_id_to_entity.mapping.entry(idx).or_insert_with(|| {
+                    // This is the texture that will be rendered to.
+                    // TODO: needs to be greater than the bounds of the target (enforce this)
+                    let scale_factor = window.scale_factor();
+                    let scaled_width = (width * scale_factor) as u32;
+                    let scaled_height = (height * scale_factor) as u32;
+                    let size = Extent3d {
+                        width: scaled_width,
+                        height: scaled_height,
+                        depth_or_array_layers: 1,
+                    };
+                    let mut image = Image {
+                        texture_descriptor: TextureDescriptor {
+                            label: None,
+                            dimension: TextureDimension::D2,
+                            format: TextureFormat::Bgra8UnormSrgb,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            usage: TextureUsages::TEXTURE_BINDING
+                                | TextureUsages::COPY_DST
+                                | TextureUsages::RENDER_ATTACHMENT,
+                            view_formats: &[],
+                            size
+                        },
+                        ..default()
+                    };
+                    image.resize(size);
+                    let image_handle = images.add(image);
+                    let node_material = materials_custom.add(RoundedRectMaterial {
+                        width: 1.0,
+                        height: 1.0,
+                        color_texture: Some(image_handle.clone()),
+                        base_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
+                        alpha_mode: AlphaMode::Blend,
+                    });
+
+                    let entity = commands.spawn((
+                        MaterialMeshBundle {
+                            mesh: meshes.add(Mesh::from(Rectangle::new(1.0, 1.0))),
+                            material: node_material,
+                            transform: Transform::from_xyz(parent_pos.x, parent_pos.y, -1.0).with_scale(vec3(width, height, 1.0)),
+                            ..Default::default()
+                        },
+                        GraphIdx {
+                            loading: false,
+                            execution_id: **node,
+                            id: idx.index(),
+                            is_hovered: false,
+                            is_selected: false,
+                        },
+                        EguiRenderTarget {
+                            inner_physical_width: scaled_width,
+                            inner_physical_height: scaled_height,
+                            image: Some(image_handle),
+                            inner_scale_factor: scale_factor,
+                            ..default()
+                        },
+                        Sensor,
+                        Collider::cuboid(0.5, 0.5),
+                        RenderLayers::layer(RENDER_LAYER_GRAPH_VIEW),
+                        OnGraphScreen
+                    ));
+                    node_index_to_entity.insert(n.external_id, entity.id());
+                    entity.id()
+                });
+
+                // Check if dimensions have changed for existing entries
+                if let Ok((_, mut transform, _, _, mut egui_render_target, material_handle)) = node_query.get_mut(*entity) {
+                    let current_image = egui_render_target.image.as_ref();
+                    let dimensions_changed = current_image.map_or(true, |image| {
+                        let texture = images.get(image).unwrap();
+                        texture.texture_descriptor.size.width != (width * window.scale_factor()) as u32 ||
+                            texture.texture_descriptor.size.height != (height * window.scale_factor()) as u32
+                    });
+
+                    if dimensions_changed {
+                        // Create new image with updated dimensions
                         let scale_factor = window.scale_factor();
                         let scaled_width = (width * scale_factor) as u32;
                         let scaled_height = (height * scale_factor) as u32;
@@ -926,227 +1009,153 @@ fn update_graph_system_renderer(
                         };
                         image.resize(size);
                         let image_handle = images.add(image);
-                        let node_material = materials_custom.add(RoundedRectMaterial {
-                            width: 1.0,
-                            height: 1.0,
-                            color_texture: Some(image_handle.clone()),
-                            base_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
-                            alpha_mode: AlphaMode::Blend,
-                        });
 
-                        let entity = commands.spawn((
-                            MaterialMeshBundle {
-                                mesh: meshes.add(Mesh::from(Rectangle::new(1.0, 1.0))),
-                                material: node_material,
-                                transform: Transform::from_xyz(parent_pos.x, parent_pos.y, -1.0).with_scale(vec3(width, height, 1.0)),
-                                ..Default::default()
-                            },
-                            GraphIdx {
-                                loading: false,
-                                execution_id: **node,
-                                id: idx.index(),
-                                is_hovered: false,
-                                is_selected: false,
-                            },
-                            EguiRenderTarget {
-                                inner_physical_width: scaled_width,
-                                inner_physical_height: scaled_height,
-                                image: Some(image_handle),
-                                inner_scale_factor: scale_factor,
-                                ..default()
-                            },
-                            Sensor,
-                            Collider::cuboid(0.5, 0.5),
-                            RenderLayers::layer(RENDER_LAYER_GRAPH_VIEW),
-                            OnGraphScreen
-                        ));
-                        node_index_to_entity.insert(n.id, entity.id());
-                        entity.id()
-                    });
+                        // Create new EguiRenderTarget, this avoids issues swapping the image target underneath rendering
+                        // which otherwise resulted in scissor rect errors.
+                        let new_egui_render_target = EguiRenderTarget {
+                            inner_physical_width: scaled_width,
+                            inner_physical_height: scaled_height,
+                            image: Some(image_handle.clone()),
+                            inner_scale_factor: scale_factor,
+                            ..default()
+                        };
 
-                    // Check if dimensions have changed for existing entries
-                    if let Ok((_, mut transform, _, _, mut egui_render_target, material_handle)) = node_query.get_mut(*entity) {
-                        let current_image = egui_render_target.image.as_ref();
-                        let dimensions_changed = current_image.map_or(true, |image| {
-                            let texture = images.get(image).unwrap();
-                            texture.texture_descriptor.size.width != (width * window.scale_factor()) as u32 ||
-                                texture.texture_descriptor.size.height != (height * window.scale_factor()) as u32
-                        });
+                        // Replace the old EguiRenderTarget with the new one
+                        commands.entity(*entity).remove::<EguiRenderTarget>()
+                            .insert(new_egui_render_target);
 
-                        if dimensions_changed {
-                            // Create new image with updated dimensions
-                            let scale_factor = window.scale_factor();
-                            let scaled_width = (width * scale_factor) as u32;
-                            let scaled_height = (height * scale_factor) as u32;
-                            let size = Extent3d {
-                                width: scaled_width,
-                                height: scaled_height,
-                                depth_or_array_layers: 1,
-                            };
-                            let mut image = Image {
-                                texture_descriptor: TextureDescriptor {
-                                    label: None,
-                                    dimension: TextureDimension::D2,
-                                    format: TextureFormat::Bgra8UnormSrgb,
-                                    mip_level_count: 1,
-                                    sample_count: 1,
-                                    usage: TextureUsages::TEXTURE_BINDING
-                                        | TextureUsages::COPY_DST
-                                        | TextureUsages::RENDER_ATTACHMENT,
-                                    view_formats: &[],
-                                    size
-                                },
-                                ..default()
-                            };
-                            image.resize(size);
-                            let image_handle = images.add(image);
+                        // Update material with new texture
+                        let mut material = materials_custom.get_mut(material_handle).unwrap();
+                        material.color_texture = Some(image_handle);
 
-                            // Create new EguiRenderTarget, this avoids issues swapping the image target underneath rendering
-                            // which otherwise resulted in scissor rect errors.
-                            let new_egui_render_target = EguiRenderTarget {
-                                inner_physical_width: scaled_width,
-                                inner_physical_height: scaled_height,
-                                image: Some(image_handle.clone()),
-                                inner_scale_factor: scale_factor,
-                                ..default()
-                            };
-
-                            // Replace the old EguiRenderTarget with the new one
-                            commands.entity(*entity).remove::<EguiRenderTarget>()
-                                .insert(new_egui_render_target);
-
-                            // Update material with new texture
-                            let mut material = materials_custom.get_mut(material_handle).unwrap();
-                            material.color_texture = Some(image_handle);
-
-                            transform.scale.x = scaled_width as f32;
-                            transform.scale.y = scaled_height as f32;
-                        }
+                        transform.scale.x = scaled_width as f32;
+                        transform.scale.y = scaled_height as f32;
                     }
+                }
 
 
-                    if let Ok((entity, mut transform, gidx, mut egui_ctx, _, _)) = node_query.get_mut(*entity) {
-                        let egui_ctx = egui_ctx.into_inner();
-                        let ctx = egui_ctx.get_mut();
+                if let Ok((entity, mut transform, gidx, mut egui_ctx, _, _)) = node_query.get_mut(*entity) {
+                    let egui_ctx = egui_ctx.into_inner();
+                    let ctx = egui_ctx.get_mut();
 
-                        // Position the node according to its tidytree layout
-                        transform.translation = transform.translation.lerp(Vec3::new(n.x.to_f32().unwrap(), -n.y.to_f32().unwrap(), -1.0), 0.5);
+                    // Position the node according to its tidytree layout
+                    transform.translation = transform.translation.lerp(Vec3::new(n.x.to_f32().unwrap(), -n.y.to_f32().unwrap(), -1.0), 0.5);
 
-                        // Draw text within these elements
-                        egui::Area::new(format!("{:?}", entity).into())
-                            .fixed_pos(Pos2::new(0.0, 0.0)).show(ctx, |ui| {
+                    // Draw text within these elements
+                    egui::Area::new(format!("{:?}", entity).into())
+                        .fixed_pos(Pos2::new(0.0, 0.0)).show(ctx, |ui| {
 
-                            ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
-                            let mut frame = egui::Frame::default().fill(current_theme.theme.card).stroke(current_theme.theme.card_border).inner_margin(16.0).rounding(6.0).begin(ui);
-                            {
-                                let mut ui = &mut frame.content_ui;
-                                let node1 = *node;
-                                let original_style = (*ui.ctx().style()).clone();
+                        ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
+                        let mut frame = egui::Frame::default().fill(current_theme.theme.card).stroke(current_theme.theme.card_border).inner_margin(16.0).rounding(6.0).begin(ui);
+                        {
+                            let mut ui = &mut frame.content_ui;
+                            let node1 = *node;
+                            let original_style = (*ui.ctx().style()).clone();
 
-                                let mut style = original_style.clone();
-                                // style.visuals.override_text_color = Some(Color32::BLACK);
-                                ui.set_style(style);
+                            let mut style = original_style.clone();
+                            // style.visuals.override_text_color = Some(Color32::BLACK);
+                            ui.set_style(style);
 
 
 
-                                if *node1 == chidori_core::uuid::Uuid::nil() {
-                                    ui.horizontal(|ui| {
-                                        ui.label("Initialization...");
-                                        if internal_state.debug_mode {
-                                            ui.label(node1.to_string());
-                                        }
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                                            if ui.button(RichText::new("Revert to this State").color(Color32::from_hex("#dddddd").unwrap())).clicked() {
-                                                let _ = internal_state.set_execution_id(*node1);
-                                            }
-                                        });
-                                    });
-                                } else {
-
-                                    if let Some(state) = internal_state.get_execution_state_at_id(&node1) {
-                                        let state = &state;
-                                        if !matches!(state, ExecutionStateEvaluation::Executing(_)) {
-                                            ui.horizontal(|ui| {
-                                                if internal_state.debug_mode {
-                                                    ui.label(node1.to_string());
-                                                }
-                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                                                    if ui.button("Revert to this State").clicked() {
-                                                        println!("We would like to revert to {:?}", node1);
-                                                        let _ = internal_state.set_execution_id(*node1);
-                                                    }
-                                                });
-                                            });
-                                        }
-
-                                        match state {
-                                            ExecutionStateEvaluation::Error(state) => {
-                                                let mut frame = egui::Frame::default().fill(current_theme.theme.card).stroke(Stroke {
-                                                    width: 0.5,
-                                                    color: Color32::from_hex("#ff0000").unwrap(),
-                                                }).inner_margin(16.0).rounding(6.0).begin(ui);
-                                                {
-                                                    let mut ui = &mut frame.content_ui;
-                                                    ui.label("Error");
-                                                    egui_execution_state(ui, &internal_state, state, &current_theme.theme);
-                                                }
-                                                frame.end(ui);
-                                            }
-                                            ExecutionStateEvaluation::EvalFailure(_) => {
-                                                ui.label("Eval Failure");
-                                            }
-                                            ExecutionStateEvaluation::Executing(state) => {
-                                                ui.label("Executing");
-                                                egui_execution_state(ui, &internal_state, state,  &current_theme.theme);
-                                            }
-                                            ExecutionStateEvaluation::Complete(state)=> {
-                                                for (key, value) in state.state.iter() {
-                                                    let image_paths = crate::util::find_matching_strings(&value.output.clone().unwrap(), r"(?i)\.(png|jpe?g)$");
-                                                    for (img_path, object_path_to_img) in image_paths {
-                                                        let texture = if let Some(cached_texture) = node_image_texture_cache.get(&img_path) {
-                                                            cached_texture.clone()
-                                                        } else {
-                                                            // Load the image
-                                                            let img = image::io::Reader::open(&img_path)
-                                                                .expect("Failed to open image")
-                                                                .decode()
-                                                                .expect("Failed to decode image");
-
-                                                            // Convert the image to egui::ColorImage
-                                                            let size = [img.width() as _, img.height() as _];
-                                                            let image_buffer = img.to_rgba8();
-                                                            let pixels = image_buffer.as_flat_samples();
-                                                            let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                                                size,
-                                                                pixels.as_slice(),
-                                                            );
-
-                                                            // Create the texture
-                                                            let texture = ui.ctx().load_texture(
-                                                                &img_path,
-                                                                color_image,
-                                                                egui::TextureOptions::default()
-                                                            );
-
-                                                            // Cache the texture
-                                                            node_image_texture_cache.insert(img_path.clone(), texture.clone());
-
-                                                            texture
-                                                        };
-
-                                                        // Display the image
-                                                        ui.add(egui::Image::new(&texture));
-                                                    }
-                                                }
-
-                                                egui_execution_state(ui, &internal_state, state,  &current_theme.theme);
-                                            }
-                                        }
-                                    } else {
-                                        ui.label("No evaluation recorded");
-                                        // internal_state.get_execution_state_at_id(*node);
+                            if *node1 == chidori_core::uuid::Uuid::nil() {
+                                ui.horizontal(|ui| {
+                                    ui.label("Initialization...");
+                                    if internal_state.debug_mode {
+                                        ui.label(node1.to_string());
                                     }
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                        if ui.button(RichText::new("Revert to this State").color(Color32::from_hex("#dddddd").unwrap())).clicked() {
+                                            let _ = internal_state.set_execution_id(*node1);
+                                        }
+                                    });
+                                });
+                            } else {
+
+                                if let Some(state) = internal_state.get_execution_state_at_id(&node1) {
+                                    let state = &state;
+                                    if !matches!(state, ExecutionStateEvaluation::Executing(_)) {
+                                        ui.horizontal(|ui| {
+                                            if internal_state.debug_mode {
+                                                ui.label(node1.to_string());
+                                            }
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                                if ui.button("Revert to this State").clicked() {
+                                                    println!("We would like to revert to {:?}", node1);
+                                                    let _ = internal_state.set_execution_id(*node1);
+                                                }
+                                            });
+                                        });
+                                    }
+
+                                    match state {
+                                        ExecutionStateEvaluation::Error(state) => {
+                                            let mut frame = egui::Frame::default().fill(current_theme.theme.card).stroke(Stroke {
+                                                width: 0.5,
+                                                color: Color32::from_hex("#ff0000").unwrap(),
+                                            }).inner_margin(16.0).rounding(6.0).begin(ui);
+                                            {
+                                                let mut ui = &mut frame.content_ui;
+                                                ui.label("Error");
+                                                egui_execution_state(ui, &internal_state, state, &current_theme.theme);
+                                            }
+                                            frame.end(ui);
+                                        }
+                                        ExecutionStateEvaluation::EvalFailure(_) => {
+                                            ui.label("Eval Failure");
+                                        }
+                                        ExecutionStateEvaluation::Executing(state) => {
+                                            ui.label("Executing");
+                                            egui_execution_state(ui, &internal_state, state,  &current_theme.theme);
+                                        }
+                                        ExecutionStateEvaluation::Complete(state)=> {
+                                            for (key, value) in state.state.iter() {
+                                                let image_paths = crate::util::find_matching_strings(&value.output.clone().unwrap(), r"(?i)\.(png|jpe?g)$");
+                                                for (img_path, object_path_to_img) in image_paths {
+                                                    let texture = if let Some(cached_texture) = node_image_texture_cache.get(&img_path) {
+                                                        cached_texture.clone()
+                                                    } else {
+                                                        // Load the image
+                                                        let img = image::io::Reader::open(&img_path)
+                                                            .expect("Failed to open image")
+                                                            .decode()
+                                                            .expect("Failed to decode image");
+
+                                                        // Convert the image to egui::ColorImage
+                                                        let size = [img.width() as _, img.height() as _];
+                                                        let image_buffer = img.to_rgba8();
+                                                        let pixels = image_buffer.as_flat_samples();
+                                                        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                                            size,
+                                                            pixels.as_slice(),
+                                                        );
+
+                                                        // Create the texture
+                                                        let texture = ui.ctx().load_texture(
+                                                            &img_path,
+                                                            color_image,
+                                                            egui::TextureOptions::default()
+                                                        );
+
+                                                        // Cache the texture
+                                                        node_image_texture_cache.insert(img_path.clone(), texture.clone());
+
+                                                        texture
+                                                    };
+
+                                                    // Display the image
+                                                    ui.add(egui::Image::new(&texture));
+                                                }
+                                            }
+
+                                            egui_execution_state(ui, &internal_state, state,  &current_theme.theme);
+                                        }
+                                    }
+                                } else {
+                                    ui.label("No evaluation recorded");
+                                    // internal_state.get_execution_state_at_id(*node);
                                 }
+                            }
 
 
                             // egui::ScrollArea::new([false, true]) // Horizontal: false, Vertical: true
@@ -1155,85 +1164,94 @@ fn update_graph_system_renderer(
                             //         .show(ui, |ui| {
                             //         });
 
-                                ui.set_style(original_style);
-                            }
-                            frame.end(ui);
-                        });
+                            ui.set_style(original_style);
+                        }
+                        frame.end(ui);
+                    });
 
-                        let used_rect = ctx.used_rect();
-                        // let width = used_rect.width().max(600.0);
-                        // let height = used_rect.height().max(300.0);
-                        let width = used_rect.width();
-                        let height = used_rect.height();
-                        graph_resource.node_dimensions.insert(*node.clone(), (width, height));
-                        transform.scale = vec3(width, height, 1.0);
+                    let used_rect = ctx.used_rect();
+                    // let width = used_rect.width().max(600.0);
+                    // let height = used_rect.height().max(300.0);
+                    let width = used_rect.width();
+                    let height = used_rect.height();
+                    graph_resource.node_dimensions.insert(*node.clone(), (width, height));
+                    flag_layout_is_dirtied = true;
+                    transform.scale = vec3(width, height, 1.0);
+                }
+
+                tree_graph.get_children(*n_idx).into_iter().for_each(|child| {
+                    let child = &tree_graph.graph[child];
+                    let parent_pos = if let Some(entity ) = node_index_to_entity.get(&n.external_id) {
+                        if let Ok((entity, mut transform, gidx, _, _, _)) = node_query.get(*entity) {
+                            transform.translation.truncate()
+                        } else {
+                            return;
+                        }
+                    } else {
+                        return;
+                    };
+                    let child_pos = if let Some(entity ) = node_index_to_entity.get(&child.external_id) {
+                        if let Ok((entity, mut transform, gidx, _, _, _)) = node_query.get(*entity) {
+                            transform.translation.truncate()
+                        } else {
+                            return;
+                        }
+                    } else {
+                        return;
+                    };
+                    let midpoint = (parent_pos + child_pos) / 2.0;
+                    let distance = (parent_pos - child_pos).length();
+                    let angle = (child_pos.y - parent_pos.y).atan2(child_pos.x - parent_pos.x);
+
+                    let entity = edge_pair_id_to_entity.mapping.entry((n.external_id, child.external_id)).or_insert_with(|| {
+                        let entity = commands.spawn((
+                            PbrBundle {
+                                mesh: meshes.add(Rectangle::new(1.0, 1.0)),
+                                transform: Transform::from_xyz(midpoint.x, midpoint.y, -50.0).with_scale(vec3(distance, 3.0, 1.0)).with_rotation(Quat::from_rotation_z(-angle)),
+                                material: materials.add(StandardMaterial {
+                                    base_color: Color::hex("#ffffff").unwrap().into(),
+                                    unlit: true,
+                                    ..default()
+                                }),
+                                ..default()
+                            },
+                            GraphIdxPair{
+                                source: n.external_id,
+                                target: child.external_id,
+                            },
+                            RenderLayers::layer(RENDER_LAYER_GRAPH_VIEW),
+                            OnGraphScreen ));
+                        entity.id()
+                    });
+
+
+                    if let Ok((_, mut transform, _)) = edge_query.get_mut(*entity) {
+                        transform.translation = vec3(midpoint.x, midpoint.y, -50.0);
+                        transform.scale = vec3(distance, 3.0, 1.0);
+                        transform.rotation = Quat::from_rotation_z(angle);
                     }
 
-                    n.children.iter().for_each(|child| {
-                        let parent_pos = if let Some(entity ) = node_index_to_entity.get(&n.id) {
-                            if let Ok((entity, mut transform, gidx, _, _, _)) = node_query.get(*entity) {
-                                transform.translation.truncate()
-                            } else {
-                                return;
-                            }
-                        } else {
-                            return;
-                        };
-                        let child_pos = if let Some(entity ) = node_index_to_entity.get(&child.id) {
-                            if let Ok((entity, mut transform, gidx, _, _, _)) = node_query.get(*entity) {
-                                transform.translation.truncate()
-                            } else {
-                                return;
-                            }
-                        } else {
-                            return;
-                        };
-                        let midpoint = (parent_pos + child_pos) / 2.0;
-                        let distance = (parent_pos - child_pos).length();
-                        let angle = (child_pos.y - parent_pos.y).atan2(child_pos.x - parent_pos.x);
-
-                        let entity = edge_pair_id_to_entity.mapping.entry((n.id, child.id)).or_insert_with(|| {
-                            let entity = commands.spawn((
-                                PbrBundle {
-                                    mesh: meshes.add(Rectangle::new(1.0, 1.0)),
-                                    transform: Transform::from_xyz(midpoint.x, midpoint.y, -50.0).with_scale(vec3(distance, 3.0, 1.0)).with_rotation(Quat::from_rotation_z(-angle)),
-                                    material: materials.add(StandardMaterial {
-                                        base_color: Color::hex("#ffffff").unwrap().into(),
-                                        unlit: true,
-                                        ..default()
-                                    }),
-                                    ..default()
-                                },
-                                GraphIdxPair{
-                                    source: n.id,
-                                    target: child.id,
-                                },
-                                RenderLayers::layer(RENDER_LAYER_GRAPH_VIEW),
-                                OnGraphScreen ));
-                            entity.id()
-                        });
-
-
-                        if let Ok((_, mut transform, _)) = edge_query.get_mut(*entity) {
-                            transform.translation = vec3(midpoint.x, midpoint.y, -50.0);
-                            transform.scale = vec3(distance, 3.0, 1.0);
-                            transform.rotation = Quat::from_rotation_z(angle);
-                        }
-
-                    });
-                }
+                });
             }
         }
+    }
+
+    if flag_layout_is_dirtied {
+        graph_resource.is_layout_dirty = true;
     }
 }
 
 fn generate_tree_layout(
-    tidy: &mut TidyLayout,
-    mut root: &mut crate::tidy_tree::Node,
+    // tidy: &mut TidyLayout,
+    // tree_graph: &mut crate::tidy_tree::TreeGraph,
     execution_graph: &&StableGraph<ExecutionNodeId, ()>,
     node_dimensions: &DashMap<ExecutionNodeId, (f32, f32)>
-) -> HashMap<NodeIndex, NonNull<crate::tidy_tree::Node>> {
-    let mut node_mapping: HashMap<NodeIndex, NonNull<crate::tidy_tree::Node>> = HashMap::new();
+) -> TreeGraph {
+    let mut tidy = TidyLayout::new(200., 200.);
+    let mut root = crate::tidy_tree::Node::new(0, 10., 10.);
+    let mut tree_graph = crate::tidy_tree::TreeGraph::new(root);
+
+    // Initialize nodes within a TreeGraph using our ExecutionGraph
     let mut topo = petgraph::visit::Topo::new(&execution_graph);
     while let Some(x) = topo.next(&execution_graph) {
         if let Some(node) = &execution_graph.node_weight(x) {
@@ -1241,38 +1259,40 @@ fn generate_tree_layout(
             let mut width = dims.0;
             let mut height = dims.1;
             let tree_node = crate::tidy_tree::Node::new(x.index(), (width) as f64, (height) as f64);
+
+            // Get parent of this node and attach it if there is one
             let mut parents = &mut execution_graph
                 .neighbors_directed(x, petgraph::Direction::Incoming);
+
+
             // Only a single parent ever occurs
             if let Some(parent) = &mut parents.next() {
-                if let Some(parent) = node_mapping.get_mut(parent) {
-                    unsafe {
-                        let parent = parent.as_mut();
-                        let node = parent.append_child(tree_node);
-                        node_mapping.insert(x, node);
-                    }
-                }
+                let node = tree_graph.add_child(parent.clone(), tree_node);
+                // if let Some(parent) = node_mapping.get(parent) {
+                //     let node = tree_graph.add_child(parent.clone(), tree_node);
+                //     // node_mapping.insert(x, node);
+                // }
             } else {
-                let node = root.append_child(tree_node);
-                node_mapping.insert(x, node);
+                let node = tree_graph.add_child(x, tree_node);
+                // node_mapping.insert(x, node);
             }
         }
     }
 
-    tidy.layout(&mut root);
+    tidy.layout(&mut tree_graph);
     let mut max_y: f32 = 0.0;
     let mut max_x: f32 = 0.0;
     let mut min_x: f32 = 0.0;
-    for node in node_mapping.values() {
-        unsafe {
-            let node = node.as_ref();
-            max_x = max_x.max(node.x.to_f32().unwrap());
-            min_x = min_x.min(node.x.to_f32().unwrap());
-            max_y = max_y.max(node.y.to_f32().unwrap());
-        }
-    }
+    // for node in node_mapping.values() {
+    //     unsafe {
+    //         let node = node.as_ref();
+    //         max_x = max_x.max(node.x.to_f32().unwrap());
+    //         min_x = min_x.min(node.x.to_f32().unwrap());
+    //         max_y = max_y.max(node.y.to_f32().unwrap());
+    //     }
+    // }
 
-    node_mapping
+    tree_graph
 }
 
 fn update_graph_system_data_structures(
@@ -1292,6 +1312,7 @@ fn update_graph_system_data_structures(
         graph_res.grouped_nodes = grouped_tree;
         graph_res.group_dependency_graph = group_dep_graph;
         graph_res.hash_graph = hash_graph(&execution_graph.execution_graph);
+        graph_res.is_layout_dirty = true;
 
     }
 }
@@ -1564,6 +1585,7 @@ fn graph_setup(
     let mut node_ids = HashMap::new();
     commands.spawn((CursorWorldCoords(vec2(0.0, 0.0)), OnGraphScreen));
     commands.insert_resource(GraphResource {
+        
         execution_graph: dataset,
         group_dependency_graph: Default::default(),
         hash_graph: hash_graph(&execution_graph.execution_graph),
@@ -1571,6 +1593,8 @@ fn graph_setup(
         node_dimensions: Default::default(),
         grouped_nodes: Default::default(),
         is_active: false,
+        is_layout_dirty: true,
+        layout_graph: None,
     });
 }
 

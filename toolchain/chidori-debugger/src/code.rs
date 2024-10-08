@@ -361,7 +361,7 @@ fn render_prompt_cell(
         state.json_content = populate_json_content(&schema.unwrap(), Some(&state.json_content));
     }
 
-    let mut cfg = serde_yaml::to_string(&configuration.clone()).unwrap();
+    // let mut cfg = serde_yaml::to_string(&configuration.clone()).unwrap();
     ui.horizontal(|ui| {
         egui_label(ui, "Prompt");
         // render_applied_status(ui, exists_in_current_tree);
@@ -653,8 +653,8 @@ fn render_code_cell(
                 Ok(report) => {
                     ui.push_id((op_id, 0), |ui| {
                         ui.collapsing("Cell Analysis", |ui| {
-                            let response = JsonTree::new(format!("{:?} report", op_id), &serde_json::json!(&report))
-                                .show(ui);
+                            // let response = JsonTree::new(format!("{:?} report", op_id), &serde_json::json!(&report))
+                            //     .show(ui);
                         });
                     });
                 }

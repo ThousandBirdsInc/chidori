@@ -580,6 +580,9 @@ fn update_positions(
     mut call_tree: ResMut<TracesCallTree>,
     windows: Query<&Window>,
 ) {
+    if !trace_space.is_active {
+        return;
+    }
 
     let scale_factor = windows.single().scale_factor();
     let span_height = SPAN_HEIGHT * scale_factor;

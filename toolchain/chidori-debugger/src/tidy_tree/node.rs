@@ -1,98 +1,48 @@
-use std::{collections::VecDeque, ptr::NonNull};
-
+use petgraph::graph::{Graph, Neighbors, NodeIndex};
+use petgraph::Direction;
+use std::collections::{HashMap, VecDeque};
+use std::iter::Map;
+use petgraph::visit::Bfs;
 use crate::tidy_tree::{geometry::Coord, layout::BoundingBox};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TidyData {
-    pub thread_left: Option<NonNull<Node>>,
-    pub thread_right: Option<NonNull<Node>>,
-    /// ```text
-    /// this.extreme_left == this.thread_left.extreme_left ||
-    /// this.extreme_left == this.children[0].extreme_left
-    /// ```
-    pub extreme_left: Option<NonNull<Node>>,
-    /// ```text
-    /// this.extreme_right == this.thread_right.extreme_right ||
-    /// this.extreme_right == this.children[-1].extreme_right
-    /// ```
-    pub extreme_right: Option<NonNull<Node>>,
-
-    /// Cached change of x position.
+    pub thread_left: Option<NodeIndex>,
+    pub thread_right: Option<NodeIndex>,
+    pub extreme_left: Option<NodeIndex>,
+    pub extreme_right: Option<NodeIndex>,
     pub shift_acceleration: Coord,
-    /// Cached change of x position
     pub shift_change: Coord,
-
-    /// this.x = parent.x + modifier_to_subtree
     pub modifier_to_subtree: Coord,
-    /// this.x + modifier_thread_left == thread_left.x
     pub modifier_thread_left: Coord,
-    /// this.x + modifier_thread_right == thread_right.x
     pub modifier_thread_right: Coord,
-    /// this.x + modifier_extreme_left == extreme_left.x
     pub modifier_extreme_left: Coord,
-    /// this.x + modifier_extreme_right == extreme_right.x
     pub modifier_extreme_right: Coord,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Node {
-    pub id: usize,
+    pub external_id: usize,
     pub width: Coord,
     pub height: Coord,
     pub x: Coord,
     pub y: Coord,
-    /// node x position relative to its parent
     pub relative_x: Coord,
-    /// node y position relative to its parent
     pub relative_y: Coord,
     pub bbox: BoundingBox,
-    pub parent: Option<NonNull<Node>>,
-    /// Children need boxing to get a stable addr in the heap
-    pub children: Vec<Box<Node>>,
-    pub tidy: Option<Box<TidyData>>,
-}
-
-impl Clone for Node {
-    fn clone(&self) -> Self {
-        let mut root = Self {
-            id: self.id,
-            width: self.width,
-            height: self.height,
-            x: self.x,
-            y: self.y,
-            relative_x: self.relative_x,
-            relative_y: self.relative_y,
-            bbox: self.bbox.clone(),
-            parent: None,
-            children: self.children.clone(),
-            tidy: None,
-        };
-
-        if self.parent.is_none() {
-            root.post_order_traversal_mut(|node| {
-                let node_ptr = node.into();
-                for child in node.children.iter_mut() {
-                    child.parent = Some(node_ptr);
-                }
-            });
-        }
-
-        root
-    }
+    pub tidy: Option<TidyData>,
 }
 
 impl Default for Node {
     fn default() -> Self {
         Self {
-            id: usize::MAX,
+            external_id: usize::MAX,
             width: 0.,
             height: 0.,
             x: 0.,
             y: 0.,
             relative_x: 0.,
             relative_y: 0.,
-            children: vec![],
-            parent: None,
             bbox: Default::default(),
             tidy: None,
         }
@@ -102,7 +52,7 @@ impl Default for Node {
 impl Node {
     pub fn new(id: usize, width: Coord, height: Coord) -> Self {
         Node {
-            id,
+            external_id: id,
             width,
             height,
             bbox: Default::default(),
@@ -110,29 +60,8 @@ impl Node {
             y: 0.,
             relative_x: 0.,
             relative_y: 0.,
-            children: vec![],
-            parent: None,
             tidy: None,
         }
-    }
-
-    pub fn depth(&self) -> usize {
-        let mut depth = 0;
-        let mut node = self;
-        while node.parent.is_some() {
-            node = node.parent().unwrap();
-            depth += 1;
-        }
-
-        depth
-    }
-
-    pub fn parent_mut(&mut self) -> Option<&mut Self> {
-        unsafe { self.parent.map(|mut node| node.as_mut()) }
-    }
-
-    pub fn parent(&self) -> Option<&Self> {
-        unsafe { self.parent.map(|node| node.as_ref()) }
     }
 
     pub fn bottom(&self) -> Coord {
@@ -147,178 +76,141 @@ impl Node {
         self.tidy.as_ref().unwrap()
     }
 
-    fn reset_parent_link_of_children(&mut self) {
-        if self.children.is_empty() {
-            return;
-        }
-
-        let ptr = self.into();
-        for child in self.children.iter_mut() {
-            child.parent = Some(ptr);
-        }
-    }
-
-    pub fn append_child(&mut self, mut child: Self) -> NonNull<Self> {
-        child.parent = Some(self.into());
-        let mut boxed = Box::new(child);
-        boxed.reset_parent_link_of_children();
-        let ptr = boxed.as_mut().into();
-        self.children.push(boxed);
-        ptr
-    }
-
-    pub fn new_with_child(id: usize, width: Coord, height: Coord, child: Self) -> Self {
-        let mut node = Node::new(id, width, height);
-        node.append_child(child);
-        node
-    }
-
-    pub fn new_with_children(id: usize, width: Coord, height: Coord, children: Vec<Self>) -> Self {
-        let mut node = Node::new(id, width, height);
-        for child in children {
-            node.append_child(child);
-        }
-        node
-    }
-
     pub fn intersects(&self, other: &Self) -> bool {
         self.x - self.width / 2. < other.x + other.width / 2.
             && self.x + self.width / 2. > other.x - other.width / 2.
             && self.y < other.y + other.height
             && self.y + self.height > other.y
     }
+}
 
-    pub fn post_order_traversal<F>(&self, mut f: F)
-    where
-        F: FnMut(&Node),
-    {
-        let mut stack: Vec<(NonNull<Self>, bool)> = vec![(self.into(), true)];
-        while let Some((mut node_ptr, is_first)) = stack.pop() {
-            let node = unsafe { node_ptr.as_mut() };
-            if !is_first {
-                f(node);
-                continue;
-            }
+pub struct TreeGraph {
+    pub(crate) graph: Graph<Node, ()>,
+    pub(crate) root: NodeIndex,
+    pub(crate) external_id_mapping: HashMap<usize, NodeIndex>
+}
 
-            stack.push((node_ptr, false));
-            for child in node.children.iter_mut() {
-                stack.push((child.as_mut().into(), true));
-            }
+impl TreeGraph {
+    pub fn new(root: Node) -> Self {
+        let mut graph = Graph::new();
+        let root_id = root.external_id.clone();
+        let root_index = graph.add_node(root);
+        let mut external_id_mapping: HashMap<usize, NodeIndex> = HashMap::new();
+        external_id_mapping.insert(root_id, root_index);
+        Self {
+            graph,
+            root: root_index,
+            external_id_mapping,
         }
     }
 
-    pub fn post_order_traversal_mut<F>(&mut self, mut f: F)
-    where
-        F: FnMut(&mut Node),
-    {
-        let mut stack: Vec<(NonNull<Self>, bool)> = vec![(self.into(), true)];
-        while let Some((mut node_ptr, is_first)) = stack.pop() {
-            let node = unsafe { node_ptr.as_mut() };
-            if !is_first {
-                f(node);
-                continue;
-            }
-
-            stack.push((node_ptr, false));
-            for child in node.children.iter_mut() {
-                stack.push((child.as_mut().into(), true));
-            }
-        }
+    pub fn add_child(&mut self, parent: NodeIndex, child: Node) -> NodeIndex {
+        let child_external_id = child.external_id.clone();
+        let child_index = self.graph.add_node(child);
+        self.graph.add_edge(parent, child_index, ());
+        self.external_id_mapping.insert(child_external_id, child_index);
+        child_index
     }
 
-    pub fn pre_order_traversal<F>(&self, mut f: F)
-    where
-        F: FnMut(&Node),
-    {
-        let mut stack: Vec<NonNull<Self>> = vec![self.into()];
-        while let Some(mut node) = stack.pop() {
-            let node = unsafe { node.as_mut() };
-            f(node);
-            for child in node.children.iter_mut() {
-                stack.push(child.as_mut().into());
-            }
+    pub fn depth(&self, node: NodeIndex) -> usize {
+        let mut depth = 0;
+        let mut current = node;
+        while let Some(parent) = self.graph.neighbors_directed(current, Direction::Incoming).next() {
+            current = parent;
+            depth += 1;
         }
+        depth
     }
 
-    pub fn pre_order_traversal_mut<F>(&mut self, mut f: F)
-    where
-        F: FnMut(&mut Node),
-    {
-        let mut stack: Vec<NonNull<Self>> = vec![self.into()];
-        while let Some(mut node) = stack.pop() {
-            let node = unsafe { node.as_mut() };
-            f(node);
-            for child in node.children.iter_mut() {
-                stack.push(child.as_mut().into());
-            }
-        }
-    }
+    pub fn bfs_traversal_with_depth_mut(
+        &mut self
+    ) -> impl Iterator<Item = (NodeIndex, usize)> + '_ {
+        let mut bfs = Bfs::new(&self.graph, self.root);
+        let mut depth_map = std::collections::HashMap::new();
+        depth_map.insert(self.root, 0);
 
-    pub fn bfs_traversal_with_depth_mut<F>(&mut self, mut f: F)
-    where
-        F: FnMut(&mut Node, usize),
-    {
-        let mut queue: VecDeque<(NonNull<Self>, usize)> = VecDeque::new();
-        queue.push_back((self.into(), 0));
-        while let Some((mut node, depth)) = queue.pop_front() {
-            let node = unsafe { node.as_mut() };
-            f(node, depth);
-            for child in node.children.iter_mut() {
-                queue.push_back((child.as_mut().into(), depth + 1));
-            }
-        }
-    }
+        std::iter::from_fn(move || {
+            while let Some(nx) = bfs.next(&self.graph) {
+                let depth = *depth_map.get(&nx).unwrap_or(&0);
 
-    pub fn remove_child(&mut self, id: usize) {
-        let pos = self.children.iter().position(|node| node.id == id);
-        if let Some(index) = pos {
-            self.children.remove(index);
-        }
+                // Update depth map for neighbors
+                let children: Vec<_> = self.graph.neighbors(nx).collect();
+                for neighbor in children {
+                    if !depth_map.contains_key(&neighbor) {
+                        depth_map.insert(neighbor, depth + 1);
+                    }
+                }
+
+                return Some((nx, depth));
+            }
+            None
+        })
     }
 
     pub fn pre_order_traversal_with_depth_mut<F>(&mut self, mut f: F)
     where
         F: FnMut(&mut Node, usize),
     {
-        let mut stack: Vec<(NonNull<Self>, usize)> = vec![(self.into(), 0)];
-        while let Some((mut node, depth)) = stack.pop() {
-            let node = unsafe { node.as_mut() };
-            f(node, depth);
-            for child in node.children.iter_mut() {
-                stack.push((child.as_mut().into(), depth + 1));
-            }
+        self.pre_order_traversal_with_depth_mut_helper(self.root, 0, &mut f);
+    }
+
+    fn pre_order_traversal_with_depth_mut_helper<F>(&mut self, node: NodeIndex, depth: usize, f: &mut F)
+    where
+        F: FnMut(&mut Node, usize),
+    {
+        f(&mut self.graph[node], depth);
+        let children: Vec<_> = self.graph.neighbors(node).collect();
+        for child in children {
+            self.pre_order_traversal_with_depth_mut_helper(child, depth + 1, f);
         }
     }
 
     pub fn str(&self) -> String {
         let mut s = String::new();
-        if self.tidy.is_some() {
+        self.str_helper(self.root, 0, &mut s);
+        s
+    }
+
+    fn str_helper(&self, node: NodeIndex, depth: usize, s: &mut String) {
+        let node_data = &self.graph[node];
+        let indent = "    ".repeat(depth);
+
+        if node_data.tidy.is_some() {
             s.push_str(&format!(
-                "x: {}, y: {}, width: {}, height: {}, rx: {}, mod: {}, id: {}\n",
-                self.x,
-                self.y,
-                self.width,
-                self.height,
-                self.relative_x,
-                self.tidy().modifier_to_subtree,
-                self.id
+                "{}x: {}, y: {}, width: {}, height: {}, rx: {}, mod: {}, id: {}\n",
+                indent,
+                node_data.x,
+                node_data.y,
+                node_data.width,
+                node_data.height,
+                node_data.relative_x,
+                node_data.tidy().modifier_to_subtree,
+                node_data.external_id
             ));
         } else {
             s.push_str(&format!(
-                "x: {}, y: {}, width: {}, height: {}, rx: {}, id: {}\n",
-                self.x, self.y, self.width, self.height, self.relative_x, self.id
+                "{}x: {}, y: {}, width: {}, height: {}, rx: {}, id: {}\n",
+                indent,
+                node_data.x,
+                node_data.y,
+                node_data.width,
+                node_data.height,
+                node_data.relative_x,
+                node_data.external_id
             ));
         }
-        for child in self.children.iter() {
-            for line in child.str().split('\n') {
-                if line.is_empty() {
-                    continue;
-                }
 
-                s.push_str(&format!("    {}\n", line));
-            }
+        for child in self.graph.neighbors(node) {
+            self.str_helper(child, depth + 1, s);
         }
+    }
 
-        s
+    pub fn get_from_external_id(&self, external_id: &usize) -> Option<(&NodeIndex, &Node)> {
+        self.external_id_mapping.get(external_id).map(|idx| (idx, &self.graph[*idx]))
+    }
+
+    pub fn get_children(&self, idx: NodeIndex) -> Vec<NodeIndex> {
+        let children: Vec<_> = self.graph.neighbors(idx).collect();
+        children
     }
 }
