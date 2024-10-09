@@ -17,6 +17,10 @@ mod bevy_egui;
 mod egui_json_tree;
 mod tree_grouping;
 mod json_editor;
+// mod r#mod;
+// use bevy_assets_bundler::BundledAssetIoPlugin;
+// use r#mod::BUNDLE_OPTIONS;
+
 
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
 use bevy::prelude::*;
@@ -32,6 +36,8 @@ use bevy_rapier2d::plugin::{NoUserData, RapierPhysicsPlugin};
 use bevy_rapier2d::render::RapierDebugRenderPlugin;
 use egui::style::{HandleShape, NumericColorSpace};
 use once_cell::sync::{Lazy, OnceCell};
+
+
 
 
 static DEVICE_SCALE: OnceCell<f32> = OnceCell::new();

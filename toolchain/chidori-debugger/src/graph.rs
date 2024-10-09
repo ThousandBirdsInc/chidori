@@ -35,6 +35,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
+use bevy::asset::embedded_asset;
 use bevy::render::camera::{ScalingMode, Viewport};
 use bevy::render::render_asset::RenderAssetUsages;
 use dashmap::DashMap;
@@ -1399,7 +1400,7 @@ struct RoundedRectMaterial {
 /// You only need to implement functions for features that need non-default behavior. See the Material api docs for details!
 impl Material for RoundedRectMaterial {
     fn fragment_shader() -> ShaderRef {
-        "shaders/rounded_rect.wgsl".into()
+        "embedded://chidori_debugger/../assets/shaders/rounded_rect.wgsl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {
@@ -1600,6 +1601,7 @@ fn graph_setup(
 struct OnGraphScreen;
 
 pub fn graph_plugin(app: &mut App) {
+    embedded_asset!(app, "../assets/shaders/rounded_rect.wgsl");
     app.init_resource::<NodeIdToEntity>()
         .init_resource::<EdgePairIdToEntity>()
         .init_resource::<SelectedEntity>()

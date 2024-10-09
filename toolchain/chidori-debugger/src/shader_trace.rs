@@ -8,7 +8,7 @@ use bevy::render::mesh::{GpuBufferInfo, MeshVertexBufferLayout};
 use bevy::core_pipeline::core_3d::Transparent3d;
 use bevy::render::render_resource::{Buffer, BufferInitDescriptor, BufferUsages, PipelineCache, RenderPipelineDescriptor, SpecializedMeshPipeline, SpecializedMeshPipelineError, SpecializedMeshPipelines, VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode};
 use bevy::render::view::{ExtractedView, RenderLayers};
-use bevy::asset::{AssetServer, Handle};
+use bevy::asset::{embedded_asset, AssetServer, Handle};
 use bevy::render::renderer::RenderDevice;
 use bytemuck::offset_of;
 use bevy::render::extract_component::{ExtractComponent, ExtractComponentPlugin};
@@ -102,7 +102,8 @@ pub struct CustomPipeline {
 impl FromWorld for CustomPipeline {
     fn from_world(world: &mut World) -> Self {
         let asset_server = world.resource::<AssetServer>();
-        let shader = asset_server.load("shaders/instancing.wgsl");
+        let shader = asset_server.load("embedded://chidori_debugger/../assets/shaders/instancing.wgsl");
+
 
         let mesh_pipeline = world.resource::<MeshPipeline>();
 
@@ -233,6 +234,7 @@ pub struct CustomMaterialPlugin;
 
 impl Plugin for CustomMaterialPlugin {
     fn build(&self, app: &mut App) {
+        embedded_asset!(app, "../assets/shaders/instancing.wgsl");
         app.add_plugins(ExtractComponentPlugin::<InstanceMaterialData>::default());
         app.sub_app_mut(RenderApp)
             .add_render_command::<Transparent3d, DrawCustom>()

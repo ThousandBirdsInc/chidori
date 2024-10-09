@@ -1,8 +1,10 @@
+
 use dirs::home_dir;
 use std::env;
 use std::io::{self, Write};
 use std::str::FromStr;
 use target_lexicon::{OperatingSystem, Triple};
+
 
 fn add_extension_module_link_args(triple: &Triple) -> io::Result<()> {
     let mut writer = io::stdout();
