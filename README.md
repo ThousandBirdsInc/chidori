@@ -80,7 +80,8 @@ brew install \
 # Chidori uses uv for handling python dependencies 
   uv
 
-cargo install chidori-debugger
+# We depend on features only supported by nightly at the moment
+cargo +nightly install chidori-debugger --locked
 ```
 
 If you prefer to use a different python interpreter you can set PYO3_PYTHON=python3.12 (or whichever version > 3.7) during

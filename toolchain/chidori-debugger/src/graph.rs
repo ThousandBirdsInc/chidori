@@ -863,8 +863,8 @@ fn update_graph_system_renderer(
     let group_dep_graph = &graph_resource.group_dependency_graph;
     // let mut group_layouts = HashMap::new();
     for (id, group_graph) in grouped_nodes {
-        let node_mapping = generate_tree_layout(&group_graph, &graph_resource.node_dimensions);
-        // group_layouts.insert(id, (tidy, root, node_mapping));
+        let tree_layout = generate_tree_layout(&group_graph, &graph_resource.node_dimensions);
+        // group_layouts.insert(id, tree_layout);
     }
 
     // TODO: traverse the group dep graph, allocating nodes
@@ -1263,17 +1263,9 @@ fn generate_tree_layout(
             let mut parents = &mut execution_graph
                 .neighbors_directed(x, petgraph::Direction::Incoming);
 
-
             // Only a single parent ever occurs
             if let Some(parent) = &mut parents.next() {
                 let node = tree_graph.add_child(parent.clone(), tree_node);
-                // if let Some(parent) = node_mapping.get(parent) {
-                //     let node = tree_graph.add_child(parent.clone(), tree_node);
-                //     // node_mapping.insert(x, node);
-                // }
-            } else {
-                let node = tree_graph.add_child(x, tree_node);
-                // node_mapping.insert(x, node);
             }
         }
     }
@@ -1584,7 +1576,6 @@ fn graph_setup(
     let mut node_ids = HashMap::new();
     commands.spawn((CursorWorldCoords(vec2(0.0, 0.0)), OnGraphScreen));
     commands.insert_resource(GraphResource {
-        
         execution_graph: dataset,
         group_dependency_graph: Default::default(),
         hash_graph: hash_graph(&execution_graph.execution_graph),
