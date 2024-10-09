@@ -27,7 +27,7 @@ use chidori_core::execution::execution::execution_graph::ExecutionNodeId;
 use chidori_core::execution::execution::ExecutionState;
 use num::ToPrimitive;
 use petgraph::data::DataMap;
-use petgraph::prelude::StableGraph;
+use petgraph::prelude::{NodeIndex, StableGraph};
 use petgraph::visit::Walker;
 use std::collections::{HashMap, HashSet};
 use std::fmt::format;
