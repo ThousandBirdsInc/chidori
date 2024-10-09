@@ -25,8 +25,6 @@ use bevy_rapier2d::plugin::RapierContext;
 use bevy_rapier2d::prelude::*;
 use chidori_core::execution::execution::execution_graph::ExecutionNodeId;
 use chidori_core::execution::execution::ExecutionState;
-use fdg::petgraph::graph::NodeIndex;
-use fdg::ForceGraph;
 use num::ToPrimitive;
 use petgraph::data::DataMap;
 use petgraph::prelude::StableGraph;

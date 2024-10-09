@@ -24,7 +24,6 @@ rfd = "0.14.1"
 bytemuck = "1.15.0"
 rand = "0.8.5"
 petgraph-gen = "0.1.3"
-fdg = { git = "https://github.com/grantshandy/fdg.git", version = "1.0.0" }
 num = "0.4.0"
 tinyset = "0.4.10"
 egui_json_tree = "0.6.0"
