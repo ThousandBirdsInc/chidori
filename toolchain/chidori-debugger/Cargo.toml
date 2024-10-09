@@ -15,7 +15,7 @@ bevy = "0.13.2"
 egui = { version = "0.28.1", default-features = false, features = ["bytemuck"] }
 image = { version = "0.24", features = ["jpeg", "png"] }
 bevy_utils = "0.13.2"
-bevy_rapier2d = { version = "*", features = [ "simd-stable", "debug-render-2d" ]}
+bevy_rapier2d = { version = "0.25.0", features = [ "simd-stable", "debug-render-2d" ]}
 bevy_prototype_lyon = "0.11.0"
 egui_extras = { version = "0.28.1" , features = ["syntect", "all_loaders"]}
 egui_tiles = "0.9.1"
