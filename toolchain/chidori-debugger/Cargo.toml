@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
+description = "Visual debugger for Chidori"
 
 [dependencies]
 objc = "0.2"
@@ -39,7 +40,7 @@ futures.workspace = true
 petgraph.workspace = true
 
 syntect = "5.2.0"
-chidori-core = { path = "../chidori-core" }
+chidori-core = { path = "../chidori-core", version = "0.2.1"   }
 dirs = "5.0.1"
 target-lexicon = "0.12.14"
 rusqlite.workspace = true
