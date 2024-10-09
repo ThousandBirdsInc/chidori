@@ -1,4 +1,7 @@
 #![feature(generic_nonzero)]
+#![feature(inline_const)]
+#![feature(associated_type_bounds)]
+#![feature(pointer_is_aligned)]
 
 mod util;
 mod code;
