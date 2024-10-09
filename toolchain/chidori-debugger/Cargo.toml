@@ -8,6 +8,8 @@ homepage.workspace = true
 repository.workspace = true
 description = "Visual debugger for Chidori"
 
+[package.metadata.cargo-install]
+locked = true
 
 [dependencies]
 objc = "0.2"
