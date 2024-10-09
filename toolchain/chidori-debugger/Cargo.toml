@@ -1,3 +1,5 @@
+cargo-features = ["publish-lockfile"]
+
 [package]
 name = "chidori-debugger"
 version.workspace = true
@@ -7,6 +9,8 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 description = "Visual debugger for Chidori"
+publish-lockfile = true
+
 
 [dependencies]
 objc = "0.2"
