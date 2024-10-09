@@ -1,7 +1,7 @@
 use petgraph::graph::{Graph, NodeIndex};
 use petgraph::Direction;
 use std::collections::{HashMap, HashSet, VecDeque};
-use petgraph::prelude::StableGraph;
+use petgraph::prelude::{EdgeRef, StableGraph};
 use chidori_core::execution::execution::execution_graph::ExecutionNodeId;
 use chidori_core::uuid::Uuid;
 // Example structure tree:
@@ -20,7 +20,7 @@ use chidori_core::uuid::Uuid;
 
 pub fn group_tree(
     original_tree: &StableGraph<ExecutionNodeId, (), petgraph::Directed>,
-    groups: &HashSet<ExecutionNodeId>,
+    first_level_children: &HashSet<ExecutionNodeId>,
 ) -> (
     StableGraph<ExecutionNodeId, (), petgraph::Directed>,
     HashMap<ExecutionNodeId, StableGraph<ExecutionNodeId, (), petgraph::Directed>>,
@@ -34,8 +34,19 @@ pub fn group_tree(
     let root_node_id = chidori_core::uuid::Uuid::nil();
     group_dependency_graph.add_node(root_node_id);
 
+    let mut groups = HashSet::new();
+    for &child_id in first_level_children {
+        if let Some(child_index) = original_tree.node_indices().find(|&i| original_tree.node_weight(i).cloned() == Some(child_id)) {
+            for edge in original_tree.edges_directed(child_index, petgraph::Direction::Incoming) {
+                if let Some(parent_id) = original_tree.node_weight(edge.source()).cloned() {
+                    groups.insert(parent_id);
+                }
+            }
+        }
+    }
+
     // Initialize group_dependency_graph with nodes from groups
-    for &group_id in groups {
+    for &group_id in &groups {
         group_dependency_graph.add_node(group_id);
     }
 
@@ -118,11 +129,11 @@ pub fn group_tree(
 
             // Create the subgraph for the root group
             let mut root_subgraph = StableGraph::new();
-            process_subtree(root, original_tree, groups, &mut root_subgraph, &mut grouped_trees, &mut group_dependency_graph, None);
+            process_subtree(root, original_tree, &groups, &mut root_subgraph, &mut grouped_trees, &mut group_dependency_graph, None);
             grouped_trees.insert(root_id, root_subgraph);
         } else {
             // If the root is not a group, process the tree normally
-            process_subtree(root, original_tree, groups, &mut modified_tree, &mut grouped_trees, &mut group_dependency_graph, None);
+            process_subtree(root, original_tree, &groups, &mut modified_tree, &mut grouped_trees, &mut group_dependency_graph, None);
         }
     }
 
@@ -189,7 +200,7 @@ mod tests {
         original_tree.add_edge(a_node, b_node, ());
         original_tree.add_edge(a_node, c_node, ());
 
-        let groups = vec![a].into_iter().collect();
+        let groups = vec![b,c].into_iter().collect();
 
         let (modified_tree, grouped_trees, dependency_graph) = group_tree(&original_tree, &groups);
 
@@ -244,7 +255,7 @@ mod tests {
         original_tree.add_edge(b_node, e_node, ());
         original_tree.add_edge(c_node, f_node, ());
 
-        let groups = vec![b, c].into_iter().collect();
+        let groups = vec![d,e,f].into_iter().collect();
 
         let (modified_tree, grouped_trees, dependency_graph) = group_tree(&original_tree, &groups);
 
@@ -302,7 +313,7 @@ mod tests {
         original_tree.add_edge(a_node, d_node, ());
         original_tree.add_edge(b_node, e_node, ());
 
-        let groups = vec![b].into_iter().collect();
+        let groups = vec![e].into_iter().collect();
 
         let (modified_tree, grouped_trees, dependency_graph) = group_tree(&original_tree, &groups);
 
@@ -369,7 +380,7 @@ mod tests {
         original_tree.add_edge(e_node, g_node, ());
         original_tree.add_edge(e_node, h_node, ());
 
-        let groups = vec![a, c].into_iter().collect();
+        let groups = vec![b,c,f].into_iter().collect();
 
         let (modified_tree, grouped_trees, dependency_graph) = group_tree(&original_tree, &groups);
 

@@ -40,7 +40,7 @@ const USER_INTERACTION_RECEIVER_TIMEOUT_MS: u64 = 500;
 
 type Func = fn(RKV) -> RKV;
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub enum PlaybackState {
     Paused,
     Step,
@@ -87,6 +87,7 @@ pub enum UserInteractionMessage {
 //
 #[derive(Clone, Debug)]
 pub enum EventsFromRuntime {
+    PlaybackState(PlaybackState),
     DefinitionGraphUpdated(Vec<(OperationId, OperationId, Vec<DependencyReference>)>),
     ExecutionGraphUpdated((Vec<(ExecutionNodeId, ExecutionNodeId)>, HashSet<ExecutionNodeId>)),
     ExecutionStateChange(MergedStateHistory),

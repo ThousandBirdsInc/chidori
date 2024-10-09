@@ -18,12 +18,12 @@ use chidori_core::chidori_static_analysis::language::{ChidoriStaticAnalysisError
 use chidori_core::execution::primitives::identifiers::OperationId;
 use chidori_core::sdk::entry::CellHolder;
 use crate::json_editor::{JsonEditorExample, Show};
-use crate::chidori::{ChidoriCells, ChidoriExecutionGraph, ChidoriExecutionState, EguiTree, EguiTreeIdentities, InternalState};
+use crate::chidori::{ChidoriCells, ChidoriExecutionGraph, ChidoriExecutionState, EguiTree, EguiTreeIdentities, ChidoriState};
 use egui_json_tree::JsonTree;
 use serde_derive::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use chidori_core::chidori_prompt_format::templating::templates::{SchemaItem, SchemaItemType};
-use crate::{CurrentTheme, GameState};
+use crate::{CurrentTheme, GameState, Theme};
 use crate::util::{change_active_editor_ui, deselect_editor_on_esc, despawn_screen, egui_label, egui_logs, egui_rkyv, print_editor_text, serialized_value_to_json_value};
 
 #[derive(Component)]
@@ -52,7 +52,7 @@ struct CellState {
 
 
 #[derive(Default)]
-struct CellIdToState {
+pub struct CellIdToState {
     cell_id_to_state: HashMap<Uuid, CellState>
 }
 
@@ -62,7 +62,7 @@ fn editor_update(
     q_window: Query<&Window, With<PrimaryWindow>>,
     execution_state: Res<ChidoriExecutionState>,
     execution_graph: Res<ChidoriExecutionGraph>,
-    internal_state: Res<InternalState>,
+    internal_state: Res<ChidoriState>,
     current_theme: Res<CurrentTheme>,
     mut tree: ResMut<EguiTree>,
     mut chidori_cells: ResMut<ChidoriCells>,
@@ -135,61 +135,7 @@ fn editor_update(
             frame.end(ui);
 
             for mut cell_holder in cells {
-                let op_id = cell_holder.op_id;
-
-                // let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(Margin::symmetric(8.0, 16.0)).inner_margin(16.0).rounding(6.0).begin(ui);
-                let mut frame = egui::Frame::default()
-                    .fill(current_theme.theme.card)
-                    .stroke(current_theme.theme.card_border)
-                    .outer_margin(Margin::symmetric(8.0, 16.0))
-                    .inner_margin(16.0)
-                    .rounding(current_theme.theme.radius as f32)
-                    .begin(ui);
-                {
-                    let ui = &mut frame.content_ui;
-                    ui.set_max_width(800.0);
-                    let mut exists_in_current_tree = false;
-                    if let Some(applied_at) = &cell_holder.applied_at {
-                        if internal_state.debug_mode {
-                            ui.label(format!("Applied At: {:?}", applied_at));
-                        }
-                        exists_in_current_tree = execution_graph.exists_in_current_tree(applied_at);
-                    } else {
-                        if ui.button("Pending Application To Graph").clicked() {
-                            internal_state.update_cell(cell_holder.clone());
-                        }
-                    }
-                    if internal_state.debug_mode {
-                        ui.label(format!("Operation Id: {:?}", op_id));
-                    }
-                    match &mut cell_holder.cell {
-                        CellTypes::Code(_, ..) => {
-                            render_code_cell(
-                                &internal_state,
-                                &execution_state,
-                                &mut local_cell_state,
-                                &mut theme,
-                                &op_id,
-                                ui,
-                                cell_holder,
-                                exists_in_current_tree
-                            );
-                        }
-                        CellTypes::CodeGen(..) => {
-                            render_code_gen_cell(&execution_state, &mut local_cell_state, &op_id, ui, cell_holder, exists_in_current_tree);
-                        }
-                        CellTypes::Prompt(LLMPromptCell::Completion { .. }, _) => {}
-                        CellTypes::Prompt(LLMPromptCell::Chat {..}, _) => {
-                            render_prompt_cell(&execution_state, &mut local_cell_state, &op_id, ui, cell_holder, exists_in_current_tree);
-                        }
-                        CellTypes::Embedding(LLMEmbeddingCell { .. }, _) => {}
-                        CellTypes::Template(..) => {
-                            render_template_cell(&execution_state, &mut local_cell_state, &op_id, ui, cell_holder, exists_in_current_tree);
-                        }
-                        CellTypes::Memory(MemoryCell { .. }, _) => {}
-                    }
-                }
-                frame.end(ui);
+                editable_chidori_cell_content(&execution_state, &execution_graph, &internal_state, &current_theme.theme, &mut local_cell_state, ui, &mut theme, &mut cell_holder);
             }
 
             if !internal_state.display_example_modal {
@@ -209,6 +155,64 @@ fn editor_update(
 
         });
     });
+}
+
+pub fn editable_chidori_cell_content(execution_state: &ChidoriExecutionState, execution_graph: &ChidoriExecutionGraph, internal_state: &ChidoriState, theme: &Theme, mut local_cell_state: &mut CellIdToState, ui: &mut Ui, mut code_theme: &mut CodeTheme, mut cell_holder: &mut CellHolder) {
+    let op_id = cell_holder.op_id;
+
+    // let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(Margin::symmetric(8.0, 16.0)).inner_margin(16.0).rounding(6.0).begin(ui);
+    let mut frame = egui::Frame::default()
+        .fill(theme.card)
+        .stroke(theme.card_border)
+        .outer_margin(Margin::symmetric(8.0, 16.0))
+        .inner_margin(16.0)
+        .rounding(theme.radius as f32)
+        .begin(ui);
+    {
+        let ui = &mut frame.content_ui;
+        ui.set_max_width(800.0);
+        let mut exists_in_current_tree = false;
+        if let Some(applied_at) = &cell_holder.applied_at {
+            if internal_state.debug_mode {
+                ui.label(format!("Applied At: {:?}", applied_at));
+            }
+            exists_in_current_tree = execution_graph.exists_in_current_tree(applied_at);
+        } else {
+            if ui.button("Pending Application To Graph").clicked() {
+                internal_state.update_cell(cell_holder.clone());
+            }
+        }
+        if internal_state.debug_mode {
+            ui.label(format!("Operation Id: {:?}", op_id));
+        }
+        match &mut cell_holder.cell {
+            CellTypes::Code(_, ..) => {
+                render_code_cell(
+                    &internal_state,
+                    &execution_state,
+                    &mut local_cell_state,
+                    &mut code_theme,
+                    &op_id,
+                    ui,
+                    cell_holder,
+                    exists_in_current_tree
+                );
+            }
+            CellTypes::CodeGen(..) => {
+                render_code_gen_cell(&execution_state, &mut local_cell_state, &op_id, ui, cell_holder, exists_in_current_tree);
+            }
+            CellTypes::Prompt(LLMPromptCell::Completion { .. }, _) => {}
+            CellTypes::Prompt(LLMPromptCell::Chat { .. }, _) => {
+                render_prompt_cell(&execution_state, &mut local_cell_state, &op_id, ui, cell_holder, exists_in_current_tree);
+            }
+            CellTypes::Embedding(LLMEmbeddingCell { .. }, _) => {}
+            CellTypes::Template(..) => {
+                render_template_cell(&execution_state, &mut local_cell_state, &op_id, ui, cell_holder, exists_in_current_tree);
+            }
+            CellTypes::Memory(MemoryCell { .. }, _) => {}
+        }
+    }
+    frame.end(ui);
 }
 
 fn render_template_cell(
@@ -262,10 +266,10 @@ fn render_template_cell(
 fn render_operation_output(execution_state: &ChidoriExecutionState, op_id: &&OperationId, ui: &mut Ui) {
     if let Some(state) = &execution_state.inner {
         if let Some((exec_id, o)) = state.0.get(op_id) {
-            if ui.button(format!("Go To Most Recent Execution")).clicked() {
+            if ui.button(format!("View Most Recent Execution")).clicked() {
                 // TODO: move visualized head of graph to this point
             }
-            if ui.button(format!("Revert to: {:?} {:?}", exec_id, op_id)).clicked() {}
+            if ui.button(format!("Revert To Most Recent Execution")).clicked() {}
             ui.push_id((exec_id, op_id), |ui| {
                 ui.collapsing("Values", |ui| {
                     let response = JsonTree::new(format!("{} {} values", exec_id, op_id), &serialized_value_to_json_value(&o.output.clone().unwrap()))
@@ -483,7 +487,7 @@ fn render_applied_status(mut ui: &mut Ui, exists_in_current_tree: bool) {
 }
 
 fn render_code_cell(
-    internal_state: &InternalState ,
+    internal_state: &ChidoriState,
     execution_state: &ChidoriExecutionState,
     local_cell_state: &mut CellIdToState,
     theme: &mut CodeTheme,
@@ -669,13 +673,13 @@ fn render_code_cell(
 fn render_new_cell_interface(
     execution_state: &ChidoriExecutionState,
     mut ui: &mut Ui,
-    x: &mut ResMut<ChidoriCells>
+    chidori_cells: &mut ResMut<ChidoriCells>
 ) {
     ui.horizontal(|ui| {
         egui_label(ui, "New Cell");
     });
     if ui.button("Add Code Cell").clicked() {
-        x.editor_cells.push(CellHolder {
+        chidori_cells.editor_cells.push(CellHolder {
             cell: CellTypes::Code(CodeCell {
                 backing_file_reference: None,
                 name: None,
@@ -689,7 +693,7 @@ fn render_new_cell_interface(
         })
     }
     if ui.button("Add Prompt Cell").clicked() {
-        x.editor_cells.push(CellHolder {
+        chidori_cells.editor_cells.push(CellHolder {
             cell: CellTypes::Prompt(LLMPromptCell::Chat {
                 backing_file_reference: None,
                 function_invocation: false,
@@ -705,7 +709,7 @@ fn render_new_cell_interface(
         })
     }
     if ui.button("Add Template Cell").clicked() {
-        x.editor_cells.push(CellHolder {
+        chidori_cells.editor_cells.push(CellHolder {
             cell: CellTypes::Template(TemplateCell {
                 backing_file_reference: None,
                 name: None,
@@ -717,7 +721,7 @@ fn render_new_cell_interface(
         })
     }
     if ui.button("Add Code Generation Cell").clicked() {
-        x.editor_cells.push(CellHolder {
+        chidori_cells.editor_cells.push(CellHolder {
             cell: CellTypes::CodeGen(LLMCodeGenCell {
                 backing_file_reference: None,
                 function_invocation: false,

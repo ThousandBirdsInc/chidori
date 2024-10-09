@@ -25,10 +25,7 @@ use chidori_core::execution::execution::execution_graph::{
 };
 use chidori_core::execution::execution::ExecutionState;
 use chidori_core::execution::primitives::identifiers::{DependencyReference, OperationId};
-use chidori_core::sdk::entry::{
-    CellHolder, EventsFromRuntime,
-    UserInteractionMessage,
-};
+use chidori_core::sdk::entry::{CellHolder, EventsFromRuntime, PlaybackState, UserInteractionMessage};
 use chidori_core::tokio::task::JoinHandle;
 use chidori_core::utils::telemetry::TraceEvents;
 use petgraph::prelude::StableGraph;
@@ -317,16 +314,20 @@ pub struct ChidoriCells {
 }
 
 #[derive(Resource)]
-pub struct InternalState {
+pub struct ChidoriState {
     pub debug_mode: bool,
     watched_path: Mutex<Option<String>>,
     file_watch: Mutex<Option<Debouncer<RecommendedWatcher, FileIdMap>>>,
     background_thread: Mutex<Option<JoinHandle<()>>>,
     pub chidori: Arc<Mutex<Chidori>>,
     pub display_example_modal: bool,
+    pub current_playback_state: PlaybackState
+
+
+
 }
 
-impl InternalState {
+impl ChidoriState {
     pub fn get_loaded_path(&self) -> String {
         let env = self.chidori.lock().unwrap();
         if env.loaded_path.is_none() {
@@ -476,7 +477,7 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
 
     let (trace_event_sender, trace_event_receiver) = std::sync::mpsc::channel();
     let (runtime_event_sender, runtime_event_receiver) = std::sync::mpsc::channel();
-    let mut internal_state = InternalState {
+    let mut internal_state = ChidoriState {
         debug_mode: false,
         chidori: Arc::new(Mutex::new(Chidori::new_with_events(
             trace_event_sender,
@@ -486,6 +487,7 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
         background_thread: Mutex::new(None),
         file_watch: Mutex::new(None),
         display_example_modal: true,
+        current_playback_state: PlaybackState::Paused,
     };
 
     {
@@ -611,6 +613,14 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                                 .await;
 
                         }
+                        EventsFromRuntime::PlaybackState(state) => {
+                            ctx.run_on_main_thread(move |ctx| {
+                                if let Some(mut internal_state) = ctx.world.get_resource_mut::<ChidoriState>() {
+                                    internal_state.current_playback_state = state;
+                                }
+                            })
+                                .await;
+                        }
                     }
                 }
                 Err(e) => match e {
@@ -663,7 +673,7 @@ pub fn update_gui(
     mut contexts: EguiContexts,
     mut egui_tree: ResMut<EguiTree>,
     runtime: ResMut<tokio_tasks::TokioTasksRuntime>,
-    mut internal_state: ResMut<InternalState>,
+    mut internal_state: ResMut<ChidoriState>,
     mut state: ResMut<NextState<GameState>>,
     mut theme: Res<CurrentTheme>,
     mut displayed_example_desc: Local<Option<(String, String, String)>>
@@ -706,7 +716,7 @@ pub fn update_gui(
                                         let path = folder.path().to_string_lossy().to_string();
                                         ctx.run_on_main_thread(move |ctx| {
                                             if let Some(mut internal_state) =
-                                                ctx.world.get_resource_mut::<InternalState>()
+                                                ctx.world.get_resource_mut::<ChidoriState>()
                                             {
                                                 match internal_state.load_and_watch_directory(path) {
                                                     Ok(()) => {
@@ -858,7 +868,7 @@ pub fn update_gui(
                                 let path = folder.path().to_string_lossy().to_string();
                                 ctx.run_on_main_thread(move |ctx| {
                                     if let Some(mut internal_state) =
-                                        ctx.world.get_resource_mut::<InternalState>()
+                                        ctx.world.get_resource_mut::<ChidoriState>()
                                     {
                                         match internal_state.load_and_watch_directory(path) {
                                             Ok(()) => {
@@ -881,14 +891,28 @@ pub fn update_gui(
                     }
                     ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
 
-                    if with_cursor(ui.button("Run")).clicked() {
-                        internal_state.play();
-                    }
-                    if with_cursor(ui.button("Stop")).clicked() {
-                        internal_state.pause();
-                    }
-                    if with_cursor(ui.button("Step")).clicked() {
-                        internal_state.step();
+                    match internal_state.current_playback_state {
+                        PlaybackState::Paused => {
+                            if with_cursor(ui.button("Run")).clicked() {
+                                internal_state.play();
+                            }
+                            if with_cursor(ui.button("Step")).clicked() {
+                                internal_state.step();
+                            }
+                        }
+                        PlaybackState::Step => {
+                            if with_cursor(ui.button("Run")).clicked() {
+                                internal_state.play();
+                            }
+                            if with_cursor(ui.button("Pause")).clicked() {
+                                internal_state.pause();
+                            }
+                        }
+                        PlaybackState::Running => {
+                            if with_cursor(ui.button("Pause")).clicked() {
+                                internal_state.pause();
+                            }
+                        }
                     }
                     ui.add_space(8.0);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {

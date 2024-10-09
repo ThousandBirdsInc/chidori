@@ -109,13 +109,10 @@ impl InstancedEnvironment {
     }
 
     /// Entrypoint for execution of an instanced environment, handles messages from the host
-    ///
-    ///
-    ///
     // #[tracing::instrument]
     pub async fn run(&mut self) -> anyhow::Result<()> {
         println!("Starting instanced environment");
-        self.playback_state = PlaybackState::Paused;
+        self.set_playback_state(PlaybackState::Paused);
 
         // Reload cells to make sure we're up-to-date
         self.reload_cells()?;
@@ -162,7 +159,7 @@ impl InstancedEnvironment {
                 let exec_head = self.execution_head_state_id;
                 let get_conditional_polling_step = match self.playback_state {
                     PlaybackState::Step => {
-                        self.playback_state = PlaybackState::Paused;
+                        self.set_playback_state(PlaybackState::Paused);
                         Some((exec_head, ExecutionGraph::immutable_external_step_execution(exec_head, state)))
                     }
                     PlaybackState::Paused => {
@@ -254,26 +251,33 @@ impl InstancedEnvironment {
                 }
             }
             if should_pause {
-                self.playback_state = PlaybackState::Paused;
+                self.set_playback_state(PlaybackState::Paused);
             }
         }
         unreachable!("We've exited the run loop");
         Ok(())
     }
 
+    fn set_playback_state(&mut self, playback_state: PlaybackState) {
+        self.playback_state = playback_state.clone();
+        if let Some(sender ) = self.runtime_event_sender.as_mut() {
+            sender.send(EventsFromRuntime::PlaybackState(playback_state)).unwrap();
+        }
+    }
+
     async fn handle_user_interaction_message(&mut self, message: UserInteractionMessage) -> Result<(), anyhow::Error> {
         println!("Received user interaction message");
         match message {
             UserInteractionMessage::Step => {
-                self.playback_state = PlaybackState::Step;
+                self.set_playback_state(PlaybackState::Step);
             },
             UserInteractionMessage::Play => {
                 self.get_state_at_current_execution_head().render_dependency_graph();
-                self.playback_state = PlaybackState::Running;
+                self.set_playback_state(PlaybackState::Running);
             },
             UserInteractionMessage::Pause => {
                 self.get_state_at_current_execution_head().render_dependency_graph();
-                self.playback_state = PlaybackState::Paused;
+                self.set_playback_state(PlaybackState::Paused);
             },
             UserInteractionMessage::ReloadCells => {
                 self.reload_cells()?;
