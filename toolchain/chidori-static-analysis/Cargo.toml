@@ -26,9 +26,9 @@ thiserror.workspace = true
 petgraph.workspace = true
 
 # Support for parsing typescript/javascript
-swc_common = {  version = "0.33.14", features = ["tty-emitter", "arbitrary"]}
-swc_ecma_parser = {  version = "0.142.0", features = ["typescript"]}
-swc_ecma_ast = {  version = "0.111.0", features = ["arbitrary"]}
+swc_common = {  version = "0.40.1", features = ["tty-emitter"]}
+swc_ecma_parser = {  version = "0.152.1", features = ["typescript"]}
+swc_ecma_ast = {  version = "0.121.1", features = []}
 
 # Support for parsing python
 rustpython-parser = "0.3.0"

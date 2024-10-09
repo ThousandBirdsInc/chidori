@@ -28,7 +28,7 @@ anyhow = { version = "1.0", default-features = false }
 indoc = "1.0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_derive = "1"
-serde_json = "=1.0.115"
+serde_json = "=1.0.128"
 tonic = "0.9"
 prost = "0.11"
 tokio = { version = "1", features = ["full", "tracing"] }
@@ -36,7 +36,7 @@ env_logger = "0.10.0"
 log = "0.4.16"
 futures = "0.3.15"
 bytes = "1.0.1"
-reqwest = { version = "0.12.5", features = ["json", "stream"]}
+reqwest = { version = "0.12.8", features = ["json", "stream"]}
 futures-core = "0.3"
 tokio-stream = "0.1"
 ulid = "1.0.0"
@@ -50,6 +50,7 @@ bincode = "2.0.0-rc.3"
 petgraph = "0.6.3"
 insta = { version = "1.38.0", features = ["yaml", "redactions"] }
 thiserror = "1.0.58"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
 
 [workspace.dependencies.uuid]
 version = "=1.8.0"
@@ -59,9 +60,12 @@ features = [
     "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
 ]
 
-[patch.crates-io]
-deno = { git = "https://github.com/ThousandBirdsInc/deno", rev = "e7f2e968826ea6da8cf65387a13ea61672c7ea5c" }
-deno_runtime = { git = "https://github.com/ThousandBirdsInc/deno", rev = "e7f2e968826ea6da8cf65387a13ea61672c7ea5c" }
+#[patch.crates-io]
+#deno = { git = "https://github.com/ThousandBirdsInc/deno", rev = "e7f2e968826ea6da8cf65387a13ea61672c7ea5c" }
+#deno_runtime = { git = "https://github.com/ThousandBirdsInc/deno", rev = "e7f2e968826ea6da8cf65387a13ea61672c7ea5c" }
+#deno = { git = "https://github.com/ThousandBirdsInc/deno", rev = "043024ee3e72c60e96f2c988ba190229febe0b46" }
+#deno_runtime = { git = "https://github.com/ThousandBirdsInc/deno", rev = "043024ee3e72c60e96f2c988ba190229febe0b46" }
+
 #serde = {path = "../../serde/serde" }
 #serde_derive = {path = "../../serde/serde_derive" }
 #openai_api_rs = {path = "../../openai-api-rs" }

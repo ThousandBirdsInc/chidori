@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use deno_core;
 use deno_core::error::AnyError;
 use deno_core::{Extension, ExtensionFileSource, ExtensionFileSourceCode, FastString, JsRuntime, ModuleSpecifier, Op, op2, OpState, PollEventLoopOptions, RuntimeOptions, serde_json, serde_v8, v8};
 use deno;
@@ -19,7 +20,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use deno::factory::CliFactory;
 use deno::file_fetcher::File;
-use deno_runtime::permissions::{Permissions, PermissionsContainer};
+use deno::deno_runtime::deno_permissions::{Permissions, PermissionsContainer};
 use futures_util::FutureExt;
 use pyo3::{Py, PyAny};
 use pyo3::types::{IntoPyDict, PyTuple};
@@ -40,7 +41,7 @@ fn serde_v8_to_rkyv(
             let msg = deno_core::v8::String::new(&mut scope, &{
                 let res = std::fmt::format(std::format_args!(
                     "{}",
-                    deno_core::anyhow::Error::from(arg0_err.clone())
+                    deno_core::anyhow::Error::msg(arg0_err.to_string())
                 ));
                 res
             })
@@ -390,6 +391,8 @@ fn js_args_to_rkyv(args: Vec<RkyvSerializedValue>, kwargs: Option<HashMap<String
 }
 
 
+
+
 #[tracing::instrument]
 pub async fn source_code_run_deno(
     execution_state: &ExecutionState,
@@ -440,18 +443,20 @@ pub async fn source_code_run_deno(
             }));
 
             let my_op_state_clone = my_op_state.clone();
-            let ext = Extension {
+            let ext = deno::deno_runtime::deno_core::Extension {
                 name: "chidori_ext",
-                ops: std::borrow::Cow::Borrowed(&[
-                    op_set_globals::DECL,
-                    op_call_rust::DECL,
-                    op_assert_eq::DECL,
-                    op_save_result::DECL,
-                    op_save_result_object::DECL,
-                    op_invoke_function::DECL,
-                    op_console_log::DECL,
-                    op_console_err::DECL,
-                ]),
+                ops: ::std::borrow::Cow::Owned(<[_]>::into_vec(
+                    Box::new([
+                        op_set_globals(),
+                        op_call_rust(),
+                        op_assert_eq(),
+                        op_save_result(),
+                        op_save_result_object(),
+                        op_invoke_function(),
+                        op_console_log(),
+                        op_console_err(),
+                    ])
+                )),
                 op_state_fn: Some(Box::new(move |state| {
                     state.put(my_op_state_clone);
                 })),
@@ -574,13 +579,13 @@ pub async fn source_code_run_deno(
             let mut flags = deno::args::Flags::default();
             // TODO: give user control over this in configuration
             // TODO: allow_net is causing this to block our execution entirely
-            flags.allow_net = Some(vec![]);
-            flags.allow_env = Some(vec![]);
-            flags.allow_read = Some(vec![]);
-            flags.allow_write = Some(vec![]);
-            flags.allow_run = Some(vec![]);
-            let factory = deno::factory::CliFactory::from_flags(flags)?;
-            let cli_options = factory.cli_options();
+            flags.permissions.allow_net = Some(vec![]);
+            flags.permissions.allow_env = Some(vec![]);
+            flags.permissions.allow_read = Some(vec![]);
+            flags.permissions.allow_write = Some(vec![]);
+            flags.permissions.allow_run = Some(vec![]);
+            let factory = deno::factory::CliFactory::from_flags(Arc::new(flags));
+            let cli_options = factory.cli_options()?;
             let file_fetcher = factory.file_fetcher()?;
             let main_module = cli_options.resolve_main_module()?;
 
@@ -593,7 +598,7 @@ pub async fn source_code_run_deno(
             });
 
             let permissions = PermissionsContainer::new(Permissions::from_options(
-                &cli_options.permissions_options(),
+                &cli_options.permissions_options()?,
             )?);
 
             // Create a single-threaded runtime
@@ -607,6 +612,7 @@ pub async fn source_code_run_deno(
                 let worker_factory = factory.create_cli_main_worker_factory().await?;
                 let mut worker = worker_factory
                     .create_custom_worker(
+                        deno::deno_runtime::WorkerExecutionMode::Run,
                         main_module,
                         permissions,
                         vec![ext],

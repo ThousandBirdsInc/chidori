@@ -11,9 +11,9 @@ use swc_common::{
     errors::{ColorConfig, Handler},
     FileName, FilePathMapping, SourceMap,
 };
-use swc_common::source_map::Pos;
+use swc_common::source_map::SmallPos;
 use swc_ecma_ast as ast;
-use swc_ecma_ast::{BlockStmtOrExpr, Callee, Decl, Expr, FnDecl, ForHead, Ident, ImportSpecifier, Lit, MemberProp, ModuleDecl, ModuleItem, Pat, PatOrExpr, PropName, Stmt};
+use swc_ecma_ast::{AssignTarget, AssignTargetPat, BlockStmtOrExpr, Callee, Decl, Expr, FnDecl, ForHead, Ident, ImportSpecifier, Lit, MemberProp, ModuleDecl, ModuleItem, Pat, PropName, SimpleAssignTarget, Stmt};
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
 use crate::language::ChidoriStaticAnalysisError;
 use crate::language::ContextPath;
@@ -201,7 +201,7 @@ impl ASTWalkContext {
         self.context_stack.len()
     }
 
-    fn enter_attr(&mut self, name: &ast::Ident) -> usize {
+    fn enter_attr(&mut self, name: &ast::IdentName) -> usize {
         let name = remove_hash_and_numbers(&name.to_string());
         self.context_stack
             .push(ContextPath::Attribute(name.to_string()));
@@ -335,12 +335,30 @@ fn traverse_expr(expr: &ast::Expr, machine: &mut ASTWalkContext) {
             op, left, right, ..
         }) => {
             let idx = machine.enter_assignment_to_statement();
+            todo!("Resolve this new branch");
             match left {
-                PatOrExpr::Expr(expr) => {
-                    traverse_expr(expr, machine);
+                AssignTarget::Simple(s) => {
+                    match s {
+                        SimpleAssignTarget::Ident(_) => {}
+                        SimpleAssignTarget::Member(_) => {}
+                        SimpleAssignTarget::SuperProp(_) => {}
+                        SimpleAssignTarget::Paren(_) => {}
+                        SimpleAssignTarget::OptChain(_) => {}
+                        SimpleAssignTarget::TsAs(_) => {}
+                        SimpleAssignTarget::TsSatisfies(_) => {}
+                        SimpleAssignTarget::TsNonNull(_) => {}
+                        SimpleAssignTarget::TsTypeAssertion(_) => {}
+                        SimpleAssignTarget::TsInstantiation(_) => {}
+                        SimpleAssignTarget::Invalid(_) => {}
+                    }
                 }
-                PatOrExpr::Pat(pat) => {
-                    traverse_pat(pat, machine);
+                AssignTarget::Pat(pat) => {
+                    match pat {
+                        AssignTargetPat::Array(_) => {}
+                        AssignTargetPat::Object(_) => {}
+                        AssignTargetPat::Invalid(_) => {}
+                    }
+                    // traverse_pat(pat, machine);
                 }
             }
             machine.pop_until(idx);
@@ -353,8 +371,9 @@ fn traverse_expr(expr: &ast::Expr, machine: &mut ASTWalkContext) {
                 MemberProp::Ident(id) => {
                     machine.enter_attr(id);
                 },
-                MemberProp::PrivateName(ast::PrivateName { id, .. }) => {
-                    machine.enter_attr(id);
+                MemberProp::PrivateName(ast::PrivateName { .. }) => {
+                    todo!("Need to handle")
+                    // machine.enter_attr(id);
                 }
                 MemberProp::Computed(ast::ComputedPropName { expr, .. }) => {
                     // TODO: handle computed prop name
@@ -681,7 +700,7 @@ pub fn extract_dependencies_js(source: &str) -> Result<Vec<Vec<ContextPath>>, Ch
     let mut machine = ASTWalkContext::new();
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
-    let fm = cm.new_source_file(FileName::Custom("test.js".into()), source.to_string());
+    let fm = cm.new_source_file(Lrc::new(FileName::Custom("test.js".into())), source.to_string());
 
     let parse_module = |syntax: Syntax| {
         let lexer = Lexer::new(
@@ -696,7 +715,6 @@ pub fn extract_dependencies_js(source: &str) -> Result<Vec<Vec<ContextPath>>, Ch
         for e in parser.take_errors() {
             e.into_diagnostic(&handler).emit();
         }
-
         parser.parse_module()
     };
 

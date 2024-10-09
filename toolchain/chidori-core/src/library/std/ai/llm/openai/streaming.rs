@@ -2,7 +2,6 @@ use crate::library::std::ai::llm;
 use crate::library::std::ai::llm::openai::OpenAIChatModel;
 use crate::library::std::ai::llm::{ChatCompletionReq, ChatModelStream, LLMStream, Usage};
 use async_trait::async_trait;
-use deno_core::serde_json;
 use futures_util::stream::Stream;
 use openai_api_rs::v1::chat_completion::ChatCompletionMessage;
 use openai_api_rs::v1::chat_completion::ChatCompletionRequest;
