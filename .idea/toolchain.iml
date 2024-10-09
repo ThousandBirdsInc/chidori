@@ -18,7 +18,6 @@
       <sourceFolder url="file://$MODULE_DIR$/prompt-graph-exec/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/prompt-graph-sdk/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/prompt-graph-sdk/tests" isTestSource="true" />
-      <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-core/examples" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-core/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-core/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-im-hashmap/src" isTestSource="false" />
@@ -35,6 +34,7 @@
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-optimizer-dsp/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-tsne/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-im-petgraph/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-debugger/examples" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/prompt-graph-core/target" />
       <excludeFolder url="file://$MODULE_DIR$/prompt-graph-exec/target" />

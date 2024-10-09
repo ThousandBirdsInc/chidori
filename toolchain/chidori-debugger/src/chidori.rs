@@ -193,28 +193,28 @@ impl Default for EguiTree {
     }
 }
 
-const EXAMPLES_CORE1: &str = include_str!("../../chidori-core/examples/core1_simple_math/core.md");
-const EXAMPLES_CORE2: &str = include_str!("../../chidori-core/examples/core2_marshalling/core.md");
+const EXAMPLES_CORE1: &str = include_str!("../examples/core1_simple_math/core.md");
+const EXAMPLES_CORE2: &str = include_str!("../examples/core2_marshalling/core.md");
 const EXAMPLES_CORE3: &str =
-    include_str!("../../chidori-core/examples/core3_function_invocations/core.md");
+    include_str!("../examples/core3_function_invocations/core.md");
 const EXAMPLES_CORE4: &str =
-    include_str!("../../chidori-core/examples/core4_async_function_invocations/core.md");
+    include_str!("../examples/core4_async_function_invocations/core.md");
 const EXAMPLES_CORE5: &str =
-    include_str!("../../chidori-core/examples/core5_prompts_invoked_as_functions/core.md");
+    include_str!("../examples/core5_prompts_invoked_as_functions/core.md");
 const EXAMPLES_CORE6: &str =
-    include_str!("../../chidori-core/examples/core6_prompts_leveraging_function_calling/core.md");
+    include_str!("../examples/core6_prompts_leveraging_function_calling/core.md");
 const EXAMPLES_CORE7: &str =
-    include_str!("../../chidori-core/examples/core7_rag_stateful_memory_cells/core.md");
+    include_str!("../examples/core7_rag_stateful_memory_cells/core.md");
 const EXAMPLES_CORE8: &str =
-    include_str!("../../chidori-core/examples/core8_prompt_code_generation_and_execution/core.md");
+    include_str!("../examples/core8_prompt_code_generation_and_execution/core.md");
 const EXAMPLES_CORE9: &str =
-    include_str!("../../chidori-core/examples/core9_multi_agent_simulation/core.md");
+    include_str!("../examples/core9_multi_agent_simulation/core.md");
 const EXAMPLES_CORE10: &str =
-    include_str!("../../chidori-core/examples/core10_concurrency/core.md");
+    include_str!("../examples/core10_concurrency/core.md");
 const EXAMPLES_CORE11: &str =
-    include_str!("../../chidori-core/examples/core11_hono/core.md");
+    include_str!("../examples/core11_hono/core.md");
 const EXAMPLES_CORE12: &str =
-    include_str!("../../chidori-core/examples/core12_dependency_management/core.md");
+    include_str!("../examples/core12_dependency_management/core.md");
 
 #[derive(Resource)]
 pub struct ChidoriTraceEvents {
