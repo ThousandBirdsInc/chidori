@@ -531,9 +531,7 @@ fn my_cursor_system(
 
 fn egui_execution_state(
     ui: &mut Ui,
-    chidori_execution_state: &ChidoriState,
-    execution_graph: &ChidoriState,
-    internal_state: &ChidoriState,
+    mut internal_state: &mut ChidoriState,
     execution_state: &ExecutionState,
     current_theme: &Theme
 ) {
@@ -609,7 +607,7 @@ fn egui_execution_state(
             }
         }
 
-        if let Some(cell) = &execution_state.operation_mutation {
+        if let Some((op_id, cell)) = &execution_state.operation_mutation {
             ui.label("Cell Mutation:");
             ui.horizontal(|ui| {
                 ui.add_space(10.0);
@@ -619,22 +617,12 @@ fn egui_execution_state(
             });
             egui_render_cell_read(ui, cell, execution_state);
             let mut code_theme = egui_extras::syntax_highlighting::CodeTheme::dark();
-            let mut cell_holder = CellHolder {
-                cell: cell.clone(),
-                op_id: Default::default(),
-                applied_at: None,
-                needs_update: false,
-            };
-            let mut local_cell_state = crate::code::CellIdToState::default();
-            // crate::code::editable_chidori_cell_content(
-            //     chidori_execution_state,
-            //     execution_graph,
-            //     &internal_state,
-            //     &current_theme,
-            //     &mut local_cell_state,
-            //     ui,
-            //     &mut code_theme,
-            //     &mut cell_holder);
+            crate::code::editable_chidori_cell_content(
+                &mut internal_state,
+                &current_theme,
+                ui,
+                &mut code_theme,
+                *op_id);
         }
 
 
@@ -829,7 +817,7 @@ fn update_graph_system_renderer(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut materials_custom: ResMut<Assets<RoundedRectMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
-    chidori_state: Res<ChidoriState>,
+    mut chidori_state: ResMut<ChidoriState>,
     mut node_index_to_entity: Local<HashMap<usize, Entity>>,
     // mut node_image_texture_cache: Local<HashMap<String, egui::TextureHandle>>,
 ) {
@@ -1058,9 +1046,8 @@ fn update_graph_system_renderer(
                                                 let mut ui = &mut frame.content_ui;
                                                 ui.label("Error");
                                                 egui_execution_state(ui,
-                                                                     &chidori_state,
-                                                                     &chidori_state,
-                                                                     &chidori_state, state, &current_theme.theme);
+                                                                     &mut chidori_state,
+                                                                     state, &current_theme.theme);
                                             }
                                             frame.end(ui);
                                         }
@@ -1070,9 +1057,8 @@ fn update_graph_system_renderer(
                                         ExecutionStateEvaluation::Executing(state) => {
                                             ui.label("Executing");
                                             egui_execution_state(ui,
-                                                                 &chidori_state,
-                                                                 &chidori_state,
-                                                                 &chidori_state, state, &current_theme.theme);
+                                                                 &mut chidori_state,
+                                                                 state, &current_theme.theme);
                                         }
                                         ExecutionStateEvaluation::Complete(state)=> {
                                             for (key, value) in state.state.iter() {
@@ -1092,9 +1078,8 @@ fn update_graph_system_renderer(
                                             }
 
                                             egui_execution_state(ui,
-                                                                 &chidori_state,
-                                                                 &chidori_state,
-                                                                 &chidori_state, state, &current_theme.theme);
+                                                                 &mut chidori_state,
+                                                                  state, &current_theme.theme);
                                         }
                                     }
                                 } else {

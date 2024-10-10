@@ -276,6 +276,12 @@ impl ChidoriState {
 }
 
 
+#[derive(Default)]
+pub struct CellState {
+    pub(crate) is_repl_open: bool,
+    pub(crate) repl_content: String,
+    pub(crate) json_content: serde_json::Value,
+}
 
 
 #[derive(Resource)]
@@ -289,8 +295,9 @@ pub struct ChidoriState {
     pub current_playback_state: PlaybackState,
 
 
-    pub editor_cells: Vec<CellHolder>,
+    pub editor_cells: HashMap<OperationId, Arc<Mutex<CellHolder>>>,
     pub state_cells: Vec<CellHolder>,
+    pub local_cell_state: HashMap<Uuid, Arc<Mutex<CellState>>>,
 
     pub log_messages: Vec<String>,
 
@@ -457,8 +464,9 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
         display_example_modal: true,
         current_playback_state: PlaybackState::Paused,
 
-        editor_cells: vec![],
+        editor_cells: HashMap::new(),
         state_cells: vec![],
+        local_cell_state: Default::default(),
         log_messages: vec![],
         merged_state_history: None,
         definition_graph: vec![],
@@ -560,10 +568,11 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                             ctx.run_on_main_thread(move |ctx| {
                                 if let Some(mut s) = ctx.world.get_resource_mut::<ChidoriState>() {
                                     let mut sort_cells: Vec<CellHolder> = state.values().cloned().collect();
-                                    sort_cells.sort_by(|a, b| {
-                                        a.op_id.cmp(&b.op_id)
-                                    });
-                                    s.editor_cells = sort_cells;
+                                    let mut editor_cells = HashMap::new();
+                                    for cell in sort_cells {
+                                        editor_cells.insert(cell.op_id, Arc::new(Mutex::new(cell)));
+                                    }
+                                    s.editor_cells = editor_cells;
                                 }
                             })
                             .await;

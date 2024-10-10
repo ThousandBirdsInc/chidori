@@ -165,7 +165,7 @@ pub struct ExecutionState {
     pub evaluating_cell: Option<CellTypes>,
 
     /// CellType applied, by a state that is mutating cell definitions
-    pub operation_mutation: Option<CellTypes>,
+    pub operation_mutation: Option<(OperationId, CellTypes)>,
 
     /// Channel sender used to update the execution graph and resume execution
     pub graph_sender: Option<Arc<tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>>>,
@@ -445,7 +445,7 @@ impl ExecutionState {
         let (op_id, new_state) = new_state.upsert_operation(op, op_id);
         let mutations = Self::assign_dependencies_to_operations(&new_state)?;
         let mut final_state = new_state.apply_dependency_graph_mutations(mutations);
-        final_state.operation_mutation = Some(cell);
+        final_state.operation_mutation = Some((op_id, cell));
         Ok((final_state, op_id))
     }
 
@@ -1008,7 +1008,7 @@ mod tests {
         let (new_state, op_id) = state.update_operation(cell.clone(), None).unwrap();
         
         assert!(new_state.operation_by_id.contains_key(&op_id));
-        assert_eq!(new_state.operation_mutation, Some(cell));
+        assert_eq!(new_state.operation_mutation, Some((op_id, cell)));
     }
 
     #[test]

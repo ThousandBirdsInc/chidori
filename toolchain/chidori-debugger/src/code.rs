@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::slice::IterMut;
+use std::sync::{Arc, Mutex};
 use bevy::app::{App, Startup, Update};
 use bevy::DefaultPlugins;
 use bevy::math::UVec2;
@@ -18,7 +19,7 @@ use chidori_core::chidori_static_analysis::language::{ChidoriStaticAnalysisError
 use chidori_core::execution::primitives::identifiers::OperationId;
 use chidori_core::sdk::entry::CellHolder;
 use crate::json_editor::{JsonEditorExample, Show};
-use crate::chidori::{ChidoriState, EguiTree, EguiTreeIdentities};
+use crate::chidori::{CellState, ChidoriState, EguiTree, EguiTreeIdentities};
 use egui_json_tree::JsonTree;
 use serde_derive::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -42,19 +43,9 @@ impl Default for ViewingWatchedFileCells {
     }
 }
 
-#[derive(Default)]
-struct CellState {
-    is_repl_open: bool,
-    repl_content: String,
-    json_content: serde_json::Value,
-}
 
 
 
-#[derive(Default)]
-pub struct CellIdToState {
-    cell_id_to_state: HashMap<Uuid, CellState>
-}
 
 fn editor_update(
     mut contexts: EguiContexts,
@@ -64,7 +55,6 @@ fn editor_update(
     current_theme: Res<CurrentTheme>,
     mut tree: ResMut<EguiTree>,
     mut viewing_watched_file_cells: Local<ViewingWatchedFileCells>,
-    mut local_cell_state: Local<CellIdToState>,
 ) {
     let window = q_window.single();
     let mut hide_all = false;
@@ -126,14 +116,15 @@ fn editor_update(
             }
             frame.end(ui);
 
-            let cells = if viewing_watched_file_cells.is_showing_editor_cells {
-                chidori_state.editor_cells.iter_mut()
-            } else {
-                chidori_state.state_cells.iter_mut()
-            };
-            let cell_count =  chidori_state.editor_cells.len();
-            for cell_idx in 0..cell_count {
-                editable_chidori_cell_content(&mut chidori_state, &current_theme.theme, &mut local_cell_state, ui, &mut theme, cell_idx);
+            // let cells = if viewing_watched_file_cells.is_showing_editor_cells {
+            //     chidori_state.editor_cells.iter_mut()
+            // } else {
+            //     chidori_state.state_cells.iter_mut()
+            // };
+            let mut cells_ids: Vec<_> =  chidori_state.editor_cells.keys().cloned().collect();
+            cells_ids.sort();
+            for cell_id in &cells_ids {
+                editable_chidori_cell_content(&mut chidori_state, &current_theme.theme, ui, &mut theme, *cell_id);
             }
 
             if !chidori_state.display_example_modal {
@@ -155,9 +146,9 @@ fn editor_update(
     });
 }
 
-pub fn editable_chidori_cell_content(chidori_state: &mut ChidoriState, theme: &Theme, mut local_cell_state: &mut CellIdToState, ui: &mut Ui, mut code_theme: &mut CodeTheme, cell_idx: usize) {
-    let mut cell_holder = &mut chidori_state.editor_cells[cell_idx].clone();
-    let op_id = cell_holder.op_id;
+pub fn editable_chidori_cell_content(mut chidori_state: &mut ChidoriState, theme: &Theme, ui: &mut Ui, mut code_theme: &mut CodeTheme, op_id: OperationId) {
+    let binding = chidori_state.editor_cells.get(&op_id).unwrap().clone();
+    let mut cell_holder = &mut binding.lock().unwrap();
 
     // let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(Margin::symmetric(8.0, 16.0)).inner_margin(16.0).rounding(6.0).begin(ui);
     let mut frame = egui::Frame::default()
@@ -187,8 +178,7 @@ pub fn editable_chidori_cell_content(chidori_state: &mut ChidoriState, theme: &T
         match &mut cell_holder.cell {
             CellTypes::Code(_, ..) => {
                 render_code_cell(
-                    &chidori_state,
-                    &mut local_cell_state,
+                    &mut chidori_state,
                     &mut code_theme,
                     &op_id,
                     ui,
@@ -197,15 +187,15 @@ pub fn editable_chidori_cell_content(chidori_state: &mut ChidoriState, theme: &T
                 );
             }
             CellTypes::CodeGen(..) => {
-                render_code_gen_cell(&chidori_state, &mut local_cell_state, &op_id, ui, cell_holder, exists_in_current_tree);
+                render_code_gen_cell(&mut chidori_state, &op_id, ui, cell_holder, exists_in_current_tree);
             }
             CellTypes::Prompt(LLMPromptCell::Completion { .. }, _) => {}
             CellTypes::Prompt(LLMPromptCell::Chat { .. }, _) => {
-                render_prompt_cell(&chidori_state, &mut local_cell_state, &op_id, ui, cell_holder, exists_in_current_tree);
+                render_prompt_cell(&mut chidori_state, &op_id, ui, cell_holder, exists_in_current_tree);
             }
             CellTypes::Embedding(LLMEmbeddingCell { .. }, _) => {}
             CellTypes::Template(..) => {
-                render_template_cell(&chidori_state, &mut local_cell_state, &op_id, ui, cell_holder, exists_in_current_tree);
+                render_template_cell(&mut chidori_state, &op_id, ui, cell_holder, exists_in_current_tree);
             }
             CellTypes::Memory(MemoryCell { .. }, _) => {}
         }
@@ -215,7 +205,6 @@ pub fn editable_chidori_cell_content(chidori_state: &mut ChidoriState, theme: &T
 
 fn render_template_cell(
     execution_state: &ChidoriState,
-    local_cell_state: &mut CellIdToState,
     op_id: &OperationId,
     mut ui: &mut Ui,
     cell_holder: &mut CellHolder,
@@ -331,8 +320,7 @@ fn populate_json_content(schema: &SchemaItem, existing_content: Option<&Value>) 
 
 
 fn render_prompt_cell(
-    execution_state: &ChidoriState,
-    local_cell_state: &mut CellIdToState,
+    execution_state: &mut ChidoriState,
     op_id: &OperationId,
     mut ui: &mut Ui,
     cell_holder: &mut CellHolder,
@@ -354,7 +342,8 @@ fn render_prompt_cell(
         }
     }
 
-    let state = local_cell_state.cell_id_to_state.entry(*op_id).or_insert(CellState::default());
+    let state_binding = execution_state.local_cell_state.entry(*op_id).or_insert(Arc::new(Mutex::new(CellState::default()))).clone();
+    let mut state = state_binding.lock().unwrap();
     let (frontmatter, req) = chidori_core::chidori_prompt_format::templating::templates::split_frontmatter(&complete_body).map_err(|e| {
         anyhow::Error::msg(e.to_string())
     }).unwrap_or((String::new(), String::new()));
@@ -418,15 +407,15 @@ fn render_prompt_cell(
 }
 
 fn render_code_gen_cell(
-    execution_state: &ChidoriState,
-    local_cell_state: &mut CellIdToState,
+    execution_state: &mut ChidoriState,
     op_id: &OperationId,
     mut ui: &mut Ui,
     mut cell_holder: &mut CellHolder,
     exists_in_current_tree: bool
 ) {
     let CellTypes::CodeGen(LLMCodeGenCell { name, req, backing_file_reference, .. }, _) = &mut cell_holder.cell else { panic!("Must be code gen cell") };
-    let state = local_cell_state.cell_id_to_state.entry(*op_id).or_insert(CellState::default());
+    let state_binding = execution_state.local_cell_state.entry(*op_id).or_insert(Arc::new(Mutex::new(CellState::default()))).clone();
+    let mut state = state_binding.lock().unwrap();
     if let Some(name) = name {
         if ui.add(
             egui::TextEdit::singleline(name)
@@ -485,15 +474,15 @@ fn render_applied_status(mut ui: &mut Ui, exists_in_current_tree: bool) {
 }
 
 fn render_code_cell(
-    chidori_state: &ChidoriState,
-    local_cell_state: &mut CellIdToState,
+    chidori_state: &mut ChidoriState,
     theme: &mut CodeTheme,
     op_id: &OperationId,
     mut ui: &mut Ui,
     mut cell_holder: &mut CellHolder,
     exists_in_current_tree: bool
 ) {
-    let state = local_cell_state.cell_id_to_state.entry(*op_id).or_insert(CellState::default());
+    let state_binding = chidori_state.local_cell_state.entry(*op_id).or_insert(Arc::new(Mutex::new(CellState::default()))).clone();
+    let mut state = state_binding.lock().unwrap();
     let CellTypes::Code(CodeCell { name, source_code, language, backing_file_reference, ..}, _) = &mut cell_holder.cell else { panic!("Mut be cell_holder") };
     if let Some(name) = name {
         if ui.add(
@@ -675,7 +664,8 @@ fn render_new_cell_interface(
         egui_label(ui, "New Cell");
     });
     if ui.button("Add Code Cell").clicked() {
-        chidori_state.editor_cells.push(CellHolder {
+        let op_id = Uuid::new_v4();
+        chidori_state.editor_cells.insert(op_id, Arc::new(Mutex::new(CellHolder {
             cell: CellTypes::Code(CodeCell {
                 backing_file_reference: None,
                 name: None,
@@ -683,13 +673,14 @@ fn render_new_cell_interface(
                 source_code: "".to_string(),
                 function_invocation: None,
             }, TextRange::default()),
-            op_id: Uuid::new_v4(),
+            op_id,
             applied_at: Default::default(),
             needs_update: false,
-        })
+        })));
     }
     if ui.button("Add Prompt Cell").clicked() {
-        chidori_state.editor_cells.push(CellHolder {
+        let op_id = Uuid::new_v4();
+        chidori_state.editor_cells.insert(op_id, Arc::new(Mutex::new(CellHolder {
             cell: CellTypes::Prompt(LLMPromptCell::Chat {
                 backing_file_reference: None,
                 function_invocation: false,
@@ -699,25 +690,27 @@ fn render_new_cell_interface(
                 complete_body: "".to_string(),
                 req: "".to_string(),
             }, TextRange::default()),
-            op_id: Uuid::new_v4(),
+            op_id,
             applied_at: Default::default(),
             needs_update: false,
-        })
+        })));
     }
     if ui.button("Add Template Cell").clicked() {
-        chidori_state.editor_cells.push(CellHolder {
+        let op_id = Uuid::new_v4();
+        chidori_state.editor_cells.insert(op_id, Arc::new(Mutex::new(CellHolder {
             cell: CellTypes::Template(TemplateCell {
                 backing_file_reference: None,
                 name: None,
                 body: "".to_string(),
             }, TextRange::default()),
-            op_id: Uuid::new_v4(),
+            op_id,
             applied_at: Default::default(),
             needs_update: false,
-        })
+        })));
     }
     if ui.button("Add Code Generation Cell").clicked() {
-        chidori_state.editor_cells.push(CellHolder {
+        let op_id = Uuid::new_v4();
+        chidori_state.editor_cells.insert(op_id, Arc::new(Mutex::new(CellHolder {
             cell: CellTypes::CodeGen(LLMCodeGenCell {
                 backing_file_reference: None,
                 function_invocation: false,
@@ -726,10 +719,10 @@ fn render_new_cell_interface(
                 provider: SupportedModelProviders::OpenAI,
                 req: "".to_string(),
             }, TextRange::default()),
-            op_id: Uuid::new_v4(),
+            op_id,
             applied_at: Default::default(),
             needs_update: false,
-        })
+        })));
     }
 }
 
