@@ -22,7 +22,7 @@ use egui_tiles::Tile;
 use petgraph::graph::DiGraph;
 use petgraph::prelude::{EdgeRef, NodeIndex, StableDiGraph, StableGraph};
 use chidori_core::utils::telemetry::TraceEvents;
-use crate::chidori::{ChidoriTraceEvents, EguiTree, EguiTreeIdentities};
+use crate::chidori::{ChidoriState, EguiTree, EguiTreeIdentities};
 use crate::{RENDER_LAYER_TRACE_MINIMAP, RENDER_LAYER_TRACE_TEXT, RENDER_LAYER_TRACE_VIEW};
 use crate::shader_trace::{CustomMaterialPlugin, InstanceData, InstanceMaterialData};
 use crate::util::despawn_screen;
@@ -559,10 +559,10 @@ struct TracesCallTree {
 }
 
 fn maintain_call_tree(
-    mut traces: ResMut<ChidoriTraceEvents>,
+    mut traces: ResMut<ChidoriState>,
     mut call_tree: ResMut<TracesCallTree>,
 ) {
-    let tree = build_call_tree(traces.inner.clone(), false);
+    let tree = build_call_tree(traces.trace_events.clone(), false);
     call_tree.inner = tree;
 }
 

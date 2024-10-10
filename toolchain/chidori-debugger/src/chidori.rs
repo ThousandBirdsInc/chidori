@@ -213,32 +213,17 @@ const EXAMPLES_CORE11: &str =
 const EXAMPLES_CORE12: &str =
     include_str!("../examples/core12_dependency_management/core.md");
 
-#[derive(Resource)]
-pub struct ChidoriTraceEvents {
-    pub inner: Vec<TraceEvents>,
-}
 
-#[derive(Resource)]
-pub struct ChidoriExecutionIdsToStates {
-    pub inner: HashMap<ExecutionNodeId, ExecutionState>,
-}
 
-#[derive(Resource)]
-pub struct ChidoriExecutionGraph {
-    pub execution_graph: Vec<(ExecutionNodeId, ExecutionNodeId)>,
-    pub grouped_nodes: HashSet<ExecutionNodeId>,
-    pub current_execution_head: ExecutionNodeId,
-}
-
-impl Default for ChidoriExecutionGraph {
-    fn default() -> Self {
-        ChidoriExecutionGraph {
-            execution_graph: vec![],
-            grouped_nodes: Default::default(),
-            current_execution_head: Uuid::nil(),
-        }
-    }
-}
+// impl Default for ChidoriState {
+//     fn default() -> Self {
+//         ChidoriState {
+//             execution_graph: vec![],
+//             grouped_nodes: Default::default(),
+//             current_execution_head: Uuid::nil(),
+//         }
+//     }
+// }
 
 fn hash_graph(input: &Vec<(ExecutionNodeId, ExecutionNodeId)>) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
@@ -246,7 +231,7 @@ fn hash_graph(input: &Vec<(ExecutionNodeId, ExecutionNodeId)>) -> u64 {
     hasher.finish()
 }
 
-impl ChidoriExecutionGraph {
+impl ChidoriState {
     pub fn construct_stablegraph_from_chidori_execution_graph(&self) -> (StableGraph<ExecutionNodeId, ()>, HashMap<ExecutionNodeId, NodeIndex>) {
         let execution_graph = &self.execution_graph;
         let mut dataset = StableGraph::new();
@@ -290,28 +275,8 @@ impl ChidoriExecutionGraph {
     }
 }
 
-#[derive(Resource)]
-pub struct ChidoriDefinitionGraph {
-    pub inner: Vec<(OperationId, OperationId, Vec<DependencyReference>)>,
-}
-
-#[derive(Resource)]
-pub struct ChidoriExecutionState {
-    pub inner: Option<MergedStateHistory>,
-}
 
 
-
-#[derive(Resource, Default)]
-pub struct ChidoriLogMessages {
-    pub inner: Vec<String>,
-}
-
-#[derive(Resource)]
-pub struct ChidoriCells {
-    pub editor_cells: Vec<CellHolder>,
-    pub state_cells: Vec<CellHolder>,
-}
 
 #[derive(Resource)]
 pub struct ChidoriState {
@@ -321,10 +286,27 @@ pub struct ChidoriState {
     background_thread: Mutex<Option<JoinHandle<()>>>,
     pub chidori: Arc<Mutex<Chidori>>,
     pub display_example_modal: bool,
-    pub current_playback_state: PlaybackState
+    pub current_playback_state: PlaybackState,
 
 
+    pub editor_cells: Vec<CellHolder>,
+    pub state_cells: Vec<CellHolder>,
 
+    pub log_messages: Vec<String>,
+
+    pub merged_state_history: Option<MergedStateHistory>,
+
+    pub definition_graph: Vec<(OperationId, OperationId, Vec<DependencyReference>)>,
+
+
+    pub execution_graph: Vec<(ExecutionNodeId, ExecutionNodeId)>,
+    pub grouped_nodes: HashSet<ExecutionNodeId>,
+    pub current_execution_head: ExecutionNodeId,
+
+
+    pub execution_ids_to_states: HashMap<ExecutionNodeId, ExecutionState>,
+
+    pub trace_events: Vec<TraceEvents>,
 }
 
 impl ChidoriState {
@@ -461,20 +443,6 @@ impl ChidoriState {
 }
 
 fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>) {
-    commands.insert_resource(ChidoriTraceEvents { inner: vec![] });
-    commands.insert_resource(ChidoriExecutionGraph {
-        execution_graph: vec![],
-        grouped_nodes: Default::default(),
-        current_execution_head: Uuid::nil(),
-    });
-    commands.insert_resource(ChidoriExecutionIdsToStates {
-        inner: HashMap::new(),
-    });
-
-    commands.insert_resource(ChidoriDefinitionGraph { inner: vec![] });
-    commands.insert_resource(ChidoriExecutionState { inner: None });
-    commands.insert_resource(ChidoriCells { editor_cells: vec![], state_cells: vec![] });
-
     let (trace_event_sender, trace_event_receiver) = std::sync::mpsc::channel();
     let (runtime_event_sender, runtime_event_receiver) = std::sync::mpsc::channel();
     let mut internal_state = ChidoriState {
@@ -488,6 +456,17 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
         file_watch: Mutex::new(None),
         display_example_modal: true,
         current_playback_state: PlaybackState::Paused,
+
+        editor_cells: vec![],
+        state_cells: vec![],
+        log_messages: vec![],
+        merged_state_history: None,
+        definition_graph: vec![],
+        execution_graph: vec![],
+        grouped_nodes: Default::default(),
+        current_execution_head: Default::default(),
+        execution_ids_to_states: Default::default(),
+        trace_events: vec![],
     };
 
     {
@@ -529,9 +508,9 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                     let msg_to_logs = msg.clone();
                     ctx.run_on_main_thread(move |ctx| {
                         if let Some(mut s) =
-                            ctx.world.get_resource_mut::<ChidoriLogMessages>()
+                            ctx.world.get_resource_mut::<ChidoriState>()
                         {
-                            s.inner.push(format!("Received from runtime: {:?}", &msg_to_logs));
+                            s.log_messages.push(format!("Received from runtime: {:?}", &msg_to_logs));
                         }
                     })
                         .await;
@@ -539,7 +518,7 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                         EventsFromRuntime::ExecutionGraphUpdated(state) => {
                             ctx.run_on_main_thread(move |ctx| {
                                 if let Some(mut s) =
-                                    ctx.world.get_resource_mut::<ChidoriExecutionGraph>()
+                                    ctx.world.get_resource_mut::<ChidoriState>()
                                 {
                                     s.execution_graph = state.0;
                                     s.grouped_nodes = state.1;
@@ -550,9 +529,9 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                         EventsFromRuntime::StateAtId(id, state) => {
                             ctx.run_on_main_thread(move |ctx| {
                                 if let Some(mut s) =
-                                    ctx.world.get_resource_mut::<ChidoriExecutionIdsToStates>()
+                                    ctx.world.get_resource_mut::<ChidoriState>()
                                 {
-                                    s.inner.insert(id, state);
+                                    s.execution_ids_to_states.insert(id, state);
                                 }
                             })
                             .await;
@@ -560,9 +539,9 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                         EventsFromRuntime::ExecutionStateChange(state) => {
                             ctx.run_on_main_thread(move |ctx| {
                                 if let Some(mut s) =
-                                    ctx.world.get_resource_mut::<ChidoriExecutionState>()
+                                    ctx.world.get_resource_mut::<ChidoriState>()
                                 {
-                                    s.inner = Some(state);
+                                    s.merged_state_history = Some(state);
                                 }
                             })
                             .await;
@@ -570,16 +549,16 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                         EventsFromRuntime::DefinitionGraphUpdated(state) => {
                             ctx.run_on_main_thread(move |ctx| {
                                 if let Some(mut s) =
-                                    ctx.world.get_resource_mut::<ChidoriDefinitionGraph>()
+                                    ctx.world.get_resource_mut::<ChidoriState>()
                                 {
-                                    s.inner = state;
+                                    s.definition_graph = state;
                                 }
                             })
                             .await;
                         }
                         EventsFromRuntime::EditorCellsUpdated(state) => {
                             ctx.run_on_main_thread(move |ctx| {
-                                if let Some(mut s) = ctx.world.get_resource_mut::<ChidoriCells>() {
+                                if let Some(mut s) = ctx.world.get_resource_mut::<ChidoriState>() {
                                     let mut sort_cells: Vec<CellHolder> = state.values().cloned().collect();
                                     sort_cells.sort_by(|a, b| {
                                         a.op_id.cmp(&b.op_id)
@@ -592,7 +571,7 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                         EventsFromRuntime::UpdateExecutionHead(head) => {
                             ctx.run_on_main_thread(move |ctx| {
                                 if let Some(mut s) =
-                                    ctx.world.get_resource_mut::<ChidoriExecutionGraph>()
+                                    ctx.world.get_resource_mut::<ChidoriState>()
                                 {
                                     s.current_execution_head = head;
                                 }
@@ -602,7 +581,7 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                         EventsFromRuntime::ReceivedChatMessage(_) => {}
                         EventsFromRuntime::ExecutionStateCellsViewUpdated(cells) => {
                             ctx.run_on_main_thread(move |ctx| {
-                                if let Some(mut s) = ctx.world.get_resource_mut::<ChidoriCells>() {
+                                if let Some(mut s) = ctx.world.get_resource_mut::<ChidoriState>() {
                                     let mut sort_cells = cells.clone();
                                     sort_cells.sort_by(|a, b| {
                                         a.op_id.cmp(&b.op_id)
@@ -642,8 +621,8 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                     // println!("Received: {:?}", &msg);
                     // handle.emit_all("execution:events", Some(trace_event_to_string(msg)));
                     ctx.run_on_main_thread(move |ctx| {
-                        if let Some(mut s) = ctx.world.get_resource_mut::<ChidoriTraceEvents>() {
-                            s.inner.push(msg);
+                        if let Some(mut s) = ctx.world.get_resource_mut::<ChidoriState>() {
+                            s.trace_events.push(msg);
                         }
                     })
                     .await;
@@ -931,7 +910,6 @@ pub fn update_gui(
 pub fn chidori_plugin(app: &mut App) {
     app.init_resource::<EguiTree>()
         .init_resource::<EguiTreeIdentities>()
-        .init_resource::<ChidoriLogMessages>()
         .add_systems(Update, (update_gui, maintain_egui_tree_identities))
         .add_systems(Startup, setup);
 }

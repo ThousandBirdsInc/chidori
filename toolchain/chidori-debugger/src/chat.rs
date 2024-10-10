@@ -9,7 +9,7 @@ use egui;
 use egui::{FontFamily, Frame, Margin};
 use egui_tiles::Tile;
 use chidori_core::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, TemplateCell, TextRange, WebserviceCell};
-use crate::chidori::{ChidoriCells, EguiTree, EguiTreeIdentities};
+use crate::chidori::{ChidoriState, EguiTree, EguiTreeIdentities};
 use crate::GameState;
 use crate::util::{change_active_editor_ui, deselect_editor_on_esc, despawn_screen, print_editor_text};
 use std::borrow::BorrowMut;

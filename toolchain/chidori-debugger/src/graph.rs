@@ -1,4 +1,4 @@
-use crate::chidori::{ChidoriExecutionGraph, ChidoriExecutionState, EguiTree, EguiTreeIdentities, ChidoriState};
+use crate::chidori::{EguiTree, EguiTreeIdentities, ChidoriState};
 use crate::tidy_tree::{Layout, TidyLayout, TreeGraph};
 use crate::util::{despawn_screen, egui_render_cell_function_evaluation, egui_render_cell_read, serialized_value_to_json_value};
 use crate::{chidori, CurrentTheme, GameState, RENDER_LAYER_GRAPH_MINIMAP, RENDER_LAYER_GRAPH_VIEW, RENDER_LAYER_TRACE_MINIMAP, RENDER_LAYER_TRACE_VIEW, Theme, util};
@@ -67,18 +67,6 @@ struct GraphResource {
     is_layout_dirty: bool
 }
 
-
-// impl FromWorld for GraphResource {
-//     fn from_world(world: &mut World) -> Self {
-//         GraphResource {
-//             execution_graph: Default::default(),
-//             hash_graph: 0,
-//             node_ids: Default::default(),
-//             grouped_nodes: Default::default(),
-//             is_active: false,
-//         }
-//     }
-// }
 
 #[derive(Component)]
 struct GraphIdx {
@@ -149,7 +137,7 @@ fn keyboard_navigate_graph(
     keyboard_input: Res<ButtonInput<KeyCode>>,
     mut q_camera: Query<(&mut Projection, &mut Transform, &mut CameraState), (With<OnGraphScreen> , Without<GraphMinimapCamera>, Without<GraphIdxPair>, Without<GraphIdx>)>,
     mut graph_res: ResMut<GraphResource>,
-    execution_graph: Res<ChidoriExecutionGraph>,
+    execution_graph: Res<ChidoriState>,
     mut selected_node: Local<SelectedNode>,
     mut node_query: Query<(Entity, &mut Transform, &GraphIdx)>,
     mut keyboard_nav_state: Local<KeyboardNavigationState>,
@@ -543,8 +531,8 @@ fn my_cursor_system(
 
 fn egui_execution_state(
     ui: &mut Ui,
-    chidori_execution_state: &ChidoriExecutionState,
-    execution_graph: &ChidoriExecutionGraph,
+    chidori_execution_state: &ChidoriState,
+    execution_graph: &ChidoriState,
     internal_state: &ChidoriState,
     execution_state: &ExecutionState,
     current_theme: &Theme
@@ -638,15 +626,15 @@ fn egui_execution_state(
                 needs_update: false,
             };
             let mut local_cell_state = crate::code::CellIdToState::default();
-            crate::code::editable_chidori_cell_content(
-                chidori_execution_state,
-                execution_graph,
-                &internal_state,
-                &current_theme,
-                &mut local_cell_state,
-                ui,
-                &mut code_theme,
-                &mut cell_holder);
+            // crate::code::editable_chidori_cell_content(
+            //     chidori_execution_state,
+            //     execution_graph,
+            //     &internal_state,
+            //     &current_theme,
+            //     &mut local_cell_state,
+            //     ui,
+            //     &mut code_theme,
+            //     &mut cell_holder);
         }
 
 
@@ -655,7 +643,7 @@ fn egui_execution_state(
 
 fn camera_follow_selection_head(
     mut q_camera: Query<(&Camera, &mut Transform, &CameraState), (With<OnGraphScreen>,  With<GraphMainCamera>, Without<ExecutionSelectionCursor>, Without<GraphMinimapCamera>)>,
-    execution_graph: Res<crate::chidori::ChidoriExecutionGraph>,
+    execution_graph: Res<crate::chidori::ChidoriState>,
     mut execution_selection_query: Query<
         (Entity, &mut Transform),
         (With<ExecutionSelectionCursor>, Without<GraphIdx>, Without<ExecutionHeadCursor>),
@@ -667,8 +655,6 @@ fn camera_follow_selection_head(
 ) {
     let (camera, mut camera_transform, camera_state) = q_camera.single_mut();
     let (_, mut t) = execution_head_cursor.single_mut();
-    let mut camera_x = camera_transform.translation.x;
-    let mut camera_y = camera_transform.translation.y;
 
     if matches!(camera_state.state, CameraStateValue::LockedOnExecHead) {
         camera_transform.translation.x = t.translation.x;
@@ -701,8 +687,6 @@ fn mouse_over_system(
     mut contexts: EguiContexts,
     rapier_context: Res<RapierContext>,
     q_camera: Query<(&Camera, &GlobalTransform), (With<OnGraphScreen>, Without<GraphMinimapCamera>)>,
-    internal_state: ResMut<crate::chidori::ChidoriState>,
-    exec_id_to_state: ResMut<crate::chidori::ChidoriExecutionIdsToStates>,
 ) {
     if !graph_resource.is_active {
         return;
@@ -765,7 +749,7 @@ fn node_cursor_handling(
         (Entity, &Transform, &GraphIdx),
         (With<GraphIdx>, Without<ExecutionHeadCursor>, Without<ExecutionSelectionCursor>),
     >,
-    execution_graph: Res<crate::chidori::ChidoriExecutionGraph>,
+    execution_graph: Res<crate::chidori::ChidoriState>,
 ) {
     node_query
         .iter_mut()
@@ -845,11 +829,9 @@ fn update_graph_system_renderer(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut materials_custom: ResMut<Assets<RoundedRectMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
-    chidori_execution_state: Res<ChidoriExecutionState>,
-    chidori_execution_graph: Res<ChidoriExecutionGraph>,
+    chidori_state: Res<ChidoriState>,
     mut node_index_to_entity: Local<HashMap<usize, Entity>>,
     // mut node_image_texture_cache: Local<HashMap<String, egui::TextureHandle>>,
-    internal_state: ResMut<crate::chidori::ChidoriState>,
 ) {
     // TODO: something in this logic is affecting the trace rendering
     if !graph_resource.is_active {
@@ -1040,27 +1022,27 @@ fn update_graph_system_renderer(
                             if *node1 == chidori_core::uuid::Uuid::nil() {
                                 ui.horizontal(|ui| {
                                     ui.label("Initialization...");
-                                    if internal_state.debug_mode {
+                                    if chidori_state.debug_mode {
                                         ui.label(node1.to_string());
                                     }
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                                         if ui.button(RichText::new("Revert to this State").color(Color32::from_hex("#dddddd").unwrap())).clicked() {
-                                            let _ = internal_state.set_execution_id(*node1);
+                                            let _ = chidori_state.set_execution_id(*node1);
                                         }
                                     });
                                 });
                             } else {
-                                if let Some(state) = internal_state.get_execution_state_at_id(&node1) {
+                                if let Some(state) = chidori_state.get_execution_state_at_id(&node1) {
                                     let state = &state;
                                     if !matches!(state, ExecutionStateEvaluation::Executing(_)) {
                                         ui.horizontal(|ui| {
-                                            if internal_state.debug_mode {
+                                            if chidori_state.debug_mode {
                                                 ui.label(node1.to_string());
                                             }
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                                                 if ui.button("Revert to this State").clicked() {
                                                     println!("We would like to revert to {:?}", node1);
-                                                    let _ = internal_state.set_execution_id(*node1);
+                                                    let _ = chidori_state.set_execution_id(*node1);
                                                 }
                                             });
                                         });
@@ -1076,9 +1058,9 @@ fn update_graph_system_renderer(
                                                 let mut ui = &mut frame.content_ui;
                                                 ui.label("Error");
                                                 egui_execution_state(ui,
-                                                                     &chidori_execution_state,
-                                                                     &chidori_execution_graph,
-                                                                     &internal_state, state, &current_theme.theme);
+                                                                     &chidori_state,
+                                                                     &chidori_state,
+                                                                     &chidori_state, state, &current_theme.theme);
                                             }
                                             frame.end(ui);
                                         }
@@ -1088,9 +1070,9 @@ fn update_graph_system_renderer(
                                         ExecutionStateEvaluation::Executing(state) => {
                                             ui.label("Executing");
                                             egui_execution_state(ui,
-                                                                 &chidori_execution_state,
-                                                                 &chidori_execution_graph,
-                                                                 &internal_state, state,  &current_theme.theme);
+                                                                 &chidori_state,
+                                                                 &chidori_state,
+                                                                 &chidori_state, state, &current_theme.theme);
                                         }
                                         ExecutionStateEvaluation::Complete(state)=> {
                                             for (key, value) in state.state.iter() {
@@ -1110,9 +1092,9 @@ fn update_graph_system_renderer(
                                             }
 
                                             egui_execution_state(ui,
-                                                                 &chidori_execution_state,
-                                                                 &chidori_execution_graph,
-                                                                 &internal_state, state,  &current_theme.theme);
+                                                                 &chidori_state,
+                                                                 &chidori_state,
+                                                                 &chidori_state, state, &current_theme.theme);
                                         }
                                     }
                                 } else {
@@ -1319,7 +1301,7 @@ fn generate_tree_layout(
 
 fn update_graph_system_data_structures(
     mut graph_res: ResMut<GraphResource>,
-    execution_graph: Res<ChidoriExecutionGraph>,
+    execution_graph: Res<ChidoriState>,
 ) {
     // If the execution graph has changed, clear the graph and reconstruct it
     if graph_res.hash_graph != hash_graph(&execution_graph.execution_graph) {
@@ -1475,7 +1457,7 @@ fn graph_setup(
     windows: Query<&Window>,
     mut config_store: ResMut<GizmoConfigStore>,
     mut commands: Commands,
-    execution_graph: Res<ChidoriExecutionGraph>,
+    execution_graph: Res<ChidoriState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials_standard: ResMut<Assets<StandardMaterial>>,
     mut materials_custom: ResMut<Assets<RoundedRectMaterial>>,

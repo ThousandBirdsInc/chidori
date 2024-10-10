@@ -9,7 +9,7 @@ use egui;
 use egui::{FontFamily, Frame, Margin};
 use egui_tiles::Tile;
 use chidori_core::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, TemplateCell, TextRange, WebserviceCell};
-use crate::chidori::{ChidoriCells, ChidoriLogMessages, EguiTree, EguiTreeIdentities};
+use crate::chidori::{ChidoriState, EguiTree, EguiTreeIdentities};
 use crate::GameState;
 use crate::util::{change_active_editor_ui, deselect_editor_on_esc, despawn_screen, print_editor_text};
 use std::borrow::BorrowMut;
@@ -30,7 +30,7 @@ fn logs_update(
     tree_identities: Res<EguiTreeIdentities>,
     mut contexts: EguiContexts,
     logs_history: Res<LogsHistory>,
-    log_messages: Res<ChidoriLogMessages>,
+    chidori_state: Res<ChidoriState>,
     mut input_text: Local<String>,
     keyboard_input: Res<ButtonInput<KeyCode>>,
 ) {
@@ -94,7 +94,7 @@ fn logs_update(
             ui.separator();
 
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for message in &log_messages.inner {
+                for message in &chidori_state.log_messages {
                     let formatted_message = message.replace("\\n", "\n");
                     ui.label(formatted_message);
                     ui.add_space(5.0);
