@@ -615,7 +615,7 @@ fn egui_execution_state(
                 //     ui.label(format!("Operation Id: {:?}", execution_state.evaluating_id));
                 // })
             });
-            egui_render_cell_read(ui, cell, execution_state);
+            // egui_render_cell_read(ui, cell, execution_state);
             let mut code_theme = egui_extras::syntax_highlighting::CodeTheme::dark();
             crate::code::editable_chidori_cell_content(
                 &mut internal_state,
