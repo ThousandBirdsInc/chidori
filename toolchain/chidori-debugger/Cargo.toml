@@ -42,7 +42,7 @@ futures.workspace = true
 petgraph.workspace = true
 
 syntect = "5.2.0"
-chidori-core = { path = "../chidori-core", version = "0.2.1"   }
+chidori-core = { path = "../chidori-core", version = "0.2.5"   }
 dirs = "5.0.1"
 target-lexicon = "0.12.14"
 rusqlite.workspace = true
