@@ -15,6 +15,11 @@ name = "chidori_core"
 crate-type = ["cdylib", "lib"]
 bench = false
 proc-macro = true
+path = "src/lib.rs"
+
+[[bin]]
+name = "chidori-core"
+path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
@@ -67,6 +72,7 @@ chidori-static-analysis = { path = "../chidori-static-analysis", version = "0.1.
 
 indexmap = "2.2.6"
 dashmap = "5.5.3"
+clap = { version = "4.5.13", features = ["derive"] }
 
 # TODO: make optional
 yaml-front-matter = "0.1.0"

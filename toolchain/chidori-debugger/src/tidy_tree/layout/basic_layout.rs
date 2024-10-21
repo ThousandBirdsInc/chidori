@@ -121,12 +121,12 @@ mod basic_layout_test {
 
     #[test]
     fn easy_test_0() {
-        let mut tree = TreeGraph::new(Node::new(0, 10., 10.));
+        let mut tree = TreeGraph::new(Node::new(0, 10., 10., None));
         let root_index = tree.root;
-        let child1 = tree.add_child(root_index, Node::new(1, 10., 10.));
-        let child2 = tree.add_child(root_index, Node::new(2, 10., 10.));
-        tree.add_child(child2, Node::new(3, 10., 10.));
-        tree.add_child(root_index, Node::new(4, 10., 10.));
+        let child1 = tree.add_child(root_index, Node::new(1, 10., 10., None));
+        let child2 = tree.add_child(root_index, Node::new(2, 10., 10., None));
+        tree.add_child(child2, Node::new(3, 10., 10., None));
+        tree.add_child(root_index, Node::new(4, 10., 10., None));
 
         let mut layout = BasicLayout {
             parent_child_margin: 10.,

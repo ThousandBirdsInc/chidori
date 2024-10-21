@@ -156,17 +156,6 @@ pub fn interpret_markdown_code_block(block: &MarkdownCodeBlock) -> Result<Option
                 function_invocation: None,
             }, block.range.clone()))
         },
-        "memory" => Some(CellTypes::Memory(MemoryCell {
-            name: block.name.clone(),
-            provider: SupportedMemoryProviders::InMemory,
-            embedding_function: block.body.clone(),
-        }, block.range.clone())),
-        "embedding" => Some(CellTypes::Embedding(LLMEmbeddingCell {
-            function_invocation: false,
-            configuration: serde_yaml::from_str(&frontmatter)?,
-            name: block.name.clone(),
-            req: body,
-        }, block.range.clone())),
         "prompt" => Some(CellTypes::Prompt(LLMPromptCell::Chat {
             backing_file_reference: None,
             function_invocation: false,
@@ -181,6 +170,7 @@ pub fn interpret_markdown_code_block(block: &MarkdownCodeBlock) -> Result<Option
             function_invocation: false,
             configuration: serde_yaml::from_str(&frontmatter)?,
             name: block.name.clone(),
+            complete_body: whole_body,
             provider: SupportedModelProviders::OpenAI,
             req: body,
         }, block.range.clone())),

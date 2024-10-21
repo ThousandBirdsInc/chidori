@@ -1,4 +1,5 @@
 use std::{collections::HashSet};
+use bevy::log;
 use petgraph::graph::{NodeIndex, Graph};
 use num::Float;
 use petgraph::prelude::Dfs;
@@ -15,25 +16,34 @@ pub struct TidyLayout {
     pub peer_margin: Coord,
     is_layered: bool,
     /// this is only for layered layout
-    depth_to_y: Vec<Coord>,
+    depth_to_position: Vec<Coord>,
+    default_orientation: Orientation,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Orientation {
+    Vertical,
+    Horizontal,
 }
 
 impl TidyLayout {
-    pub fn new(parent_child_margin: Coord, peer_margin: Coord) -> Self {
+    pub fn new(parent_child_margin: Coord, peer_margin: Coord, default_orientation: Orientation) -> Self {
         TidyLayout {
             parent_child_margin,
             peer_margin,
             is_layered: false,
-            depth_to_y: vec![],
+            depth_to_position: vec![],
+            default_orientation,
         }
     }
 
-    pub fn new_layered(parent_child_margin: Coord, peer_margin: Coord) -> Self {
+    pub fn new_layered(parent_child_margin: Coord, peer_margin: Coord, default_orientation: Orientation) -> Self {
         TidyLayout {
             parent_child_margin,
             peer_margin,
             is_layered: true,
-            depth_to_y: vec![],
+            depth_to_position: vec![],
+            default_orientation,
         }
     }
 }
@@ -61,21 +71,31 @@ impl Contour {
         self.current.is_none()
     }
 
+
     pub fn left(&self, graph: &Graph<Node, ()>) -> Coord {
         let node = self.node(graph);
-        self.modifier_sum + node.relative_x - node.width / 2.
+        match node.orientation {
+            Orientation::Vertical => self.modifier_sum + node.relative_x - node.width / 2.,
+            Orientation::Horizontal => self.modifier_sum + node.relative_y - node.height / 2.,
+        }
     }
 
     pub fn right(&self, graph: &Graph<Node, ()>) -> Coord {
         let node = self.node(graph);
-        self.modifier_sum + node.relative_x + node.width / 2.
+        match node.orientation {
+            Orientation::Vertical => self.modifier_sum + node.relative_x + node.width / 2.,
+            Orientation::Horizontal => self.modifier_sum + node.relative_y + node.height / 2.,
+        }
     }
 
     pub fn bottom(&self, graph: &Graph<Node, ()>) -> Coord {
         match self.current {
             Some(node_index) => {
                 let node = &graph[node_index];
-                node.y + node.height
+                match node.orientation {
+                    Orientation::Vertical => node.y + node.height,
+                    Orientation::Horizontal => node.x + node.width,
+                }
             }
             None => 0.,
         }
@@ -108,6 +128,8 @@ impl Contour {
 }
 
 impl TidyLayout {
+
+
     fn separate(
         &mut self,
         tree: &mut TreeGraph,
@@ -126,18 +148,16 @@ impl TidyLayout {
 
         while !left.is_none() && !right.is_none() {
             if left.bottom(&tree.graph) > y_list.bottom() {
-                let b = y_list.bottom();
-                let top = y_list.pop();
-                if top.is_none() {
-                    println!(
-                        "Err\n\n{}\n\nleft.bottom={}\nyList.bottom={}",
-                        tree.str(),
-                        left.bottom(&tree.graph),
-                        b
-                    );
+                match y_list.pop() {
+                    Some(new_y_list) => y_list = new_y_list,
+                    None => {
+                        // Handle the case where y_list is empty
+                        log::warn!("Y-list is empty in separate function. This might indicate an issue with the tree structure.");
+                        // Create a new y_list with the current left bottom
+                        y_list = LinkedYList::new(child_index, left.bottom(&tree.graph));
+                        break;
+                    }
                 }
-
-                y_list = top.unwrap();
             }
 
             let dist = left.right(&tree.graph) - right.left(&tree.graph) + self.peer_margin;
@@ -165,6 +185,7 @@ impl TidyLayout {
 
         y_list
     }
+
 
     fn set_left_thread(
         &mut self,
@@ -236,40 +257,63 @@ impl TidyLayout {
         }
     }
 
-    fn set_y_recursive(&mut self, tree: &mut TreeGraph) {
+
+    fn set_positions_recursive(&mut self, tree: &mut TreeGraph) {
         if !self.is_layered {
             let mut dfs = Dfs::new(&tree.graph, tree.root);
             while let Some(nx) = dfs.next(&tree.graph) {
                 let parent = tree.graph.neighbors_directed(nx, petgraph::Direction::Incoming).next();
-                let parent_y = parent.map(|p| tree.graph[p].y + tree.graph[p].height).unwrap_or(0.);
-                let new_y = parent_y + self.parent_child_margin;
-                tree.graph[nx].y = new_y;
+                let node_orientation = &mut tree.graph[nx].orientation.clone();
+                let parent_pos = match node_orientation {
+                    Orientation::Vertical => parent.map(|p| tree.graph[p].y + tree.graph[p].height).unwrap_or(0.),
+                    Orientation::Horizontal => parent.map(|p| tree.graph[p].x + tree.graph[p].width).unwrap_or(0.),
+                };
+                let node = &mut tree.graph[nx];
+                let new_pos = parent_pos + self.parent_child_margin;
+                match node.orientation {
+                    Orientation::Vertical => node.y = new_pos,
+                    Orientation::Horizontal => node.x = new_pos,
+                }
             }
         } else {
-            let depth_to_y = &mut self.depth_to_y;
-            depth_to_y.clear();
+            let depth_to_pos = &mut self.depth_to_position;
+            depth_to_pos.clear();
             let margin = self.parent_child_margin;
             let collected_nodes: Vec<_> = tree.bfs_traversal_with_depth_mut().collect();
 
             for (nx, depth) in collected_nodes {
-                while depth >= depth_to_y.len() {
-                    depth_to_y.push(0.);
+                while depth >= depth_to_pos.len() {
+                    depth_to_pos.push(0.);
                 }
 
-                if tree.graph.neighbors_directed(nx, petgraph::Direction::Incoming).next().is_none() || depth == 0 {
+                let node_orientation = &mut tree.graph[nx].orientation.clone();
+                let is_none_neighbor = {
+                    tree.graph.neighbors_directed(nx, petgraph::Direction::Incoming).next().is_none()
+                };
+                if is_none_neighbor || depth == 0 {
                     let node = &mut tree.graph[nx];
-                    node.y = 0.;
+                    match node_orientation {
+                        Orientation::Vertical => node.y = 0.,
+                        Orientation::Horizontal => node.x = 0.,
+                    }
                     continue;
                 }
 
                 let parent = tree.graph.neighbors_directed(nx, petgraph::Direction::Incoming).next().unwrap();
-                depth_to_y[depth] = Float::max(
-                    depth_to_y[depth],
-                    depth_to_y[depth - 1] + tree.graph[parent].height + self.parent_child_margin,
+                let node = &mut tree.graph[nx];
+                depth_to_pos[depth] = Float::max(
+                    depth_to_pos[depth],
+                    match node.orientation {
+                        Orientation::Vertical => depth_to_pos[depth - 1] + tree.graph[parent].height + margin,
+                        Orientation::Horizontal => depth_to_pos[depth - 1] + tree.graph[parent].width + margin,
+                    }
                 );
             }
             tree.pre_order_traversal_with_depth_mut(|node, depth| {
-                node.y = depth_to_y[depth];
+                match node.orientation {
+                    Orientation::Vertical => node.y = depth_to_pos[depth],
+                    Orientation::Horizontal => node.x = depth_to_pos[depth],
+                }
             })
         }
     }
@@ -282,18 +326,19 @@ impl TidyLayout {
         }
 
         self.first_walk(tree, children[0]);
-        let mut y_list = LinkedYList::new(0, tree.graph[tree.graph[children[0]].tidy().extreme_right.unwrap()].bottom());
+        let mut list = LinkedYList::new(0, tree.graph[tree.graph[children[0]].tidy().extreme_right.unwrap()].bottom());
         for i in 1..children.len() {
             let current_child = children[i];
             self.first_walk(tree, current_child);
-            let max_y = tree.graph[tree.graph[current_child].tidy().extreme_left.unwrap()].bottom();
-            y_list = self.separate(tree, node, i, y_list);
-            y_list = y_list.update(i, max_y);
+            let max_pos = tree.graph[tree.graph[current_child].tidy().extreme_left.unwrap()].bottom();
+            list = self.separate(tree, node, i, list);
+            list = list.update(i, max_pos);
         }
 
         self.position_root(tree, node);
         self.set_extreme(tree, node);
     }
+
 
     fn first_walk_with_filter(&mut self, tree: &mut TreeGraph, node: NodeIndex, set: &SetUsize) {
         if !set.contains(node.index()) {
@@ -324,7 +369,11 @@ impl TidyLayout {
 
     fn second_walk(&mut self, tree: &mut TreeGraph, node: NodeIndex, mut mod_sum: Coord) {
         mod_sum += tree.graph[node].tidy().modifier_to_subtree;
-        tree.graph[node].x = tree.graph[node].relative_x + mod_sum;
+        let node_orientation = tree.graph[node].orientation;
+        match node_orientation {
+            Orientation::Vertical => tree.graph[node].x = tree.graph[node].relative_x + mod_sum,
+            Orientation::Horizontal => tree.graph[node].y = tree.graph[node].relative_y + mod_sum,
+        }
         self.add_child_spacing(tree, node);
 
         let children: Vec<NodeIndex> = tree.graph.neighbors(node).collect();
@@ -370,13 +419,26 @@ impl TidyLayout {
     fn position_root(&mut self, tree: &mut TreeGraph, node: NodeIndex) {
         let children: Vec<NodeIndex> = tree.graph.neighbors(node).collect();
         let first = children[0];
-        let first_child_pos = tree.graph[first].relative_x + tree.graph[first].tidy().modifier_to_subtree;
+        let node_orientation = tree.graph[node].orientation;
+        let first_child_pos = match node_orientation {
+            Orientation::Vertical => tree.graph[first].relative_x + tree.graph[first].tidy().modifier_to_subtree,
+            Orientation::Horizontal => tree.graph[first].relative_y + tree.graph[first].tidy().modifier_to_subtree,
+        };
         let last = *children.last().unwrap();
-        let last_child_pos = tree.graph[last].relative_x + tree.graph[last].tidy().modifier_to_subtree;
-        tree.graph[node].relative_x = (first_child_pos + last_child_pos) / 2.;
-        // make modifier_to_subtree + relative_x = 0. so that
+        let last_child_pos = match node_orientation {
+            Orientation::Vertical => tree.graph[last].relative_x + tree.graph[last].tidy().modifier_to_subtree,
+            Orientation::Horizontal => tree.graph[last].relative_y + tree.graph[last].tidy().modifier_to_subtree,
+        };
+        match node_orientation {
+            Orientation::Vertical => tree.graph[node].relative_x = (first_child_pos + last_child_pos) / 2.,
+            Orientation::Horizontal => tree.graph[node].relative_y = (first_child_pos + last_child_pos) / 2.,
+        };
+        // make modifier_to_subtree + relative_pos = 0. so that
         // there will always be collision in `separation()`'s first loop
-        tree.graph[node].tidy_mut().modifier_to_subtree = -tree.graph[node].relative_x;
+        tree.graph[node].tidy_mut().modifier_to_subtree = match node_orientation {
+            Orientation::Vertical => -tree.graph[node].relative_x,
+            Orientation::Horizontal => -tree.graph[node].relative_y,
+        };
     }
 
     fn add_child_spacing(&mut self, tree: &mut TreeGraph, node: NodeIndex) {
@@ -396,13 +458,12 @@ impl TidyLayout {
 
 impl Layout for TidyLayout {
     fn layout(&mut self, tree: &mut TreeGraph) {
-        // tree.pre_order_traversal_mut(|node| init_node(node));
         let mut dfs = Dfs::new(&tree.graph, tree.root);
         while let Some(nx) = dfs.next(&tree.graph) {
             let node = &mut tree.graph[nx];
             init_node(node);
         }
-        self.set_y_recursive(tree);
+        self.set_positions_recursive(tree);
         self.first_walk(tree, tree.root);
         self.second_walk(tree, tree.root, 0.);
     }
@@ -429,7 +490,7 @@ impl Layout for TidyLayout {
             }
 
             // TODO: can be lazy
-            self.set_y_recursive(tree);
+            self.set_positions_recursive(tree);
         }
 
         let mut set: SetUsize = SetUsize::new();
@@ -479,7 +540,6 @@ fn init_node(node: &mut Node) {
             modifier_thread_right: 0.,
         });
     }
-
     node.x = 0.;
     node.y = 0.;
     node.relative_x = 0.;
@@ -509,19 +569,19 @@ mod test {
 
     #[test]
     fn test_tidy_layout() {
-        let mut tidy = TidyLayout::new(1., 1.);
-        let mut tree = TreeGraph::new(Node::new(0, 1., 1.));
+        let mut tidy = TidyLayout::new(1., 1., Orientation::Vertical);
+        let mut tree = TreeGraph::new(Node::new(0, 1., 1., None));
         let root = tree.root;
 
-        let first_child = tree.add_child(root, Node::new(1, 1., 1.));
-        let first_grandchild = tree.add_child(first_child, Node::new(10, 1., 1.));
-        tree.add_child(first_grandchild, Node::new(100, 1., 1.));
+        let first_child = tree.add_child(root, Node::new(1, 1., 1., None));
+        let first_grandchild = tree.add_child(first_child, Node::new(10, 1., 1., None));
+        tree.add_child(first_grandchild, Node::new(100, 1., 1., None));
 
-        let second_child = tree.add_child(root, Node::new(2, 1., 1.));
-        let second_grandchild = tree.add_child(second_child, Node::new(11, 1., 1.));
-        tree.add_child(second_grandchild, Node::new(101, 1., 1.));
+        let second_child = tree.add_child(root, Node::new(2, 1., 1., None));
+        let second_grandchild = tree.add_child(second_child, Node::new(11, 1., 1., None));
+        tree.add_child(second_grandchild, Node::new(101, 1., 1., None));
 
-        tree.add_child(root, Node::new(3, 1., 2.));
+        tree.add_child(root, Node::new(3, 1., 2., None));
 
         tidy.layout(&mut tree);
         println!("{}", tree.str());

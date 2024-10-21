@@ -1,31 +1,25 @@
-use std::collections::HashMap;
-use std::slice::IterMut;
-use std::sync::{Arc, Mutex};
-use bevy::app::{App, Startup, Update};
-use bevy::DefaultPlugins;
-use bevy::math::UVec2;
-use bevy::prelude::{ButtonBundle, Camera, Camera2dBundle, ClearColorConfig, Color, Commands, Component, default, in_state, IntoSystemConfigs, Local, OnEnter, OnExit, Query, Res, ResMut, Style, Val, Window, With};
-use bevy::render::camera::Viewport;
+use crate::bevy_egui::EguiContexts;
+use crate::chidori::{CellState, ChidoriState, EguiTree, EguiTreeIdentities};
+use crate::json_editor::{JsonEditorExample, Show};
+use crate::util::{despawn_screen, egui_label, egui_logs, serialized_value_to_json_value};
+use crate::{CurrentTheme, GameState, Theme};
+use bevy::app::{App, Update};
+use bevy::prelude::{in_state, Component, IntoSystemConfigs, Local, OnExit, Query, Res, ResMut, Window, With};
 use bevy::window::PrimaryWindow;
-use bevy_cosmic_edit::{Attrs, CosmicBuffer, CosmicColor, CosmicEditBundle, CosmicEditPlugin, CosmicFontConfig, CosmicFontSystem, CosmicPrimaryCamera, CosmicSource, Family, FocusedWidget, Metrics};
-use crate::bevy_egui::{EguiContexts};
-use egui;
-use egui::{Align, Color32, FontFamily, Frame, Id, Margin, Pos2, Rounding, Stroke, Ui, Vec2, Vec2b};
-use egui_extras::syntax_highlighting::CodeTheme;
-use egui_tiles::Tile;
-use chidori_core::uuid::Uuid;
-use chidori_core::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, LLMPromptCellChatConfiguration, MemoryCell, SupportedLanguage, SupportedModelProviders, TemplateCell, TextRange, WebserviceCell};
-use chidori_core::chidori_static_analysis::language::{ChidoriStaticAnalysisError, Report};
+use chidori_core::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, SupportedModelProviders, TemplateCell, TextRange};
+use chidori_core::chidori_prompt_format::templating::templates::{SchemaItem, SchemaItemType};
 use chidori_core::execution::primitives::identifiers::OperationId;
 use chidori_core::sdk::entry::CellHolder;
-use crate::json_editor::{JsonEditorExample, Show};
-use crate::chidori::{CellState, ChidoriState, EguiTree, EguiTreeIdentities};
+use chidori_core::uuid::Uuid;
+use egui;
+use egui::{Align, Color32, FontFamily, Frame, Id, Margin, Rounding, Stroke, Ui, Vec2, Vec2b};
+use egui_extras::syntax_highlighting::CodeTheme;
 use egui_json_tree::JsonTree;
-use serde_derive::{Deserialize, Serialize};
+use egui_tiles::Tile;
 use serde_json::{Map, Value};
-use chidori_core::chidori_prompt_format::templating::templates::{SchemaItem, SchemaItemType};
-use crate::{CurrentTheme, GameState, Theme};
-use crate::util::{change_active_editor_ui, deselect_editor_on_esc, despawn_screen, egui_label, egui_logs, egui_rkyv, print_editor_text, serialized_value_to_json_value};
+use std::fs;
+use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Component)]
 struct OnEditorScreen;
@@ -44,6 +38,36 @@ impl Default for ViewingWatchedFileCells {
 }
 
 
+fn file_browser(ui: &mut egui::Ui, path: &Path) {
+    let metadata = fs::metadata(path).unwrap();
+    let file_name = path.file_name().unwrap().to_str().unwrap();
+
+    if metadata.is_dir() {
+        let id = ui.make_persistent_id(path);
+        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+
+        state.show_header(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(egui::Label::new("📁").sense(egui::Sense::click()));
+                ui.label(file_name);
+            });
+        })
+            .body(|ui| {
+                if let Ok(entries) = fs::read_dir(path) {
+                    for entry in entries {
+                        if let Ok(entry) = entry {
+                            file_browser(ui, &entry.path());
+                        }
+                    }
+                }
+            });
+    } else {
+        ui.horizontal(|ui| {
+            ui.add(egui::Label::new("📄").sense(egui::Sense::click()));
+            ui.label(file_name);
+        });
+    }
+}
 
 
 
@@ -91,63 +115,104 @@ fn editor_update(
         return;
     }
 
+
     egui::CentralPanel::default().frame(container_frame).show(contexts.ctx_mut(), |ui| {
-        egui::ScrollArea::vertical().min_scrolled_width(f32::INFINITY).auto_shrink(Vec2b::new(true, false)).show(ui, |ui| {
-            let mut theme = egui_extras::syntax_highlighting::CodeTheme::dark();
-
-            let mut frame = egui::Frame::default()
-                .fill(current_theme.theme.card)
-                .stroke(current_theme.theme.card_border)
-                .outer_margin(Margin::symmetric(8.0, 16.0))
-                .inner_margin(16.0)
-                .rounding(current_theme.theme.radius as f32)
-                .begin(ui);
-            {
-                ui.set_width(800.0);
-                let ui = &mut frame.content_ui;
-                ui.horizontal(|ui| {
-                    if ui.radio(viewing_watched_file_cells.is_showing_editor_cells, "View Editor Cells").clicked() {
-                        viewing_watched_file_cells.is_showing_editor_cells = true;
-                    }
-                    if ui.radio(!viewing_watched_file_cells.is_showing_editor_cells, "View Cells at Current State").clicked() {
-                        viewing_watched_file_cells.is_showing_editor_cells = false;
-                    }
+        let available_height = ui.available_height();
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.set_height(available_height);
+                ui.push_id("file_browser", |ui| {
+                    egui::ScrollArea::vertical().auto_shrink(Vec2b::new(true, false)).show(ui, |ui| {
+                        ui.set_max_width(200.0);
+                        let path = &chidori_state.watched_path.lock().unwrap().clone();
+                        if path.is_some() {
+                            file_browser(ui, Path::new(&path.as_ref().unwrap()));
+                        }
+                    });
                 });
-            }
-            frame.end(ui);
+            });
 
-            // let cells = if viewing_watched_file_cells.is_showing_editor_cells {
-            //     chidori_state.editor_cells.iter_mut()
-            // } else {
-            //     chidori_state.state_cells.iter_mut()
-            // };
-            let mut cells_ids: Vec<_> =  chidori_state.editor_cells.keys().cloned().collect();
-            cells_ids.sort();
-            for cell_id in &cells_ids {
-                editable_chidori_cell_content(&mut chidori_state, &current_theme.theme, ui, &mut theme, *cell_id);
-            }
+            ui.vertical(|ui| {
+                ui.set_height(available_height);
+                ui.push_id("notebook", |ui| {
+                    egui::ScrollArea::vertical().min_scrolled_width(f32::INFINITY).auto_shrink(Vec2b::new(true, false)).show(ui, |ui| {
+                        let mut theme = egui_extras::syntax_highlighting::CodeTheme::dark();
 
-            if !chidori_state.display_example_modal {
-                let mut frame = egui::Frame::default()
-                    .fill(current_theme.theme.card)
-                    .stroke(current_theme.theme.card_border)
-                    .outer_margin(Margin::symmetric(8.0, 16.0))
-                    .inner_margin(16.0)
-                    .rounding(current_theme.theme.radius as f32)
-                    .begin(ui);
-                {
-                    let mut ui = &mut frame.content_ui;
-                    render_new_cell_interface(ui, &mut chidori_state);
-                }
-                frame.end(ui);
-            }
+                        let mut frame = egui::Frame::default()
+                            .fill(current_theme.theme.card)
+                            .stroke(current_theme.theme.card_border)
+                            .outer_margin(Margin::symmetric(8.0, 16.0))
+                            .inner_margin(16.0)
+                            .rounding(current_theme.theme.radius as f32)
+                            .begin(ui);
+                        {
+                            ui.set_width(800.0);
+                            let ui = &mut frame.content_ui;
+                            ui.horizontal(|ui| {
+                                if ui.radio(viewing_watched_file_cells.is_showing_editor_cells, "View Editor Cells").clicked() {
+                                    viewing_watched_file_cells.is_showing_editor_cells = true;
+                                }
+                                if ui.radio(!viewing_watched_file_cells.is_showing_editor_cells, "View Cells at Current State").clicked() {
+                                    viewing_watched_file_cells.is_showing_editor_cells = false;
+                                }
+                            });
+                        }
+                        frame.end(ui);
+
+                        // let cells = if viewing_watched_file_cells.is_showing_editor_cells {
+                        //     chidori_state.editor_cells.iter_mut()
+                        // } else {
+                        //     chidori_state.state_cells.iter_mut()
+                        // };
+                        let mut cells_ids: Vec<_> = chidori_state.editor_cells.keys().cloned().collect();
+                        cells_ids.sort();
+                        for cell_id in &cells_ids {
+                            editable_chidori_cell_content(&mut chidori_state, &current_theme.theme, ui, &mut theme, *cell_id);
+                        }
+
+                        if !chidori_state.display_example_modal {
+                            let mut frame = egui::Frame::default()
+                                .fill(current_theme.theme.card)
+                                .stroke(current_theme.theme.card_border)
+                                .outer_margin(Margin::symmetric(8.0, 16.0))
+                                .inner_margin(16.0)
+                                .rounding(current_theme.theme.radius as f32)
+                                .begin(ui);
+                            {
+                                let mut ui = &mut frame.content_ui;
+                                let state_binding = chidori_state.local_cell_state.entry(Uuid::nil()).or_insert(Arc::new(Mutex::new(CellState::default()))).clone();
+                                let mut state = state_binding.lock().unwrap();
+                                render_new_cell_interface(
+                                    ui,
+                                    &mut chidori_state,
+                                    &mut state,
+                                    &mut theme
+                                );
+                            }
+                            frame.end(ui);
+                        }
+
+                    });
+                });
+            });
 
         });
+
     });
 }
 
-pub fn editable_chidori_cell_content(mut chidori_state: &mut ChidoriState, theme: &Theme, ui: &mut Ui, mut code_theme: &mut CodeTheme, op_id: OperationId) {
-    let binding = chidori_state.editor_cells.get(&op_id).unwrap().clone();
+pub fn editable_chidori_cell_content(
+    mut chidori_state: &mut ChidoriState,
+    theme: &Theme,
+    ui: &mut Ui,
+    mut code_theme: &mut CodeTheme,
+    op_id: OperationId
+) {
+    let binding = if let Some(binding) = chidori_state.editor_cells.get(&op_id) {
+        binding.clone()
+    } else {
+        return;
+    };
     let mut cell_holder = &mut binding.lock().unwrap();
 
     // let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(Margin::symmetric(8.0, 16.0)).inner_margin(16.0).rounding(6.0).begin(ui);
@@ -193,12 +258,36 @@ pub fn editable_chidori_cell_content(mut chidori_state: &mut ChidoriState, theme
             CellTypes::Prompt(LLMPromptCell::Chat { .. }, _) => {
                 render_prompt_cell(&mut chidori_state, &op_id, ui, cell_holder, exists_in_current_tree);
             }
-            CellTypes::Embedding(LLMEmbeddingCell { .. }, _) => {}
             CellTypes::Template(..) => {
                 render_template_cell(&mut chidori_state, &op_id, ui, cell_holder, exists_in_current_tree);
             }
-            CellTypes::Memory(MemoryCell { .. }, _) => {}
         }
+
+        let state_binding = chidori_state.local_cell_state.entry(op_id).or_insert(Arc::new(Mutex::new(CellState::default()))).clone();
+        let mut state = state_binding.lock().unwrap();
+
+        ui.push_id(("add_cell", op_id), |ui| {
+            egui::CollapsingHeader::new("Add Cell")
+                .show(ui, |ui| {
+                    render_new_cell_interface(
+                        ui,
+                        chidori_state,
+                        &mut state,
+                        &mut code_theme,
+                    );
+                });
+        });
+        //
+        // if !state.is_new_cell_open {
+        //     if ui.button("Add Cell").clicked() {
+        //         state.is_new_cell_open = true;
+        //     }
+        // } else {
+        //     if ui.button("Close").clicked() {
+        //         state.is_new_cell_open = false;
+        //     }
+        // }
+
     }
     frame.end(ui);
 }
@@ -224,8 +313,7 @@ fn render_template_cell(
         }
     }
     ui.horizontal(|ui| {
-        egui_label(ui, "Prompt");
-        // render_applied_status(ui, exists_in_current_tree);
+        egui_label(ui, "Template");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
             if backing_file_reference.is_some() {
                 if ui.button("Open File").clicked() {
@@ -258,7 +346,7 @@ fn render_operation_output(execution_state: &ChidoriState, op_id: &&OperationId,
             }
             if ui.button(format!("Revert To Most Recent Execution")).clicked() {}
             ui.push_id((exec_id, op_id), |ui| {
-                ui.collapsing("Values", |ui| {
+                ui.collapsing("Output", |ui| {
                     let response = JsonTree::new(format!("{} {} values", exec_id, op_id), &serialized_value_to_json_value(&o.output.clone().unwrap()))
                         .show(ui);
                 });
@@ -355,7 +443,6 @@ fn render_prompt_cell(
     // let mut cfg = serde_yaml::to_string(&configuration.clone()).unwrap();
     ui.horizontal(|ui| {
         egui_label(ui, "Prompt");
-        // render_applied_status(ui, exists_in_current_tree);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
             if backing_file_reference.is_some() {
                 if ui.button("Open File").clicked() {
@@ -413,7 +500,7 @@ fn render_code_gen_cell(
     mut cell_holder: &mut CellHolder,
     exists_in_current_tree: bool
 ) {
-    let CellTypes::CodeGen(LLMCodeGenCell { name, req, backing_file_reference, .. }, _) = &mut cell_holder.cell else { panic!("Must be code gen cell") };
+    let CellTypes::CodeGen(LLMCodeGenCell { name, req, complete_body, backing_file_reference, .. }, _) = &mut cell_holder.cell else { panic!("Must be code gen cell") };
     let state_binding = execution_state.local_cell_state.entry(*op_id).or_insert(Arc::new(Mutex::new(CellState::default()))).clone();
     let mut state = state_binding.lock().unwrap();
     if let Some(name) = name {
@@ -428,10 +515,8 @@ fn render_code_gen_cell(
             cell_holder.applied_at = None;
         }
     }
-    let mut s = req.clone();
     ui.horizontal(|ui| {
-        egui_label(ui, "Prompt");
-        render_applied_status(ui, exists_in_current_tree);
+        egui_label(ui, "Code Generation");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
             if backing_file_reference.is_some() {
                 if ui.button("Open File").clicked() {
@@ -447,7 +532,7 @@ fn render_code_gen_cell(
     // Add widgets inside the frame
     ui.vertical(|ui| {
         if ui.add(
-            egui::TextEdit::multiline(&mut s)
+            egui::TextEdit::multiline(complete_body)
                 .code_editor()
                 .lock_focus(true)
                 .desired_width(f32::INFINITY)
@@ -463,15 +548,6 @@ fn render_code_gen_cell(
     });
 }
 
-fn render_applied_status(mut ui: &mut Ui, exists_in_current_tree: bool) {
-    if exists_in_current_tree {
-        egui_label(ui, "Applied");
-    } else {
-        if ui.button("Push Update").clicked() {
-            println!("Attempting to push update");
-        }
-    }
-}
 
 fn render_code_cell(
     chidori_state: &mut ChidoriState,
@@ -537,7 +613,6 @@ fn render_code_cell(
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::left_to_right(Align::Center), |ui| {
             egui_label(ui, "Code");
-            // render_applied_status(ui, exists_in_current_tree);
             let old_button_padding = ui.spacing().button_padding;
             ui.spacing_mut().button_padding = Vec2::new(4.0, 2.0);
             let result = egui::ComboBox::from_id_source(format!("{:?} LangSelect", cell_holder.op_id))
@@ -658,72 +733,127 @@ fn render_code_cell(
 
 fn render_new_cell_interface(
     mut ui: &mut Ui,
-    chidori_state: &mut ResMut<ChidoriState>
+    mut chidori_state: &mut ChidoriState,
+    mut state: &mut CellState,
+    code_theme: &mut CodeTheme
 ) {
     ui.horizontal(|ui| {
-        egui_label(ui, "New Cell");
+        egui_label(ui, "Appending New Cell");
     });
-    if ui.button("Add Code Cell").clicked() {
-        let op_id = Uuid::new_v4();
-        chidori_state.editor_cells.insert(op_id, Arc::new(Mutex::new(CellHolder {
-            cell: CellTypes::Code(CodeCell {
-                backing_file_reference: None,
-                name: None,
-                language: SupportedLanguage::PyO3,
-                source_code: "".to_string(),
-                function_invocation: None,
-            }, TextRange::default()),
-            op_id,
-            applied_at: Default::default(),
-            needs_update: false,
-        })));
+
+    if state.temp_cell.is_some() {
+        if ui.button("Cancel").clicked() {
+            state.temp_cell = None;
+            state.is_new_cell_open = false;
+        }
     }
-    if ui.button("Add Prompt Cell").clicked() {
-        let op_id = Uuid::new_v4();
-        chidori_state.editor_cells.insert(op_id, Arc::new(Mutex::new(CellHolder {
-            cell: CellTypes::Prompt(LLMPromptCell::Chat {
-                backing_file_reference: None,
-                function_invocation: false,
-                configuration: Default::default(),
-                name: None,
-                provider: SupportedModelProviders::OpenAI,
-                complete_body: "".to_string(),
-                req: "".to_string(),
-            }, TextRange::default()),
-            op_id,
-            applied_at: Default::default(),
-            needs_update: false,
-        })));
+
+    if state.temp_cell.is_none() {
+        if ui.button("Add Code Cell").clicked() {
+            let op_id = Uuid::new_v4();
+            state.temp_cell = Some(CellHolder {
+                cell: CellTypes::Code(CodeCell {
+                    backing_file_reference: None,
+                    name: None,
+                    language: SupportedLanguage::PyO3,
+                    source_code: "".to_string(),
+                    function_invocation: None,
+                }, TextRange::default()),
+                op_id,
+                applied_at: Default::default(),
+                needs_update: false,
+            });
+        }
+        if ui.button("Add Prompt Cell").clicked() {
+            let op_id = Uuid::new_v4();
+            state.temp_cell = Some(CellHolder {
+                cell: CellTypes::Prompt(LLMPromptCell::Chat {
+                    backing_file_reference: None,
+                    function_invocation: false,
+                    configuration: Default::default(),
+                    name: None,
+                    provider: SupportedModelProviders::OpenAI,
+                    complete_body: "".to_string(),
+                    req: "".to_string(),
+                }, TextRange::default()),
+                op_id,
+                applied_at: Default::default(),
+                needs_update: false,
+            });
+        }
+        if ui.button("Add Template Cell").clicked() {
+            let op_id = Uuid::new_v4();
+            state.temp_cell = Some(CellHolder {
+                cell: CellTypes::Template(TemplateCell {
+                    backing_file_reference: None,
+                    name: None,
+                    body: "".to_string(),
+                }, TextRange::default()),
+                op_id,
+                applied_at: Default::default(),
+                needs_update: false,
+            });
+        }
+        if ui.button("Add Code Generation Cell").clicked() {
+            let op_id = Uuid::new_v4();
+            state.temp_cell = Some((CellHolder {
+                cell: CellTypes::CodeGen(LLMCodeGenCell {
+                    backing_file_reference: None,
+                    function_invocation: false,
+                    configuration: Default::default(),
+                    name: None,
+                    provider: SupportedModelProviders::OpenAI,
+                    req: "".to_string(),
+                    complete_body: "".to_string(),
+                }, TextRange::default()),
+                op_id,
+                applied_at: Default::default(),
+                needs_update: false,
+            }));
+        }
     }
-    if ui.button("Add Template Cell").clicked() {
-        let op_id = Uuid::new_v4();
-        chidori_state.editor_cells.insert(op_id, Arc::new(Mutex::new(CellHolder {
-            cell: CellTypes::Template(TemplateCell {
-                backing_file_reference: None,
-                name: None,
-                body: "".to_string(),
-            }, TextRange::default()),
-            op_id,
-            applied_at: Default::default(),
-            needs_update: false,
-        })));
+
+let exists_in_current_tree = false;
+    let mut temp_cell_created = false;
+    if let Some(temp_cell) = state.temp_cell.as_mut() {
+        let op_id = temp_cell.op_id.clone();
+        match &mut temp_cell.cell {
+            CellTypes::Code(_, ..) => {
+                render_code_cell(
+                    &mut chidori_state,
+                    code_theme,
+                    &op_id,
+                    ui,
+                    temp_cell,
+                    exists_in_current_tree
+                );
+            }
+            CellTypes::CodeGen(..) => {
+                render_code_gen_cell(&mut chidori_state, &op_id, ui, temp_cell, exists_in_current_tree);
+            }
+            CellTypes::Prompt(LLMPromptCell::Completion { .. }, _) => {}
+            CellTypes::Prompt(LLMPromptCell::Chat { .. }, _) => {
+                render_prompt_cell(&mut chidori_state, &op_id, ui, temp_cell, exists_in_current_tree);
+            }
+            CellTypes::Template(..) => {
+                render_template_cell(&mut chidori_state, &op_id, ui, temp_cell, exists_in_current_tree);
+            }
+        }
+
+        if ui.button("Save and Push To Graph").clicked() {
+            // chidori_state.editor_cells.insert(op_id, Arc::new(Mutex::new(temp_cell.clone())));
+            chidori_state.update_cell(temp_cell.clone());
+            temp_cell_created = true;
+        }
+
     }
-    if ui.button("Add Code Generation Cell").clicked() {
-        let op_id = Uuid::new_v4();
-        chidori_state.editor_cells.insert(op_id, Arc::new(Mutex::new(CellHolder {
-            cell: CellTypes::CodeGen(LLMCodeGenCell {
-                backing_file_reference: None,
-                function_invocation: false,
-                configuration: Default::default(),
-                name: None,
-                provider: SupportedModelProviders::OpenAI,
-                req: "".to_string(),
-            }, TextRange::default()),
-            op_id,
-            applied_at: Default::default(),
-            needs_update: false,
-        })));
+    if temp_cell_created {
+        state.temp_cell = None;
+        state.is_new_cell_open = false;
     }
+
+
+
 }
 
 pub fn editor_plugin(app: &mut App) {

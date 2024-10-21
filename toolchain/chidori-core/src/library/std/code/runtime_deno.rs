@@ -684,14 +684,17 @@ mod tests {
     use crate::cells::{SupportedLanguage, TextRange};
     use crate::execution::primitives::serialized_value::RkyvObjectBuilder;
     use indoc::indoc;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn test_source_code_run_with_external_function_invocation() -> anyhow::Result<()> {
         let source_code = String::from(r#"const y = await test_function(5, 5);"#);
 
         let mut state = ExecutionState::new_with_random_id();
+        let id_a = Uuid::new_v4();
         let (state, _) = state.update_operation(CellTypes::Code(
             crate::cells::CodeCell {
+                backing_file_reference: None,
                 name: None,
                 language: SupportedLanguage::PyO3,
                 source_code: String::from(indoc! { r#"
@@ -700,7 +703,7 @@ mod tests {
                                 "#
                                 }),
                 function_invocation: None,
-            }, TextRange::default()), Some(0))?;
+            }, TextRange::default()), id_a)?;
         let result = source_code_run_deno(
             &state,
             &source_code,

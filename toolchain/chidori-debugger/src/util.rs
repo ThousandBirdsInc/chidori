@@ -289,9 +289,7 @@ pub fn egui_render_cell_read(ui: &mut Ui, cell: &CellTypes, state: &ExecutionSta
         CellTypes::Template(TemplateCell { name, body, .. }, _) => {
             render_text_cell(ui, name, body, "Prompt", "", &theme);
         }
-        CellTypes::Prompt(LLMPromptCell::Completion { .. }, _) |
-        CellTypes::Embedding(LLMEmbeddingCell { .. }, _) |
-        CellTypes::Memory(MemoryCell { .. }, _) => {}
+        CellTypes::Prompt(LLMPromptCell::Completion { .. }, _)  => {}
     }
 }
 

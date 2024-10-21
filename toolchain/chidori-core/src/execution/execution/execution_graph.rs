@@ -87,11 +87,16 @@ pub struct ExecutionGraph {
     /// along those edges are always considered to have occurred _after_ the target step.
     execution_graph: Arc<Mutex<ExecutionGraphDiGraphSet>>,
 
-    // TODO: move to just using the digraph for this
-    pub(crate) execution_node_id_to_state: Arc<DashMap<ExecutionNodeId, ExecutionStateEvaluation>>,
 
     /// Sender channel for sending messages to the execution graph
     graph_mutation_sender: tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>,
+
+
+    execution_event_sender: Sender<ExecutionEvent>,
+    execution_event_receiver: Option<tokio::sync::mpsc::Receiver<ExecutionEvent>>,
+
+    // TODO: move to just using the digraph for this
+    pub(crate) execution_node_id_to_state: Arc<DashMap<ExecutionNodeId, ExecutionStateEvaluation>>,
 
     pub execution_depth_orchestration_handle: tokio::task::JoinHandle<()>,
     pub execution_depth_orchestration_initialized_notify: Arc<Notify>,
@@ -101,9 +106,6 @@ pub struct ExecutionGraph {
     /// execution states maintain a value that indicates the head location within this queue
     /// that they've processed thus far.
     pub chat_message_queue: Vec<String>,
-
-    execution_event_sender: Sender<ExecutionEvent>,
-    execution_event_receiver: Option<tokio::sync::mpsc::Receiver<ExecutionEvent>>,
 }
 
 impl std::fmt::Debug for ExecutionGraph {
@@ -135,7 +137,7 @@ impl ExecutionGraph {
     #[tracing::instrument]
     pub fn new() -> Self {
         println!("Initializing ExecutionGraph");
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<ExecutionGraphSendPayload>(1028);
+        let (sender, mut execution_graph_event_receiver) = tokio::sync::mpsc::channel::<ExecutionGraphSendPayload>(1028);
 
         let mut state_id_to_state = DashMap::new();
 
@@ -177,7 +179,7 @@ impl ExecutionGraph {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                        match receiver.try_recv() {
+                        match execution_graph_event_receiver.try_recv() {
                             Ok((resulting_execution_state, oneshot)) => {
                                 println!("==== Execution Graph received dispatch event {:?}", resulting_execution_state);
 
@@ -207,7 +209,9 @@ impl ExecutionGraph {
                                 let mut state_id_to_state = state_id_to_state_clone.clone();
 
                                 match resulting_execution_state {
-                                    ExecutionStateEvaluation::Error(state) => {
+                                    ExecutionStateEvaluation::Error(state) |
+                                    ExecutionStateEvaluation::Complete(state)
+                                    => {
                                         let resulting_state_id = state.id;
                                         state_id_to_state.insert(resulting_state_id.clone(), s.clone());
                                         execution_graph.deref_mut()
@@ -215,13 +219,6 @@ impl ExecutionGraph {
                                     }
                                     ExecutionStateEvaluation::EvalFailure(id) => {
                                         state_id_to_state.insert(id.clone(), s.clone());
-                                    }
-                                    ExecutionStateEvaluation::Complete(state) => {
-                                        // println!("Adding to execution state!!!! {:?}", state.id);
-                                        let resulting_state_id = state.id;
-                                        state_id_to_state.insert(resulting_state_id.clone(), s.clone());
-                                        execution_graph.deref_mut()
-                                            .add_edge(state.parent_state_id, resulting_state_id.clone(), s);
                                     }
                                     ExecutionStateEvaluation::Executing(state) => {
                                         let resulting_state_id = state.id;
@@ -235,6 +232,7 @@ impl ExecutionGraph {
                                 }
 
                                 // Resume execution
+                                // TODO: check if we're currently paused, and if so wait for this.
                                 // TODO: currently if this is not sent and the oneshot is dropped at the end of this, invocations will fail
                                 if let Some(oneshot) = oneshot {
                                     oneshot.send(()).unwrap();
@@ -302,12 +300,6 @@ impl ExecutionGraph {
         }
 
         (execution_graph.deref().all_edges().map(|x| (x.0, x.1)).collect(), grouped_nodes)
-    }
-
-    pub fn render_execution_graph_to_graphviz(&self) {
-        println!("================ Execution graph ================");
-        let execution_graph = self.execution_graph.lock().unwrap();
-        println!("{:?}", Dot::with_config(&execution_graph.deref(), &[]));
     }
 
     pub fn get_state_at_id(&self, id: ExecutionNodeId) -> Option<ExecutionStateEvaluation> {
@@ -378,34 +370,17 @@ impl ExecutionGraph {
         resulting_state_id
     }
 
-    // TODO: step execution should be able to progress even when the previous state is current held up
-    //       by an executing resolution. We instead want to return the NESTED state of the execution.
-
-    // TODO: the mechanism of our execution engine should be hidden from outside of this class
-    //       all that the parent observes is that there is a function that when they call it, it gets new states.
-    //
-    // TODO: right now, when this function is called, the parent is responsible for what execution id is being evaluated
-    //       and for providing the right state. Instead we want to hide state access within this class.
-    #[tracing::instrument]
-    pub async fn step_execution_with_previous_state(
-        &mut self,
-        previous_state: &ExecutionStateEvaluation,
+    pub async fn one_off_execute_code_against_state(
+        &self,
+        state_id: usize,
+        code_cell: &CellTypes,
+        cell: &CellTypes,
+        args: RkyvSerializedValue
     ) -> anyhow::Result<(
         (ExecutionNodeId, ExecutionStateEvaluation), // the resulting total state of this step
         Vec<(OperationId, OperationFnOutput)>, // values emitted by operations during this step
     )> {
-        println!("step_execution_with_previous_state");
-        let previous_state = match previous_state {
-            ExecutionStateEvaluation::Complete(state) => state,
-            _ => { panic!("Stepping execution should only occur against completed states") }
-        };
-        let eval_state = previous_state.determine_next_operation()?;
-        let (new_state, outputs) = previous_state.step_execution(eval_state).await?;
-        let resulting_state_id = self.progress_graph(new_state.clone());
-        Ok(((resulting_state_id, new_state), outputs))
-    }
-
-    pub async fn execute_operation_in_isolation(&self, cell: &CellTypes, args: RkyvSerializedValue) -> anyhow::Result<OperationFnOutput> {
+        // ExecutionGraph::immutable_external_step_execution(state_id, state)
         // TODO: we want a code cell that depends on the target cell
 
         // TODO: treat the repl as a two cell instances, one being the original cell, two being the evaluator
@@ -415,7 +390,14 @@ impl ExecutionGraph {
         op_node.attach_cell(cell.clone());
         new_state.evaluating_cell = Some(op_node.cell.clone());
         let result = op_node.execute(&mut new_state, args, None, None).await?;
-        Ok(result)
+
+        let mut outputs = vec![];
+        let next_operation_id = new_state.evaluating_id.clone();
+        outputs.push((next_operation_id, result.clone()));
+        // new_state.update_state(&mut new_state, next_operation_id, result);
+
+        println!("step_execution about to complete, after update_state");
+        todo!("complete implementations");
     }
 
     #[tracing::instrument]
@@ -433,7 +415,6 @@ impl ExecutionGraph {
         let (final_state, op_id) = match state {
             ExecutionStateEvaluation::Complete(state) => {
                 println!( "Capturing state of the mutate graph operation parent {:?}, id {:?}", state.parent_state_id, state.id);
-                let state = state.clone_with_new_id();
                 state.update_operation(cell, op_id)?
             },
             ExecutionStateEvaluation::Executing(..) => {
@@ -453,39 +434,22 @@ impl ExecutionGraph {
     }
 
     #[tracing::instrument]
-    pub async fn external_step_execution(
-        &mut self,
-        prev_execution_id: ExecutionNodeId,
-    ) -> anyhow::Result<(
-        (ExecutionNodeId, ExecutionStateEvaluation), // the resulting total state of this step
-        Vec<(OperationId, OperationFnOutput)>, // values emitted by operations during this step
-    )> {
-        println!("external_step_execution");
-        let state = self.get_state_at_id(prev_execution_id);
-        if let Some(state) = state {
-            self.step_execution_with_previous_state(&state).await
-        } else {
-            panic!("No state found for id {:?}", prev_execution_id);
-        }
-    }
-
-    #[tracing::instrument]
     pub async fn immutable_external_step_execution(
-        source_id: ExecutionNodeId,
         state: ExecutionStateEvaluation,
     ) -> anyhow::Result<(
         ExecutionNodeId,
         ExecutionStateEvaluation, // the resulting total state of this step
         Vec<(OperationId, OperationFnOutput)>, // values emitted by operations during this step
     )> {
-        println!("step_execution_with_previous_state {:?} {:?}", &source_id, &state);
+        println!("step_execution_with_previous_state {:?}", &state);
         let previous_state = match &state {
             ExecutionStateEvaluation::Complete(state1) => state1,
             _ => { panic!("Stepping execution should only occur against completed states") }
         };
+        let resolved_state_id = previous_state.id;
         let eval_state = previous_state.determine_next_operation()?;
         let (new_state, outputs) = previous_state.step_execution(eval_state).await?;
-        Ok((source_id, new_state, outputs))
+        Ok((resolved_state_id, new_state, outputs))
     }
 }
 
@@ -509,23 +473,23 @@ mod tests {
         let mut db = ExecutionGraph::new();
         let mut state = ExecutionState::new_with_random_id();
         let state_id = Uuid::nil();
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+        let (id_a, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::new(),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
                 ),
-                                                    Uuid::nil());
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                                                    Uuid::new_v4());
+        let (id_b, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::new(),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(2))) }.boxed()),
                 ),
-                                                    Uuid::nil());
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                                                    Uuid::new_v4());
+        let (id_c, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::from_args_list(vec!["a", "b"]),
@@ -546,14 +510,14 @@ mod tests {
                         }.boxed()
                     }),
                 ),
-                                                    None);
+                                                    Uuid::new_v4());
 
         let mut state =
             state.apply_dependency_graph_mutations(vec![DependencyGraphMutation::Create {
-                operation_id: 2,
+                operation_id: id_c,
                 depends_on: vec![
-                    (0, DependencyReference::Positional(0)),
-                    (1, DependencyReference::Positional(1)),
+                    (id_a, DependencyReference::Positional(0)),
+                    (id_b, DependencyReference::Positional(1)),
                 ],
             }]);
 
@@ -561,25 +525,23 @@ mod tests {
         let arg1 = RSV::Number(2);
 
         // Manually manipulating the state to insert the arguments for this test
-        state.state_insert(0, OperationFnOutput {
+        state.state_insert(id_a, OperationFnOutput {
             has_error: false,
             execution_state: None,
             output: Ok(arg0),
             stdout: vec![],
             stderr: vec![],
         });
-        state.state_insert(1, OperationFnOutput {
+        state.state_insert(id_b, OperationFnOutput {
             has_error: false,
             execution_state: None,
             output: Ok(arg1),
             stdout: vec![],
             stderr: vec![],
         });
-
-        let ((_, new_state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state.clone())).await?;
-
-        assert!(new_state.state_get_value(&2).is_some());
-        let result = new_state.state_get_value(&2).unwrap();
+        let (_, new_state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state.clone())).await?;
+        assert!(new_state.state_get_value(&id_c).is_some());
+        let result = new_state.state_get_value(&id_c).unwrap();
         assert_eq!(result, &Ok(RSV::Number(3)));
         Ok(())
     }
@@ -594,36 +556,37 @@ mod tests {
         let mut db = ExecutionGraph::new();
         let mut state = ExecutionState::new_with_random_id();
         let state_id = Uuid::nil();
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+        let (id_a, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::new(),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(0))) }.boxed()),
                 ),
-                                                    None);
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                                                    Uuid::new_v4());
+        let (id_b, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::new(),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
                 ),
-                                                    None);
+                                                    Uuid::new_v4());
         let mut state =
             state.apply_dependency_graph_mutations(vec![DependencyGraphMutation::Create {
-                operation_id: 1,
-                depends_on: vec![(0, DependencyReference::Positional(0))],
+                operation_id: id_b,
+                depends_on: vec![(id_a, DependencyReference::Positional(0))],
             }]);
 
-        let ((_, new_state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
+        let (_, new_state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state.clone())).await?;
         assert_eq!(
-            new_state.state_get_value(&0).unwrap(),
+            new_state.state_get_value(&id_a).unwrap(),
             &Ok(RkyvSerializedValue::Number(0))
         );
-        let ((_, new_state), _) = db.step_execution_with_previous_state(&new_state).await?;
+
+        let (_, new_state, _) = ExecutionGraph::immutable_external_step_execution(new_state).await?;
         assert_eq!(
-            new_state.state_get_value(&1).unwrap(),
+            new_state.state_get_value(&id_b).unwrap(),
             &Ok(RkyvSerializedValue::Number(1))
         );
         Ok(())
@@ -643,62 +606,62 @@ mod tests {
         let mut state = ExecutionState::new_with_random_id();
         let state_id = Uuid::nil();
 
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+        let (id_a, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::new(),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(0))) }.boxed()),
                 ),
-                                                    None);
+                                                    Uuid::new_v4());
 
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+        let (id_b, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::from_args_list(vec!["0"]),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
                 ),
-                                                    None);
+                                                    Uuid::new_v4());
 
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+        let (id_c, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::from_args_list(vec!["0"]),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(2))) }.boxed()),
                 ),
-                                                    None);
+                                                    Uuid::new_v4());
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
-                operation_id: 1,
-                depends_on: vec![(0, DependencyReference::Positional(0))],
+                operation_id: id_b,
+                depends_on: vec![(id_a, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
-                operation_id: 2,
-                depends_on: vec![(1, DependencyReference::Positional(0))],
+                operation_id: id_c,
+                depends_on: vec![(id_b, DependencyReference::Positional(0))],
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
-        assert_eq!(state.state_get_value(&1), None);
-        assert_eq!(state.state_get_value(&2), None);
-        if let ExecutionStateEvaluation::Complete(s) = &state {
-            assert_eq!(s.exec_queue, VecDeque::from(vec![1,2]));
-        }
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
-        assert_eq!(state.state_get_value(&2), None);
-        if let ExecutionStateEvaluation::Complete(s) = &state {
-            assert_eq!(s.exec_queue, VecDeque::from(vec![2]));
-        }
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
-        if let ExecutionStateEvaluation::Complete(s) = &state {
-            assert_eq!(s.exec_queue, VecDeque::from(vec![]));
-        }
+        let (state_id, new_state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state.clone())).await?;
+        assert_eq!(state.state_get_value(&id_b), None);
+        assert_eq!(state.state_get_value(&id_c), None);
+        // if let ExecutionStateEvaluation::Complete(s) = &state {
+        //     assert_eq!(s.exec_queue, VecDeque::from(vec![1,2]));
+        // }
+        let (state_id, new_state, _) = ExecutionGraph::immutable_external_step_execution(new_state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&id_c), None);
+        // if let ExecutionStateEvaluation::Complete(s) = &state {
+        //     assert_eq!(s.exec_queue, VecDeque::from(vec![2]));
+        // }
+        let (state_id, new_state, _) = ExecutionGraph::immutable_external_step_execution(new_state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(2))));
+        // if let ExecutionStateEvaluation::Complete(s) = &state {
+        //     assert_eq!(s.exec_queue, VecDeque::from(vec![]));
+        // }
         db.shutdown().await;
         Ok(())
     }
@@ -717,48 +680,54 @@ mod tests {
         let mut state = ExecutionState::new_with_random_id();
         let state_id = Uuid::nil();
 
+        let mut ids = vec![];
         for x in 0..4 {
-            let (_, mut nstate) = state.upsert_operation(OperationNode::new(
+            let (id, mut nstate) = state.upsert_operation(OperationNode::new(
                         None,
                         Uuid::nil(),
                         if x == 0 { InputSignature::new() } else { InputSignature::from_args_list(vec!["0"]) },
                         OutputSignature::new(),
                         Box::new(move |_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(x))) }.boxed()),
                     ),
-                                                        None);
+                                                        Uuid::new_v4());
+            ids.push(id);
             state = nstate
         }
+        let id_a = ids[0];
+        let id_b = ids[1];
+        let id_c = ids[2];
+        let id_d = ids[3];
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
-                operation_id: 1,
-                depends_on: vec![(0, DependencyReference::Positional(0))],
+                operation_id: id_b,
+                depends_on: vec![(id_a, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
-                operation_id: 2,
-                depends_on: vec![(1, DependencyReference::Positional(0))],
+                operation_id: id_c,
+                depends_on: vec![(id_b, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
-                operation_id: 3,
-                depends_on: vec![(1, DependencyReference::Positional(0))],
+                operation_id: id_d,
+                depends_on: vec![(id_c, DependencyReference::Positional(0))],
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
-        assert_eq!(state.state_get_value(&1), None);
-        assert_eq!(state.state_get_value(&2), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
-        assert_eq!(state.state_get_value(&2), None);
-        assert_eq!(state.state_get_value(&3), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
-        assert_eq!(state.state_get_value(&3), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
-        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(3))));
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
+        assert_eq!(state.state_get_value(&id_b), None);
+        assert_eq!(state.state_get_value(&id_c), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&id_c), None);
+        assert_eq!(state.state_get_value(&id_d), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&id_d), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&id_d), Some(&Ok(RSV::Number(3))));
         db.shutdown().await;
         Ok(())
     }
@@ -778,61 +747,68 @@ mod tests {
 
         let mut state = ExecutionState::new_with_random_id();
         let state_id = Uuid::nil();
+        let mut ids = vec![];
         for x in 0..5 {
-            let (_, mut nstate) = state.upsert_operation(OperationNode::new(
+            let (id, mut nstate) = state.upsert_operation(OperationNode::new(
                         None,
                         Uuid::nil(),
                         if x == 0 { InputSignature::new() } else if x == 4 {InputSignature::from_args_list(vec!["1", "2"]) } else { InputSignature::from_args_list(vec!["1"]) },
                         OutputSignature::new(),
                         Box::new(move |_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(x))) }.boxed()),
                     ),
-                                                        None);
+                                                        Uuid::new_v4());
+            ids.push(id);
             state = nstate
         }
+        let id_a = ids[0];
+        let id_b = ids[1];
+        let id_c = ids[2];
+        let id_d = ids[3];
+        let id_e = ids[4];
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
-                operation_id: 1,
-                depends_on: vec![(0, DependencyReference::Positional(0))],
+                operation_id: id_b,
+                depends_on: vec![(id_a, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
-                operation_id: 2,
-                depends_on: vec![(1, DependencyReference::Positional(0))],
+                operation_id: id_c,
+                depends_on: vec![(id_b, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
-                operation_id: 3,
-                depends_on: vec![(1, DependencyReference::Positional(0))],
+                operation_id: id_d,
+                depends_on: vec![(id_b, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
-                operation_id: 4,
+                operation_id: id_e,
                 depends_on: vec![
-                    (2, DependencyReference::Positional(0)),
-                    (3, DependencyReference::Positional(1)),
+                    (id_c, DependencyReference::Positional(0)),
+                    (id_d, DependencyReference::Positional(1)),
                 ],
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
-        assert_eq!(state.state_get_value(&1), None);
-        assert_eq!(state.state_get_value(&2), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
-        assert_eq!(state.state_get_value(&2), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
-        assert_eq!(state.state_get_value(&3), None);
-        assert_eq!(state.state_get_value(&4), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
-        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(3))));
-        assert_eq!(state.state_get_value(&4), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
-        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(3))));
-        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(4))));
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
+        assert_eq!(state.state_get_value(&id_b), None);
+        assert_eq!(state.state_get_value(&id_c), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&id_c), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&id_d), None);
+        assert_eq!(state.state_get_value(&id_e), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&id_d), Some(&Ok(RSV::Number(3))));
+        assert_eq!(state.state_get_value(&id_e), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&id_d), Some(&Ok(RSV::Number(3))));
+        assert_eq!(state.state_get_value(&id_e), Some(&Ok(RSV::Number(4))));
         Ok(())
     }
 
@@ -855,14 +831,14 @@ mod tests {
         let state_id = Uuid::nil();
 
         // We start with the number 1 at node 0
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+        let (id_a, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::new(),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
                 ),
-                                                    None);
+                                                    Uuid::new_v4());
 
         // Each node adds 1 to the inbound item (all nodes only have one dependency per index)
         let f1 = |_: &ExecutionState, args: RkyvSerializedValue, _, _| {
@@ -879,145 +855,145 @@ mod tests {
             }.boxed()
         };
 
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+        let (id_b, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
                     Box::new(f1),
                 ),
-                                                    None);
+                                                    Uuid::new_v4());
 
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+        let (id_c, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
                     Box::new(f1),
                 ),
-                                                    None);
+                                                    Uuid::new_v4());
 
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+        let (id_d, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
                     Box::new(f1),
                 ),
-                                                    None);
+                                                    Uuid::new_v4());
 
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+        let (id_e, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
                     Box::new(f1),
                 ),
-                                                    None);
+                                                    Uuid::new_v4());
 
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+        let (id_f, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::from_args_list(vec!["1"]),
                     OutputSignature::new(),
                     Box::new(f1),
                 ),
-                                                    None);
+                                                    Uuid::new_v4());
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
-                operation_id: 1,
+                operation_id: id_b,
                 depends_on: vec![
-                    (0, DependencyReference::Positional(0)),
-                    (3, DependencyReference::Positional(0)),
+                    (id_a, DependencyReference::Positional(0)),
+                    (id_d, DependencyReference::Positional(0)),
                 ],
             },
             DependencyGraphMutation::Create {
-                operation_id: 2,
-                depends_on: vec![(1, DependencyReference::Positional(0))],
+                operation_id: id_c,
+                depends_on: vec![(id_b, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
-                operation_id: 3,
-                depends_on: vec![(4, DependencyReference::Positional(0))],
+                operation_id: id_d,
+                depends_on: vec![(id_e, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
-                operation_id: 4,
-                depends_on: vec![(2, DependencyReference::Positional(0))],
+                operation_id: id_e,
+                depends_on: vec![(id_c, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
-                operation_id: 5,
-                depends_on: vec![(4, DependencyReference::Positional(0))],
+                operation_id: id_f,
+                depends_on: vec![(id_e, DependencyReference::Positional(0))],
             },
         ]);
 
         // We expect to see the value at each node increment repeatedly.
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
-        assert_eq!(state.state_get_value(&1), None);
-        assert_eq!(state.state_get_value(&2), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
+        assert_eq!(state.state_get_value(&id_b), None);
+        assert_eq!(state.state_get_value(&id_c), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
 
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(2))));
-        assert_eq!(state.state_get_value(&2), None);
-        assert_eq!(state.state_get_value(&3), None);
-        assert_eq!(state.state_get_value(&4), None);
-        assert_eq!(state.state_get_value(&5), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(2))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(3))));
-        assert_eq!(state.state_get_value(&3), None);
-        assert_eq!(state.state_get_value(&4), None);
-        assert_eq!(state.state_get_value(&5), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(2))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(3))));
-        assert_eq!(state.state_get_value(&3), None);
-        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(4))));
-        assert_eq!(state.state_get_value(&5), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(2))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(3))));
-        assert_eq!(state.state_get_value(&3), None);
-        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(4))));
-        assert_eq!(state.state_get_value(&5), Some(&Ok(RSV::Number(5))));
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(2))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(3))));
-        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(5))));
-        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(4))));
-        assert_eq!(state.state_get_value(&5), Some(&Ok(RSV::Number(5))));
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(6))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(3))));
-        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(5))));
-        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(4))));
-        assert_eq!(state.state_get_value(&5), Some(&Ok(RSV::Number(5))));
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(6))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(7))));
-        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(5))));
-        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(4))));
-        assert_eq!(state.state_get_value(&5), Some(&Ok(RSV::Number(5))));
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&id_c), None);
+        assert_eq!(state.state_get_value(&id_d), None);
+        assert_eq!(state.state_get_value(&id_e), None);
+        assert_eq!(state.state_get_value(&id_f), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(3))));
+        assert_eq!(state.state_get_value(&id_d), None);
+        assert_eq!(state.state_get_value(&id_e), None);
+        assert_eq!(state.state_get_value(&id_f), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(3))));
+        assert_eq!(state.state_get_value(&id_d), None);
+        assert_eq!(state.state_get_value(&id_e), Some(&Ok(RSV::Number(4))));
+        assert_eq!(state.state_get_value(&id_f), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(3))));
+        assert_eq!(state.state_get_value(&id_d), None);
+        assert_eq!(state.state_get_value(&id_e), Some(&Ok(RSV::Number(4))));
+        assert_eq!(state.state_get_value(&id_f), Some(&Ok(RSV::Number(5))));
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(3))));
+        assert_eq!(state.state_get_value(&id_d), Some(&Ok(RSV::Number(5))));
+        assert_eq!(state.state_get_value(&id_e), Some(&Ok(RSV::Number(4))));
+        assert_eq!(state.state_get_value(&id_f), Some(&Ok(RSV::Number(5))));
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(6))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(3))));
+        assert_eq!(state.state_get_value(&id_d), Some(&Ok(RSV::Number(5))));
+        assert_eq!(state.state_get_value(&id_e), Some(&Ok(RSV::Number(4))));
+        assert_eq!(state.state_get_value(&id_f), Some(&Ok(RSV::Number(5))));
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(6))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(7))));
+        assert_eq!(state.state_get_value(&id_d), Some(&Ok(RSV::Number(5))));
+        assert_eq!(state.state_get_value(&id_e), Some(&Ok(RSV::Number(4))));
+        assert_eq!(state.state_get_value(&id_f), Some(&Ok(RSV::Number(5))));
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
         if let ExecutionStateEvaluation::Complete(s) = &state {
             s.render_dependency_graph();
         }
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(6))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(7))));
-        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(5))));
-        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(8))));
-        assert_eq!(state.state_get_value(&5), Some(&Ok(RSV::Number(5))));
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(6))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(7))));
-        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(5))));
-        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(8))));
-        assert_eq!(state.state_get_value(&5), Some(&Ok(RSV::Number(9))));
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(6))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(7))));
-        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(9))));
-        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(8))));
-        assert_eq!(state.state_get_value(&5), Some(&Ok(RSV::Number(9))));
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(6))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(7))));
+        assert_eq!(state.state_get_value(&id_d), Some(&Ok(RSV::Number(5))));
+        assert_eq!(state.state_get_value(&id_e), Some(&Ok(RSV::Number(8))));
+        assert_eq!(state.state_get_value(&id_f), Some(&Ok(RSV::Number(5))));
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(6))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(7))));
+        assert_eq!(state.state_get_value(&id_d), Some(&Ok(RSV::Number(5))));
+        assert_eq!(state.state_get_value(&id_e), Some(&Ok(RSV::Number(8))));
+        assert_eq!(state.state_get_value(&id_f), Some(&Ok(RSV::Number(9))));
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(6))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(7))));
+        assert_eq!(state.state_get_value(&id_d), Some(&Ok(RSV::Number(9))));
+        assert_eq!(state.state_get_value(&id_e), Some(&Ok(RSV::Number(8))));
+        assert_eq!(state.state_get_value(&id_f), Some(&Ok(RSV::Number(9))));
         Ok(())
     }
 
@@ -1036,14 +1012,14 @@ mod tests {
         let state_id = Uuid::nil();
 
         // We start with the number 1 at node 0
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+        let (id_a, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::new(),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
                 ),
-                                                    None);
+                                                    Uuid::new_v4());
 
         // Globally mutates this value, making each call to this function side-effecting
         static atomic_usize: AtomicUsize = AtomicUsize::new(0);
@@ -1062,52 +1038,52 @@ mod tests {
             }.boxed()
         };
 
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+        let (id_b, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::from_args_list(vec!["0"]),
                     OutputSignature::new(),
                     Box::new(f_side_effect),
                 ),
-                                                    None);
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                                                    Uuid::new_v4());
+        let (id_c, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::from_args_list(vec!["0"]),
                     OutputSignature::new(),
                     Box::new(f_side_effect),
                 ),
-                                                    None);
+                                                    Uuid::new_v4());
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
-                operation_id: 1,
-                depends_on: vec![(0, DependencyReference::Positional(0))],
+                operation_id: id_b,
+                depends_on: vec![(id_a, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
-                operation_id: 2,
-                depends_on: vec![(1, DependencyReference::Positional(0))],
+                operation_id: id_c,
+                depends_on: vec![(id_b, DependencyReference::Positional(0))],
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
-        assert_eq!(state.state_get_value(&1), None);
-        assert_eq!(state.state_get_value(&2), None);
-        let ((x_state_id, x_state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(x_state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
-        assert_eq!(x_state.state_get_value(&2), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
+        assert_eq!(state.state_get_value(&id_b), None);
+        assert_eq!(state.state_get_value(&id_c), None);
+        let (x_state_id, x_state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(x_state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
+        assert_eq!(x_state.state_get_value(&id_c), None);
 
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&x_state.clone()).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(x_state.clone()).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(2))));
 
         // When we re-evaluate from a previous point, we should get a new branch
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&x_state).await?;
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(x_state.clone()).await?;
         // The state_id.0 being incremented indicates that we're on a new branch
         // TODO: test some structural indiciation of what branch we're on
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
         // Op 2 should re-evaluate to 3, since it's on a new branch but continuing to mutate the stateful counter
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(3))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(3))));
         Ok(())
     }
 
@@ -1126,14 +1102,14 @@ mod tests {
         let state_id = Uuid::nil();
 
         // We start with the number 0 at node 0
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+        let (id_a, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::new(),
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(0))) }.boxed()),
                 ),
-                                                    None);
+                                                    Uuid::new_v4());
 
         let f_v1 = |_: &ExecutionState, args: RkyvSerializedValue, _, _| {
             async move {
@@ -1163,43 +1139,43 @@ mod tests {
             }.boxed()
         };
 
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+        let (id_b, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::from_args_list(vec!["0"]),
                     OutputSignature::new(),
                     Box::new(f_v1),
                 ),
-                                                    None);
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+                                                    Uuid::new_v4());
+        let (id_c, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
                     InputSignature::from_args_list(vec!["0"]),
                     OutputSignature::new(),
                     Box::new(f_v1),
                 ),
-                                                    None);
+                                                    Uuid::new_v4());
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
-                operation_id: 1,
-                depends_on: vec![(0, DependencyReference::Positional(0))],
+                operation_id: id_b,
+                depends_on: vec![(id_a, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
-                operation_id: 2,
-                depends_on: vec![(1, DependencyReference::Positional(0))],
+                operation_id: id_c,
+                depends_on: vec![(id_b, DependencyReference::Positional(0))],
             },
         ]);
 
-        let ((x_state_id, mut x_state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
-        assert_eq!(x_state.state_get_value(&1), None);
-        assert_eq!(x_state.state_get_value(&2), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&x_state.clone()).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
-        assert_eq!(state.state_get_value(&2), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
+        let (x_state_id, mut x_state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
+        assert_eq!(x_state.state_get_value(&id_b), None);
+        assert_eq!(x_state.state_get_value(&id_c), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(x_state.clone()).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&id_c), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(2))));
 
         // Change the definition of the operation "1" to add 200 instead of 1, then re-evaluate
         if let ExecutionStateEvaluation::Complete(x_state) = x_state {
@@ -1209,13 +1185,13 @@ mod tests {
                 InputSignature::from_args_list(vec!["0"]),
                 OutputSignature::new(),
                 Box::new(f_v2),
-            ), Some(1));
-            let ((state_id, state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state.clone())).await?;
-            assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(200))));
-            assert_eq!(state.state_get_value(&2), None);
-            let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-            assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(200))));
-            assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(201))));
+            ), id_b);
+            let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state.clone())).await?;
+            assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(200))));
+            assert_eq!(state.state_get_value(&id_c), None);
+            let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+            assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(200))));
+            assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(201))));
         }
         Ok(())
 
@@ -1242,64 +1218,71 @@ mod tests {
         let mut state = ExecutionState::new_with_random_id();
         let state_id = Uuid::nil();
 
+        let mut ids = vec![];
         for x in 0..5 {
-            let (_, mut nstate) = state.upsert_operation(OperationNode::new(
+            let (id, mut nstate) = state.upsert_operation(OperationNode::new(
                 None,
                 Uuid::nil(),
                 if x == 0 { InputSignature::new() } else if x == 4 {InputSignature::from_args_list(vec!["1", "2"]) } else { InputSignature::from_args_list(vec!["1"]) },
                 OutputSignature::new(),
                 Box::new(move |_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(x))) }.boxed()),
             ),
-                                                         None);
+                                                         Uuid::new_v4());
+            ids.push(id);
             state = nstate
         }
+        let id_a = ids[0];
+        let id_b = ids[1];
+        let id_c = ids[2];
+        let id_d = ids[3];
+        let id_e = ids[4];
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
-                operation_id: 1,
-                depends_on: vec![(0, DependencyReference::Positional(0))],
+                operation_id: id_b,
+                depends_on: vec![(id_a, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
-                operation_id: 2,
-                depends_on: vec![(1, DependencyReference::Positional(0))],
+                operation_id: id_c,
+                depends_on: vec![(id_b, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
-                operation_id: 3,
-                depends_on: vec![(1, DependencyReference::Positional(0))],
+                operation_id: id_d,
+                depends_on: vec![(id_c, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
-                operation_id: 4,
+                operation_id: id_e,
                 depends_on: vec![
-                    (2, DependencyReference::Positional(0)),
-                    (3, DependencyReference::Positional(1)),
+                    (id_c, DependencyReference::Positional(0)),
+                    (id_d, DependencyReference::Positional(1)),
                 ],
             },
         ]);
 
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
-        assert_eq!(state.state_get_value(&1), None);
-        assert_eq!(state.state_get_value(&2), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
-        assert_eq!(state.state_get_value(&2), None);
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
-        assert_eq!(state.state_get_value(&3), None);
-        assert_eq!(state.state_get_value(&4), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
+        assert_eq!(state.state_get_value(&id_b), None);
+        assert_eq!(state.state_get_value(&id_c), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&id_c), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&id_d), None);
+        assert_eq!(state.state_get_value(&id_e), None);
 
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
-        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(3))));
-        assert_eq!(state.state_get_value(&4), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&id_d), Some(&Ok(RSV::Number(3))));
+        assert_eq!(state.state_get_value(&id_e), None);
 
         // This is the final state we're arriving at in execution
-        let ((state_id, state), _) = db.step_execution_with_previous_state(&state).await?;
-        assert_eq!(state.state_get_value(&1), Some(&Ok(RSV::Number(1))));
-        assert_eq!(state.state_get_value(&2), Some(&Ok(RSV::Number(2))));
-        assert_eq!(state.state_get_value(&3), Some(&Ok(RSV::Number(3))));
-        assert_eq!(state.state_get_value(&4), Some(&Ok(RSV::Number(4))));
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(2))));
+        assert_eq!(state.state_get_value(&id_d), Some(&Ok(RSV::Number(3))));
+        assert_eq!(state.state_get_value(&id_e), Some(&Ok(RSV::Number(4))));
 
         // TODO: convert this to an actual test
         // dbg!(db.get_merged_state_history(state_id));
@@ -1325,10 +1308,10 @@ mod tests {
             InputSignature::new(),
             OutputSignature::new(),
             Box::new(|_, _, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
-        ), None);
+        ), Uuid::new_v4());
         let init_state_id = state.id.clone();
 
-        let ((state_id, _), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
 
         let (edges, stack_hierarchy) = db.get_execution_graph_elements();
         assert_eq!(edges.len(), 1);
@@ -1344,32 +1327,37 @@ mod tests {
         let mut state = ExecutionState::new_with_random_id();
 
         let mut last_state_id = Uuid::nil();
+        let mut ids = vec![];
         for i in 0..3 {
-            let (_, mut new_state) = state.upsert_operation(OperationNode::new(
+            let (id, mut new_state) = state.upsert_operation(OperationNode::new(
                 None,
                 Uuid::nil(),
                 InputSignature::new(),
                 OutputSignature::new(),
                 Box::new(move |_, _, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(i))) }.boxed()),
-            ), None);
+            ), Uuid::new_v4());
+            ids.push(id);
             state = new_state;
         }
+        let id_a = ids[0];
+        let id_b = ids[1];
+        let id_c = ids[2];
 
         state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
-                operation_id: 1,
-                depends_on: vec![(0, DependencyReference::Positional(0))],
+                operation_id: id_b,
+                depends_on: vec![(id_a, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
-                operation_id: 2,
-                depends_on: vec![(1, DependencyReference::Positional(0))],
+                operation_id: id_c,
+                depends_on: vec![(id_b, DependencyReference::Positional(0))],
             },
         ]);
         let init_state_id = state.id.clone();
 
-        let ((state_id1, state), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
-        let ((state_id2, state), _) = db.step_execution_with_previous_state(&state).await?;
-        let ((state_id3, _), _) = db.step_execution_with_previous_state(&state).await?;
+        let (state_id1, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
+        let (state_id2, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        let (state_id3, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
 
         let (edges, stack_hierarchy) = db.get_execution_graph_elements();
 
@@ -1399,14 +1387,14 @@ mod tests {
             Box::new(|_, _, _, _| async move {
                 Ok(OperationFnOutput::with_value(RSV::Number(1)))
             }.boxed()),
-        ), None);
+        ), Uuid::new_v4());
         let init_state_id = state.id.clone();
 
         // Simulate a stack by manually setting it in the state
         let stack = VecDeque::from(vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()]);
         state.stack = stack.clone();
 
-        let ((state_id, _), _) = db.step_execution_with_previous_state(&ExecutionStateEvaluation::Complete(state)).await?;
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
 
         let (edges, stack_hierarchy) = db.get_execution_graph_elements();
 

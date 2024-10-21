@@ -666,6 +666,7 @@ fn create_python_dispatch_closure(py: Python, clone_function_name: String, execu
             let clone_function_name = clone_function_name.clone();
             let parent_span_id = parent_span_id.clone();
             let py = args.py();
+            // TODO: this should be after the dispatch, substituting it
             let mut new_exec_state = {
                 let mut exec_state = execution_state_handle.lock().unwrap();
                 let mut new_exec_state = exec_state.clone();
@@ -941,7 +942,9 @@ a = 20 + await demo()
         "#,
         );
         let mut state = ExecutionState::new_with_random_id();
+        let id_a = Uuid::new_v4();
         let (state, _) = state.update_operation(CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! {r#"
@@ -949,7 +952,7 @@ a = 20 + await demo()
                             return 100
                         "#}),
             function_invocation: None,
-        }, TextRange::default()), Some(0))?;
+        }, TextRange::default()), id_a)?;
         let result = source_code_run_python(&state,
                                             &source_code,
                                             &RkyvObjectBuilder::new()
@@ -973,7 +976,9 @@ a = 20 + await demo()
     #[tokio::test]
     async fn test_running_async_function_dependency() -> anyhow::Result<()> {
         let mut state = ExecutionState::new_with_random_id();
+        let id_a = Uuid::new_v4();
         let (state, _) = state.update_operation(CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! {r#"
@@ -983,7 +988,7 @@ a = 20 + await demo()
                             return 100
                         "#}),
             function_invocation: None,
-        }, TextRange::default()), Some(0))?;
+        }, TextRange::default()), id_a)?;
         let result = source_code_run_python(&state,
                                             &String::from( r#"data = await demo()"#, ),
                                             &RkyvObjectBuilder::new()
@@ -1014,7 +1019,9 @@ data = await demo()
         "#,
         );
         let mut state = ExecutionState::new_with_random_id();
+        let id_a = Uuid::new_v4();
         let (mut state, _) = state.update_operation(CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! {r#"
@@ -1024,8 +1031,10 @@ data = await demo()
                             return 100 + await demo_second_function_call()
                         "#}),
             function_invocation: None,
-        }, TextRange::default()), Some(0))?;
+        }, TextRange::default()), id_a)?;
+        let id_b = Uuid::new_v4();
         let (state, _) = state.update_operation(CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! {r#"
@@ -1035,7 +1044,7 @@ data = await demo()
                             return 100
                         "#}),
             function_invocation: None,
-        }, TextRange::default()), Some(1))?;
+        }, TextRange::default()), id_b)?;
         let result = source_code_run_python(&state,
                                             &source_code,
                                             &RkyvObjectBuilder::new()
@@ -1059,7 +1068,9 @@ data = await demo()
     async fn test_internal_function_invocation_chain_with_observability() -> anyhow::Result<()> {
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<ExecutionGraphSendPayload>(1028);
         let mut state_a = ExecutionState::new_with_graph_sender(Uuid::nil(), Arc::new(sender.clone()));
+        let id_a = Uuid::new_v4();
         let (state, _) = state_a.update_operation(CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! {r#"
@@ -1077,7 +1088,7 @@ data = await demo()
                             return 100 + await function_b()
                         "#}),
             function_invocation: None,
-        }, TextRange::default()), Some(0))?;
+        }, TextRange::default()), id_a)?;
         let source_code = String::from(
             r#"data = await function_c()"#,
         );

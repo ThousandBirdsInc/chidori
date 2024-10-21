@@ -6,11 +6,11 @@ model: gpt-3.5-turbo
 language: python
 ---
 Generate a function that returns the Fibonacci sequence up to the nth number. 
-The function should be named `fib_sequence` and should accept a single 
+The function should be named `gen_fib_sequence` and should accept a single 
 argument `n` which is the amount of the Fibonacci sequence to generate.
 ```
 
 
 ```python (entry)
-out = gen_fib_sequence(10)
+out = await gen_fib_sequence(10)
 ```

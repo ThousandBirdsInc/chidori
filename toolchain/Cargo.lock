@@ -2652,6 +2652,7 @@ dependencies = [
  "chidori-prompt-format",
  "chidori-static-analysis",
  "chumsky",
+ "clap",
  "crossbeam-utils",
  "dashmap",
  "deno_core",
@@ -2738,13 +2739,15 @@ dependencies = [
  "dashmap",
  "dirs 3.0.2",
  "dirs 5.0.1",
- "egui",
+ "egui 0.28.1",
  "egui_extras",
+ "egui_flex",
  "egui_json_tree",
  "egui_tiles",
  "futures",
  "image 0.24.9",
  "lazy_static",
+ "log",
  "notify-debouncer-full",
  "num",
  "objc",
@@ -2862,6 +2865,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fbb260a053428790f3de475e304ff84cdbc4face759ea7a3e64c1edd938a7fc"
 dependencies = [
  "clap_builder",
+ "clap_derive",
 ]
 
 [[package]]
@@ -2894,6 +2898,18 @@ checksum = "d494102c8ff3951810c72baf96910b980fb065ca5d3101243e6a8dc19747c86b"
 dependencies = [
  "clap",
  "clap_complete",
+]
+
+[[package]]
+name = "clap_derive"
+version = "4.5.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "501d359d5f3dcaf6ecdeee48833ae73ec6e42723a1e52419c79abf9507eec0a0"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.58",
 ]
 
 [[package]]
@@ -5045,8 +5061,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e6b451ff1143f6de0f33fc7f1b68fecfd2c7de06e104de96c4514de3f5396f8"
 dependencies = [
  "bytemuck",
- "emath",
+ "emath 0.28.1",
  "serde",
+]
+
+[[package]]
+name = "ecolor"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "775cfde491852059e386c4e1deb4aef381c617dc364184c6f6afee99b87c402b"
+dependencies = [
+ "emath 0.29.1",
 ]
 
 [[package]]
@@ -5096,10 +5121,22 @@ checksum = "20c97e70a2768de630f161bb5392cbd3874fcf72868f14df0e002e82e06cb798"
 dependencies = [
  "accesskit 0.12.3",
  "ahash 0.8.11",
- "emath",
- "epaint",
+ "emath 0.28.1",
+ "epaint 0.28.1",
  "nohash-hasher",
  "serde",
+]
+
+[[package]]
+name = "egui"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53eafabcce0cb2325a59a98736efe0bf060585b437763f8c476957fb274bb974"
+dependencies = [
+ "ahash 0.8.11",
+ "emath 0.29.1",
+ "epaint 0.29.1",
+ "nohash-hasher",
 ]
 
 [[package]]
@@ -5109,7 +5146,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5bb783d9fa348f69ed5c340aa25af78b5472043090e8b809040e30960cc2a746"
 dependencies = [
  "ahash 0.8.11",
- "egui",
+ "egui 0.28.1",
  "ehttp",
  "enum-map",
  "image 0.25.2",
@@ -5121,12 +5158,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui_flex"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2493033babe116a1493ddaea0198ef2833cc6f4ad3a53de2a02376e8547b4d01"
+dependencies = [
+ "egui 0.29.1",
+ "log",
+]
+
+[[package]]
 name = "egui_json_tree"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c970b56d92f81c31109c0faa38c8989bee9ca733b0671f9148e5d73ea9e1824a"
 dependencies = [
- "egui",
+ "egui 0.28.1",
  "serde_json",
 ]
 
@@ -5137,7 +5184,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ec2e18c8665b7aaccfb560e383d08bfbce9cb905e055417f6bb0ecd63056561"
 dependencies = [
  "ahash 0.8.11",
- "egui",
+ "egui 0.28.1",
  "itertools 0.13.0",
  "log",
  "serde",
@@ -5196,6 +5243,12 @@ dependencies = [
  "bytemuck",
  "serde",
 ]
+
+[[package]]
+name = "emath"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1fe0049ce51d0fb414d029e668dd72eb30bc2b739bf34296ed97bd33df544f3"
 
 [[package]]
 name = "encase"
@@ -5381,11 +5434,25 @@ dependencies = [
  "ab_glyph",
  "ahash 0.8.11",
  "bytemuck",
- "ecolor",
- "emath",
+ "ecolor 0.28.1",
+ "emath 0.28.1",
  "nohash-hasher",
  "parking_lot 0.12.3",
  "serde",
+]
+
+[[package]]
+name = "epaint"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a32af8da821bd4f43f2c137e295459ee2e1661d87ca8779dfa0eaf45d870e20f"
+dependencies = [
+ "ab_glyph",
+ "ahash 0.8.11",
+ "ecolor 0.29.1",
+ "emath 0.29.1",
+ "nohash-hasher",
+ "parking_lot 0.12.3",
 ]
 
 [[package]]

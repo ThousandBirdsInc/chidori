@@ -10,7 +10,7 @@ use std::{any::Any, collections::HashMap, ptr::NonNull};
 
 use geometry::Coord;
 use layout::BoundingBox;
-pub use layout::{BasicLayout, Layout, TidyLayout};
+pub use layout::{BasicLayout, Layout, TidyLayout, Orientation};
 pub use node::Node;
 pub use crate::tidy_tree::node::TreeGraph;
 

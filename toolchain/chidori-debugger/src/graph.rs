@@ -1,5 +1,5 @@
 use crate::chidori::{EguiTree, EguiTreeIdentities, ChidoriState};
-use crate::tidy_tree::{Layout, TidyLayout, TreeGraph};
+use crate::tidy_tree::{Layout, TidyLayout, TreeGraph, Orientation};
 use crate::util::{despawn_screen, egui_render_cell_function_evaluation, egui_render_cell_read, serialized_value_to_json_value};
 use crate::{chidori, CurrentTheme, GameState, RENDER_LAYER_GRAPH_MINIMAP, RENDER_LAYER_GRAPH_VIEW, RENDER_LAYER_TRACE_MINIMAP, RENDER_LAYER_TRACE_VIEW, Theme, util};
 use bevy::app::{App, Update};
@@ -150,7 +150,7 @@ fn keyboard_navigate_graph(
     if time.elapsed_seconds() - keyboard_nav_state.last_move < keyboard_nav_state.move_cooldown {
         return;
     }
-    let (projection, mut camera_transform, mut camera_state) = q_camera.single_mut();
+    let (_, _, mut camera_state) = q_camera.single_mut();
     let current_node = if let Some(node) = selected_node.0 {
         node
     } else {
@@ -238,8 +238,8 @@ fn keyboard_navigate_graph(
 fn update_minimap_camera_configuration(
     mut camera: Query<(&mut Projection, &mut Transform), (With<OnGraphScreen>, With<GraphMinimapCamera>)>,
 ) {
-    let (projection, mut camera_transform) = camera.single_mut();
-    let (mut scale) = match projection.into_inner() {
+    let (projection, _) = camera.single_mut();
+    let (scale) = match projection.into_inner() {
         Projection::Perspective(_) => { unreachable!("This should be orthographic") }
         Projection::Orthographic(ref mut o) => { (&mut o.scaling_mode) }
     };
@@ -251,30 +251,19 @@ fn update_minimap_camera_configuration(
 }
 
 fn update_trace_space_to_camera_configuration(
-    windows: Query<&Window>,
     mut main_camera: Query<(&mut Projection, &mut Transform), (With<GraphMainCamera>, Without<GraphMinimapCamera>)>,
-    mut minimap_camera: Query<(&mut Projection, &mut Transform), (With<GraphMinimapCamera>, Without<GraphMainCamera>)>,
     mut minimap_viewport_indicator: Query<(&mut Transform), (With<GraphMinimapViewportIndicator>, Without<GraphMainCamera>, Without<GraphMinimapCamera>)>,
 ) {
 
-    let window = windows.single();
-    let scale_factor = window.scale_factor();
     let (main_projection, mut main_camera_transform) = main_camera.single_mut();
-    let (mini_projection, mut mini_camera_transform) = minimap_camera.single_mut();
 
     let main_projection = match main_projection.into_inner() {
         Projection::Perspective(_) => { unreachable!("This should be orthographic") }
         Projection::Orthographic(ref mut o) => { o }
     };
-    let mini_projection = match mini_projection.into_inner() {
-        Projection::Perspective(_) => { unreachable!("This should be orthographic") }
-        Projection::Orthographic(ref mut o) => { o }
-    };
 
-    let camera_position = mini_camera_transform.translation;
     let main_viewport_width = main_projection.area.width();
     let main_viewport_height = main_projection.area.height();
-    let viewport_width = mini_projection.area.width();
 
     minimap_viewport_indicator.iter_mut().for_each(|mut transform| {
         transform.translation.x = main_camera_transform.translation.x;
@@ -287,7 +276,6 @@ fn update_trace_space_to_camera_configuration(
 fn set_camera_viewports(
     windows: Query<&Window>,
     mut resize_events: EventReader<WindowResized>,
-    mut main_camera: Query<(&mut Camera, &mut Projection), (With<GraphMainCamera>, Without<GraphMinimapCamera>)>,
     mut minimap_camera: Query<&mut Camera, (With<GraphMinimapCamera>, Without<GraphMainCamera>)>,
 ) {
     let window = windows.single();
@@ -295,13 +283,12 @@ fn set_camera_viewports(
     // let minimap_offset = crate::traces::MINIMAP_OFFSET * scale_factor as u32;
     // let minimap_height = (crate::traces::MINIMAP_HEIGHT as f32 * scale_factor) as u32;
     // let minimap_height_and_offset = crate::traces::MINIMAP_HEIGHT_AND_OFFSET * scale_factor as u32;
-    let (mut main_camera , mut projection) = main_camera.single_mut();
     let mut minimap_camera = minimap_camera.single_mut();
 
     // We need to dynamically resize the camera's viewports whenever the window size changes
     // so then each camera always takes up half the screen.
     // A resize_event is sent when the window is first created, allowing us to reuse this system for initial setup.
-    for resize_event in resize_events.read() {
+    for _ in resize_events.read() {
         minimap_camera.viewport = Some(Viewport {
             physical_position: UVec2::new((window.width() * scale_factor) as u32 - (300 * scale_factor as u32), 0),
             physical_size: UVec2::new((300 * scale_factor as u32), (window.height() * scale_factor) as u32),
@@ -351,40 +338,10 @@ fn mouse_scroll_events(
     mut q_camera: Query<(&mut Projection, &mut Transform, &mut CameraState), (With<OnGraphScreen> , Without<GraphMinimapCamera>, Without<GraphIdxPair>, Without<GraphIdx>)>,
     keyboard_input: Res<ButtonInput<KeyCode>>,
     q_mycoords: Query<&CursorWorldCoords, With<OnGraphScreen>>,
-    node_query: Query<
-        (Entity, &Transform, &GraphIdx, &EguiRenderTarget),
-        (With<GraphIdx>, Without<GraphIdxPair>),
-    >,
-    mut focus_start: Local<Option<Instant>>,
 ) {
     if !graph_resource.is_active {
         return;
     }
-
-    let mut should_return = false;
-    let mut an_element_is_in_focus = false;
-
-    // Prevent scroll panning when we're hovering over an element
-    for (_, _, mut gidx, mut egui_render_target) in node_query.iter() {
-        if egui_render_target.is_focused && egui_render_target.image.is_some() {
-            an_element_is_in_focus = true;
-            if let Some(start_time) = *focus_start {
-                if start_time.elapsed() > Duration::from_millis(100) {
-                    should_return = true;
-                    break;
-                }
-            } else {
-                *focus_start = Some(Instant::now());
-            }
-        }
-    }
-    if !an_element_is_in_focus {
-        *focus_start = None;
-    }
-    if should_return {
-        return;
-    }
-
 
     let (projection, mut camera_transform, mut camera_state) = q_camera.single_mut();
     let mut coords = q_mycoords.single();
@@ -405,11 +362,12 @@ fn mouse_scroll_events(
     let mut camera_y = camera_transform.translation.y;
     for ev in scroll_evr.read() {
         if keyboard_input.pressed(KeyCode::SuperLeft) {
-            let zoom_factor = (projection.scale + ev.y).clamp(1.0, 1000.0) / projection.scale;
+            let zoom_base = (projection.scale + ev.y).clamp(1.0, 1000.0);
+            let zoom_factor = zoom_base / projection.scale;
             camera_x = coords.0.x - zoom_factor * (coords.0.x - camera_transform.translation.x);
             camera_y = coords.0.y - zoom_factor * (coords.0.y - camera_transform.translation.y);
             camera_state.state = CameraStateValue::Free(camera_x, camera_y);
-            projection.scale = (projection.scale + ev.y).clamp(1.0, 1000.0);
+            projection.scale = zoom_base;
             // apply immediately to prevent jitter
             camera_transform.translation.y = camera_y;
             camera_transform.translation.x = camera_x;
@@ -429,7 +387,7 @@ fn touchpad_gestures(
     mut q_camera: Query<(&mut Projection, &GlobalTransform), (With<OnGraphScreen>, Without<GraphMinimapCamera>)>,
     mut evr_touchpad_magnify: EventReader<TouchpadMagnify>,
 ) {
-    let (projection, camera_transform) = q_camera.single_mut();
+    let (projection, _) = q_camera.single_mut();
     let mut projection = match projection.into_inner() {
         Projection::Perspective(_) => {
             unreachable!("This should be orthographic")
@@ -443,12 +401,11 @@ fn touchpad_gestures(
 
 
 fn compute_egui_transform_matrix(
-    mut contexts: EguiContexts,
     mut q_egui_render_target: Query<(&mut EguiRenderTarget, &Transform), (With<EguiRenderTarget>, Without<Window>)>,
     q_window: Query<&Window, With<PrimaryWindow>>,
     q_camera: Query<(&Projection, &Camera, &GlobalTransform), (Without<GraphMinimapCamera>,  With<OnGraphScreen>)>,
 ) {
-    let (projection, camera, camera_transform) = q_camera.single();
+    let (_, camera, camera_transform) = q_camera.single();
     let window = q_window.single();
     let scale_factor = window.scale_factor();
     let viewport_pos = if let Some(viewport) = &camera.viewport {
@@ -456,17 +413,6 @@ fn compute_egui_transform_matrix(
     } else {
         Vec2::ZERO
     };
-    let mut projection = match projection {
-        Projection::Perspective(_) => {
-            unreachable!("This should be orthographic")
-        }
-        Projection::Orthographic(o) => o,
-    };
-    // Attempting to reduce lag at large zooms
-    // if projection.scale > 50.0 {
-    //     println!("above threshold");
-    //     return;
-    // }
     let Some(cursor) = window.cursor_position() else {
         return;
     };
@@ -561,7 +507,7 @@ fn egui_execution_state(
                             if execution_state.fresh_values.contains(key) {
                                 match &value.output.clone() {
                                     Ok(o) => {
-                                        let response = JsonTree::new(format!("{:?}", key), &serialized_value_to_json_value(&o))
+                                        let _ = JsonTree::new(format!("{:?}", key), &serialized_value_to_json_value(&o))
                                             // .default_expand(DefaultExpand::SearchResults(&self.search_input))
                                             .show(ui);
                                     }
@@ -601,13 +547,13 @@ fn egui_execution_state(
             }
             if let Some(args) = &execution_state.evaluating_arguments {
                 ui.label("Evaluating With Arguments");
-                let response = JsonTree::new(format!("evaluating_args"), &serialized_value_to_json_value(&args))
+                let _ = JsonTree::new(format!("evaluating_args"), &serialized_value_to_json_value(&args))
                     // .default_expand(DefaultExpand::SearchResults(&self.search_input))
                     .show(ui);
             }
         }
 
-        if let Some((op_id, cell)) = &execution_state.operation_mutation {
+        if let Some((op_id, _)) = &execution_state.operation_mutation {
             ui.label("Cell Mutation:");
             ui.horizontal(|ui| {
                 ui.add_space(10.0);
@@ -631,7 +577,6 @@ fn egui_execution_state(
 
 fn camera_follow_selection_head(
     mut q_camera: Query<(&Camera, &mut Transform, &CameraState), (With<OnGraphScreen>,  With<GraphMainCamera>, Without<ExecutionSelectionCursor>, Without<GraphMinimapCamera>)>,
-    execution_graph: Res<crate::chidori::ChidoriState>,
     mut execution_selection_query: Query<
         (Entity, &mut Transform),
         (With<ExecutionSelectionCursor>, Without<GraphIdx>, Without<ExecutionHeadCursor>),
@@ -641,7 +586,7 @@ fn camera_follow_selection_head(
         (With<ExecutionHeadCursor>, Without<GraphIdx>, Without<ExecutionSelectionCursor>, Without<GraphMainCamera>),
     >,
 ) {
-    let (camera, mut camera_transform, camera_state) = q_camera.single_mut();
+    let (_, mut camera_transform, camera_state) = q_camera.single_mut();
     let (_, mut t) = execution_head_cursor.single_mut();
 
     if matches!(camera_state.state, CameraStateValue::LockedOnExecHead) {
@@ -663,7 +608,6 @@ fn camera_follow_selection_head(
 
 fn mouse_over_system(
     mut graph_resource: ResMut<GraphResource>,
-    mut commands: Commands,
     buttons: Res<ButtonInput<MouseButton>>,
     q_mycoords: Query<&CursorWorldCoords, With<OnGraphScreen>>,
     mut selected_entity: ResMut<SelectedEntity>,
@@ -672,17 +616,12 @@ fn mouse_over_system(
         (With<GraphIdx>, Without<GraphIdxPair>),
     >,
     mut gizmos: Gizmos,
-    mut contexts: EguiContexts,
     rapier_context: Res<RapierContext>,
-    q_camera: Query<(&Camera, &GlobalTransform), (With<OnGraphScreen>, Without<GraphMinimapCamera>)>,
 ) {
     if !graph_resource.is_active {
         return;
     }
-    let ctx = contexts.ctx_mut();
     // https://docs.rs/bevy/latest/bevy/prelude/enum.CursorIcon.html
-
-    let (camera, camera_transform) = q_camera.single();
     let cursor = q_mycoords.single();
 
     for (_, _, mut gidx, mut egui_render_target) in node_query.iter_mut() {
@@ -701,7 +640,7 @@ fn mouse_over_system(
     let point = Vec2::new(cursor.0.x, cursor.0.y);
     let filter = QueryFilter::default();
     rapier_context.intersections_with_point(point, filter, |entity| {
-        if let Ok((_, t, mut gidx, mut egui_render_target)) = node_query.get_mut(entity) {
+        if let Ok((_, _, mut gidx, mut egui_render_target)) = node_query.get_mut(entity) {
             gidx.is_hovered = true;
             egui_render_target.is_focused = true;
 
@@ -723,7 +662,6 @@ fn mouse_over_system(
 }
 
 fn node_cursor_handling(
-    mut commands: Commands,
     selected_entity: Res<SelectedEntity>,
     mut execution_head_query: Query<
         (Entity, &mut Transform),
@@ -777,25 +715,7 @@ fn save_image_to_png(image: &Image) {
     img_buffer.save(Path::new("./outputimage.png")).expect("Failed to save image");
 }
 
-fn update_node_textures_as_available(
-    mut node_query: Query<
-        (Entity, &Handle<RoundedRectMaterial>, &EguiRenderTarget),
-        (With<GraphIdx>, Without<GraphIdxPair>),
-    >,
-    mut egui_managed_textures: ResMut<EguiManagedTextures>,
-    mut materials_custom: ResMut<Assets<RoundedRectMaterial>>,
-    mut images: Res<Assets<Image>>,
-) {
-    for (e, mat, o) in node_query.iter_mut() {
-        if let Some(mut mat) = materials_custom.get_mut(mat) {
-            if let Some(t) = &o.image {
-                let img = images.get(t).unwrap();
-                // save_image_to_png(img);
-            }
-            // mat.color_texture = o.texture_handle.clone();
-        }
-    }
-}
+
 
 
 fn update_graph_system_renderer(
@@ -819,7 +739,7 @@ fn update_graph_system_renderer(
     mut meshes: ResMut<Assets<Mesh>>,
     mut chidori_state: ResMut<ChidoriState>,
     mut node_index_to_entity: Local<HashMap<usize, Entity>>,
-    // mut node_image_texture_cache: Local<HashMap<String, egui::TextureHandle>>,
+    mut node_image_texture_cache: Local<HashMap<String, egui::TextureHandle>>,
 ) {
     // TODO: something in this logic is affecting the trace rendering
     if !graph_resource.is_active {
@@ -983,20 +903,22 @@ fn update_graph_system_renderer(
                 }
 
 
-                if let Ok((entity, mut transform, gidx, mut egui_ctx, _, _)) = node_query.get_mut(*entity) {
+                if let Ok((entity, mut transform, _, mut egui_ctx, _, _)) = node_query.get_mut(*entity) {
                     let egui_ctx = egui_ctx.into_inner();
                     let ctx = egui_ctx.get_mut();
 
                     // Position the node according to its tidytree layout
-                    transform.translation = transform.translation.lerp(Vec3::new(n.x.to_f32().unwrap(), -n.y.to_f32().unwrap(), -1.0), 0.5);
+                    transform.translation = transform.translation.lerp(Vec3::new(n.x.to_f32().unwrap(), -n.y.to_f32().unwrap() - (n.height.to_f32().unwrap() / 2.0), -1.0), 0.5);
 
                     // Draw text within these elements
                     egui::Area::new(format!("{:?}", entity).into())
                         .fixed_pos(Pos2::new(0.0, 0.0)).show(ctx, |ui| {
 
                         ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
-                        let mut frame = egui::Frame::default().fill(current_theme.theme.card).stroke(current_theme.theme.card_border).inner_margin(16.0).rounding(6.0).begin(ui);
+                        let mut frame = egui::Frame::default().fill(current_theme.theme.card).stroke(current_theme.theme.card_border)
+                            .inner_margin(16.0).rounding(6.0).begin(ui);
                         {
+                            ui.set_min_width(600.0);
                             let mut ui = &mut frame.content_ui;
                             let node1 = *node;
                             let original_style = (*ui.ctx().style()).clone();
@@ -1045,9 +967,10 @@ fn update_graph_system_renderer(
                                             {
                                                 let mut ui = &mut frame.content_ui;
                                                 ui.label("Error");
-                                                egui_execution_state(ui,
-                                                                     &mut chidori_state,
-                                                                     state, &current_theme.theme);
+                                                egui_execution_state(
+                                                    ui,
+                                                    &mut chidori_state,
+                                                    state, &current_theme.theme);
                                             }
                                             frame.end(ui);
                                         }
@@ -1055,31 +978,30 @@ fn update_graph_system_renderer(
                                             ui.label("Eval Failure");
                                         }
                                         ExecutionStateEvaluation::Executing(state) => {
+                                            ui.set_min_width(600.0);
                                             ui.label("Executing");
-                                            egui_execution_state(ui,
-                                                                 &mut chidori_state,
-                                                                 state, &current_theme.theme);
+                                            egui_execution_state(
+                                                ui,
+                                                &mut chidori_state,
+                                                state, &current_theme.theme);
                                         }
                                         ExecutionStateEvaluation::Complete(state)=> {
-                                            for (key, value) in state.state.iter() {
+                                            egui_execution_state(ui, &mut chidori_state, state, &current_theme.theme);
+                                            for (_, value) in state.state.iter() {
                                                 let image_paths = crate::util::find_matching_strings(&value.output.clone().unwrap(), r"(?i)\.(png|jpe?g)$");
-                                                // for (img_path, object_path_to_img) in image_paths {
-                                                //     let texture = if let Some(cached_texture) = node_image_texture_cache.get(&img_path) {
-                                                //         cached_texture.clone()
-                                                //     } else {
-                                                //         let texture = read_image(ui, &img_path);
-                                                //         node_image_texture_cache.insert(img_path.clone(), texture.clone());
-                                                //         texture
-                                                //     };
-                                                //
-                                                //     // Display the image
-                                                //     ui.add(egui::Image::new(&texture));
-                                                // }
-                                            }
+                                                for (img_path, _) in image_paths {
+                                                    let texture = if let Some(cached_texture) = node_image_texture_cache.get(&img_path) {
+                                                        cached_texture.clone()
+                                                    } else {
+                                                        let texture = read_image(ui, &img_path);
+                                                        node_image_texture_cache.insert(img_path.clone(), texture.clone());
+                                                        texture
+                                                    };
 
-                                            egui_execution_state(ui,
-                                                                 &mut chidori_state,
-                                                                  state, &current_theme.theme);
+                                                    // Display the image
+                                                    ui.add(egui::Image::new(&texture));
+                                                }
+                                            }
                                         }
                                     }
                                 } else {
@@ -1088,21 +1010,12 @@ fn update_graph_system_renderer(
                                 }
                             }
 
-
-                            // egui::ScrollArea::new([false, true]) // Horizontal: false, Vertical: true
-                            //         .max_width(700.0)
-                            //         .max_height(400.0)
-                            //         .show(ui, |ui| {
-                            //         });
-
                             ui.set_style(original_style);
                         }
                         frame.end(ui);
                     });
 
                     let used_rect = ctx.used_rect();
-                    // let width = used_rect.width().max(600.0);
-                    // let height = used_rect.height().max(300.0);
                     let width = used_rect.width();
                     let height = used_rect.height();
                     graph_resource.node_dimensions.insert(*node.clone(), (width, height));
@@ -1113,7 +1026,7 @@ fn update_graph_system_renderer(
                 tree_graph.get_children(*n_idx).into_iter().for_each(|child| {
                     let child = &tree_graph.graph[child];
                     let parent_pos = if let Some(entity ) = node_index_to_entity.get(&n.external_id) {
-                        if let Ok((entity, mut transform, gidx, _, _, _)) = node_query.get(*entity) {
+                        if let Ok((_, mut transform, _, _, _, _)) = node_query.get(*entity) {
                             transform.translation.truncate()
                         } else {
                             return;
@@ -1122,7 +1035,7 @@ fn update_graph_system_renderer(
                         return;
                     };
                     let child_pos = if let Some(entity ) = node_index_to_entity.get(&child.external_id) {
-                        if let Ok((entity, mut transform, gidx, _, _, _)) = node_query.get(*entity) {
+                        if let Ok((_, mut transform, _, _, _, _)) = node_query.get(*entity) {
                             transform.translation.truncate()
                         } else {
                             return;
@@ -1239,13 +1152,11 @@ fn read_image(mut ui: &mut Ui, img_path: &String) -> TextureHandle {
 }
 
 fn generate_tree_layout(
-    // tidy: &mut TidyLayout,
-    // tree_graph: &mut crate::tidy_tree::TreeGraph,
     execution_graph: &&StableGraph<ExecutionNodeId, ()>,
     node_dimensions: &DashMap<ExecutionNodeId, (f32, f32)>
 ) -> TreeGraph {
-    let mut tidy = TidyLayout::new(200., 200.);
-    let mut root = crate::tidy_tree::Node::new(0, 10., 10.);
+    let mut tidy = TidyLayout::new(200., 200., Orientation::Vertical);
+    let mut root = crate::tidy_tree::Node::new(0, 600., 80., None);
     let mut tree_graph = crate::tidy_tree::TreeGraph::new(root);
 
     // Initialize nodes within a TreeGraph using our ExecutionGraph
@@ -1255,7 +1166,7 @@ fn generate_tree_layout(
             let dims = node_dimensions.entry(**node).or_insert((600.0, 300.0));
             let mut width = dims.0;
             let mut height = dims.1;
-            let tree_node = crate::tidy_tree::Node::new(x.index(), (width) as f64, (height) as f64);
+            let tree_node = crate::tidy_tree::Node::new(x.index(), (width) as f64, (height) as f64, Some(Orientation::Vertical));
 
             // Get parent of this node and attach it if there is one
             let mut parents = &mut execution_graph
@@ -1263,7 +1174,7 @@ fn generate_tree_layout(
 
             // Only a single parent ever occurs
             if let Some(parent) = &mut parents.next() {
-                let node = tree_graph.add_child(parent.clone(), tree_node);
+                let _ = tree_graph.add_child(parent.clone(), tree_node);
             }
         }
     }
@@ -1284,6 +1195,7 @@ fn generate_tree_layout(
     tree_graph
 }
 
+
 fn update_graph_system_data_structures(
     mut graph_res: ResMut<GraphResource>,
     execution_graph: Res<ChidoriState>,
@@ -1302,7 +1214,6 @@ fn update_graph_system_data_structures(
         graph_res.group_dependency_graph = group_dep_graph;
         graph_res.hash_graph = hash_graph(&execution_graph.execution_graph);
         graph_res.is_layout_dirty = true;
-
     }
 }
 
@@ -1335,8 +1246,8 @@ fn enforce_tiled_viewports(
 ) {
     let window = q_window.single();
     let scale_factor = window.scale_factor() as u32;
-    let (mut main_camera, mut projection) = main_camera.single_mut();
-    let (mut mini_camera, mut projection) = mini_camera.single_mut();
+    let (mut main_camera, _) = main_camera.single_mut();
+    let (mut mini_camera, _) = mini_camera.single_mut();
     if let Some(graph_tile) = tree_identities.graph_tile {
         if let Some(tile) = tree.tree.tiles.get(graph_tile) {
             match tile {
@@ -1440,7 +1351,6 @@ fn update_cursor_materials(
 
 fn graph_setup(
     windows: Query<&Window>,
-    mut config_store: ResMut<GizmoConfigStore>,
     mut commands: Commands,
     execution_graph: Res<ChidoriState>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -1546,7 +1456,7 @@ fn graph_setup(
         OnGraphScreen,
     ));
 
-    let entity_selection_head = commands.spawn((
+    let _ = commands.spawn((
         MaterialMeshBundle {
             mesh: meshes.add(Mesh::from(Rectangle::new(1.0, 1.0))),
             material: cursor_selection_material.clone(),
@@ -1558,7 +1468,7 @@ fn graph_setup(
         OnGraphScreen
     ));
 
-    let entity_execution_head = commands.spawn((
+    let _ = commands.spawn((
         MaterialMeshBundle {
             mesh: meshes.add(Mesh::from(Rectangle::new(1.0, 1.0))),
             material: cursor_head_material,
@@ -1604,7 +1514,6 @@ pub fn graph_plugin(app: &mut App) {
         .add_systems(
             Update,
             (
-                // update_node_textures_as_available,
                 keyboard_navigate_graph,
                 compute_egui_transform_matrix,
                 mouse_pan,

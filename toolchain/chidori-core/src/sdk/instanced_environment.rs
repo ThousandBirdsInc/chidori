@@ -39,7 +39,7 @@ impl std::fmt::Debug for InstancedEnvironment {
 }
 
 impl InstancedEnvironment {
-    fn new() -> InstancedEnvironment {
+    pub(crate) fn new() -> InstancedEnvironment {
         let (tx, rx) = mpsc::channel();
         let mut db = ExecutionGraph::new();
         let execution_event_rx = db.take_execution_event_receiver();
@@ -60,7 +60,7 @@ impl InstancedEnvironment {
 
     // TODO: reload_cells needs to diff the mutations that live on the current branch, with the state
     //       that we see in the shared state when this event is fired.
-    fn reload_cells(&mut self) -> anyhow::Result<()> {
+    pub(crate) fn reload_cells(&mut self) -> anyhow::Result<()> {
         println!("Reloading cells");
         let cells_to_upsert: Vec<_> = {
             let shared_state = self.shared_state.lock().unwrap();
@@ -108,6 +108,8 @@ impl InstancedEnvironment {
         Ok(())
     }
 
+
+
     /// Entrypoint for execution of an instanced environment, handles messages from the host
     // #[tracing::instrument]
     pub async fn run(&mut self) -> anyhow::Result<()> {
@@ -148,25 +150,18 @@ impl InstancedEnvironment {
             let mut should_pause = false;;
             let mut timeout_future_available = false;
             {
-
-                // println!("execution_state count {:?}", executing_states);
-
-                let state = if let Some(state) = self.db.get_state_at_id(self.execution_head_state_id) { state } else {
-                    println!("failed to get state for the target id {:?}", self.execution_head_state_id);
-                    return Err(anyhow::format_err!("failed to get state for the target id {:?}", self.execution_head_state_id));
-                };
-
+                let state = self.get_state_at_current_execution_head_result()?;
                 let exec_head = self.execution_head_state_id;
                 let get_conditional_polling_step = match self.playback_state {
                     PlaybackState::Step => {
                         self.set_playback_state(PlaybackState::Paused);
-                        Some((exec_head, ExecutionGraph::immutable_external_step_execution(exec_head, state)))
+                        Some((exec_head, ExecutionGraph::immutable_external_step_execution(state)))
                     }
                     PlaybackState::Paused => {
                         None
                     }
                     PlaybackState::Running => {
-                        Some((exec_head, ExecutionGraph::immutable_external_step_execution(exec_head, state)))
+                        Some((exec_head, ExecutionGraph::immutable_external_step_execution(state)))
                     }
                 };
 
@@ -204,14 +199,6 @@ impl InstancedEnvironment {
                     println!("completed_result {:?}", completed_result);
                     loop_remaining_futures = remaining_futures;
                     println!("loop_remaining_futures count {:?}", loop_remaining_futures.len());
-
-                    // for fut in remaining_futures {
-                    //     // Extract the identifier and future
-                    //     // let (id, fut) = fut;
-                    //     // We need to re-box the future
-                    //     execution_futures.push_back(fut);
-                    // }
-
 
                     match completed_result {
                         Some(anyhow::Result::Ok((resolved_id, new_state, o)))  => {
@@ -272,11 +259,11 @@ impl InstancedEnvironment {
                 self.set_playback_state(PlaybackState::Step);
             },
             UserInteractionMessage::Play => {
-                self.get_state_at_current_execution_head().render_dependency_graph();
+                // self.get_state_at_current_execution_head().render_dependency_graph();
                 self.set_playback_state(PlaybackState::Running);
             },
             UserInteractionMessage::Pause => {
-                self.get_state_at_current_execution_head().render_dependency_graph();
+                // self.get_state_at_current_execution_head().render_dependency_graph();
                 self.set_playback_state(PlaybackState::Paused);
             },
             UserInteractionMessage::ReloadCells => {
@@ -341,7 +328,7 @@ impl InstancedEnvironment {
                 self.db.push_message(msg).await?;
             }
             UserInteractionMessage::RunCellInIsolation(cell, args) => {
-                self.db.execute_operation_in_isolation(&cell.cell, args).await?;
+                // self.db.execute_operation_in_isolation(&cell.cell, args).await?;
             }
         }
         Ok(())
@@ -362,6 +349,14 @@ impl InstancedEnvironment {
         }
     }
 
+    pub fn get_state_at_current_execution_head_result(&self) -> anyhow::Result<ExecutionStateEvaluation> {
+        let state = if let Some(state) = self.db.get_state_at_id(self.execution_head_state_id) { state } else {
+            println!("failed to get state for the target id {:?}", self.execution_head_state_id);
+            return Err(anyhow::format_err!("failed to get state for the target id {:?}", self.execution_head_state_id));
+        };
+        Ok(state)
+    }
+
     pub fn get_state_at_current_execution_head(&self) -> ExecutionState {
         match self.db.get_state_at_id(self.execution_head_state_id).unwrap() {
             ExecutionStateEvaluation::Complete(s) => s,
@@ -375,17 +370,13 @@ impl InstancedEnvironment {
         println!("Resulted in state with id {:?}, {:?}", &state_id, &state);
         if let Some(sender) = self.runtime_event_sender.as_mut() {
             if let ExecutionStateEvaluation::Complete(s) = &state {
-                // TODO: if there are cells we want to update the shared state with those
                 sender.send(EventsFromRuntime::DefinitionGraphUpdated(s.get_dependency_graph_flattened())).unwrap();
                 let mut cells = vec![];
-                // TODO: keep a separate mapping of cells so we don't need to lock operations
-                // TODO: if this operation is still running we can't acquire this lock
                 for (op_id, cell ) in s.cells_by_id.iter() {
                     cells.push(CellHolder {
                         cell: cell.clone(),
                         op_id: op_id.clone(),
-                        // TODO: this should be op.created_at_state_id.clone() from the associated op
-                        applied_at: Some(Uuid::new_v4()),
+                        applied_at: Some(s.id),
                         needs_update: false,
                     });
                 }
@@ -415,8 +406,10 @@ impl InstancedEnvironment {
     /// Increment the execution graph by one step
     #[tracing::instrument]
     pub(crate) async fn step(&mut self) -> anyhow::Result<Vec<(OperationId, OperationFnOutput)>> {
-        println!("======================= Executing state with id {:?} ======================", self.execution_head_state_id);
-        let ((state_id, state), outputs) = self.db.external_step_execution(self.execution_head_state_id).await?;
+        let exec_head = self.execution_head_state_id;
+        println!("======================= Executing state with id {:?} ======================", &exec_head);
+        let state = self.get_state_at_current_execution_head_result()?;
+        let (state_id, state, outputs) = ExecutionGraph::immutable_external_step_execution(state).await?;
         self.push_update_to_client(&state_id, state);
         Ok(outputs)
     }

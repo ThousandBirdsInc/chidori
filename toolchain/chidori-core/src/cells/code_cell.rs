@@ -1,9 +1,13 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::mpsc::Sender;
 use futures_util::FutureExt;
 use chidori_static_analysis::language::Report;
 use crate::cells::{CodeCell, SupportedLanguage, TextRange};
 use crate::execution::execution::execution_graph::ExecutionNodeId;
 use crate::execution::execution::ExecutionState;
-use crate::execution::primitives::operation::{InputItemConfiguration, InputSignature, InputType, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
+use crate::execution::primitives::operation::{AsyncRPCCommunication, InputItemConfiguration, InputSignature, InputType, OperationFn, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
+use crate::execution::primitives::serialized_value::RkyvSerializedValue;
 
 /// Code cells allow notebooks to evaluate source code in a variety of languages.
 #[tracing::instrument]
@@ -15,7 +19,6 @@ pub fn code_cell(execution_state_id: ExecutionNodeId, cell: &CodeCell, range: &T
                     &cell.source_code,
                 )?;
             let report = chidori_static_analysis::language::python::parse::build_report(&paths);
-
             let (input_signature, output_signature) = signatures_from_report(&report);
 
             let cell = cell.clone();
@@ -24,30 +27,7 @@ pub fn code_cell(execution_state_id: ExecutionNodeId, cell: &CodeCell, range: &T
                 execution_state_id,
                 input_signature,
                 output_signature,
-                Box::new(move |s, x, _, _| {
-                    let closure_span = tracing::span!(tracing::Level::INFO, "pyo3_code_cell");
-                    let _enter = closure_span.enter();
-                    let cell = cell.clone();
-                    let s = s.clone();
-                    async move {
-                        let result = crate::library::std::code::runtime_pyo3::source_code_run_python(
-                            &s,
-                            &cell.source_code,
-                            &x,
-                            &cell.function_invocation,
-                            &None,
-                            &None,
-                        ).await?;
-                        // TODO: don't unwrap the output result here
-                        Ok(OperationFnOutput {
-                            has_error: false,
-                            execution_state: None,
-                            output: result.0,
-                            stdout: result.1,
-                            stderr: result.2,
-                        })
-                    }.boxed()
-                }),
+                code_cell_exec_python(cell),
             ))
         }
         SupportedLanguage::Starlark => Ok(OperationNode::new(
@@ -72,32 +52,63 @@ pub fn code_cell(execution_state_id: ExecutionNodeId, cell: &CodeCell, range: &T
                 execution_state_id,
                 input_signature,
                 output_signature,
-                Box::new(move |s, x, _, _| {
-                    let closure_span = tracing::span!(tracing::Level::INFO, "deno_code_cell");
-                    let _enter = closure_span.enter();
-                    let s = s.clone();
-                    let cell = cell.clone();
-                    async move {
-                        println!("Should be running source_code_run_deno");
-                        let result = crate::library::std::code::runtime_deno::source_code_run_deno(
-                            &s,
-                            &cell.source_code,
-                            &x,
-                            &cell.function_invocation,
-                        ).await?;
-                        println!("After the evaluation of running source_code_run_deno");
-                        Ok(OperationFnOutput {
-                            has_error: false,
-                            execution_state: None,
-                            output: result.0,
-                            stdout: result.1,
-                            stderr: result.2,
-                        })
-                    }.boxed()
-                }),
+                code_cell_exec_deno(cell),
             ))
         }
     }
+}
+
+pub(crate) fn code_cell_exec_deno(cell: CodeCell) -> Box<OperationFn> {
+    Box::new(move |s, x, _, _| {
+        let closure_span = tracing::span!(tracing::Level::INFO, "deno_code_cell");
+        let _enter = closure_span.enter();
+        let s = s.clone();
+        let cell = cell.clone();
+        async move {
+            println!("Should be running source_code_run_deno");
+            let result = crate::library::std::code::runtime_deno::source_code_run_deno(
+                &s,
+                &cell.source_code,
+                &x,
+                &cell.function_invocation,
+            ).await?;
+            println!("After the evaluation of running source_code_run_deno");
+            Ok(OperationFnOutput {
+                has_error: false,
+                execution_state: None,
+                output: result.0,
+                stdout: result.1,
+                stderr: result.2,
+            })
+        }.boxed()
+    })
+}
+
+pub fn code_cell_exec_python(cell: CodeCell) -> Box<OperationFn> {
+    Box::new(move |s, x, _, _| {
+        let closure_span = tracing::span!(tracing::Level::INFO, "pyo3_code_cell");
+        let _enter = closure_span.enter();
+        let cell = cell.clone();
+        let s = s.clone();
+        async move {
+            let result = crate::library::std::code::runtime_pyo3::source_code_run_python(
+                &s,
+                &cell.source_code,
+                &x,
+                &cell.function_invocation,
+                &None,
+                &None,
+            ).await?;
+            // TODO: don't unwrap the output result here
+            Ok(OperationFnOutput {
+                has_error: false,
+                execution_state: None,
+                output: result.0,
+                stdout: result.1,
+                stderr: result.2,
+            })
+        }.boxed()
+    })
 }
 
 fn signatures_from_report(report: &Report) -> (InputSignature, OutputSignature) {

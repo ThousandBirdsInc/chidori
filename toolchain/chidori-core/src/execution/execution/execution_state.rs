@@ -13,10 +13,7 @@ use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::ops::{Deref};
 use std::sync::{Arc, mpsc};
-// use std::sync::{Mutex};
 use no_deadlocks::{Mutex, MutexGuard};
-use std::sync::mpsc::Sender;
-use std::time::Duration;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde::de::{MapAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeStruct};
@@ -26,9 +23,6 @@ use std::task::{Context, Poll};
 use anyhow::Error;
 use tokio::sync::oneshot;
 use futures_util::FutureExt;
-use log::info;
-use sha1::digest::typenum::op;
-use tokio::runtime::Runtime;
 use tokio::sync::oneshot::error::TryRecvError;
 use uuid::Uuid;
 use crate::cells::{CellTypes, CodeCell, get_cell_name, LLMPromptCell};
@@ -153,6 +147,7 @@ pub struct FunctionMetadata {
 pub struct ExecutionState {
     pub(crate) op_counter: usize,
     pub id: ExecutionNodeId,
+    pub exec_counter: usize,
     pub stack: VecDeque<ExecutionNodeId>,
     pub parent_state_id: ExecutionNodeId,
 
@@ -186,7 +181,7 @@ pub struct ExecutionState {
     pub operation_name_to_id: ImHashMap<String, OperationId>,
 
     /// Map of operation_id -> OperationNode definition
-    pub operation_by_id: ImHashMap<OperationId, Arc<Mutex<OperationNode>>>,
+    pub operation_by_id: ImHashMap<OperationId, OperationNode>,
 
     /// Map of operation_id -> Cell definition
     pub cells_by_id: ImHashMap<OperationId, CellTypes>,
@@ -213,7 +208,6 @@ pub struct ExecutionState {
     value_freshness_map: ImHashMap<OperationId, usize>,
 
     execution_event_sender: Option<mpsc::Sender<OperationExecutionStatus>>,
-    pub exec_counter: usize,
 }
 
 impl std::fmt::Debug for ExecutionState {
@@ -269,7 +263,6 @@ async fn pause_future_with_oneshot(execution_state_evaluation: ExecutionStateEva
 impl Default for ExecutionState {
     fn default() -> Self {
         ExecutionState {
-            
             exec_counter: 0,
             id: Uuid::new_v4(),
             stack: Default::default(),
@@ -343,7 +336,7 @@ impl ExecutionState {
         }
     }
 
-    pub fn clone_with_new_id(&self) -> Self {
+    fn clone_with_new_id(&self) -> Self {
         let mut new = self.clone();
         new.parent_state_id = new.id;
         new.fresh_values = IndexSet::new();
@@ -353,10 +346,10 @@ impl ExecutionState {
     }
 
     pub fn have_all_operations_been_set_at_least_once(&self) -> bool {
-        return self.has_been_set.len() == self.operation_by_id.len()
+        self.has_been_set.len() == self.operation_by_id.len()
     }
 
-    pub fn state_get(&self, operation_id: &OperationId) -> Option<&OperationFnOutput> {
+    fn state_get(&self, operation_id: &OperationId) -> Option<&OperationFnOutput> {
         self.state.get(operation_id).map(|x| x.as_ref())
     }
 
@@ -364,7 +357,7 @@ impl ExecutionState {
         self.state.get(operation_id).map(|x| x.as_ref()).map(|o| &o.output)
     }
 
-    pub fn check_if_previously_set(&self, operation_id: &OperationId) -> bool {
+    fn check_if_previously_set(&self, operation_id: &OperationId) -> bool {
         self.has_been_set.contains(operation_id)
     }
 
@@ -374,6 +367,7 @@ impl ExecutionState {
         self.has_been_set.insert(operation_id);
     }
 
+    #[cfg(test)]
     pub fn render_dependency_graph(&self) {
         println!("================ Dependency graph ================");
         println!(
@@ -425,9 +419,7 @@ impl ExecutionState {
         let op = match cell {
             CellTypes::Code(c, r) => crate::cells::code_cell::code_cell(self.id.clone(), c, r),
             CellTypes::Prompt(c, r) => crate::cells::llm_prompt_cell::llm_prompt_cell(self.id.clone(), c, r),
-            CellTypes::Embedding(c, r) => crate::cells::embedding_cell::llm_embedding_cell(self.id.clone(), c, r),
             CellTypes::Template(c, r) => crate::cells::template_cell::template_cell(self.id.clone(), c, r),
-            CellTypes::Memory(c, r) => crate::cells::memory_cell::memory_cell(self.id.clone(), c, r),
             CellTypes::CodeGen(c, r) => crate::cells::code_gen_cell::code_gen_cell(self.id.clone(), c, r),
         }?;
         Ok(op)
@@ -441,8 +433,8 @@ impl ExecutionState {
     ) -> anyhow::Result<(ExecutionState, OperationId)> {
         let mut op = self.get_operation_from_cell_type(&cell)?;
         op.attach_cell(cell.clone());
-        let new_state = self.clone();
-        let (op_id, new_state) = new_state.upsert_operation(op, op_id);
+        let new_state = self.clone_with_new_id();
+        let (op_id, mut new_state) = new_state.upsert_operation(op, op_id);
         let mutations = Self::assign_dependencies_to_operations(&new_state)?;
         let mut final_state = new_state.apply_dependency_graph_mutations(mutations);
         final_state.operation_mutation = Some((op_id, cell));
@@ -463,9 +455,8 @@ impl ExecutionState {
         // let mut unsatisfied_dependencies = vec![];
         // For each destination cell, we inspect their input signatures and accumulate the
         // mutation operations that we need to apply to the dependency graph.
-        for (destination_cell_id, op) in new_state.operation_by_id.iter() {
+        for (destination_cell_id, operation) in new_state.operation_by_id.iter() {
             // The currently running operation will be locked and will fail this condition, but we're not updating it.
-            let Ok(operation) = op.try_lock() else { continue; };
             let input_signature = &operation.signature.input_signature;
             let mut accum = vec![];
             for (value_name, value) in input_signature.globals.iter() {
@@ -506,10 +497,9 @@ impl ExecutionState {
         let mut available_functions = HashMap::new();
 
         // For all reported cells, add their exposed values to the available values
-        for (id, op) in new_state.operation_by_id.iter() {
+        for (id, operation) in new_state.operation_by_id.iter() {
             // The currently running operation will be locked and will fail this condition, but we're not updating it.
-            let Ok(op_lock) = op.try_lock() else { continue; };
-            let output_signature = &op_lock.signature.output_signature;
+            let output_signature = &operation.signature.output_signature;
 
             // Store values that are available as globals
             for (key, value) in output_signature.globals.iter() {
@@ -545,7 +535,7 @@ impl ExecutionState {
             });
         operation_node.id = op_id;
         s.cells_by_id.insert(op_id, operation_node.cell.clone());
-        s.operation_by_id.insert(op_id, Arc::new(Mutex::new(operation_node)));
+        s.operation_by_id.insert(op_id, operation_node);
         s.update_callable_functions();
         s.exec_queue.push_back(op_id);
         (op_id, s)
@@ -589,8 +579,7 @@ impl ExecutionState {
         // Ensure no stale data exists
         self.function_name_to_metadata.clear();
 
-        for (id, op) in &self.operation_by_id {
-            let Ok(op_node) = op.try_lock() else { continue };
+        for (id, op_node) in &self.operation_by_id {
             self.function_name_to_metadata.extend(
                 op_node.signature.output_signature.functions.iter().map(|(name, config)| {
                     let input_signature = match config {
@@ -625,9 +614,9 @@ impl ExecutionState {
         let op_name;
         let cell;
         {
-            let op = state.operation_by_id.get(&meta.operation_id).unwrap().lock().unwrap();
-            op_name = op.name.clone();
-            cell = op.cell.clone();
+            let cell_g = state.cells_by_id.get(&meta.operation_id).unwrap();
+            op_name = get_cell_name(&cell_g).clone();
+            cell = cell_g.clone();
         }
         state.evaluating_cell = Some(cell.clone());
         state.evaluating_fn = Some(function_name.to_string());
@@ -657,14 +646,12 @@ impl ExecutionState {
                     }
                 }
             }
-            CellTypes::Embedding(c, r) => {
-                crate::cells::embedding_cell::llm_embedding_cell(Uuid::nil(), &c, &r)?
-            }
             _ => {
                 unreachable!("Unsupported cell type");
             }
         };
 
+        // State that indicates in progress execution of this dispatched function
         let mut before_execution_state = state.clone();
         // When we receive a message from the graph_sender, execution of this coroutine will resume.
         if let Some(graph_sender) = self.graph_sender.as_ref() {
@@ -676,12 +663,12 @@ impl ExecutionState {
         // invocation of the operation
         // TODO: the total arg payload here does not include necessary function calls for this cell itself
         /// Receiver that we pass to the exec for it to capture oneshot RPC communication
-        let exec = op.operation.deref();
-        let result = exec(&before_execution_state, payload, None, None).await?;
+        let result = op.execute(&before_execution_state, payload, None, None).await?;
 
+        // State that indicates in resolution of execution of this dispatched function
         // Add result into a new execution state
         let mut after_execution_state = state.clone();
-        after_execution_state.stack.pop_back();
+        // after_execution_state.stack.pop_back();
         after_execution_state.state_insert(Uuid::nil(), result.clone());
         after_execution_state.fresh_values.insert(Uuid::nil());
 
@@ -702,44 +689,28 @@ impl ExecutionState {
         Ok((result.output, after_execution_state))
     }
 
-    pub fn get_operation_node(&self, operation_id: OperationId) -> anyhow::Result<MutexGuard<OperationNode>> {
+    fn get_operation_node(&self, operation_id: OperationId) -> anyhow::Result<&OperationNode> {
         println!("Getting operation node");
-        self.operation_by_id
+        let op = self.operation_by_id
             .get(&operation_id)
-            .ok_or_else(|| anyhow::anyhow!("Operation not found"))?
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Failed to lock operation node"))
+            .ok_or_else(|| anyhow::anyhow!("Operation not found"))?;
+        println!("Got operation node");
+        Ok(op)
     }
 
     fn update_state(
-        &self,
         new_state: &mut ExecutionState,
         next_operation_id: OperationId,
         result: OperationFnOutput,
+        exec_counter: usize
     ) {
         if let Some(s) = &result.execution_state {
             *new_state = s.clone();
         }
         new_state.fresh_values.insert(next_operation_id);
         new_state.state_insert(next_operation_id, result);
-        new_state.value_freshness_map.insert(next_operation_id, self.exec_counter);
+        new_state.value_freshness_map.insert(next_operation_id, exec_counter);
     }
-    //
-    // async fn execute_operation(
-    //     &self,
-    //     new_state: &mut ExecutionState,
-    //     mut op_node: MutexGuard<'_, OperationNode>,
-    //     next_operation_id: OperationId,
-    //     inputs: OperationInputs,
-    // ) -> anyhow::Result<OperationFnOutput> {
-    //     let argument_payload = inputs.to_serialized_value();
-    //
-    //     new_state.evaluating_fn = None;
-    //     new_state.evaluating_id = next_operation_id;
-    //     new_state.evaluating_name = op_node.name.clone();
-    //
-    //     op_node.execute(new_state, argument_payload, None, None).await
-    // }
 
     fn prepare_operation_inputs(
         &self,
@@ -769,8 +740,8 @@ impl ExecutionState {
                             }
                         }
                         DependencyReference::FunctionInvocation(name) => {
-                            let op = self.operation_by_id.get(&from).ok_or_else(|| anyhow::anyhow!("Operation must exist"))?.lock().map_err(|_| anyhow::anyhow!("Failed to lock operation"))?;
-                            inputs.functions.insert(name.clone(), RkyvSerializedValue::Cell(op.cell.clone()));
+                            let cell = self.cells_by_id.get(&from).ok_or_else(|| anyhow::anyhow!("Operation must exist"))?;
+                            inputs.functions.insert(name.clone(), RkyvSerializedValue::Cell(cell.clone()));
                         }
                         DependencyReference::Ordering => {}
                     }
@@ -783,7 +754,7 @@ impl ExecutionState {
     }
 
 
-    fn select_next_operation_to_evalute(
+    fn select_next_operation_to_evaluate(
         &self,
         exec_queue: &mut VecDeque<OperationId>,
     ) -> anyhow::Result<Option<(Option<String>, OperationId, OperationInputs)>> {
@@ -843,11 +814,11 @@ impl ExecutionState {
 
 
     #[tracing::instrument]
-    pub fn determine_next_operation(
+    pub(crate) fn determine_next_operation(
         &self,
     ) -> anyhow::Result<ExecutionStateEvaluation> {
         let mut exec_queue = self.exec_queue.clone();
-        let operation_count = self.operation_by_id.keys().count();
+        let operation_count = self.cells_by_id.keys().count();
         let mut count_loops = 0;
         loop {
             println!("looping {:?} {:?}", self.exec_queue, count_loops);
@@ -855,7 +826,7 @@ impl ExecutionState {
             if count_loops >= operation_count * 2 {
                 return Err(Error::msg("Looped through all operations without detecting an execution"));
             }
-            match self.select_next_operation_to_evalute(&mut exec_queue) {
+            match self.select_next_operation_to_evaluate(&mut exec_queue) {
                 Ok(Some((op_node_name, next_operation_id, inputs))) => {
                     let mut new_state = self.initialize_new_state();
                     new_state.evaluating_fn = None;
@@ -869,7 +840,7 @@ impl ExecutionState {
                     // There was no operation to evaluate
                     // If the queue is empty we reload it and continue looping
                     if exec_queue.is_empty() {
-                        let mut operation_ids: Vec<OperationId> = self.operation_by_id.keys().copied().collect();
+                        let mut operation_ids: Vec<OperationId> = self.cells_by_id.keys().copied().collect();
                         operation_ids.sort();
                         exec_queue.extend(operation_ids.iter());
                     }
@@ -905,9 +876,9 @@ impl ExecutionState {
         let result = op_node.execute(&mut new_state, args, None, None).await?;
         println!("step_execution after op_node.execute");
         outputs.push((next_operation_id, result.clone()));
-        self.update_state(&mut new_state, next_operation_id, result);
+        ExecutionState::update_state(&mut new_state, next_operation_id, result, self.exec_counter);
         println!("step_execution about to complete, after update_state");
-        return Ok((ExecutionStateEvaluation::Complete(new_state), outputs));
+        Ok((ExecutionStateEvaluation::Complete(new_state), outputs))
     }
 }
 
@@ -921,7 +892,7 @@ mod tests {
     #[test]
     fn test_state_insert_and_get_value() {
         let mut exec_state = ExecutionState::new_with_random_id();
-        let operation_id = 1;
+        let operation_id = Uuid::new_v4();
         let value = RkyvSerializedValue::Number(1);
         let value = OperationFnOutput {
             has_error: false,
@@ -939,8 +910,9 @@ mod tests {
     #[test]
     fn test_dependency_graph_mutation() {
         let mut exec_state = ExecutionState::new_with_random_id();
-        let operation_id = 1;
-        let depends_on = vec![(2, DependencyReference::Positional(0))];
+        let operation_id = Uuid::new_v4();
+        let operation_id_2 = Uuid::new_v4();
+        let depends_on = vec![(operation_id_2, DependencyReference::Positional(0))];
         let mutation = DependencyGraphMutation::Create {
             operation_id,
             depends_on: depends_on.clone(),
@@ -956,8 +928,9 @@ mod tests {
     #[test]
     fn test_dependency_graph_deletion() {
         let mut exec_state = ExecutionState::new_with_random_id();
-        let operation_id = 1;
-        let depends_on = vec![(2, DependencyReference::Positional(0))];
+        let operation_id = Uuid::new_v4();
+        let operation_id_2 = Uuid::new_v4();
+        let depends_on = vec![(operation_id_2, DependencyReference::Positional(0))];
         let create_mutation = DependencyGraphMutation::Create {
             operation_id,
             depends_on,
@@ -975,8 +948,9 @@ mod tests {
     #[test]
     fn test_async_execution_at_a_state() {
         let mut exec_state = ExecutionState::new_with_random_id();
-        let operation_id = 1;
-        let depends_on = vec![(2, DependencyReference::Positional(0))];
+        let operation_id = Uuid::new_v4();
+        let operation_id_2 = Uuid::new_v4();
+        let depends_on = vec![(operation_id_2, DependencyReference::Positional(0))];
         let create_mutation = DependencyGraphMutation::Create {
             operation_id,
             depends_on,
@@ -999,13 +973,15 @@ mod tests {
     fn test_update_op() {
         let state = ExecutionState::new_with_random_id();
         let cell = CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: Some(String::from("a")),
             language: SupportedLanguage::PyO3,
             source_code: String::from("y = x + 1"),
             function_invocation: None,
         }, Default::default());
-        
-        let (new_state, op_id) = state.update_operation(cell.clone(), None).unwrap();
+
+        let id_a = Uuid::new_v4();
+        let (new_state, op_id) = state.update_operation(cell.clone(), id_a).unwrap();
         
         assert!(new_state.operation_by_id.contains_key(&op_id));
         assert_eq!(new_state.operation_mutation, Some((op_id, cell)));
@@ -1015,8 +991,9 @@ mod tests {
     fn test_upsert_operation() {
         let state = ExecutionState::new_with_random_id();
         let op_node = OperationNode::default();
-        
-        let (op_id, new_state) = state.upsert_operation(op_node, None);
+
+        let id_a = Uuid::new_v4();
+        let (op_id, new_state) = state.upsert_operation(op_node, id_a);
         
         assert!(new_state.operation_by_id.contains_key(&op_id));
         assert_eq!(new_state.op_counter, state.op_counter + 1);
@@ -1026,27 +1003,30 @@ mod tests {
     #[test]
     fn test_apply_dependency_graph_mutations() {
         let state = ExecutionState::new_with_random_id();
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        let id_c = Uuid::new_v4();
         let mutations = vec![
             DependencyGraphMutation::Create {
-                operation_id: 1,
-                depends_on: vec![(2, DependencyReference::Positional(0))],
+                operation_id: id_a,
+                depends_on: vec![(id_b, DependencyReference::Positional(0))],
             },
             DependencyGraphMutation::Create {
-                operation_id: 2,
-                depends_on: vec![(3, DependencyReference::Global("x".to_string()))],
+                operation_id: id_b,
+                depends_on: vec![(id_c, DependencyReference::Global("x".to_string()))],
             },
             DependencyGraphMutation::Create {
-                operation_id: 3,
+                operation_id: id_c,
                 depends_on: vec![],
             },
         ];
         
         let new_state = state.apply_dependency_graph_mutations(mutations);
         
-        assert!(new_state.dependency_map.contains_key(&1));
-        assert!(new_state.dependency_map.contains_key(&2));
-        assert!(new_state.value_freshness_map.contains_key(&2));
-        assert!(new_state.value_freshness_map.contains_key(&3));
+        assert!(new_state.dependency_map.contains_key(&id_a));
+        assert!(new_state.dependency_map.contains_key(&id_b));
+        assert!(new_state.value_freshness_map.contains_key(&id_b));
+        assert!(new_state.value_freshness_map.contains_key(&id_c));
     }
 
     #[tokio::test]
@@ -1054,13 +1034,15 @@ mod tests {
         let mut state = ExecutionState::new_with_random_id();
         let mut op_node = OperationNode::default();
         op_node.cell = CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: "def test_fn(): return 2".to_string(),
             function_invocation: None,
         }, TextRange::default());
 
-        let (op_id, mut new_state) = state.upsert_operation(op_node, None);
+        let id_a = Uuid::new_v4();
+        let (op_id, mut new_state) = state.upsert_operation(op_node, id_a);
         
         new_state.function_name_to_metadata.insert("test_fn".to_string(), FunctionMetadata {
             operation_id: op_id,
@@ -1076,13 +1058,16 @@ mod tests {
     #[test]
     fn test_get_dependency_graph() {
         let mut state = ExecutionState::new_with_random_id();
-        state.dependency_map.insert(1, IndexSet::from_iter(vec![(2, DependencyReference::Positional(0))]));
-        state.dependency_map.insert(2, IndexSet::from_iter(vec![(3, DependencyReference::Global("x".to_string()))]));
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        let id_c = Uuid::new_v4();
+        state.dependency_map.insert(id_a, IndexSet::from_iter(vec![(id_b, DependencyReference::Positional(0))]));
+        state.dependency_map.insert(id_b, IndexSet::from_iter(vec![(id_c, DependencyReference::Global("x".to_string()))]));
         
         let graph = state.get_dependency_graph();
         
-        assert!(graph.contains_edge(2, 1));
-        assert!(graph.contains_edge(3, 2));
+        assert!(graph.contains_edge(id_b, id_a));
+        assert!(graph.contains_edge(id_c, id_b));
     }
 
     #[test]
@@ -1112,8 +1097,9 @@ mod tests {
                 functions: HashMap::new(),
             },
         };
-        
-        let (op_id, exec_state) = exec_state.upsert_operation(op, None);
+
+        let id_a = Uuid::new_v4();
+        let (op_id, exec_state) = exec_state.upsert_operation(op, id_a);
         
         // Prepare inputs
         let mut inputs = OperationInputs::new();

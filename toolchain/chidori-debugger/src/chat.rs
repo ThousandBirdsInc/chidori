@@ -1,18 +1,14 @@
-use bevy::app::{App, Startup, Update};
-use bevy::DefaultPlugins;
-use bevy::input::ButtonInput;
-use bevy::prelude::{ButtonBundle, Camera, Camera2dBundle, ClearColorConfig, Color, Commands, Component, default, in_state, IntoSystemConfigs, KeyCode, Local, OnEnter, OnExit, Query, Res, ResMut, Resource, Style, Val, Window, With};
-use bevy::window::PrimaryWindow;
-use bevy_cosmic_edit::{Attrs, CosmicBuffer, CosmicColor, CosmicEditBundle, CosmicEditPlugin, CosmicFontConfig, CosmicFontSystem, CosmicPrimaryCamera, CosmicSource, Family, FocusedWidget, Metrics};
-use crate::bevy_egui::{EguiContexts};
-use egui;
-use egui::{FontFamily, Frame, Margin};
-use egui_tiles::Tile;
-use chidori_core::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, TemplateCell, TextRange, WebserviceCell};
-use crate::chidori::{ChidoriState, EguiTree, EguiTreeIdentities};
+use crate::bevy_egui::EguiContexts;
+use crate::chidori::{EguiTree, EguiTreeIdentities};
+use crate::util::despawn_screen;
 use crate::GameState;
-use crate::util::{change_active_editor_ui, deselect_editor_on_esc, despawn_screen, print_editor_text};
-use std::borrow::BorrowMut;
+use bevy::app::{App, Update};
+use bevy::input::ButtonInput;
+use bevy::prelude::{in_state, Component, IntoSystemConfigs, KeyCode, Local, OnExit, Query, Res, ResMut, Resource, Window, With};
+use bevy::window::PrimaryWindow;
+use egui;
+use egui::{Frame, Margin};
+use egui_tiles::Tile;
 
 #[derive(Component)]
 struct OnChatScreen;
@@ -23,8 +19,6 @@ struct ChatMessage(String);
 struct ChatHistory {
     messages: Vec<ChatMessage>,
 }
-
-
 
 fn chat_update(
     q_window: Query<&Window, With<PrimaryWindow>>,

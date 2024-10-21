@@ -1,8 +1,6 @@
 pub mod template_cell;
 pub mod code_cell;
 pub mod llm_prompt_cell;
-pub mod memory_cell;
-pub mod embedding_cell;
 pub mod code_gen_cell;
 
 use std::cmp::Ordering;
@@ -398,6 +396,7 @@ pub struct LLMCodeGenCell {
     pub name: Option<String>,
     pub provider: SupportedModelProviders,
     pub req: String,
+    pub complete_body: String,
 }
 
 
@@ -467,9 +466,7 @@ pub enum CellTypes {
     Code(CodeCell, TextRange),
     CodeGen(LLMCodeGenCell, TextRange),
     Prompt(LLMPromptCell, TextRange),
-    Embedding(LLMEmbeddingCell, TextRange),
     Template(TemplateCell, TextRange),
-    Memory(MemoryCell, TextRange),
 }
 
 impl Eq for CellTypes {
@@ -496,8 +493,6 @@ pub fn get_cell_name(cell: &CellTypes) -> &Option<String> {
             LLMPromptCell::Completion { .. } => &None,
         },
         CellTypes::Template(c, _) => &c.name,
-        CellTypes::Memory(c, _) => &c.name,
-        CellTypes::Embedding(c, _) => &c.name,
         CellTypes::CodeGen(c, _) => &c.name
     }
 }

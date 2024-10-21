@@ -1,11 +1,16 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::mpsc::Sender;
 use tonic::codegen::Body;
-use crate::cells::{TemplateCell, TextRange};
-use crate::execution::primitives::operation::{InputItemConfiguration, InputSignature, InputType, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
-use crate::execution::primitives::serialized_value::{RkyvSerializedValue as RKV, serialized_value_to_json_value};
+use crate::cells::{LLMCodeGenCellChatConfiguration, TemplateCell, TextRange};
+use crate::execution::primitives::operation::{AsyncRPCCommunication, InputItemConfiguration, InputSignature, InputType, OperationFn, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
+use crate::execution::primitives::serialized_value::{RkyvSerializedValue as RKV, serialized_value_to_json_value, RkyvSerializedValue};
 
 use futures_util::FutureExt;
+use chidori_prompt_format::templating::templates::{ChatModelRoles, TemplateWithSource};
 use crate::execution::execution::execution_graph::ExecutionNodeId;
+use crate::execution::execution::ExecutionState;
 
 /// Template cells leverage the same tooling as LLM Prompt Cells, but are used for more general templating.
 #[tracing::instrument]
@@ -43,25 +48,29 @@ pub fn template_cell(execution_state_id: ExecutionNodeId, cell: &TemplateCell, r
         execution_state_id,
         input_signature,
         output_signature,
-        Box::new(move |_, x, _, _| {
-            let body = body.clone();
-            async move {
-                let data = if let RKV::Object(m) = x {
-                    if let Some(m) = m.get("globals") {
-                        serialized_value_to_json_value( m )
-                    } else {
-                        serialized_value_to_json_value(&RKV::Null)
-                    }
-                } else {
-                    serialized_value_to_json_value(&x)
-                };
-                let rendered = chidori_prompt_format::templating::templates::render_template_prompt(&body, &data, &HashMap::new()).unwrap();
-                Ok(OperationFnOutput::with_value(RKV::String(rendered)))
-            }.boxed()
-        }),
+        template_cell_exec(body),
     ))
 }
 
+
+pub fn template_cell_exec(body: String) -> Box<OperationFn> {
+    Box::new(move |_, x, _, _| {
+        let body = body.clone();
+        async move {
+            let data = if let RKV::Object(m) = x {
+                if let Some(m) = m.get("globals") {
+                    serialized_value_to_json_value(m)
+                } else {
+                    serialized_value_to_json_value(&RKV::Null)
+                }
+            } else {
+                serialized_value_to_json_value(&x)
+            };
+            let rendered = chidori_prompt_format::templating::templates::render_template_prompt(&body, &data, &HashMap::new()).unwrap();
+            Ok(OperationFnOutput::with_value(RKV::String(rendered)))
+        }.boxed()
+    })
+}
 
 #[cfg(test)]
 mod test {

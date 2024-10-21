@@ -17,27 +17,19 @@ mod bevy_egui;
 mod egui_json_tree;
 mod tree_grouping;
 mod json_editor;
-// mod r#mod;
-// use bevy_assets_bundler::BundledAssetIoPlugin;
-// use r#mod::BUNDLE_OPTIONS;
+mod vim_text_edit;
 
-
+use crate::bevy_egui::{egui, EguiContexts, EguiPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
+use bevy::log::LogPlugin;
 use bevy::prelude::*;
-use bevy::log::{Level, LogPlugin};
-use bevy::render::render_resource::{Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages};
-use bevy::render::view::{Layer, RenderLayers};
-use bevy::window::{PrimaryWindow, WindowMode, WindowResolution};
+use bevy::render::view::Layer;
+use bevy::window::{PrimaryWindow, WindowMode};
 use bevy::winit::WinitWindows;
 use bevy_cosmic_edit::*;
-use crate::bevy_egui::{EguiPlugin, egui, EguiContexts};
-use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Rounding, Stroke};
 use bevy_rapier2d::plugin::{NoUserData, RapierPhysicsPlugin};
-use bevy_rapier2d::render::RapierDebugRenderPlugin;
-use egui::style::{HandleShape, NumericColorSpace};
-use once_cell::sync::{Lazy, OnceCell};
-
-
+use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Rounding, Stroke};
+use once_cell::sync::OnceCell;
 
 
 static DEVICE_SCALE: OnceCell<f32> = OnceCell::new();
@@ -79,28 +71,6 @@ fn check_key_input(
             state.set(GameState::Graph);
         }
     }
-}
-
-
-
-fn setup(
-    mut commands: Commands,
-    mut contexts: EguiContexts,
-) {
-    // commands.spawn((
-    //     Camera2dBundle {
-    //         camera: Camera {
-    //             clear_color: ClearColorConfig::Custom(Color::BLACK),
-    //             order: 8,
-    //             ..default()
-    //         },
-    //         ..default()
-    //
-    //     },
-    //     RenderLayers::layer(RENDER_LAYER_ROOT_CAMERA)));
-
-
-    // style_egui_context(contexts);
 }
 
 
@@ -375,7 +345,7 @@ fn main() {
         // .insert_resource(Volume(7))
         // Declare the game state, whose starting value is determined by the `Default` trait
         .init_state::<GameState>()
-        .add_systems(Startup, (setup, set_window_size))
+        .add_systems(Startup, (set_window_size))
         .add_systems(Update, check_key_input)
         // Adds the plugins for each state
         .add_plugins((chidori::chidori_plugin, code::editor_plugin, traces::trace_plugin, graph::graph_plugin, chat::chat_plugin, logs::logs_plugin))

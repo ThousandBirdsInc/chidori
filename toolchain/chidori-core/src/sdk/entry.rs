@@ -1,35 +1,19 @@
 use crate::execution::execution::execution_graph::{ExecutionGraph, ExecutionNodeId, MergedStateHistory};
 use crate::execution::execution::execution_state::{ExecutionState, ExecutionStateErrors, ExecutionStateEvaluation, OperationExecutionStatus};
-use crate::execution::execution::DependencyGraphMutation;
 use crate::cells::{CellTypes, get_cell_name, LLMPromptCell};
 use crate::execution::primitives::identifiers::{DependencyReference, OperationId};
 use crate::execution::primitives::serialized_value::{
     RkyvSerializedValue as RKV, RkyvSerializedValue,
 };
-use crate::sdk::md::{interpret_markdown_code_block, load_folder};
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::{fmt, thread};
 use std::ops::Deref;
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::{Arc, mpsc, Mutex, MutexGuard};
-use std::sync::mpsc::{Receiver, Sender};
-use std::thread::sleep;
-use std::time::Duration;
-use chumsky::prelude::any;
 use dashmap::DashMap;
-use futures_util::future::{BoxFuture, select_all};
 use futures_util::{FutureExt, StreamExt};
-use petgraph::graphmap::DiGraphMap;
 use serde::ser::SerializeMap;
-use tracing::dispatcher::DefaultGuard;
-use tracing::Span;
 use uuid::Uuid;
-use crate::execution::primitives::operation::OperationFnOutput;
-use crate::utils::telemetry::{init_internal_telemetry, TraceEvents};
-use tokio::sync::mpsc::{Receiver as TokioReceiver, Sender as TokioSender};
-use crate::execution::execution::execution_graph::ExecutionEvent;
 use crate::sdk::instanced_environment::InstancedEnvironment;
 
 /// This is an SDK for building execution graphs. It is designed to be used interactively.
@@ -160,6 +144,7 @@ mod tests {
     async fn test_execute_cells_with_global_dependency() -> anyhow::Result<()> {
         let mut env = InstancedEnvironment::new();
         let (_, op_id_x) = env.upsert_cell(CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
@@ -167,9 +152,9 @@ mod tests {
                         "#}),
             function_invocation: None,
         }, TextRange::default()),
-                                           None)?;
-        assert_eq!(op_id_x, 0);
+                                           Uuid::new_v4())?;
         let (_, op_id_y) = env.upsert_cell(CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
@@ -177,10 +162,10 @@ mod tests {
                         "#}),
             function_invocation: None,
         }, TextRange::default()),
-                                           None)?;
-        assert_eq!(op_id_y, 1);
+                                           Uuid::new_v4())?;
         // env.resolve_dependencies_from_input_signature();
         env.get_state_at_current_execution_head().render_dependency_graph();
+        // ExecutionGraph::immutable_external_step_execution(env.execution_head_state_id, env.)
         env.step().await;
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&op_id_x),
@@ -202,6 +187,7 @@ mod tests {
         dotenv::dotenv().ok();
         let mut env = InstancedEnvironment::new();
         let (_, op_id_x) = env.upsert_cell(CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
@@ -209,25 +195,26 @@ mod tests {
                         "#}),
             function_invocation: None,
         }, TextRange::default()),
-                                           None)?;
-        assert_eq!(op_id_x, 0);
+                                           Uuid::new_v4())?;
         let (_, op_id_y) = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
+            backing_file_reference: None,
             function_invocation: false,
             configuration: LLMPromptCellChatConfiguration {
-                model: "gpt-3.5-turbo".into(),
+                model: Some("gpt-3.5-turbo".into()),
                 ..Default::default()
             },
             name: Some("example".into()),
             provider: SupportedModelProviders::OpenAI,
+            complete_body: "".to_string(),
             req: "\
                       Say only a single word. Give no additional explanation.
                       What is the first word of the following: {{x}}.
                     "
                 .to_string(),
         }, TextRange::default()),
-                                           None)?;
-        assert_eq!(op_id_y, 1);
+                                           Uuid::new_v4())?;
         let (_, op_id_z) = env.upsert_cell(CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
@@ -235,15 +222,10 @@ mod tests {
                         "#}),
             function_invocation: None,
         }, TextRange::default()),
-                                           None)?;
+                                           Uuid::new_v4())?;
 
-        assert_eq!(op_id_z, 2);
         env.get_state_at_current_execution_head().render_dependency_graph();
         let out = env.step().await;
-        assert_eq!(
-            out.as_ref().unwrap().first().unwrap().0,
-            0
-        );
         assert_eq!(
             out.as_ref().unwrap().first().unwrap().1.output,
             Ok(RkyvObjectBuilder::new()
@@ -259,10 +241,6 @@ mod tests {
             )
         );
         let out = env.step().await;
-        assert_eq!(
-            out.as_ref().unwrap().first().unwrap().0,
-            1
-        );
         assert_eq!(
             out.as_ref().unwrap().first().unwrap().1.output,
             Ok(RkyvObjectBuilder::new()
@@ -282,6 +260,7 @@ mod tests {
     async fn test_execute_cells_prompts_as_functions() -> anyhow::Result<()> {
         let mut env = InstancedEnvironment::new();
         let (_, op_id_x) = env.upsert_cell(CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
@@ -289,20 +268,20 @@ mod tests {
                         "#}),
             function_invocation: None,
         }, TextRange::default()),
-                                           None)?;
-        assert_eq!(op_id_x, 0);
+                                           Uuid::new_v4())?;
         let (_, op_id_y) = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
+            backing_file_reference: None,
             function_invocation: false,
             configuration: LLMPromptCellChatConfiguration::default(),
             name: Some("generate_names".to_string()),
             provider: SupportedModelProviders::OpenAI,
+            complete_body: "".to_string(),
             req: "\
                       Generate names starting with {{x}}
                     "
                 .to_string(),
         }, TextRange::default()),
-                                           None)?;
-        assert_eq!(op_id_y, 1);
+                                           Uuid::new_v4())?;
         env.get_state_at_current_execution_head().render_dependency_graph();
         dbg!(env.step().await);
         dbg!(env.step().await);
@@ -320,7 +299,8 @@ mod tests {
     async fn test_execute_cells_invoking_a_function() -> anyhow::Result<()> {
         let mut env = InstancedEnvironment::new();
         env.wait_until_ready().await.unwrap();
-        let (_, id) = env.upsert_cell(CellTypes::Code(CodeCell {
+        let (_, id_a) = env.upsert_cell(CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
@@ -329,9 +309,9 @@ mod tests {
                         "#}),
             function_invocation: None,
         }, TextRange::default()),
-                                      None)?;
-        assert_eq!(id, 0);
-        let (_, id) = env.upsert_cell(CellTypes::Code(CodeCell {
+                                      Uuid::new_v4())?;
+        let (_, id_b) = env.upsert_cell(CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: None,
             function_invocation: None,
             language: SupportedLanguage::PyO3,
@@ -339,22 +319,21 @@ mod tests {
                         y = await add(2, 3)
                         "#}),
         }, TextRange::default()),
-                                      None)?;
-        assert_eq!(id, 1);
+                                      Uuid::new_v4())?;
         env.get_state_at_current_execution_head().render_dependency_graph();
         env.step().await;
         // Empty object from the function declaration
         assert_eq!(
-            env.get_state_at_current_execution_head().state_get_value(&0),
+            env.get_state_at_current_execution_head().state_get_value(&id_a),
             Some(&Ok(RkyvObjectBuilder::new().insert_string("add", String::from("function")).build()))
         );
-        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&1), None);
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&id_b), None);
         env.step().await;
-        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&0),
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&id_a),
                    Some(&Ok(RkyvObjectBuilder::new().insert_string("add", String::from("function")).build()))
             );
         assert_eq!(
-            env.get_state_at_current_execution_head().state_get_value(&1),
+            env.get_state_at_current_execution_head().state_get_value(&id_b),
             Some(&Ok(RkyvObjectBuilder::new().insert_number("y", 5).build()))
         );
         env.shutdown().await;
@@ -365,7 +344,8 @@ mod tests {
     async fn test_execute_inter_runtime_code_plain() -> anyhow::Result<()> {
         let mut env = InstancedEnvironment::new();
         env.wait_until_ready().await.unwrap();
-        let (_, id) = env.upsert_cell(CellTypes::Code(CodeCell {
+        let (_, id_a) = env.upsert_cell(CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! { r#"
@@ -374,9 +354,9 @@ mod tests {
                         "#}),
             function_invocation: None,
         }, TextRange::default()),
-                                      None)?;
-        assert_eq!(id, 0);
-        let (_, id) = env.upsert_cell(CellTypes::Code(CodeCell {
+                                      Uuid::new_v4())?;
+        let (_, id_b) = env.upsert_cell(CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: None,
             function_invocation: None,
             language: SupportedLanguage::Deno,
@@ -384,23 +364,22 @@ mod tests {
                         const y = await add(2, 3);
                         "#}),
         }, TextRange::default()),
-                                      None)?;
-        assert_eq!(id, 1);
+                                      Uuid::new_v4())?;
         env.get_state_at_current_execution_head().render_dependency_graph();
         env.step().await;
         // Function declaration cell
         assert_eq!(
-            env.get_state_at_current_execution_head().state_get_value(&0),
+            env.get_state_at_current_execution_head().state_get_value(&id_a),
             Some(&Ok(RkyvObjectBuilder::new().insert_string("add", String::from("function")).build()))
         );
-        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&1),
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&id_b),
                    None);
         env.step().await;
-        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&0),
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&id_a),
                    Some(&Ok(RkyvObjectBuilder::new().insert_string("add", String::from("function")).build()))
         );
         assert_eq!(
-            env.get_state_at_current_execution_head().state_get_value(&1),
+            env.get_state_at_current_execution_head().state_get_value(&id_b),
             Some(&Ok(RkyvObjectBuilder::new().insert_number("y", 5).build()))
         );
         env.shutdown().await;
@@ -428,22 +407,24 @@ mod tests {
         env.get_state_at_current_execution_head().render_dependency_graph();
         env.step().await;
         // Function declaration cell
+        let id_0 = Uuid::new_v4();
+        let id_1 = Uuid::new_v4();
         assert_eq!(
-            env.get_state_at_current_execution_head().state_get_value(&0),
+            env.get_state_at_current_execution_head().state_get_value(&id_0),
             Some(&Ok(RkyvObjectBuilder::new()
                 .insert_number("v", 40)
                 .insert_string("squared_value", "function".to_string())
                 .build()))
         );
-        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&1), None);
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&id_1), None);
         env.step().await;
-        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&0),
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&id_0),
                    Some(&Ok(RkyvObjectBuilder::new().insert_number("v", 40)
                        .insert_string("squared_value", "function".to_string())
                        .build()))
         );
         assert_eq!(
-            env.get_state_at_current_execution_head().state_get_value(&1),
+            env.get_state_at_current_execution_head().state_get_value(&id_1),
             Some(&Ok(RkyvObjectBuilder::new().insert_number("z", 640000).insert_number("y", 800).build()))
         );
         env.shutdown().await;
@@ -477,21 +458,23 @@ mod tests {
         s.render_dependency_graph();
         env.step().await;
         // Function declaration cell
+        let id_0 = Uuid::new_v4();
         assert_eq!(
-            env.get_state_at_current_execution_head().state_get_value(&0),
+            env.get_state_at_current_execution_head().state_get_value(&id_0),
             Some(&Ok(RkyvObjectBuilder::new()
                 .insert_string("add", "function".to_string())
                 .build()))
         );
-        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&1), None);
+        let id_1 = Uuid::new_v4();
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&id_1), None);
         env.step().await;
-        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&0),
+        assert_eq!(env.get_state_at_current_execution_head().state_get_value(&id_0),
                    Some(&Ok(RkyvObjectBuilder::new()
                        .insert_string("add", "function".to_string())
                        .build()))
         );
         assert_eq!(
-            env.get_state_at_current_execution_head().state_get_value(&1),
+            env.get_state_at_current_execution_head().state_get_value(&id_1),
             Some(&Ok(RkyvObjectBuilder::new().insert_number("y", 5).build()))
         );
     }
@@ -609,7 +592,7 @@ mod tests {
         env.reload_cells();
         env.get_state_at_current_execution_head().render_dependency_graph();
         let mut out = env.step().await?;
-        assert_eq!(out[0].0, 0);
+        assert_eq!(out[0].0, Uuid::nil());
         assert_eq!(out[0].1.output, Ok(RkyvObjectBuilder::new()
             .insert_value("x2", RkyvSerializedValue::Array(vec![
                 RkyvSerializedValue::Number(1),
@@ -637,7 +620,7 @@ mod tests {
             ].iter().cloned())))
             .build()));
         let mut out = env.step().await?;
-        assert_eq!(out[0].0, 2);
+        assert_eq!(out[0].0, Uuid::nil());
         assert_eq!(out[0].1.output, Ok(RkyvObjectBuilder::new()
             .insert_object("y3", RkyvObjectBuilder::new()
                 .insert_number("a", 1)
@@ -660,7 +643,7 @@ mod tests {
             .insert_value("y4", RkyvSerializedValue::Boolean(false))
             .build()));
         let mut out = env.step().await?;
-        assert_eq!(out[0].0, 3);
+        assert_eq!(out[0].0, Uuid::nil());
         assert!(out[0].1.stderr.contains(&"OK".to_string()));
         Ok(())
     }
@@ -674,17 +657,17 @@ mod tests {
         env.reload_cells();
         env.get_state_at_current_execution_head().render_dependency_graph();
         let mut out = env.step().await?;
-        assert_eq!(out[0].0, 0);
+        assert_eq!(out[0].0, Uuid::nil());
         assert_eq!(out[0].1.output, Ok(RkyvObjectBuilder::new().insert_string("add_two", "function".to_string()).build()));
 
         // TODO: there's nothing to test on this instance but that's an issue
         dbg!(env.step().await);
 
         let mut out = env.step().await?;
-        assert_eq!(out[0].0, 2);
+        assert_eq!(out[0].0, Uuid::nil());
         assert_eq!(out[0].1.output, Ok(RkyvObjectBuilder::new().insert_string("addTwo", "function".to_string()).build()));
         let mut out = env.step().await?;
-        assert_eq!(out[0].0, 3);
+        assert_eq!(out[0].0, Uuid::nil());
         assert_eq!(out[0].1.stderr.contains(&"OK".to_string()), true);
         assert_eq!(env.get_state_at_current_execution_head().have_all_operations_been_set_at_least_once(), true);
         env.shutdown().await;
@@ -699,17 +682,17 @@ mod tests {
         env.reload_cells();
         env.get_state_at_current_execution_head().render_dependency_graph();
         let mut out = env.step().await?;
-        assert_eq!(out[0].0, 0);
+        assert_eq!(out[0].0, Uuid::nil());
         assert_eq!(out[0].1.output, Ok(RkyvObjectBuilder::new().insert_string("add_two", "function".to_string()).build()));
 
         // TODO: there's nothing to test on this instance but that's an issue
         dbg!(env.step().await);
 
         let mut out = env.step().await?;
-        assert_eq!(out[0].0, 2);
+        assert_eq!(out[0].0, Uuid::nil());
         assert_eq!(out[0].1.output, Ok(RkyvObjectBuilder::new().insert_string("addTwo", "function".to_string()).build()));
         let mut out = env.step().await?;
-        assert_eq!(out[0].0, 3);
+        assert_eq!(out[0].0, Uuid::nil());
         assert_eq!(out[0].1.stderr.contains(&"OK".to_string()), true);
         assert_eq!(env.get_state_at_current_execution_head().have_all_operations_been_set_at_least_once(), true);
         env.shutdown().await;

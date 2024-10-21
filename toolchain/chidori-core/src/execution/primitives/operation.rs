@@ -139,14 +139,14 @@ impl InputSignature {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TriggerConfiguration {
     OnChange,
     OnEvent,
     Manual,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub enum OutputItemConfiguration {
     Function {
         input_signature: InputSignature,
@@ -164,7 +164,7 @@ pub struct OutputSignatureFunction {
     trigger_on: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OutputSignature {
     pub globals: HashMap<String, OutputItemConfiguration>,
     pub functions: HashMap<String, OutputItemConfiguration>,
@@ -179,7 +179,7 @@ impl OutputSignature {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Signature {
     pub trigger_on: TriggerConfiguration,
 
@@ -207,13 +207,13 @@ impl Signature {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 enum Purity {
     Pure,
     Impure,
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 enum Mutability {
     Mutable,
     Immutable,
@@ -299,7 +299,9 @@ pub type OperationFn = dyn Fn(
     Option<AsyncRPCCommunication>
 ) -> Pin<Box<dyn Future<Output = anyhow::Result<OperationFnOutput>> + Send>> + Send;
 
-// TODO: rather than dep_count operation node should have a specific dep mapping
+
+
+#[derive(Clone)]
 pub struct OperationNode {
     pub(crate) id: OperationId,
     pub(crate) name: Option<String>,
@@ -329,7 +331,7 @@ pub struct OperationNode {
     pub(crate) signature: Signature,
 
     /// The operation function itself
-    pub(crate) operation: Box<OperationFn>,
+    // pub(crate) operation: Box<OperationFn>,
 
     /// Dependencies of this node
     pub(crate) unresolved_dependencies: Vec<usize>,
@@ -388,7 +390,7 @@ impl Default for OperationNode {
             verified_at: 0,
             dirty: true,
             signature: Signature::new(),
-            operation: Box::new(|_, x, _, _| async move { Ok(OperationFnOutput::with_value(x)) }.boxed()),
+            // operation: Box::new(|_, x, _, _| async move { Ok(OperationFnOutput::with_value(x)) }.boxed()),
             unresolved_dependencies: vec![],
             partial_application: Vec::new(),
         }
@@ -407,7 +409,7 @@ impl OperationNode {
         node.created_at_state_id = created_at;
         node.signature.input_signature = input_signature;
         node.signature.output_signature = output_signature;
-        node.operation = f;
+        // node.operation = f;
         node.name = name;
         node
     }
@@ -428,8 +430,35 @@ impl OperationNode {
         intermediate_output_channel_tx: Option<Sender<(ExecutionNodeId, RkyvSerializedValue)>>,
         async_communication_channel: Option<AsyncRPCCommunication>,
     ) -> Pin<Box<dyn Future<Output=anyhow::Result<OperationFnOutput>> + Send>> {
+
+        // Construct the cell execution closure
+        let closure = match &self.cell {
+            CellTypes::Code(code_cell, _) => {
+                match code_cell.language {
+                    SupportedLanguage::PyO3 => {
+                        crate::cells::code_cell::code_cell_exec_python(code_cell.clone())
+                    }
+                    SupportedLanguage::Starlark => {
+                        unreachable!("We do not yet support starlark")
+                    }
+                    SupportedLanguage::Deno => {
+                        crate::cells::code_cell::code_cell_exec_deno(code_cell.clone())
+                    }
+                }
+            }
+            CellTypes::CodeGen(code_gen_cell, _) => {
+                crate::cells::code_gen_cell::code_gen_cell_exec_openai(code_gen_cell.clone())
+            }
+            CellTypes::Prompt(llm_prompt_cell, _) => {
+                crate::cells::llm_prompt_cell::llm_prompt_cell_exec_chat_openai(llm_prompt_cell.clone())
+            }
+            CellTypes::Template(crate::cells::TemplateCell {body, ..}, _) => {
+                crate::cells::template_cell::template_cell_exec(body.clone())
+            }
+        };
+
         /// Receiver that we pass to the exec for it to capture oneshot RPC communication
-        let exec = self.operation.deref();
+        let exec = closure;
         exec(state, argument_payload, intermediate_output_channel_tx, async_communication_channel)
     }
 }
@@ -448,7 +477,7 @@ mod tests {
             Box::new(|_, context, _, _| { async move { Ok(OperationFnOutput::with_value(RkyvSerializedValue::Boolean(true))) }.boxed() });
 
         let mut node = OperationNode::default();
-        node.operation = operation;
+        // node.operation = operation;
 
         let result = node.execute(&ExecutionState::new_with_random_id(), RkyvSerializedValue::Null, None, None).await?;
 
@@ -466,12 +495,14 @@ mod tests {
     #[tokio::test]
     async fn test_async_communication_rpc() {
         let (async_rpc_communication, rpc_sender, callable_interface_receiver) = AsyncRPCCommunication::new();
+        let id_a = Uuid::new_v4();
         let op = OperationNode {
             created_at_state_id: Uuid::nil(),
-            id: 0,
+            id: id_a,
             name: None,
             is_long_running_background_thread: false,
             cell: CellTypes::Code(CodeCell {
+                backing_file_reference: None,
                 name: None,
                 language: SupportedLanguage::PyO3,
                 source_code: "".to_string(),
@@ -483,22 +514,22 @@ mod tests {
             verified_at: 0,
             dirty: true,
             signature: Signature::new(),
-            operation: Box::new(|_, p: RkyvSerializedValue, _, async_rpccommunication: Option<AsyncRPCCommunication>| async move {
-                let mut state = 0;
-                let mut async_rpccommunication: AsyncRPCCommunication = async_rpccommunication.unwrap();
-                async_rpccommunication.callable_interface_sender.send(vec!["run".to_string()]).unwrap();
-                tokio::spawn(async move {
-                    loop {
-                        if let Ok((key, value, sender)) = async_rpccommunication.receiver.try_recv() {
-                            sender.send(RkyvSerializedValue::Number(state)).unwrap();
-                            state += 1;
-                        } else {
-                            tokio::time::sleep(Duration::from_millis(10)).await; // Sleep for 10 milliseconds
-                        }
-                    }
-                }).await;
-                Ok(OperationFnOutput::with_value(RkyvSerializedValue::Null))
-            }.boxed()),
+            // operation: Box::new(|_, p: RkyvSerializedValue, _, async_rpccommunication: Option<AsyncRPCCommunication>| async move {
+            //     let mut state = 0;
+            //     let mut async_rpccommunication: AsyncRPCCommunication = async_rpccommunication.unwrap();
+            //     async_rpccommunication.callable_interface_sender.send(vec!["run".to_string()]).unwrap();
+            //     tokio::spawn(async move {
+            //         loop {
+            //             if let Ok((key, value, sender)) = async_rpccommunication.receiver.try_recv() {
+            //                 sender.send(RkyvSerializedValue::Number(state)).unwrap();
+            //                 state += 1;
+            //             } else {
+            //                 tokio::time::sleep(Duration::from_millis(10)).await; // Sleep for 10 milliseconds
+            //             }
+            //         }
+            //     }).await;
+            //     Ok(OperationFnOutput::with_value(RkyvSerializedValue::Null))
+            // }.boxed()),
             unresolved_dependencies: vec![],
             partial_application: Vec::new(),
         };

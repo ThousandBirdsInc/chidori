@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::iter::Map;
 use petgraph::visit::Bfs;
 use crate::tidy_tree::{geometry::Coord, layout::BoundingBox};
+use crate::tidy_tree::layout::tidy_layout::Orientation;
 
 #[derive(Debug, Clone)]
 pub struct TidyData {
@@ -31,11 +32,13 @@ pub struct Node {
     pub relative_y: Coord,
     pub bbox: BoundingBox,
     pub tidy: Option<TidyData>,
+    pub orientation: Orientation
 }
 
 impl Default for Node {
     fn default() -> Self {
         Self {
+
             external_id: usize::MAX,
             width: 0.,
             height: 0.,
@@ -45,12 +48,13 @@ impl Default for Node {
             relative_y: 0.,
             bbox: Default::default(),
             tidy: None,
+            orientation: Orientation::Vertical,
         }
     }
 }
 
 impl Node {
-    pub fn new(id: usize, width: Coord, height: Coord) -> Self {
+    pub fn new(id: usize, width: Coord, height: Coord, opt_orientation: Option<Orientation>) -> Self {
         Node {
             external_id: id,
             width,
@@ -61,6 +65,7 @@ impl Node {
             relative_x: 0.,
             relative_y: 0.,
             tidy: None,
+            orientation: opt_orientation.unwrap_or(Orientation::Vertical),
         }
     }
 

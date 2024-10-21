@@ -1,38 +1,39 @@
 use std::collections::{HashMap, HashSet};
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::bevy_egui::EguiContexts;
 use bevy::app::{App, Startup, Update};
 use bevy::input::ButtonInput;
-use bevy::prelude::{Commands, default, KeyCode, Local, NextState, Res, ResMut, Resource};
-use crate::bevy_egui::EguiContexts;
+use bevy::prelude::{default, Commands, KeyCode, Local, Res, ResMut, Resource};
+use chidori_core::uuid::Uuid;
 use egui;
-use egui::{Color32, FontFamily, Frame, Id, Margin, Response, Vec2b, Visuals, Widget};
 use egui::panel::TopBottomSide;
+use egui::{FontFamily, Frame, Id, Margin, Response, Widget};
 use egui_tiles::{Tile, TileId};
 use notify_debouncer_full::{
-    DebounceEventResult,
-    Debouncer,
-    FileIdMap, new_debouncer, notify::{RecommendedWatcher, RecursiveMode, Watcher},
+    new_debouncer,
+    notify::{RecommendedWatcher, RecursiveMode, Watcher},
+    DebounceEventResult, Debouncer, FileIdMap,
 };
-use chidori_core::uuid::Uuid;
 
+use crate::{tokio_tasks, CurrentTheme};
+use chidori_core::cells::CellTypes;
 use chidori_core::execution::execution::execution_graph::{
     ExecutionNodeId, MergedStateHistory,
 };
+use chidori_core::execution::execution::execution_state::ExecutionStateEvaluation;
 use chidori_core::execution::execution::ExecutionState;
 use chidori_core::execution::primitives::identifiers::{DependencyReference, OperationId};
+use chidori_core::sdk::chidori::Chidori;
 use chidori_core::sdk::entry::{CellHolder, EventsFromRuntime, PlaybackState, UserInteractionMessage};
 use chidori_core::tokio::task::JoinHandle;
 use chidori_core::utils::telemetry::TraceEvents;
-use petgraph::prelude::StableGraph;
 use petgraph::graph::NodeIndex;
-use chidori_core::execution::execution::execution_state::ExecutionStateEvaluation;
-use chidori_core::sdk::chidori::Chidori;
-use crate::{CurrentTheme, GameState, tokio_tasks};
+use petgraph::prelude::StableGraph;
 
 const RECV_RUNTIME_EVENT_TIMEOUT_MS: u64 = 100;
 
@@ -48,10 +49,6 @@ struct TreeBehavior<'a> {
 }
 
 impl<'a> egui_tiles::Behavior<Pane> for TreeBehavior<'a> {
-
-    // fn tab_bar_color(&self, visuals: &Visuals) -> Color32 {
-    //     self.current_theme.theme.card
-    // }
 
     fn pane_ui(
         &mut self,
@@ -213,18 +210,6 @@ const EXAMPLES_CORE11: &str =
 const EXAMPLES_CORE12: &str =
     include_str!("../examples/core12_dependency_management/core.md");
 
-
-
-// impl Default for ChidoriState {
-//     fn default() -> Self {
-//         ChidoriState {
-//             execution_graph: vec![],
-//             grouped_nodes: Default::default(),
-//             current_execution_head: Uuid::nil(),
-//         }
-//     }
-// }
-
 fn hash_graph(input: &Vec<(ExecutionNodeId, ExecutionNodeId)>) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     input.hash(&mut hasher);
@@ -232,11 +217,12 @@ fn hash_graph(input: &Vec<(ExecutionNodeId, ExecutionNodeId)>) -> u64 {
 }
 
 impl ChidoriState {
+
     pub fn construct_stablegraph_from_chidori_execution_graph(&self) -> (StableGraph<ExecutionNodeId, ()>, HashMap<ExecutionNodeId, NodeIndex>) {
+        // TODO: cache this
         let execution_graph = &self.execution_graph;
         let mut dataset = StableGraph::new();
         let mut node_ids = HashMap::new();
-        // for (a, b) in &execution_graph.stack_graph
         for (a, b) in execution_graph {
             let node_index_a = *node_ids
                 .entry(a.clone())
@@ -249,7 +235,7 @@ impl ChidoriState {
         (dataset, node_ids)
     }
 
-
+    /// Check if the target ExecutionNodeId, traversing back from the current execution head is included
     pub fn exists_in_current_tree(&self, n: &ExecutionNodeId) -> bool {
         let h = self.current_execution_head;
         let (graph, nodes) = self.construct_stablegraph_from_chidori_execution_graph();
@@ -279,15 +265,17 @@ impl ChidoriState {
 #[derive(Default)]
 pub struct CellState {
     pub(crate) is_repl_open: bool,
+    pub(crate) is_new_cell_open: bool,
     pub(crate) repl_content: String,
     pub(crate) json_content: serde_json::Value,
+    pub(crate) temp_cell: Option<CellHolder>
 }
 
 
 #[derive(Resource)]
 pub struct ChidoriState {
     pub debug_mode: bool,
-    watched_path: Mutex<Option<String>>,
+    pub(crate) watched_path: Mutex<Option<String>>,
     file_watch: Mutex<Option<Debouncer<RecommendedWatcher, FileIdMap>>>,
     background_thread: Mutex<Option<JoinHandle<()>>>,
     pub chidori: Arc<Mutex<Chidori>>,
@@ -493,12 +481,11 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                     instance
                 };
 
-                let await_ready = instance.wait_until_ready().await;
+                let _ = instance.wait_until_ready().await;
                 let result = instance.run().await;
                 match result {
                     Ok(_) => {
                         panic!("Instance completed execution and closed successfully.");
-                        break;
                     }
                     Err(e) => {
                         println!("Error occurred: {}, retrying...", e);
@@ -657,12 +644,10 @@ fn with_cursor(res: Response) -> Response {
 }
 
 pub fn update_gui(
-    mut commands: Commands,
     mut contexts: EguiContexts,
     mut egui_tree: ResMut<EguiTree>,
     runtime: ResMut<tokio_tasks::TokioTasksRuntime>,
     mut internal_state: ResMut<ChidoriState>,
-    mut state: ResMut<NextState<GameState>>,
     mut theme: Res<CurrentTheme>,
     mut displayed_example_desc: Local<Option<(String, String, String)>>
 ) {
@@ -706,6 +691,8 @@ pub fn update_gui(
                                             if let Some(mut internal_state) =
                                                 ctx.world.get_resource_mut::<ChidoriState>()
                                             {
+                                                let mut watched_path = internal_state.watched_path.get_mut().unwrap();
+                                                *watched_path = Some(path.clone());
                                                 match internal_state.load_and_watch_directory(path) {
                                                     Ok(()) => {
                                                         // Directory loaded and watched successfully
@@ -903,6 +890,10 @@ pub fn update_gui(
                         }
                     }
                     ui.add_space(8.0);
+
+                    // let mut my_f32 = 0.0;
+                    // ui.add(egui::Slider::new(&mut my_f32, 0.0..=100.0).text("Rate Limit func/s"));
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                         if with_cursor(ui.button("UI Debug Mode")).clicked() {
                             internal_state.debug_mode = !internal_state.debug_mode;

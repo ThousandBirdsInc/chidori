@@ -472,6 +472,7 @@ pub async fn ai_llm_code_generation_chat_model(
                 .filter_map(|block| interpret_markdown_code_block(block).unwrap())
                 .for_each(|block| { cells.push(block); });
             cells.sort();
+            dbg!(&cells);
 
             for cell in cells {
                 let (s, _) = new_execution_state.update_operation(cell, Uuid::new_v4())?;
@@ -529,6 +530,7 @@ fn template_data_payload_from_rkyv(payload: &RkyvSerializedValue) -> chidori_pro
 #[cfg(test)]
 mod test {
     use indoc::indoc;
+    use uuid::Uuid;
     use crate::cells::{CellTypes, CodeCell, LLMPromptCellChatConfiguration, SupportedLanguage, TextRange};
     use crate::execution::execution::ExecutionState;
     use crate::library::std::ai::llm::infer_tool_usage_from_imports;
@@ -536,7 +538,10 @@ mod test {
     #[tokio::test]
     async fn test_tool_usage_inference() -> anyhow::Result<()> {
         let mut state = ExecutionState::new_with_random_id();
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
         let (mut state, _) = state.update_operation(CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! {r#"
@@ -546,8 +551,9 @@ mod test {
                             return 100 + await demo_second_function_call()
                         "#}),
             function_invocation: None,
-        }, TextRange::default()), None)?;
+        }, TextRange::default()), id_a)?;
         let (mut state, _) = state.update_operation(CellTypes::Code(CodeCell {
+            backing_file_reference: None,
             name: None,
             language: SupportedLanguage::PyO3,
             source_code: String::from(indoc! {r#"
@@ -555,7 +561,7 @@ mod test {
                             return a + b + c + d
                         "#}),
             function_invocation: None,
-        }, TextRange::default()), None)?;
+        }, TextRange::default()), id_b)?;
 
         insta::with_settings!({
             omit_expression => true

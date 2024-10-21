@@ -274,6 +274,7 @@ fn mouse_over_system(
                                 ui.label(format!("parent_id: {:?}", parent_id));
                                 ui.label(format!("absolute_timestamp: {:?}", node.absolute_timestamp));
                                 ui.label(format!("parent_relative_timestamp: {:?}", node.adjusted_timestamp));
+                                ui.label(format!("total_duration: {:.2} seconds", (node.total_duration as f64) / 1_000_000_000.0));
                                 ui.label(format!("total_duration {:?}", node.total_duration));
                                 ui.label(format!("depth {:?}", node.depth));
                                 if let Some(execution_id) = execution_id {
@@ -613,12 +614,11 @@ fn update_positions(
     };
 
     let CallTree {
-        max_thread_depth,
-        max_render_lane,
         relative_endpoint,
         startpoint: startpoint_value,
         endpoint: endpoint_value,
-        graph: call_tree
+        graph: call_tree,
+        ..
     } = &call_tree.inner;
 
     if relative_endpoint < startpoint_value {
@@ -691,7 +691,7 @@ fn update_positions(
                     }.as_rgba_f32();
                     // Hovered state
                     if let Some(&entity) = span_to_text_mapping.identity.get(&node.id) {
-                        if let Ok((span, mut collider, mut transform)) = q_span_identities.get_mut(entity) {
+                        if let Ok((span, _, _)) = q_span_identities.get_mut(entity) {
                             if span.is_hovered {
                                 instances[idx].border_color = Color::Rgba {
                                     red: 1.0,
