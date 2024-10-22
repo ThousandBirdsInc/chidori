@@ -1174,7 +1174,11 @@ fn generate_tree_layout(
 
             // Only a single parent ever occurs
             if let Some(parent) = &mut parents.next() {
-                let _ = tree_graph.add_child(parent.clone(), tree_node);
+                // TODO: this is the wrong parent identity, this is the parent in the execution graph
+                // needs to be in the tree graph
+                if let Some(parent_index) = tree_graph.external_id_mapping.get(&parent.index()) {
+                    let _ = tree_graph.add_child(parent_index.clone(), tree_node);
+                }
             }
         }
     }

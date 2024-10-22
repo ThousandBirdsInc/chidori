@@ -3,7 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::mpsc::Sender;
 use tonic::codegen::Body;
-use crate::cells::{LLMCodeGenCellChatConfiguration, TemplateCell, TextRange};
+use crate::cells::{CellTypes, LLMCodeGenCellChatConfiguration, TemplateCell, TextRange};
 use crate::execution::primitives::operation::{AsyncRPCCommunication, InputItemConfiguration, InputSignature, InputType, OperationFn, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
 use crate::execution::primitives::serialized_value::{RkyvSerializedValue as RKV, serialized_value_to_json_value, RkyvSerializedValue};
 
@@ -48,7 +48,7 @@ pub fn template_cell(execution_state_id: ExecutionNodeId, cell: &TemplateCell, r
         execution_state_id,
         input_signature,
         output_signature,
-        template_cell_exec(body),
+        CellTypes::Template(cell.clone(), Default::default())
     ))
 }
 

@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::mpsc::Sender;
 use futures_util::FutureExt;
 use chidori_static_analysis::language::Report;
-use crate::cells::{CodeCell, SupportedLanguage, TextRange};
+use crate::cells::{CellTypes, CodeCell, SupportedLanguage, TextRange};
 use crate::execution::execution::execution_graph::ExecutionNodeId;
 use crate::execution::execution::ExecutionState;
 use crate::execution::primitives::operation::{AsyncRPCCommunication, InputItemConfiguration, InputSignature, InputType, OperationFn, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
@@ -27,16 +27,12 @@ pub fn code_cell(execution_state_id: ExecutionNodeId, cell: &CodeCell, range: &T
                 execution_state_id,
                 input_signature,
                 output_signature,
-                code_cell_exec_python(cell),
+                CellTypes::Code(cell, Default::default()),
             ))
         }
-        SupportedLanguage::Starlark => Ok(OperationNode::new(
-            cell.name.clone(),
-            execution_state_id,
-            InputSignature::new(),
-            OutputSignature::new(),
-            Box::new(|_, x, _, _| async move { Ok(OperationFnOutput::with_value(x)) }.boxed()),
-        )),
+        SupportedLanguage::Starlark => {
+            unreachable!("fail")
+        },
         SupportedLanguage::Deno => {
             let paths =
                 chidori_static_analysis::language::javascript::parse::extract_dependencies_js(
@@ -52,7 +48,7 @@ pub fn code_cell(execution_state_id: ExecutionNodeId, cell: &CodeCell, range: &T
                 execution_state_id,
                 input_signature,
                 output_signature,
-                code_cell_exec_deno(cell),
+                CellTypes::Code(cell, Default::default()),
             ))
         }
     }

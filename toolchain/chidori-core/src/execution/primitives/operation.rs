@@ -403,7 +403,7 @@ impl OperationNode {
         created_at: ExecutionNodeId,
         input_signature: InputSignature,
         output_signature: OutputSignature,
-        f: Box<OperationFn>,
+        cell: CellTypes,
     ) -> Self {
         let mut node = OperationNode::default();
         node.created_at_state_id = created_at;
@@ -411,6 +411,7 @@ impl OperationNode {
         node.signature.output_signature = output_signature;
         // node.operation = f;
         node.name = name;
+        node.cell = cell;
         node
     }
 

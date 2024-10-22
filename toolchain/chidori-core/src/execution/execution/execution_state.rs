@@ -141,6 +141,10 @@ pub struct FunctionMetadata {
     pub(crate) input_signature: InputSignature,
 }
 
+pub struct OperationRunningStatus {
+    running: bool
+}
+
 
 // TODO: make this thread-safe
 #[derive(Clone)]
@@ -182,6 +186,9 @@ pub struct ExecutionState {
 
     /// Map of operation_id -> OperationNode definition
     pub operation_by_id: ImHashMap<OperationId, OperationNode>,
+
+    /// Map of operation_id -> OperationNode definition
+    pub operation_running_status_by_id: ImHashMap<OperationId, Arc<Mutex<OperationRunningStatus>>>,
 
     /// Map of operation_id -> Cell definition
     pub cells_by_id: ImHashMap<OperationId, CellTypes>,
@@ -263,6 +270,7 @@ async fn pause_future_with_oneshot(execution_state_evaluation: ExecutionStateEva
 impl Default for ExecutionState {
     fn default() -> Self {
         ExecutionState {
+            
             exec_counter: 0,
             id: Uuid::new_v4(),
             stack: Default::default(),
@@ -280,6 +288,7 @@ impl Default for ExecutionState {
             fresh_values: Default::default(),
             operation_name_to_id: Default::default(),
             operation_by_id: Default::default(),
+            operation_running_status_by_id: Default::default(),
             cells_by_id: Default::default(),
             function_name_to_metadata: Default::default(),
             has_been_set: Default::default(),
@@ -379,7 +388,7 @@ impl ExecutionState {
                 &|_, n| {
                     // Node attributes
                     if let Some(op) = self.operation_by_id.get(n.1) {
-                        let op = op.lock().unwrap();
+                        // let op = op.lock().unwrap();
                         let default = format!("{:?}", n.1);
                         let name = get_cell_name(&op.cell).as_ref().unwrap_or(&default);
                         format!("label=\"{}\"", name) // Assuming get_name() fetches the cell name
@@ -444,10 +453,6 @@ impl ExecutionState {
     #[tracing::instrument]
     fn assign_dependencies_to_operations(new_state: &ExecutionState) -> anyhow::Result<Vec<DependencyGraphMutation>> {
         let (available_values, available_functions) = Self::get_possible_dependencies(new_state)?;
-
-        // TODO: we need to report on INVOKED functions - these functions are calls to
-        //       functions with the locals assigned in a particular way. But then how do we handle compositions of these?
-        //       Well we just need to invoke them in the correct pattern as determined by operations in that context.
 
         // Anywhere there is a matched value, we create a dependency graph edge
         let mut mutations = vec![];
@@ -770,8 +775,10 @@ impl ExecutionState {
         let name = op_node.name.clone();
         let signature = &op_node.signature.input_signature;
 
+
         // If the signature has no dependencies and the operation has been run once, skip it.
         if signature.is_empty() {
+            println!("Signature is empty");
             if self.check_if_previously_set(&next_operation_id) {
                 println!("Zero dep operation already set, continuing");
                 return Ok(None)
@@ -871,12 +878,12 @@ impl ExecutionState {
         new_state.evaluating_cell = Some(op_node.cell.clone());
         println!("step_execution, completed getting operation node {:?}", &new_state.evaluating_id);
         let args = new_state.evaluating_arguments.take().unwrap();
-        let next_operation_id = new_state.evaluating_id.clone();
+        let executed_operation_id = new_state.evaluating_id.clone();
         println!("step_execution about to run op_node.execute");
         let result = op_node.execute(&mut new_state, args, None, None).await?;
         println!("step_execution after op_node.execute");
-        outputs.push((next_operation_id, result.clone()));
-        ExecutionState::update_state(&mut new_state, next_operation_id, result, self.exec_counter);
+        outputs.push((executed_operation_id, result.clone()));
+        ExecutionState::update_state(&mut new_state, executed_operation_id, result, self.exec_counter);
         println!("step_execution about to complete, after update_state");
         Ok((ExecutionStateEvaluation::Complete(new_state), outputs))
     }

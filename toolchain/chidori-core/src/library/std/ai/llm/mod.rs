@@ -386,7 +386,7 @@ pub async fn ai_llm_run_chat_model(
                         let result = if is_function_invocation {
                             RkyvSerializedValue::String(choice.text.as_ref().unwrap().clone())
                         } else {
-                            let default_name = String::from("name");
+                            let default_name = String::from("output");
                             let name = name.as_ref().unwrap_or(&default_name);
                             let text = choice.text.as_ref().unwrap().clone();
                             result_map.insert(name.clone(), RkyvSerializedValue::String(text));

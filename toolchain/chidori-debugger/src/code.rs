@@ -718,8 +718,8 @@ fn render_code_cell(
                 Ok(report) => {
                     ui.push_id((op_id, 0), |ui| {
                         ui.collapsing("Cell Analysis", |ui| {
-                            // let response = JsonTree::new(format!("{:?} report", op_id), &serde_json::json!(&report))
-                            //     .show(ui);
+                            let response = JsonTree::new(format!("{:?} report", op_id), &serde_json::json!(&report))
+                                .show(ui);
                         });
                     });
                 }

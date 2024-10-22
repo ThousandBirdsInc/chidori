@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::mpsc::Sender;
-use crate::cells::{LLMCodeGenCell, LLMCodeGenCellChatConfiguration, LLMPromptCell, SupportedModelProviders, TextRange};
+use crate::cells::{CellTypes, LLMCodeGenCell, LLMCodeGenCellChatConfiguration, LLMPromptCell, SupportedModelProviders, TextRange};
 use crate::execution::primitives::operation::{AsyncRPCCommunication, InputItemConfiguration, InputSignature, InputType, OperationFn, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
 use crate::execution::primitives::serialized_value::{RkyvSerializedValue as RKV, RkyvSerializedValue, serialized_value_to_json_value};
 use futures_util::FutureExt;
@@ -77,7 +77,8 @@ pub fn code_gen_cell(execution_state_id: ExecutionNodeId, cell: &LLMCodeGenCell,
             execution_state_id,
             input_signature,
             output_signature,
-            code_gen_cell_exec_openai(cell.clone()),
+            CellTypes::CodeGen(cell.clone(), Default::default())
+            // code_gen_cell_exec_openai(cell.clone()),
         )),
     }
 }

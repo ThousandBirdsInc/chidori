@@ -5,7 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::mpsc::Sender;
 use tokio::runtime;
-use crate::cells::{llm_prompt_cell, LLMPromptCell, LLMPromptCellChatConfiguration, SupportedModelProviders, TextRange};
+use crate::cells::{llm_prompt_cell, CellTypes, LLMPromptCell, LLMPromptCellChatConfiguration, SupportedModelProviders, TextRange};
 use crate::execution::primitives::operation::{AsyncRPCCommunication, InputItemConfiguration, InputSignature, InputType, OperationFn, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue as RKV, RkyvSerializedValue, serialized_value_to_json_value};
 use futures_util::FutureExt;
@@ -92,17 +92,14 @@ pub fn llm_prompt_cell(execution_state_id: ExecutionNodeId, cell: &LLMPromptCell
                     execution_state_id,
                     input_signature,
                     output_signature,
-                    llm_prompt_cell_exec_chat_openai(llm_prompt_cell.clone()),
+                    CellTypes::Prompt(llm_prompt_cell.clone(), Default::default())
+                    // llm_prompt_cell_exec_chat_openai(),
                 )),
             }
         }
-        LLMPromptCell::Completion { .. } => Ok(OperationNode::new(
-            None,
-            execution_state_id,
-            InputSignature::new(),
-            OutputSignature::new(),
-            Box::new(|_, x, _, _| async move { Ok(OperationFnOutput::with_value(x)) }.boxed()),
-        )),
+        LLMPromptCell::Completion { .. } => {
+            unreachable!("fail")
+        },
     }
 }
 
