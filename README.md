@@ -67,8 +67,11 @@ Chidori is available on [crates.io](https://crates.io/crates/chidori) and can be
 prototype development is `chidori-debugger` which wraps our runtime in a useful visual interface.
 
 ```bash
+# Install the rust toolchain and the nightly channel
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 rustup toolchain install nightly
+
+# Required for building dependencies
 xcode-select --install
 
 # These dependencies are necessary for a successful build
