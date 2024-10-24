@@ -22,7 +22,6 @@ repository = "https://github.com/ThousandBirdsInc/chidori"
 
 [workspace.dependencies]
 rkyv = {version = "0.7.42", features = ["validation"]}
-
 protobuf = "3.2.0"
 anyhow = { version = "1.0", default-features = false }
 indoc = "1.0.3"
@@ -59,13 +58,3 @@ features = [
     "fast-rng",          # Use a faster (but still sufficiently random) RNG
     "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
 ]
-
-#[patch.crates-io]
-#deno = { git = "https://github.com/ThousandBirdsInc/deno", rev = "e7f2e968826ea6da8cf65387a13ea61672c7ea5c" }
-#deno_runtime = { git = "https://github.com/ThousandBirdsInc/deno", rev = "e7f2e968826ea6da8cf65387a13ea61672c7ea5c" }
-#deno = { git = "https://github.com/ThousandBirdsInc/deno", rev = "043024ee3e72c60e96f2c988ba190229febe0b46" }
-#deno_runtime = { git = "https://github.com/ThousandBirdsInc/deno", rev = "043024ee3e72c60e96f2c988ba190229febe0b46" }
-
-#serde = {path = "../../serde/serde" }
-#serde_derive = {path = "../../serde/serde_derive" }
-#openai_api_rs = {path = "../../openai-api-rs" }

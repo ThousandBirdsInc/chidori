@@ -14,7 +14,6 @@ description = "Core of Chidori, compiles graph and node definitions into an inte
 name = "chidori_core"
 crate-type = ["cdylib", "lib"]
 bench = false
-proc-macro = true
 path = "src/lib.rs"
 
 [[bin]]
@@ -22,6 +21,8 @@ name = "chidori-core"
 path = "src/main.rs"
 
 [dependencies]
+chidori-prompt-format = { path = "../chidori-prompt-format", version = "0.1.36" }
+chidori-static-analysis = { path = "../chidori-static-analysis", version = "0.1.3" }
 anyhow.workspace = true
 indoc.workspace = true
 serde.workspace = true
@@ -40,6 +41,8 @@ reqwest.workspace = true
 bytes.workspace = true
 petgraph.workspace = true
 thiserror.workspace = true
+insta.workspace = true
+rusqlite.workspace = true
 
 fancy-regex = "0.13.0"
 tokio-cron-scheduler = "0.10.0"
@@ -60,25 +63,15 @@ async-trait = "0.1.69"
 dotenv = "0.15.0"
 futures-util = "0.3.28"
 typed-arena = "2.0.1"
-insta.workspace = true
 sha1 = "0.10.5"
 
-
-# Support for parsing python
-rustpython-parser = "0.3.0"
-
-chidori-prompt-format = { path = "../chidori-prompt-format", version = "0.1.36" }
-chidori-static-analysis = { path = "../chidori-static-analysis", version = "0.1.3" }
 
 indexmap = "2.2.6"
 dashmap = "5.5.3"
 clap = { version = "4.5.13", features = ["derive"] }
 
-# TODO: make optional
 yaml-front-matter = "0.1.0"
-#deno = "1.46.3"
 thousand_birds_deno = "1.46.3"
-#deno_runtime = "0.177.0"
 deno_core = "=0.307.0"
 #starlark = { version = "0.9.0"}
 http-body-util = "0.1.0-rc.2"
@@ -87,8 +80,6 @@ hnsw_rs_thousand_birds = "0.1.20"
 openai-api-rs = "5.0.4"
 
 
-#rustpython = { git = "https://github.com/RustPython/RustPython.git" }
-#rustpython-vm = { git = "https://github.com/RustPython/RustPython.git" }
 pyo3 = { version = "0.20.3", features = ["abi3-py37"]}
 pyo3-asyncio = { version = "0.20.0", features = ["attributes", "tokio-runtime"] }
 pyo3-log = { version = "0.9.0"}
@@ -113,13 +104,12 @@ tracing-opentelemetry = "0.23.0"
 opentelemetry-semantic-conventions = "0.14.0"
 no_deadlocks = "1.3.2"
 # ollama-rs = { version = "0.1.0", features = ["stream"] }
-rusqlite.workspace = true
 which = "4.4.2"
 
 [build-dependencies]
 target-lexicon = "0.12"
 dirs = "3.0"
-pyo3-build-config = "0.22.5"
+#pyo3-build-config = "0.22.5"
 anyhow = "1.0.82"
 
 
@@ -127,14 +117,14 @@ anyhow = "1.0.82"
 #[package.metadata.pyo3]
 #python = "/opt/homebrew/bin/python3.12"
 
-[target.x86_64-apple-darwin]
-rustflags = [
-    "-C", "link-arg=-undefined",
-    "-C", "link-arg=dynamic_lookup",
-]
-
-[target.aarch64-apple-darwin]
-rustflags = [
-    "-C", "link-arg=-undefined",
-    "-C", "link-arg=dynamic_lookup",
-]
+#[target.x86_64-apple-darwin]
+#rustflags = [
+#    "-C", "link-arg=-undefined",
+#    "-C", "link-arg=dynamic_lookup",
+#]
+#
+#[target.aarch64-apple-darwin]
+#rustflags = [
+#    "-C", "link-arg=-undefined",
+#    "-C", "link-arg=dynamic_lookup",
+#]

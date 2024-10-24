@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::mpsc::Sender;
-use tonic::codegen::Body;
 use crate::cells::{CellTypes, LLMCodeGenCellChatConfiguration, TemplateCell, TextRange};
 use crate::execution::primitives::operation::{AsyncRPCCommunication, InputItemConfiguration, InputSignature, InputType, OperationFn, OperationFnOutput, OperationNode, OutputItemConfiguration, OutputSignature};
 use crate::execution::primitives::serialized_value::{RkyvSerializedValue as RKV, serialized_value_to_json_value, RkyvSerializedValue};

@@ -10,10 +10,6 @@ use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyCFunction, PyDict, PyList, PySet, PyTuple};
 use std::sync::mpsc::{self, Sender};
 
-// use rustpython::vm::{pymodule, PyPayload, PyResult, VirtualMachine};
-// use rustpython_vm as vm;
-// use rustpython_vm::builtins::{PyBool, PyDict, PyInt, PyList, PyStr};
-
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -24,7 +20,6 @@ use once_cell::sync::OnceCell;
 use pyo3_asyncio::generic;
 use tokio::runtime::Runtime;
 use chidori_static_analysis::language::Report;
-// use rustpython_vm::PyObjectRef;
 use crate::cells::{CellTypes, CodeCell, LLMPromptCell};
 use crate::execution::execution::ExecutionState;
 
