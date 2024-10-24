@@ -718,8 +718,8 @@ fn render_code_cell(
                 Ok(report) => {
                     ui.push_id((op_id, 0), |ui| {
                         ui.collapsing("Cell Analysis", |ui| {
-                            let response = JsonTree::new(format!("{:?} report", op_id), &serde_json::json!(&report))
-                                .show(ui);
+                            // let response = JsonTree::new(format!("{:?} report", op_id), &serde_json::json!(&report))
+                            //     .show(ui);
                         });
                     });
                 }
@@ -737,10 +737,6 @@ fn render_new_cell_interface(
     mut state: &mut CellState,
     code_theme: &mut CodeTheme
 ) {
-    ui.horizontal(|ui| {
-        egui_label(ui, "Appending New Cell");
-    });
-
     if state.temp_cell.is_some() {
         if ui.button("Cancel").clicked() {
             state.temp_cell = None;
@@ -749,6 +745,7 @@ fn render_new_cell_interface(
     }
 
     if state.temp_cell.is_none() {
+        ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
         if ui.button("Add Code Cell").clicked() {
             let op_id = Uuid::new_v4();
             state.temp_cell = Some(CellHolder {

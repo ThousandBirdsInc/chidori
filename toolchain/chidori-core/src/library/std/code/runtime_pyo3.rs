@@ -667,12 +667,14 @@ fn create_python_dispatch_closure(py: Python, clone_function_name: String, execu
             let parent_span_id = parent_span_id.clone();
             let py = args.py();
             // TODO: this should be after the dispatch, substituting it
-            let mut new_exec_state = {
-                let mut exec_state = execution_state_handle.lock().unwrap();
-                let mut new_exec_state = exec_state.clone();
-                std::mem::swap(&mut *exec_state, &mut new_exec_state);
-                new_exec_state
-            };
+            // let mut new_exec_state = {
+            //     let mut exec_state = execution_state_handle.lock().unwrap();
+            //     let mut new_exec_state = exec_state.clone();
+            //     std::mem::swap(&mut *exec_state, &mut new_exec_state);
+            //     new_exec_state
+            // };
+
+            let mut new_exec_state = execution_state_handle.lock().unwrap().clone();
             // All function calls across cells are forced to be async
             pyo3_asyncio::tokio::future_into_py(py, async move {
                 let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload, parent_span_id.clone()).await.map_err(|e| AnyhowErrWrapper(e))?;

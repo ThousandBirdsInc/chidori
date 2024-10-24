@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, mpsc, Mutex};
 use tokio::sync::mpsc::Receiver as TokioReceiver;
@@ -8,6 +9,7 @@ use std::pin::Pin;
 use std::time::Duration;
 use futures_util::future::select_all;
 use futures_util::FutureExt;
+use tokio::runtime::Handle;
 use crate::cells::CellTypes;
 use crate::execution::execution::execution_graph::{ExecutionEvent, ExecutionGraph, ExecutionNodeId};
 use crate::execution::execution::execution_state::ExecutionStateEvaluation;
@@ -109,7 +111,6 @@ impl InstancedEnvironment {
     }
 
 
-
     /// Entrypoint for execution of an instanced environment, handles messages from the host
     // #[tracing::instrument]
     pub async fn run(&mut self) -> anyhow::Result<()> {
@@ -119,125 +120,101 @@ impl InstancedEnvironment {
         // Reload cells to make sure we're up-to-date
         self.reload_cells()?;
 
-        // Get the current span ID
-        // let current_span_id = Span::current().id().expect("There is no current span");
+        // Channel for receiving step execution results
+        let (step_tx, mut step_rx) = tokio::sync::mpsc::channel(100);
+        let executing_states = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
 
-        let mut executing_states = DashMap::new();
-        let mut loop_remaining_futures = vec![];
         loop {
-            // println!("Looping UserInteraction");
-            // let closure_span = tracing::span!(parent: &current_span_id, tracing::Level::INFO, "execution_instance_loop");
-            // let _enter = closure_span.enter();
-
             // Handle user interactions first for responsiveness
             if let Ok(message) = self.env_rx.try_recv() {
                 println!("Received message from user: {:?}", message);
                 self.handle_user_interaction_message(message).await?;
             }
 
-
-            tokio::select! {
-                Some(event) = self.execution_event_rx.recv() => {
-                    println!("InstancedEnvironment received an execution event {:?}", &event);
-                    self.handle_execution_event(event).await?;
-                }
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                }
+            if let Ok(event) = self.execution_event_rx.try_recv() {
+                println!("InstancedEnvironment received an execution event {:?}", &event);
+                self.handle_execution_event(event).await?;
             }
 
-            // TODO: what if we're somehow contending over resources, and that's why the fast polling makes this fail
-
-            let mut should_pause = false;;
-            let mut timeout_future_available = false;
+            let mut should_pause = false;
             {
                 let state = self.get_state_at_current_execution_head_result()?;
                 let exec_head = self.execution_head_state_id;
+
                 let get_conditional_polling_step = match self.playback_state {
                     PlaybackState::Step => {
                         self.set_playback_state(PlaybackState::Paused);
                         Some((exec_head, ExecutionGraph::immutable_external_step_execution(state)))
                     }
-                    PlaybackState::Paused => {
-                        None
-                    }
+                    PlaybackState::Paused => None,
                     PlaybackState::Running => {
                         Some((exec_head, ExecutionGraph::immutable_external_step_execution(state)))
                     }
                 };
 
                 if let Some((executing_from_source_state_id, step)) = get_conditional_polling_step {
-
-                    let mut futures_vec: Vec<
-                        Pin<Box<dyn futures::Future<Output = Option<anyhow::Result<(ExecutionNodeId, ExecutionStateEvaluation, Vec<(Uuid, OperationFnOutput)>)>>> + Send>>,
-                    > = loop_remaining_futures;
-
-                    // Only add a step iteration if we're not currently executing the given state
-                    if !executing_states.contains_key(&executing_from_source_state_id) {
+                    // Acquire lock and check if we're already executing this state
+                    let mut executing_states_instance = executing_states.lock().await;
+                    if !executing_states_instance.contains(&executing_from_source_state_id) {
                         println!("Will eval step, inserting eval state {:?}", &executing_from_source_state_id);
-                        executing_states.insert(executing_from_source_state_id, true);
-                        let fut_with_some = step.map(move |res| Some(res)).boxed();
-                        futures_vec.push(fut_with_some);
-                    }
+                        executing_states_instance.insert(executing_from_source_state_id);
+                        drop(executing_states_instance); // Release lock before spawning task
 
-                    // TODO: when we decrease the timeout of the sleep, we start to fail to progress execution
-                    // This is intended to be 10ms but due to the above bug, we're set to 2000ms
-                    // My current theory is that looping more often causes contention over
-                    // some resource that causes evaluation to slow to a halt
-                    // Add a 2000ms timeout future
-                    if !timeout_future_available {
-                        let timeout_future = tokio::time::sleep(Duration::from_millis(2000)).then(|_| {
-                            // Return a special result to indicate timeout
-                            futures::future::ready(None)
+                        // Clone necessary values for the spawned task
+                        let step_tx = step_tx.clone();
+                        let state_id = executing_from_source_state_id;
+                        let executing_states = Arc::clone(&executing_states);
+
+                        // Spawn the step execution in a separate task
+                        tokio::spawn(async move {
+                            let result = step.await;
+                            // Clean up executing state regardless of result
+                            let _ = executing_states.lock().await.remove(&state_id);
+                            let _ = step_tx.send((state_id, result)).await;
                         });
-                        futures_vec.push(timeout_future.boxed());
-                        timeout_future_available = true;
                     }
+                }
+            }
 
-                    let futures_vec_len = futures_vec.len();
-
-                    let (completed_result, _completed_index, remaining_futures) = select_all(futures_vec).await;
-                    println!("completed_result {:?}", completed_result);
-                    loop_remaining_futures = remaining_futures;
-                    println!("loop_remaining_futures count {:?}", loop_remaining_futures.len());
-
-                    match completed_result {
-                        Some(anyhow::Result::Ok((resolved_id, new_state, o)))  => {
-                            println!("Got completed result {:?}", &resolved_id);
-
-                            // TODO: remove from the dashmap when we see the parent_id here
+            // Check for completed step results
+            match tokio::time::timeout(Duration::from_millis(10), step_rx.recv()).await {
+                Ok(Some((resolved_id, step_result))) => {
+                    match step_result {
+                        Ok((node_id, new_state, outputs)) => {
+                            println!("Got completed result {:?}", &node_id);
                             match &new_state {
                                 ExecutionStateEvaluation::Error(s) => {
-                                    println!("Got result {:?}, {:?}", resolved_id, new_state);
-                                    executing_states.remove(&resolved_id);
+                                    println!("Got result {:?}, {:?}", node_id, new_state);
                                 }
                                 ExecutionStateEvaluation::EvalFailure(_) => {}
                                 ExecutionStateEvaluation::Complete(s) => {
-                                    println!("Got result {:?}, {:?}", resolved_id, new_state);
-                                    executing_states.remove(&resolved_id);
+                                    println!("Got result {:?}, {:?}", node_id, new_state);
                                 }
                                 ExecutionStateEvaluation::Executing(s) => {
-                                    println!("Still executing result {:?}, {:?}", resolved_id, new_state);
+                                    println!("Still executing result {:?}, {:?}", node_id, new_state);
                                 }
                             }
                             let resulting_state_id = self.db.progress_graph(new_state.clone());
                             self.push_update_to_client(&resulting_state_id, new_state);
-                            if o.is_empty() {
+                            if outputs.is_empty() {
                                 println!("Playback paused, awaiting input from user");
                                 should_pause = true;
                             }
                         }
-                        Some(anyhow::Result::Err(_))  => {
+                        Err(_) => {
                             println!("Error should pause");
                             should_pause = true;
                         }
-                        None => {
-                            timeout_future_available = false;
-                            println!("Loop timeout, continuing");
-                        }
                     }
                 }
+                Ok(None) => {
+                    panic!("Step execution channel closed unexpectedly");
+                }
+                Err(_) => {}
             }
+
             if should_pause {
+                println!("Setting paused playback state");
                 self.set_playback_state(PlaybackState::Paused);
             }
         }
@@ -275,20 +252,16 @@ impl InstancedEnvironment {
                 sender.send(EventsFromRuntime::StateAtId(id, state)).unwrap();
             },
             UserInteractionMessage::RevertToState(id) => {
-                println!("=== 0");
                 if let Some(id) = id {
                     self.execution_head_state_id = id;
-                    println!("=== A");
                     let merged_state = self.db.get_merged_state_history(&id);
                     let sender = self.runtime_event_sender.as_mut().unwrap();
                     sender.send(EventsFromRuntime::ExecutionStateChange(merged_state)).unwrap();
                     sender.send(EventsFromRuntime::UpdateExecutionHead(id)).unwrap();
-                    println!("=== B");
 
                     if let Some(ExecutionStateEvaluation::Complete(state)) = self.db.get_state_at_id(self.execution_head_state_id) {
                         let mut cells = vec![];
                         // TODO: keep a separate mapping of cells so we don't need to lock operations
-                        println!("=== C");
                         for (id, cell) in state.cells_by_id.iter() {
                             cells.push(CellHolder {
                                 cell: cell.clone(),
@@ -297,11 +270,9 @@ impl InstancedEnvironment {
                                 needs_update: false,
                             });
                         }
-                        println!("=== D");
                         let mut ss = self.shared_state.lock().unwrap();
                         ss.at_execution_state_cells = cells.clone();
                         sender.send(EventsFromRuntime::ExecutionStateCellsViewUpdated(cells)).unwrap();
-                        println!("=== E");
                     }
                 }
             },
@@ -420,7 +391,7 @@ impl InstancedEnvironment {
     #[tracing::instrument]
     pub fn upsert_cell(&mut self, cell: CellTypes, op_id: OperationId) -> anyhow::Result<(ExecutionNodeId, OperationId)> {
         println!("Upserting cell into state with id {:?}", &self.execution_head_state_id);
-        let ((state_id, state), op_id) = self.db.mutate_graph(self.execution_head_state_id, cell, op_id)?;
+        let ((state_id, state), op_id) = self.db.update_operation(self.execution_head_state_id, cell, op_id)?;
         self.push_update_to_client(&state_id, state);
         Ok((state_id, op_id))
     }

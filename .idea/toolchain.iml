@@ -35,6 +35,7 @@
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-tsne/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-im-petgraph/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/toolchain/chidori-debugger/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/toolchain/eval-tokio/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/prompt-graph-core/target" />
       <excludeFolder url="file://$MODULE_DIR$/prompt-graph-exec/target" />

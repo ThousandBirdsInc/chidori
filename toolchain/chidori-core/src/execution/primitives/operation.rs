@@ -459,8 +459,7 @@ impl OperationNode {
         };
 
         /// Receiver that we pass to the exec for it to capture oneshot RPC communication
-        let exec = closure;
-        exec(state, argument_payload, intermediate_output_channel_tx, async_communication_channel)
+        closure(state, argument_payload, intermediate_output_channel_tx, async_communication_channel)
     }
 }
 

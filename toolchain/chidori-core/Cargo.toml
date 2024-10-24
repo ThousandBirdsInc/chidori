@@ -117,13 +117,24 @@ rusqlite.workspace = true
 which = "4.4.2"
 
 [build-dependencies]
-tonic-build = "0.9.2"
 target-lexicon = "0.12"
 dirs = "3.0"
-pyo3-build-config = "0.19.1"
+pyo3-build-config = "0.22.5"
 anyhow = "1.0.82"
 
 
 
-[package.metadata.pyo3]
-python = "/opt/homebrew/bin/python3.12"
+#[package.metadata.pyo3]
+#python = "/opt/homebrew/bin/python3.12"
+
+[target.x86_64-apple-darwin]
+rustflags = [
+    "-C", "link-arg=-undefined",
+    "-C", "link-arg=dynamic_lookup",
+]
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "link-arg=-undefined",
+    "-C", "link-arg=dynamic_lookup",
+]

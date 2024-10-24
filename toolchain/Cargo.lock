@@ -820,6 +820,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "atty"
+version = "0.2.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9b39be18770d11421cdb1b9947a45dd3f37e93092cbf377614828a319d5fee8"
+dependencies = [
+ "hermit-abi 0.1.19",
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "auto_impl"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2649,10 +2660,91 @@ dependencies = [
  "async-trait",
  "base64 0.21.7",
  "bytes",
- "chidori-prompt-format",
- "chidori-static-analysis",
+ "chidori-prompt-format 0.1.36",
+ "chidori-static-analysis 0.1.3",
  "chumsky",
  "clap",
+ "crossbeam-utils",
+ "dashmap",
+ "deno_core",
+ "dirs 3.0.2",
+ "dirs 5.0.1",
+ "dotenv",
+ "env_logger",
+ "fancy-regex 0.13.0",
+ "fantoccini",
+ "futures",
+ "futures-util",
+ "handlebars 4.5.0",
+ "hnsw_rs_thousand_birds",
+ "http-body-util",
+ "im",
+ "indexmap 2.6.0",
+ "indoc 1.0.9",
+ "insta",
+ "log",
+ "no_deadlocks",
+ "num",
+ "num_cpus",
+ "once_cell",
+ "openai-api-rs",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
+ "petgraph",
+ "priority-queue",
+ "prost 0.11.9",
+ "pyo3",
+ "pyo3-asyncio",
+ "pyo3-build-config 0.22.5",
+ "pyo3-log",
+ "qdrant-client",
+ "quote",
+ "rand 0.8.5",
+ "regex",
+ "reqwest 0.12.8",
+ "rkyv",
+ "rusqlite",
+ "rustpython-parser",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "serde_yaml 0.9.34+deprecated",
+ "sha1",
+ "syn 1.0.109",
+ "target-lexicon",
+ "thiserror",
+ "thousand_birds_deno",
+ "tokio",
+ "tokio-cron-scheduler",
+ "tonic 0.9.2",
+ "tracing",
+ "tracing-bunyan-formatter",
+ "tracing-chrome",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "typed-arena",
+ "typescript-type-def",
+ "uuid",
+ "which 4.4.2",
+ "yaml-front-matter",
+]
+
+[[package]]
+name = "chidori-core"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63521a20cfeef028f5d49c887b9b1566b707de4e5eee1f02ad942e5dbb0e1850"
+dependencies = [
+ "anyhow",
+ "ariadne",
+ "async-trait",
+ "base64 0.21.7",
+ "bytes",
+ "chidori-prompt-format 0.1.36 (registry+https://github.com/rust-lang/crates.io-index)",
+ "chidori-static-analysis 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "chumsky",
  "crossbeam-utils",
  "dashmap",
  "deno_core",
@@ -2734,7 +2826,7 @@ dependencies = [
  "bevy_rapier2d",
  "bevy_utils 0.13.2",
  "bytemuck",
- "chidori-core",
+ "chidori-core 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "crossbeam-channel",
  "dashmap",
  "dirs 3.0.2",
@@ -2754,7 +2846,6 @@ dependencies = [
  "once_cell",
  "petgraph",
  "petgraph-gen",
- "pyo3-build-config 0.19.2",
  "rand 0.8.5",
  "regex",
  "rfd",
@@ -2793,6 +2884,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "chidori-prompt-format"
+version = "0.1.36"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e26b6bf535b879a9f592cf9f14e13da4f33f2a4fe51594d3731357886485285"
+dependencies = [
+ "anyhow",
+ "console_error_panic_hook",
+ "indoc 1.0.9",
+ "lazy_static",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "serde_yaml 0.9.34+deprecated",
+ "thousand_birds_handlebars",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "chidori-static-analysis"
 version = "0.1.3"
 dependencies = [
@@ -2812,6 +2921,29 @@ dependencies = [
  "thiserror",
  "wasm-bindgen",
  "wasm-bindgen-test",
+]
+
+[[package]]
+name = "chidori-static-analysis"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cef4a3566f94dd8d9ac4a73d64c79fa6361c960d12e0b42439a4116fd0924b38"
+dependencies = [
+ "anyhow",
+ "console_error_panic_hook",
+ "indoc 1.0.9",
+ "insta",
+ "lazy_static",
+ "petgraph",
+ "rustpython-parser",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_yaml 0.9.34+deprecated",
+ "swc_common 0.33.26",
+ "swc_ecma_ast 0.111.1",
+ "swc_ecma_parser 0.142.2",
+ "thiserror",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3630,7 +3762,7 @@ dependencies = [
  "swc_eq_ignore_macros",
  "swc_graph_analyzer",
  "swc_macros_common",
- "swc_visit",
+ "swc_visit 0.6.1",
  "swc_visit_macros",
  "text_lines",
  "thiserror",
@@ -6616,6 +6748,15 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermit-abi"
+version = "0.1.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62b467343b94ba476dcb2500d242dadbb39557df889310ac77c5d99100aaac33"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "hermit-abi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d231dfb89cfffdbc30e7fc41579ed6066ad03abda9e567ccafae602b97ec5024"
@@ -7285,7 +7426,7 @@ version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f23ff5ef2b80d608d61efee834934d862cd92461afc0560dedf493e4c033738b"
 dependencies = [
- "hermit-abi",
+ "hermit-abi 0.3.9",
  "libc",
  "windows-sys 0.52.0",
 ]
@@ -8697,7 +8838,7 @@ version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4161fcb6d602d4d2081af7c3a45852d875a03dd337a6bfdd6e06407b61342a43"
 dependencies = [
- "hermit-abi",
+ "hermit-abi 0.3.9",
  "libc",
 ]
 
@@ -9636,7 +9777,7 @@ checksum = "e0c976a60b2d7e99d6f229e414670a9b85d13ac305cc6d1e9c134de58c5aaaf6"
 dependencies = [
  "cfg-if",
  "concurrent-queue",
- "hermit-abi",
+ "hermit-abi 0.3.9",
  "pin-project-lite",
  "rustix",
  "tracing",
@@ -9995,6 +10136,16 @@ name = "pyo3-build-config"
 version = "0.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "deaa5745de3f5231ce10517a1f5dd97d53e5a2fd77aa6b5842292085831d48d7"
+dependencies = [
+ "once_cell",
+ "target-lexicon",
+]
+
+[[package]]
+name = "pyo3-build-config"
+version = "0.22.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc38c5feeb496c8321091edf3d63e9a6829eab4b863b4a6a65f26f3e9cc6b179"
 dependencies = [
  "once_cell",
  "target-lexicon",
@@ -11975,6 +12126,34 @@ dependencies = [
 
 [[package]]
 name = "swc_common"
+version = "0.33.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2f9706038906e66f3919028f9f7a37f3ed552f1b85578e93f4468742e2da438"
+dependencies = [
+ "arbitrary",
+ "ast_node 0.9.9",
+ "atty",
+ "better_scoped_tls",
+ "cfg-if",
+ "either",
+ "from_variant 0.1.9",
+ "new_debug_unreachable",
+ "num-bigint",
+ "once_cell",
+ "rustc-hash",
+ "serde",
+ "siphasher",
+ "swc_atoms 0.6.7",
+ "swc_eq_ignore_macros",
+ "swc_visit 0.5.14",
+ "termcolor",
+ "tracing",
+ "unicode-width",
+ "url",
+]
+
+[[package]]
+name = "swc_common"
 version = "0.36.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1802b1642488aec58597dc55ea88992c165660d6e44e9838d4d93f7b78ab95f3"
@@ -11994,7 +12173,7 @@ dependencies = [
  "swc_allocator",
  "swc_atoms 0.6.7",
  "swc_eq_ignore_macros",
- "swc_visit",
+ "swc_visit 0.6.1",
  "tracing",
  "unicode-width",
  "url",
@@ -12020,7 +12199,7 @@ dependencies = [
  "swc_allocator",
  "swc_atoms 1.0.2",
  "swc_eq_ignore_macros",
- "swc_visit",
+ "swc_visit 0.6.1",
  "termcolor",
  "tracing",
  "unicode-width",
@@ -12051,6 +12230,24 @@ dependencies = [
  "quote",
  "swc_macros_common",
  "syn 2.0.58",
+]
+
+[[package]]
+name = "swc_ecma_ast"
+version = "0.111.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e12b4d0f3b31d293dac16fc13a50f8a282a3bdb658f2a000ffe09b1b638f45c9"
+dependencies = [
+ "arbitrary",
+ "bitflags 2.6.0",
+ "is-macro",
+ "num-bigint",
+ "phf 0.11.2",
+ "scoped-tls",
+ "string_enum",
+ "swc_atoms 0.6.7",
+ "swc_common 0.33.26",
+ "unicode-id",
 ]
 
 [[package]]
@@ -12131,6 +12328,28 @@ dependencies = [
  "swc_atoms 0.6.7",
  "swc_common 0.36.2",
  "tracing",
+]
+
+[[package]]
+name = "swc_ecma_parser"
+version = "0.142.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2048574683e3847ecb360dd6ac603ba3c68331254a545eaf927f56f6aeeea205"
+dependencies = [
+ "either",
+ "new_debug_unreachable",
+ "num-bigint",
+ "num-traits",
+ "phf 0.11.2",
+ "serde",
+ "smallvec",
+ "smartstring",
+ "stacker",
+ "swc_atoms 0.6.7",
+ "swc_common 0.33.26",
+ "swc_ecma_ast 0.111.1",
+ "tracing",
+ "typed-arena",
 ]
 
 [[package]]
@@ -12342,7 +12561,7 @@ dependencies = [
  "swc_atoms 0.6.7",
  "swc_common 0.36.2",
  "swc_ecma_ast 0.117.4",
- "swc_visit",
+ "swc_visit 0.6.1",
  "tracing",
 ]
 
@@ -12391,6 +12610,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.58",
+]
+
+[[package]]
+name = "swc_visit"
+version = "0.5.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "043d11fe683dcb934583ead49405c0896a5af5face522e4682c16971ef7871b9"
+dependencies = [
+ "either",
+ "swc_visit_macros",
 ]
 
 [[package]]

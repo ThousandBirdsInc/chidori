@@ -348,14 +348,14 @@ fn create_function_shims(
                 let parent_span_id = parent_span_id.clone();
                 async move {
                     let total_arg_payload = js_args_to_rkyv(args, kwargs);
-                    let mut new_exec_state = {
-                        let mut exec_state = execution_state_handle.lock().unwrap();
-                        let mut v = exec_state.clone();
-                        // get a new execution state
-                        std::mem::swap(&mut *exec_state, &mut v);
-                        v
-                    };
+                    // let mut new_exec_state = {
+                    //     let mut exec_state = execution_state_handle.lock().unwrap();
+                    //     let mut new_exec_state = exec_state.clone();
+                    //     std::mem::swap(&mut *exec_state, &mut new_exec_state);
+                    //     new_exec_state
+                    // };
                     println!("Deno expecting to call dispatch");
+                    let mut new_exec_state = execution_state_handle.lock().unwrap().clone();
                     let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload, parent_span_id.clone()).await?;
                     return result;
                 }.boxed()

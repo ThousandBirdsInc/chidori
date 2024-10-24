@@ -12,7 +12,7 @@ use bevy::prelude::{default, Commands, KeyCode, Local, Res, ResMut, Resource};
 use chidori_core::uuid::Uuid;
 use egui;
 use egui::panel::TopBottomSide;
-use egui::{FontFamily, Frame, Id, Margin, Response, Widget};
+use egui::{FontFamily, Frame, Id, Margin, Response, Vec2b, Widget};
 use egui_tiles::{Tile, TileId};
 use notify_debouncer_full::{
     new_debouncer,
@@ -735,7 +735,10 @@ pub fn update_gui(
                             ];
 
 
-                            egui::ScrollArea::vertical().min_scrolled_height(400.0).show(ui, |ui| {
+                            let available_height = ui.available_height();
+                            egui::ScrollArea::vertical()
+                                .auto_shrink(Vec2b::new(true, false))
+                                .min_scrolled_height(400.0).show(ui, |ui| {
                                 let mut frame = egui::Frame::default().outer_margin(Margin {
                                     left: 0.0,
                                     right: 40.0,
@@ -743,6 +746,7 @@ pub fn update_gui(
                                     bottom: 0.0,
                                 }).rounding(6.0).begin(ui);
                                 {
+                                    ui.set_height(available_height);
                                     let mut ui = &mut frame.content_ui;
                                     let mut is_a_button_hovered = false;
                                     for button in buttons_text_load {

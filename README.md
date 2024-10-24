@@ -75,15 +75,17 @@ rustup toolchain install nightly
 xcode-select --install
 
 # These dependencies are necessary for a successful build
-brew install \ 
-  cmake \
+brew install cmake  
+
 # Protobuf is depended upon by denokv, which we in turn currently depend on
-  protobuf \
+brew install protobuf
+
 # We are investigating if this is necessary or can be removed
-  libiconv \
-  python@3.12 \
+brew install libiconv
+brew install python@3.12
+
 # Chidori uses uv for handling python dependencies 
-  uv
+brew install uv
 
 # We depend on features only supported by nightly at the moment
 cargo +nightly install chidori-debugger --locked

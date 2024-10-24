@@ -127,6 +127,10 @@ pub fn get_execution_id() -> Uuid {
     Uuid::new_v4()
 }
 
+pub fn get_operation_id() -> Uuid {
+    Uuid::new_v4()
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionEvent {
     pub id: ExecutionNodeId,
@@ -178,74 +182,80 @@ impl ExecutionGraph {
             initialization_notify_clone.notify_one();
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                        match execution_graph_event_receiver.try_recv() {
-                            Ok((resulting_execution_state, oneshot)) => {
-                                println!("==== Execution Graph received dispatch event {:?}", resulting_execution_state);
+                    biased;  // Prioritize message handling over cancellation
 
-                                let s = resulting_execution_state.clone();
-                                match &resulting_execution_state {
-                                    ExecutionStateEvaluation::Error(state) => {
-                                        let resulting_state_id = state.id;
-                                        execution_event_tx_clone.send(ExecutionEvent{id: resulting_state_id.clone(), evaluation: s.clone()}).await;
-                                    }
-                                    ExecutionStateEvaluation::EvalFailure(id) => {
-                                        execution_event_tx_clone.send(ExecutionEvent{id: id.clone(), evaluation: s.clone()}).await;
-                                    }
-                                    ExecutionStateEvaluation::Complete(state) => {
-                                        // println!("Adding to execution state!!!! {:?}", state.id);
-                                        let resulting_state_id = state.id;
-                                        execution_event_tx_clone.send(ExecutionEvent{id: resulting_state_id.clone(), evaluation: s.clone()}).await;
-                                    }
-                                    ExecutionStateEvaluation::Executing(state) => {
-                                        let resulting_state_id = state.id;
-                                        execution_event_tx_clone.send(ExecutionEvent{id: resulting_state_id.clone(), evaluation: s.clone()}).await;
-                                    }
+                    Some((resulting_execution_state, oneshot)) = execution_graph_event_receiver.recv() => {
+                        println!("==== Execution Graph received dispatch event {:?}", resulting_execution_state.id());
+
+                        let s = resulting_execution_state.clone();
+                        match &resulting_execution_state {
+                            ExecutionStateEvaluation::Error(state) => {
+                                let resulting_state_id = state.id;
+                                if let Err(e) = execution_event_tx_clone.send(ExecutionEvent{
+                                    id: resulting_state_id.clone(),
+                                    evaluation: s.clone()
+                                }).await {
+                                    println!("Failed to send execution event: {}", e);
                                 }
-
-
-                                // Pushing this state into the graph
-                                let mut execution_graph = execution_graph_clone.lock().unwrap();
-                                let mut state_id_to_state = state_id_to_state_clone.clone();
-
-                                match resulting_execution_state {
-                                    ExecutionStateEvaluation::Error(state) |
-                                    ExecutionStateEvaluation::Complete(state)
-                                    => {
-                                        let resulting_state_id = state.id;
-                                        state_id_to_state.insert(resulting_state_id.clone(), s.clone());
-                                        execution_graph.deref_mut()
-                                            .add_edge(state.parent_state_id, resulting_state_id.clone(), s);
-                                    }
-                                    ExecutionStateEvaluation::EvalFailure(id) => {
-                                        state_id_to_state.insert(id.clone(), s.clone());
-                                    }
-                                    ExecutionStateEvaluation::Executing(state) => {
-                                        let resulting_state_id = state.id;
-                                        if let Some(ExecutionStateEvaluation::Complete(_)) = state_id_to_state.get(&resulting_state_id).map(|x| x.clone()) {
-                                        } else {
-                                            state_id_to_state.insert(resulting_state_id.clone(), s.clone());
-                                            execution_graph.deref_mut()
-                                                .add_edge(state.parent_state_id, resulting_state_id.clone(), s);
-                                        }
-                                    }
-                                }
-
-                                // Resume execution
-                                // TODO: check if we're currently paused, and if so wait for this.
-                                // TODO: currently if this is not sent and the oneshot is dropped at the end of this, invocations will fail
-                                if let Some(oneshot) = oneshot {
-                                    oneshot.send(()).unwrap();
-                                }
-                            },
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                                // No messages available
-                            },
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                println!("===== Was DC'd");
-                                // Handle the case where the sender has disconnected and no more messages will be received
-                                break; // or handle it according to your application logic
                             }
+                            ExecutionStateEvaluation::EvalFailure(id) => {
+                                if let Err(e) = execution_event_tx_clone.send(ExecutionEvent{
+                                    id: id.clone(),
+                                    evaluation: s.clone()
+                                }).await {
+                                    println!("Failed to send execution event: {}", e);
+                                }
+                            }
+                            ExecutionStateEvaluation::Complete(state) => {
+                                let resulting_state_id = state.id;
+                                if let Err(e) = execution_event_tx_clone.send(ExecutionEvent{
+                                    id: resulting_state_id.clone(),
+                                    evaluation: s.clone()
+                                }).await {
+                                    println!("Failed to send execution event: {}", e);
+                                }
+                            }
+                            ExecutionStateEvaluation::Executing(state) => {
+                                let resulting_state_id = state.id;
+                                if let Err(e) = execution_event_tx_clone.send(ExecutionEvent{
+                                    id: resulting_state_id.clone(),
+                                    evaluation: s.clone()
+                                }).await {
+                                    println!("Failed to send execution event: {}", e);
+                                }
+                            }
+                        }
+
+                        // Pushing this state into the graph
+                        let mut execution_graph = execution_graph_clone.lock().unwrap();
+                        let mut state_id_to_state = state_id_to_state_clone.clone();
+
+                        match resulting_execution_state {
+                            ExecutionStateEvaluation::Error(state) |
+                            ExecutionStateEvaluation::Complete(state) => {
+                                let resulting_state_id = state.id;
+                                state_id_to_state.insert(resulting_state_id.clone(), s.clone());
+                                execution_graph.deref_mut()
+                                    .add_edge(state.parent_state_id, resulting_state_id.clone(), s);
+                            }
+                            ExecutionStateEvaluation::EvalFailure(id) => {
+                                state_id_to_state.insert(id.clone(), s.clone());
+                            }
+                            ExecutionStateEvaluation::Executing(state) => {
+                                let resulting_state_id = state.id;
+                                if let Some(ExecutionStateEvaluation::Complete(_)) = state_id_to_state.get(&resulting_state_id).map(|x| x.clone()) {
+                                    // State is already complete, skip updating
+                                } else {
+                                    state_id_to_state.insert(resulting_state_id.clone(), s.clone());
+                                    execution_graph.deref_mut()
+                                        .add_edge(state.parent_state_id, resulting_state_id.clone(), s);
+                                }
+                            }
+                        }
+
+                        // Resume execution
+                        if let Some(oneshot) = oneshot {
+                            oneshot.send(()).expect("Failed to send oneshot completion signal")
                         }
                     }
                     _ = cancellation_notify_clone.notified() => {
@@ -401,7 +411,7 @@ impl ExecutionGraph {
     }
 
     #[tracing::instrument]
-    pub fn mutate_graph(
+    pub fn update_operation(
         &mut self,
         prev_execution_id: ExecutionNodeId,
         cell: CellTypes,
@@ -447,8 +457,7 @@ impl ExecutionGraph {
             _ => { panic!("Stepping execution should only occur against completed states") }
         };
         let resolved_state_id = previous_state.id;
-        let eval_state = previous_state.determine_next_operation()?;
-        let (new_state, outputs) = previous_state.step_execution(eval_state).await?;
+        let (new_state, outputs) = previous_state.step_execution().await?;
         Ok((resolved_state_id, new_state, outputs))
     }
 }

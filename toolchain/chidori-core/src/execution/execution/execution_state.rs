@@ -50,26 +50,6 @@ pub enum DependencyGraphMutation {
     },
 }
 
-pub struct FutureExecutionState {
-    receiver: Option<oneshot::Receiver<ExecutionState>>,
-}
-
-impl Future for FutureExecutionState {
-    type Output = Option<ExecutionState>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(rx) = self.receiver.as_mut() {
-            match rx.poll_unpin(cx) {
-                Poll::Ready(Ok(value)) => Poll::Ready(Some(value)),
-                Poll::Ready(Err(_)) => Poll::Ready(None), // Channel was closed
-                Poll::Pending => Poll::Pending,
-            }
-        } else {
-            Poll::Ready(None) // Receiver was already taken and we received nothing
-        }
-    }
-}
-
 #[derive(thiserror::Error, Debug, PartialOrd, PartialEq, Clone, Serialize)]
 pub enum ExecutionStateErrors {
     #[error("the execution of this graph has reached a fixed point and will not continue without outside influence")]
@@ -101,9 +81,15 @@ pub enum ExecutionStateEvaluation {
 }
 
 impl ExecutionStateEvaluation {
-    pub fn state_get(&self, operation_id: &OperationId) -> Option<&OperationFnOutput> {
+    pub fn id(&self) -> &ExecutionNodeId {
         match self {
-
+            ExecutionStateEvaluation::Complete(ref state) => &state.id,
+            ExecutionStateEvaluation::Executing(ref state) => &state.id,
+            ExecutionStateEvaluation::Error(ref state) => &state.id,
+            ExecutionStateEvaluation::EvalFailure(ref id) => &id,
+        }
+    }
+    pub fn state_get(&self, operation_id: &OperationId) -> Option<&OperationFnOutput> { match self {
             ExecutionStateEvaluation::Complete(ref state) => state.state_get(operation_id),
             ExecutionStateEvaluation::Executing(..) => unreachable!("Cannot get state from a future state"),
             ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
@@ -241,26 +227,29 @@ fn render_map_as_table(exec_state: &ExecutionState) -> String {
 
 /// This causes the current async loop to pause until we send a signal over the oneshot sender returned
 async fn pause_future_with_oneshot(execution_state_evaluation: ExecutionStateEvaluation, sender: &tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>) -> Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>> {
-    println!("============= should pause =============");
+    let id = execution_state_evaluation.id();
+    println!("============= should pause {:?} =============", &id);
+    let cid = id.clone();
     let (oneshot_sender, mut oneshot_receiver) = tokio::sync::oneshot::channel();
     let future = async move {
         println!("Should be pending oneshot signal");
-        loop {
-            match oneshot_receiver.try_recv() {
-                Ok(_) => {
-                    break;
-                }
-                Err(TryRecvError::Empty) => {
-                }
-                Err(TryRecvError::Closed) => {
-                    // TODO: error instead of just continuing
-                    println!("Error during oneshot pause.");
-                    break;
-                }
-            }
+        let recv = oneshot_receiver.await.expect("Failed to receive oneshot signal");
+        // loop {
+        //     match oneshot_receiver.try_recv() {
+        //         Ok(_) => {
+        //             break;
+        //         }
+        //         Err(TryRecvError::Empty) => {
+        //         }
+        //         Err(TryRecvError::Closed) => {
+        //             // TODO: error instead of just continuing
+        //             println!("Error during oneshot pause.");
+        //             break;
+        //         }
+        //     }
             // let recv = oneshot_receiver.await.expect("Failed to receive oneshot signal");
-        }
-        println!("============= should resume =============");
+        // }
+        println!("============= should resume {:?} =============", &cid);
         RkyvSerializedValue::Null
     };
     sender.send((execution_state_evaluation, Some(oneshot_sender))).await.expect("Failed to send oneshot signal to the graph receiver");
@@ -270,8 +259,7 @@ async fn pause_future_with_oneshot(execution_state_evaluation: ExecutionStateEva
 impl Default for ExecutionState {
     fn default() -> Self {
         ExecutionState {
-            
-            exec_counter: 0,
+            exec_counter: 1,
             id: Uuid::new_v4(),
             stack: Default::default(),
             parent_state_id: Uuid::nil(),
@@ -352,6 +340,13 @@ impl ExecutionState {
         new.id = Uuid::new_v4();
         new.exec_counter += 1;
         new
+    }
+
+    fn swap_identity(&mut self, mut swap_with: &mut ExecutionState) {
+        let s_parent_state_id = swap_with.parent_state_id;
+        let s_id = swap_with.id;
+        self.parent_state_id = s_parent_state_id;
+        self.id = s_id;
     }
 
     pub fn have_all_operations_been_set_at_least_once(&self) -> bool {
@@ -674,8 +669,8 @@ impl ExecutionState {
         // Add result into a new execution state
         let mut after_execution_state = state.clone();
         // after_execution_state.stack.pop_back();
-        after_execution_state.state_insert(Uuid::nil(), result.clone());
-        after_execution_state.fresh_values.insert(Uuid::nil());
+        after_execution_state.state_insert(Uuid::max(), result.clone());
+        after_execution_state.fresh_values.insert(Uuid::max());
 
         // TODO: if result is an error, return an error instead and then pause
 
@@ -715,6 +710,9 @@ impl ExecutionState {
         new_state.fresh_values.insert(next_operation_id);
         new_state.state_insert(next_operation_id, result);
         new_state.value_freshness_map.insert(next_operation_id, exec_counter);
+        // if let Ok(output) = result.output {
+        //     new_state.value_freshness_map.insert(next_operation_id, exec_counter);
+        // }
     }
 
     fn prepare_operation_inputs(
@@ -758,7 +756,6 @@ impl ExecutionState {
         Ok(inputs)
     }
 
-
     fn select_next_operation_to_evaluate(
         &self,
         exec_queue: &mut VecDeque<OperationId>,
@@ -775,7 +772,6 @@ impl ExecutionState {
         let name = op_node.name.clone();
         let signature = &op_node.signature.input_signature;
 
-
         // If the signature has no dependencies and the operation has been run once, skip it.
         if signature.is_empty() {
             println!("Signature is empty");
@@ -791,10 +787,15 @@ impl ExecutionState {
         // If none of the inputs are more fresh than our own operation freshness, skip this node
         if !signature.is_empty() {
             let our_freshness = self.value_freshness_map.get(&next_operation_id).copied().unwrap_or(0);
+            println!("Freshness of {:?} is {:?}", &next_operation_id, &our_freshness);
+            dbg!(&self.value_freshness_map);
             let any_more_fresh = dependency_graph
                 .edges_directed(next_operation_id, Direction::Incoming)
                 .any(|(from, _, _)| {
                     let their_freshness = self.value_freshness_map.get(&from).copied().unwrap_or(0);
+                    if their_freshness >= our_freshness {
+                        println!("Freshness of input {:?} is {:?}", &from, &their_freshness);
+                    }
                     their_freshness >= our_freshness
                 });
             if !any_more_fresh {
@@ -813,12 +814,6 @@ impl ExecutionState {
         Ok(Some((name, next_operation_id, inputs)))
     }
 
-    fn initialize_new_state(&self) -> ExecutionState {
-        let mut new_state = self.clone_with_new_id();
-        new_state.operation_mutation = None;
-        new_state
-    }
-
 
     #[tracing::instrument]
     pub(crate) fn determine_next_operation(
@@ -835,7 +830,8 @@ impl ExecutionState {
             }
             match self.select_next_operation_to_evaluate(&mut exec_queue) {
                 Ok(Some((op_node_name, next_operation_id, inputs))) => {
-                    let mut new_state = self.initialize_new_state();
+                    let mut new_state = self.clone_with_new_id();
+                    new_state.operation_mutation = None;
                     new_state.evaluating_fn = None;
                     new_state.evaluating_id = next_operation_id;
                     new_state.evaluating_name = op_node_name;
@@ -861,8 +857,9 @@ impl ExecutionState {
     #[tracing::instrument]
     pub async fn step_execution(
         &self,
-        eval: ExecutionStateEvaluation,
     ) -> anyhow::Result<(ExecutionStateEvaluation, Vec<(OperationId, OperationFnOutput)>)> {
+        let eval = self.determine_next_operation()?;
+
         let mut outputs = vec![];
         let ExecutionStateEvaluation::Executing(mut new_state) = eval else {
             return Err(Error::msg("attempting to step invalid state"));
