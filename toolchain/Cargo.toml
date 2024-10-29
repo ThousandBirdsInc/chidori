@@ -55,6 +55,7 @@ rusqlite = { version = "0.32.1", features = ["bundled"] }
 version = "=1.8.0"
 features = [
     "v4",                # Lets you generate random UUIDs
+    "v7",                # Lets you generate timestamp UUIDs
     "fast-rng",          # Use a faster (but still sufficiently random) RNG
     "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
 ]

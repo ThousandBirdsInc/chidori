@@ -260,7 +260,7 @@ impl Default for ExecutionState {
     fn default() -> Self {
         ExecutionState {
             exec_counter: 1,
-            id: Uuid::new_v4(),
+            id: Uuid::now_v7(),
             stack: Default::default(),
             parent_state_id: Uuid::nil(),
             op_counter: 0,
@@ -337,7 +337,7 @@ impl ExecutionState {
         let mut new = self.clone();
         new.parent_state_id = new.id;
         new.fresh_values = IndexSet::new();
-        new.id = Uuid::new_v4();
+        new.id = Uuid::now_v7();
         new.exec_counter += 1;
         new
     }
@@ -527,7 +527,7 @@ impl ExecutionState {
         operation_node.name.as_ref()
             .and_then(|name| s.operation_name_to_id.get(name).copied())
             .unwrap_or_else(|| {
-                let new_id = Uuid::new_v4();
+                let new_id = Uuid::now_v7();
                 if let Some(name) = &operation_node.name {
                     s.operation_name_to_id.insert(name.clone(), op_id);
                 }
@@ -690,11 +690,9 @@ impl ExecutionState {
     }
 
     fn get_operation_node(&self, operation_id: OperationId) -> anyhow::Result<&OperationNode> {
-        println!("Getting operation node");
         let op = self.operation_by_id
             .get(&operation_id)
             .ok_or_else(|| anyhow::anyhow!("Operation not found"))?;
-        println!("Got operation node");
         Ok(op)
     }
 
@@ -756,14 +754,19 @@ impl ExecutionState {
         Ok(inputs)
     }
 
+
     fn select_next_operation_to_evaluate(
         &self,
         exec_queue: &mut VecDeque<OperationId>,
     ) -> anyhow::Result<Option<(Option<String>, OperationId, OperationInputs)>> {
+        println!("=== Selecting next operation to evaluate");
         let next_operation_id = match exec_queue.pop_front() {
-            Some(id) => id,
+            Some(id) => {
+                println!("Selected operation {:?} from execution queue for evaluation", &id);
+                id
+            }
             None => {
-                // Continue to loop after refreshing the queue
+                println!("Execution queue is empty, no operations to evaluate");
                 return Ok(None);
             }
         };
@@ -772,45 +775,55 @@ impl ExecutionState {
         let name = op_node.name.clone();
         let signature = &op_node.signature.input_signature;
 
+        println!("Evaluating operation {:?} with name {:?}", &next_operation_id, &name);
+
         // If the signature has no dependencies and the operation has been run once, skip it.
         if signature.is_empty() {
-            println!("Signature is empty");
+            println!("Operation has no input dependencies (empty signature)");
             if self.check_if_previously_set(&next_operation_id) {
-                println!("Zero dep operation already set, continuing");
+                println!("Operation has already been executed once and has no dependencies - skipping evaluation");
+                println!("=== DONE Selecting next operation to evaluate");
                 return Ok(None)
             }
+            println!("Operation has no dependencies and hasn't been executed yet - proceeding with evaluation");
         }
-
 
         let dependency_graph = self.get_dependency_graph();
 
         // If none of the inputs are more fresh than our own operation freshness, skip this node
         if !signature.is_empty() {
             let our_freshness = self.value_freshness_map.get(&next_operation_id).copied().unwrap_or(0);
-            println!("Freshness of {:?} is {:?}", &next_operation_id, &our_freshness);
-            dbg!(&self.value_freshness_map);
-            let any_more_fresh = dependency_graph
-                .edges_directed(next_operation_id, Direction::Incoming)
-                .any(|(from, _, _)| {
-                    let their_freshness = self.value_freshness_map.get(&from).copied().unwrap_or(0);
-                    if their_freshness >= our_freshness {
-                        println!("Freshness of input {:?} is {:?}", &from, &their_freshness);
-                    }
-                    their_freshness >= our_freshness
-                });
-            if !any_more_fresh {
-                println!("None more fresh, continuing");
+            println!("Current operation freshness value: {:?}", &our_freshness);
+
+            println!("Checking input dependencies freshness values:");
+            let mut found_fresher_input = false;
+            for (from, _, _) in dependency_graph.edges_directed(next_operation_id, Direction::Incoming) {
+                let their_freshness = self.value_freshness_map.get(&from).copied().unwrap_or(0);
+                println!("  - Input {:?} has freshness {:?}", &from, &their_freshness);
+                if their_freshness >= our_freshness {
+                    println!("    → This input is fresher than our operation, evaluation needed");
+                    found_fresher_input = true;
+                }
+            }
+
+            if !found_fresher_input {
+                println!("No inputs are fresher than our operation - skipping evaluation");
+                println!("=== DONE Selecting next operation to evaluate");
                 return Ok(None);
             }
+            println!("Found fresher inputs - proceeding with evaluation");
         }
 
+        println!("Preparing operation inputs based on signature requirements");
         let inputs = self.prepare_operation_inputs(signature, next_operation_id, dependency_graph)?;
 
         if !signature.check_input_against_signature(&inputs) {
-            println!("Signature validation failed, continuing");
+            println!("Input validation failed against operation signature - skipping evaluation");
             return Ok(None);
         }
 
+        println!("Operation {:?} selected for evaluation with valid inputs", &next_operation_id);
+        println!("=== DONE Selecting next operation to evaluate");
         Ok(Some((name, next_operation_id, inputs)))
     }
 
@@ -896,7 +909,7 @@ mod tests {
     #[test]
     fn test_state_insert_and_get_value() {
         let mut exec_state = ExecutionState::new_with_random_id();
-        let operation_id = Uuid::new_v4();
+        let operation_id = Uuid::now_v7();
         let value = RkyvSerializedValue::Number(1);
         let value = OperationFnOutput {
             has_error: false,
@@ -914,8 +927,8 @@ mod tests {
     #[test]
     fn test_dependency_graph_mutation() {
         let mut exec_state = ExecutionState::new_with_random_id();
-        let operation_id = Uuid::new_v4();
-        let operation_id_2 = Uuid::new_v4();
+        let operation_id = Uuid::now_v7();
+        let operation_id_2 = Uuid::now_v7();
         let depends_on = vec![(operation_id_2, DependencyReference::Positional(0))];
         let mutation = DependencyGraphMutation::Create {
             operation_id,
@@ -932,8 +945,8 @@ mod tests {
     #[test]
     fn test_dependency_graph_deletion() {
         let mut exec_state = ExecutionState::new_with_random_id();
-        let operation_id = Uuid::new_v4();
-        let operation_id_2 = Uuid::new_v4();
+        let operation_id = Uuid::now_v7();
+        let operation_id_2 = Uuid::now_v7();
         let depends_on = vec![(operation_id_2, DependencyReference::Positional(0))];
         let create_mutation = DependencyGraphMutation::Create {
             operation_id,
@@ -952,8 +965,8 @@ mod tests {
     #[test]
     fn test_async_execution_at_a_state() {
         let mut exec_state = ExecutionState::new_with_random_id();
-        let operation_id = Uuid::new_v4();
-        let operation_id_2 = Uuid::new_v4();
+        let operation_id = Uuid::now_v7();
+        let operation_id_2 = Uuid::now_v7();
         let depends_on = vec![(operation_id_2, DependencyReference::Positional(0))];
         let create_mutation = DependencyGraphMutation::Create {
             operation_id,
@@ -984,7 +997,7 @@ mod tests {
             function_invocation: None,
         }, Default::default());
 
-        let id_a = Uuid::new_v4();
+        let id_a = Uuid::now_v7();
         let (new_state, op_id) = state.update_operation(cell.clone(), id_a).unwrap();
         
         assert!(new_state.operation_by_id.contains_key(&op_id));
@@ -996,7 +1009,7 @@ mod tests {
         let state = ExecutionState::new_with_random_id();
         let op_node = OperationNode::default();
 
-        let id_a = Uuid::new_v4();
+        let id_a = Uuid::now_v7();
         let (op_id, new_state) = state.upsert_operation(op_node, id_a);
         
         assert!(new_state.operation_by_id.contains_key(&op_id));
@@ -1007,9 +1020,9 @@ mod tests {
     #[test]
     fn test_apply_dependency_graph_mutations() {
         let state = ExecutionState::new_with_random_id();
-        let id_a = Uuid::new_v4();
-        let id_b = Uuid::new_v4();
-        let id_c = Uuid::new_v4();
+        let id_a = Uuid::now_v7();
+        let id_b = Uuid::now_v7();
+        let id_c = Uuid::now_v7();
         let mutations = vec![
             DependencyGraphMutation::Create {
                 operation_id: id_a,
@@ -1045,7 +1058,7 @@ mod tests {
             function_invocation: None,
         }, TextRange::default());
 
-        let id_a = Uuid::new_v4();
+        let id_a = Uuid::now_v7();
         let (op_id, mut new_state) = state.upsert_operation(op_node, id_a);
         
         new_state.function_name_to_metadata.insert("test_fn".to_string(), FunctionMetadata {
@@ -1062,9 +1075,9 @@ mod tests {
     #[test]
     fn test_get_dependency_graph() {
         let mut state = ExecutionState::new_with_random_id();
-        let id_a = Uuid::new_v4();
-        let id_b = Uuid::new_v4();
-        let id_c = Uuid::new_v4();
+        let id_a = Uuid::now_v7();
+        let id_b = Uuid::now_v7();
+        let id_c = Uuid::now_v7();
         state.dependency_map.insert(id_a, IndexSet::from_iter(vec![(id_b, DependencyReference::Positional(0))]));
         state.dependency_map.insert(id_b, IndexSet::from_iter(vec![(id_c, DependencyReference::Global("x".to_string()))]));
         
@@ -1102,7 +1115,7 @@ mod tests {
             },
         };
 
-        let id_a = Uuid::new_v4();
+        let id_a = Uuid::now_v7();
         let (op_id, exec_state) = exec_state.upsert_operation(op, id_a);
         
         // Prepare inputs

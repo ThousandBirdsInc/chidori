@@ -74,7 +74,7 @@ fn get_or_create_default_venv() -> anyhow::Result<PathBuf> {
         std::fs::create_dir_all(&default_venv_dir)?;
     }
 
-    let venv_name = format!("chidori_venv_{}", Uuid::new_v4());
+    let venv_name = format!("chidori_venv_{}", Uuid::now_v7());
     let venv_path = default_venv_dir.join(venv_name);
 
     let uv_path = which::which("uv").map_err(|_| anyhow::anyhow!("uv not found in PATH"))?;
@@ -939,7 +939,7 @@ a = 20 + await demo()
         "#,
         );
         let mut state = ExecutionState::new_with_random_id();
-        let id_a = Uuid::new_v4();
+        let id_a = Uuid::now_v7();
         let (state, _) = state.update_operation(CellTypes::Code(CodeCell {
             backing_file_reference: None,
             name: None,
@@ -973,7 +973,7 @@ a = 20 + await demo()
     #[tokio::test]
     async fn test_running_async_function_dependency() -> anyhow::Result<()> {
         let mut state = ExecutionState::new_with_random_id();
-        let id_a = Uuid::new_v4();
+        let id_a = Uuid::now_v7();
         let (state, _) = state.update_operation(CellTypes::Code(CodeCell {
             backing_file_reference: None,
             name: None,
@@ -1016,7 +1016,7 @@ data = await demo()
         "#,
         );
         let mut state = ExecutionState::new_with_random_id();
-        let id_a = Uuid::new_v4();
+        let id_a = Uuid::now_v7();
         let (mut state, _) = state.update_operation(CellTypes::Code(CodeCell {
             backing_file_reference: None,
             name: None,
@@ -1029,7 +1029,7 @@ data = await demo()
                         "#}),
             function_invocation: None,
         }, TextRange::default()), id_a)?;
-        let id_b = Uuid::new_v4();
+        let id_b = Uuid::now_v7();
         let (state, _) = state.update_operation(CellTypes::Code(CodeCell {
             backing_file_reference: None,
             name: None,
@@ -1065,7 +1065,7 @@ data = await demo()
     async fn test_internal_function_invocation_chain_with_observability() -> anyhow::Result<()> {
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<ExecutionGraphSendPayload>(1028);
         let mut state_a = ExecutionState::new_with_graph_sender(Uuid::nil(), Arc::new(sender.clone()));
-        let id_a = Uuid::new_v4();
+        let id_a = Uuid::now_v7();
         let (state, _) = state_a.update_operation(CellTypes::Code(CodeCell {
             backing_file_reference: None,
             name: None,

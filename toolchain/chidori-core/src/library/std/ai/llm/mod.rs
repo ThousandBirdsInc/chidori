@@ -475,7 +475,7 @@ pub async fn ai_llm_code_generation_chat_model(
             dbg!(&cells);
 
             for cell in cells {
-                let (s, _) = new_execution_state.update_operation(cell, Uuid::new_v4())?;
+                let (s, _) = new_execution_state.update_operation(cell, Uuid::now_v7())?;
                 new_execution_state = s;
             }
 
@@ -538,8 +538,8 @@ mod test {
     #[tokio::test]
     async fn test_tool_usage_inference() -> anyhow::Result<()> {
         let mut state = ExecutionState::new_with_random_id();
-        let id_a = Uuid::new_v4();
-        let id_b = Uuid::new_v4();
+        let id_a = Uuid::now_v7();
+        let id_b = Uuid::now_v7();
         let (mut state, _) = state.update_operation(CellTypes::Code(CodeCell {
             backing_file_reference: None,
             name: None,

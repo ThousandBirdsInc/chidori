@@ -747,7 +747,7 @@ fn render_new_cell_interface(
     if state.temp_cell.is_none() {
         ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
         if ui.button("Add Code Cell").clicked() {
-            let op_id = Uuid::new_v4();
+            let op_id = Uuid::now_v7();
             state.temp_cell = Some(CellHolder {
                 cell: CellTypes::Code(CodeCell {
                     backing_file_reference: None,
@@ -762,7 +762,7 @@ fn render_new_cell_interface(
             });
         }
         if ui.button("Add Prompt Cell").clicked() {
-            let op_id = Uuid::new_v4();
+            let op_id = Uuid::now_v7();
             state.temp_cell = Some(CellHolder {
                 cell: CellTypes::Prompt(LLMPromptCell::Chat {
                     backing_file_reference: None,
@@ -779,7 +779,7 @@ fn render_new_cell_interface(
             });
         }
         if ui.button("Add Template Cell").clicked() {
-            let op_id = Uuid::new_v4();
+            let op_id = Uuid::now_v7();
             state.temp_cell = Some(CellHolder {
                 cell: CellTypes::Template(TemplateCell {
                     backing_file_reference: None,
@@ -792,7 +792,7 @@ fn render_new_cell_interface(
             });
         }
         if ui.button("Add Code Generation Cell").clicked() {
-            let op_id = Uuid::new_v4();
+            let op_id = Uuid::now_v7();
             state.temp_cell = Some((CellHolder {
                 cell: CellTypes::CodeGen(LLMCodeGenCell {
                     backing_file_reference: None,

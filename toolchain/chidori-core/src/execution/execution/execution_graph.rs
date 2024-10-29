@@ -124,11 +124,11 @@ impl std::fmt::Debug for ExecutionGraph {
 /// we re-evaluate a node that head already previously been evaluated - creating a
 /// new line of execution.
 pub fn get_execution_id() -> Uuid {
-    Uuid::new_v4()
+    Uuid::now_v7()
 }
 
 pub fn get_operation_id() -> Uuid {
-    Uuid::new_v4()
+    Uuid::now_v7()
 }
 
 #[derive(Debug, Clone)]
@@ -176,7 +176,7 @@ impl ExecutionGraph {
         // Kick off a background thread that listens for events from async operations
         // These events inject additional state into the execution graph on new branches
         // Those branches will continue to evaluate independently.
-        println!("Initializing execution depth thread.");
+        println!("Initializing background thread for handling async updates to our execution graph");
         let handle = tokio::spawn(async move {
             // Signal that the task has started, we can continue initialization
             initialization_notify_clone.notify_one();
@@ -489,7 +489,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
         let (id_b, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
@@ -497,7 +497,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(2))) }.boxed()),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
         let (id_c, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
@@ -519,7 +519,7 @@ mod tests {
                         }.boxed()
                     }),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
 
         let mut state =
             state.apply_dependency_graph_mutations(vec![DependencyGraphMutation::Create {
@@ -572,7 +572,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(0))) }.boxed()),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
         let (id_b, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
@@ -580,7 +580,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
         let mut state =
             state.apply_dependency_graph_mutations(vec![DependencyGraphMutation::Create {
                 operation_id: id_b,
@@ -622,7 +622,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(0))) }.boxed()),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
 
         let (id_b, mut state) = state.upsert_operation(OperationNode::new(
                     None,
@@ -631,7 +631,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
 
         let (id_c, mut state) = state.upsert_operation(OperationNode::new(
                     None,
@@ -640,7 +640,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(2))) }.boxed()),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
@@ -698,7 +698,7 @@ mod tests {
                         OutputSignature::new(),
                         Box::new(move |_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(x))) }.boxed()),
                     ),
-                                                        Uuid::new_v4());
+                                                        Uuid::now_v7());
             ids.push(id);
             state = nstate
         }
@@ -765,7 +765,7 @@ mod tests {
                         OutputSignature::new(),
                         Box::new(move |_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(x))) }.boxed()),
                     ),
-                                                        Uuid::new_v4());
+                                                        Uuid::now_v7());
             ids.push(id);
             state = nstate
         }
@@ -847,7 +847,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
 
         // Each node adds 1 to the inbound item (all nodes only have one dependency per index)
         let f1 = |_: &ExecutionState, args: RkyvSerializedValue, _, _| {
@@ -871,7 +871,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(f1),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
 
         let (id_c, mut state) = state.upsert_operation(OperationNode::new(
                     None,
@@ -880,7 +880,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(f1),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
 
         let (id_d, mut state) = state.upsert_operation(OperationNode::new(
                     None,
@@ -889,7 +889,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(f1),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
 
         let (id_e, mut state) = state.upsert_operation(OperationNode::new(
                     None,
@@ -898,7 +898,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(f1),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
 
         let (id_f, mut state) = state.upsert_operation(OperationNode::new(
                     None,
@@ -907,7 +907,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(f1),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
@@ -1028,7 +1028,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
 
         // Globally mutates this value, making each call to this function side-effecting
         static atomic_usize: AtomicUsize = AtomicUsize::new(0);
@@ -1054,7 +1054,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(f_side_effect),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
         let (id_c, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
@@ -1062,7 +1062,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(f_side_effect),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
@@ -1118,7 +1118,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(0))) }.boxed()),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
 
         let f_v1 = |_: &ExecutionState, args: RkyvSerializedValue, _, _| {
             async move {
@@ -1155,7 +1155,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(f_v1),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
         let (id_c, mut state) = state.upsert_operation(OperationNode::new(
                     None,
                     Uuid::nil(),
@@ -1163,7 +1163,7 @@ mod tests {
                     OutputSignature::new(),
                     Box::new(f_v1),
                 ),
-                                                    Uuid::new_v4());
+                                                    Uuid::now_v7());
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
@@ -1236,7 +1236,7 @@ mod tests {
                 OutputSignature::new(),
                 Box::new(move |_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(x))) }.boxed()),
             ),
-                                                         Uuid::new_v4());
+                                                         Uuid::now_v7());
             ids.push(id);
             state = nstate
         }
@@ -1317,7 +1317,7 @@ mod tests {
             InputSignature::new(),
             OutputSignature::new(),
             Box::new(|_, _, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
-        ), Uuid::new_v4());
+        ), Uuid::now_v7());
         let init_state_id = state.id.clone();
 
         let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
@@ -1344,7 +1344,7 @@ mod tests {
                 InputSignature::new(),
                 OutputSignature::new(),
                 Box::new(move |_, _, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(i))) }.boxed()),
-            ), Uuid::new_v4());
+            ), Uuid::now_v7());
             ids.push(id);
             state = new_state;
         }
@@ -1396,11 +1396,11 @@ mod tests {
             Box::new(|_, _, _, _| async move {
                 Ok(OperationFnOutput::with_value(RSV::Number(1)))
             }.boxed()),
-        ), Uuid::new_v4());
+        ), Uuid::now_v7());
         let init_state_id = state.id.clone();
 
         // Simulate a stack by manually setting it in the state
-        let stack = VecDeque::from(vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()]);
+        let stack = VecDeque::from(vec![Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()]);
         state.stack = stack.clone();
 
         let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;

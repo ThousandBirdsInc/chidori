@@ -124,7 +124,7 @@ impl Chidori {
                 }
             } else {
                 // This is a new cell, so we push it with a null applied at
-                let id = Uuid::new_v4();
+                let id = Uuid::now_v7();
                 new_cells_state.insert(id, CellHolder {
                     cell,
                     applied_at: None,

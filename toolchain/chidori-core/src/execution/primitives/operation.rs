@@ -495,7 +495,7 @@ mod tests {
     #[tokio::test]
     async fn test_async_communication_rpc() {
         let (async_rpc_communication, rpc_sender, callable_interface_receiver) = AsyncRPCCommunication::new();
-        let id_a = Uuid::new_v4();
+        let id_a = Uuid::now_v7();
         let op = OperationNode {
             created_at_state_id: Uuid::nil(),
             id: id_a,

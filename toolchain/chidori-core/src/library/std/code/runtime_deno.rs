@@ -691,7 +691,7 @@ mod tests {
         let source_code = String::from(r#"const y = await test_function(5, 5);"#);
 
         let mut state = ExecutionState::new_with_random_id();
-        let id_a = Uuid::new_v4();
+        let id_a = Uuid::now_v7();
         let (state, _) = state.update_operation(CellTypes::Code(
             crate::cells::CodeCell {
                 backing_file_reference: None,

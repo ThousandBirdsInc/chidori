@@ -152,7 +152,7 @@ mod tests {
                         "#}),
             function_invocation: None,
         }, TextRange::default()),
-                                           Uuid::new_v4())?;
+                                           Uuid::now_v7())?;
         let (_, op_id_y) = env.upsert_cell(CellTypes::Code(CodeCell {
             backing_file_reference: None,
             name: None,
@@ -162,7 +162,7 @@ mod tests {
                         "#}),
             function_invocation: None,
         }, TextRange::default()),
-                                           Uuid::new_v4())?;
+                                           Uuid::now_v7())?;
         // env.resolve_dependencies_from_input_signature();
         env.get_state_at_current_execution_head().render_dependency_graph();
         // ExecutionGraph::immutable_external_step_execution(env.execution_head_state_id, env.)
@@ -195,7 +195,7 @@ mod tests {
                         "#}),
             function_invocation: None,
         }, TextRange::default()),
-                                           Uuid::new_v4())?;
+                                           Uuid::now_v7())?;
         let (_, op_id_y) = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
             backing_file_reference: None,
             function_invocation: false,
@@ -212,7 +212,7 @@ mod tests {
                     "
                 .to_string(),
         }, TextRange::default()),
-                                           Uuid::new_v4())?;
+                                           Uuid::now_v7())?;
         let (_, op_id_z) = env.upsert_cell(CellTypes::Code(CodeCell {
             backing_file_reference: None,
             name: None,
@@ -222,7 +222,7 @@ mod tests {
                         "#}),
             function_invocation: None,
         }, TextRange::default()),
-                                           Uuid::new_v4())?;
+                                           Uuid::now_v7())?;
 
         env.get_state_at_current_execution_head().render_dependency_graph();
         let out = env.step().await;
@@ -268,7 +268,7 @@ mod tests {
                         "#}),
             function_invocation: None,
         }, TextRange::default()),
-                                           Uuid::new_v4())?;
+                                           Uuid::now_v7())?;
         let (_, op_id_y) = env.upsert_cell(CellTypes::Prompt(LLMPromptCell::Chat {
             backing_file_reference: None,
             function_invocation: false,
@@ -281,7 +281,7 @@ mod tests {
                     "
                 .to_string(),
         }, TextRange::default()),
-                                           Uuid::new_v4())?;
+                                           Uuid::now_v7())?;
         env.get_state_at_current_execution_head().render_dependency_graph();
         dbg!(env.step().await);
         dbg!(env.step().await);
@@ -309,7 +309,7 @@ mod tests {
                         "#}),
             function_invocation: None,
         }, TextRange::default()),
-                                      Uuid::new_v4())?;
+                                      Uuid::now_v7())?;
         let (_, id_b) = env.upsert_cell(CellTypes::Code(CodeCell {
             backing_file_reference: None,
             name: None,
@@ -319,7 +319,7 @@ mod tests {
                         y = await add(2, 3)
                         "#}),
         }, TextRange::default()),
-                                      Uuid::new_v4())?;
+                                      Uuid::now_v7())?;
         env.get_state_at_current_execution_head().render_dependency_graph();
         env.step().await;
         // Empty object from the function declaration
@@ -354,7 +354,7 @@ mod tests {
                         "#}),
             function_invocation: None,
         }, TextRange::default()),
-                                      Uuid::new_v4())?;
+                                      Uuid::now_v7())?;
         let (_, id_b) = env.upsert_cell(CellTypes::Code(CodeCell {
             backing_file_reference: None,
             name: None,
@@ -364,7 +364,7 @@ mod tests {
                         const y = await add(2, 3);
                         "#}),
         }, TextRange::default()),
-                                      Uuid::new_v4())?;
+                                      Uuid::now_v7())?;
         env.get_state_at_current_execution_head().render_dependency_graph();
         env.step().await;
         // Function declaration cell
@@ -407,8 +407,8 @@ mod tests {
         env.get_state_at_current_execution_head().render_dependency_graph();
         env.step().await;
         // Function declaration cell
-        let id_0 = Uuid::new_v4();
-        let id_1 = Uuid::new_v4();
+        let id_0 = Uuid::now_v7();
+        let id_1 = Uuid::now_v7();
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&id_0),
             Some(&Ok(RkyvObjectBuilder::new()
@@ -458,14 +458,14 @@ mod tests {
         s.render_dependency_graph();
         env.step().await;
         // Function declaration cell
-        let id_0 = Uuid::new_v4();
+        let id_0 = Uuid::now_v7();
         assert_eq!(
             env.get_state_at_current_execution_head().state_get_value(&id_0),
             Some(&Ok(RkyvObjectBuilder::new()
                 .insert_string("add", "function".to_string())
                 .build()))
         );
-        let id_1 = Uuid::new_v4();
+        let id_1 = Uuid::now_v7();
         assert_eq!(env.get_state_at_current_execution_head().state_get_value(&id_1), None);
         env.step().await;
         assert_eq!(env.get_state_at_current_execution_head().state_get_value(&id_0),

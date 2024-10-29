@@ -150,7 +150,7 @@ mod tests {
     use chidori_core::execution::execution::execution_graph::ExecutionNodeId;
 
     fn create_uuid() -> ExecutionNodeId {
-        chidori_core::uuid::Uuid::new_v4()
+        chidori_core::uuid::Uuid::now_v7()
     }
 
     fn assert_tree_structure(tree: &StableGraph<ExecutionNodeId, (), petgraph::Directed>, expected_edges: &[(ExecutionNodeId, ExecutionNodeId)]) {

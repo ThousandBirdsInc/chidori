@@ -4,12 +4,7 @@ use std::sync::{Arc, mpsc, Mutex};
 use tokio::sync::mpsc::Receiver as TokioReceiver;
 use std::fmt;
 use uuid::Uuid;
-use dashmap::DashMap;
-use std::pin::Pin;
 use std::time::Duration;
-use futures_util::future::select_all;
-use futures_util::FutureExt;
-use tokio::runtime::Handle;
 use crate::cells::CellTypes;
 use crate::execution::execution::execution_graph::{ExecutionEvent, ExecutionGraph, ExecutionNodeId};
 use crate::execution::execution::execution_state::ExecutionStateEvaluation;
@@ -169,6 +164,7 @@ impl InstancedEnvironment {
                         tokio::spawn(async move {
                             let result = step.await;
                             // Clean up executing state regardless of result
+                            // If the result of the execution is a Completion
                             let _ = executing_states.lock().await.remove(&state_id);
                             let _ = step_tx.send((state_id, result)).await;
                         });
@@ -181,19 +177,7 @@ impl InstancedEnvironment {
                 Ok(Some((resolved_id, step_result))) => {
                     match step_result {
                         Ok((node_id, new_state, outputs)) => {
-                            println!("Got completed result {:?}", &node_id);
-                            match &new_state {
-                                ExecutionStateEvaluation::Error(s) => {
-                                    println!("Got result {:?}, {:?}", node_id, new_state);
-                                }
-                                ExecutionStateEvaluation::EvalFailure(_) => {}
-                                ExecutionStateEvaluation::Complete(s) => {
-                                    println!("Got result {:?}, {:?}", node_id, new_state);
-                                }
-                                ExecutionStateEvaluation::Executing(s) => {
-                                    println!("Still executing result {:?}, {:?}", node_id, new_state);
-                                }
-                            }
+                            println!("Got result {:?}, {:?}", node_id, new_state);
                             let resulting_state_id = self.db.progress_graph(new_state.clone());
                             self.push_update_to_client(&resulting_state_id, new_state);
                             if outputs.is_empty() {
@@ -360,9 +344,11 @@ impl InstancedEnvironment {
 
         let mut shared_state = self.shared_state.lock().unwrap();
         // Only completed states update execution heads
-        if let ExecutionStateEvaluation::Complete(_) = &state {
-            shared_state.execution_state_head_id = *state_id;
-            self.execution_head_state_id = *state_id;
+        if let ExecutionStateEvaluation::Complete(s) = &state {
+            if s.stack.is_empty() {
+                shared_state.execution_state_head_id = *state_id;
+                self.execution_head_state_id = *state_id;
+            }
         }
         shared_state.execution_id_to_evaluation
             .entry(*state_id)

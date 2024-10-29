@@ -34,41 +34,43 @@ enum Commands {
         #[arg(short, long)]
         load: PathBuf,
     },
-    /// Run tests
-    Test {
-        /// Path to the test directory
-        #[arg(short, long)]
-        test_dir: PathBuf,
-        /// Verbose output
-        #[arg(short, long)]
-        verbose: bool,
-    },
-    /// Deploy the application
-    Deploy {
-        /// Target environment
-        #[arg(short, long)]
-        environment: String,
-        /// Path to the deployment script
-        #[arg(short, long)]
-        script: PathBuf,
-    },
+    // /// Run tests
+    // Test {
+    //     /// Path to the test directory
+    //     #[arg(short, long)]
+    //     test_dir: PathBuf,
+    //     /// Verbose output
+    //     #[arg(short, long)]
+    //     verbose: bool,
+    // },
+    // /// Deploy the application
+    // Deploy {
+    //     /// Target environment
+    //     #[arg(short, long)]
+    //     environment: String,
+    //     /// Path to the deployment script
+    //     #[arg(short, long)]
+    //     script: PathBuf,
+    // },
 }
 
-async fn run_command(config: &PathBuf) {
+async fn run_command(run_directory: &PathBuf) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Handle::current();
 
     let (trace_event_sender, trace_event_receiver) = mpsc::channel();
     let (runtime_event_sender, runtime_event_receiver) = mpsc::channel();
 
     let mut chidori = Chidori::new_with_events(
-            trace_event_sender,
-            runtime_event_sender,
-        );
+        trace_event_sender,
+        runtime_event_sender,
+    );
 
+    let run_directory_clone = run_directory.clone();
     runtime.spawn(async move {
         loop {
             let mut instance = chidori.get_instance().unwrap();
             let _await_ready = instance.wait_until_ready().await;
+            chidori.load_md_directory(&run_directory_clone).unwrap();
             let result = instance.run().await;
             match result {
                 Ok(_) => {
@@ -88,28 +90,31 @@ async fn run_command(config: &PathBuf) {
     // Keep the main thread alive
     tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl+c");
     println!("Received shutdown signal. Terminating...");
+    Ok(())
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> anyhow::Result<()>{
     let cli = Cli::parse();
 
     match &cli.command {
         Some(Commands::Run { load }) => {
-            println!("Running the application with config file: {:?}", load);
-            run_command(load);
+            println!("Running Chidori with target src directory: {:?}", load);
+            run_command(load).await
         }
-        Some(Commands::Test { test_dir, verbose }) => {
-            println!("Running tests in directory: {:?}", test_dir);
-            println!("Verbose mode: {}", verbose);
-            // Add your test logic here
-        }
-        Some(Commands::Deploy { environment, script }) => {
-            println!("Deploying to environment: {}", environment);
-            println!("Using deployment script: {:?}", script);
-            // Add your deployment logic here
-        }
+        // Some(Commands::Test { test_dir, verbose }) => {
+        //     println!("Running tests in directory: {:?}", test_dir);
+        //     println!("Verbose mode: {}", verbose);
+        //     // Add your test logic here
+        // }
+        // Some(Commands::Deploy { environment, script }) => {
+        //     println!("Deploying to environment: {}", environment);
+        //     println!("Using deployment script: {:?}", script);
+        //     // Add your deployment logic here
+        // }
         None => {
             println!("No command was used");
+            Ok(())
         }
     }
 }
