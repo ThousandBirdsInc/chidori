@@ -6,7 +6,7 @@ RUN apt install -y cmake curl
 RUN apt install -y python3-dev
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-RUN cargo +nightly install chidori-core@0.2.9 --locked
+RUN cargo +nightly install chidori-core@0.2.10 --locked
 RUN uv venv
 RUN uv pip install "litellm[proxy]"
 
@@ -19,6 +19,7 @@ RUN chmod +x ./init.sh
 
 ENV OPENAI_API_KEY=OPENAI_API_KEY
 ENV ANTHROPIC_API_KEY=ANTHROPIC_API_KEY
+ENV CHIDORI_HOME_DIRECTORY=/usr/src
 
 EXPOSE 8000
 

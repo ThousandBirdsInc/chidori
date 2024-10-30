@@ -67,7 +67,7 @@ fn install_dependencies_from_requirements(requirements_dir: &str, venv_path: &st
 }
 
 fn get_or_create_default_venv() -> anyhow::Result<PathBuf> {
-    let home_dir = env::var("HOME").or_else(|_| env::var("USERPROFILE"))?;
+    let home_dir = env::var("CHIDORI_HOME_DIRECTORY").or_else(|_| env::var("USERPROFILE"))?;
     let default_venv_dir = PathBuf::from(home_dir).join(".chidori_venvs");
 
     if !default_venv_dir.exists() {
