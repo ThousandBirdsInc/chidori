@@ -4,11 +4,11 @@
 mkdir -p logs
 
 # Start LiteLLM and redirect both stdout and stderr to log files
-uv run litellm --config ./litellm_config.yaml 2>&1 &
+uv run litellm --config ./litellm_config.yaml > logs/litellm.out 2> logs/litellm.err &
 LITELLM_PID=$!
 
 # Start Chidori and stream its output to console while still maintaining the background process
-chidori-core run --load ./example_agent 2>&1 &
+chidori-core run --load /usr/src/example_agent 2>&1 &
 CHIDORI_PID=$!
 
 # Optional: Print PIDs for debugging

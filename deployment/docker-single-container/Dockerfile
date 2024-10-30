@@ -6,19 +6,20 @@ RUN apt install -y cmake curl
 RUN apt install -y python3-dev
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-RUN cargo +nightly install chidori-core --locked
+RUN cargo +nightly install chidori-core@0.2.9 --locked
 RUN uv venv
 RUN uv pip install "litellm[proxy]"
 
 WORKDIR /usr/src
 RUN mkdir logs
-COPY example_agent ./example_agent
+COPY example_agent /usr/src/example_agent
 COPY init.sh ./init.sh
 COPY litellm_config.yaml litellm_config.yaml
 RUN chmod +x ./init.sh
 
 ENV OPENAI_API_KEY=OPENAI_API_KEY
 ENV ANTHROPIC_API_KEY=ANTHROPIC_API_KEY
+
 EXPOSE 8000
 
 CMD ["./init.sh"]

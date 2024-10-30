@@ -185,8 +185,8 @@ impl InstancedEnvironment {
                                 should_pause = true;
                             }
                         }
-                        Err(_) => {
-                            println!("Error should pause");
+                        Err(e) => {
+                            println!("Error {:?}, pausing", e);
                             should_pause = true;
                         }
                     }
