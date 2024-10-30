@@ -16,7 +16,7 @@ use bevy::render::view::{NoFrustumCulling, RenderLayers};
 use bevy::tasks::futures_lite::StreamExt;
 use bevy::utils::petgraph::stable_graph::GraphIndex;
 use bevy::window::{PrimaryWindow, WindowResized};
-use egui::{Color32, Order, Pos2, Rgba, RichText, Stroke, TextureHandle, Ui};
+use egui::{Color32, Frame, Margin, Order, Pos2, Rgba, RichText, Stroke, TextureHandle, Ui};
 use crate::bevy_egui::{EguiContext, EguiContexts, EguiManagedTextures, EguiRenderOutput, EguiRenderTarget};
 use egui;
 use bevy_rapier2d::geometry::Collider;
@@ -42,7 +42,7 @@ use dashmap::DashMap;
 use egui_extras::syntax_highlighting::CodeTheme;
 use egui_json_tree::JsonTree;
 use egui_tiles::Tile;
-use image::{ImageBuffer, RgbaImage};
+use image::{DynamicImage, ImageBuffer, RgbImage, RgbaImage};
 use chidori_core::execution::execution::execution_state::{ExecutionStateErrors, ExecutionStateEvaluation};
 use uuid::Uuid;
 use chidori_core::execution::primitives::serialized_value::RkyvSerializedValue;
@@ -1384,12 +1384,18 @@ fn graph_setup(
         alpha_mode: AlphaMode::Blend,
     });
 
+    // Main camera
     commands.spawn((
         Camera3dBundle {
             transform: Transform::from_xyz(0.0, 0.0, 1.0).looking_at(Vec3::ZERO, Vec3::Y),
             camera: Camera {
                 order: 1,
                 clear_color: ClearColorConfig::Custom(Color::rgba(0.035, 0.035, 0.043, 1.0)),
+                // viewport: Some(Viewport {
+                //     physical_position: UVec2::new((300.0 * scale_factor) as u32, 0),
+                //     physical_size: UVec2::new(window.physical_width() - 300 * (scale_factor as u32), window.physical_height()),
+                //     ..default()
+                // }),
                 ..default()
             },
             projection: OrthographicProjection {
@@ -1500,6 +1506,73 @@ fn graph_setup(
     });
 }
 
+fn ui_window(
+    mut contexts: EguiContexts,
+    tree_identities: Res<EguiTreeIdentities>,
+    q_window: Query<&Window, With<PrimaryWindow>>,
+    mut chidori_state: ResMut<ChidoriState>,
+    current_theme: Res<CurrentTheme>,
+    mut tree: ResMut<EguiTree>,
+) {
+    let window = q_window.single();
+    let mut hide_all = false;
+
+    let mut container_frame = Frame::default()
+        .fill(current_theme.theme.accent)
+        .outer_margin(Margin {
+            left: 0.0,
+            right: 0.0,
+            top: 0.0,
+            bottom: 0.0,
+        })
+        .inner_margin(16.0);
+    if let Some(graph_title) = tree_identities.graph_tile {
+        if let Some(tile) = tree.tree.tiles.get(graph_title) {
+            match tile {
+                Tile::Pane(p) => {
+                    if !tree.tree.active_tiles().contains(&graph_title) {
+                        hide_all = true;
+                    } else {
+                        if let Some(r) = p.rect {
+                            container_frame = container_frame.outer_margin(Margin {
+                                left: r.min.x,
+                                right: (window.width() - 300.0),
+                                top: r.min.y,
+                                bottom: window.height() - r.max.y,
+                            });
+                        }
+                    }
+                }
+                Tile::Container(_) => {}
+            }
+        }
+    }
+
+    if hide_all || chidori_state.display_example_modal {
+        return;
+    }
+
+    egui::CentralPanel::default().frame(container_frame).show(contexts.ctx_mut(), |ui| {
+        ui.add_space(22.0);
+        ui.horizontal(|ui| {
+            ui.add_space(22.0);
+            ui.vertical(|ui| {
+                ui.label("Sidebar");
+                ui.button("Collapse Alternate Branches");
+            });
+        });
+
+    });
+    // egui::SidePanel::left("Explorer")
+    //     .frame(container_frame)
+    //     .min_width(300.0)
+    //     .max_width(300.0)
+    //     .resizable(false)
+    //     .show_separator_line(false)
+    //     .show(contexts.ctx_mut(), |ui| {
+    //     });
+}
+
 #[derive(Component)]
 struct OnGraphScreen;
 
@@ -1534,7 +1607,8 @@ pub fn graph_plugin(app: &mut App) {
                 mouse_over_system,
                 enforce_tiled_viewports,
                 update_cursor_materials,
-                update_node_materials
+                update_node_materials,
+                ui_window
             )
                 .run_if(in_state(GameState::Graph)),
         );

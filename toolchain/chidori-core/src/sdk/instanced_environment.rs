@@ -57,7 +57,7 @@ impl InstancedEnvironment {
 
     // TODO: reload_cells needs to diff the mutations that live on the current branch, with the state
     //       that we see in the shared state when this event is fired.
-    pub(crate) fn reload_cells(&mut self) -> anyhow::Result<()> {
+    pub fn reload_cells(&mut self) -> anyhow::Result<()> {
         println!("Reloading cells");
         let cells_to_upsert: Vec<_> = {
             let shared_state = self.shared_state.lock().unwrap();
@@ -108,9 +108,9 @@ impl InstancedEnvironment {
 
     /// Entrypoint for execution of an instanced environment, handles messages from the host
     // #[tracing::instrument]
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    pub async fn run(&mut self, initial_playback_state: PlaybackState) -> anyhow::Result<()> {
         println!("Starting instanced environment");
-        self.set_playback_state(PlaybackState::Paused);
+        self.set_playback_state(initial_playback_state);
 
         // Reload cells to make sure we're up-to-date
         self.reload_cells()?;

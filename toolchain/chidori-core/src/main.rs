@@ -16,6 +16,7 @@ mod utils;
 pub use tokio;
 pub use uuid;
 use chidori_core::sdk::chidori::Chidori;
+use chidori_core::sdk::entry::PlaybackState;
 pub use chidori_static_analysis;
 pub use chidori_prompt_format;
 
@@ -71,7 +72,7 @@ async fn run_command(run_directory: &PathBuf) -> anyhow::Result<()> {
             let mut instance = chidori.get_instance().unwrap();
             let _await_ready = instance.wait_until_ready().await;
             chidori.load_md_directory(&run_directory_clone).unwrap();
-            let result = instance.run().await;
+            let result = instance.run(PlaybackState::Running).await;
             match result {
                 Ok(_) => {
                     println!("Instance completed execution and closed successfully.");

@@ -338,21 +338,21 @@ impl ChidoriState {
 
     pub fn step(&self) -> anyhow::Result<(), String> {
         let env = self.chidori.lock().unwrap();
-        env.handle_user_action(UserInteractionMessage::Step)
+        env.dispatch_user_interaction_to_instance(UserInteractionMessage::Step)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn play(&self) -> anyhow::Result<(), String> {
         let env = self.chidori.lock().unwrap();
-        env.handle_user_action(UserInteractionMessage::Play)
+        env.dispatch_user_interaction_to_instance(UserInteractionMessage::Play)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn pause(&self) -> anyhow::Result<(), String> {
         let env = self.chidori.lock().unwrap();
-        env.handle_user_action(UserInteractionMessage::Pause)
+        env.dispatch_user_interaction_to_instance(UserInteractionMessage::Pause)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -364,7 +364,7 @@ impl ChidoriState {
         {
             let chidori_guard = chidori.lock().expect("Failed to lock chidori");
             println!("=== handle user action Revert");
-            chidori_guard.handle_user_action(UserInteractionMessage::RevertToState(Some(id)))
+            chidori_guard.dispatch_user_interaction_to_instance(UserInteractionMessage::RevertToState(Some(id)))
                 .map_err(|e| e.to_string())?;
 
         }
@@ -376,7 +376,7 @@ impl ChidoriState {
         let chidori = self.chidori.clone();
         {
             let chidori_guard = chidori.lock().expect("Failed to lock chidori");
-            chidori_guard.handle_user_action(UserInteractionMessage::MutateCell(cell_holder))
+            chidori_guard.dispatch_user_interaction_to_instance(UserInteractionMessage::MutateCell(cell_holder))
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
@@ -482,7 +482,7 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                 };
 
                 let _ = instance.wait_until_ready().await;
-                let result = instance.run().await;
+                let result = instance.run(PlaybackState::Paused).await;
                 match result {
                     Ok(_) => {
                         panic!("Instance completed execution and closed successfully.");

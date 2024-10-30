@@ -88,7 +88,7 @@ impl Chidori {
     }
 
     #[tracing::instrument]
-    pub fn handle_user_action(&self, action: UserInteractionMessage) -> anyhow::Result<()> {
+    pub fn dispatch_user_interaction_to_instance(&self, action: UserInteractionMessage) -> anyhow::Result<()> {
         if let Some(tx) = &self.instanced_env_tx {
             tx.send(action)?;
         }
@@ -135,7 +135,7 @@ impl Chidori {
         }
         self.shared_state.lock().unwrap().editor_cells = new_cells_state;
         println!("Cells commit to shared state");
-        self.handle_user_action(UserInteractionMessage::ReloadCells)?;
+        self.dispatch_user_interaction_to_instance(UserInteractionMessage::ReloadCells)?;
         Ok(())
     }
 
@@ -162,6 +162,7 @@ impl Chidori {
         }
         self.loaded_path = Some(path.to_str().unwrap().to_string());
         cells.sort();
+        println!("Loading {} cells from {:?}", cells.len(), path);
         self.load_cells(cells)
     }
 
