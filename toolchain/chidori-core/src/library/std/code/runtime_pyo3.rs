@@ -342,6 +342,11 @@ pub async fn source_code_run_python(
     let report = build_report(&dependencies);
 
     let result =  Python::with_gil(|py| {
+
+
+
+
+
         // TODO: this was causing a deadlock
         let current_event_loop = pyo3_asyncio::tokio::get_current_loop(py);
         // Initialize our event loop if one is not already established
@@ -363,10 +368,14 @@ pub async fn source_code_run_python(
 
         let sys = py.import("sys")?;
 
+        // Get Python version from PyO3
+        let v = py.version_info();
+        let site_packages_dir = format!("python{}.{}", v.major, v.minor);
+
         // Add virtualenv path to sys.path
         let site_packages_path = venv_path
             .join("lib")
-            .join("python3.12")  // Adjust this version as needed
+            .join(site_packages_dir)
             .join("site-packages");
 
         if site_packages_path.exists() {

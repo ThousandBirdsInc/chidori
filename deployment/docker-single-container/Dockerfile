@@ -6,7 +6,7 @@ RUN apt install -y cmake curl
 RUN apt install -y python3-dev
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-RUN cargo +nightly install chidori-core@0.2.10 --locked
+RUN cargo +nightly install chidori-core@0.2.11 --locked
 RUN uv venv
 RUN uv pip install "litellm[proxy]"
 
