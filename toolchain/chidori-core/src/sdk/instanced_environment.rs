@@ -285,6 +285,13 @@ impl InstancedEnvironment {
             UserInteractionMessage::RunCellInIsolation(cell, args) => {
                 // self.db.execute_operation_in_isolation(&cell.cell, args).await?;
             }
+            UserInteractionMessage::Reset => {
+                self.db = ExecutionGraph::new();
+                self.set_playback_state(PlaybackState::Paused);
+                self.execution_head_state_id = Uuid::nil();
+                let mut shared_state = self.shared_state.lock().unwrap();
+                shared_state.clear();
+            }
         }
         Ok(())
     }

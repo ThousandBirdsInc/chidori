@@ -31,6 +31,7 @@ use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use dashmap::DashMap;
 use log::info;
+use pyo3::PythonVersionInfo;
 use regex::Regex;
 
 use sha1::{Sha1, Digest};
@@ -66,8 +67,8 @@ fn install_dependencies_from_requirements(requirements_dir: &str, venv_path: &st
     }
 }
 
-fn get_or_create_default_venv() -> anyhow::Result<PathBuf> {
-    let home_dir = env::var("CHIDORI_HOME_DIRECTORY").or_else(|_| env::var("USERPROFILE"))?;
+fn get_or_create_default_venv(v: &PythonVersionInfo) -> anyhow::Result<PathBuf> {
+    let home_dir = env::var("CHIDORI_HOME_DIRECTORY").or_else(|_| env::var("HOME")).or_else(|_| env::var("USERPROFILE"))?;
     let default_venv_dir = PathBuf::from(home_dir).join(".chidori_venvs");
 
     if !default_venv_dir.exists() {
@@ -80,6 +81,8 @@ fn get_or_create_default_venv() -> anyhow::Result<PathBuf> {
     let uv_path = which::which("uv").map_err(|_| anyhow::anyhow!("uv not found in PATH"))?;
     let status = Command::new(uv_path)
         .arg("venv")
+        .arg("--python")
+        .arg(format!("{}.{}", v.major, v.minor))
         .arg(&venv_path)
         .status()?;
 
@@ -310,30 +313,6 @@ pub async fn source_code_run_python(
 
     let exec_id = increment_source_code_run_counter();
 
-    // Ensure virtualenv exists or create it
-    let venv_path = if let Some(venv_path) = &virtualenv_path {
-        PathBuf::from(venv_path)
-    } else {
-        let default_venv = get_or_create_default_venv()?;
-        default_venv
-    };
-
-    if !venv_path.exists() {
-        let uv_path = which::which("uv").map_err(|_| anyhow::anyhow!("uv not found in PATH"))?;
-        let status = Command::new(uv_path)
-            .arg("venv")
-            .arg(&venv_path)
-            .status()?;
-        if !status.success() {
-            return Err(anyhow::anyhow!("Failed to create virtualenv"));
-        }
-    }
-
-    // Install dependencies from requirements.txt if specified
-    if let Some(req_dir) = &requirements_dir {
-        install_dependencies_from_requirements(req_dir, venv_path.to_str().unwrap())?;
-    }
-
     pyo3::prepare_freethreaded_python();
     let (sender_stdout, receiver_stdout) = mpsc::channel();
     let (sender_stderr, receiver_stderr) = mpsc::channel();
@@ -342,9 +321,20 @@ pub async fn source_code_run_python(
     let report = build_report(&dependencies);
 
     let result =  Python::with_gil(|py| {
+        let v = py.version_info();
 
+        // Ensure virtualenv exists or create it
+        let venv_path = if let Some(venv_path) = &virtualenv_path {
+            PathBuf::from(venv_path)
+        } else {
+            let default_venv = get_or_create_default_venv(&v)?;
+            default_venv
+        };
 
-
+        // Install dependencies from requirements.txt if specified
+        if let Some(req_dir) = &requirements_dir {
+            install_dependencies_from_requirements(req_dir, venv_path.to_str().unwrap())?;
+        }
 
 
         // TODO: this was causing a deadlock

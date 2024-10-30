@@ -52,27 +52,6 @@ enum GameState {
     Graph,
 }
 
-// System to check if the 'E' key is pressed and change state
-fn check_key_input(
-    keyboard_input: Res<ButtonInput<KeyCode>>,
-    mut state: ResMut<NextState<GameState>>,
-) {
-    if keyboard_input.pressed(KeyCode::SuperLeft) {
-        if keyboard_input.just_pressed(KeyCode::KeyE) {
-            state.set(GameState::Editor);
-        }
-        if keyboard_input.just_pressed(KeyCode::KeyT) {
-            state.set(GameState::Traces);
-        }
-        if keyboard_input.just_pressed(KeyCode::KeyC) {
-            state.set(GameState::Chat);
-        }
-        if keyboard_input.just_pressed(KeyCode::KeyG) {
-            state.set(GameState::Graph);
-        }
-    }
-}
-
 
 #[derive(Debug, Clone, Copy, Hash)]
 pub struct Theme {
@@ -346,7 +325,6 @@ fn main() {
         // Declare the game state, whose starting value is determined by the `Default` trait
         .init_state::<GameState>()
         .add_systems(Startup, (set_window_size))
-        .add_systems(Update, check_key_input)
         // Adds the plugins for each state
         .add_plugins((chidori::chidori_plugin, code::editor_plugin, traces::trace_plugin, graph::graph_plugin, chat::chat_plugin, logs::logs_plugin))
         .run();

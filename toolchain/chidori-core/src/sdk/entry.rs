@@ -48,7 +48,8 @@ pub enum UserInteractionMessage {
     Shutdown,
     Step,
     ChatMessage(String),
-    RunCellInIsolation(CellHolder, RkyvSerializedValue)
+    RunCellInIsolation(CellHolder, RkyvSerializedValue),
+    Reset
 }
 
 
@@ -124,6 +125,14 @@ impl SharedState {
             editor_cells: Default::default(),
             at_execution_state_cells: vec![],
         }
+    }
+
+    pub fn clear(&mut self) {
+        self.execution_id_to_evaluation = Default::default();
+        self.execution_state_head_id = Uuid::nil();
+        self.latest_state = None;
+        self.editor_cells = Default::default();
+        self.at_execution_state_cells = vec![];
     }
 }
 

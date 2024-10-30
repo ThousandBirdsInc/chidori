@@ -25,7 +25,7 @@ use futures_util::FutureExt;
 use pyo3::{Py, PyAny};
 use pyo3::types::{IntoPyDict, PyTuple};
 use tokio::runtime::{Builder, Runtime};
-use tracing::Span;
+use tracing::{Id, Span};
 use crate::cells::{CellTypes, CodeCell, LLMPromptCell};
 use crate::execution::execution::execution_state::ExecutionStateErrors;
 use crate::execution::execution::ExecutionState;
@@ -64,7 +64,7 @@ struct MyOpState {
     stderr: Vec<String>,
     functions: HashMap<
         String,
-        InternalClosureFnMut,
+        FunctionConstructorState,
     >,
 }
 
@@ -88,8 +88,8 @@ fn op_console_log(
     state: Rc<RefCell<OpState>>,
     #[string] message: String,
 ) -> Result<(), AnyError> {
-    let mut op_state = state.borrow_mut();
-    let mut my_op_state: &mut Arc<Mutex<MyOpState>> = (*op_state).borrow_mut();
+    let op_state = state.borrow();
+    let my_op_state: &Arc<Mutex<MyOpState>> = (*op_state).borrow();
     let mut my_op_state = my_op_state.lock().unwrap();
     my_op_state.stdout.push(message.clone());
     println!("[Custom console.log] {:?}", message);
@@ -102,16 +102,21 @@ fn op_console_err(
     state: Rc<RefCell<OpState>>,
     #[string] message: String,
 ) -> Result<(), AnyError> {
-    let mut op_state = state.borrow_mut();
-    let mut my_op_state: &mut Arc<Mutex<MyOpState>> = (*op_state).borrow_mut();
+    let op_state = state.borrow();
+    let my_op_state: &Arc<Mutex<MyOpState>> = (*op_state).borrow();
     let mut my_op_state = my_op_state.lock().unwrap();
     my_op_state.stderr.push(message.clone());
     println!("[Custom console.err] {:?}", message);
     Ok(())
 }
 
+#[derive(Clone)]
+struct FunctionConstructorState {
+    function_name: String,
+    parent_span_id: Option<Id>
+}
 
-#[op2(async)]
+#[op2(async, reentrant)]
 #[serde]
 async fn op_call_rust(
     state: Rc<RefCell<OpState>>,
@@ -119,15 +124,46 @@ async fn op_call_rust(
     #[serde] args: Vec<RkyvSerializedValue>,
     #[serde] kwargs: HashMap<String, RkyvSerializedValue>,
 ) -> Result<RkyvSerializedValue, AnyError> {
-    let mut op_state = state.borrow_mut();
-    let mut my_op_state: &mut Arc<Mutex<MyOpState>> = (*op_state).borrow_mut();
-    let mut my_op_state = my_op_state.lock().unwrap();
-    let func = my_op_state.functions.get_mut(&name).unwrap();
+    let (func_constructor, execution_state_handle) = {
+        let op_state = state.borrow();
+        let my_op_state: &Arc<Mutex<MyOpState>> = (*op_state).borrow();
+        let mut my_op_state = my_op_state.lock().unwrap();
+        (my_op_state.functions.get_mut(&name)
+            .ok_or_else(|| anyhow::anyhow!("Function '{}' not found", name))?
+            .clone(),
+            my_op_state.execution_state_handle.clone()
+        )
+    };
+
     let kwargs = if kwargs.is_empty() {
         None
     } else {
         Some(kwargs)
     };
+
+    let clone_function_name = func_constructor.function_name.clone();
+    let parent_span_id = func_constructor.parent_span_id.clone();
+    let mut func: InternalClosureFnMut  = Box::new(move |args: Vec<RkyvSerializedValue>, kwargs: Option<HashMap<String, RkyvSerializedValue>>| {
+        let clone_function_name = clone_function_name.clone();
+        let execution_state_handle = execution_state_handle.clone();
+        let parent_span_id = parent_span_id.clone();
+        async move {
+            let total_arg_payload = js_args_to_rkyv(args, kwargs);
+            // let mut new_exec_state = {
+            //     let mut exec_state = execution_state_handle.lock().unwrap();
+            //     let mut new_exec_state = exec_state.clone();
+            //     std::mem::swap(&mut *exec_state, &mut new_exec_state);
+            //     new_exec_state
+            // };
+            println!("Deno expecting to call dispatch");
+            let mut new_exec_state = execution_state_handle.lock().unwrap().clone();
+            let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload, parent_span_id.clone()).await?;
+            return result;
+        }.boxed()
+    });
+
+
+    // Call the function without holding any borrows
     let result = func(args, kwargs).await?;
     Ok(result)
 }
@@ -136,10 +172,11 @@ async fn op_call_rust(
 #[op2]
 #[serde]
 fn op_save_result<'scope>(
-    mut state: &mut OpState,
+    state: Rc<RefCell<OpState>>,
     #[serde] val: RkyvSerializedValue,
 ) -> Result<(), AnyError> {
-    let mut my_op_state: &Arc<Mutex<MyOpState>> = state.borrow_mut();
+    let op_state = state.borrow();
+    let my_op_state: &Arc<Mutex<MyOpState>> = op_state.borrow();
     let mut my_op_state = my_op_state.lock().unwrap();
     my_op_state.output = Some(val);
     Ok(())
@@ -162,10 +199,11 @@ fn op_save_result<'scope>(
 #[op2]
 #[serde]
 fn op_save_result_object<'scope>(
-    mut state: &mut OpState,
+    state: Rc<RefCell<OpState>>,
     #[serde] kwargs: HashMap<String, RkyvSerializedValue>,
 ) -> Result<(), AnyError> {
-    let mut my_op_state: &Arc<Mutex<MyOpState>> = state.borrow_mut();
+    let op_state = state.borrow();
+    let my_op_state: &Arc<Mutex<MyOpState>> = op_state.borrow();
     let mut my_op_state = my_op_state.lock().unwrap();
     let mut output = RkyvObjectBuilder::new();
     for (key, value) in kwargs {
@@ -177,11 +215,11 @@ fn op_save_result_object<'scope>(
 }
 
 
-#[op2]
+#[op2(reentrant)]
 #[serde]
 fn op_invoke_function<'scope>(
     scope: &mut v8::HandleScope<'scope>,
-    mut state: &mut OpState,
+    state: Rc<RefCell<OpState>>,
     input: v8::Local<v8::Function>,
 ) -> Result<RkyvSerializedValue, AnyError> {
     let global = scope.get_current_context().global(scope);
@@ -193,7 +231,8 @@ fn op_invoke_function<'scope>(
     let mut args: Vec<_> = vec![];
     let mut kwargs = vec![];
 
-    let mut my_op_state: &Arc<Mutex<MyOpState>> = state.borrow_mut();
+    let op_state = state.borrow();
+    let my_op_state: &Arc<Mutex<MyOpState>> = op_state.borrow();
     let mut my_op_state = my_op_state.lock().unwrap();
     if let RkyvSerializedValue::Object(ref payload_map) = my_op_state.payload {
         if let Some(RkyvSerializedValue::Object(args_map)) = payload_map.get("args")
@@ -251,12 +290,13 @@ fn op_invoke_function<'scope>(
 #[serde]
 fn op_set_globals<'scope>(
     scope: &mut v8::HandleScope<'scope>,
-    mut state: &mut OpState,
+    state: Rc<RefCell<OpState>>,
 ) -> Result<RkyvSerializedValue, AnyError> {
     // Get the global object
     let global = scope.get_current_context().global(scope);
 
-    let mut my_op_state: &Arc<Mutex<MyOpState>> = state.borrow_mut();
+    let op_state = state.borrow();
+    let my_op_state: &Arc<Mutex<MyOpState>> = op_state.borrow();
     let mut my_op_state = my_op_state.lock().unwrap();
 
     // put globals into the global scope before invoking
@@ -328,7 +368,7 @@ fn create_function_shims(
     execution_state_handle: &Arc<Mutex<ExecutionState>>,
     cell_depended_values: &HashMap<String, String>,
     parent_span_id: Option<tracing::Id>,
-) -> Result<Vec<(String, InternalClosureFnMut)>, ()> {
+) -> Result<Vec<(String, FunctionConstructorState)>, ()> {
     let mut functions = Vec::new();
     // Create shims for functions that are referred to, we look at what functions are being provided
     // and create shims for matches between the function name provided and the identifiers referred to.
@@ -339,28 +379,12 @@ fn create_function_shims(
     };
     for function_name in function_names {
         if cell_depended_values.contains_key(&function_name) {
-            let clone_function_name = function_name.clone();
-            let execution_state_handle = execution_state_handle.clone();
             let parent_span_id = parent_span_id.clone();
-            let closure_callable: InternalClosureFnMut  = Box::new(move |args: Vec<RkyvSerializedValue>, kwargs: Option<HashMap<String, RkyvSerializedValue>>| {
-                let clone_function_name = clone_function_name.clone();
-                let execution_state_handle = execution_state_handle.clone();
-                let parent_span_id = parent_span_id.clone();
-                async move {
-                    let total_arg_payload = js_args_to_rkyv(args, kwargs);
-                    // let mut new_exec_state = {
-                    //     let mut exec_state = execution_state_handle.lock().unwrap();
-                    //     let mut new_exec_state = exec_state.clone();
-                    //     std::mem::swap(&mut *exec_state, &mut new_exec_state);
-                    //     new_exec_state
-                    // };
-                    println!("Deno expecting to call dispatch");
-                    let mut new_exec_state = execution_state_handle.lock().unwrap().clone();
-                    let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload, parent_span_id.clone()).await?;
-                    return result;
-                }.boxed()
-            });
-            functions.push((function_name.clone(), closure_callable));
+            let function_constructor_state: FunctionConstructorState  = FunctionConstructorState {
+                function_name: function_name.clone(),
+                parent_span_id,
+            };
+            functions.push((function_name.clone(), function_constructor_state));
         }
     }
     Ok(functions)

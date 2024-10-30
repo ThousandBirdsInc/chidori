@@ -77,11 +77,7 @@ xcode-select --install
 # These dependencies are necessary for a successful build
 brew install cmake  
 
-# Protobuf is depended upon by denokv, which we in turn currently depend on
-brew install protobuf
-
 # We are investigating if this is necessary or can be removed
-brew install libiconv
 brew install python@3.12
 
 # Chidori uses uv for handling python dependencies 
@@ -100,8 +96,8 @@ Chidori's interactions with LLMs default to http://localhost:4000 to hook into L
 If you'd like to leverage gpt-3.5-turbo the included config file will support that.
 You will need to install `pip install litellm[proxy]` in order to run the below:
 ```bash
-uv sync
 export OPENAI_API_KEY=...
+uv pip install "litellm[proxy]"
 uv run litellm --config ./litellm_config.yaml
 ```
 

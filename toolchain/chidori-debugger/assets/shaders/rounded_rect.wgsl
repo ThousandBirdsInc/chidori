@@ -58,8 +58,7 @@ fn fragment(
         let aa: f32 = 0.005;
         let smooth_dist = smoothstep(0.0, aa, dist);
         if smooth_dist > 0.0 {
-            let v = 1.0 - smooth_dist; // Invert for anti-aliasing effect
-            return vec4<f32>(color.rgb, v); // Set alpha to 1.0 for visibility
+            return vec4<f32>(color.rgb, 0.0); // Set alpha to 1.0 for visibility
         }
 
         if texture_color.a == 0.0 {

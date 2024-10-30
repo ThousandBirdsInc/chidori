@@ -372,6 +372,33 @@ impl ChidoriState {
         Ok(())
     }
 
+    pub fn reset(&mut self) -> anyhow::Result<(), String> {
+        // TODO: this does not clear the state of the visualized execution graph fully
+        let chidori = self.chidori.clone();
+        {
+            let chidori_guard = chidori.lock().expect("Failed to lock chidori");
+            chidori_guard.dispatch_user_interaction_to_instance(UserInteractionMessage::Reset)
+                .map_err(|e| e.to_string())?;
+        }
+        self.watched_path = Mutex::new(None);
+        self.background_thread = Mutex::new(None);
+        self.file_watch = Mutex::new(None);
+        self.display_example_modal = true;
+        self.current_playback_state = PlaybackState::Paused;
+        self.editor_cells = HashMap::new();
+        self.state_cells = vec![];
+        self.local_cell_state = Default::default();
+        self.log_messages = vec![];
+        self.merged_state_history = None;
+        self.definition_graph = vec![];
+        self.execution_graph = vec![];
+        self.grouped_nodes = Default::default();
+        self.current_execution_head = Default::default();
+        self.execution_ids_to_states = Default::default();
+        self.trace_events = vec![];
+        Ok(())
+    }
+
     pub fn update_cell(&self, cell_holder: CellHolder) -> anyhow::Result<(), String> {
         let chidori = self.chidori.clone();
         {
@@ -837,6 +864,9 @@ pub fn update_gui(
                 let mut ui = &mut frame.content_ui;
                 ui.horizontal(|ui| {
                     ui.style_mut().spacing.item_spacing = egui::vec2(32.0, 8.0);
+                    if with_cursor(ui.button("Reset")).clicked() {
+                        internal_state.reset();
+                    }
                     if with_cursor(ui.button("Open")).clicked() {
                         internal_state.display_example_modal = false;
                         // let sender = self.text_channel.0.clone();

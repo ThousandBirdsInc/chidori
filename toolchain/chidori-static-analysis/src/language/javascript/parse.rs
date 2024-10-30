@@ -13,7 +13,7 @@ use swc_common::{
 };
 use swc_common::source_map::SmallPos;
 use swc_ecma_ast as ast;
-use swc_ecma_ast::{AssignTarget, AssignTargetPat, BlockStmtOrExpr, Callee, Decl, Expr, FnDecl, ForHead, Ident, ImportSpecifier, Lit, MemberProp, ModuleDecl, ModuleItem, Pat, PropName, SimpleAssignTarget, Stmt};
+use swc_ecma_ast::{AssignTarget, AssignTargetPat, BlockStmtOrExpr, Callee, Decl, Expr, FnDecl, ForHead, Ident, ImportSpecifier, Lit, MemberProp, ModuleDecl, ModuleItem, ObjectPatProp, Pat, PropName, SimpleAssignTarget, Stmt, SuperProp};
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
 use crate::language::ChidoriStaticAnalysisError;
 use crate::language::ContextPath;
@@ -268,6 +268,91 @@ fn traverse_prop_name(prop_name: &PropName, machine: &mut ASTWalkContext) {
     }
 }
 
+fn traverse_assign_target(left: &AssignTarget, machine: &mut ASTWalkContext) {
+    match left {
+        AssignTarget::Simple(s) => {
+            match s {
+                SimpleAssignTarget::Ident(id) => {
+                    machine.encounter_named_reference(id);
+                }
+                SimpleAssignTarget::Member(member) => {
+                    // Similar to traverse_prop_name for the property access
+                    traverse_expr(&member.obj, machine);
+                }
+                SimpleAssignTarget::SuperProp(super_prop) => {
+                    todo!("handle superprop");
+                    match &super_prop.prop {
+                        SuperProp::Ident(id) => {
+                            // machine.encounter_named_reference(id)
+                        }
+                        SuperProp::Computed(_) => {}
+                    }
+                }
+                SimpleAssignTarget::Paren(paren) => {
+                    traverse_expr(&paren.expr, machine);
+                }
+                SimpleAssignTarget::OptChain(opt_chain) => {
+                    todo!("Handle opt chain")
+                    // traverse_opt_chain_expr(opt_chain, machine);
+                }
+                SimpleAssignTarget::TsAs(ts_as) => {
+                    traverse_expr(&ts_as.expr, machine);
+                    // traverse_ts_type(&ts_as.type_ann, machine);
+                }
+                SimpleAssignTarget::TsSatisfies(ts_satisfies) => {
+                    traverse_expr(&ts_satisfies.expr, machine);
+                    // traverse_ts_type(&ts_satisfies.type_ann, machine);
+                }
+                SimpleAssignTarget::TsNonNull(ts_non_null) => {
+                    traverse_expr(&ts_non_null.expr, machine);
+                }
+                SimpleAssignTarget::TsTypeAssertion(ts_type_assertion) => {
+                    // traverse_ts_type(&ts_type_assertion.type_ann, machine);
+                    traverse_expr(&ts_type_assertion.expr, machine);
+                }
+                SimpleAssignTarget::TsInstantiation(ts_instantiation) => {
+                    traverse_expr(&ts_instantiation.expr, machine);
+                    // for type_param in &ts_instantiation.type_args.params {
+                    //     traverse_ts_type(type_param, machine);
+                    // }
+                }
+                SimpleAssignTarget::Invalid(_) => {}
+            }
+        }
+        AssignTarget::Pat(pat) => {
+            match pat {
+                AssignTargetPat::Array(array_pat) => {
+                    for elem in &array_pat.elems {
+                        if let Some(elem) = elem {
+                            traverse_pat(elem, machine);
+                        }
+                    }
+                }
+                AssignTargetPat::Object(object_pat) => {
+                    for prop in &object_pat.props {
+                        match prop {
+                            ObjectPatProp::KeyValue(key_value) => {
+                                traverse_prop_name(&key_value.key, machine);
+                                traverse_pat(&key_value.value, machine);
+                            }
+                            ObjectPatProp::Assign(assign) => {
+                                machine.encounter_named_reference(&assign.key);
+                                if let Some(value) = &assign.value {
+                                    traverse_expr(value, machine);
+                                }
+                            }
+                            ObjectPatProp::Rest(rest) => {
+                                traverse_pat(&rest.arg, machine);
+                            }
+                        }
+                    }
+                }
+                AssignTargetPat::Invalid(_) => {}
+            }
+        }
+    }
+}
+
 fn traverse_pat(pat: &ast::Pat, machine: &mut ASTWalkContext) {
     match pat {
         Pat::Ident(ast::BindingIdent { id, .. }) => {
@@ -335,32 +420,7 @@ fn traverse_expr(expr: &ast::Expr, machine: &mut ASTWalkContext) {
             op, left, right, ..
         }) => {
             let idx = machine.enter_assignment_to_statement();
-            todo!("Resolve this new branch");
-            match left {
-                AssignTarget::Simple(s) => {
-                    match s {
-                        SimpleAssignTarget::Ident(_) => {}
-                        SimpleAssignTarget::Member(_) => {}
-                        SimpleAssignTarget::SuperProp(_) => {}
-                        SimpleAssignTarget::Paren(_) => {}
-                        SimpleAssignTarget::OptChain(_) => {}
-                        SimpleAssignTarget::TsAs(_) => {}
-                        SimpleAssignTarget::TsSatisfies(_) => {}
-                        SimpleAssignTarget::TsNonNull(_) => {}
-                        SimpleAssignTarget::TsTypeAssertion(_) => {}
-                        SimpleAssignTarget::TsInstantiation(_) => {}
-                        SimpleAssignTarget::Invalid(_) => {}
-                    }
-                }
-                AssignTarget::Pat(pat) => {
-                    match pat {
-                        AssignTargetPat::Array(_) => {}
-                        AssignTargetPat::Object(_) => {}
-                        AssignTargetPat::Invalid(_) => {}
-                    }
-                    // traverse_pat(pat, machine);
-                }
-            }
+            traverse_assign_target(&left, machine);
             machine.pop_until(idx);
             let idx = machine.enter_assignment_from_statement();
             traverse_expr(right, machine);
