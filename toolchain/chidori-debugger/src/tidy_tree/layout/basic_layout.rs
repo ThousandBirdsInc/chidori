@@ -133,6 +133,5 @@ mod basic_layout_test {
             peer_margin: 5.,
         };
         layout.layout(&mut tree);
-        println!("{}", tree.str());
     }
 }

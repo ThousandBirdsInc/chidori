@@ -439,9 +439,6 @@ impl OperationNode {
                     SupportedLanguage::PyO3 => {
                         crate::cells::code_cell::code_cell_exec_python(code_cell.clone())
                     }
-                    SupportedLanguage::Starlark => {
-                        unreachable!("We do not yet support starlark")
-                    }
                     SupportedLanguage::Deno => {
                         crate::cells::code_cell::code_cell_exec_deno(code_cell.clone())
                     }

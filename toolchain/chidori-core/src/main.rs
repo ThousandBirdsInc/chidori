@@ -14,6 +14,7 @@ mod sdk;
 mod utils;
 
 pub use tokio;
+use tracing::info;
 pub use uuid;
 use chidori_core::sdk::chidori::Chidori;
 use chidori_core::sdk::entry::PlaybackState;
@@ -75,22 +76,22 @@ async fn run_command(run_directory: &PathBuf) -> anyhow::Result<()> {
             let result = instance.run(PlaybackState::Running).await;
             match result {
                 Ok(_) => {
-                    println!("Instance completed execution and closed successfully.");
+                    info!("Instance completed execution and closed successfully.");
                     break;
                 }
                 Err(e) => {
-                    println!("Error occurred: {}, retrying...", e);
+                    info!("Error occurred: {}, retrying...", e);
                 }
             }
         }
     });
 
     // Here you can add any additional setup or processing needed for the run command
-    println!("Chidori instance is running in the background.");
+    info!("Chidori instance is running in the background.");
 
     // Keep the main thread alive
     tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl+c");
-    println!("Received shutdown signal. Terminating...");
+    info!("Received shutdown signal. Terminating...");
     Ok(())
 }
 
@@ -100,7 +101,7 @@ async fn main() -> anyhow::Result<()>{
 
     match &cli.command {
         Some(Commands::Run { load }) => {
-            println!("Running Chidori with target src directory: {:?}", load);
+            info!("Running Chidori with target src directory: {:?}", load);
             run_command(load).await
         }
         // Some(Commands::Test { test_dir, verbose }) => {

@@ -218,7 +218,7 @@ pub fn analyze_referenced_partials_inner<F>(
                 }
             }
             TemplateElement::PartialBlock(x) => {
-                println!("PartialBlock {:?}", x)
+                todo!("PartialBlock {:?}", x)
             }
             TemplateElement::Comment(_) => {}
         }

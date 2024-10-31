@@ -27,7 +27,6 @@ use crate::library::std::ai::llm::ChatModelBatch;
 #[archive_attr(derive(Debug))]
 pub enum SupportedLanguage {
     PyO3,
-    Starlark,
     Deno,
 }
 
@@ -49,7 +48,8 @@ pub enum SupportedLanguage {
 ))]
 #[archive_attr(derive(Debug))]
 pub struct BackingFileReference {
-    path: String
+    pub(crate) path: String,
+    pub(crate) text_range: Option<TextRange>
 }
 
 #[derive(
@@ -432,6 +432,7 @@ Serialize,
 Deserialize,
 Debug,
 PartialEq,
+Eq,
 Default,
 Clone,
 )]
@@ -444,6 +445,26 @@ bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: 
 pub struct TextRange {
     pub start: usize,
     pub end: usize,
+}
+
+
+impl Ord for TextRange {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // First compare by start position
+        match self.start.cmp(&other.start) {
+            Ordering::Equal => {
+                // If starts are equal, compare by end position
+                self.end.cmp(&other.end)
+            }
+            ordering => ordering,
+        }
+    }
+}
+
+impl PartialOrd for TextRange {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(

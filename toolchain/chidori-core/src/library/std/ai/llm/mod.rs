@@ -469,10 +469,9 @@ pub async fn ai_llm_code_generation_chat_model(
             let mut cells = vec![];
             crate::sdk::md::extract_code_blocks(&text)
                 .iter()
-                .filter_map(|block| interpret_markdown_code_block(block).unwrap())
+                .filter_map(|block| interpret_markdown_code_block(block, None).unwrap())
                 .for_each(|block| { cells.push(block); });
             cells.sort();
-            dbg!(&cells);
 
             for cell in cells {
                 let (s, _) = new_execution_state.update_operation(cell, Uuid::now_v7())?;

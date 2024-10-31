@@ -34,7 +34,7 @@ use uuid::Uuid;
 use crate::cells::CellTypes;
 use crate::execution::primitives::operation::OperationFnOutput;
 use tokio::sync::mpsc::{Sender, channel};
-
+use tracing::debug;
 // TODO: update all of these identifies to include a "space" they're within
 
 type EdgeIdentity = (OperationId, OperationId, DependencyReference);
@@ -140,7 +140,7 @@ pub struct ExecutionEvent {
 impl ExecutionGraph {
     #[tracing::instrument]
     pub fn new() -> Self {
-        println!("Initializing ExecutionGraph");
+        debug!("Initializing ExecutionGraph");
         let (sender, mut execution_graph_event_receiver) = tokio::sync::mpsc::channel::<ExecutionGraphSendPayload>(1028);
 
         let mut state_id_to_state = DashMap::new();
@@ -176,7 +176,7 @@ impl ExecutionGraph {
         // Kick off a background thread that listens for events from async operations
         // These events inject additional state into the execution graph on new branches
         // Those branches will continue to evaluate independently.
-        println!("Initializing background thread for handling async updates to our execution graph");
+        debug!("Initializing background thread for handling async updates to our execution graph");
         let handle = tokio::spawn(async move {
             // Signal that the task has started, we can continue initialization
             initialization_notify_clone.notify_one();
@@ -185,7 +185,7 @@ impl ExecutionGraph {
                     biased;  // Prioritize message handling over cancellation
 
                     Some((resulting_execution_state, oneshot)) = execution_graph_event_receiver.recv() => {
-                        println!("==== Execution Graph received dispatch event {:?}", resulting_execution_state.id());
+                        debug!("==== Execution Graph received dispatch event {:?}", resulting_execution_state.id());
 
                         let s = resulting_execution_state.clone();
                         match &resulting_execution_state {
@@ -195,7 +195,7 @@ impl ExecutionGraph {
                                     id: resulting_state_id.clone(),
                                     evaluation: s.clone()
                                 }).await {
-                                    println!("Failed to send execution event: {}", e);
+                                    debug!("Failed to send execution event: {}", e);
                                 }
                             }
                             ExecutionStateEvaluation::EvalFailure(id) => {
@@ -203,7 +203,7 @@ impl ExecutionGraph {
                                     id: id.clone(),
                                     evaluation: s.clone()
                                 }).await {
-                                    println!("Failed to send execution event: {}", e);
+                                    debug!("Failed to send execution event: {}", e);
                                 }
                             }
                             ExecutionStateEvaluation::Complete(state) => {
@@ -212,7 +212,7 @@ impl ExecutionGraph {
                                     id: resulting_state_id.clone(),
                                     evaluation: s.clone()
                                 }).await {
-                                    println!("Failed to send execution event: {}", e);
+                                    debug!("Failed to send execution event: {}", e);
                                 }
                             }
                             ExecutionStateEvaluation::Executing(state) => {
@@ -221,7 +221,7 @@ impl ExecutionGraph {
                                     id: resulting_state_id.clone(),
                                     evaluation: s.clone()
                                 }).await {
-                                    println!("Failed to send execution event: {}", e);
+                                    debug!("Failed to send execution event: {}", e);
                                 }
                             }
                         }
@@ -259,7 +259,7 @@ impl ExecutionGraph {
                         }
                     }
                     _ = cancellation_notify_clone.notified() => {
-                        println!("Task is notified to stop");
+                        debug!("Task is notified to stop");
                         return;
                     }
                 }

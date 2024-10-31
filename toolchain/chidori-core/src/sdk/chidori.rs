@@ -5,6 +5,8 @@ use std::sync::mpsc::Sender;
 use tracing::dispatcher::DefaultGuard;
 use std::collections::HashMap;
 use std::path::Path;
+use futures_util::future::Shared;
+use tracing::info;
 use crate::cells::{CellTypes, get_cell_name};
 use crate::execution::execution::execution_graph::ExecutionGraph;
 use crate::sdk::entry::{CellHolder, EventsFromRuntime, PlaybackState, SharedState, UserInteractionMessage};
@@ -40,6 +42,16 @@ impl std::fmt::Debug for Chidori {
     }
 }
 
+fn initialize_shared_state_object() -> Arc<Mutex<SharedState>> {
+    Arc::new(Mutex::new(SharedState {
+        execution_id_to_evaluation: Default::default(),
+        execution_state_head_id: Uuid::nil(),
+        editor_cells: Default::default(),
+        at_execution_state_cells: vec![],
+        latest_state: None,
+    }))
+}
+
 impl Chidori {
     pub fn new() -> Self {
         Chidori {
@@ -47,34 +59,21 @@ impl Chidori {
             runtime_event_sender: None,
             trace_event_sender: None,
             loaded_path: None,
-            shared_state: Arc::new(Mutex::new(SharedState {
-                execution_id_to_evaluation: Default::default(),
-                execution_state_head_id: Uuid::nil(),
-                editor_cells: Default::default(),
-                at_execution_state_cells: vec![],
-                latest_state: None,
-            })),
+            shared_state: initialize_shared_state_object(),
             tracing_guard: None,
         }
     }
 
     pub fn new_with_events(sender: Sender<TraceEvents>, runtime_event_sender: Sender<EventsFromRuntime>) -> Self {
-        tracing::subscriber::set_global_default(init_internal_telemetry(sender.clone())).expect("Failed to set global default");
-        let guard: DefaultGuard = tracing::subscriber::set_default(init_internal_telemetry(sender.clone()));
+        let init_telemetry = init_internal_telemetry(sender.clone());
+        // tracing::subscriber::set_global_default(init_telemetry.clone()).expect("Failed to set global default");
+        let guard: DefaultGuard = tracing::subscriber::set_default(init_telemetry);
         Chidori {
             instanced_env_tx: None,
             runtime_event_sender: Some(runtime_event_sender),
             trace_event_sender: Some(sender),
             loaded_path: None,
-            shared_state: Arc::new(Mutex::new(SharedState {
-                execution_id_to_evaluation: Default::default(),
-                execution_state_head_id: Uuid::nil(),
-                editor_cells: Default::default(),
-
-                at_execution_state_cells: vec![],
-
-                latest_state: None,
-            })),
+            shared_state: initialize_shared_state_object(),
             tracing_guard: Some(guard)
         }
     }
@@ -143,7 +142,7 @@ impl Chidori {
         let mut cells = vec![];
         crate::sdk::md::extract_code_blocks(s)
             .iter()
-            .filter_map(|block| interpret_markdown_code_block(block).unwrap())
+            .filter_map(|block| interpret_markdown_code_block(block, None).unwrap())
             .for_each(|block| { cells.push(block); });
         cells.sort();
         self.loaded_path = Some("raw_text".to_string());
@@ -155,14 +154,14 @@ impl Chidori {
         let mut cells = vec![];
         for file in files {
             for block in file.result {
-                if let Some(block) = interpret_markdown_code_block(&block).unwrap() {
+                if let Some(block) = interpret_markdown_code_block(&block, Some(path.to_string_lossy().to_string())).unwrap() {
                     cells.push(block);
                 }
             }
         }
         self.loaded_path = Some(path.to_str().unwrap().to_string());
         cells.sort();
-        println!("Loading {} cells from {:?}", cells.len(), path);
+        info!("Loading {} cells from {:?}", cells.len(), path);
         self.load_cells(cells)
     }
 

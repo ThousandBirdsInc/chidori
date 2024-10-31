@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use tokio_cron_scheduler::{Job, JobScheduler, JobSchedulerError};
+use tracing::debug;
 use uuid::Uuid;
 use crate::cells::{CellTypes, CodeCell, ScheduleCell};
 use crate::execution::execution::ExecutionState;
@@ -88,7 +89,7 @@ pub async fn run_cron(
     // Add code to be run during/after shutdown
     sched.set_shutdown_handler(Box::new(|| {
         Box::pin(async move {
-            println!("Shut down done");
+            debug!("Shut down done");
         })
     }));
 

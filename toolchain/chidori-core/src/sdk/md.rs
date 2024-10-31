@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use serde_derive::Serialize;
 use thiserror::Error;
-use crate::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, SupportedMemoryProviders, SupportedModelProviders, TemplateCell, TextRange, WebserviceCell};
+use crate::cells::{BackingFileReference, CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, SupportedMemoryProviders, SupportedModelProviders, TemplateCell, TextRange, WebserviceCell};
 
 #[derive(PartialEq, Serialize, Debug)]
 pub struct MarkdownCodeBlock {
@@ -102,24 +102,16 @@ pub fn load_folder(path: &Path) -> anyhow::Result<Vec<ParsedFile>> {
             res.extend(load_folder(&path)?);
         }
 
-        if metadata.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
-            let parsed_file = parse_markdown_file(&path);
-            res.push(parsed_file);
-        }
-
-        if metadata.is_file() && path.extension().and_then(|s| s.to_str()) == Some("py") {
-            let parsed_file = parse_markdown_file(&path);
-            res.push(parsed_file);
-        }
-
-        if metadata.is_file() && path.extension().and_then(|s| s.to_str()) == Some("js") {
-            let parsed_file = parse_markdown_file(&path);
-            res.push(parsed_file);
-        }
-
-        if metadata.is_file() && path.extension().and_then(|s| s.to_str()) == Some("ts") {
-            let parsed_file = parse_markdown_file(&path);
-            res.push(parsed_file);
+        if metadata.is_file() {
+            if let Some(extension)  = path.extension().and_then(|s| s.to_str()) {
+                match extension {
+                    "md" | "py" | "js" | "ts" => {
+                        let parsed_file = parse_markdown_file(&path);
+                        res.push(parsed_file);
+                    },
+                    _ => {}
+                }
+            }
         }
     }
     Ok(res)
@@ -136,11 +128,14 @@ pub enum InterpretError {
 }
 
 
-pub fn interpret_markdown_code_block(block: &MarkdownCodeBlock) -> Result<Option<CellTypes>, InterpretError> {
+pub fn interpret_markdown_code_block(block: &MarkdownCodeBlock, file_path: Option<String>) -> Result<Option<CellTypes>, InterpretError> {
     let whole_body = block.body.clone();
     let (frontmatter, body) = chidori_prompt_format::templating::templates::split_frontmatter(&block.body)
         .map_err(|e| InterpretError::FrontmatterSplitError(e.to_string()))?;
-
+    let backing_file_reference = file_path.map(|p| BackingFileReference {
+        path: p,
+        text_range: Some(block.range.clone())
+    });
     Ok(match block.tag.as_str() {
         "python" | "javascript" | "py" | "js" | "ts" | "typescript" => {
             let language = match block.tag.as_str() {
@@ -149,7 +144,7 @@ pub fn interpret_markdown_code_block(block: &MarkdownCodeBlock) -> Result<Option
                 _ => unreachable!(), // Given the outer match, this branch should never be reached
             };
             Some(CellTypes::Code(CodeCell {
-                backing_file_reference: None,
+                backing_file_reference,
                 name: block.name.clone(),
                 language,
                 source_code: block.body.clone(),
@@ -157,7 +152,7 @@ pub fn interpret_markdown_code_block(block: &MarkdownCodeBlock) -> Result<Option
             }, block.range.clone()))
         },
         "prompt" => Some(CellTypes::Prompt(LLMPromptCell::Chat {
-            backing_file_reference: None,
+            backing_file_reference,
             function_invocation: false,
             configuration: serde_yaml::from_str(&frontmatter)?,
             name: block.name.clone(),
@@ -166,7 +161,7 @@ pub fn interpret_markdown_code_block(block: &MarkdownCodeBlock) -> Result<Option
             req: body,
         }, block.range.clone())),
         "codegen" => Some(CellTypes::CodeGen(LLMCodeGenCell {
-            backing_file_reference: None,
+            backing_file_reference,
             function_invocation: false,
             configuration: serde_yaml::from_str(&frontmatter)?,
             name: block.name.clone(),
@@ -174,8 +169,8 @@ pub fn interpret_markdown_code_block(block: &MarkdownCodeBlock) -> Result<Option
             provider: SupportedModelProviders::OpenAI,
             req: body,
         }, block.range.clone())),
-        "html" => Some(CellTypes::Template(TemplateCell {
-            backing_file_reference: None,
+        "html" | "template" => Some(CellTypes::Template(TemplateCell {
+            backing_file_reference,
             name: block.name.clone(),
             body: block.body.clone(),
         }, block.range.clone())),
@@ -198,7 +193,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block).ok())
+            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -212,7 +207,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block).ok())
+            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -226,7 +221,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block).ok())
+            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -240,7 +235,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block).ok())
+            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -254,7 +249,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block).ok())
+            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -268,7 +263,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block).ok())
+            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -282,7 +277,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block).ok())
+            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {

@@ -576,12 +576,11 @@ fn render_code_cell(
     let mut local_language = language.clone();
     let language_string = match language {
         SupportedLanguage::PyO3 => "python",
-        SupportedLanguage::Starlark => "starlark",
         SupportedLanguage::Deno => "javascript/typescript"
     };
 
     let report = match language {
-        SupportedLanguage::PyO3 | SupportedLanguage::Starlark => {
+        SupportedLanguage::PyO3 => {
             let d = chidori_core::chidori_static_analysis::language::python::parse::extract_dependencies_python(&source_code);
             d.map(|d| chidori_core::chidori_static_analysis::language::python::parse::build_report(&d))
         },
@@ -595,7 +594,6 @@ fn render_code_cell(
     let mut layouter = |ui: &egui::Ui, text_string: &str, wrap_width: f32| {
         let syntax_language = match language_clone {
             SupportedLanguage::PyO3 => "py",
-            SupportedLanguage::Starlark => "py",
             SupportedLanguage::Deno => "js"
         };
         let mut layout_job =

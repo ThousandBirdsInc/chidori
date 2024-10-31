@@ -296,7 +296,6 @@ pub fn egui_render_cell_read(ui: &mut Ui, cell: &CellTypes, state: &ExecutionSta
 fn render_code_cell(ui: &mut Ui, name: &Option<String>, source_code: &str, language: &SupportedLanguage, theme: &CodeTheme) {
     let (language_string, syntax_language) = match language {
         SupportedLanguage::PyO3 => ("python", "py"),
-        SupportedLanguage::Starlark => ("starlark", "py"),
         SupportedLanguage::Deno => ("javascript/typescript", "js"),
     };
 

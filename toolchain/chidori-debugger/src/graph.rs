@@ -951,7 +951,7 @@ fn update_graph_system_renderer(
                                             }
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                                                 if ui.button("Revert to this State").clicked() {
-                                                    println!("We would like to revert to {:?}", node1);
+                                                    info!("We would like to revert to {:?}", node1);
                                                     let _ = chidori_state.set_execution_id(*node1);
                                                 }
                                             });

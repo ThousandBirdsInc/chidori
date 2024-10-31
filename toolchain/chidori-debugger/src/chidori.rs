@@ -359,16 +359,13 @@ impl ChidoriState {
 
     pub fn set_execution_id(&self, id: ExecutionNodeId) -> anyhow::Result<(), String> {
         // TODO: we're failing to lock chidori
-        println!("=== lock chidori");
         let chidori = self.chidori.clone();
         {
             let chidori_guard = chidori.lock().expect("Failed to lock chidori");
-            println!("=== handle user action Revert");
             chidori_guard.dispatch_user_interaction_to_instance(UserInteractionMessage::RevertToState(Some(id)))
                 .map_err(|e| e.to_string())?;
 
         }
-        println!("=== set execution id, drop the lock");
         Ok(())
     }
 
