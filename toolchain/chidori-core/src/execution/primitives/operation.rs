@@ -306,38 +306,9 @@ pub struct OperationNode {
     pub(crate) id: OperationId,
     pub(crate) name: Option<String>,
     pub created_at_state_id: ExecutionNodeId,
-
-    /// Should this operation run in a background thread
-    pub is_long_running_background_thread: bool,
-
     pub cell: CellTypes,
-
-    /// Is the node pure or impure, does it have side effects? Does it depend on external state?
-    purity: Purity,
-
-    /// Is the node mutable or immutable, can its value change after an execution?
-    mutability: Mutability,
-
-    /// When did the output of this node last actually change
-    changed_at: usize,
-
-    /// When was this operation last brought up to date
-    verified_at: usize,
-
-    /// Is this operation dirty
-    pub(crate) dirty: bool,
-
     /// Signature of the inputs and outputs of this node
     pub(crate) signature: Signature,
-
-    /// The operation function itself
-    // pub(crate) operation: Box<OperationFn>,
-
-    /// Dependencies of this node
-    pub(crate) unresolved_dependencies: Vec<usize>,
-
-    /// Partial application arena - this stores partially applied arguments for this OperationNode
-    partial_application: Vec<u8>,
 }
 
 impl core::hash::Hash for OperationNode {
@@ -358,14 +329,7 @@ impl fmt::Debug for OperationNode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OperationNode")
             .field("id", &self.id)
-            .field("purity", &self.purity)
-            .field("mutability", &self.mutability)
-            .field("changed_at", &self.changed_at)
-            .field("verified_at", &self.verified_at)
-            .field("dirty", &self.dirty)
             .field("signature", &self.signature)
-            .field("unresolved_dependencies", &self.unresolved_dependencies)
-            .field("partial_application", &self.partial_application)
             .finish()
     }
 }
@@ -376,7 +340,6 @@ impl Default for OperationNode {
             id: Uuid::nil(),
             name: None,
             created_at_state_id: Uuid::nil(),
-            is_long_running_background_thread: false,
             cell: CellTypes::Code(CodeCell {
                 backing_file_reference: None,
                 name: None,
@@ -384,15 +347,8 @@ impl Default for OperationNode {
                 source_code: "".to_string(),
                 function_invocation: None,
             }, TextRange::default()),
-            purity: Purity::Pure,
-            mutability: Mutability::Mutable,
-            changed_at: 0,
-            verified_at: 0,
-            dirty: true,
             signature: Signature::new(),
             // operation: Box::new(|_, x, _, _| async move { Ok(OperationFnOutput::with_value(x)) }.boxed()),
-            unresolved_dependencies: vec![],
-            partial_application: Vec::new(),
         }
     }
 }
@@ -409,18 +365,9 @@ impl OperationNode {
         node.created_at_state_id = created_at;
         node.signature.input_signature = input_signature;
         node.signature.output_signature = output_signature;
-        // node.operation = f;
         node.name = name;
         node.cell = cell;
         node
-    }
-
-    pub fn attach_cell(&mut self, cell: CellTypes) {
-        self.cell = cell;
-    }
-
-    fn apply() -> Self {
-        unimplemented!();
     }
 
     #[tracing::instrument]
@@ -431,8 +378,6 @@ impl OperationNode {
         intermediate_output_channel_tx: Option<Sender<(ExecutionNodeId, RkyvSerializedValue)>>,
         async_communication_channel: Option<AsyncRPCCommunication>,
     ) -> Pin<Box<dyn Future<Output=anyhow::Result<OperationFnOutput>> + Send>> {
-
-        // Construct the cell execution closure
         let closure = match &self.cell {
             CellTypes::Code(code_cell, _) => {
                 match code_cell.language {
@@ -497,7 +442,6 @@ mod tests {
             created_at_state_id: Uuid::nil(),
             id: id_a,
             name: None,
-            is_long_running_background_thread: false,
             cell: CellTypes::Code(CodeCell {
                 backing_file_reference: None,
                 name: None,
@@ -505,11 +449,6 @@ mod tests {
                 source_code: "".to_string(),
                 function_invocation: None,
             }, TextRange::default()),
-            purity: Purity::Pure,
-            mutability: Mutability::Mutable,
-            changed_at: 0,
-            verified_at: 0,
-            dirty: true,
             signature: Signature::new(),
             // operation: Box::new(|_, p: RkyvSerializedValue, _, async_rpccommunication: Option<AsyncRPCCommunication>| async move {
             //     let mut state = 0;
@@ -527,8 +466,6 @@ mod tests {
             //     }).await;
             //     Ok(OperationFnOutput::with_value(RkyvSerializedValue::Null))
             // }.boxed()),
-            unresolved_dependencies: vec![],
-            partial_application: Vec::new(),
         };
         let ex = op.execute(&ExecutionState::new_with_random_id(), RkyvSerializedValue::Boolean(true), None, Some(async_rpc_communication));
         let join_handle = tokio::spawn(async move {

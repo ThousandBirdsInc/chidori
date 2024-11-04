@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use crate::execution::execution::execution_state::{DependencyGraphMutation, ExecutionState, ExecutionStateEvaluation};
+use crate::execution::execution::execution_state::{CloseReason, DependencyGraphMutation, EnclosedState, ExecutionState};
 use std::fmt;
 use std::fmt::Debug;
 use std::future::Future;
@@ -40,31 +40,17 @@ use tracing::debug;
 type EdgeIdentity = (OperationId, OperationId, DependencyReference);
 
 /// ExecutionId is a unique identifier for a point in the execution graph.
-/// It is a tuple of (branch, counter) where branch is an instance of a divergence from a previous
-/// execution state. Counter is the iteration of steps taken in that branch.
-// TODO: add a globally incrementing counter to this so that there can never be identity collisions
-
-// TODO: (branch, depth, counter)
 pub type ExecutionNodeId = Uuid;
+
+pub type ChronologyId = Uuid;
 
 
 #[derive(Debug, Clone)]
 pub struct MergedStateHistory(pub HashMap<OperationId, (ExecutionNodeId, Arc<OperationFnOutput>)>);
 
-// TODO: every point in the execution graph should be a top level element in an execution stack
-//       but what about async functions?
+pub type ExecutionGraphSendPayload = (ExecutionState, Option<tokio::sync::oneshot::Sender<()>>);
 
-// TODO: we need to introduce a concept of depth in the execution graph.
-//       depth could be more edges from an element with a particular labelling.
-//       we would need execution ids to have both branch, counter (steps), and depth they occur at.
-
-// TODO: we need to effectively step inside of a function, so effectively these are fractional
-//       steps we take within a given counter. but then those can nest even further.
-//
-
-pub type ExecutionGraphSendPayload = (ExecutionStateEvaluation, Option<tokio::sync::oneshot::Sender<()>>);
-
-pub type ExecutionGraphDiGraphSet = DiGraphMap<ExecutionNodeId, ExecutionStateEvaluation>;
+pub type ExecutionGraphDiGraphSet = DiGraphMap<ExecutionNodeId, ExecutionState>;
 
 
 /// This models the network of reactive relationships between different components.
@@ -87,16 +73,11 @@ pub struct ExecutionGraph {
     /// along those edges are always considered to have occurred _after_ the target step.
     execution_graph: Arc<Mutex<ExecutionGraphDiGraphSet>>,
 
-
-    /// Sender channel for sending messages to the execution graph
-    graph_mutation_sender: tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>,
-
-
-    execution_event_sender: Sender<ExecutionEvent>,
-    execution_event_receiver: Option<tokio::sync::mpsc::Receiver<ExecutionEvent>>,
+    execution_state_sender: Sender<ExecutionState>,
+    execution_state_receiver: Option<tokio::sync::mpsc::Receiver<ExecutionState>>,
 
     // TODO: move to just using the digraph for this
-    pub(crate) execution_node_id_to_state: Arc<DashMap<ExecutionNodeId, ExecutionStateEvaluation>>,
+    pub(crate) execution_node_id_to_state: Arc<DashMap<ExecutionNodeId, ExecutionState>>,
 
     pub execution_depth_orchestration_handle: tokio::task::JoinHandle<()>,
     pub execution_depth_orchestration_initialized_notify: Arc<Notify>,
@@ -116,41 +97,20 @@ impl std::fmt::Debug for ExecutionGraph {
 }
 
 
-/// Execution Ids identify transitions in state during execution, as values are
-/// emitted, we update the state of the graph and create a new execution id.
-///
-/// They are structured in the format (branch, counter), counter represents
-/// iterative execution of the same branch. Branch in contrast increments when
-/// we re-evaluate a node that head already previously been evaluated - creating a
-/// new line of execution.
-pub fn get_execution_id() -> Uuid {
-    Uuid::now_v7()
-}
-
-pub fn get_operation_id() -> Uuid {
-    Uuid::now_v7()
-}
-
-#[derive(Debug, Clone)]
-pub struct ExecutionEvent {
-    pub id: ExecutionNodeId,
-    pub evaluation: ExecutionStateEvaluation
-}
-
 impl ExecutionGraph {
     #[tracing::instrument]
     pub fn new() -> Self {
         debug!("Initializing ExecutionGraph");
-        let (sender, mut execution_graph_event_receiver) = tokio::sync::mpsc::channel::<ExecutionGraphSendPayload>(1028);
+        let (sender_new_execution_states, mut receiver_new_execution_states) = tokio::sync::mpsc::channel::<ExecutionGraphSendPayload>(1028);
 
         let mut state_id_to_state = DashMap::new();
 
         // Initialization of the execution graph at Uuid::nil - this is always the root of the execution graph
         let init_id = Uuid::nil();
-        state_id_to_state.insert(init_id, ExecutionStateEvaluation::Complete(ExecutionState::new_with_graph_sender(
+        state_id_to_state.insert(init_id, ExecutionState::new_with_graph_sender(
             init_id,
-            Arc::new(sender.clone())
-        )));
+            Arc::new(sender_new_execution_states)
+        ));
 
         // Graph of execution states
         let mut execution_graph = Arc::new(Mutex::new(DiGraphMap::new()));
@@ -168,90 +128,39 @@ impl ExecutionGraph {
         let cancellation_notify = Arc::new(Notify::new());
         let cancellation_notify_clone = cancellation_notify.clone();
 
-
         // Channel for execution_events
-        let (execution_event_tx, execution_event_rx) = channel::<ExecutionEvent>(100);
+        let (execution_event_tx, execution_event_rx) = channel::<ExecutionState>(100);
         let execution_event_tx_clone = execution_event_tx.clone();
 
         // Kick off a background thread that listens for events from async operations
         // These events inject additional state into the execution graph on new branches
         // Those branches will continue to evaluate independently.
         debug!("Initializing background thread for handling async updates to our execution graph");
+        let state_id_to_state_clone  = state_id_to_state.clone();
         let handle = tokio::spawn(async move {
             // Signal that the task has started, we can continue initialization
             initialization_notify_clone.notify_one();
+            // Pushing this state into the graph
             loop {
                 tokio::select! {
                     biased;  // Prioritize message handling over cancellation
 
-                    Some((resulting_execution_state, oneshot)) = execution_graph_event_receiver.recv() => {
-                        debug!("==== Execution Graph received dispatch event {:?}", resulting_execution_state.id());
+                    Some((resulting_execution_state, oneshot)) = receiver_new_execution_states.recv() => {
+                        let chronology_id = resulting_execution_state.chronology_id;
+                        let parent_id = resulting_execution_state.parent_state_chronology_id;
+                        println!("==== Execution Graph received dispatch event {:?}", chronology_id);
 
-                        let s = resulting_execution_state.clone();
-                        match &resulting_execution_state {
-                            ExecutionStateEvaluation::Error(state) => {
-                                let resulting_state_id = state.id;
-                                if let Err(e) = execution_event_tx_clone.send(ExecutionEvent{
-                                    id: resulting_state_id.clone(),
-                                    evaluation: s.clone()
-                                }).await {
-                                    debug!("Failed to send execution event: {}", e);
-                                }
-                            }
-                            ExecutionStateEvaluation::EvalFailure(id) => {
-                                if let Err(e) = execution_event_tx_clone.send(ExecutionEvent{
-                                    id: id.clone(),
-                                    evaluation: s.clone()
-                                }).await {
-                                    debug!("Failed to send execution event: {}", e);
-                                }
-                            }
-                            ExecutionStateEvaluation::Complete(state) => {
-                                let resulting_state_id = state.id;
-                                if let Err(e) = execution_event_tx_clone.send(ExecutionEvent{
-                                    id: resulting_state_id.clone(),
-                                    evaluation: s.clone()
-                                }).await {
-                                    debug!("Failed to send execution event: {}", e);
-                                }
-                            }
-                            ExecutionStateEvaluation::Executing(state) => {
-                                let resulting_state_id = state.id;
-                                if let Err(e) = execution_event_tx_clone.send(ExecutionEvent{
-                                    id: resulting_state_id.clone(),
-                                    evaluation: s.clone()
-                                }).await {
-                                    debug!("Failed to send execution event: {}", e);
-                                }
-                            }
+                        // Forward this new execution state to the runtime instance
+                        if let Err(e) = execution_event_tx_clone.send(resulting_execution_state.clone()).await {
+                            debug!("Failed to send execution event: {}", e);
                         }
 
                         // Pushing this state into the graph
-                        let mut execution_graph = execution_graph_clone.lock().unwrap();
-                        let mut state_id_to_state = state_id_to_state_clone.clone();
-
-                        match resulting_execution_state {
-                            ExecutionStateEvaluation::Error(state) |
-                            ExecutionStateEvaluation::Complete(state) => {
-                                let resulting_state_id = state.id;
-                                state_id_to_state.insert(resulting_state_id.clone(), s.clone());
-                                execution_graph.deref_mut()
-                                    .add_edge(state.parent_state_id, resulting_state_id.clone(), s);
-                            }
-                            ExecutionStateEvaluation::EvalFailure(id) => {
-                                state_id_to_state.insert(id.clone(), s.clone());
-                            }
-                            ExecutionStateEvaluation::Executing(state) => {
-                                let resulting_state_id = state.id;
-                                if let Some(ExecutionStateEvaluation::Complete(_)) = state_id_to_state.get(&resulting_state_id).map(|x| x.clone()) {
-                                    // State is already complete, skip updating
-                                } else {
-                                    state_id_to_state.insert(resulting_state_id.clone(), s.clone());
-                                    execution_graph.deref_mut()
-                                        .add_edge(state.parent_state_id, resulting_state_id.clone(), s);
-                                }
-                            }
-                        }
+                        state_id_to_state_clone.insert(chronology_id, resulting_execution_state.clone());
+                        execution_graph_clone.lock().unwrap().deref_mut().add_edge(
+                            parent_id,
+                            chronology_id,
+                            resulting_execution_state.clone());
 
                         // Resume execution
                         if let Some(oneshot) = oneshot {
@@ -265,23 +174,20 @@ impl ExecutionGraph {
                 }
             }
         });
-        let graph = ExecutionGraph {
+        ExecutionGraph {
             cancellation_notify,
             execution_depth_orchestration_initialized_notify: initialization_notify,
             execution_depth_orchestration_handle: handle,
             execution_node_id_to_state: state_id_to_state,
             execution_graph,
-            graph_mutation_sender: sender,
             chat_message_queue: vec![],
-            execution_event_sender: execution_event_tx,
-            execution_event_receiver: Some(execution_event_rx)
-        };
-
-        graph
+            execution_state_sender: execution_event_tx,
+            execution_state_receiver: Some(execution_event_rx)
+        }
     }
 
-    pub fn take_execution_event_receiver(&mut self) -> tokio::sync::mpsc::Receiver<ExecutionEvent> {
-        self.execution_event_receiver.take().expect("Execution event receiver may only be taken once by a new owner")
+    pub fn take_execution_event_receiver(&mut self) -> tokio::sync::mpsc::Receiver<ExecutionState> {
+        self.execution_state_receiver.take().expect("Execution event receiver may only be taken once by a new owner")
     }
 
     pub async fn shutdown(&mut self) {
@@ -289,34 +195,18 @@ impl ExecutionGraph {
     }
 
     #[tracing::instrument]
-    pub fn get_execution_graph_elements(&self) -> (Vec<(ExecutionNodeId, ExecutionNodeId)>, HashSet<ExecutionNodeId>)  {
+    pub fn get_execution_graph_elements(&self) -> Vec<(ChronologyId, ChronologyId)>  {
         let execution_graph = self.execution_graph.lock().unwrap();
-        let mut grouped_nodes = HashSet::new();
-        for (source, target, ev) in execution_graph.deref().all_edges() {
-            match ev {
-                ExecutionStateEvaluation::EvalFailure(_) => {},
-                ExecutionStateEvaluation::Error(_) => {}
-                ExecutionStateEvaluation::Executing(s) => {
-                }
-                ExecutionStateEvaluation::Complete(s) => {
-                    if !s.stack.is_empty() {
-                        for item in s.stack.iter().cloned() {
-                            grouped_nodes.insert(item);
-                        }
-                    }
-                }
-            }
-
-        }
-
-        (execution_graph.deref().all_edges().map(|x| (x.0, x.1)).collect(), grouped_nodes)
+        execution_graph.deref().all_edges().map(|x| (x.0, x.1)).collect()
     }
 
-    pub fn get_state_at_id(&self, id: ExecutionNodeId) -> Option<ExecutionStateEvaluation> {
+    pub fn get_state_at_id(&self, id: ExecutionNodeId) -> Option<ExecutionState> {
         let state_id_to_state = self.execution_node_id_to_state.clone();
         state_id_to_state.get(&id).map(|x| x.clone())
     }
 
+    /// Performs a depth first traversal of the execution graph to resolve the combined
+    /// state at a given node.
     #[tracing::instrument]
     pub fn get_merged_state_history(&self, endpoint: &ExecutionNodeId) -> MergedStateHistory {
         println!("Getting merged state history for id {:?}", &endpoint);
@@ -340,10 +230,8 @@ impl ExecutionGraph {
         let mut merged_state = HashMap::new();
         for predecessor in queue {
             let state = self.get_state_at_id(predecessor).unwrap();
-            if let ExecutionStateEvaluation::Complete(state) = state {
-                for (k, v) in state.state.iter() {
-                    merged_state.insert(*k, (predecessor, v.clone()));
-                }
+            for (k, v) in state.state.iter() {
+                merged_state.insert(*k, (predecessor, v.clone()));
             }
         }
         MergedStateHistory(merged_state)
@@ -358,107 +246,17 @@ impl ExecutionGraph {
         Ok(())
     }
 
-    #[tracing::instrument]
-    pub fn progress_graph(&mut self, new_state: ExecutionStateEvaluation) -> ExecutionNodeId {
-        let mut execution_graph = self.execution_graph.lock().unwrap();
-        let mut state_id_to_state = self.execution_node_id_to_state.clone();
-        let (parent_id, resulting_state_id ) = match &new_state {
-            ExecutionStateEvaluation::Complete(state) => {
-                (state.parent_state_id, state.id)
-            },
-            ExecutionStateEvaluation::Executing(state) =>
-                (state.parent_state_id, state.id)
-,
-            ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
-            ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
-        };
-        println!("Resulting state received from progress_graph {:?}", &resulting_state_id);
-        // TODO: if state already exists how to handle
-        state_id_to_state.insert(resulting_state_id.clone(), new_state.clone());
-        execution_graph.deref_mut()
-            .add_edge(parent_id, resulting_state_id.clone(), new_state.clone());
-        resulting_state_id
-    }
-
-    pub async fn one_off_execute_code_against_state(
-        &self,
-        state_id: usize,
-        code_cell: &CellTypes,
-        cell: &CellTypes,
-        args: RkyvSerializedValue
-    ) -> anyhow::Result<(
-        (ExecutionNodeId, ExecutionStateEvaluation), // the resulting total state of this step
-        Vec<(OperationId, OperationFnOutput)>, // values emitted by operations during this step
-    )> {
-        // ExecutionGraph::immutable_external_step_execution(state_id, state)
-        // TODO: we want a code cell that depends on the target cell
-
-        // TODO: treat the repl as a two cell instances, one being the original cell, two being the evaluator
-        // TODO: need to fetch functions that we depend on from other cells
-        let mut new_state = ExecutionState::default();
-        let mut op_node = new_state.get_operation_from_cell_type(cell)?;
-        op_node.attach_cell(cell.clone());
-        new_state.evaluating_cell = Some(op_node.cell.clone());
-        let result = op_node.execute(&mut new_state, args, None, None).await?;
-
-        let mut outputs = vec![];
-        let next_operation_id = new_state.evaluating_id.clone();
-        outputs.push((next_operation_id, result.clone()));
-        // new_state.update_state(&mut new_state, next_operation_id, result);
-
-        println!("step_execution about to complete, after update_state");
-        todo!("complete implementations");
-    }
-
-    #[tracing::instrument]
-    pub fn update_operation(
-        &mut self,
-        prev_execution_id: ExecutionNodeId,
-        cell: CellTypes,
-        op_id: OperationId,
-    ) -> anyhow::Result<(
-        (ExecutionNodeId, ExecutionStateEvaluation), // the resulting total state of this step
-        OperationId, // id of the new operation
-    )> {
-        let state = self.get_state_at_id(prev_execution_id)
-            .ok_or_else(|| anyhow!("No state found for id {:?}", prev_execution_id))?;
-        let (final_state, op_id) = match state {
-            ExecutionStateEvaluation::Complete(state) => {
-                println!( "Capturing state of the mutate graph operation parent {:?}, id {:?}", state.parent_state_id, state.id);
-                state.update_operation(cell, op_id)?
-            },
-            ExecutionStateEvaluation::Executing(..) => {
-                return Err(anyhow!("Cannot mutate a graph that is currently executing"))
-            },
-
-            ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
-            ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
-
-        };
-
-        let eval = ExecutionStateEvaluation::Complete(final_state.clone());
-        println!("Capturing final_state of the mutate graph operation parent {:?}, id {:?}", final_state.parent_state_id, final_state.id);
-
-        let resulting_state_id = self.progress_graph(eval.clone());
-        Ok(((resulting_state_id, eval), op_id))
-    }
-
-    #[tracing::instrument]
+    #[deprecated(note="please use `step_execution` directly")]
     pub async fn immutable_external_step_execution(
-        state: ExecutionStateEvaluation,
+        state: ExecutionState,
     ) -> anyhow::Result<(
         ExecutionNodeId,
-        ExecutionStateEvaluation, // the resulting total state of this step
+        ExecutionState, // the resulting total state of this step
         Vec<(OperationId, OperationFnOutput)>, // values emitted by operations during this step
     )> {
         println!("step_execution_with_previous_state {:?}", &state);
-        let previous_state = match &state {
-            ExecutionStateEvaluation::Complete(state1) => state1,
-            _ => { panic!("Stepping execution should only occur against completed states") }
-        };
-        let resolved_state_id = previous_state.id;
-        let (new_state, outputs) = previous_state.step_execution().await?;
-        Ok((resolved_state_id, new_state, outputs))
+        let (new_state, outputs) = state.step_execution().await?;
+        Ok((state.chronology_id, new_state, outputs))
     }
 }
 
@@ -548,7 +346,7 @@ mod tests {
             stdout: vec![],
             stderr: vec![],
         });
-        let (_, new_state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state.clone())).await?;
+        let (_, new_state, _) = ExecutionGraph::immutable_external_step_execution(state.clone()).await?;
         assert!(new_state.state_get_value(&id_c).is_some());
         let result = new_state.state_get_value(&id_c).unwrap();
         assert_eq!(result, &Ok(RSV::Number(3)));
@@ -1271,23 +1069,29 @@ mod tests {
         let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
         assert_eq!(state.state_get_value(&id_b), None);
         assert_eq!(state.state_get_value(&id_c), None);
-        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state)?;
         assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
         assert_eq!(state.state_get_value(&id_c), None);
-        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        println!("step_execution_with_previous_state {:?}", &state);
+        let (new_state, outputs) = state.step_execution().await?;
+        let (state_id, state, _) = (state.chronology_id, new_state, outputs);
         assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
         assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(2))));
         assert_eq!(state.state_get_value(&id_d), None);
         assert_eq!(state.state_get_value(&id_e), None);
 
-        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        println!("step_execution_with_previous_state {:?}", &state);
+        let (new_state, outputs) = state.step_execution().await?;
+        let (state_id, state, _) = (state.chronology_id, new_state, outputs);
         assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
         assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(2))));
         assert_eq!(state.state_get_value(&id_d), Some(&Ok(RSV::Number(3))));
         assert_eq!(state.state_get_value(&id_e), None);
 
         // This is the final state we're arriving at in execution
-        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        println!("step_execution_with_previous_state {:?}", &state);
+        let (new_state, outputs) = state.step_execution().await?;
+        let (state_id, state, _) = (state.chronology_id, new_state, outputs);
         assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
         assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(2))));
         assert_eq!(state.state_get_value(&id_d), Some(&Ok(RSV::Number(3))));
@@ -1320,7 +1124,10 @@ mod tests {
         ), Uuid::now_v7());
         let init_state_id = state.id.clone();
 
-        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
+        let state1 = ExecutionStateEvaluation::Complete(state);
+        println!("step_execution_with_previous_state {:?}", &state1);
+        let (new_state, outputs) = state1.step_execution().await?;
+        let (state_id, state, _) = (state1.chronology_id, new_state, outputs);
 
         let (edges, stack_hierarchy) = db.get_execution_graph_elements();
         assert_eq!(edges.len(), 1);
@@ -1364,9 +1171,16 @@ mod tests {
         ]);
         let init_state_id = state.id.clone();
 
-        let (state_id1, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
-        let (state_id2, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
-        let (state_id3, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        let state1 = ExecutionStateEvaluation::Complete(state);
+        println!("step_execution_with_previous_state {:?}", &state1);
+        let (new_state, outputs) = state1.step_execution().await?;
+        let (state_id1, state, _) = (state1.chronology_id, new_state, outputs);
+        println!("step_execution_with_previous_state {:?}", &state);
+        let (new_state, outputs) = state.step_execution().await?;
+        let (state_id2, state, _) = (state.chronology_id, new_state, outputs);
+        println!("step_execution_with_previous_state {:?}", &state);
+        let (new_state, outputs) = state.step_execution().await?;
+        let (state_id3, state, _) = (state.chronology_id, new_state, outputs);
 
         let (edges, stack_hierarchy) = db.get_execution_graph_elements();
 
@@ -1403,7 +1217,10 @@ mod tests {
         let stack = VecDeque::from(vec![Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()]);
         state.stack = stack.clone();
 
-        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
+        let state1 = ExecutionStateEvaluation::Complete(state);
+        println!("step_execution_with_previous_state {:?}", &state1);
+        let (new_state, outputs) = state1.step_execution().await?;
+        let (state_id, state, _) = (state1.chronology_id, new_state, outputs);
 
         let (edges, stack_hierarchy) = db.get_execution_graph_elements();
 

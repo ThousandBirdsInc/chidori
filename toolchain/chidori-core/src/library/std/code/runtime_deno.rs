@@ -25,9 +25,9 @@ use futures_util::FutureExt;
 use pyo3::{Py, PyAny};
 use pyo3::types::{IntoPyDict, PyTuple};
 use tokio::runtime::{Builder, Runtime};
-use tracing::{Id, Span};
+use tracing::{debug, Id, Span};
 use crate::cells::{CellTypes, CodeCell, LLMPromptCell};
-use crate::execution::execution::execution_state::ExecutionStateErrors;
+use crate::execution::execution::execution_state::{EnclosedState, ExecutionStateErrors};
 use crate::execution::execution::ExecutionState;
 
 
@@ -149,15 +149,17 @@ async fn op_call_rust(
         let parent_span_id = parent_span_id.clone();
         async move {
             let total_arg_payload = js_args_to_rkyv(args, kwargs);
-            // let mut new_exec_state = {
-            //     let mut exec_state = execution_state_handle.lock().unwrap();
-            //     let mut new_exec_state = exec_state.clone();
-            //     std::mem::swap(&mut *exec_state, &mut new_exec_state);
-            //     new_exec_state
-            // };
-            println!("Deno expecting to call dispatch");
-            let mut new_exec_state = execution_state_handle.lock().unwrap().clone();
-            let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload, parent_span_id.clone()).await?;
+
+            let mut new_exec_state = {
+                let mut exec_state = execution_state_handle.lock().unwrap();
+                let exec_state_clone = exec_state.clone();
+                exec_state_clone
+            };
+
+            let (result, mut result_execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload, parent_span_id.clone()).await?;
+
+            let mut exec_state = execution_state_handle.lock().unwrap();
+            std::mem::swap(&mut *exec_state, &mut result_execution_state);
             return result;
         }.boxed()
     });
@@ -426,7 +428,8 @@ pub async fn source_code_run_deno(
 ) -> anyhow::Result<(
     Result<RkyvSerializedValue, ExecutionStateErrors>,
     Vec<String>,
-    Vec<String>
+    Vec<String>,
+    ExecutionState
 )> {
     let execution_state = execution_state.clone();
     let source_code = source_code.clone();
@@ -440,6 +443,7 @@ pub async fn source_code_run_deno(
             Result<RkyvSerializedValue, ExecutionStateErrors>,
             Vec<String>,
             Vec<String>,
+            ExecutionState
         )> {
             let source_code = source_code.clone();
             // Capture the current span's ID
@@ -651,37 +655,27 @@ pub async fn source_code_run_deno(
                 dbg!(&e);
                 e
             })?;
-            println!("After the runtime block on in source_code_run_deno");
-
-            println!("Attempting to lock my_op_state");
             let mut my_op_state = my_op_state.lock().unwrap();
-            println!("After the my_op_state lock");
             let output = Ok(my_op_state.output.clone().unwrap_or(RkyvSerializedValue::Null));
-            println!("After the my_op_state lock here is the output {:?}", &output);
+            let execution_state = my_op_state.execution_state_handle.lock().unwrap().clone();
             let stdout = my_op_state.stdout.clone();
-            println!("After the my_op_state lock here is the stdout {:?}", &stdout);
             let stderr = my_op_state.stderr.clone();
-            println!("After the my_op_state lock here is the stderr {:?}", &stderr);
-            Ok((output, stdout, stderr))
+            Ok((output, stdout, stderr, execution_state))
         })();
 
         if tx.send(thread_result).is_err() {
-            eprintln!("Receiver dropped");
+            debug!("Receiver dropped");
         }
-        println!("After sending the tx");
         anyhow::Ok(())
     });
 
-    println!("Awaiting the rx");
     // Receive the result asynchronously without blocking the executor
     let result_of_thread = tokio::task::spawn_blocking(move || {
-        println!("Inside spawn_blocking closure");
         rx.recv()
     })
         .await?
         .map_err(|e| anyhow::anyhow!("Failed to receive from channel: {:?}", e))??;
 
-    dbg!(&result_of_thread);
     Ok(result_of_thread)
 }
 

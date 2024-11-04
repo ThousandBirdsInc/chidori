@@ -23,7 +23,7 @@ use bevy_rapier2d::geometry::Collider;
 use bevy_rapier2d::pipeline::QueryFilter;
 use bevy_rapier2d::plugin::RapierContext;
 use bevy_rapier2d::prelude::*;
-use chidori_core::execution::execution::execution_graph::ExecutionNodeId;
+use chidori_core::execution::execution::execution_graph::{ChronologyId, ExecutionNodeId};
 use chidori_core::execution::execution::ExecutionState;
 use num::ToPrimitive;
 use petgraph::data::DataMap;
@@ -43,10 +43,10 @@ use egui_extras::syntax_highlighting::CodeTheme;
 use egui_json_tree::JsonTree;
 use egui_tiles::Tile;
 use image::{DynamicImage, ImageBuffer, RgbImage, RgbaImage};
-use chidori_core::execution::execution::execution_state::{ExecutionStateErrors, ExecutionStateEvaluation};
+use chidori_core::execution::execution::execution_state::{CloseReason, EnclosedState, ExecutionStateErrors};
 use uuid::Uuid;
 use chidori_core::execution::primitives::serialized_value::RkyvSerializedValue;
-use chidori_core::sdk::entry::CellHolder;
+use chidori_core::sdk::interactive_chidori_wrapper::CellHolder;
 use crate::tree_grouping::group_tree;
 
 #[derive(Resource, Default)]
@@ -56,12 +56,12 @@ struct SelectedEntity {
 
 #[derive(Resource)]
 struct GraphResource {
-    execution_graph: StableGraph<ExecutionNodeId, ()>,
-    group_dependency_graph: StableGraph<ExecutionNodeId, ()>,
+    execution_graph: StableGraph<ChronologyId, ()>,
+    group_dependency_graph: StableGraph<ChronologyId, ()>,
     hash_graph: u64,
-    node_ids: HashMap<ExecutionNodeId, NodeIndex>,
-    node_dimensions: DashMap<ExecutionNodeId, (f32, f32)>,
-    grouped_tree: HashMap<ExecutionNodeId, StableGraph<ExecutionNodeId, ()>>,
+    node_ids: HashMap<ChronologyId, NodeIndex>,
+    node_dimensions: DashMap<ChronologyId, (f32, f32)>,
+    grouped_tree: HashMap<ChronologyId, StableGraph<ChronologyId, ()>>,
     is_active: bool,
     layout_graph: Option<TreeGraph>,
     is_layout_dirty: bool
@@ -487,14 +487,16 @@ fn egui_execution_state(
             ui.add_space(10.0);
             ui.vertical(|ui| {
                 if internal_state.debug_mode {
-                    ui.label(format!("Operation Id: {:?}", execution_state.evaluating_id));
+                    ui.label(format!("Chronology Id: {:?}", execution_state.chronology_id));
+                    ui.label(format!("Chronology Parent Id: {:?}", execution_state.parent_state_chronology_id));
+                    ui.label(format!("State Id: {:?}", execution_state.resolving_execution_node_state_id));
+                    ui.label(format!("Enclosed State: {:?}", execution_state.evaluating_enclosed_state));
+                    ui.label(format!("Function Name: {:?}", execution_state.evaluating_fn));
+                    ui.label(format!("Operation Id: {:?}", execution_state.evaluating_operation_id));
                 }
                 if let Some(evaluating_name) = execution_state.evaluating_name.as_ref() {
                     ui.label(format!("Cell Name: {:?}", evaluating_name));
                 }
-                // if let Some(evaluating_fn) = &execution_state.evaluating_fn {
-                //     ui.label(format!("Function Invoked: {:?}", evaluating_fn));
-                // }
                 egui_render_cell_function_evaluation(ui, execution_state);
                 if !execution_state.state.is_empty() {
                     ui.label("Output:");
@@ -518,8 +520,6 @@ fn egui_execution_state(
                             }
                         }
                     });
-                    // }
-                    // frame.end(ui);
                 }
             })
         });
@@ -553,7 +553,7 @@ fn egui_execution_state(
             }
         }
 
-        if let Some((op_id, _)) = &execution_state.operation_mutation {
+        if let Some((op_id, _)) = &execution_state.evaluated_mutation_of_cell {
             ui.label("Cell Mutation:");
             ui.horizontal(|ui| {
                 ui.add_space(10.0);
@@ -755,7 +755,7 @@ fn update_graph_system_renderer(
             width: 1.0,
             height: 1.0,
             color_texture: None,
-            base_color: Vec4::new(0.565, 1.00, 0.882, 1.00),
+            base_color: Vec4::new(0.565, 1.00, 0.882, 0.00),
             alpha_mode: AlphaMode::Blend,
         });
         let entity_selection_head = commands.spawn((
@@ -918,7 +918,7 @@ fn update_graph_system_renderer(
                         let mut frame = egui::Frame::default().fill(current_theme.theme.card).stroke(current_theme.theme.card_border)
                             .inner_margin(16.0).rounding(6.0).begin(ui);
                         {
-                            ui.set_min_width(600.0);
+                            ui.set_min_width(1000.0);
                             let mut ui = &mut frame.content_ui;
                             let node1 = *node;
                             let original_style = (*ui.ctx().style()).clone();
@@ -944,7 +944,7 @@ fn update_graph_system_renderer(
                             } else {
                                 if let Some(state) = chidori_state.get_execution_state_at_id(&node1) {
                                     let state = &state;
-                                    if !matches!(state, ExecutionStateEvaluation::Executing(_)) {
+                                    if !matches!(state.evaluating_enclosed_state, EnclosedState::Open) {
                                         ui.horizontal(|ui| {
                                             if chidori_state.debug_mode {
                                                 ui.label(node1.to_string());
@@ -958,8 +958,8 @@ fn update_graph_system_renderer(
                                         });
                                     }
 
-                                    match state {
-                                        ExecutionStateEvaluation::Error(state) => {
+                                    match &state.evaluating_enclosed_state {
+                                        EnclosedState::Close(CloseReason::Error) => {
                                             let mut frame = egui::Frame::default().fill(current_theme.theme.card).stroke(Stroke {
                                                 width: 0.5,
                                                 color: Color32::from_hex("#ff0000").unwrap(),
@@ -974,18 +974,18 @@ fn update_graph_system_renderer(
                                             }
                                             frame.end(ui);
                                         }
-                                        ExecutionStateEvaluation::EvalFailure(_) => {
+                                        EnclosedState::Close(CloseReason::Failure) => {
                                             ui.label("Eval Failure");
                                         }
-                                        ExecutionStateEvaluation::Executing(state) => {
-                                            ui.set_min_width(600.0);
+                                        EnclosedState::Open => {
+                                            ui.set_min_width(1000.0);
                                             ui.label("Executing");
                                             egui_execution_state(
                                                 ui,
                                                 &mut chidori_state,
                                                 state, &current_theme.theme);
                                         }
-                                        ExecutionStateEvaluation::Complete(state)=> {
+                                        EnclosedState::SelfContained | EnclosedState::Close(CloseReason::Complete) => {
                                             egui_execution_state(ui, &mut chidori_state, state, &current_theme.theme);
                                             for (_, value) in state.state.iter() {
                                                 let image_paths = crate::util::find_matching_strings(&value.output.clone().unwrap(), r"(?i)\.(png|jpe?g)$");
@@ -1372,7 +1372,7 @@ fn graph_setup(
         width: 1.0,
         height: 1.0,
         color_texture: None,
-        base_color: Vec4::new(0.565, 1.00, 0.882, 1.00),
+        base_color: Vec4::new(0.565, 1.00, 0.882, 0.00),
         alpha_mode: AlphaMode::Blend,
     });
 
@@ -1380,7 +1380,7 @@ fn graph_setup(
         width: 1.0,
         height: 1.0,
         color_texture: None,
-        base_color: Vec4::new(0.882, 0.00392, 0.357, 1.0),
+        base_color: Vec4::new(0.882, 0.00392, 0.357, 0.0),
         alpha_mode: AlphaMode::Blend,
     });
 

@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 use chidori_prompt_format::templating::templates::{ChatModelRoles, TemplateWithSource};
 use crate::cells::{LLMCodeGenCellChatConfiguration, LLMPromptCellChatConfiguration, TextRange};
@@ -319,6 +320,7 @@ pub async fn ai_llm_run_chat_model(
     is_function_invocation: bool,
     configuration: LLMPromptCellChatConfiguration
 ) -> anyhow::Result<(Result<RkyvSerializedValue, ExecutionStateErrors>, Option<ExecutionState>)> {
+    println!("Executing ai_llm_run_chat_model");
     let mut template_messages: Vec<TemplateMessage> = Vec::new();
     let data = template_data_payload_from_rkyv(&payload);
 
@@ -340,8 +342,6 @@ pub async fn ai_llm_run_chat_model(
     let api_url_v1 = configuration.api_url.clone();
     let c = crate::library::std::ai::llm::openai::OpenAIChatModel::new(api_url_v1.unwrap_or("http://localhost:4000/v1".to_string()), "".to_string());
 
-
-
     let result = c.batch(ChatCompletionReq {
         config: configuration.clone(),
         template_messages,
@@ -353,62 +353,72 @@ pub async fn ai_llm_run_chat_model(
         },
     }).await;
 
+    println!("Completed chat model execution {:?}", result);
 
-    match result {
-        Ok(ChatCompletionRes { choices, .. }) => {
-            let mut results = vec![];
-            for choice in choices {
+    if let Err(e) = result {
+        return Ok((Result::Err(ExecutionStateErrors::AnyhowError(e)), None))
+    }
+    let Ok(ChatCompletionRes { choices, .. }) = result else { unreachable!() };
 
-                // TODO: how do we handle tools in the case of reference as a function
 
-                let mut result_map = HashMap::new();
-                match choice.tool_calls {
-                    Some(tool_calls) => {
-                        for tool_call in tool_calls {
-                            if let Some(function_name) = tool_call.function.name {
-                                let args = tool_call.function.arguments.unwrap_or(RkyvSerializedValue::Null);
-                                let args = RkyvObjectBuilder::new().insert_value("kwargs", args).build();
-                                let (dispatch_result, _) = execution_state.dispatch(&function_name, args, None).await?;
-                                if !dispatch_result.is_ok() {
-                                    return Ok((dispatch_result, None));
-                                }
-                                result_map.insert(function_name, dispatch_result.unwrap());
-                            }
+    let execution_state_handle = Arc::new(Mutex::new(execution_state.clone()));
+    let mut results = vec![];
+    for choice in choices {
+        let mut result_map = HashMap::new();
+        match choice.tool_calls {
+            Some(tool_calls) => {
+                for tool_call in tool_calls {
+                    if let Some(function_name) = tool_call.function.name {
+                        let args = tool_call.function.arguments.unwrap_or(RkyvSerializedValue::Null);
+                        let args = RkyvObjectBuilder::new().insert_value("kwargs", args).build();
+
+
+                        let mut new_exec_state = {
+                            let mut exec_state = execution_state_handle.lock().unwrap();
+                            let exec_state_clone = exec_state.clone();
+                            exec_state_clone
+                        };
+                        let (dispatch_result, mut result_execution_state) = new_exec_state.dispatch(&function_name, args, None).await?;
+
+                        if !dispatch_result.is_ok() {
+                            return Ok((dispatch_result, Some(result_execution_state)));
                         }
-                        let result = if is_function_invocation {
-                            RkyvSerializedValue::Object(result_map)
-                        } else {
-                            RkyvObjectBuilder::new().insert_value(name.as_deref().unwrap(), RkyvSerializedValue::Object(result_map)).build()
-                        };
-                        results.push(result);
-                    }
-                    None => {
-                        let result = if is_function_invocation {
-                            RkyvSerializedValue::String(choice.text.as_ref().unwrap().clone())
-                        } else {
-                            let default_name = String::from("output");
-                            let name = name.as_ref().unwrap_or(&default_name);
-                            let text = choice.text.as_ref().unwrap().clone();
-                            result_map.insert(name.clone(), RkyvSerializedValue::String(text));
-                            RkyvSerializedValue::Object(result_map)
-                        };
-                        results.push(result)
+
+                        let mut exec_state = execution_state_handle.lock().unwrap();
+                        std::mem::swap(&mut *exec_state, &mut result_execution_state);
+
+                        result_map.insert(function_name, dispatch_result.unwrap());
                     }
                 }
+                let result = if is_function_invocation {
+                    RkyvSerializedValue::Object(result_map)
+                } else {
+                    RkyvObjectBuilder::new().insert_value(name.as_deref().unwrap(), RkyvSerializedValue::Object(result_map)).build()
+                };
+                results.push(result);
             }
-
-
-            let out = if results.len() == 1 {
-                results[0].clone()
-            } else {
-                RkyvSerializedValue::Array(results)
-            };
-            Ok((Ok(out), None))
-        }
-        Err(e) => {
-            Ok((Result::Err(ExecutionStateErrors::AnyhowError(e)), None))
+            None => {
+                let result = if is_function_invocation {
+                    RkyvSerializedValue::String(choice.text.as_ref().unwrap().clone())
+                } else {
+                    let default_name = String::from("output");
+                    let name = name.as_ref().unwrap_or(&default_name);
+                    let text = choice.text.as_ref().unwrap().clone();
+                    result_map.insert(name.clone(), RkyvSerializedValue::String(text));
+                    RkyvSerializedValue::Object(result_map)
+                };
+                results.push(result)
+            }
         }
     }
+
+    let out = if results.len() == 1 {
+        results[0].clone()
+    } else {
+        RkyvSerializedValue::Array(results)
+    };
+    let mut exec_state = execution_state_handle.lock().unwrap().clone();
+    Ok((Ok(out), Some(exec_state)))
 }
 
 pub async fn ai_llm_code_generation_chat_model(
@@ -474,7 +484,7 @@ pub async fn ai_llm_code_generation_chat_model(
             cells.sort();
 
             for cell in cells {
-                let (s, _) = new_execution_state.update_operation(cell, Uuid::now_v7())?;
+                let (s, _) = new_execution_state.update_operation(cell, Uuid::now_v7()).await?;
                 new_execution_state = s;
             }
 

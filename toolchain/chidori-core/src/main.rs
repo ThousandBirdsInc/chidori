@@ -16,8 +16,8 @@ mod utils;
 pub use tokio;
 use tracing::info;
 pub use uuid;
-use chidori_core::sdk::chidori::Chidori;
-use chidori_core::sdk::entry::PlaybackState;
+use chidori_core::sdk::interactive_chidori_wrapper::InteractiveChidoriWrapper;
+use chidori_core::sdk::chidori_runtime_instance::PlaybackState;
 pub use chidori_static_analysis;
 pub use chidori_prompt_format;
 
@@ -62,7 +62,7 @@ async fn run_command(run_directory: &PathBuf) -> anyhow::Result<()> {
     let (trace_event_sender, trace_event_receiver) = mpsc::channel();
     let (runtime_event_sender, runtime_event_receiver) = mpsc::channel();
 
-    let mut chidori = Chidori::new_with_events(
+    let mut chidori = InteractiveChidoriWrapper::new_with_events(
         trace_event_sender,
         runtime_event_sender,
     );

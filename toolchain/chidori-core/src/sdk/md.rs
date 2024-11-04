@@ -1,4 +1,4 @@
-use crate::sdk::chidori::Chidori;
+use crate::sdk::interactive_chidori_wrapper::InteractiveChidoriWrapper;
 use chidori_prompt_format::extract_yaml_frontmatter_string;
 use indoc::indoc;
 use std::collections::HashMap;
@@ -153,7 +153,7 @@ pub fn interpret_markdown_code_block(block: &MarkdownCodeBlock, file_path: Optio
         },
         "prompt" => Some(CellTypes::Prompt(LLMPromptCell::Chat {
             backing_file_reference,
-            function_invocation: false,
+            is_function_invocation: false,
             configuration: serde_yaml::from_str(&frontmatter)?,
             name: block.name.clone(),
             provider: SupportedModelProviders::OpenAI,

@@ -36,19 +36,7 @@ fn fragment(
         let corner_radius: f32 = 10.0;
         let aspect_ratio = width / height;
         let adjusted_uv = vec2<f32>(uv.x * aspect_ratio, uv.y);
-
-
-//        let target_width = 620.0;
-//        let target_height = 320.0;
-//        let target_aspect_ratio = target_width / target_height;
-
-        // Calculate scale factors for the UV adjustment
-//        let scale_x =  width / target_width;
-//        let scale_y = height / target_height;
-
-//        let adjusted_uv_target = vec2<f32>(uv.x * scale_x, uv.y * scale_y);
         let adjusted_uv_target = vec2<f32>(uv.x, uv.y);
-
 
         var texture_color = textureSample(material_color_texture, material_color_sampler, adjusted_uv_target);
         let color = vec4<f32>(texture_color.rgb * texture_color.a, texture_color.a);
@@ -58,14 +46,17 @@ fn fragment(
         let aa: f32 = 0.005;
         let smooth_dist = smoothstep(0.0, aa, dist);
         if smooth_dist > 0.0 {
-            return vec4<f32>(color.rgb, 0.0); // Set alpha to 1.0 for visibility
+            return vec4<f32>(color.rgb, 0.0);
+        }
+
+        if base_color.a == 0.0 {
+            return vec4<f32>(base_color.rgb, 1.0);
         }
 
         if texture_color.a == 0.0 {
-            return base_color;
+            return vec4<f32>(color.rgb, 1.0);
         }
 
-//         If the texture is pure white at a give point
 
         return color;
 }

@@ -31,13 +31,14 @@ use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use dashmap::DashMap;
 use log::info;
+use petgraph::visit::Walker;
 use pyo3::PythonVersionInfo;
 use regex::Regex;
 
 use sha1::{Sha1, Digest};
-use tracing::{Id, Span};
+use tracing::{debug, Id, Span};
 use uuid::Uuid;
-use crate::execution::execution::execution_state::ExecutionStateErrors;
+use crate::execution::execution::execution_state::{EnclosedState, ExecutionStateErrors};
 
 static SOURCE_CODE_RUN_COUNTER: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
 static CURRENT_PYTHON_EXECUTION_ID: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
@@ -304,7 +305,7 @@ pub async fn source_code_run_python(
     function_invocation: &Option<String>,
     virtualenv_path: &Option<String>,
     requirements_dir: &Option<String>,
-) -> anyhow::Result<(Result<RkyvSerializedValue, ExecutionStateErrors>, Vec<String>, Vec<String>)> {
+) -> anyhow::Result<(Result<RkyvSerializedValue, ExecutionStateErrors>, Vec<String>, Vec<String>, ExecutionState)> {
 
     // Capture the current span's ID
     let current_span_id = Span::current().id();
@@ -320,6 +321,7 @@ pub async fn source_code_run_python(
     let dependencies = extract_dependencies_python(&source_code)?;
     let report = build_report(&dependencies);
 
+    let execution_state = Arc::new(Mutex::new(execution_state.clone()));
     let result =  Python::with_gil(|py| {
         let v = py.version_info();
 
@@ -351,7 +353,6 @@ pub async fn source_code_run_python(
 
         // Configure locals and globals passed to evaluation
         let globals = PyDict::new(py);
-        let execution_state = Arc::new(Mutex::new(execution_state.clone()));
         create_external_function_shims(&execution_state, &report, py, globals, current_span_id.clone())?;
         create_internal_proxy_shims(&execution_state, &report, py, globals, current_span_id)?;
 
@@ -438,7 +439,7 @@ sys.stderr.set_exec_id({exec_id})
             .any(|line| line.contains("asyncio.run") || line.contains("unittest.IsolatedAsyncioTestCase") || line.contains("loadTestsFromTestCase"));
 
         let mut complete_code = if does_contain_async_runtime {
-            println!("Executing python with 'does_contain_async_runtime' ");
+            debug!("Executing python with 'does_contain_async_runtime' ");
             // If we have an async function, we don't need to wrap it in an async function
             format!(r#"
 import chidori
@@ -564,15 +565,12 @@ asyncio.run(__wrapper())
                     let args = PyTuple::new(py, &args);
                     let kwargs = kwargs.into_iter().into_py_dict(py);
 
-                    println!("calling the function");
                     let result = py_func.call(args, Some(kwargs)).map_err(|e| {
                         dbg!(&e);
                         e
                     })?;
-                    println!("after calling the function");
                     if result.get_type().name().unwrap() == "coroutine" {
                         // If the function is a coroutine, we need to await it
-                        println!("before into future for python coroutine");
                         let is_running = event_loop.call_method0("is_running")?.extract::<bool>()?;
                         let (fut, result, needs_await) = if !is_running {
                             // If not running, run the event loop
@@ -617,12 +615,11 @@ asyncio.run(__wrapper())
     });
     match result {
         Ok(result) => {
-            println!("about to await result");
             let awaited_result = result.await;
-            println!("after awaited result");
+            let execution_state = execution_state.lock().unwrap().clone();
             let (_, output_stdout) = PYTHON_LOGGING_BUFFER_STDOUT.remove(&exec_id).unwrap_or((0, vec![]));
             let (_, output_stderr) = PYTHON_LOGGING_BUFFER_STDERR.remove(&exec_id).unwrap_or((0, vec![]));
-            Ok((awaited_result, output_stdout, output_stderr))
+            Ok((awaited_result, output_stdout, output_stderr, execution_state))
         }
         Err(e) => {
             return Err(anyhow::anyhow!(e.to_string()));
@@ -636,7 +633,6 @@ fn create_internal_proxy_shims(execution_state_handle: &Arc<Mutex<ExecutionState
     // when a hashed reference to a function is invoked, we invoke the actual function internally
     // but through our dispatch system, producing execution states.
 
-    // map_of_renamed_fns_to_original: HashMap<String, String>
     for (function_name, triggerable_function) in &report.triggerable_functions {
         let clone_function_name = function_name.clone();
         let execution_state_handle = execution_state_handle.clone();
@@ -660,20 +656,26 @@ fn create_python_dispatch_closure(py: Python, clone_function_name: String, execu
             let clone_function_name = clone_function_name.clone();
             let parent_span_id = parent_span_id.clone();
             let py = args.py();
-            // TODO: this should be after the dispatch, substituting it
-            // let mut new_exec_state = {
-            //     let mut exec_state = execution_state_handle.lock().unwrap();
-            //     let mut new_exec_state = exec_state.clone();
-            //     std::mem::swap(&mut *exec_state, &mut new_exec_state);
-            //     new_exec_state
-            // };
 
-            let mut new_exec_state = execution_state_handle.lock().unwrap().clone();
+
+            let mut new_exec_state = {
+                let mut exec_state = execution_state_handle.lock().unwrap();
+                let exec_state_clone = exec_state.clone();
+                exec_state_clone
+            };
+
             // All function calls across cells are forced to be async
+            let execution_state_handle = execution_state_handle.clone();
             pyo3_asyncio::tokio::future_into_py(py, async move {
-                let (result, execution_state) = new_exec_state.dispatch(&clone_function_name, total_arg_payload, parent_span_id.clone()).await.map_err(|e| AnyhowErrWrapper(e))?;
-                // TODO: assign this execution state to the current so that as we continue to execute this is now where we're progressing from
-                // TODO: this should not be an unwrap and should instead propagate the error
+                let (result, mut result_execution_state) = new_exec_state
+                    .dispatch(&clone_function_name, total_arg_payload, parent_span_id.clone())
+                    .await.map_err(|e| AnyhowErrWrapper(e))?;
+
+                // swap this execution state with the root state of this cell execution
+                // so that we continue from the state where this function has resolved
+                let mut exec_state = execution_state_handle.lock().unwrap();
+                std::mem::swap(&mut *exec_state, &mut result_execution_state);
+
                 match result {
                     Ok(result) => {
                         PyResult::Ok(Python::with_gil(|py| rkyv_serialized_value_to_pyany(py, &result)))
@@ -815,8 +817,20 @@ mod tests {
     use tokio::sync::Notify;
     use chidori_static_analysis::language::{InternalCallGraph, ReportTriggerableFunctions};
     use crate::execution::execution::execution_graph::ExecutionGraphSendPayload;
-    use crate::execution::execution::execution_state::ExecutionStateEvaluation;
     use crate::execution::primitives::operation::OperationFnOutput;
+
+    #[derive(Clone)]
+    pub enum ExecutionStateEvaluation {
+        /// An exception was thrown
+        Error(ExecutionState),
+        /// An eval function indicated that we should return
+        EvalFailure(ExecutionState),
+        /// Execution complete
+        Complete(ExecutionState),
+        /// Execution in progress
+        Executing(ExecutionState)
+    }
+
     use crate::execution::primitives::serialized_value::ArchivedRkyvSerializedValue::Number;
     //     #[tokio::test]
     //     async fn test_source_code_run_py_success() {

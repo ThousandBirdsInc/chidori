@@ -20,7 +20,7 @@ use crate::library::std::ai::llm::ai_llm_run_embedding_model;
 pub fn llm_prompt_cell(execution_state_id: ExecutionNodeId, cell: &LLMPromptCell, range: &TextRange) -> anyhow::Result<OperationNode> {
     match cell {
         llm_prompt_cell @ LLMPromptCell::Chat {
-            function_invocation,
+            is_function_invocation: function_invocation,
             name,
             provider,
             complete_body,
@@ -105,13 +105,12 @@ pub fn llm_prompt_cell(execution_state_id: ExecutionNodeId, cell: &LLMPromptCell
 
 pub fn llm_prompt_cell_exec_chat_openai(llm_prompt_cell: LLMPromptCell) -> Box<OperationFn> {
     let LLMPromptCell::Chat {
-        function_invocation,
+        is_function_invocation,
         name,
         provider,
         complete_body,
         ..
     } = llm_prompt_cell else { unreachable!() };
-    let is_function_invocation = function_invocation;
     let (frontmatter, req) = chidori_prompt_format::templating::templates::split_frontmatter(&complete_body).map_err(|e| {
         anyhow::Error::msg(e.to_string())
     }).unwrap();

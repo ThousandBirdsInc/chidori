@@ -21,19 +21,18 @@ use notify_debouncer_full::{
 };
 
 use crate::{tokio_tasks, CurrentTheme};
-use chidori_core::cells::CellTypes;
 use chidori_core::execution::execution::execution_graph::{
     ExecutionNodeId, MergedStateHistory,
 };
-use chidori_core::execution::execution::execution_state::ExecutionStateEvaluation;
 use chidori_core::execution::execution::ExecutionState;
 use chidori_core::execution::primitives::identifiers::{DependencyReference, OperationId};
-use chidori_core::sdk::chidori::Chidori;
-use chidori_core::sdk::entry::{CellHolder, EventsFromRuntime, PlaybackState, UserInteractionMessage};
+use chidori_core::sdk::interactive_chidori_wrapper::{InteractiveChidoriWrapper, EventsFromRuntime};
+use chidori_core::sdk::interactive_chidori_wrapper::CellHolder;
 use chidori_core::tokio::task::JoinHandle;
 use chidori_core::utils::telemetry::TraceEvents;
 use petgraph::graph::NodeIndex;
 use petgraph::prelude::StableGraph;
+use chidori_core::sdk::chidori_runtime_instance::{PlaybackState, UserInteractionMessage};
 
 const RECV_RUNTIME_EVENT_TIMEOUT_MS: u64 = 100;
 
@@ -278,7 +277,7 @@ pub struct ChidoriState {
     pub(crate) watched_path: Mutex<Option<String>>,
     file_watch: Mutex<Option<Debouncer<RecommendedWatcher, FileIdMap>>>,
     background_thread: Mutex<Option<JoinHandle<()>>>,
-    pub chidori: Arc<Mutex<Chidori>>,
+    pub chidori: Arc<Mutex<InteractiveChidoriWrapper>>,
     pub display_example_modal: bool,
     pub current_playback_state: PlaybackState,
 
@@ -323,11 +322,11 @@ impl ChidoriState {
     pub fn get_execution_state_at_id(
         &self,
         execution_node_id: &ExecutionNodeId,
-    ) -> Option<ExecutionStateEvaluation> {
+    ) -> Option<ExecutionState> {
         // TODO: this is like 3 locks just to get the current state - maybe we should cache these?
         let chidori = self.chidori.lock().unwrap();
         let eval = {
-            let shared_state = chidori.get_shared_state();
+            let shared_state = chidori.shared_state.lock().unwrap();
             let exec = shared_state.execution_id_to_evaluation.clone();
             let eval = exec.get(&execution_node_id).map(|x| x.clone());
             eval
@@ -338,21 +337,21 @@ impl ChidoriState {
 
     pub fn step(&self) -> anyhow::Result<(), String> {
         let env = self.chidori.lock().unwrap();
-        env.dispatch_user_interaction_to_instance(UserInteractionMessage::Step)
+        env.dispatch_user_interaction_to_instance(UserInteractionMessage::SetPlaybackState(PlaybackState::Step))
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn play(&self) -> anyhow::Result<(), String> {
         let env = self.chidori.lock().unwrap();
-        env.dispatch_user_interaction_to_instance(UserInteractionMessage::Play)
+        env.dispatch_user_interaction_to_instance(UserInteractionMessage::SetPlaybackState(PlaybackState::Running))
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn pause(&self) -> anyhow::Result<(), String> {
         let env = self.chidori.lock().unwrap();
-        env.dispatch_user_interaction_to_instance(UserInteractionMessage::Pause)
+        env.dispatch_user_interaction_to_instance(UserInteractionMessage::SetPlaybackState(PlaybackState::Paused))
             .map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -466,7 +465,7 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
     let (runtime_event_sender, runtime_event_receiver) = std::sync::mpsc::channel();
     let mut internal_state = ChidoriState {
         debug_mode: false,
-        chidori: Arc::new(Mutex::new(Chidori::new_with_events(
+        chidori: Arc::new(Mutex::new(InteractiveChidoriWrapper::new_with_events(
             trace_event_sender,
             runtime_event_sender,
         ))),
@@ -539,8 +538,7 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                                 if let Some(mut s) =
                                     ctx.world.get_resource_mut::<ChidoriState>()
                                 {
-                                    s.execution_graph = state.0;
-                                    s.grouped_nodes = state.1;
+                                    s.execution_graph = state;
                                 }
                             })
                             .await;

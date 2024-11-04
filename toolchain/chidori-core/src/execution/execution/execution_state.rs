@@ -25,8 +25,8 @@ use tokio::sync::oneshot;
 use futures_util::FutureExt;
 use tokio::sync::oneshot::error::TryRecvError;
 use uuid::Uuid;
-use crate::cells::{CellTypes, CodeCell, get_cell_name, LLMPromptCell};
-use crate::execution::execution::execution_graph::{ExecutionGraphSendPayload, ExecutionNodeId, get_execution_id};
+use crate::cells::{CellTypes, CodeCell, LLMPromptCell};
+use crate::execution::execution::execution_graph::{ExecutionGraphSendPayload, ExecutionNodeId, ChronologyId};
 
 pub enum OperationExecutionStatusOption {
     Running,
@@ -68,58 +68,6 @@ impl From<anyhow::Error> for ExecutionStateErrors {
     }
 }
 
-#[derive(Clone)]
-pub enum ExecutionStateEvaluation {
-    /// An exception was thrown
-    Error(ExecutionState),
-    /// An eval function indicated that we should return
-    EvalFailure(ExecutionNodeId),
-    /// Execution complete
-    Complete(ExecutionState),
-    /// Execution in progress
-    Executing(ExecutionState)
-}
-
-impl ExecutionStateEvaluation {
-    pub fn id(&self) -> &ExecutionNodeId {
-        match self {
-            ExecutionStateEvaluation::Complete(ref state) => &state.id,
-            ExecutionStateEvaluation::Executing(ref state) => &state.id,
-            ExecutionStateEvaluation::Error(ref state) => &state.id,
-            ExecutionStateEvaluation::EvalFailure(ref id) => &id,
-        }
-    }
-    pub fn state_get(&self, operation_id: &OperationId) -> Option<&OperationFnOutput> { match self {
-            ExecutionStateEvaluation::Complete(ref state) => state.state_get(operation_id),
-            ExecutionStateEvaluation::Executing(..) => unreachable!("Cannot get state from a future state"),
-            ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
-            ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
-        }
-    }
-
-    pub fn state_get_value(&self, operation_id: &OperationId) -> Option<&Result<RkyvSerializedValue, ExecutionStateErrors>> {
-        match self {
-            ExecutionStateEvaluation::Complete(ref state) => state.state_get(operation_id).map(|o| &o.output),
-            ExecutionStateEvaluation::Executing(..) => unreachable!("Cannot get state from a future state"),
-            ExecutionStateEvaluation::Error(_) => unreachable!("Cannot get state from a future state"),
-            ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
-        }
-    }
-}
-
-impl Debug for ExecutionStateEvaluation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ExecutionStateEvaluation::Complete(ref state) => f.debug_tuple("Complete").field(state).finish(),
-            ExecutionStateEvaluation::Executing(ref state) => f.debug_tuple("Executing").field(state).finish(),
-            ExecutionStateEvaluation::Error(ref state) => f.debug_tuple("Error").field(state).finish(),
-            ExecutionStateEvaluation::EvalFailure(_) => unreachable!("Cannot get state from a future state"),
-        }
-    }
-}
-
-
-
 
 #[derive(Debug, Clone)]
 pub struct FunctionMetadata {
@@ -131,35 +79,57 @@ pub struct OperationRunningStatus {
     running: bool
 }
 
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub enum CloseReason {
+    Failure,
+    Error,
+    Complete
+}
 
-// TODO: make this thread-safe
+#[derive(Default, Clone, Eq, PartialEq, Debug)]
+pub enum EnclosedState {
+    Open,
+    Close(CloseReason),
+    #[default]
+    SelfContained
+}
+
+
 #[derive(Clone)]
 pub struct ExecutionState {
-    pub(crate) op_counter: usize,
-    pub id: ExecutionNodeId,
+
+    /// This represents the specific state that we are resolving.
+    /// Most states of execution will have two ExecutionStates that refer to this.
+    /// One beginning the computation and one where it has been concluded.
+    pub resolving_execution_node_state_id: ExecutionNodeId,
+
+    /// This represents the point in the chronology of the graph
+    /// there should only ever be one of these.
+    pub chronology_id: ChronologyId,
+
     pub exec_counter: usize,
     pub stack: VecDeque<ExecutionNodeId>,
-    pub parent_state_id: ExecutionNodeId,
+    pub parent_state_chronology_id: ChronologyId,
 
     pub external_event_queue_head: usize,
 
-    pub evaluating_id: OperationId,
+    /// These fields ("evaluating_*") represent the current invocation
+    /// of this execution state
+    pub evaluating_operation_id: OperationId,
     pub evaluating_name: Option<String>,
     pub evaluating_fn: Option<String>,
     pub evaluating_arguments: Option<RkyvSerializedValue>,
     pub evaluating_cell: Option<CellTypes>,
+    pub evaluating_enclosed_state: EnclosedState,
 
     /// CellType applied, by a state that is mutating cell definitions
-    pub operation_mutation: Option<(OperationId, CellTypes)>,
+    pub evaluated_mutation_of_cell: Option<(OperationId, CellTypes)>,
 
     /// Channel sender used to update the execution graph and resume execution
     pub graph_sender: Option<Arc<tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>>>,
 
     /// Queue of operations to evaluate
     pub exec_queue: VecDeque<OperationId>,
-
-    // TODO: call_stack is only ever a single coroutine at a time and instead its the stack of execution states being resolved?
-    // pub call_stack: Arc<Mutex<Pin<Box<dyn Coroutine<Return=CoroutineYieldValue, Yield=CoroutineYieldValue>>>>>,
 
     /// Map of operation_id -> output value of that operation
     pub state: ImHashMap<OperationId, Arc<OperationFnOutput>>,
@@ -199,8 +169,6 @@ pub struct ExecutionState {
     dependency_map: ImHashMap<OperationId, IndexSet<(OperationId, DependencyReference)>>,
 
     value_freshness_map: ImHashMap<OperationId, usize>,
-
-    execution_event_sender: Option<mpsc::Sender<OperationExecutionStatus>>,
 }
 
 impl std::fmt::Debug for ExecutionState {
@@ -225,51 +193,21 @@ fn render_map_as_table(exec_state: &ExecutionState) -> String {
     table
 }
 
-/// This causes the current async loop to pause until we send a signal over the oneshot sender returned
-async fn pause_future_with_oneshot(execution_state_evaluation: ExecutionStateEvaluation, sender: &tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>) -> Pin<Box<dyn Future<Output = RkyvSerializedValue> + Send>> {
-    let id = execution_state_evaluation.id();
-    println!("============= should pause {:?} =============", &id);
-    let cid = id.clone();
-    let (oneshot_sender, mut oneshot_receiver) = tokio::sync::oneshot::channel();
-    let future = async move {
-        println!("Should be pending oneshot signal");
-        let recv = oneshot_receiver.await.expect("Failed to receive oneshot signal");
-        // loop {
-        //     match oneshot_receiver.try_recv() {
-        //         Ok(_) => {
-        //             break;
-        //         }
-        //         Err(TryRecvError::Empty) => {
-        //         }
-        //         Err(TryRecvError::Closed) => {
-        //             // TODO: error instead of just continuing
-        //             println!("Error during oneshot pause.");
-        //             break;
-        //         }
-        //     }
-            // let recv = oneshot_receiver.await.expect("Failed to receive oneshot signal");
-        // }
-        println!("============= should resume {:?} =============", &cid);
-        RkyvSerializedValue::Null
-    };
-    sender.send((execution_state_evaluation, Some(oneshot_sender))).await.expect("Failed to send oneshot signal to the graph receiver");
-    Box::pin(future)
-}
-
 impl Default for ExecutionState {
     fn default() -> Self {
         ExecutionState {
             exec_counter: 1,
-            id: Uuid::now_v7(),
+            resolving_execution_node_state_id: Uuid::now_v7(),
+            chronology_id: Uuid::now_v7(),
             stack: Default::default(),
-            parent_state_id: Uuid::nil(),
-            op_counter: 0,
-            evaluating_id: Uuid::nil(),
+            parent_state_chronology_id: Uuid::nil(),
+            evaluating_operation_id: Uuid::nil(),
             evaluating_name: None,
             evaluating_fn: None,
             evaluating_arguments: None,
             evaluating_cell: None,
-            operation_mutation: None,
+            evaluating_enclosed_state: Default::default(),
+            evaluated_mutation_of_cell: None,
             graph_sender: None,
             exec_queue: VecDeque::new(),
             state: Default::default(),
@@ -282,7 +220,6 @@ impl Default for ExecutionState {
             has_been_set: Default::default(),
             dependency_map: Default::default(),
             value_freshness_map: Default::default(),
-            execution_event_sender: None,
             external_event_queue_head: 0,
         }
     }
@@ -326,29 +263,41 @@ impl ExecutionState {
 
     pub fn new_with_graph_sender(parent_state_id: ExecutionNodeId, graph_sender: Arc<tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>>) -> Self {
         ExecutionState {
-            id: Uuid::nil(),
-            parent_state_id,
+            chronology_id: Uuid::nil(),
+            resolving_execution_node_state_id: Uuid::nil(),
+            parent_state_chronology_id: parent_state_id,
             graph_sender: Some(graph_sender),
             ..Self::default()
         }
     }
 
-    fn clone_with_new_id(&self) -> Self {
+    fn create_new_revision_of_execution_state(&self) -> Self {
         let mut new = self.clone();
-        new.parent_state_id = new.id;
+        new.evaluated_mutation_of_cell = None;
+        new.evaluating_fn = None;
+        new.evaluating_name = None;
+        new.evaluating_arguments = None;
+        new.evaluating_cell = None;
+        new.parent_state_chronology_id = new.chronology_id;
         new.fresh_values = IndexSet::new();
-        new.id = Uuid::now_v7();
+        new.evaluating_enclosed_state = EnclosedState::Open;
+        let new_id = Uuid::now_v7();
+        new.resolving_execution_node_state_id = new_id;
+        new.chronology_id = new_id;
         new.exec_counter += 1;
         new
     }
 
-    fn swap_identity(&mut self, mut swap_with: &mut ExecutionState) {
-        let s_parent_state_id = swap_with.parent_state_id;
-        let s_id = swap_with.id;
-        self.parent_state_id = s_parent_state_id;
-        self.id = s_id;
+    fn close_and_set_chronological_parent(&self, parent_state: &ExecutionState) -> Self {
+        let mut new = self.clone();
+        new.chronology_id = Uuid::now_v7();
+        new.resolving_execution_node_state_id = self.resolving_execution_node_state_id;
+        new.parent_state_chronology_id = parent_state.chronology_id;
+        new.evaluating_enclosed_state = EnclosedState::Close(CloseReason::Complete);
+        new
     }
 
+    #[cfg(test)]
     pub fn have_all_operations_been_set_at_least_once(&self) -> bool {
         self.has_been_set.len() == self.operation_by_id.len()
     }
@@ -357,12 +306,9 @@ impl ExecutionState {
         self.state.get(operation_id).map(|x| x.as_ref())
     }
 
+    #[cfg(test)]
     pub fn state_get_value(&self, operation_id: &OperationId) -> Option<&Result<RkyvSerializedValue, ExecutionStateErrors>> {
         self.state.get(operation_id).map(|x| x.as_ref()).map(|o| &o.output)
-    }
-
-    fn check_if_previously_set(&self, operation_id: &OperationId) -> bool {
-        self.has_been_set.contains(operation_id)
     }
 
     #[tracing::instrument]
@@ -385,7 +331,7 @@ impl ExecutionState {
                     if let Some(op) = self.operation_by_id.get(n.1) {
                         // let op = op.lock().unwrap();
                         let default = format!("{:?}", n.1);
-                        let name = get_cell_name(&op.cell).as_ref().unwrap_or(&default);
+                        let name = &op.cell.name().as_ref().unwrap_or(&default);
                         format!("label=\"{}\"", name) // Assuming get_name() fetches the cell name
                     } else {
                         String::new()
@@ -421,33 +367,29 @@ impl ExecutionState {
 
     pub fn get_operation_from_cell_type(&self, cell: &CellTypes) -> anyhow::Result<OperationNode> {
         let op = match cell {
-            CellTypes::Code(c, r) => crate::cells::code_cell::code_cell(self.id.clone(), c, r),
-            CellTypes::Prompt(c, r) => crate::cells::llm_prompt_cell::llm_prompt_cell(self.id.clone(), c, r),
-            CellTypes::Template(c, r) => crate::cells::template_cell::template_cell(self.id.clone(), c, r),
-            CellTypes::CodeGen(c, r) => crate::cells::code_gen_cell::code_gen_cell(self.id.clone(), c, r),
+            CellTypes::Code(c, r) => crate::cells::code_cell::code_cell(self.chronology_id.clone(), c, r),
+            CellTypes::Prompt(c, r) => crate::cells::llm_prompt_cell::llm_prompt_cell(self.chronology_id.clone(), c, r),
+            CellTypes::Template(c, r) => crate::cells::template_cell::template_cell(self.chronology_id.clone(), c, r),
+            CellTypes::CodeGen(c, r) => crate::cells::code_gen_cell::code_gen_cell(self.chronology_id.clone(), c, r),
         }?;
         Ok(op)
     }
 
     #[tracing::instrument]
-    pub fn update_operation(
+    pub async fn update_operation(
         &self,
         cell: CellTypes,
         op_id: OperationId,
     ) -> anyhow::Result<(ExecutionState, OperationId)> {
-        let mut op = self.get_operation_from_cell_type(&cell)?;
-        op.attach_cell(cell.clone());
-        let new_state = self.clone_with_new_id();
-        let (op_id, mut new_state) = new_state.upsert_operation(op, op_id);
-        let mutations = Self::assign_dependencies_to_operations(&new_state)?;
-        let mut final_state = new_state.apply_dependency_graph_mutations(mutations);
-        final_state.operation_mutation = Some((op_id, cell));
+        let op = self.get_operation_from_cell_type(&cell)?;
+        let (op_id, mut final_state) = self.upsert_operation(op, op_id)?;
+        self.send_new_state_to_graph_and_pause_with_oneshot(&mut final_state.clone()).await;
         Ok((final_state, op_id))
     }
 
     #[tracing::instrument]
     fn assign_dependencies_to_operations(new_state: &ExecutionState) -> anyhow::Result<Vec<DependencyGraphMutation>> {
-        let (available_values, available_functions) = Self::get_possible_dependencies(new_state)?;
+        let (available_values, available_functions) = Self::extract_available_values_and_functions(new_state)?;
 
         // Anywhere there is a matched value, we create a dependency graph edge
         let mut mutations = vec![];
@@ -492,13 +434,12 @@ impl ExecutionState {
     }
 
     #[tracing::instrument]
-    fn get_possible_dependencies(new_state: &ExecutionState) -> anyhow::Result<(HashMap<String, &OperationId>, HashMap<String, &OperationId>)> {
+    fn extract_available_values_and_functions(new_state: &ExecutionState) -> anyhow::Result<(HashMap<String, &OperationId>, HashMap<String, &OperationId>)> {
         let mut available_values = HashMap::new();
         let mut available_functions = HashMap::new();
 
         // For all reported cells, add their exposed values to the available values
         for (id, operation) in new_state.operation_by_id.iter() {
-            // The currently running operation will be locked and will fail this condition, but we're not updating it.
             let output_signature = &operation.signature.output_signature;
 
             // Store values that are available as globals
@@ -522,8 +463,9 @@ impl ExecutionState {
     /// Inserts a new operation into the execution state, returning the operation id and the new state.
     /// That operation can then be referred to by its id.
     #[tracing::instrument]
-    pub fn upsert_operation(&self, mut operation_node: OperationNode, op_id: OperationId) -> (OperationId, Self) {
-        let mut s = self.clone();
+    pub fn upsert_operation(&self, mut operation_node: OperationNode, op_id: OperationId) -> anyhow::Result<(OperationId, Self)> {
+        let mut s = self.create_new_revision_of_execution_state();
+        s.evaluating_enclosed_state = EnclosedState::SelfContained;
         operation_node.name.as_ref()
             .and_then(|name| s.operation_name_to_id.get(name).copied())
             .unwrap_or_else(|| {
@@ -535,10 +477,13 @@ impl ExecutionState {
             });
         operation_node.id = op_id;
         s.cells_by_id.insert(op_id, operation_node.cell.clone());
+        s.evaluated_mutation_of_cell = Some((op_id, operation_node.cell.clone()));
         s.operation_by_id.insert(op_id, operation_node);
         s.update_callable_functions();
         s.exec_queue.push_back(op_id);
-        (op_id, s)
+        let mutations = Self::assign_dependencies_to_operations(&s)?;
+        let final_state = s.apply_dependency_graph_mutations(mutations);
+        Ok((op_id, final_state))
     }
 
     /// Applies a series of mutations to the dependency graph of cells. This returns a new ExecutionState
@@ -604,29 +549,44 @@ impl ExecutionState {
         println!("Running dispatch {:?}", function_name);
 
         // Store the invocation payload into an execution state and record this before executing
-        let mut state = self.clone_with_new_id();
-        state.stack.push_back(self.id);
+        let mut before_execution_state = self.create_new_revision_of_execution_state();
+        before_execution_state.stack.push_back(self.resolving_execution_node_state_id);
 
         let meta = self.function_name_to_metadata.get(function_name).map(|meta| {
             meta
         }).expect("Failed to find named function");
 
-        let op_name;
-        let cell;
-        {
-            let cell_g = state.cells_by_id.get(&meta.operation_id).unwrap();
-            op_name = get_cell_name(&cell_g).clone();
-            cell = cell_g.clone();
-        }
-        state.evaluating_cell = Some(cell.clone());
-        state.evaluating_fn = Some(function_name.to_string());
-        state.evaluating_id = meta.operation_id;
-        state.evaluating_name = op_name;
-        state.evaluating_arguments = Some(payload.clone());
-
+        let cell = before_execution_state.cells_by_id.get(&meta.operation_id).unwrap();
         // modify code cell to indicate execution of the target function
         // reconstruction of the cell
-        let clone_function_name = function_name.to_string();
+        let op = Self::cell_to_function_invocation(cell, function_name.to_string())?;
+        before_execution_state.evaluating_name = cell.name().clone();
+        before_execution_state.evaluating_cell = Some(cell.clone());
+        before_execution_state.evaluating_fn = Some(function_name.to_string());
+        before_execution_state.evaluating_operation_id = meta.operation_id;
+        before_execution_state.evaluating_arguments = Some(payload.clone());
+        self.send_new_state_to_graph_and_pause_with_oneshot(&mut before_execution_state).await;
+
+        // invocation of the operation
+        // TODO: the total arg payload here does not include necessary function calls for this cell itself
+        /// Receiver that we pass to the exec for it to capture oneshot RPC communication
+        let result = op.execute(&before_execution_state, payload, None, None).await?;
+
+
+        // State that indicates in resolution of execution of this dispatched function
+        // Add result into a new execution state
+        let mut after_execution_state = before_execution_state
+            .close_and_set_chronological_parent(&result.execution_state.as_ref().unwrap_or(&before_execution_state));
+
+        after_execution_state.stack.pop_back();
+        after_execution_state.state_insert(Uuid::max(), result.clone());
+        after_execution_state.fresh_values.insert(Uuid::max());
+        self.send_new_state_to_graph_and_pause_with_oneshot(&mut after_execution_state).await;
+
+        Ok((result.output, after_execution_state))
+    }
+
+    fn cell_to_function_invocation(cell: &CellTypes, clone_function_name: String) -> Result<OperationNode, Error> {
         let mut op = match cell {
             CellTypes::Code(c, r) => {
                 let mut c = c.clone();
@@ -637,7 +597,7 @@ impl ExecutionState {
             CellTypes::Prompt(c, r) => {
                 let mut c = c.clone();
                 match c {
-                    LLMPromptCell::Chat{ref mut function_invocation, ..} => {
+                    LLMPromptCell::Chat { is_function_invocation: ref mut function_invocation, .. } => {
                         *function_invocation = true;
                         crate::cells::llm_prompt_cell::llm_prompt_cell(Uuid::nil(), &c, &r)?
                     }
@@ -650,43 +610,17 @@ impl ExecutionState {
                 unreachable!("Unsupported cell type");
             }
         };
+        Ok(op)
+    }
 
-        // State that indicates in progress execution of this dispatched function
-        let mut before_execution_state = state.clone();
-        // When we receive a message from the graph_sender, execution of this coroutine will resume.
+    async fn send_new_state_to_graph_and_pause_with_oneshot(&self, mut execution_state: &mut ExecutionState) {
         if let Some(graph_sender) = self.graph_sender.as_ref() {
-            let s = graph_sender.clone();
-            let result = pause_future_with_oneshot(ExecutionStateEvaluation::Executing(before_execution_state.clone()), &s).await;
-            let _recv = result.await;
+            let (oneshot_sender, mut oneshot_receiver) = tokio::sync::oneshot::channel();
+            graph_sender.send((execution_state.clone(), Some(oneshot_sender))).await.expect("Failed to send oneshot signal to the graph receiver");
+            println!("============= should pause {:?} {:?} =============", &execution_state.chronology_id, &(&execution_state.evaluating_fn));
+            let _recv = oneshot_receiver.await.expect("Failed to receive oneshot signal");
+            println!("============= should resume {:?} {:?} =============", &execution_state.chronology_id, &(&execution_state.evaluating_fn));
         }
-
-        // invocation of the operation
-        // TODO: the total arg payload here does not include necessary function calls for this cell itself
-        /// Receiver that we pass to the exec for it to capture oneshot RPC communication
-        let result = op.execute(&before_execution_state, payload, None, None).await?;
-
-        // State that indicates in resolution of execution of this dispatched function
-        // Add result into a new execution state
-        let mut after_execution_state = state.clone();
-        // after_execution_state.stack.pop_back();
-        after_execution_state.state_insert(Uuid::max(), result.clone());
-        after_execution_state.fresh_values.insert(Uuid::max());
-
-        // TODO: if result is an error, return an error instead and then pause
-
-        if let Some(graph_sender) = self.graph_sender.as_ref() {
-            let s = graph_sender.clone();
-            if result.output.is_err() {
-                let result = pause_future_with_oneshot(ExecutionStateEvaluation::Error(after_execution_state.clone()), &s).await;
-                let _recv = result.await;
-            } else {
-                let result = pause_future_with_oneshot(ExecutionStateEvaluation::Complete(after_execution_state.clone()), &s).await;
-                let _recv = result.await;
-            }
-        }
-
-        // Return the result, to be used in the context of the parent function
-        Ok((result.output, after_execution_state))
     }
 
     fn get_operation_node(&self, operation_id: OperationId) -> anyhow::Result<&OperationNode> {
@@ -694,23 +628,6 @@ impl ExecutionState {
             .get(&operation_id)
             .ok_or_else(|| anyhow::anyhow!("Operation not found"))?;
         Ok(op)
-    }
-
-    fn update_state(
-        new_state: &mut ExecutionState,
-        next_operation_id: OperationId,
-        result: OperationFnOutput,
-        exec_counter: usize
-    ) {
-        if let Some(s) = &result.execution_state {
-            *new_state = s.clone();
-        }
-        new_state.fresh_values.insert(next_operation_id);
-        new_state.state_insert(next_operation_id, result);
-        new_state.value_freshness_map.insert(next_operation_id, exec_counter);
-        // if let Ok(output) = result.output {
-        //     new_state.value_freshness_map.insert(next_operation_id, exec_counter);
-        // }
     }
 
     fn prepare_operation_inputs(
@@ -747,155 +664,114 @@ impl ExecutionState {
                         DependencyReference::Ordering => {}
                     }
                 }
-                ();
             }
         }
 
         Ok(inputs)
     }
 
-
-    fn select_next_operation_to_evaluate(
-        &self,
-        exec_queue: &mut VecDeque<OperationId>,
-    ) -> anyhow::Result<Option<(Option<String>, OperationId, OperationInputs)>> {
-        println!("=== Selecting next operation to evaluate");
-        let next_operation_id = match exec_queue.pop_front() {
-            Some(id) => {
-                println!("Selected operation {:?} from execution queue for evaluation", &id);
-                id
-            }
-            None => {
-                println!("Execution queue is empty, no operations to evaluate");
-                return Ok(None);
-            }
-        };
-
-        let mut op_node = self.get_operation_node(next_operation_id)?;
-        let name = op_node.name.clone();
-        let signature = &op_node.signature.input_signature;
-
-        println!("Evaluating operation {:?} with name {:?}", &next_operation_id, &name);
-
-        // If the signature has no dependencies and the operation has been run once, skip it.
-        if signature.is_empty() {
-            println!("Operation has no input dependencies (empty signature)");
-            if self.check_if_previously_set(&next_operation_id) {
-                println!("Operation has already been executed once and has no dependencies - skipping evaluation");
-                println!("=== DONE Selecting next operation to evaluate");
-                return Ok(None)
-            }
-            println!("Operation has no dependencies and hasn't been executed yet - proceeding with evaluation");
-        }
-
+    fn has_fresher_inputs(&self, operation_id: OperationId) -> anyhow::Result<bool> {
+        let our_freshness = self.value_freshness_map.get(&operation_id).copied().unwrap_or(0);
         let dependency_graph = self.get_dependency_graph();
-
-        // If none of the inputs are more fresh than our own operation freshness, skip this node
-        if !signature.is_empty() {
-            let our_freshness = self.value_freshness_map.get(&next_operation_id).copied().unwrap_or(0);
-            println!("Current operation freshness value: {:?}", &our_freshness);
-
-            println!("Checking input dependencies freshness values:");
-            let mut found_fresher_input = false;
-            for (from, _, _) in dependency_graph.edges_directed(next_operation_id, Direction::Incoming) {
-                let their_freshness = self.value_freshness_map.get(&from).copied().unwrap_or(0);
-                println!("  - Input {:?} has freshness {:?}", &from, &their_freshness);
-                if their_freshness >= our_freshness {
-                    println!("    → This input is fresher than our operation, evaluation needed");
-                    found_fresher_input = true;
-                }
-            }
-
-            if !found_fresher_input {
-                println!("No inputs are fresher than our operation - skipping evaluation");
-                println!("=== DONE Selecting next operation to evaluate");
-                return Ok(None);
-            }
-            println!("Found fresher inputs - proceeding with evaluation");
-        }
-
-        println!("Preparing operation inputs based on signature requirements");
-        let inputs = self.prepare_operation_inputs(signature, next_operation_id, dependency_graph)?;
-
-        if !signature.check_input_against_signature(&inputs) {
-            println!("Input validation failed against operation signature - skipping evaluation");
-            return Ok(None);
-        }
-
-        println!("Operation {:?} selected for evaluation with valid inputs", &next_operation_id);
-        println!("=== DONE Selecting next operation to evaluate");
-        Ok(Some((name, next_operation_id, inputs)))
+        Ok(dependency_graph
+            .edges_directed(operation_id, Direction::Incoming)
+            .any(|(from, _, _)| {
+                self.value_freshness_map
+                    .get(&from)
+                    .copied()
+                    .unwrap_or(0) >= our_freshness
+            }))
     }
 
-
     #[tracing::instrument]
-    pub(crate) fn determine_next_operation(
-        &self,
-    ) -> anyhow::Result<ExecutionStateEvaluation> {
+    pub(crate) fn determine_next_operation(&self) -> anyhow::Result<ExecutionState> {
         let mut exec_queue = self.exec_queue.clone();
         let operation_count = self.cells_by_id.keys().count();
         let mut count_loops = 0;
+
         loop {
             println!("looping {:?} {:?}", self.exec_queue, count_loops);
-            count_loops += 1;
+
             if count_loops >= operation_count * 2 {
                 return Err(Error::msg("Looped through all operations without detecting an execution"));
             }
-            match self.select_next_operation_to_evaluate(&mut exec_queue) {
-                Ok(Some((op_node_name, next_operation_id, inputs))) => {
-                    let mut new_state = self.clone_with_new_id();
-                    new_state.operation_mutation = None;
-                    new_state.evaluating_fn = None;
-                    new_state.evaluating_id = next_operation_id;
-                    new_state.evaluating_name = op_node_name;
-                    new_state.evaluating_arguments = Some(inputs.to_serialized_value());
-                    new_state.exec_queue = exec_queue;
-                    return Ok(ExecutionStateEvaluation::Executing(new_state));
-                }
-                Ok(None) => {
-                    // There was no operation to evaluate
-                    // If the queue is empty we reload it and continue looping
-                    if exec_queue.is_empty() {
-                        let mut operation_ids: Vec<OperationId> = self.cells_by_id.keys().copied().collect();
-                        operation_ids.sort();
-                        exec_queue.extend(operation_ids.iter());
-                    }
+            count_loops += 1;
+
+            // Get next operation from queue, reload queue if empty
+            let next_operation_id = match exec_queue.pop_front() {
+                Some(id) => id,
+                None => {
+                    let mut operation_ids: Vec<OperationId> = self.cells_by_id.keys().copied().collect();
+                    operation_ids.sort();
+                    exec_queue.extend(operation_ids.iter());
                     continue;
                 }
-                Err(e) => return Err(e),
+            };
+
+            // Get operation node and check validity
+            let op_node = self.get_operation_node(next_operation_id)?;
+            let signature = &op_node.signature.input_signature;
+
+            // Skip if already run with no dependencies
+            if signature.is_empty() && self.has_been_set.contains(&next_operation_id) {
+                continue;
             }
+
+            // Skip if no new inputs available
+            if !signature.is_empty() && !self.has_fresher_inputs(next_operation_id)? {
+                continue;
+            }
+
+            // Prepare and validate inputs
+            let inputs = self.prepare_operation_inputs(signature, next_operation_id, self.get_dependency_graph())?;
+            if !signature.check_input_against_signature(&inputs) {
+                continue;
+            }
+
+            // Create and stage new execution state
+            let mut new_state = self.create_new_revision_of_execution_state();
+            new_state.evaluating_operation_id = next_operation_id;
+            new_state.evaluating_name = op_node.name.clone();
+            new_state.evaluating_arguments = Some(inputs.to_serialized_value());
+            new_state.exec_queue = exec_queue;
+            return Ok(new_state);
         }
     }
 
     #[tracing::instrument]
     pub async fn step_execution(
         &self,
-    ) -> anyhow::Result<(ExecutionStateEvaluation, Vec<(OperationId, OperationFnOutput)>)> {
-        let eval = self.determine_next_operation()?;
+    ) -> anyhow::Result<(ExecutionState, Vec<(OperationId, OperationFnOutput)>)> {
+        // 1. Initialize state and prepare for execution
+        let mut before_execution_state = self.determine_next_operation()?;
+        let operation_id = before_execution_state.evaluating_operation_id.clone();
+        let args = before_execution_state.evaluating_arguments.take().unwrap();
 
-        let mut outputs = vec![];
-        let ExecutionStateEvaluation::Executing(mut new_state) = eval else {
-            return Err(Error::msg("attempting to step invalid state"));
-        };
-        // Send this event to the graph so that we can update in progress execution
-        if let Some(graph_sender) = self.graph_sender.as_ref() {
-            let s = graph_sender.clone();
-            let result = pause_future_with_oneshot(ExecutionStateEvaluation::Executing(new_state.clone()), &s).await;
-            let _recv = result.await;
-        }
-        println!("step_execution, getting operation node {:?}", &new_state.evaluating_id);
-        let op_node = self.get_operation_node(new_state.evaluating_id)?;
-        new_state.evaluating_cell = Some(op_node.cell.clone());
-        println!("step_execution, completed getting operation node {:?}", &new_state.evaluating_id);
-        let args = new_state.evaluating_arguments.take().unwrap();
-        let executed_operation_id = new_state.evaluating_id.clone();
-        println!("step_execution about to run op_node.execute");
-        let result = op_node.execute(&mut new_state, args, None, None).await?;
-        println!("step_execution after op_node.execute");
-        outputs.push((executed_operation_id, result.clone()));
-        ExecutionState::update_state(&mut new_state, executed_operation_id, result, self.exec_counter);
-        println!("step_execution about to complete, after update_state");
-        Ok((ExecutionStateEvaluation::Complete(new_state), outputs))
+        // 2. Update operation node info
+        let op_node = self.get_operation_node(operation_id)?;
+        before_execution_state.evaluating_cell = Some(op_node.cell.clone());
+
+        // 3. Pause if needed, sending in progress execution to the graph
+        self.send_new_state_to_graph_and_pause_with_oneshot(&mut before_execution_state).await;
+
+        // 4. Execute the operation
+        let result = op_node.execute(&mut before_execution_state, args, None, None).await?;
+
+        // 5. Update state with execution results
+        // If the result of the execution returned a new execution state
+        // make sure that our Close for the step_execution is parented by
+        // that new state.
+        let mut after_execution_state = before_execution_state
+            .close_and_set_chronological_parent(&result.execution_state.as_ref().unwrap_or(&before_execution_state));
+
+        // 6. Finalize state
+        after_execution_state.fresh_values.insert(operation_id.clone());
+        after_execution_state.state_insert(operation_id.clone(), result.clone());
+        after_execution_state.value_freshness_map.insert(operation_id.clone(), after_execution_state.exec_counter);
+
+        self.send_new_state_to_graph_and_pause_with_oneshot(&mut after_execution_state).await;
+
+        Ok((after_execution_state, vec![(operation_id, result)]))
     }
 }
 
@@ -921,7 +797,7 @@ mod tests {
         exec_state.state_insert(operation_id, value.clone());
 
         assert_eq!(exec_state.state_get_value(&operation_id).unwrap(), &value.output);
-        assert!(exec_state.check_if_previously_set(&operation_id));
+        assert!(exec_state.has_been_set.contains(&operation_id));
     }
 
     #[test]
@@ -978,10 +854,10 @@ mod tests {
     #[test]
     fn test_clone_with_new_id() {
         let original = ExecutionState::new_with_random_id();
-        let cloned = original.clone_with_new_id();
+        let cloned = original.create_new_revision_of_execution_state();
 
-        assert_ne!(original.id, cloned.id);
-        assert_eq!(original.id, cloned.parent_state_id);
+        assert_ne!(original.resolving_execution_node_state_id, cloned.resolving_execution_node_state_id);
+        assert_eq!(original.resolving_execution_node_state_id, cloned.parent_state_chronology_id);
         assert_eq!(original.exec_counter + 1, cloned.exec_counter);
         assert!(cloned.fresh_values.is_empty());
     }

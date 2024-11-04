@@ -324,7 +324,7 @@ pub struct LLMPromptCellChatConfiguration {
 pub enum LLMPromptCell {
     Chat {
         backing_file_reference: Option<BackingFileReference>,
-        function_invocation: bool,
+        is_function_invocation: bool,
         configuration: LLMPromptCellChatConfiguration,
         name: Option<String>,
         provider: SupportedModelProviders,
@@ -506,14 +506,17 @@ impl Ord for CellTypes {
     }
 }
 
-pub fn get_cell_name(cell: &CellTypes) -> &Option<String> {
-    match &cell {
-        CellTypes::Code(c, _) => &c.name,
-        CellTypes::Prompt(c, _) => match c {
-            LLMPromptCell::Chat { name, .. } => name,
-            LLMPromptCell::Completion { .. } => &None,
-        },
-        CellTypes::Template(c, _) => &c.name,
-        CellTypes::CodeGen(c, _) => &c.name
+impl CellTypes {
+    pub fn name(&self) -> &Option<String> {
+        match &self {
+            CellTypes::Code(c, _) => &c.name,
+            CellTypes::Prompt(c, _) => match c {
+                LLMPromptCell::Chat { name, .. } => name,
+                LLMPromptCell::Completion { .. } => &None,
+            },
+            CellTypes::Template(c, _) => &c.name,
+            CellTypes::CodeGen(c, _) => &c.name
+        }
     }
 }
+

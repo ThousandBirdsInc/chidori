@@ -9,7 +9,7 @@ use bevy::window::PrimaryWindow;
 use chidori_core::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, SupportedModelProviders, TemplateCell, TextRange};
 use chidori_core::chidori_prompt_format::templating::templates::{SchemaItem, SchemaItemType};
 use chidori_core::execution::primitives::identifiers::OperationId;
-use chidori_core::sdk::entry::CellHolder;
+use chidori_core::sdk::interactive_chidori_wrapper::CellHolder;
 use chidori_core::uuid::Uuid;
 use egui;
 use egui::{Align, Color32, FontFamily, Frame, Id, Margin, Rounding, Stroke, Ui, Vec2, Vec2b};
@@ -764,7 +764,7 @@ fn render_new_cell_interface(
             state.temp_cell = Some(CellHolder {
                 cell: CellTypes::Prompt(LLMPromptCell::Chat {
                     backing_file_reference: None,
-                    function_invocation: false,
+                    is_function_invocation: false,
                     configuration: Default::default(),
                     name: None,
                     provider: SupportedModelProviders::OpenAI,

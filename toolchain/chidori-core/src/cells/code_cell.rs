@@ -30,9 +30,6 @@ pub fn code_cell(execution_state_id: ExecutionNodeId, cell: &CodeCell, range: &T
                 CellTypes::Code(cell, Default::default()),
             ))
         }
-        SupportedLanguage::Starlark => {
-            unreachable!("fail")
-        },
         SupportedLanguage::Deno => {
             let paths =
                 chidori_static_analysis::language::javascript::parse::extract_dependencies_js(
@@ -61,17 +58,15 @@ pub(crate) fn code_cell_exec_deno(cell: CodeCell) -> Box<OperationFn> {
         let s = s.clone();
         let cell = cell.clone();
         async move {
-            println!("Should be running source_code_run_deno");
             let result = crate::library::std::code::runtime_deno::source_code_run_deno(
                 &s,
                 &cell.source_code,
                 &x,
                 &cell.function_invocation,
             ).await?;
-            println!("After the evaluation of running source_code_run_deno");
             Ok(OperationFnOutput {
                 has_error: false,
-                execution_state: None,
+                execution_state: Some(result.3),
                 output: result.0,
                 stdout: result.1,
                 stderr: result.2,
@@ -95,10 +90,9 @@ pub fn code_cell_exec_python(cell: CodeCell) -> Box<OperationFn> {
                 &None,
                 &None,
             ).await?;
-            // TODO: don't unwrap the output result here
             Ok(OperationFnOutput {
                 has_error: false,
-                execution_state: None,
+                execution_state: Some(result.3),
                 output: result.0,
                 stdout: result.1,
                 stderr: result.2,

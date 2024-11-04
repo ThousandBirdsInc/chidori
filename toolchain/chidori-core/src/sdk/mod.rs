@@ -1,4 +1,3 @@
-pub mod entry;
 pub mod md;
-pub mod chidori;
-pub mod instanced_environment;
+pub mod interactive_chidori_wrapper;
+pub mod chidori_runtime_instance;
