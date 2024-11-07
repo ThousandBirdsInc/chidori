@@ -1,14 +1,14 @@
-use crate::chidori::{EguiTree, EguiTreeIdentities, ChidoriState};
-use crate::tidy_tree::{Layout, TidyLayout, TreeGraph, Orientation};
+use crate::chidori::{ChidoriState, EguiTree, EguiTreeIdentities};
+use crate::tidy_tree::{Layout, Orientation, TidyLayout, TreeGraph};
 use crate::util::{despawn_screen, egui_render_cell_function_evaluation, egui_render_cell_read, serialized_value_to_json_value};
-use crate::{chidori, CurrentTheme, GameState, RENDER_LAYER_GRAPH_MINIMAP, RENDER_LAYER_GRAPH_VIEW, RENDER_LAYER_TRACE_MINIMAP, RENDER_LAYER_TRACE_VIEW, Theme, util};
+use crate::{bevy_egui, chidori, util, CurrentTheme, GameState, Theme, RENDER_LAYER_GRAPH_MINIMAP, RENDER_LAYER_GRAPH_VIEW, RENDER_LAYER_TRACE_MINIMAP, RENDER_LAYER_TRACE_TEXT, RENDER_LAYER_TRACE_VIEW};
 use bevy::app::{App, Update};
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::input::touchpad::TouchpadMagnify;
 use bevy::math::{vec2, vec3, Vec3};
 use bevy::prelude::*;
 use bevy::prelude::{
-    Assets, Circle, Color, Commands, Component, default, in_state,
+    default, in_state, Assets, Circle, Color, Commands, Component,
     IntoSystemConfigs, Mesh, OnEnter, OnExit, ResMut, Transform,
 };
 use bevy::render::render_resource::{AsBindGroup, Extent3d, ShaderRef, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages};
@@ -16,7 +16,7 @@ use bevy::render::view::{NoFrustumCulling, RenderLayers};
 use bevy::tasks::futures_lite::StreamExt;
 use bevy::utils::petgraph::stable_graph::GraphIndex;
 use bevy::window::{PrimaryWindow, WindowResized};
-use egui::{Color32, Frame, Margin, Order, Pos2, Rgba, RichText, Stroke, TextureHandle, Ui};
+use egui::{Color32, Context, Frame, Margin, Order, Pos2, Rgba, RichText, Stroke, TextureHandle, Ui};
 use crate::bevy_egui::{EguiContext, EguiContexts, EguiManagedTextures, EguiRenderOutput, EguiRenderTarget};
 use egui;
 use bevy_rapier2d::geometry::Collider;
@@ -27,26 +27,33 @@ use chidori_core::execution::execution::execution_graph::{ChronologyId, Executio
 use chidori_core::execution::execution::ExecutionState;
 use num::ToPrimitive;
 use petgraph::data::DataMap;
-use petgraph::prelude::{NodeIndex, StableGraph};
-use petgraph::visit::Walker;
+use petgraph::prelude::{Dfs, NodeIndex, StableGraph};
+use petgraph::visit::{IntoNeighborsDirected, Walker};
 use std::collections::{HashMap, HashSet};
+use std::f32::consts::PI;
 use std::fmt::format;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::path::Path;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 use bevy::asset::embedded_asset;
 use bevy::render::camera::{ScalingMode, Viewport};
 use bevy::render::render_asset::RenderAssetUsages;
+use crate::bevy_prototype_lyon::entity::Path;
+use crate::bevy_prototype_lyon::path::PathBuilder;
+use crate::bevy_prototype_lyon::prelude::{GeometryBuilder, ShapeBundle};
+use crate::bevy_prototype_lyon::shapes;
 use dashmap::DashMap;
 use egui_extras::syntax_highlighting::CodeTheme;
 use egui_json_tree::JsonTree;
 use egui_tiles::Tile;
 use image::{DynamicImage, ImageBuffer, RgbImage, RgbaImage};
+use petgraph::{Graph, Outgoing};
 use chidori_core::execution::execution::execution_state::{CloseReason, EnclosedState, ExecutionStateErrors};
 use uuid::Uuid;
 use chidori_core::execution::primitives::serialized_value::RkyvSerializedValue;
 use chidori_core::sdk::interactive_chidori_wrapper::CellHolder;
+use crate::bevy_prototype_lyon::draw::Fill;
+use crate::graph_range_collector::{ElementDimensions, RangeCollector, StateRange};
 use crate::tree_grouping::group_tree;
 
 #[derive(Resource, Default)]
@@ -94,6 +101,9 @@ struct GraphMinimapViewportIndicator;
 struct GraphMainCamera;
 
 #[derive(Component, Default)]
+struct GraphMain2dCamera;
+
+#[derive(Component, Default)]
 struct GraphMinimapCamera;
 
 enum CameraStateValue {
@@ -135,7 +145,7 @@ struct KeyboardNavigationState {
 fn keyboard_navigate_graph(
     time: Res<Time>,
     keyboard_input: Res<ButtonInput<KeyCode>>,
-    mut q_camera: Query<(&mut Projection, &mut Transform, &mut CameraState), (With<OnGraphScreen> , Without<GraphMinimapCamera>, Without<GraphIdxPair>, Without<GraphIdx>)>,
+    mut q_camera: Query<(&mut Projection, &mut Transform, &mut CameraState), (With<OnGraphScreen> , With<GraphMainCamera>, Without<GraphMinimapCamera>, Without<GraphIdxPair>, Without<GraphIdx>)>,
     mut graph_res: ResMut<GraphResource>,
     execution_graph: Res<ChidoriState>,
     mut selected_node: Local<SelectedNode>,
@@ -332,10 +342,11 @@ fn mouse_pan(
 }
 
 
+
 fn mouse_scroll_events(
     graph_resource: Res<GraphResource>,
     mut scroll_evr: EventReader<MouseWheel>,
-    mut q_camera: Query<(&mut Projection, &mut Transform, &mut CameraState), (With<OnGraphScreen> , Without<GraphMinimapCamera>, Without<GraphIdxPair>, Without<GraphIdx>)>,
+    mut q_camera: Query<(&mut Projection, &mut Transform, &mut CameraState), (With<OnGraphScreen> , Without<GraphMinimapCamera>, Without<GraphIdxPair>, Without<GraphIdx>, Without<GraphMain2dCamera>)>,
     keyboard_input: Res<ButtonInput<KeyCode>>,
     q_mycoords: Query<&CursorWorldCoords, With<OnGraphScreen>>,
 ) {
@@ -357,6 +368,7 @@ fn mouse_scroll_events(
         }
         Projection::Orthographic(ref mut o) => o,
     };
+
 
     let mut camera_x = camera_transform.translation.x;
     let mut camera_y = camera_transform.translation.y;
@@ -452,7 +464,7 @@ fn compute_egui_transform_matrix(
 fn my_cursor_system(
     mut q_mycoords: Query<&mut CursorWorldCoords, With<OnGraphScreen>>,
     q_window: Query<&Window, With<PrimaryWindow>>,
-    q_camera: Query<(&Camera, &GlobalTransform), (With<OnGraphScreen>, Without<GraphMinimapCamera>)>,
+    q_camera: Query<(&Camera, &GlobalTransform), (With<OnGraphScreen>, With<GraphMainCamera>, Without<GraphMinimapCamera>)>,
 ) {
     let mut coords = q_mycoords.single_mut();
     let (camera, camera_transform) = q_camera.single();
@@ -489,7 +501,7 @@ fn egui_execution_state(
                 if internal_state.debug_mode {
                     ui.label(format!("Chronology Id: {:?}", execution_state.chronology_id));
                     ui.label(format!("Chronology Parent Id: {:?}", execution_state.parent_state_chronology_id));
-                    ui.label(format!("State Id: {:?}", execution_state.resolving_execution_node_state_id));
+                    ui.label(format!("Resolving Execution Node Id: {:?}", execution_state.resolving_execution_node_state_id));
                     ui.label(format!("Enclosed State: {:?}", execution_state.evaluating_enclosed_state));
                     ui.label(format!("Function Name: {:?}", execution_state.evaluating_fn));
                     ui.label(format!("Operation Id: {:?}", execution_state.evaluating_operation_id));
@@ -712,10 +724,381 @@ fn save_image_to_png(image: &Image) {
     let height = image.texture_descriptor.size.height;
     let data = &image.data;
     let img_buffer = RgbaImage::from_raw(width, height, data.clone()).expect("Failed to create image buffer");
-    img_buffer.save(Path::new("./outputimage.png")).expect("Failed to save image");
+    img_buffer.save(std::path::Path::new("./outputimage.png")).expect("Failed to save image");
+}
+
+fn generate_noodle_path(elements: &[ElementDimensions], noodle_width: f32, nesting_depth: usize) -> (Path, Vec<ControlPoint>) {
+    let left_offset = nesting_depth as f32 * -30.0 - 30.0;
+    let mut path_builder = PathBuilder::new();
+    let mut all_points = Vec::new();
+
+    if elements.is_empty() {
+        return (path_builder.build(), all_points);
+    }
+
+    // Sort elements by y position (top to bottom)
+    let mut sorted_elements = elements.to_vec();
+    sorted_elements.sort_by(|a, b| b.y.partial_cmp(&a.y).unwrap());
+
+    // Find the topmost and bottommost points
+    let highest_elem = sorted_elements.first().unwrap();
+    let lowest_elem = sorted_elements.last().unwrap();
+
+    let (left_x, top_y, bottom_y) = elem_anchors(noodle_width, highest_elem, left_offset);
+
+    // Helper function to calculate handles based on point distance
+    fn calculate_handles(current: Vec2, next: Vec2, path_direction: f32) -> (Vec2, Vec2) {
+        let path_direction = Vec2::new(0.0, path_direction);
+        let distance = (next - current).length();
+        let handle_length = distance / 3.0;
+        let in_handle = -path_direction * handle_length;
+        let out_handle = path_direction * handle_length;
+        (out_handle, in_handle)
+    }
+
+    // Generate forward path points
+    let mut forward_points = Vec::new();
+
+    // Start point
+    forward_points.push(ControlPoint::new(
+        Vec2::new( left_x, top_y ),
+        Vec2::new( left_x, top_y ),
+        None,
+        None
+    ));
+
+    forward_points.push(ControlPoint::new(
+        Vec2::new( left_x, top_y ),
+        Vec2::new( left_x, bottom_y ),
+        None,
+        None
+    ));
+
+    // Process each element for forward path
+    for (i, window) in sorted_elements.windows(3).enumerate() {
+        let (prev_left_x, prev_top_y, prev_bottom_y) = elem_anchors(noodle_width, &window[0], left_offset);
+        let prev_bottom = Vec2::new(prev_left_x, prev_bottom_y);
+
+        let (left_x, top_y, bottom_y) = elem_anchors(noodle_width, &window[1], left_offset);
+
+        let current_top = Vec2::new(left_x, top_y);
+        let current_bottom = Vec2::new(left_x, bottom_y);
+        let (out_handle, in_handle) = calculate_handles(prev_bottom, current_top, 1.0);
+
+        if (i == 0) {
+            forward_points.push(ControlPoint::new(
+                prev_bottom,
+                current_top,
+                Some(in_handle),
+                Some(out_handle)
+            ));
+        }
+
+        forward_points.push(ControlPoint::new(
+            current_top,
+            current_bottom,
+            None,
+            None
+        ));
+
+        let (next_left_x, next_top_y, next_bottom_y) = elem_anchors(noodle_width, &window[2], left_offset);
+        let next_top = Vec2::new(next_left_x, next_top_y);
+        let (out_handle, in_handle) = calculate_handles(current_bottom, next_top, 1.0);
+        forward_points.push(ControlPoint::new(
+            current_bottom,
+            next_top,
+            Some(in_handle),
+            Some(out_handle),
+        ));
+    }
+
+    // Add control points for the solid edge of the last element
+    let end_point = {
+        let (left_x, top_y, bottom_y) = elem_anchors(noodle_width, lowest_elem, left_offset);
+
+        forward_points.push(ControlPoint::new(
+            Vec2::new( left_x, top_y ),
+            Vec2::new( left_x, top_y ),
+            None,
+            None
+        ));
+
+        // End point of forward path
+        forward_points.push(ControlPoint::new(
+            Vec2::new( left_x, top_y ),
+            Vec2::new( left_x, bottom_y ),
+            None,
+            None
+        ));
+
+        Vec2::new( left_x, bottom_y )
+    };
+
+    // Draw the forward path
+    path_builder.move_to(forward_points[0].end_position);
+    for current in forward_points.iter() {
+        if let (Some(in_handle), Some(out_handle)) = (current.in_handle, current.out_handle) {
+            path_builder.cubic_bezier_to(
+                current.start_position + in_handle,
+                current.end_position + out_handle,
+                current.end_position
+            );
+        } else {
+            path_builder.line_to(current.end_position);
+        }
+    }
+
+    // Draw bottom semicircle
+    path_builder.arc(
+        end_point + Vec2::new(noodle_width/2.0, 0.0),
+        Vec2::new(noodle_width/2.0, noodle_width/2.0),
+        PI as f32,
+        PI as f32
+    );
+
+    let (left_x, top_y, bottom_y) = elem_anchors(noodle_width, lowest_elem, left_offset + noodle_width);
+
+    // Generate return path points
+    let mut return_points = Vec::new();
+    return_points.push(ControlPoint::new(
+        Vec2::new( left_x, bottom_y ),
+        Vec2::new( left_x, bottom_y ),
+        None,
+        None
+    ));
+
+    return_points.push(ControlPoint::new(
+        Vec2::new( left_x, bottom_y ),
+        Vec2::new( left_x, top_y ),
+        None,
+        None
+    ));
+
+
+    let reversed_sorted_elements: Vec<_> = sorted_elements.iter().rev().collect();
+    for (i, window) in reversed_sorted_elements.windows(3).enumerate() {
+        let (prev_left_x, prev_top_y, prev_bottom_y) = elem_anchors(noodle_width, &window[0], left_offset + noodle_width);
+        let prev_top = Vec2::new(prev_left_x, prev_top_y);
+
+        let (left_x, top_y, bottom_y) = elem_anchors(noodle_width, &window[1], left_offset + noodle_width);
+
+        let current_top = Vec2::new(left_x, top_y);
+        let current_bottom = Vec2::new(left_x, bottom_y);
+        let (out_handle, in_handle) = calculate_handles(prev_top, current_bottom, -1.0);
+
+        if i == 0 {
+            return_points.push(ControlPoint::new(
+                prev_top,
+                current_bottom,
+                Some(in_handle),
+                Some(out_handle),
+            ));
+        }
+
+        return_points.push(ControlPoint::new(
+            current_bottom,
+            current_top,
+            None,
+            None
+        ));
+
+        let (next_left_x, next_top_y, next_bottom_y) = elem_anchors(noodle_width, &window[2], left_offset + noodle_width);
+        let next_bottom = Vec2::new(next_left_x, next_bottom_y);
+        let (out_handle, in_handle) = calculate_handles(current_top, next_bottom, -1.0);
+        return_points.push(ControlPoint::new(
+            current_top,
+            next_bottom,
+            Some(in_handle),
+            Some(out_handle),
+        ));
+    }
+
+    let (left_x, top_y, bottom_y) = elem_anchors(noodle_width, highest_elem, left_offset + noodle_width);
+    return_points.push(ControlPoint::new(
+        Vec2::new( left_x, top_y ),
+        Vec2::new( left_x, top_y ),
+        None,
+        None
+    ));
+
+    // Draw the return path
+    for current in return_points.iter() {
+        if let (Some(in_handle), Some(out_handle)) = (current.in_handle, current.out_handle) {
+            path_builder.cubic_bezier_to(
+                current.start_position + in_handle,
+                current.end_position + out_handle,
+                current.end_position
+            );
+        } else {
+            path_builder.line_to(current.end_position);
+        }
+    }
+
+    // Draw top semicircle and close total path
+    let start_point = forward_points[0].start_position;
+    path_builder.arc(
+        start_point + Vec2::new(noodle_width/2.0, 0.0),
+        Vec2::new(noodle_width/2.0, noodle_width/2.0),
+        PI as f32,
+        PI as f32
+    );
+    path_builder.close();
+
+    // Combine all points in the correct order
+    all_points.extend(forward_points);
+    all_points.extend(return_points);
+
+    (path_builder.build(), all_points)
+}
+
+fn elem_anchors(noodle_width: f32, prev: &ElementDimensions, left_offset: f32) -> (f32, f32, f32) {
+    let prev_left_x = prev.x - prev.width / 2.0 - noodle_width + left_offset;
+    let prev_top_y = prev.y + prev.height / 2.0 + noodle_width;
+    let prev_bottom_y = prev.y - prev.height / 2.0 - noodle_width;
+    (prev_left_x, prev_top_y, prev_bottom_y)
+}
+
+// Helper struct to store point and handle information
+#[derive(Clone)]
+struct ControlPoint {
+    start_position: Vec2,
+    end_position: Vec2,
+    in_handle: Option<Vec2>,  // Handle for incoming curve
+    out_handle: Option<Vec2>, // Handle for outgoing curve
+}
+
+impl ControlPoint {
+    fn new(start_position: Vec2, end_position: Vec2, in_handle: Option<Vec2>, out_handle: Option<Vec2>) -> Self {
+        Self {
+            start_position,
+            end_position,
+            in_handle,
+            out_handle,
+        }
+    }
 }
 
 
+fn generate_contour_path_for_range(range: &StateRange) -> (Path, Vec<ControlPoint>) {
+    if range.elements.is_empty() {
+        return (PathBuilder::new().build(), Vec::new());
+    }
+
+    generate_noodle_path(&range.elements, 10.0, range.nesting_depth)
+}
+
+
+
+fn get_color_for_depth(depth: usize) -> Color {
+    // Define a palette of visually distinct colors
+    const COLORS: &[Color] = &[
+        Color::rgb(0.0, 0.7, 0.9),     // Cyan
+        Color::rgb(0.9, 0.1, 0.1),     // Red
+        Color::rgb(0.1, 0.8, 0.1),     // Green
+        Color::rgb(0.9, 0.6, 0.1),     // Orange
+        Color::rgb(0.6, 0.1, 0.9),     // Purple
+        Color::rgb(0.9, 0.9, 0.1),     // Yellow
+        Color::rgb(0.1, 0.1, 0.9),     // Blue
+        Color::rgb(0.9, 0.1, 0.9),     // Magenta
+    ];
+
+    COLORS[depth % COLORS.len()]
+}
+
+
+fn render_graph_grouping(
+    mut commands: Commands,
+    mut graph_resource: ResMut<GraphResource>,
+    mut chidori_state: ResMut<ChidoriState>,
+    mut range_id_to_entity_id: Local<HashMap<(ChronologyId, ChronologyId), Entity>>,
+    mut cached_collector: Local<Vec<StateRange>>,
+    // Add query to modify existing entities
+    mut existing_shapes: Query<(&mut Path, &mut Transform)>,
+) {
+    let execution_graph = &graph_resource.execution_graph;
+    let tree_graph = generate_tree_layout(&execution_graph, &graph_resource.node_dimensions);
+
+    // Main collection logic
+    let mut collector = RangeCollector::new();
+
+    // Create a map of node indices to dimensions for efficient lookup
+    let mut dimensions_map = HashMap::new();
+
+    // First pass: collect dimensions
+    let mut topo = petgraph::visit::Topo::new(&graph_resource.execution_graph);
+    while let Some(idx) = topo.next(&graph_resource.execution_graph) {
+        if let Some(node) = &graph_resource.execution_graph.node_weight(idx) {
+            if let Some((_, n)) = tree_graph.get_from_external_id(&idx.index()) {
+                dimensions_map.insert(idx, ElementDimensions {
+                    width: n.width.to_f32().unwrap(),
+                    height: n.height.to_f32().unwrap(),
+                    x: n.x.to_f32().unwrap(),
+                    y: -n.y.to_f32().unwrap(),
+                });
+            }
+        }
+    }
+
+    // Second pass: find Open states and collect paths
+    let mut topo = petgraph::visit::Topo::new(&graph_resource.execution_graph);
+    while let Some(idx) = topo.next(&graph_resource.execution_graph) {
+        if let Some(chronology_id) = &graph_resource.execution_graph.node_weight(idx) {
+            if let Some(state) = chidori_state.get_execution_state_at_id(&chronology_id) {
+                if let EnclosedState::Open = state.evaluating_enclosed_state {
+                    collector.collect_paths(
+                        &graph_resource.execution_graph,
+                        idx,
+                        state.resolving_execution_node_state_id.clone(),
+                        &dimensions_map,
+                        &chidori_state
+                    );
+                }
+            }
+        }
+    }
+
+    collector.calculate_nesting_depths();
+
+    let mut existing_ranges: HashSet<_> = range_id_to_entity_id.keys().cloned().collect();
+    for range in collector.ranges {
+        existing_ranges.remove(&range.id());
+        if range.elements.len() <= 1 {
+            continue;
+        }
+
+        let (path , _)= generate_contour_path_for_range(&range);
+        let z_position = range.nesting_depth as f32 * -10.0;
+        let color = get_color_for_depth(range.nesting_depth);
+
+        if let Some(&entity) = range_id_to_entity_id.get(&range.id()) {
+            // Update existing entity
+            if let Ok((mut path_component, mut transform)) = existing_shapes.get_mut(entity) {
+                *path_component = path;
+                transform.translation.z = z_position;
+            }
+        } else {
+            // Spawn new entity
+            let entity = commands.spawn((
+                ShapeBundle {
+                    path,
+                    transform: Transform::from_xyz(0.0, 0.0, z_position),
+                    ..default()
+                },
+                crate::bevy_prototype_lyon::prelude::Fill::color(color),
+                crate::bevy_prototype_lyon::prelude::Stroke::new(color, 10.0),
+                RenderLayers::layer(RENDER_LAYER_GRAPH_VIEW),
+                OnGraphScreen
+            ));
+            range_id_to_entity_id.insert(range.id(), entity.id());
+        }
+    }
+    for missing_range in existing_ranges {
+        if let Some(entity ) = range_id_to_entity_id.remove(&missing_range) {
+            commands.entity(entity).despawn_recursive();
+        }
+
+    }
+}
 
 
 fn update_graph_system_renderer(
@@ -734,8 +1117,8 @@ fn update_graph_system_renderer(
         (With<GraphIdxPair>, Without<GraphIdx>),
     >,
     mut images: ResMut<Assets<Image>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     mut materials_custom: ResMut<Assets<RoundedRectMaterial>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut chidori_state: ResMut<ChidoriState>,
     mut node_index_to_entity: Local<HashMap<usize, Entity>>,
@@ -908,117 +1291,14 @@ fn update_graph_system_renderer(
                     let ctx = egui_ctx.get_mut();
 
                     // Position the node according to its tidytree layout
-                    transform.translation = transform.translation.lerp(Vec3::new(n.x.to_f32().unwrap(), -n.y.to_f32().unwrap() - (n.height.to_f32().unwrap() / 2.0), -1.0), 0.5);
+                    transform.translation = transform.translation.lerp(Vec3::new(n.x.to_f32().unwrap(), -n.y.to_f32().unwrap(), -1.0), 0.5);
 
                     // Draw text within these elements
-                    egui::Area::new(format!("{:?}", entity).into())
-                        .fixed_pos(Pos2::new(0.0, 0.0)).show(ctx, |ui| {
-
-                        ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
-                        let mut frame = egui::Frame::default().fill(current_theme.theme.card).stroke(current_theme.theme.card_border)
-                            .inner_margin(16.0).rounding(6.0).begin(ui);
-                        {
-                            ui.set_min_width(1000.0);
-                            let mut ui = &mut frame.content_ui;
-                            let node1 = *node;
-                            let original_style = (*ui.ctx().style()).clone();
-
-                            let mut style = original_style.clone();
-                            // style.visuals.override_text_color = Some(Color32::BLACK);
-                            ui.set_style(style);
-
-
-
-                            if *node1 == chidori_core::uuid::Uuid::nil() {
-                                ui.horizontal(|ui| {
-                                    ui.label("Initialization...");
-                                    if chidori_state.debug_mode {
-                                        ui.label(node1.to_string());
-                                    }
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                                        if ui.button(RichText::new("Revert to this State").color(Color32::from_hex("#dddddd").unwrap())).clicked() {
-                                            let _ = chidori_state.set_execution_id(*node1);
-                                        }
-                                    });
-                                });
-                            } else {
-                                if let Some(state) = chidori_state.get_execution_state_at_id(&node1) {
-                                    let state = &state;
-                                    if !matches!(state.evaluating_enclosed_state, EnclosedState::Open) {
-                                        ui.horizontal(|ui| {
-                                            if chidori_state.debug_mode {
-                                                ui.label(node1.to_string());
-                                            }
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                                                if ui.button("Revert to this State").clicked() {
-                                                    info!("We would like to revert to {:?}", node1);
-                                                    let _ = chidori_state.set_execution_id(*node1);
-                                                }
-                                            });
-                                        });
-                                    }
-
-                                    match &state.evaluating_enclosed_state {
-                                        EnclosedState::Close(CloseReason::Error) => {
-                                            let mut frame = egui::Frame::default().fill(current_theme.theme.card).stroke(Stroke {
-                                                width: 0.5,
-                                                color: Color32::from_hex("#ff0000").unwrap(),
-                                            }).inner_margin(16.0).rounding(6.0).begin(ui);
-                                            {
-                                                let mut ui = &mut frame.content_ui;
-                                                ui.label("Error");
-                                                egui_execution_state(
-                                                    ui,
-                                                    &mut chidori_state,
-                                                    state, &current_theme.theme);
-                                            }
-                                            frame.end(ui);
-                                        }
-                                        EnclosedState::Close(CloseReason::Failure) => {
-                                            ui.label("Eval Failure");
-                                        }
-                                        EnclosedState::Open => {
-                                            ui.set_min_width(1000.0);
-                                            ui.label("Executing");
-                                            egui_execution_state(
-                                                ui,
-                                                &mut chidori_state,
-                                                state, &current_theme.theme);
-                                        }
-                                        EnclosedState::SelfContained | EnclosedState::Close(CloseReason::Complete) => {
-                                            egui_execution_state(ui, &mut chidori_state, state, &current_theme.theme);
-                                            for (_, value) in state.state.iter() {
-                                                let image_paths = crate::util::find_matching_strings(&value.output.clone().unwrap(), r"(?i)\.(png|jpe?g)$");
-                                                for (img_path, _) in image_paths {
-                                                    let texture = if let Some(cached_texture) = node_image_texture_cache.get(&img_path) {
-                                                        cached_texture.clone()
-                                                    } else {
-                                                        let texture = read_image(ui, &img_path);
-                                                        node_image_texture_cache.insert(img_path.clone(), texture.clone());
-                                                        texture
-                                                    };
-
-                                                    // Display the image
-                                                    ui.add(egui::Image::new(&texture));
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    ui.label("No evaluation recorded");
-                                    // internal_state.get_execution_state_at_id(*node);
-                                }
-                            }
-
-                            ui.set_style(original_style);
-                        }
-                        frame.end(ui);
-                    });
+                    egui_graph_node(&current_theme, &mut chidori_state, &mut node_image_texture_cache, node, entity, ctx);
 
                     let used_rect = ctx.used_rect();
-                    let width = used_rect.width();
                     let height = used_rect.height();
-                    graph_resource.node_dimensions.insert(*node.clone(), (width, height));
+                    graph_resource.node_dimensions.insert(*node.clone(), (1000.0, height));
                     flag_layout_is_dirtied = true;
                     transform.scale = vec3(width, height, 1.0);
                 }
@@ -1083,6 +1363,118 @@ fn update_graph_system_renderer(
     if flag_layout_is_dirtied {
         graph_resource.is_layout_dirty = true;
     }
+}
+
+fn egui_graph_node(
+    current_theme: &Res<CurrentTheme>,
+    mut chidori_state: &mut ResMut<ChidoriState>,
+    mut node_image_texture_cache: &mut HashMap<String, TextureHandle>,
+    node: &&ChronologyId,
+    entity: Entity,
+    ctx: &mut Context
+) {
+    egui::Area::new(format!("{:?}", entity).into())
+        .fixed_pos(Pos2::new(0.0, 0.0)).show(ctx, |ui| {
+        ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
+        let mut frame = egui::Frame::default().fill(current_theme.theme.card).stroke(current_theme.theme.card_border)
+            .inner_margin(16.0).rounding(6.0).begin(ui);
+        {
+            ui.set_min_width(800.0);
+            ui.set_max_width(800.0);
+            let mut ui = &mut frame.content_ui;
+            let node1 = *node;
+            let original_style = (*ui.ctx().style()).clone();
+
+            let mut style = original_style.clone();
+            // style.visuals.override_text_color = Some(Color32::BLACK);
+            ui.set_style(style);
+
+
+            if *node1 == chidori_core::uuid::Uuid::nil() {
+                ui.horizontal(|ui| {
+                    ui.label("Initialization...");
+                    if chidori_state.debug_mode {
+                        ui.label(node1.to_string());
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        if ui.button(RichText::new("Revert to this State").color(Color32::from_hex("#dddddd").unwrap())).clicked() {
+                            let _ = chidori_state.set_execution_id(*node1);
+                        }
+                    });
+                });
+            } else {
+                if let Some(state) = chidori_state.get_execution_state_at_id(&node1) {
+                    let state = &state;
+                    if !matches!(state.evaluating_enclosed_state, EnclosedState::Open) {
+                        ui.horizontal(|ui| {
+                            if chidori_state.debug_mode {
+                                ui.label(node1.to_string());
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                if ui.button("Revert to this State").clicked() {
+                                    info!("We would like to revert to {:?}", node1);
+                                    let _ = chidori_state.set_execution_id(*node1);
+                                }
+                            });
+                        });
+                    }
+
+                    match &state.evaluating_enclosed_state {
+                        EnclosedState::Close(CloseReason::Error) => {
+                            let mut frame = egui::Frame::default().fill(current_theme.theme.card).stroke(Stroke {
+                                width: 0.5,
+                                color: Color32::from_hex("#ff0000").unwrap(),
+                            }).inner_margin(16.0).rounding(6.0).begin(ui);
+                            {
+                                let mut ui = &mut frame.content_ui;
+                                ui.label("Error");
+                                egui_execution_state(
+                                    ui,
+                                    &mut chidori_state,
+                                    state, &current_theme.theme);
+                            }
+                            frame.end(ui);
+                        }
+                        EnclosedState::Close(CloseReason::Failure) => {
+                            ui.label("Eval Failure");
+                        }
+                        EnclosedState::Open => {
+                            ui.set_min_width(1000.0);
+                            ui.label("Executing");
+                            egui_execution_state(
+                                ui,
+                                &mut chidori_state,
+                                state, &current_theme.theme);
+                        }
+                        EnclosedState::SelfContained | EnclosedState::Close(CloseReason::Complete) => {
+                            egui_execution_state(ui, &mut chidori_state, state, &current_theme.theme);
+                            for (_, value) in state.state.iter() {
+                                let image_paths = crate::util::find_matching_strings(&value.output.clone().unwrap(), r"(?i)\.(png|jpe?g)$");
+                                for (img_path, _) in image_paths {
+                                    let texture = if let Some(cached_texture) = node_image_texture_cache.get(&img_path) {
+                                        cached_texture.clone()
+                                    } else {
+                                        let texture = read_image(ui, &img_path);
+                                        node_image_texture_cache.insert(img_path.clone(), texture.clone());
+                                        texture
+                                    };
+
+                                    // Display the image
+                                    ui.add(egui::Image::new(&texture));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    ui.label("No evaluation recorded");
+                    // internal_state.get_execution_state_at_id(*node);
+                }
+            }
+
+            ui.set_style(original_style);
+        }
+        frame.end(ui);
+    });
 }
 
 fn create_egui_texture_image(window: &Window, width: f32, height: f32) -> (f32, u32, u32, Image) {
@@ -1163,7 +1555,7 @@ fn generate_tree_layout(
     let mut topo = petgraph::visit::Topo::new(&execution_graph);
     while let Some(x) = topo.next(&execution_graph) {
         if let Some(node) = &execution_graph.node_weight(x) {
-            let dims = node_dimensions.entry(**node).or_insert((600.0, 300.0));
+            let dims = node_dimensions.entry(**node).or_insert((1000.0, 300.0));
             let mut width = dims.0;
             let mut height = dims.1;
             let tree_node = crate::tidy_tree::Node::new(x.index(), (width) as f64, (height) as f64, Some(Orientation::Vertical));
@@ -1387,9 +1779,8 @@ fn graph_setup(
     // Main camera
     commands.spawn((
         Camera3dBundle {
-            transform: Transform::from_xyz(0.0, 0.0, 1.0).looking_at(Vec3::ZERO, Vec3::Y),
             camera: Camera {
-                order: 1,
+                order: 2,
                 clear_color: ClearColorConfig::Custom(Color::rgba(0.035, 0.035, 0.043, 1.0)),
                 // viewport: Some(Viewport {
                 //     physical_position: UVec2::new((300.0 * scale_factor) as u32, 0),
@@ -1400,6 +1791,8 @@ fn graph_setup(
             },
             projection: OrthographicProjection {
                 scale: 1.0,
+                near: -10000.0,
+                far: 10000.0,
                 ..default()
             }.into(),
             ..default()
@@ -1413,9 +1806,9 @@ fn graph_setup(
     // Minimap camera
     commands.spawn((
         Camera3dBundle {
-            transform: Transform::from_xyz(0.0, 0.0, 1.0).looking_at(Vec3::ZERO, Vec3::Y),
+            transform: Transform::from_xyz(0.0, 0.0, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
             camera: Camera {
-                order: 2,
+                order: 3,
                 clear_color: ClearColorConfig::Custom(Color::rgba(0.1, 0.1, 0.1, 1.0)),
                 viewport: Some(Viewport {
                     physical_position: UVec2::new((window.width() * scale_factor) as u32 - (300 * scale_factor as u32), 0),
@@ -1489,6 +1882,21 @@ fn graph_setup(
         ExecutionHeadCursor,
         OnGraphScreen
     ));
+
+    // let shape = shapes::RegularPolygon {
+    //     sides: 6,
+    //     feature: shapes::RegularPolygonFeature::Radius(200.0),
+    //     ..shapes::RegularPolygon::default()
+    // };
+    //
+    // commands.spawn((
+    //     ShapeBundle {
+    //         path: GeometryBuilder::build_as(&shape),
+    //         ..default()
+    //     },
+    //     crate::bevy_prototype_lyon::prelude::Fill::color(bevy::prelude::Color::CYAN),
+    //     crate::bevy_prototype_lyon::prelude::Stroke::new(bevy::prelude::Color::BLACK, 10.0),
+    // ));
 
     let mut dataset = StableGraph::new();
     let mut node_ids = HashMap::new();
@@ -1608,7 +2016,8 @@ pub fn graph_plugin(app: &mut App) {
                 enforce_tiled_viewports,
                 update_cursor_materials,
                 update_node_materials,
-                ui_window
+                ui_window,
+                render_graph_grouping
             )
                 .run_if(in_state(GameState::Graph)),
         );

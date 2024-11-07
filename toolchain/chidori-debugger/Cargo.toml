@@ -29,10 +29,11 @@ egui = { version = "0.28.1", default-features = false, features = ["bytemuck"] }
 image = { version = "0.24", features = ["jpeg", "png"] }
 bevy_utils = "0.13.2"
 bevy_rapier2d = { version = "0.25.0", features = [ "simd-stable", "debug-render-2d" ]}
-bevy_prototype_lyon = "0.11.0"
+lyon_tessellation = "1"
+lyon_algorithms = "1"
+svgtypes = "0.15"
 egui_extras = { version = "0.28.1" , features = ["syntect", "all_loaders"]}
 egui_tiles = "0.9.1"
-bevy_cosmic_edit = { version = "0.19.0", features = ["multicam"] }
 rfd = "0.14.1"
 bytemuck = "1.15.0"
 rand = "0.8.5"

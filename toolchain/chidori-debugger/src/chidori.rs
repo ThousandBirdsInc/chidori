@@ -303,6 +303,32 @@ pub struct ChidoriState {
     pub trace_events: Vec<TraceEvents>,
 }
 
+impl Default for ChidoriState {
+    fn default() -> Self {
+        ChidoriState {
+            debug_mode: false,
+            chidori: Arc::new(Mutex::new(InteractiveChidoriWrapper::new())),
+            watched_path: Mutex::new(None),
+            background_thread: Mutex::new(None),
+            file_watch: Mutex::new(None),
+            display_example_modal: true,
+            current_playback_state: PlaybackState::Paused,
+
+            editor_cells: HashMap::new(),
+            state_cells: vec![],
+            local_cell_state: Default::default(),
+            log_messages: vec![],
+            merged_state_history: None,
+            definition_graph: vec![],
+            execution_graph: vec![],
+            grouped_nodes: Default::default(),
+            current_execution_head: Default::default(),
+            execution_ids_to_states: Default::default(),
+            trace_events: vec![],
+        }
+    }
+}
+
 impl ChidoriState {
     pub fn get_loaded_path(&self) -> String {
         let env = self.chidori.lock().unwrap();
@@ -318,6 +344,21 @@ impl ChidoriState {
     //         .map_err(|e| e.to_string())?;
     //     Ok(())
     // }
+
+    #[cfg(test)]
+    pub fn set_execution_state_at_id(
+        &self,
+        execution_node_id: &ExecutionNodeId,
+        execution_state: ExecutionState
+    ) {
+        // TODO: this is like 3 locks just to get the current state - maybe we should cache these?
+        let chidori = self.chidori.lock().unwrap();
+        {
+            let shared_state = chidori.shared_state.lock().unwrap();
+            let exec = shared_state.execution_id_to_evaluation.clone();
+            exec.insert(*execution_node_id, execution_state);
+        };
+    }
 
     pub fn get_execution_state_at_id(
         &self,

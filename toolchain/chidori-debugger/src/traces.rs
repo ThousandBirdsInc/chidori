@@ -12,7 +12,7 @@ use bevy::render::camera::{ScalingMode, Viewport};
 use bevy::render::view::RenderLayers;
 use bevy::sprite::Anchor;
 use bevy::text::{BreakLineOn, Text2dBounds};
-use bevy::utils::petgraph::visit::Walker;
+use petgraph::visit::Walker;
 use bevy::window::{PrimaryWindow, WindowResized};
 use crate::bevy_egui::{egui, EguiContexts};
 use bevy_rapier2d::geometry::{Collider, Sensor};

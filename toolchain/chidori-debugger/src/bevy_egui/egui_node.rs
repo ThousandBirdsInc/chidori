@@ -1,8 +1,8 @@
 use crate::bevy_egui::{render_systems::{
     EguiPipelines, EguiTextureBindGroups, EguiTextureId, EguiTransform, EguiTransforms,
 }, EguiRenderOutput, EguiSettings, EguiRenderTargetSize, EguiRenderedTexture, EguiRenderTarget};
+use bytemuck::cast_slice;
 use bevy::{
-    core::cast_slice,
     ecs::world::{FromWorld, World},
     prelude::{Entity, Handle, Resource},
     render::{

@@ -15,9 +15,11 @@ mod logs;
 mod shader_trace;
 mod bevy_egui;
 mod egui_json_tree;
+mod bevy_prototype_lyon;
 mod tree_grouping;
 mod json_editor;
 mod vim_text_edit;
+mod graph_range_collector;
 
 use crate::bevy_egui::{egui, EguiContexts, EguiPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
@@ -26,7 +28,7 @@ use bevy::prelude::*;
 use bevy::render::view::Layer;
 use bevy::window::{PrimaryWindow, WindowMode};
 use bevy::winit::WinitWindows;
-use bevy_cosmic_edit::*;
+use crate::bevy_prototype_lyon::prelude::*;
 use bevy_rapier2d::plugin::{NoUserData, RapierPhysicsPlugin};
 use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Rounding, Stroke};
 use once_cell::sync::OnceCell;
@@ -315,6 +317,7 @@ fn main() {
             FrameTimeDiagnosticsPlugin,
         ))
         .add_plugins(RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(100.0))
+        .add_plugins(ShapePlugin)
         // .add_plugins(RapierDebugRenderPlugin::default())
         // .add_plugins(bevy_framepace::FramepacePlugin)
         .add_plugins(EguiPlugin)

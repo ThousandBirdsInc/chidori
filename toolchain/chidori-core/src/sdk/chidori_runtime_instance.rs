@@ -119,12 +119,22 @@ impl ChidoriRuntimeInstance {
         self.reload_cells().await?;
 
         let executing_states = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+        // Create a channel for error notifications
+        let (error_tx, mut error_rx) = tokio::sync::mpsc::channel(32);
 
         loop {
             // Handle user interactions first for responsiveness
             if let Ok(message) = self.env_rx.try_recv() {
                 println!("Received message from user: {:?}", message);
                 self.handle_user_interaction_message(message).await?;
+            }
+
+            // Check for execution errors
+            if let Ok(error) = error_rx.try_recv() {
+                // println!("Received execution error: {:?}", error);
+                self.set_playback_state(PlaybackState::Paused);
+                // TODO: notify the client about the error
+                // self.push_update_to_client(&ExecutionState::Error(error));
             }
 
             // Receives the results of execution during progression of ExecutionStates
@@ -153,18 +163,28 @@ impl ChidoriRuntimeInstance {
 
                     // Spawn the progression of the given step in a separate task
                     let executing_states = Arc::clone(&executing_states);
+                    let error_tx = error_tx.clone();
                     tokio::spawn(async move {
-                        let _ = state.step_execution().await;
-                        // Clean up regardless of result
-                        let _ = executing_states.lock().await.remove(&execution_head_state_id);
+                        let result = state.step_execution().await;
+                        match result {
+                            Ok(_) => {
+                                // Handle successful execution
+                                executing_states.lock().await.remove(&execution_head_state_id);
+                            },
+                            Err(err) => {
+                                // Ensure we clean up the execution state
+                                executing_states.lock().await.remove(&execution_head_state_id);
+                                // Send the error through the channel
+                                if let Err(send_err) = error_tx.send(err).await {
+                                    eprintln!("Failed to send error through channel: {:?}", send_err);
+                                }
+
+                            }
+                        }
                     });
                 }
-
-
             }
         }
-        unreachable!("We've exited the run loop");
-        Ok(())
     }
 
     fn set_playback_state(&mut self, playback_state: PlaybackState) {

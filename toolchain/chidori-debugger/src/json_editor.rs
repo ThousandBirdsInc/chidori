@@ -1,7 +1,6 @@
 use std::str::FromStr;
 // Common functions for examples
 use bevy::{prelude::*, window::PrimaryWindow};
-use bevy_cosmic_edit::*;
 use egui;
 use egui::{Color32, FontFamily, FontId, Frame, Id, Margin, RichText, TextEdit, Ui, vec2};
 use egui::text::CCursor;

@@ -101,7 +101,7 @@ pub struct ExecutionState {
     /// This represents the specific state that we are resolving.
     /// Most states of execution will have two ExecutionStates that refer to this.
     /// One beginning the computation and one where it has been concluded.
-    pub resolving_execution_node_state_id: ExecutionNodeId,
+    pub resolving_execution_node_state_id: ChronologyId,
 
     /// This represents the point in the chronology of the graph
     /// there should only ever be one of these.
@@ -166,9 +166,9 @@ pub struct ExecutionState {
     ///
     /// The usize::MAX index is a no-op that indicates that the operation is ready to run, an execution
     /// order dependency rather than a value dependency.
-    dependency_map: ImHashMap<OperationId, IndexSet<(OperationId, DependencyReference)>>,
+    pub dependency_map: ImHashMap<OperationId, IndexSet<(OperationId, DependencyReference)>>,
 
-    value_freshness_map: ImHashMap<OperationId, usize>,
+    pub value_freshness_map: ImHashMap<OperationId, usize>,
 }
 
 impl std::fmt::Debug for ExecutionState {
@@ -572,7 +572,6 @@ impl ExecutionState {
         /// Receiver that we pass to the exec for it to capture oneshot RPC communication
         let result = op.execute(&before_execution_state, payload, None, None).await?;
 
-
         // State that indicates in resolution of execution of this dispatched function
         // Add result into a new execution state
         let mut after_execution_state = before_execution_state
@@ -590,8 +589,7 @@ impl ExecutionState {
         let mut op = match cell {
             CellTypes::Code(c, r) => {
                 let mut c = c.clone();
-                c.function_invocation =
-                    Some(clone_function_name.to_string());
+                c.function_invocation = Some(clone_function_name.to_string());
                 crate::cells::code_cell::code_cell(Uuid::nil(), &c, &r)?
             }
             CellTypes::Prompt(c, r) => {
@@ -641,28 +639,26 @@ impl ExecutionState {
         signature.prepopulate_defaults(&mut inputs);
 
         for (from, _, argument_indices) in dependency_graph.edges_directed(operation_id, Direction::Incoming) {
-            if let Some(output) = self.state_get(&from) {
-                let output_value = &output.output;
-
-                for argument_index in argument_indices {
-                    match argument_index {
-                        DependencyReference::Positional(pos) => {
-                            inputs.args.insert(pos.to_string(), output_value.clone().unwrap());
-                        }
-                        DependencyReference::Keyword(kw) => {
-                            inputs.kwargs.insert(kw.clone(), output_value.clone().unwrap());
-                        }
-                        DependencyReference::Global(name) => {
-                            if let RkyvSerializedValue::Object(value) = &output.output.clone().unwrap() {
-                                inputs.globals.insert(name.clone(), value.get(name).ok_or_else(|| anyhow::anyhow!("Expected value with name: {:?} to be available", name))?.clone());
-                            }
-                        }
-                        DependencyReference::FunctionInvocation(name) => {
-                            let cell = self.cells_by_id.get(&from).ok_or_else(|| anyhow::anyhow!("Operation must exist"))?;
-                            inputs.functions.insert(name.clone(), RkyvSerializedValue::Cell(cell.clone()));
-                        }
-                        DependencyReference::Ordering => {}
+            let Some(output) = self.state_get(&from) else { continue; };
+            let output_value = &output.output;
+            for argument_index in argument_indices {
+                match argument_index {
+                    DependencyReference::Positional(pos) => {
+                        inputs.args.insert(pos.to_string(), output_value.clone().unwrap());
                     }
+                    DependencyReference::Keyword(kw) => {
+                        inputs.kwargs.insert(kw.clone(), output_value.clone().unwrap());
+                    }
+                    DependencyReference::Global(name) => {
+                        if let RkyvSerializedValue::Object(value) = &output.output.clone().unwrap() {
+                            inputs.globals.insert(name.clone(), value.get(name).ok_or_else(|| anyhow::anyhow!("Expected value with name: {:?} to be available", name))?.clone());
+                        }
+                    }
+                    DependencyReference::FunctionInvocation(name) => {
+                        let cell = self.cells_by_id.get(&from).ok_or_else(|| anyhow::anyhow!("Operation must exist"))?;
+                        inputs.functions.insert(name.clone(), RkyvSerializedValue::Cell(cell.clone()));
+                    }
+                    DependencyReference::Ordering => {}
                 }
             }
         }

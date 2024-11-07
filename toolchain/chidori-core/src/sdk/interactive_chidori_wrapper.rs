@@ -71,7 +71,7 @@ impl InteractiveChidoriWrapper {
 
     pub fn new_with_events(sender: Sender<TraceEvents>, runtime_event_sender: Sender<EventsFromRuntime>) -> Self {
         let init_telemetry = init_internal_telemetry(sender.clone());
-        // tracing::subscriber::set_global_default(init_telemetry.clone()).expect("Failed to set global default");
+        tracing::subscriber::set_global_default(init_internal_telemetry(sender.clone())).expect("Failed to set global default");
         let guard: DefaultGuard = tracing::subscriber::set_default(init_telemetry);
         InteractiveChidoriWrapper {
             instanced_env_tx: None,
