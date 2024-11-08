@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use petgraph::prelude::{Dfs, StableGraph};
 use chidori_core::execution::execution::execution_graph::ChronologyId;
 use petgraph::graph::NodeIndex;
@@ -14,6 +15,7 @@ pub struct StateRange {
     path: Vec<NodeIndex>,
     // Maximum depth of nested paths contained within this path
     pub(crate) nesting_depth: usize,
+    pub is_explicit_close: bool,
 }
 
 impl StateRange {
@@ -60,7 +62,7 @@ impl RangeCollector {
                 if let Some(state) = chidori_state.get_execution_state_at_id(node_weight) {
                     if matches!(state.evaluating_enclosed_state, EnclosedState::Close(_)) {
                         if state.resolving_execution_node_state_id == chronology_id {
-                            potential_endpoints.push(node);
+                            potential_endpoints.push((node, true));
                         }
                     }
                 }
@@ -68,12 +70,15 @@ impl RangeCollector {
 
             // If no outgoing edges, consider it an endpoint
             if graph.neighbors_directed(node, Outgoing).count() == 0 {
-                potential_endpoints.push(node);
+                potential_endpoints.push((node, false));
             }
         }
 
+        // Sort by node index
+        potential_endpoints.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+        });
         // Remove duplicates from potential_endpoints
-        potential_endpoints.sort();
         potential_endpoints.dedup();
 
         for end_idx in potential_endpoints {
@@ -83,16 +88,14 @@ impl RangeCollector {
             self.collect_path_recursive(
                 graph,
                 start_idx,
-                end_idx,
+                end_idx.0,
+                end_idx.1,
                 &mut visited,
                 &mut current_path,
                 dimensions_map,
                 &chronology_id,
             );
         }
-
-        // After collecting all paths, calculate nesting depths
-        // self.calculate_nesting_depths();
     }
 
     fn collect_path_recursive(
@@ -100,6 +103,7 @@ impl RangeCollector {
         graph: &StableGraph<ChronologyId, ()>,
         current: NodeIndex,
         target: NodeIndex,
+        is_explicit_close: bool,
         visited: &mut HashSet<NodeIndex>,
         current_path: &mut Vec<NodeIndex>,
         dimensions_map: &HashMap<NodeIndex, ElementDimensions>,
@@ -123,6 +127,7 @@ impl RangeCollector {
             let range = StateRange {
                 start_chronology_id: *chronology_id,
                 end_chronology_id: *target_chronology_id,
+                is_explicit_close,
                 elements,
                 path: current_path.clone(),
                 nesting_depth: 0, // Will be calculated later
@@ -136,6 +141,7 @@ impl RangeCollector {
                         graph,
                         neighbor,
                         target,
+                        is_explicit_close,
                         visited,
                         current_path,
                         dimensions_map,
@@ -149,14 +155,58 @@ impl RangeCollector {
         visited.remove(&current);
     }
 
+
+    pub(crate) fn remove_implicitly_ended_ranges(&mut self) {
+        // Group ranges by start chronology IDs
+        let mut range_groups: HashMap<ChronologyId, Vec<StateRange>> = HashMap::new();
+
+        // First, group all ranges by their start and end IDs
+        for range in self.ranges.drain(..) {
+            let key = range.start_chronology_id;
+            range_groups.entry(key).or_default().push(range);
+        }
+
+        // Process each group
+        for ranges in range_groups.values() {
+            // Check if there's an explicitly closed range in the group
+            let explicit_ranges: Vec<_> = ranges.iter()
+                .filter(|r| r.is_explicit_close)
+                .collect();
+
+            if !explicit_ranges.is_empty() {
+                // If there are explicit ranges, only keep the first explicit one
+                self.ranges.push(explicit_ranges[0].clone());
+            } else {
+                // If no explicit ranges, keep all ranges in the group
+                self.ranges.extend(ranges.iter().cloned());
+            }
+        }
+
+        // Sort ranges by start_chronology_id for consistent ordering
+        self.ranges.sort_by_key(|r| r.start_chronology_id);
+    }
+
     pub(crate) fn calculate_nesting_depths(&mut self) {
         // For each path, count how many other paths are fully contained within it
+        self.ranges.sort_by(|a, b| {
+            if a.elements.len() > b.elements.len() {
+                Ordering::Greater
+            } else if a.elements.len() < b.elements.len() {
+                Ordering::Less
+            } else {
+                Ordering::Equal
+            }
+        });
         for i in 0..self.ranges.len() {
             let mut max_contained_depth = 0;
             let parent_path = &self.ranges[i].path;
 
+            // compare path with all other paths
             for j in 0..self.ranges.len() {
+
+                // skip the same path
                 if i != j {
+
                     let child_path = &self.ranges[j].path;
 
                     // Check if child_path is completely contained within parent_path

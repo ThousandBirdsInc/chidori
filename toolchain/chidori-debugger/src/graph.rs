@@ -728,7 +728,7 @@ fn save_image_to_png(image: &Image) {
 }
 
 fn generate_noodle_path(elements: &[ElementDimensions], noodle_width: f32, nesting_depth: usize) -> (Path, Vec<ControlPoint>) {
-    let left_offset = nesting_depth as f32 * -30.0 - 30.0;
+    let left_offset = nesting_depth as f32 * noodle_width * -6.0 - 30.0;
     let mut path_builder = PathBuilder::new();
     let mut all_points = Vec::new();
 
@@ -984,7 +984,7 @@ fn generate_contour_path_for_range(range: &StateRange) -> (Path, Vec<ControlPoin
         return (PathBuilder::new().build(), Vec::new());
     }
 
-    generate_noodle_path(&range.elements, 10.0, range.nesting_depth)
+    generate_noodle_path(&range.elements, 3.0, range.nesting_depth)
 }
 
 
@@ -1057,6 +1057,7 @@ fn render_graph_grouping(
         }
     }
 
+    collector.remove_implicitly_ended_ranges();
     collector.calculate_nesting_depths();
 
     let mut existing_ranges: HashSet<_> = range_id_to_entity_id.keys().cloned().collect();
@@ -1439,7 +1440,7 @@ fn egui_graph_node(
                             ui.label("Eval Failure");
                         }
                         EnclosedState::Open => {
-                            ui.set_min_width(1000.0);
+                            ui.set_min_width(800.0);
                             ui.label("Executing");
                             egui_execution_state(
                                 ui,
@@ -1451,6 +1452,7 @@ fn egui_graph_node(
                             for (_, value) in state.state.iter() {
                                 let image_paths = crate::util::find_matching_strings(&value.output.clone().unwrap(), r"(?i)\.(png|jpe?g)$");
                                 for (img_path, _) in image_paths {
+                                    // TODO: cache this based on node and the path
                                     let texture = if let Some(cached_texture) = node_image_texture_cache.get(&img_path) {
                                         cached_texture.clone()
                                     } else {
@@ -1555,7 +1557,7 @@ fn generate_tree_layout(
     let mut topo = petgraph::visit::Topo::new(&execution_graph);
     while let Some(x) = topo.next(&execution_graph) {
         if let Some(node) = &execution_graph.node_weight(x) {
-            let dims = node_dimensions.entry(**node).or_insert((1000.0, 300.0));
+            let dims = node_dimensions.entry(**node).or_insert((800.0, 300.0));
             let mut width = dims.0;
             let mut height = dims.1;
             let tree_node = crate::tidy_tree::Node::new(x.index(), (width) as f64, (height) as f64, Some(Orientation::Vertical));

@@ -203,11 +203,6 @@ impl ChidoriRuntimeInstance {
             UserInteractionMessage::ReloadCells => {
                 self.reload_cells().await?;
             },
-            UserInteractionMessage::FetchStateAt(id) => {
-                let state = self.db.get_state_at_id(id).unwrap();
-                let sender = self.runtime_event_sender.as_mut().unwrap();
-                sender.send(EventsFromRuntime::StateAtId(id, state)).unwrap();
-            },
             UserInteractionMessage::RevertToState(id) => {
                 if let Some(id) = id {
                     self.execution_head_state_id = id;
@@ -276,6 +271,7 @@ impl ChidoriRuntimeInstance {
         Ok(state)
     }
 
+    #[cfg(test)]
     pub fn get_state_at_current_execution_head(&self) -> ExecutionState {
         self.db.get_state_at_id(self.execution_head_state_id).unwrap()
     }
@@ -348,7 +344,6 @@ pub enum UserInteractionMessage {
     SetPlaybackState(PlaybackState),
     RevertToState(Option<ExecutionNodeId>),
     ReloadCells,
-    FetchStateAt(ExecutionNodeId),
     MutateCell(CellHolder),
     Shutdown,
     PushChatMessage(String),

@@ -469,11 +469,10 @@ impl ExecutionState {
         operation_node.name.as_ref()
             .and_then(|name| s.operation_name_to_id.get(name).copied())
             .unwrap_or_else(|| {
-                let new_id = Uuid::now_v7();
                 if let Some(name) = &operation_node.name {
                     s.operation_name_to_id.insert(name.clone(), op_id);
                 }
-                new_id
+                op_id
             });
         operation_node.id = op_id;
         s.cells_by_id.insert(op_id, operation_node.cell.clone());

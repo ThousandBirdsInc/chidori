@@ -201,8 +201,7 @@ impl ExecutionGraph {
     }
 
     pub fn get_state_at_id(&self, id: ExecutionNodeId) -> Option<ExecutionState> {
-        let state_id_to_state = self.execution_node_id_to_state.clone();
-        state_id_to_state.get(&id).map(|x| x.clone())
+        self.execution_node_id_to_state.get(&id).map(|x| x.clone())
     }
 
     /// Performs a depth first traversal of the execution graph to resolve the combined
