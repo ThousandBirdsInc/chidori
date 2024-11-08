@@ -1299,7 +1299,7 @@ fn update_graph_system_renderer(
 
                     let used_rect = ctx.used_rect();
                     let height = used_rect.height();
-                    graph_resource.node_dimensions.insert(*node.clone(), (1000.0, height));
+                    graph_resource.node_dimensions.insert(*node.clone(), (800.0, height));
                     flag_layout_is_dirtied = true;
                     transform.scale = vec3(width, height, 1.0);
                 }
@@ -1380,9 +1380,8 @@ fn egui_graph_node(
         let mut frame = egui::Frame::default().fill(current_theme.theme.card).stroke(current_theme.theme.card_border)
             .inner_margin(16.0).rounding(6.0).begin(ui);
         {
-            ui.set_min_width(800.0);
-            ui.set_max_width(800.0);
             let mut ui = &mut frame.content_ui;
+            ui.set_width(800.0);
             let node1 = *node;
             let original_style = (*ui.ctx().style()).clone();
 
@@ -1393,7 +1392,6 @@ fn egui_graph_node(
 
             if *node1 == chidori_core::uuid::Uuid::nil() {
                 ui.horizontal(|ui| {
-                    ui.label("Initialization...");
                     if chidori_state.debug_mode {
                         ui.label(node1.to_string());
                     }
@@ -1440,8 +1438,6 @@ fn egui_graph_node(
                             ui.label("Eval Failure");
                         }
                         EnclosedState::Open => {
-                            ui.set_min_width(800.0);
-                            ui.label("Executing");
                             egui_execution_state(
                                 ui,
                                 &mut chidori_state,
