@@ -339,24 +339,24 @@ fn render_template_cell(
 }
 
 fn render_operation_output(execution_state: &ChidoriState, op_id: &&OperationId, ui: &mut Ui) {
-    if let Some(state) = &execution_state.merged_state_history {
-        if let Some((exec_id, o)) = state.0.get(op_id) {
-            if ui.button(format!("View Most Recent Execution")).clicked() {
-                // TODO: move visualized head of graph to this point
-            }
-            if ui.button(format!("Revert To Most Recent Execution")).clicked() {}
-            ui.push_id((exec_id, op_id), |ui| {
-                ui.collapsing("Output", |ui| {
-                    let response = JsonTree::new(format!("{} {} values", exec_id, op_id), &serialized_value_to_json_value(&o.output.clone().unwrap()))
-                        .show(ui);
-                });
-                ui.collapsing("Logs", |ui| {
-                    egui_logs(ui, &o.stdout);
-                    egui_logs(ui, &o.stderr);
-                });
-            });
-        }
-    }
+    // if let Some(state) = &execution_state.merged_state_history {
+    //     if let Some((exec_id, o)) = state.0.get(op_id) {
+    //         if ui.button(format!("View Most Recent Execution")).clicked() {
+    //             // TODO: move visualized head of graph to this point
+    //         }
+    //         if ui.button(format!("Revert To Most Recent Execution")).clicked() {}
+    //         ui.push_id((exec_id, op_id), |ui| {
+    //             ui.collapsing("Output", |ui| {
+    //                 let response = JsonTree::new(format!("{} {} values", exec_id, op_id), &serialized_value_to_json_value(&o.output.clone().unwrap()))
+    //                     .show(ui);
+    //             });
+    //             ui.collapsing("Logs", |ui| {
+    //                 egui_logs(ui, &o.stdout);
+    //                 egui_logs(ui, &o.stderr);
+    //             });
+    //         });
+    //     }
+    // }
 }
 
 

@@ -76,7 +76,6 @@ pub struct ExecutionGraph {
     execution_state_sender: Sender<ExecutionState>,
     execution_state_receiver: Option<tokio::sync::mpsc::Receiver<ExecutionState>>,
 
-    // TODO: move to just using the digraph for this
     pub(crate) execution_node_id_to_state: Arc<DashMap<ExecutionNodeId, ExecutionState>>,
 
     pub execution_depth_orchestration_handle: tokio::task::JoinHandle<()>,
@@ -206,35 +205,35 @@ impl ExecutionGraph {
 
     /// Performs a depth first traversal of the execution graph to resolve the combined
     /// state at a given node.
-    #[tracing::instrument]
-    pub fn get_merged_state_history(&self, endpoint: &ExecutionNodeId) -> MergedStateHistory {
-        println!("Getting merged state history for id {:?}", &endpoint);
-        let execution_graph = self.execution_graph.lock();
-        let graph = execution_graph.as_ref().unwrap();
-        let mut dfs = Dfs::new(graph.deref(), endpoint.clone());
-        let root = Uuid::nil();
-        let mut queue = vec![endpoint.clone()];
-        while let Some(node) = dfs.next(graph.deref()) {
-            if node == root {
-                break;
-            }
-            for predecessor in graph.neighbors_directed(node, Direction::Incoming) {
-                if !dfs.discovered.is_visited(&predecessor) {
-                    queue.push(predecessor);
-                    dfs.stack.push(predecessor);
-                }
-            }
-        }
-
-        let mut merged_state = HashMap::new();
-        for predecessor in queue {
-            let state = self.get_state_at_id(predecessor).unwrap();
-            for (k, v) in state.state.iter() {
-                merged_state.insert(*k, (predecessor, v.clone()));
-            }
-        }
-        MergedStateHistory(merged_state)
-    }
+    // #[tracing::instrument]
+    // pub fn get_merged_state_history(&self, endpoint: &ExecutionNodeId) -> MergedStateHistory {
+    //     println!("Getting merged state history for id {:?}", &endpoint);
+    //     let execution_graph = self.execution_graph.lock();
+    //     let graph = execution_graph.as_ref().unwrap();
+    //     let mut dfs = Dfs::new(graph.deref(), endpoint.clone());
+    //     let root = Uuid::nil();
+    //     let mut queue = vec![endpoint.clone()];
+    //     while let Some(node) = dfs.next(graph.deref()) {
+    //         if node == root {
+    //             break;
+    //         }
+    //         for predecessor in graph.neighbors_directed(node, Direction::Incoming) {
+    //             if !dfs.discovered.is_visited(&predecessor) {
+    //                 queue.push(predecessor);
+    //                 dfs.stack.push(predecessor);
+    //             }
+    //         }
+    //     }
+    //
+    //     let mut merged_state = HashMap::new();
+    //     for predecessor in queue {
+    //         let state = self.get_state_at_id(predecessor).unwrap();
+    //         for (k, v) in state.state.iter() {
+    //             merged_state.insert(*k, (predecessor, v.clone()));
+    //         }
+    //     }
+    //     MergedStateHistory(merged_state)
+    // }
 
     #[tracing::instrument]
     pub async fn push_message(

@@ -6,6 +6,7 @@ use std::fmt;
 use uuid::Uuid;
 use std::time::Duration;
 use anyhow::anyhow;
+use dashmap::mapref::one::Ref;
 use crate::cells::CellTypes;
 use crate::execution::execution::execution_graph::{ExecutionGraph, ExecutionNodeId};
 use crate::execution::execution::execution_state::{EnclosedState};
@@ -145,7 +146,6 @@ impl ChidoriRuntimeInstance {
             }
 
             {
-                let state = self.get_state_at_current_execution_head_result()?;
                 if matches!(self.playback_state, PlaybackState::Paused) {
                     continue;
                 }
@@ -164,6 +164,7 @@ impl ChidoriRuntimeInstance {
                     // Spawn the progression of the given step in a separate task
                     let executing_states = Arc::clone(&executing_states);
                     let error_tx = error_tx.clone();
+                    let state = self.get_state_at_current_execution_head_result()?.clone();
                     tokio::spawn(async move {
                         let result = state.step_execution().await;
                         match result {
@@ -206,9 +207,9 @@ impl ChidoriRuntimeInstance {
             UserInteractionMessage::RevertToState(id) => {
                 if let Some(id) = id {
                     self.execution_head_state_id = id;
-                    let merged_state = self.db.get_merged_state_history(&id);
                     let sender = self.runtime_event_sender.as_mut().unwrap();
-                    sender.send(EventsFromRuntime::ExecutionStateChange(merged_state)).unwrap();
+                    // let merged_state = self.db.get_merged_state_history(&id);
+                    // sender.send(EventsFromRuntime::ExecutionStateChange(merged_state)).unwrap();
                     sender.send(EventsFromRuntime::UpdateExecutionHead(id)).unwrap();
 
                     if let Some(state) = self.db.get_state_at_id(self.execution_head_state_id) {
@@ -263,8 +264,10 @@ impl ChidoriRuntimeInstance {
         Ok(())
     }
 
-    pub fn get_state_at_current_execution_head_result(&self) -> anyhow::Result<ExecutionState> {
-        let state = if let Some(state) = self.db.get_state_at_id(self.execution_head_state_id) { state } else {
+    pub fn get_state_at_current_execution_head_result(&self) -> anyhow::Result<Ref<ExecutionNodeId, ExecutionState>> {
+        let state = if let Some(state) = self.db.execution_node_id_to_state.get(&self.execution_head_state_id) {
+            state
+        } else {
             println!("failed to get state for the target id {:?}", self.execution_head_state_id);
             return Err(anyhow::format_err!("failed to get state for the target id {:?}", self.execution_head_state_id));
         };
@@ -307,7 +310,7 @@ impl ChidoriRuntimeInstance {
             }
             sender.send(EventsFromRuntime::ExecutionStateCellsViewUpdated(cells)).unwrap();
             sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
-            sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
+            // sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
         }
     }
 
@@ -316,8 +319,10 @@ impl ChidoriRuntimeInstance {
     pub async fn step(&mut self) -> anyhow::Result<Vec<(OperationId, OperationFnOutput)>> {
         let exec_head = self.execution_head_state_id;
         println!("======================= Executing state with id {:?} ======================", &exec_head);
-        let state = self.get_state_at_current_execution_head_result()?;
-        let (state, outputs) = state.step_execution().await?;
+        let (state, outputs) = {
+            let state = self.get_state_at_current_execution_head_result()?;
+            state.step_execution().await?
+        };
         self.push_update_to_client(&state);
         self.set_execution_head(&state);
         Ok(outputs)
@@ -326,8 +331,11 @@ impl ChidoriRuntimeInstance {
     /// Add a cell into the execution graph
     #[tracing::instrument]
     pub async fn upsert_cell(&mut self, cell: CellTypes, op_id: OperationId) -> anyhow::Result<(ExecutionNodeId, OperationId)> {
-        let state = self.get_state_at_current_execution_head_result()?;
-        let (final_state, op_id2) = state.update_operation(cell, op_id).await?;
+        let (final_state, op_id2) = {
+            let state = self.get_state_at_current_execution_head_result()?;
+            let (final_state, op_id2) = state.update_operation(cell, op_id).await?;
+            (final_state, op_id2)
+        };
         println!("Capturing final_state of the mutate graph operation parent {:?}, id {:?}", final_state.parent_state_chronology_id, final_state.chronology_id);
         let ((state_id, state), op_id) = ((final_state.chronology_id.clone(), final_state.clone()), op_id2);
         self.push_update_to_client(&state);

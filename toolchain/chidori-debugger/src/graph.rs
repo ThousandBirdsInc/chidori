@@ -1101,6 +1101,12 @@ fn render_graph_grouping(
     }
 }
 
+#[derive(Default)]
+struct NodeResourcesCache {
+    matched_strings_in_resource: HashMap<ChronologyId, Vec<(String, Vec<String>)>>,
+    image_texture_cache: HashMap<String, egui::TextureHandle>
+}
+
 
 fn update_graph_system_renderer(
     q_window: Query<&Window, With<PrimaryWindow>>,
@@ -1123,7 +1129,7 @@ fn update_graph_system_renderer(
     mut meshes: ResMut<Assets<Mesh>>,
     mut chidori_state: ResMut<ChidoriState>,
     mut node_index_to_entity: Local<HashMap<usize, Entity>>,
-    mut node_image_texture_cache: Local<HashMap<String, egui::TextureHandle>>,
+    mut node_resources_cache: Local<NodeResourcesCache>,
 ) {
     // TODO: something in this logic is affecting the trace rendering
     if !graph_resource.is_active {
@@ -1295,7 +1301,7 @@ fn update_graph_system_renderer(
                     transform.translation = transform.translation.lerp(Vec3::new(n.x.to_f32().unwrap(), -n.y.to_f32().unwrap(), -1.0), 0.5);
 
                     // Draw text within these elements
-                    egui_graph_node(&current_theme, &mut chidori_state, &mut node_image_texture_cache, node, entity, ctx);
+                    egui_graph_node(&current_theme, &mut chidori_state, &mut node_resources_cache, node, entity, ctx);
 
                     let used_rect = ctx.used_rect();
                     let height = used_rect.height();
@@ -1369,7 +1375,7 @@ fn update_graph_system_renderer(
 fn egui_graph_node(
     current_theme: &Res<CurrentTheme>,
     mut chidori_state: &mut ResMut<ChidoriState>,
-    mut node_image_texture_cache: &mut HashMap<String, TextureHandle>,
+    mut node_resources_cache: &mut NodeResourcesCache,
     node: &&ChronologyId,
     entity: Entity,
     ctx: &mut Context
@@ -1445,21 +1451,23 @@ fn egui_graph_node(
                         }
                         EnclosedState::SelfContained | EnclosedState::Close(CloseReason::Complete) => {
                             egui_execution_state(ui, &mut chidori_state, state, &current_theme.theme);
-                            for (_, value) in state.state.iter() {
-                                let image_paths = crate::util::find_matching_strings(&value.output.clone().unwrap(), r"(?i)\.(png|jpe?g)$");
-                                for (img_path, _) in image_paths {
-                                    // TODO: cache this based on node and the path
-                                    let texture = if let Some(cached_texture) = node_image_texture_cache.get(&img_path) {
-                                        cached_texture.clone()
-                                    } else {
-                                        let texture = read_image(ui, &img_path);
-                                        node_image_texture_cache.insert(img_path.clone(), texture.clone());
-                                        texture
-                                    };
+                            let image_paths = node_resources_cache.matched_strings_in_resource.entry(*node1).or_insert_with(|| {
+                                state.state.iter().map(|(_, value)| {
+                                    crate::util::find_matching_strings(&value.output.clone().unwrap(), r"(?i)\.(png|jpe?g)$")
+                                }).flatten().collect()
+                            });
+                            for (img_path ,_) in image_paths {
+                                // TODO: cache this based on node and the path
+                                let texture = if let Some(cached_texture) = node_resources_cache.image_texture_cache.get(img_path) {
+                                    cached_texture.clone()
+                                } else {
+                                    let texture = read_image(ui, &img_path);
+                                    node_resources_cache.image_texture_cache.insert(img_path.clone(), texture.clone());
+                                    texture
+                                };
 
-                                    // Display the image
-                                    ui.add(egui::Image::new(&texture));
-                                }
+                                // Display the image
+                                ui.add(egui::Image::new(&texture));
                             }
                         }
                     }
