@@ -1,5 +1,7 @@
 use std::fmt;
-use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, MutexGuard};
+
+use no_deadlocks::Mutex;
 use uuid::Uuid;
 use std::sync::mpsc::Sender;
 use tracing::dispatcher::DefaultGuard;

@@ -115,7 +115,7 @@ async fn main() -> anyhow::Result<()>{
         //     // Add your deployment logic here
         // }
         None => {
-            println!("No command was used");
+            info!("No command was used");
             Ok(())
         }
     }

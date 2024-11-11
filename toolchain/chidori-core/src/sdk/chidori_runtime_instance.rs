@@ -1,12 +1,14 @@
 use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use tokio::sync::mpsc::Receiver as TokioReceiver;
+use no_deadlocks::Mutex;
 use std::fmt;
 use uuid::Uuid;
 use std::time::Duration;
 use anyhow::anyhow;
 use dashmap::mapref::one::Ref;
+use tracing::{debug, info};
 use crate::cells::CellTypes;
 use crate::execution::execution::execution_graph::{ExecutionGraph, ExecutionNodeId};
 use crate::execution::execution::execution_state::{EnclosedState};
@@ -62,7 +64,7 @@ impl ChidoriRuntimeInstance {
     // TODO: reload_cells needs to diff the mutations that live on the current branch, with the state
     //       that we see in the shared state when this event is fired.
     pub async fn reload_cells(&mut self) -> anyhow::Result<()> {
-        println!("Reloading cells");
+        debug!("Reloading cells");
         let cells_to_upsert: Vec<_> = {
             let shared_state = self.shared_state.lock().unwrap();
             shared_state.editor_cells.values().map(|cell| cell.clone()).collect()
@@ -97,14 +99,14 @@ impl ChidoriRuntimeInstance {
     }
 
     pub async fn shutdown(&mut self) {
-        println!("Shutting down Chidori runtime.");
+        info!("Shutting down Chidori runtime.");
         self.db.shutdown().await;
     }
 
 
     // #[tracing::instrument]
     pub async fn wait_until_ready(&mut self) -> anyhow::Result<()> {
-        println!("Awaiting initialization of the execution coordinator");
+        info!("Awaiting initialization of the execution coordinator");
         self.db.execution_depth_orchestration_initialized_notify.notified().await;
         Ok(())
     }
@@ -119,7 +121,7 @@ impl ChidoriRuntimeInstance {
         // Reload cells to make sure we're up-to-date
         self.reload_cells().await?;
 
-        let executing_states = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+        let executing_states = Arc::new(Mutex::new(HashSet::new()));
         // Create a channel for error notifications
         let (error_tx, mut error_rx) = tokio::sync::mpsc::channel(32);
 
@@ -140,7 +142,7 @@ impl ChidoriRuntimeInstance {
 
             // Receives the results of execution during progression of ExecutionStates
             if let Ok(state) = self.rx_execution_states.try_recv() {
-                println!("InstancedEnvironment received an execution event {:?}", &state);
+                println!("InstancedEnvironment received an execution event {:?}", &state.chronology_id);
                 self.push_update_to_client(&state);
                 self.set_execution_head(&state);
             }
@@ -155,7 +157,7 @@ impl ChidoriRuntimeInstance {
                 let execution_head_state_id = self.execution_head_state_id;
 
                 // Acquire lock and check if we're already executing this state
-                let mut executing_states_instance = executing_states.lock().await;
+                let mut executing_states_instance = executing_states.lock().unwrap();
                 if !executing_states_instance.contains(&execution_head_state_id) {
                     println!("Will eval step, inserting eval state {:?}", &execution_head_state_id);
                     executing_states_instance.insert(execution_head_state_id);
@@ -165,23 +167,32 @@ impl ChidoriRuntimeInstance {
                     let executing_states = Arc::clone(&executing_states);
                     let error_tx = error_tx.clone();
                     let state = self.get_state_at_current_execution_head_result()?.clone();
-                    tokio::spawn(async move {
-                        let result = state.step_execution().await;
-                        match result {
-                            Ok(_) => {
-                                // Handle successful execution
-                                executing_states.lock().await.remove(&execution_head_state_id);
-                            },
-                            Err(err) => {
-                                // Ensure we clean up the execution state
-                                executing_states.lock().await.remove(&execution_head_state_id);
-                                // Send the error through the channel
-                                if let Err(send_err) = error_tx.send(err).await {
-                                    eprintln!("Failed to send error through channel: {:?}", send_err);
-                                }
 
+                    std::thread::spawn(move || {
+                        // Create a new tokio runtime for this thread
+                        let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
+                        // Enter the runtime context
+                        let _guard = runtime.enter();
+
+                        // Execute the async block on this runtime
+                        runtime.block_on(async {
+                            let result = state.step_execution().await;
+                            // Clear execution
+                            let mut executing_states_lock = executing_states.lock().unwrap();
+                            executing_states_lock.remove(&execution_head_state_id);
+                            drop(executing_states_lock);
+
+                            match result {
+                                Err(err) => {
+                                    // Send the error through the channel
+                                    if let Err(send_err) = error_tx.send(err).await {
+                                        eprintln!("Failed to send error through channel: {:?}", send_err);
+                                    }
+                                }
+                                Ok(_) => {},
                             }
-                        }
+                        });
                     });
                 }
             }
@@ -280,7 +291,7 @@ impl ChidoriRuntimeInstance {
     }
 
     fn set_execution_head(&mut self, state: &ExecutionState) {
-        println!("Setting execution head");
+        debug!("Setting execution head to {:?}", state.chronology_id);
         // Execution heads can only be Completed states, not states still evaluating
         if matches!(&state.evaluating_enclosed_state, EnclosedState::Close(_)) || (&state).evaluating_enclosed_state == EnclosedState::SelfContained {
             if state.evaluating_fn.is_none() {
@@ -296,7 +307,7 @@ impl ChidoriRuntimeInstance {
 
     fn push_update_to_client(&mut self, state: &ExecutionState) {
         let state_id = state.chronology_id;
-        println!("Resulted in state with id {:?}, {:?}", &state_id, &state);
+        println!("Resulted in state with id {:?}", &state_id);
         if let Some(sender) = self.runtime_event_sender.as_mut() {
             sender.send(EventsFromRuntime::DefinitionGraphUpdated(state.get_dependency_graph_flattened())).unwrap();
             let mut cells = vec![];

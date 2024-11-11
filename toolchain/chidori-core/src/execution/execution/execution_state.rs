@@ -24,6 +24,7 @@ use anyhow::Error;
 use tokio::sync::oneshot;
 use futures_util::FutureExt;
 use tokio::sync::oneshot::error::TryRecvError;
+use tracing::debug;
 use uuid::Uuid;
 use crate::cells::{CellTypes, CodeCell, LLMPromptCell};
 use crate::execution::execution::execution_graph::{ExecutionGraphSendPayload, ExecutionNodeId, ChronologyId};
@@ -173,7 +174,7 @@ pub struct ExecutionState {
 
 impl std::fmt::Debug for ExecutionState {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(&render_map_as_table(self))
+        f.write_str(&self.chronology_id.to_string())
     }
 }
 
@@ -545,7 +546,7 @@ impl ExecutionState {
     // TODO: this should create a coroutine that yields with the result of the function invocation
     #[tracing::instrument(parent = parent_span_id.clone(), skip(self, payload))]
     pub async fn dispatch(&self, function_name: &str, payload: RkyvSerializedValue, parent_span_id: Option<tracing::Id>) -> anyhow::Result<(Result<RkyvSerializedValue, ExecutionStateErrors>, ExecutionState)> {
-        println!("Running dispatch {:?}", function_name);
+        debug!("Running dispatch {:?}", function_name);
 
         // Store the invocation payload into an execution state and record this before executing
         let mut before_execution_state = self.create_new_revision_of_execution_state();
@@ -614,9 +615,9 @@ impl ExecutionState {
         if let Some(graph_sender) = self.graph_sender.as_ref() {
             let (oneshot_sender, mut oneshot_receiver) = tokio::sync::oneshot::channel();
             graph_sender.send((execution_state.clone(), Some(oneshot_sender))).await.expect("Failed to send oneshot signal to the graph receiver");
-            println!("============= should pause {:?} {:?} =============", &execution_state.chronology_id, &(&execution_state.evaluating_fn));
+            debug!("============= should pause {:?} {:?} =============", &execution_state.chronology_id, &(&execution_state.evaluating_fn));
             let _recv = oneshot_receiver.await.expect("Failed to receive oneshot signal");
-            println!("============= should resume {:?} {:?} =============", &execution_state.chronology_id, &(&execution_state.evaluating_fn));
+            debug!("============= should resume {:?} {:?} =============", &execution_state.chronology_id, &(&execution_state.evaluating_fn));
         }
     }
 
@@ -685,7 +686,7 @@ impl ExecutionState {
         let mut count_loops = 0;
 
         loop {
-            println!("looping {:?} {:?}", self.exec_queue, count_loops);
+            debug!("Looping through queue of executable cells {:?} {:?}", self.exec_queue, count_loops);
 
             if count_loops >= operation_count * 2 {
                 return Err(Error::msg("Looped through all operations without detecting an execution"));
@@ -737,6 +738,7 @@ impl ExecutionState {
     pub async fn step_execution(
         &self,
     ) -> anyhow::Result<(ExecutionState, Vec<(OperationId, OperationFnOutput)>)> {
+        debug!("Running step_execution for state {:?}", self.chronology_id);
         // 1. Initialize state and prepare for execution
         let mut before_execution_state = self.determine_next_operation()?;
         let operation_id = before_execution_state.evaluating_operation_id.clone();

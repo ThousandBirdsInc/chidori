@@ -131,7 +131,6 @@ impl<S> Layer<S> for CustomLayer
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        dbg!(&event);
         // Process events here
         self.sender.send(TraceEvents::Event).unwrap();
     }

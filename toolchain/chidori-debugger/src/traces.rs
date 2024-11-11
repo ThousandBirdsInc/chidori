@@ -563,8 +563,8 @@ fn maintain_call_tree(
     mut traces: ResMut<ChidoriState>,
     mut call_tree: ResMut<TracesCallTree>,
 ) {
-    let tree = build_call_tree(traces.trace_events.clone(), false);
-    call_tree.inner = tree;
+    // let tree = build_call_tree(traces.trace_events.clone(), false);
+    // call_tree.inner = tree;
 }
 
 fn update_positions(

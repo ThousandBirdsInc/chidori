@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::env;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use tracing::debug;
 use uuid::Uuid;
 use chidori_prompt_format::templating::templates::{ChatModelRoles, TemplateWithSource};
 use crate::cells::{LLMCodeGenCellChatConfiguration, LLMPromptCellChatConfiguration, TextRange};
@@ -320,7 +321,7 @@ pub async fn ai_llm_run_chat_model(
     is_function_invocation: bool,
     configuration: LLMPromptCellChatConfiguration
 ) -> anyhow::Result<(Result<RkyvSerializedValue, ExecutionStateErrors>, Option<ExecutionState>)> {
-    println!("Executing ai_llm_run_chat_model");
+    debug!("Executing ai_llm_run_chat_model");
     let mut template_messages: Vec<TemplateMessage> = Vec::new();
     let data = template_data_payload_from_rkyv(&payload);
 
@@ -352,8 +353,6 @@ pub async fn ai_llm_run_chat_model(
             Some(tools)
         },
     }).await;
-
-    println!("Completed chat model execution {:?}", result);
 
     if let Err(e) = result {
         return Ok((Result::Err(ExecutionStateErrors::AnyhowError(e)), None))

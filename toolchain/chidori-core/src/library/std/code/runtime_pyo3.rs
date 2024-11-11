@@ -310,7 +310,7 @@ pub async fn source_code_run_python(
     // Capture the current span's ID
     let current_span_id = Span::current().id();
 
-    println!("Invoking source_code_run_python");
+    debug!("Invoking source_code_run_python");
 
     let exec_id = increment_source_code_run_counter();
 
