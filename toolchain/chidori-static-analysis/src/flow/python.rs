@@ -1,15 +1,44 @@
+/// This slices python code into executable units that are useful to handle state checkpointing against:
+/// - The bodies of while and for loops are split out into function calls
+/// - If statements are split into individual branches and the evaluation of their condition
+/// - Function definitions are hoisted to the top level
+/// - Try/except blocks are split into protected and handler sections
+
+/// This also injects statements that keep track of our execution stack during evaluation and for jumping to
+/// the appropriate point in execution when we restore from a stored execution state
+
+
+/// This is primarily performed by hoisting statements into functions and then executing a chain of those.
+/// We want a series of functions to execute in a linear manner, so that we can keep track of where
+/// in the stack of functions we've reached and skip there on resuming execution.
+///     - While bodies are extracted into functions
+///     - If/elif/else branches become separate functions
+///     - Try blocks and their exception handlers become separate functions
+///     - Function definitions are moved to module scope
+///     - Complex expressions are broken down into simpler statements
+///     - Each function maintains its own local state
+///     - Control flow between functions is managed by a state machine
+///     - State checkpoints can be created at any function boundary
+///     - Execution can be resumed from any checkpoint by restoring state and jumping
+
+/// The transformation preserves:
+///     - Program semantics and behavior
+///     - Variable scope and visibility rules
+///     - Exception handling semantics
+///     - Iterator and generator behavior
+///     - Function and class definitions
+
+/// Implementation notes:
+///     - Each extracted function receives necessary context as parameters
+///     - State is passed explicitly between functions
+///     - Stack trace and debugging information is preserved
+///     - Performance overhead is minimized by only splitting at control flow boundaries
+///     - Generated code remains readable and debuggable
 use ruff_python_ast::{Expr, Operator, Stmt, StmtClassDef, StmtFunctionDef};
 use ruff_python_ast::{str::Quote, Mod, ModModule};
 use ruff_python_parser::{self, parse_module, Mode, ParseError};
 use ruff_source_file::LineEnding;
 use crate::ruff_python_codegen::{Generator, Stylist};
-
-/// This slices python code into executable units that are useful to handle state checkpointing against:
-/// - The body of while and for loops are split out into function calls
-/// - If statements are split into individual branches and the evaluation of their condition
-
-/// This also injects statements that keep track of our execution stack during evaluation and for jumping to
-/// the appropriate point in execution when we restore from a stored execution state
 
 
 fn handle_expr(expr: Expr) {

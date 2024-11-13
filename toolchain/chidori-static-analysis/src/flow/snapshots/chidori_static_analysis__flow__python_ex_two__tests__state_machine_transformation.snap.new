@@ -1,0 +1,65 @@
+---
+source: chidori-static-analysis/src/flow/python_ex_two.rs
+assertion_line: 1114
+description: "\ndef example():\n    x = 1\n    while x < 10:\n        x += 1\n    if x > 5:\n        print(\"big\")\n    else:\n        print(\"small\")\n"
+---
+_state_0 = 0
+
+
+def example():
+    if _state_0 == 0:
+        _state_0 = 0
+    x = 1
+    if _state_0 == 0:
+        create_checkpoint()
+        _state_0 = 2
+    if _state_0 == 1:
+        while_controller(x < 10, while_body_0)
+        _state_0 = 2
+    if _state_0 == 2:
+        create_checkpoint()
+        _state_0 = 4
+    if _state_0 == 3:
+        if_chain_controller(x > 5, if_then_1, else_2)
+        _state_0 = 4
+    return
+
+
+_state_2 = 0
+
+
+def while_body_0(x):
+    if _state_2 == 0:
+        _state_2 = 0
+    x += 1
+    return
+
+
+_state_3 = 0
+
+
+def if_then_1():
+    if _state_3 == 0:
+        _state_3 = 0
+    print("big")
+    return
+
+
+_state_4 = 0
+
+
+def else_2():
+    if _state_4 == 0:
+        _state_4 = 0
+    print("small")
+    return
+
+
+def example():
+    x = 1
+    while x < 10:
+        x += 1
+    if x > 5:
+        print("big")
+    else:
+        print("small")

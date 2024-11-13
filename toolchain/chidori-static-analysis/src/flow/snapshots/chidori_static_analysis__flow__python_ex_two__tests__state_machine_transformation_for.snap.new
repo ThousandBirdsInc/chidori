@@ -1,0 +1,13 @@
+---
+source: chidori-static-analysis/src/flow/python_ex_two.rs
+assertion_line: 1145
+description: "\ndef example():\n    for i in range(5):\n        print(i)\n"
+---
+_state_0 = 0
+if _state_0 == 0:
+    create_checkpoint()
+    _state_0 = 2
+_iterator = iter(range(5))
+if _state_0 == 1:
+    for_controller(_iterator, i, for_body_0)
+    _state_0 = 2

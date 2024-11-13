@@ -1,0 +1,34 @@
+---
+source: chidori-static-analysis/src/flow/python_ex_two.rs
+assertion_line: 788
+description: "\ndef example():\n    for i in range(3):\n        for j in range(2):\n            print(i, j)\n"
+---
+def example():
+    if _state == 0:
+        create_checkpoint()
+        _state = 2
+
+    def for_body_0():
+        if _state == 2:
+            create_checkpoint()
+            _state = 4
+
+        def for_body_1():
+            print(i, j)
+        _iterator = iter(range(2))
+        if _state == 3:
+            for_controller(_iterator, j, for_body_1)
+            _state = 4
+    _iterator = iter(range(3))
+    if _state == 1:
+        for_controller(_iterator, i, for_body_0)
+        _state = 2
+
+
+_state = 0
+
+
+def example():
+    for i in range(3):
+        for j in range(2):
+            print(i, j)
