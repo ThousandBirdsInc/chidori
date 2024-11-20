@@ -20,6 +20,7 @@ mod tree_grouping;
 mod json_editor;
 mod vim_text_edit;
 mod graph_range_collector;
+mod text_editing;
 
 use crate::bevy_egui::{egui, EguiContexts, EguiPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;

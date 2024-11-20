@@ -63,40 +63,32 @@ impl ChidoriRuntimeInstance {
 
     // TODO: reload_cells needs to diff the mutations that live on the current branch, with the state
     //       that we see in the shared state when this event is fired.
-    pub async fn reload_cells(&mut self) -> anyhow::Result<()> {
-        debug!("Reloading cells");
-        let cells_to_upsert: Vec<_> = {
-            let shared_state = self.shared_state.lock().unwrap();
-            shared_state.editor_cells.values().map(|cell| cell.clone()).collect()
-        };
+    pub async fn upsert_cells(&mut self, cells: Vec<CellHolder>) -> anyhow::Result<()> {
+        debug!("Upserting {} cells", cells.len());
+        // let cells_to_upsert: Vec<_> = {
+        //     let shared_state = self.shared_state.lock().unwrap();
+        //     shared_state.editor_cells.values().map(|cell| cell.clone()).collect()
+        // };
 
         // unlock shared_state
-        let mut ids = vec![];
-        for cell_holder in cells_to_upsert {
-            if cell_holder.needs_update {
-                ids.push((self.upsert_cell(cell_holder.cell.clone(), cell_holder.op_id).await?, cell_holder));
-            } else {
-                // TODO: remove these unwraps and handle this better
-                ids.push(((cell_holder.applied_at.unwrap(), cell_holder.op_id), cell_holder));
-            }
+        for cell_holder in cells {
+            self.upsert_cell(cell_holder.cell.clone(), cell_holder.op_id).await?;
         }
 
         // lock again and update
-        let mut shared_state = self.shared_state.lock().unwrap();
-        for ((applied_at, op_id), cell_holder) in ids {
-            shared_state.editor_cells.insert(op_id, cell_holder);
-            shared_state.editor_cells.entry(op_id).and_modify(|cell| {
-                cell.applied_at = Some(applied_at.clone());
-                cell.op_id = op_id;
-                cell.needs_update = false;
-            });
-        }
+        // let mut shared_state = self.shared_state.lock().unwrap();
+        // for ((applied_at, op_id), cell_holder) in ids {
+        //     shared_state.editor_cells.insert(op_id, cell_holder);
+        //     shared_state.editor_cells.entry(op_id).and_modify(|cell| {
+        //         cell.applied_at = Some(applied_at.clone());
+        //         cell.op_id = op_id;
+        //         cell.needs_update = false;
+        //     });
+        // }
 
-        if let Some(sender) = self.runtime_event_sender.as_mut() {
-            sender.send(EventsFromRuntime::EditorCellsUpdated(shared_state.editor_cells.clone())).unwrap();
-        }
         Ok(())
     }
+
 
     pub async fn shutdown(&mut self) {
         info!("Shutting down Chidori runtime.");
@@ -115,11 +107,11 @@ impl ChidoriRuntimeInstance {
     /// Entrypoint for execution of an instanced environment, handles messages from the host
     // #[tracing::instrument]
     pub async fn run(&mut self, initial_playback_state: PlaybackState) -> anyhow::Result<()> {
-        println!("Starting instanced environment");
+        info!("Starting instanced environment");
         self.set_playback_state(initial_playback_state);
 
         // Reload cells to make sure we're up-to-date
-        self.reload_cells().await?;
+        // self.reload_cells().await?;
 
         let executing_states = Arc::new(Mutex::new(HashSet::new()));
         // Create a channel for error notifications
@@ -128,7 +120,7 @@ impl ChidoriRuntimeInstance {
         loop {
             // Handle user interactions first for responsiveness
             if let Ok(message) = self.env_rx.try_recv() {
-                println!("Received message from user: {:?}", message);
+                debug!("Received message from user: {:?}", message);
                 self.handle_user_interaction_message(message).await?;
             }
 
@@ -142,7 +134,7 @@ impl ChidoriRuntimeInstance {
 
             // Receives the results of execution during progression of ExecutionStates
             if let Ok(state) = self.rx_execution_states.try_recv() {
-                println!("InstancedEnvironment received an execution event {:?}", &state.chronology_id);
+                debug!("InstancedEnvironment received an execution event {:?}", &state.chronology_id);
                 self.push_update_to_client(&state);
                 self.set_execution_head(&state);
             }
@@ -207,13 +199,13 @@ impl ChidoriRuntimeInstance {
     }
 
     async fn handle_user_interaction_message(&mut self, message: UserInteractionMessage) -> Result<(), anyhow::Error> {
-        println!("Received user interaction message");
+        debug!("Received user interaction message {:?}", &message);
         match message {
             UserInteractionMessage::SetPlaybackState(state) => {
                 self.set_playback_state(state);
             },
-            UserInteractionMessage::ReloadCells => {
-                self.reload_cells().await?;
+            UserInteractionMessage::ReloadCells(cells) => {
+                self.upsert_cells(cells).await?;
             },
             UserInteractionMessage::RevertToState(id) => {
                 if let Some(id) = id {
@@ -230,13 +222,8 @@ impl ChidoriRuntimeInstance {
                             cells.push(CellHolder {
                                 cell: cell.clone(),
                                 op_id: id.clone(),
-                                applied_at: None,
-                                needs_update: false,
                             });
                         }
-                        let mut ss = self.shared_state.lock().unwrap();
-                        ss.at_execution_state_cells = cells.clone();
-                        sender.send(EventsFromRuntime::ExecutionStateCellsViewUpdated(cells)).unwrap();
                     }
                 }
             },
@@ -246,16 +233,16 @@ impl ChidoriRuntimeInstance {
             UserInteractionMessage::MutateCell(cell_holder) => {
                 println!("Mutating individual cell");
                 let (applied_at, op_id) = self.upsert_cell(cell_holder.cell.clone(), cell_holder.op_id).await?;
-                let mut shared_state = self.shared_state.lock().unwrap();
-                shared_state.editor_cells.insert(op_id, cell_holder);
-                shared_state.editor_cells.entry(op_id).and_modify(|cell| {
-                    cell.applied_at = Some(applied_at.clone());
-                    cell.op_id = op_id;
-                    cell.needs_update = false;
-                });
-                if let Some(sender) = self.runtime_event_sender.as_mut() {
-                    sender.send(EventsFromRuntime::EditorCellsUpdated(shared_state.editor_cells.clone())).unwrap();
-                }
+                // let mut shared_state = self.shared_state.lock().unwrap();
+                // shared_state.editor_cells.insert(op_id, cell_holder);
+                // shared_state.editor_cells.entry(op_id).and_modify(|cell| {
+                //     cell.applied_at = Some(applied_at.clone());
+                //     cell.op_id = op_id;
+                //     cell.needs_update = false;
+                // });
+                // if let Some(sender) = self.runtime_event_sender.as_mut() {
+                //     sender.send(EventsFromRuntime::EditorCellsUpdated(shared_state.editor_cells.clone())).unwrap();
+                // }
             }
             UserInteractionMessage::PushChatMessage(msg) => {
                 self.db.push_message(msg).await?;
@@ -307,19 +294,18 @@ impl ChidoriRuntimeInstance {
 
     fn push_update_to_client(&mut self, state: &ExecutionState) {
         let state_id = state.chronology_id;
-        println!("Resulted in state with id {:?}", &state_id);
+        debug!("Push update to client with state_id {:?}", &state_id);
         if let Some(sender) = self.runtime_event_sender.as_mut() {
-            sender.send(EventsFromRuntime::DefinitionGraphUpdated(state.get_dependency_graph_flattened())).unwrap();
-            let mut cells = vec![];
-            for (op_id, cell ) in state.cells_by_id.iter() {
-                cells.push(CellHolder {
-                    cell: cell.clone(),
-                    op_id: op_id.clone(),
-                    applied_at: Some(state.chronology_id),
-                    needs_update: false,
-                });
-            }
-            sender.send(EventsFromRuntime::ExecutionStateCellsViewUpdated(cells)).unwrap();
+            // sender.send(EventsFromRuntime::DefinitionGraphUpdated(state.get_dependency_graph_flattened())).unwrap();
+            // let mut cells = vec![];
+            // for (op_id, cell ) in state.cells_by_id.iter() {
+            //     cells.push(CellHolder {
+            //         cell: cell.clone(),
+            //         op_id: op_id.clone(),
+            //         applied_at: Some(state.chronology_id),
+            //         needs_update: false,
+            //     });
+            // }
             sender.send(EventsFromRuntime::ExecutionGraphUpdated(self.db.get_execution_graph_elements())).unwrap();
             // sender.send(EventsFromRuntime::ExecutionStateChange(self.db.get_merged_state_history(&state_id))).unwrap();
         }
@@ -362,7 +348,7 @@ impl ChidoriRuntimeInstance {
 pub enum UserInteractionMessage {
     SetPlaybackState(PlaybackState),
     RevertToState(Option<ExecutionNodeId>),
-    ReloadCells,
+    ReloadCells(Vec<CellHolder>),
     MutateCell(CellHolder),
     Shutdown,
     PushChatMessage(String),

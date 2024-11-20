@@ -349,9 +349,32 @@ fn mouse_scroll_events(
     mut q_camera: Query<(&mut Projection, &mut Transform, &mut CameraState), (With<OnGraphScreen> , Without<GraphMinimapCamera>, Without<GraphIdxPair>, Without<GraphIdx>, Without<GraphMain2dCamera>)>,
     keyboard_input: Res<ButtonInput<KeyCode>>,
     q_mycoords: Query<&CursorWorldCoords, With<OnGraphScreen>>,
+    tree_identities: Res<EguiTreeIdentities>,
+    mut tree: ResMut<EguiTree>,
+    q_window: Query<&Window, With<PrimaryWindow>>,
 ) {
     if !graph_resource.is_active {
         return;
+    }
+
+    let window = q_window.single();
+    if let Some(graph_tile) = tree_identities.graph_tile {
+        if let Some(tile) = tree.tree.tiles.get(graph_tile) {
+            match tile {
+                Tile::Pane(p) => {
+                    if &p.nr == &"Graph" {
+                        if let Some(r) = p.rect {
+                            if let Some(cursor) = window.cursor_position() {
+                                if !r.contains(egui::pos2(cursor.x as f32, cursor.y as f32)) {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                Tile::Container(_) => {}
+            }
+        }
     }
 
     let (projection, mut camera_transform, mut camera_state) = q_camera.single_mut();
@@ -538,7 +561,7 @@ fn egui_execution_state(
 
 
 
-        if let Some(cell) = &execution_state.evaluating_cell {
+        if let Some(cell) = &execution_state.evaluating_cell() {
             egui::CollapsingHeader::new("Cell Definition")
                 .show(ui, |ui| {
                     egui_render_cell_read(ui, cell, execution_state);
@@ -1600,21 +1623,21 @@ fn generate_tree_layout(
 
 fn update_graph_system_data_structures(
     mut graph_res: ResMut<GraphResource>,
-    execution_graph: Res<ChidoriState>,
+    chidori_state: Res<ChidoriState>,
 ) {
     // If the execution graph has changed, clear the graph and reconstruct it
-    if graph_res.hash_graph != hash_graph(&execution_graph.execution_graph) {
-        let (dataset, node_ids) = execution_graph.construct_stablegraph_from_chidori_execution_graph();
+    if graph_res.hash_graph != hash_graph(&chidori_state.execution_graph) {
+        let (dataset, node_ids) = chidori_state.construct_stablegraph_from_chidori_execution_graph(&chidori_state.execution_graph);
         graph_res.node_ids = node_ids;
 
-        let (grouped_dataset, grouped_tree, group_dep_graph) = group_tree(&dataset, &execution_graph.grouped_nodes);
+        let (grouped_dataset, grouped_tree, group_dep_graph) = group_tree(&dataset, &chidori_state.grouped_nodes);
 
         // TODO: handle support for displaying groups
         // graph_res.execution_graph = grouped_dataset;
         graph_res.execution_graph = dataset;
         graph_res.grouped_tree = grouped_tree;
         graph_res.group_dependency_graph = group_dep_graph;
-        graph_res.hash_graph = hash_graph(&execution_graph.execution_graph);
+        graph_res.hash_graph = hash_graph(&chidori_state.execution_graph);
         graph_res.is_layout_dirty = true;
     }
 }
@@ -1889,21 +1912,6 @@ fn graph_setup(
         OnGraphScreen
     ));
 
-    // let shape = shapes::RegularPolygon {
-    //     sides: 6,
-    //     feature: shapes::RegularPolygonFeature::Radius(200.0),
-    //     ..shapes::RegularPolygon::default()
-    // };
-    //
-    // commands.spawn((
-    //     ShapeBundle {
-    //         path: GeometryBuilder::build_as(&shape),
-    //         ..default()
-    //     },
-    //     crate::bevy_prototype_lyon::prelude::Fill::color(bevy::prelude::Color::CYAN),
-    //     crate::bevy_prototype_lyon::prelude::Stroke::new(bevy::prelude::Color::BLACK, 10.0),
-    // ));
-
     let mut dataset = StableGraph::new();
     let mut node_ids = HashMap::new();
     commands.spawn((CursorWorldCoords(vec2(0.0, 0.0)), OnGraphScreen));
@@ -1966,25 +1974,19 @@ fn ui_window(
         return;
     }
 
-    egui::CentralPanel::default().frame(container_frame).show(contexts.ctx_mut(), |ui| {
-        ui.add_space(22.0);
-        ui.horizontal(|ui| {
+    if window.width() > 600.0 {
+        egui::CentralPanel::default().frame(container_frame).show(contexts.ctx_mut(), |ui| {
             ui.add_space(22.0);
-            ui.vertical(|ui| {
-                ui.label("Sidebar");
-                ui.button("Collapse Alternate Branches");
+            ui.horizontal(|ui| {
+                ui.add_space(22.0);
+                ui.vertical(|ui| {
+                    ui.label("Sidebar");
+                    ui.button("Collapse Alternate Branches");
+                });
             });
         });
+    }
 
-    });
-    // egui::SidePanel::left("Explorer")
-    //     .frame(container_frame)
-    //     .min_width(300.0)
-    //     .max_width(300.0)
-    //     .resizable(false)
-    //     .show_separator_line(false)
-    //     .show(contexts.ctx_mut(), |ui| {
-    //     });
 }
 
 #[derive(Component)]

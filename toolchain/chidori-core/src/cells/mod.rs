@@ -422,6 +422,26 @@ pub struct LLMEmbeddingCell {
     pub name: Option<String>,
     pub req: String,
 }
+#[derive(
+    Archive,
+    serde::Serialize,
+    serde::Deserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    PartialEq,
+    Clone,
+)]
+#[archive(bound(serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer"))]
+#[archive(check_bytes)]
+#[archive_attr(check_bytes(
+    bound = "__C: rkyv::validation::ArchiveContext, <__C as rkyv::Fallible>::Error: std::error::Error"
+))]
+#[archive_attr(derive(Debug))]
+pub struct PlainTextCell {
+    pub backing_file_reference: Option<BackingFileReference>,
+    pub text: String,
+}
 
 
 #[derive(
@@ -488,6 +508,7 @@ pub enum CellTypes {
     CodeGen(LLMCodeGenCell, TextRange),
     Prompt(LLMPromptCell, TextRange),
     Template(TemplateCell, TextRange),
+    PlainText(PlainTextCell, TextRange),
 }
 
 impl Eq for CellTypes {
@@ -515,7 +536,8 @@ impl CellTypes {
                 LLMPromptCell::Completion { .. } => &None,
             },
             CellTypes::Template(c, _) => &c.name,
-            CellTypes::CodeGen(c, _) => &c.name
+            CellTypes::CodeGen(c, _) => &c.name,
+            CellTypes::PlainText(_, _) => &None
         }
     }
 }

@@ -9,6 +9,8 @@ use crate::bevy_egui::EguiContexts;
 use bevy::app::{App, Startup, Update};
 use bevy::input::ButtonInput;
 use bevy::prelude::{default, Commands, KeyCode, Local, Res, ResMut, Resource};
+use bevy_utils::tracing::debug;
+use dashmap::mapref::one::Ref;
 use chidori_core::uuid::Uuid;
 use egui;
 use egui::panel::TopBottomSide;
@@ -217,9 +219,8 @@ fn hash_graph(input: &Vec<(ExecutionNodeId, ExecutionNodeId)>) -> u64 {
 
 impl ChidoriState {
 
-    pub fn construct_stablegraph_from_chidori_execution_graph(&self) -> (StableGraph<ExecutionNodeId, ()>, HashMap<ExecutionNodeId, NodeIndex>) {
+    pub fn construct_stablegraph_from_chidori_execution_graph(&self, execution_graph: &Vec<(ExecutionNodeId, ExecutionNodeId)>) -> (StableGraph<ExecutionNodeId, ()>, HashMap<ExecutionNodeId, NodeIndex>) {
         // TODO: cache this
-        let execution_graph = &self.execution_graph;
         let mut dataset = StableGraph::new();
         let mut node_ids = HashMap::new();
         for (a, b) in execution_graph {
@@ -237,7 +238,7 @@ impl ChidoriState {
     /// Check if the target ExecutionNodeId, traversing back from the current execution head is included
     pub fn exists_in_current_tree(&self, n: &ExecutionNodeId) -> bool {
         let h = self.current_execution_head;
-        let (graph, nodes) = self.construct_stablegraph_from_chidori_execution_graph();
+        let (graph, nodes) = self.construct_stablegraph_from_chidori_execution_graph(&self.execution_graph);
         if let Some(h_idx) = nodes.get(&h) {
             let mut current = *h_idx;
             let mut current_weight = graph.node_weight(current);
@@ -273,22 +274,30 @@ pub struct CellState {
 
 #[derive(Resource)]
 pub struct ChidoriState {
+    /// Toggles visualization of debug information
     pub debug_mode: bool,
+
+    /// What is the current path on the file system that we're observing
     pub(crate) watched_path: Mutex<Option<String>>,
+
+    /// Handler for watching the watched_path directory
     file_watch: Mutex<Option<Debouncer<RecommendedWatcher, FileIdMap>>>,
+
+    /// Retain thread handle for the Chidori runtime
     background_thread: Mutex<Option<JoinHandle<()>>>,
+
+    /// Instance of the InteractiveChidoriWrapper
     pub chidori: Arc<Mutex<InteractiveChidoriWrapper>>,
+
+    /// Toggles display of the initialization modal
     pub display_example_modal: bool,
+
     pub current_playback_state: PlaybackState,
 
-
-    pub editor_cells: HashMap<OperationId, Arc<Mutex<CellHolder>>>,
-    pub state_cells: Vec<CellHolder>,
-    pub local_cell_state: HashMap<Uuid, Arc<Mutex<CellState>>>,
+    pub execution_id_to_evaluation: Arc<dashmap::DashMap<OperationId, ExecutionState>>,
+    pub local_cell_state: dashmap::DashMap<OperationId, Arc<Mutex<CellState>>>,
 
     pub log_messages: Vec<String>,
-
-    pub merged_state_history: Option<MergedStateHistory>,
 
     pub definition_graph: Vec<(OperationId, OperationId, Vec<DependencyReference>)>,
 
@@ -297,39 +306,35 @@ pub struct ChidoriState {
     pub grouped_nodes: HashSet<ExecutionNodeId>,
     pub current_execution_head: ExecutionNodeId,
 
-
-    pub execution_ids_to_states: HashMap<ExecutionNodeId, ExecutionState>,
-
     pub trace_events: Vec<TraceEvents>,
 }
+
 
 impl Default for ChidoriState {
     fn default() -> Self {
         ChidoriState {
             debug_mode: false,
             chidori: Arc::new(Mutex::new(InteractiveChidoriWrapper::new())),
+
             watched_path: Mutex::new(None),
             background_thread: Mutex::new(None),
             file_watch: Mutex::new(None),
             display_example_modal: true,
             current_playback_state: PlaybackState::Paused,
-
-            editor_cells: HashMap::new(),
-            state_cells: vec![],
+            execution_id_to_evaluation: Arc::new(Default::default()),
             local_cell_state: Default::default(),
             log_messages: vec![],
-            merged_state_history: None,
             definition_graph: vec![],
             execution_graph: vec![],
             grouped_nodes: Default::default(),
             current_execution_head: Default::default(),
-            execution_ids_to_states: Default::default(),
             trace_events: vec![],
         }
     }
 }
 
 impl ChidoriState {
+
     pub fn get_loaded_path(&self) -> String {
         let env = self.chidori.lock().unwrap();
         if env.loaded_path.is_none() {
@@ -338,20 +343,12 @@ impl ChidoriState {
         env.loaded_path.as_ref().unwrap().to_string()
     }
 
-    // pub fn move_state_view_to_id(&self, id: ExecutionNodeId) -> anyhow::Result<(), String> {
-    //     let env = self.chidori.lock().unwrap();
-    //     env.handle_user_action(UserInteractionMessage::RevertToState(Some(id)))
-    //         .map_err(|e| e.to_string())?;
-    //     Ok(())
-    // }
-
     #[cfg(test)]
     pub fn set_execution_state_at_id(
         &self,
         execution_node_id: &ExecutionNodeId,
         execution_state: ExecutionState
     ) {
-        // TODO: this is like 3 locks just to get the current state - maybe we should cache these?
         let chidori = self.chidori.lock().unwrap();
         {
             let shared_state = chidori.shared_state.lock().unwrap();
@@ -364,7 +361,7 @@ impl ChidoriState {
         &self,
         execution_node_id: &ExecutionNodeId,
     ) -> Option<ExecutionState> {
-        // TODO: this is like 3 locks just to get the current state - maybe we should cache these?
+        // TODO: this is like 3 locks just to get the current state
         let chidori = self.chidori.lock().unwrap();
         let eval = {
             let shared_state = chidori.shared_state.lock().unwrap();
@@ -398,40 +395,28 @@ impl ChidoriState {
     }
 
     pub fn set_execution_id(&self, id: ExecutionNodeId) -> anyhow::Result<(), String> {
-        // TODO: we're failing to lock chidori
-        let chidori = self.chidori.clone();
-        {
-            let chidori_guard = chidori.lock().expect("Failed to lock chidori");
-            chidori_guard.dispatch_user_interaction_to_instance(UserInteractionMessage::RevertToState(Some(id)))
-                .map_err(|e| e.to_string())?;
-
-        }
+        let env = self.chidori.lock().unwrap();
+        env.dispatch_user_interaction_to_instance(UserInteractionMessage::RevertToState(Some(id)))
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn reset(&mut self) -> anyhow::Result<(), String> {
         // TODO: this does not clear the state of the visualized execution graph fully
-        let chidori = self.chidori.clone();
-        {
-            let chidori_guard = chidori.lock().expect("Failed to lock chidori");
-            chidori_guard.dispatch_user_interaction_to_instance(UserInteractionMessage::Reset)
-                .map_err(|e| e.to_string())?;
-        }
+        let env = self.chidori.lock().unwrap();
+        env.dispatch_user_interaction_to_instance(UserInteractionMessage::Reset)
+            .map_err(|e| e.to_string())?;
         self.watched_path = Mutex::new(None);
         self.background_thread = Mutex::new(None);
         self.file_watch = Mutex::new(None);
         self.display_example_modal = true;
         self.current_playback_state = PlaybackState::Paused;
-        self.editor_cells = HashMap::new();
-        self.state_cells = vec![];
         self.local_cell_state = Default::default();
         self.log_messages = vec![];
-        self.merged_state_history = None;
         self.definition_graph = vec![];
         self.execution_graph = vec![];
         self.grouped_nodes = Default::default();
         self.current_execution_head = Default::default();
-        self.execution_ids_to_states = Default::default();
         self.trace_events = vec![];
         Ok(())
     }
@@ -449,9 +434,13 @@ impl ChidoriState {
     pub fn load_string(&mut self, file: &str) -> anyhow::Result<(), String> {
         self.display_example_modal = false;
         let chidori = self.chidori.clone();
-        {
-            let mut chidori_guard = chidori.lock().expect("Failed to lock chidori");
-            chidori_guard.load_md_string(file).expect("Failed to load markdown string");
+        let mut chidori_guard = chidori.lock().expect("Failed to lock chidori");
+        let cell_holders = chidori_guard.load_md_string(file).expect("Failed to load markdown string");
+        for cell in cell_holders {
+            self.local_cell_state.insert(cell.op_id, Arc::new(Mutex::new(crate::chidori::CellState {
+                temp_cell: Some(cell),
+                ..default()
+            })));
         }
         Ok(())
     }
@@ -515,19 +504,25 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
         file_watch: Mutex::new(None),
         display_example_modal: true,
         current_playback_state: PlaybackState::Paused,
-
-        editor_cells: HashMap::new(),
-        state_cells: vec![],
+        execution_id_to_evaluation: Arc::new(Default::default()),
         local_cell_state: Default::default(),
         log_messages: vec![],
-        merged_state_history: None,
         definition_graph: vec![],
         execution_graph: vec![],
         grouped_nodes: Default::default(),
         current_execution_head: Default::default(),
-        execution_ids_to_states: Default::default(),
         trace_events: vec![],
     };
+
+    // Clone a reference to the shared execution_id_to_evaluation
+    {
+        let mut chidori = internal_state
+            .chidori
+            .lock()
+            .expect("Failed to lock background_thread");
+        let shared_state = chidori.shared_state.lock().unwrap();
+        internal_state.execution_id_to_evaluation = shared_state.execution_id_to_evaluation.clone();
+    }
 
     {
         let mut background_thread_guard = internal_state
@@ -563,7 +558,7 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
         loop {
             match runtime_event_receiver.recv_timeout(Duration::from_millis(RECV_RUNTIME_EVENT_TIMEOUT_MS)) {
                 Ok(msg) => {
-                    // println!("Received from runtime: {:?}", &msg);
+                    debug!("Received message from runtime: {:?}", &msg);
                     let msg_to_logs = msg.clone();
                     ctx.run_on_main_thread(move |ctx| {
                         if let Some(mut s) =
@@ -584,49 +579,6 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                             })
                             .await;
                         }
-                        EventsFromRuntime::StateAtId(id, state) => {
-                            ctx.run_on_main_thread(move |ctx| {
-                                if let Some(mut s) =
-                                    ctx.world.get_resource_mut::<ChidoriState>()
-                                {
-                                    s.execution_ids_to_states.insert(id, state);
-                                }
-                            })
-                            .await;
-                        }
-                        EventsFromRuntime::ExecutionStateChange(state) => {
-                            ctx.run_on_main_thread(move |ctx| {
-                                if let Some(mut s) =
-                                    ctx.world.get_resource_mut::<ChidoriState>()
-                                {
-                                    s.merged_state_history = Some(state);
-                                }
-                            })
-                            .await;
-                        }
-                        EventsFromRuntime::DefinitionGraphUpdated(state) => {
-                            ctx.run_on_main_thread(move |ctx| {
-                                if let Some(mut s) =
-                                    ctx.world.get_resource_mut::<ChidoriState>()
-                                {
-                                    s.definition_graph = state;
-                                }
-                            })
-                            .await;
-                        }
-                        EventsFromRuntime::EditorCellsUpdated(state) => {
-                            ctx.run_on_main_thread(move |ctx| {
-                                if let Some(mut s) = ctx.world.get_resource_mut::<ChidoriState>() {
-                                    let mut sort_cells: Vec<CellHolder> = state.values().cloned().collect();
-                                    let mut editor_cells = HashMap::new();
-                                    for cell in sort_cells {
-                                        editor_cells.insert(cell.op_id, Arc::new(Mutex::new(cell)));
-                                    }
-                                    s.editor_cells = editor_cells;
-                                }
-                            })
-                            .await;
-                        }
                         EventsFromRuntime::UpdateExecutionHead(head) => {
                             ctx.run_on_main_thread(move |ctx| {
                                 if let Some(mut s) =
@@ -638,19 +590,6 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
                             .await;
                         }
                         EventsFromRuntime::ReceivedChatMessage(_) => {}
-                        EventsFromRuntime::ExecutionStateCellsViewUpdated(cells) => {
-                            ctx.run_on_main_thread(move |ctx| {
-                                if let Some(mut s) = ctx.world.get_resource_mut::<ChidoriState>() {
-                                    let mut sort_cells = cells.clone();
-                                    sort_cells.sort_by(|a, b| {
-                                        a.op_id.cmp(&b.op_id)
-                                    });
-                                    s.state_cells = sort_cells;
-                                }
-                            })
-                                .await;
-
-                        }
                         EventsFromRuntime::PlaybackState(state) => {
                             ctx.run_on_main_thread(move |ctx| {
                                 if let Some(mut internal_state) = ctx.world.get_resource_mut::<ChidoriState>() {
@@ -900,6 +839,9 @@ pub fn update_gui(
                 let mut ui = &mut frame.content_ui;
                 ui.horizontal(|ui| {
                     ui.style_mut().spacing.item_spacing = egui::vec2(32.0, 8.0);
+                    if with_cursor(ui.button("Save")).clicked() {
+                        internal_state.reset();
+                    }
                     if with_cursor(ui.button("Reset")).clicked() {
                         internal_state.reset();
                     }

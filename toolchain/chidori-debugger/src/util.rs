@@ -216,6 +216,8 @@ pub fn egui_render_cell_read(ui: &mut Ui, cell: &CellTypes, state: &ExecutionSta
             render_text_cell(ui, name, body, "Prompt", "", &theme);
         }
         CellTypes::Prompt(LLMPromptCell::Completion { .. }, _)  => {}
+        CellTypes::PlainText(_, _) => {
+        }
     }
 }
 

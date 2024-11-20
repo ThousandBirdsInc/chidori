@@ -1,5 +1,5 @@
 use std::ops::Deref;
-use tracing::{Subscriber, span::{Attributes, Record}, Event, span, Metadata};
+use tracing::{Subscriber, span::{Attributes, Record}, Event, span, Metadata, debug};
 use tracing_subscriber::{layer::Context, Layer, registry::LookupSpan, fmt};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
@@ -190,7 +190,7 @@ impl<S, T> Layer<T> for ForwardingLayer<S>
 
 
 pub fn init_internal_telemetry(sender: Sender<TraceEvents>) -> impl Subscriber {
-    println!("Initializing internal telemetry");
+    debug!("Initializing internal telemetry");
     let custom_layer = CustomLayer::new(sender);
     let filter_layer = tracing_subscriber::EnvFilter::new("chidori_core=trace");
     let forwarding_layer = ForwardingLayer::new(tracing_subscriber::fmt::layer());
@@ -203,7 +203,7 @@ pub fn init_internal_telemetry(sender: Sender<TraceEvents>) -> impl Subscriber {
 }
 
 pub fn init_test_telemetry() -> impl Subscriber {
-    println!("Initializing internal telemetry");
+    debug!("Initializing internal telemetry");
     let filter_layer = tracing_subscriber::EnvFilter::new("chidori_core=trace");
     let forwarding_layer = ForwardingLayer::new(tracing_subscriber::fmt::layer());
 

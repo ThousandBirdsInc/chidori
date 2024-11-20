@@ -42,6 +42,9 @@ num = "0.4.0"
 tinyset = "0.4.10"
 egui_json_tree = "0.6.0"
 egui_flex = "0.1.1"
+automerge = "0.5.12"
+
+im = "15.1.0"
 
 dashmap = "5.5.3"
 

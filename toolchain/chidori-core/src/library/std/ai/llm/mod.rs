@@ -476,7 +476,8 @@ pub async fn ai_llm_code_generation_chat_model(
             let mut new_execution_state = execution_state.clone();
 
             let mut cells = vec![];
-            crate::sdk::md::extract_code_blocks(&text)
+            crate::sdk::md::extract_blocks(&text)
+                .0
                 .iter()
                 .filter_map(|block| interpret_markdown_code_block(block, None).unwrap())
                 .for_each(|block| { cells.push(block); });

@@ -64,6 +64,7 @@ dotenv = "0.15.0"
 futures-util = "0.3.28"
 typed-arena = "2.0.1"
 sha1 = "0.10.5"
+hashmoji = "0.1.0"
 
 
 indexmap = "2.2.6"

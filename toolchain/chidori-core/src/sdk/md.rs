@@ -2,10 +2,16 @@ use crate::sdk::interactive_chidori_wrapper::InteractiveChidoriWrapper;
 use chidori_prompt_format::extract_yaml_frontmatter_string;
 use indoc::indoc;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use serde_derive::Serialize;
 use thiserror::Error;
 use crate::cells::{BackingFileReference, CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, SupportedMemoryProviders, SupportedModelProviders, TemplateCell, TextRange, WebserviceCell};
+
+#[derive(Debug)]
+pub struct TextBlock {
+    pub content: String,
+    pub range: TextRange,
+}
 
 #[derive(PartialEq, Serialize, Debug)]
 pub struct MarkdownCodeBlock {
@@ -23,19 +29,38 @@ enum CodeResource {
 
 #[derive(Debug)]
 pub struct ParsedFile {
-    filename: Option<Box<std::path::PathBuf>>,
-    code: Option<String>,
-    num_lines: usize,
-    pub(crate) result: Vec<MarkdownCodeBlock>,
+    pub filename: Option<Box<PathBuf>>,
+    pub code: Option<String>,
+    pub num_lines: usize,
+    pub code_blocks: Vec<MarkdownCodeBlock>,
+    pub text_blocks: Vec<TextBlock>,
 }
 
-pub(crate) fn extract_code_blocks(body: &str) -> Vec<MarkdownCodeBlock> {
+pub(crate) fn extract_blocks(body: &str) -> (Vec<MarkdownCodeBlock>, Vec<TextBlock>) {
     let mut code_blocks = Vec::new();
+    let mut text_blocks = Vec::new();
     let mut start = 0;
+    let mut last_code_end = 0;
 
     // Iterate over each occurrence of backticks
-    while let Some(end) = body[start..].find("```") {
-        start += end + 3; // Move start to the character after the closing ```
+    while let Some(code_start) = body[start..].find("```") {
+        let absolute_start = start + code_start;
+
+        // Extract text before this code block
+        if absolute_start > last_code_end {
+            let text = body[last_code_end..absolute_start].trim();
+            if !text.is_empty() {
+                text_blocks.push(TextBlock {
+                    content: text.to_string(),
+                    range: TextRange {
+                        start: last_code_end,
+                        end: absolute_start
+                    },
+                });
+            }
+        }
+
+        start = absolute_start + 3; // Move start to after opening ```
 
         if let Some(end_of_code) = body[start..].find("```") {
             let code = &body[start..start + end_of_code].trim();
@@ -47,9 +72,11 @@ pub(crate) fn extract_code_blocks(body: &str) -> Vec<MarkdownCodeBlock> {
 
             let tag_and_name: Vec<&str> = first_line.split_whitespace().collect();
             let tag = tag_and_name.get(0).cloned().unwrap_or_default().to_string();
-            let name = tag_and_name.get(1).and_then(|n| n.strip_prefix('(').and_then(|n| n.strip_suffix(')'))).map(|n| n.to_string());
+            let name = tag_and_name.get(1)
+                .and_then(|n| n.strip_prefix('(').and_then(|n| n.strip_suffix(')')))
+                .map(|n| n.to_string());
 
-            // Add the code block with the text range
+            // Add the code block
             code_blocks.push(MarkdownCodeBlock {
                 tag,
                 name,
@@ -60,32 +87,50 @@ pub(crate) fn extract_code_blocks(body: &str) -> Vec<MarkdownCodeBlock> {
                 },
             });
 
-            start += end_of_code + 3; // Move start to the character after the closing ```
+            start += end_of_code + 3; // Move start to after closing ```
+            last_code_end = start;
         } else {
-            break; // No closing backticks found, exit the loop
+            break; // No closing backticks found
         }
     }
 
-    code_blocks
+    // Get final text block after last code block if it exists
+    if last_code_end < body.len() {
+        let final_text = body[last_code_end..].trim();
+        if !final_text.is_empty() {
+            text_blocks.push(TextBlock {
+                content: final_text.to_string(),
+                range: TextRange {
+                    start: last_code_end,
+                    end: body.len()
+                },
+            });
+        }
+    }
+
+    (code_blocks, text_blocks)
 }
+
 
 
 fn parse_markdown_file(filename: &Path) -> ParsedFile {
     match std::fs::read_to_string(filename) {
-        Err(e) => ParsedFile {
+        Err(_) => ParsedFile {
             filename: Some(Box::new(filename.to_path_buf())),
             code: Some("".to_owned()),
             num_lines: 0,
-            result: vec![],
+            code_blocks: vec![],
+            text_blocks: vec![],
         },
         Ok(source) => {
             let num_lines = source.lines().count();
-            let result = extract_code_blocks(&source);
+            let (code_blocks, text_blocks) = extract_blocks(&source);
             ParsedFile {
                 filename: Some(Box::new(filename.to_path_buf())),
                 code: Some(source.to_string()),
                 num_lines,
-                result,
+                code_blocks,
+                text_blocks,
             }
         }
     }
@@ -120,7 +165,7 @@ pub fn load_folder(path: &Path) -> anyhow::Result<Vec<ParsedFile>> {
 #[derive(Error, Debug)]
 pub enum InterpretError {
     #[error("Failed to split frontmatter: {0}")]
-    FrontmatterSplitError(String),
+    FrontMatterSplitError(String),
     #[error("Failed to deserialize YAML: {0}")]
     YamlDeserializeError(#[from] serde_yaml::Error),
     #[error("Failed to parse port number")]
@@ -131,7 +176,7 @@ pub enum InterpretError {
 pub fn interpret_markdown_code_block(block: &MarkdownCodeBlock, file_path: Option<String>) -> Result<Option<CellTypes>, InterpretError> {
     let whole_body = block.body.clone();
     let (frontmatter, body) = chidori_prompt_format::templating::templates::split_frontmatter(&block.body)
-        .map_err(|e| InterpretError::FrontmatterSplitError(e.to_string()))?;
+        .map_err(|e| InterpretError::FrontMatterSplitError(e.to_string()))?;
     let backing_file_reference = file_path.map(|p| BackingFileReference {
         path: p,
         text_range: Some(block.range.clone())
