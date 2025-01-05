@@ -1969,17 +1969,17 @@ fn ui_window(
         return;
     }
 
-    if window.width() > 600.0 {
-        egui::CentralPanel::default().frame(container_frame).show(contexts.ctx_mut(), |ui| {
-            ui.set_width(sidebar_width);
-            ui.horizontal(|ui| {
-                ui.add_space(16.0);
-                ui.vertical(|ui| {
-                    ui.button("Collapse Alternate Branches");
-                });
-            });
-        });
-    }
+    // if window.width() > 600.0 {
+    //     egui::CentralPanel::default().frame(container_frame).show(contexts.ctx_mut(), |ui| {
+    //         ui.set_width(sidebar_width);
+    //         ui.horizontal(|ui| {
+    //             ui.add_space(16.0);
+    //             ui.vertical(|ui| {
+    //                 ui.button("Collapse Alternate Branches");
+    //             });
+    //         });
+    //     });
+    // }
 
 }
 

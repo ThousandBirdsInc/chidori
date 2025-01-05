@@ -313,6 +313,7 @@ pub struct ChidoriState {
 
     /// Toggles display of the initialization modal
     pub application_state_is_displaying_example_modal: bool,
+    pub application_state_is_displaying_save_dialog: bool,
 
     pub current_playback_state: PlaybackState,
 
@@ -335,12 +336,14 @@ pub struct ChidoriState {
 impl Default for ChidoriState {
     fn default() -> Self {
         ChidoriState {
+            
             debug_mode: false,
             chidori: Arc::new(Mutex::new(InteractiveChidoriWrapper::new())),
             watched_path: Mutex::new(None),
             background_thread: Mutex::new(None),
             file_watch: Mutex::new(None),
             application_state_is_displaying_example_modal: true,
+            application_state_is_displaying_save_dialog: false,
             current_playback_state: PlaybackState::Paused,
             execution_id_to_evaluation: Arc::new(Default::default()),
             local_cell_state: Default::default(),
@@ -442,8 +445,8 @@ impl ChidoriState {
         Ok(())
     }
 
-    pub fn save_notebook(&mut self, notebook_name: String) {
-
+    pub fn save_notebook(&mut self, notebook_name: &str) {
+        dbg!("Save notebook");
     }
 
     pub fn update_cell(&self, cell_holder: CellHolder) -> anyhow::Result<(), String> {
@@ -531,6 +534,7 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
     let (trace_event_sender, trace_event_receiver) = std::sync::mpsc::channel();
     let (runtime_event_sender, runtime_event_receiver) = std::sync::mpsc::channel();
     let mut internal_state = ChidoriState {
+        
         debug_mode: false,
         chidori: Arc::new(Mutex::new(InteractiveChidoriWrapper::new_with_events(
             trace_event_sender,
@@ -540,6 +544,7 @@ fn setup(mut commands: Commands, runtime: ResMut<tokio_tasks::TokioTasksRuntime>
         background_thread: Mutex::new(None),
         file_watch: Mutex::new(None),
         application_state_is_displaying_example_modal: true,
+        application_state_is_displaying_save_dialog: false,
         current_playback_state: PlaybackState::Paused,
         execution_id_to_evaluation: Arc::new(Default::default()),
         local_cell_state: Default::default(),
@@ -691,6 +696,9 @@ pub fn initial_save_notebook_dialog(
     mut theme: Res<CurrentTheme>,
     mut notebook_name_state: Local<Option<String>>,
 ) {
+    if !internal_state.application_state_is_displaying_save_dialog {
+        return;
+    }
     let mut contexts1 = &mut contexts;
     let mut internal_state1 = &mut internal_state;
 
@@ -699,6 +707,7 @@ pub fn initial_save_notebook_dialog(
         *notebook_name_state = Some(String::new());
     }
 
+    let mut saving_notebook_name = Some(String::new());
     egui::CentralPanel::default()
         .frame(
             Frame::default()
@@ -714,19 +723,17 @@ pub fn initial_save_notebook_dialog(
                 ui.add_space(8.0);
 
                 // Get a mutable reference to the String inside the Option
-                let mut notebook_name = notebook_name_state.as_mut().unwrap();
-
-                let response = ui.add(
-                    egui::TextEdit::singleline(notebook_name)
-                        .hint_text("Enter notebook name...")
-                        .desired_width(300.0)
-                );
-
-                // Handle Enter key press
-                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    if !notebook_name.trim().is_empty() {
-                        // internal_state1.save_notebook(notebook_name, &runtime);
-                        // *notebook_name_state = Some(String::new());
+                {
+                    let mut notebook_name = notebook_name_state.as_mut().unwrap();
+                    let response = ui.add(
+                        egui::TextEdit::singleline(notebook_name)
+                            .hint_text("Enter notebook name...")
+                            .desired_width(300.0)
+                    );
+                    if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if !notebook_name.trim().is_empty() {
+                            internal_state1.save_notebook(notebook_name);
+                        }
                     }
                 }
 
@@ -735,26 +742,40 @@ pub fn initial_save_notebook_dialog(
                 // Buttons row
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
-                        // *notebook_name_state = Some(String::new());
+                        saving_notebook_name = Some(String::new());
+                        internal_state1.application_state_is_displaying_save_dialog = false;
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // let save_button = ui.add_enabled(
-                        //     !notebook_name.trim().is_empty(),
-                        //     egui::Button::new("Save")
-                        // );
+                        let notebook_name = notebook_name_state.as_mut().unwrap();
+                        let save_button = ui.add_enabled(
+                            !notebook_name.trim().is_empty(),
+                            egui::Button::new("Save")
+                        );
 
-                        // if save_button.clicked() {
-                        //     // internal_state1.save_notebook(notebook_name, &runtime);
-                        //     *notebook_name_state = Some(String::new());
-                        // }
+                        if save_button.clicked() {
+                            // internal_state1.save_notebook(notebook_name, &runtime);
+                            saving_notebook_name = Some(String::new());
+                            internal_state1.application_state_is_displaying_save_dialog = false;
+                        }
                     });
                 });
             });
         });
 }
 
-pub fn update_gui(
+
+pub fn menubar(
+    mut contexts: EguiContexts,
+    mut egui_tree: ResMut<EguiTree>,
+    runtime: ResMut<tokio_tasks::TokioTasksRuntime>,
+    mut internal_state: ResMut<ChidoriState>,
+    mut theme: Res<CurrentTheme>,
+    mut displayed_example_desc: Local<Option<(String, String, String)>>
+) {
+}
+
+pub fn root_gui(
     mut contexts: EguiContexts,
     mut egui_tree: ResMut<EguiTree>,
     runtime: ResMut<tokio_tasks::TokioTasksRuntime>,
@@ -787,6 +808,7 @@ pub fn update_gui(
                             let res = with_cursor(ui.button("Create New Notebook"));
                             if res.clicked() {
                                 internal_state1.application_state_is_displaying_example_modal = false;
+                                internal_state1.application_state_is_displaying_save_dialog = true;
                             }
                             ui.add_space(16.0);
                             ui.label("Load Existing Project");
@@ -933,6 +955,7 @@ pub fn update_gui(
                 };
                 egui_tree.tree.ui(&mut behavior, ui);
             });
+
     }
 
     egui::TopBottomPanel::new(TopBottomSide::Top, Id::new("top_panel")).show(
@@ -948,43 +971,40 @@ pub fn update_gui(
                 let mut ui = &mut frame.content_ui;
                 ui.horizontal(|ui| {
                     ui.style_mut().spacing.item_spacing = egui::vec2(32.0, 8.0);
-                    if with_cursor(ui.button("Save")).clicked() {
-                        internal_state.reset();
-                    }
-                    if with_cursor(ui.button("Reset")).clicked() {
-                        internal_state.reset();
-                    }
-                    if with_cursor(ui.button("Open")).clicked() {
-                        internal_state.application_state_is_displaying_example_modal = false;
-                        // let sender = self.text_channel.0.clone();
-                        runtime.spawn_background_task(|mut ctx| async move {
-                            let task = rfd::AsyncFileDialog::new().pick_folder();
-                            let folder = task.await;
-                            if let Some(folder) = folder {
-                                let path = folder.path().to_string_lossy().to_string();
-                                ctx.run_on_main_thread(move |ctx| {
-                                    if let Some(mut internal_state) =
-                                        ctx.world.get_resource_mut::<ChidoriState>()
-                                    {
-                                        match internal_state.load_and_watch_directory(path) {
-                                            Ok(()) => {
-                                                // Directory loaded and watched successfully
-                                                println!("Directory loaded and being watched successfully");
-                                            },
-                                            Err(e) => {
-                                                // Handle the error
-                                                eprintln!("Error loading and watching directory: {}", e);
-                                            }
-                                        }
-                                    }
-                                })
-                                    .await;
-                            }
-                        });
-                    }
-                    ui.add_space(8.0);
-                    if with_cursor(ui.button("Examples")).clicked() {
-                    }
+                    // if with_cursor(ui.button("Save")).clicked() {
+                    //     internal_state.reset();
+                    // }
+                    // if with_cursor(ui.button("Reset")).clicked() {
+                    //     internal_state.reset();
+                    // }
+                    // if with_cursor(ui.button("Open")).clicked() {
+                    //     internal_state.application_state_is_displaying_example_modal = false;
+                    //     // let sender = self.text_channel.0.clone();
+                    //     runtime.spawn_background_task(|mut ctx| async move {
+                    //         let task = rfd::AsyncFileDialog::new().pick_folder();
+                    //         let folder = task.await;
+                    //         if let Some(folder) = folder {
+                    //             let path = folder.path().to_string_lossy().to_string();
+                    //             ctx.run_on_main_thread(move |ctx| {
+                    //                 if let Some(mut internal_state) =
+                    //                     ctx.world.get_resource_mut::<ChidoriState>()
+                    //                 {
+                    //                     match internal_state.load_and_watch_directory(path) {
+                    //                         Ok(()) => {
+                    //                             // Directory loaded and watched successfully
+                    //                             println!("Directory loaded and being watched successfully");
+                    //                         },
+                    //                         Err(e) => {
+                    //                             // Handle the error
+                    //                             eprintln!("Error loading and watching directory: {}", e);
+                    //                         }
+                    //                     }
+                    //                 }
+                    //             })
+                    //                 .await;
+                    //         }
+                    //     });
+                    // }
                     ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
 
                     match internal_state.current_playback_state {
@@ -1015,11 +1035,11 @@ pub fn update_gui(
                     // let mut my_f32 = 0.0;
                     // ui.add(egui::Slider::new(&mut my_f32, 0.0..=100.0).text("Rate Limit func/s"));
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        if with_cursor(ui.button("UI Debug Mode")).clicked() {
-                            internal_state.debug_mode = !internal_state.debug_mode;
-                        }
-                    });
+                    // ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                    //     if with_cursor(ui.button("UI Debug Mode")).clicked() {
+                    //         internal_state.debug_mode = !internal_state.debug_mode;
+                    //     }
+                    // });
                 });
 
             }
@@ -1031,7 +1051,12 @@ pub fn update_gui(
 pub fn chidori_plugin(app: &mut App) {
     app.init_resource::<EguiTree>()
         .init_resource::<EguiTreeIdentities>()
-        .add_systems(Update, (update_gui, maintain_egui_tree_identities))
+        .add_systems(Update, (
+            menubar,
+            root_gui,
+            initial_save_notebook_dialog,
+            maintain_egui_tree_identities
+        ))
         .add_systems(Startup, setup);
 }
 
