@@ -17,7 +17,7 @@ use crate::execution::execution::ExecutionState;
 use crate::execution::primitives::operation::InputSignature;
 use crate::execution::primitives::serialized_value::{RkyvObjectBuilder, RkyvSerializedValue, serialized_value_to_json_value};
 use crate::library::std::ai::llm::openai::OpenAIChatModel;
-use crate::sdk::md::interpret_markdown_code_block;
+use crate::sdk::md::interpret_code_block;
 
 #[derive(Debug)]
 pub enum LLMErrors {
@@ -479,7 +479,7 @@ pub async fn ai_llm_code_generation_chat_model(
             crate::sdk::md::extract_blocks(&text)
                 .0
                 .iter()
-                .filter_map(|block| interpret_markdown_code_block(block, None).unwrap())
+                .filter_map(|block| interpret_code_block(block, &None).unwrap())
                 .for_each(|block| { cells.push(block); });
             cells.sort();
 

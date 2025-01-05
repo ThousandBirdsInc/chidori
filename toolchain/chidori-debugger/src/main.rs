@@ -20,7 +20,6 @@ mod tree_grouping;
 mod json_editor;
 mod vim_text_edit;
 mod graph_range_collector;
-mod text_editing;
 
 use crate::bevy_egui::{egui, EguiContexts, EguiPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
@@ -330,6 +329,11 @@ fn main() {
         .init_state::<GameState>()
         .add_systems(Startup, (set_window_size))
         // Adds the plugins for each state
-        .add_plugins((chidori::chidori_plugin, code::editor_plugin, traces::trace_plugin, graph::graph_plugin, chat::chat_plugin, logs::logs_plugin))
+        .add_plugins(chat::chat_plugin)
+        .add_plugins(chidori::chidori_plugin)
+        .add_plugins(code::editor_plugin)
+        .add_plugins(graph::graph_plugin)
+        .add_plugins(logs::logs_plugin)
+        .add_plugins(traces::trace_plugin)
         .run();
 }

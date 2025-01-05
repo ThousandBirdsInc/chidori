@@ -222,6 +222,7 @@ impl ChidoriRuntimeInstance {
                             cells.push(CellHolder {
                                 cell: cell.clone(),
                                 op_id: id.clone(),
+                                is_dirty_editor: false,
                             });
                         }
                     }

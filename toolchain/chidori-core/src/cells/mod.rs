@@ -48,8 +48,8 @@ pub enum SupportedLanguage {
 ))]
 #[archive_attr(derive(Debug))]
 pub struct BackingFileReference {
-    pub(crate) path: String,
-    pub(crate) text_range: Option<TextRange>
+    pub path: String,
+    pub text_range: Option<TextRange>
 }
 
 #[derive(
@@ -538,6 +538,32 @@ impl CellTypes {
             CellTypes::Template(c, _) => &c.name,
             CellTypes::CodeGen(c, _) => &c.name,
             CellTypes::PlainText(_, _) => &None
+        }
+    }
+
+    pub fn backing_file_reference(&self) -> &Option<BackingFileReference> {
+        match &self {
+            CellTypes::Code(c, _) => &c.backing_file_reference,
+            CellTypes::CodeGen(c, _) => &c.backing_file_reference,
+            CellTypes::Prompt(c, _) => match c {
+                LLMPromptCell::Chat { backing_file_reference, .. } => backing_file_reference,
+                LLMPromptCell::Completion { .. } => &None,
+            },
+            CellTypes::Template(c, _) => &c.backing_file_reference,
+            CellTypes::PlainText(c, _) => &c.backing_file_reference,
+        }
+    }
+
+    pub fn body(&self) -> Option<&String> {
+        match &self {
+            CellTypes::Code(c, _) => Some(&c.source_code),
+            CellTypes::CodeGen(c, _) => Some(&c.complete_body),
+            CellTypes::Prompt(c, _) => match c {
+                LLMPromptCell::Chat { complete_body, .. } => Some(&complete_body),
+                LLMPromptCell::Completion { .. } => None,
+            },
+            CellTypes::Template(c, _) => Some(&c.body),
+            CellTypes::PlainText(c, _) => Some(&c.text),
         }
     }
 }

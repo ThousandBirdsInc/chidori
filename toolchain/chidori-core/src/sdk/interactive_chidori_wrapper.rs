@@ -19,7 +19,7 @@ use crate::execution::execution::execution_graph::{ExecutionGraph, ExecutionNode
 use crate::execution::execution::ExecutionState;
 use crate::execution::primitives::identifiers::{DependencyReference, OperationId};
 use crate::sdk::chidori_runtime_instance::{ChidoriRuntimeInstance, PlaybackState, UserInteractionMessage};
-use crate::sdk::md::{interpret_markdown_code_block, load_folder};
+use crate::sdk::md::{interpret_code_block, load_folder};
 use crate::utils::telemetry::{init_internal_telemetry, TraceEvents};
 
 
@@ -47,6 +47,7 @@ impl SharedState {
 pub struct CellHolder {
     pub cell: CellTypes,
     pub op_id: OperationId,
+    pub is_dirty_editor: bool,
     // pub applied_at: Option<ExecutionNodeId>,
     // pub needs_update: bool
 }
@@ -95,6 +96,7 @@ impl CellHolder {
 
     fn from_cell(cell: CellTypes) -> CellHolder {
         CellHolder {
+            is_dirty_editor: false,
             op_id: Uuid::now_v7(),
             cell,
         }
@@ -172,52 +174,13 @@ impl InteractiveChidoriWrapper {
         Ok(())
     }
 
-    fn load_cells(&mut self, cells: Vec<CellHolder>) -> anyhow::Result<()>  {
-        // let cell_name_map = {
-        //     let previous_cells = &self.shared_state.lock().unwrap().editor_cells;
-        //     previous_cells.values().map(|cell| {
-        //         let name = cell.cell.name();
-        //         (name.clone(), cell.clone())
-        //     }).collect::<HashMap<_, _>>()
-        // };
-        //
-        // let mut new_cells_state = HashMap::new();
-        // for cell in cells {
-        //     let name = cell.name();
-        //     // If the named cell exists in our map already
-        //     if let Some(existing_cell_instance) = cell_name_map.get(&name) {
-        //         // If it's not the same cell, replace it
-        //         if existing_cell_instance.cell != cell {
-        //             new_cells_state.insert(existing_cell_instance.op_id, CellHolder {
-        //                 cell,
-        //                 op_id: existing_cell_instance.op_id,
-        //             });
-        //         } else {
-        //             // It's the same cell so just push our existing state
-        //             new_cells_state.insert(existing_cell_instance.op_id, existing_cell_instance.clone());
-        //         }
-        //     } else {
-        //         // This is a new cell, so we push it with a null applied at
-        //         let id = Uuid::now_v7();
-        //         new_cells_state.insert(id, CellHolder {
-        //             cell,
-        //             op_id: id,
-        //         });
-        //     }
-        // }
-        // debug!("Updating editor cells based on load");
-        // self.shared_state.lock().unwrap().editor_cells = new_cells_state;
-        self.dispatch_user_interaction_to_instance(UserInteractionMessage::ReloadCells(cells))?;
-        Ok(())
-    }
-
     pub fn load_md_string(&mut self, s: &str) -> anyhow::Result<Vec<CellHolder>> {
         let mut cells = vec![];
         let blocks = crate::sdk::md::extract_blocks(s);
         blocks
             .0
             .iter()
-            .filter_map(|block| interpret_markdown_code_block(block, None).unwrap())
+            .filter_map(|block| interpret_code_block(block, &None).unwrap())
             .for_each(|block| { cells.push(block); });
         blocks
             .1
@@ -235,16 +198,17 @@ impl InteractiveChidoriWrapper {
         cells.sort();
         self.loaded_path = Some("raw_text".to_string());
         let cell_holders: Vec<_> = cells.into_iter().map(|x| CellHolder::from_cell(x)).collect();
-        self.load_cells(cell_holders.clone())?;
+        let cells1 = cell_holders.clone();
+        self.dispatch_user_interaction_to_instance(UserInteractionMessage::ReloadCells(cells1))?;
         Ok(cell_holders)
     }
 
-    pub fn load_md_directory(&mut self, path: &Path) -> anyhow::Result<()> {
+    pub fn load_md_directory(&mut self, path: &Path) -> anyhow::Result<Vec<CellHolder>> {
         let files = load_folder(path)?;
         let mut cells = vec![];
         for file in files {
             for block in file.code_blocks {
-                if let Some(block) = interpret_markdown_code_block(&block, Some(path.to_string_lossy().to_string())).unwrap() {
+                if let Some(block) = interpret_code_block(&block, &file.filename).unwrap() {
                     cells.push(block);
                 }
             }
@@ -252,7 +216,9 @@ impl InteractiveChidoriWrapper {
         self.loaded_path = Some(path.to_str().unwrap().to_string());
         cells.sort();
         info!("Loading {} cells from {:?}", cells.len(), path);
-        self.load_cells(cells.into_iter().map(|x| CellHolder::from_cell(x)).collect())
+        let cells1 : Vec<_> = cells.into_iter().map(|x| CellHolder::from_cell(x)).collect();
+        self.dispatch_user_interaction_to_instance(UserInteractionMessage::ReloadCells(cells1.clone()))?;
+        Ok(cells1)
     }
 
     pub fn get_instance(&mut self) -> anyhow::Result<ChidoriRuntimeInstance> {

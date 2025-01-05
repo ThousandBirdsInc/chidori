@@ -2,6 +2,7 @@ use crate::sdk::interactive_chidori_wrapper::InteractiveChidoriWrapper;
 use chidori_prompt_format::extract_yaml_frontmatter_string;
 use indoc::indoc;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use serde_derive::Serialize;
 use thiserror::Error;
@@ -14,7 +15,7 @@ pub struct TextBlock {
 }
 
 #[derive(PartialEq, Serialize, Debug)]
-pub struct MarkdownCodeBlock {
+pub struct CodeBlock {
     pub tag: String,
     pub name: Option<String>,
     pub body: String,
@@ -30,13 +31,13 @@ enum CodeResource {
 #[derive(Debug)]
 pub struct ParsedFile {
     pub filename: Option<Box<PathBuf>>,
-    pub code: Option<String>,
+    pub raw_text: Option<String>,
     pub num_lines: usize,
-    pub code_blocks: Vec<MarkdownCodeBlock>,
+    pub code_blocks: Vec<CodeBlock>,
     pub text_blocks: Vec<TextBlock>,
 }
 
-pub(crate) fn extract_blocks(body: &str) -> (Vec<MarkdownCodeBlock>, Vec<TextBlock>) {
+pub(crate) fn extract_blocks(body: &str) -> (Vec<CodeBlock>, Vec<TextBlock>) {
     let mut code_blocks = Vec::new();
     let mut text_blocks = Vec::new();
     let mut start = 0;
@@ -77,7 +78,7 @@ pub(crate) fn extract_blocks(body: &str) -> (Vec<MarkdownCodeBlock>, Vec<TextBlo
                 .map(|n| n.to_string());
 
             // Add the code block
-            code_blocks.push(MarkdownCodeBlock {
+            code_blocks.push(CodeBlock {
                 tag,
                 name,
                 body: rest,
@@ -112,12 +113,40 @@ pub(crate) fn extract_blocks(body: &str) -> (Vec<MarkdownCodeBlock>, Vec<TextBlo
 }
 
 
-
-fn parse_markdown_file(filename: &Path) -> ParsedFile {
+pub fn parse_code_file(filename: &Path) -> ParsedFile {
+    let extension = filename.extension().and_then(OsStr::to_str).unwrap();
     match std::fs::read_to_string(filename) {
         Err(_) => ParsedFile {
             filename: Some(Box::new(filename.to_path_buf())),
-            code: Some("".to_owned()),
+            raw_text: Some("".to_owned()),
+            num_lines: 0,
+            code_blocks: vec![],
+            text_blocks: vec![],
+        },
+        Ok(source) => {
+            let num_lines = source.lines().count();
+            ParsedFile {
+                filename: Some(Box::new(filename.to_path_buf())),
+                raw_text: Some(source.to_string()),
+                num_lines,
+                code_blocks: vec![CodeBlock {
+                    tag: extension.to_string(),
+                    name: None,
+                    body: source.to_string(),
+                    range: Default::default(),
+                }],
+                text_blocks: vec![],
+            }
+        }
+    }
+}
+
+
+pub fn parse_markdown_file(filename: &Path) -> ParsedFile {
+    match std::fs::read_to_string(filename) {
+        Err(_) => ParsedFile {
+            filename: Some(Box::new(filename.to_path_buf())),
+            raw_text: Some("".to_owned()),
             num_lines: 0,
             code_blocks: vec![],
             text_blocks: vec![],
@@ -127,7 +156,7 @@ fn parse_markdown_file(filename: &Path) -> ParsedFile {
             let (code_blocks, text_blocks) = extract_blocks(&source);
             ParsedFile {
                 filename: Some(Box::new(filename.to_path_buf())),
-                code: Some(source.to_string()),
+                raw_text: Some(source.to_string()),
                 num_lines,
                 code_blocks,
                 text_blocks,
@@ -150,8 +179,12 @@ pub fn load_folder(path: &Path) -> anyhow::Result<Vec<ParsedFile>> {
         if metadata.is_file() {
             if let Some(extension)  = path.extension().and_then(|s| s.to_str()) {
                 match extension {
-                    "md" | "py" | "js" | "ts" => {
+                    "md" => {
                         let parsed_file = parse_markdown_file(&path);
+                        res.push(parsed_file);
+                    },
+                    "py" | "js" | "ts" => {
+                        let parsed_file = parse_code_file(&path);
                         res.push(parsed_file);
                     },
                     _ => {}
@@ -173,12 +206,12 @@ pub enum InterpretError {
 }
 
 
-pub fn interpret_markdown_code_block(block: &MarkdownCodeBlock, file_path: Option<String>) -> Result<Option<CellTypes>, InterpretError> {
+pub fn interpret_code_block(block: &CodeBlock, file_path: &Option<Box<PathBuf>>) -> Result<Option<CellTypes>, InterpretError> {
     let whole_body = block.body.clone();
     let (frontmatter, body) = chidori_prompt_format::templating::templates::split_frontmatter(&block.body)
         .map_err(|e| InterpretError::FrontMatterSplitError(e.to_string()))?;
-    let backing_file_reference = file_path.map(|p| BackingFileReference {
-        path: p,
+    let backing_file_reference = file_path.as_ref().map(|p| BackingFileReference {
+        path: p.to_string_lossy().to_string(),
         text_range: Some(block.range.clone())
     });
     Ok(match block.tag.as_str() {
@@ -238,7 +271,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -252,7 +285,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -266,7 +299,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -280,7 +313,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -294,7 +327,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -308,7 +341,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -322,7 +355,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {

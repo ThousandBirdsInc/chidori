@@ -42,7 +42,6 @@ num = "0.4.0"
 tinyset = "0.4.10"
 egui_json_tree = "0.6.0"
 egui_flex = "0.1.1"
-automerge = "0.5.12"
 
 im = "15.1.0"
 
@@ -63,6 +62,7 @@ bevy_framepace = "0.17.1"
 #bevy_assets_bundler = "0.6.0"
 lazy_static = "1.5.0"
 log = "0.4.20"
+sha2 = "0.10.8"
 
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
 arboard = { version = "3.2.0", optional = true }
