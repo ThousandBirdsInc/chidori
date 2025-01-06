@@ -20,6 +20,7 @@ mod tree_grouping;
 mod json_editor;
 mod vim_text_edit;
 mod graph_range_collector;
+mod file_interaction;
 
 use crate::bevy_egui::{egui, EguiContexts, EguiPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
@@ -449,27 +450,10 @@ fn handle_menu_actions(
 ) {
     for event in menu_events.read() {
         match event {
-            MenuAction::NewProject => {
-                println!("New project");
-            }
-            MenuAction::OpenProject => {
-                println!("Open project");
-            }
-            MenuAction::Save => {
-                println!("Save project");
-            }
-            MenuAction::SwitchToGraph => {
-                next_state.set(GameState::Graph);
-            }
-            MenuAction::SwitchToTraces => {
-                next_state.set(GameState::Traces);
-            }
-            MenuAction::SwitchToChat => {
-                next_state.set(GameState::Chat);
-            }
             MenuAction::Quit => {
                 exit.send(AppExit);
             }
+            _ => {}
         }
     }
 }

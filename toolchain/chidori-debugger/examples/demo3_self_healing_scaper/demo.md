@@ -2,7 +2,7 @@
 
 
 # This is a simple function that initially will scrape a website, extract some information, and take a screenshot
-```js
+```javascript
 
 const puppeteer = require('puppeteer');
 
@@ -24,6 +24,8 @@ async function scrapeWebsite() {
 }
 
 scrapeWebsite().catch(console.error);
+
+// modified text
 ```
 
 

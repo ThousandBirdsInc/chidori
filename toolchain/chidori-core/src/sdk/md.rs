@@ -6,6 +6,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use serde_derive::Serialize;
 use thiserror::Error;
+use crate::sdk::interactive_chidori_wrapper::CellHolder;
 use crate::cells::{BackingFileReference, CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, SupportedMemoryProviders, SupportedModelProviders, TemplateCell, TextRange, WebserviceCell};
 
 #[derive(Debug)]
@@ -165,6 +166,14 @@ pub fn parse_markdown_file(filename: &Path) -> ParsedFile {
     }
 }
 
+// pub fn write_folder(files: &Vec<ParsedFile>, cell_holders: &Vec<CellHolder>) {
+//     for c in cell_holders {
+//         if let Some(backing_file_reference ) = &c.cell.backing_file_reference() {
+//             backing_file_reference.path
+//         }
+//     }
+// }
+
 pub fn load_folder(path: &Path) -> anyhow::Result<Vec<ParsedFile>> {
     let mut res = vec![];
     for entry in path.read_dir()? {
@@ -256,6 +265,56 @@ pub fn interpret_code_block(block: &CodeBlock, file_path: &Option<Box<PathBuf>>)
     })
 }
 
+pub fn cell_type_to_markdown(cell: &CellTypes) -> String {
+    match cell {
+        CellTypes::Code(code_cell, _) => {
+            let tag = match code_cell.language {
+                SupportedLanguage::PyO3 => "python",
+                SupportedLanguage::Deno => "javascript",
+            };
+            let name_part = code_cell.name.as_ref()
+                .map(|n| format!(" ({})", n))
+                .unwrap_or_default();
+            
+            format!("{}{}\n{}\n", tag, name_part, code_cell.source_code)
+        },
+        CellTypes::Prompt(LLMPromptCell::Chat { configuration, name, req, complete_body, .. }, _) => {
+            let name_part = name.as_ref()
+                .map(|n| format!(" ({})", n))
+                .unwrap_or_default();
+            
+            // If we have the complete_body, use it to preserve the original formatting
+            if !complete_body.is_empty() {
+                format!("prompt{}\n{}\n", name_part, complete_body)
+            } else {
+                // Otherwise reconstruct from parts
+                let yaml = serde_yaml::to_string(configuration).unwrap_or_default();
+                format!("prompt{}\n---\n{}\n---\n{}\n", name_part, yaml.trim(), req)
+            }
+        },
+        CellTypes::CodeGen(code_gen, _) => {
+            let name_part = code_gen.name.as_ref()
+                .map(|n| format!(" ({})", n))
+                .unwrap_or_default();
+            
+            if !code_gen.complete_body.is_empty() {
+                format!("codegen{}\n{}\n", name_part, code_gen.complete_body)
+            } else {
+                let yaml = serde_yaml::to_string(&code_gen.configuration).unwrap_or_default();
+                format!("codegen{}\n---\n{}\n---\n{}\n", name_part, yaml.trim(), code_gen.req)
+            }
+        },
+        CellTypes::Template(template, _) => {
+            let name_part = template.name.as_ref()
+                .map(|n| format!(" ({})", n))
+                .unwrap_or_default();
+            
+            format!("template{}\n{}\n", name_part, template.body)
+        },
+        // Add other cell types as needed
+        _ => String::new()
+    }
+}
 
 #[cfg(test)]
 mod test {
@@ -397,5 +456,21 @@ mod test {
         }, {
             insta::assert_yaml_snapshot!(extracted);
         });
+    }
+
+    #[test]
+    fn test_cell_type_roundtrip() {
+        let markdown = indoc! {r#"
+        ```python (test_func)
+        def add(a, b):
+            return a + b
+        ```
+        "#};
+        
+        let (blocks, _) = extract_blocks(markdown);
+        let cell = interpret_code_block(&blocks[0], None).unwrap().unwrap();
+        let reconstructed = cell_type_to_markdown(&cell);
+        
+        assert_eq!(reconstructed.trim(), markdown.trim());
     }
 }

@@ -78,6 +78,7 @@ thread_local = { version = "1.1.0", optional = true }
 ##pyo3-build-config = "0.22.5"
 
 
+
 # https://github.com/mvlabat/bevy_egui/blob/main/Cargo.toml
 [features]
 default = ["manage_clipboard", "open_url", "default_fonts", "render"]
@@ -85,3 +86,6 @@ manage_clipboard = ["arboard", "thread_local"]
 open_url = ["webbrowser"]
 default_fonts = ["egui/default_fonts"]
 render = ["bevy/bevy_render"]
+
+[dev-dependencies]
+tempfile = "3.8.1"

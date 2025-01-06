@@ -2799,6 +2799,7 @@ dependencies = [
  "svgtypes 0.15.2",
  "syntect",
  "target-lexicon",
+ "tempfile",
  "thread_local",
  "tinyset",
  "tokio",
