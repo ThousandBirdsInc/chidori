@@ -201,7 +201,7 @@ impl Default for EguiTree {
             tiles.insert_pane(gen_pane(String::from("Code"))),
             tiles.insert_pane(gen_pane(String::from("Logs"))),
             tiles.insert_pane(gen_pane(String::from("Graph"))),
-            tiles.insert_pane(gen_pane(String::from("Traces"))),
+            // tiles.insert_pane(gen_pane(String::from("Traces"))),
             tiles.insert_pane(gen_pane(String::from("Chat")))
         ];
         let root = tiles.insert_tab_tile(tabs);
