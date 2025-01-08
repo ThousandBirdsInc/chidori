@@ -69,3 +69,4 @@ toolchain/chidori-old/package_python/chidori/_chidori.abi3.so
 .pre-commit-config.yaml
 
 .env
+.envrc

@@ -2,13 +2,21 @@ use crate::sdk::interactive_chidori_wrapper::InteractiveChidoriWrapper;
 use chidori_prompt_format::extract_yaml_frontmatter_string;
 use indoc::indoc;
 use std::collections::HashMap;
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use serde_derive::Serialize;
 use thiserror::Error;
+use crate::sdk::interactive_chidori_wrapper::CellHolder;
 use crate::cells::{BackingFileReference, CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, SupportedMemoryProviders, SupportedModelProviders, TemplateCell, TextRange, WebserviceCell};
 
+#[derive(Debug)]
+pub struct TextBlock {
+    pub content: String,
+    pub range: TextRange,
+}
+
 #[derive(PartialEq, Serialize, Debug)]
-pub struct MarkdownCodeBlock {
+pub struct CodeBlock {
     pub tag: String,
     pub name: Option<String>,
     pub body: String,
@@ -23,19 +31,38 @@ enum CodeResource {
 
 #[derive(Debug)]
 pub struct ParsedFile {
-    filename: Option<Box<std::path::PathBuf>>,
-    code: Option<String>,
-    num_lines: usize,
-    pub(crate) result: Vec<MarkdownCodeBlock>,
+    pub filename: Option<Box<PathBuf>>,
+    pub raw_text: Option<String>,
+    pub num_lines: usize,
+    pub code_blocks: Vec<CodeBlock>,
+    pub text_blocks: Vec<TextBlock>,
 }
 
-pub(crate) fn extract_code_blocks(body: &str) -> Vec<MarkdownCodeBlock> {
+pub(crate) fn extract_blocks(body: &str) -> (Vec<CodeBlock>, Vec<TextBlock>) {
     let mut code_blocks = Vec::new();
+    let mut text_blocks = Vec::new();
     let mut start = 0;
+    let mut last_code_end = 0;
 
     // Iterate over each occurrence of backticks
-    while let Some(end) = body[start..].find("```") {
-        start += end + 3; // Move start to the character after the closing ```
+    while let Some(code_start) = body[start..].find("```") {
+        let absolute_start = start + code_start;
+
+        // Extract text before this code block
+        if absolute_start > last_code_end {
+            let text = body[last_code_end..absolute_start].trim();
+            if !text.is_empty() {
+                text_blocks.push(TextBlock {
+                    content: text.to_string(),
+                    range: TextRange {
+                        start: last_code_end,
+                        end: absolute_start
+                    },
+                });
+            }
+        }
+
+        start = absolute_start + 3; // Move start to after opening ```
 
         if let Some(end_of_code) = body[start..].find("```") {
             let code = &body[start..start + end_of_code].trim();
@@ -47,10 +74,12 @@ pub(crate) fn extract_code_blocks(body: &str) -> Vec<MarkdownCodeBlock> {
 
             let tag_and_name: Vec<&str> = first_line.split_whitespace().collect();
             let tag = tag_and_name.get(0).cloned().unwrap_or_default().to_string();
-            let name = tag_and_name.get(1).and_then(|n| n.strip_prefix('(').and_then(|n| n.strip_suffix(')'))).map(|n| n.to_string());
+            let name = tag_and_name.get(1)
+                .and_then(|n| n.strip_prefix('(').and_then(|n| n.strip_suffix(')')))
+                .map(|n| n.to_string());
 
-            // Add the code block with the text range
-            code_blocks.push(MarkdownCodeBlock {
+            // Add the code block
+            code_blocks.push(CodeBlock {
                 tag,
                 name,
                 body: rest,
@@ -60,36 +89,90 @@ pub(crate) fn extract_code_blocks(body: &str) -> Vec<MarkdownCodeBlock> {
                 },
             });
 
-            start += end_of_code + 3; // Move start to the character after the closing ```
+            start += end_of_code + 3; // Move start to after closing ```
+            last_code_end = start;
         } else {
-            break; // No closing backticks found, exit the loop
+            break; // No closing backticks found
         }
     }
 
-    code_blocks
+    // Get final text block after last code block if it exists
+    if last_code_end < body.len() {
+        let final_text = body[last_code_end..].trim();
+        if !final_text.is_empty() {
+            text_blocks.push(TextBlock {
+                content: final_text.to_string(),
+                range: TextRange {
+                    start: last_code_end,
+                    end: body.len()
+                },
+            });
+        }
+    }
+
+    (code_blocks, text_blocks)
 }
 
 
-fn parse_markdown_file(filename: &Path) -> ParsedFile {
+pub fn parse_code_file(filename: &Path) -> ParsedFile {
+    let extension = filename.extension().and_then(OsStr::to_str).unwrap();
     match std::fs::read_to_string(filename) {
-        Err(e) => ParsedFile {
+        Err(_) => ParsedFile {
             filename: Some(Box::new(filename.to_path_buf())),
-            code: Some("".to_owned()),
+            raw_text: Some("".to_owned()),
             num_lines: 0,
-            result: vec![],
+            code_blocks: vec![],
+            text_blocks: vec![],
         },
         Ok(source) => {
             let num_lines = source.lines().count();
-            let result = extract_code_blocks(&source);
             ParsedFile {
                 filename: Some(Box::new(filename.to_path_buf())),
-                code: Some(source.to_string()),
+                raw_text: Some(source.to_string()),
                 num_lines,
-                result,
+                code_blocks: vec![CodeBlock {
+                    tag: extension.to_string(),
+                    name: None,
+                    body: source.to_string(),
+                    range: Default::default(),
+                }],
+                text_blocks: vec![],
             }
         }
     }
 }
+
+
+pub fn parse_markdown_file(filename: &Path) -> ParsedFile {
+    match std::fs::read_to_string(filename) {
+        Err(_) => ParsedFile {
+            filename: Some(Box::new(filename.to_path_buf())),
+            raw_text: Some("".to_owned()),
+            num_lines: 0,
+            code_blocks: vec![],
+            text_blocks: vec![],
+        },
+        Ok(source) => {
+            let num_lines = source.lines().count();
+            let (code_blocks, text_blocks) = extract_blocks(&source);
+            ParsedFile {
+                filename: Some(Box::new(filename.to_path_buf())),
+                raw_text: Some(source.to_string()),
+                num_lines,
+                code_blocks,
+                text_blocks,
+            }
+        }
+    }
+}
+
+// pub fn write_folder(files: &Vec<ParsedFile>, cell_holders: &Vec<CellHolder>) {
+//     for c in cell_holders {
+//         if let Some(backing_file_reference ) = &c.cell.backing_file_reference() {
+//             backing_file_reference.path
+//         }
+//     }
+// }
 
 pub fn load_folder(path: &Path) -> anyhow::Result<Vec<ParsedFile>> {
     let mut res = vec![];
@@ -105,8 +188,12 @@ pub fn load_folder(path: &Path) -> anyhow::Result<Vec<ParsedFile>> {
         if metadata.is_file() {
             if let Some(extension)  = path.extension().and_then(|s| s.to_str()) {
                 match extension {
-                    "md" | "py" | "js" | "ts" => {
+                    "md" => {
                         let parsed_file = parse_markdown_file(&path);
+                        res.push(parsed_file);
+                    },
+                    "py" | "js" | "ts" => {
+                        let parsed_file = parse_code_file(&path);
                         res.push(parsed_file);
                     },
                     _ => {}
@@ -120,7 +207,7 @@ pub fn load_folder(path: &Path) -> anyhow::Result<Vec<ParsedFile>> {
 #[derive(Error, Debug)]
 pub enum InterpretError {
     #[error("Failed to split frontmatter: {0}")]
-    FrontmatterSplitError(String),
+    FrontMatterSplitError(String),
     #[error("Failed to deserialize YAML: {0}")]
     YamlDeserializeError(#[from] serde_yaml::Error),
     #[error("Failed to parse port number")]
@@ -128,12 +215,12 @@ pub enum InterpretError {
 }
 
 
-pub fn interpret_markdown_code_block(block: &MarkdownCodeBlock, file_path: Option<String>) -> Result<Option<CellTypes>, InterpretError> {
+pub fn interpret_code_block(block: &CodeBlock, file_path: &Option<Box<PathBuf>>) -> Result<Option<CellTypes>, InterpretError> {
     let whole_body = block.body.clone();
     let (frontmatter, body) = chidori_prompt_format::templating::templates::split_frontmatter(&block.body)
-        .map_err(|e| InterpretError::FrontmatterSplitError(e.to_string()))?;
-    let backing_file_reference = file_path.map(|p| BackingFileReference {
-        path: p,
+        .map_err(|e| InterpretError::FrontMatterSplitError(e.to_string()))?;
+    let backing_file_reference = file_path.as_ref().map(|p| BackingFileReference {
+        path: p.to_string_lossy().to_string(),
         text_range: Some(block.range.clone())
     });
     Ok(match block.tag.as_str() {
@@ -178,6 +265,56 @@ pub fn interpret_markdown_code_block(block: &MarkdownCodeBlock, file_path: Optio
     })
 }
 
+pub fn cell_type_to_markdown(cell: &CellTypes) -> String {
+    match cell {
+        CellTypes::Code(code_cell, _) => {
+            let tag = match code_cell.language {
+                SupportedLanguage::PyO3 => "python",
+                SupportedLanguage::Deno => "javascript",
+            };
+            let name_part = code_cell.name.as_ref()
+                .map(|n| format!(" ({})", n))
+                .unwrap_or_default();
+            
+            format!("{}{}\n{}\n", tag, name_part, code_cell.source_code)
+        },
+        CellTypes::Prompt(LLMPromptCell::Chat { configuration, name, req, complete_body, .. }, _) => {
+            let name_part = name.as_ref()
+                .map(|n| format!(" ({})", n))
+                .unwrap_or_default();
+            
+            // If we have the complete_body, use it to preserve the original formatting
+            if !complete_body.is_empty() {
+                format!("prompt{}\n{}\n", name_part, complete_body)
+            } else {
+                // Otherwise reconstruct from parts
+                let yaml = serde_yaml::to_string(configuration).unwrap_or_default();
+                format!("prompt{}\n---\n{}\n---\n{}\n", name_part, yaml.trim(), req)
+            }
+        },
+        CellTypes::CodeGen(code_gen, _) => {
+            let name_part = code_gen.name.as_ref()
+                .map(|n| format!(" ({})", n))
+                .unwrap_or_default();
+            
+            if !code_gen.complete_body.is_empty() {
+                format!("codegen{}\n{}\n", name_part, code_gen.complete_body)
+            } else {
+                let yaml = serde_yaml::to_string(&code_gen.configuration).unwrap_or_default();
+                format!("codegen{}\n---\n{}\n---\n{}\n", name_part, yaml.trim(), code_gen.req)
+            }
+        },
+        CellTypes::Template(template, _) => {
+            let name_part = template.name.as_ref()
+                .map(|n| format!(" ({})", n))
+                .unwrap_or_default();
+            
+            format!("template{}\n{}\n", name_part, template.body)
+        },
+        // Add other cell types as needed
+        _ => String::new()
+    }
+}
 
 #[cfg(test)]
 mod test {
@@ -193,7 +330,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -207,7 +344,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -221,7 +358,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -235,7 +372,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -249,7 +386,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -263,7 +400,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -277,7 +414,7 @@ mod test {
             .expect("Should have been able to read the file");
         let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
             .iter()
-            .flat_map(|block| interpret_markdown_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -319,5 +456,21 @@ mod test {
         }, {
             insta::assert_yaml_snapshot!(extracted);
         });
+    }
+
+    #[test]
+    fn test_cell_type_roundtrip() {
+        let markdown = indoc! {r#"
+        ```python (test_func)
+        def add(a, b):
+            return a + b
+        ```
+        "#};
+        
+        let (blocks, _) = extract_blocks(markdown);
+        let cell = interpret_code_block(&blocks[0], None).unwrap().unwrap();
+        let reconstructed = cell_type_to_markdown(&cell);
+        
+        assert_eq!(reconstructed.trim(), markdown.trim());
     }
 }

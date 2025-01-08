@@ -54,6 +54,7 @@ use chidori_core::execution::primitives::serialized_value::RkyvSerializedValue;
 use chidori_core::sdk::interactive_chidori_wrapper::CellHolder;
 use crate::bevy_prototype_lyon::draw::Fill;
 use crate::graph_range_collector::{ElementDimensions, RangeCollector, StateRange};
+use crate::tidy_tree::geometry::Coord;
 use crate::tree_grouping::group_tree;
 
 #[derive(Resource, Default)]
@@ -290,9 +291,6 @@ fn set_camera_viewports(
 ) {
     let window = windows.single();
     let scale_factor = window.scale_factor();
-    // let minimap_offset = crate::traces::MINIMAP_OFFSET * scale_factor as u32;
-    // let minimap_height = (crate::traces::MINIMAP_HEIGHT as f32 * scale_factor) as u32;
-    // let minimap_height_and_offset = crate::traces::MINIMAP_HEIGHT_AND_OFFSET * scale_factor as u32;
     let mut minimap_camera = minimap_camera.single_mut();
 
     // We need to dynamically resize the camera's viewports whenever the window size changes
@@ -311,12 +309,6 @@ fn mouse_pan(
     mut q_camera: Query<(&mut Projection, &mut Transform, &mut CameraState), (With<OnGraphScreen>, Without<GraphMinimapCamera>, Without<GraphIdxPair>, Without<GraphIdx>)>,
     buttons: Res<ButtonInput<MouseButton>>,
     mut motion_evr: EventReader<MouseMotion>,
-    // node_query: Query<
-    //     (Entity, &Transform, &GraphIdx, &EguiRenderTarget),
-    //     (With<GraphIdx>, Without<GraphIdxPair>),
-    // >,
-    // rapier_context: Res<RapierContext>,
-
     graph_resource: Res<GraphResource>,
 ) {
     if !graph_resource.is_active {
@@ -349,9 +341,32 @@ fn mouse_scroll_events(
     mut q_camera: Query<(&mut Projection, &mut Transform, &mut CameraState), (With<OnGraphScreen> , Without<GraphMinimapCamera>, Without<GraphIdxPair>, Without<GraphIdx>, Without<GraphMain2dCamera>)>,
     keyboard_input: Res<ButtonInput<KeyCode>>,
     q_mycoords: Query<&CursorWorldCoords, With<OnGraphScreen>>,
+    tree_identities: Res<EguiTreeIdentities>,
+    mut tree: ResMut<EguiTree>,
+    q_window: Query<&Window, With<PrimaryWindow>>,
 ) {
     if !graph_resource.is_active {
         return;
+    }
+
+    let window = q_window.single();
+    if let Some(graph_tile) = tree_identities.graph_tile {
+        if let Some(tile) = tree.tree.tiles.get(graph_tile) {
+            match tile {
+                Tile::Pane(p) => {
+                    if &p.nr == &"Graph" {
+                        if let Some(r) = p.rect {
+                            if let Some(cursor) = window.cursor_position() {
+                                if !r.contains(egui::pos2(cursor.x as f32, cursor.y as f32)) {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                Tile::Container(_) => {}
+            }
+        }
     }
 
     let (projection, mut camera_transform, mut camera_state) = q_camera.single_mut();
@@ -538,7 +553,7 @@ fn egui_execution_state(
 
 
 
-        if let Some(cell) = &execution_state.evaluating_cell {
+        if let Some(cell) = &execution_state.evaluating_cell() {
             egui::CollapsingHeader::new("Cell Definition")
                 .show(ui, |ui| {
                     egui_render_cell_read(ui, cell, execution_state);
@@ -580,7 +595,8 @@ fn egui_execution_state(
                 &current_theme,
                 ui,
                 &mut code_theme,
-                *op_id);
+                *op_id,
+                true);
         }
 
 
@@ -1027,7 +1043,7 @@ fn render_graph_grouping(
     // First pass: collect dimensions
     let mut topo = petgraph::visit::Topo::new(&graph_resource.execution_graph);
     while let Some(idx) = topo.next(&graph_resource.execution_graph) {
-        if let Some(node) = &graph_resource.execution_graph.node_weight(idx) {
+        if let Some(_) = &graph_resource.execution_graph.node_weight(idx) {
             if let Some((_, n)) = tree_graph.get_from_external_id(&idx.index()) {
                 dimensions_map.insert(idx, ElementDimensions {
                     width: n.width.to_f32().unwrap(),
@@ -1161,21 +1177,8 @@ fn update_graph_system_renderer(
         ));
     }
 
-
-    // Construct the tidy_tree from a topo traversal of the graph
-    // TODO: grouping is currently unused
     let execution_graph = &graph_resource.execution_graph;
     let grouped_nodes = &graph_resource.grouped_tree;
-    let group_dep_graph = &graph_resource.group_dependency_graph;
-    // let mut group_layouts = HashMap::new();
-    // dbg!(&grouped_nodes);
-    for (id, group_graph) in grouped_nodes {
-        let tree_layout = generate_tree_layout(&group_graph, &graph_resource.node_dimensions);
-        // group_layouts.insert(id, tree_layout);
-    }
-
-    // TODO: traverse the group dep graph, allocating nodes
-
     if graph_resource.is_layout_dirty {
         let tree_graph = generate_tree_layout(&execution_graph, &graph_resource.node_dimensions);
         graph_resource.layout_graph = Some(tree_graph);
@@ -1301,10 +1304,10 @@ fn update_graph_system_renderer(
                     transform.translation = transform.translation.lerp(Vec3::new(n.x.to_f32().unwrap(), -n.y.to_f32().unwrap(), -1.0), 0.5);
 
                     // Draw text within these elements
-                    egui_graph_node(&current_theme, &mut chidori_state, &mut node_resources_cache, node, entity, ctx);
+                    egui_graph_node(&current_theme, &mut chidori_state, &mut node_resources_cache, node, entity, ctx, &transform);
 
                     let used_rect = ctx.used_rect();
-                    let height = used_rect.height();
+                    let height = used_rect.height().min(1000.0);
                     graph_resource.node_dimensions.insert(*node.clone(), (800.0, height));
                     flag_layout_is_dirtied = true;
                     transform.scale = vec3(width, height, 1.0);
@@ -1378,7 +1381,8 @@ fn egui_graph_node(
     mut node_resources_cache: &mut NodeResourcesCache,
     node: &&ChronologyId,
     entity: Entity,
-    ctx: &mut Context
+    ctx: &mut Context,
+    transform: &Transform
 ) {
     egui::Area::new(format!("{:?}", entity).into())
         .fixed_pos(Pos2::new(0.0, 0.0)).show(ctx, |ui| {
@@ -1387,13 +1391,19 @@ fn egui_graph_node(
             .inner_margin(16.0).rounding(6.0).begin(ui);
         {
             let mut ui = &mut frame.content_ui;
-            ui.set_width(800.0);
+            ui.set_width(800.0 - (2.0 * 16.0));
+            ui.set_max_height(1000.0);
             let node1 = *node;
             let original_style = (*ui.ctx().style()).clone();
 
             let mut style = original_style.clone();
             // style.visuals.override_text_color = Some(Color32::BLACK);
             ui.set_style(style);
+
+
+            if chidori_state.debug_mode {
+                ui.label(format!("{:?}", transform));
+            }
 
 
             if *node1 == chidori_core::uuid::Uuid::nil() {
@@ -1408,73 +1418,78 @@ fn egui_graph_node(
                     });
                 });
             } else {
-                if let Some(state) = chidori_state.get_execution_state_at_id(&node1) {
-                    let state = &state;
-                    if !matches!(state.evaluating_enclosed_state, EnclosedState::Open) {
-                        ui.horizontal(|ui| {
-                            if chidori_state.debug_mode {
-                                ui.label(node1.to_string());
-                            }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                                if ui.button("Revert to this State").clicked() {
-                                    info!("We would like to revert to {:?}", node1);
-                                    let _ = chidori_state.set_execution_id(*node1);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if let Some(state) = chidori_state.get_execution_state_at_id(&node1) {
+                        let state = &state;
+                        if !matches!(state.evaluating_enclosed_state, EnclosedState::Open) {
+                            ui.horizontal(|ui| {
+                                if chidori_state.debug_mode {
+                                    ui.label(node1.to_string());
                                 }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                    if ui.button("Revert to this State").clicked() {
+                                        info!("We would like to revert to {:?}", node1);
+                                        let _ = chidori_state.set_execution_id(*node1);
+                                    }
+                                });
                             });
-                        });
-                    }
+                        }
 
-                    match &state.evaluating_enclosed_state {
-                        EnclosedState::Close(CloseReason::Error) => {
-                            let mut frame = egui::Frame::default().fill(current_theme.theme.card).stroke(Stroke {
-                                width: 0.5,
-                                color: Color32::from_hex("#ff0000").unwrap(),
-                            }).inner_margin(16.0).rounding(6.0).begin(ui);
-                            {
-                                let mut ui = &mut frame.content_ui;
-                                ui.label("Error");
+                        match &state.evaluating_enclosed_state {
+                            EnclosedState::Close(CloseReason::Error) => {
+                                let mut frame = egui::Frame::default().fill(current_theme.theme.card).stroke(Stroke {
+                                    width: 0.5,
+                                    color: Color32::from_hex("#ff0000").unwrap(),
+                                }).inner_margin(16.0).rounding(6.0).begin(ui);
+                                {
+                                    let mut ui = &mut frame.content_ui;
+                                    ui.label("Error");
+                                    egui_execution_state(
+                                        ui,
+                                        &mut chidori_state,
+                                        state, &current_theme.theme);
+                                }
+                                frame.end(ui);
+                            }
+                            EnclosedState::Close(CloseReason::Failure) => {
+                                ui.label("Eval Failure");
+                            }
+                            EnclosedState::Open => {
                                 egui_execution_state(
                                     ui,
                                     &mut chidori_state,
                                     state, &current_theme.theme);
                             }
-                            frame.end(ui);
-                        }
-                        EnclosedState::Close(CloseReason::Failure) => {
-                            ui.label("Eval Failure");
-                        }
-                        EnclosedState::Open => {
-                            egui_execution_state(
-                                ui,
-                                &mut chidori_state,
-                                state, &current_theme.theme);
-                        }
-                        EnclosedState::SelfContained | EnclosedState::Close(CloseReason::Complete) => {
-                            egui_execution_state(ui, &mut chidori_state, state, &current_theme.theme);
-                            let image_paths = node_resources_cache.matched_strings_in_resource.entry(*node1).or_insert_with(|| {
-                                state.state.iter().map(|(_, value)| {
-                                    crate::util::find_matching_strings(&value.output.clone().unwrap(), r"(?i)\.(png|jpe?g)$")
-                                }).flatten().collect()
-                            });
-                            for (img_path ,_) in image_paths {
-                                // TODO: cache this based on node and the path
-                                let texture = if let Some(cached_texture) = node_resources_cache.image_texture_cache.get(img_path) {
-                                    cached_texture.clone()
-                                } else {
-                                    let texture = read_image(ui, &img_path);
-                                    node_resources_cache.image_texture_cache.insert(img_path.clone(), texture.clone());
-                                    texture
-                                };
+                            EnclosedState::SelfContained | EnclosedState::Close(CloseReason::Complete) => {
+                                egui_execution_state(ui, &mut chidori_state, state, &current_theme.theme);
+                                let image_paths = node_resources_cache.matched_strings_in_resource.entry(*node1).or_insert_with(|| {
+                                    state.state.iter().map(|(_, value)| {
+                                        if let Ok(output) = &value.output.clone() {
+                                            crate::util::find_matching_strings(&output, r"(?i)\.(png|jpe?g)$")
+                                        } else {
+                                            vec![]
+                                        }
+                                    }).flatten().collect()
+                                });
+                                for (img_path, _) in image_paths {
+                                    let texture = if let Some(cached_texture) = node_resources_cache.image_texture_cache.get(img_path) {
+                                        cached_texture.clone()
+                                    } else {
+                                        let texture = read_image(ui, &img_path);
+                                        node_resources_cache.image_texture_cache.insert(img_path.clone(), texture.clone());
+                                        texture
+                                    };
 
-                                // Display the image
-                                ui.add(egui::Image::new(&texture));
+                                    // Display the image
+                                    ui.add(egui::Image::new(&texture));
+                                }
                             }
                         }
+                    } else {
+                        ui.label("No evaluation recorded");
+                        // internal_state.get_execution_state_at_id(*node);
                     }
-                } else {
-                    ui.label("No evaluation recorded");
-                    // internal_state.get_execution_state_at_id(*node);
-                }
+                });
             }
 
             ui.set_style(original_style);
@@ -1486,7 +1501,7 @@ fn egui_graph_node(
 fn create_egui_texture_image(window: &Window, width: f32, height: f32) -> (f32, u32, u32, Image) {
     let scale_factor = window.scale_factor();
     let scaled_width = (width * scale_factor) as u32;
-    let scaled_height = (height * scale_factor) as u32;
+    let scaled_height = ((height * scale_factor) as u32);
     let size = Extent3d {
         width: scaled_width,
         height: scaled_height,
@@ -1553,14 +1568,20 @@ fn generate_tree_layout(
     execution_graph: &&StableGraph<ExecutionNodeId, ()>,
     node_dimensions: &DashMap<ExecutionNodeId, (f32, f32)>
 ) -> TreeGraph {
-    let mut tidy = TidyLayout::new(200., 200., Orientation::Vertical);
-    let mut root = crate::tidy_tree::Node::new(0, 600., 80., None);
+    let mut tidy = TidyLayout::new(100., 100., Orientation::Vertical);
+    let mut root = crate::tidy_tree::Node::new(0, 800., 100., None);
+    root.y = 0.0;
+    root.x = 0.0;
     let mut tree_graph = crate::tidy_tree::TreeGraph::new(root);
 
     // Initialize nodes within a TreeGraph using our ExecutionGraph
     let mut topo = petgraph::visit::Topo::new(&execution_graph);
     while let Some(x) = topo.next(&execution_graph) {
         if let Some(node) = &execution_graph.node_weight(x) {
+            if x.index() == 0 {
+                let dims = node_dimensions.entry(**node).or_insert((800.0, 100.0));
+                continue;
+            }
             let dims = node_dimensions.entry(**node).or_insert((800.0, 300.0));
             let mut width = dims.0;
             let mut height = dims.1;
@@ -1583,6 +1604,11 @@ fn generate_tree_layout(
 
     tidy.layout(&mut tree_graph);
 
+    if let Some(root ) = tree_graph.graph.node_weight_mut(tree_graph.root) {
+        root.y = 0.0;
+    }
+
+
     let mut max_y: f32 = 0.0;
     let mut max_x: f32 = 0.0;
     let mut min_x: f32 = 0.0;
@@ -1600,21 +1626,21 @@ fn generate_tree_layout(
 
 fn update_graph_system_data_structures(
     mut graph_res: ResMut<GraphResource>,
-    execution_graph: Res<ChidoriState>,
+    chidori_state: Res<ChidoriState>,
 ) {
     // If the execution graph has changed, clear the graph and reconstruct it
-    if graph_res.hash_graph != hash_graph(&execution_graph.execution_graph) {
-        let (dataset, node_ids) = execution_graph.construct_stablegraph_from_chidori_execution_graph();
+    if graph_res.hash_graph != hash_graph(&chidori_state.execution_graph) {
+        let (dataset, node_ids) = chidori_state.construct_stablegraph_from_chidori_execution_graph(&chidori_state.execution_graph);
         graph_res.node_ids = node_ids;
 
-        let (grouped_dataset, grouped_tree, group_dep_graph) = group_tree(&dataset, &execution_graph.grouped_nodes);
+        let (grouped_dataset, grouped_tree, group_dep_graph) = group_tree(&dataset, &chidori_state.grouped_nodes);
 
         // TODO: handle support for displaying groups
         // graph_res.execution_graph = grouped_dataset;
         graph_res.execution_graph = dataset;
         graph_res.grouped_tree = grouped_tree;
         graph_res.group_dependency_graph = group_dep_graph;
-        graph_res.hash_graph = hash_graph(&execution_graph.execution_graph);
+        graph_res.hash_graph = hash_graph(&chidori_state.execution_graph);
         graph_res.is_layout_dirty = true;
     }
 }
@@ -1762,10 +1788,6 @@ fn graph_setup(
     let window = windows.single();
     let scale_factor = window.scale_factor();
 
-    // let (config, _) = config_store.config_mut::<DefaultGizmoConfigGroup>();
-    // config.line_width = 1.0;
-    // config.render_layers = RenderLayers::layer(RENDER_LAYER_GRAPH_VIEW);
-
     let cursor_selection_material = materials_custom.add(RoundedRectMaterial {
         width: 1.0,
         height: 1.0,
@@ -1788,11 +1810,6 @@ fn graph_setup(
             camera: Camera {
                 order: 2,
                 clear_color: ClearColorConfig::Custom(Color::rgba(0.035, 0.035, 0.043, 1.0)),
-                // viewport: Some(Viewport {
-                //     physical_position: UVec2::new((300.0 * scale_factor) as u32, 0),
-                //     physical_size: UVec2::new(window.physical_width() - 300 * (scale_factor as u32), window.physical_height()),
-                //     ..default()
-                // }),
                 ..default()
             },
             projection: OrthographicProjection {
@@ -1889,21 +1906,6 @@ fn graph_setup(
         OnGraphScreen
     ));
 
-    // let shape = shapes::RegularPolygon {
-    //     sides: 6,
-    //     feature: shapes::RegularPolygonFeature::Radius(200.0),
-    //     ..shapes::RegularPolygon::default()
-    // };
-    //
-    // commands.spawn((
-    //     ShapeBundle {
-    //         path: GeometryBuilder::build_as(&shape),
-    //         ..default()
-    //     },
-    //     crate::bevy_prototype_lyon::prelude::Fill::color(bevy::prelude::Color::CYAN),
-    //     crate::bevy_prototype_lyon::prelude::Stroke::new(bevy::prelude::Color::BLACK, 10.0),
-    // ));
-
     let mut dataset = StableGraph::new();
     let mut node_ids = HashMap::new();
     commands.spawn((CursorWorldCoords(vec2(0.0, 0.0)), OnGraphScreen));
@@ -1931,8 +1933,9 @@ fn ui_window(
     let window = q_window.single();
     let mut hide_all = false;
 
+    let sidebar_width = 275.0;
     let mut container_frame = Frame::default()
-        .fill(current_theme.theme.accent)
+        .fill(current_theme.theme.card)
         .outer_margin(Margin {
             left: 0.0,
             right: 0.0,
@@ -1950,7 +1953,7 @@ fn ui_window(
                         if let Some(r) = p.rect {
                             container_frame = container_frame.outer_margin(Margin {
                                 left: r.min.x,
-                                right: (window.width() - 300.0),
+                                right: (window.width() - sidebar_width),
                                 top: r.min.y,
                                 bottom: window.height() - r.max.y,
                             });
@@ -1962,29 +1965,22 @@ fn ui_window(
         }
     }
 
-    if hide_all || chidori_state.display_example_modal {
+    if hide_all || chidori_state.application_state_is_displaying_example_modal {
         return;
     }
 
-    egui::CentralPanel::default().frame(container_frame).show(contexts.ctx_mut(), |ui| {
-        ui.add_space(22.0);
-        ui.horizontal(|ui| {
-            ui.add_space(22.0);
-            ui.vertical(|ui| {
-                ui.label("Sidebar");
-                ui.button("Collapse Alternate Branches");
-            });
-        });
-
-    });
-    // egui::SidePanel::left("Explorer")
-    //     .frame(container_frame)
-    //     .min_width(300.0)
-    //     .max_width(300.0)
-    //     .resizable(false)
-    //     .show_separator_line(false)
-    //     .show(contexts.ctx_mut(), |ui| {
+    // if window.width() > 600.0 {
+    //     egui::CentralPanel::default().frame(container_frame).show(contexts.ctx_mut(), |ui| {
+    //         ui.set_width(sidebar_width);
+    //         ui.horizontal(|ui| {
+    //             ui.add_space(16.0);
+    //             ui.vertical(|ui| {
+    //                 ui.button("Collapse Alternate Branches");
+    //             });
+    //         });
     //     });
+    // }
+
 }
 
 #[derive(Component)]

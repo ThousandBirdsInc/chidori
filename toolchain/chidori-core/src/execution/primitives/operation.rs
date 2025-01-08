@@ -398,6 +398,7 @@ impl OperationNode {
             CellTypes::Template(crate::cells::TemplateCell {body, ..}, _) => {
                 crate::cells::template_cell::template_cell_exec(body.clone())
             }
+            CellTypes::PlainText(_, _) => unreachable!()
         };
 
         /// Receiver that we pass to the exec for it to capture oneshot RPC communication

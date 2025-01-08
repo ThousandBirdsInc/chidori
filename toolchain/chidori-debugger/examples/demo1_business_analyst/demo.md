@@ -3,7 +3,7 @@
 We use Astral rather than Playwright for Deno support
 https://astral.deno.dev/guides/navigation/
 
-```ts
+```javascript
 // Import Astral
 import { launch } from "https://deno.land/x/astral/mod.ts";
 

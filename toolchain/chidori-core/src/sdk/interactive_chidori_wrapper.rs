@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::fmt;
 use std::sync::{mpsc, Arc, MutexGuard};
 
@@ -8,20 +9,101 @@ use tracing::dispatcher::DefaultGuard;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use futures_util::future::Shared;
-use tracing::info;
+use tracing::{debug, info};
 use dashmap::DashMap;
 use serde::{Serialize, Serializer};
 use serde::ser::SerializeMap;
 use std::ops::Deref;
-use crate::cells::{CellTypes};
+use crate::cells::{BackingFileReference, CellTypes, PlainTextCell};
 use crate::execution::execution::execution_graph::{ExecutionGraph, ExecutionNodeId, MergedStateHistory};
 use crate::execution::execution::ExecutionState;
 use crate::execution::primitives::identifiers::{DependencyReference, OperationId};
 use crate::sdk::chidori_runtime_instance::{ChidoriRuntimeInstance, PlaybackState, UserInteractionMessage};
-use crate::sdk::md::{interpret_markdown_code_block, load_folder};
+use crate::sdk::md::{interpret_code_block, load_folder};
 use crate::utils::telemetry::{init_internal_telemetry, TraceEvents};
 
-/// Chidori is the high level interface for interacting with our runtime.
+
+#[derive(Debug)]
+pub struct SharedState {
+    pub execution_id_to_evaluation: Arc<DashMap<ExecutionNodeId, ExecutionState>>,
+    pub execution_state_head_id: ExecutionNodeId,
+}
+
+impl SharedState {
+    pub fn new() -> Self {
+        SharedState {
+            execution_id_to_evaluation: Default::default(),
+            execution_state_head_id: Uuid::nil(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.execution_id_to_evaluation = Default::default();
+        self.execution_state_head_id = Uuid::nil();
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct CellHolder {
+    pub cell: CellTypes,
+    pub op_id: OperationId,
+    pub is_dirty_editor: bool,
+    // pub applied_at: Option<ExecutionNodeId>,
+    // pub needs_update: bool
+}
+
+// Implement Eq to indicate total equality
+impl Eq for CellHolder {}
+
+
+
+impl PartialOrd for CellHolder {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        // Compare based on the start time from get_ordering_key
+        self.get_ordering_key().partial_cmp(&other.get_ordering_key())
+    }
+}
+
+// You'll also need to implement PartialEq since it's required for PartialOrd
+impl PartialEq for CellHolder {
+    fn eq(&self, other: &Self) -> bool {
+        self.get_ordering_key() == other.get_ordering_key()
+    }
+}
+
+
+// Add Ord implementation
+impl Ord for CellHolder {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Since we're comparing usize values, this will always give us a valid ordering
+        self.get_ordering_key().cmp(&other.get_ordering_key())
+    }
+}
+
+impl CellHolder {
+    fn get_ordering_key(&self) -> usize {
+        let t = match &self.cell {
+            CellTypes::Code(_, t) |
+            CellTypes::CodeGen(_, t) |
+            CellTypes::Prompt(_, t) |
+            CellTypes::PlainText(_, t) |
+            CellTypes::Template(_, t) => {
+                t
+            }
+        };
+        t.start
+    }
+
+    fn from_cell(cell: CellTypes) -> CellHolder {
+        CellHolder {
+            is_dirty_editor: false,
+            op_id: Uuid::now_v7(),
+            cell,
+        }
+    }
+}
+
+/// InteractiveChidoriWrapper is the high level interface for interacting with our runtime.
 /// It is responsible for loading cells and creating instances of the environment.
 /// It is expected to run on a "main thread" while instances may run in background threads.
 pub struct InteractiveChidoriWrapper {
@@ -37,6 +119,7 @@ pub struct InteractiveChidoriWrapper {
     pub trace_event_sender: Option<Sender<TraceEvents>>,
 
     pub shared_state: Arc<Mutex<SharedState>>,
+
     pub loaded_path: Option<String>,
 
     pub tracing_guard: Option<DefaultGuard>
@@ -53,9 +136,7 @@ fn initialize_shared_state_object() -> Arc<Mutex<SharedState>> {
     Arc::new(Mutex::new(SharedState {
         execution_id_to_evaluation: Default::default(),
         execution_state_head_id: Uuid::nil(),
-        editor_cells: Default::default(),
-        at_execution_state_cells: vec![],
-        latest_state: None,
+        // editor_cells: Default::default(),
     }))
 }
 
@@ -93,67 +174,41 @@ impl InteractiveChidoriWrapper {
         Ok(())
     }
 
-    fn load_cells(&mut self, cells: Vec<CellTypes>) -> anyhow::Result<()>  {
-        // TODO: this overrides the entire shared state object
-        let cell_name_map = {
-            let previous_cells = &self.shared_state.lock().unwrap().editor_cells;
-            previous_cells.values().map(|cell| {
-                let name = cell.cell.name();
-                (name.clone(), cell.clone())
-            }).collect::<HashMap<_, _>>()
-        };
-
-        let mut new_cells_state = HashMap::new();
-        for cell in cells {
-            let name = cell.name();
-            // If the named cell exists in our map already
-            if let Some(existing_cell_instance) = cell_name_map.get(&name) {
-                // If it's not the same cell, replace it
-                if existing_cell_instance.cell != cell {
-                    new_cells_state.insert(existing_cell_instance.op_id, CellHolder {
-                        cell,
-                        applied_at: None,
-                        op_id: existing_cell_instance.op_id,
-                        needs_update: true
-                    });
-                } else {
-                    // It's the same cell so just push our existing state
-                    new_cells_state.insert(existing_cell_instance.op_id, existing_cell_instance.clone());
-                }
-            } else {
-                // This is a new cell, so we push it with a null applied at
-                let id = Uuid::now_v7();
-                new_cells_state.insert(id, CellHolder {
-                    cell,
-                    applied_at: None,
-                    op_id: id,
-                    needs_update: true
-                });
-            }
-        }
-        self.shared_state.lock().unwrap().editor_cells = new_cells_state;
-        println!("Cells commit to shared state");
-        self.dispatch_user_interaction_to_instance(UserInteractionMessage::ReloadCells)?;
-        Ok(())
-    }
-
-    pub fn load_md_string(&mut self, s: &str) -> anyhow::Result<()> {
+    pub fn load_md_string(&mut self, s: &str) -> anyhow::Result<Vec<CellHolder>> {
         let mut cells = vec![];
-        crate::sdk::md::extract_code_blocks(s)
+        let blocks = crate::sdk::md::extract_blocks(s);
+        blocks
+            .0
             .iter()
-            .filter_map(|block| interpret_markdown_code_block(block, None).unwrap())
+            .filter_map(|block| interpret_code_block(block, &None).unwrap())
+            .for_each(|block| { cells.push(block); });
+        blocks
+            .1
+            .iter()
+            .filter_map(|block| {
+                Some(CellTypes::PlainText( PlainTextCell {
+                    backing_file_reference: Some(BackingFileReference {
+                        path: "".to_string(),
+                        text_range: Some(block.range.clone()),
+                    }),
+                    text: block.content.clone()
+                }, block.range.clone()))
+            })
             .for_each(|block| { cells.push(block); });
         cells.sort();
         self.loaded_path = Some("raw_text".to_string());
-        self.load_cells(cells)
+        let cell_holders: Vec<_> = cells.into_iter().map(|x| CellHolder::from_cell(x)).collect();
+        let cells1 = cell_holders.clone();
+        self.dispatch_user_interaction_to_instance(UserInteractionMessage::ReloadCells(cells1))?;
+        Ok(cell_holders)
     }
 
-    pub fn load_md_directory(&mut self, path: &Path) -> anyhow::Result<()> {
+    pub fn load_md_directory(&mut self, path: &Path) -> anyhow::Result<Vec<CellHolder>> {
         let files = load_folder(path)?;
         let mut cells = vec![];
         for file in files {
-            for block in file.result {
-                if let Some(block) = interpret_markdown_code_block(&block, Some(path.to_string_lossy().to_string())).unwrap() {
+            for block in file.code_blocks {
+                if let Some(block) = interpret_code_block(&block, &file.filename).unwrap() {
                     cells.push(block);
                 }
             }
@@ -161,7 +216,9 @@ impl InteractiveChidoriWrapper {
         self.loaded_path = Some(path.to_str().unwrap().to_string());
         cells.sort();
         info!("Loading {} cells from {:?}", cells.len(), path);
-        self.load_cells(cells)
+        let cells1 : Vec<_> = cells.into_iter().map(|x| CellHolder::from_cell(x)).collect();
+        self.dispatch_user_interaction_to_instance(UserInteractionMessage::ReloadCells(cells1.clone()))?;
+        Ok(cells1)
     }
 
     pub fn get_instance(&mut self) -> anyhow::Result<ChidoriRuntimeInstance> {
@@ -169,8 +226,6 @@ impl InteractiveChidoriWrapper {
         self.instanced_env_tx = Some(instanced_env_tx);
         let mut db = ExecutionGraph::new();
         let execution_event_rx = db.take_execution_event_receiver();
-        let state_id = Uuid::nil();
-        let playback_state = PlaybackState::Paused;
 
         let mut shared_state = self.shared_state.lock().unwrap();
         shared_state.execution_id_to_evaluation = db.execution_node_id_to_state.clone();
@@ -178,10 +233,10 @@ impl InteractiveChidoriWrapper {
         Ok(ChidoriRuntimeInstance {
             env_rx,
             db,
-            execution_head_state_id: state_id,
+            execution_head_state_id: Uuid::nil(),
             runtime_event_sender: self.runtime_event_sender.clone(),
             trace_event_sender: self.trace_event_sender.clone(),
-            playback_state,
+            playback_state: PlaybackState::Paused,
             shared_state: self.shared_state.clone(),
             rx_execution_states: execution_event_rx,
         })
@@ -191,64 +246,7 @@ impl InteractiveChidoriWrapper {
 #[derive(Clone, Debug)]
 pub enum EventsFromRuntime {
     PlaybackState(PlaybackState),
-    DefinitionGraphUpdated(Vec<(OperationId, OperationId, Vec<DependencyReference>)>),
     ExecutionGraphUpdated(Vec<(ExecutionNodeId, ExecutionNodeId)>),
-    ExecutionStateChange(MergedStateHistory),
-    EditorCellsUpdated(HashMap<OperationId, CellHolder>),
-    StateAtId(ExecutionNodeId, ExecutionState),
     UpdateExecutionHead(ExecutionNodeId),
     ReceivedChatMessage(String),
-    ExecutionStateCellsViewUpdated(Vec<CellHolder>),
-}
-
-#[derive(Debug)]
-pub struct SharedState {
-    pub execution_id_to_evaluation: Arc<DashMap<ExecutionNodeId, ExecutionState>>,
-    pub execution_state_head_id: ExecutionNodeId,
-    pub latest_state: Option<ExecutionState>,
-    pub editor_cells: HashMap<OperationId, CellHolder>,
-    pub at_execution_state_cells: Vec<CellHolder>,
-}
-
-impl Serialize for SharedState {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-    {
-        let mut state = serializer.serialize_map(None)?;
-        if let Some(map) = &self.latest_state {
-            for (k, v) in &map.state {
-                state.serialize_entry(&k, &v.deref().output)?; // Dereference `Arc` to serialize the value inside
-            }
-        }
-        state.end()
-    }
-}
-
-impl SharedState {
-    pub fn new() -> Self {
-        SharedState {
-            execution_id_to_evaluation: Default::default(),
-            execution_state_head_id: Uuid::nil(),
-            latest_state: None,
-            editor_cells: Default::default(),
-            at_execution_state_cells: vec![],
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.execution_id_to_evaluation = Default::default();
-        self.execution_state_head_id = Uuid::nil();
-        self.latest_state = None;
-        self.editor_cells = Default::default();
-        self.at_execution_state_cells = vec![];
-    }
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
-pub struct CellHolder {
-    pub cell: CellTypes,
-    pub op_id: OperationId,
-    pub applied_at: Option<ExecutionNodeId>,
-    pub needs_update: bool
 }

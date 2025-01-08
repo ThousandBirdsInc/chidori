@@ -120,7 +120,7 @@ pub struct ExecutionState {
     pub evaluating_name: Option<String>,
     pub evaluating_fn: Option<String>,
     pub evaluating_arguments: Option<RkyvSerializedValue>,
-    pub evaluating_cell: Option<CellTypes>,
+    // pub evaluating_cell: Option<CellTypes>,
     pub evaluating_enclosed_state: EnclosedState,
 
     /// CellType applied, by a state that is mutating cell definitions
@@ -172,6 +172,12 @@ pub struct ExecutionState {
     pub value_freshness_map: ImHashMap<OperationId, usize>,
 }
 
+impl ExecutionState {
+    pub fn evaluating_cell(&self) -> Option<&CellTypes> {
+        self.cells_by_id.get(&self.evaluating_operation_id)
+    }
+}
+
 impl std::fmt::Debug for ExecutionState {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(&self.chronology_id.to_string())
@@ -206,7 +212,7 @@ impl Default for ExecutionState {
             evaluating_name: None,
             evaluating_fn: None,
             evaluating_arguments: None,
-            evaluating_cell: None,
+            // evaluating_cell: None,
             evaluating_enclosed_state: Default::default(),
             evaluated_mutation_of_cell: None,
             graph_sender: None,
@@ -278,7 +284,6 @@ impl ExecutionState {
         new.evaluating_fn = None;
         new.evaluating_name = None;
         new.evaluating_arguments = None;
-        new.evaluating_cell = None;
         new.parent_state_chronology_id = new.chronology_id;
         new.fresh_values = IndexSet::new();
         new.evaluating_enclosed_state = EnclosedState::Open;
@@ -366,13 +371,14 @@ impl ExecutionState {
         graph
     }
 
-    pub fn get_operation_from_cell_type(&self, cell: &CellTypes) -> anyhow::Result<OperationNode> {
+    pub fn get_operation_from_cell_type(&self, cell: &CellTypes) -> anyhow::Result<Option<OperationNode>> {
         let op = match cell {
-            CellTypes::Code(c, r) => crate::cells::code_cell::code_cell(self.chronology_id.clone(), c, r),
-            CellTypes::Prompt(c, r) => crate::cells::llm_prompt_cell::llm_prompt_cell(self.chronology_id.clone(), c, r),
-            CellTypes::Template(c, r) => crate::cells::template_cell::template_cell(self.chronology_id.clone(), c, r),
-            CellTypes::CodeGen(c, r) => crate::cells::code_gen_cell::code_gen_cell(self.chronology_id.clone(), c, r),
-        }?;
+            CellTypes::Code(c, r) => Some(crate::cells::code_cell::code_cell(self.chronology_id.clone(), c, r)?),
+            CellTypes::Prompt(c, r) => Some(crate::cells::llm_prompt_cell::llm_prompt_cell(self.chronology_id.clone(), c, r)?),
+            CellTypes::Template(c, r) => Some(crate::cells::template_cell::template_cell(self.chronology_id.clone(), c, r)?),
+            CellTypes::CodeGen(c, r) => Some(crate::cells::code_gen_cell::code_gen_cell(self.chronology_id.clone(), c, r)?),
+            CellTypes::PlainText(c, r) => None
+        };
         Ok(op)
     }
 
@@ -382,7 +388,10 @@ impl ExecutionState {
         cell: CellTypes,
         op_id: OperationId,
     ) -> anyhow::Result<(ExecutionState, OperationId)> {
-        let op = self.get_operation_from_cell_type(&cell)?;
+        let Some(op ) = self.get_operation_from_cell_type(&cell)? else {
+            // Return no op pass-through if not an operation
+            return Ok((self.clone(), op_id))
+        };
         let (op_id, mut final_state) = self.upsert_operation(op, op_id)?;
         self.send_new_state_to_graph_and_pause_with_oneshot(&mut final_state.clone()).await;
         Ok((final_state, op_id))
@@ -561,7 +570,7 @@ impl ExecutionState {
         // reconstruction of the cell
         let op = Self::cell_to_function_invocation(cell, function_name.to_string())?;
         before_execution_state.evaluating_name = cell.name().clone();
-        before_execution_state.evaluating_cell = Some(cell.clone());
+        // before_execution_state.evaluating_cell = Some(cell.clone());
         before_execution_state.evaluating_fn = Some(function_name.to_string());
         before_execution_state.evaluating_operation_id = meta.operation_id;
         before_execution_state.evaluating_arguments = Some(payload.clone());
@@ -746,7 +755,6 @@ impl ExecutionState {
 
         // 2. Update operation node info
         let op_node = self.get_operation_node(operation_id)?;
-        before_execution_state.evaluating_cell = Some(op_node.cell.clone());
 
         // 3. Pause if needed, sending in progress execution to the graph
         self.send_new_state_to_graph_and_pause_with_oneshot(&mut before_execution_state).await;

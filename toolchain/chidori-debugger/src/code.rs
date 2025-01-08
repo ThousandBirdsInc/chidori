@@ -1,12 +1,13 @@
+use std::cmp::Ordering;
 use crate::bevy_egui::EguiContexts;
 use crate::chidori::{CellState, ChidoriState, EguiTree, EguiTreeIdentities};
 use crate::json_editor::{JsonEditorExample, Show};
 use crate::util::{despawn_screen, egui_label, egui_logs, serialized_value_to_json_value};
 use crate::{CurrentTheme, GameState, Theme};
 use bevy::app::{App, Update};
-use bevy::prelude::{in_state, Component, IntoSystemConfigs, Local, OnExit, Query, Res, ResMut, Window, With};
+use bevy::prelude::{in_state, Component, IntoSystemConfigs, Local, OnExit, Query, Res, ResMut, Resource, Window, With};
 use bevy::window::PrimaryWindow;
-use chidori_core::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, SupportedModelProviders, TemplateCell, TextRange};
+use chidori_core::cells::{CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, PlainTextCell, SupportedLanguage, SupportedModelProviders, TemplateCell, TextRange};
 use chidori_core::chidori_prompt_format::templating::templates::{SchemaItem, SchemaItemType};
 use chidori_core::execution::primitives::identifiers::OperationId;
 use chidori_core::sdk::interactive_chidori_wrapper::CellHolder;
@@ -18,12 +19,26 @@ use egui_json_tree::JsonTree;
 use egui_tiles::Tile;
 use serde_json::{Map, Value};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use bevy_utils::tracing::debug;
 
 #[derive(Component)]
 struct OnEditorScreen;
 
+
+#[derive(Resource)]
+struct EditorState {
+    selected_file: Option<PathBuf>
+}
+
+impl Default for EditorState {
+    fn default() -> Self {
+        EditorState {
+            selected_file: None
+        }
+    }
+}
 
 struct ViewingWatchedFileCells {
     is_showing_editor_cells: bool
@@ -38,33 +53,73 @@ impl Default for ViewingWatchedFileCells {
 }
 
 
-fn file_browser(ui: &mut egui::Ui, path: &Path) {
+fn file_browser(ui: &mut egui::Ui, path: &Path, editor_state: &mut EditorState) {
     let metadata = fs::metadata(path).unwrap();
     let file_name = path.file_name().unwrap().to_str().unwrap();
+    let path_buf = path.to_path_buf();
 
     if metadata.is_dir() {
         let id = ui.make_persistent_id(path);
-        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
 
         state.show_header(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.add(egui::Label::new("📁").sense(egui::Sense::click()));
-                ui.label(file_name);
+                // Make folder icon non-selectable
+                ui.add(egui::Label::new("📁")
+                    .sense(egui::Sense::click())
+                    .selectable(false));
+                // Make folder name non-selectable
+                ui.add(egui::Label::new(file_name).selectable(false));
             });
         })
             .body(|ui| {
                 if let Ok(entries) = fs::read_dir(path) {
                     for entry in entries {
                         if let Ok(entry) = entry {
-                            file_browser(ui, &entry.path());
+                            file_browser(ui, &entry.path(), editor_state);
                         }
                     }
                 }
             });
     } else {
-        ui.horizontal(|ui| {
-            ui.add(egui::Label::new("📄").sense(egui::Sense::click()));
-            ui.label(file_name);
+        let id = ui.make_persistent_id(path);
+        ui.push_id(id, |ui| {
+            // Create a non-interactive frame that prevents text selection
+            let frame = egui::Frame::none()
+                .inner_margin(egui::vec2(0.0, 0.0))
+                .fill(if editor_state.selected_file.as_ref().map_or(false, |p| p == path) {
+                    ui.style().visuals.selection.bg_fill
+                } else {
+                    egui::Color32::TRANSPARENT
+                });
+
+            let response = frame.show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // Make file icon non-selectable
+                    ui.add(egui::Label::new("📄").selectable(false));
+                    // Make filename non-selectable
+                    ui.add(egui::Label::new(file_name).selectable(false));
+                })
+            })
+                .response
+                .interact(egui::Sense::click());
+
+
+            //
+            // // Add hover effect using custom rendering
+            // if response.hovered() {
+            //     ui.painter().rect_filled(
+            //         response.rect,
+            //         0.0,
+            //         ui.style().visuals.widgets.hovered.bg_fill,
+            //     );
+            // }
+
+            // Handle click with the full row response
+            if response.clicked() {
+                debug!("Clicked select file");
+                editor_state.selected_file = Some(path_buf);
+            }
         });
     }
 }
@@ -78,6 +133,7 @@ fn editor_update(
     mut chidori_state: ResMut<ChidoriState>,
     current_theme: Res<CurrentTheme>,
     mut tree: ResMut<EguiTree>,
+    mut editor_state: ResMut<EditorState>,
     mut viewing_watched_file_cells: Local<ViewingWatchedFileCells>,
 ) {
     let window = q_window.single();
@@ -111,7 +167,7 @@ fn editor_update(
         }
     }
 
-    if hide_all || chidori_state.display_example_modal {
+    if hide_all || chidori_state.application_state_is_displaying_example_modal {
         return;
     }
 
@@ -119,58 +175,72 @@ fn editor_update(
     egui::CentralPanel::default().frame(container_frame).show(contexts.ctx_mut(), |ui| {
         let available_height = ui.available_height();
         ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.set_height(available_height);
-                ui.push_id("file_browser", |ui| {
-                    egui::ScrollArea::vertical().auto_shrink(Vec2b::new(true, false)).show(ui, |ui| {
-                        ui.set_max_width(200.0);
-                        let path = &chidori_state.watched_path.lock().unwrap().clone();
-                        if path.is_some() {
-                            file_browser(ui, Path::new(&path.as_ref().unwrap()));
-                        }
-                    });
+            if window.width() > 600.0 {
+                ui.vertical(|ui| {
+                    ui.set_height(available_height);
+                    let path = &chidori_state.watched_path.lock().unwrap().clone();
+                    if path.is_some() {
+                        ui.push_id("file_browser", |ui| {
+                            egui::ScrollArea::vertical().auto_shrink(Vec2b::new(true, false)).show(ui, |ui| {
+                                ui.set_width(200.0);
+                                file_browser(ui, Path::new(&path.as_ref().unwrap()), &mut editor_state);
+                            });
+                        });
+                    }
                 });
-            });
-
+                ui.add_space(20.0);
+            }
             ui.vertical(|ui| {
                 ui.set_height(available_height);
+                if let Some(selected_file) = &editor_state.selected_file.as_ref().and_then(|f| f.file_name()) {
+                    let mut frame = egui::Frame::default()
+                        .fill(current_theme.theme.card)
+                        .stroke(current_theme.theme.card_border)
+                        .outer_margin(Margin::symmetric(8.0, 16.0))
+                        .inner_margin(16.0)
+                        .rounding(current_theme.theme.radius as f32)
+                        .begin(ui);
+                    {
+                        let mut ui = &mut frame.content_ui;
+                        ui.set_width(875.0);
+                        ui.label(format!("{}", selected_file.to_string_lossy()));
+                    }
+                    frame.end(ui);
+                }
                 ui.push_id("notebook", |ui| {
                     egui::ScrollArea::vertical().min_scrolled_width(f32::INFINITY).auto_shrink(Vec2b::new(true, false)).show(ui, |ui| {
                         let mut theme = egui_extras::syntax_highlighting::CodeTheme::dark();
+                        ui.set_width(875.0);
 
-                        let mut frame = egui::Frame::default()
-                            .fill(current_theme.theme.card)
-                            .stroke(current_theme.theme.card_border)
-                            .outer_margin(Margin::symmetric(8.0, 16.0))
-                            .inner_margin(16.0)
-                            .rounding(current_theme.theme.radius as f32)
-                            .begin(ui);
-                        {
-                            ui.set_width(800.0);
-                            let ui = &mut frame.content_ui;
-                            ui.horizontal(|ui| {
-                                if ui.radio(viewing_watched_file_cells.is_showing_editor_cells, "View Editor Cells").clicked() {
-                                    viewing_watched_file_cells.is_showing_editor_cells = true;
-                                }
-                                if ui.radio(!viewing_watched_file_cells.is_showing_editor_cells, "View Cells at Current State").clicked() {
-                                    viewing_watched_file_cells.is_showing_editor_cells = false;
-                                }
+                        let ids : Vec<_> = {
+                            let mut cells_ids: Vec<_> = chidori_state.local_cell_state
+                                .iter()
+                                .filter(|x| {
+                                    let Some(selected_file) = editor_state.selected_file.as_ref() else { return true };
+                                    let Ok(cell) = x.value().lock() else { return false };
+                                    let Some(cell) = cell.cell.as_ref() else { return false };
+                                    let Some(backing_file) = cell.cell.backing_file_reference().as_ref() else { return false };
+                                    backing_file.path == selected_file.to_string_lossy()
+                                })
+                                .collect();
+                            cells_ids.sort_by(|a, b| {
+                                let a_cell = a.value().lock().unwrap();
+                                let b_cell = b.value().lock().unwrap();
+                                let Some(a_cell) = a_cell.cell.as_ref() else {
+                                    return Ordering::Less;
+                                };
+                                let Some( b_cell) = b_cell.cell.as_ref() else {
+                                    return Ordering::Less;
+                                };
+                                a_cell.cmp(b_cell)
                             });
-                        }
-                        frame.end(ui);
-
-                        // let cells = if viewing_watched_file_cells.is_showing_editor_cells {
-                        //     chidori_state.editor_cells.iter_mut()
-                        // } else {
-                        //     chidori_state.state_cells.iter_mut()
-                        // };
-                        let mut cells_ids: Vec<_> = chidori_state.editor_cells.keys().cloned().collect();
-                        cells_ids.sort();
-                        for cell_id in &cells_ids {
-                            editable_chidori_cell_content(&mut chidori_state, &current_theme.theme, ui, &mut theme, *cell_id);
+                            cells_ids.iter().map(|x| x.key().clone()).collect()
+                        };
+                        for cell_id in &ids {
+                            editable_chidori_cell_content(&mut chidori_state, &current_theme.theme, ui, &mut theme, *cell_id, false);
                         }
 
-                        if !chidori_state.display_example_modal {
+                        if !chidori_state.application_state_is_displaying_example_modal {
                             let mut frame = egui::Frame::default()
                                 .fill(current_theme.theme.card)
                                 .stroke(current_theme.theme.card_border)
@@ -181,11 +251,12 @@ fn editor_update(
                             {
                                 let mut ui = &mut frame.content_ui;
                                 let state_binding = chidori_state.local_cell_state.entry(Uuid::nil()).or_insert(Arc::new(Mutex::new(CellState::default()))).clone();
-                                let mut state = state_binding.lock().unwrap();
+                                let mut state = state_binding.lock();
+                                let mut state = state.as_mut().unwrap();
                                 render_new_cell_interface(
                                     ui,
                                     &mut chidori_state,
-                                    &mut state,
+                                    state,
                                     &mut theme
                                 );
                             }
@@ -206,36 +277,39 @@ pub fn editable_chidori_cell_content(
     theme: &Theme,
     ui: &mut Ui,
     mut code_theme: &mut CodeTheme,
-    op_id: OperationId
+    op_id: OperationId,
+    is_embedded: bool
 ) {
-    let binding = if let Some(binding) = chidori_state.editor_cells.get(&op_id) {
-        binding.clone()
-    } else {
+    let Some(mut binding) = chidori_state.local_cell_state.get(&op_id).map(|x| x.value().clone()) else {
         return;
     };
-    let mut cell_holder = &mut binding.lock().unwrap();
+    let mut binding = binding.lock();
+    let mut cell_state = binding.as_mut().unwrap();
+    let Some(mut cell_holder)= cell_state.cell.as_mut() else {
+        return;
+    };
+    let is_plain_text = {
+        matches!(cell_holder.cell, CellTypes::PlainText(..))
+    };
+
 
     // let mut frame = egui::Frame::default().fill(Color32::from_hex("#222222").unwrap()).outer_margin(Margin::symmetric(8.0, 16.0)).inner_margin(16.0).rounding(6.0).begin(ui);
-    let mut frame = egui::Frame::default()
-        .fill(theme.card)
-        .stroke(theme.card_border)
-        .outer_margin(Margin::symmetric(8.0, 16.0))
-        .inner_margin(16.0)
-        .rounding(theme.radius as f32)
-        .begin(ui);
+    let mut frame = if is_embedded {
+        egui::Frame::default()
+            .begin(ui)
+    } else {
+        egui::Frame::default()
+            .fill(if !is_plain_text {theme.card } else { theme.background})
+            .stroke(theme.card_border)
+            .outer_margin( Margin::symmetric(8.0, 16.0))
+            .inner_margin(16.0)
+            .rounding(theme.radius as f32)
+            .begin(ui)
+    };
     {
         let ui = &mut frame.content_ui;
-        ui.set_max_width(800.0);
-        let mut exists_in_current_tree = false;
-        if let Some(applied_at) = &cell_holder.applied_at {
-            if chidori_state.debug_mode {
-                ui.label(format!("Applied At: {:?}", applied_at));
-            }
-            exists_in_current_tree = chidori_state.exists_in_current_tree(applied_at);
-        } else {
-            if ui.button("Pending Application To Graph").clicked() {
-                chidori_state.update_cell(cell_holder.clone());
-            }
+        if !is_embedded {
+            ui.set_max_width(800.0);
         }
         if chidori_state.debug_mode {
             ui.label(format!("Operation Id: {:?}", op_id));
@@ -247,58 +321,75 @@ pub fn editable_chidori_cell_content(
                     &mut code_theme,
                     &op_id,
                     ui,
-                    cell_holder,
-                    exists_in_current_tree
+                    cell_state
                 );
             }
             CellTypes::CodeGen(..) => {
-                render_code_gen_cell(&mut chidori_state, &op_id, ui, cell_holder, exists_in_current_tree);
+                render_code_gen_cell(&mut chidori_state, &op_id, ui, cell_state);
             }
             CellTypes::Prompt(LLMPromptCell::Completion { .. }, _) => {}
             CellTypes::Prompt(LLMPromptCell::Chat { .. }, _) => {
-                render_prompt_cell(&mut chidori_state, &op_id, ui, cell_holder, exists_in_current_tree);
+                render_prompt_cell(&mut chidori_state, &op_id, ui, cell_state);
             }
             CellTypes::Template(..) => {
-                render_template_cell(&mut chidori_state, &op_id, ui, cell_holder, exists_in_current_tree);
+                render_template_cell(&mut chidori_state, &op_id, ui, cell_state);
+            }
+            CellTypes::PlainText(..) => {
+                render_plaintext_cell(&mut chidori_state, &op_id, ui, cell_state);
             }
         }
 
-        let state_binding = chidori_state.local_cell_state.entry(op_id).or_insert(Arc::new(Mutex::new(CellState::default()))).clone();
-        let mut state = state_binding.lock().unwrap();
-
-        ui.push_id(("add_cell", op_id), |ui| {
-            egui::CollapsingHeader::new("Add Cell")
-                .show(ui, |ui| {
-                    render_new_cell_interface(
-                        ui,
-                        chidori_state,
-                        &mut state,
-                        &mut code_theme,
-                    );
-                });
-        });
-        //
-        // if !state.is_new_cell_open {
-        //     if ui.button("Add Cell").clicked() {
-        //         state.is_new_cell_open = true;
-        //     }
-        // } else {
-        //     if ui.button("Close").clicked() {
-        //         state.is_new_cell_open = false;
-        //     }
-        // }
-
+        if !is_plain_text {
+            ui.push_id(("add_cell", op_id), |ui| {
+                egui::CollapsingHeader::new("Add Cell")
+                    .show(ui, |ui| {
+                        render_new_cell_interface(
+                            ui,
+                            chidori_state,
+                            &mut cell_state,
+                            &mut code_theme,
+                        );
+                    });
+            });
+        }
     }
     frame.end(ui);
+}
+
+fn render_plaintext_cell(
+    execution_state: &ChidoriState,
+    op_id: &OperationId,
+    mut ui: &mut Ui,
+    state: &mut MutexGuard<CellState>
+) {
+    let Some(mut cell_holder)= state.cell.as_mut() else {
+        return;
+    };
+    let CellTypes::PlainText(PlainTextCell { text, ..}, _) = &mut cell_holder.cell else { panic!("Must be plain text cell")};
+    ui.vertical(|ui| {
+        if ui.add(
+            egui::TextEdit::multiline(text)
+                .code_editor()
+                .lock_focus(true)
+                .margin(Margin::symmetric(8.0, 8.0))
+                .desired_width(f32::INFINITY)
+        ).changed() {
+            cell_holder.is_dirty_editor = true;
+            // cell_holder.applied_at = None;
+        }
+        render_operation_output(&execution_state, &op_id, ui);
+    });
 }
 
 fn render_template_cell(
     execution_state: &ChidoriState,
     op_id: &OperationId,
     mut ui: &mut Ui,
-    cell_holder: &mut CellHolder,
-    exists_in_current_tree: bool
+    state: &mut MutexGuard<CellState>
 ) {
+    let Some(mut cell_holder)= state.cell.as_mut() else {
+        return;
+    };
     let CellTypes::Template(TemplateCell { name, body , backing_file_reference, ..}, _) = &mut cell_holder.cell else { panic!("Must be template cell")};
     if let Some(name) = name {
         if ui.add(
@@ -308,8 +399,8 @@ fn render_template_cell(
                 .margin(Margin::symmetric(8.0, 8.0))
                 .desired_width(f32::INFINITY)
         ).changed() {
-            cell_holder.needs_update = true;
-            cell_holder.applied_at = None;
+            cell_holder.is_dirty_editor = true;
+            // cell_holder.applied_at = None;
         }
     }
     ui.horizontal(|ui| {
@@ -331,8 +422,8 @@ fn render_template_cell(
                 .margin(Margin::symmetric(8.0, 8.0))
                 .desired_width(f32::INFINITY)
         ).changed() {
-            cell_holder.needs_update = true;
-            cell_holder.applied_at = None;
+            cell_holder.is_dirty_editor = true;
+            // cell_holder.applied_at = None;
         }
         render_operation_output(&execution_state, &op_id, ui);
     });
@@ -405,15 +496,58 @@ fn populate_json_content(schema: &SchemaItem, existing_content: Option<&Value>) 
 }
 
 
+// fn popover_menu() {
+//     // Button that triggers the popover
+//     if ui.button("Click me for menu ▼").clicked() {
+//         self.show_popover = !self.show_popover;
+//         // Store the button's position for the popover
+//         self.popover_anchor = ui.min_rect().left_bottom();
+//     }
+//
+//     // Show popover when active
+//     if self.show_popover {
+//         let popover_response = egui::Area::new("popover")
+//             .fixed_pos(self.popover_anchor)
+//             .show(ctx, |ui| {
+//                 egui::Frame::popup(ui.style())
+//                     .stroke(egui::Stroke::new(1.0, ui.style().visuals.window_stroke.color))
+//                     .shadow(egui::epaint::Shadow::small_dark())
+//                     .show(ui, |ui| {
+//                         ui.set_min_width(150.0);
+//                         ui.style_mut().spacing.item_spacing.y = 10.0;
+//
+//                         if ui.button("Option 1").clicked() {
+//                             println!("Option 1 selected");
+//                             self.show_popover = false;
+//                         }
+//                         if ui.button("Option 2").clicked() {
+//                             println!("Option 2 selected");
+//                             self.show_popover = false;
+//                         }
+//                         ui.separator();
+//                         if ui.button("Exit").clicked() {
+//                             self.show_popover = false;
+//                         }
+//                     });
+//             });
+//
+//         // Close popover when clicking outside
+//         if ui.input().pointer.any_click() && !popover_response.response.clicked() {
+//             self.show_popover = false;
+//         }
+//     }
+// }
 
 
 fn render_prompt_cell(
     execution_state: &mut ChidoriState,
     op_id: &OperationId,
     mut ui: &mut Ui,
-    cell_holder: &mut CellHolder,
-    exists_in_current_tree: bool
+    state: &mut MutexGuard<CellState>
 ) {
+    let Some(mut cell_holder) = state.cell.take() else {
+        return;
+    };
     let CellTypes::Prompt(LLMPromptCell::Chat { name, configuration, req, complete_body, backing_file_reference,  .. }, _) = &mut cell_holder.cell else {panic!("Must be llm prompt cell")};
 
     if let Some(name) = name {
@@ -425,13 +559,11 @@ fn render_prompt_cell(
                 .margin(Margin::symmetric(8.0, 8.0))
                 .desired_width(f32::INFINITY)
         ).changed() {
-            cell_holder.needs_update = true;
-            cell_holder.applied_at = None;
+            cell_holder.is_dirty_editor = true;
+            // cell_holder.applied_at = None;
         }
     }
 
-    let state_binding = execution_state.local_cell_state.entry(*op_id).or_insert(Arc::new(Mutex::new(CellState::default()))).clone();
-    let mut state = state_binding.lock().unwrap();
     let (frontmatter, req) = chidori_core::chidori_prompt_format::templating::templates::split_frontmatter(&complete_body).map_err(|e| {
         anyhow::Error::msg(e.to_string())
     }).unwrap_or((String::new(), String::new()));
@@ -466,8 +598,8 @@ fn render_prompt_cell(
                 .margin(Margin::symmetric(8.0, 8.0))
                 .desired_width(f32::INFINITY)
         ).changed() {
-            cell_holder.needs_update = true;
-            cell_holder.applied_at = None;
+            cell_holder.is_dirty_editor = true;
+            // cell_holder.applied_at = None;
         }
         ui.add_space(10.0);
 
@@ -491,18 +623,19 @@ fn render_prompt_cell(
         render_operation_output(&execution_state, &op_id, ui);
 
     });
+    state.cell = Some(cell_holder);
 }
 
 fn render_code_gen_cell(
     execution_state: &mut ChidoriState,
     op_id: &OperationId,
     mut ui: &mut Ui,
-    mut cell_holder: &mut CellHolder,
-    exists_in_current_tree: bool
+    state: &mut MutexGuard<CellState>
 ) {
+    let Some(mut cell_holder)= state.cell.take() else {
+        return;
+    };
     let CellTypes::CodeGen(LLMCodeGenCell { name, req, complete_body, backing_file_reference, .. }, _) = &mut cell_holder.cell else { panic!("Must be code gen cell") };
-    let state_binding = execution_state.local_cell_state.entry(*op_id).or_insert(Arc::new(Mutex::new(CellState::default()))).clone();
-    let mut state = state_binding.lock().unwrap();
     if let Some(name) = name {
         if ui.add(
             egui::TextEdit::singleline(name)
@@ -511,8 +644,8 @@ fn render_code_gen_cell(
                 .margin(Margin::symmetric(8.0, 8.0))
                 .desired_width(f32::INFINITY)
         ).changed() {
-            cell_holder.needs_update = true;
-            cell_holder.applied_at = None;
+            cell_holder.is_dirty_editor = true;
+            // cell_holder.applied_at = None;
         }
     }
     ui.horizontal(|ui| {
@@ -538,14 +671,16 @@ fn render_code_gen_cell(
                 .desired_width(f32::INFINITY)
                 .margin(Margin::symmetric(8.0, 8.0))
         ).changed() {
-            cell_holder.needs_update = true;
-            cell_holder.applied_at = None;
+            cell_holder.is_dirty_editor = true;
+            // cell_holder.applied_at = None;
         }
         ui.add_space(10.0);
 
         render_operation_output(&execution_state, &op_id, ui);
 
     });
+
+    state.cell = Some(cell_holder);
 }
 
 
@@ -554,11 +689,11 @@ fn render_code_cell(
     theme: &mut CodeTheme,
     op_id: &OperationId,
     mut ui: &mut Ui,
-    mut cell_holder: &mut CellHolder,
-    exists_in_current_tree: bool
+    state: &mut MutexGuard<CellState>
 ) {
-    let state_binding = chidori_state.local_cell_state.entry(*op_id).or_insert(Arc::new(Mutex::new(CellState::default()))).clone();
-    let mut state = state_binding.lock().unwrap();
+    let Some(mut cell_holder)= state.cell.take() else {
+        return;
+    };
     let CellTypes::Code(CodeCell { name, source_code, language, backing_file_reference, ..}, _) = &mut cell_holder.cell else { panic!("Mut be cell_holder") };
     if let Some(name) = name {
         if ui.add(
@@ -568,8 +703,8 @@ fn render_code_cell(
                 .margin(Margin::symmetric(8.0, 8.0))
                 .desired_width(f32::INFINITY)
         ).changed() {
-            cell_holder.needs_update = true;
-            cell_holder.applied_at = None;
+            cell_holder.is_dirty_editor = true;
+            // cell_holder.applied_at = None;
         }
     }
 
@@ -662,8 +797,8 @@ fn render_code_cell(
                     .margin(Margin::symmetric(8.0, 8.0))
                     .layouter(&mut layouter),
             ).changed() {
-                cell_holder.needs_update = true;
-                cell_holder.applied_at = None;
+                cell_holder.is_dirty_editor = true;
+                // cell_holder.applied_at = None;
             }
         }
         code_frame.end(ui);
@@ -695,8 +830,8 @@ fn render_code_cell(
                         .margin(Margin::symmetric(8.0, 8.0))
                         .layouter(&mut layouter),
                 ).changed() {
-                    cell_holder.needs_update = true;
-                    cell_holder.applied_at = None;
+                    cell_holder.is_dirty_editor = true;
+                    // cell_holder.applied_at = None;
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
@@ -727,26 +862,28 @@ fn render_code_cell(
             }
         }
     });
+    state.cell = Some(cell_holder);
 }
 
 fn render_new_cell_interface(
     mut ui: &mut Ui,
     mut chidori_state: &mut ChidoriState,
-    mut state: &mut CellState,
+    mut state: &mut MutexGuard<CellState>,
     code_theme: &mut CodeTheme
 ) {
-    if state.temp_cell.is_some() {
+    if state.cell.is_some() {
         if ui.button("Cancel").clicked() {
-            state.temp_cell = None;
+            state.cell = None;
             state.is_new_cell_open = false;
         }
     }
 
-    if state.temp_cell.is_none() {
+    if state.cell.is_none() {
         ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
         if ui.button("Add Code Cell").clicked() {
             let op_id = Uuid::now_v7();
-            state.temp_cell = Some(CellHolder {
+            state.cell = Some(CellHolder {
+                
                 cell: CellTypes::Code(CodeCell {
                     backing_file_reference: None,
                     name: None,
@@ -755,13 +892,12 @@ fn render_new_cell_interface(
                     function_invocation: None,
                 }, TextRange::default()),
                 op_id,
-                applied_at: Default::default(),
-                needs_update: false,
+                is_dirty_editor: false,
             });
         }
         if ui.button("Add Prompt Cell").clicked() {
             let op_id = Uuid::now_v7();
-            state.temp_cell = Some(CellHolder {
+            state.cell = Some(CellHolder {
                 cell: CellTypes::Prompt(LLMPromptCell::Chat {
                     backing_file_reference: None,
                     is_function_invocation: false,
@@ -772,26 +908,26 @@ fn render_new_cell_interface(
                     req: "".to_string(),
                 }, TextRange::default()),
                 op_id,
-                applied_at: Default::default(),
-                needs_update: false,
+
+                is_dirty_editor: false,
             });
         }
         if ui.button("Add Template Cell").clicked() {
             let op_id = Uuid::now_v7();
-            state.temp_cell = Some(CellHolder {
+            state.cell = Some(CellHolder {
                 cell: CellTypes::Template(TemplateCell {
                     backing_file_reference: None,
                     name: None,
                     body: "".to_string(),
                 }, TextRange::default()),
                 op_id,
-                applied_at: Default::default(),
-                needs_update: false,
+
+                is_dirty_editor: false,
             });
         }
         if ui.button("Add Code Generation Cell").clicked() {
             let op_id = Uuid::now_v7();
-            state.temp_cell = Some((CellHolder {
+            state.cell = Some((CellHolder {
                 cell: CellTypes::CodeGen(LLMCodeGenCell {
                     backing_file_reference: None,
                     function_invocation: false,
@@ -802,15 +938,15 @@ fn render_new_cell_interface(
                     complete_body: "".to_string(),
                 }, TextRange::default()),
                 op_id,
-                applied_at: Default::default(),
-                needs_update: false,
+
+                is_dirty_editor: false,
             }));
         }
     }
 
-let exists_in_current_tree = false;
+    let exists_in_current_tree = false;
     let mut temp_cell_created = false;
-    if let Some(temp_cell) = state.temp_cell.as_mut() {
+    if let Some(mut temp_cell) = state.cell.take() {
         let op_id = temp_cell.op_id.clone();
         match &mut temp_cell.cell {
             CellTypes::Code(_, ..) => {
@@ -819,19 +955,20 @@ let exists_in_current_tree = false;
                     code_theme,
                     &op_id,
                     ui,
-                    temp_cell,
-                    exists_in_current_tree
+                    state
                 );
             }
             CellTypes::CodeGen(..) => {
-                render_code_gen_cell(&mut chidori_state, &op_id, ui, temp_cell, exists_in_current_tree);
+                render_code_gen_cell(&mut chidori_state, &op_id, ui, state);
             }
             CellTypes::Prompt(LLMPromptCell::Completion { .. }, _) => {}
             CellTypes::Prompt(LLMPromptCell::Chat { .. }, _) => {
-                render_prompt_cell(&mut chidori_state, &op_id, ui, temp_cell, exists_in_current_tree);
+                render_prompt_cell(&mut chidori_state, &op_id, ui, state);
             }
             CellTypes::Template(..) => {
-                render_template_cell(&mut chidori_state, &op_id, ui, temp_cell, exists_in_current_tree);
+                render_template_cell(&mut chidori_state, &op_id, ui, state);
+            }
+            CellTypes::PlainText(..) => {
             }
         }
 
@@ -840,19 +977,17 @@ let exists_in_current_tree = false;
             chidori_state.update_cell(temp_cell.clone());
             temp_cell_created = true;
         }
-
+        state.cell = Some(temp_cell);
     }
     if temp_cell_created {
-        state.temp_cell = None;
+        state.cell = None;
         state.is_new_cell_open = false;
     }
-
-
-
 }
 
 pub fn editor_plugin(app: &mut App) {
     app
+        .init_resource::<EditorState>()
         .add_systems(OnExit(crate::GameState::Graph), despawn_screen::<OnEditorScreen>)
         .add_systems(
             Update,

@@ -20,6 +20,7 @@ mod tree_grouping;
 mod json_editor;
 mod vim_text_edit;
 mod graph_range_collector;
+mod file_interaction;
 
 use crate::bevy_egui::{egui, EguiContexts, EguiPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
@@ -31,8 +32,15 @@ use bevy::winit::WinitWindows;
 use crate::bevy_prototype_lyon::prelude::*;
 use bevy_rapier2d::plugin::{NoUserData, RapierPhysicsPlugin};
 use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Rounding, Stroke};
+use muda::{Menu, MenuItem, PredefinedMenuItem, Submenu, AboutMetadata};
+use muda::accelerator::{Accelerator, Code, Modifiers};
 use once_cell::sync::OnceCell;
-
+use bevy::app::AppExit;
+use muda::{ContextMenu, MenuEvent};
+use winit::event::WindowEvent;
+use bevy::ecs::event::EventWriter;
+use crossbeam_channel::{self, Sender, Receiver};
+use bevy::ecs::system::Resource;
 
 static DEVICE_SCALE: OnceCell<f32> = OnceCell::new();
 
@@ -296,7 +304,172 @@ fn set_window_size(
     }
 }
 
+
+
+#[derive(Event)]
+pub enum MenuAction {
+    NewProject,
+    OpenProject,
+    Save,
+    SwitchToGraph,
+    SwitchToTraces,
+    SwitchToChat,
+    Quit,
+}
+
+#[derive(Resource)]
+struct MenuEventChannel {
+    receiver: Receiver<MenuAction>,
+}
+
+fn load_icon(path: &std::path::Path) -> muda::Icon {
+    let (icon_rgba, icon_width, icon_height) = {
+        let image = image::open(path)
+            .expect("Failed to open icon path")
+            .into_rgba8();
+        let (width, height) = image.dimensions();
+        let rgba = image.into_raw();
+        (rgba, width, height)
+    };
+    muda::Icon::from_rgba(icon_rgba, icon_width, icon_height).expect("Failed to open icon")
+}
+
+fn setup_raw_window(
+    world: &mut World
+) {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    world.insert_resource(MenuEventChannel { receiver: rx });
+
+    let menu_bar = Menu::new();
+    
+    // Create File menu
+    let about_menu = Submenu::new("&About", true);
+    let file_menu = Submenu::new("&File", true);
+    let edit_menu = Submenu::new("&Edit", true);
+    let view_menu = Submenu::new("&View", true);
+    let help_menu = Submenu::new("&Help", true);
+
+    // Add menus to menu bar
+    menu_bar.append_items(&[&about_menu, &file_menu, &edit_menu, &view_menu, &help_menu]);
+
+    // Add items to File menu with IDs
+    file_menu.append_items(&[
+        &MenuItem::with_id("new_project", "New Project", true, Some(Accelerator::new(Some(Modifiers::CONTROL), Code::KeyN))),
+        &MenuItem::with_id("open_project", "Open Project", true, Some(Accelerator::new(Some(Modifiers::CONTROL), Code::KeyO))),
+        &PredefinedMenuItem::separator(),
+        &MenuItem::with_id("save", "Save", true, Some(Accelerator::new(Some(Modifiers::CONTROL), Code::KeyS))),
+        &PredefinedMenuItem::separator(),
+        &MenuItem::with_id("reset", "Reset", true, None),
+        &MenuItem::with_id("quit", "Quit", true, Some(Accelerator::new(Some(Modifiers::CONTROL), Code::KeyQ))),
+    ]);
+
+    // Add items to Edit menu
+    edit_menu.append_items(&[
+        &PredefinedMenuItem::undo(None),
+        &PredefinedMenuItem::redo(None),
+        &PredefinedMenuItem::separator(),
+        &PredefinedMenuItem::cut(None),
+        &PredefinedMenuItem::copy(None),
+        &PredefinedMenuItem::paste(None),
+    ]);
+
+    // Add items to View menu with IDs
+    view_menu.append_items(&[
+        &MenuItem::with_id("graph_view", "Graph View", true, Some(Accelerator::new(Some(Modifiers::CONTROL), Code::KeyG))),
+        &MenuItem::with_id("trace_view", "Trace View", true, Some(Accelerator::new(Some(Modifiers::CONTROL), Code::KeyT))),
+        &MenuItem::with_id("chat_view", "Chat View", true, Some(Accelerator::new(Some(Modifiers::CONTROL), Code::KeyC))),
+    ]);
+
+    help_menu.append_items(&[
+        &MenuItem::with_id("documentation", "Documentation", true, None),
+        &MenuItem::with_id("ui_debug_mode", "UI Debug Mode", true, None),
+    ]);
+
+    // Set up menu event handler using the channel
+    let sender = tx;
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        let action = match event.id {
+            id if id == "new_project" => Some(MenuAction::NewProject),
+            id if id == "open_project" => Some(MenuAction::OpenProject),
+            id if id == "save" => Some(MenuAction::Save),
+            id if id == "graph_view" => Some(MenuAction::SwitchToGraph),
+            id if id == "trace_view" => Some(MenuAction::SwitchToTraces),
+            id if id == "chat_view" => Some(MenuAction::SwitchToChat),
+            id if id == "quit" => Some(MenuAction::Quit),
+            _ => None,
+        };
+        if let Some(action) = action {
+            let _ = sender.send(action);
+        }
+    }));
+
+    // Platform specific menu initialization
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use winit::platform::windows::WindowExtWindows;
+        menu_bar.init_for_hwnd(window.hwnd() as _);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+
+        // Add macOS specific app menu
+        menu_bar.append(
+            &PredefinedMenuItem::about(
+                None,
+                Some(AboutMetadata::from_cargo_metadata()),
+            ),
+        );
+        menu_bar.init_for_nsapp();
+        view_menu.set_as_windows_menu_for_nsapp();
+    }
+
+    #[cfg(target_os = "linux")]
+    menu_bar.init_for_gtk_window(window);
+
+    // Set up context menu handling
+    // let context_menu = file_menu.clone();
+    // window.on_window_event(move |event| {
+    //     if let WindowEvent::MouseInput {
+    //         state: winit::event::ElementState::Pressed,
+    //         button: MouseButton::Right,
+    //         ..
+    //     } = event {
+    //         if let Some(position) = window.cursor_position() {
+    //             // Handle context menu
+    //         }
+    //     }
+    // });
+    world.insert_non_send_resource(menu_bar);
+}
+
+fn handle_menu_actions(
+    mut menu_events: EventReader<MenuAction>,
+    mut next_state: ResMut<NextState<GameState>>,
+    mut exit: EventWriter<AppExit>,
+) {
+    for event in menu_events.read() {
+        match event {
+            MenuAction::Quit => {
+                exit.send(AppExit);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn forward_menu_events(
+    channel: Res<MenuEventChannel>,
+    mut menu_events: EventWriter<MenuAction>,
+) {
+    while let Ok(action) = channel.receiver.try_recv() {
+        menu_events.send(action);
+    }
+}
+
 fn main() {
+
+
     App::new()
         .add_plugins((
             DefaultPlugins
@@ -327,8 +500,18 @@ fn main() {
         // .insert_resource(Volume(7))
         // Declare the game state, whose starting value is determined by the `Default` trait
         .init_state::<GameState>()
-        .add_systems(Startup, (set_window_size))
+        .add_systems(Startup, (set_window_size,))
+        .add_systems(Startup, (setup_raw_window,))
         // Adds the plugins for each state
-        .add_plugins((chidori::chidori_plugin, code::editor_plugin, traces::trace_plugin, graph::graph_plugin, chat::chat_plugin, logs::logs_plugin))
+        .add_plugins(chat::chat_plugin)
+        .add_plugins(chidori::chidori_plugin)
+        .add_plugins(code::editor_plugin)
+        .add_plugins(graph::graph_plugin)
+        .add_plugins(logs::logs_plugin)
+        .add_plugins(traces::trace_plugin)
+        // Add the menu event handling system
+        .add_systems(Update, handle_menu_actions)
+        .add_event::<MenuAction>()
+        .add_systems(Update, (handle_menu_actions, forward_menu_events))
         .run();
 }

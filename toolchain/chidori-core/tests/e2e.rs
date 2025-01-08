@@ -272,7 +272,7 @@ async fn test_multiple_dependencies_across_nodes() -> anyhow::Result<()> {
             "#
             }).unwrap();
     let mut env = ee.get_instance().unwrap();
-    env.reload_cells();
+    env.upsert_cells();
     env.get_state_at_current_execution_head().render_dependency_graph();
     env.step().await;
     // Function declaration cell
@@ -323,7 +323,7 @@ async fn test_execute_inter_runtime_code_with_markdown() {
             }).unwrap();
     let mut env = ee.get_instance().unwrap();
     let s = env.get_state_at_current_execution_head();
-    env.reload_cells();
+    env.upsert_cells();
     s.render_dependency_graph();
     env.step().await;
     // Function declaration cell
@@ -370,7 +370,7 @@ async fn test_execute_webservice_and_handle_request_with_code_cell_md() {
                 "#
             }).unwrap();
     let mut env = ee.get_instance().unwrap();
-    env.reload_cells();
+    env.upsert_cells();
     env.get_state_at_current_execution_head().render_dependency_graph();
 
     // This will initialize the service
@@ -414,7 +414,7 @@ async fn test_execute_webservice_and_serve_html() {
                 "#
             }).unwrap();
     let mut env = ee.get_instance().unwrap();
-    env.reload_cells();
+    env.upsert_cells();
     env.get_state_at_current_execution_head().render_dependency_graph();
 
     // This will initialize the service
@@ -442,7 +442,7 @@ async fn test_core1_simple_math() -> anyhow::Result<()>{
     let mut ee = InteractiveChidoriWrapper::new();
     ee.load_md_directory(Path::new("./examples/core1_simple_math")).unwrap();
     let mut env = ee.get_instance().unwrap();
-    env.reload_cells();
+    env.upsert_cells();
     env.get_state_at_current_execution_head().render_dependency_graph();
     let out = env.step().await?;
     assert_eq!(out[0].1.output, Ok(RkyvObjectBuilder::new().insert_number("x", 20).build()));
@@ -458,7 +458,7 @@ async fn test_core2_marshalling() -> anyhow::Result<()> {
     let mut ee = InteractiveChidoriWrapper::new();
     ee.load_md_directory(Path::new("./examples/core2_marshalling")).unwrap();
     let mut env = ee.get_instance().unwrap();
-    env.reload_cells();
+    env.upsert_cells();
     env.get_state_at_current_execution_head().render_dependency_graph();
     let mut out = env.step().await?;
     assert_eq!(out[0].0, Uuid::nil());
@@ -523,7 +523,7 @@ async fn test_core3_function_invocations() -> anyhow::Result<()> {
     let mut ee = InteractiveChidoriWrapper::new();
     ee.load_md_directory(Path::new("./examples/core3_function_invocations")).unwrap();
     let mut env = ee.get_instance().unwrap();
-    env.reload_cells();
+    env.upsert_cells();
     env.get_state_at_current_execution_head().render_dependency_graph();
     let mut out = env.step().await?;
     assert_eq!(out[0].0, Uuid::nil());
@@ -548,7 +548,7 @@ async fn test_core4_async_function_invocations() -> anyhow::Result<()> {
     let mut ee = InteractiveChidoriWrapper::new();
     ee.load_md_directory(Path::new("./examples/core4_async_function_invocations")).unwrap();
     let mut env = ee.get_instance().unwrap();
-    env.reload_cells();
+    env.upsert_cells();
     env.get_state_at_current_execution_head().render_dependency_graph();
     let mut out = env.step().await?;
     assert_eq!(out[0].0, Uuid::nil());
@@ -574,7 +574,7 @@ async fn test_core5_prompts_invoked_as_functions() -> anyhow::Result<()>  {
     let mut ee = InteractiveChidoriWrapper::new();
     ee.load_md_directory(Path::new("./examples/core5_prompts_invoked_as_functions")).unwrap();
     let mut env = ee.get_instance().unwrap();
-    env.reload_cells();
+    env.upsert_cells();
     env.get_state_at_current_execution_head().render_dependency_graph();
     let out = env.step().await;
     dbg!(out);
@@ -593,7 +593,7 @@ async fn test_core6_prompts_leveraging_function_calling() {
     let mut ee = InteractiveChidoriWrapper::new();
     ee.load_md_directory(Path::new("./examples/core6_prompts_leveraging_function_calling")).unwrap();
     let mut env = ee.get_instance().unwrap();
-    env.reload_cells();
+    env.upsert_cells();
     env.get_state_at_current_execution_head().render_dependency_graph();
     let out = env.step().await;
     let out = env.step().await;
@@ -609,7 +609,7 @@ async fn test_core7_rag_stateful_memory_cells() {
     let mut ee = InteractiveChidoriWrapper::new();
     ee.load_md_directory(Path::new("./examples/core7_rag_stateful_memory_cells")).unwrap();
     let mut env = ee.get_instance().unwrap();
-    env.reload_cells();
+    env.upsert_cells();
     env.get_state_at_current_execution_head().render_dependency_graph();
     let out = env.step().await;
     let out = env.step().await;
@@ -624,7 +624,7 @@ async fn test_core8_prompt_code_generation_and_execution() {
     let mut ee = InteractiveChidoriWrapper::new();
     ee.load_md_directory(Path::new("./examples/core8_prompt_code_generation_and_execution")).unwrap();
     let mut env = ee.get_instance().unwrap();
-    env.reload_cells();
+    env.upsert_cells();
     env.get_state_at_current_execution_head().render_dependency_graph();
     let out = env.step().await;
     let out = env.step().await;
@@ -639,7 +639,7 @@ async fn test_core9_multi_agent_simulation() {
     let mut ee = InteractiveChidoriWrapper::new();
     ee.load_md_directory(Path::new("./examples/core9_multi_agent_simulation")).unwrap();
     let mut env = ee.get_instance().unwrap();
-    env.reload_cells();
+    env.upsert_cells();
     env.get_state_at_current_execution_head().render_dependency_graph();
     let out = env.step().await;
     let out = env.step().await;
