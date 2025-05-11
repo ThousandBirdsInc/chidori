@@ -5,10 +5,10 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::bevy_egui::EguiContexts;
+use crate::vendored::bevy_egui::EguiContexts;
 use bevy::app::{App, AppExit, Startup, Update};
 use bevy::input::ButtonInput;
-use bevy::prelude::{default, Commands, KeyCode, Local, Res, ResMut, Resource, EventReader, NextState, EventWriter};
+use bevy::prelude::{Commands, default, EventReader, EventWriter, KeyCode, Local, NextState, Res, ResMut, Resource};
 use bevy_utils::tracing::{debug, error, info};
 use dashmap::mapref::one::Ref;
 use chidori_core::uuid::Uuid;
@@ -17,18 +17,18 @@ use egui::panel::TopBottomSide;
 use egui::{Color32, FontFamily, Frame, Id, Margin, Response, Rgba, Vec2b, Visuals, Widget};
 use egui_tiles::{TabState, Tile, TileId, Tiles};
 use notify_debouncer_full::{
-    new_debouncer,
-    notify::{RecommendedWatcher, RecursiveMode, Watcher},
-    DebounceEventResult, Debouncer, FileIdMap,
+    DebounceEventResult,
+    Debouncer,
+    FileIdMap, new_debouncer, notify::{RecommendedWatcher, RecursiveMode, Watcher},
 };
 
-use crate::{tokio_tasks, CurrentTheme, MenuAction, GameState};
+use crate::{CurrentTheme, GameState, MenuAction};
 use chidori_core::execution::execution::execution_graph::{
     ExecutionNodeId, MergedStateHistory,
 };
 use chidori_core::execution::execution::ExecutionState;
 use chidori_core::execution::primitives::identifiers::{DependencyReference, OperationId};
-use chidori_core::sdk::interactive_chidori_wrapper::{InteractiveChidoriWrapper, EventsFromRuntime};
+use chidori_core::sdk::interactive_chidori_wrapper::{EventsFromRuntime, InteractiveChidoriWrapper};
 use chidori_core::sdk::interactive_chidori_wrapper::CellHolder;
 use chidori_core::tokio::task::JoinHandle;
 use chidori_core::utils::telemetry::TraceEvents;
@@ -37,6 +37,7 @@ use petgraph::prelude::StableGraph;
 use chidori_core::cells::TextRange;
 use chidori_core::sdk::chidori_runtime_instance::{PlaybackState, UserInteractionMessage};
 use chidori_core::sdk::md::cell_type_to_markdown;
+use crate::accidental::tokio_tasks;
 
 const RECV_RUNTIME_EVENT_TIMEOUT_MS: u64 = 100;
 
