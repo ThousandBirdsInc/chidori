@@ -1,6 +1,6 @@
 use egui::{Color32, FontId, TextStyle, Ui};
 
-use crate::egui_json_tree::value::BaseValueType;
+use crate::vendored::egui_json_tree::value::BaseValueType;
 
 /// Contains coloring parameters for JSON syntax highlighting, and search match highlighting.
 #[derive(Debug, Clone, Hash)]

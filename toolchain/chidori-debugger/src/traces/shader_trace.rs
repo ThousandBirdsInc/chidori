@@ -234,7 +234,7 @@ pub struct CustomMaterialPlugin;
 
 impl Plugin for CustomMaterialPlugin {
     fn build(&self, app: &mut App) {
-        embedded_asset!(app, "../assets/shaders/instancing.wgsl");
+        embedded_asset!(app, "../../assets/shaders/instancing.wgsl");
         app.add_plugins(ExtractComponentPlugin::<InstanceMaterialData>::default());
         app.sub_app_mut(RenderApp)
             .add_render_command::<Transparent3d, DrawCustom>()

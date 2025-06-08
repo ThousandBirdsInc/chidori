@@ -12,7 +12,7 @@ use geometry::Coord;
 use layout::BoundingBox;
 pub use layout::{BasicLayout, Layout, TidyLayout, Orientation};
 pub use node::Node;
-pub use crate::tidy_tree::node::TreeGraph;
+pub use crate::vendored::tidy_tree::node::TreeGraph;
 
 #[derive(PartialEq, Eq)]
 pub enum LayoutType {

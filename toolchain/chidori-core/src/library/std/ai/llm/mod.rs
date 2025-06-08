@@ -417,7 +417,7 @@ pub async fn ai_llm_run_chat_model(
         RkyvSerializedValue::Array(results)
     };
     let mut exec_state = execution_state_handle.lock().unwrap().clone();
-    Ok((Ok(out), Some(exec_state)))
+    Ok((Ok(out), Some(exec_state.clone())))
 }
 
 pub async fn ai_llm_code_generation_chat_model(
@@ -485,7 +485,7 @@ pub async fn ai_llm_code_generation_chat_model(
 
             for cell in cells {
                 let (s, _) = new_execution_state.update_operation(cell, Uuid::now_v7()).await?;
-                new_execution_state = s;
+                new_execution_state = s.clone();
             }
 
             return Ok((RkyvSerializedValue::String(text.clone()), Some(new_execution_state)));
@@ -560,7 +560,7 @@ mod test {
                             return 100 + await demo_second_function_call()
                         "#}),
             function_invocation: None,
-        }, TextRange::default()), id_a)?;
+        }, TextRange::default()), id_a).await?;
         let (mut state, _) = state.update_operation(CellTypes::Code(CodeCell {
             backing_file_reference: None,
             name: None,
@@ -570,7 +570,7 @@ mod test {
                             return a + b + c + d
                         "#}),
             function_invocation: None,
-        }, TextRange::default()), id_b)?;
+        }, TextRange::default()), id_b).await?;
 
         insta::with_settings!({
             omit_expression => true

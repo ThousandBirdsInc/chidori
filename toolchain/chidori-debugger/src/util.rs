@@ -352,7 +352,7 @@ fn render_frame(ui: &mut Ui, label: &str, extra_label: Option<&str>, name: &Opti
 use regex::Regex;
 use serde_json::Value;
 use chidori_core::execution::execution::ExecutionState;
-use crate::egui_json_tree::JsonTree;
+use crate::vendored::egui_json_tree::JsonTree;
 
 fn traverse_rkyv_serialized_value(
     value: &RkyvSerializedValue,

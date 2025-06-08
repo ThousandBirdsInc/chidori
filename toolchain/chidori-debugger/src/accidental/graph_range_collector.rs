@@ -5,7 +5,7 @@ use petgraph::graph::NodeIndex;
 use std::collections::{HashMap, HashSet};
 use petgraph::Outgoing;
 use chidori_core::execution::execution::execution_state::EnclosedState;
-use crate::chidori::ChidoriState;
+use crate::application::ChidoriState;
 
 #[derive(Clone, Default, Debug)]
 pub struct StateRange {

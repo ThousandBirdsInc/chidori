@@ -9,9 +9,9 @@ use thiserror::Error;
 use crate::sdk::interactive_chidori_wrapper::CellHolder;
 use crate::cells::{BackingFileReference, CellTypes, CodeCell, LLMCodeGenCell, LLMEmbeddingCell, LLMPromptCell, MemoryCell, SupportedLanguage, SupportedMemoryProviders, SupportedModelProviders, TemplateCell, TextRange, WebserviceCell};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TextBlock {
-    pub content: String,
+    pub text: String,
     pub range: TextRange,
 }
 
@@ -53,7 +53,7 @@ pub(crate) fn extract_blocks(body: &str) -> (Vec<CodeBlock>, Vec<TextBlock>) {
             let text = body[last_code_end..absolute_start].trim();
             if !text.is_empty() {
                 text_blocks.push(TextBlock {
-                    content: text.to_string(),
+                    text: text.to_string(),
                     range: TextRange {
                         start: last_code_end,
                         end: absolute_start
@@ -101,7 +101,7 @@ pub(crate) fn extract_blocks(body: &str) -> (Vec<CodeBlock>, Vec<TextBlock>) {
         let final_text = body[last_code_end..].trim();
         if !final_text.is_empty() {
             text_blocks.push(TextBlock {
-                content: final_text.to_string(),
+                text: final_text.to_string(),
                 range: TextRange {
                     start: last_code_end,
                     end: body.len()
@@ -328,9 +328,10 @@ mod test {
     fn test_core1() {
         let contents = fs::read_to_string("./examples/core1_simple_math/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
+        let v: Vec<Option<CellTypes>> = extract_blocks(&contents)
+            .0
             .iter()
-            .flat_map(|block| interpret_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, &None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -342,9 +343,10 @@ mod test {
     fn test_core2() {
         let contents = fs::read_to_string("./examples/core2_marshalling/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
+        let v: Vec<Option<CellTypes>> = extract_blocks(&contents)
+            .0
             .iter()
-            .flat_map(|block| interpret_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, &None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -356,9 +358,10 @@ mod test {
     fn test_core3() {
         let contents = fs::read_to_string("./examples/core3_function_invocations/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
+        let v: Vec<Option<CellTypes>> = extract_blocks(&contents)
+            .0
             .iter()
-            .flat_map(|block| interpret_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, &None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -370,9 +373,10 @@ mod test {
     fn test_core4() {
         let contents = fs::read_to_string("./examples/core4_async_function_invocations/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
+        let v: Vec<Option<CellTypes>> = extract_blocks(&contents)
+            .0
             .iter()
-            .flat_map(|block| interpret_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, &None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -384,9 +388,10 @@ mod test {
     fn test_core5() {
         let contents = fs::read_to_string("./examples/core5_prompts_invoked_as_functions/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
+        let v: Vec<Option<CellTypes>> = extract_blocks(&contents)
+            .0
             .iter()
-            .flat_map(|block| interpret_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, &None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -398,9 +403,10 @@ mod test {
     fn test_core6() {
         let contents = fs::read_to_string("./examples/core6_prompts_leveraging_function_calling/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
+        let v: Vec<Option<CellTypes>> = extract_blocks(&contents)
+            .0
             .iter()
-            .flat_map(|block| interpret_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, &None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -412,9 +418,10 @@ mod test {
     fn test_core7() {
         let contents = fs::read_to_string("./examples/core7_rag_stateful_memory_cells/core.md")
             .expect("Should have been able to read the file");
-        let v: Vec<Option<CellTypes>> = extract_code_blocks(&contents)
+        let v: Vec<Option<CellTypes>> = extract_blocks(&contents)
+            .0
             .iter()
-            .flat_map(|block| interpret_code_block(block, None).ok())
+            .flat_map(|block| interpret_code_block(block, &None).ok())
             .collect();
         insta::with_settings!({
         }, {
@@ -424,7 +431,7 @@ mod test {
 
     #[test]
     fn test_extract_markdown() {
-        let extracted = extract_code_blocks(indoc! {  r#"
+        let extracted = extract_blocks(indoc! {  r#"
         Generation
         
         ```python
@@ -468,7 +475,7 @@ mod test {
         "#};
         
         let (blocks, _) = extract_blocks(markdown);
-        let cell = interpret_code_block(&blocks[0], None).unwrap().unwrap();
+        let cell = interpret_code_block(&blocks[0], &None).unwrap().unwrap();
         let reconstructed = cell_type_to_markdown(&cell);
         
         assert_eq!(reconstructed.trim(), markdown.trim());

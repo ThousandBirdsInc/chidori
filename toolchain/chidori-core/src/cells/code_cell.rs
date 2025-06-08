@@ -51,29 +51,29 @@ pub fn code_cell(execution_state_id: ExecutionNodeId, cell: &CodeCell, range: &T
     }
 }
 
-pub(crate) fn code_cell_exec_deno(cell: CodeCell) -> Box<OperationFn> {
-    Box::new(move |s, x, _, _| {
-        let closure_span = tracing::span!(tracing::Level::INFO, "deno_code_cell");
-        let _enter = closure_span.enter();
-        let s = s.clone();
-        let cell = cell.clone();
-        async move {
-            let result = crate::library::std::code::runtime_deno::source_code_run_deno(
-                &s,
-                &cell.source_code,
-                &x,
-                &cell.function_invocation,
-            ).await?;
-            Ok(OperationFnOutput {
-                has_error: false,
-                execution_state: Some(result.3),
-                output: result.0,
-                stdout: result.1,
-                stderr: result.2,
-            })
-        }.boxed()
-    })
-}
+// pub(crate) fn code_cell_exec_deno(cell: CodeCell) -> Box<OperationFn> {
+//     Box::new(move |s, x, _, _| {
+//         let closure_span = tracing::span!(tracing::Level::INFO, "deno_code_cell");
+//         let _enter = closure_span.enter();
+//         let s = s.clone();
+//         let cell = cell.clone();
+//         async move {
+//             let result = crate::library::std::code::runtime_deno::source_code_run_deno(
+//                 &s,
+//                 &cell.source_code,
+//                 &x,
+//                 &cell.function_invocation,
+//             ).await?;
+//             Ok(OperationFnOutput {
+//                 has_error: false,
+//                 execution_state: Some(result.3),
+//                 output: result.0,
+//                 stdout: result.1,
+//                 stderr: result.2,
+//             })
+//         }.boxed()
+//     })
+// }
 
 pub fn code_cell_exec_python(cell: CodeCell) -> Box<OperationFn> {
     Box::new(move |s, x, _, _| {

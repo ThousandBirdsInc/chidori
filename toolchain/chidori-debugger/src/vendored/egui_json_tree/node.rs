@@ -7,7 +7,7 @@ use egui::{
     Color32, FontId, Id, Label, Response, Sense, TextFormat, Ui,
 };
 
-use crate::egui_json_tree::{
+use crate::vendored::egui_json_tree::{
     delimiters::{ARRAY_DELIMITERS, OBJECT_DELIMITERS},
     response::JsonTreeResponse,
     search::SearchTerm,

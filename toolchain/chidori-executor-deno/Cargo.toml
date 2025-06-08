@@ -1,0 +1,13 @@
+[package]
+name = "chidori-executor-deno"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+thousand_birds_deno = "1.46.3"
+deno_core = "=0.307.0"
+futures-util = "0.3.28"

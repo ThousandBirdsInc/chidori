@@ -1,5 +1,7 @@
 //! A shader that renders a mesh multiple times in one draw call.
 
+mod shader_trace;
+
 use std::collections::HashMap;
 use std::num::NonZero;
 use bevy::input::touchpad::TouchpadMagnify;
@@ -22,9 +24,9 @@ use egui_tiles::Tile;
 use petgraph::graph::DiGraph;
 use petgraph::prelude::{EdgeRef, NodeIndex, StableDiGraph, StableGraph};
 use chidori_core::utils::telemetry::TraceEvents;
-use crate::chidori::{ChidoriState, EguiTree, EguiTreeIdentities};
+use crate::application::{ChidoriState, EguiTree, EguiTreeIdentities};
 use crate::{RENDER_LAYER_TRACE_MINIMAP, RENDER_LAYER_TRACE_TEXT, RENDER_LAYER_TRACE_VIEW};
-use crate::shader_trace::{CustomMaterialPlugin, InstanceData, InstanceMaterialData};
+use self::shader_trace::{CustomMaterialPlugin, InstanceData, InstanceMaterialData};
 use crate::util::despawn_screen;
 
 
@@ -1035,20 +1037,20 @@ fn trace_setup(
     ));
 
     // Minimap viewport indicator
-    commands.spawn((
-        PbrBundle {
-            mesh: meshes.add(Mesh::from(Rectangle::new(1.0, 1.0))).into(),
-            material: materials.add(Color::hsla(3.0, 1.0, 1.0, 0.8)),
-            transform: Transform::from_xyz(0.0, -50.0, -1.0),
-            ..default()
-        },
-        RenderLayers::layer(RENDER_LAYER_TRACE_MINIMAP),
-        MinimapTraceViewportIndicator,
-        Collider::cuboid(0.5, 0.5),
-        Sensor,
-        NoFrustumCulling,
-        OnTraceScreen,
-    ));
+    // commands.spawn((
+    //     PbrBundle {
+    //         mesh: meshes.add(Mesh::from(Rectangle::new(1.0, 1.0))).into(),
+    //         material: materials.add(Color::hsla(3.0, 1.0, 1.0, 0.8)),
+    //         transform: Transform::from_xyz(0.0, -50.0, -1.0),
+    //         ..default()
+    //     },
+    //     RenderLayers::layer(RENDER_LAYER_TRACE_MINIMAP),
+    //     MinimapTraceViewportIndicator,
+    //     Collider::cuboid(0.5, 0.5),
+    //     Sensor,
+    //     NoFrustumCulling,
+    //     OnTraceScreen,
+    // ));
 
     commands.spawn((CursorWorldCoords(Vec2::ZERO), OnTraceScreen));
 

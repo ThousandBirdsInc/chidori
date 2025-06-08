@@ -268,6 +268,7 @@ mod tests {
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::runtime::Runtime;
+    use crate::cells::{CellTypes, CodeCell, SupportedLanguage};
 
     /*
     Testing the execution of individual nodes. Validating that operations as defined can be executed.
@@ -279,43 +280,44 @@ mod tests {
         let mut state = ExecutionState::new_with_random_id();
         let state_id = Uuid::nil();
         let (id_a, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::new(),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::new(),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "1".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
         let (id_b, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::new(),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(2))) }.boxed()),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::new(),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "2".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
         let (id_c, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::from_args_list(vec!["a", "b"]),
-                    OutputSignature::new(),
-                    Box::new(|_, args, _, _| {
-                        async move {
-                            if let RSV::Object(m) = args {
-                                if let RSV::Object(args) = m.get("args").unwrap() {
-                                    if let (Some(RSV::Number(a)), Some(RSV::Number(b))) =
-                                        (args.get(&"0".to_string()), args.get(&"1".to_string()))
-                                    {
-                                        return Ok(OperationFnOutput::with_value(RSV::Number(a + b)));
-                                    }
-                                }
-                            }
-
-                            panic!("Invalid arguments")
-                        }.boxed()
-                    }),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::from_args_list(vec!["a", "b"]),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "a + b".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
 
         let mut state =
             state.apply_dependency_graph_mutations(vec![DependencyGraphMutation::Create {
@@ -362,28 +364,38 @@ mod tests {
         let mut state = ExecutionState::new_with_random_id();
         let state_id = Uuid::nil();
         let (id_a, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::new(),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(0))) }.boxed()),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::new(),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "0".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
         let (id_b, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::new(),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::new(),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "1".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
         let mut state =
             state.apply_dependency_graph_mutations(vec![DependencyGraphMutation::Create {
                 operation_id: id_b,
                 depends_on: vec![(id_a, DependencyReference::Positional(0))],
             }]);
 
-        let (_, new_state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state.clone())).await?;
+        let (_, new_state, _) = ExecutionGraph::immutable_external_step_execution(state.clone()).await?;
         assert_eq!(
             new_state.state_get_value(&id_a).unwrap(),
             &Ok(RkyvSerializedValue::Number(0))
@@ -412,31 +424,46 @@ mod tests {
         let state_id = Uuid::nil();
 
         let (id_a, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::new(),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(0))) }.boxed()),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::new(),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "0".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
 
         let (id_b, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::from_args_list(vec!["0"]),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::from_args_list(vec!["0"]),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "1".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
 
         let (id_c, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::from_args_list(vec!["0"]),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(2))) }.boxed()),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::from_args_list(vec!["0"]),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "2".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
@@ -449,24 +476,18 @@ mod tests {
             },
         ]);
 
-        let (state_id, new_state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state.clone())).await?;
+        let (state_id, new_state, _) = ExecutionGraph::immutable_external_step_execution(state.clone()).await?;
         assert_eq!(state.state_get_value(&id_b), None);
         assert_eq!(state.state_get_value(&id_c), None);
-        // if let ExecutionStateEvaluation::Complete(s) = &state {
-        //     assert_eq!(s.exec_queue, VecDeque::from(vec![1,2]));
-        // }
+
         let (state_id, new_state, _) = ExecutionGraph::immutable_external_step_execution(new_state).await?;
         assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
         assert_eq!(state.state_get_value(&id_c), None);
-        // if let ExecutionStateEvaluation::Complete(s) = &state {
-        //     assert_eq!(s.exec_queue, VecDeque::from(vec![2]));
-        // }
+
         let (state_id, new_state, _) = ExecutionGraph::immutable_external_step_execution(new_state).await?;
         assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
         assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(2))));
-        // if let ExecutionStateEvaluation::Complete(s) = &state {
-        //     assert_eq!(s.exec_queue, VecDeque::from(vec![]));
-        // }
+
         db.shutdown().await;
         Ok(())
     }
@@ -488,13 +509,18 @@ mod tests {
         let mut ids = vec![];
         for x in 0..4 {
             let (id, mut nstate) = state.upsert_operation(OperationNode::new(
-                        None,
-                        Uuid::nil(),
-                        if x == 0 { InputSignature::new() } else { InputSignature::from_args_list(vec!["0"]) },
-                        OutputSignature::new(),
-                        Box::new(move |_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(x))) }.boxed()),
-                    ),
-                                                        Uuid::now_v7());
+                None,
+                Uuid::nil(),
+                if x == 0 { InputSignature::new() } else { InputSignature::from_args_list(vec!["0"]) },
+                OutputSignature::new(),
+                CellTypes::Code(CodeCell {
+                    backing_file_reference: None,
+                    name: None,
+                    language: SupportedLanguage::PyO3,
+                    source_code: format!("{}", x),
+                    function_invocation: None,
+                }, Default::default()),
+            ), Uuid::now_v7())?;
             ids.push(id);
             state = nstate
         }
@@ -518,7 +544,7 @@ mod tests {
             },
         ]);
 
-        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state.clone()).await?;
         assert_eq!(state.state_get_value(&id_b), None);
         assert_eq!(state.state_get_value(&id_c), None);
         let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
@@ -555,13 +581,18 @@ mod tests {
         let mut ids = vec![];
         for x in 0..5 {
             let (id, mut nstate) = state.upsert_operation(OperationNode::new(
-                        None,
-                        Uuid::nil(),
-                        if x == 0 { InputSignature::new() } else if x == 4 {InputSignature::from_args_list(vec!["1", "2"]) } else { InputSignature::from_args_list(vec!["1"]) },
-                        OutputSignature::new(),
-                        Box::new(move |_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(x))) }.boxed()),
-                    ),
-                                                        Uuid::now_v7());
+                None,
+                Uuid::nil(),
+                if x == 0 { InputSignature::new() } else if x == 4 {InputSignature::from_args_list(vec!["1", "2"]) } else { InputSignature::from_args_list(vec!["1"]) },
+                OutputSignature::new(),
+                CellTypes::Code(CodeCell {
+                    backing_file_reference: None,
+                    name: None,
+                    language: SupportedLanguage::PyO3,
+                    source_code: format!("{}", x),
+                    function_invocation: None,
+                }, Default::default()),
+            ), Uuid::now_v7())?;
             ids.push(id);
             state = nstate
         }
@@ -593,7 +624,7 @@ mod tests {
             },
         ]);
 
-        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state.clone()).await?;
         assert_eq!(state.state_get_value(&id_b), None);
         assert_eq!(state.state_get_value(&id_c), None);
         let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
@@ -637,73 +668,89 @@ mod tests {
 
         // We start with the number 1 at node 0
         let (id_a, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::new(),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::new(),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "1".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
 
-        // Each node adds 1 to the inbound item (all nodes only have one dependency per index)
-        let f1 = |_: &ExecutionState, args: RkyvSerializedValue, _, _| {
-            async move {
-                if let RSV::Object(m) = args {
-                    if let RSV::Object(args) = m.get("args").unwrap() {
-                        if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
-                            return Ok(OperationFnOutput::with_value(RSV::Number(a + 1)));
-                        }
-                    }
-                }
-
-                panic!("Invalid arguments")
-            }.boxed()
-        };
-
+        // Each node adds 1 to the inbound item
         let (id_b, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::from_args_list(vec!["1"]),
-                    OutputSignature::new(),
-                    Box::new(f1),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::from_args_list(vec!["1"]),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "x + 1".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
 
         let (id_c, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::from_args_list(vec!["1"]),
-                    OutputSignature::new(),
-                    Box::new(f1),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::from_args_list(vec!["1"]),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "x + 1".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
 
         let (id_d, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::from_args_list(vec!["1"]),
-                    OutputSignature::new(),
-                    Box::new(f1),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::from_args_list(vec!["1"]),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "x + 1".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
 
         let (id_e, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::from_args_list(vec!["1"]),
-                    OutputSignature::new(),
-                    Box::new(f1),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::from_args_list(vec!["1"]),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "x + 1".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
 
         let (id_f, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::from_args_list(vec!["1"]),
-                    OutputSignature::new(),
-                    Box::new(f1),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::from_args_list(vec!["1"]),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "x + 1".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
@@ -732,7 +779,7 @@ mod tests {
         ]);
 
         // We expect to see the value at each node increment repeatedly.
-        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state.clone()).await?;
         assert_eq!(state.state_get_value(&id_b), None);
         assert_eq!(state.state_get_value(&id_c), None);
         let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
@@ -761,27 +808,7 @@ mod tests {
         assert_eq!(state.state_get_value(&id_e), Some(&Ok(RSV::Number(4))));
         assert_eq!(state.state_get_value(&id_f), Some(&Ok(RSV::Number(5))));
         let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
-        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(2))));
-        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(3))));
-        assert_eq!(state.state_get_value(&id_d), Some(&Ok(RSV::Number(5))));
-        assert_eq!(state.state_get_value(&id_e), Some(&Ok(RSV::Number(4))));
-        assert_eq!(state.state_get_value(&id_f), Some(&Ok(RSV::Number(5))));
-        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
-        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(6))));
-        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(3))));
-        assert_eq!(state.state_get_value(&id_d), Some(&Ok(RSV::Number(5))));
-        assert_eq!(state.state_get_value(&id_e), Some(&Ok(RSV::Number(4))));
-        assert_eq!(state.state_get_value(&id_f), Some(&Ok(RSV::Number(5))));
-        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
-        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(6))));
-        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(7))));
-        assert_eq!(state.state_get_value(&id_d), Some(&Ok(RSV::Number(5))));
-        assert_eq!(state.state_get_value(&id_e), Some(&Ok(RSV::Number(4))));
-        assert_eq!(state.state_get_value(&id_f), Some(&Ok(RSV::Number(5))));
-        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
-        if let ExecutionStateEvaluation::Complete(s) = &state {
-            s.render_dependency_graph();
-        }
+        state.render_dependency_graph();
         assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(6))));
         assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(7))));
         assert_eq!(state.state_get_value(&id_d), Some(&Ok(RSV::Number(5))));
@@ -818,47 +845,47 @@ mod tests {
 
         // We start with the number 1 at node 0
         let (id_a, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::new(),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::new(),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "1".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
 
         // Globally mutates this value, making each call to this function side-effecting
         static atomic_usize: AtomicUsize = AtomicUsize::new(0);
-        let f_side_effect = |_: &ExecutionState, args: RkyvSerializedValue, _, _| {
-            async move {
-                if let RSV::Object(m) = args {
-                    if let RSV::Object(args) = m.get("args").unwrap() {
-                        if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
-                            let plus = atomic_usize.fetch_add(1, Ordering::SeqCst);
-                            return Ok(OperationFnOutput::with_value(RSV::Number(a + plus as i32)));
-                        }
-                    }
-                }
-
-                panic!("Invalid arguments")
-            }.boxed()
-        };
-
         let (id_b, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::from_args_list(vec!["0"]),
-                    OutputSignature::new(),
-                    Box::new(f_side_effect),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::from_args_list(vec!["0"]),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "x + atomic_usize.fetch_add(1, Ordering::SeqCst)".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
         let (id_c, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::from_args_list(vec!["0"]),
-                    OutputSignature::new(),
-                    Box::new(f_side_effect),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::from_args_list(vec!["0"]),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "x + atomic_usize.fetch_add(1, Ordering::SeqCst)".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
@@ -871,7 +898,7 @@ mod tests {
             },
         ]);
 
-        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state.clone()).await?;
         assert_eq!(state.state_get_value(&id_b), None);
         assert_eq!(state.state_get_value(&id_c), None);
         let (x_state_id, x_state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
@@ -908,58 +935,45 @@ mod tests {
 
         // We start with the number 0 at node 0
         let (id_a, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::new(),
-                    OutputSignature::new(),
-                    Box::new(|_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(0))) }.boxed()),
-                ),
-                                                    Uuid::now_v7());
-
-        let f_v1 = |_: &ExecutionState, args: RkyvSerializedValue, _, _| {
-            async move {
-                if let RSV::Object(m) = args {
-                    if let RSV::Object(args) = m.get("args").unwrap() {
-                        if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
-                            return Ok(OperationFnOutput::with_value(RSV::Number(a + 1)));
-                        }
-                    }
-                }
-
-                panic!("Invalid arguments")
-            }.boxed()
-        };
-
-        let f_v2 = |_: &ExecutionState, args: RkyvSerializedValue, _, _| {
-            async move {
-            if let RSV::Object(m) = args {
-                if let RSV::Object(args) = m.get("args").unwrap() {
-                    if let Some(RSV::Number(a)) = args.get(&"0".to_string()) {
-                        return Ok(OperationFnOutput::with_value(RSV::Number(a + 200)));
-                    }
-                }
-            }
-
-            panic!("Invalid arguments")
-            }.boxed()
-        };
+            None,
+            Uuid::nil(),
+            InputSignature::new(),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "0".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
 
         let (id_b, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::from_args_list(vec!["0"]),
-                    OutputSignature::new(),
-                    Box::new(f_v1),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::from_args_list(vec!["0"]),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "x + 1".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
         let (id_c, mut state) = state.upsert_operation(OperationNode::new(
-                    None,
-                    Uuid::nil(),
-                    InputSignature::from_args_list(vec!["0"]),
-                    OutputSignature::new(),
-                    Box::new(f_v1),
-                ),
-                                                    Uuid::now_v7());
+            None,
+            Uuid::nil(),
+            InputSignature::from_args_list(vec!["0"]),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "x + 1".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
 
         let mut state = state.apply_dependency_graph_mutations(vec![
             DependencyGraphMutation::Create {
@@ -972,7 +986,7 @@ mod tests {
             },
         ]);
 
-        let (x_state_id, mut x_state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
+        let (x_state_id, mut x_state, _) = ExecutionGraph::immutable_external_step_execution(state.clone()).await?;
         assert_eq!(x_state.state_get_value(&id_b), None);
         assert_eq!(x_state.state_get_value(&id_c), None);
         let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(x_state.clone()).await?;
@@ -983,23 +997,26 @@ mod tests {
         assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(2))));
 
         // Change the definition of the operation "1" to add 200 instead of 1, then re-evaluate
-        if let ExecutionStateEvaluation::Complete(x_state) = x_state {
-            let (_, mut state) = x_state.upsert_operation(OperationNode::new(
-                None,
-                Uuid::nil(),
-                InputSignature::from_args_list(vec!["0"]),
-                OutputSignature::new(),
-                Box::new(f_v2),
-            ), id_b);
-            let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state.clone())).await?;
-            assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(200))));
-            assert_eq!(state.state_get_value(&id_c), None);
-            let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
-            assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(200))));
-            assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(201))));
-        }
+        let (_, mut state) = x_state.upsert_operation(OperationNode::new(
+            None,
+            Uuid::nil(),
+            InputSignature::from_args_list(vec!["0"]),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "x + 200".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), id_b)?;
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state.clone()).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(200))));
+        assert_eq!(state.state_get_value(&id_c), None);
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
+        assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(200))));
+        assert_eq!(state.state_get_value(&id_c), Some(&Ok(RSV::Number(201))));
         Ok(())
-
     }
 
     #[tokio::test]
@@ -1030,9 +1047,14 @@ mod tests {
                 Uuid::nil(),
                 if x == 0 { InputSignature::new() } else if x == 4 {InputSignature::from_args_list(vec!["1", "2"]) } else { InputSignature::from_args_list(vec!["1"]) },
                 OutputSignature::new(),
-                Box::new(move |_, _args, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(x))) }.boxed()),
-            ),
-                                                         Uuid::now_v7());
+                CellTypes::Code(CodeCell {
+                    backing_file_reference: None,
+                    name: None,
+                    language: SupportedLanguage::PyO3,
+                    source_code: format!("{}", x),
+                    function_invocation: None,
+                }, Default::default()),
+            ), Uuid::now_v7())?;
             ids.push(id);
             state = nstate
         }
@@ -1064,10 +1086,10 @@ mod tests {
             },
         ]);
 
-        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(ExecutionStateEvaluation::Complete(state)).await?;
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state.clone()).await?;
         assert_eq!(state.state_get_value(&id_b), None);
         assert_eq!(state.state_get_value(&id_c), None);
-        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state)?;
+        let (state_id, state, _) = ExecutionGraph::immutable_external_step_execution(state).await?;
         assert_eq!(state.state_get_value(&id_b), Some(&Ok(RSV::Number(1))));
         assert_eq!(state.state_get_value(&id_c), None);
         println!("step_execution_with_previous_state {:?}", &state);
@@ -1100,12 +1122,11 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_get_execution_graph_elements_empty() {
-        let db = ExecutionGraph::new();
-        let (edges, stack_hierarchy) = db.get_execution_graph_elements();
-        assert!(edges.is_empty());
-        assert!(stack_hierarchy.is_empty());
+    #[test]
+    fn test_get_execution_graph_elements() {
+        let mut db = ExecutionGraph::new();
+        let edges = db.get_execution_graph_elements();
+        assert_eq!(edges, vec![]);
     }
 
     #[tokio::test]
@@ -1113,24 +1134,27 @@ mod tests {
         let mut db = ExecutionGraph::new();
         let mut state = ExecutionState::new_with_random_id();
 
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+        let (id_a, mut state) = state.upsert_operation(OperationNode::new(
             None,
             Uuid::nil(),
             InputSignature::new(),
             OutputSignature::new(),
-            Box::new(|_, _, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(1))) }.boxed()),
-        ), Uuid::now_v7());
-        let init_state_id = state.id.clone();
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "1".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
+        let init_state_id = state.chronology_id.clone();
 
-        let state1 = ExecutionStateEvaluation::Complete(state);
-        println!("step_execution_with_previous_state {:?}", &state1);
-        let (new_state, outputs) = state1.step_execution().await?;
-        let (state_id, state, _) = (state1.chronology_id, new_state, outputs);
+        let (new_state, outputs) = state.step_execution().await?;
+        let (state_id, state, _) = (state.chronology_id, new_state, outputs);
 
-        let (edges, stack_hierarchy) = db.get_execution_graph_elements();
+        let edges = db.get_execution_graph_elements();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0], (init_state_id, state_id));
-        assert!(stack_hierarchy.is_empty());
 
         Ok(())
     }
@@ -1148,8 +1172,14 @@ mod tests {
                 Uuid::nil(),
                 InputSignature::new(),
                 OutputSignature::new(),
-                Box::new(move |_, _, _, _| async move { Ok(OperationFnOutput::with_value(RSV::Number(i))) }.boxed()),
-            ), Uuid::now_v7());
+                CellTypes::Code(CodeCell {
+                    backing_file_reference: None,
+                    name: None,
+                    language: SupportedLanguage::PyO3,
+                    source_code: format!("{}", i),
+                    function_invocation: None,
+                }, Default::default()),
+            ), Uuid::now_v7())?;
             ids.push(id);
             state = new_state;
         }
@@ -1167,20 +1197,16 @@ mod tests {
                 depends_on: vec![(id_b, DependencyReference::Positional(0))],
             },
         ]);
-        let init_state_id = state.id.clone();
+        let init_state_id = state.chronology_id.clone();
 
-        let state1 = ExecutionStateEvaluation::Complete(state);
-        println!("step_execution_with_previous_state {:?}", &state1);
-        let (new_state, outputs) = state1.step_execution().await?;
-        let (state_id1, state, _) = (state1.chronology_id, new_state, outputs);
-        println!("step_execution_with_previous_state {:?}", &state);
+        let (new_state, outputs) = state.step_execution().await?;
+        let (state_id1, state, _) = (state.chronology_id, new_state, outputs);
         let (new_state, outputs) = state.step_execution().await?;
         let (state_id2, state, _) = (state.chronology_id, new_state, outputs);
-        println!("step_execution_with_previous_state {:?}", &state);
         let (new_state, outputs) = state.step_execution().await?;
         let (state_id3, state, _) = (state.chronology_id, new_state, outputs);
 
-        let (edges, stack_hierarchy) = db.get_execution_graph_elements();
+        let edges = db.get_execution_graph_elements();
 
         let expected_edges: HashSet<_> = vec![
             (init_state_id, state_id1),
@@ -1190,7 +1216,6 @@ mod tests {
 
         assert_eq!(edges.len(), 3);
         assert_eq!(HashSet::from_iter(edges.into_iter()), expected_edges);
-        assert!(stack_hierarchy.is_empty());
 
         Ok(())
     }
@@ -1200,39 +1225,34 @@ mod tests {
         let mut db = ExecutionGraph::new();
         let mut state = ExecutionState::new_with_random_id();
 
-        let (_, mut state) = state.upsert_operation(OperationNode::new(
+        let (id_a, mut state) = state.upsert_operation(OperationNode::new(
             None,
             Uuid::nil(),
             InputSignature::new(),
             OutputSignature::new(),
-            Box::new(|_, _, _, _| async move {
-                Ok(OperationFnOutput::with_value(RSV::Number(1)))
-            }.boxed()),
-        ), Uuid::now_v7());
-        let init_state_id = state.id.clone();
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "1".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        ), Uuid::now_v7())?;
+        let init_state_id = state.chronology_id.clone();
 
         // Simulate a stack by manually setting it in the state
         let stack = VecDeque::from(vec![Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()]);
         state.stack = stack.clone();
 
-        let state1 = ExecutionStateEvaluation::Complete(state);
+        let state1 = ExecutionState::Complete(state.clone());
         println!("step_execution_with_previous_state {:?}", &state1);
         let (new_state, outputs) = state1.step_execution().await?;
-        let (state_id, state, _) = (state1.chronology_id, new_state, outputs);
+        let (state_id, state, _) = (state.chronology_id, new_state, outputs);
 
-        let (edges, stack_hierarchy) = db.get_execution_graph_elements();
+        let edges = db.get_execution_graph_elements();
 
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0], (init_state_id, state_id));
-
-        let expected_stack_hierarchy: HashSet<_> = vec![
-            stack[0],
-            stack[1],
-            stack[2],
-        ].into_iter().collect();
-
-        assert_eq!(stack_hierarchy.len(), 3);
-        assert_eq!(HashSet::from_iter(stack_hierarchy.into_iter()), expected_stack_hierarchy);
 
         Ok(())
     }

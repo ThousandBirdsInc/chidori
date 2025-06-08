@@ -385,7 +385,8 @@ impl OperationNode {
                         crate::cells::code_cell::code_cell_exec_python(code_cell.clone())
                     }
                     SupportedLanguage::Deno => {
-                        crate::cells::code_cell::code_cell_exec_deno(code_cell.clone())
+                        unreachable!();
+                        // crate::cells::code_cell::code_cell_exec_deno(code_cell.clone())
                     }
                 }
             }

@@ -22,8 +22,6 @@ use deno::factory::CliFactory;
 use deno::file_fetcher::File;
 use deno::deno_runtime::deno_permissions::{Permissions, PermissionsContainer};
 use futures_util::FutureExt;
-use pyo3::{Py, PyAny};
-use pyo3::types::{IntoPyDict, PyTuple};
 use tokio::runtime::{Builder, Runtime};
 use tracing::{debug, Id, Span};
 use crate::cells::{CellTypes, CodeCell, LLMPromptCell};

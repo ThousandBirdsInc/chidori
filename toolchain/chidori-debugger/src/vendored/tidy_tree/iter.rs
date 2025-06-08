@@ -1,4 +1,4 @@
-use crate::tidy_tree::Node;
+use crate::vendored::tidy_tree::Node;
 
 pub struct Iter<'a> {
     nodes: Vec<&'a Node>,

@@ -1,4 +1,4 @@
-use crate::egui_json_tree::{
+use crate::vendored::egui_json_tree::{
     node::JsonTreeNode, value::ToJsonTreeValue, DefaultExpand, JsonTreeResponse, JsonTreeStyle,
 };
 use egui::{Id, Response, Ui};

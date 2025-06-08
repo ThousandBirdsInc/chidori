@@ -191,7 +191,7 @@ impl InteractiveChidoriWrapper {
                         path: "".to_string(),
                         text_range: Some(block.range.clone()),
                     }),
-                    text: block.content.clone()
+                    text: block.text.clone()
                 }, block.range.clone()))
             })
             .for_each(|block| { cells.push(block); });

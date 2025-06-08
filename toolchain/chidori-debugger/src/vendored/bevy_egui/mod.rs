@@ -801,7 +801,7 @@ impl Plugin for EguiPlugin {
         load_internal_asset!(
             app,
             EGUI_SHADER_HANDLE,
-            "../../assets/shaders/egui.wgsl",
+            "../../../assets/shaders/egui.wgsl",
             Shader::from_wgsl
         );
     }

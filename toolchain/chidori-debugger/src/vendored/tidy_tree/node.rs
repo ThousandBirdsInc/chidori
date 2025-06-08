@@ -3,8 +3,8 @@ use petgraph::Direction;
 use std::collections::{HashMap, VecDeque};
 use std::iter::Map;
 use petgraph::visit::Bfs;
-use crate::tidy_tree::{geometry::Coord, layout::BoundingBox};
-use crate::tidy_tree::layout::tidy_layout::Orientation;
+use crate::vendored::tidy_tree::{geometry::Coord, layout::BoundingBox};
+use crate::vendored::tidy_tree::layout::tidy_layout::Orientation;
 
 #[derive(Debug, Clone)]
 pub struct TidyData {
@@ -89,6 +89,7 @@ impl Node {
     }
 }
 
+#[derive(Clone)]
 pub struct TreeGraph {
     pub(crate) graph: Graph<Node, ()>,
     pub(crate) root: NodeIndex,

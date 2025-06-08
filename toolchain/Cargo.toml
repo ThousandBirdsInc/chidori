@@ -3,7 +3,7 @@ members = [
     "chidori-core",
     "chidori-prompt-format",
     "chidori-static-analysis",
-    "chidori-debugger",
+    "chidori-debugger", "chidori-executor-deno",
 ]
 resolver = "2"
 
@@ -52,8 +52,9 @@ thiserror = "1.0.58"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 
 [workspace.dependencies.uuid]
-version = "=1.8.0"
+version = "=1.16.0"
 features = [
+    "serde",
     "v4",                # Lets you generate random UUIDs
     "v7",                # Lets you generate timestamp UUIDs
     "fast-rng",          # Use a faster (but still sufficiently random) RNG

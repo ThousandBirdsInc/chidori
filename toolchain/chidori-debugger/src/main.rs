@@ -7,22 +7,13 @@ mod util;
 mod code;
 mod traces;
 mod graph;
-mod chidori;
-mod tokio_tasks;
-mod tidy_tree;
-mod chat;
-mod logs;
-mod shader_trace;
-mod bevy_egui;
-mod egui_json_tree;
+mod components;
+mod application;
+mod accidental;
+mod vendored;
 mod bevy_prototype_lyon;
-mod tree_grouping;
-mod json_editor;
-mod vim_text_edit;
-mod graph_range_collector;
-mod file_interaction;
-
-use crate::bevy_egui::{egui, EguiContexts, EguiPlugin};
+use crate::vendored::bevy_egui;
+use crate::vendored::bevy_egui::{egui, EguiContexts, EguiPlugin};
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
 use bevy::log::LogPlugin;
 use bevy::prelude::*;
@@ -57,7 +48,6 @@ pub const RENDER_LAYER_TRACE_MINIMAP: Layer = 5;
 enum GameState {
     Editor,
     Traces,
-    Chat,
     #[default]
     Graph,
 }
@@ -313,7 +303,6 @@ pub enum MenuAction {
     Save,
     SwitchToGraph,
     SwitchToTraces,
-    SwitchToChat,
     Quit,
 }
 
@@ -377,7 +366,6 @@ fn setup_raw_window(
     view_menu.append_items(&[
         &MenuItem::with_id("graph_view", "Graph View", true, Some(Accelerator::new(Some(Modifiers::CONTROL), Code::KeyG))),
         &MenuItem::with_id("trace_view", "Trace View", true, Some(Accelerator::new(Some(Modifiers::CONTROL), Code::KeyT))),
-        &MenuItem::with_id("chat_view", "Chat View", true, Some(Accelerator::new(Some(Modifiers::CONTROL), Code::KeyC))),
     ]);
 
     help_menu.append_items(&[
@@ -394,7 +382,6 @@ fn setup_raw_window(
             id if id == "save" => Some(MenuAction::Save),
             id if id == "graph_view" => Some(MenuAction::SwitchToGraph),
             id if id == "trace_view" => Some(MenuAction::SwitchToTraces),
-            id if id == "chat_view" => Some(MenuAction::SwitchToChat),
             id if id == "quit" => Some(MenuAction::Quit),
             _ => None,
         };
@@ -468,8 +455,6 @@ fn forward_menu_events(
 }
 
 fn main() {
-
-
     App::new()
         .add_plugins((
             DefaultPlugins
@@ -485,8 +470,7 @@ fn main() {
                     ..Default::default()
                 })
                 // We disable the log plugin to avoid conflicts with the Chidori logger
-                .disable::<LogPlugin>()
-            ,
+                .disable::<LogPlugin>(),
             FrameTimeDiagnosticsPlugin,
         ))
         .add_plugins(RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(100.0))
@@ -494,7 +478,7 @@ fn main() {
         // .add_plugins(RapierDebugRenderPlugin::default())
         // .add_plugins(bevy_framepace::FramepacePlugin)
         .add_plugins(EguiPlugin)
-        .add_plugins(tokio_tasks::TokioTasksPlugin::default())
+        .add_plugins(accidental::tokio_tasks::TokioTasksPlugin::default())
         // Insert as resource the initial value for the settings resources
         .insert_resource(CurrentTheme::default())
         // .insert_resource(Volume(7))
@@ -503,11 +487,9 @@ fn main() {
         .add_systems(Startup, (set_window_size,))
         .add_systems(Startup, (setup_raw_window,))
         // Adds the plugins for each state
-        .add_plugins(chat::chat_plugin)
-        .add_plugins(chidori::chidori_plugin)
+        .add_plugins(application::chidori_plugin)
         .add_plugins(code::editor_plugin)
         .add_plugins(graph::graph_plugin)
-        .add_plugins(logs::logs_plugin)
         .add_plugins(traces::trace_plugin)
         // Add the menu event handling system
         .add_systems(Update, handle_menu_actions)

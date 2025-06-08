@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::egui_json_tree::value::{ExpandableType, JsonTreeValue, ToJsonTreeValue};
+use crate::vendored::egui_json_tree::value::{ExpandableType, JsonTreeValue, ToJsonTreeValue};
 
 #[derive(Debug, Clone, Hash)]
 pub struct SearchTerm(String);

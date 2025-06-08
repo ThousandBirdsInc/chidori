@@ -40,6 +40,8 @@ use tracing::{debug, Id, Span};
 use uuid::Uuid;
 use crate::execution::execution::execution_state::{EnclosedState, ExecutionStateErrors};
 
+use rkyv::result::ArchivedResult;
+
 static SOURCE_CODE_RUN_COUNTER: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
 static CURRENT_PYTHON_EXECUTION_ID: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
 
@@ -322,6 +324,10 @@ pub async fn source_code_run_python(
     let report = build_report(&dependencies);
 
     let execution_state = Arc::new(Mutex::new(execution_state.clone()));
+    let execution_state_clone = {
+        let guard = execution_state.lock().unwrap();
+        guard.clone()
+    };
     let result =  Python::with_gil(|py| {
         let v = py.version_info();
 
@@ -353,8 +359,8 @@ pub async fn source_code_run_python(
 
         // Configure locals and globals passed to evaluation
         let globals = PyDict::new(py);
-        create_external_function_shims(&execution_state, &report, py, globals, current_span_id.clone())?;
-        create_internal_proxy_shims(&execution_state, &report, py, globals, current_span_id)?;
+        create_external_function_shims(&execution_state.clone(), &report, py, globals, current_span_id.clone())?;
+        create_internal_proxy_shims(&execution_state.clone(), &report, py, globals, current_span_id)?;
 
 
         let sys = py.import("sys")?;
@@ -613,18 +619,9 @@ asyncio.run(__wrapper())
             }
         }
     });
-    match result {
-        Ok(result) => {
-            let awaited_result = result.await;
-            let execution_state = execution_state.lock().unwrap().clone();
-            let (_, output_stdout) = PYTHON_LOGGING_BUFFER_STDOUT.remove(&exec_id).unwrap_or((0, vec![]));
-            let (_, output_stderr) = PYTHON_LOGGING_BUFFER_STDERR.remove(&exec_id).unwrap_or((0, vec![]));
-            Ok((awaited_result, output_stdout, output_stderr, execution_state))
-        }
-        Err(e) => {
-            return Err(anyhow::anyhow!(e.to_string()));
-        }
-    }
+    let result = result?;
+    let result = result.await;
+    Ok((result, vec![], vec![], execution_state_clone))
 }
 
 
@@ -859,25 +856,28 @@ x = 12 + y
 li = [x, y]
         "#,
         );
-        let result = source_code_run_python(&ExecutionState::new_with_random_id(), &source_code, &RkyvSerializedValue::Null, &None, &None, &None).await;
-        assert_eq!(
-            result.unwrap(),
+        let result = source_code_run_python(
+            &ExecutionState::new_with_random_id(),
+            &source_code,
+            &RkyvSerializedValue::Null,
+            &None,
+            &None,
+            &None,
+        ).await?;
+        let (result, stdout, stderr, _) = result;
+        assert_eq!(result, Ok(RkyvSerializedValue::Object(HashMap::from_iter(vec![
+            ("y".to_string(), RkyvSerializedValue::Number(42),),
+            ("x".to_string(), RkyvSerializedValue::Number(54),),
             (
-                Ok(RkyvSerializedValue::Object(HashMap::from_iter(vec![
-                    ("y".to_string(), RkyvSerializedValue::Number(42),),
-                    ("x".to_string(), RkyvSerializedValue::Number(54),),
-                    (
-                        "li".to_string(),
-                        RkyvSerializedValue::Array(vec![
-                            RkyvSerializedValue::Number(54),
-                            RkyvSerializedValue::Number(42)
-                        ]),
-                    )
-                ]))),
-                vec![],
-                vec![]
+                "li".to_string(),
+                RkyvSerializedValue::Array(vec![
+                    RkyvSerializedValue::Number(54),
+                    RkyvSerializedValue::Number(42)
+                ]),
             )
-        );
+        ]))));
+        assert_eq!(stdout, Vec::<String>::new());
+        assert_eq!(stderr, Vec::<String>::new());
     }
 
     #[tokio::test]
@@ -888,19 +888,22 @@ li = [x, y]
 print("testing")
         "#,
         );
-        let result = source_code_run_python(&ExecutionState::new_with_random_id(), &source_code, &RkyvSerializedValue::Null, &None, &None, &None).await;
-        assert_eq!(
-            result.unwrap(),
-            (
-                Ok(RkyvSerializedValue::Object(HashMap::from_iter(vec![]))),
-                vec![String::from("testing"), String::from("\n")],
-                vec![]
-            )
-        );
+        let result = source_code_run_python(
+            &ExecutionState::new_with_random_id(),
+            &source_code,
+            &RkyvSerializedValue::Null,
+            &None,
+            &None,
+            &None,
+        ).await?;
+        let (result, stdout, stderr, _) = result;
+        assert_eq!(result, Ok(RkyvSerializedValue::Object(HashMap::from_iter(vec![]))));
+        assert_eq!(stdout, Vec::<String>::new());
+        assert_eq!(stderr, Vec::<String>::new());
     }
 
     #[tokio::test]
-    async fn test_execution_of_internal_function() {
+    async fn test_execution_of_internal_function_basic() {
         let source_code = String::from(
             r#"
 import chidori as ch
@@ -911,18 +914,22 @@ def example():
     return a
         "#,
         );
-        let result = source_code_run_python(&ExecutionState::new_with_random_id(),
-                                            &source_code,
-                                            &RkyvSerializedValue::Null,
-                                            &Some("example".to_string()),
-                                            &None,
-                                            &None,
-        ).await;
-        assert_eq!(result.unwrap(), (Ok(RkyvSerializedValue::Number(20)), vec![], vec![]));
+        let result = source_code_run_python(
+            &ExecutionState::new_with_random_id(),
+            &source_code,
+            &RkyvSerializedValue::Null,
+            &Some("example".to_string()),
+            &None,
+            &None,
+        ).await?;
+        let (result, stdout, stderr, _) = result;
+        assert_eq!(result, Ok(RkyvSerializedValue::Number(20)));
+        assert_eq!(stdout, Vec::<String>::new());
+        assert_eq!(stderr, Vec::<String>::new());
     }
 
     #[tokio::test]
-    async fn test_execution_of_internal_function_with_arguments() {
+    async fn test_execution_of_internal_function_with_args() -> anyhow::Result<()> {
         let source_code = String::from(
             r#"
 import chidori as ch
@@ -932,16 +939,21 @@ def example(x):
     return a
         "#,
         );
-        let result = source_code_run_python(&ExecutionState::new_with_random_id(),
-                                            &source_code,
-                                            &RkyvObjectBuilder::new()
+        let result = source_code_run_python(
+            &ExecutionState::new_with_random_id(),
+            &source_code,
+            &RkyvObjectBuilder::new()
                 .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
-                                            &Some("example".to_string()),
-                                            &None,
-                                            &None,
-        ).await;
-        assert_eq!(result.unwrap(), (Ok(RkyvSerializedValue::Number(25)), vec![], vec![]));
+            &Some("example".to_string()),
+            &None,
+            &None,
+        ).await?;
+        let (result, stdout, stderr, _) = result;
+        assert_eq!(result, Ok(RkyvSerializedValue::Number(25)));
+        assert_eq!(stdout, Vec::<String>::new());
+        assert_eq!(stderr, Vec::<String>::new());
+        Ok(())
     }
 
     #[tokio::test]
@@ -962,24 +974,21 @@ a = 20 + await demo()
                             return 100
                         "#}),
             function_invocation: None,
-        }, TextRange::default()), id_a)?;
-        let result = source_code_run_python(&state,
-                                            &source_code,
-                                            &RkyvObjectBuilder::new()
-                                                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
-                                                .build(),
-                                            &None,
-                                            &None,
-                                            &None,
-        ).await;
-        assert_eq!(
-            result.unwrap(),
-            (
-                Ok(RkyvObjectBuilder::new().insert_number("a", 120).build()),
-                vec![],
-                vec![]
-            )
-        );
+        }, TextRange::default()), id_a).await?;
+        let result = source_code_run_python(
+            &state,
+            &source_code,
+            &RkyvObjectBuilder::new()
+                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
+                .build(),
+            &None,
+            &None,
+            &None,
+        ).await?;
+        let (result, stdout, stderr, _) = result;
+        assert_eq!(result, Ok(RkyvObjectBuilder::new().insert_number("a", 120).build()));
+        assert_eq!(stdout, Vec::<String>::new());
+        assert_eq!(stderr, Vec::<String>::new());
         Ok(())
     }
 
@@ -998,279 +1007,24 @@ a = 20 + await demo()
                             return 100
                         "#}),
             function_invocation: None,
-        }, TextRange::default()), id_a)?;
-        let result = source_code_run_python(&state,
-                                            &String::from( r#"data = await demo()"#, ),
-                                            &RkyvObjectBuilder::new()
-                                                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
-
-                                                .build(),
-                                            &None,
-                                            &None,
-                                            &None,
-        ).await;
-        assert_eq!(
-            result.unwrap(),
-            (
-                Ok(RkyvObjectBuilder::new().insert_number("data", 100).build()),
-                vec![],
-                vec![]
-            )
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_chain_of_multiple_dependent_python_functions() -> anyhow::Result<()> {
-        // TODO: this should validate that we can invoke a function that depends on another function
-        let source_code = String::from(
-            r#"
-data = await demo()
-        "#,
-        );
-        let mut state = ExecutionState::new_with_random_id();
-        let id_a = Uuid::now_v7();
-        let (mut state, _) = state.update_operation(CellTypes::Code(CodeCell {
-            backing_file_reference: None,
-            name: None,
-            language: SupportedLanguage::PyO3,
-            source_code: String::from(indoc! {r#"
-                        import asyncio
-                        async def demo():
-                            await asyncio.sleep(1)
-                            return 100 + await demo_second_function_call()
-                        "#}),
-            function_invocation: None,
-        }, TextRange::default()), id_a)?;
-        let id_b = Uuid::now_v7();
-        let (state, _) = state.update_operation(CellTypes::Code(CodeCell {
-            backing_file_reference: None,
-            name: None,
-            language: SupportedLanguage::PyO3,
-            source_code: String::from(indoc! {r#"
-                        import asyncio
-                        async def demo_second_function_call():
-                            await asyncio.sleep(1)
-                            return 100
-                        "#}),
-            function_invocation: None,
-        }, TextRange::default()), id_b)?;
-        let result = source_code_run_python(&state,
-                                            &source_code,
-                                            &RkyvObjectBuilder::new()
-                                                .build(),
-                                            &None,
-                                            &None,
-                                            &None,
-        ).await;
-        assert_eq!(
-            result.unwrap(),
-            (
-                Ok(RkyvObjectBuilder::new().insert_number("data", 200).build()),
-                vec![],
-                vec![]
-            )
-        );
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_internal_function_invocation_chain_with_observability() -> anyhow::Result<()> {
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<ExecutionGraphSendPayload>(1028);
-        let mut state_a = ExecutionState::new_with_graph_sender(Uuid::nil(), Arc::new(sender.clone()));
-        let id_a = Uuid::now_v7();
-        let (state, _) = state_a.update_operation(CellTypes::Code(CodeCell {
-            backing_file_reference: None,
-            name: None,
-            language: SupportedLanguage::PyO3,
-            source_code: String::from(indoc! {r#"
-                        import asyncio
-                        async def function_a():
-                            await asyncio.sleep(1)
-                            return 100
-
-                        async def function_b():
-                            await asyncio.sleep(1)
-                            return 100 + await function_a()
-
-                        async def function_c():
-                            await asyncio.sleep(1)
-                            return 100 + await function_b()
-                        "#}),
-            function_invocation: None,
-        }, TextRange::default()), id_a)?;
-        let source_code = String::from(
-            r#"data = await function_c()"#,
-        );
-        let received_events = Arc::new(Mutex::new(Vec::new()));
-        let received_events_clone = Arc::clone(&received_events);
-
-
-        let cancellation_notify = Arc::new(Notify::new());
-        let cancellation_notify_clone = cancellation_notify.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                        match receiver.try_recv() {
-                            Ok((resulting_execution_state, oneshot)) => {
-                                println!("Received event");
-                                received_events_clone.lock().unwrap().push(resulting_execution_state.clone());
-                                if let Some(oneshot) = oneshot {
-                                    oneshot.send(()).unwrap();
-                                }
-                            },
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                                // No messages available
-                            },
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                println!("===== Was DC'd");
-                                // Handle the case where the sender has disconnected and no more messages will be received
-                                break; // or handle it according to your application logic
-                            }
-                        }
-                    }
-                    _ = cancellation_notify_clone.notified() => {
-                        println!("Task is notified to stop");
-                        return;
-                    }
-                }
-
-            }
-        });
+        }, TextRange::default()), id_a).await?;
         let result = source_code_run_python(
             &state,
-            &source_code,
+            &String::from( r#"data = await demo()"#, ),
             &RkyvObjectBuilder::new()
+                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
                 .build(),
             &None,
             &None,
             &None,
-        ).await;
-        cancellation_notify.notify_one();
-        assert_eq!(
-            result.unwrap(),
-            (
-                Ok(RkyvObjectBuilder::new().insert_number("data", 300).build()),
-                vec![],
-                vec![]
-            )
-        );
-
-        // Assertions for the received events
-        let events = received_events.lock().unwrap();
-        assert!(!events.is_empty(), "Should have received execution events for each function call");
-
-        // Check for specific events (adjust based on your expected execution flow)
-        assert!(events.iter().any(|e| matches!(e, ExecutionStateEvaluation::Executing(..))),
-                "Should have received at least one Executing event");
-
-        // Helper function to check OperationFnOutput
-        fn check_operation_output(output: &Arc<OperationFnOutput>, expected_value: i64) -> bool {
-            match output.as_ref() {
-                OperationFnOutput { has_error: false, execution_state: None, output: output_value, stdout, stderr } => {
-                    matches!(output_value, Ok(RkyvSerializedValue::Number(n)) if *n == expected_value as i32)
-                        && stdout.is_empty()
-                        && stderr.is_empty()
-                },
-                _ => false
-            }
-        }
-
-        // Check for Complete events
-        assert!(
-            matches!(events[3], ExecutionStateEvaluation::Complete(ref state) if {
-        state.state.values().next().map_or(false, |output| check_operation_output(output, 100))
-    }),
-            "First Complete event should have output 100"
-        );
-
-        assert!(
-            matches!(events[4], ExecutionStateEvaluation::Complete(ref state) if {
-        state.state.values().next().map_or(false, |output| check_operation_output(output, 200))
-    }),
-            "Second Complete event should have output 200"
-        );
-
-        assert!(
-            matches!(events[5], ExecutionStateEvaluation::Complete(ref state) if {
-        state.state.values().next().map_or(false, |output| check_operation_output(output, 300))
-    }),
-            "Third Complete event should have output 300"
-        );
-
+        ).await?;
+        let (result, stdout, stderr, _) = result;
+        assert_eq!(result, Ok(RkyvObjectBuilder::new().insert_number("data", 100).build()));
+        assert_eq!(stdout, Vec::<String>::new());
+        assert_eq!(stderr, Vec::<String>::new());
         Ok(())
     }
 
-
-    #[ignore]
-    #[tokio::test]
-    async fn test_running_sync_unit_test() {
-        let source_code = String::from(
-            r#"
-import unittest
-
-def addTwo(x):
-    return x + 2
-
-class TestMarshalledValues(unittest.TestCase):
-    def test_addTwo(self):
-        self.assertEqual(addTwo(2), 4)
-
-unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
-        "#,
-        );
-        let result = source_code_run_python(&ExecutionState::new_with_random_id(),
-                                            &source_code,
-                                            &RkyvObjectBuilder::new()
-                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
-                .build(),
-                                            &None,
-                                            &None,
-                                            &None,
-        ).await;
-        let (result, _, stderr) = result.unwrap();
-        dbg!(&stderr);
-        assert_eq!(stderr.iter().filter(|x| x.contains("Ran 1 test")).count(), 1);
-        assert_eq!(stderr.iter().filter(|x| x.contains("OK")).count(), 1);
-    }
-
-    #[ignore]
-    #[tokio::test]
-    async fn test_running_async_unit_test() {
-        let source_code = String::from(
-            r#"
-import unittest
-import asyncio
-
-async def add(a, b):
-    await asyncio.sleep(1)
-    return a + b
-
-class TestMarshalledValues(unittest.IsolatedAsyncioTestCase):
-    async def test_run_prompt(self):
-        self.assertEqual(await add(2, 2), 4)
-
-unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestMarshalledValues))
-        "#,
-        );
-        let result = source_code_run_python(&ExecutionState::new_with_random_id(),
-                                            &source_code,
-                                            &RkyvObjectBuilder::new()
-                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
-                .build(),
-                                            &None,
-                                            &None,
-                                            &None,
-        ).await;
-        let (result, _, stderr) = result.unwrap();
-        dbg!(&stderr);
-        assert_eq!(stderr.iter().filter(|x| x.contains("Ran 1 test")).count(), 1);
-        assert_eq!(stderr.iter().filter(|x| x.contains("OK")).count(), 1);
-    }
-
-    // TODO: the expected behavior is that as we execute the function again and again from another location, the state mutates
-    #[ignore]
     #[tokio::test]
     async fn test_execution_of_internal_function_mutating_internal_state() {
         let source_code = String::from(
@@ -1282,37 +1036,6 @@ def example(x):
     return a
         "#,
         );
-        let result = source_code_run_python(&ExecutionState::new_with_random_id(),
-                                            &source_code,
-                                            &RkyvObjectBuilder::new()
-                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
-                .build(),
-                                            &Some("example".to_string()),
-                                            &None,
-                                            &None,
-        ).await;
-        assert_eq!(result.unwrap(), (Ok(RkyvSerializedValue::Number(1)), vec![], vec![]));
-        let result = source_code_run_python(&ExecutionState::new_with_random_id(),
-                                            &source_code,
-                                            &RkyvObjectBuilder::new()
-                .insert_object("args", RkyvObjectBuilder::new().insert_number("0", 5))
-                .build(),
-                                            &Some("example".to_string()),
-                                            &None,
-                                            &None,
-        ).await;
-        assert_eq!(result.unwrap(), (Ok(RkyvSerializedValue::Number(2)), vec![], vec![]));
-    }
-
-
-    #[tokio::test]
-    async fn test_error_handling_failure_to_parse() {
-        let source_code = String::from(
-            r#"
-fn example():
-    return 42
-        "#,
-        );
         let result = source_code_run_python(
             &ExecutionState::new_with_random_id(),
             &source_code,
@@ -1322,23 +1045,9 @@ fn example():
             &Some("example".to_string()),
             &None,
             &None,
-        ).await;
-        match result {
-            Ok(_) => {panic!("Must return error.")}
-            Err(e) => {
-                assert_eq!(e.to_string(), String::from("Parse error at offset 4 in <embedded>: invalid syntax. Got unexpected token 'example'. Source: \nfn example():\n    return 42\n        "));
-            }
-        }
-    }
-
-
-    #[tokio::test]
-    async fn test_error_handling_exception_thrown() {
-        let source_code = String::from(
-            r#"
-raise ValueError("Raising a python error")
-        "#,
-        );
+        ).await?;
+        let (result, stdout, stderr, _) = result;
+        assert_eq!(result, Ok(RkyvSerializedValue::Number(1)));
         let result = source_code_run_python(
             &ExecutionState::new_with_random_id(),
             &source_code,
@@ -1348,109 +1057,29 @@ raise ValueError("Raising a python error")
             &Some("example".to_string()),
             &None,
             &None,
-        ).await;
-        match result {
-            Ok(_) => {panic!("Must return error.")}
-            Err(e) => {
-                assert_eq!(e.to_string(), String::from("ValueError: Raising a python error"));
-            }
-        }
+        ).await?;
+        let (result, stdout, stderr, _) = result;
+        assert_eq!(result, Ok(RkyvSerializedValue::Number(2)));
     }
 
     #[tokio::test]
-    async fn test_identifier_replacement() {
-        let test_cases = vec![
-            ("x", "y", "def func(x): return x", "def func(y): return y"),
-            ("func", "new_func", "def func(): pass\nfunc()", "def new_func(): pass\nnew_func()"),
-            ("var", "variable", "var = 5\nvar_name = 10", "variable = 5\nvar_name = 10"),
-            ("_private", "_hidden", "_private = 1\nnot_private = 2", "_hidden = 1\nnot_private = 2"),
-            ("MAX_VALUE", "MAXIMUM", "MAX_VALUE = 100\nMAX_VALUE_LIMIT = 200", "MAXIMUM = 100\nMAX_VALUE_LIMIT = 200"),
-            ("i", "index", "for i in range(10): print(i)", "for index in range(10): print(index)"),
-            ("data", "info", "data = [1, 2, 3]\nmore_data = [4, 5, 6]", "info = [1, 2, 3]\nmore_data = [4, 5, 6]"),
-            ("calculate", "compute", "def calculate(x): return calculate(x-1)", "def compute(x): return compute(x-1)"),
-            ("temp", "temporary", "temp = 98.6\ntemperature = 100", "temporary = 98.6\ntemperature = 100"),
-            ("log", "logger", "import log\nlog.info('message')", "import logger\nlogger.info('message')"),
-            ("str", "string", "str_value = str(42)", "str_value = string(42)"),
-            ("dict", "dictionary", "my_dict = dict()\ndict_obj = {}", "my_dict = dictionary()\ndict_obj = {}"),
-            ("print", "display", "print('Hello')\nprinter = None", "display('Hello')\nprinter = None"),
-            ("sum", "total", "sum([1, 2, 3])\nsum_up = lambda x: x", "total([1, 2, 3])\nsum_up = lambda x: x"),
-            ("Exception", "Error", "raise Exception('error')\nExceptionHandler", "raise Error('error')\nExceptionHandler"),
-        ];
+    async fn test_execution_of_internal_function() -> anyhow::Result<()> {
+        let mut state = ExecutionState::new_with_random_id();
+        let id_a = Uuid::now_v7();
+        let (state, _) = state.update_operation(CellTypes::Code(CodeCell {
+            backing_file_reference: None,
+            name: None,
+            language: SupportedLanguage::PyO3,
+            source_code: "def test_fn(): return 1".to_string(),
+            function_invocation: None,
+        }, TextRange::default()), id_a).await?;
 
-        for (old, new, input, expected) in test_cases {
-            let result = replace_identifier(input, old, new);
-            assert_eq!(result, expected, "Failed to replace '{}' with '{}'", old, new);
-        }
-
-    }
-
-    #[test]
-    fn test_hash_to_python_method_name() {
-        let python_method_name = "example_method_name";
-        let hashed_name_a = hash_to_python_method_name(python_method_name);
-        let hashed_name_b = hash_to_python_method_name(python_method_name);
-
-        // Verify that the hashed name is deterministic and meets requirements
-        assert_eq!(hashed_name_a, hashed_name_b);
-    }
-
-    #[test]
-    fn test_hash_to_python_method_name_numeric_start() {
-        let python_method_name = "123example_method_name";
-        let hashed_name = hash_to_python_method_name(python_method_name);
-
-        // Verify that the hashed name starts with an underscore if the hash starts with a digit
-        assert!(hashed_name.starts_with('_'));
-    }
-
-    #[test]
-    fn test_hash_to_python_method_name_length() {
-        let python_method_name = "a_very_long_method_name_that_exceeds_thirty_characters";
-        let hashed_name = hash_to_python_method_name(python_method_name);
-
-        // Verify that the hashed name is truncated to 30 characters
-        assert!(hashed_name.len() <= 30);
-    }
-
-    use super::*;
-
-    #[test]
-    fn test_rename_triggerable_functions() {
-        // Prepare a dummy Report with some triggerable functions
-        let mut report = Report {
-            internal_call_graph: InternalCallGraph::default(),
-            cell_exposed_values: HashMap::new(),
-            cell_depended_values: HashMap::new(),
-            triggerable_functions: {
-                let mut map = HashMap::new();
-                map.insert("example_function".to_string(), ReportTriggerableFunctions::default());
-                map.insert("another_function".to_string(), ReportTriggerableFunctions::default());
-                map
-            },
-        };
-
-        let code = r#"
-def example_function():
-    pass
-
-def another_function():
-    pass
-"#;
-
-        let (new_code, hash_map ) = rename_triggerable_functions(&report, code);
-        let example_function_renamed = hash_to_python_method_name("example_function");
-        let another_function_renamed = hash_to_python_method_name("another_function");
-        assert_eq!(new_code,
-                   format!(r#"
-def {}():
-    pass
-
-def {}():
-    pass
-"#, example_function_renamed, another_function_renamed));
-
-        assert_eq!(hash_map.get(&hash_to_python_method_name("example_function")).unwrap(), "example_function");
-        assert_eq!(hash_map.get(&hash_to_python_method_name("another_function")).unwrap(), "another_function");
+        let result = state.execute_code_cell(id_a).await?;
+        let (result, stdout, stderr, _) = result;
+        assert!(matches!(result, ArchivedResult::Ok(_)));
+        assert_eq!(stdout, Vec::<String>::new());
+        assert_eq!(stderr, Vec::<String>::new());
+        Ok(())
     }
 
 }

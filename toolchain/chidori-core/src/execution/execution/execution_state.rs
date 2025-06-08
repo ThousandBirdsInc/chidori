@@ -26,6 +26,7 @@ use futures_util::FutureExt;
 use tokio::sync::oneshot::error::TryRecvError;
 use tracing::debug;
 use uuid::Uuid;
+use crate::library::std::code::runtime_pyo3::source_code_run_python;
 use crate::cells::{CellTypes, CodeCell, LLMPromptCell};
 use crate::execution::execution::execution_graph::{ExecutionGraphSendPayload, ExecutionNodeId, ChronologyId};
 
@@ -98,7 +99,6 @@ pub enum EnclosedState {
 
 #[derive(Clone)]
 pub struct ExecutionState {
-
     /// This represents the specific state that we are resolving.
     /// Most states of execution will have two ExecutionStates that refer to this.
     /// One beginning the computation and one where it has been concluded.
@@ -268,6 +268,10 @@ impl ExecutionState {
         }
     }
 
+    pub fn Complete(state: ExecutionState) -> Self {
+        state
+    }
+
     pub fn new_with_graph_sender(parent_state_id: ExecutionNodeId, graph_sender: Arc<tokio::sync::mpsc::Sender<ExecutionGraphSendPayload>>) -> Self {
         ExecutionState {
             chronology_id: Uuid::nil(),
@@ -388,12 +392,12 @@ impl ExecutionState {
         cell: CellTypes,
         op_id: OperationId,
     ) -> anyhow::Result<(ExecutionState, OperationId)> {
-        let Some(op ) = self.get_operation_from_cell_type(&cell)? else {
+        let Some(op) = self.get_operation_from_cell_type(&cell)? else {
             // Return no op pass-through if not an operation
             return Ok((self.clone(), op_id))
         };
         let (op_id, mut final_state) = self.upsert_operation(op, op_id)?;
-        self.send_new_state_to_graph_and_pause_with_oneshot(&mut final_state.clone()).await;
+        self.send_new_state_to_graph_and_pause_with_oneshot(&mut final_state).await;
         Ok((final_state, op_id))
     }
 
@@ -620,7 +624,7 @@ impl ExecutionState {
         Ok(op)
     }
 
-    async fn send_new_state_to_graph_and_pause_with_oneshot(&self, mut execution_state: &mut ExecutionState) {
+    async fn send_new_state_to_graph_and_pause_with_oneshot(&self, execution_state: &mut ExecutionState) {
         if let Some(graph_sender) = self.graph_sender.as_ref() {
             let (oneshot_sender, mut oneshot_receiver) = tokio::sync::oneshot::channel();
             graph_sender.send((execution_state.clone(), Some(oneshot_sender))).await.expect("Failed to send oneshot signal to the graph receiver");
@@ -778,6 +782,52 @@ impl ExecutionState {
 
         Ok((after_execution_state, vec![(operation_id, result)]))
     }
+
+    pub async fn execute_code_cell(&self, cell_id: Uuid) -> anyhow::Result<Result<(Result<RkyvSerializedValue, ExecutionStateErrors>, Vec<String>, Vec<String>, ExecutionState), ExecutionStateErrors>> {
+        let op = self.operation_by_id.get(&cell_id)
+            .ok_or_else(|| anyhow::anyhow!("Cell not found"))?;
+
+        match &op.cell {
+            CellTypes::Code(code_cell, _) => {
+                let result = source_code_run_python(
+                    self,
+                    &code_cell.source_code,
+                    &RkyvSerializedValue::Null,
+                    &code_cell.function_invocation,
+                    &None,
+                    &None,
+                ).await?;
+
+                Ok(Ok(result))
+            }
+            _ => Err(anyhow::anyhow!("Not a code cell")),
+        }
+    }
+}
+
+impl PartialEq for ExecutionState {
+    fn eq(&self, other: &Self) -> bool {
+        self.resolving_execution_node_state_id == other.resolving_execution_node_state_id &&
+        self.chronology_id == other.chronology_id &&
+        self.exec_counter == other.exec_counter &&
+        self.stack == other.stack &&
+        self.parent_state_chronology_id == other.parent_state_chronology_id &&
+        self.external_event_queue_head == other.external_event_queue_head &&
+        self.evaluating_operation_id == other.evaluating_operation_id &&
+        self.evaluating_name == other.evaluating_name &&
+        self.evaluating_fn == other.evaluating_fn &&
+        self.evaluating_arguments == other.evaluating_arguments &&
+        self.evaluating_enclosed_state == other.evaluating_enclosed_state &&
+        self.evaluated_mutation_of_cell == other.evaluated_mutation_of_cell &&
+        self.exec_queue == other.exec_queue &&
+        self.fresh_values == other.fresh_values &&
+        self.operation_name_to_id == other.operation_name_to_id &&
+        self.operation_by_id == other.operation_by_id &&
+        self.cells_by_id == other.cells_by_id &&
+        self.has_been_set == other.has_been_set &&
+        self.dependency_map == other.dependency_map &&
+        self.value_freshness_map == other.value_freshness_map
+    }
 }
 
 #[cfg(test)]
@@ -867,8 +917,8 @@ mod tests {
         assert!(cloned.fresh_values.is_empty());
     }
 
-    #[test]
-    fn test_update_op() {
+    #[tokio::test]
+    async fn test_update_op() {
         let state = ExecutionState::new_with_random_id();
         let cell = CellTypes::Code(CodeCell {
             backing_file_reference: None,
@@ -879,23 +929,79 @@ mod tests {
         }, Default::default());
 
         let id_a = Uuid::now_v7();
-        let (new_state, op_id) = state.update_operation(cell.clone(), id_a).unwrap();
+        let (new_state, op_id) = state.update_operation(cell.clone(), id_a).await.unwrap();
         
         assert!(new_state.operation_by_id.contains_key(&op_id));
-        assert_eq!(new_state.operation_mutation, Some((op_id, cell)));
+        assert_eq!(new_state.evaluated_mutation_of_cell, Some((op_id, cell)));
     }
 
-    #[test]
-    fn test_upsert_operation() {
-        let state = ExecutionState::new_with_random_id();
-        let op_node = OperationNode::default();
-
+    #[tokio::test]
+    async fn test_upsert_operation() -> anyhow::Result<()> {
+        let mut state = ExecutionState::new_with_random_id();
         let id_a = Uuid::now_v7();
-        let (op_id, new_state) = state.upsert_operation(op_node, id_a);
-        
-        assert!(new_state.operation_by_id.contains_key(&op_id));
-        assert_eq!(new_state.op_counter, state.op_counter + 1);
-        assert!(new_state.exec_queue.contains(&op_id));
+        let op_node = OperationNode::new(
+            None,
+            Uuid::nil(),
+            InputSignature::new(),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "1".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        );
+        let Ok((op_id, mut new_state)) = state.upsert_operation(op_node, id_a) else {
+            panic!("Failed to upsert operation");
+        };
+        assert_eq!(op_id, id_a);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_upsert_operation_with_existing() -> anyhow::Result<()> {
+        let mut state = ExecutionState::new_with_random_id();
+        let id_a = Uuid::now_v7();
+        let op_node = OperationNode::new(
+            None,
+            Uuid::nil(),
+            InputSignature::new(),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "1".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        );
+        let (op_id, mut new_state) = state.upsert_operation(op_node.clone(), id_a)?;
+        let (op_id2, new_state2) = new_state.upsert_operation(op_node, id_a)?;
+        assert_eq!(op_id, op_id2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_upsert_operation_with_existing_and_new() -> anyhow::Result<()> {
+        let mut state = ExecutionState::new_with_random_id();
+        let id_a = Uuid::now_v7();
+        let op_node = OperationNode::new(
+            None,
+            Uuid::nil(),
+            InputSignature::new(),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "1".to_string(),
+                function_invocation: None,
+            }, Default::default()),
+        );
+        let (op_id, exec_state) = state.upsert_operation(op_node, id_a)?;
+        assert_eq!(op_id, id_a);
+        Ok(())
     }
 
     #[test]
@@ -940,7 +1046,9 @@ mod tests {
         }, TextRange::default());
 
         let id_a = Uuid::now_v7();
-        let (op_id, mut new_state) = state.upsert_operation(op_node, id_a);
+        let Ok((op_id, mut new_state)) = state.upsert_operation(op_node, id_a) else {
+            panic!("Failed to upsert operation");
+        };
         
         new_state.function_name_to_metadata.insert("test_fn".to_string(), FunctionMetadata {
             operation_id: op_id,
@@ -997,7 +1105,9 @@ mod tests {
         };
 
         let id_a = Uuid::now_v7();
-        let (op_id, exec_state) = exec_state.upsert_operation(op, id_a);
+        let Ok((op_id, exec_state)) = exec_state.upsert_operation(op, id_a) else {
+            panic!("Failed to upsert operation");
+        };
         
         // Prepare inputs
         let mut inputs = OperationInputs::new();
@@ -1021,6 +1131,54 @@ mod tests {
         let mut extra_inputs = inputs.clone();
         extra_inputs.kwargs.insert("extra_kwarg".to_string(), RkyvSerializedValue::Null);
         assert!(signature.check_input_against_signature(&extra_inputs));
+    }
+
+    #[tokio::test]
+    async fn test_input_signature_check_async() -> anyhow::Result<()> {
+        let mut state = ExecutionState::new_with_random_id();
+        let id_a = Uuid::now_v7();
+        let op_node = OperationNode::new(
+            None,
+            Uuid::nil(),
+            InputSignature::from_args_list(vec!["x"]),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "def test_fn(x: int): return x".to_string(),
+                function_invocation: None,
+            }, TextRange::default()),
+        );
+
+        let Ok((op_id, mut new_state)) = state.upsert_operation(op_node, id_a) else {
+            panic!("Failed to upsert operation");
+        };
+        assert_eq!(op_id, id_a);
+        assert_eq!(new_state.state_get_value(&id_a), None);
+
+        let mut inputs = HashMap::new();
+        inputs.insert("x".to_string(), RkyvSerializedValue::Number(1));
+        let op_node = OperationNode::new(
+            None,
+            Uuid::nil(),
+            InputSignature::from_args_list(vec!["x"]),
+            OutputSignature::new(),
+            CellTypes::Code(CodeCell {
+                backing_file_reference: None,
+                name: None,
+                language: SupportedLanguage::PyO3,
+                source_code: "def test_fn(x: int): return x".to_string(),
+                function_invocation: None,
+            }, TextRange::default()),
+        );
+
+        let Ok((op_id, mut new_state)) = new_state.upsert_operation(op_node, id_a) else {
+            panic!("Failed to upsert operation");
+        };
+        assert_eq!(op_id, id_a);
+        assert_eq!(new_state.state_get_value(&id_a), Some(&Ok(RkyvSerializedValue::Number(1))));
+        Ok(())
     }
 }
 

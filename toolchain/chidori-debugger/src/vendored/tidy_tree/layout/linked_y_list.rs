@@ -1,6 +1,6 @@
 use std::collections::LinkedList;
 
-use crate::tidy_tree::geometry::Coord;
+use crate::vendored::tidy_tree::geometry::Coord;
 
 pub struct LinkedYList {
     pub index: usize,

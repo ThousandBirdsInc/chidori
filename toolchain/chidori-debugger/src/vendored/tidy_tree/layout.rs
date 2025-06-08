@@ -1,4 +1,4 @@
-use crate::tidy_tree::{geometry::Coord, node::Node};
+use crate::vendored::tidy_tree::{geometry::Coord, node::Node};
 use std::ptr::NonNull;
 use petgraph::graph::NodeIndex;
 
@@ -9,7 +9,7 @@ pub(crate) mod tidy_layout;
 pub use basic_layout::{BasicLayout, BoundingBox};
 pub use tidy_layout::TidyLayout;
 pub use tidy_layout::Orientation;
-use crate::tidy_tree::node::TreeGraph;
+use crate::vendored::tidy_tree::node::TreeGraph;
 
 pub trait Layout {
     fn layout(&mut self, tree: &mut TreeGraph);

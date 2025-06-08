@@ -5,10 +5,10 @@ use num::Float;
 use petgraph::prelude::Dfs;
 use tinyset::SetUsize;
 
-use crate::tidy_tree::{geometry::Coord, node::{TidyData}};
+use crate::vendored::tidy_tree::{geometry::Coord, node::{TidyData}};
 
-use crate::tidy_tree::node::{Node, TreeGraph};
-use crate::tidy_tree::layout::{Layout};
+use crate::vendored::tidy_tree::node::{Node, TreeGraph};
+use crate::vendored::tidy_tree::layout::{Layout};
 use super::linked_y_list::LinkedYList;
 
 pub struct TidyLayout {

@@ -1,8 +1,8 @@
 use num::Float;
 use petgraph::graph::NodeIndex;
 
-use crate::tidy_tree::layout::Layout;
-use crate::tidy_tree::{geometry::Coord, node::{Node, TreeGraph}};
+use crate::vendored::tidy_tree::layout::Layout;
+use crate::vendored::tidy_tree::{geometry::Coord, node::{Node, TreeGraph}};
 use std::cmp::{max, min};
 use petgraph::prelude::Dfs;
 use petgraph::visit::DfsPostOrder;
@@ -116,8 +116,8 @@ impl BasicLayout {
 #[cfg(test)]
 mod basic_layout_test {
     use super::{BasicLayout, BoundingBox};
-    use crate::tidy_tree::{layout::Layout};
-    use crate::tidy_tree::node::{Node, TreeGraph};
+    use crate::vendored::tidy_tree::{layout::Layout};
+    use crate::vendored::tidy_tree::node::{Node, TreeGraph};
 
     #[test]
     fn easy_test_0() {
