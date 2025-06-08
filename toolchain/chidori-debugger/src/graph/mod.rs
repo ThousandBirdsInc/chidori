@@ -10,6 +10,9 @@ use bevy::prelude::{in_state, IntoSystemConfigs, OnEnter, OnExit};
 use bevy::asset::embedded_asset;
 use crate::util::despawn_screen;
 use crate::GameState;
+use crate::application::{ChidoriState, EguiTree, EguiTreeIdentities};
+use crate::graph::types::*;
+use crate::{bevy_egui, CurrentTheme, RENDER_LAYER_GRAPH_VIEW};
 
 pub mod types;
 pub mod camera;
@@ -23,8 +26,10 @@ pub mod ui;
 
 pub use types::*;
 
+
+
 pub fn graph_plugin(app: &mut App) {
-    embedded_asset!(app, "../../assets/shaders/rounded_rect.wgsl");
+    embedded_asset!(app, "rounded_rect.wgsl");
     app.init_resource::<NodeIdToEntity>()
         .init_resource::<EdgePairIdToEntity>()
         .init_resource::<SelectedEntity>()
@@ -52,7 +57,7 @@ pub fn graph_plugin(app: &mut App) {
                 camera::my_cursor_system,
                 camera::mouse_scroll_events,
                 input::mouse_over_system,
-                camera::enforce_tiled_viewports,
+                camera::enforce_tiled_viewports.after(crate::application::tree::maintain_egui_tree_identities),
                 materials::update_cursor_materials,
                 materials::update_node_materials,
                 ui::ui_window,
@@ -69,6 +74,7 @@ pub mod setup {
     use bevy::render::view::{NoFrustumCulling, RenderLayers};
     use bevy::render::camera::{Viewport};
     use bevy::window::{PrimaryWindow};
+    use bevy::render::render_resource::Shader;
     use crate::{RENDER_LAYER_GRAPH_MINIMAP, RENDER_LAYER_GRAPH_VIEW};
     use crate::application::ChidoriState;
 
@@ -79,6 +85,7 @@ pub mod setup {
         mut meshes: ResMut<Assets<Mesh>>,
         mut materials_standard: ResMut<Assets<StandardMaterial>>,
         mut materials_custom: ResMut<Assets<crate::graph::materials::RoundedRectMaterial>>,
+        asset_server: Res<AssetServer>,
     ) {
         let window = windows.single();
         let scale_factor = window.scale_factor();
@@ -87,7 +94,7 @@ pub mod setup {
             width: 1.0,
             height: 1.0,
             color_texture: None,
-            base_color: Vec4::new(0.565, 1.00, 0.882, 0.00),
+            base_color: Vec4::new(0.565, 1.00, 0.882, 0.3),
             alpha_mode: AlphaMode::Blend,
         });
 
@@ -95,7 +102,7 @@ pub mod setup {
             width: 1.0,
             height: 1.0,
             color_texture: None,
-            base_color: Vec4::new(0.882, 0.00392, 0.357, 0.0),
+            base_color: Vec4::new(0.882, 0.00392, 0.357, 0.8),
             alpha_mode: AlphaMode::Blend,
         });
 

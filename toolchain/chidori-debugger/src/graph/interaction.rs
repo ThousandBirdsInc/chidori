@@ -34,6 +34,8 @@ pub fn node_cursor_handling(
                 t.translation.y = node_transform.translation.y;
                 t.scale = node_transform.scale + 16.0;
                 t.translation.z = -3.0;
+                println!("Positioning execution head cursor at node {:?}: pos=({}, {}), scale={:?}",
+                         graph_idx.execution_id, t.translation.x, t.translation.y, t.scale);
             }
             if Some(entity) == selected_entity.id {
                 let (_, mut t) = execution_selection_query.single_mut();

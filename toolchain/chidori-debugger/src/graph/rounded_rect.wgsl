@@ -32,6 +32,7 @@ fn scaleUv(uv: vec2<f32>, scale: f32) -> vec2<f32> {
 fn fragment(
     mesh: VertexOutput,
 ) -> @location(0) vec4<f32> {
+
         let uv = mesh.uv;
         let corner_radius: f32 = 10.0;
         let aspect_ratio = width / height;
@@ -39,24 +40,23 @@ fn fragment(
         let adjusted_uv_target = vec2<f32>(uv.x, uv.y);
 
         var texture_color = textureSample(material_color_texture, material_color_sampler, adjusted_uv_target);
-        let color = vec4<f32>(texture_color.rgb * texture_color.a, texture_color.a);
-
+        
+        // Calculate rounded rectangle mask
         let border_radius = corner_radius / min(width, height);
         let dist = sdRoundedBox(adjusted_uv + vec2(-0.5 * aspect_ratio, -0.5), vec2<f32>(0.5 * aspect_ratio, 0.5), vec4<f32>(border_radius, border_radius, border_radius, border_radius));
         let aa: f32 = 0.005;
         let smooth_dist = smoothstep(0.0, aa, dist);
+        
+        // If outside the rounded rectangle, make transparent
         if smooth_dist > 0.0 {
-            return vec4<f32>(color.rgb, 0.0);
+            return vec4<f32>(0.0, 0.0, 0.0, 0.0);
         }
 
-        if base_color.a == 0.0 {
-            return vec4<f32>(base_color.rgb, 1.0);
-        }
+        // Determine final color - blend texture over base color
+        var final_color: vec4<f32>;
+        
+        // Always blend texture over base color for proper compositing
+        final_color = mix(base_color, texture_color, texture_color.a);
 
-        if texture_color.a == 0.0 {
-            return vec4<f32>(color.rgb, 1.0);
-        }
-
-
-        return color;
+        return final_color;
 }

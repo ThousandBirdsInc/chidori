@@ -55,13 +55,11 @@ pub fn generate_tree_layout(
     execution_graph: &&StableGraph<ChronologyId, ()>,
     node_dimensions: &DashMap<ChronologyId, (f32, f32)>
 ) -> TreeGraph {
-    println!("=== GENERATE_TREE_LAYOUT CALLED ===");
     let mut tidy = TidyLayout::new(100., 100., Orientation::Vertical);
     let mut root = crate::vendored::tidy_tree::Node::new(0, 800., 100., None);
     root.y = 0.0;
     root.x = 0.0;
     let mut tree_graph = crate::vendored::tidy_tree::TreeGraph::new(root);
-    println!("Created tree graph with root node");
 
     // Initialize nodes within a TreeGraph using our ExecutionGraph
     let mut topo = petgraph::visit::Topo::new(&execution_graph);
@@ -71,7 +69,6 @@ pub fn generate_tree_layout(
         if let Some(node) = &execution_graph.node_weight(x) {
             processed_count += 1;
             if x.index() == 0 {
-                println!("Skipping root node at index 0");
                 let dims = node_dimensions.entry(**node).or_insert((800.0, 100.0));
                 continue;
             }
@@ -86,22 +83,17 @@ pub fn generate_tree_layout(
 
             // Only a single parent ever occurs
             if let Some(parent) = &mut parents.next() {
-                println!("Node {} has parent {}", x.index(), parent.index());
                 // TODO: this is the wrong parent identity, this is the parent in the execution graph
                 // needs to be in the tree graph
                 if let Some(parent_index) = tree_graph.external_id_mapping.get(&parent.index()) {
-                    println!("Found parent {} in tree, adding child {}", parent.index(), x.index());
                     let _ = tree_graph.add_child(parent_index.clone(), tree_node);
                     added_count += 1;
                 } else {
                     println!("WARNING: Parent {} not found in tree for node {}", parent.index(), x.index());
                 }
-            } else {
-                println!("Node {} has no parents, should be root", x.index());
             }
         }
     }
-    println!("Processed {} nodes, added {} to tree", processed_count, added_count);
 
     tidy.layout(&mut tree_graph);
 

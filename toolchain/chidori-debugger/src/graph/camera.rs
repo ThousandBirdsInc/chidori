@@ -221,6 +221,9 @@ pub fn camera_follow_selection_head(
     if matches!(camera_state.state, CameraStateValue::LockedOnExecHead) {
         camera_transform.translation.x = t.translation.x;
         camera_transform.translation.y = t.translation.y;
+        println!("Camera following execution head: camera at ({}, {}), head at ({}, {})", 
+                 camera_transform.translation.x, camera_transform.translation.y,
+                 t.translation.x, t.translation.y);
     }
 
     let (_, mut t) = execution_selection_query.single_mut();
@@ -247,6 +250,7 @@ pub fn enforce_tiled_viewports(
     let scale_factor = window.scale_factor() as u32;
     let (mut main_camera, _) = main_camera.single_mut();
     let (mut mini_camera, _) = mini_camera.single_mut();
+    
     if let Some(graph_tile) = tree_identities.graph_tile {
         if let Some(tile) = tree.tree.tiles.get(graph_tile) {
             match tile {
@@ -273,5 +277,11 @@ pub fn enforce_tiled_viewports(
                 Tile::Container(_) => {}
             }
         }
+    } else {
+        // If no graph tile ID is found, assume we should still render the graph
+        // This could be the issue - defaulting to false when no tile is found
+        mini_camera.is_active = true;
+        main_camera.is_active = true;
+        graph_resource.is_active = true;
     }
 } 

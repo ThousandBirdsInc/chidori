@@ -31,7 +31,7 @@ pub struct RoundedRectMaterial {
 /// You only need to implement functions for features that need non-default behavior. See the Material api docs for details!
 impl Material for RoundedRectMaterial {
     fn fragment_shader() -> ShaderRef {
-        "embedded://chidori_debugger/../../assets/shaders/rounded_rect.wgsl".into()
+        "embedded://chidori_debugger/graph/rounded_rect.wgsl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {
