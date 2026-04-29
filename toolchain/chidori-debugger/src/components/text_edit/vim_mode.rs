@@ -1,19 +1,19 @@
 use std::collections::HashMap;
-use epaint::{
+use egui::epaint::{
     text::{
         cursor::{CCursor, PCursor},
         TAB_SIZE,
     },
     Galley,
 };
-use crate::text_selection::{
+use egui::text_selection::{
     text_cursor_state::{
         byte_index_from_char_index, ccursor_next_word, ccursor_previous_word, find_line_start,
         slice_char_range,
     },
     CursorRange, CCursorRange,
 };
-use super::TextBuffer;
+use super::text_buffer::TextBuffer;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VimMode {
@@ -207,10 +207,10 @@ impl VimMotions {
         matches!(c, 'h' | 'j' | 'k' | 'l' | 'w' | 'b' | 'e' | '0' | '$' | 'g')
     }
 
-    /// Handle vim motion in normal mode
+    /// Handle vim motion in normal, visual, and visual line modes
     pub fn handle_normal_mode_key(
         vim_state: &mut VimState,
-        key_char: char,
+        ch: char,
         text: &mut dyn TextBuffer,
         galley: &Galley,
         cursor_range: &mut CursorRange,
@@ -218,17 +218,17 @@ impl VimMotions {
         let current_cursor = cursor_range.primary.ccursor;
 
         // Parse numbers for count
-        if key_char.is_ascii_digit() && key_char != '0' {
-            let digit = key_char.to_digit(10).unwrap();
+        if ch.is_ascii_digit() && ch != '0' {
+            let digit = ch.to_digit(10).unwrap();
             let current_count = vim_state.current_command.count.unwrap_or(0);
             vim_state.set_count(current_count * 10 + digit);
-            vim_state.add_to_command_buffer(key_char);
+            vim_state.add_to_command_buffer(ch);
             return true;
         }
 
         // Handle operators first
         if vim_state.is_normal_mode() {
-            match key_char {
+            match ch {
                 'd' => {
                     if vim_state.command_buffer == "d" {
                         // dd - delete line
@@ -239,7 +239,7 @@ impl VimMotions {
                         return true;
                     } else {
                         vim_state.set_operator(VimOperator::Delete);
-                        vim_state.add_to_command_buffer(key_char);
+                        vim_state.add_to_command_buffer(ch);
                         return true;
                     }
                 }
@@ -253,7 +253,7 @@ impl VimMotions {
                         return true;
                     } else {
                         vim_state.set_operator(VimOperator::Yank);
-                        vim_state.add_to_command_buffer(key_char);
+                        vim_state.add_to_command_buffer(ch);
                         return true;
                     }
                 }
@@ -267,7 +267,7 @@ impl VimMotions {
                         return true;
                     } else {
                         vim_state.set_operator(VimOperator::Change);
-                        vim_state.add_to_command_buffer(key_char);
+                        vim_state.add_to_command_buffer(ch);
                         return true;
                     }
                 }
@@ -275,8 +275,8 @@ impl VimMotions {
             }
         }
 
-        // Handle motions (both in normal mode and operator-pending mode)
-        let motion = match key_char {
+        // Handle motions (in normal mode, visual mode, and operator-pending mode)
+        let motion = match ch {
             'h' => Some(VimMotion::Left),
             'l' => Some(VimMotion::Right),
             'j' => Some(VimMotion::Down),
@@ -290,7 +290,7 @@ impl VimMotions {
                 if vim_state.current_command.count.is_none() {
                     Some(VimMotion::LineStart)
                 } else {
-                    vim_state.add_to_command_buffer(key_char);
+                    vim_state.add_to_command_buffer(ch);
                     return true;
                 }
             }
@@ -298,7 +298,7 @@ impl VimMotions {
                 if vim_state.command_buffer.ends_with('g') {
                     Some(VimMotion::FirstLine)
                 } else {
-                    vim_state.add_to_command_buffer(key_char);
+                    vim_state.add_to_command_buffer(ch);
                     return true;
                 }
             }
@@ -313,8 +313,12 @@ impl VimMotions {
                 if let Some(cmd) = vim_state.complete_command() {
                     Self::execute_command(&cmd, text, galley, cursor_range);
                 }
+            } else if vim_state.is_visual_mode() {
+                // In visual mode, move cursor and extend selection
+                Self::execute_visual_motion(motion, vim_state, vim_state.get_count(), galley, text, cursor_range);
+                vim_state.clear_command_buffer();
             } else {
-                // Just move the cursor
+                // Just move the cursor in normal mode
                 Self::execute_motion(motion, vim_state.get_count(), galley, text, cursor_range);
                 vim_state.clear_command_buffer();
             }
@@ -323,7 +327,7 @@ impl VimMotions {
 
         // Handle text objects (only in operator-pending mode)
         if vim_state.is_operator_pending() {
-            let text_object = match key_char {
+            let text_object = match ch {
                 'w' if vim_state.command_buffer.ends_with('i') => Some(TextObject::InnerWord),
                 'w' if vim_state.command_buffer.ends_with('a') => Some(TextObject::AroundWord),
                 '(' | ')' if vim_state.command_buffer.ends_with('i') => Some(TextObject::InnerParens),
@@ -337,7 +341,7 @@ impl VimMotions {
                 '"' if vim_state.command_buffer.ends_with('i') => Some(TextObject::InnerDoubleQuotes),
                 '"' if vim_state.command_buffer.ends_with('a') => Some(TextObject::AroundDoubleQuotes),
                 'i' | 'a' => {
-                    vim_state.add_to_command_buffer(key_char);
+                    vim_state.add_to_command_buffer(ch);
                     return true;
                 }
                 _ => None,
@@ -352,9 +356,35 @@ impl VimMotions {
             }
         }
 
+        // Handle visual mode commands
+        if vim_state.is_visual_mode() {
+            match ch {
+                'd' => {
+                    // Delete visual selection
+                    text.delete_char_range(Self::get_visual_selection_range(cursor_range));
+                    cursor_range.primary = cursor_range.secondary;
+                    vim_state.enter_mode(VimMode::Normal);
+                    return true;
+                }
+                'y' => {
+                    // TODO: Yank visual selection to register
+                    vim_state.enter_mode(VimMode::Normal);
+                    return true;
+                }
+                'c' => {
+                    // Change visual selection (delete and enter insert mode)
+                    text.delete_char_range(Self::get_visual_selection_range(cursor_range));
+                    cursor_range.primary = cursor_range.secondary;
+                    vim_state.enter_mode(VimMode::Insert);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
         // Handle other commands only in normal mode
         if vim_state.is_normal_mode() {
-            match key_char {
+            match ch {
                 // Mode changes
                 'i' => {
                     vim_state.enter_mode(VimMode::Insert);
@@ -395,13 +425,27 @@ impl VimMotions {
                     return true;
                 }
                 'v' => {
-                    vim_state.visual_start = Some(current_cursor);
-                    vim_state.enter_mode(VimMode::Visual);
+                    if vim_state.is_visual_mode() {
+                        // Exit visual mode back to normal mode
+                        vim_state.enter_mode(VimMode::Normal);
+                    } else {
+                        vim_state.visual_start = Some(current_cursor);
+                        vim_state.enter_mode(VimMode::Visual);
+                        // Initialize visual selection
+                        cursor_range.secondary = cursor_range.primary;
+                    }
                     return true;
                 }
                 'V' => {
-                    vim_state.visual_start = Some(current_cursor);
-                    vim_state.enter_mode(VimMode::VisualLine);
+                    if vim_state.mode == VimMode::VisualLine {
+                        // Exit visual line mode back to normal mode
+                        vim_state.enter_mode(VimMode::Normal);
+                    } else {
+                        vim_state.visual_start = Some(current_cursor);
+                        vim_state.enter_mode(VimMode::VisualLine);
+                        // Initialize visual line selection - select the whole line
+                        Self::select_visual_line(galley, text, cursor_range);
+                    }
                     return true;
                 }
                 ':' => {
@@ -707,6 +751,91 @@ impl VimMotions {
         let end_ccursor = galley.from_pcursor(line_end).ccursor;
         
         text.delete_char_range(start_ccursor.index..end_ccursor.index);
+    }
+
+    fn execute_visual_motion(
+        motion: VimMotion,
+        vim_state: &VimState,
+        count: u32,
+        galley: &Galley,
+        text: &dyn TextBuffer,
+        cursor_range: &mut CursorRange,
+    ) {
+        let new_cursor = match motion {
+            VimMotion::Left => Self::move_left(cursor_range.primary.ccursor, count),
+            VimMotion::Right => Self::move_right(cursor_range.primary.ccursor, text.as_str(), count),
+            VimMotion::Up => Self::move_up(galley, cursor_range.primary.ccursor, count),
+            VimMotion::Down => Self::move_down(galley, cursor_range.primary.ccursor, count),
+            VimMotion::WordForward => Self::move_word_forward(text.as_str(), cursor_range.primary.ccursor, count),
+            VimMotion::WordBackward => Self::move_word_backward(text.as_str(), cursor_range.primary.ccursor, count),
+            VimMotion::WordEnd => Self::move_word_end(text.as_str(), cursor_range.primary.ccursor, count),
+            VimMotion::LineStart => Self::move_line_start(galley, cursor_range.primary.ccursor),
+            VimMotion::LineEnd => Self::move_line_end(galley, cursor_range.primary.ccursor),
+            VimMotion::FirstLine => CCursor { index: 0, prefer_next_row: false },
+            VimMotion::LastLine => CCursor { 
+                index: text.as_str().chars().count(), 
+                prefer_next_row: false 
+            },
+            VimMotion::LineForward => Self::move_down(galley, cursor_range.primary.ccursor, count),
+            VimMotion::LineBackward => Self::move_up(galley, cursor_range.primary.ccursor, count),
+        };
+
+        cursor_range.primary = galley.from_ccursor(new_cursor);
+        
+        // In visual line mode, extend selection to include whole lines
+        if vim_state.mode == VimMode::VisualLine {
+            Self::extend_visual_line_selection(galley, cursor_range);
+        }
+        // In regular visual mode, the selection is already handled by cursor_range.primary/secondary
+    }
+
+    fn select_visual_line(galley: &Galley, text: &dyn TextBuffer, cursor_range: &mut CursorRange) {
+        let current_pos = galley.from_ccursor(cursor_range.primary.ccursor);
+        
+        // Start of current line
+        let line_start = PCursor {
+            paragraph: current_pos.pcursor.paragraph,
+            offset: 0,
+            prefer_next_row: false,
+        };
+        
+        // End of current line (including newline if present)
+        let line_end = PCursor {
+            paragraph: current_pos.pcursor.paragraph,
+            offset: usize::MAX,
+            prefer_next_row: false,
+        };
+        
+        cursor_range.secondary = galley.from_pcursor(line_start);
+        cursor_range.primary = galley.from_pcursor(line_end);
+    }
+
+    fn extend_visual_line_selection(galley: &Galley, cursor_range: &mut CursorRange) {
+        let primary_pos = galley.from_ccursor(cursor_range.primary.ccursor);
+        let secondary_pos = galley.from_ccursor(cursor_range.secondary.ccursor);
+        
+        // Extend primary to end of its line
+        let primary_line_end = PCursor {
+            paragraph: primary_pos.pcursor.paragraph,
+            offset: usize::MAX,
+            prefer_next_row: false,
+        };
+        
+        // Extend secondary to start of its line
+        let secondary_line_start = PCursor {
+            paragraph: secondary_pos.pcursor.paragraph,
+            offset: 0,
+            prefer_next_row: false,
+        };
+        
+        cursor_range.primary = galley.from_pcursor(primary_line_end);
+        cursor_range.secondary = galley.from_pcursor(secondary_line_start);
+    }
+
+    fn get_visual_selection_range(cursor_range: &CursorRange) -> std::ops::Range<usize> {
+        let start = cursor_range.primary.ccursor.index.min(cursor_range.secondary.ccursor.index);
+        let end = cursor_range.primary.ccursor.index.max(cursor_range.secondary.ccursor.index);
+        start..end
     }
 }
 

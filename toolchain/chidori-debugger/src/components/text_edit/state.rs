@@ -1,13 +1,15 @@
 use std::sync::Arc;
 
-use crate::mutex::Mutex;
+use egui::mutex::Mutex;
+use egui::{Context, Id};
+use egui::epaint::Galley;
 
 use crate::*;
 
-use self::text_selection::{CCursorRange, CursorRange, TextCursorState};
+use egui::text_selection::{CCursorRange, CursorRange, TextCursorState};
 use super::vim_mode::VimState;
 
-pub type TextEditUndoer = crate::util::undoer::Undoer<(CCursorRange, String)>;
+pub type TextEditUndoer = egui::util::undoer::Undoer<(CCursorRange, String)>;
 
 /// The text edit state stored between frames.
 ///

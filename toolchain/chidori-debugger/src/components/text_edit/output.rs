@@ -1,21 +1,21 @@
 use std::sync::Arc;
 
-use crate::text::CursorRange;
+use egui::text_selection::CursorRange;
 use super::vim_mode::{VimMode, VimState};
 
 /// The output from a [`TextEdit`](crate::TextEdit).
 pub struct TextEditOutput {
     /// The interaction response.
-    pub response: crate::Response,
+    pub response: egui::Response,
 
     /// How the text was displayed.
-    pub galley: Arc<crate::Galley>,
+    pub galley: Arc<egui::epaint::Galley>,
 
     /// Where the text in [`Self::galley`] ended up on the screen.
-    pub galley_pos: crate::Pos2,
+    pub galley_pos: egui::Pos2,
 
     /// The text was clipped to this rectangle when painted.
-    pub text_clip_rect: crate::Rect,
+    pub text_clip_rect: egui::Rect,
 
     /// The state we stored after the run.
     pub state: super::TextEditState,
@@ -26,7 +26,7 @@ pub struct TextEditOutput {
 
 impl TextEditOutput {
     #[deprecated = "Renamed `self.galley_pos`"]
-    pub fn text_draw_pos(&self) -> crate::Pos2 {
+    pub fn text_draw_pos(&self) -> egui::Pos2 {
         self.galley_pos
     }
 

@@ -1,6 +1,6 @@
 use std::{borrow::Cow, ops::Range};
 
-use epaint::{
+use egui::epaint::{
     text::{
         cursor::{CCursor, PCursor},
         TAB_SIZE,
@@ -8,7 +8,7 @@ use epaint::{
     Galley,
 };
 
-use crate::text_selection::{
+use egui::text_selection::{
     text_cursor_state::{
         byte_index_from_char_index, ccursor_next_word, ccursor_previous_word, find_line_start,
         slice_char_range,
@@ -273,4 +273,25 @@ impl<'a> TextBuffer for &'a str {
     }
 
     fn delete_char_range(&mut self, _ch_range: Range<usize>) {}
+}
+
+/// A wrapper around egui::TextBuffer that implements our local TextBuffer trait
+pub struct EguiTextBufferWrapper<'a>(pub &'a mut dyn egui::TextBuffer);
+
+impl<'a> TextBuffer for EguiTextBufferWrapper<'a> {
+    fn is_mutable(&self) -> bool {
+        true
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    fn insert_text(&mut self, text: &str, char_index: usize) -> usize {
+        self.0.insert_text(text, char_index)
+    }
+
+    fn delete_char_range(&mut self, char_range: Range<usize>) {
+        self.0.delete_char_range(char_range)
+    }
 }

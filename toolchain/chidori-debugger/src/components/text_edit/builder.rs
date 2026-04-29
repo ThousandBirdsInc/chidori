@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use epaint::text::{cursor::*, Galley, LayoutJob};
 
-use crate::{
+use egui::{
     os::OperatingSystem,
     output::OutputEvent,
     text_selection::{
@@ -12,6 +12,7 @@ use crate::{
 };
 
 use super::{TextEditOutput, TextEditState, vim_mode::{VimMode, VimState, VimMotions}};
+use super::text_buffer::TextBuffer;
 
 /// A text region that the user can edit the contents of.
 ///
@@ -532,12 +533,15 @@ impl<'t> TextEdit<'t> {
         });
         let mut state = TextEditState::load(ui.ctx(), temp_id).unwrap_or_default();
 
-        // Initialize line number settings
+        // Initialize line number settings (initial estimate)
         state.show_line_numbers = show_line_numbers;
         if show_line_numbers && multiline {
-            let line_count = text.as_str().lines().count().max(1);
-            let line_count_str = line_count.to_string();
-            let line_number_width = ui.fonts(|f| f.glyph_width(&font_id, '0')) * (line_count_str.len() as f32 + 1.0);
+            // Start with a rough estimate based on text lines for initial width calculation
+            let estimated_line_count = text.as_str().lines().count().max(1);
+            let line_count_str = estimated_line_count.to_string();
+            let digit_width = ui.fonts(|f| f.glyph_width(&font_id, '0'));
+            // Reserve space for digits + padding on both sides + separator
+            let line_number_width = digit_width * (line_count_str.len() as f32) + 24.0;
             state.line_number_width = line_number_width;
         } else {
             state.line_number_width = 0.0;
@@ -564,6 +568,20 @@ impl<'t> TextEdit<'t> {
         };
 
         let layouter = layouter.unwrap_or(&mut default_layouter);
+
+        // Now update line number width based on actual galley if needed
+        if show_line_numbers && multiline {
+            let temp_galley = layouter(ui, text.as_str(), wrap_width);
+            let actual_line_count = temp_galley.rows.len().max(1);
+            let estimated_line_count = text.as_str().lines().count().max(1);
+            
+            // Only recalculate if the actual line count differs significantly from estimate
+            if actual_line_count != estimated_line_count {
+                let line_count_str = actual_line_count.to_string();
+                let digit_width = ui.fonts(|f| f.glyph_width(&font_id, '0'));
+                state.line_number_width = digit_width * (line_count_str.len() as f32) + 24.0;
+            }
+        }
 
         let mut galley = layouter(ui, text.as_str(), wrap_width);
 
@@ -737,29 +755,35 @@ impl<'t> TextEdit<'t> {
             // Render line numbers if enabled
             if state.show_line_numbers && multiline {
                 let line_number_color = line_number_color.unwrap_or_else(|| ui.visuals().weak_text_color());
-                let line_count = text.as_str().lines().count().max(1);
                 
-                for (line_idx, _) in text.as_str().lines().enumerate() {
-                    let line_number = line_idx + 1;
-                    let line_number_text = format!("{:>3}", line_number);
+                // Use the galley's actual row positions for proper alignment
+                for (row_idx, row) in galley.rows.iter().enumerate() {
+                    let line_number = row_idx + 1;
+                    let line_number_text = line_number.to_string();
                     
-                    let line_y = galley_pos.y + (line_idx as f32 * row_height);
-                    let line_number_pos = pos2(rect.min.x + 4.0, line_y);
+                    // Use the actual row position from the galley
+                    let line_y = galley_pos.y + row.rect.min.y;
                     
                     let line_galley = ui.fonts(|f| {
                         f.layout(
                             line_number_text,
                             font_id.clone(),
                             line_number_color,
-                            state.line_number_width,
+                            state.line_number_width - 16.0, // Reserve space for padding
                         )
                     });
+                    
+                    // Right-align line numbers within the available space
+                    let line_number_pos = pos2(
+                        rect.min.x + state.line_number_width - line_galley.size().x - 12.0,
+                        line_y
+                    );
                     
                     painter.galley(line_number_pos, line_galley, line_number_color);
                 }
                 
                 // Draw separator line between line numbers and text
-                let separator_x = rect.min.x + state.line_number_width - 4.0;
+                let separator_x = rect.min.x + state.line_number_width - 8.0;
                 painter.line_segment(
                     [pos2(separator_x, rect.min.y), pos2(separator_x, rect.max.y)],
                     Stroke::new(1.0, line_number_color),
@@ -836,7 +860,7 @@ impl<'t> TextEdit<'t> {
                             .unwrap_or_default();
 
                         ui.ctx().output_mut(|o| {
-                            o.ime = Some(crate::output::IMEOutput {
+                            o.ime = Some(egui::output::IMEOutput {
                                 rect: transform * rect,
                                 cursor_rect: transform * primary_cursor_rect,
                             });
@@ -926,7 +950,7 @@ fn mask_if_password(is_password: bool, text: &str) -> String {
 /// Check for (keyboard) events to edit the cursor and/or text.
 #[allow(clippy::too_many_arguments)]
 fn events(
-    ui: &crate::Ui,
+    ui: &Ui,
     state: &mut TextEditState,
     text: &mut dyn TextBuffer,
     galley: &mut Arc<Galley>,
@@ -982,7 +1006,20 @@ fn events(
                         false
                     }
                 }
-                Event::Text(text_input) if state.vim_state.is_normal_mode() => {
+                Event::Key {
+                    key: Key::C,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.ctrl => {
+                    if state.vim_state.is_visual_mode() {
+                        state.vim_state.enter_mode(VimMode::Normal);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Event::Text(text_input) if state.vim_state.is_normal_mode() || state.vim_state.is_visual_mode() => {
                     if let Some(ch) = text_input.chars().next() {
                         if VimMotions::handle_normal_mode_key(
                             &mut state.vim_state,
@@ -1009,15 +1046,15 @@ fn events(
                 continue;
             }
 
-            // In vim normal mode, skip regular text input processing
-            if state.vim_state.is_normal_mode() {
+            // In vim normal mode or visual mode, skip regular text input processing
+            if state.vim_state.is_normal_mode() || state.vim_state.is_visual_mode() {
                 continue;
             }
         }
 
         let did_mutate_text = match event {
             // First handle events that only changes the selection cursor, not the text:
-            event if cursor_range.on_event(os, event, galley, id) => None,
+            event if cursor_range.on_event(os, &event, galley, id) => None,
 
             Event::Copy => {
                 if cursor_range.is_empty() {
@@ -1040,7 +1077,7 @@ fn events(
                 if !text_to_insert.is_empty() {
                     let mut ccursor = text.delete_selected(&cursor_range);
 
-                    text.insert_text_at(&mut ccursor, text_to_insert, char_limit);
+                    text.insert_text_at(&mut ccursor, &text_to_insert, char_limit);
 
                     Some(CCursorRange::one(ccursor))
                 } else {
@@ -1052,7 +1089,7 @@ fn events(
                 if !text_to_insert.is_empty() && text_to_insert != "\n" && text_to_insert != "\r" {
                     let mut ccursor = text.delete_selected(&cursor_range);
 
-                    text.insert_text_at(&mut ccursor, text_to_insert, char_limit);
+                    text.insert_text_at(&mut ccursor, &text_to_insert, char_limit);
 
                     Some(CCursorRange::one(ccursor))
                 } else {
@@ -1136,7 +1173,7 @@ fn events(
                 key,
                 pressed: true,
                 ..
-            } => check_for_mutating_key_press(os, &cursor_range, text, galley, modifiers, *key),
+            } => check_for_mutating_key_press(os, &cursor_range, text, galley, &modifiers, *key),
 
             Event::Ime(ime_event) => match ime_event {
                 ImeEvent::Enabled => {
@@ -1153,7 +1190,7 @@ fn events(
                         let mut ccursor = text.delete_selected(&cursor_range);
                         let start_cursor = ccursor;
                         if !text_mark.is_empty() {
-                            text.insert_text_at(&mut ccursor, text_mark, char_limit);
+                            text.insert_text_at(&mut ccursor, &text_mark, char_limit);
                         }
                         state.ime_cursor_range = cursor_range;
                         Some(CCursorRange::two(start_cursor, ccursor))
@@ -1170,7 +1207,7 @@ fn events(
                                 == state.ime_cursor_range.secondary.ccursor.index
                         {
                             let mut ccursor = text.delete_selected(&cursor_range);
-                            text.insert_text_at(&mut ccursor, prediction, char_limit);
+                            text.insert_text_at(&mut ccursor, &prediction, char_limit);
                             Some(CCursorRange::one(ccursor))
                         } else {
                             let ccursor = cursor_range.primary.ccursor;

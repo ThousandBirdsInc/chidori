@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::sync::MutexGuard;
 use crate::application::{CellState, ChidoriState};
 use crate::components::json_editor::{JsonEditorExample, Show};
+use crate::components::text_edit::TextEdit;
 use crate::util::{egui_label, egui_logs, serialized_value_to_json_value};
 use crate::{CurrentTheme, Theme};
 use crate::code::utils::populate_json_content;
@@ -106,9 +107,8 @@ pub fn render_plaintext_cell(
     let CellTypes::PlainText(PlainTextCell { text, ..}, _) = &mut cell_holder.cell else { panic!("Must be plain text cell")};
     ui.vertical(|ui| {
         if ui.add(
-            egui::TextEdit::multiline(text)
-                .code_editor()
-                .lock_focus(true)
+            TextEdit::multiline(text)
+                .vim_code_editor()
                 .margin(Margin::symmetric(8.0, 8.0))
                 .desired_width(f32::INFINITY)
         ).changed() {
@@ -130,9 +130,8 @@ pub fn render_template_cell(
     let CellTypes::Template(TemplateCell { name, body , backing_file_reference, ..}, _) = &mut cell_holder.cell else { panic!("Must be template cell")};
     if let Some(name) = name {
         if ui.add(
-            egui::TextEdit::singleline(name)
+            TextEdit::singleline(name)
                 .code_editor()
-                .lock_focus(true)
                 .margin(Margin::symmetric(8.0, 8.0))
                 .desired_width(f32::INFINITY)
         ).changed() {
@@ -151,9 +150,8 @@ pub fn render_template_cell(
     });
     ui.vertical(|ui| {
         if ui.add(
-            egui::TextEdit::multiline(body)
-                .code_editor()
-                .lock_focus(true)
+            TextEdit::multiline(body)
+                .vim_code_editor()
                 .margin(Margin::symmetric(8.0, 8.0))
                 .desired_width(f32::INFINITY)
         ).changed() {
@@ -176,9 +174,8 @@ pub fn render_prompt_cell(
 
     if let Some(name) = name {
         if ui.add(
-            egui::TextEdit::singleline(name)
+            TextEdit::singleline(name)
                 .code_editor()
-                .lock_focus(true)
                 .margin(Margin::symmetric(8.0, 8.0))
                 .desired_width(f32::INFINITY)
         ).changed() {
@@ -210,10 +207,9 @@ pub fn render_prompt_cell(
 
     ui.vertical(|ui| {
         if ui.add(
-            egui::TextEdit::multiline(complete_body)
+            TextEdit::multiline(complete_body)
                 .id(Id::new(format!("{:?} prompt_editor", op_id)))
-                .code_editor()
-                .lock_focus(true)
+                .vim_code_editor()
                 .margin(Margin::symmetric(8.0, 8.0))
                 .desired_width(f32::INFINITY)
         ).changed() {
@@ -255,9 +251,8 @@ pub fn render_code_gen_cell(
     let CellTypes::CodeGen(LLMCodeGenCell { name, req, complete_body, backing_file_reference, .. }, _) = &mut cell_holder.cell else { panic!("Must be code gen cell") };
     if let Some(name) = name {
         if ui.add(
-            egui::TextEdit::singleline(name)
+            TextEdit::singleline(name)
                 .code_editor()
-                .lock_focus(true)
                 .margin(Margin::symmetric(8.0, 8.0))
                 .desired_width(f32::INFINITY)
         ).changed() {
@@ -279,9 +274,8 @@ pub fn render_code_gen_cell(
     });
     ui.vertical(|ui| {
         if ui.add(
-            egui::TextEdit::multiline(complete_body)
-                .code_editor()
-                .lock_focus(true)
+            TextEdit::multiline(complete_body)
+                .vim_code_editor()
                 .desired_width(f32::INFINITY)
                 .margin(Margin::symmetric(8.0, 8.0))
         ).changed() {
@@ -308,9 +302,8 @@ pub fn render_code_cell(
     let CellTypes::Code(CodeCell { name, source_code, language, backing_file_reference, ..}, _) = &mut cell_holder.cell else { panic!("Mut be cell_holder") };
     if let Some(name) = name {
         if ui.add(
-            egui::TextEdit::singleline(name)
+            TextEdit::singleline(name)
                 .code_editor()
-                .lock_focus(true)
                 .margin(Margin::symmetric(8.0, 8.0))
                 .desired_width(f32::INFINITY)
         ).changed() {
@@ -397,11 +390,9 @@ pub fn render_code_cell(
         {
             let mut ui = &mut code_frame.content_ui;
             if ui.add(
-                egui::TextEdit::multiline(source_code)
+                TextEdit::multiline(source_code)
                     .id(Id::new(format!("{:?} source_code", op_id)))
-                    .font(egui::FontId::new(14.0, FontFamily::Monospace))
-                    .code_editor()
-                    .lock_focus(true)
+                    .vim_code_editor()
                     .desired_width(f32::INFINITY)
                     .margin(Margin::symmetric(8.0, 8.0))
                     .layouter(&mut layouter),
@@ -429,11 +420,9 @@ pub fn render_code_cell(
             {
                 let mut ui = &mut code_frame.content_ui;
                 if ui.add(
-                    egui::TextEdit::multiline(&mut state.repl_content)
+                    TextEdit::multiline(&mut state.repl_content)
                         .id(Id::new(format!("{:?} repl_content", op_id)))
-                        .font(egui::FontId::new(14.0, FontFamily::Monospace))
-                        .code_editor()
-                        .lock_focus(true)
+                        .vim_code_editor()
                         .desired_width(f32::INFINITY)
                         .margin(Margin::symmetric(8.0, 8.0))
                         .layouter(&mut layouter),
