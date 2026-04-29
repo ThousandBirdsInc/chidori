@@ -1,0 +1,40 @@
+[
+  {
+    "seq": 1,
+    "function": "http",
+    "args": {
+      "body": null,
+      "headers": {
+        "User-Agent": "app-agent/0.1"
+      },
+      "method": "GET",
+      "params": null,
+      "url": "https://httpbin.org/get"
+    },
+    "result": {
+      "body": {
+        "args": {},
+        "headers": {
+          "Accept": "*/*",
+          "Host": "httpbin.org",
+          "User-Agent": "app-agent/0.1",
+          "X-Amzn-Trace-Id": "Root=1-69dc8290-49f5db325a14b62e4401e428"
+        },
+        "origin": "73.70.101.176",
+        "url": "https://httpbin.org/get"
+      },
+      "headers": {
+        "access-control-allow-credentials": "true",
+        "access-control-allow-origin": "*",
+        "connection": "keep-alive",
+        "content-length": "257",
+        "content-type": "application/json",
+        "date": "Mon, 13 Apr 2026 05:43:44 GMT",
+        "server": "gunicorn/19.9.0"
+      },
+      "status": 200
+    },
+    "duration_ms": 412,
+    "timestamp": "2026-04-13T05:43:44.956557Z"
+  }
+]

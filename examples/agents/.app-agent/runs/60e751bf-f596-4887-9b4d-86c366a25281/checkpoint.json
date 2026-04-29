@@ -1,0 +1,47 @@
+[
+  {
+    "seq": 1,
+    "function": "exec_js",
+    "args": {
+      "fuel": 200000000,
+      "source": "\nfunction fact(n) { return n <= 1 ? 1 : n * fact(n - 1); }\nfact(6)\n"
+    },
+    "result": "720",
+    "duration_ms": 162,
+    "timestamp": "2026-04-14T07:27:32.513606Z"
+  },
+  {
+    "seq": 2,
+    "function": "exec_js",
+    "args": {
+      "fuel": 200000000,
+      "source": "Array.from({length: 6}, (_, i) => i * i).reduce((a, b) => a + b, 0)"
+    },
+    "result": "55",
+    "duration_ms": 10,
+    "timestamp": "2026-04-14T07:27:32.524704Z"
+  },
+  {
+    "seq": 3,
+    "function": "exec_js",
+    "args": {
+      "fuel": 200000000,
+      "source": "\nconst name = \"world\";\n`${\"hello \" + name}`.split(\" \").map(w => w[0].toUpperCase() + w.slice(1)).join(\", \") + \"!\"\n"
+    },
+    "result": "Hello, World!",
+    "duration_ms": 10,
+    "timestamp": "2026-04-14T07:27:32.535365Z"
+  },
+  {
+    "seq": 4,
+    "function": "exec_js",
+    "args": {
+      "fuel": 200000000,
+      "source": "throw new Error('nope')"
+    },
+    "result": null,
+    "duration_ms": 10,
+    "timestamp": "2026-04-14T07:27:32.546056Z",
+    "error": "JavaScript error: Error: nope (unknown at :1:7)"
+  }
+]

@@ -1,0 +1,78 @@
+[
+  {
+    "seq": 1,
+    "function": "shell",
+    "args": {
+      "args": [
+        "hello from shell"
+      ],
+      "command": "echo",
+      "cwd": null,
+      "timeout_ms": 5000
+    },
+    "result": {
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "hello from shell\n",
+      "timed_out": false
+    },
+    "duration_ms": 3,
+    "timestamp": "2026-04-14T20:31:33.651121Z"
+  },
+  {
+    "seq": 2,
+    "function": "shell",
+    "args": {
+      "args": [
+        "-1",
+        "."
+      ],
+      "command": "ls",
+      "cwd": null,
+      "timeout_ms": 2000
+    },
+    "result": {
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "Cargo.lock\nCargo.toml\nDESIGN.md\nREADME.md\nTODO.md\ndocs\nexamples\nllm.txt\nsandbox-js\nsandbox-python\nsandbox-runtime\nsdk\nsrc\ntarget\n",
+      "timed_out": false
+    },
+    "duration_ms": 4,
+    "timestamp": "2026-04-14T20:31:33.655713Z"
+  },
+  {
+    "seq": 3,
+    "function": "shell",
+    "args": {
+      "args": [
+        "-rf",
+        "/"
+      ],
+      "command": "rm"
+    },
+    "result": null,
+    "duration_ms": 0,
+    "timestamp": "2026-04-14T20:31:33.656349Z",
+    "error": "shell() command `rm` is not in APP_AGENT_SHELL_ALLOW (echo,ls,sleep)"
+  },
+  {
+    "seq": 4,
+    "function": "shell",
+    "args": {
+      "args": [
+        "5"
+      ],
+      "command": "sleep",
+      "cwd": null,
+      "timeout_ms": 200
+    },
+    "result": {
+      "exit_code": -1,
+      "stderr": "timed out after 200ms",
+      "stdout": "",
+      "timed_out": true
+    },
+    "duration_ms": 203,
+    "timestamp": "2026-04-14T20:31:33.860615Z"
+  }
+]

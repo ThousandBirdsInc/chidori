@@ -1,0 +1,38 @@
+[
+  {
+    "seq": 1,
+    "function": "http",
+    "args": {
+      "method": "GET",
+      "url": "http://127.0.0.1:1/unreachable"
+    },
+    "result": null,
+    "duration_ms": 3,
+    "timestamp": "2026-04-13T23:52:43.171440Z",
+    "error": "error sending request for url (http://127.0.0.1:1/unreachable)"
+  },
+  {
+    "seq": 2,
+    "function": "http",
+    "args": {
+      "method": "GET",
+      "url": "http://127.0.0.1:1/unreachable"
+    },
+    "result": null,
+    "duration_ms": 0,
+    "timestamp": "2026-04-13T23:52:43.172263Z",
+    "error": "error sending request for url (http://127.0.0.1:1/unreachable)"
+  },
+  {
+    "seq": 3,
+    "function": "http",
+    "args": {
+      "method": "GET",
+      "url": "http://127.0.0.1:1/unreachable"
+    },
+    "result": null,
+    "duration_ms": 0,
+    "timestamp": "2026-04-13T23:52:43.185613Z",
+    "error": "error sending request for url (http://127.0.0.1:1/unreachable)"
+  }
+]

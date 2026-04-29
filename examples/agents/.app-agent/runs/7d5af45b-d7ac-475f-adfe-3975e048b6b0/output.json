@@ -1,0 +1,6 @@
+{
+  "add": 13,
+  "add_fuel_remaining": 99996,
+  "mul": 42,
+  "runaway_error": "Traceback (most recent call last):\n  File <builtin>, in <module>\n  * examples/agents/wasm_demo.star:27, in agent\n      runaway = try_call(\n  File <builtin>, in try_call\n  File <builtin>, in None\n  * examples/agents/wasm_demo.star:28, in lambda\n      lambda: exec(INFINITE, function = \"loop\", args = [], fuel = 1000),\nerror: WASM fuel exhausted after 1000 instructions\n  --> examples/agents/wasm_demo.star:28:17\n   |\n28 |         lambda: exec(INFINITE, function = \"loop\", args = [], fuel = 1000),\n   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n   |\n"
+}

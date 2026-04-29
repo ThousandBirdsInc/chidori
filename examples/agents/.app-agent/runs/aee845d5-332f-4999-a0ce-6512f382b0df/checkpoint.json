@@ -1,0 +1,101 @@
+[
+  {
+    "seq": 1,
+    "function": "exec_expr",
+    "args": {
+      "fuel": 1000000,
+      "source": "a + b",
+      "vars": {
+        "a": 7,
+        "b": 6
+      }
+    },
+    "result": "13",
+    "duration_ms": 115,
+    "timestamp": "2026-04-14T03:46:10.627040Z"
+  },
+  {
+    "seq": 2,
+    "function": "exec_expr",
+    "args": {
+      "fuel": 1000000,
+      "source": "if a < 0 then 0 else if a > 100 then 100 else a",
+      "vars": {
+        "a": 7
+      }
+    },
+    "result": "7",
+    "duration_ms": 0,
+    "timestamp": "2026-04-14T03:46:10.627765Z"
+  },
+  {
+    "seq": 3,
+    "function": "exec_expr",
+    "args": {
+      "fuel": 1000000,
+      "source": "if a > b then a else b",
+      "vars": {
+        "a": 7,
+        "b": 6
+      }
+    },
+    "result": "7",
+    "duration_ms": 0,
+    "timestamp": "2026-04-14T03:46:10.628088Z"
+  },
+  {
+    "seq": 4,
+    "function": "exec_expr",
+    "args": {
+      "fuel": 1000000,
+      "source": "\n        let f1 = 1 in\n        let f2 = f1 * 2 in\n        let f3 = f2 * 3 in\n        let f4 = f3 * 4 in\n        let f5 = f4 * 5 in\n        f5\n    ",
+      "vars": {}
+    },
+    "result": "120",
+    "duration_ms": 0,
+    "timestamp": "2026-04-14T03:46:10.628395Z"
+  },
+  {
+    "seq": 5,
+    "function": "exec_expr",
+    "args": {
+      "fuel": 1000000,
+      "source": "(a + b) * (a - b)",
+      "vars": {
+        "a": 7,
+        "b": 6
+      }
+    },
+    "result": "13",
+    "duration_ms": 0,
+    "timestamp": "2026-04-14T03:46:10.628680Z"
+  },
+  {
+    "seq": 6,
+    "function": "exec_expr",
+    "args": {
+      "fuel": 1000000,
+      "source": "a > 0 && b > 0 && a + b < 100",
+      "vars": {
+        "a": 7,
+        "b": 6
+      }
+    },
+    "result": "true",
+    "duration_ms": 0,
+    "timestamp": "2026-04-14T03:46:10.628957Z"
+  },
+  {
+    "seq": 7,
+    "function": "exec_expr",
+    "args": {
+      "fuel": 1000000,
+      "source": "10 / 0",
+      "vars": {}
+    },
+    "result": null,
+    "duration_ms": 0,
+    "timestamp": "2026-04-14T03:46:10.629260Z",
+    "error": "expr runtime error: div by zero"
+  }
+]

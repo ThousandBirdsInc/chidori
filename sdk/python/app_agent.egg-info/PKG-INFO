@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: app-agent
+Version: 0.1.0
+Summary: Python SDK for the app-agent framework — HTTP client for running and replaying Starlark agents.
+Author: app-agent contributors
+License: MIT
+Project-URL: Homepage, https://github.com/anthropics/app-agent-framework
+Keywords: ai,agents,starlark,llm
+Classifier: Development Status :: 3 - Alpha
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3 :: Only
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown

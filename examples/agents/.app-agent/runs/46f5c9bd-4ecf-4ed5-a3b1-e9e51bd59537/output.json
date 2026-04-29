@@ -1,0 +1,14 @@
+{
+  "all": [
+    {
+      "key": "pref:alice",
+      "value": {
+        "theme": "dark"
+      }
+    }
+  ],
+  "count": 1,
+  "loaded": {
+    "theme": "dark"
+  }
+}

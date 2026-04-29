@@ -1,0 +1,780 @@
+# App Agent Framework
+
+> Build AI agents as Starlark scripts. Starlark is a deterministic Python dialect — it looks like Python but is sandboxed, has no I/O, and all side effects go through host functions the runtime controls.
+
+## Quick Start
+
+An agent is a `.star` file with a `def agent(...)` function:
+
+```python
+config(model = "claude-sonnet")
+
+def agent(document):
+    summary = prompt("Summarize in 3 bullets:\n" + document)
+    actions = prompt("Extract action items:\n" + summary)
+    return {"summary": summary, "action_items": actions}
+```
+
+Run it:
+```
+app-agent run agents/summarizer.star --input document=@file.txt
+app-agent run agents/summarizer.star --input document="some text here"
+app-agent run agents/summarizer.star --input '{"document": "some text"}'
+```
+
+## File Structure
+
+```
+my-project/
+├── agents/          # .star agent files
+├── prompts/         # .jinja template files
+├── tools/           # .star tool files
+└── app-agent.star   # project config (optional)
+```
+
+## Agent Anatomy
+
+Every agent file has:
+1. An optional `config(...)` call at module scope to set defaults.
+2. A `def agent(...)` function — this is the entry point.
+3. The function's parameters are the agent's inputs.
+4. The return value is the agent's JSON output.
+
+```python
+config(
+    model = "claude-sonnet",     # default model for prompt() calls
+    temperature = 0.7,            # default temperature
+    max_tokens = 4096,            # default max tokens
+    max_turns = 10,               # max tool-use loop iterations
+    timeout = 300,                # agent timeout in seconds
+)
+
+def agent(question, depth = "standard"):
+    # ... agent logic ...
+    return {"answer": answer}
+```
+
+## Host Functions — Complete API
+
+These are the ONLY functions that interact with the outside world. Everything else in Starlark is pure computation.
+
+### prompt(text, **kwargs) → string | dict
+
+Send a message to an LLM. Returns the response as a string, or as a parsed dict/list if `format="json"`.
+
+```python
+# Simple
+answer = prompt("What is 2+2?")
+
+# Full options
+result = prompt(
+    "Analyze this data: " + data,
+    model = "claude-opus",         # override default model
+    temperature = 0.2,             # 0.0 - 1.0
+    max_tokens = 4000,             # max response tokens
+    system = "You are an analyst.",# system prompt
+    format = "json",               # parse response as JSON → returns dict/list
+    tools = ["web_search", "calc"],# enable LLM tool-use with these tools
+    max_turns = 5,                 # max tool-use iterations
+)
+```
+
+**Parameters:**
+- `text` (string, required): The user message to send.
+- `model` (string): Model name. Defaults to agent config.
+- `temperature` (float): Sampling temperature. Defaults to agent config.
+- `max_tokens` (int): Max response tokens. Defaults to agent config.
+- `system` (string): System prompt prepended to the conversation.
+- `format` (string): If `"json"`, the response is parsed as JSON. The runtime strips markdown code fences if present.
+- `tools` (list of strings): Tool names to make available for LLM function-calling. The LLM can autonomously call these tools.
+- `max_turns` (int): When `tools` is set, max number of tool-use loop iterations.
+
+### template(template_str, **kwargs) → string
+
+Render a Jinja2 template with variables. Use for complex prompts with conditionals, loops, or reusable fragments.
+
+```python
+# Inline template
+text = template("Hello {{ name }}, you have {{ count }} items.", name = "Alice", count = 5)
+
+# Template from file (path ends in .jinja or .j2)
+text = template("prompts/analysis.jinja", items = items, role = "analyst")
+```
+
+Typically composed with prompt():
+```python
+answer = prompt(template("prompts/research.jinja", topic = topic, sources = sources))
+```
+
+**Template syntax (Jinja2 via minijinja):**
+- Variables: `{{ variable }}`
+- Conditionals: `{% if x %}...{% elif y %}...{% else %}...{% endif %}`
+- Loops: `{% for item in list %}...{% endfor %}`
+- Filters: `{{ text | upper }}`, `{{ items | join(", ") }}`, `{{ data | tojson }}`
+- Includes: `{% include "fragment.jinja" %}`
+- Inheritance: `{% extends "base.jinja" %}` / `{% block name %}...{% endblock %}`
+
+### tool(name, **kwargs) → any
+
+Invoke a registered tool by name.
+
+```python
+results = tool("web_search", query = "rust programming", max_results = 5)
+data = tool("fetch_url", url = "https://example.com")
+```
+
+Tools are defined as `.star` files in the `tools/` directory. See "Defining Tools" below.
+
+### agent(name, **kwargs) → any
+
+Call another agent as a sub-agent.
+
+```python
+summary = agent("summarizer", document = long_text)
+checked = agent("fact_checker", claims = summary)
+```
+
+The name resolves to `agents/<name>.star`.
+
+### parallel(fns) → list
+
+Run a list of functions concurrently. Returns results in order.
+
+```python
+# Search multiple queries in parallel
+results = parallel([
+    lambda q = q: tool("web_search", query = q)
+    for q in queries
+])
+
+# Run multiple prompts concurrently
+summaries = parallel([
+    lambda a = a: prompt("Summarize for " + a + " audience:\n" + doc)
+    for a in ["technical", "executive", "general"]
+])
+```
+
+**Important:** Use `lambda q = q:` (default arg capture) to avoid late-binding closure issues — same as Python.
+
+### input(message, **kwargs) → string
+
+Pause execution and wait for human input. Used for approval flows, clarification, etc.
+
+```python
+approved = input("Proceed with this plan?", context = plan, timeout = 300)
+if approved == "yes":
+    execute(plan)
+```
+
+**Parameters:**
+- `message` (string, required): Message shown to the human.
+- `context` (any): Additional context displayed alongside the message.
+- `timeout` (int): Seconds to wait before timing out.
+
+### exec(code, **kwargs) → any
+
+Execute arbitrary code in a sandboxed WASM runtime. Used for running code that an LLM generated at runtime.
+
+```python
+code = prompt("Write Python to analyze this CSV:\n" + data, system = "Return only code.")
+result = exec(code, lang = "python", vars = {"data": data}, timeout = 30)
+```
+
+**Parameters:**
+- `code` (string, required): Source code to execute.
+- `lang` (string): `"python"` (default) or `"javascript"`.
+- `vars` (dict): Variables injected into the sandbox scope.
+- `timeout` (int): Max execution time in seconds.
+
+**The sandbox cannot access the filesystem, network, or anything outside its boundary.** Data flows in via `vars`, results flow out as the return value.
+
+### http(method, url, **kwargs) → dict
+
+Make an HTTP request.
+
+```python
+resp = http("GET", "https://api.example.com/data",
+    headers = {"Authorization": "Bearer " + token},
+)
+resp = http("POST", "https://api.example.com/submit",
+    json = {"key": "value"},
+)
+```
+
+**Parameters:**
+- `method` (string, required): HTTP method (GET, POST, PUT, DELETE, etc.).
+- `url` (string, required): Request URL.
+- `headers` (dict): Request headers.
+- `json` (dict): JSON request body (sets Content-Type automatically).
+- `params` (dict): URL query parameters.
+
+### memory(action, **kwargs) → any
+
+Read/write persistent storage across agent runs.
+
+```python
+# Store a value
+memory("store", key = "user_pref", value = "dark mode")
+
+# Retrieve a value
+pref = memory("get", key = "user_pref")
+
+# Semantic search across stored memories
+results = memory("search", query = "What does the user prefer?", top_k = 3)
+```
+
+### log(message, **kwargs) → None
+
+Structured logging. Appears in traces and stderr (with --verbose).
+
+```python
+log("Processing batch", count = len(items), batch_id = id)
+```
+
+### env(name) → string | None
+
+Read an environment variable. Returns None if not set.
+
+```python
+api_key = env("MY_API_KEY")
+```
+
+### retry(fn, **kwargs) → any
+
+Retry a function with backoff on failure.
+
+```python
+result = retry(
+    lambda: prompt("Translate to French:\n" + text),
+    max_attempts = 3,
+    backoff = "exponential",  # "constant" | "linear" | "exponential"
+)
+```
+
+### try_call(fn) → result
+
+Execute a function and capture errors instead of raising.
+
+```python
+result = try_call(lambda: tool("flaky_api", query = text))
+if result.error:
+    log("API failed", error = result.error)
+    result = prompt("Fallback: answer this yourself:\n" + text)
+```
+
+## Defining Tools
+
+Tools are `.star` files in the `tools/` directory. Each file exports one function:
+
+```python
+# tools/search.star
+def web_search(query, max_results = 5):
+    """Search the web and return results."""
+    response = http("GET", "https://api.search.example/search", params = {
+        "q": query,
+        "limit": max_results,
+    })
+    return response["results"]
+```
+
+- The function name becomes the tool name.
+- The docstring becomes the tool description (used in LLM function-calling schemas).
+- Parameters and defaults are parsed into a JSON schema automatically.
+- Tools can use host functions (`http`, `prompt`, `log`, etc.).
+
+For tools that need native libraries, wrap an external service:
+
+```python
+# tools/analyze.star
+def analyze(data):
+    """Run heavy analysis via external service."""
+    return http("POST", "http://localhost:9000/analyze", json = {"data": data})
+```
+
+## Control Flow
+
+Starlark supports standard Python control flow — no special DSL needed:
+
+```python
+# Conditionals
+if depth == "deep":
+    sources = fetch_sources(urls)
+else:
+    sources = []
+
+# For loops (no while loops — Starlark guarantees termination)
+facts = []
+for url in urls:
+    page = tool("fetch_url", url = url)
+    facts.append(prompt("Extract facts:\n" + page))
+
+# List comprehensions
+urls = [r["url"] for batch in results for r in batch[:3]]
+
+# Helper functions
+def summarize_for(audience, doc):
+    return prompt("Summarize for " + audience + ":\n" + doc)
+
+# String operations
+combined = ", ".join(items)
+upper = text.upper()
+trimmed = text.strip()
+```
+
+**Starlark restrictions vs. Python:**
+- No `while` loops (only `for ... in ...`) — guarantees termination.
+- No `import` of external modules — all capabilities come from host functions.
+- No classes — use dicts and functions.
+- No exceptions — use `try_call()` for error handling.
+- No mutation of global variables inside functions.
+- Deterministic — no `random`, no `time`, no I/O except through host functions.
+
+## Prompt Templates (.jinja files)
+
+For complex prompts, use separate `.jinja` files in the `prompts/` directory:
+
+```jinja
+{# prompts/research.jinja #}
+You are a {{ role }} research assistant.
+
+Answer the following question: {{ question }}
+
+{% if sources %}
+Use these sources:
+{% for source in sources %}
+- [{{ source.title }}]({{ source.url }}): {{ source.snippet }}
+{% endfor %}
+{% endif %}
+
+{% if format == "detailed" %}
+Provide a comprehensive analysis with citations.
+{% else %}
+Provide a concise answer in 2-3 sentences.
+{% endif %}
+```
+
+Load and use in an agent:
+
+```python
+answer = prompt(template("prompts/research.jinja",
+    role = "senior",
+    question = question,
+    sources = sources,
+    format = "detailed",
+))
+```
+
+## Agent Composition
+
+Agents can call other agents:
+
+```python
+# agents/research_pipeline.star
+config(model = "claude-sonnet")
+
+def agent(question):
+    raw = tool("web_search", query = question)
+    summary = agent("summarizer", document = repr(raw))
+    verified = agent("fact_checker", claims = summary)
+    return {"answer": verified, "sources": raw}
+```
+
+Agents can also be exposed as tools for LLM function-calling:
+
+```python
+answer = prompt(
+    "Research this question and verify your findings: " + question,
+    tools = ["web_search", "summarizer", "fact_checker"],
+    max_turns = 5,
+)
+```
+
+## Event-Driven Agents (serve)
+
+Agents can run as persistent HTTP servers that react to incoming events. Use `app-agent serve` to start the server — every incoming HTTP request is converted into an `event` dict and passed to `agent(event)`.
+
+```
+app-agent serve agents/webhook.star --port 8080
+```
+
+### The Event Dict
+
+Every HTTP request becomes a dict with this shape:
+
+```python
+event = {
+    "method": "POST",           # HTTP method
+    "path": "/webhooks/github", # URL path
+    "headers": {                # all request headers
+        "content-type": "application/json",
+        "x-github-event": "pull_request",
+    },
+    "query": {                  # URL query parameters
+        "token": "abc123",
+    },
+    "body": {                   # parsed as JSON if possible, otherwise string
+        "action": "opened",
+        "pull_request": {"title": "..."},
+    },
+}
+```
+
+### Response Format
+
+The agent's return value becomes the HTTP response. Return a dict with `status`, `body`, and optional `headers`:
+
+```python
+# Return structured response
+return {
+    "status": 200,
+    "body": {"result": "processed"},
+    "headers": {"x-request-id": request_id},
+}
+
+# Errors
+return {"status": 400, "body": {"error": "Missing required field"}}
+
+# If you return a dict without a "body" key, the entire dict is the response body with status 200
+return {"summary": summary}  # → 200 {"summary": "..."}
+```
+
+### Example: Webhook Handler
+
+```python
+# agents/webhook.star
+config(model = "claude-sonnet")
+
+def dict_get(d, key, default = None):
+    """Safe dict access — Starlark dicts don't have .get()."""
+    if key in d:
+        return d[key]
+    return default
+
+def agent(event):
+    path = event["path"]
+
+    if path == "/ping":
+        return {"status": 200, "body": {"pong": True}}
+
+    if path == "/github":
+        return handle_github(event)
+
+    if path == "/alert":
+        return handle_alert(event)
+
+    return {"status": 404, "body": {"error": "Unknown path: " + path}}
+
+def handle_github(event):
+    body = event["body"]
+    action = dict_get(body, "action", "unknown")
+
+    summary = prompt(
+        "Summarize this GitHub event and suggest actions:\n" + repr(body),
+        max_tokens = 200,
+    )
+
+    return {"status": 200, "body": {"action": action, "summary": summary}}
+
+def handle_alert(event):
+    body = event["body"]
+    severity = dict_get(body, "severity", "unknown")
+
+    diagnosis = prompt(
+        "You are an SRE. Diagnose this alert — root cause, mitigation, escalation:\n"
+        + repr(body),
+        max_tokens = 300,
+    )
+
+    return {"status": 200, "body": {"severity": severity, "diagnosis": diagnosis}}
+```
+
+### Testing an Event-Driven Agent
+
+```bash
+# Start the server
+app-agent serve agents/webhook.star --port 8080
+
+# In another terminal:
+# Health check (built-in, always available)
+curl http://localhost:8080/health
+
+# Simple ping (no LLM call)
+curl http://localhost:8080/ping
+
+# GitHub webhook
+curl -X POST http://localhost:8080/github \
+  -H "Content-Type: application/json" \
+  -d '{"action": "opened", "pull_request": {"title": "Add login", "user": {"login": "alice"}}}'
+
+# Alert
+curl -X POST http://localhost:8080/alert \
+  -H "Content-Type: application/json" \
+  -d '{"severity": "high", "service": "payments", "message": "p99 latency > 2s"}'
+```
+
+### Routing Patterns
+
+Route by path, method, headers, or body content:
+
+```python
+def agent(event):
+    path = event["path"]
+    method = event["method"]
+
+    # Path-based routing
+    if path == "/webhooks/github":
+        return handle_github(event)
+    if path == "/webhooks/slack":
+        return handle_slack(event)
+
+    # Method-based routing
+    if path == "/tasks" and method == "POST":
+        return create_task(event)
+    if path == "/tasks" and method == "GET":
+        return list_tasks(event)
+
+    # Header-based routing
+    if "x-github-event" in event["headers"]:
+        return handle_github(event)
+
+    return {"status": 404, "body": {"error": "Not found"}}
+```
+
+### Starlark Tips for Event Handlers
+
+Starlark dicts don't have `.get()` — use `in` checks or a helper:
+
+```python
+# Option 1: check with `in`
+if "action" in body:
+    action = body["action"]
+else:
+    action = "unknown"
+
+# Option 2: helper function (define once, reuse)
+def dict_get(d, key, default = None):
+    if key in d:
+        return d[key]
+    return default
+
+action = dict_get(body, "action", "unknown")
+```
+
+## Sessions, Checkpointing, and Replay
+
+When an agent runs via `app-agent serve`, every execution becomes a **session** with a unique ID. The session's call log (all host function calls with their cached results) can be saved and later used to **replay** the agent — re-executing the Starlark code but returning cached results instead of hitting LLMs.
+
+### Session API (HTTP)
+
+```
+POST /sessions                  → create session, run agent
+GET  /sessions                  → list all sessions
+GET  /sessions/{id}             → get session result
+GET  /sessions/{id}/checkpoint  → get the call log
+POST /sessions/{id}/replay      → replay session from its checkpoint
+```
+
+**Create a session:**
+```bash
+curl -X POST http://localhost:8080/sessions \
+  -H "Content-Type: application/json" \
+  -d '{"input": {"document": "Rust is a systems language."}}'
+```
+
+Response:
+```json
+{
+  "id": "c4cac6c7-4092-4df4-a0fe-c67dd3951792",
+  "status": "completed",
+  "output": {"summary": "...", "action_items": "..."}
+}
+```
+
+**Get the checkpoint (call log):**
+```bash
+curl http://localhost:8080/sessions/c4cac6c7-.../checkpoint
+```
+
+**Replay from a checkpoint:**
+```bash
+curl -X POST http://localhost:8080/sessions \
+  -H "Content-Type: application/json" \
+  -d @checkpoint.json   # {"input": ..., "replay_from": [...]}
+```
+
+### Python SDK
+
+The Python SDK (`sdk/python/app_agent/`) is a pure-stdlib client — no `pip install`, no native bindings, just HTTP calls to a running `app-agent serve` instance.
+
+```python
+import sys
+sys.path.insert(0, "sdk/python")
+
+from app_agent import AgentClient, Checkpoint
+
+client = AgentClient("http://localhost:8080")
+
+# Run an agent — live LLM calls
+session = client.run({"document": "Rust is great."})
+print(session.output)  # {"summary": "...", "action_items": "..."}
+print(session.status)  # "completed"
+
+# Get and save the checkpoint
+checkpoint = session.checkpoint()
+checkpoint.save("session.json")
+
+# Later: replay — zero LLM calls, identical output
+cp = Checkpoint.load("session.json")
+replayed = client.replay(cp)
+assert replayed.output == session.output
+
+# Multi-session workflow
+for doc in documents:
+    s = client.run({"document": doc})
+    s.checkpoint().save(f"checkpoints/{s.id}.json")
+
+# List all sessions on the server
+for s in client.list_sessions():
+    print(s["id"], s["status"])
+```
+
+### What Replay Guarantees
+
+Starlark is **deterministic**: same inputs + same cached host function results → same control flow. This means replay is:
+
+- **Exact:** Same output, byte-for-byte.
+- **Fast:** No LLM round trips (replayed sessions complete in milliseconds).
+- **Cheap:** Zero token cost.
+- **Useful for:**
+  - **Debugging** — reproduce a failed run locally without spending money on LLM calls
+  - **Testing** — check in a checkpoint, assert `agent()` output hasn't regressed
+  - **Crash recovery** — if an agent crashes mid-execution, replay from the last checkpoint
+  - **Human-in-the-loop** — `input()` suspends execution; replay resumes exactly where it paused
+  - **Development** — iterate on downstream logic without re-running earlier LLM calls
+
+### Checkpoint Format
+
+A checkpoint is a JSON object with the session input and call log:
+
+```json
+{
+  "session_id": "c4cac6c7-...",
+  "input": {"document": "Rust is great."},
+  "call_log": [
+    {
+      "seq": 1,
+      "function": "prompt",
+      "args": {"text": "Summarize...", "model": "claude-sonnet"},
+      "result": "Here are 3 bullets...",
+      "duration_ms": 2024,
+      "token_usage": {"input_tokens": 26, "output_tokens": 66},
+      "timestamp": "2026-04-11T21:10:24.362337Z"
+    },
+    ...
+  ]
+}
+```
+
+### How Replay Works Internally
+
+1. The runtime loads the checkpoint's call log into a `RuntimeContext::with_replay()`.
+2. The agent's `.star` file is parsed and `agent()` is called with the original input.
+3. Each host function call (`prompt`, `tool`, `http`, etc.) assigns itself a sequence number.
+4. Before executing, the host function calls `ctx.try_replay(seq)` — if there's a matching record in the replay log, it returns the cached result instantly.
+5. Past the end of the replay log, execution continues normally with live calls — new results are appended to the log.
+
+Because Starlark guarantees determinism, the sequence numbers always match up, and the agent takes the same control-flow path it did on the original run.
+
+## CLI Reference
+
+```
+app-agent run <file.star> [--input key=value]... [--trace] [--verbose]
+app-agent check <file.star>
+app-agent tools [--dir <path>]...
+app-agent serve <file.star> [--port 8080] [--verbose]
+```
+
+**`serve` exposes:**
+- `GET /health` — health check
+- `ANY /*` — fallback: any request → `agent(event)`
+- `POST /sessions` — create session
+- `GET /sessions` — list sessions
+- `GET /sessions/{id}` — get session
+- `GET /sessions/{id}/checkpoint` — get call log
+- `POST /sessions/{id}/replay` — replay from checkpoint
+
+**Input formats:**
+- `--input key=value` — string value
+- `--input key=@file.txt` — read value from file
+- `--input '{"key": "value"}'` — JSON object (merged into inputs)
+
+**Environment variables for providers:**
+- `ANTHROPIC_API_KEY` — use Anthropic API directly (models starting with `claude`)
+- `OPENAI_API_KEY` — use OpenAI API directly (models starting with `gpt`, `o1`, `o3`)
+- `LITELLM_API_URL` + `LITELLM_API_KEY` — use a LiteLLM proxy (or any OpenAI-compatible endpoint) as a catch-all provider for any model name
+
+## Execution Model
+
+1. The `.star` file is parsed and the module is evaluated (runs `config()`, defines functions).
+2. The `agent()` function is called with the provided inputs.
+3. Every host function call (`prompt`, `tool`, etc.) is a **checkpoint boundary** — the runtime logs the call, its arguments, and its result.
+4. The return value of `agent()` is serialized as JSON and printed to stdout.
+
+**Checkpointing:** Because Starlark is deterministic, execution can be replayed from a checkpoint by re-running the code and returning cached results for already-completed host function calls. This enables pause/resume, human-in-the-loop workflows, and crash recovery.
+
+**Tracing:** Use `--trace` to see the full call log as structured JSON, including timestamps, durations, and token usage for each host function call.
+
+## Output Format
+
+Agent output is always JSON, printed to stdout. The return value of `agent()` is serialized:
+- Dicts → JSON objects
+- Lists → JSON arrays
+- Strings → JSON strings
+- Numbers → JSON numbers
+- Booleans → JSON booleans
+- None → JSON null
+
+Traces and diagnostics go to stderr.
+
+## Complete Example
+
+```python
+# agents/deep_researcher.star
+config(model = "claude-sonnet", max_turns = 15)
+
+def agent(question, depth = "standard"):
+    queries = prompt(
+        "Generate 3 search queries for: " + question
+        + "\nReturn as a JSON array of strings.",
+        format = "json",
+    )
+
+    all_results = parallel([
+        lambda q = q: tool("web_search", query = q)
+        for q in queries
+    ])
+
+    sources = []
+    if depth == "deep":
+        urls = [r["url"] for batch in all_results for r in batch[:2]]
+        sources = parallel([
+            lambda u = u: tool("fetch_url", url = u)
+            for u in urls
+        ])
+
+    answer = prompt(template("prompts/research.jinja",
+        question = question,
+        results = all_results,
+        sources = sources,
+    ), model = "claude-opus", temperature = 0.3)
+
+    final = prompt(
+        "Fact-check this answer. Return the corrected version.\n\n" + answer,
+    )
+
+    return {
+        "answer": final,
+        "sources": all_results,
+        "queries_used": queries,
+    }
+```

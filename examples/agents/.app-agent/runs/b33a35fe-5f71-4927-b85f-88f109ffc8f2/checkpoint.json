@@ -1,0 +1,66 @@
+[
+  {
+    "seq": 1,
+    "function": "log",
+    "args": {
+      "message": "running kitchen sink"
+    },
+    "result": null,
+    "duration_ms": 0,
+    "timestamp": "2026-04-20T05:01:10.940487Z"
+  },
+  {
+    "seq": 2,
+    "function": "memory",
+    "args": {
+      "action": "set",
+      "key": "ks:last_name",
+      "namespace": "default",
+      "prefix": ""
+    },
+    "result": null,
+    "duration_ms": 0,
+    "timestamp": "2026-04-20T05:01:10.941071Z"
+  },
+  {
+    "seq": 3,
+    "function": "memory",
+    "args": {
+      "action": "get",
+      "key": "ks:last_name",
+      "namespace": "default",
+      "prefix": ""
+    },
+    "result": "world",
+    "duration_ms": 0,
+    "timestamp": "2026-04-20T05:01:10.941180Z"
+  },
+  {
+    "seq": 4,
+    "function": "exec_expr",
+    "args": {
+      "fuel": 1000000,
+      "source": "10 / 0",
+      "vars": {}
+    },
+    "result": null,
+    "duration_ms": 3,
+    "timestamp": "2026-04-20T05:01:10.944429Z",
+    "error": "expr runtime error: div by zero"
+  },
+  {
+    "seq": 5,
+    "function": "exec_expr",
+    "args": {
+      "fuel": 1000000,
+      "source": "if a > b then a * 2 else b * 2",
+      "vars": {
+        "a": 7,
+        "b": 4
+      }
+    },
+    "result": "14",
+    "duration_ms": 0,
+    "timestamp": "2026-04-20T05:01:10.951172Z"
+  }
+]

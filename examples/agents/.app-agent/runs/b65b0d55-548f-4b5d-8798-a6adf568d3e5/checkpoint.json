@@ -1,0 +1,17 @@
+[
+  {
+    "seq": 1,
+    "function": "call_agent",
+    "args": {
+      "kwargs": {
+        "x": "3",
+        "y": "4"
+      },
+      "path": "examples/agents/subagent_child.star"
+    },
+    "result": null,
+    "duration_ms": 0,
+    "timestamp": "2026-04-13T23:55:36.177743Z",
+    "error": "Traceback (most recent call last):\n  File <builtin>, in <module>\nerror: Operation `*` not supported for types `string` and `string`\n --> examples/agents/subagent_child.star:2:38\n  |\n2 |     return {\"sum\": x + y, \"product\": x * y}\n  |                                      ^^^^^\n  |\n"
+  }
+]

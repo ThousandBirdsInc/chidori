@@ -1,0 +1,340 @@
+[
+  {
+    "seq": 1,
+    "function": "shell",
+    "args": {
+      "args": [
+        "branch",
+        "--show-current"
+      ],
+      "command": "git",
+      "cwd": ".",
+      "timeout_ms": 2000
+    },
+    "result": {
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "main\n",
+      "timed_out": false
+    },
+    "duration_ms": 11,
+    "timestamp": "2026-04-16T18:20:30.726743Z"
+  },
+  {
+    "seq": 2,
+    "function": "shell",
+    "args": {
+      "args": [
+        "+%Y-%m-%d %H:%M"
+      ],
+      "command": "date",
+      "cwd": null,
+      "timeout_ms": 1000
+    },
+    "result": {
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "2026-04-16 11:20\n",
+      "timed_out": false
+    },
+    "duration_ms": 2,
+    "timestamp": "2026-04-16T18:20:30.729840Z"
+  },
+  {
+    "seq": 3,
+    "function": "shell",
+    "args": {
+      "args": [
+        "-1",
+        "."
+      ],
+      "command": "ls",
+      "cwd": null,
+      "timeout_ms": 2000
+    },
+    "result": {
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "Cargo.lock\nCargo.toml\nDESIGN.md\nREADME.md\nTODO.md\ndocs\nexamples\nllm.txt\nsandbox-js\nsandbox-python\nsandbox-runtime\nscripts\nsdk\nsrc\ntarget\n",
+      "timed_out": false
+    },
+    "duration_ms": 2,
+    "timestamp": "2026-04-16T18:20:30.732602Z"
+  },
+  {
+    "seq": 4,
+    "function": "prompt",
+    "args": {
+      "model": "claude-sonnet-4-6",
+      "text": "What is this project? List the top-level files and give me a one-paragraph summary.",
+      "tools": [
+        "text_editor",
+        "tree",
+        "search",
+        "shell_exec",
+        "create_file",
+        "read",
+        "todo",
+        "analyze"
+      ],
+      "turn": 0
+    },
+    "result": {
+      "blocks": [
+        {
+          "id": "toolu_013qHa436rmQ9U6ZZdhfteeT",
+          "input": {
+            "max_depth": 2,
+            "path": "."
+          },
+          "name": "tree",
+          "type": "tool_use"
+        },
+        {
+          "id": "toolu_01VZtSh6khrkPKhPrqNFpVrS",
+          "input": {
+            "path": "README.md"
+          },
+          "name": "read",
+          "type": "tool_use"
+        }
+      ],
+      "content": "",
+      "input_tokens": 1876,
+      "output_tokens": 106,
+      "stop_reason": "tool_use",
+      "tool_calls": [
+        {
+          "id": "toolu_013qHa436rmQ9U6ZZdhfteeT",
+          "input": {
+            "max_depth": 2,
+            "path": "."
+          },
+          "name": "tree"
+        },
+        {
+          "id": "toolu_01VZtSh6khrkPKhPrqNFpVrS",
+          "input": {
+            "path": "README.md"
+          },
+          "name": "read"
+        }
+      ]
+    },
+    "duration_ms": 2089,
+    "token_usage": {
+      "input_tokens": 1876,
+      "output_tokens": 106
+    },
+    "timestamp": "2026-04-16T18:20:32.822607Z"
+  },
+  {
+    "seq": 6,
+    "function": "shell",
+    "args": {
+      "args": [
+        ".",
+        "-maxdepth",
+        "2",
+        "-type",
+        "d",
+        "-not",
+        "-path",
+        "*/.git/*",
+        "-not",
+        "-path",
+        "*/node_modules/*",
+        "-not",
+        "-path",
+        "*/target/*",
+        "-not",
+        "-path",
+        "*/__pycache__/*",
+        "-not",
+        "-path",
+        "*/.venv/*"
+      ],
+      "command": "find",
+      "cwd": null,
+      "timeout_ms": 5000
+    },
+    "result": {
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": ".\n./target\n./sandbox-runtime\n./sandbox-runtime/target\n./sandbox-runtime/src\n./.claude\n./docs\n./.app-agent\n./.app-agent/memory\n./.app-agent/wasm-cache\n./sandbox-js\n./sandbox-js/target\n./sandbox-js/src\n./sdk\n./sdk/python\n./sdk/typescript\n./examples\n./examples/tools\n./examples/coding-agent\n./examples/agents\n./examples/prompts\n./scripts\n./sandbox-python\n./sandbox-python/target\n./sandbox-python/src\n./.git\n./src\n./src/tools\n./src/providers\n./src/runtime\n./src/mcp\n",
+      "timed_out": false
+    },
+    "duration_ms": 6,
+    "timestamp": "2026-04-16T18:20:32.829424Z"
+  },
+  {
+    "seq": 7,
+    "function": "shell",
+    "args": {
+      "args": [
+        ".",
+        "-maxdepth",
+        "2",
+        "-type",
+        "f",
+        "-not",
+        "-path",
+        "*/.git/*",
+        "-not",
+        "-path",
+        "*/node_modules/*",
+        "-not",
+        "-path",
+        "*/target/*",
+        "-not",
+        "-path",
+        "*/__pycache__/*",
+        "-not",
+        "-path",
+        "*/.venv/*"
+      ],
+      "command": "find",
+      "cwd": null,
+      "timeout_ms": 5000
+    },
+    "result": {
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "./Cargo.toml\n./sandbox-runtime/Cargo.toml\n./sandbox-runtime/Cargo.lock\n./.claude/settings.local.json\n./Cargo.lock\n./TODO.md\n./README.md\n./sandbox-js/Cargo.toml\n./sandbox-js/Cargo.lock\n./.gitignore\n./examples/sdk_demo.py\n./scripts/build-wasm.sh\n./llm.txt\n./sandbox-python/Cargo.toml\n./sandbox-python/Cargo.lock\n./DESIGN.md\n./src/policy.rs\n./src/server.rs\n./src/scheduler.rs\n./src/main.rs\n./src/storage.rs\n./src/recipes.rs\n./src/acp.rs\n",
+      "timed_out": false
+    },
+    "duration_ms": 2,
+    "timestamp": "2026-04-16T18:20:32.832465Z"
+  },
+  {
+    "seq": 8,
+    "function": "shell",
+    "args": {
+      "args": [
+        "-l",
+        "./.claude/settings.local.json",
+        "./.gitignore",
+        "./Cargo.lock",
+        "./Cargo.toml",
+        "./DESIGN.md",
+        "./README.md",
+        "./TODO.md",
+        "./examples/sdk_demo.py",
+        "./llm.txt",
+        "./sandbox-js/Cargo.lock",
+        "./sandbox-js/Cargo.toml",
+        "./sandbox-python/Cargo.lock",
+        "./sandbox-python/Cargo.toml",
+        "./sandbox-runtime/Cargo.lock",
+        "./sandbox-runtime/Cargo.toml",
+        "./scripts/build-wasm.sh",
+        "./src/acp.rs",
+        "./src/main.rs",
+        "./src/policy.rs",
+        "./src/recipes.rs",
+        "./src/scheduler.rs",
+        "./src/server.rs",
+        "./src/storage.rs"
+      ],
+      "command": "wc",
+      "cwd": null,
+      "timeout_ms": 10000
+    },
+    "result": {
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "      21 ./.claude/settings.local.json\n       1 ./.gitignore\n    4384 ./Cargo.lock\n      66 ./Cargo.toml\n     903 ./DESIGN.md\n     272 ./README.md\n     321 ./TODO.md\n     114 ./examples/sdk_demo.py\n     780 ./llm.txt\n    1240 ./sandbox-js/Cargo.lock\n      27 ./sandbox-js/Cargo.toml\n    2136 ./sandbox-python/Cargo.lock\n      28 ./sandbox-python/Cargo.toml\n       7 ./sandbox-runtime/Cargo.lock\n      22 ./sandbox-runtime/Cargo.toml\n      30 ./scripts/build-wasm.sh\n     185 ./src/acp.rs\n     681 ./src/main.rs\n     130 ./src/policy.rs\n      77 ./src/recipes.rs\n     142 ./src/scheduler.rs\n    1025 ./src/server.rs\n     208 ./src/storage.rs\n   12800 total\n",
+      "timed_out": false
+    },
+    "duration_ms": 4,
+    "timestamp": "2026-04-16T18:20:32.837408Z"
+  },
+  {
+    "seq": 5,
+    "function": "tool",
+    "args": {
+      "kwargs": {
+        "max_depth": 2,
+        "path": "."
+      },
+      "name": "tree"
+    },
+    "result": "{\"dir_count\":31,\"file_count\":23,\"tree\":\"./\\n./.app-agent/\\n./.app-agent/memory/\\n./.app-agent/wasm-cache/\\n./.claude/\\n./.git/\\n./docs/\\n./examples/\\n./examples/agents/\\n./examples/coding-agent/\\n./examples/prompts/\\n./examples/tools/\\n./sandbox-js/\\n./sandbox-js/src/\\n./sandbox-js/target/\\n./sandbox-python/\\n./sandbox-python/src/\\n./sandbox-python/target/\\n./sandbox-runtime/\\n./sandbox-runtime/src/\\n./sandbox-runtime/target/\\n./scripts/\\n./sdk/\\n./sdk/python/\\n./sdk/typescript/\\n./src/\\n./src/mcp/\\n./src/providers/\\n./src/runtime/\\n./src/tools/\\n./target/\\n21 ./.claude/settings.local.json\\n1 ./.gitignore\\n4384 ./Cargo.lock\\n66 ./Cargo.toml\\n903 ./DESIGN.md\\n272 ./README.md\\n321 ./TODO.md\\n114 ./examples/sdk_demo.py\\n780 ./llm.txt\\n1240 ./sandbox-js/Cargo.lock\\n27 ./sandbox-js/Cargo.toml\\n2136 ./sandbox-python/Cargo.lock\\n28 ./sandbox-python/Cargo.toml\\n7 ./sandbox-runtime/Cargo.lock\\n22 ./sandbox-runtime/Cargo.toml\\n30 ./scripts/build-wasm.sh\\n185 ./src/acp.rs\\n681 ./src/main.rs\\n130 ./src/policy.rs\\n77 ./src/recipes.rs\\n142 ./src/scheduler.rs\\n1025 ./src/server.rs\\n208 ./src/storage.rs\"}",
+    "duration_ms": 14,
+    "timestamp": "2026-04-16T18:20:32.837575Z"
+  },
+  {
+    "seq": 10,
+    "function": "read_file",
+    "args": {
+      "path": "README.md"
+    },
+    "result": "# App Agent Framework\n\nA YAML-free AI agent framework where agents are written as **Starlark** scripts — a deterministic Python dialect that enables checkpointing, replay, and visual editing.\n\n- **Agents look like Python.** Native control flow, variables, list comprehensions — no template DSL.\n- **Deterministic execution.** Every side effect goes through a host function the runtime can log, cache, and replay.\n- **Zero-cost checkpointing.** Save a session's call log to disk, replay it later for identical output with zero LLM calls.\n- **Event-driven agents.** Agents can run as HTTP servers that react to webhooks and other events.\n- **Rust core, Python SDK.** The runtime is a single binary. The Python SDK talks to it over HTTP — no `pip install`, no native bindings.\n\n## Quick Start\n\n### 1. Write an agent\n\n```python\n# agents/summarizer.star\nconfig(model = \"claude-sonnet\")\n\ndef agent(document):\n    summary = prompt(\"Summarize in 3 bullets:\\n\" + document)\n    actions = prompt(\"Extract action items:\\n\" + summary)\n    return {\"summary\": summary, \"action_items\": actions}\n```\n\n### 2. Run it\n\n```bash\n# Set up LLM provider (uses LiteLLM in this example)\nexport LITELLM_API_URL=http://localhost:4401/v1\nexport LITELLM_API_KEY=sk-litellm-master-key\n\n# Or use providers directly\n# export ANTHROPIC_API_KEY=sk-ant-...\n# export OPENAI_API_KEY=sk-...\n\ncargo build\n./target/debug/app-agent run agents/summarizer.star \\\n  --input document=\"Rust is a systems programming language...\"\n```\n\n### 3. Try the example agents\n\n```bash\n# Minimal agent — no LLM calls needed\n./target/debug/app-agent run examples/agents/hello.star --input name=Colton\n\n# Summarizer with trace\n./target/debug/app-agent run examples/agents/summarizer.star \\\n  --input document=\"Rust is great.\" --trace\n\n# Template-based agent\n./target/debug/app-agent run examples/agents/template_demo.star \\\n  --input '{\"items\": [\"alpha\", \"beta\", \"gamma\"]}'\n\n# Event-driven webhook handler\n./target/debug/app-agent serve examples/agents/webhook.star --port 8080\n```\n\n## Core Concepts\n\nAn agent is a `.star` file with a `def agent(...)` function. The runtime provides a fixed set of **host functions** for side effects — everything else is pure Starlark:\n\n| Function | Purpose |\n|---|---|\n| `prompt(text, ...)` | Send to an LLM, return string or parsed JSON |\n| `template(str_or_path, ...)` | Render a Jinja2 template with minijinja |\n| `tool(name, ...)` | Invoke a registered tool |\n| `agent(name, ...)` | Call a sub-agent |\n| `parallel(fns)` | Run functions concurrently |\n| `input(msg, ...)` | Human-in-the-loop — pauses execution |\n| `exec(code, ...)` | Run AI-generated code in a WASM sandbox |\n| `http(method, url, ...)` | Make an HTTP request |\n| `memory(action, ...)` | Persistent storage (key-value + vector) |\n| `log(msg, ...)` | Structured logging |\n| `env(name)` | Read environment variables |\n| `retry(fn, ...)` | Retry with backoff |\n| `try_call(fn)` | Capture errors without raising |\n\nSee [`llm.txt`](./llm.txt) for the full API reference.\n\n## Running Modes\n\n### 1. One-shot CLI\n\n```bash\napp-agent run agents/my_agent.star --input key=value\napp-agent run agents/my_agent.star --input '{\"complex\": \"input\"}'\napp-agent check agents/my_agent.star          # validate without running\napp-agent tools --dir tools/                   # list available tools\n```\n\n### 2. HTTP Server (event-driven + session API)\n\n```bash\napp-agent serve agents/my_agent.star --port 8080\n```\n\nExposes:\n- `GET  /health` — health check\n- `ANY  /*` — any request is passed to `agent(event)` as an event dict\n- `POST /sessions` — create a session and run the agent with given input\n- `GET  /sessions` — list all sessions\n- `GET  /sessions/{id}` — get session result\n- `GET  /sessions/{id}/checkpoint` — get the call log (for replay)\n- `POST /sessions/{id}/replay` — replay from a session's checkpoint\n\n### 3. Event-Driven Agents\n\nAn agent can handle incoming HTTP events:\n\n```python\n# agents/webhook.star\nconfig(model = \"claude-sonnet\")\n\ndef agent(event):\n    if event[\"path\"] == \"/github\":\n        body = event[\"body\"]\n        summary = prompt(\"Summarize this GitHub event:\\n\" + repr(body))\n        return {\"status\": 200, \"body\": {\"summary\": summary}}\n\n    return {\"status\": 404, \"body\": {\"error\": \"Unknown path\"}}\n```\n\n```bash\napp-agent serve agents/webhook.star --port 8080\n\ncurl -X POST http://localhost:8080/github \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"action\": \"opened\", \"pull_request\": {\"title\": \"Add login\"}}'\n```\n\n## Python SDK\n\nThe Python SDK is a pure-stdlib HTTP client that talks to a running `app-agent serve` instance. No `pip install`, no native bindings.\n\n```python\nimport sys\nsys.path.insert(0, \"sdk/python\")\n\nfrom app_agent import AgentClient, Checkpoint\n\nclient = AgentClient(\"http://localhost:8080\")\n\n# Create a session (runs the agent with live LLM calls)\nsession = client.run({\"document\": \"Rust is a systems language.\"})\nprint(session.output)\n# {\"summary\": \"...\", \"action_items\": \"...\"}\n\n# Save a checkpoint to disk\ncheckpoint = session.checkpoint()\ncheckpoint.save(\"/tmp/session.json\")\n```\n\nLater, replay the session from disk — **zero LLM calls**:\n\n```python\nfrom app_agent import AgentClient, Checkpoint\n\nclient = AgentClient(\"http://localhost:8080\")\ncp = Checkpoint.load(\"/tmp/session.json\")\n\n# Replay: re-executes Starlark but returns cached LLM results\nreplayed = client.replay(cp)\nassert replayed.output == session.output  # identical output\n```\n\n## How Replay Works\n\nStarlark is deterministic. Given the same inputs and the same cached results for host function calls, the agent's control flow is guaranteed to produce the same outputs.\n\n1. **Original run:** Every `prompt()`, `tool()`, `http()` call is logged with seq number + result.\n2. **Checkpoint:** The call log is a JSON array — save it to disk, send it over the wire, commit it to git.\n3. **Replay:** Re-run the agent with the call log pre-loaded. Each host function call checks the log for its seq number — hit returns the cached result instantly, miss executes normally.\n\nThis means you can:\n- **Debug without spending money:** save a failing session, replay locally with breakpoints.\n- **Run deterministic tests:** check in a checkpoint, assert the agent's behavior hasn't changed.\n- **Resume after crashes:** the runtime can persist checkpoints after each call; on restart, replay picks up where it left off.\n- **Pause for human approval:** `input()` suspends execution; when the human responds, the agent replays to that point and continues.\n\n## Examples\n\nSee [`examples/`](./examples):\n\n- [`agents/hello.star`](./examples/agents/hello.star) — minimal agent, no LLM\n- [`agents/summarizer.star`](./examples/agents/summarizer.star) — 2-step LLM pipeline\n- [`agents/template_demo.star`](./examples/agents/template_demo.star) — Jinja2 prompt templates\n- [`agents/webhook.star`](./examples/agents/webhook.star) — event-driven HTTP handler\n- [`sdk_demo.py`](./examples/sdk_demo.py) — Python SDK with checkpointing + replay\n- [`prompts/analysis.jinja`](./examples/prompts/analysis.jinja) — shared prompt template\n- [`tools/greet.star`](./examples/tools/greet.star) — simple tool definition\n\n## Architecture\n\n```\n┌─────────────────────────────────────────────────────┐\n│  User code (.star files, .jinja prompts, Python SDK) │\n└────────────────────────┬────────────────────────────┘\n                         │\n┌────────────────────────▼────────────────────────────┐\n│               Rust Core Runtime                      │\n│                                                      │\n│  ┌─────────────┐ ┌──────────────┐ ┌──────────────┐  │\n│  │  Starlark   │ │ Host Function│ │  Checkpoint  │  │\n│  │  Evaluator  │ │ Registry     │ │  / Replay    │  │\n│  └─────────────┘ └──────────────┘ └──────────────┘  │\n│  ┌─────────────┐ ┌──────────────┐ ┌──────────────┐  │\n│  │  LLM Client │ │  Template    │ │  HTTP Server │  │\n│  │  (providers)│ │  (minijinja) │ │  (axum)      │  │\n│  └─────────────┘ └──────────────┘ └──────────────┘  │\n└──────────────────────────────────────────────────────┘\n```\n\n- **Starlark evaluator** (`starlark-rust` crate) parses `.star` files and executes them.\n- **Host functions** (`#[starlark_module]`) are the only way agents touch the outside world.\n- **Checkpoint/replay engine** intercepts host calls for deterministic replay.\n- **LLM providers** (Anthropic, OpenAI, LiteLLM-compatible) are swappable via `reqwest`.\n- **Template engine** uses `minijinja` for Jinja2 prompt templates.\n- **HTTP server** (`axum`) powers the `serve` command and session API.\n\nSee [`DESIGN.md`](./DESIGN.md) for the full architecture and design rationale, and [`TODO.md`](./TODO.md) for the implementation roadmap.\n\n## Project Structure\n\n```\napp-agent-framework/\n├── src/\n│   ├── main.rs             # CLI entry point\n│   ├── server.rs           # HTTP server (serve + session API)\n│   ├── runtime/\n│   │   ├── engine.rs       # Starlark evaluator + agent() invocation\n│   │   ├── host_functions.rs  # prompt, template, config, log, env\n│   │   ├── context.rs      # Runtime context (call log + replay)\n│   │   ├── call_log.rs     # Checkpoint data structures\n│   │   └── template.rs     # minijinja integration\n│   ├── providers/\n│   │   ├── mod.rs          # Provider registry, model routing\n│   │   ├── anthropic.rs    # Anthropic Messages API\n│   │   └── openai.rs       # OpenAI-compatible (incl. LiteLLM)\n│   └── tools/\n│       └── mod.rs          # Tool discovery + JSON schema generation\n├── sdk/\n│   └── python/app_agent/   # Python SDK (pure stdlib, no deps)\n├── examples/\n│   ├── agents/             # Example .star agents\n│   ├── prompts/            # Example .jinja templates\n│   ├── tools/              # Example tools\n│   └── sdk_demo.py         # Python SDK demo\n├── DESIGN.md               # Architecture & design rationale\n├── TODO.md                 # Implementation roadmap\n└── llm.txt                 # Complete API reference for LLM-assisted development\n```\n\n## Current Status\n\n**Phase 1 (Core Runtime)** — ✅ Working\n- Starlark evaluator with host functions (`prompt`, `template`, `config`, `log`, `env`)\n- LLM providers: Anthropic, OpenAI, LiteLLM/OpenAI-compatible\n- CLI: `run`, `check`, `tools`, `serve`\n- Template engine (minijinja)\n- Structured tracing & token accounting\n- Tool auto-discovery\n\n**Phase 2 (Sessions + Replay)** — ✅ Working\n- Session API (create, list, get, checkpoint, replay)\n- Replay-based checkpointing in the engine\n- Python SDK with checkpoint save/load\n- Event-driven agents over HTTP\n\n**Phase 3 (Visual Editor)** — 🚧 Not started. See [`DESIGN.md`](./DESIGN.md).\n\n**Phase 4 (Production)** — 🚧 Partial (serve works, memory/SDK packaging TBD).\n",
+    "duration_ms": 0,
+    "timestamp": "2026-04-16T18:20:32.837878Z"
+  },
+  {
+    "seq": 9,
+    "function": "tool",
+    "args": {
+      "kwargs": {
+        "path": "README.md"
+      },
+      "name": "read"
+    },
+    "result": "# README.md (273 lines total)\n1\t# App Agent Framework\n2\t\n3\tA YAML-free AI agent framework where agents are written as **Starlark** scripts — a deterministic Python dialect that enables checkpointing, replay, and visual editing.\n4\t\n5\t- **Agents look like Python.** Native control flow, variables, list comprehensions — no template DSL.\n6\t- **Deterministic execution.** Every side effect goes through a host function the runtime can log, cache, and replay.\n7\t- **Zero-cost checkpointing.** Save a session's call log to disk, replay it later for identical output with zero LLM calls.\n8\t- **Event-driven agents.** Agents can run as HTTP servers that react to webhooks and other events.\n9\t- **Rust core, Python SDK.** The runtime is a single binary. The Python SDK talks to it over HTTP — no `pip install`, no native bindings.\n10\t\n11\t## Quick Start\n12\t\n13\t### 1. Write an agent\n14\t\n15\t```python\n16\t# agents/summarizer.star\n17\tconfig(model = \"claude-sonnet\")\n18\t\n19\tdef agent(document):\n20\t    summary = prompt(\"Summarize in 3 bullets:\\n\" + document)\n21\t    actions = prompt(\"Extract action items:\\n\" + summary)\n22\t    return {\"summary\": summary, \"action_items\": actions}\n23\t```\n24\t\n25\t### 2. Run it\n26\t\n27\t```bash\n28\t# Set up LLM provider (uses LiteLLM in this example)\n29\texport LITELLM_API_URL=http://localhost:4401/v1\n30\texport LITELLM_API_KEY=sk-litellm-master-key\n31\t\n32\t# Or use providers directly\n33\t# export ANTHROPIC_API_KEY=sk-ant-...\n34\t# export OPENAI_API_KEY=sk-...\n35\t\n36\tcargo build\n37\t./target/debug/app-agent run agents/summarizer.star \\\n38\t  --input document=\"Rust is a systems programming language...\"\n39\t```\n40\t\n41\t### 3. Try the example agents\n42\t\n43\t```bash\n44\t# Minimal agent — no LLM calls needed\n45\t./target/debug/app-agent run examples/agents/hello.star --input name=Colton\n46\t\n47\t# Summarizer with trace\n48\t./target/debug/app-agent run examples/agents/summarizer.star \\\n49\t  --input document=\"Rust is great.\" --trace\n50\t\n51\t# Template-based agent\n52\t./target/debug/app-agent run examples/agents/template_demo.star \\\n53\t  --input '{\"items\": [\"alpha\", \"beta\", \"gamma\"]}'\n54\t\n55\t# Event-driven webhook handler\n56\t./target/debug/app-agent serve examples/agents/webhook.star --port 8080\n57\t```\n58\t\n59\t## Core Concepts\n60\t\n61\tAn agent is a `.star` file with a `def agent(...)` function. The runtime provides a fixed set of **host functions** for side effects — everything else is pure Starlark:\n62\t\n63\t| Function | Purpose |\n64\t|---|---|\n65\t| `prompt(text, ...)` | Send to an LLM, return string or parsed JSON |\n66\t| `template(str_or_path, ...)` | Render a Jinja2 template with minijinja |\n67\t| `tool(name, ...)` | Invoke a registered tool |\n68\t| `agent(name, ...)` | Call a sub-agent |\n69\t| `parallel(fns)` | Run functions concurrently |\n70\t| `input(msg, ...)` | Human-in-the-loop — pauses execution |\n71\t| `exec(code, ...)` | Run AI-generated code in a WASM sandbox |\n72\t| `http(method, url, ...)` | Make an HTTP request |\n73\t| `memory(action, ...)` | Persistent storage (key-value + vector) |\n74\t| `log(msg, ...)` | Structured logging |\n75\t| `env(name)` | Read environment variables |\n76\t| `retry(fn, ...)` | Retry with backoff |\n77\t| `try_call(fn)` | Capture errors without raising |\n78\t\n79\tSee [`llm.txt`](./llm.txt) for the full API reference.\n80\t\n81\t## Running Modes\n82\t\n83\t### 1. One-shot CLI\n84\t\n85\t```bash\n86\tapp-agent run agents/my_agent.star --input key=value\n87\tapp-agent run agents/my_agent.star --input '{\"complex\": \"input\"}'\n88\tapp-agent check agents/my_agent.star          # validate without running\n89\tapp-agent tools --dir tools/                   # list available tools\n90\t```\n91\t\n92\t### 2. HTTP Server (event-driven + session API)\n93\t\n94\t```bash\n95\tapp-agent serve agents/my_agent.star --port 8080\n96\t```\n97\t\n98\tExposes:\n99\t- `GET  /health` — health check\n100\t- `ANY  /*` — any request is passed to `agent(event)` as an event dict\n101\t- `POST /sessions` — create a session and run the agent with given input\n102\t- `GET  /sessions` — list all sessions\n103\t- `GET  /sessions/{id}` — get session result\n104\t- `GET  /sessions/{id}/checkpoint` — get the call log (for replay)\n105\t- `POST /sessions/{id}/replay` — replay from a session's checkpoint\n106\t\n107\t### 3. Event-Driven Agents\n108\t\n109\tAn agent can handle incoming HTTP events:\n110\t\n111\t```python\n112\t# agents/webhook.star\n113\tconfig(model = \"claude-sonnet\")\n114\t\n115\tdef agent(event):\n116\t    if event[\"path\"] == \"/github\":\n117\t        body = event[\"body\"]\n118\t        summary = prompt(\"Summarize this GitHub event:\\n\" + repr(body))\n119\t        return {\"status\": 200, \"body\": {\"summary\": summary}}\n120\t\n121\t    return {\"status\": 404, \"body\": {\"error\": \"Unknown path\"}}\n122\t```\n123\t\n124\t```bash\n125\tapp-agent serve agents/webhook.star --port 8080\n126\t\n127\tcurl -X POST http://localhost:8080/github \\\n128\t  -H \"Content-Type: application/json\" \\\n129\t  -d '{\"action\": \"opened\", \"pull_request\": {\"title\": \"Add login\"}}'\n130\t```\n131\t\n132\t## Python SDK\n133\t\n134\tThe Python SDK is a pure-stdlib HTTP client that talks to a running `app-agent serve` instance. No `pip install`, no native bindings.\n135\t\n136\t```python\n137\timport sys\n138\tsys.path.insert(0, \"sdk/python\")\n139\t\n140\tfrom app_agent import AgentClient, Checkpoint\n141\t\n142\tclient = AgentClient(\"http://localhost:8080\")\n143\t\n144\t# Create a session (runs the agent with live LLM calls)\n145\tsession = client.run({\"document\": \"Rust is a systems language.\"})\n146\tprint(session.output)\n147\t# {\"summary\": \"...\", \"action_items\": \"...\"}\n148\t\n149\t# Save a checkpoint to disk\n150\tcheckpoint = session.checkpoint()\n151\tcheckpoint.save(\"/tmp/session.json\")\n152\t```\n153\t\n154\tLater, replay the session from disk — **zero LLM calls**:\n155\t\n156\t```python\n157\tfrom app_agent import AgentClient, Checkpoint\n158\t\n159\tclient = AgentClient(\"http://localhost:8080\")\n160\tcp = Checkpoint.load(\"/tmp/session.json\")\n161\t\n162\t# Replay: re-executes Starlark but returns cached LLM results\n163\treplayed = client.replay(cp)\n164\tassert replayed.output == session.output  # identical output\n165\t```\n166\t\n167\t## How Replay Works\n168\t\n169\tStarlark is deterministic. Given the same inputs and the same cached results for host function calls, the agent's control flow is guaranteed to produce the same outputs.\n170\t\n171\t1. **Original run:** Every `prompt()`, `tool()`, `http()` call is logged with seq number + result.\n172\t2. **Checkpoint:** The call log is a JSON array — save it to disk, send it over the wire, commit it to git.\n173\t3. **Replay:** Re-run the agent with the call log pre-loaded. Each host function call checks the log for its seq number — hit returns the cached result instantly, miss executes normally.\n174\t\n175\tThis means you can:\n176\t- **Debug without spending money:** save a failing session, replay locally with breakpoints.\n177\t- **Run deterministic tests:** check in a checkpoint, assert the agent's behavior hasn't changed.\n178\t- **Resume after crashes:** the runtime can persist checkpoints after each call; on restart, replay picks up where it left off.\n179\t- **Pause for human approval:** `input()` suspends execution; when the human responds, the agent replays to that point and continues.\n180\t\n181\t## Examples\n182\t\n183\tSee [`examples/`](./examples):\n184\t\n185\t- [`agents/hello.star`](./examples/agents/hello.star) — minimal agent, no LLM\n186\t- [`agents/summarizer.star`](./examples/agents/summarizer.star) — 2-step LLM pipeline\n187\t- [`agents/template_demo.star`](./examples/agents/template_demo.star) — Jinja2 prompt templates\n188\t- [`agents/webhook.star`](./examples/agents/webhook.star) — event-driven HTTP handler\n189\t- [`sdk_demo.py`](./examples/sdk_demo.py) — Python SDK with checkpointing + replay\n190\t- [`prompts/analysis.jinja`](./examples/prompts/analysis.jinja) — shared prompt template\n191\t- [`tools/greet.star`](./examples/tools/greet.star) — simple tool definition\n192\t\n193\t## Architecture\n194\t\n195\t```\n196\t┌─────────────────────────────────────────────────────┐\n197\t│  User code (.star files, .jinja prompts, Python SDK) │\n198\t└────────────────────────┬────────────────────────────┘\n199\t                         │\n200\t┌────────────────────────▼────────────────────────────┐\n201\t│               Rust Core Runtime                      │\n202\t│                                                      │\n203\t│  ┌─────────────┐ ┌──────────────┐ ┌──────────────┐  │\n204\t│  │  Starlark   │ │ Host Function│ │  Checkpoint  │  │\n205\t│  │  Evaluator  │ │ Registry     │ │  / Replay    │  │\n206\t│  └─────────────┘ └──────────────┘ └──────────────┘  │\n207\t│  ┌─────────────┐ ┌──────────────┐ ┌──────────────┐  │\n208\t│  │  LLM Client │ │  Template    │ │  HTTP Server │  │\n209\t│  │  (providers)│ │  (minijinja) │ │  (axum)      │  │\n210\t│  └─────────────┘ └──────────────┘ └──────────────┘  │\n211\t└──────────────────────────────────────────────────────┘\n212\t```\n213\t\n214\t- **Starlark evaluator** (`starlark-rust` crate) parses `.star` files and executes them.\n215\t- **Host functions** (`#[starlark_module]`) are the only way agents touch the outside world.\n216\t- **Checkpoint/replay engine** intercepts host calls for deterministic replay.\n217\t- **LLM providers** (Anthropic, OpenAI, LiteLLM-compatible) are swappable via `reqwest`.\n218\t- **Template engine** uses `minijinja` for Jinja2 prompt templates.\n219\t- **HTTP server** (`axum`) powers the `serve` command and session API.\n220\t\n221\tSee [`DESIGN.md`](./DESIGN.md) for the full architecture and design rationale, and [`TODO.md`](./TODO.md) for the implementation roadmap.\n222\t\n223\t## Project Structure\n224\t\n225\t```\n226\tapp-agent-framework/\n227\t├── src/\n228\t│   ├── main.rs             # CLI entry point\n229\t│   ├── server.rs           # HTTP server (serve + session API)\n230\t│   ├── runtime/\n231\t│   │   ├── engine.rs       # Starlark evaluator + agent() invocation\n232\t│   │   ├── host_functions.rs  # prompt, template, config, log, env\n233\t│   │   ├── context.rs      # Runtime context (call log + replay)\n234\t│   │   ├── call_log.rs     # Checkpoint data structures\n235\t│   │   └── template.rs     # minijinja integration\n236\t│   ├── providers/\n237\t│   │   ├── mod.rs          # Provider registry, model routing\n238\t│   │   ├── anthropic.rs    # Anthropic Messages API\n239\t│   │   └── openai.rs       # OpenAI-compatible (incl. LiteLLM)\n240\t│   └── tools/\n241\t│       └── mod.rs          # Tool discovery + JSON schema generation\n242\t├── sdk/\n243\t│   └── python/app_agent/   # Python SDK (pure stdlib, no deps)\n244\t├── examples/\n245\t│   ├── agents/             # Example .star agents\n246\t│   ├── prompts/            # Example .jinja templates\n247\t│   ├── tools/              # Example tools\n248\t│   └── sdk_demo.py         # Python SDK demo\n249\t├── DESIGN.md               # Architecture & design rationale\n250\t├── TODO.md                 # Implementation roadmap\n251\t└── llm.txt                 # Complete API reference for LLM-assisted development\n252\t```\n253\t\n254\t## Current Status\n255\t\n256\t**Phase 1 (Core Runtime)** — ✅ Working\n257\t- Starlark evaluator with host functions (`prompt`, `template`, `config`, `log`, `env`)\n258\t- LLM providers: Anthropic, OpenAI, LiteLLM/OpenAI-compatible\n259\t- CLI: `run`, `check`, `tools`, `serve`\n260\t- Template engine (minijinja)\n261\t- Structured tracing & token accounting\n262\t- Tool auto-discovery\n263\t\n264\t**Phase 2 (Sessions + Replay)** — ✅ Working\n265\t- Session API (create, list, get, checkpoint, replay)\n266\t- Replay-based checkpointing in the engine\n267\t- Python SDK with checkpoint save/load\n268\t- Event-driven agents over HTTP\n269\t\n270\t**Phase 3 (Visual Editor)** — 🚧 Not started. See [`DESIGN.md`](./DESIGN.md).\n271\t\n272\t**Phase 4 (Production)** — 🚧 Partial (serve works, memory/SDK packaging TBD).\n273\t",
+    "duration_ms": 0,
+    "timestamp": "2026-04-16T18:20:32.838020Z"
+  },
+  {
+    "seq": 11,
+    "function": "prompt",
+    "args": {
+      "model": "claude-sonnet-4-6",
+      "text": "What is this project? List the top-level files and give me a one-paragraph summary.",
+      "tools": [
+        "text_editor",
+        "tree",
+        "search",
+        "shell_exec",
+        "create_file",
+        "read",
+        "todo",
+        "analyze"
+      ],
+      "turn": 1
+    },
+    "result": {
+      "blocks": [
+        {
+          "text": "## Top-Level Files & Directories\n\n| Path | Description |\n|---|---|\n| `Cargo.toml` / `Cargo.lock` | Rust workspace manifest and lockfile |\n| `src/` | Main Rust source (runtime, server, providers, tools) |\n| `sdk/` | Python & TypeScript SDKs |\n| `examples/` | Example agents, prompts, tools, and SDK demo |\n| `sandbox-js/` | WASM sandbox for running AI-generated JavaScript |\n| `sandbox-python/` | WASM sandbox for running AI-generated Python |\n| `sandbox-runtime/` | Shared WASM sandbox runtime |\n| `scripts/` | Build scripts (e.g., WASM compilation) |\n| `docs/` | Additional documentation |\n| `DESIGN.md` | Full architecture & design rationale |\n| `README.md` | Project overview and quick start |\n| `TODO.md` | Implementation roadmap |\n| `llm.txt` | Complete API reference for LLM-assisted development |\n\n## Summary\n\n**App Agent Framework** is a YAML-free AI agent framework where agents are written as **Starlark** scripts (a deterministic, Python-dialect language). Its Rust core runtime executes `.star` agent files, providing a fixed set of host functions — `prompt()`, `tool()`, `http()`, `memory()`, `exec()`, and others — as the only interface to the outside world. Because Starlark is deterministic and all side effects are logged, the framework supports **zero-cost checkpointing and replay**: an agent's full execution can be saved to disk and re-run later with zero LLM API calls, enabling cheap debugging, deterministic testing, and crash recovery. The runtime can be used as a one-shot CLI (`app-agent run`) or as an HTTP server (`app-agent serve`) for event-driven/webhook agents, and is complemented by a pure-stdlib Python SDK (no `pip install` required) that communicates with the server over HTTP.",
+          "type": "text"
+        }
+      ],
+      "content": "## Top-Level Files & Directories\n\n| Path | Description |\n|---|---|\n| `Cargo.toml` / `Cargo.lock` | Rust workspace manifest and lockfile |\n| `src/` | Main Rust source (runtime, server, providers, tools) |\n| `sdk/` | Python & TypeScript SDKs |\n| `examples/` | Example agents, prompts, tools, and SDK demo |\n| `sandbox-js/` | WASM sandbox for running AI-generated JavaScript |\n| `sandbox-python/` | WASM sandbox for running AI-generated Python |\n| `sandbox-runtime/` | Shared WASM sandbox runtime |\n| `scripts/` | Build scripts (e.g., WASM compilation) |\n| `docs/` | Additional documentation |\n| `DESIGN.md` | Full architecture & design rationale |\n| `README.md` | Project overview and quick start |\n| `TODO.md` | Implementation roadmap |\n| `llm.txt` | Complete API reference for LLM-assisted development |\n\n## Summary\n\n**App Agent Framework** is a YAML-free AI agent framework where agents are written as **Starlark** scripts (a deterministic, Python-dialect language). Its Rust core runtime executes `.star` agent files, providing a fixed set of host functions — `prompt()`, `tool()`, `http()`, `memory()`, `exec()`, and others — as the only interface to the outside world. Because Starlark is deterministic and all side effects are logged, the framework supports **zero-cost checkpointing and replay**: an agent's full execution can be saved to disk and re-run later with zero LLM API calls, enabling cheap debugging, deterministic testing, and crash recovery. The runtime can be used as a one-shot CLI (`app-agent run`) or as an HTTP server (`app-agent serve`) for event-driven/webhook agents, and is complemented by a pure-stdlib Python SDK (no `pip install` required) that communicates with the server over HTTP.",
+      "input_tokens": 6430,
+      "output_tokens": 470,
+      "stop_reason": "end_turn",
+      "tool_calls": []
+    },
+    "duration_ms": 11442,
+    "token_usage": {
+      "input_tokens": 6430,
+      "output_tokens": 470
+    },
+    "timestamp": "2026-04-16T18:20:44.281003Z"
+  },
+  {
+    "seq": 12,
+    "function": "memory",
+    "args": {
+      "action": "get",
+      "key": "_todo_items",
+      "namespace": "default",
+      "prefix": ""
+    },
+    "result": null,
+    "duration_ms": 0,
+    "timestamp": "2026-04-16T18:20:44.281525Z"
+  }
+]

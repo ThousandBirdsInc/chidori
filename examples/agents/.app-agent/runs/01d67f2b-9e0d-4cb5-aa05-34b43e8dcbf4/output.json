@@ -1,0 +1,6 @@
+{
+  "echoed": "hello from shell",
+  "file_count": 14,
+  "rm_blocked": true,
+  "timeout_triggered": true
+}

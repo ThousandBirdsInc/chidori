@@ -1,0 +1,903 @@
+# App Agent Framework — Design Document
+
+## Overview
+
+A framework for building AI agents using **Starlark** — a deterministic, sandboxed Python dialect. Agents are written as `.star` files that look like Python but execute in a controlled runtime where every side effect (LLM calls, tool invocations, HTTP requests) is a host function the runtime can intercept, checkpoint, and replay.
+
+A visual node-based editor can generate and round-trip Starlark code, making agents accessible to both developers and non-technical users.
+
+**Design philosophy:** Agents should be as easy to write as a Python script, as easy to inspect as a config file, and as reliable as a workflow engine.
+
+### Inspiration
+
+This framework draws on concepts from [Chidori](https://github.com/ThousandBirdsInc/chidori) — a reactive runtime for durable AI agents — but makes fundamentally different trade-offs:
+
+| Chidori | This Framework |
+|---|---|
+| Markdown files with embedded code blocks | Starlark `.star` files |
+| Multi-language runtime (Python, JS, Rust) | Rust core, Starlark DSL for agent logic |
+| Implicit dependency inference via variable names | Explicit variable binding and function calls |
+| Immutable execution graph with time-travel | Replay-based checkpointing (Temporal model) |
+| Complex reactive evaluation model | Sequential + parallel, deterministic execution |
+| PyO3 for Python embedding | `starlark-rust` crate (no native Python needed) |
+| Code-only authoring | Code + visual editor, fully round-trippable |
+
+---
+
+## Core Concepts
+
+### 1. Agent
+
+An agent is a `.star` file containing a `def agent(...)` function. Inputs are function parameters. The return value is the agent's output.
+
+```python
+# agents/summarizer.star
+
+config(model = "claude-sonnet-4-6")
+
+def agent(document):
+    summary = prompt(
+        "Summarize the following document in 3 bullet points:\n" + document,
+    )
+
+    action_items = prompt(
+        "Given this summary, extract any action items:\n" + summary,
+    )
+
+    return {"summary": summary, "action_items": action_items}
+```
+
+That's a complete, runnable agent.
+
+### 2. Host Functions
+
+All side effects go through host functions provided by the Rust runtime. These are the *only* way an agent interacts with the outside world — and every call is a checkpoint boundary.
+
+#### `prompt()` — LLM call
+
+```python
+answer = prompt("What is the capital of " + country)
+```
+
+With full options:
+
+```python
+analysis = prompt(
+    "Analyze this data: " + data,
+    model = "claude-opus-4-6",
+    temperature = 0.2,
+    max_tokens = 4000,
+    system = "You are a data analyst.",
+    format = "json",
+)
+```
+
+#### `tool()` — invoke a registered tool
+
+```python
+results = tool("web_search", query = topic + " latest news")
+```
+
+#### `agent()` — call a sub-agent
+
+```python
+summary = agent("summarizer", document = long_text)
+```
+
+#### `parallel()` — run functions concurrently
+
+```python
+results = parallel([
+    lambda q = q: tool("web_search", query = q)
+    for q in queries
+])
+```
+
+#### `input()` — human-in-the-loop
+
+```python
+approved = input("Proceed with this plan?", context = plan, timeout = 300)
+```
+
+#### `http()` — make an HTTP request
+
+```python
+response = http("GET", "https://api.example.com/data", headers = {"Authorization": "Bearer " + token})
+```
+
+#### `memory()` — persistent storage
+
+```python
+memory("store", key = "user_pref", value = preference)
+past = memory("search", query = "What does the user prefer?", top_k = 3)
+```
+
+#### `exec()` — run AI-generated code in the WASM sandbox
+
+Starlark is the agent authoring language, but LLMs generate arbitrary code at runtime — data analysis scripts, transformations, one-off logic. That code needs a real execution environment. `exec()` runs code in a sandboxed WASM runtime ([py2wasm](https://wasmer.io/posts/py2wasm-a-python-to-wasm-compiler) for Python, QuickJS for JavaScript).
+
+```python
+# Ask the LLM to write code, then execute it safely
+code = prompt(
+    "Write Python code that analyzes this CSV data and returns "
+    + "the top 5 rows by revenue as JSON:\n" + csv_data,
+    system = "Return only valid Python code, no explanation.",
+)
+
+result = exec(code, lang = "python", vars = {"csv_data": csv_data})
+```
+
+With options:
+
+```python
+result = exec(
+    code,
+    lang = "python",           # "python" (default) | "javascript"
+    vars = {"input": data},    # variables injected into the sandbox scope
+    timeout = 30,              # max execution time in seconds
+)
+```
+
+`exec()` is a host function like any other — it's checkpointed, traced, and sandboxed. The code cannot access the filesystem, network, or anything outside the WASM boundary. Input data flows in through `vars`, the result flows out as the return value.
+
+**When to use `exec()` vs. Starlark:**
+
+| Use case | Use |
+|---|---|
+| Agent control flow, orchestration, composition | Starlark (the `.star` file) |
+| Data transformation you write yourself | Starlark (list comprehensions, loops, etc.) |
+| Code generated by an LLM at runtime | `exec()` (WASM sandbox) |
+| Code that needs libraries beyond Starlark's stdlib | `exec()` (Python in WASM has broader stdlib) |
+
+#### `template()` — render a Jinja2 prompt template
+
+For complex prompts with conditional sections, loops over data, and reusable fragments, raw string concatenation gets unwieldy. `template()` renders a [Jinja2](https://jinja.palletsprojects.com/) template (via [minijinja](https://github.com/mitsuhiko/minijinja) in the Rust runtime) with variables from the current scope.
+
+```python
+answer = prompt(template("""
+You are a {{ role }} assistant.
+
+Analyze the following items:
+{% for item in items %}
+- {{ item.name }}: {{ item.description }}
+{% endfor %}
+
+{% if format == "detailed" %}
+Provide a detailed analysis with pros and cons for each item.
+{% else %}
+Provide a brief summary.
+{% endif %}
+""", role = role, items = items, format = format))
+```
+
+Templates can also be loaded from files:
+
+```python
+# Load from a .jinja file — keeps prompts separate from logic
+answer = prompt(template("prompts/analysis.jinja",
+    role = role,
+    items = items,
+    format = format,
+))
+```
+
+Where `prompts/analysis.jinja` contains:
+
+```jinja
+You are a {{ role }} assistant.
+
+Analyze the following items:
+{% for item in items %}
+- {{ item.name }}: {{ item.description }}
+{% endfor %}
+
+{% if format == "detailed" %}
+Provide a detailed analysis with pros and cons for each item.
+{% else %}
+Provide a brief summary.
+{% endif %}
+```
+
+**Template features (minijinja):**
+
+- Variable interpolation: `{{ variable }}`
+- Conditionals: `{% if %}` / `{% elif %}` / `{% else %}` / `{% endif %}`
+- Loops: `{% for item in list %}` / `{% endfor %}`
+- Filters: `{{ text | upper }}`, `{{ list | join(", ") }}`, `{{ data | tojson }}`
+- Template inheritance: `{% extends "base.jinja" %}` / `{% block content %}`
+- Includes: `{% include "fragment.jinja" %}`
+- Whitespace control: `{%- trimmed -%}`
+
+**Why `template()` instead of just string concatenation:**
+
+- Conditional prompt sections without awkward ternary expressions
+- Loops over structured data without `repr()` or manual formatting
+- Reusable prompt fragments via includes and inheritance
+- Prompts can live in separate `.jinja` files — easier to review and iterate on independently from agent logic
+- Same template language in Starlark code and in the visual editor's Prompt node properties
+
+#### `log()` — structured logging
+
+```python
+log("Processing batch", count = len(items), batch_id = batch_id)
+```
+
+### 3. Control Flow
+
+Starlark provides native control flow — no DSL workarounds needed.
+
+```python
+# Conditionals
+if depth == "deep":
+    sources = fetch_all_sources(urls)
+else:
+    sources = []
+
+# Loops
+facts = []
+for url in urls:
+    page = tool("fetch_url", url = url)
+    extracted = prompt("Extract key facts from:\n" + page)
+    facts.append(extracted)
+
+# List comprehensions
+urls = [r["url"] for batch in all_results for r in batch[:2]]
+
+# Helper functions
+def summarize_for(audience, doc):
+    return prompt(
+        "Summarize for a " + audience + " audience:\n" + doc,
+    )
+```
+
+### 4. Configuration
+
+Agent-level configuration uses the `config()` built-in, called at module scope:
+
+```python
+config(
+    model = "claude-sonnet-4-6",
+    temperature = 0.7,
+    max_tokens = 2000,
+    max_turns = 10,
+    timeout = 300,
+    on_error = "stop",           # "stop" | "skip" | "retry"
+    retry = {"max_attempts": 3, "backoff": "exponential"},
+)
+```
+
+### 5. Tools
+
+Tools are Starlark files that export a function:
+
+```python
+# tools/search.star
+
+def web_search(query, max_results = 5):
+    """Search the web and return results."""
+    response = http("GET", "https://api.search.example/search", params = {
+        "q": query,
+        "limit": max_results,
+    })
+    return response["results"]
+```
+
+For tools that need native dependencies (C extensions, system libraries), define an HTTP tool:
+
+```python
+# tools/heavy_search.star
+
+def heavy_search(query):
+    """Search using an external service with native deps."""
+    return http("POST", "http://localhost:9000/search", json = {"query": query})
+```
+
+Tools are auto-discovered from the tools directory. The runtime generates JSON schemas from function signatures and docstrings for LLM function-calling.
+
+### 6. Error Handling
+
+```python
+def agent(text):
+    translation = retry(
+        lambda: prompt("Translate to French:\n" + text),
+        max_attempts = 3,
+        backoff = "exponential",
+    )
+
+    # Or handle errors explicitly
+    result = try_call(lambda: tool("flaky_api", query = text))
+    if result.error:
+        result = prompt("The API failed. Best-effort answer for: " + text)
+
+    return {"translation": translation, "result": result}
+```
+
+---
+
+## Execution Model
+
+### Lifecycle
+
+```
+1. Parse .star file      → starlark-rust evaluates module, registers config/tools
+2. Resolve imports       → Load referenced agents and tool files
+3. Call agent() function → Execute with provided inputs
+4. Checkpoint at each host function call
+5. Return output         → agent() return value serialized as JSON
+```
+
+### Replay-Based Checkpointing
+
+Starlark's determinism is the key property. Since the language has no randomness, no system clock access, and no I/O except through host functions, the control flow between host calls is guaranteed to be identical on replay.
+
+**How it works:**
+
+Every host function call is logged with its arguments and result:
+
+```json
+[
+  {"seq": 1, "fn": "prompt", "args": {"text": "Summarize..."}, "result": "Three key points..."},
+  {"seq": 2, "fn": "prompt", "args": {"text": "Extract..."}, "result": "1. Review doc..."},
+  {"seq": 3, "fn": "tool",   "args": {"name": "web_search", "query": "..."}, "result": [...]}
+]
+```
+
+**To checkpoint:** serialize the call log after any host function completes.
+
+**To resume from checkpoint:** replay the Starlark code from the top. When it hits call #1, return the cached result. Same for #2. When it reaches a call with no cached result, real execution resumes.
+
+**To pause (human-in-the-loop):** `input()` is a host function. The runtime checkpoints, suspends, persists the call log, and waits. When the human responds, the runtime replays from the top, fast-forwarding through cached calls, then continues.
+
+**Why this works:** Starlark guarantees determinism. The code between host calls always produces the same control flow given the same host function results. No interpreter state serialization needed — just the call log.
+
+### Execution Tracing
+
+Every host function call is traced with:
+- Function name and arguments
+- Result value
+- Duration
+- Token usage (for LLM calls)
+- Error details (if any)
+
+```bash
+app-agent run agents/summarizer.star --input document=@file.txt --trace
+```
+
+---
+
+## Agent Composition
+
+### Importing Other Agents
+
+```python
+# agents/research_assistant.star
+
+load("agents/summarizer.star", "agent")      # Starlark's native import
+summarizer = agent
+
+load("agents/fact_checker.star", "agent")
+fact_checker = agent
+
+def agent(question):
+    raw_results = tool("web_search", query = question)
+    summary = agent("summarizer", document = raw_results)
+    verified = agent("fact_checker", claims = summary)
+    return {"answer": verified}
+```
+
+Or more simply, using the `agent()` host function which resolves by filename:
+
+```python
+def agent(question):
+    raw_results = tool("web_search", query = question)
+    summary = agent("summarizer", document = raw_results)
+    verified = agent("fact_checker", claims = summary)
+    return {"answer": verified}
+```
+
+### Agent as a Tool (Agentic LLM Calls)
+
+Let the LLM autonomously decide when to call sub-agents:
+
+```python
+answer = prompt(
+    "You are a research assistant. Answer the user's question.",
+    tools = ["web_search", "summarizer", "fact_checker"],
+    max_turns = 5,
+)
+```
+
+---
+
+## Visual Editor
+
+### Overview
+
+The visual editor is a node-based UI for building agents. Each node represents a host function call or control flow construct. Wires between nodes represent data flow. The editor **generates Starlark code** as its output format — `.star` files are the source of truth, not a proprietary graph format.
+
+### Why Starlark Makes This Possible
+
+Most visual-to-code editors fail because general-purpose languages are too expressive to round-trip. Starlark's restrictions make it tractable:
+
+| Starlark restriction | Why it helps the visual editor |
+|---|---|
+| No classes or complex OOP | Nodes map 1:1 to function calls |
+| No exceptions (we use `try_call`) | Error paths are explicit, representable as branches |
+| No `while` loops (only `for x in collection`) | Loops have known iteration targets, representable as loop nodes |
+| No side effects except host functions | Every node that "does something" is a host function — a finite, known set |
+| No imports of arbitrary modules | The available nodes are exactly the host functions + tools + sub-agents |
+| Deterministic execution | The graph always executes the same way — visual preview matches reality |
+
+A general Python AST would be nearly impossible to visualize well. Starlark's constrained surface area means the visual representation covers ~100% of what the language can express.
+
+### Node Types
+
+The visual editor has a fixed set of node types, each mapping to a Starlark construct:
+
+#### Action Nodes (host function calls)
+
+| Node | Starlark | Inputs | Outputs |
+|---|---|---|---|
+| **Prompt** | `prompt(...)` | text, model, temperature, system, format, tools | result (string or JSON) |
+| **Template** | `template(...)` | template string or file path, variables | rendered string |
+| **Tool** | `tool(name, ...)` | tool name, tool-specific args | result |
+| **Exec** | `exec(code, ...)` | code string, lang, vars, timeout | result (WASM sandbox) |
+| **Sub-agent** | `agent(name, ...)` | agent name, agent-specific inputs | result |
+| **HTTP** | `http(...)` | method, url, headers, body | response |
+| **Human Input** | `input(...)` | message, context, timeout | response |
+| **Memory** | `memory(...)` | action, key/query, value | result |
+
+#### Control Flow Nodes
+
+| Node | Starlark | Visual |
+|---|---|---|
+| **Branch** | `if condition:` | Diamond with true/false output ports |
+| **Loop** | `for item in collection:` | Loop container with item output port |
+| **Parallel** | `parallel([...])` | Fan-out / fan-in container |
+| **Retry** | `retry(fn, ...)` | Wrapper around any action node |
+| **Try** | `try_call(fn)` | Wrapper with success/error output ports |
+
+#### Data Nodes
+
+| Node | Starlark | Visual |
+|---|---|---|
+| **Input** | Function parameter | Entry point on the canvas |
+| **Output** | `return {...}` | Exit point on the canvas |
+| **Transform** | Inline expression | Small code block for data manipulation |
+| **Constant** | String/number/dict literal | Static value |
+
+### Code Generation
+
+The editor maintains a Starlark AST internally. Each canvas operation (add node, connect wire, set property) mutates the AST, which is then pretty-printed to `.star` code. The mapping is direct:
+
+**Canvas:**
+```
+[Input: question] → [Prompt: "Generate 3 queries for: {question}"] → [Parallel Loop] → [Tool: web_search] → [Prompt: "Synthesize answer"] → [Output]
+```
+
+**Generated Starlark:**
+```python
+config(model = "claude-sonnet-4-6")
+
+def agent(question):
+    queries = prompt(
+        "Generate 3 diverse search queries for: " + question,
+        format = "json",
+    )
+
+    all_results = parallel([
+        lambda q = q: tool("web_search", query = q)
+        for q in queries
+    ])
+
+    answer = prompt(
+        "Synthesize an answer to: " + question + "\n\nSearch results:\n" + repr(all_results),
+        model = "claude-opus-4-6",
+    )
+
+    return {"answer": answer, "sources": all_results}
+```
+
+### Round-tripping: Code → Visual → Code
+
+This is the hard part. The editor must be able to parse *any* valid `.star` agent file back into a visual graph, not just files it generated.
+
+**How it works:**
+
+1. **Parse** the `.star` file using `starlark-rust` into an AST.
+2. **Walk the AST** and identify:
+   - The `agent()` function and its parameters → Input nodes
+   - Host function calls (`prompt`, `tool`, `agent`, `http`, `input`, `memory`) → Action nodes
+   - Variable assignments → wires (data flow from one node's output to another's input)
+   - `if`/`else` blocks → Branch nodes
+   - `for` loops → Loop nodes
+   - `parallel()` calls → Parallel nodes
+   - The `return` statement → Output node
+3. **Layout** the nodes using a topological sort of the data flow graph, arranged left-to-right.
+
+**What about arbitrary Starlark code that doesn't fit neatly into nodes?**
+
+Any code between host function calls that isn't a simple assignment or control flow construct gets wrapped in a **Transform node** — a small inline code editor that shows the raw Starlark expression. This is the escape hatch. The visual editor doesn't need to understand list comprehensions or string formatting — it just treats them as opaque transforms with typed inputs and outputs.
+
+```python
+# This line becomes a Transform node:
+urls = [r["url"] for batch in all_results for r in batch[:2]]
+```
+
+The Transform node shows the code as-is, with `all_results` as an input port and `urls` as an output port. Editing it modifies the Starlark source directly.
+
+**Round-trip fidelity:**
+
+- Code generated by the visual editor → parsed back to visual: **lossless**
+- Hand-written Starlark → parsed to visual: **lossless** (complex expressions become Transform nodes)
+- Visual → code → visual: **lossless** (the AST is the shared representation)
+
+The only thing the visual editor won't preserve is cosmetic formatting and comments. Generated code uses a canonical style (consistent indentation, standard ordering). Comments are stored as metadata on nodes and re-emitted during code generation.
+
+### Editor Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     Visual Editor (Web UI)                    │
+│                                                              │
+│  ┌────────────┐  ┌──────────────┐  ┌──────────────────────┐ │
+│  │  Canvas    │  │  Node Palette│  │  Properties Panel    │ │
+│  │  (nodes +  │  │  (drag to   │  │  (edit selected      │ │
+│  │   wires)   │  │   canvas)   │  │   node's config)     │ │
+│  └──────┬─────┘  └──────────────┘  └──────────────────────┘ │
+│         │                                                     │
+│  ┌──────▼──────────────────────────────────────────────────┐ │
+│  │                    AST Model                             │ │
+│  │  Canvas ops ←→ AST mutations ←→ Starlark pretty-print   │ │
+│  └──────┬──────────────────────────────────────┬───────────┘ │
+│         │                                      │             │
+│  ┌──────▼──────┐                    ┌──────────▼──────────┐ │
+│  │ Code Panel  │                    │  Live Preview       │ │
+│  │ (read-only  │                    │  (simulated run     │ │
+│  │  .star view)│                    │   with mock data)   │ │
+│  └─────────────┘                    └─────────────────────┘ │
+└──────────────────────────────────────────────────────────────┘
+         │
+         │  saves .star file
+         ▼
+┌──────────────────────┐
+│  agents/my_agent.star │  ← source of truth, committed to git
+└──────────────────────┘
+```
+
+**Key property:** The `.star` file is always the source of truth. The visual editor is a view on top of it. You can edit the `.star` file by hand, open it in the visual editor, make changes, and the file is updated. No proprietary format, no lock-in.
+
+### Live Preview
+
+The visual editor can simulate execution with mock inputs. Since the Starlark code is deterministic and all host functions are intercepted, the editor can:
+
+1. Provide mock return values for `prompt()`, `tool()`, etc.
+2. Execute the agent step by step
+3. Show intermediate values flowing through wires in real time
+4. Highlight the active node during execution
+
+This uses the same replay mechanism as checkpointing — the editor just provides the host function results from mock data instead of real LLM calls.
+
+---
+
+## Configuration
+
+### Project Config
+
+```python
+# app-agent.star (project root)
+
+project(
+    tool_dirs = ["tools/", "../shared-tools/"],
+    defaults = {
+        "model": "claude-sonnet-4-6",
+        "temperature": 0.7,
+    },
+)
+```
+
+### Model Providers
+
+```python
+# config/providers.star
+
+providers(
+    anthropic = {
+        "api_key": env("ANTHROPIC_API_KEY"),
+        "models": ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
+    },
+    openai = {
+        "api_key": env("OPENAI_API_KEY"),
+        "models": ["gpt-4o", "gpt-4o-mini"],
+    },
+    ollama = {
+        "base_url": "http://localhost:11434",
+        "models": ["llama3", "mistral"],
+    },
+)
+```
+
+---
+
+## CLI
+
+```bash
+# Run an agent
+app-agent run agents/summarizer.star --input document=@file.txt
+
+# Run with JSON input
+app-agent run agents/research.star --input '{"question": "What is quantum computing?"}'
+
+# Interactive mode (human-in-the-loop steps prompt in terminal)
+app-agent run agents/assistant.star --interactive
+
+# Resume from checkpoint
+app-agent resume <run-id>
+
+# Validate an agent definition
+app-agent check agents/my_agent.star
+
+# List available tools
+app-agent tools
+
+# View execution trace
+app-agent trace <run-id>
+
+# Serve agent as an HTTP API
+app-agent serve agents/assistant.star --port 8080
+
+# Launch visual editor
+app-agent edit agents/assistant.star --port 3000
+```
+
+### HTTP API (via `serve`)
+
+```
+POST /run
+{
+  "input": { "document": "..." },
+  "stream": true
+}
+
+→ SSE stream of host function call results
+```
+
+---
+
+## Project Structure
+
+```
+my-project/
+├── agents/
+│   ├── summarizer.star
+│   ├── researcher.star
+│   └── assistant.star
+├── prompts/
+│   ├── analysis.jinja
+│   ├── base.jinja              # shared base template
+│   └── fact_check.jinja
+├── tools/
+│   ├── search.star
+│   └── database.star
+├── config/
+│   └── providers.star
+└── app-agent.star              # project config
+```
+
+---
+
+## Example: Full Research Agent
+
+```python
+# agents/deep_researcher.star
+
+config(model = "claude-sonnet-4-6", max_turns = 15)
+
+def agent(question, depth = "standard"):
+    # Step 1: Generate search queries
+    queries = prompt(
+        "Generate 3 diverse search queries to research this question: " + question
+        + "\n\nReturn as a JSON array of strings.",
+        format = "json",
+    )
+
+    # Step 2: Search in parallel
+    all_results = parallel([
+        lambda q = q: tool("web_search", query = q)
+        for q in queries
+    ])
+
+    # Step 3: Deep mode — fetch and read top sources
+    sources = []
+    if depth == "deep":
+        urls = [r["url"] for batch in all_results for r in batch[:2]]
+        sources = parallel([
+            lambda u = u: tool("fetch_url", url = u)
+            for u in urls
+        ])
+
+    # Step 4: Synthesize
+    answer = prompt(
+        "Based on the following search results and source content, "
+        + "provide a comprehensive answer to: " + question
+        + "\n\nSearch results:\n" + repr(all_results)
+        + ("\n\nSource content:\n" + repr(sources) if sources else "")
+        + "\n\nCite your sources. Be thorough but concise.",
+        model = "claude-opus-4-6",
+        temperature = 0.3,
+    )
+
+    # Step 5: Fact check
+    final = prompt(
+        "Fact-check the following answer. Identify any claims that "
+        + "are unsupported or incorrect. Return the corrected answer."
+        + "\n\n" + answer,
+    )
+
+    return {
+        "answer": final,
+        "sources": all_results,
+        "queries_used": queries,
+    }
+```
+
+---
+
+## Design Principles
+
+1. **Starlark is the source of truth.** An agent is a `.star` file. The visual editor reads and writes `.star` files. No proprietary graph format, no hidden state.
+
+2. **Deterministic execution enables everything.** Checkpointing, replay, live preview, and visual simulation all fall out of Starlark's guarantee that the same inputs produce the same control flow.
+
+3. **Host functions are the boundary.** Every side effect goes through a known, finite set of host functions. The runtime controls the boundary. Everything inside is pure computation.
+
+4. **Two authoring modes, one format.** Write code or drag nodes — both produce the same `.star` file. Switch freely between them. Neither is second-class.
+
+5. **No infrastructure required.** A single binary and an API key gets you running. No Python install, no proxy servers, no database required.
+
+6. **Composable by default.** Agents call agents. Agents are tools. Tools are functions. Everything snaps together.
+
+7. **Observable without effort.** Every run produces a structured trace from the call log. The same log that enables checkpointing also enables debugging.
+
+---
+
+## What We Intentionally Leave Out (vs. Chidori)
+
+| Feature | Why we skip it |
+|---|---|
+| Time-travel debugging | Replay-based checkpointing gives us rewind and resume without the full execution graph complexity. |
+| Reactive dependency inference | Starlark has explicit variable binding. Data flows through assignment, not implicit globals. |
+| PyO3 / native Python embedding | PyO3 caused endless grief in Chidori. `starlark-rust` is a pure Rust crate — no FFI, no linker issues, no system Python dependency. |
+| Immutable execution graph | The call log (a JSON array) is our checkpoint format. Simple, inspectable, portable. |
+| Custom UI framework | The visual editor is a standard web app. The runtime is a CLI/server. |
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                       User Layer                              │
+│  .star agent files  ·  .jinja prompts  ·  Visual editor      │
+└────────────────────────────┬─────────────────────────────────┘
+                             │
+┌────────────────────────────▼─────────────────────────────────┐
+│                     Rust Core Runtime                         │
+│                                                               │
+│  ┌──────────────┐ ┌──────────────┐ ┌───────────────────────┐ │
+│  │  Starlark    │ │ Host Function│ │  Checkpoint / Replay  │ │
+│  │  Evaluator   │ │ Registry     │ │  Engine               │ │
+│  │ (starlark-rs)│ │              │ │  (call log)           │ │
+│  └──────────────┘ └──────────────┘ └───────────────────────┘ │
+│  ┌──────────────┐ ┌──────────────┐ ┌───────────────────────┐ │
+│  │  LLM Client  │ │  Template    │ │  Tracer               │ │
+│  │  (providers) │ │  Engine      │ │  (structured)         │ │
+│  │  (reqwest)   │ │  (minijinja) │ │                       │ │
+│  └──────────────┘ └──────────────┘ └───────────────────────┘ │
+│  ┌──────────────┐ ┌──────────────┐ ┌───────────────────────┐ │
+│  │  HTTP Server │ │  Parallel    │ │  Tool                 │ │
+│  │  (axum)      │ │  Scheduler   │ │  Registry             │ │
+│  │              │ │  (tokio)     │ │                       │ │
+│  └──────────────┘ └──────────────┘ └───────────────────────┘ │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │  WASM Sandbox (exec() host function)                     │ │
+│  │  ┌──────────────────┐  ┌──────────────────┐              │ │
+│  │  │  py2wasm/Wasmer  │  │  QuickJS (.wasm) │              │ │
+│  │  │  (Python)        │  │  (JavaScript)    │              │ │
+│  │  └──────────────────┘  └──────────────────┘              │ │
+│  │  Runs AI-generated code · Sandboxed · No fs/net access   │ │
+│  └──────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Why Rust
+
+- **Performance:** Parallel step execution, streaming HTTP serving, and LLM client management benefit from Rust's async runtime (tokio).
+- **Single binary CLI:** Zero runtime dependencies. No Python install, no Node, no system libraries. Download one binary and run.
+- **Reliable concurrency:** `parallel()` fans out to tokio tasks with compile-time safety.
+
+### Why Starlark for Agent Authoring (not YAML, not full Python)
+
+- **vs. YAML:** YAML becomes a worse programming language the moment you add conditionals and loops. Starlark *is* a programming language with native control flow, variable binding, list comprehensions, and function composition.
+- **vs. Full Python:** Python is too powerful to sandbox, checkpoint, or visually represent. Starlark's restrictions (no `while`, no classes, no I/O, deterministic) are exactly the properties we need for reliable agents and visual editing.
+- **vs. PyO3:** `starlark-rust` is a pure Rust crate. No FFI boundary, no linker issues, no `PYO3_PYTHON` version pinning, no virtualenv conflicts. It just compiles.
+
+### Why WASM for AI-Generated Code (not Starlark, not native Python)
+
+Agents frequently need to execute code that an LLM generates at runtime — data transformations, analysis scripts, one-off computations. This code can't run in Starlark (too restricted, no real stdlib) and shouldn't run natively (untrusted, potentially dangerous).
+
+- **Sandboxed by default.** WASM has no filesystem access, no network access, no syscalls. AI-generated code can't escape the sandbox.
+- **Full Python stdlib** via [py2wasm](https://wasmer.io/posts/py2wasm-a-python-to-wasm-compiler) (Wasmer). Nuitka transpiles to CPython API calls, then compiles to WASM/WASI. Real Python compatibility, not a subset.
+- **JavaScript support** via QuickJS compiled to WASM.
+- **No PyO3.** The WASM sandbox has zero coupling to a system Python install. No linker issues, no version conflicts.
+- **Timeout enforcement.** Wasmer provides fuel-based execution limits — runaway AI-generated code is killed deterministically.
+
+### Two Execution Layers
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Starlark (.star files)                              │
+│  Agent logic you write · Deterministic · Checkpointable │
+│  Runs in: starlark-rust (native Rust, zero overhead) │
+├─────────────────────────────────────────────────────┤
+│  WASM Sandbox (exec() calls)                         │
+│  Code the AI writes · Untrusted · Sandboxed          │
+│  Runs in: Wasmer (py2wasm / QuickJS)                 │
+└─────────────────────────────────────────────────────┘
+```
+
+Starlark orchestrates. WASM executes untrusted code. They're complementary, not competing.
+
+### Key Crates
+
+| Crate | Role |
+|---|---|
+| `starlark` | Starlark evaluator — parses and executes `.star` files, hosts native functions via `#[starlark_module]` |
+| `wasmer` | WASM runtime for `exec()` sandbox (runs py2wasm and QuickJS modules) |
+| `minijinja` | Jinja2-compatible template engine for `template()` host function and prompt rendering |
+| `tokio` | Async runtime, parallel step execution |
+| `axum` | HTTP server for `serve` and `edit` commands |
+| `reqwest` | HTTP client for LLM providers and `http()` host function |
+| `tracing` + `tracing-subscriber` | Structured execution traces |
+| `clap` | CLI argument parsing |
+| `serde` + `serde_json` | Call log serialization, JSON parsing for LLM responses |
+
+---
+
+## Implementation Priorities
+
+### Phase 1 — Rust Core Runtime
+- Starlark evaluator with `#[starlark_module]` host functions (`prompt`, `tool`, `config`, `log`)
+- `template()` host function — minijinja integration for prompt rendering (inline strings + `.jinja` file loading)
+- LLM provider clients — Anthropic + OpenAI (`reqwest`)
+- CLI binary: `run`, `check` (`clap`)
+- Structured tracing from call log
+- Tool auto-discovery from `tools/` directory
+
+### Phase 2 — WASM Sandbox, Checkpointing & Composition
+- `exec()` host function — Wasmer runtime, py2wasm for Python, QuickJS for JavaScript
+- WASM module caching for repeated `exec()` calls
+- Call log persistence and replay-based resume
+- `parallel()` execution (tokio tasks)
+- Sub-agent calls via `agent()` host function
+- Human-in-the-loop via `input()` with suspend/resume
+- `retry()` and `try_call()` error handling
+- `app-agent resume <run-id>`
+
+### Phase 3 — Visual Editor
+- Web-based node canvas (React + a graph library)
+- Starlark AST → node graph parser (code to visual)
+- Node graph → Starlark AST code generator (visual to code)
+- Round-trip fidelity: code → visual → code is lossless
+- Transform nodes as escape hatch for complex expressions
+- Properties panel for node configuration
+- Live code preview panel
+
+### Phase 4 — Production & Ecosystem
+- `serve` command — HTTP API with SSE streaming (`axum`)
+- Live preview with mock execution in visual editor
+- Memory backends (SQLite, vector)
+- Rate limiting and cost tracking
+- Ollama/local model support
+- Published tool packages
+- VS Code extension (`.star` syntax highlighting, run/debug)

@@ -1,0 +1,47 @@
+[
+  {
+    "seq": 1,
+    "function": "exec_python",
+    "args": {
+      "fuel": 200000000,
+      "source": "\ndef fact(n):\n    return 1 if n <= 1 else n * fact(n - 1)\nresult = fact(5)\n"
+    },
+    "result": "120",
+    "duration_ms": 365,
+    "timestamp": "2026-04-14T06:55:14.207443Z"
+  },
+  {
+    "seq": 2,
+    "function": "exec_python",
+    "args": {
+      "fuel": 200000000,
+      "source": "result = sum(i * i for i in range(5))"
+    },
+    "result": "30",
+    "duration_ms": 37,
+    "timestamp": "2026-04-14T06:55:14.244892Z"
+  },
+  {
+    "seq": 3,
+    "function": "exec_python",
+    "args": {
+      "fuel": 200000000,
+      "source": "\nname = \"world\"\nresult = \", \".join([w.capitalize() for w in (\"hello \" + name).split()]) + \"!\"\n"
+    },
+    "result": "'Hello, World!'",
+    "duration_ms": 36,
+    "timestamp": "2026-04-14T06:55:14.281910Z"
+  },
+  {
+    "seq": 4,
+    "function": "exec_python",
+    "args": {
+      "fuel": 200000000,
+      "source": "result = 1 / 0"
+    },
+    "result": null,
+    "duration_ms": 35,
+    "timestamp": "2026-04-14T06:55:14.317795Z",
+    "error": "Python error: ZeroDivisionError: division by zero"
+  }
+]

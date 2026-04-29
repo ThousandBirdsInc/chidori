@@ -1,0 +1,20 @@
+{
+  "count": 14,
+  "files": [
+    "memory_demo.star",
+    "summarizer.star",
+    "webhook.star",
+    "tool_use_demo.star",
+    "subagent_parent.star",
+    "http_demo.star",
+    "approval.star",
+    "tool_demo.star",
+    "subagent_child.star",
+    "hello.star",
+    "parallel_demo.star",
+    "template_demo.star",
+    "retry_demo.star",
+    "file_demo.star"
+  ],
+  "read_back_bytes": 236
+}

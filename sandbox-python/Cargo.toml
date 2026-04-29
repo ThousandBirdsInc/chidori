@@ -1,0 +1,28 @@
+# Standalone workspace so the host crate's `cargo test` does not try to
+# build this wasm32-wasip1-only crate natively. Build it explicitly with:
+#   cargo build --release --target wasm32-wasip1
+[workspace]
+
+[package]
+name = "sandbox-python"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "RustPython-powered Python sandbox, compiled to wasm32-wasip1 and embedded into the host crate via include_bytes!."
+
+[[bin]]
+name = "sandbox-python"
+path = "src/main.rs"
+
+[dependencies]
+# RustPython VM with just what we need: the compiler (to parse Python source
+# at runtime) and nothing else. Skip the default `wasmbind` (browser-only),
+# `stdio` (we talk to stdin/stdout ourselves), `gc`, and `host_env` features.
+rustpython-vm = { version = "0.5", default-features = false, features = ["compiler"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,26 @@
+{
+  "all": [
+    {
+      "key": "pref:alice",
+      "value": {
+        "theme": "dark"
+      }
+    },
+    {
+      "key": "pref:bob",
+      "value": {
+        "theme": "light"
+      }
+    },
+    {
+      "key": "pref:carol",
+      "value": {
+        "theme": "dark"
+      }
+    }
+  ],
+  "count": 3,
+  "loaded": {
+    "theme": "dark"
+  }
+}

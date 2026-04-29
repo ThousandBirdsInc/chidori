@@ -1,0 +1,76 @@
+[
+  {
+    "seq": 1,
+    "function": "shell",
+    "args": {
+      "args": [
+        "branch",
+        "--show-current"
+      ],
+      "command": "git",
+      "cwd": ".",
+      "timeout_ms": 2000
+    },
+    "result": {
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "main\n",
+      "timed_out": false
+    },
+    "duration_ms": 18,
+    "timestamp": "2026-04-16T01:35:52.666983Z"
+  },
+  {
+    "seq": 2,
+    "function": "shell",
+    "args": {
+      "args": [
+        "+%Y-%m-%d %H:%M"
+      ],
+      "command": "date",
+      "cwd": null,
+      "timeout_ms": 1000
+    },
+    "result": {
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "2026-04-15 18:35\n",
+      "timed_out": false
+    },
+    "duration_ms": 9,
+    "timestamp": "2026-04-16T01:35:52.677002Z"
+  },
+  {
+    "seq": 3,
+    "function": "shell",
+    "args": {
+      "args": [
+        "-1",
+        "."
+      ],
+      "command": "ls",
+      "cwd": null,
+      "timeout_ms": 2000
+    },
+    "result": {
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "Cargo.lock\nCargo.toml\nDESIGN.md\nREADME.md\nTODO.md\ndocs\nexamples\nllm.txt\nsandbox-js\nsandbox-python\nsandbox-runtime\nscripts\nsdk\nsrc\ntarget\n",
+      "timed_out": false
+    },
+    "duration_ms": 5,
+    "timestamp": "2026-04-16T01:35:52.682921Z"
+  },
+  {
+    "seq": 4,
+    "function": "prompt",
+    "args": {
+      "model": "claude-sonnet-4-6",
+      "text": "What is this project? List the top-level files and give me a one-paragraph summary."
+    },
+    "result": null,
+    "duration_ms": 262,
+    "timestamp": "2026-04-16T01:35:52.945858Z",
+    "error": "Anthropic API error (401 Unauthorized): invalid x-api-key"
+  }
+]
