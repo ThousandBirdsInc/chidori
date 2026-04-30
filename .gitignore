@@ -23,3 +23,9 @@ sdk/python/dist/
 
 # Node
 node_modules/
+
+# Secrets / local env
+.env
+.envrc
+.env*.local
+.env.local
