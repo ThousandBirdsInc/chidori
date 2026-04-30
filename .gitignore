@@ -10,9 +10,11 @@
 .idea/
 .vscode/
 
-# Run artifacts produced by `chidori run` (kept out of source control)
+# Run artifacts and runtime state produced by `chidori run`
+# (kept out of source control)
 .chidori/runs/
 .chidori/wasm-cache/
+.chidori/memory/
 
 # Python build/dist
 __pycache__/
