@@ -4,7 +4,7 @@
   "description": "TypeScript SDK for the Chidori agent framework — HTTP client for running and replaying Starlark agents.",
   "homepage": "https://github.com/ThousandBirdsInc/chidori",
   "repository": { "type": "git", "url": "https://github.com/ThousandBirdsInc/chidori.git" },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

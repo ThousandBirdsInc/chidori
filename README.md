@@ -9,7 +9,7 @@
 <a href="https://crates.io/crates/chidori"><img alt="crates.io version" src="https://img.shields.io/crates/v/chidori" /></a>
 <a href="https://pypi.org/project/chidori/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/chidori" /></a>
 <a href="https://www.npmjs.com/package/chidori"><img alt="npm version" src="https://img.shields.io/npm/v/chidori" /></a>
-<a href="https://github.com/ThousandBirdsInc/chidori/blob/main/LICENSE"><img alt="License MIT" src="https://img.shields.io/badge/License-MIT-green.svg" /></a>
+<a href="https://github.com/ThousandBirdsInc/chidori/blob/main/LICENSE"><img alt="License Apache-2.0" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" /></a>
 </p>
 <br />
 </div>
@@ -28,7 +28,6 @@ Star us on GitHub! Join us on [Discord](https://discord.gg/CJwKsPSgew).
 - [🧪 Examples](#-examples)
 - [🏗 Architecture](#-architecture)
 - [📦 Project Structure](#-project-structure)
-- [🚧 Current Status](#-current-status)
 
 ## 📖 About
 
@@ -281,22 +280,3 @@ chidori/
 └── llm.txt                 # Complete API reference for LLM-assisted development
 ```
 
-## 🚧 Current Status
-
-**Phase 1 (Core Runtime)** — ✅ Working
-- Starlark evaluator with host functions (`prompt`, `template`, `config`, `log`, `env`)
-- LLM providers: Anthropic, OpenAI, LiteLLM/OpenAI-compatible
-- CLI: `run`, `check`, `tools`, `serve`
-- Template engine (minijinja)
-- Structured tracing & token accounting
-- Tool auto-discovery
-
-**Phase 2 (Sessions + Replay)** — ✅ Working
-- Session API (create, list, get, checkpoint, replay)
-- Replay-based checkpointing in the engine
-- Python SDK with checkpoint save/load
-- Event-driven agents over HTTP
-
-**Phase 3 (Visual Editor)** — 🚧 Not started. See [`DESIGN.md`](./DESIGN.md).
-
-**Phase 4 (Production)** — 🚧 Partial (serve works, memory/SDK packaging TBD).

@@ -7,7 +7,7 @@ name = "chidori"
 version = "3.0.0"
 description = "Python SDK for the Chidori agent framework — HTTP client for running and replaying Starlark agents."
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
 authors = [{ name = "Colton Pierson", email = "colton@thousandbirds.ai" }]
 keywords = ["ai", "agents", "starlark", "llm", "chidori"]
@@ -15,7 +15,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
 ]
 # Pure stdlib — intentionally no runtime dependencies.
