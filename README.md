@@ -1,8 +1,36 @@
-# Chidori v3
+<div align="center">
 
-The third generation of [Chidori](https://github.com/ThousandBirdsInc/chidori) — a YAML-free AI agent framework where agents are written as **Starlark** scripts, a deterministic Python dialect that enables checkpointing, replay, and visual editing.
+# &nbsp; Chidori (v3) &nbsp;
+
+**An agent framework where agents are deterministic Starlark scripts — checkpoint, replay, and resume by default.**
+
+<p>
+<a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/ThousandBirdsInc/chidori" /></a>
+<a href="https://crates.io/crates/chidori"><img alt="crates.io version" src="https://img.shields.io/crates/v/chidori" /></a>
+<a href="https://pypi.org/project/chidori/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/chidori" /></a>
+<a href="https://www.npmjs.com/package/chidori"><img alt="npm version" src="https://img.shields.io/npm/v/chidori" /></a>
+<a href="https://github.com/ThousandBirdsInc/chidori/blob/main/LICENSE"><img alt="License MIT" src="https://img.shields.io/badge/License-MIT-green.svg" /></a>
+</p>
+<br />
+</div>
+
+Star us on GitHub! Join us on [Discord](https://discord.gg/CJwKsPSgew).
 
 > **About v3.** Chidori began as a reactive runtime exploring how to build durable, debuggable agents. v3 is a ground-up rewrite that distills those ideas into a smaller, sharper core: a single Rust binary, Starlark instead of bespoke cells, and replay as the foundation for everything else (tests, debugging, resume, human-in-the-loop). Earlier versions of Chidori live in the git history and on prior tags.
+
+## Contents
+- [📖 About](#-about)
+- [⚡️ Quick Start](#️-quick-start)
+- [🧩 Core Concepts](#-core-concepts)
+- [🚦 Running Modes](#-running-modes)
+- [🐍 Python SDK](#-python-sdk)
+- [⏪ How Replay Works](#-how-replay-works)
+- [🧪 Examples](#-examples)
+- [🏗 Architecture](#-architecture)
+- [📦 Project Structure](#-project-structure)
+- [🚧 Current Status](#-current-status)
+
+## 📖 About
 
 - **Agents look like Python.** Native control flow, variables, list comprehensions — no template DSL.
 - **Deterministic execution.** Every side effect goes through a host function the runtime can log, cache, and replay.
@@ -10,7 +38,7 @@ The third generation of [Chidori](https://github.com/ThousandBirdsInc/chidori) �
 - **Event-driven agents.** Agents can run as HTTP servers that react to webhooks and other events.
 - **Rust core, Python SDK.** The runtime is a single binary. The Python SDK talks to it over HTTP — no `pip install`, no native bindings.
 
-## Quick Start
+## ⚡️ Quick Start
 
 ### 1. Write an agent
 
@@ -58,7 +86,7 @@ cargo build
 ./target/debug/chidori serve examples/agents/webhook.star --port 8080
 ```
 
-## Core Concepts
+## 🧩 Core Concepts
 
 An agent is a `.star` file with a `def agent(...)` function. The runtime provides a fixed set of **host functions** for side effects — everything else is pure Starlark:
 
@@ -80,7 +108,7 @@ An agent is a `.star` file with a `def agent(...)` function. The runtime provide
 
 See [`llm.txt`](./llm.txt) for the full API reference.
 
-## Running Modes
+## 🚦 Running Modes
 
 ### 1. One-shot CLI
 
@@ -131,7 +159,7 @@ curl -X POST http://localhost:8080/github \
   -d '{"action": "opened", "pull_request": {"title": "Add login"}}'
 ```
 
-## Python SDK
+## 🐍 Python SDK
 
 The Python SDK is a pure-stdlib HTTP client that talks to a running `chidori serve` instance. No `pip install`, no native bindings.
 
@@ -166,7 +194,7 @@ replayed = client.replay(cp)
 assert replayed.output == session.output  # identical output
 ```
 
-## How Replay Works
+## ⏪ How Replay Works
 
 Starlark is deterministic. Given the same inputs and the same cached results for host function calls, the agent's control flow is guaranteed to produce the same outputs.
 
@@ -180,7 +208,7 @@ This means you can:
 - **Resume after crashes:** the runtime can persist checkpoints after each call; on restart, replay picks up where it left off.
 - **Pause for human approval:** `input()` suspends execution; when the human responds, the agent replays to that point and continues.
 
-## Examples
+## 🧪 Examples
 
 See [`examples/`](./examples):
 
@@ -192,7 +220,7 @@ See [`examples/`](./examples):
 - [`prompts/analysis.jinja`](./examples/prompts/analysis.jinja) — shared prompt template
 - [`tools/greet.star`](./examples/tools/greet.star) — simple tool definition
 
-## Architecture
+## 🏗 Architecture
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -222,7 +250,7 @@ See [`examples/`](./examples):
 
 See [`DESIGN.md`](./DESIGN.md) for the full architecture and design rationale, and [`TODO.md`](./TODO.md) for the implementation roadmap.
 
-## Project Structure
+## 📦 Project Structure
 
 ```
 chidori/
@@ -253,7 +281,7 @@ chidori/
 └── llm.txt                 # Complete API reference for LLM-assisted development
 ```
 
-## Current Status
+## 🚧 Current Status
 
 **Phase 1 (Core Runtime)** — ✅ Working
 - Starlark evaluator with host functions (`prompt`, `template`, `config`, `log`, `env`)
