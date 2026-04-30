@@ -1,6 +1,6 @@
-# app-agent TypeScript SDK
+# chidori TypeScript SDK
 
-Zero-dependency TypeScript client for a running `app-agent serve` instance.
+Zero-dependency TypeScript client for a running `chidori serve` instance.
 Uses the global `fetch` (Node 18+, browsers). Mirrors the Python SDK.
 
 ## Install
@@ -14,13 +14,13 @@ npm run build
 Then import from the package or link it locally:
 
 ```ts
-import { AgentClient, Checkpoint } from "app-agent";
+import { AgentClient, Checkpoint } from "chidori";
 ```
 
 ## Usage
 
 ```ts
-import { AgentClient, Checkpoint } from "app-agent";
+import { AgentClient, Checkpoint } from "chidori";
 
 const client = new AgentClient("http://localhost:8080");
 
@@ -45,4 +45,4 @@ if (session.status === "paused") {
 }
 ```
 
-See the top-level `sdk/python/app_agent` for the Python equivalent.
+See the top-level `sdk/python/chidori` for the Python equivalent.

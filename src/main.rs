@@ -22,7 +22,7 @@ use crate::runtime::template::TemplateEngine;
 use crate::tools::ToolRegistry;
 
 #[derive(Parser)]
-#[command(name = "app-agent", version, about = "AI agent framework powered by Starlark")]
+#[command(name = "chidori", version, about = "AI agent framework powered by Starlark")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -84,26 +84,26 @@ enum Commands {
         /// Agent .star file (same one the run was created from)
         file: PathBuf,
 
-        /// Run id (subdirectory name under `.app-agent/runs/`)
+        /// Run id (subdirectory name under `.chidori/runs/`)
         run_id: String,
 
-        /// Project dir containing `.app-agent/runs/` (defaults to agent file's parent)
+        /// Project dir containing `.chidori/runs/` (defaults to agent file's parent)
         #[arg(short, long)]
         dir: Option<PathBuf>,
     },
 
     /// Pretty-print a persisted run's call log.
     Trace {
-        /// Run id (subdirectory name under `.app-agent/runs/`)
+        /// Run id (subdirectory name under `.chidori/runs/`)
         run_id: String,
 
-        /// Project dir containing `.app-agent/runs/` (defaults to current dir)
+        /// Project dir containing `.chidori/runs/` (defaults to current dir)
         #[arg(short, long)]
         dir: Option<PathBuf>,
     },
 
     /// Aggregate run history: total runs, tokens, est. cost, per-model breakdown.
-    /// Reads `.app-agent/runs/<id>/checkpoint.json` in the given directory.
+    /// Reads `.chidori/runs/<id>/checkpoint.json` in the given directory.
     Stats {
         /// Directory containing agent runs (defaults to current dir)
         #[arg(short, long)]
@@ -215,7 +215,7 @@ fn cmd_run(
 
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
-        .with_persist_base(base_dir.join(".app-agent").join("runs"));
+        .with_persist_base(base_dir.join(".chidori").join("runs"));
 
     // Run the agent.
     let result = engine.run(file, &input_value)?;
@@ -400,7 +400,7 @@ fn cmd_resume(file: &PathBuf, run_id: &str, dir: Option<&std::path::Path>) -> Re
         .or_else(|| file.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let run_dir = base_dir.join(".app-agent").join("runs").join(run_id);
+    let run_dir = base_dir.join(".chidori").join("runs").join(run_id);
     let checkpoint_path = run_dir.join("checkpoint.json");
     let input_path = run_dir.join("input.json");
 
@@ -448,7 +448,7 @@ fn cmd_trace(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
     let base_dir = dir
         .map(|d| d.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    let run_dir = base_dir.join(".app-agent").join("runs").join(run_id);
+    let run_dir = base_dir.join(".chidori").join("runs").join(run_id);
     let checkpoint_path = run_dir.join("checkpoint.json");
 
     if !checkpoint_path.exists() {
@@ -522,7 +522,7 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
     let runs_dir = dir
         .map(|d| d.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".app-agent")
+        .join(".chidori")
         .join("runs");
 
     if !runs_dir.exists() {

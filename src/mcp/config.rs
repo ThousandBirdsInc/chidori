@@ -41,11 +41,11 @@ pub struct McpServersConfig {
 
 impl McpServersConfig {
     pub fn load_from_env() -> Result<Self> {
-        let Ok(path) = std::env::var("APP_AGENT_MCP_CONFIG") else {
+        let Ok(path) = std::env::var("CHIDORI_MCP_CONFIG") else {
             return Ok(Self::default());
         };
         let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading APP_AGENT_MCP_CONFIG at {}", path))?;
+            .with_context(|| format!("reading CHIDORI_MCP_CONFIG at {}", path))?;
         let cfg: McpServersConfig = serde_json::from_str(&text)
             .with_context(|| format!("parsing MCP config at {}", path))?;
         Ok(cfg)

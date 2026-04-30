@@ -213,7 +213,7 @@ fn cost(_: &Operator) -> u64 {
 /// wasmer's `Engine` and `Module` are both `Send + Sync + Clone` (internally
 /// Arc'd), so this cache can live in a global Mutex without copying on hit.
 /// Compiled artifacts are additionally persisted to disk under
-/// `.app-agent/wasm-cache/` so the first call after a fresh `cargo run`
+/// `.chidori/wasm-cache/` so the first call after a fresh `cargo run`
 /// doesn't re-pay the ~30s Cranelift compile cost for the RustPython
 /// binary. Cache files are loaded via `Module::deserialize`, which is
 /// `unsafe` because the bytes are executed directly — we trust them only
@@ -244,7 +244,7 @@ const DISK_CACHE_VERSION: u32 = 1;
 /// directory exists. Returns `None` if we can't materialize the directory
 /// (e.g. home dir missing), in which case the in-memory cache still works.
 fn disk_cache_path(key: u64) -> Option<std::path::PathBuf> {
-    let base = std::path::PathBuf::from(".app-agent").join("wasm-cache");
+    let base = std::path::PathBuf::from(".chidori").join("wasm-cache");
     if std::fs::create_dir_all(&base).is_err() {
         return None;
     }
@@ -277,7 +277,7 @@ fn try_load_from_disk(key: u64, memory_pages: u32) -> Option<CachedArtifact> {
     let bytes = std::fs::read(&path).ok()?;
     let engine = make_engine(memory_pages);
     // SAFETY: We only read files we wrote into our own cache directory.
-    // If a user manually tampers with `.app-agent/wasm-cache/`, they are
+    // If a user manually tampers with `.chidori/wasm-cache/`, they are
     // opting into running that code. The version tag in the filename
     // guards against cross-wasmer-version collisions; a corrupt file
     // causes deserialize to fail and we fall through to a fresh compile.

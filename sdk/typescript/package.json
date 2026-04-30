@@ -1,7 +1,9 @@
 {
-  "name": "app-agent",
-  "version": "0.1.0",
-  "description": "TypeScript SDK for the app-agent framework — HTTP client for running and replaying Starlark agents.",
+  "name": "chidori",
+  "version": "3.0.0",
+  "description": "TypeScript SDK for the Chidori agent framework — HTTP client for running and replaying Starlark agents.",
+  "homepage": "https://github.com/ThousandBirdsInc/chidori",
+  "repository": { "type": "git", "url": "https://github.com/ThousandBirdsInc/chidori.git" },
   "license": "MIT",
   "type": "module",
   "main": "dist/index.js",

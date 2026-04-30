@@ -1,10 +1,18 @@
 [package]
-name = "app-agent"
-version = "0.1.0"
+name = "chidori"
+version = "3.0.0"
 edition = "2021"
+authors = ["Colton Pierson <colton@thousandbirds.ai>"]
+license = "MIT"
+description = "YAML-free AI agent framework where agents are deterministic Starlark scripts with built-in checkpointing and replay."
+homepage = "https://docs.thousandbirds.ai"
+repository = "https://github.com/ThousandBirdsInc/chidori"
+readme = "README.md"
+keywords = ["agent", "ai", "llm", "starlark", "replay"]
+categories = ["development-tools", "command-line-utilities"]
 
 [[bin]]
-name = "app-agent"
+name = "chidori"
 path = "src/main.rs"
 
 [dependencies]

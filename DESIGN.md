@@ -360,7 +360,7 @@ Every host function call is traced with:
 - Error details (if any)
 
 ```bash
-app-agent run agents/summarizer.star --input document=@file.txt --trace
+chidori run agents/summarizer.star --input document=@file.txt --trace
 ```
 
 ---
@@ -585,7 +585,7 @@ This uses the same replay mechanism as checkpointing — the editor just provide
 ### Project Config
 
 ```python
-# app-agent.star (project root)
+# chidori.star (project root)
 
 project(
     tool_dirs = ["tools/", "../shared-tools/"],
@@ -623,31 +623,31 @@ providers(
 
 ```bash
 # Run an agent
-app-agent run agents/summarizer.star --input document=@file.txt
+chidori run agents/summarizer.star --input document=@file.txt
 
 # Run with JSON input
-app-agent run agents/research.star --input '{"question": "What is quantum computing?"}'
+chidori run agents/research.star --input '{"question": "What is quantum computing?"}'
 
 # Interactive mode (human-in-the-loop steps prompt in terminal)
-app-agent run agents/assistant.star --interactive
+chidori run agents/assistant.star --interactive
 
 # Resume from checkpoint
-app-agent resume <run-id>
+chidori resume <run-id>
 
 # Validate an agent definition
-app-agent check agents/my_agent.star
+chidori check agents/my_agent.star
 
 # List available tools
-app-agent tools
+chidori tools
 
 # View execution trace
-app-agent trace <run-id>
+chidori trace <run-id>
 
 # Serve agent as an HTTP API
-app-agent serve agents/assistant.star --port 8080
+chidori serve agents/assistant.star --port 8080
 
 # Launch visual editor
-app-agent edit agents/assistant.star --port 3000
+chidori edit agents/assistant.star --port 3000
 ```
 
 ### HTTP API (via `serve`)
@@ -681,7 +681,7 @@ my-project/
 │   └── database.star
 ├── config/
 │   └── providers.star
-└── app-agent.star              # project config
+└── chidori.star              # project config
 ```
 
 ---
@@ -882,7 +882,7 @@ Starlark orchestrates. WASM executes untrusted code. They're complementary, not 
 - Sub-agent calls via `agent()` host function
 - Human-in-the-loop via `input()` with suspend/resume
 - `retry()` and `try_call()` error handling
-- `app-agent resume <run-id>`
+- `chidori resume <run-id>`
 
 ### Phase 3 — Visual Editor
 - Web-based node canvas (React + a graph library)

@@ -1,1 +1,25 @@
 /target
+/sandbox-runtime/target
+/sandbox-python/target
+/sandbox-js/target
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+
+# Run artifacts produced by `chidori run` (kept out of source control)
+.chidori/runs/
+.chidori/wasm-cache/
+
+# Python build/dist
+__pycache__/
+*.pyc
+*.egg-info/
+sdk/python/build/
+sdk/python/dist/
+
+# Node
+node_modules/

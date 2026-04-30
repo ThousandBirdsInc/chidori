@@ -3,14 +3,14 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "app-agent"
-version = "0.1.0"
-description = "Python SDK for the app-agent framework — HTTP client for running and replaying Starlark agents."
+name = "chidori"
+version = "3.0.0"
+description = "Python SDK for the Chidori agent framework — HTTP client for running and replaying Starlark agents."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
-authors = [{ name = "app-agent contributors" }]
-keywords = ["ai", "agents", "starlark", "llm"]
+authors = [{ name = "Colton Pierson", email = "colton@thousandbirds.ai" }]
+keywords = ["ai", "agents", "starlark", "llm", "chidori"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3",
@@ -22,7 +22,8 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/anthropics/app-agent-framework"
+Homepage = "https://github.com/ThousandBirdsInc/chidori"
+Repository = "https://github.com/ThousandBirdsInc/chidori"
 
 [tool.setuptools.packages.find]
-include = ["app_agent*"]
+include = ["chidori*"]

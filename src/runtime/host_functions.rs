@@ -93,7 +93,7 @@ pub(crate) fn enforce_policy(
                     return Ok(());
                 }
             }
-            if std::env::var("APP_AGENT_POLICY_AUTO_APPROVE").ok().as_deref() == Some("1") {
+            if std::env::var("CHIDORI_POLICY_AUTO_APPROVE").ok().as_deref() == Some("1") {
                 host.policy_cache.lock().unwrap().approve(target, args);
                 return Ok(());
             }
@@ -110,7 +110,7 @@ pub(crate) fn enforce_policy(
                 return Err(anyhow::anyhow!("{}", PAUSE_MARKER));
             }
             Err(anyhow::anyhow!(
-                "policy: `{}` requires approval{}. Set APP_AGENT_POLICY_AUTO_APPROVE=1 to \
+                "policy: `{}` requires approval{}. Set CHIDORI_POLICY_AUTO_APPROVE=1 to \
                  auto-approve, or run through the server so the approval flow can pause.",
                 target,
                 reason.map(|r| format!(" — {}", r)).unwrap_or_default()
@@ -1456,7 +1456,7 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
     /// shell("git", args=["log", "--oneline", "-n", "5"], cwd="/repo")
     ///
     /// Security model: the command name must appear in the
-    /// `APP_AGENT_SHELL_ALLOW` env var (comma-separated, e.g. `"ls,cat,echo,git"`)
+    /// `CHIDORI_SHELL_ALLOW` env var (comma-separated, e.g. `"ls,cat,echo,git"`)
     /// or be literally `*` (allow anything — do not set in production).
     /// The allow list is checked against the *bare* command name, not a full
     /// path, and args are passed directly to the OS via `execvp`-style
@@ -1822,7 +1822,7 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
     /// memory("delete", "user_pref")
     /// all = memory("list", prefix="user_", namespace="profile")
     ///
-    /// Storage: `.app-agent/memory/<namespace>.json`. Goes through the
+    /// Storage: `.chidori/memory/<namespace>.json`. Goes through the
     /// replay cache so replays return the values observed at record time,
     /// independent of what's on disk now.
     fn memory<'v>(
@@ -2237,18 +2237,18 @@ struct ShellOutcome {
     timed_out: bool,
 }
 
-/// Enforce the `APP_AGENT_SHELL_ALLOW` whitelist for `shell()`.
+/// Enforce the `CHIDORI_SHELL_ALLOW` whitelist for `shell()`.
 ///
 /// Default: empty → every command is refused. Users opt in by setting
-/// `APP_AGENT_SHELL_ALLOW` to a comma-separated list (e.g. `"ls,cat,git"`)
+/// `CHIDORI_SHELL_ALLOW` to a comma-separated list (e.g. `"ls,cat,git"`)
 /// or to `*` to allow anything. The allow list matches on the *bare*
 /// command name; it does not do path-based or regex matching.
 fn check_shell_allowed(command: &str) -> anyhow::Result<()> {
-    let allow = std::env::var("APP_AGENT_SHELL_ALLOW").unwrap_or_default();
+    let allow = std::env::var("CHIDORI_SHELL_ALLOW").unwrap_or_default();
     let trimmed = allow.trim();
     if trimmed.is_empty() {
         return Err(anyhow::anyhow!(
-            "shell() is disabled: set APP_AGENT_SHELL_ALLOW to a comma-separated \
+            "shell() is disabled: set CHIDORI_SHELL_ALLOW to a comma-separated \
              allow list (e.g. \"ls,cat,git\") to enable specific commands"
         ));
     }
@@ -2267,7 +2267,7 @@ fn check_shell_allowed(command: &str) -> anyhow::Result<()> {
         Ok(())
     } else {
         Err(anyhow::anyhow!(
-            "shell() command `{}` is not in APP_AGENT_SHELL_ALLOW ({})",
+            "shell() command `{}` is not in CHIDORI_SHELL_ALLOW ({})",
             command,
             trimmed
         ))
@@ -2478,7 +2478,7 @@ fn invoke_tool_call(
 }
 
 /// Execute a memory() action against the JSON-file backend.
-/// Storage layout: `.app-agent/memory/<namespace>.json` containing a flat
+/// Storage layout: `.chidori/memory/<namespace>.json` containing a flat
 /// object `{ key: value, ... }`. One file per namespace keeps actions atomic
 /// (each call reads + writes the whole file) and keeps the backend dependency-
 /// free. A SQLite backend is a later upgrade.
@@ -2489,7 +2489,7 @@ fn memory_execute(
     value: Option<&Value>,
     prefix: &str,
 ) -> anyhow::Result<Value> {
-    let dir = std::path::PathBuf::from(".app-agent").join("memory");
+    let dir = std::path::PathBuf::from(".chidori").join("memory");
     std::fs::create_dir_all(&dir)?;
     let file = dir.join(format!("{}.json", sanitize_namespace(namespace)));
 
@@ -2602,7 +2602,7 @@ mod tests {
     }
 
     // Serialize shell-whitelist tests so concurrent test threads don't
-    // stomp on each other's APP_AGENT_SHELL_ALLOW env value.
+    // stomp on each other's CHIDORI_SHELL_ALLOW env value.
     fn with_env<F: FnOnce()>(key: &str, value: Option<&str>, f: F) {
         use std::sync::Mutex;
         static LOCK: Mutex<()> = Mutex::new(());
@@ -2621,7 +2621,7 @@ mod tests {
 
     #[test]
     fn test_shell_whitelist_default_closed() {
-        with_env("APP_AGENT_SHELL_ALLOW", None, || {
+        with_env("CHIDORI_SHELL_ALLOW", None, || {
             let err = check_shell_allowed("echo").unwrap_err();
             assert!(err.to_string().contains("disabled"));
         });
@@ -2629,7 +2629,7 @@ mod tests {
 
     #[test]
     fn test_shell_whitelist_specific() {
-        with_env("APP_AGENT_SHELL_ALLOW", Some("ls, cat , echo"), || {
+        with_env("CHIDORI_SHELL_ALLOW", Some("ls, cat , echo"), || {
             assert!(check_shell_allowed("echo").is_ok());
             assert!(check_shell_allowed("cat").is_ok());
             // basename match: full path still resolves to `ls`.
@@ -2641,7 +2641,7 @@ mod tests {
 
     #[test]
     fn test_shell_whitelist_star() {
-        with_env("APP_AGENT_SHELL_ALLOW", Some("*"), || {
+        with_env("CHIDORI_SHELL_ALLOW", Some("*"), || {
             assert!(check_shell_allowed("rm").is_ok());
             assert!(check_shell_allowed("arbitrary-command").is_ok());
         });

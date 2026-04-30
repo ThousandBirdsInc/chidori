@@ -1,7 +1,7 @@
 # Webhook event handler agent.
 #
 # Listens for incoming HTTP events and processes them with an LLM.
-# Run with: app-agent serve examples/agents/webhook.star --port 8080
+# Run with: chidori serve examples/agents/webhook.star --port 8080
 #
 # The agent receives every HTTP request as an `event` dict:
 #   {

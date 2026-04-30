@@ -1,6 +1,6 @@
-"""Integration tests for the app-agent session API.
+"""Integration tests for the chidori session API.
 
-These tests drive a real `app-agent serve` subprocess through the Python
+These tests drive a real `chidori serve` subprocess through the Python
 SDK, pointing it at a stdlib-only mock LLM server so no real network calls
 happen. They lock in the contract for the recently-hardened session API:
 concurrency limits + 503, bearer-token auth, CORS headers, pause/resume,
@@ -9,8 +9,8 @@ and byte-identical replay from a checkpoint.
 Run with:
     cd sdk/python && python3 -m unittest tests/test_session_api.py
 
-Set `APP_AGENT_BIN` to override the binary path if it isn't at the default
-`target/debug/app-agent` relative to the repo root.
+Set `CHIDORI_BIN` to override the binary path if it isn't at the default
+`target/debug/chidori` relative to the repo root.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from pathlib import Path
 
 # The SDK lives alongside this test file.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from app_agent import AgentClient, Checkpoint  # noqa: E402
+from chidori import AgentClient, Checkpoint  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Paths + defaults
@@ -38,7 +38,7 @@ from app_agent import AgentClient, Checkpoint  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 AGENT_BIN = Path(
-    os.environ.get("APP_AGENT_BIN", str(REPO_ROOT / "target" / "debug" / "app-agent"))
+    os.environ.get("CHIDORI_BIN", str(REPO_ROOT / "target" / "debug" / "chidori"))
 )
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -138,11 +138,11 @@ def _wait_for_health(base_url: str, timeout: float = 10.0) -> None:
         except (urllib.error.URLError, ConnectionError, OSError):
             pass
         time.sleep(0.1)
-    raise RuntimeError(f"app-agent never came up at {base_url}")
+    raise RuntimeError(f"chidori never came up at {base_url}")
 
 
 class ServeProcess:
-    """Start `app-agent serve` as a subprocess against a given agent file.
+    """Start `chidori serve` as a subprocess against a given agent file.
 
     Takes extra env vars for hardening/test configuration. Cleans up on
     `stop()` via SIGTERM + timeout-bounded wait.
@@ -164,8 +164,8 @@ class ServeProcess:
         env.update(self.extra_env)
         if not AGENT_BIN.exists():
             raise RuntimeError(
-                f"app-agent binary not found at {AGENT_BIN}; "
-                "run `cargo build` or set APP_AGENT_BIN"
+                f"chidori binary not found at {AGENT_BIN}; "
+                "run `cargo build` or set CHIDORI_BIN"
             )
         self.proc = subprocess.Popen(
             [str(AGENT_BIN), "serve", str(self.agent), "--port", str(self.port)],
@@ -192,7 +192,7 @@ class ServeProcess:
 
 
 class _MockLlmTestCase(unittest.TestCase):
-    """Shared harness: mock LLM + app-agent + Python SDK client.
+    """Shared harness: mock LLM + chidori + Python SDK client.
 
     Subclasses override `extra_env` to configure auth, concurrency, CORS.
     Each test class gets its own subprocess so env-var changes take
@@ -323,7 +323,7 @@ class PauseResumeTests(_MockLlmTestCase):
 
 
 class AuthTests(_MockLlmTestCase):
-    extra_env = {"APP_AGENT_API_KEY": "test-bearer-token"}
+    extra_env = {"CHIDORI_API_KEY": "test-bearer-token"}
 
     def _post_raw(self, path: str, body: dict, headers: dict | None = None):
         req = urllib.request.Request(
@@ -373,9 +373,9 @@ class AuthTests(_MockLlmTestCase):
 class ConcurrencyTests(_MockLlmTestCase):
     agent = FIXTURES / "slow.star"
     extra_env = {
-        "APP_AGENT_MAX_CONCURRENT_SESSIONS": "1",
-        "APP_AGENT_ACQUIRE_TIMEOUT_MS": "200",
-        "APP_AGENT_SHELL_ALLOW": "sleep",
+        "CHIDORI_MAX_CONCURRENT_SESSIONS": "1",
+        "CHIDORI_ACQUIRE_TIMEOUT_MS": "200",
+        "CHIDORI_SHELL_ALLOW": "sleep",
     }
 
     def test_second_concurrent_request_gets_503(self):
@@ -414,7 +414,7 @@ class ConcurrencyTests(_MockLlmTestCase):
 
 
 class CorsTests(_MockLlmTestCase):
-    extra_env = {"APP_AGENT_CORS_ORIGINS": "*"}
+    extra_env = {"CHIDORI_CORS_ORIGINS": "*"}
 
     def test_preflight_emits_allow_origin(self):
         req = urllib.request.Request(

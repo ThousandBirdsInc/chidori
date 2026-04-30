@@ -17,9 +17,9 @@ def agent(document):
 
 Run it:
 ```
-app-agent run agents/summarizer.star --input document=@file.txt
-app-agent run agents/summarizer.star --input document="some text here"
-app-agent run agents/summarizer.star --input '{"document": "some text"}'
+chidori run agents/summarizer.star --input document=@file.txt
+chidori run agents/summarizer.star --input document="some text here"
+chidori run agents/summarizer.star --input '{"document": "some text"}'
 ```
 
 ## File Structure
@@ -29,7 +29,7 @@ my-project/
 ├── agents/          # .star agent files
 ├── prompts/         # .jinja template files
 ├── tools/           # .star tool files
-└── app-agent.star   # project config (optional)
+└── chidori.star   # project config (optional)
 ```
 
 ## Agent Anatomy
@@ -391,10 +391,10 @@ answer = prompt(
 
 ## Event-Driven Agents (serve)
 
-Agents can run as persistent HTTP servers that react to incoming events. Use `app-agent serve` to start the server — every incoming HTTP request is converted into an `event` dict and passed to `agent(event)`.
+Agents can run as persistent HTTP servers that react to incoming events. Use `chidori serve` to start the server — every incoming HTTP request is converted into an `event` dict and passed to `agent(event)`.
 
 ```
-app-agent serve agents/webhook.star --port 8080
+chidori serve agents/webhook.star --port 8080
 ```
 
 ### The Event Dict
@@ -492,7 +492,7 @@ def handle_alert(event):
 
 ```bash
 # Start the server
-app-agent serve agents/webhook.star --port 8080
+chidori serve agents/webhook.star --port 8080
 
 # In another terminal:
 # Health check (built-in, always available)
@@ -562,7 +562,7 @@ action = dict_get(body, "action", "unknown")
 
 ## Sessions, Checkpointing, and Replay
 
-When an agent runs via `app-agent serve`, every execution becomes a **session** with a unique ID. The session's call log (all host function calls with their cached results) can be saved and later used to **replay** the agent — re-executing the Starlark code but returning cached results instead of hitting LLMs.
+When an agent runs via `chidori serve`, every execution becomes a **session** with a unique ID. The session's call log (all host function calls with their cached results) can be saved and later used to **replay** the agent — re-executing the Starlark code but returning cached results instead of hitting LLMs.
 
 ### Session API (HTTP)
 
@@ -604,13 +604,13 @@ curl -X POST http://localhost:8080/sessions \
 
 ### Python SDK
 
-The Python SDK (`sdk/python/app_agent/`) is a pure-stdlib client — no `pip install`, no native bindings, just HTTP calls to a running `app-agent serve` instance.
+The Python SDK (`sdk/python/chidori/`) is a pure-stdlib client — no `pip install`, no native bindings, just HTTP calls to a running `chidori serve` instance.
 
 ```python
 import sys
 sys.path.insert(0, "sdk/python")
 
-from app_agent import AgentClient, Checkpoint
+from chidori import AgentClient, Checkpoint
 
 client = AgentClient("http://localhost:8080")
 
@@ -688,10 +688,10 @@ Because Starlark guarantees determinism, the sequence numbers always match up, a
 ## CLI Reference
 
 ```
-app-agent run <file.star> [--input key=value]... [--trace] [--verbose]
-app-agent check <file.star>
-app-agent tools [--dir <path>]...
-app-agent serve <file.star> [--port 8080] [--verbose]
+chidori run <file.star> [--input key=value]... [--trace] [--verbose]
+chidori check <file.star>
+chidori tools [--dir <path>]...
+chidori serve <file.star> [--port 8080] [--verbose]
 ```
 
 **`serve` exposes:**

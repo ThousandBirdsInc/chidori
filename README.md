@@ -1,6 +1,8 @@
-# App Agent Framework
+# Chidori v3
 
-A YAML-free AI agent framework where agents are written as **Starlark** scripts — a deterministic Python dialect that enables checkpointing, replay, and visual editing.
+The third generation of [Chidori](https://github.com/ThousandBirdsInc/chidori) — a YAML-free AI agent framework where agents are written as **Starlark** scripts, a deterministic Python dialect that enables checkpointing, replay, and visual editing.
+
+> **About v3.** Chidori began as a reactive runtime exploring how to build durable, debuggable agents. v3 is a ground-up rewrite that distills those ideas into a smaller, sharper core: a single Rust binary, Starlark instead of bespoke cells, and replay as the foundation for everything else (tests, debugging, resume, human-in-the-loop). Earlier versions of Chidori live in the git history and on prior tags.
 
 - **Agents look like Python.** Native control flow, variables, list comprehensions — no template DSL.
 - **Deterministic execution.** Every side effect goes through a host function the runtime can log, cache, and replay.
@@ -34,7 +36,7 @@ export LITELLM_API_KEY=sk-litellm-master-key
 # export OPENAI_API_KEY=sk-...
 
 cargo build
-./target/debug/app-agent run agents/summarizer.star \
+./target/debug/chidori run agents/summarizer.star \
   --input document="Rust is a systems programming language..."
 ```
 
@@ -42,18 +44,18 @@ cargo build
 
 ```bash
 # Minimal agent — no LLM calls needed
-./target/debug/app-agent run examples/agents/hello.star --input name=Colton
+./target/debug/chidori run examples/agents/hello.star --input name=Colton
 
 # Summarizer with trace
-./target/debug/app-agent run examples/agents/summarizer.star \
+./target/debug/chidori run examples/agents/summarizer.star \
   --input document="Rust is great." --trace
 
 # Template-based agent
-./target/debug/app-agent run examples/agents/template_demo.star \
+./target/debug/chidori run examples/agents/template_demo.star \
   --input '{"items": ["alpha", "beta", "gamma"]}'
 
 # Event-driven webhook handler
-./target/debug/app-agent serve examples/agents/webhook.star --port 8080
+./target/debug/chidori serve examples/agents/webhook.star --port 8080
 ```
 
 ## Core Concepts
@@ -83,16 +85,16 @@ See [`llm.txt`](./llm.txt) for the full API reference.
 ### 1. One-shot CLI
 
 ```bash
-app-agent run agents/my_agent.star --input key=value
-app-agent run agents/my_agent.star --input '{"complex": "input"}'
-app-agent check agents/my_agent.star          # validate without running
-app-agent tools --dir tools/                   # list available tools
+chidori run agents/my_agent.star --input key=value
+chidori run agents/my_agent.star --input '{"complex": "input"}'
+chidori check agents/my_agent.star          # validate without running
+chidori tools --dir tools/                   # list available tools
 ```
 
 ### 2. HTTP Server (event-driven + session API)
 
 ```bash
-app-agent serve agents/my_agent.star --port 8080
+chidori serve agents/my_agent.star --port 8080
 ```
 
 Exposes:
@@ -122,7 +124,7 @@ def agent(event):
 ```
 
 ```bash
-app-agent serve agents/webhook.star --port 8080
+chidori serve agents/webhook.star --port 8080
 
 curl -X POST http://localhost:8080/github \
   -H "Content-Type: application/json" \
@@ -131,13 +133,13 @@ curl -X POST http://localhost:8080/github \
 
 ## Python SDK
 
-The Python SDK is a pure-stdlib HTTP client that talks to a running `app-agent serve` instance. No `pip install`, no native bindings.
+The Python SDK is a pure-stdlib HTTP client that talks to a running `chidori serve` instance. No `pip install`, no native bindings.
 
 ```python
 import sys
 sys.path.insert(0, "sdk/python")
 
-from app_agent import AgentClient, Checkpoint
+from chidori import AgentClient, Checkpoint
 
 client = AgentClient("http://localhost:8080")
 
@@ -154,7 +156,7 @@ checkpoint.save("/tmp/session.json")
 Later, replay the session from disk — **zero LLM calls**:
 
 ```python
-from app_agent import AgentClient, Checkpoint
+from chidori import AgentClient, Checkpoint
 
 client = AgentClient("http://localhost:8080")
 cp = Checkpoint.load("/tmp/session.json")
@@ -223,7 +225,7 @@ See [`DESIGN.md`](./DESIGN.md) for the full architecture and design rationale, a
 ## Project Structure
 
 ```
-app-agent-framework/
+chidori/
 ├── src/
 │   ├── main.rs             # CLI entry point
 │   ├── server.rs           # HTTP server (serve + session API)
@@ -240,7 +242,7 @@ app-agent-framework/
 │   └── tools/
 │       └── mod.rs          # Tool discovery + JSON schema generation
 ├── sdk/
-│   └── python/app_agent/   # Python SDK (pure stdlib, no deps)
+│   └── python/chidori/     # Python SDK (pure stdlib, no deps)
 ├── examples/
 │   ├── agents/             # Example .star agents
 │   ├── prompts/            # Example .jinja templates

@@ -164,43 +164,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "app-agent"
-version = "0.1.0"
-dependencies = [
- "allocative",
- "anyhow",
- "async-stream",
- "async-trait",
- "axum 0.8.8",
- "chrono",
- "clap",
- "cron",
- "derive_more",
- "futures",
- "minijinja",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "reqwest",
- "rquickjs",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml",
- "starlark",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tower 0.5.3",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "wasmer",
- "wasmer-middlewares",
-]
-
-[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -495,6 +458,43 @@ name = "cfg_aliases"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd16c4719339c4530435d38e511904438d07cce7950afa3718a84ac36c10e89e"
+
+[[package]]
+name = "chidori"
+version = "3.0.0"
+dependencies = [
+ "allocative",
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum 0.8.8",
+ "chrono",
+ "clap",
+ "cron",
+ "derive_more",
+ "futures",
+ "minijinja",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "reqwest",
+ "rquickjs",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "starlark",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tower 0.5.3",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "wasmer",
+ "wasmer-middlewares",
+]
 
 [[package]]
 name = "chrono"

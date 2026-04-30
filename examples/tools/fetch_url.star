@@ -54,7 +54,7 @@ def _collapse_ws(text):
 def fetch_url(url, max_chars = 8000):
     """Fetch a URL and return its visible text content."""
     response = http(url, method = "GET", headers = {
-        "User-Agent": "app-agent/0.1 fetch_url tool",
+        "User-Agent": "chidori/0.1 fetch_url tool",
         "Accept": "text/html,application/xhtml+xml",
     })
 

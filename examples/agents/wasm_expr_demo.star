@@ -2,7 +2,7 @@
 #
 # `exec_expr` ships a small Rust-authored interpreter (lexer, recursive-
 # descent parser, tree-walking evaluator) compiled to wasm32 and embedded
-# in the app-agent binary. The source below runs inside wasmer under a
+# in the chidori binary. The source below runs inside wasmer under a
 # fuel budget + capped linear memory, with host-supplied `vars` passed in
 # by prepending `let name = value in …` chains.
 

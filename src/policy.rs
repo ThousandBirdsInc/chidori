@@ -7,10 +7,10 @@
 //!   * NeverAllow  — hard refusal, the call errors out
 //!
 //! Policy is loaded at engine startup from:
-//!   1. APP_AGENT_POLICY_FILE — path to a JSON file
-//!   2. APP_AGENT_POLICY — inline JSON string
+//!   1. CHIDORI_POLICY_FILE — path to a JSON file
+//!   2. CHIDORI_POLICY — inline JSON string
 //!   3. default (AlwaysAllow for everything except shell, which keeps the
-//!      existing APP_AGENT_SHELL_ALLOW semantics)
+//!      existing CHIDORI_SHELL_ALLOW semantics)
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -57,18 +57,18 @@ pub struct PolicyConfig {
 
 impl PolicyConfig {
     pub fn from_env() -> Arc<Self> {
-        if let Ok(path) = std::env::var("APP_AGENT_POLICY_FILE") {
+        if let Ok(path) = std::env::var("CHIDORI_POLICY_FILE") {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 match serde_json::from_str::<PolicyConfig>(&text) {
                     Ok(cfg) => return Arc::new(cfg),
-                    Err(e) => tracing::warn!("APP_AGENT_POLICY_FILE parse error: {}", e),
+                    Err(e) => tracing::warn!("CHIDORI_POLICY_FILE parse error: {}", e),
                 }
             }
         }
-        if let Ok(inline) = std::env::var("APP_AGENT_POLICY") {
+        if let Ok(inline) = std::env::var("CHIDORI_POLICY") {
             match serde_json::from_str::<PolicyConfig>(&inline) {
                 Ok(cfg) => return Arc::new(cfg),
-                Err(e) => tracing::warn!("APP_AGENT_POLICY parse error: {}", e),
+                Err(e) => tracing::warn!("CHIDORI_POLICY parse error: {}", e),
             }
         }
         Arc::new(PolicyConfig::default())

@@ -369,12 +369,12 @@ src/runtime/trace/
 ├── stack.rs        # call-depth tracking for `parent` span
 └── sink/
     ├── mod.rs      # TraceSink trait
-    ├── jsonl.rs    # .app-agent/runs/{id}/events.jsonl writer
+    ├── jsonl.rs    # .chidori/runs/{id}/events.jsonl writer
     ├── channel.rs  # tokio::mpsc sink for SSE/WS streaming
     └── null.rs     # zero-cost no-op sink (default when disabled)
 ```
 
-### 6.1 Public API surface (inside `app-agent-framework`)
+### 6.1 Public API surface (inside `chidori`)
 
 ```rust
 // src/runtime/trace/mod.rs
@@ -514,7 +514,7 @@ we store it once. The viewer fetches via the new
 
 - **`NullSink`** — default when `AGENT_TRACE` unset. Zero-cost no-op.
 - **`JsonlSink`** — appends one JSON event per line to
-  `.app-agent/runs/{run_id}/events.jsonl`. Thread-safe via a single
+  `.chidori/runs/{run_id}/events.jsonl`. Thread-safe via a single
   `Mutex<BufWriter<File>>`. Flushed on run end.
 - **`ChannelSink`** — fans out to a `tokio::sync::mpsc` that the
   HTTP server subscribes to for `/runs/:id/stream`.
@@ -569,7 +569,7 @@ New endpoints in `src/server.rs`, scoped under `/runs`:
 | `GET` | `/runs/:id/values/:value_id` | Raw large-value body |
 
 Implementation: a new `src/server/runs.rs` module parallel to
-session routes. Reads from `.app-agent/runs/{id}/` for static
+session routes. Reads from `.chidori/runs/{id}/` for static
 endpoints; subscribes to `ChannelSink` broadcasts for `/stream`.
 
 ---

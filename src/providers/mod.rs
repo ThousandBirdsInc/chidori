@@ -159,7 +159,7 @@ impl ProviderRegistry {
 
         if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
             let mut p = anthropic::AnthropicProvider::new(api_key);
-            if let Some(rpm) = rpm_env("APP_AGENT_ANTHROPIC_RPM") {
+            if let Some(rpm) = rpm_env("CHIDORI_ANTHROPIC_RPM") {
                 p = p.with_rate_limit(rpm);
             }
             registry.register(Box::new(p));
@@ -167,7 +167,7 @@ impl ProviderRegistry {
 
         if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
             let mut p = openai::OpenAiProvider::new(api_key);
-            if let Some(rpm) = rpm_env("APP_AGENT_OPENAI_RPM") {
+            if let Some(rpm) = rpm_env("CHIDORI_OPENAI_RPM") {
                 p = p.with_rate_limit(rpm);
             }
             registry.register(Box::new(p));
@@ -185,7 +185,7 @@ impl ProviderRegistry {
                 url,
                 vec!["".to_string()],
             );
-            if let Some(rpm) = rpm_env("APP_AGENT_LITELLM_RPM") {
+            if let Some(rpm) = rpm_env("CHIDORI_LITELLM_RPM") {
                 p = p.with_rate_limit(rpm);
             }
             registry.register(Box::new(p));

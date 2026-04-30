@@ -1,5 +1,5 @@
 _MAX_LINES = 2000
-_OVERFLOW_DIR = "/tmp/app_agent_overflow"
+_OVERFLOW_DIR = "/tmp/chidori_overflow"
 
 def shell_exec(command, args = [], cwd = ""):
     """Execute a shell command. Use this for running tests, builds, linters, git operations, and other CLI tools. Returns stdout, stderr, and exit_code. Output longer than 2000 lines is truncated and saved to a temporary file."""

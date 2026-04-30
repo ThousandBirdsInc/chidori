@@ -29,7 +29,7 @@ use opentelemetry_sdk::Resource;
 use crate::runtime::call_log::CallRecord;
 
 /// Tracer instance name under which every agent span is emitted.
-const TRACER_NAME: &str = "app-agent";
+const TRACER_NAME: &str = "chidori";
 
 /// Process-wide OTEL handle. Initialized lazily on first call to
 /// [`init_from_env`]; re-initialization is a no-op.
@@ -43,11 +43,11 @@ pub struct OtelHandle {
 impl OtelHandle {
     /// Flush any buffered spans and shut the exporter down cleanly.
     ///
-    /// Errors are printed to stderr only when `APP_AGENT_OTEL_DEBUG=1`; the
+    /// Errors are printed to stderr only when `CHIDORI_OTEL_DEBUG=1`; the
     /// normal unreachable-endpoint case doesn't need to alarm users whose
     /// agents ran fine.
     pub fn shutdown(&self) {
-        let debug = std::env::var("APP_AGENT_OTEL_DEBUG").as_deref() == Ok("1");
+        let debug = std::env::var("CHIDORI_OTEL_DEBUG").as_deref() == Ok("1");
         for r in self.provider.force_flush() {
             if let Err(e) = r {
                 if debug {
@@ -89,7 +89,7 @@ pub fn shutdown_on_exit() {
 fn try_init() -> Option<OtelHandle> {
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
     let service_name =
-        std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "app-agent".to_string());
+        std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "chidori".to_string());
 
     let exporter = match SpanExporter::builder()
         .with_tonic()

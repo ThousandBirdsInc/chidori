@@ -72,22 +72,22 @@ See [README.md](./README.md) for what works today, [DESIGN.md](./DESIGN.md) for 
 ### Tool System
 - [x] Tool registry: load `.star` files from `tools/` directory
 - [x] Parse tool function signatures and docstrings → JSON schema
-- [x] `app-agent tools --dir <path>` lists discovered tools with params
+- [x] `chidori tools --dir <path>` lists discovered tools with params
 - [x] Make tools available to `tool()` host function (tools can transitively call host fns)
 - [x] Make tools available to `prompt()` via `tools` kwarg (LLM function-calling)
 - [ ] Inline tool definition support (tools defined within agent `.star` files)
 
 ### CLI
-- [x] `app-agent run <file.star>` — run an agent with `--input` args
-- [x] `app-agent check <file.star>` — parse and validate without executing
-- [x] `app-agent tools` — list discovered tools with signatures
-- [x] `app-agent serve <file.star>` — run as HTTP server (see Phase 2a)
+- [x] `chidori run <file.star>` — run an agent with `--input` args
+- [x] `chidori check <file.star>` — parse and validate without executing
+- [x] `chidori tools` — list discovered tools with signatures
+- [x] `chidori serve <file.star>` — run as HTTP server (see Phase 2a)
 - [x] `--trace` flag outputs call log as JSON
 - [x] `--verbose` flag enables structured tracing to stderr
 - [x] `--input key=value`, `--input key=@file.txt`, `--input '{"json": "object"}'` all work
-- [x] `app-agent resume <file> <run-id>` — resume from a disk checkpoint
-- [x] `app-agent trace <run-id>` — pretty-print a saved trace
-- [x] `app-agent stats` — aggregate tokens + cost across runs
+- [x] `chidori resume <file> <run-id>` — resume from a disk checkpoint
+- [x] `chidori trace <run-id>` — pretty-print a saved trace
+- [x] `chidori stats` — aggregate tokens + cost across runs
 - [x] Exit codes: 0 success, 1 agent/runtime error, 2 parse/config error (check-only)
 
 ### Tracing & Call Log
@@ -101,7 +101,7 @@ See [README.md](./README.md) for what works today, [DESIGN.md](./DESIGN.md) for 
 ## Phase 2a: Sessions, Replay, Python SDK — ✅ DONE
 
 ### HTTP Server (`serve`)
-- [x] `app-agent serve <file.star> --port 8080`
+- [x] `chidori serve <file.star> --port 8080`
 - [x] Built on `axum`
 - [x] Each request runs agent on a blocking thread with its own tokio runtime (avoids nested-runtime panic)
 - [x] Health endpoint: `GET /health`
@@ -126,13 +126,13 @@ See [README.md](./README.md) for what works today, [DESIGN.md](./DESIGN.md) for 
 - [x] Cached results returned instantly (milliseconds instead of seconds)
 - [x] Output parity: replayed sessions produce byte-identical output to originals
 - [x] Verified end-to-end: 3 live sessions, saved checkpoints, replayed all 3 with matching output
-- [x] Persist call log to disk after each host function call (`.app-agent/runs/<id>/checkpoint.json`)
+- [x] Persist call log to disk after each host function call (`.chidori/runs/<id>/checkpoint.json`)
 - [x] Divergence detection: replay errors cleanly when the host-function sequence at a given seq doesn't match the checkpoint (e.g. agent code changed). `log()` also participates so logging edits don't silently skew the stream.
-- [ ] Checkpoint storage directory (default `.app-agent/runs/`)
+- [ ] Checkpoint storage directory (default `.chidori/runs/`)
 - [ ] Partial replay: fast-forward to N, execute from N+1 onward (works but not exposed as first-class API)
 
 ### Python SDK
-- [x] `sdk/python/app_agent/` — pure stdlib, no dependencies
+- [x] `sdk/python/chidori/` — pure stdlib, no dependencies
 - [x] `AgentClient` — HTTP client for the server
 - [x] `Session` — dataclass with status, output, error, call log
 - [x] `Checkpoint` — save/load to JSON files
@@ -163,7 +163,7 @@ See [README.md](./README.md) for what works today, [DESIGN.md](./DESIGN.md) for 
 - [x] **JavaScript language layer via Boa.** New `sandbox-js/` subcrate compiles `boa_engine` (default features off — no float16/xsum/intl/temporal/wasm-bindgen) to `wasm32-wasip1`, producing a 3.4 MB WASI binary. Host exposes `exec_js(source, fuel=…)` that runs real JS: arrow functions, recursion, array methods (`map`/`reduce`/`Array.from`), template literals, `throw`. Final-expression semantics — returns `String(value)` of the last expression. **Cold 6.2s → warm 0.22s** with the on-disk Module cache. Reuses the same WASI preview 1 shim as Python; Boa only imports 9 of the 18 WASI functions (no fd/path operations), so the shim is already a superset.
 - [x] **Shared `run_wasi_guest` helper** factors out the boilerplate (artifact load, store, env, 18 imports, memory wiring, fuel, `_start`, proc_exit/fuel/trap demux, `ERR:` prefix handling) so `exec_python` and `exec_js` are each a one-liner delegating to the helper with their own (binary, memory_pages, label) triple.
 - [x] **WASI preview 1 shim (hand-rolled).** Rather than pulling in `wasmer-wasix` (which drags reqwest, tokio networking, virtual-fs, webc, and ~100 more crates), `src/runtime/sandbox.rs` implements 18 WASI preview-1 functions directly on top of the existing wasmer `Function::new_typed_with_env` machinery: `args_*`, `environ_*`, `clock_time_get` (fixed for determinism), `fd_close`, `fd_fdstat_get`, `fd_read` (stdin preloaded with source), `fd_write` (fd 1 → stdout capture buffer, fd 2 → stderr), `fd_filestat_get`/`fd_prestat_*`/`path_*` (return errors — zero preopens), `poll_oneoff` (NOTSUP), `proc_exit` (raises a `ProcExit` user error the orchestrator distinguishes from real traps), `random_get` (xorshift64 with fixed seed for determinism), `sched_yield` (success noop).
-- [x] **On-disk compiled-artifact cache.** `load_or_compile` now walks in-memory cache → disk cache (`.app-agent/wasm-cache/v01-<key>.cwasm`) → fresh compile, and persists newly-compiled Modules via `Module::serialize` (~55 MB for RustPython). Disk load uses the `unsafe Module::deserialize` path, which we justify with: files live under our own private cache dir, filenames include a `DISK_CACHE_VERSION` tag that bumps on compiler/tunables/wasmer changes, and a corrupt file falls through to a fresh compile. **Measured end-to-end on `python_sandbox_demo.star`: 18.7s cold (Cranelift + disk serialize), 0.5s warm (deserialize) — ~37× speedup.**
+- [x] **On-disk compiled-artifact cache.** `load_or_compile` now walks in-memory cache → disk cache (`.chidori/wasm-cache/v01-<key>.cwasm`) → fresh compile, and persists newly-compiled Modules via `Module::serialize` (~55 MB for RustPython). Disk load uses the `unsafe Module::deserialize` path, which we justify with: files live under our own private cache dir, filenames include a `DISK_CACHE_VERSION` tag that bumps on compiler/tunables/wasmer changes, and a corrupt file falls through to a fresh compile. **Measured end-to-end on `python_sandbox_demo.star`: 18.7s cold (Cranelift + disk serialize), 0.5s warm (deserialize) — ~37× speedup.**
 - [ ] **Follow-up: fuel budget for Python.** Python tests run at 200 M instructions; a tighter language-specific default + a per-op multiplier (parsing dominates) is a nice-to-have.
 
 ### Parallel Execution
@@ -255,7 +255,7 @@ work until the decision is revisited.
 - [ ] New agent from blank canvas
 
 ### Editor Server (`edit`)
-- [ ] `app-agent edit <file.star> --port 3000`
+- [ ] `chidori edit <file.star> --port 3000`
 - [ ] Serve editor static assets from embedded binary
 - [ ] WebSocket sync between canvas and `.star` file
 - [ ] Live preview: mock execution reusing the replay mechanism with synthetic results
@@ -268,14 +268,14 @@ work until the decision is revisited.
 - [x] Basic serve command working
 - [x] Session API working
 - [x] SSE streaming: `POST /sessions/stream` emits `event: call` per host function and `event: done` with the final output. Note: streams *per-call*, not per-token (token-level streaming from providers would require async-through-Starlark plumbing — tracked as a follow-up).
-- [x] **Concurrent session limits + queueing.** `AppState` grew a `run_semaphore: Arc<Semaphore>` (size from `APP_AGENT_MAX_CONCURRENT_SESSIONS`, default 8) plus an `acquire_timeout` (from `APP_AGENT_ACQUIRE_TIMEOUT_MS`, default 30 000). `create_session` and `stream_session` `acquire_owned` before running and hold the permit for the entire blocking agent run. Saturated requests wait up to the timeout, then return **503** with `Retry-After: 1` and a JSON body `{error: "server busy…", acquire_timeout_ms: N}`. Verified against a slow sleep-agent: max=2 / timeout=200ms / 1s agent → 3rd and 4th concurrent requests hit 503 cleanly.
-- [x] **Auth middleware.** `axum::middleware::from_fn(auth_middleware)` gated on the `APP_AGENT_API_KEY` env var. Default-off (local dev unchanged); when set, every route except `/health` requires `Authorization: Bearer $APP_AGENT_API_KEY`. Mismatches return **401** with `WWW-Authenticate: Bearer` and a JSON error body.
-- [x] **CORS layer.** `build_cors_layer()` reads `APP_AGENT_CORS_ORIGINS`: unset → no CORS headers (same-origin only), `*` → permissive with `Any` origin/methods/headers, comma-separated list → explicit allow-list. Sits in the router as a `tower_http::cors::CorsLayer`.
+- [x] **Concurrent session limits + queueing.** `AppState` grew a `run_semaphore: Arc<Semaphore>` (size from `CHIDORI_MAX_CONCURRENT_SESSIONS`, default 8) plus an `acquire_timeout` (from `CHIDORI_ACQUIRE_TIMEOUT_MS`, default 30 000). `create_session` and `stream_session` `acquire_owned` before running and hold the permit for the entire blocking agent run. Saturated requests wait up to the timeout, then return **503** with `Retry-After: 1` and a JSON body `{error: "server busy…", acquire_timeout_ms: N}`. Verified against a slow sleep-agent: max=2 / timeout=200ms / 1s agent → 3rd and 4th concurrent requests hit 503 cleanly.
+- [x] **Auth middleware.** `axum::middleware::from_fn(auth_middleware)` gated on the `CHIDORI_API_KEY` env var. Default-off (local dev unchanged); when set, every route except `/health` requires `Authorization: Bearer $CHIDORI_API_KEY`. Mismatches return **401** with `WWW-Authenticate: Bearer` and a JSON error body.
+- [x] **CORS layer.** `build_cors_layer()` reads `CHIDORI_CORS_ORIGINS`: unset → no CORS headers (same-origin only), `*` → permissive with `Any` origin/methods/headers, comma-separated list → explicit allow-list. Sits in the router as a `tower_http::cors::CorsLayer`.
 - [x] Startup banner now prints the active concurrency cap, auth state, and CORS config so ops can verify settings without inspecting env vars.
 
 ### Memory Backends
 - [x] `memory()` host function (get/set/delete/list/clear)
-- [x] JSON-file backend (one file per namespace under `.app-agent/memory/`)
+- [x] JSON-file backend (one file per namespace under `.chidori/memory/`)
 - [x] Memory namespace isolation per agent (via `namespace=` kwarg)
 - [x] Goes through replay cache for deterministic replays
 - [ ] SQLite backend for better concurrency / larger datasets
@@ -286,8 +286,8 @@ work until the decision is revisited.
 - [x] Per-run token usage tracking (input + output counts)
 - [x] Per-run duration tracking
 - [x] Cost estimation based on model pricing (`src/runtime/cost.rs`, surfaced in `--trace`)
-- [x] Rate limiting: configurable requests-per-minute per provider via `APP_AGENT_{ANTHROPIC,OPENAI,LITELLM}_RPM` env vars (async token bucket)
-- [x] `app-agent stats` — aggregate usage across runs (reads `.app-agent/runs/*/checkpoint.json`)
+- [x] Rate limiting: configurable requests-per-minute per provider via `CHIDORI_{ANTHROPIC,OPENAI,LITELLM}_RPM` env vars (async token bucket)
+- [x] `chidori stats` — aggregate usage across runs (reads `.chidori/runs/*/checkpoint.json`)
 - [ ] Dashboard: web UI for viewing traces, run history, cost breakdown
 
 ### Local Model Support
@@ -296,9 +296,9 @@ work until the decision is revisited.
 
 ### Ecosystem Packages
 - [x] `web_search` tool — Tavily backend, pure Starlark tool using `http()`, `TAVILY_API_KEY` from env. Returns `{query, answer, results: [{title, url, snippet, score}]}`. Brave/SerpAPI backends still open.
-- [x] `fetch_url` tool — HTTP fetch + cheap HTML-to-text pass (script/style stripping, tag removal, whitespace collapse). Not a real readability parser; good enough to feed page content into an LLM prompt. Lives at `examples/tools/fetch_url.star`; use with `app-agent run … --tools examples/tools`.
+- [x] `fetch_url` tool — HTTP fetch + cheap HTML-to-text pass (script/style stripping, tag removal, whitespace collapse). Not a real readability parser; good enough to feed page content into an LLM prompt. Lives at `examples/tools/fetch_url.star`; use with `chidori run … --tools examples/tools`.
 - [x] `read_file`, `write_file`, `list_dir` as first-class host functions (not tools). Sandboxing (restrict to project base) is a follow-up.
-- [x] `shell()` **host function** — whitelisted by `APP_AGENT_SHELL_ALLOW` env var (default-closed; `*` for "allow anything"). Uses tokio's `Command` with `kill_on_drop` + `tokio::time::timeout` for cancellation; basename-matched so `/usr/bin/ls` still resolves to `ls` in the allow list; empty env by default (no PATH / AWS_* leakage) — caller opts in via `env={...}`. Returns `{stdout, stderr, exit_code, timed_out}`. Participates in replay cache + divergence detection. Verified end-to-end (success, listing, whitelist block, timeout) plus 3 unit tests on the whitelist parser.
+- [x] `shell()` **host function** — whitelisted by `CHIDORI_SHELL_ALLOW` env var (default-closed; `*` for "allow anything"). Uses tokio's `Command` with `kill_on_drop` + `tokio::time::timeout` for cancellation; basename-matched so `/usr/bin/ls` still resolves to `ls` in the allow list; empty env by default (no PATH / AWS_* leakage) — caller opts in via `env={...}`. Returns `{stdout, stderr, exit_code, timed_out}`. Participates in replay cache + divergence detection. Verified end-to-end (success, listing, whitelist block, timeout) plus 3 unit tests on the whitelist parser.
 - [ ] `database` tool (SQL query + read-only mode)
 - [ ] Agent registry: publish/share `.star` agents
 
@@ -307,7 +307,7 @@ work until the decision is revisited.
 - [ ] VS Code extension: `.jinja` prompt template preview
 - [ ] VS Code extension: run agent + debug from editor
 - [ ] LSP server for Starlark completion (leveraging `starlark-rust`'s LSP features)
-- [ ] Pre-commit hook: `app-agent check` on changed `.star` files
+- [ ] Pre-commit hook: `chidori check` on changed `.star` files
 
 ---
 
@@ -317,5 +317,5 @@ work until the decision is revisited.
 - [ ] Anthropic provider's `content_type` field is unused — either use it to filter content blocks or remove
 - [ ] `ProviderRegistry` is re-created per request inside `spawn_blocking` because `reqwest::Client` is bound to its owning tokio runtime. Cheap but wasteful — consider a `reqwest::blocking::Client` alternative or pooling.
 - [x] `parse_tool_file` in `tools/mod.rs` now matches on `def <filename_stem>(...)` instead of grabbing the first `def`, so files with private helper defs (e.g. `_strip_tags`) work correctly. A full Starlark AST walk is still a later upgrade.
-- [x] **Session API integration tests** — `sdk/python/tests/test_session_api.py`, 13 tests covering run/checkpoint/replay/list, pause+resume via `input()`, auth middleware (401 missing / 401 wrong / 200 correct / health open), concurrency semaphore 503 saturation, and CORS preflight. Each class starts its own `app-agent serve` subprocess with a fresh env (auth / concurrency / cors configs isolated). A stdlib-only `MockLlm` HTTP server sits in front of the runtime via `LITELLM_API_URL` so no real provider traffic happens; hit counts assert that replay does NOT re-call the LLM. Discovered and fixed a real gap while writing: Python SDK was missing `resume()` and `pending_prompt` on `Session` (TS SDK already had it).
+- [x] **Session API integration tests** — `sdk/python/tests/test_session_api.py`, 13 tests covering run/checkpoint/replay/list, pause+resume via `input()`, auth middleware (401 missing / 401 wrong / 200 correct / health open), concurrency semaphore 503 saturation, and CORS preflight. Each class starts its own `chidori serve` subprocess with a fresh env (auth / concurrency / cors configs isolated). A stdlib-only `MockLlm` HTTP server sits in front of the runtime via `LITELLM_API_URL` so no real provider traffic happens; hit counts assert that replay does NOT re-call the LLM. Discovered and fixed a real gap while writing: Python SDK was missing `resume()` and `pending_prompt` on `Session` (TS SDK already had it).
 - [ ] `config()` silently ignores unknown keys — should warn or error.

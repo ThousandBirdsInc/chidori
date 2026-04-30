@@ -1,5 +1,5 @@
 # kitchen_sink.star — deliberately exercises as many Starlark language
-# constructs and app-agent host functions as possible.
+# constructs and chidori host functions as possible.
 #
 # Intended as the canonical fixture for bi-directional renderer tests:
 # any construct a renderer needs to round-trip through a visual editor
@@ -55,7 +55,7 @@ TUPLE_NESTED = ((1, 2), (3, 4))
 
 DICT_EMPTY = {}
 DICT_NESTED = {
-    "name": "app-agent",
+    "name": "chidori",
     "version": 1,
     "flags": {"debug": True, "trace": False, "verbose": True},
     "numbers": [1, 2, 3],

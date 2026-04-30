@@ -1,4 +1,0 @@
-{
-  "task": "Find the agent function in examples/coding-agent/agent.star, read lines 5-15, and search for all uses of 'prompt' in the coding-agent directory. Report what you found.",
-  "working_dir": "."
-}

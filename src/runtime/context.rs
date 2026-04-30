@@ -39,7 +39,7 @@ struct RuntimeContextInner {
     /// return cached results instead of executing for matching sequence numbers.
     pub replay_log: Option<Vec<CallRecord>>,
     /// Unique identifier for this run. Used as the subdirectory name
-    /// under `.app-agent/runs/` when persistence is enabled.
+    /// under `.chidori/runs/` when persistence is enabled.
     pub run_id: String,
     /// Directory into which the checkpoint file is written after each call.
     /// None disables on-disk persistence.
@@ -92,7 +92,7 @@ pub struct PendingApproval {
 
 /// Marker text used to tag the pause sentinel error so the engine can
 /// distinguish it from a genuine failure.
-pub const PAUSE_MARKER: &str = "__APP_AGENT_PAUSED_FOR_INPUT__";
+pub const PAUSE_MARKER: &str = "__CHIDORI_PAUSED_FOR_INPUT__";
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {

@@ -2,7 +2,7 @@
 //!
 //! Provides two backends:
 //!   * JSON files (default; same layout the framework has used since v0)
-//!   * SQLite (enabled via APP_AGENT_DB_PATH)
+//!   * SQLite (enabled via CHIDORI_DB_PATH)
 //!
 //! The server holds a `SessionStore` trait object so it can switch backends
 //! without touching the HTTP handlers. Sessions are serialized as a JSON blob
@@ -190,10 +190,10 @@ impl SessionStore for SqliteStore {
     }
 }
 
-/// Build the SessionStore configured by env. APP_AGENT_DB_PATH picks SQLite;
+/// Build the SessionStore configured by env. CHIDORI_DB_PATH picks SQLite;
 /// otherwise an in-memory store is returned.
 pub fn build_session_store() -> std::sync::Arc<dyn SessionStore> {
-    if let Ok(path) = std::env::var("APP_AGENT_DB_PATH") {
+    if let Ok(path) = std::env::var("CHIDORI_DB_PATH") {
         match SqliteStore::open(PathBuf::from(&path)) {
             Ok(store) => {
                 tracing::info!("session store: sqlite at {}", path);

@@ -1,6 +1,6 @@
 /**
- * app-agent TypeScript SDK — HTTP client for a running `app-agent serve`
- * instance. Mirrors the Python SDK (`sdk/python/app_agent`). Zero runtime
+ * chidori TypeScript SDK — HTTP client for a running `chidori serve`
+ * instance. Mirrors the Python SDK (`sdk/python/chidori`). Zero runtime
  * dependencies; uses the global `fetch` available in Node 18+ and browsers.
  */
 /**
@@ -72,7 +72,7 @@ export class Session {
     }
 }
 /**
- * HTTP client for an `app-agent serve` instance.
+ * HTTP client for an `chidori serve` instance.
  *
  * ```ts
  * const client = new AgentClient("http://localhost:8080");

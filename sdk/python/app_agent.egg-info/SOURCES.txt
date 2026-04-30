@@ -1,7 +1,0 @@
-pyproject.toml
-app_agent/__init__.py
-app_agent/client.py
-app_agent.egg-info/PKG-INFO
-app_agent.egg-info/SOURCES.txt
-app_agent.egg-info/dependency_links.txt
-app_agent.egg-info/top_level.txt

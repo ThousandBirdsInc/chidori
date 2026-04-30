@@ -91,12 +91,12 @@ pub async fn serve(
     // LLM provider from being flooded and high enough that a small agent
     // fleet can saturate. Expose as env var so ops can tune without a
     // rebuild.
-    let max_concurrent: usize = std::env::var("APP_AGENT_MAX_CONCURRENT_SESSIONS")
+    let max_concurrent: usize = std::env::var("CHIDORI_MAX_CONCURRENT_SESSIONS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n: &usize| *n > 0)
         .unwrap_or(8);
-    let acquire_timeout_ms: u64 = std::env::var("APP_AGENT_ACQUIRE_TIMEOUT_MS")
+    let acquire_timeout_ms: u64 = std::env::var("CHIDORI_ACQUIRE_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(30_000);
@@ -117,7 +117,7 @@ pub async fn serve(
 
     let session_store = build_session_store();
 
-    let recipe_dir = std::env::var("APP_AGENT_RECIPE_DIR").ok().map(PathBuf::from);
+    let recipe_dir = std::env::var("CHIDORI_RECIPE_DIR").ok().map(PathBuf::from);
     let recipes = recipe_dir
         .as_ref()
         .map(|d| Recipe::load_dir(d).unwrap_or_default())
@@ -149,7 +149,7 @@ pub async fn serve(
         acquire_timeout: std::time::Duration::from_millis(acquire_timeout_ms),
     };
 
-    let auth_required = std::env::var("APP_AGENT_API_KEY").is_ok();
+    let auth_required = std::env::var("CHIDORI_API_KEY").is_ok();
     let cors_layer = build_cors_layer();
 
     // ACP router owns its own state so session lookups go through the same
@@ -193,14 +193,14 @@ pub async fn serve(
     eprintln!();
     eprintln!("  Concurrency: max {} sessions, {}ms acquire timeout", max_concurrent, acquire_timeout_ms);
     eprintln!("  Auth:        {}", if auth_required {
-        "REQUIRED (Authorization: Bearer $APP_AGENT_API_KEY)"
+        "REQUIRED (Authorization: Bearer $CHIDORI_API_KEY)"
     } else {
-        "disabled (set APP_AGENT_API_KEY to enable)"
+        "disabled (set CHIDORI_API_KEY to enable)"
     });
-    eprintln!("  CORS:        {}", match std::env::var("APP_AGENT_CORS_ORIGINS").ok() {
+    eprintln!("  CORS:        {}", match std::env::var("CHIDORI_CORS_ORIGINS").ok() {
         Some(v) if v.trim() == "*" => "open (Any)".to_string(),
         Some(v) => format!("allow: {}", v),
-        None => "disabled (set APP_AGENT_CORS_ORIGINS to enable)".to_string(),
+        None => "disabled (set CHIDORI_CORS_ORIGINS to enable)".to_string(),
     });
     eprintln!();
     eprintln!("  Events:     ANY /*           → agent(event)");
@@ -227,14 +227,14 @@ pub async fn serve(
 // Hardening layers: auth, CORS, concurrency limits
 // ---------------------------------------------------------------------------
 
-/// Middleware: if `APP_AGENT_API_KEY` is set, require every non-health
+/// Middleware: if `CHIDORI_API_KEY` is set, require every non-health
 /// request to carry a matching `Authorization: Bearer …` header. Health
 /// stays open so container orchestrators can probe without a key.
 ///
 /// When the env var is unset the middleware is a no-op, so the default
 /// local-dev experience is unchanged.
 async fn auth_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
-    let Ok(expected) = std::env::var("APP_AGENT_API_KEY") else {
+    let Ok(expected) = std::env::var("CHIDORI_API_KEY") else {
         return next.run(req).await;
     };
     if req.uri().path() == "/health" {
@@ -258,13 +258,13 @@ async fn auth_middleware(req: Request<axum::body::Body>, next: Next) -> Response
     }
 }
 
-/// Build a CORS layer from `APP_AGENT_CORS_ORIGINS`:
+/// Build a CORS layer from `CHIDORI_CORS_ORIGINS`:
 ///
 ///  * unset     → no CORS headers emitted (same-origin only)
 ///  * `*`       → `Access-Control-Allow-Origin: *`, `Any` methods + headers
 ///  * `a,b,c`   → explicit allow-list of origins
 fn build_cors_layer() -> CorsLayer {
-    let Ok(raw) = std::env::var("APP_AGENT_CORS_ORIGINS") else {
+    let Ok(raw) = std::env::var("CHIDORI_CORS_ORIGINS") else {
         return CorsLayer::new();
     };
     let raw = raw.trim();

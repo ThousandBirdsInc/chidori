@@ -1,6 +1,6 @@
-# app-agent Python SDK
+# chidori Python SDK
 
-Pure-stdlib HTTP client for a running `app-agent serve` instance. No native
+Pure-stdlib HTTP client for a running `chidori serve` instance. No native
 bindings, no third-party dependencies.
 
 ## Install
@@ -12,7 +12,7 @@ pip install -e ./sdk/python
 ## Usage
 
 ```python
-from app_agent import AgentClient, Checkpoint
+from chidori import AgentClient, Checkpoint
 
 client = AgentClient("http://localhost:8080")
 
@@ -48,11 +48,11 @@ top-level `examples/sdk_demo.py` for a longer walkthrough and the server's
 ## Testing
 
 ```bash
-cargo build                     # make sure target/debug/app-agent is up to date
+cargo build                     # make sure target/debug/chidori is up to date
 python3 -m unittest sdk/python/tests/test_session_api.py -v
 ```
 
-The integration tests spin up a real `app-agent serve` subprocess per
+The integration tests spin up a real `chidori serve` subprocess per
 config (default / auth / concurrency / cors) and drive it through this
 SDK against an in-process stdlib mock LLM server. No real provider
 traffic; no third-party dependencies.

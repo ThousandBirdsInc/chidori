@@ -5,7 +5,7 @@ Demonstrates the Python SDK with multiple sessions, checkpointing, and replay.
 Prerequisites:
     1. Start the server:
        LITELLM_API_URL=http://localhost:4401/v1 LITELLM_API_KEY=sk-litellm-master-key \
-         ./target/debug/app-agent serve examples/agents/summarizer.star --port 8080
+         ./target/debug/chidori serve examples/agents/summarizer.star --port 8080
 
     2. Run this script:
        PYTHONPATH=sdk/python python3 examples/sdk_demo.py
@@ -18,7 +18,7 @@ import json
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sdk", "python"))
 
-from app_agent import AgentClient, Checkpoint
+from chidori import AgentClient, Checkpoint
 
 BASE_URL = os.environ.get("AGENT_URL", "http://localhost:8080")
 
@@ -62,7 +62,7 @@ def main():
     print("=== Saving checkpoints ===")
     print()
 
-    checkpoint_dir = "/tmp/app-agent-checkpoints"
+    checkpoint_dir = "/tmp/chidori-checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     for i, session in enumerate(sessions):
