@@ -1,222 +1,274 @@
+# Chidori v3
 
+The third generation of [Chidori](https://github.com/ThousandBirdsInc/chidori) — a YAML-free AI agent framework where agents are written as **Starlark** scripts, a deterministic Python dialect that enables checkpointing, replay, and visual editing.
 
-[//]: # ([![Demo Video]&#40;https://github.com/ThousandBirdsInc/chidori/blob/main/media/ChidoriPanel.png?raw=true&#41;]&#40;https://github.com/ThousandBirdsInc/chidori/assets/515757/6b088f7d-d8f7-4c7e-9006-4360ae40d1de&#41;)
-[![Demo Video](https://github.com/ThousandBirdsInc/chidori/blob/main/media/ChidoriPanel.png?raw=true)]()
+> **About v3.** Chidori began as a reactive runtime exploring how to build durable, debuggable agents. v3 is a ground-up rewrite that distills those ideas into a smaller, sharper core: a single Rust binary, Starlark instead of bespoke cells, and replay as the foundation for everything else (tests, debugging, resume, human-in-the-loop). Earlier versions of Chidori live in the git history and on prior tags.
 
-<div align="center">
+- **Agents look like Python.** Native control flow, variables, list comprehensions — no template DSL.
+- **Deterministic execution.** Every side effect goes through a host function the runtime can log, cache, and replay.
+- **Zero-cost checkpointing.** Save a session's call log to disk, replay it later for identical output with zero LLM calls.
+- **Event-driven agents.** Agents can run as HTTP servers that react to webhooks and other events.
+- **Rust core, Python SDK.** The runtime is a single binary. The Python SDK talks to it over HTTP — no `pip install`, no native bindings.
 
-# &nbsp; Chidori (v2) &nbsp;
+## Quick Start
 
-**A reactive runtime for building durable AI agents**
+### 1. Write an agent
 
-<p>
-<a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="Current Build Status" src="https://img.shields.io/github/actions/workflow/status/ThousandBirdsInc/chidori/push.yml" /></a>
-<a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/ThousandBirdsInc/chidori" /></a>
-<a href="https://crates.io/crates/chidori-debugger"><img alt="Cargo.io download" src="https://img.shields.io/crates/v/chidori-debugger" /></a>
-<a href="https://github.com/ThousandBirdsInc/chidori/blob/main/LICENSE"><img alt="GitHub License" src="https://img.shields.io/badge/License-MIT-green.svg" /></a>
-</p>
-<br />
-</div>
+```python
+# agents/summarizer.star
+config(model = "claude-sonnet")
 
-Star us on GitHub! Join us on [Discord](https://discord.gg/CJwKsPSgew).
-
-## Contents
-- [📖 Chidori V2](#-chidori-v2)
-- [⚡️ Getting Started](#️-getting-started)
-  - [Installation](#installation)
-  - [Environment Variables](#environment-variables)
-  - [Example](#example)
-- [🤔 About](#-about)
-  - [Reactive Runtime](#reactive-runtime)
-  - [Monitoring and Observability](#monitoring-and-observability)
-  - [Branching and Time-Travel](#branching-and-time-travel)
-  - [Code Interpreter Environments](#code-interpreter-environments)
-- [🛣️ Roadmap](#️-roadmap)
-  - [Short term](#short-term)
-  - [Medium term](#med-term)
-- [Contributing](#contributing)
-- [Inspiration](#inspiration)
-- [License](#license)
-- [Help us out!](#help-us-out)
-
-
-## 📖 Chidori V2
-Chidori is an open-source orchestrator, runtime, and IDE for building software in symbiosis with modern AI tools.
-It is especially catered towards building AI agents by providing solutions to the following problems:
-
-- How do we understand what an agent is doing and how it got into a given state?
-- How can we pause execution and then resume after interaction with a human?
-- How do we handle the accidental complexity of state-space exploration, evaluating and reverting execution throughout our software?
-
-When using Chidori, you author code with python or javascript, we provide a layer for interfacing
-with the complexities of AI models in long-running workflows. We have avoided the need for declaring a new language 
-or SDK in order to provide these capabilities so that you can leverage software patterns that you are already familiar with.
-
-Features:
-
-- Runtime written in Rust, supporting Python and JavaScript code execution
-- The ability to cache behaviors and resume from partially executed agents
-- Time travel debugging, execution of the program can be reverted to prior states
-- Visual debugging environment, visualize and manipulate the graph of states your code has executed through.
-- Create and navigate tree-searching code execution workflows
-
-## ⚡️ Getting Started
-
-### Installation
-Chidori is available on [crates.io](https://crates.io/crates/chidori) and can be installed using cargo. Our expected entrypoint for
-prototype development is `chidori-debugger` which wraps our runtime in a useful visual interface.
-
-```bash
-# Install the rust toolchain and the nightly channel
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-rustup toolchain install nightly
-
-# Required for building dependencies
-xcode-select --install
-
-# These dependencies are necessary for a successful build
-brew install cmake  
-
-# We are investigating if this is necessary or can be removed
-brew install python@3.12
-
-# Chidori uses uv for handling python dependencies 
-brew install uv
-
-# We depend on features only supported by nightly at the moment
-cargo +nightly install chidori-debugger --locked
+def agent(document):
+    summary = prompt("Summarize in 3 bullets:\n" + document)
+    actions = prompt("Extract action items:\n" + summary)
+    return {"summary": summary, "action_items": actions}
 ```
 
-If you prefer to use a different python interpreter you can set PYO3_PYTHON=python3.12 (or whichever version > 3.7) during
-your installation to change which is linked against.
+### 2. Run it
 
-
-### Setting Up The Runtime Environment
-Chidori's interactions with LLMs default to http://localhost:4000 to hook into LiteLLM's proxy.
-If you'd like to leverage gpt-3.5-turbo the included config file will support that.
-You will need to install `pip install litellm[proxy]` in order to run the below:
 ```bash
-export OPENAI_API_KEY=...
-uv pip install "litellm[proxy]"
-uv run litellm --config ./litellm_config.yaml
+# Set up LLM provider (uses LiteLLM in this example)
+export LITELLM_API_URL=http://localhost:4401/v1
+export LITELLM_API_KEY=sk-litellm-master-key
+
+# Or use providers directly
+# export ANTHROPIC_API_KEY=sk-ant-...
+# export OPENAI_API_KEY=sk-...
+
+cargo build
+./target/debug/chidori run agents/summarizer.star \
+  --input document="Rust is a systems programming language..."
 ```
+
+### 3. Try the example agents
+
+```bash
+# Minimal agent — no LLM calls needed
+./target/debug/chidori run examples/agents/hello.star --input name=Colton
+
+# Summarizer with trace
+./target/debug/chidori run examples/agents/summarizer.star \
+  --input document="Rust is great." --trace
+
+# Template-based agent
+./target/debug/chidori run examples/agents/template_demo.star \
+  --input '{"items": ["alpha", "beta", "gamma"]}'
+
+# Event-driven webhook handler
+./target/debug/chidori serve examples/agents/webhook.star --port 8080
+```
+
+## Core Concepts
+
+An agent is a `.star` file with a `def agent(...)` function. The runtime provides a fixed set of **host functions** for side effects — everything else is pure Starlark:
+
+| Function | Purpose |
+|---|---|
+| `prompt(text, ...)` | Send to an LLM, return string or parsed JSON |
+| `template(str_or_path, ...)` | Render a Jinja2 template with minijinja |
+| `tool(name, ...)` | Invoke a registered tool |
+| `agent(name, ...)` | Call a sub-agent |
+| `parallel(fns)` | Run functions concurrently |
+| `input(msg, ...)` | Human-in-the-loop — pauses execution |
+| `exec(code, ...)` | Run AI-generated code in a WASM sandbox |
+| `http(method, url, ...)` | Make an HTTP request |
+| `memory(action, ...)` | Persistent storage (key-value + vector) |
+| `log(msg, ...)` | Structured logging |
+| `env(name)` | Read environment variables |
+| `retry(fn, ...)` | Retry with backoff |
+| `try_call(fn)` | Capture errors without raising |
+
+See [`llm.txt`](./llm.txt) for the full API reference.
+
+## Running Modes
+
+### 1. One-shot CLI
+
+```bash
+chidori run agents/my_agent.star --input key=value
+chidori run agents/my_agent.star --input '{"complex": "input"}'
+chidori check agents/my_agent.star          # validate without running
+chidori tools --dir tools/                   # list available tools
+```
+
+### 2. HTTP Server (event-driven + session API)
+
+```bash
+chidori serve agents/my_agent.star --port 8080
+```
+
+Exposes:
+- `GET  /health` — health check
+- `ANY  /*` — any request is passed to `agent(event)` as an event dict
+- `POST /sessions` — create a session and run the agent with given input
+- `GET  /sessions` — list all sessions
+- `GET  /sessions/{id}` — get session result
+- `GET  /sessions/{id}/checkpoint` — get the call log (for replay)
+- `POST /sessions/{id}/replay` — replay from a session's checkpoint
+
+### 3. Event-Driven Agents
+
+An agent can handle incoming HTTP events:
+
+```python
+# agents/webhook.star
+config(model = "claude-sonnet")
+
+def agent(event):
+    if event["path"] == "/github":
+        body = event["body"]
+        summary = prompt("Summarize this GitHub event:\n" + repr(body))
+        return {"status": 200, "body": {"summary": summary}}
+
+    return {"status": 404, "body": {"error": "Unknown path"}}
+```
+
+```bash
+chidori serve agents/webhook.star --port 8080
+
+curl -X POST http://localhost:8080/github \
+  -H "Content-Type: application/json" \
+  -d '{"action": "opened", "pull_request": {"title": "Add login"}}'
+```
+
+## Python SDK
+
+The Python SDK is a pure-stdlib HTTP client that talks to a running `chidori serve` instance. No `pip install`, no native bindings.
+
+```python
+import sys
+sys.path.insert(0, "sdk/python")
+
+from chidori import AgentClient, Checkpoint
+
+client = AgentClient("http://localhost:8080")
+
+# Create a session (runs the agent with live LLM calls)
+session = client.run({"document": "Rust is a systems language."})
+print(session.output)
+# {"summary": "...", "action_items": "..."}
+
+# Save a checkpoint to disk
+checkpoint = session.checkpoint()
+checkpoint.save("/tmp/session.json")
+```
+
+Later, replay the session from disk — **zero LLM calls**:
+
+```python
+from chidori import AgentClient, Checkpoint
+
+client = AgentClient("http://localhost:8080")
+cp = Checkpoint.load("/tmp/session.json")
+
+# Replay: re-executes Starlark but returns cached LLM results
+replayed = client.replay(cp)
+assert replayed.output == session.output  # identical output
+```
+
+## How Replay Works
+
+Starlark is deterministic. Given the same inputs and the same cached results for host function calls, the agent's control flow is guaranteed to produce the same outputs.
+
+1. **Original run:** Every `prompt()`, `tool()`, `http()` call is logged with seq number + result.
+2. **Checkpoint:** The call log is a JSON array — save it to disk, send it over the wire, commit it to git.
+3. **Replay:** Re-run the agent with the call log pre-loaded. Each host function call checks the log for its seq number — hit returns the cached result instantly, miss executes normally.
+
+This means you can:
+- **Debug without spending money:** save a failing session, replay locally with breakpoints.
+- **Run deterministic tests:** check in a checkpoint, assert the agent's behavior hasn't changed.
+- **Resume after crashes:** the runtime can persist checkpoints after each call; on restart, replay picks up where it left off.
+- **Pause for human approval:** `input()` suspends execution; when the human responds, the agent replays to that point and continues.
 
 ## Examples
 
-The following example shows how to build a simple agent that fetches the top stories from Hacker News and call the OpenAI API to filter to AI related launches and then format that data into markdown.
+See [`examples/`](./examples):
 
-------
+- [`agents/hello.star`](./examples/agents/hello.star) — minimal agent, no LLM
+- [`agents/summarizer.star`](./examples/agents/summarizer.star) — 2-step LLM pipeline
+- [`agents/template_demo.star`](./examples/agents/template_demo.star) — Jinja2 prompt templates
+- [`agents/webhook.star`](./examples/agents/webhook.star) — event-driven HTTP handler
+- [`sdk_demo.py`](./examples/sdk_demo.py) — Python SDK with checkpointing + replay
+- [`prompts/analysis.jinja`](./examples/prompts/analysis.jinja) — shared prompt template
+- [`tools/greet.star`](./examples/tools/greet.star) — simple tool definition
 
-### Beginning here is an example executable Chidori agent:
+## Architecture
 
-Chidori agents can be a single file, or a collection of files structured as a typical Typescript or Python project. 
-The following example is a single file agent. Consider this similar to something like a jupyter/iPython notebook 
-represented as a markdown file.
-
-<pre>
-
-```javascript (load_hacker_news)
-const axios = require('https://deno.land/x/axiod/mod.ts');
-
-const HN_URL_TOP_STORIES = "https://hacker-news.firebaseio.com/v0/topstories.json";
-
-function fetchStory(id) {
-    return axios.get(`https://hacker-news.firebaseio.com/v0/item/${id}.json?print=pretty`)
-        .then(response => response.data);
-}
-
-async function fetchHN() {
-    const stories = await axios.get(HN_URL_TOP_STORIES);
-    const storyIds = stories.data;
-    // only the first 30 
-    const tasks = storyIds.slice(0, 30).map(id => fetchStory(id));
-    return Promise.all(tasks)
-      .then(stories => {
-        return stories.map(story => {
-          const { title, url, score } = story;
-          return {title, url, score};
-        });
-      });
-}
+```
+┌─────────────────────────────────────────────────────┐
+│  User code (.star files, .jinja prompts, Python SDK) │
+└────────────────────────┬────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────┐
+│               Rust Core Runtime                      │
+│                                                      │
+│  ┌─────────────┐ ┌──────────────┐ ┌──────────────┐  │
+│  │  Starlark   │ │ Host Function│ │  Checkpoint  │  │
+│  │  Evaluator  │ │ Registry     │ │  / Replay    │  │
+│  └─────────────┘ └──────────────┘ └──────────────┘  │
+│  ┌─────────────┐ ┌──────────────┐ ┌──────────────┐  │
+│  │  LLM Client │ │  Template    │ │  HTTP Server │  │
+│  │  (providers)│ │  (minijinja) │ │  (axum)      │  │
+│  └─────────────┘ └──────────────┘ └──────────────┘  │
+└──────────────────────────────────────────────────────┘
 ```
 
-Prompt "interpret_the_group"
-```prompt (interpret_the_group)
-  Based on the following list of HackerNews threads,
-  filter this list to only launches of 
-  new AI projects: {{fetched_articles}}
+- **Starlark evaluator** (`starlark-rust` crate) parses `.star` files and executes them.
+- **Host functions** (`#[starlark_module]`) are the only way agents touch the outside world.
+- **Checkpoint/replay engine** intercepts host calls for deterministic replay.
+- **LLM providers** (Anthropic, OpenAI, LiteLLM-compatible) are swappable via `reqwest`.
+- **Template engine** uses `minijinja` for Jinja2 prompt templates.
+- **HTTP server** (`axum`) powers the `serve` command and session API.
+
+See [`DESIGN.md`](./DESIGN.md) for the full architecture and design rationale, and [`TODO.md`](./TODO.md) for the implementation roadmap.
+
+## Project Structure
+
+```
+chidori/
+├── src/
+│   ├── main.rs             # CLI entry point
+│   ├── server.rs           # HTTP server (serve + session API)
+│   ├── runtime/
+│   │   ├── engine.rs       # Starlark evaluator + agent() invocation
+│   │   ├── host_functions.rs  # prompt, template, config, log, env
+│   │   ├── context.rs      # Runtime context (call log + replay)
+│   │   ├── call_log.rs     # Checkpoint data structures
+│   │   └── template.rs     # minijinja integration
+│   ├── providers/
+│   │   ├── mod.rs          # Provider registry, model routing
+│   │   ├── anthropic.rs    # Anthropic Messages API
+│   │   └── openai.rs       # OpenAI-compatible (incl. LiteLLM)
+│   └── tools/
+│       └── mod.rs          # Tool discovery + JSON schema generation
+├── sdk/
+│   └── python/chidori/     # Python SDK (pure stdlib, no deps)
+├── examples/
+│   ├── agents/             # Example .star agents
+│   ├── prompts/            # Example .jinja templates
+│   ├── tools/              # Example tools
+│   └── sdk_demo.py         # Python SDK demo
+├── DESIGN.md               # Architecture & design rationale
+├── TODO.md                 # Implementation roadmap
+└── llm.txt                 # Complete API reference for LLM-assisted development
 ```
 
-Prompt "format_and_rank"
-```prompt (format_and_rank)
-Format this list of new AI projects in markdown, ranking the most 
-interesting projects from most interesting to least. 
-{{interpret_the_group}}
-```
+## Current Status
 
-Using a python cell as our entrypoint, demonstrating inter-language execution:
-```python
-articles = await fetchHN()
-format_and_rank(articles=articles)
-```
-</pre>
-------
+**Phase 1 (Core Runtime)** — ✅ Working
+- Starlark evaluator with host functions (`prompt`, `template`, `config`, `log`, `env`)
+- LLM providers: Anthropic, OpenAI, LiteLLM/OpenAI-compatible
+- CLI: `run`, `check`, `tools`, `serve`
+- Template engine (minijinja)
+- Structured tracing & token accounting
+- Tool auto-discovery
 
+**Phase 2 (Sessions + Replay)** — ✅ Working
+- Session API (create, list, get, checkpoint, replay)
+- Replay-based checkpointing in the engine
+- Python SDK with checkpoint save/load
+- Event-driven agents over HTTP
 
-## About
+**Phase 3 (Visual Editor)** — 🚧 Not started. See [`DESIGN.md`](./DESIGN.md).
 
-### Reactive Runtime
-At its core, Chidori brings a reactive runtime that orchestrates interactions between different agents and their components. 
-Chidori accepts arbitrary Python or JavaScript code, taking over brokering and execution of it to allow for interruptions and reactivity.
-This allows you to get the benefits of these runtime behaviors while leveraging the patterns you're already familiar with.
-
-### Monitoring and Observability
-Chidori ensures comprehensive monitoring and observability of your agents. We record all the inputs and outputs emitted by functions throughout the execution of your agent, enabling us to explain precisely what led to what, enhancing your debugging experience and understanding of the system’s production behavior.
-
-### Branching and Time-Travel
-With Chidori, you can take snapshots of your system and explore different possible outcomes from that point (branching), or rewind the system to a previous state (time-travel). This functionality improves error handling, debugging, and system robustness by offering alternative pathways and do-overs.
-
-### Code Interpreter Environments
-Chidori comes with first-class support for code interpretation for both Python and JavaScript. You can execute code directly within your system, providing quick startup, ease of use, and secure execution. We're continually working on additional safeguards against running untrusted code, with containerized environment support coming soon.
-
-### Code Generation During Evaluation
-With our execution graph, preservation of state, and tools for debugging - Chidori is an exceptional environment for generating code during the evaluation of your agent.
-You can use this to leverage LLMs to achieve more generalized behavior and to evolve your agents over time.
-
-
-
-
-## 🛣️ Roadmap
-
-### Short term
-* [x] Reactive subscriptions between nodes
-* [x] Branching and time travel debugging, reverting execution of a graph
-* [x] Node.js, Python, and Rust support for building and executing graphs
-* [x] Simple local vector db for development
-* [ ] Adding support for containerized nodes
-
-### Medium term
-* [x] Analysis tools for comparing executions
-* [x] Adding support for more vector databases
-* [x] Adding support for other LLM sources
-* [x] Adding support for more code interpreter environments
-* [ ] Agent re-evaluation with feedback
-* [ ] Definitive patterns for human in the loop agents
-
-
-## Contributing
-This is an early open source release and we're looking for collaborators from the community. 
-A good place to start would be to join our [discord](https://discord.gg/CJwKsPSgew)!
-
-## Inspiration
-Our framework is inspired by the work of many others, including:
-* [Temporal.io](https://temporal.io) - providing reliability and durability to workflows
-* [Eve](http://witheve.com) - developing patterns for building reactive systems and reducing accidental complexity
-* [Timely Dataflow](https://timelydataflow.github.io/timely-dataflow) - efficiently streaming changes
-* [Langchain](https://www.langchain.com) - developing tools and patterns for building with LLMs
-
-## License
-Chidori is under the MIT license. See the [LICENSE](LICENSE) for more information.
-
-## Help us out!
-Please star the GitHub repo and join our [discord](https://discord.gg/CJwKsPSgew)!
+**Phase 4 (Production)** — 🚧 Partial (serve works, memory/SDK packaging TBD).

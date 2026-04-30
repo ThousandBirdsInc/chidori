@@ -1,0 +1,81 @@
+[package]
+name = "chidori"
+version = "3.0.0"
+edition = "2021"
+authors = ["Colton Pierson <colton@thousandbirds.ai>"]
+license = "MIT"
+description = "YAML-free AI agent framework where agents are deterministic Starlark scripts with built-in checkpointing and replay."
+homepage = "https://docs.thousandbirds.ai"
+repository = "https://github.com/ThousandBirdsInc/chidori"
+readme = "README.md"
+keywords = ["agent", "ai", "llm", "starlark", "replay"]
+categories = ["development-tools", "command-line-utilities"]
+
+[[bin]]
+name = "chidori"
+path = "src/main.rs"
+
+[dependencies]
+# Starlark evaluator
+starlark = "0.13"
+allocative = "0.3"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client for LLM providers
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# HTTP server for serve command
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+
+# Template engine
+minijinja = { version = "2", features = ["loader"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Utilities
+anyhow = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+tokio-stream = "0.1"
+async-stream = "0.3"
+
+# WebAssembly sandbox for exec() host function.
+# Cranelift compiler + metering middleware give us fuel-based timeouts.
+wasmer = "4"
+wasmer-middlewares = "4"
+
+# Sandboxed JavaScript execution for exec() host function
+rquickjs = { version = "0.9", features = ["macro"] }
+async-trait = "0.1"
+derive_more = { version = "1", features = ["display"] }
+
+# SQLite session store
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Cron scheduler for recipes
+cron = "0.12"
+
+# YAML recipe parsing
+serde_yaml = "0.9"
+
+# OpenTelemetry OTLP export — emits one span per host function call so agents
+# can be shipped into any OTLP-compatible backend (tael, Jaeger, Tempo, etc.).
+# Activated at runtime when OTEL_EXPORTER_OTLP_ENDPOINT is set.
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }

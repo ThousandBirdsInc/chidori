@@ -1,0 +1,27 @@
+# Standalone workspace so the host crate's `cargo test` does not try to
+# build this wasm32-wasip1-only crate natively. Build it explicitly with:
+#   cargo build --release --target wasm32-wasip1
+[workspace]
+
+[package]
+name = "sandbox-js"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Boa-powered JavaScript sandbox, compiled to wasm32-wasip1 and embedded into the host crate via include_bytes!."
+
+[[bin]]
+name = "sandbox-js"
+path = "src/main.rs"
+
+[dependencies]
+# Boa with defaults off — we don't need float16, xsum, intl, temporal, or
+# any of the wasm-bindgen / browser pieces. Just the lexer + parser + vm.
+boa_engine = { version = "0.21", default-features = false }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

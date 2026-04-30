@@ -1,0 +1,22 @@
+# Standalone workspace so the host crate's `cargo test` does not try to
+# build this no_std wasm32-only crate natively. Build it explicitly with:
+#   cargo build --release --target wasm32-unknown-unknown
+[workspace]
+
+[package]
+name = "sandbox-runtime"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Tiny no_std runtime compiled to wasm32-unknown-unknown and embedded into the host. Reads a source program from linear memory, evaluates it, writes the result back."
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

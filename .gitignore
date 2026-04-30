@@ -1,72 +1,33 @@
-target
-node_modules
-toolchain/chidori-old/package_node/native/chidori.node
-toolcahin/chidori/build
-__pycache__
+/target
+/sandbox-runtime/target
+/sandbox-python/target
+/sandbox-js/target
 
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
-
-/.venv
-
-# dependencies
-/global_node_modules
-node_modules
-/.pnp
-.pnp.js
-
-# testing
-/coverage
-
-# next.js
-/.next/
-/out/
-
-# production
-/build
-
-# misc
+# macOS
 .DS_Store
-*.pem
 
-# debug
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
+# Editor / IDE
+.idea/
+.vscode/
 
-# local env files
-.env*.local
+# Run artifacts and runtime state produced by `chidori run`
+# (kept out of source control)
+.chidori/runs/
+.chidori/wasm-cache/
+.chidori/memory/
 
-# vercel
-.vercel
+# Python build/dist
+__pycache__/
+*.pyc
+*.egg-info/
+sdk/python/build/
+sdk/python/dist/
 
-# typescript
-*.tsbuildinfo
-next-env.d.ts
+# Node
+node_modules/
 
-# Sentry Auth Token
-.sentryclirc
-
-/dist
-
-monorepo-diff-buildkite-plugin
-
-# Devenv
-.devenv*
-devenv.local.nix
-
-index.node
-databases/simulation_host_db/report.json
-databases/simulation_host_db/report.html
-
-.next
-dist
-.idea
-.venv
-
-toolchain/chidori-old/package_python/chidori/_chidori.abi3.so
-
-.pre-commit-config.yaml
-
+# Secrets / local env
 .env
 .envrc
+.env*.local
+.env.local
