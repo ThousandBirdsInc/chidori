@@ -9,7 +9,7 @@
 <a href="https://crates.io/crates/chidori"><img alt="crates.io version" src="https://img.shields.io/crates/v/chidori" /></a>
 <a href="https://pypi.org/project/chidori/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/chidori" /></a>
 <a href="https://www.npmjs.com/package/chidori"><img alt="npm version" src="https://img.shields.io/npm/v/chidori" /></a>
-<a href="https://github.com/ThousandBirdsInc/chidori/blob/main/LICENSE"><img alt="License MIT" src="https://img.shields.io/badge/License-MIT-green.svg" /></a>
+<a href="https://github.com/ThousandBirdsInc/chidori/blob/main/LICENSE"><img alt="License Apache-2.0" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" /></a>
 </p>
 <br />
 </div>
