@@ -149,9 +149,21 @@ results = parallel([
 
 # Run multiple prompts concurrently
 summaries = parallel([
-    lambda a = a: prompt("Summarize for " + a + " audience:\n" + doc)
+    lambda a = a: prompt(
+        "Summarize for " + a + " audience:\n" + doc,
+        type = "progress",
+    )
     for a in ["technical", "executive", "general"]
 ])
+```
+
+When an agent is run through a streaming runtime, `prompt()` emits
+`prompt_start`, `prompt_delta`, and `prompt_end` events. Set `type` (or
+`stream_type`) to label the stream so clients can filter progress output:
+
+```python
+status = prompt("Explain what work remains in one sentence", type = "progress")
+answer = prompt("Write the final answer", type = "final")
 ```
 
 **Important:** Use `lambda q = q:` (default arg capture) to avoid late-binding closure issues — same as Python.

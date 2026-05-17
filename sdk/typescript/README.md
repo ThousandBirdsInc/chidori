@@ -32,9 +32,12 @@ console.log(session.output);
 const checkpoint = await session.checkpoint();
 const replayed = await client.replay(checkpoint);
 
-// Live streaming: yields one event per host function call, then `done`
+// Live streaming: host calls, prompt stream deltas, then `done`
 for await (const evt of client.stream({ document: "hi" })) {
   if (evt.type === "call") console.log(evt.record.function);
+  if (evt.type === "prompt_delta" && evt.prompt_type === "progress") {
+    process.stdout.write(evt.delta);
+  }
   if (evt.type === "done") console.log(evt.status, evt.output);
 }
 

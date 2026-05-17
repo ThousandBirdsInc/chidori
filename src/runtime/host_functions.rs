@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, OnceLock};
 use std::time::Instant;
 
 use chrono::Utc;
@@ -27,6 +27,7 @@ use crate::runtime::context::{
     InputMode, PendingApproval, PendingInput, RuntimeContext, PAUSE_MARKER,
 };
 use crate::runtime::sandbox;
+use tracing::{debug, info, error as tracing_error};
 
 /// Divergence-checked replay lookup. Wraps `RuntimeContext::try_replay_checked`
 /// and converts the mismatch string into a `starlark::Error` so host functions
@@ -42,9 +43,61 @@ fn replay_or_live(
 use crate::runtime::template::TemplateEngine;
 use crate::tools::{ToolDef, ToolRegistry};
 
+const PARALLEL_BRANCH_DONE: &str = "__CHIDORI_PARALLEL_BRANCH_DONE__";
+
+#[derive(Clone)]
+pub struct StarlarkEntry {
+    source_name: String,
+    source: Arc<String>,
+    fn_name: String,
+    kwargs: Arc<serde_json::Map<String, Value>>,
+    parallel_counter: Arc<StdMutex<u64>>,
+}
+
+impl StarlarkEntry {
+    pub fn new(
+        source_name: String,
+        source: Arc<String>,
+        fn_name: String,
+        kwargs: serde_json::Map<String, Value>,
+    ) -> Self {
+        Self {
+            source_name,
+            source,
+            fn_name,
+            kwargs: Arc::new(kwargs),
+            parallel_counter: Arc::new(StdMutex::new(0)),
+        }
+    }
+
+    fn next_parallel_index(&self) -> u64 {
+        let mut counter = self.parallel_counter.lock().unwrap();
+        let index = *counter;
+        *counter += 1;
+        index
+    }
+
+    fn for_replay(&self) -> Self {
+        Self {
+            source_name: self.source_name.clone(),
+            source: self.source.clone(),
+            fn_name: self.fn_name.clone(),
+            kwargs: self.kwargs.clone(),
+            parallel_counter: Arc::new(StdMutex::new(0)),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ParallelBranchMode {
+    target_parallel_index: u64,
+    branch_index: usize,
+    result: Arc<StdMutex<Option<Result<Value, String>>>>,
+}
+
 /// Extra data attached to the Starlark Evaluator via `extra`.
 /// Provides host functions access to the runtime context, providers, and template engine.
-#[derive(ProvidesStaticType, allocative::Allocative)]
+#[derive(Clone, ProvidesStaticType, allocative::Allocative)]
 pub struct HostState {
     #[allocative(skip)]
     pub ctx: RuntimeContext,
@@ -62,6 +115,47 @@ pub struct HostState {
     pub policy_cache: Arc<StdMutex<PolicyCache>>,
     #[allocative(skip)]
     pub mcp: Arc<McpManager>,
+    #[allocative(skip)]
+    pub starlark_entry: Option<Arc<StarlarkEntry>>,
+    #[allocative(skip)]
+    pub(crate) parallel_branch: Option<Arc<ParallelBranchMode>>,
+}
+
+impl HostState {
+    fn with_entry(
+        &self,
+        source_name: String,
+        source: Arc<String>,
+        fn_name: String,
+        kwargs: serde_json::Map<String, Value>,
+    ) -> Self {
+        Self {
+            starlark_entry: Some(Arc::new(StarlarkEntry::new(
+                source_name,
+                source,
+                fn_name,
+                kwargs,
+            ))),
+            parallel_branch: None,
+            ..self.clone()
+        }
+    }
+
+    fn for_parallel_replay(
+        &self,
+        ctx: RuntimeContext,
+        branch_mode: Arc<ParallelBranchMode>,
+    ) -> Self {
+        Self {
+            ctx,
+            starlark_entry: self
+                .starlark_entry
+                .as_ref()
+                .map(|entry| Arc::new(entry.for_replay())),
+            parallel_branch: Some(branch_mode),
+            ..self.clone()
+        }
+    }
 }
 
 /// Resolve a host function call against the permission policy. Returns Ok
@@ -73,11 +167,7 @@ pub struct HostState {
 ///               Caching the approval means repeated calls in the same run
 ///               don't ask again.
 /// NeverAllow  → refuse, with the rule's reason if present.
-pub(crate) fn enforce_policy(
-    host: &HostState,
-    target: &str,
-    args: &Value,
-) -> anyhow::Result<()> {
+pub(crate) fn enforce_policy(host: &HostState, target: &str, args: &Value) -> anyhow::Result<()> {
     let (decision, reason) = host.policy.decide(target, args);
     match decision {
         Decision::AlwaysAllow => Ok(()),
@@ -176,8 +266,10 @@ pub fn json_to_starlark<'v>(heap: &'v Heap, v: &Value) -> StarlarkValue<'v> {
         }
         Value::String(s) => heap.alloc_str(s).to_value(),
         Value::Array(arr) => {
-            let items: Vec<StarlarkValue> =
-                arr.iter().map(|item| json_to_starlark(heap, item)).collect();
+            let items: Vec<StarlarkValue> = arr
+                .iter()
+                .map(|item| json_to_starlark(heap, item))
+                .collect();
             heap.alloc(AllocList(items))
         }
         Value::Object(map) => {
@@ -202,6 +294,55 @@ pub fn json_to_starlark<'v>(heap: &'v Heap, v: &Value) -> StarlarkValue<'v> {
         }
     }
 }
+
+// ---------- parallel() concurrency limiter -----------------------------------
+
+type SemInner = (StdMutex<usize>, Condvar);
+
+/// Global semaphore that caps how many parallel() branches may run
+/// simultaneously. Defaults to 3; override with CHIDORI_PARALLEL_CONCURRENCY.
+static PARALLEL_SEM: OnceLock<Arc<SemInner>> = OnceLock::new();
+
+fn parallel_sem() -> &'static Arc<SemInner> {
+    PARALLEL_SEM.get_or_init(|| {
+        let limit = std::env::var("CHIDORI_PARALLEL_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(3);
+        Arc::new((StdMutex::new(limit), Condvar::new()))
+    })
+}
+
+/// RAII permit — decrements the counter on acquire, increments on drop.
+/// Ensures the slot is released even if the branch thread panics.
+struct ParallelPermit {
+    sem: Arc<SemInner>,
+}
+
+impl ParallelPermit {
+    fn acquire(sem: Arc<SemInner>) -> Self {
+        {
+            let (lock, cvar) = &*sem;
+            let mut available = lock.lock().unwrap();
+            while *available == 0 {
+                available = cvar.wait(available).unwrap();
+            }
+            *available -= 1;
+        } // references into sem released here before the move below
+        ParallelPermit { sem }
+    }
+}
+
+impl Drop for ParallelPermit {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.sem;
+        *lock.lock().unwrap() += 1;
+        cvar.notify_one();
+    }
+}
+
+// -----------------------------------------------------------------------------
 
 #[starlark_module]
 pub fn host_functions(builder: &mut GlobalsBuilder) {
@@ -293,6 +434,7 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
         let mut max_turns = agent_config.max_turns;
         let mut system: Option<String> = None;
         let mut format: Option<String> = None;
+        let mut prompt_type: Option<String> = None;
         let mut tool_names: Vec<String> = Vec::new();
 
         for (key, val) in &kwargs.entries {
@@ -329,6 +471,11 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
                         format = Some(s.to_string());
                     }
                 }
+                "type" | "stream_type" => {
+                    if let Some(s) = val.unpack_str() {
+                        prompt_type = Some(s.to_string());
+                    }
+                }
                 "tools" => {
                     if let Some(list) = ListRef::from_value(*val) {
                         for item in list.iter() {
@@ -362,11 +509,18 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
         let prompt_text = text.as_str().to_string();
         if tool_schemas.is_empty() {
             let seq = ctx.next_seq();
+            debug!(
+                seq,
+                model = %model,
+                prompt_type = ?prompt_type,
+                text_len = prompt_text.len(),
+                "prompt() start"
+            );
             if let Some(cached) = replay_or_live(&ctx, seq, "prompt")? {
                 if format.as_deref() == Some("json") {
-                    if let Ok(val) = serde_json::from_str::<Value>(
-                        cached.result.as_str().unwrap_or(""),
-                    ) {
+                    if let Ok(val) =
+                        serde_json::from_str::<Value>(cached.result.as_str().unwrap_or(""))
+                    {
                         return Ok(json_to_starlark(eval.heap(), &val));
                     }
                 }
@@ -388,12 +542,31 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
             // one is attached (i.e. the SSE endpoint is consuming events).
             // Otherwise fall back to a plain send() with no streaming cost.
             let response = if ctx.has_event_sender() {
+                let stream_id = ctx.begin_prompt_stream(seq, prompt_type.clone(), model.clone());
                 let ctx_for_cb = ctx.clone();
-                let seq_for_cb = seq;
+                let stream_id_for_cb = stream_id.clone();
+                let prompt_type_for_cb = prompt_type.clone();
                 let mut sink: crate::providers::TokenSink = Box::new(move |delta: &str| {
-                    ctx_for_cb.emit_token_delta(seq_for_cb, delta.to_string());
+                    if let Some(stream_id) = stream_id_for_cb.clone() {
+                        ctx_for_cb.emit_prompt_delta(
+                            stream_id,
+                            seq,
+                            prompt_type_for_cb.clone(),
+                            delta.to_string(),
+                        );
+                    }
                 });
-                tokio_rt.block_on(async { providers.stream(&request, &mut sink).await })
+                let response =
+                    tokio_rt.block_on(async { providers.stream(&request, &mut sink).await });
+                if let Some(stream_id) = stream_id {
+                    ctx.end_prompt_stream(
+                        stream_id,
+                        seq,
+                        prompt_type.clone(),
+                        response.as_ref().err().map(|e| e.to_string()),
+                    );
+                }
+                response
             } else {
                 tokio_rt.block_on(async { providers.send(&request).await })
             };
@@ -401,10 +574,19 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
 
             return match response {
                 Ok(resp) => {
+                    info!(
+                        seq,
+                        model = %model,
+                        prompt_type = ?prompt_type,
+                        input_tokens = resp.input_tokens,
+                        output_tokens = resp.output_tokens,
+                        duration_ms,
+                        "prompt() ok"
+                    );
                     ctx.record_call(CallRecord {
                         seq,
                         function: "prompt".to_string(),
-                        args: json!({ "text": prompt_text, "model": model }),
+                        args: json!({ "text": prompt_text, "model": model, "type": prompt_type }),
                         result: json!(resp.content),
                         duration_ms,
                         token_usage: Some(TokenUsage {
@@ -425,10 +607,18 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
                     }
                 }
                 Err(e) => {
+                    tracing_error!(
+                        seq,
+                        model = %model,
+                        prompt_type = ?prompt_type,
+                        duration_ms,
+                        error = %e,
+                        "prompt() failed"
+                    );
                     ctx.record_call(CallRecord {
                         seq,
                         function: "prompt".to_string(),
-                        args: json!({ "text": prompt_text, "model": model }),
+                        args: json!({ "text": prompt_text, "model": model, "type": prompt_type }),
                         result: Value::Null,
                         duration_ms,
                         token_usage: None,
@@ -470,7 +660,36 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
                     tools: tool_schemas.clone(),
                 };
                 let start = Instant::now();
-                let response = tokio_rt.block_on(async { providers.send(&request).await });
+                let response = if ctx.has_event_sender() {
+                    let stream_id =
+                        ctx.begin_prompt_stream(seq, prompt_type.clone(), model.clone());
+                    let ctx_for_cb = ctx.clone();
+                    let stream_id_for_cb = stream_id.clone();
+                    let prompt_type_for_cb = prompt_type.clone();
+                    let mut sink: crate::providers::TokenSink = Box::new(move |delta: &str| {
+                        if let Some(stream_id) = stream_id_for_cb.clone() {
+                            ctx_for_cb.emit_prompt_delta(
+                                stream_id,
+                                seq,
+                                prompt_type_for_cb.clone(),
+                                delta.to_string(),
+                            );
+                        }
+                    });
+                    let response =
+                        tokio_rt.block_on(async { providers.stream(&request, &mut sink).await });
+                    if let Some(stream_id) = stream_id {
+                        ctx.end_prompt_stream(
+                            stream_id,
+                            seq,
+                            prompt_type.clone(),
+                            response.as_ref().err().map(|e| e.to_string()),
+                        );
+                    }
+                    response
+                } else {
+                    tokio_rt.block_on(async { providers.send(&request).await })
+                };
                 let duration_ms = start.elapsed().as_millis() as u64;
                 match response {
                     Ok(resp) => {
@@ -480,6 +699,7 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
                             args: json!({
                                 "text": prompt_text,
                                 "model": model,
+                                "type": prompt_type,
                                 "tools": tool_names,
                                 "turn": _turn,
                             }),
@@ -498,7 +718,7 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
                         ctx.record_call(CallRecord {
                             seq,
                             function: "prompt".to_string(),
-                            args: json!({ "text": prompt_text, "model": model }),
+                            args: json!({ "text": prompt_text, "model": model, "type": prompt_type }),
                             result: Value::Null,
                             duration_ms,
                             token_usage: None,
@@ -536,6 +756,8 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
                         policy: policy.clone(),
                         policy_cache: policy_cache.clone(),
                         mcp: mcp.clone(),
+                        starlark_entry: None,
+                        parallel_branch: None,
                     },
                 );
                 result_blocks.push(block);
@@ -614,6 +836,7 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
         }
 
         let seq = ctx.next_seq();
+        debug!(seq, tool = %tool_name, "tool() start");
 
         // Replay hit — return the cached result directly.
         if let Some(cached) = replay_or_live(&ctx, seq, "tool")? {
@@ -634,6 +857,8 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
                 policy: policy.clone(),
                 policy_cache: policy_cache.clone(),
                 mcp: mcp.clone(),
+                starlark_entry: None,
+                parallel_branch: None,
             };
             if let Err(e) = enforce_policy(&probe, &policy_target, &policy_args) {
                 ctx.record_call(CallRecord {
@@ -707,6 +932,8 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
                 policy,
                 policy_cache,
                 mcp,
+                starlark_entry: None,
+                parallel_branch: None,
             },
         );
 
@@ -714,6 +941,7 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
 
         match result_json {
             Ok(val) => {
+                info!(seq, tool = %tool_name, duration_ms, "tool() ok");
                 ctx.record_call(CallRecord {
                     seq,
                     function: "tool".to_string(),
@@ -727,6 +955,7 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
                 Ok(json_to_starlark(eval.heap(), &val))
             }
             Err(e) => {
+                tracing_error!(seq, tool = %tool_name, duration_ms, error = %e, "tool() failed");
                 ctx.record_call(CallRecord {
                     seq,
                     function: "tool".to_string(),
@@ -791,14 +1020,12 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
             return Ok(json_to_starlark(eval.heap(), &cached.result));
         }
 
-        if let Err(e) = enforce_policy(
-            state,
-            "http",
-            &json!({ "url": url_str, "method": method }),
-        ) {
+        if let Err(e) = enforce_policy(state, "http", &json!({ "url": url_str, "method": method }))
+        {
             return Err(starlark::Error::new_other(e));
         }
 
+        debug!(seq, method = %method, url = %url_str, "http() start");
         let start = Instant::now();
 
         let request_method = method.clone();
@@ -824,7 +1051,10 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
                 let pairs: Vec<(String, String)> = p
                     .into_iter()
                     .map(|(k, v)| {
-                        let vs = v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string());
+                        let vs = v
+                            .as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| v.to_string());
                         (k, vs)
                     })
                     .collect();
@@ -857,6 +1087,8 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
 
         match response {
             Ok(val) => {
+                let status_code = val.get("status").and_then(|v| v.as_u64()).unwrap_or(0);
+                info!(seq, method = %method, url = %url_str, status = status_code, duration_ms, "http() ok");
                 state.ctx.record_call(CallRecord {
                     seq,
                     function: "http".to_string(),
@@ -876,6 +1108,7 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
                 Ok(json_to_starlark(eval.heap(), &val))
             }
             Err(e) => {
+                tracing_error!(seq, method = %method, url = %url_str, duration_ms, error = %e, "http() failed");
                 state.ctx.record_call(CallRecord {
                     seq,
                     function: "http".to_string(),
@@ -974,9 +1207,9 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
             InputMode::Stdin => {
                 eprintln!("{}", prompt_text);
                 let mut line = String::new();
-                std::io::stdin()
-                    .read_line(&mut line)
-                    .map_err(|e| starlark::Error::new_other(anyhow::anyhow!("stdin read: {}", e)))?;
+                std::io::stdin().read_line(&mut line).map_err(|e| {
+                    starlark::Error::new_other(anyhow::anyhow!("stdin read: {}", e))
+                })?;
                 let response = line.trim_end_matches(&['\r', '\n'][..]).to_string();
                 state.ctx.record_call(CallRecord {
                     seq,
@@ -1081,6 +1314,8 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
                 policy,
                 policy_cache,
                 mcp,
+                starlark_entry: None,
+                parallel_branch: None,
             },
         );
 
@@ -1195,12 +1430,14 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
             })),
         };
 
+        debug!(seq, function = %function, fuel, "exec() start");
         let start = Instant::now();
         let result = sandbox::exec_wasm(req);
         let duration_ms = start.elapsed().as_millis() as u64;
 
         match result {
             Ok(exec_result) => {
+                info!(seq, function = %function, duration_ms, fuel_remaining = exec_result.fuel_remaining, "exec() ok");
                 let result_json = json!({
                     "returns": exec_result.returns,
                     "fuel_remaining": exec_result.fuel_remaining,
@@ -1218,6 +1455,7 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
                 Ok(json_to_starlark(eval.heap(), &result_json))
             }
             Err(e) => {
+                tracing_error!(seq, function = %function, duration_ms, error = %e, "exec() failed");
                 state.ctx.record_call(CallRecord {
                     seq,
                     function: "exec".to_string(),
@@ -1548,44 +1786,43 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
 
         // Run under tokio so we get cancellation-on-timeout for free. The
         // process is killed when the future is dropped on timeout.
-        let exec_outcome: anyhow::Result<ShellOutcome> =
-            state.tokio_rt.block_on(async move {
-                use tokio::process::Command as TokioCommand;
-                let mut command = TokioCommand::new(&cmd_clone);
-                command
-                    .args(&args_clone)
-                    .kill_on_drop(true)
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .stdin(std::process::Stdio::null());
-                if let Some(ref dir) = cwd_clone {
-                    command.current_dir(dir);
-                }
-                // Start from an empty env and add just what the caller asked
-                // for — prevents secret leakage via PATH / AWS_* / etc.
-                command.env_clear();
-                for (k, v) in &env_clone {
-                    command.env(k, v);
-                }
+        let exec_outcome: anyhow::Result<ShellOutcome> = state.tokio_rt.block_on(async move {
+            use tokio::process::Command as TokioCommand;
+            let mut command = TokioCommand::new(&cmd_clone);
+            command
+                .args(&args_clone)
+                .kill_on_drop(true)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .stdin(std::process::Stdio::null());
+            if let Some(ref dir) = cwd_clone {
+                command.current_dir(dir);
+            }
+            // Start from an empty env and add just what the caller asked
+            // for — prevents secret leakage via PATH / AWS_* / etc.
+            command.env_clear();
+            for (k, v) in &env_clone {
+                command.env(k, v);
+            }
 
-                let fut = command.output();
-                let dur = std::time::Duration::from_millis(timeout_ms);
-                match tokio::time::timeout(dur, fut).await {
-                    Ok(Ok(output)) => Ok(ShellOutcome {
-                        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                        exit_code: output.status.code().unwrap_or(-1),
-                        timed_out: false,
-                    }),
-                    Ok(Err(e)) => Err(anyhow::anyhow!("spawn `{}`: {}", cmd_clone, e)),
-                    Err(_) => Ok(ShellOutcome {
-                        stdout: String::new(),
-                        stderr: format!("timed out after {}ms", timeout_ms),
-                        exit_code: -1,
-                        timed_out: true,
-                    }),
-                }
-            });
+            let fut = command.output();
+            let dur = std::time::Duration::from_millis(timeout_ms);
+            match tokio::time::timeout(dur, fut).await {
+                Ok(Ok(output)) => Ok(ShellOutcome {
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    exit_code: output.status.code().unwrap_or(-1),
+                    timed_out: false,
+                }),
+                Ok(Err(e)) => Err(anyhow::anyhow!("spawn `{}`: {}", cmd_clone, e)),
+                Err(_) => Ok(ShellOutcome {
+                    stdout: String::new(),
+                    stderr: format!("timed out after {}ms", timeout_ms),
+                    exit_code: -1,
+                    timed_out: true,
+                }),
+            }
+        });
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -1865,7 +2102,13 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
         }
 
         let start = Instant::now();
-        let result = memory_execute(&action_str, &namespace, key.as_deref(), value.as_ref(), &prefix);
+        let result = memory_execute(
+            &action_str,
+            &namespace,
+            key.as_deref(),
+            value.as_ref(),
+            &prefix,
+        );
         let duration_ms = start.elapsed().as_millis() as u64;
 
         match result {
@@ -1914,27 +2157,191 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
     ///     lambda: prompt("summarize doc B"),
     /// ])
     ///
-    /// Note: today each branch executes sequentially — the Starlark
-    /// evaluator is single-threaded and lambdas are bound to its heap, so
-    /// they can't cross threads. The API is in place so agents can be
-    /// written against it; a future implementation may run branches truly
-    /// concurrently when the runtime supports it.
+    /// Each branch runs in its own evaluator on a worker thread. To preserve
+    /// lexical captures, the worker replays the same entrypoint up to this
+    /// parallel() occurrence and then evaluates only the selected lambda.
+    ///
+    /// Concurrency is capped by `CHIDORI_PARALLEL_CONCURRENCY` (default 3) so
+    /// that LLM providers with per-account connection limits don't see 429s.
     fn parallel<'v>(
         branches: StarlarkValue<'v>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkValue<'v>> {
         let list = ListRef::from_value(branches).ok_or_else(|| {
-            starlark::Error::new_other(anyhow::anyhow!(
-                "parallel() expects a list of callables"
-            ))
+            starlark::Error::new_other(anyhow::anyhow!("parallel() expects a list of callables"))
         })?;
 
         let callables: Vec<StarlarkValue<'v>> = list.iter().collect();
-        let mut results: Vec<StarlarkValue<'v>> = Vec::with_capacity(callables.len());
-        for callable in callables {
-            let value = eval.eval_function(callable, &[], &[])?;
-            results.push(value);
+        let state = get_state(eval).clone();
+        let Some(entry) = state.starlark_entry.clone() else {
+            let mut results: Vec<StarlarkValue<'v>> = Vec::with_capacity(callables.len());
+            for callable in callables {
+                let value = eval.eval_function(callable, &[], &[])?;
+                results.push(value);
+            }
+            return Ok(eval.heap().alloc(AllocList(results)));
+        };
+        let current_parallel_index = entry.next_parallel_index();
+
+        if let Some(branch_mode) = state.parallel_branch.clone() {
+            if current_parallel_index == branch_mode.target_parallel_index {
+                let branch_result = match callables.get(branch_mode.branch_index) {
+                    Some(callable) => eval
+                        .eval_function(*callable, &[], &[])
+                        .map(starlark_to_json)
+                        .map_err(|e| e.to_string()),
+                    None => Err(format!(
+                        "parallel branch index {} out of range for {} branches",
+                        branch_mode.branch_index,
+                        callables.len()
+                    )),
+                };
+                *branch_mode.result.lock().unwrap() = Some(branch_result);
+                return Err(starlark::Error::new_other(anyhow::anyhow!(
+                    "{}",
+                    PARALLEL_BRANCH_DONE
+                )));
+            }
+
+            let mut results: Vec<StarlarkValue<'v>> = Vec::with_capacity(callables.len());
+            for callable in callables {
+                let value = eval.eval_function(callable, &[], &[])?;
+                results.push(value);
+            }
+            return Ok(eval.heap().alloc(AllocList(results)));
         }
+
+        if callables.len() <= 1 {
+            let mut results: Vec<StarlarkValue<'v>> = Vec::with_capacity(callables.len());
+            for callable in callables {
+                let value = eval.eval_function(callable, &[], &[])?;
+                results.push(value);
+            }
+            return Ok(eval.heap().alloc(AllocList(results)));
+        }
+
+        if state.ctx.is_replaying() {
+            let mut results: Vec<StarlarkValue<'v>> = Vec::with_capacity(callables.len());
+            for callable in callables {
+                let value = eval.eval_function(callable, &[], &[])?;
+                results.push(value);
+            }
+            return Ok(eval.heap().alloc(AllocList(results)));
+        }
+
+        let replay_log = state.ctx.call_log().into_records();
+        let replay_len = replay_log.len();
+        let input_mode = state.ctx.input_mode();
+        let mut handles = Vec::with_capacity(callables.len());
+
+        let sem = parallel_sem().clone();
+        info!(branches = callables.len(), "parallel() start");
+
+        for branch_index in 0..callables.len() {
+            let branch_state = state.clone();
+            let branch_replay_log = replay_log.clone();
+            let result_slot = Arc::new(StdMutex::new(None));
+            let branch_mode = Arc::new(ParallelBranchMode {
+                target_parallel_index: current_parallel_index,
+                branch_index,
+                result: result_slot.clone(),
+            });
+            let branch_sem = sem.clone();
+
+            handles.push(std::thread::spawn(move || {
+                // Acquire a concurrency permit before doing any LLM work.
+                // Blocks until a slot is free; released automatically on drop.
+                let _permit = ParallelPermit::acquire(branch_sem);
+
+                let branch_ctx = RuntimeContext::with_replay(branch_replay_log);
+                branch_ctx.inherit_event_sink(&branch_state.ctx, false);
+                branch_ctx.set_input_mode(input_mode);
+                let branch_host =
+                    branch_state.for_parallel_replay(branch_ctx.clone(), branch_mode.clone());
+
+                let Some(branch_entry) = branch_host.starlark_entry.clone() else {
+                    return ParallelBranchOutcome {
+                        branch_index,
+                        result: Err("parallel branch has no Starlark entry".to_string()),
+                        records: Vec::new(),
+                    };
+                };
+
+                let run_result = invoke_starlark_entry(
+                    &branch_entry.source_name,
+                    branch_entry.source.as_str(),
+                    &branch_entry.fn_name,
+                    branch_entry.kwargs.as_ref(),
+                    branch_host,
+                );
+
+                let result = match run_result {
+                    Ok(_) => Err(format!(
+                        "parallel branch {} finished without reaching target parallel()",
+                        branch_index
+                    )),
+                    Err(e) if e.to_string().contains(PARALLEL_BRANCH_DONE) => {
+                        result_slot.lock().unwrap().take().unwrap_or_else(|| {
+                            Err(format!(
+                                "parallel branch {} stopped without a result",
+                                branch_index
+                            ))
+                        })
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+
+                let records = branch_ctx
+                    .call_log()
+                    .into_records()
+                    .into_iter()
+                    .skip(replay_len)
+                    .collect();
+
+                ParallelBranchOutcome {
+                    branch_index,
+                    result,
+                    records,
+                }
+            }));
+        }
+
+        let mut branch_outputs: Vec<Option<Value>> = vec![None; handles.len()];
+        let mut first_error: Option<String> = None;
+
+        for handle in handles {
+            let outcome = handle.join().map_err(|_| {
+                starlark::Error::new_other(anyhow::anyhow!("parallel branch panicked"))
+            })?;
+
+            for mut record in outcome.records {
+                record.seq = state.ctx.next_seq();
+                state.ctx.record_call(record);
+            }
+
+            match outcome.result {
+                Ok(value) => {
+                    debug!(branch = outcome.branch_index, "parallel branch ok");
+                    branch_outputs[outcome.branch_index] = Some(value);
+                }
+                Err(ref e) if first_error.is_none() => {
+                    tracing_error!(branch = outcome.branch_index, error = %e, "parallel branch failed");
+                    first_error = Some(outcome.result.unwrap_err());
+                }
+                Err(_) => {}
+            }
+        }
+
+        if let Some(e) = first_error {
+            tracing_error!(error = %e, "parallel() failed");
+            return Err(starlark::Error::new_other(anyhow::anyhow!(e)));
+        }
+        info!(branches = branch_outputs.len(), "parallel() ok");
+
+        let results: Vec<StarlarkValue<'v>> = branch_outputs
+            .into_iter()
+            .map(|value| json_to_starlark(eval.heap(), &value.unwrap_or_else(|| Value::Null)))
+            .collect();
         Ok(eval.heap().alloc(AllocList(results)))
     }
 
@@ -1955,14 +2362,20 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
             Ok(value) => {
                 let entries = vec![
                     (heap.alloc_str("value").to_value(), value),
-                    (heap.alloc_str("error").to_value(), StarlarkValue::new_none()),
+                    (
+                        heap.alloc_str("error").to_value(),
+                        StarlarkValue::new_none(),
+                    ),
                 ];
                 Ok(alloc_dict(heap, entries))
             }
             Err(e) => {
                 let msg = heap.alloc_str(&e.to_string()).to_value();
                 let entries = vec![
-                    (heap.alloc_str("value").to_value(), StarlarkValue::new_none()),
+                    (
+                        heap.alloc_str("value").to_value(),
+                        StarlarkValue::new_none(),
+                    ),
                     (heap.alloc_str("error").to_value(), msg),
                 ];
                 Ok(alloc_dict(heap, entries))
@@ -2110,9 +2523,9 @@ pub fn host_functions(builder: &mut GlobalsBuilder) {
                  Keep under 400 words.\n\n{}",
                 flattened
             ))],
-            system: system_prompt.clone().or_else(|| {
-                Some("You compact long conversations into dense recaps.".to_string())
-            }),
+            system: system_prompt
+                .clone()
+                .or_else(|| Some("You compact long conversations into dense recaps.".to_string())),
             temperature: 0.2,
             max_tokens: 800,
             tools: Vec::new(),
@@ -2185,6 +2598,22 @@ fn invoke_tool_starlark(
     kwargs: &serde_json::Map<String, Value>,
     host: HostState,
 ) -> anyhow::Result<Value> {
+    let host = host.with_entry(
+        source_name.to_string(),
+        Arc::new(source.to_string()),
+        fn_name.to_string(),
+        kwargs.clone(),
+    );
+    invoke_starlark_entry(source_name, source, fn_name, kwargs, host)
+}
+
+fn invoke_starlark_entry(
+    source_name: &str,
+    source: &str,
+    fn_name: &str,
+    kwargs: &serde_json::Map<String, Value>,
+    host: HostState,
+) -> anyhow::Result<Value> {
     let ast = AstModule::parse(source_name, source.to_string(), &studio_dialect())
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
@@ -2226,6 +2655,12 @@ fn invoke_tool_starlark(
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     Ok(starlark_to_json(result))
+}
+
+struct ParallelBranchOutcome {
+    branch_index: usize,
+    result: Result<Value, String>,
+    records: Vec<CallRecord>,
 }
 
 /// Captured output of a sandboxed `shell()` call. Mirrors the dict we hand
@@ -2348,18 +2783,20 @@ fn llm_response_from_record(record: &CallRecord) -> Option<LlmResponse> {
             .and_then(|v| v.as_str())
             .unwrap_or("end_turn")
             .to_string(),
-        input_tokens: obj.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-        output_tokens: obj.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+        input_tokens: obj
+            .get("input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        output_tokens: obj
+            .get("output_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
     })
 }
 
 /// Invoke a tool the LLM asked for and return a tool_result ContentBlock.
 /// Records the invocation in the call log so it is replayable.
-fn invoke_tool_call(
-    call: &ToolCall,
-    tool_defs: &[ToolDef],
-    host: HostState,
-) -> ContentBlock {
+fn invoke_tool_call(call: &ToolCall, tool_defs: &[ToolDef], host: HostState) -> ContentBlock {
     let seq = host.ctx.next_seq();
 
     // This helper is called from within the tool-use loop of prompt(), which
@@ -2369,9 +2806,11 @@ fn invoke_tool_call(
     // promote this to a hard failure later.
     match host.ctx.try_replay_checked(seq, "tool") {
         Ok(Some(cached)) => {
-            let content = cached.result.as_str().map(|s| s.to_string()).unwrap_or_else(
-                || cached.result.to_string(),
-            );
+            let content = cached
+                .result
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| cached.result.to_string());
             return ContentBlock::ToolResult {
                 tool_use_id: call.id.clone(),
                 content,
@@ -2430,6 +2869,8 @@ fn invoke_tool_call(
             policy: host.policy.clone(),
             policy_cache: host.policy_cache.clone(),
             mcp: host.mcp.clone(),
+            starlark_entry: None,
+            parallel_branch: None,
         },
     );
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -2559,7 +3000,13 @@ fn memory_execute(
 /// Keep namespace strings safe for use as a filename.
 fn sanitize_namespace(ns: &str) -> String {
     ns.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 

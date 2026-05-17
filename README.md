@@ -92,7 +92,7 @@ An agent is a `.star` file with a `def agent(...)` function. The runtime provide
 
 | Function | Purpose |
 |---|---|
-| `prompt(text, ...)` | Send to an LLM, return string or parsed JSON |
+| `prompt(text, type=..., ...)` | Send to an LLM, return string or parsed JSON; streamed prompt events carry the optional type |
 | `template(str_or_path, ...)` | Render a Jinja2 template with minijinja |
 | `tool(name, ...)` | Invoke a registered tool |
 | `agent(name, ...)` | Call a sub-agent |
@@ -107,6 +107,22 @@ An agent is a `.star` file with a `def agent(...)` function. The runtime provide
 | `try_call(fn)` | Capture errors without raising |
 
 See [`llm.txt`](./llm.txt) for the full API reference.
+
+### Streaming Prompt Progress
+
+Agents can label prompt output streams with `type` so UIs can filter incremental
+progress separately from final answers:
+
+```python
+status = prompt("Say what work is starting", type = "progress")
+answer = prompt("Write the final answer", type = "final")
+```
+
+When using `--stream` or `POST /sessions/stream`, prompt calls emit
+`prompt_start`, `prompt_delta`, and `prompt_end` events with `stream_id`,
+`seq`, and `prompt_type`. This also works for prompts inside `parallel(...)`
+branches and `call_agent(...)` sub-agents. See
+[`examples/agents/streaming_progress_demo.star`](./examples/agents/streaming_progress_demo.star).
 
 ## 🚦 Running Modes
 

@@ -1,4 +1,5 @@
 /target
+/sdk/typescript/dist/
 /sandbox-runtime/target
 /sandbox-python/target
 /sandbox-js/target

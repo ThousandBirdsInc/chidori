@@ -167,15 +167,13 @@ See [README.md](./README.md) for what works today, [DESIGN.md](./DESIGN.md) for 
 - [ ] **Follow-up: fuel budget for Python.** Python tests run at 200 M instructions; a tighter language-specific default + a per-op multiplier (parsing dominates) is a nice-to-have.
 
 ### Parallel Execution
-- [x] `parallel()` host function accepting a list of lambdas (sequential today — see follow-ups)
-- [ ] **Follow-up: true concurrency.** Today each branch runs sequentially because the Starlark evaluator is single-threaded and the lambdas are bound to the parent evaluator's heap — they can't cross thread boundaries. Real parallelism needs one of:
-  - (a) Run each branch in its own `Module` + `Evaluator` on a dedicated thread, serializing arguments/results across the boundary (requires re-parsing the branch's body or restructuring `parallel()` to take a spec like `parallel([{"kind": "prompt", ...}, ...])` instead of lambdas).
-  - (b) Fan out at the host-call level only: detect when a branch is a one-shot `prompt()`/`tool()`/`http()` and issue those concurrently while keeping Starlark itself sequential. Narrower but preserves the lambda API.
-  - (c) Wait for upstream `starlark-rust` to grow a thread-safe evaluator story.
+- [x] `parallel()` host function accepting a list of lambdas.
+- [x] **True concurrency.** Each branch runs in its own `Module` + `Evaluator` on a dedicated thread. The worker replays the same entrypoint up to the matching `parallel()` call, evaluates only the selected lambda in that evaluator so lexical captures still work, serializes the branch result through JSON, and merges branch call records back into the parent context with deterministic sequence numbers.
+- [ ] Optimize replay overhead for very cheap pure-Starlark branches.
 - [ ] Each parallel branch gets its own call log sequence range
-- [ ] Merge parallel branch logs into the main log on completion
-- [ ] Error handling: propagate first error (or collect all)
-- [ ] Replay support: parallel branches replay deterministically (works today only because execution is sequential)
+- [x] Merge parallel branch logs into the main log on completion
+- [x] Error handling: propagate first error
+- [x] Replay support: resume runs evaluate `parallel()` branches sequentially against the checkpoint so host-call sequence numbers remain deterministic.
 
 ### Agent Composition
 - [x] `call_agent()` host function: resolve path → `.star` file and invoke

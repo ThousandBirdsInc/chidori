@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::rate_limit::RateLimiter;
 use super::{ContentBlock, LlmProvider, LlmRequest, LlmResponse, TokenSink, ToolCall};
@@ -107,11 +108,6 @@ impl LlmProvider for AnthropicProvider {
     }
 
     async fn send(&self, request: &LlmRequest) -> Result<LlmResponse> {
-        if let Some(ref rl) = self.rate_limiter {
-            rl.acquire().await;
-        }
-
-        // Build the messages array. Anthropic accepts content as an array of blocks.
         let messages: Vec<Value> = request
             .messages
             .iter()
@@ -121,10 +117,7 @@ impl LlmProvider for AnthropicProvider {
                     .iter()
                     .map(content_block_to_anthropic_json)
                     .collect();
-                json!({
-                    "role": m.role,
-                    "content": blocks,
-                })
+                json!({ "role": m.role, "content": blocks })
             })
             .collect();
 
@@ -142,7 +135,6 @@ impl LlmProvider for AnthropicProvider {
             "model": resolve_alias(&request.model),
             "messages": messages,
             "max_tokens": request.max_tokens,
-            "temperature": request.temperature,
         });
         if let Some(ref system) = request.system {
             body["system"] = Value::String(system.clone());
@@ -151,59 +143,77 @@ impl LlmProvider for AnthropicProvider {
             body["tools"] = serde_json::to_value(&tools_json)?;
         }
 
-        let resp = self
-            .client
-            .post(ANTHROPIC_API_URL)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .context("Failed to send request to Anthropic API")?;
-
-        let status = resp.status();
-        let resp_text = resp.text().await.context("Failed to read Anthropic response")?;
-
-        if !status.is_success() {
-            if let Ok(err) = serde_json::from_str::<AnthropicError>(&resp_text) {
-                bail!("Anthropic API error ({}): {}", status, err.error.message);
+        let mut attempt = 0u32;
+        loop {
+            if let Some(ref rl) = self.rate_limiter {
+                rl.acquire().await;
             }
-            bail!("Anthropic API error ({}): {}", status, resp_text);
-        }
 
-        let parsed: AnthropicResponseBody =
-            serde_json::from_str(&resp_text).context("Failed to parse Anthropic response")?;
+            let resp = self
+                .client
+                .post(ANTHROPIC_API_URL)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await
+                .context("Failed to send request to Anthropic API")?;
 
-        let mut text_parts = Vec::new();
-        let mut tool_calls = Vec::new();
-        let mut blocks = Vec::new();
-        for block in parsed.content {
-            match block {
-                AnthropicResponseBlock::Text { text } => {
-                    text_parts.push(text.clone());
-                    blocks.push(ContentBlock::Text { text });
+            let status = resp.status();
+
+            if status.as_u16() == 429 {
+                attempt += 1;
+                if attempt >= 8 {
+                    bail!("Anthropic rate limit: exceeded max retries after 429");
                 }
-                AnthropicResponseBlock::ToolUse { id, name, input } => {
-                    tool_calls.push(ToolCall {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: input.clone(),
-                    });
-                    blocks.push(ContentBlock::ToolUse { id, name, input });
-                }
-                AnthropicResponseBlock::Other => {}
+                let wait = retry_after_duration(resp.headers(), attempt);
+                tracing::warn!(attempt, ?wait, "Anthropic 429 — backing off");
+                tokio::time::sleep(wait).await;
+                continue;
             }
-        }
 
-        Ok(LlmResponse {
-            content: text_parts.join(""),
-            blocks,
-            tool_calls,
-            stop_reason: parsed.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
-            input_tokens: parsed.usage.input_tokens,
-            output_tokens: parsed.usage.output_tokens,
-        })
+            let resp_text = resp.text().await.context("Failed to read Anthropic response")?;
+            if !status.is_success() {
+                if let Ok(err) = serde_json::from_str::<AnthropicError>(&resp_text) {
+                    bail!("Anthropic API error ({}): {}", status, err.error.message);
+                }
+                bail!("Anthropic API error ({}): {}", status, resp_text);
+            }
+
+            let parsed: AnthropicResponseBody =
+                serde_json::from_str(&resp_text).context("Failed to parse Anthropic response")?;
+
+            let mut text_parts = Vec::new();
+            let mut tool_calls = Vec::new();
+            let mut blocks = Vec::new();
+            for block in parsed.content {
+                match block {
+                    AnthropicResponseBlock::Text { text } => {
+                        text_parts.push(text.clone());
+                        blocks.push(ContentBlock::Text { text });
+                    }
+                    AnthropicResponseBlock::ToolUse { id, name, input } => {
+                        tool_calls.push(ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        });
+                        blocks.push(ContentBlock::ToolUse { id, name, input });
+                    }
+                    AnthropicResponseBlock::Other => {}
+                }
+            }
+
+            return Ok(LlmResponse {
+                content: text_parts.join(""),
+                blocks,
+                tool_calls,
+                stop_reason: parsed.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
+                input_tokens: parsed.usage.input_tokens,
+                output_tokens: parsed.usage.output_tokens,
+            });
+        }
     }
 
     /// Anthropic SSE streaming. Sends the request with `stream: true` and
@@ -248,7 +258,6 @@ impl LlmProvider for AnthropicProvider {
             "model": resolve_alias(&request.model),
             "messages": messages,
             "max_tokens": request.max_tokens,
-            "temperature": request.temperature,
             "stream": true,
         });
         if let Some(ref system) = request.system {
@@ -258,17 +267,38 @@ impl LlmProvider for AnthropicProvider {
             body["tools"] = serde_json::to_value(&tools_json)?;
         }
 
-        let resp = self
-            .client
-            .post(ANTHROPIC_API_URL)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .context("streaming request to Anthropic")?;
+        let resp = 'retry: {
+            let mut attempt = 0u32;
+            loop {
+                if let Some(ref rl) = self.rate_limiter {
+                    rl.acquire().await;
+                }
+                let r = self
+                    .client
+                    .post(ANTHROPIC_API_URL)
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", ANTHROPIC_VERSION)
+                    .header("content-type", "application/json")
+                    .header("accept", "text/event-stream")
+                    .json(&body)
+                    .send()
+                    .await
+                    .context("streaming request to Anthropic")?;
+
+                if r.status().as_u16() == 429 {
+                    attempt += 1;
+                    if attempt >= 8 {
+                        bail!("Anthropic rate limit: exceeded max retries after 429");
+                    }
+                    let wait = retry_after_duration(r.headers(), attempt);
+                    tracing::warn!(attempt, ?wait, "Anthropic 429 (stream) — backing off");
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+
+                break 'retry r;
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -425,6 +455,17 @@ impl LlmProvider for AnthropicProvider {
             output_tokens,
         })
     }
+}
+
+/// Pick a wait duration for a 429 retry. Uses the `retry-after` header
+/// (seconds) when present; otherwise exponential backoff: 1s, 2s, 4s, 8s…
+fn retry_after_duration(headers: &reqwest::header::HeaderMap, attempt: u32) -> Duration {
+    if let Some(v) = headers.get("retry-after").and_then(|v| v.to_str().ok()) {
+        if let Ok(secs) = v.parse::<f64>() {
+            return Duration::from_secs_f64(secs.max(0.5));
+        }
+    }
+    Duration::from_secs(1u64 << attempt.min(6))
 }
 
 fn content_block_to_anthropic_json(block: &ContentBlock) -> Value {
