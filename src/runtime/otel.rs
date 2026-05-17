@@ -13,6 +13,7 @@
 //! span per host function call. Attributes include agent name, run id,
 //! call sequence, model, token counts, and duration.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -123,6 +124,8 @@ pub struct RunSpan {
     parent_cx: Context,
     agent_name: String,
     run_id: String,
+    total_input_tokens: AtomicU64,
+    total_output_tokens: AtomicU64,
 }
 
 /// Start a root span for an agent run if OTEL is active. Returns None when
@@ -145,6 +148,8 @@ pub fn start_run_span(agent_name: &str, run_id: &str) -> Option<Arc<RunSpan>> {
         parent_cx,
         agent_name: agent_name.to_string(),
         run_id: run_id.to_string(),
+        total_input_tokens: AtomicU64::new(0),
+        total_output_tokens: AtomicU64::new(0),
     }))
 }
 
@@ -181,6 +186,8 @@ impl RunSpan {
                 "gen_ai.usage.output_tokens",
                 usage.output_tokens as i64,
             ));
+            self.total_input_tokens.fetch_add(usage.input_tokens, Ordering::Relaxed);
+            self.total_output_tokens.fetch_add(usage.output_tokens, Ordering::Relaxed);
         }
 
         let builder = SpanBuilder::from_name(format!("host.{}", record.function))
@@ -191,6 +198,15 @@ impl RunSpan {
 
         let mut span = tracer.build_with_context(builder, &self.parent_cx);
         if let Some(err) = &record.error {
+            span.set_attribute(KeyValue::new("error.type", record.function.clone()));
+            span.set_attribute(KeyValue::new("exception.message", err.clone()));
+            span.add_event(
+                "exception",
+                vec![
+                    KeyValue::new("exception.type", record.function.clone()),
+                    KeyValue::new("exception.message", err.clone()),
+                ],
+            );
             span.set_status(SpanStatus::error(err.clone()));
         } else {
             span.set_status(SpanStatus::Ok);
@@ -203,6 +219,11 @@ impl RunSpan {
     /// Close the parent span. Sets overall status and releases resources.
     pub fn finish(&self, error: Option<&str>) {
         let span = self.parent_cx.span();
+        let input = self.total_input_tokens.load(Ordering::Relaxed);
+        let output = self.total_output_tokens.load(Ordering::Relaxed);
+        span.set_attribute(KeyValue::new("gen_ai.usage.total_input_tokens", input as i64));
+        span.set_attribute(KeyValue::new("gen_ai.usage.total_output_tokens", output as i64));
+        span.set_attribute(KeyValue::new("gen_ai.usage.total_tokens", (input + output) as i64));
         if let Some(err) = error {
             span.set_status(SpanStatus::error(err.to_string()));
         } else {

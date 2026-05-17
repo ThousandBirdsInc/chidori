@@ -99,6 +99,27 @@ export class Session {
 /** Stream event yielded by `AgentClient.stream`. */
 export type StreamEvent =
   | { type: "call"; record: CallRecord }
+  | {
+      type: "prompt_start";
+      stream_id: string;
+      seq: number;
+      prompt_type?: string | null;
+      model: string;
+    }
+  | {
+      type: "prompt_delta";
+      stream_id: string;
+      seq: number;
+      prompt_type?: string | null;
+      delta: string;
+    }
+  | {
+      type: "prompt_end";
+      stream_id: string;
+      seq: number;
+      prompt_type?: string | null;
+      error?: string | null;
+    }
   | { type: "done"; id: string; status: SessionStatus; output?: Json; error?: string };
 
 /**
@@ -173,10 +194,10 @@ export class AgentClient {
   }
 
   /**
-   * Stream an agent run: yields one event per host function call plus a
-   * final `done` event. Uses the server's `POST /sessions/stream` SSE
-   * endpoint. Requires an environment with streaming `fetch` (Node 18+,
-   * modern browsers).
+   * Stream an agent run: yields host function calls, prompt stream lifecycle
+   * events (`prompt_start`, `prompt_delta`, `prompt_end`), then a final
+   * `done` event. Prompt events include `prompt_type` so UIs can filter
+   * progress streams separately from final-answer streams.
    */
   async *stream(input: Json): AsyncGenerator<StreamEvent, void, void> {
     const resp = await fetch(`${this.baseUrl}/sessions/stream`, {
@@ -254,6 +275,15 @@ function parseSseFrame(frame: string): StreamEvent | null {
   try {
     const data = JSON.parse(dataLines.join("\n"));
     if (event === "call") return { type: "call", record: data as CallRecord };
+    if (event === "prompt_start") {
+      return { type: "prompt_start", ...(data as object) } as StreamEvent;
+    }
+    if (event === "prompt_delta") {
+      return { type: "prompt_delta", ...(data as object) } as StreamEvent;
+    }
+    if (event === "prompt_end") {
+      return { type: "prompt_end", ...(data as object) } as StreamEvent;
+    }
     if (event === "done") return { type: "done", ...(data as object) } as StreamEvent;
   } catch {
     return null;

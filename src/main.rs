@@ -304,9 +304,42 @@ fn cmd_run_stream(
                 RuntimeEvent::Call(record) => {
                     serde_json::json!({ "type": "call", "record": record })
                 }
-                RuntimeEvent::TokenDelta { seq, delta } => {
-                    serde_json::json!({ "type": "token", "seq": seq, "delta": delta })
-                }
+                RuntimeEvent::PromptStart {
+                    stream_id,
+                    seq,
+                    prompt_type,
+                    model,
+                } => serde_json::json!({
+                    "type": "prompt_start",
+                    "stream_id": stream_id,
+                    "seq": seq,
+                    "prompt_type": prompt_type,
+                    "model": model,
+                }),
+                RuntimeEvent::PromptDelta {
+                    stream_id,
+                    seq,
+                    prompt_type,
+                    delta,
+                } => serde_json::json!({
+                    "type": "prompt_delta",
+                    "stream_id": stream_id,
+                    "seq": seq,
+                    "prompt_type": prompt_type,
+                    "delta": delta,
+                }),
+                RuntimeEvent::PromptEnd {
+                    stream_id,
+                    seq,
+                    prompt_type,
+                    error,
+                } => serde_json::json!({
+                    "type": "prompt_end",
+                    "stream_id": stream_id,
+                    "seq": seq,
+                    "prompt_type": prompt_type,
+                    "error": error,
+                }),
             };
             println!("{line}");
         }

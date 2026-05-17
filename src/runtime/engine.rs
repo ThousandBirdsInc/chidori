@@ -13,11 +13,12 @@ use starlark::values::Value as StarlarkValue;
 use crate::mcp::McpManager;
 use crate::policy::{PolicyCache, PolicyConfig};
 use crate::providers::ProviderRegistry;
+use tracing::{info, error as tracing_error};
 use crate::runtime::call_log::{CallLog, CallRecord};
 use crate::runtime::context::{
     InputMode, PendingApproval, PendingInput, RuntimeContext, RuntimeEvent,
 };
-use crate::runtime::host_functions::{self, json_to_starlark, HostState};
+use crate::runtime::host_functions::{self, json_to_starlark, HostState, StarlarkEntry};
 use crate::runtime::template::TemplateEngine;
 use crate::tools::ToolRegistry;
 
@@ -106,12 +107,8 @@ impl Engine {
     pub fn check(&self, path: &Path) -> Result<()> {
         let source = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
-        let _ast = AstModule::parse(
-            &path.display().to_string(),
-            source,
-            &studio_dialect(),
-        )
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let _ast = AstModule::parse(&path.display().to_string(), source, &studio_dialect())
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
         Ok(())
     }
 
@@ -204,6 +201,7 @@ impl Engine {
         // current Tokio runtime; entering `tokio_rt` here makes both the
         // one-time init and the per-call span emissions well-formed.
         let _tokio_guard = self.tokio_rt.enter();
+        info!(agent = %agent_name, run_id = %run_id, "agent run start");
         if let Some(run_span) = crate::runtime::otel::start_run_span(&agent_name, &run_id) {
             ctx.set_otel_run(run_span);
         }
@@ -211,12 +209,11 @@ impl Engine {
         let source = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
 
-        let ast = AstModule::parse(
-            &path.display().to_string(),
-            source,
-            &studio_dialect(),
-        )
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let source_for_entry = Arc::new(source.clone());
+        let source_name = path.display().to_string();
+
+        let ast = AstModule::parse(&source_name, source, &studio_dialect())
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         let globals = Self::globals();
         let module = Module::new();
@@ -236,6 +233,13 @@ impl Engine {
             policy: self.policy.clone(),
             policy_cache: Arc::new(StdMutex::new(seeded)),
             mcp: self.mcp.clone(),
+            starlark_entry: Some(Arc::new(StarlarkEntry::new(
+                source_name,
+                source_for_entry,
+                "agent".to_string(),
+                inputs.as_object().cloned().unwrap_or_default(),
+            ))),
+            parallel_branch: None,
         };
 
         // First pass: evaluate the module.
@@ -246,9 +250,7 @@ impl Engine {
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
         }
 
-        let frozen = module
-            .freeze()
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        let frozen = module.freeze().map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
         let agent_fn = frozen.get("agent").map_err(|_| {
             anyhow::anyhow!(
@@ -279,6 +281,7 @@ impl Engine {
                     );
                 }
 
+                info!(agent = %agent_name, run_id = %run_id, "agent run ok");
                 if let Some(otel) = ctx.otel_run() {
                     otel.finish(None);
                 }
@@ -319,6 +322,7 @@ impl Engine {
                     });
                 }
                 let err_msg = format!("{}", e);
+                tracing_error!(agent = %agent_name, run_id = %run_id, error = %err_msg, "agent run failed");
                 if let Some(otel) = ctx.otel_run() {
                     otel.finish(Some(&err_msg));
                 }

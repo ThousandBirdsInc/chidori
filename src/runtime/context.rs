@@ -8,13 +8,30 @@ use crate::runtime::call_log::{CallLog, CallRecord};
 use crate::runtime::otel::RunSpan;
 
 /// A streaming event the runtime emits while an agent runs. CallRecord is
-/// the original per-call event; TokenDelta carries partial LLM output as the
+/// the original per-call event; prompt stream events carry LLM output as the
 /// provider streams it back. A single SSE endpoint can multiplex both.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RuntimeEvent {
     Call(CallRecord),
-    TokenDelta { seq: u64, delta: String },
+    PromptStart {
+        stream_id: String,
+        seq: u64,
+        prompt_type: Option<String>,
+        model: String,
+    },
+    PromptDelta {
+        stream_id: String,
+        seq: u64,
+        prompt_type: Option<String>,
+        delta: String,
+    },
+    PromptEnd {
+        stream_id: String,
+        seq: u64,
+        prompt_type: Option<String>,
+        error: Option<String>,
+    },
 }
 
 /// Shared runtime context passed into Starlark host functions.
@@ -55,8 +72,12 @@ struct RuntimeContextInner {
     /// Optional live-event sink. When set, every `record_call` is also
     /// forwarded here so the server can stream host-function calls to
     /// connected clients (e.g. over SSE). Token deltas emitted by streaming
-    /// providers flow through the same channel as RuntimeEvent::TokenDelta.
+    /// providers flow through the same channel as prompt stream events.
     pub event_sender: Option<UnboundedSender<RuntimeEvent>>,
+    /// Whether `record_call` should forward Call events to `event_sender`.
+    /// Parallel branch contexts disable this because their local sequence
+    /// numbers are remapped when branch logs are merged into the parent.
+    pub emit_call_events: bool,
     /// Optional OpenTelemetry parent span for this run. When set, every
     /// `record_call` also emits a child OTLP span with the call's timing
     /// and attributes — shipping automatically to any OTLP backend (tael,
@@ -129,6 +150,7 @@ impl RuntimeContext {
                 pending_input: None,
                 pending_approval: None,
                 event_sender: None,
+                emit_call_events: true,
                 otel_run: None,
             })),
         }
@@ -149,6 +171,7 @@ impl RuntimeContext {
                 pending_input: None,
                 pending_approval: None,
                 event_sender: None,
+                emit_call_events: true,
                 otel_run: None,
             })),
         }
@@ -225,6 +248,10 @@ impl RuntimeContext {
         }
     }
 
+    pub fn is_replaying(&self) -> bool {
+        self.inner.lock().unwrap().replay_log.is_some()
+    }
+
     pub fn record_call(&self, record: CallRecord) {
         let mut inner = self.inner.lock().unwrap();
         inner.call_log.push(record.clone());
@@ -236,18 +263,73 @@ impl RuntimeContext {
         if let Some(ref otel) = inner.otel_run {
             otel.record_call_span(&record);
         }
-        if let Some(ref tx) = inner.event_sender {
-            let _ = tx.send(RuntimeEvent::Call(record));
+        if inner.emit_call_events {
+            if let Some(ref tx) = inner.event_sender {
+                let _ = tx.send(RuntimeEvent::Call(record));
+            }
         }
     }
 
-    /// Emit a streaming token fragment for seq. Used by prompt() when the
-    /// provider supports incremental decoding. Ignored if no event sender
-    /// is attached to the context.
-    pub fn emit_token_delta(&self, seq: u64, delta: String) {
+    pub fn inherit_event_sink(&self, parent: &RuntimeContext, emit_call_events: bool) {
+        let parent_inner = parent.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        inner.event_sender = parent_inner.event_sender.clone();
+        inner.emit_call_events = emit_call_events;
+    }
+
+    pub fn begin_prompt_stream(
+        &self,
+        seq: u64,
+        prompt_type: Option<String>,
+        model: String,
+    ) -> Option<String> {
+        let tx = self.inner.lock().unwrap().event_sender.clone()?;
+        let stream_id = uuid::Uuid::new_v4().to_string();
+        let _ = tx.send(RuntimeEvent::PromptStart {
+            stream_id: stream_id.clone(),
+            seq,
+            prompt_type,
+            model,
+        });
+        Some(stream_id)
+    }
+
+    /// Emit a streaming token fragment for a prompt stream. Used by prompt()
+    /// when the provider supports incremental decoding. Ignored if no event
+    /// sender is attached to the context.
+    pub fn emit_prompt_delta(
+        &self,
+        stream_id: String,
+        seq: u64,
+        prompt_type: Option<String>,
+        delta: String,
+    ) {
         let inner = self.inner.lock().unwrap();
         if let Some(ref tx) = inner.event_sender {
-            let _ = tx.send(RuntimeEvent::TokenDelta { seq, delta });
+            let _ = tx.send(RuntimeEvent::PromptDelta {
+                stream_id,
+                seq,
+                prompt_type,
+                delta,
+            });
+        }
+    }
+
+    pub fn end_prompt_stream(
+        &self,
+        stream_id: String,
+        seq: u64,
+        prompt_type: Option<String>,
+        error: Option<String>,
+    ) {
+        let inner = self.inner.lock().unwrap();
+        if let Some(ref tx) = inner.event_sender {
+            let _ = tx.send(RuntimeEvent::PromptEnd {
+                stream_id,
+                seq,
+                prompt_type,
+                error,
+            });
         }
     }
 

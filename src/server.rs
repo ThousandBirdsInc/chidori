@@ -801,10 +801,50 @@ async fn stream_session(
                 "call",
                 serde_json::to_string(record).unwrap_or_else(|_| "{}".into()),
             ),
-            RuntimeEvent::TokenDelta { seq, delta } => (
-                "token",
-                serde_json::to_string(&json!({ "seq": seq, "delta": delta }))
-                    .unwrap_or_else(|_| "{}".into()),
+            RuntimeEvent::PromptStart {
+                stream_id,
+                seq,
+                prompt_type,
+                model,
+            } => (
+                "prompt_start",
+                serde_json::to_string(&json!({
+                    "stream_id": stream_id,
+                    "seq": seq,
+                    "prompt_type": prompt_type,
+                    "model": model,
+                }))
+                .unwrap_or_else(|_| "{}".into()),
+            ),
+            RuntimeEvent::PromptDelta {
+                stream_id,
+                seq,
+                prompt_type,
+                delta,
+            } => (
+                "prompt_delta",
+                serde_json::to_string(&json!({
+                    "stream_id": stream_id,
+                    "seq": seq,
+                    "prompt_type": prompt_type,
+                    "delta": delta,
+                }))
+                .unwrap_or_else(|_| "{}".into()),
+            ),
+            RuntimeEvent::PromptEnd {
+                stream_id,
+                seq,
+                prompt_type,
+                error,
+            } => (
+                "prompt_end",
+                serde_json::to_string(&json!({
+                    "stream_id": stream_id,
+                    "seq": seq,
+                    "prompt_type": prompt_type,
+                    "error": error,
+                }))
+                .unwrap_or_else(|_| "{}".into()),
             ),
         };
         Ok(Event::default().event(name).data(data))
