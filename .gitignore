@@ -16,6 +16,9 @@
 .chidori/runs/
 .chidori/wasm-cache/
 .chidori/memory/
+**/.chidori/runs/
+**/.chidori/wasm-cache/
+**/.chidori/memory/
 
 # Python build/dist
 __pycache__/

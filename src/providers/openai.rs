@@ -101,7 +101,10 @@ struct OpenAiErrorBody {
 impl LlmProvider for OpenAiProvider {
     fn supports_model(&self, model: &str) -> bool {
         if !self.model_prefixes.is_empty() {
-            return self.model_prefixes.iter().any(|p| model.starts_with(p.as_str()));
+            return self
+                .model_prefixes
+                .iter()
+                .any(|p| model.starts_with(p.as_str()));
         }
         model.starts_with("gpt") || model.starts_with("o1") || model.starts_with("o3")
     }
@@ -157,7 +160,10 @@ impl LlmProvider for OpenAiProvider {
             .with_context(|| format!("Failed to send request to {}", self.base_url))?;
 
         let status = resp.status();
-        let resp_text = resp.text().await.context("Failed to read OpenAI response")?;
+        let resp_text = resp
+            .text()
+            .await
+            .context("Failed to read OpenAI response")?;
 
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<OpenAiError>(&resp_text) {
@@ -230,11 +236,7 @@ impl LlmProvider for OpenAiProvider {
     /// with `choices[0].delta`; text deltas invoke `on_delta`, tool-call
     /// deltas accumulate `function.name` + `function.arguments` per
     /// `tool_calls[i].index`.
-    async fn stream(
-        &self,
-        request: &LlmRequest,
-        on_delta: &mut TokenSink,
-    ) -> Result<LlmResponse> {
+    async fn stream(&self, request: &LlmRequest, on_delta: &mut TokenSink) -> Result<LlmResponse> {
         use futures::StreamExt;
 
         if let Some(ref rl) = self.rate_limiter {
@@ -356,9 +358,9 @@ impl LlmProvider for OpenAiProvider {
                 if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                     for tc in tcs {
                         let i = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let entry = tool_acc.entry(i).or_insert_with(|| {
-                            (String::new(), String::new(), String::new())
-                        });
+                        let entry = tool_acc
+                            .entry(i)
+                            .or_insert_with(|| (String::new(), String::new(), String::new()));
                         if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
                             if entry.0.is_empty() {
                                 entry.0 = id.to_string();
@@ -387,8 +389,7 @@ impl LlmProvider for OpenAiProvider {
         }
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         for (_idx, (id, name, args)) in tool_acc {
-            let input: Value =
-                serde_json::from_str(&args).unwrap_or_else(|_| Value::String(args));
+            let input: Value = serde_json::from_str(&args).unwrap_or_else(|_| Value::String(args));
             tool_calls.push(ToolCall {
                 id: id.clone(),
                 name: name.clone(),

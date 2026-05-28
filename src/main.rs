@@ -22,7 +22,11 @@ use crate::runtime::template::TemplateEngine;
 use crate::tools::ToolRegistry;
 
 #[derive(Parser)]
-#[command(name = "chidori", version, about = "AI agent framework powered by Starlark")]
+#[command(
+    name = "chidori",
+    version,
+    about = "AI agent framework powered by TypeScript agents"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -30,9 +34,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run an agent .star file
+    /// Pick from an interactive list of example agents to run
+    Demo,
+
+    /// Run a TypeScript agent file
     Run {
-        /// Path to the agent .star file
+        /// Path to the agent .ts file
         file: PathBuf,
 
         /// Input as key=value pairs or a JSON string.
@@ -48,7 +55,7 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
 
-        /// Extra directories to scan for tool .star files.
+        /// Extra directories to scan for tool files.
         /// Defaults to `<agent file's parent>/tools/` only.
         #[arg(long)]
         tools: Vec<PathBuf>,
@@ -64,9 +71,9 @@ enum Commands {
         stream: bool,
     },
 
-    /// Validate an agent .star file without running it
+    /// Validate a TypeScript agent file without running it
     Check {
-        /// Path to the agent .star file
+        /// Path to the agent .ts file
         file: PathBuf,
     },
 
@@ -81,7 +88,7 @@ enum Commands {
     /// the saved input and call log; LLM calls and other side effects return
     /// cached results instead of executing.
     Resume {
-        /// Agent .star file (same one the run was created from)
+        /// Agent .ts file (same one the run was created from)
         file: PathBuf,
 
         /// Run id (subdirectory name under `.chidori/runs/`)
@@ -102,6 +109,16 @@ enum Commands {
         dir: Option<PathBuf>,
     },
 
+    /// Pretty-print a persisted run's runtime snapshot manifest.
+    Snapshot {
+        /// Run id (subdirectory name under `.chidori/runs/`)
+        run_id: String,
+
+        /// Project dir containing `.chidori/runs/` (defaults to current dir)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+    },
+
     /// Aggregate run history: total runs, tokens, est. cost, per-model breakdown.
     /// Reads `.chidori/runs/<id>/checkpoint.json` in the given directory.
     Stats {
@@ -113,7 +130,7 @@ enum Commands {
     /// Serve an agent as an HTTP server.
     /// Every incoming request is passed to agent(event) as a structured event dict.
     Serve {
-        /// Path to the agent .star file
+        /// Path to the agent .ts file
         file: PathBuf,
 
         /// Port to listen on
@@ -147,6 +164,7 @@ fn main() {
             };
             (result, false)
         }
+        Commands::Demo => (cmd_demo(), false),
         Commands::Check { file } => (cmd_check(&file), true),
         Commands::Tools { dir } => (cmd_tools(&dir), false),
         Commands::Stats { dir } => (cmd_stats(dir.as_deref()), false),
@@ -154,6 +172,7 @@ fn main() {
             (cmd_resume(&file, &run_id, dir.as_deref()), false)
         }
         Commands::Trace { run_id, dir } => (cmd_trace(&run_id, dir.as_deref()), false),
+        Commands::Snapshot { run_id, dir } => (cmd_snapshot(&run_id, dir.as_deref()), false),
         Commands::Serve {
             file,
             port,
@@ -172,6 +191,223 @@ fn main() {
             std::process::exit(if parse_only { 2 } else { 1 });
         }
     }
+}
+
+struct DemoExample {
+    title: &'static str,
+    description: &'static str,
+    command: &'static str,
+    requires_provider: bool,
+    action: DemoAction,
+}
+
+enum DemoAction {
+    Run {
+        file: &'static str,
+        input: &'static [&'static str],
+        trace: bool,
+        stream: bool,
+        tools: &'static [&'static str],
+    },
+    Serve {
+        file: &'static str,
+        port: u16,
+    },
+}
+
+fn demo_examples() -> Vec<DemoExample> {
+    vec![
+        DemoExample {
+            title: "Hello agent",
+            description: "Runs a minimal TypeScript agent and records a durable log.",
+            command: "chidori run examples/agents/hello.ts --input name=Colton",
+            requires_provider: false,
+            action: DemoAction::Run {
+                file: "examples/agents/hello.ts",
+                input: &["name=Colton"],
+                trace: false,
+                stream: false,
+                tools: &[],
+            },
+        },
+        DemoExample {
+            title: "Tool call",
+            description: "Loads a local TypeScript tool and calls it from an agent.",
+            command: "chidori run examples/agents/tool_use.ts --input query=chidori --tools examples/tools",
+            requires_provider: false,
+            action: DemoAction::Run {
+                file: "examples/agents/tool_use.ts",
+                input: &["query=chidori"],
+                trace: false,
+                stream: false,
+                tools: &["examples/tools"],
+            },
+        },
+        DemoExample {
+            title: "Summarizer with trace",
+            description: "Calls an LLM and prints the host-call trace after the run.",
+            command: "chidori run examples/agents/summarizer.ts --input document=\"Rust is great.\" --trace",
+            requires_provider: true,
+            action: DemoAction::Run {
+                file: "examples/agents/summarizer.ts",
+                input: &["document=Rust is great."],
+                trace: true,
+                stream: false,
+                tools: &[],
+            },
+        },
+        DemoExample {
+            title: "Parallel prompts",
+            description: "Runs two prompt branches concurrently inside one agent.",
+            command: "chidori run examples/agents/parallel.ts --input '{\"topic\":\"runtime snapshots\"}'",
+            requires_provider: true,
+            action: DemoAction::Run {
+                file: "examples/agents/parallel.ts",
+                input: &["{\"topic\":\"runtime snapshots\"}"],
+                trace: false,
+                stream: false,
+                tools: &[],
+            },
+        },
+        DemoExample {
+            title: "Streaming progress",
+            description: "Emits newline-delimited runtime events while prompt work runs.",
+            command: "chidori run examples/agents/streaming_progress.ts --input topic=\"runtime snapshots\" --stream",
+            requires_provider: true,
+            action: DemoAction::Run {
+                file: "examples/agents/streaming_progress.ts",
+                input: &["topic=runtime snapshots"],
+                trace: false,
+                stream: true,
+                tools: &[],
+            },
+        },
+        DemoExample {
+            title: "Human input server",
+            description: "Starts the session server for the input/resume example.",
+            command: "chidori serve examples/agents/input_pause.ts --port 8080",
+            requires_provider: false,
+            action: DemoAction::Serve {
+                file: "examples/agents/input_pause.ts",
+                port: 8080,
+            },
+        },
+    ]
+}
+
+fn cmd_demo() -> Result<()> {
+    let demos = demo_examples();
+
+    println!("Chidori demos");
+    println!();
+    for (idx, demo) in demos.iter().enumerate() {
+        let provider_note = if demo.requires_provider {
+            " (requires an LLM provider)"
+        } else {
+            ""
+        };
+        println!("  {}. {}{}", idx + 1, demo.title, provider_note);
+        println!("     {}", demo.description);
+    }
+    println!();
+
+    let Some(choice) = prompt_demo_choice(demos.len())? else {
+        return Ok(());
+    };
+    let demo = &demos[choice];
+
+    println!();
+    println!("Running: {}", demo.command);
+
+    if demo.requires_provider && !has_llm_provider() {
+        println!();
+        println!("This demo needs an LLM provider. Set one of:");
+        println!("  export ANTHROPIC_API_KEY=sk-ant-...");
+        println!("  export OPENAI_API_KEY=sk-...");
+        println!("  export LITELLM_API_URL=http://localhost:4401/v1");
+        println!("  export LITELLM_API_KEY=sk-litellm-master-key");
+        return Ok(());
+    }
+
+    match &demo.action {
+        DemoAction::Run {
+            file,
+            input,
+            trace,
+            stream,
+            tools,
+        } => {
+            let file = PathBuf::from(file);
+            let inputs = input
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>();
+            let tool_dirs = tools.iter().map(PathBuf::from).collect::<Vec<_>>();
+            if *stream {
+                cmd_run_stream(&file, &inputs, false, &tool_dirs)
+            } else {
+                cmd_run(&file, &inputs, *trace, false, &tool_dirs)
+            }
+        }
+        DemoAction::Serve { file, port } => {
+            if !confirm_start_server(*port)? {
+                return Ok(());
+            }
+            cmd_serve(&PathBuf::from(file), *port, false)
+        }
+    }
+}
+
+fn prompt_demo_choice(max: usize) -> Result<Option<usize>> {
+    use std::io::Write;
+
+    loop {
+        print!("Choose a demo [1-{max}] or q to quit: ");
+        std::io::stdout().flush()?;
+
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+
+        let value = line.trim();
+        if value.eq_ignore_ascii_case("q") || value.eq_ignore_ascii_case("quit") {
+            return Ok(None);
+        }
+
+        if let Ok(choice) = value.parse::<usize>() {
+            if (1..=max).contains(&choice) {
+                return Ok(Some(choice - 1));
+            }
+        }
+
+        eprintln!("Enter a number from 1 to {max}, or q to quit.");
+    }
+}
+
+fn confirm_start_server(port: u16) -> Result<bool> {
+    use std::io::Write;
+
+    println!();
+    println!("This starts a server on http://localhost:{port} and runs until Ctrl-C.");
+    print!("Start it now? [y/N] ");
+    std::io::stdout().flush()?;
+
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line)? == 0 {
+        return Ok(false);
+    }
+
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn has_llm_provider() -> bool {
+    std::env::var_os("ANTHROPIC_API_KEY").is_some()
+        || std::env::var_os("OPENAI_API_KEY").is_some()
+        || std::env::var_os("LITELLM_API_URL").is_some()
 }
 
 fn cmd_run(
@@ -202,16 +438,14 @@ fn cmd_run(
     // Build the runtime.
     let providers = Arc::new(ProviderRegistry::from_env());
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
-    let tokio_rt = Arc::new(
-        tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?,
-    );
+    let tokio_rt =
+        Arc::new(tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?);
 
     // Auto-discover tools from `<project>/tools/` plus any `--tools` dirs.
     let mut tool_dirs: Vec<PathBuf> = vec![base_dir.join("tools")];
     tool_dirs.extend(extra_tool_dirs.iter().cloned());
-    let tools = Arc::new(
-        ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()),
-    );
+    let tools =
+        Arc::new(ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()));
 
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
@@ -243,10 +477,7 @@ fn cmd_run(
                 eprintln!("Est. cost: ${:.6}", cost);
             }
         }
-        eprintln!(
-            "Duration: {}ms",
-            result.call_log.total_duration_ms()
-        );
+        eprintln!("Duration: {}ms", result.call_log.total_duration_ms());
     }
 
     Ok(())
@@ -279,20 +510,17 @@ fn cmd_run_stream(
 
     let providers = Arc::new(ProviderRegistry::from_env());
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
-    let tokio_rt = Arc::new(
-        tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?,
-    );
+    let tokio_rt =
+        Arc::new(tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?);
 
     let mut tool_dirs: Vec<PathBuf> = vec![base_dir.join("tools")];
     tool_dirs.extend(extra_tool_dirs.iter().cloned());
-    let tools = Arc::new(
-        ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()),
-    );
+    let tools =
+        Arc::new(ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()));
 
     let engine = Engine::new(providers, template_engine, tokio_rt).with_tools(tools);
 
-    let (event_tx, event_rx) =
-        mpsc::unbounded_channel::<crate::runtime::context::RuntimeEvent>();
+    let (event_tx, event_rx) = mpsc::unbounded_channel::<crate::runtime::context::RuntimeEvent>();
 
     // Drain thread: reads events from the channel and writes NDJSON to stdout
     // concurrently with the engine's execution.
@@ -365,7 +593,7 @@ fn cmd_run_stream(
             let line = serde_json::json!({
                 "type": "done",
                 "status": "failed",
-                "error": e.to_string(),
+                "error": format!("{e:#}"),
             });
             println!("{line}");
             Err(e)
@@ -376,9 +604,8 @@ fn cmd_run_stream(
 fn cmd_check(file: &PathBuf) -> Result<()> {
     let providers = Arc::new(ProviderRegistry::new());
     let template_engine = Arc::new(TemplateEngine::new("."));
-    let tokio_rt = Arc::new(
-        tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?,
-    );
+    let tokio_rt =
+        Arc::new(tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?);
 
     let engine = Engine::new(providers, template_engine, tokio_rt);
     engine.check(file)?;
@@ -416,10 +643,7 @@ fn cmd_tools(dirs: &[PathBuf]) -> Result<()> {
                 .as_ref()
                 .map(|d| format!(" [default: {d}]"))
                 .unwrap_or_default();
-            println!(
-                "    {}: {}{}{}",
-                param.name, param.param_type, req, default
-            );
+            println!("    {}: {}{}{}", param.name, param.param_type, req, default);
         }
         println!();
     }
@@ -456,9 +680,8 @@ fn cmd_resume(file: &PathBuf, run_id: &str, dir: Option<&std::path::Path>) -> Re
 
     let providers = Arc::new(ProviderRegistry::from_env());
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
-    let tokio_rt = Arc::new(
-        tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?,
-    );
+    let tokio_rt =
+        Arc::new(tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?);
     let tools_dir = base_dir.join("tools");
     let tools = Arc::new(
         ToolRegistry::load_from_dirs(&[tools_dir]).unwrap_or_else(|_| ToolRegistry::new()),
@@ -528,11 +751,8 @@ fn cmd_trace(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
             total_out += u.output_tokens;
             if r.function == "prompt" {
                 let model = r.args.get("model").and_then(|v| v.as_str()).unwrap_or("");
-                total_cost += crate::runtime::cost::estimate_cost_usd(
-                    model,
-                    u.input_tokens,
-                    u.output_tokens,
-                );
+                total_cost +=
+                    crate::runtime::cost::estimate_cost_usd(model, u.input_tokens, u.output_tokens);
             }
         }
         total_ms += r.duration_ms;
@@ -544,6 +764,18 @@ fn cmd_trace(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
         println!("Est cost: ${:.6}", total_cost);
     }
     println!("Duration: {} ms", total_ms);
+    Ok(())
+}
+
+fn cmd_snapshot(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
+    let base_dir = dir
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let run_dir = base_dir.join(".chidori").join("runs").join(run_id);
+    let store = crate::runtime::snapshot::SnapshotStore::new(&run_dir);
+    let manifest = store.load_manifest()?;
+
+    println!("{}", serde_json::to_string_pretty(&manifest)?);
     Ok(())
 }
 
@@ -586,9 +818,14 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
         if !checkpoint_path.exists() {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&checkpoint_path) else { continue };
+        let Ok(text) = std::fs::read_to_string(&checkpoint_path) else {
+            continue;
+        };
         let Ok(records): Result<Vec<crate::runtime::call_log::CallRecord>, _> =
-            serde_json::from_str(&text) else { continue };
+            serde_json::from_str(&text)
+        else {
+            continue;
+        };
 
         run_count += 1;
         let mut log = CallLog::new();
@@ -604,8 +841,7 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown")
                         .to_string();
-                    let cost =
-                        estimate_cost_usd(&model, usage.input_tokens, usage.output_tokens);
+                    let cost = estimate_cost_usd(&model, usage.input_tokens, usage.output_tokens);
                     total_cost += cost;
                     let ms = per_model.entry(model).or_default();
                     ms.calls += 1;
@@ -675,7 +911,12 @@ fn cmd_serve(file: &PathBuf, port: u16, verbose: bool) -> Result<()> {
     eprintln!("Agent: {}", file.display());
 
     let tokio_rt = tokio::runtime::Runtime::new().context("Failed to create server runtime")?;
-    tokio_rt.block_on(server::serve(providers, template_engine, file.clone(), port))?;
+    tokio_rt.block_on(server::serve(
+        providers,
+        template_engine,
+        file.clone(),
+        port,
+    ))?;
 
     Ok(())
 }
@@ -690,6 +931,21 @@ fn parse_inputs(inputs: &[String]) -> Result<Value> {
     let mut map = serde_json::Map::new();
 
     for input in inputs {
+        // Top-level `@/path/to/input.json` — read the entire input object from
+        // a file. Useful when the JSON payload is too large to fit in argv
+        // (the kernel's ARG_MAX is hit quickly by big prompts or catalogs).
+        if let Some(path) = input.strip_prefix('@') {
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read input file: {path}"))?;
+            let val: Value = serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse JSON input from {path}"))?;
+            if let Value::Object(obj) = val {
+                map.extend(obj);
+                continue;
+            }
+            anyhow::bail!("Input file {path} must contain a JSON object");
+        }
+
         // Try parsing as raw JSON first.
         if input.starts_with('{') {
             let val: Value = serde_json::from_str(input)
@@ -700,7 +956,7 @@ fn parse_inputs(inputs: &[String]) -> Result<Value> {
             }
         }
 
-        // Parse as key=value.
+        // Parse as key=value (with optional per-value @file).
         if let Some((key, value)) = input.split_once('=') {
             let value = if let Some(path) = value.strip_prefix('@') {
                 std::fs::read_to_string(path)
@@ -710,7 +966,7 @@ fn parse_inputs(inputs: &[String]) -> Result<Value> {
             };
             map.insert(key.to_string(), Value::String(value));
         } else {
-            anyhow::bail!("Invalid input format: '{input}'. Use key=value or JSON.");
+            anyhow::bail!("Invalid input format: '{input}'. Use key=value, JSON, or @path.");
         }
     }
 

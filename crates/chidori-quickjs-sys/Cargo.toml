@@ -1,0 +1,14 @@
+[package]
+name = "chidori-quickjs-sys"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Chidori-owned QuickJS fork FFI bindings for durable VM snapshots."
+repository = "https://github.com/ThousandBirdsInc/chidori"
+
+[lib]
+name = "chidori_quickjs_sys"
+path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1"

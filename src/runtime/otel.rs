@@ -89,8 +89,7 @@ pub fn shutdown_on_exit() {
 
 fn try_init() -> Option<OtelHandle> {
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
-    let service_name =
-        std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "chidori".to_string());
+    let service_name = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "chidori".to_string());
 
     let exporter = match SpanExporter::builder()
         .with_tonic()
@@ -186,8 +185,10 @@ impl RunSpan {
                 "gen_ai.usage.output_tokens",
                 usage.output_tokens as i64,
             ));
-            self.total_input_tokens.fetch_add(usage.input_tokens, Ordering::Relaxed);
-            self.total_output_tokens.fetch_add(usage.output_tokens, Ordering::Relaxed);
+            self.total_input_tokens
+                .fetch_add(usage.input_tokens, Ordering::Relaxed);
+            self.total_output_tokens
+                .fetch_add(usage.output_tokens, Ordering::Relaxed);
         }
 
         let builder = SpanBuilder::from_name(format!("host.{}", record.function))
@@ -221,9 +222,18 @@ impl RunSpan {
         let span = self.parent_cx.span();
         let input = self.total_input_tokens.load(Ordering::Relaxed);
         let output = self.total_output_tokens.load(Ordering::Relaxed);
-        span.set_attribute(KeyValue::new("gen_ai.usage.total_input_tokens", input as i64));
-        span.set_attribute(KeyValue::new("gen_ai.usage.total_output_tokens", output as i64));
-        span.set_attribute(KeyValue::new("gen_ai.usage.total_tokens", (input + output) as i64));
+        span.set_attribute(KeyValue::new(
+            "gen_ai.usage.total_input_tokens",
+            input as i64,
+        ));
+        span.set_attribute(KeyValue::new(
+            "gen_ai.usage.total_output_tokens",
+            output as i64,
+        ));
+        span.set_attribute(KeyValue::new(
+            "gen_ai.usage.total_tokens",
+            (input + output) as i64,
+        ));
         if let Some(err) = error {
             span.set_status(SpanStatus::error(err.to_string()));
         } else {

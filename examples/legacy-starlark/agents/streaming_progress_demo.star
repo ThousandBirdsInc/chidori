@@ -1,7 +1,7 @@
 # Demonstrates labelled prompt streams for user-facing progress UIs.
 #
 # Run with:
-#   chidori run examples/agents/streaming_progress_demo.star --stream \
+#   chidori run examples/legacy-starlark/agents/streaming_progress_demo.star --stream \
 #     --input '{"topic":"parallel agent progress"}'
 #
 # Clients can listen for prompt_delta events and filter on prompt_type:
@@ -31,7 +31,7 @@ def agent(topic = "runtime streaming"):
     ])
 
     sub = call_agent(
-        "examples/agents/streaming_progress_child.star",
+        "examples/legacy-starlark/agents/streaming_progress_child.star",
         topic = topic,
     )
 

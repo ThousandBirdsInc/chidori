@@ -126,5 +126,9 @@ impl PolicyCache {
 }
 
 fn cache_key(target: &str, args: &Value) -> String {
-    format!("{}::{}", target, serde_json::to_string(args).unwrap_or_default())
+    format!(
+        "{}::{}",
+        target,
+        serde_json::to_string(args).unwrap_or_default()
+    )
 }

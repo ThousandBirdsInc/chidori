@@ -27,19 +27,35 @@ checkpoint.save("/tmp/session.json")
 replayed = client.replay(Checkpoint.load("/tmp/session.json"))
 assert replayed.output == session.output
 
+# Durable TypeScript runs may include snapshot metadata in the checkpoint.
+# The manifest is safe to inspect; raw VM snapshot bytes remain server-side.
+if checkpoint.snapshot_manifest:
+    print(checkpoint.snapshot_manifest["abi"]["engine_fork"])
+
+manifest = client.get_snapshot_manifest(session.id)
+print(manifest["policy"]["typescript_imports"])
+
 # Paused sessions (when the agent calls `input()`)
 paused = client.run({"action": "delete-prod"})
 if paused.status == "paused":
     print("prompt:", paused.pending_prompt)
     final = client.resume(paused.id, "yes")
 
-# Live streaming: yields one event per host function call, then `done`
+# Live streaming: yields host calls, prompt stream events, then `done`
 for evt in client.stream({"document": "hi"}):
     if evt["type"] == "call":
         print("call:", evt["record"]["function"])
+    elif evt["type"] == "prompt_delta":
+        print("delta:", evt["delta"])
     elif evt["type"] == "done":
         print("done:", evt["status"], evt["output"])
 ```
+
+Snapshot-aware checkpoints include the replay call log plus optional manifest
+metadata. Durable resume is exposed through `client.resume(session_id,
+response)` for paused sessions. Today it resumes through persisted
+host-promise metadata and replay/scaffold recovery; direct live VM continuation
+from the server-side snapshot is still gated on the QuickJS serializer.
 
 Mirrors the TypeScript SDK (`sdk/typescript/`) method-for-method. See the
 top-level `examples/sdk_demo.py` for a longer walkthrough and the server's

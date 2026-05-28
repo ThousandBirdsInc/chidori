@@ -4,6 +4,36 @@
  * dependencies; uses the global `fetch` available in Node 18+ and browsers.
  */
 
+export type {
+  AgentFunction,
+  AgentJson,
+  Chidori,
+  DatePolicy,
+  ExecOptions,
+  HttpRequestOptions,
+  HttpResponse,
+  InputOptions,
+  JsonObject,
+  JsonSchema,
+  MapSetSnapshotPolicy,
+  MemoryAction,
+  ParallelOptions,
+  PromptOptions,
+  PromptStreamType,
+  RandomPolicy,
+  RetryOptions,
+  RuntimePolicyConfig,
+  ToolDefinition,
+  ToolFunction,
+  TryCallResult,
+  TypeScriptImportPolicy,
+  WorkspaceEntry,
+  WorkspaceFileStatus,
+  WorkspaceHost,
+  WorkspaceListOptions,
+  WorkspaceWriteOptions,
+} from "./agent.js";
+
 /** JSON-serialisable value — what agents produce as output and accept as input. */
 export type Json =
   | null
@@ -28,23 +58,99 @@ export interface CallRecord {
   error?: string;
 }
 
+/** Source hash recorded in a runtime snapshot manifest. */
+export interface SnapshotSourceFingerprint {
+  path: string;
+  hash: string;
+}
+
+/** Snapshot ABI recorded before loading VM snapshot bytes. */
+export interface SnapshotAbi {
+  typescript_runtime: number;
+  quickjs_snapshot: number;
+  engine_fork: string;
+}
+
+/** Determinism policy captured with a runtime snapshot. */
+export interface SnapshotRuntimePolicy {
+  typescript_imports: "none" | "relative" | "project";
+  date: "disabled" | "fixed" | "host";
+  random: "disabled" | "seeded" | "host";
+  maps_sets: "reject" | "serialize";
+  deterministic_seed: string;
+}
+
+/** Pending host operation captured at a durable snapshot safepoint. */
+export interface PendingHostOperation {
+  id: number;
+  seq: number;
+  kind:
+    | "prompt"
+    | "input"
+    | "policy_approval"
+    | "tool"
+    | "call_agent"
+    | "http"
+    | "template"
+    | "memory"
+    | "checkpoint";
+  args: Json;
+  created_at: string;
+}
+
+export type HostPromiseState =
+  | "pending"
+  | { resolved: { value: Json; completed_at: string } }
+  | { rejected: { error: string; completed_at: string } };
+
+export interface HostPromiseRecord {
+  operation: PendingHostOperation;
+  state: HostPromiseState;
+}
+
 /**
- * A saved checkpoint — session id, input, and the full call log. Enough to
- * replay a run without re-executing its side effects.
+ * Public snapshot metadata. It is safe to expose in SDK checkpoints; the raw
+ * `runtime.snapshot` VM bytes stay server-side unless an admin endpoint opts in.
+ */
+export interface SnapshotManifest {
+  run_id: string;
+  abi: SnapshotAbi;
+  policy: SnapshotRuntimePolicy;
+  entry: SnapshotSourceFingerprint;
+  modules: SnapshotSourceFingerprint[];
+  pending?: PendingHostOperation | null;
+  host_promises?: HostPromiseRecord[];
+  call_log_len: number;
+  snapshot_file: string;
+  created_at: string;
+}
+
+/**
+ * A saved checkpoint — session id, input, the full call log, and optional
+ * runtime snapshot metadata. The call log is enough for deterministic replay;
+ * the snapshot manifest lets clients inspect durable-resume state without
+ * downloading raw VM snapshot bytes.
  */
 export class Checkpoint {
   constructor(
     public readonly sessionId: string,
     public readonly input: Json,
     public readonly callLog: CallRecord[],
+    public readonly snapshotManifest: SnapshotManifest | null = null,
   ) {}
 
   /** Serialise to JSON. Pairs with `Checkpoint.fromJSON`. */
-  toJSON(): { session_id: string; input: Json; call_log: CallRecord[] } {
+  toJSON(): {
+    session_id: string;
+    input: Json;
+    call_log: CallRecord[];
+    snapshot_manifest?: SnapshotManifest | null;
+  } {
     return {
       session_id: this.sessionId,
       input: this.input,
       call_log: this.callLog,
+      ...(this.snapshotManifest ? { snapshot_manifest: this.snapshotManifest } : {}),
     };
   }
 
@@ -52,8 +158,14 @@ export class Checkpoint {
     session_id: string;
     input: Json;
     call_log: CallRecord[];
+    snapshot_manifest?: SnapshotManifest | null;
   }): Checkpoint {
-    return new Checkpoint(data.session_id, data.input, data.call_log);
+    return new Checkpoint(
+      data.session_id,
+      data.input,
+      data.call_log,
+      data.snapshot_manifest ?? null,
+    );
   }
 }
 
@@ -68,6 +180,7 @@ export class Session {
     public callLog: CallRecord[] = [],
     public pendingPrompt: string | null = null,
     private readonly client: AgentClient | null = null,
+    public snapshotManifest: SnapshotManifest | null = null,
   ) {}
 
   get ok(): boolean {
@@ -79,11 +192,12 @@ export class Session {
    * wrap it in a Checkpoint suitable for saving / later replay.
    */
   async checkpoint(): Promise<Checkpoint> {
-    if (this.callLog.length === 0 && this.client) {
+    if ((this.callLog.length === 0 || this.snapshotManifest === null) && this.client) {
       const data = await this.client.getCheckpoint(this.id);
       this.callLog = data.call_log;
+      this.snapshotManifest = data.snapshot_manifest ?? null;
     }
-    return new Checkpoint(this.id, this.input, this.callLog);
+    return new Checkpoint(this.id, this.input, this.callLog, this.snapshotManifest);
   }
 
   /** Replay this session through the server; same inputs, cached results. */
@@ -186,11 +300,23 @@ export class AgentClient {
     return data.sessions;
   }
 
-  /** Fetch the full call log for a session. */
-  async getCheckpoint(id: string): Promise<{ call_log: CallRecord[] }> {
+  /** Fetch the full call log and optional snapshot manifest for a session. */
+  async getCheckpoint(id: string): Promise<{
+    call_log: CallRecord[];
+    snapshot_manifest?: SnapshotManifest | null;
+  }> {
     return (await this.getJSON(`/sessions/${id}/checkpoint`)) as {
       call_log: CallRecord[];
+      snapshot_manifest?: SnapshotManifest | null;
     };
+  }
+
+  /** Fetch only the snapshot manifest metadata for a session, never VM bytes. */
+  async getSnapshotManifest(id: string): Promise<SnapshotManifest> {
+    const data = (await this.getJSON(`/sessions/${id}/snapshot`)) as {
+      snapshot_manifest: SnapshotManifest;
+    };
+    return data.snapshot_manifest;
   }
 
   /**
@@ -239,6 +365,7 @@ export class AgentClient {
       (data.call_log as CallRecord[] | undefined) ?? [],
       (data.pending_prompt as string | undefined) ?? null,
       this,
+      (data.snapshot_manifest as SnapshotManifest | undefined) ?? null,
     );
   }
 

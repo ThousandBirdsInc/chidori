@@ -63,6 +63,7 @@ async fn create_thread(
     let id = uuid::Uuid::new_v4().to_string();
     let session = StoredSession {
         id: id.clone(),
+        run_id: None,
         status: SessionStatus::Running,
         input: json!({ "acp_title": body.title }),
         output: None,
@@ -175,11 +176,7 @@ async fn send_prompt(
             session.status = SessionStatus::Failed;
             session.error = Some(e.clone());
             let _ = state.store.put(&session);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e})),
-            )
-                .into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
         }
     }
 }

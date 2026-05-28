@@ -1,7 +1,7 @@
 {
   "name": "chidori",
   "version": "3.0.0",
-  "description": "TypeScript SDK for the Chidori agent framework — HTTP client for running and replaying Starlark agents.",
+  "description": "TypeScript SDK for the Chidori agent framework — HTTP client plus agent authoring types.",
   "homepage": "https://github.com/ThousandBirdsInc/chidori",
   "repository": { "type": "git", "url": "https://github.com/ThousandBirdsInc/chidori.git" },
   "license": "Apache-2.0",
@@ -12,6 +12,10 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./agent": {
+      "import": "./dist/agent.js",
+      "types": "./dist/agent.d.ts"
     }
   },
   "files": ["dist", "src", "README.md"],

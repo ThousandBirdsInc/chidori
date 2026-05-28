@@ -1,0 +1,12 @@
+[package]
+name = "chidori-quickjs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Safe Rust wrapper for Chidori's snapshot-capable QuickJS fork."
+repository = "https://github.com/ThousandBirdsInc/chidori"
+
+[dependencies]
+chidori-quickjs-sys = { path = "../chidori-quickjs-sys" }
+serde_json = "1"
+thiserror = "2"

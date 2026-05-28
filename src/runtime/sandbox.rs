@@ -21,9 +21,9 @@ use serde_json::Value as JsonValue;
 use wasmer::sys::{BaseTunables, Cranelift, NativeEngineExt};
 use wasmer::vm::{VMConfig, VMMemory, VMTable};
 use wasmer::{
-    imports, wasmparser::Operator, CompilerConfig, Engine, Function, FunctionEnv,
-    FunctionEnvMut, Instance, Memory, MemoryType, Module, Pages, Store, TableType, Target,
-    Tunables, Value as WasmValue,
+    imports, wasmparser::Operator, CompilerConfig, Engine, Function, FunctionEnv, FunctionEnvMut,
+    Instance, Memory, MemoryType, Module, Pages, Store, TableType, Target, Tunables,
+    Value as WasmValue,
 };
 use wasmer_middlewares::metering::{get_remaining_points, set_remaining_points, MeteringPoints};
 use wasmer_middlewares::Metering;
@@ -79,7 +79,7 @@ pub struct ExecResult {
     pub fuel_remaining: Option<u64>,
 }
 
-/// Parse args from a Starlark-friendly JSON array into typed WASM args.
+/// Parse args from a JSON array into typed WASM args.
 /// Integers become i64, floats become f64 — the WASM function signature is
 /// used later to coerce where needed.
 pub fn parse_args(args_json: &JsonValue) -> Result<Vec<WasmArg>> {
@@ -259,11 +259,8 @@ fn make_engine(memory_pages: u32) -> Engine {
     let metering = Arc::new(Metering::new(u64::MAX, cost));
     compiler.push_middleware(metering);
 
-    let mut engine: Engine = <Engine as NativeEngineExt>::new(
-        Box::new(compiler),
-        Target::default(),
-        Default::default(),
-    );
+    let mut engine: Engine =
+        <Engine as NativeEngineExt>::new(Box::new(compiler), Target::default(), Default::default());
     engine.set_tunables(CappedTunables::new(memory_pages.max(1)));
     engine
 }
@@ -301,11 +298,7 @@ fn try_save_to_disk(key: u64, artifact: &CachedArtifact) {
     match artifact.module.serialize() {
         Ok(bytes) => {
             if let Err(e) = std::fs::write(&path, &bytes) {
-                tracing::warn!(
-                    "wasm disk cache: failed to write {}: {}",
-                    path.display(),
-                    e
-                );
+                tracing::warn!("wasm disk cache: failed to write {}: {}", path.display(), e);
             }
         }
         Err(e) => {
@@ -365,7 +358,9 @@ struct HostEnv {
 /// show guest logs even without a caller-supplied callback.
 fn host_log_impl(mut env: FunctionEnvMut<HostEnv>, ptr: i32, len: i32) {
     let (data, store) = env.data_and_store_mut();
-    let Some(ref memory) = data.memory else { return };
+    let Some(ref memory) = data.memory else {
+        return;
+    };
     if len < 0 || ptr < 0 {
         return;
     }
@@ -374,7 +369,9 @@ fn host_log_impl(mut env: FunctionEnvMut<HostEnv>, ptr: i32, len: i32) {
     if view.read(ptr as u64, &mut buf).is_err() {
         return;
     }
-    let Ok(msg) = std::str::from_utf8(&buf) else { return };
+    let Ok(msg) = std::str::from_utf8(&buf) else {
+        return;
+    };
     tracing::info!(target: "wasm_sandbox", "{}", msg);
     if let Some(cb) = data.log_callback.clone() {
         cb(msg);
@@ -485,7 +482,11 @@ pub const EXPR_RUNTIME_WASM: &[u8] = include_bytes!(
 /// Returns the result as a string (decimal for ints, `"true"`/`"false"` for
 /// bools). Full JS/Python sandboxing would layer a heavyweight precompiled
 /// interpreter the same way.
-pub fn exec_expr(source: &str, vars: &serde_json::Map<String, JsonValue>, fuel: u64) -> Result<String> {
+pub fn exec_expr(
+    source: &str,
+    vars: &serde_json::Map<String, JsonValue>,
+    fuel: u64,
+) -> Result<String> {
     let mut prelude = String::new();
     for (name, value) in vars {
         if !is_valid_ident(name) {
@@ -559,9 +560,10 @@ pub fn exec_expr(source: &str, vars: &serde_json::Map<String, JsonValue>, fuel: 
         Ok(v) => v,
         Err(e) => {
             return match get_remaining_points(&mut store, &instance) {
-                MeteringPoints::Exhausted => {
-                    Err(anyhow!("exec_expr fuel exhausted after {} instructions", fuel))
-                }
+                MeteringPoints::Exhausted => Err(anyhow!(
+                    "exec_expr fuel exhausted after {} instructions",
+                    fuel
+                )),
                 MeteringPoints::Remaining(_) => Err(anyhow!("expr runtime trap: {}", e)),
             };
         }
@@ -587,9 +589,8 @@ pub fn exec_expr(source: &str, vars: &serde_json::Map<String, JsonValue>, fuel: 
 
 /// Prebuilt Python-runtime WASM binary. Built from `sandbox-python/` via
 /// `cargo build --release --target wasm32-wasip1` and embedded here.
-pub const PYTHON_RUNTIME_WASM: &[u8] = include_bytes!(
-    "../../sandbox-python/target/wasm32-wasip1/release/sandbox-python.wasm"
-);
+pub const PYTHON_RUNTIME_WASM: &[u8] =
+    include_bytes!("../../sandbox-python/target/wasm32-wasip1/release/sandbox-python.wasm");
 
 /// Shared state for our hand-rolled WASI preview 1 shim. Instead of pulling
 /// in `wasmer-wasix` (which drags in reqwest, tokio networking, virtual-fs,
@@ -697,11 +698,7 @@ fn wasi_fd_close(_env: FunctionEnvMut<WasiShim>, _fd: i32) -> i32 {
     WASI_ERRNO_SUCCESS
 }
 
-fn wasi_fd_fdstat_get(
-    mut env: FunctionEnvMut<WasiShim>,
-    _fd: i32,
-    stat_ptr: i32,
-) -> i32 {
+fn wasi_fd_fdstat_get(mut env: FunctionEnvMut<WasiShim>, _fd: i32, stat_ptr: i32) -> i32 {
     // 24-byte fdstat: fs_filetype(u8) + pad + fs_flags(u16) + pad +
     // fs_rights_base(u64) + fs_rights_inheriting(u64). Zero-filled is fine;
     // RustPython only checks a couple of fields.
@@ -848,7 +845,10 @@ fn wasi_poll_oneoff(
 /// but the 4.x API surfaces traps via `Err` returns from the caller
 /// rather than a panic-inside-host hook, so we do this from the caller
 /// side instead: mark `exit_code` and let the guest hit an unreachable.
-fn wasi_proc_exit(mut env: FunctionEnvMut<WasiShim>, code: i32) -> Result<(), wasmer::RuntimeError> {
+fn wasi_proc_exit(
+    mut env: FunctionEnvMut<WasiShim>,
+    code: i32,
+) -> Result<(), wasmer::RuntimeError> {
     env.data_mut().exit_code = Some(code);
     Err(wasmer::RuntimeError::user(Box::new(ProcExit(code))))
 }
@@ -964,9 +964,7 @@ fn run_wasi_guest(
                         label.to_lowercase(),
                         fuel
                     )),
-                    MeteringPoints::Remaining(_) => {
-                        Err(anyhow!("{} sandbox trap: {}", label, e))
-                    }
+                    MeteringPoints::Remaining(_) => Err(anyhow!("{} sandbox trap: {}", label, e)),
                 };
             }
         }
@@ -1004,9 +1002,8 @@ pub fn exec_python(source: &str, fuel: u64) -> Result<String> {
 
 /// Prebuilt JavaScript-runtime WASM binary. Built from `sandbox-js/` via
 /// `cargo build --release --target wasm32-wasip1` and embedded here.
-pub const JS_RUNTIME_WASM: &[u8] = include_bytes!(
-    "../../sandbox-js/target/wasm32-wasip1/release/sandbox-js.wasm"
-);
+pub const JS_RUNTIME_WASM: &[u8] =
+    include_bytes!("../../sandbox-js/target/wasm32-wasip1/release/sandbox-js.wasm");
 
 /// Evaluate a JavaScript program inside the WASM sandbox and return the
 /// `String(value)` of the final expression.

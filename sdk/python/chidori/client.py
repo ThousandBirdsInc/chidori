@@ -15,13 +15,16 @@ import urllib.error
 class Checkpoint:
     """A saved execution checkpoint that can be used to replay a session.
 
-    Contains the session ID, input, and the full call log — enough
-    to reconstruct execution without re-running LLM calls.
+    Contains the session ID, input, the full call log, and optional runtime
+    snapshot metadata. The call log is enough to replay cached host calls
+    without re-running LLM calls; the snapshot manifest lets clients inspect
+    durable-resume state without downloading raw VM snapshot bytes.
     """
 
     session_id: str
     input: dict
     call_log: list[dict]
+    snapshot_manifest: dict | None = None
 
     def save(self, path: str | Path) -> None:
         """Save checkpoint to a JSON file."""
@@ -29,6 +32,7 @@ class Checkpoint:
             "session_id": self.session_id,
             "input": self.input,
             "call_log": self.call_log,
+            "snapshot_manifest": self.snapshot_manifest,
         }
         Path(path).write_text(json.dumps(data, indent=2))
 
@@ -40,6 +44,7 @@ class Checkpoint:
             session_id=data["session_id"],
             input=data["input"],
             call_log=data["call_log"],
+            snapshot_manifest=data.get("snapshot_manifest"),
         )
 
 
@@ -58,6 +63,7 @@ class Session:
     # to the human and later call `client.resume(session.id, response)`.
     pending_seq: int | None = None
     pending_prompt: str | None = None
+    snapshot_manifest: dict | None = None
     _client: AgentClient | None = field(default=None, repr=False)
 
     @property
@@ -69,13 +75,15 @@ class Session:
 
         If the call log wasn't fetched yet, fetches it from the server.
         """
-        if not self.call_log and self._client:
+        if (not self.call_log or self.snapshot_manifest is None) and self._client:
             data = self._client._get(f"/sessions/{self.id}/checkpoint")
             self.call_log = data.get("call_log", [])
+            self.snapshot_manifest = data.get("snapshot_manifest")
         return Checkpoint(
             session_id=self.id,
             input=self.input,
             call_log=self.call_log,
+            snapshot_manifest=self.snapshot_manifest,
         )
 
     def replay(self) -> Session:
@@ -136,13 +144,14 @@ class AgentClient:
             error=data.get("error"),
             pending_seq=data.get("pending_seq"),
             pending_prompt=data.get("pending_prompt"),
+            snapshot_manifest=data.get("snapshot_manifest"),
             _client=self,
         )
 
     def replay(self, checkpoint: Checkpoint) -> Session:
         """Replay an agent from a saved checkpoint.
 
-        The runtime re-executes the Starlark code but returns cached
+        The runtime re-executes the TypeScript agent but returns cached
         results for all host function calls in the checkpoint's call log.
         No LLM calls are made for cached entries.
 
@@ -161,6 +170,7 @@ class AgentClient:
             error=data.get("error"),
             pending_seq=data.get("pending_seq"),
             pending_prompt=data.get("pending_prompt"),
+            snapshot_manifest=data.get("snapshot_manifest"),
             _client=self,
         )
 
@@ -179,6 +189,7 @@ class AgentClient:
             error=data.get("error"),
             pending_seq=data.get("pending_seq"),
             pending_prompt=data.get("pending_prompt"),
+            snapshot_manifest=data.get("snapshot_manifest"),
             _client=self,
         )
 
@@ -193,6 +204,7 @@ class AgentClient:
             error=data.get("error"),
             pending_seq=data.get("pending_seq"),
             pending_prompt=data.get("pending_prompt"),
+            snapshot_manifest=data.get("snapshot_manifest"),
             _client=self,
         )
 
@@ -213,7 +225,17 @@ class AgentClient:
             session_id=session_id,
             input=data.get("input", {}),
             call_log=data.get("call_log", []),
+            snapshot_manifest=data.get("snapshot_manifest"),
         )
+
+    def get_snapshot_manifest(self, session_id: str) -> dict:
+        """Fetch runtime snapshot manifest metadata for a session.
+
+        The server returns only JSON metadata. Raw `runtime.snapshot` bytes
+        remain server-side.
+        """
+        data = self._get(f"/sessions/{session_id}/snapshot")
+        return data["snapshot_manifest"]
 
     def stream(self, input: dict) -> Iterator[dict]:
         """Run an agent with live per-call streaming.
@@ -222,7 +244,9 @@ class AgentClient:
         `POST /sessions/stream` SSE endpoint. Each event has one of:
 
           * `{"type": "call", "record": <CallRecord dict>}` — emitted
-            after every host function call (prompt, tool, http, …)
+            after every host function call (prompt, tool, http, ...)
+          * `{"type": "prompt_start" | "prompt_delta" | "prompt_end", ...}`
+            — emitted for labelled prompt progress streams
           * `{"type": "done", "id": ..., "status": ..., "output": ...}`
             — emitted once when the run finishes
 
@@ -273,6 +297,13 @@ class AgentClient:
                         if decoded is not None:
                             if event_name == "call":
                                 yield {"type": "call", "record": decoded}
+                            elif event_name in {
+                                "prompt_start",
+                                "prompt_delta",
+                                "prompt_end",
+                            }:
+                                decoded["type"] = event_name
+                                yield decoded
                             elif event_name == "done":
                                 yield {"type": "done", **decoded}
                     event_name = "message"

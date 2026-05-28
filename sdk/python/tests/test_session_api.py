@@ -57,8 +57,9 @@ class MockLlm:
     talked to the LLM" (hits went up).
     """
 
-    def __init__(self, response_text: str = "forty-two"):
+    def __init__(self, response_text: str = "forty-two", delay_seconds: float = 0.0):
         self.response_text = response_text
+        self.delay_seconds = delay_seconds
         self.hits = 0
         self._server: HTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -74,7 +75,50 @@ class MockLlm:
             def do_POST(self):
                 mock.hits += 1
                 length = int(self.headers.get("content-length", "0"))
-                _ = self.rfile.read(length)
+                request_body = self.rfile.read(length)
+                if mock.delay_seconds:
+                    time.sleep(mock.delay_seconds)
+                request = json.loads(request_body or b"{}")
+                if request.get("stream"):
+                    frames = [
+                        {
+                            "choices": [
+                                {
+                                    "delta": {"content": mock.response_text},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        },
+                        {
+                            "choices": [
+                                {
+                                    "delta": {},
+                                    "finish_reason": "stop",
+                                }
+                            ],
+                        },
+                        {
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": 5,
+                                "completion_tokens": 3,
+                                "total_tokens": 8,
+                            },
+                        },
+                    ]
+                    payload = (
+                        "".join(
+                            "data: " + json.dumps(frame) + "\n\n"
+                            for frame in frames
+                        )
+                        + "data: [DONE]\n\n"
+                    ).encode()
+                    self.send_response(200)
+                    self.send_header("content-type", "text/event-stream")
+                    self.send_header("content-length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 body = {
                     "id": "mock-1",
                     "object": "chat.completion",
@@ -199,12 +243,16 @@ class _MockLlmTestCase(unittest.TestCase):
     effect; each individual test shares that subprocess.
     """
 
-    agent: Path = FIXTURES / "ask.star"
+    agent: Path = FIXTURES / "ask.ts"
     extra_env: dict[str, str] = {}
+    mock_delay_seconds: float = 0.0
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.mock = MockLlm(response_text="forty-two")
+        cls.mock = MockLlm(
+            response_text="forty-two",
+            delay_seconds=cls.mock_delay_seconds,
+        )
         cls.mock.start()
         env = dict(cls.extra_env)
         env.setdefault("LITELLM_API_URL", f"http://127.0.0.1:{cls.mock.port}/v1")
@@ -244,6 +292,19 @@ class SessionApiTests(_MockLlmTestCase):
         self.assertEqual(checkpoint.session_id, session.id)
         self.assertGreaterEqual(len(checkpoint.call_log), 1)
         self.assertEqual(checkpoint.call_log[0]["function"], "prompt")
+        self.assertIsNotNone(checkpoint.snapshot_manifest)
+        self.assertEqual(
+            checkpoint.snapshot_manifest["abi"]["engine_fork"],
+            "chidori-quickjs",
+        )
+
+    def test_snapshot_manifest_endpoint_returns_metadata(self):
+        session = self.client.run({"question": "snapshot manifest"})
+        manifest = self.client.get_snapshot_manifest(session.id)
+        self.assertIn("run_id", manifest)
+        self.assertEqual(manifest["abi"]["engine_fork"], "chidori-quickjs")
+        self.assertIn("policy", manifest)
+        self.assertEqual(manifest["snapshot_file"], "runtime.snapshot")
 
     def test_replay_is_deterministic_without_hitting_llm(self):
         session = self.client.run({"question": "q"})
@@ -276,8 +337,10 @@ class SessionApiTests(_MockLlmTestCase):
         events = list(self.client.stream({"question": "stream me"}))
         # At least one `call` event (the prompt()) and exactly one `done`.
         call_events = [e for e in events if e["type"] == "call"]
+        prompt_deltas = [e for e in events if e["type"] == "prompt_delta"]
         done_events = [e for e in events if e["type"] == "done"]
         self.assertGreaterEqual(len(call_events), 1)
+        self.assertGreaterEqual(len(prompt_deltas), 1)
         self.assertEqual(len(done_events), 1)
 
         # Call events carry a record with a seq and a function name.
@@ -297,7 +360,7 @@ class SessionApiTests(_MockLlmTestCase):
 
 
 class PauseResumeTests(_MockLlmTestCase):
-    agent = FIXTURES / "approval.star"
+    agent = FIXTURES / "approval.ts"
 
     def test_session_pauses_and_resumes(self):
         paused = self.client.run({"action": "delete-prod-db"})
@@ -371,11 +434,11 @@ class AuthTests(_MockLlmTestCase):
 
 
 class ConcurrencyTests(_MockLlmTestCase):
-    agent = FIXTURES / "slow.star"
+    agent = FIXTURES / "slow.ts"
+    mock_delay_seconds = 1.0
     extra_env = {
         "CHIDORI_MAX_CONCURRENT_SESSIONS": "1",
         "CHIDORI_ACQUIRE_TIMEOUT_MS": "200",
-        "CHIDORI_SHELL_ALLOW": "sleep",
     }
 
     def test_second_concurrent_request_gets_503(self):

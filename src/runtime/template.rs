@@ -39,10 +39,7 @@ impl TemplateEngine {
         let mut env = self.create_env();
 
         // Set up a loader for includes/extends relative to the template's directory.
-        let template_dir = full_path
-            .parent()
-            .unwrap_or(&self.base_dir)
-            .to_path_buf();
+        let template_dir = full_path.parent().unwrap_or(&self.base_dir).to_path_buf();
         env.set_loader(move |name| {
             let p = template_dir.join(name);
             match std::fs::read_to_string(&p) {

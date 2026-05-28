@@ -93,19 +93,15 @@ pub async fn run_once(recipe: &Recipe, deps: &SchedulerDeps) -> Result<String> {
 
         // Build the tool registry: recipe-local dirs + default `<agent>/tools`
         // + any MCP tools the server handed us.
-        let mut dirs: Vec<PathBuf> = recipe
-            .tools
-            .iter()
-            .cloned()
-            .collect();
+        let mut dirs: Vec<PathBuf> = recipe.tools.iter().cloned().collect();
         dirs.push(
             agent_path
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .join("tools"),
         );
-        let mut registry = ToolRegistry::load_from_dirs(&dirs)
-            .unwrap_or_else(|_| ToolRegistry::new());
+        let mut registry =
+            ToolRegistry::load_from_dirs(&dirs).unwrap_or_else(|_| ToolRegistry::new());
         for def in &deps.mcp_tools {
             registry.register(def.clone());
         }
@@ -122,6 +118,7 @@ pub async fn run_once(recipe: &Recipe, deps: &SchedulerDeps) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let session = StoredSession {
             id: id.clone(),
+            run_id: Some(result.run_id),
             status: SessionStatus::Completed,
             input: inputs,
             output: Some(result.output),

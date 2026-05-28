@@ -4,27 +4,31 @@ version = "3.0.0"
 edition = "2021"
 authors = ["Colton Pierson <colton@thousandbirds.ai>"]
 license = "Apache-2.0"
-description = "YAML-free AI agent framework where agents are deterministic Starlark scripts with built-in checkpointing and replay."
+description = "YAML-free AI agent framework where agents are deterministic TypeScript modules with built-in checkpointing and replay."
 homepage = "https://docs.thousandbirds.ai"
 repository = "https://github.com/ThousandBirdsInc/chidori"
 readme = "README.md"
-keywords = ["agent", "ai", "llm", "starlark", "replay"]
+keywords = ["agent", "ai", "llm", "typescript", "replay"]
 categories = ["development-tools", "command-line-utilities"]
+
+[workspace]
+members = [
+    ".",
+    "crates/chidori-quickjs",
+    "crates/chidori-quickjs-sys",
+]
+resolver = "2"
 
 [[bin]]
 name = "chidori"
 path = "src/main.rs"
 
 [dependencies]
-# Starlark evaluator
-starlark = "0.13"
-allocative = "0.3"
-
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
 # HTTP client for LLM providers
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "gzip"] }
 
 # HTTP server for serve command
 axum = "0.8"
@@ -53,14 +57,14 @@ chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 tokio-stream = "0.1"
 async-stream = "0.3"
+sha2 = "0.10"
 
 # WebAssembly sandbox for exec() host function.
 # Cranelift compiler + metering middleware give us fuel-based timeouts.
 wasmer = "4"
 wasmer-middlewares = "4"
 
-# Sandboxed JavaScript execution for exec() host function
-rquickjs = { version = "0.9", features = ["macro"] }
+chidori-quickjs = { path = "crates/chidori-quickjs" }
 async-trait = "0.1"
 derive_more = { version = "1", features = ["display"] }
 
@@ -79,3 +83,8 @@ serde_yaml = "0.9"
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
+
+[dev-dependencies]
+# Legacy host-binding parity tests only. Production TypeScript execution uses
+# the in-repo `chidori-quickjs` fork.
+rquickjs = { version = "0.9", features = ["macro"] }

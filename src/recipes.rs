@@ -6,7 +6,7 @@
 //!
 //! ```yaml
 //! name: daily-digest
-//! agent: agents/digest.star
+//! agent: agents/digest.ts
 //! schedule: "0 9 * * *"        # every day at 09:00
 //! inputs:
 //!   channel: "#general"
@@ -74,4 +74,3 @@ impl Recipe {
         Ok(out)
     }
 }
-

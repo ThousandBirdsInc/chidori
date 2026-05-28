@@ -50,7 +50,8 @@ impl McpManager {
                 Ok(client) => {
                     let client = Arc::new(client);
                     for remote in client.tools().iter() {
-                        let params: Vec<ToolParam> = remote.input_schema
+                        let params: Vec<ToolParam> = remote
+                            .input_schema
                             .get("properties")
                             .and_then(|v| v.as_object())
                             .map(|props| {
@@ -84,7 +85,7 @@ impl McpManager {
                             description: remote.description.clone().unwrap_or_default(),
                             params,
                             source_path: std::path::PathBuf::new(),
-                            source: String::new(),
+                            source_fingerprint: None,
                             backend: crate::tools::ToolBackend::Mcp {
                                 server_id: id.clone(),
                                 remote_name: remote.name.clone(),
@@ -110,9 +111,9 @@ impl McpManager {
     ) -> Result<Value> {
         let client = {
             let map = self.servers.lock().await;
-            map.get(server_id).cloned().ok_or_else(|| {
-                anyhow::anyhow!("MCP server `{}` is not connected", server_id)
-            })?
+            map.get(server_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("MCP server `{}` is not connected", server_id))?
         };
         client.call_tool(remote_name, args).await
     }

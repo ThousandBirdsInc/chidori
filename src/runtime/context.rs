@@ -6,6 +6,10 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::runtime::call_log::{CallLog, CallRecord};
 use crate::runtime::otel::RunSpan;
+use crate::runtime::snapshot::{
+    HostOperationId, HostPromiseRecord, HostPromiseTable, PendingHostOperation,
+    PendingHostOperationKind, HOST_PROMISE_TABLE_FILE, PENDING_HOST_OPERATION_FILE,
+};
 
 /// A streaming event the runtime emits while an agent runs. CallRecord is
 /// the original per-call event; prompt stream events carry LLM output as the
@@ -34,14 +38,88 @@ pub enum RuntimeEvent {
     },
 }
 
-/// Shared runtime context passed into Starlark host functions.
+/// Shared runtime context passed into TypeScript host bindings.
 ///
 /// Holds the LLM provider registry, call log, template engine,
 /// and agent-level configuration. Wrapped in Arc<Mutex<>> so
-/// Starlark's synchronous host functions can mutate it.
+/// synchronous TypeScript host bindings can mutate it.
 #[derive(Debug, Clone)]
 pub struct RuntimeContext {
     inner: Arc<Mutex<RuntimeContextInner>>,
+}
+
+#[derive(Clone)]
+pub struct HostOperationSafepoint(
+    Arc<dyn Fn(&PendingHostOperation) -> anyhow::Result<()> + Send + Sync>,
+);
+
+#[derive(Clone)]
+pub struct HostOperationCompletionSafepoint(
+    Arc<dyn Fn(&HostPromiseRecord) -> anyhow::Result<()> + Send + Sync>,
+);
+
+#[derive(Clone)]
+pub struct LiveVmSnapshotter(
+    Arc<dyn Fn() -> anyhow::Result<chidori_quickjs::RuntimeSnapshot> + Send + Sync>,
+);
+
+impl std::fmt::Debug for HostOperationSafepoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostOperationSafepoint")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for HostOperationCompletionSafepoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostOperationCompletionSafepoint")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for LiveVmSnapshotter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveVmSnapshotter").finish_non_exhaustive()
+    }
+}
+
+impl HostOperationSafepoint {
+    #[allow(dead_code)]
+    pub fn new(
+        callback: impl Fn(&PendingHostOperation) -> anyhow::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    fn call(&self, operation: &PendingHostOperation) -> anyhow::Result<()> {
+        (self.0)(operation)
+    }
+}
+
+impl HostOperationCompletionSafepoint {
+    #[allow(dead_code)]
+    pub fn new(
+        callback: impl Fn(&HostPromiseRecord) -> anyhow::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    fn call(&self, record: &HostPromiseRecord) -> anyhow::Result<()> {
+        (self.0)(record)
+    }
+}
+
+impl LiveVmSnapshotter {
+    #[allow(dead_code)]
+    pub fn new(
+        callback: impl Fn() -> anyhow::Result<chidori_quickjs::RuntimeSnapshot> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    fn capture(&self) -> anyhow::Result<chidori_quickjs::RuntimeSnapshot> {
+        (self.0)()
+    }
 }
 
 #[derive(Debug)]
@@ -69,6 +147,10 @@ struct RuntimeContextInner {
     pub pending_input: Option<PendingInput>,
     /// Set by the permission policy when an AskBefore rule needs approval.
     pub pending_approval: Option<PendingApproval>,
+    /// Durable host-promise bookkeeping. This is snapshot-serializable Rust
+    /// state; the QuickJS fork will bind these ids to real JS promises.
+    #[allow(dead_code)]
+    pub host_promises: HostPromiseTable,
     /// Optional live-event sink. When set, every `record_call` is also
     /// forwarded here so the server can stream host-function calls to
     /// connected clients (e.g. over SSE). Token deltas emitted by streaming
@@ -83,6 +165,23 @@ struct RuntimeContextInner {
     /// and attributes — shipping automatically to any OTLP backend (tael,
     /// Jaeger, Honeycomb, Datadog, ...). None disables OTEL export.
     pub otel_run: Option<Arc<RunSpan>>,
+    /// Optional durable safepoint invoked after a pending host operation is
+    /// persisted and before the corresponding live side effect executes.
+    pub host_operation_safepoint: Option<HostOperationSafepoint>,
+    /// Optional durable safepoint invoked after a host operation result is
+    /// persisted and recorded, before control returns to JavaScript.
+    pub host_operation_completion_safepoint: Option<HostOperationCompletionSafepoint>,
+    /// Optional live VM snapshotter registered by snapshot-capable runtimes.
+    /// When present, durable safepoints persist its live continuation bytes
+    /// instead of the initial TypeScript state scaffold.
+    pub live_vm_snapshotter: Option<LiveVmSnapshotter>,
+    /// Optional scoped workspace root exposed through `chidori.workspace`.
+    pub workspace_root: Option<PathBuf>,
+    /// Seqs of host calls currently executing (their `live()` is on the
+    /// stack). The top is the parent of any call recorded while it runs —
+    /// this is how sub-agent calls (made inside `call_agent`'s execution)
+    /// get stamped with their enclosing `call_agent`'s seq.
+    pub call_stack: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,7 +193,7 @@ pub enum InputMode {
     Pause,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingInput {
     pub seq: u64,
     pub prompt: String,
@@ -121,17 +220,18 @@ pub struct AgentConfig {
     pub temperature: f64,
     pub max_tokens: u64,
     pub max_turns: u64,
-    pub timeout: u64,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
+        let model = std::env::var("CHIDORI_MODEL")
+            .or_else(|_| std::env::var("ANTHROPIC_MODEL"))
+            .unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
         Self {
-            model: "claude-sonnet-4-6".to_string(),
+            model,
             temperature: 0.7,
             max_tokens: 4096,
             max_turns: 10,
-            timeout: 300,
         }
     }
 }
@@ -149,9 +249,15 @@ impl RuntimeContext {
                 input_mode: InputMode::Stdin,
                 pending_input: None,
                 pending_approval: None,
+                host_promises: HostPromiseTable::new(),
                 event_sender: None,
                 emit_call_events: true,
                 otel_run: None,
+                host_operation_safepoint: None,
+                host_operation_completion_safepoint: None,
+                live_vm_snapshotter: None,
+                workspace_root: default_workspace_root(),
+                call_stack: Vec::new(),
             })),
         }
     }
@@ -159,6 +265,13 @@ impl RuntimeContext {
     /// Create a context in replay mode with a pre-loaded call log.
     /// Host functions will return cached results for matching calls.
     pub fn with_replay(replay_log: Vec<CallRecord>) -> Self {
+        Self::with_replay_and_host_promises(replay_log, Vec::new())
+    }
+
+    pub fn with_replay_and_host_promises(
+        replay_log: Vec<CallRecord>,
+        host_promises: Vec<HostPromiseRecord>,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(RuntimeContextInner {
                 config: AgentConfig::default(),
@@ -170,9 +283,46 @@ impl RuntimeContext {
                 input_mode: InputMode::Stdin,
                 pending_input: None,
                 pending_approval: None,
+                host_promises: HostPromiseTable::from_records(host_promises),
                 event_sender: None,
                 emit_call_events: true,
                 otel_run: None,
+                host_operation_safepoint: None,
+                host_operation_completion_safepoint: None,
+                live_vm_snapshotter: None,
+                workspace_root: default_workspace_root(),
+                call_stack: Vec::new(),
+            })),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_existing_call_log(run_id: String, records: Vec<CallRecord>) -> Self {
+        let seq = records.iter().map(|record| record.seq).max().unwrap_or(0);
+        let mut call_log = CallLog::new();
+        for record in records {
+            call_log.push(record);
+        }
+        Self {
+            inner: Arc::new(Mutex::new(RuntimeContextInner {
+                config: AgentConfig::default(),
+                call_log,
+                seq,
+                replay_log: None,
+                run_id,
+                persist_dir: None,
+                input_mode: InputMode::Stdin,
+                pending_input: None,
+                pending_approval: None,
+                host_promises: HostPromiseTable::new(),
+                event_sender: None,
+                emit_call_events: true,
+                otel_run: None,
+                host_operation_safepoint: None,
+                host_operation_completion_safepoint: None,
+                live_vm_snapshotter: None,
+                workspace_root: default_workspace_root(),
+                call_stack: Vec::new(),
             })),
         }
     }
@@ -196,15 +346,26 @@ impl RuntimeContext {
         self.inner.lock().unwrap().config.clone()
     }
 
-    pub fn update_config<F: FnOnce(&mut AgentConfig)>(&self, f: F) {
-        let mut inner = self.inner.lock().unwrap();
-        f(&mut inner.config);
-    }
-
     pub fn next_seq(&self) -> u64 {
         let mut inner = self.inner.lock().unwrap();
         inner.seq += 1;
         inner.seq
+    }
+
+    /// Mark `seq`'s `live()` as executing: any call recorded until the
+    /// matching [`exit_call`](Self::exit_call) nests under it. Paired around
+    /// the execution of host calls that can contain other calls (`call_agent`).
+    pub fn enter_call(&self, seq: u64) {
+        self.inner.lock().unwrap().call_stack.push(seq);
+    }
+
+    /// Pop the innermost executing call. Pops `seq` defensively in case an
+    /// inner call unwound without its own `exit_call`.
+    pub fn exit_call(&self, seq: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(pos) = inner.call_stack.iter().rposition(|&s| s == seq) {
+            inner.call_stack.truncate(pos);
+        }
     }
 
     /// Check if there is a cached result for the given sequence number.
@@ -248,12 +409,16 @@ impl RuntimeContext {
         }
     }
 
-    pub fn is_replaying(&self) -> bool {
-        self.inner.lock().unwrap().replay_log.is_some()
-    }
-
-    pub fn record_call(&self, record: CallRecord) {
+    pub fn record_call(&self, mut record: CallRecord) {
         let mut inner = self.inner.lock().unwrap();
+        // Stamp the enclosing call (the live-call stack top) as the parent,
+        // unless the record already carries one — replayed records keep the
+        // parentage serialized in their checkpoint. The call being recorded
+        // has already popped itself off the stack, so the top is its parent.
+        if record.parent_seq.is_none() {
+            record.parent_seq = inner.call_stack.last().copied();
+        }
+        inner.seq = inner.seq.max(record.seq);
         inner.call_log.push(record.clone());
         if let Some(ref dir) = inner.persist_dir {
             if let Ok(json) = inner.call_log.to_json() {
@@ -268,13 +433,6 @@ impl RuntimeContext {
                 let _ = tx.send(RuntimeEvent::Call(record));
             }
         }
-    }
-
-    pub fn inherit_event_sink(&self, parent: &RuntimeContext, emit_call_events: bool) {
-        let parent_inner = parent.inner.lock().unwrap();
-        let mut inner = self.inner.lock().unwrap();
-        inner.event_sender = parent_inner.event_sender.clone();
-        inner.emit_call_events = emit_call_events;
     }
 
     pub fn begin_prompt_stream(
@@ -349,6 +507,43 @@ impl RuntimeContext {
         self.inner.lock().unwrap().otel_run.clone()
     }
 
+    #[allow(dead_code)]
+    pub fn set_host_operation_safepoint(&self, safepoint: HostOperationSafepoint) {
+        self.inner.lock().unwrap().host_operation_safepoint = Some(safepoint);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_host_operation_completion_safepoint(
+        &self,
+        safepoint: HostOperationCompletionSafepoint,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .host_operation_completion_safepoint = Some(safepoint);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_live_vm_snapshotter(&self, snapshotter: LiveVmSnapshotter) {
+        self.inner.lock().unwrap().live_vm_snapshotter = Some(snapshotter);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_workspace_root(&self, root: impl Into<PathBuf>) {
+        self.inner.lock().unwrap().workspace_root = Some(root.into());
+    }
+
+    pub fn workspace_root(&self) -> Option<PathBuf> {
+        self.inner.lock().unwrap().workspace_root.clone()
+    }
+
+    pub fn capture_live_vm_snapshot(
+        &self,
+    ) -> Option<anyhow::Result<chidori_quickjs::RuntimeSnapshot>> {
+        let snapshotter = self.inner.lock().unwrap().live_vm_snapshotter.clone()?;
+        Some(snapshotter.capture())
+    }
+
     pub fn call_log(&self) -> CallLog {
         self.inner.lock().unwrap().call_log.clone()
     }
@@ -375,5 +570,340 @@ impl RuntimeContext {
 
     pub fn take_pending_approval(&self) -> Option<PendingApproval> {
         self.inner.lock().unwrap().pending_approval.take()
+    }
+
+    #[allow(dead_code)]
+    pub fn create_host_promise(
+        &self,
+        seq: u64,
+        kind: PendingHostOperationKind,
+        args: serde_json::Value,
+    ) -> HostOperationId {
+        self.inner
+            .lock()
+            .unwrap()
+            .host_promises
+            .create(seq, kind, args)
+    }
+
+    #[allow(dead_code)]
+    pub fn begin_host_operation(
+        &self,
+        seq: u64,
+        kind: PendingHostOperationKind,
+        args: serde_json::Value,
+    ) -> HostOperationId {
+        self.begin_host_operation_with_function(seq, kind, None, args)
+    }
+
+    pub fn begin_host_operation_with_function(
+        &self,
+        seq: u64,
+        kind: PendingHostOperationKind,
+        function: Option<String>,
+        args: serde_json::Value,
+    ) -> HostOperationId {
+        let mut inner = self.inner.lock().unwrap();
+        let id = inner
+            .host_promises
+            .create_with_function(seq, kind, function, args);
+        persist_host_promises(&inner);
+        id
+    }
+
+    pub fn run_host_operation_safepoint(&self, id: HostOperationId) -> anyhow::Result<()> {
+        let (safepoint, operation) = {
+            let inner = self.inner.lock().unwrap();
+            let safepoint = inner.host_operation_safepoint.clone();
+            let operation = inner
+                .host_promises
+                .pending_operation(id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unknown pending host operation id {}", id.0))?;
+            (safepoint, operation)
+        };
+        if let Some(safepoint) = safepoint {
+            safepoint.call(&operation)?;
+        }
+        Ok(())
+    }
+
+    pub fn run_host_operation_completion_safepoint(
+        &self,
+        id: HostOperationId,
+    ) -> anyhow::Result<()> {
+        let (safepoint, record) = {
+            let inner = self.inner.lock().unwrap();
+            let safepoint = inner.host_operation_completion_safepoint.clone();
+            let record = inner
+                .host_promises
+                .record(id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unknown host operation id {}", id.0))?;
+            (safepoint, record)
+        };
+        if let Some(safepoint) = safepoint {
+            safepoint.call(&record)?;
+        }
+        Ok(())
+    }
+
+    pub fn resolve_host_operation(
+        &self,
+        id: HostOperationId,
+        value: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.host_promises.resolve(id, value)?;
+        persist_host_promises(&inner);
+        Ok(())
+    }
+
+    pub fn reject_host_operation(
+        &self,
+        id: HostOperationId,
+        error: impl Into<String>,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.host_promises.reject(id, error)?;
+        persist_host_promises(&inner);
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn resolve_host_promise(
+        &self,
+        id: HostOperationId,
+        value: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.inner.lock().unwrap().host_promises.resolve(id, value)
+    }
+
+    #[allow(dead_code)]
+    pub fn reject_host_promise(
+        &self,
+        id: HostOperationId,
+        error: impl Into<String>,
+    ) -> anyhow::Result<()> {
+        self.inner.lock().unwrap().host_promises.reject(id, error)
+    }
+
+    #[allow(dead_code)]
+    pub fn pending_host_operation(&self, id: HostOperationId) -> Option<PendingHostOperation> {
+        self.inner
+            .lock()
+            .unwrap()
+            .host_promises
+            .pending_operation(id)
+            .cloned()
+    }
+
+    #[allow(dead_code)]
+    pub fn pending_host_operations(&self) -> Vec<PendingHostOperation> {
+        self.inner
+            .lock()
+            .unwrap()
+            .host_promises
+            .pending_operations()
+    }
+
+    #[allow(dead_code)]
+    pub fn active_pending_host_operation(&self) -> Option<PendingHostOperation> {
+        self.inner
+            .lock()
+            .unwrap()
+            .host_promises
+            .active_pending_operation()
+    }
+
+    #[allow(dead_code)]
+    pub fn completed_host_operation(
+        &self,
+        seq: u64,
+        kind: PendingHostOperationKind,
+        args: &serde_json::Value,
+    ) -> Option<HostPromiseRecord> {
+        self.inner
+            .lock()
+            .unwrap()
+            .host_promises
+            .completed_operation(seq, kind, args)
+    }
+
+    #[allow(dead_code)]
+    pub fn host_promise_records(&self) -> Vec<HostPromiseRecord> {
+        self.inner.lock().unwrap().host_promises.records()
+    }
+}
+
+fn persist_host_promises(inner: &RuntimeContextInner) {
+    let Some(dir) = inner.persist_dir.as_ref() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dir);
+    let records = inner.host_promises.records();
+    if let Ok(json) = serde_json::to_vec_pretty(&records) {
+        let _ = std::fs::write(dir.join(HOST_PROMISE_TABLE_FILE), json);
+    }
+
+    let pending = inner.host_promises.active_pending_operation();
+    let pending_path = dir.join(PENDING_HOST_OPERATION_FILE);
+    match pending {
+        Some(pending) => {
+            if let Ok(json) = serde_json::to_vec_pretty(&pending) {
+                let _ = std::fs::write(pending_path, json);
+            }
+        }
+        None => {
+            if pending_path.exists() {
+                let _ = std::fs::remove_file(pending_path);
+            }
+        }
+    }
+}
+
+fn default_workspace_root() -> Option<PathBuf> {
+    std::env::var_os("CHIDORI_WORKSPACE_ROOT")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::snapshot::{
+        HostPromiseState, HOST_PROMISE_TABLE_FILE, PENDING_HOST_OPERATION_FILE,
+    };
+
+    #[test]
+    fn runtime_context_tracks_host_promise_lifecycle() {
+        let ctx = RuntimeContext::new();
+        let id = ctx.create_host_promise(
+            1,
+            PendingHostOperationKind::Prompt,
+            serde_json::json!({ "text": "hello" }),
+        );
+
+        assert_eq!(id, HostOperationId(1));
+        assert_eq!(ctx.pending_host_operations().len(), 1);
+        assert_eq!(ctx.pending_host_operation(id).unwrap().seq, 1);
+
+        ctx.resolve_host_promise(id, serde_json::json!("done"))
+            .unwrap();
+
+        assert!(ctx.pending_host_operation(id).is_none());
+        let records = ctx.host_promise_records();
+        assert!(matches!(
+            records[0].state,
+            HostPromiseState::Resolved { .. }
+        ));
+    }
+
+    #[test]
+    fn runtime_context_rejects_completed_host_promise_twice() {
+        let ctx = RuntimeContext::new();
+        let id = ctx.create_host_promise(
+            1,
+            PendingHostOperationKind::Http,
+            serde_json::json!({ "url": "https://example.com" }),
+        );
+        ctx.reject_host_promise(id, "failed").unwrap();
+
+        let err = ctx
+            .resolve_host_promise(id, serde_json::json!(null))
+            .unwrap_err();
+        assert!(err.to_string().contains("already completed"));
+    }
+
+    #[test]
+    fn runtime_context_persists_pending_and_completed_host_operations() {
+        let base = std::env::temp_dir().join(format!(
+            "chidori-host-promise-persist-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let ctx = RuntimeContext::new();
+        let run_dir = ctx.enable_persistence(base.clone());
+
+        let id = ctx.begin_host_operation(
+            1,
+            PendingHostOperationKind::Prompt,
+            serde_json::json!({ "text": "hello" }),
+        );
+
+        let pending_path = run_dir.join(PENDING_HOST_OPERATION_FILE);
+        let table_path = run_dir.join(HOST_PROMISE_TABLE_FILE);
+        assert!(pending_path.exists());
+        assert!(table_path.exists());
+        let pending: PendingHostOperation =
+            serde_json::from_slice(&std::fs::read(&pending_path).unwrap()).unwrap();
+        assert_eq!(pending.id, id);
+        assert_eq!(pending.kind, PendingHostOperationKind::Prompt);
+
+        ctx.resolve_host_operation(id, serde_json::json!("done"))
+            .unwrap();
+
+        assert!(!pending_path.exists());
+        let records: Vec<HostPromiseRecord> =
+            serde_json::from_slice(&std::fs::read(&table_path).unwrap()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            records[0].state,
+            HostPromiseState::Resolved { .. }
+        ));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn runtime_context_persists_concrete_host_function_name() {
+        let ctx = RuntimeContext::new();
+        let id = ctx.begin_host_operation_with_function(
+            1,
+            PendingHostOperationKind::Sandbox,
+            Some("exec_js".to_string()),
+            serde_json::json!({ "source": "1 + 1" }),
+        );
+
+        let pending = ctx.pending_host_operation(id).unwrap();
+        assert_eq!(pending.kind, PendingHostOperationKind::Sandbox);
+        assert_eq!(pending.function.as_deref(), Some("exec_js"));
+
+        let records = ctx.host_promise_records();
+        assert_eq!(records[0].operation.function.as_deref(), Some("exec_js"));
+    }
+
+    #[test]
+    fn runtime_context_persists_latest_pending_operation_for_nested_pause() {
+        let base = std::env::temp_dir().join(format!(
+            "chidori-host-promise-nested-pending-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let ctx = RuntimeContext::new();
+        let run_dir = ctx.enable_persistence(base.clone());
+
+        let tool_id = ctx.begin_host_operation(
+            1,
+            PendingHostOperationKind::Tool,
+            serde_json::json!({ "name": "ask", "kwargs": {} }),
+        );
+        let input_id = ctx.begin_host_operation(
+            2,
+            PendingHostOperationKind::Input,
+            serde_json::json!({ "prompt": "Continue?" }),
+        );
+
+        let active = ctx.active_pending_host_operation().unwrap();
+        assert_eq!(active.id, input_id);
+        assert_eq!(active.kind, PendingHostOperationKind::Input);
+
+        let pending: PendingHostOperation = serde_json::from_slice(
+            &std::fs::read(run_dir.join(PENDING_HOST_OPERATION_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pending.id, input_id);
+        assert_eq!(pending.kind, PendingHostOperationKind::Input);
+        assert_eq!(ctx.pending_host_operation(tool_id).unwrap().id, tool_id);
+
+        let _ = std::fs::remove_dir_all(base);
     }
 }

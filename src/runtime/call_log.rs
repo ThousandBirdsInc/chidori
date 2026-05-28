@@ -7,6 +7,12 @@ use serde_json::Value;
 pub struct CallRecord {
     /// Monotonically increasing sequence number.
     pub seq: u64,
+    /// Sequence number of the enclosing call, when this record was produced
+    /// inside another host call's execution (today: a sub-agent invoked via
+    /// `call_agent`, whose own host calls nest under it). None for top-level
+    /// calls. Lets consumers reconstruct the run as a span tree.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub parent_seq: Option<u64>,
     /// Host function name (e.g. "prompt", "tool", "exec").
     pub function: String,
     /// Arguments passed to the function.
@@ -85,11 +91,7 @@ impl CallLog {
             let Some(usage) = r.token_usage.as_ref() else {
                 continue;
             };
-            let model = r
-                .args
-                .get("model")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let model = r.args.get("model").and_then(|v| v.as_str()).unwrap_or("");
             total += estimate_cost_usd(model, usage.input_tokens, usage.output_tokens);
         }
         total

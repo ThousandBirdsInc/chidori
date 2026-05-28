@@ -1,13 +1,20 @@
-# Trace Emitter — Design for Starlark-Level Instrumentation
+# Trace Emitter — Archived Starlark Instrumentation Design
 
-**Status:** pre-implementation design doc.
+**Status:** archived design doc from the legacy Starlark runtime.
+
+Chidori has moved to TypeScript-first agent authoring. This document is kept
+only as historical context for the legacy Starlark implementation and should
+not be used as the active tracing roadmap. New tracing work should target the
+TypeScript runtime, `RuntimeEvent` streaming, call-log records, snapshot
+manifests, and OpenTelemetry spans.
+
 **Companion doc:** `util-trace-webgl/docs/design-vision.md` — the viewer
 that consumes the events this emitter produces. Read §3 (event schema)
 and §4 (framework-readiness gap analysis) there first. This doc exists
 because that §4 concluded the sub-expression events the viewer wants
 require upstream work in this repo, and nobody has decided how.
 
-This doc decides how.
+This doc records the old decision path.
 
 ---
 
@@ -329,7 +336,7 @@ primary path.
 ## 5. What `kitchen_sink.star` actually needs
 
 The canonical fixture exercises (line numbers from
-`examples/agents/kitchen_sink.star`):
+`examples/legacy-starlark/agents/kitchen_sink.star`):
 
 - Comprehensions (list, dict, multi-clause) — lines 185-191.
 - Lambdas — lines 279-280.
@@ -700,12 +707,11 @@ nice-to-have. Let usage data drive the fork decision.
   `src/eval/runtime/before_stmt.rs` (the `BeforeStmtFunc` types),
   `starlark_syntax-0.13.0/src/syntax/ast.rs` and `.../module.rs`
   (the AST API we walk for the source map).
-- `src/runtime/engine.rs:241-268` — the two `Evaluator` creation
-  sites where the hook gets installed.
-- `src/runtime/host_functions.rs` — the 37 host functions whose
-  existing `CallRecord` emission we wrap into `call_enter` /
-  `call_exit` events.
+- `src/runtime/engine.rs` and `src/runtime/host_functions.rs` references in
+  this document describe the removed Starlark implementation. The current
+  TypeScript runtime routes host behavior through `src/runtime/host_core.rs`
+  and TypeScript bindings under `src/runtime/typescript/`.
 - `src/runtime/otel.rs` — pattern for env-flag-gated optional
   instrumentation; the trace module mirrors its shape.
-- `examples/agents/kitchen_sink.star` — the coverage fixture
+- `examples/legacy-starlark/agents/kitchen_sink.star` — the coverage fixture
   (§5).

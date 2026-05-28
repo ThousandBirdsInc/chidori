@@ -1,6 +1,6 @@
 # shell() demo — run whitelisted OS commands from inside an agent.
 # Set CHIDORI_SHELL_ALLOW before running, e.g.
-#   CHIDORI_SHELL_ALLOW=echo,ls ./target/debug/chidori run examples/agents/shell_demo.star
+#   CHIDORI_SHELL_ALLOW=echo,ls ./target/debug/chidori run examples/legacy-starlark/agents/shell_demo.star
 
 def agent(greeting):
     hello = shell("echo", args = [greeting])

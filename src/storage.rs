@@ -25,6 +25,7 @@ pub enum SessionStatus {
     Running,
     Completed,
     Failed,
+    Cancelled,
     Paused,
     /// Paused waiting for the operator to approve/deny a policy-gated call.
     AwaitingApproval,
@@ -33,6 +34,8 @@ pub enum SessionStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredSession {
     pub id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
     pub status: SessionStatus,
     pub input: Value,
     pub output: Option<Value>,
@@ -168,8 +171,8 @@ impl SessionStore for SqliteStore {
 
     fn list(&self) -> Result<Vec<StoredSession>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT data FROM sessions ORDER BY created_at DESC LIMIT 200")?;
+        let mut stmt =
+            conn.prepare("SELECT data FROM sessions ORDER BY created_at DESC LIMIT 200")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
@@ -200,9 +203,38 @@ pub fn build_session_store() -> std::sync::Arc<dyn SessionStore> {
                 return std::sync::Arc::new(store);
             }
             Err(e) => {
-                tracing::warn!("sqlite session store failed ({}), falling back to memory", e);
+                tracing::warn!(
+                    "sqlite session store failed ({}), falling back to memory",
+                    e
+                );
             }
         }
     }
     std::sync::Arc::new(MemoryStore::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_session_deserializes_without_run_id() {
+        let raw = serde_json::json!({
+            "id": "session-1",
+            "status": "completed",
+            "input": null,
+            "output": {"ok": true},
+            "call_log": [],
+            "error": null,
+            "pending_seq": null,
+            "pending_prompt": null,
+            "pending_approval": null,
+            "approvals": [],
+            "created_at": "2026-05-17T00:00:00Z"
+        });
+
+        let session: StoredSession = serde_json::from_value(raw).unwrap();
+        assert_eq!(session.status, SessionStatus::Completed);
+        assert_eq!(session.run_id, None);
+    }
 }

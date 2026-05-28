@@ -173,7 +173,10 @@ impl LlmProvider for AnthropicProvider {
                 continue;
             }
 
-            let resp_text = resp.text().await.context("Failed to read Anthropic response")?;
+            let resp_text = resp
+                .text()
+                .await
+                .context("Failed to read Anthropic response")?;
             if !status.is_success() {
                 if let Ok(err) = serde_json::from_str::<AnthropicError>(&resp_text) {
                     bail!("Anthropic API error ({}): {}", status, err.error.message);
@@ -222,11 +225,7 @@ impl LlmProvider for AnthropicProvider {
     /// `on_delta`. Tool-use blocks and usage totals are accumulated the
     /// same way as the non-streaming path so the returned LlmResponse is
     /// identical in shape.
-    async fn stream(
-        &self,
-        request: &LlmRequest,
-        on_delta: &mut TokenSink,
-    ) -> Result<LlmResponse> {
+    async fn stream(&self, request: &LlmRequest, on_delta: &mut TokenSink) -> Result<LlmResponse> {
         use futures::StreamExt;
 
         if let Some(ref rl) = self.rate_limiter {
@@ -359,10 +358,7 @@ impl LlmProvider for AnthropicProvider {
                         }
                     }
                     "content_block_start" => {
-                        let idx = event
-                            .get("index")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as usize;
+                        let idx = event.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                         let block = event.get("content_block");
                         match block.and_then(|b| b.get("type")).and_then(|v| v.as_str()) {
                             Some("text") => {
@@ -389,9 +385,7 @@ impl LlmProvider for AnthropicProvider {
                         if let Some(delta) = event.get("delta") {
                             match delta.get("type").and_then(|v| v.as_str()) {
                                 Some("text_delta") => {
-                                    if let Some(text) =
-                                        delta.get("text").and_then(|v| v.as_str())
-                                    {
+                                    if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
                                         pending_text.push_str(text);
                                         text_buf.push_str(text);
                                         on_delta(text);
@@ -429,8 +423,10 @@ impl LlmProvider for AnthropicProvider {
                         }
                     }
                     "message_delta" => {
-                        if let Some(reason) =
-                            event.get("delta").and_then(|d| d.get("stop_reason")).and_then(|v| v.as_str())
+                        if let Some(reason) = event
+                            .get("delta")
+                            .and_then(|d| d.get("stop_reason"))
+                            .and_then(|v| v.as_str())
                         {
                             stop_reason = reason.to_string();
                         }

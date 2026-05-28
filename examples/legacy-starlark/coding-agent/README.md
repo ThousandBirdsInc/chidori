@@ -21,17 +21,17 @@ A goose-style coding agent built on chidori. It can read, edit, search, analyze,
 # Allow the shell commands the agent needs
 export CHIDORI_SHELL_ALLOW=rg,find,git,cargo,npm,python,pytest,make,ls,cat,echo,head,tail,wc,date,test,mkdir,sleep,ctags
 
-# Run the coding agent on a task (tools/ is auto-discovered next to agent.star)
-./target/release/chidori run examples/coding-agent/agent.star \
+# Run the archived Starlark coding agent on a task.
+./target/release/chidori run examples/legacy-starlark/coding-agent/agent.star \
   --input task="Add error handling to the parse_config function in src/config.rs" \
   --input working_dir="/path/to/your/project"
 
 # Use current directory as working_dir (the default)
-./target/release/chidori run examples/coding-agent/agent.star \
+./target/release/chidori run examples/legacy-starlark/coding-agent/agent.star \
   --input task="Fix the failing test in tests/integration.rs"
 
 # Stream output for real-time feedback
-./target/release/chidori run examples/coding-agent/agent.star \
+./target/release/chidori run examples/legacy-starlark/coding-agent/agent.star \
   --input task="Refactor the database module" \
   --stream
 ```

@@ -1,319 +1,322 @@
-# TODO — App Agent Framework
+# TODO - Chidori TypeScript Runtime
 
-## Status at a glance
+This roadmap tracks the TypeScript-runtime migration. Historical Starlark work
+is preserved in git history and under `examples/legacy-starlark/`, but new
+runtime, CLI, server, and tool work should target `.ts` agents and tools.
 
-| Phase | Area | Status |
-|---|---|---|
-| **1** | Rust core runtime, Starlark eval, host functions, CLI, templates, providers, tools | ✅ Working |
-| **2a** | Session API, replay-based checkpointing, Python SDK, event-driven `serve` | ✅ Working |
-| **2b** | WASM sandbox (`exec()`), `parallel()`, sub-agents, human-in-the-loop, retry/try_call | 🚧 Not started |
-| **3** | Visual editor (Starlark AST ↔ node graph) | 🚧 Not started |
-| **4** | Memory backends, observability/cost, ecosystem packages | 🚧 Partial |
+## Status At A Glance
 
-See [README.md](./README.md) for what works today, [DESIGN.md](./DESIGN.md) for design rationale.
+| Area | Status |
+| --- | --- |
+| TypeScript agent dispatch | Done |
+| TypeScript host API bindings | Done |
+| Language-neutral host core | Done |
+| Call-log replay | Done |
+| Human input and policy approval pause/resume | Done through live VM resume with replay fallback |
+| TypeScript tool discovery | Done |
+| TypeScript and Python SDK parity | Done |
+| Snapshot manifests, policy/source validation, host promise records | Done |
+| In-repo QuickJS fork and Rust wrapper | Done for current runtime surface |
+| Full live VM continuation snapshot/restore | Done for current TypeScript runtime surface |
+| Server resume from `LiveQuickJsVm` blobs | Done for current production TypeScript host paths |
 
----
+See [DESIGN.md](./DESIGN.md) for the top-level design and
+[docs/typescript-vm-snapshot-runtime.md](./docs/typescript-vm-snapshot-runtime.md)
+for the durable VM snapshot design. The concrete migration evidence and
+completion audit lives in
+[docs/typescript-migration-audit.md](./docs/typescript-migration-audit.md).
 
-## Phase 1: Rust Core Runtime — ✅ DONE
+## Completed Migration Work
 
-### Project Setup
-- [x] Initialize Rust project with `cargo init`
-- [x] Single-crate structure with modules: `runtime`, `providers`, `tools`, `server`
-- [x] Core dependencies: `starlark`, `tokio`, `clap`, `serde`, `reqwest`, `minijinja`, `tracing`, `axum`
-- [ ] Set up CI (build + clippy + tests)
-- [ ] Clean up dead-code warnings (unused methods flagged by compiler)
+### TypeScript Runtime
 
-### Starlark Evaluator
-- [x] Integrate `starlark-rust` 0.13
-- [x] `.star` file loading and parsing
-- [x] `agent()` function discovery and invocation with keyword args
-- [x] `config()` built-in for module-scope agent configuration
-- [x] Wire up `--input` CLI args as `agent()` function parameters
-- [x] Error reporting: Starlark traceback with line numbers propagates through to CLI/HTTP
+- [x] Require `.ts` agent files in runtime dispatch.
+- [x] Reject unsupported non-TypeScript agent files with clear errors.
+- [x] Transpile TypeScript at runtime without requiring `tsc`.
+- [x] Install deterministic `Date` and `Math.random` behavior.
+- [x] Enforce durable-run policy for host date/random settings.
+- [x] Reject dynamic imports and unsupported local import policies.
+- [x] Support relative TypeScript imports under runtime policy.
+- [x] Convert JS values to JSON-compatible host values.
+- [x] Fail clearly for functions, unsupported native values, class instances,
+  shared memory, WeakRef, and finalizers at the host boundary.
+- [x] Run TypeScript agents from CLI and server paths.
 
-### Host Functions — `#[starlark_module]`
-- [x] `prompt()` — send text to LLM, return string or parsed JSON
-  - [x] `model`, `temperature`, `max_tokens`, `system`, `format` kwargs
-  - [x] `format="json"` parses response as dict/list (strips markdown fences)
-  - [x] `tools` kwarg for LLM function-calling (tool-use loop)
-  - [x] `max_turns` kwarg for autonomous tool-use iteration limit
-- [x] `template()` — render Jinja2 inline string or `.jinja` file
-- [x] `config()` — agent-level defaults
-- [x] `env()` — read environment variables
-- [x] `log()` — structured logging
-- [x] `tool()` — invoke a registered tool by name
-- [x] `http()` — make HTTP requests with headers/body/params
-- [x] `memory()` — persistent key-value (JSON file backend). Vector storage still TODO.
-- [x] `exec()` — run WebAssembly in a bounded wasmer sandbox (Phase 2b)
-- [x] `call_agent()` — call sub-agents (renamed from `agent()` to avoid shadowing user's own `def agent(...)`)
-- [ ] `parallel()` — concurrent execution (Phase 2b)
-- [x] `input()` — human-in-the-loop (Phase 2b)
-- [x] `retry()` — retry with backoff (Phase 2b)
-- [x] `try_call()` — capture errors (Phase 2b)
+### Host API
 
-### Template Engine
-- [x] `template()` host function — inline Jinja2 rendering via minijinja
-- [x] Template file loading resolves paths relative to project base directory
-- [x] Template includes and inheritance (`{% extends %}`, `{% include %}`)
-- [x] Built-in filters work out of the box (`tojson`, `upper`, `join`, etc.)
-- [x] Trim/lstrip blocks enabled for cleaner output
-- [ ] Prompt directory auto-discovery from `prompts/` (currently requires explicit path)
+- [x] `chidori.prompt()`
+- [x] `chidori.input()`
+- [x] `chidori.callAgent()`
+- [x] `chidori.tool()`
+- [x] `chidori.parallel()`
+- [x] `chidori.retry()`
+- [x] `chidori.tryCall()`
+- [x] `chidori.http()`
+- [x] `chidori.template()`
+- [x] `chidori.log()`
+- [x] `chidori.memory()`
+- [x] `chidori.checkpoint()`
+- [x] `chidori.execJs()`
+- [x] `chidori.execPython()`
+- [x] `chidori.execWasm()`
+- [x] Replay cached host-call results without repeating side effects.
+- [x] Record host promise lifecycle metadata for durable host operations.
+- [x] Persist safepoints before live side effects and after results.
 
-### LLM Provider Clients
-- [x] Anthropic Messages API client (`reqwest`)
-- [x] OpenAI Chat Completions API client
-- [x] LiteLLM / OpenAI-compatible catch-all provider via `LITELLM_API_URL` + `LITELLM_API_KEY`
-- [x] Model routing: resolve model name → provider (Anthropic for `claude*`, OpenAI for `gpt*`/`o1`/`o3`, LiteLLM as catch-all)
-- [x] API key resolution from environment variables
-- [ ] Streaming support (SSE parsing) for both providers — token-level streaming from provider back through Starlark. Blocked on async-from-sync plumbing; per-call streaming via `/sessions/stream` is shipped as a middle ground.
-- [x] Tool use / function calling request/response handling (Anthropic + OpenAI)
-- [ ] Provider configuration loading from `config/providers.star` (only env vars today)
+### Tools And Examples
 
-### Tool System
-- [x] Tool registry: load `.star` files from `tools/` directory
-- [x] Parse tool function signatures and docstrings → JSON schema
-- [x] `chidori tools --dir <path>` lists discovered tools with params
-- [x] Make tools available to `tool()` host function (tools can transitively call host fns)
-- [x] Make tools available to `prompt()` via `tools` kwarg (LLM function-calling)
-- [ ] Inline tool definition support (tools defined within agent `.star` files)
+- [x] Discover `.ts` tools and evaluate exported `tool` metadata.
+- [x] Validate TypeScript tool JSON schema metadata.
+- [x] Invoke TypeScript tool `run(args, chidori)` exports.
+- [x] Ignore `.star` files during tool discovery.
+- [x] Convert first-party examples to TypeScript.
+- [x] Move legacy Starlark examples to `examples/legacy-starlark/`.
+- [x] Reject Starlark sub-agents from TypeScript agents.
 
-### CLI
-- [x] `chidori run <file.star>` — run an agent with `--input` args
-- [x] `chidori check <file.star>` — parse and validate without executing
-- [x] `chidori tools` — list discovered tools with signatures
-- [x] `chidori serve <file.star>` — run as HTTP server (see Phase 2a)
-- [x] `--trace` flag outputs call log as JSON
-- [x] `--verbose` flag enables structured tracing to stderr
-- [x] `--input key=value`, `--input key=@file.txt`, `--input '{"json": "object"}'` all work
-- [x] `chidori resume <file> <run-id>` — resume from a disk checkpoint
-- [x] `chidori trace <run-id>` — pretty-print a saved trace
-- [x] `chidori stats` — aggregate tokens + cost across runs
-- [x] Exit codes: 0 success, 1 agent/runtime error, 2 parse/config error (check-only)
+### CLI, Server, And SDKs
 
-### Tracing & Call Log
-- [x] Every host function call logged with name, args, result, duration, token usage, timestamp
-- [x] Call log serialized as structured JSON
-- [x] Token usage summary at end of run (`--trace`)
-- [x] Tests passing: `cargo test` (5 unit tests on template + JSON extraction)
+- [x] `chidori check <file.ts>`
+- [x] `chidori run <file.ts>`
+- [x] `chidori serve <file.ts>`
+- [x] `chidori trace <run_id>`
+- [x] `chidori stats`
+- [x] Snapshot metadata command/endpoint without exposing raw VM bytes.
+- [x] Session create/list/get/checkpoint/replay/resume APIs.
+- [x] Server-sent streaming for host calls and labelled prompt progress.
+- [x] Python SDK run/replay/resume/checkpoint/stream support.
+- [x] TypeScript SDK run/replay/resume/checkpoint/stream support.
+- [x] SDK snapshot manifest metadata types.
 
----
+### Snapshot Data Model
 
-## Phase 2a: Sessions, Replay, Python SDK — ✅ DONE
+- [x] Snapshot manifest types.
+- [x] Snapshot store read/write helpers.
+- [x] ABI, source, module graph, and policy validation.
+- [x] Snapshot blob kind gating.
+- [x] Pending host operation persistence.
+- [x] Host promise records for pending/resolved/rejected operations.
+- [x] Branch snapshot metadata and merge helpers.
+- [x] Live VM store helpers that reject invalid snapshot envelopes.
 
-### HTTP Server (`serve`)
-- [x] `chidori serve <file.star> --port 8080`
-- [x] Built on `axum`
-- [x] Each request runs agent on a blocking thread with its own tokio runtime (avoids nested-runtime panic)
-- [x] Health endpoint: `GET /health`
-- [x] Fallback handler: any request → `agent(event)` as a structured event dict
-- [x] Event dict shape: `method`, `path`, `headers`, `query`, `body` (body auto-parsed as JSON)
-- [x] Agent response mapping: `{status, headers, body}` dict → HTTP response, or any value → 200 JSON
+### QuickJS Fork Bootstrap
 
-### Session API
-- [x] `POST /sessions` — create a session, run the agent, return result + call log
-- [x] `GET /sessions` — list all sessions
-- [x] `GET /sessions/{id}` — get session result
-- [x] `GET /sessions/{id}/checkpoint` — get the full call log
-- [x] `POST /sessions/{id}/replay` — replay from a session's own checkpoint
-- [x] `POST /sessions` with `replay_from` field — replay from an arbitrary call log
-- [x] UUID-based session IDs
-- [x] In-memory session storage
+- [x] Add `crates/chidori-quickjs-sys`.
+- [x] Add `crates/chidori-quickjs`.
+- [x] Vendor QuickJS source under `crates/chidori-quickjs-sys/quickjs`.
+- [x] Use local path dependency from the main runtime.
+- [x] Add runtime memory limits and interrupt budget.
+- [x] Expose raw snapshot/restore FFI symbols.
+- [x] Expose host promise FFI symbols.
+- [x] Expose run-jobs-until-blocked FFI symbol.
+- [x] Add Rust snapshot reader/writer callback ABI.
+- [x] Add unsupported-value callback ABI.
+- [x] Validate runtime snapshot byte envelopes before persisting or loading.
+- [x] Exercise value/bytecode snapshot coverage in wrapper tests.
+- [x] Exercise snapshot-side generic `chidori.<method>()` host-promise
+  pause/restore coverage in wrapper-backed TypeScript tests, including
+  `input()` and `prompt()`.
+- [x] Include active host operation id and host-call records in default
+  TypeScript snapshot roots.
+- [x] Clear the snapshot-side active host operation id after restored host
+  promise resolution or rejection.
+- [x] Preserve queued snapshot-side host method promises so a restored agent can
+  pause again on a later host call with a distinct operation id.
+- [x] Return `BlockedOnHostOperation` from snapshot wrapper job draining when
+  resumed execution reaches another host pause.
+- [x] Add snapshot wrapper resolve/reject-and-run helpers that return the next
+  run state for future server restore wiring.
+- [x] Add TypeScript snapshot restore-from-snapshot plus resolve/reject helpers
+  that return the restored context plus next run state.
+- [x] Add a snapshot-side adapter from persisted pending host operations to
+  `chidori` host-promise method queues for unambiguous host APIs.
+- [x] Add a snapshot-side adapter from persisted host-promise records that
+  installs only pending operations for restore.
 
-### Replay-Based Checkpointing
-- [x] `RuntimeContext::with_replay(call_log)` — pre-load call log for replay mode
-- [x] `Engine::run_with_replay()` — replay entry point
-- [x] `prompt()` checks `ctx.try_replay(seq)` before making live calls
-- [x] Cached results returned instantly (milliseconds instead of seconds)
-- [x] Output parity: replayed sessions produce byte-identical output to originals
-- [x] Verified end-to-end: 3 live sessions, saved checkpoints, replayed all 3 with matching output
-- [x] Persist call log to disk after each host function call (`.chidori/runs/<id>/checkpoint.json`)
-- [x] Divergence detection: replay errors cleanly when the host-function sequence at a given seq doesn't match the checkpoint (e.g. agent code changed). `log()` also participates so logging edits don't silently skew the stream.
-- [ ] Checkpoint storage directory (default `.chidori/runs/`)
-- [ ] Partial replay: fast-forward to N, execute from N+1 onward (works but not exposed as first-class API)
+## Remaining Work
 
-### Python SDK
-- [x] `sdk/python/chidori/` — pure stdlib, no dependencies
-- [x] `AgentClient` — HTTP client for the server
-- [x] `Session` — dataclass with status, output, error, call log
-- [x] `Checkpoint` — save/load to JSON files
-- [x] `client.run(input)` — create and run a session
-- [x] `client.replay(checkpoint)` — replay from a checkpoint
-- [x] `client.list_sessions()`, `client.get_session(id)`
-- [x] `session.checkpoint().save(path)` / `Checkpoint.load(path)`
-- [x] Working demo: [`examples/sdk_demo.py`](./examples/sdk_demo.py)
-- [x] SDK packaging (pyproject.toml for `pip install -e ./sdk/python`)
-- [x] TypeScript SDK (mirror the Python one) — `sdk/typescript/`, zero runtime deps, uses global `fetch`. Ships `AgentClient` with `run`, `replay`, `resume`, `getSession`, `listSessions`, `getCheckpoint`, and a streaming `stream(input)` async generator that parses SSE from `POST /sessions/stream`. `tsc --noEmit` clean; verified end-to-end against a live server.
-- [x] **SDK streaming** — both TS and Python SDKs now expose `client.stream(input)` over `POST /sessions/stream`. TS SDK uses a `TextDecoder` + `ReadableStream` reader + async generator; Python SDK is a plain generator using `urllib`'s line iterator with a small stdlib-only SSE frame parser (no sseclient dep). Python SDK is now at full API parity with TS: `health`, `run`, `replay`, `resume`, `get_session`, `list_sessions`, `get_checkpoint`, `stream`, plus `Session.checkpoint`/`replay`/`ok` and the `pending_seq`/`pending_prompt` pause fields. Verified by `test_stream_emits_call_then_done` in the integration suite.
+### Runtime Backend Convergence
 
----
+- [x] Move the active TypeScript host-binding execution path off `rquickjs` or
+  teach it to capture equivalent live snapshots from the in-repo QuickJS fork.
+- [x] Install the full non-suspending `chidori` host object on the
+  snapshot-capable `crates/chidori-quickjs` context for the active
+  TypeScript execution path.
+- [x] Complete the remaining server direct live-resume bookkeeping for nested
+  suspending `callAgent()` rejection paths, including `return await
+  chidori.callAgent(...)` and grandchild `input()` rejection propagation through
+  parent `try/catch` handlers.
+- [x] Move recorder/no-context TypeScript agent evaluation from `rquickjs` to
+  `crates/chidori-quickjs`, including deterministic runtime policy prelude.
+- [x] Move TypeScript tool metadata evaluation from `rquickjs` to
+  `crates/chidori-quickjs` so tool discovery exercises the in-repo runtime.
+- [x] Enforce Chidori JSON host-boundary validation in the
+  `crates/chidori-quickjs` wrapper for function and class-instance results.
+- [x] Expose the minimal QuickJS native callback/context-opaque FFI and
+  `SnapshotContext` wrapper API needed to start installing production
+  Rust-backed `chidori` methods in `crates/chidori-quickjs`.
+- [x] Add `SnapshotContext` native object-method installation and callback
+  argument/JSON return helpers, with Rust-backed `chidori.log`-style coverage.
+- [x] Wire native callback/context-opaque helpers through
+  `TypeScriptSnapshotContext`, with TypeScript agent coverage calling a
+  Rust-backed `chidori.log` method.
+- [x] Install `RuntimeContext`/`host_core`-backed native `chidori.log`,
+  `chidori.checkpoint`, `chidori.memory`, and `chidori.template` methods on
+  `TypeScriptSnapshotContext` as the first real snapshot-runtime host method
+  slices.
+- [x] Install `RuntimeContext`/`host_core`-backed native `chidori.execJs`,
+  `chidori.execPython`, and `chidori.execWasm` methods on
+  `TypeScriptSnapshotContext`.
+- [x] Install `RuntimeContext`/`host_core`-backed native `chidori.http` policy
+  denial and `chidori.input` pause paths on `TypeScriptSnapshotContext`.
+- [x] Install `RuntimeContext`/provider-backed native plain-text
+  `chidori.prompt` on `TypeScriptSnapshotContext`.
+- [x] Run provider-requested `chidori.prompt` tool loops through the native
+  snapshot host path for non-suspending registered TypeScript tools.
+- [x] Install `RuntimeContext`/registry-backed native `chidori.tool` and
+  `chidori.callAgent` paths on `TypeScriptSnapshotContext` for non-suspending
+  TypeScript tools and child agents.
+- [x] Install snapshot-runtime JavaScript helpers for `chidori.tryCall`,
+  `chidori.retry`, and `chidori.parallel`.
+- [x] Persist concrete sandbox host function names in pending host operation
+  metadata so `execJs`, `execPython`, and `execWasm` can be restored without
+  ambiguity.
+- [x] Persist restorable `LiveQuickJsVm` blobs from ordinary TypeScript
+  persisted safepoints by rebuilding the continuation from persisted host
+  promise records, without test-only injected snapshotters.
 
-## Phase 2b: WASM Sandbox & Advanced Composition — 🚧 NOT STARTED
+### Full QuickJS Runtime Snapshot Serialization
 
-### WASM Sandbox (`exec()`)
-- [x] Add `wasmer` crate dependency (+ `wasmer-middlewares` for metering)
-- [x] `exec()` host function: accept WAT/WASM source, function name, args, fuel, memory_pages
-- [x] Fuel-based timeout enforcement (Cranelift + metering middleware; every operator costs 1)
-- [x] Bounded linear memory via custom `CappedTunables` (caps any declared memory at `memory_pages` * 64 KiB)
-- [x] Numeric (i32/i64/f32/f64) args and returns, serialized through JSON for the call log + replay
-- [x] Replay support: `exec()` participates in the replay cache and divergence detection
-- [x] **Language layer v2 (infix miniscript):** `sandbox-runtime/` grew from a 3.3 KB postfix calculator into a 20 KB recursive-descent interpreter with `let/in`, `if/then/else`, integers + booleans, `+ - * / %`, comparisons, `&& || !`, line comments. `exec_expr(source, vars={}, fuel=…)` passes host-supplied vars by prepending `let name = value in …` chains. Runs under wasmer with Cranelift+metering fuel limits (32 linear-memory pages to fit the Rust-compiled guest's stack + 256 KiB bump heap).
-- [x] **Host-function bridge:** sandboxed modules can import `host.log(ptr, len)` and the host reads guest linear memory, decodes UTF-8, and forwards to `tracing::info!` / user callback. Exercised by both a unit test and the agent-level `wasm_demo.star`.
-- [x] WASM module caching: `(source_hash, memory_pages) → (Engine, Module)` in a global `Mutex<HashMap>`. Fuel is reset per-call via `set_remaining_points`, so the cached artifact works across calls with different budgets.
-- [x] **Python language layer via RustPython.** New `sandbox-python/` subcrate compiles `rustpython-vm` (compiler feature, no wasmbind/stdio) to `wasm32-wasip1`, producing a 7.6 MB WASI binary embedded via `include_bytes!`. Host exposes `exec_python(source, fuel=…)` that runs real Python 3: defs, recursion, comprehensions, exceptions, string ops. The program assigns its answer to a top-level `result` variable and the sandbox returns `repr(result)`.
-- [x] **JavaScript language layer via Boa.** New `sandbox-js/` subcrate compiles `boa_engine` (default features off — no float16/xsum/intl/temporal/wasm-bindgen) to `wasm32-wasip1`, producing a 3.4 MB WASI binary. Host exposes `exec_js(source, fuel=…)` that runs real JS: arrow functions, recursion, array methods (`map`/`reduce`/`Array.from`), template literals, `throw`. Final-expression semantics — returns `String(value)` of the last expression. **Cold 6.2s → warm 0.22s** with the on-disk Module cache. Reuses the same WASI preview 1 shim as Python; Boa only imports 9 of the 18 WASI functions (no fd/path operations), so the shim is already a superset.
-- [x] **Shared `run_wasi_guest` helper** factors out the boilerplate (artifact load, store, env, 18 imports, memory wiring, fuel, `_start`, proc_exit/fuel/trap demux, `ERR:` prefix handling) so `exec_python` and `exec_js` are each a one-liner delegating to the helper with their own (binary, memory_pages, label) triple.
-- [x] **WASI preview 1 shim (hand-rolled).** Rather than pulling in `wasmer-wasix` (which drags reqwest, tokio networking, virtual-fs, webc, and ~100 more crates), `src/runtime/sandbox.rs` implements 18 WASI preview-1 functions directly on top of the existing wasmer `Function::new_typed_with_env` machinery: `args_*`, `environ_*`, `clock_time_get` (fixed for determinism), `fd_close`, `fd_fdstat_get`, `fd_read` (stdin preloaded with source), `fd_write` (fd 1 → stdout capture buffer, fd 2 → stderr), `fd_filestat_get`/`fd_prestat_*`/`path_*` (return errors — zero preopens), `poll_oneoff` (NOTSUP), `proc_exit` (raises a `ProcExit` user error the orchestrator distinguishes from real traps), `random_get` (xorshift64 with fixed seed for determinism), `sched_yield` (success noop).
-- [x] **On-disk compiled-artifact cache.** `load_or_compile` now walks in-memory cache → disk cache (`.chidori/wasm-cache/v01-<key>.cwasm`) → fresh compile, and persists newly-compiled Modules via `Module::serialize` (~55 MB for RustPython). Disk load uses the `unsafe Module::deserialize` path, which we justify with: files live under our own private cache dir, filenames include a `DISK_CACHE_VERSION` tag that bumps on compiler/tunables/wasmer changes, and a corrupt file falls through to a fresh compile. **Measured end-to-end on `python_sandbox_demo.star`: 18.7s cold (Cranelift + disk serialize), 0.5s warm (deserialize) — ~37× speedup.**
-- [ ] **Follow-up: fuel budget for Python.** Python tests run at 200 M instructions; a tighter language-specific default + a per-op multiplier (parsing dominates) is a nice-to-have.
+The in-repo fork already exercises value/object graph, bytecode, host promise,
+async continuation, and microtask queue snapshots through
+`chidori_quickjs::SnapshotContext`. The context ABI now exposes selected
+Chidori TypeScript roots and the microtask queue through
+`CHIDORI_JS_SnapshotContext` / `CHIDORI_JS_RestoreContext`. Ordinary Chidori
+TypeScript runs use a bundled selected-root module scaffold, so full QuickJS
+`JSModule` record serialization is deferred until the runtime supports a
+broader JavaScript module surface.
 
-### Parallel Execution
-- [x] `parallel()` host function accepting a list of lambdas.
-- [x] **True concurrency.** Each branch runs in its own `Module` + `Evaluator` on a dedicated thread. The worker replays the same entrypoint up to the matching `parallel()` call, evaluates only the selected lambda in that evaluator so lexical captures still work, serializes the branch result through JSON, and merges branch call records back into the parent context with deterministic sequence numbers.
-- [ ] Optimize replay overhead for very cheap pure-Starlark branches.
-- [ ] Each parallel branch gets its own call log sequence range
-- [x] Merge parallel branch logs into the main log on completion
-- [x] Error handling: propagate first error
-- [x] Replay support: resume runs evaluate `parallel()` branches sequentially against the checkpoint so host-call sequence numbers remain deterministic.
+- [x] Implement `CHIDORI_JS_SnapshotRuntime` as a versioned runtime envelope.
+- [x] Implement `CHIDORI_JS_RestoreRuntime` by restoring a fresh QuickJS
+  runtime for the context payload.
+- [x] Implement `CHIDORI_JS_SnapshotContext` for selected Chidori TypeScript
+  roots and the microtask/job queue.
+- [x] Implement `CHIDORI_JS_RestoreContext` for selected Chidori TypeScript
+  roots and the microtask/job queue.
+- [x] Compose runtime and context payload restore for a suspended Chidori host
+  call completed by host promise id.
+- [x] Preserve selected-root bundled TypeScript module namespace exports through
+  snapshot restore, including exported functions that close over exported
+  constants.
+- [x] Fail selected-root context snapshot creation with path/type detail for
+  unsupported native values.
+- [x] Add fork-level context snapshot tests for suspended async functions and
+  host promise resolution after restore.
+- [x] Add fork-level `CHIDORI_JS_SnapshotContext` /
+  `CHIDORI_JS_RestoreContext` entrypoint coverage for a suspended Chidori host
+  call restored and completed by host promise id.
+- [x] Add fork-level runtime-plus-context entrypoint tests for suspended async
+  functions and host promise resolution after restore.
+- [x] Add ordinary engine persistence coverage that restores a
+  `LiveQuickJsVm` input pause and resolves the suspended host promise.
 
-### Agent Composition
-- [x] `call_agent()` host function: resolve path → `.star` file and invoke
-- [x] Execute sub-agent with its own evaluation context
-- [x] Sub-agent calls flow into the parent's call log (flat, not nested — simpler for replay)
-- [x] Sub-agents inherit parent's provider config (shared HostState)
-- [ ] Expose sub-agents as tools for LLM function-calling
+### Server Resume From Live VM Snapshots
 
-### Human-in-the-Loop
-- [x] `input()` host function
-- [x] Interactive mode (CLI `run` command): reads one line from stdin
-- [x] Server mode: `input()` suspends, session goes to `paused` with pending prompt
-- [x] `POST /sessions/{id}/resume` endpoint with user response → injects response into call log and replays
-- [ ] Timeout handling: fail or use default after N seconds
+- [x] Remove the server resume validation guard that rejected
+  `LiveQuickJsVm` manifests up front.
+- [x] On `input()` resume, load `runtime.snapshot`, restore the QuickJS
+  runtime/context, resolve the saved host promise id, and use the live result
+  when it completes.
+- [x] Persist a newly reached direct live-VM `input()` pause, including the
+  next pending host operation, host-promise table entry, and updated live
+  snapshot.
+- [x] Execute and record an awaited direct live-VM `log()` host operation
+  without falling back to replay.
+- [x] Execute and record an awaited direct live-VM `template()` host operation
+  without falling back to replay.
+- [x] Execute and record awaited direct live-VM `memory()` host operations
+  without falling back to replay.
+- [x] Execute and record awaited direct live-VM `checkpoint()` host operations
+  without falling back to replay.
+- [x] Execute and record awaited direct live-VM sandbox host operations
+  (`execJs`, `execPython`, `execWasm`) without falling back to replay.
+- [x] Reject failed direct live-VM host promises for handled operations and
+  continue the live VM when agent code catches the error.
+- [x] Reject direct live-VM `http()` calls denied by policy without falling
+  back to replay.
+- [x] Execute and record always-allowed direct live-VM `http()` calls without
+  falling back to replay.
+- [x] Persist direct live-VM `http()` policy approval pauses without falling
+  back to replay.
+- [x] Continue approved policy-gated direct live-VM `http()` calls without
+  falling back to replay.
+- [x] Execute and record direct live-VM TypeScript `tool()` calls without
+  falling back to replay for non-suspending tools.
+- [x] Execute and record direct live-VM TypeScript `callAgent()` calls without
+  falling back to replay for non-suspending child agents.
+- [x] Execute and record direct live-VM plain-text `prompt()` calls without
+  falling back to replay.
+- [x] Execute and record direct live-VM `prompt()` tool loops without falling
+  back to replay for non-suspending tools.
+- [x] Persist and resume direct live-VM `prompt()` tool loops when a
+  TypeScript tool suspends on nested `input()`.
+- [x] Persist and resume top-level direct live-VM TypeScript `tool()` calls
+  that suspend on nested `input()`.
+- [x] Persist and resume top-level direct live-VM TypeScript `callAgent()`
+  calls when the child agent suspends on nested `input()`.
+- [x] Persist and resume nested direct live-VM TypeScript `callAgent()` calls
+  when a grandchild agent suspends on nested `input()`.
+- [x] Preserve top-level suspending `tool()`/`callAgent()` rejection paths
+  after nested `input()` resumes, including parent `try/catch` handlers.
+- [x] Keep replay recovery covered as a fallback for nested suspending
+  `callAgent()` rejection paths.
+- [x] Persist final output for direct live-VM completion.
+- [x] Extend server direct live-VM resume bookkeeping to the nested
+  `callAgent()` rejection path after a grandchild `input()` resumes.
+- [x] Keep replay as an explicit recovery path when direct live-VM resume
+  cannot drive a newly reached production host call.
 
-### Error Handling
-- [x] `retry()` host function with `max_attempts` + `backoff` strategies (`constant`, `linear`, `exponential`)
-- [x] `try_call()` host function — execute lambda, return `{value, error}` struct
-- [ ] Global `on_error` config: `stop` (default), `skip`, `retry`
+### Tool Metadata Hardening
 
----
+- [x] Replace static text metadata extraction with restricted VM-backed
+  TypeScript metadata evaluation.
+- [x] Capture tool source fingerprints in tool registry entries.
+- [x] Snapshot and directly resume TypeScript tool execution when a tool
+  suspends on nested `input()`, with replay retained as a fallback.
 
-## Phase 3: Visual Editor — ❌ DESCOPED
+### Quality Gates
 
-Not planned. Keep the roadmap below for reference only; don't schedule this
-work until the decision is revisited.
+- [x] Root Rust test suite passes with TypeScript runtime coverage.
+- [x] Add CI for `cargo fmt --check`.
+- [x] Add CI for `cargo test --workspace`.
+- [x] Add CI for `npm run typecheck` in `sdk/typescript`.
+- [x] Add CI for `npm run build` in `sdk/typescript`.
+- [x] Add CI for Python SDK tests.
+- [x] Add focused integration tests for CLI `.ts` examples.
+- [x] Add end-to-end pause/resume tests that exercise `LiveQuickJsVm` restore.
 
+## Useful Verification Commands
 
-### Editor Core
-- [ ] Web app scaffolding (React / TypeScript)
-- [ ] Integrate node graph library (React Flow / xyflow)
-- [ ] Canvas: pan, zoom, selection, undo/redo
-- [ ] Node palette with draggable node types
-- [ ] Properties panel for editing selected nodes
-- [ ] Wire drawing with type validation
+```bash
+cargo fmt --check
+cargo test
+cargo test --workspace
+cd sdk/typescript && npm run build
+cd sdk/typescript && npm run typecheck
+python -m unittest sdk/python/tests/test_session_api.py
+```
 
-### Starlark AST ↔ Node Graph
+## Deferred Or Descoped
 
-#### Code → Visual (Parser)
-- [ ] Parse `.star` file into AST (via `starlark-rust` exposed as a WASM module or server endpoint)
-- [ ] Walk AST: `agent()` params → Input nodes
-- [ ] Walk AST: host function calls → Action nodes
-- [ ] Walk AST: variable assignments → wires
-- [ ] Walk AST: `if`/`else` → Branch nodes
-- [ ] Walk AST: `for` loops → Loop nodes
-- [ ] Walk AST: `parallel()` → Parallel container nodes
-- [ ] Walk AST: `return` → Output node
-- [ ] Unrecognized expressions → Transform nodes (escape hatch)
-- [ ] Layout: topological sort, left-to-right
-
-#### Visual → Code (Generator)
-- [ ] AST builder: each node type → Starlark AST fragment
-- [ ] Wire resolution: infer variable names from port connections
-- [ ] Pretty-printer with canonical Starlark formatting
-- [ ] Comment preservation via node metadata
-- [ ] Transform nodes emit raw code as-is
-
-#### Round-trip Validation
-- [ ] Test: visual → code → visual equals original graph
-- [ ] Test: hand-written `.star` → visual → code is semantically equivalent
-- [ ] Test: complex expressions survive round-trip via Transform nodes
-
-### Node Types
-- [ ] Prompt, Template, Tool, Exec, Sub-agent, HTTP, Human Input, Memory
-- [ ] Branch, Loop, Parallel, Retry, Try
-- [ ] Input, Output, Transform, Constant
-
-### Code Panel
-- [ ] Read-only `.star` code view that live-updates as canvas changes
-- [ ] Starlark syntax highlighting
-- [ ] Click-to-select: line ↔ node bidirectional
-
-### File Operations
-- [ ] Open `.star` → parse to visual
-- [ ] Save canvas → generate `.star`
-- [ ] Watch file for external changes
-- [ ] New agent from blank canvas
-
-### Editor Server (`edit`)
-- [ ] `chidori edit <file.star> --port 3000`
-- [ ] Serve editor static assets from embedded binary
-- [ ] WebSocket sync between canvas and `.star` file
-- [ ] Live preview: mock execution reusing the replay mechanism with synthetic results
-
----
-
-## Phase 4: Production & Ecosystem — 🚧 PARTIAL
-
-### HTTP Server polish
-- [x] Basic serve command working
-- [x] Session API working
-- [x] SSE streaming: `POST /sessions/stream` emits `event: call` per host function and `event: done` with the final output. Note: streams *per-call*, not per-token (token-level streaming from providers would require async-through-Starlark plumbing — tracked as a follow-up).
-- [x] **Concurrent session limits + queueing.** `AppState` grew a `run_semaphore: Arc<Semaphore>` (size from `CHIDORI_MAX_CONCURRENT_SESSIONS`, default 8) plus an `acquire_timeout` (from `CHIDORI_ACQUIRE_TIMEOUT_MS`, default 30 000). `create_session` and `stream_session` `acquire_owned` before running and hold the permit for the entire blocking agent run. Saturated requests wait up to the timeout, then return **503** with `Retry-After: 1` and a JSON body `{error: "server busy…", acquire_timeout_ms: N}`. Verified against a slow sleep-agent: max=2 / timeout=200ms / 1s agent → 3rd and 4th concurrent requests hit 503 cleanly.
-- [x] **Auth middleware.** `axum::middleware::from_fn(auth_middleware)` gated on the `CHIDORI_API_KEY` env var. Default-off (local dev unchanged); when set, every route except `/health` requires `Authorization: Bearer $CHIDORI_API_KEY`. Mismatches return **401** with `WWW-Authenticate: Bearer` and a JSON error body.
-- [x] **CORS layer.** `build_cors_layer()` reads `CHIDORI_CORS_ORIGINS`: unset → no CORS headers (same-origin only), `*` → permissive with `Any` origin/methods/headers, comma-separated list → explicit allow-list. Sits in the router as a `tower_http::cors::CorsLayer`.
-- [x] Startup banner now prints the active concurrency cap, auth state, and CORS config so ops can verify settings without inspecting env vars.
-
-### Memory Backends
-- [x] `memory()` host function (get/set/delete/list/clear)
-- [x] JSON-file backend (one file per namespace under `.chidori/memory/`)
-- [x] Memory namespace isolation per agent (via `namespace=` kwarg)
-- [x] Goes through replay cache for deterministic replays
-- [ ] SQLite backend for better concurrency / larger datasets
-- [ ] Vector search backend (Qdrant or in-memory FAISS-like)
-- [ ] Embedding model integration (OpenAI text-embedding-3-small, Voyage)
-
-### Observability & Cost
-- [x] Per-run token usage tracking (input + output counts)
-- [x] Per-run duration tracking
-- [x] Cost estimation based on model pricing (`src/runtime/cost.rs`, surfaced in `--trace`)
-- [x] Rate limiting: configurable requests-per-minute per provider via `CHIDORI_{ANTHROPIC,OPENAI,LITELLM}_RPM` env vars (async token bucket)
-- [x] `chidori stats` — aggregate usage across runs (reads `.chidori/runs/*/checkpoint.json`)
-- [ ] Dashboard: web UI for viewing traces, run history, cost breakdown
-
-### Local Model Support
-- [x] OpenAI-compatible endpoint support via `LITELLM_API_URL` (works with LM Studio, vLLM, Ollama's OpenAI mode)
-- [ ] Dedicated Ollama provider client (native `/api/generate` endpoint)
-
-### Ecosystem Packages
-- [x] `web_search` tool — Tavily backend, pure Starlark tool using `http()`, `TAVILY_API_KEY` from env. Returns `{query, answer, results: [{title, url, snippet, score}]}`. Brave/SerpAPI backends still open.
-- [x] `fetch_url` tool — HTTP fetch + cheap HTML-to-text pass (script/style stripping, tag removal, whitespace collapse). Not a real readability parser; good enough to feed page content into an LLM prompt. Lives at `examples/tools/fetch_url.star`; use with `chidori run … --tools examples/tools`.
-- [x] `read_file`, `write_file`, `list_dir` as first-class host functions (not tools). Sandboxing (restrict to project base) is a follow-up.
-- [x] `shell()` **host function** — whitelisted by `CHIDORI_SHELL_ALLOW` env var (default-closed; `*` for "allow anything"). Uses tokio's `Command` with `kill_on_drop` + `tokio::time::timeout` for cancellation; basename-matched so `/usr/bin/ls` still resolves to `ls` in the allow list; empty env by default (no PATH / AWS_* leakage) — caller opts in via `env={...}`. Returns `{stdout, stderr, exit_code, timed_out}`. Participates in replay cache + divergence detection. Verified end-to-end (success, listing, whitelist block, timeout) plus 3 unit tests on the whitelist parser.
-- [ ] `database` tool (SQL query + read-only mode)
-- [ ] Agent registry: publish/share `.star` agents
-
-### Developer Tooling
-- [ ] VS Code extension: `.star` syntax highlighting (Starlark dialect variant)
-- [ ] VS Code extension: `.jinja` prompt template preview
-- [ ] VS Code extension: run agent + debug from editor
-- [ ] LSP server for Starlark completion (leveraging `starlark-rust`'s LSP features)
-- [ ] Pre-commit hook: `chidori check` on changed `.star` files
-
----
-
-## Known Issues
-
-- [ ] Dead-code warnings: `ToolDef.source`, `ToolDef.source_path`, `ToolRegistry.get`, `CallLog.records`, etc. flagged as unused — should either be wired up or removed
-- [ ] Anthropic provider's `content_type` field is unused — either use it to filter content blocks or remove
-- [ ] `ProviderRegistry` is re-created per request inside `spawn_blocking` because `reqwest::Client` is bound to its owning tokio runtime. Cheap but wasteful — consider a `reqwest::blocking::Client` alternative or pooling.
-- [x] `parse_tool_file` in `tools/mod.rs` now matches on `def <filename_stem>(...)` instead of grabbing the first `def`, so files with private helper defs (e.g. `_strip_tags`) work correctly. A full Starlark AST walk is still a later upgrade.
-- [x] **Session API integration tests** — `sdk/python/tests/test_session_api.py`, 13 tests covering run/checkpoint/replay/list, pause+resume via `input()`, auth middleware (401 missing / 401 wrong / 200 correct / health open), concurrency semaphore 503 saturation, and CORS preflight. Each class starts its own `chidori serve` subprocess with a fresh env (auth / concurrency / cors configs isolated). A stdlib-only `MockLlm` HTTP server sits in front of the runtime via `LITELLM_API_URL` so no real provider traffic happens; hit counts assert that replay does NOT re-call the LLM. Discovered and fixed a real gap while writing: Python SDK was missing `resume()` and `pending_prompt` on `Session` (TS SDK already had it).
-- [ ] `config()` silently ignores unknown keys — should warn or error.
+- Visual editor work is not planned for this migration.
+- Automatic `.star` to `.ts` conversion is not required for v1.
+- Node package compatibility inside agents is not required for v1.
+- Arbitrary mid-instruction snapshots for CPU-bound loops are not required for
+  v1.
+- Full QuickJS `JSModule` record serialization beyond Chidori's bundled
+  selected-root TypeScript module scaffold is future runtime generalization
+  work.
+- Promoting the runtime envelope beyond fresh-runtime plus selected context
+  roots is deferred until production host bindings require runtime-global heap
+  state outside those roots.
+- Unsupported-value path/type detail for future runtime roots outside the
+  selected context-root graph is deferred with those roots.

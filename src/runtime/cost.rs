@@ -14,23 +14,87 @@ struct Pricing {
 
 const PRICING: &[Pricing] = &[
     // Anthropic
-    Pricing { prefix: "claude-opus-4",   input_per_mtok: 15.00, output_per_mtok: 75.00 },
-    Pricing { prefix: "claude-sonnet-4", input_per_mtok:  3.00, output_per_mtok: 15.00 },
-    Pricing { prefix: "claude-haiku-4",  input_per_mtok:  0.80, output_per_mtok:  4.00 },
-    Pricing { prefix: "claude-3-5-sonnet", input_per_mtok: 3.00, output_per_mtok: 15.00 },
-    Pricing { prefix: "claude-3-5-haiku",  input_per_mtok: 0.80, output_per_mtok:  4.00 },
-    Pricing { prefix: "claude-3-opus",   input_per_mtok: 15.00, output_per_mtok: 75.00 },
-    Pricing { prefix: "claude",          input_per_mtok:  3.00, output_per_mtok: 15.00 },
+    Pricing {
+        prefix: "claude-opus-4",
+        input_per_mtok: 15.00,
+        output_per_mtok: 75.00,
+    },
+    Pricing {
+        prefix: "claude-sonnet-4",
+        input_per_mtok: 3.00,
+        output_per_mtok: 15.00,
+    },
+    Pricing {
+        prefix: "claude-haiku-4",
+        input_per_mtok: 0.80,
+        output_per_mtok: 4.00,
+    },
+    Pricing {
+        prefix: "claude-3-5-sonnet",
+        input_per_mtok: 3.00,
+        output_per_mtok: 15.00,
+    },
+    Pricing {
+        prefix: "claude-3-5-haiku",
+        input_per_mtok: 0.80,
+        output_per_mtok: 4.00,
+    },
+    Pricing {
+        prefix: "claude-3-opus",
+        input_per_mtok: 15.00,
+        output_per_mtok: 75.00,
+    },
+    Pricing {
+        prefix: "claude",
+        input_per_mtok: 3.00,
+        output_per_mtok: 15.00,
+    },
     // OpenAI
-    Pricing { prefix: "gpt-4o-mini", input_per_mtok: 0.15, output_per_mtok:  0.60 },
-    Pricing { prefix: "gpt-4o",      input_per_mtok: 2.50, output_per_mtok: 10.00 },
-    Pricing { prefix: "gpt-4.1",     input_per_mtok: 2.00, output_per_mtok:  8.00 },
-    Pricing { prefix: "gpt-4",       input_per_mtok: 30.00, output_per_mtok: 60.00 },
-    Pricing { prefix: "o3-mini",     input_per_mtok: 1.10, output_per_mtok:  4.40 },
-    Pricing { prefix: "o3",          input_per_mtok: 15.00, output_per_mtok: 60.00 },
-    Pricing { prefix: "o1-mini",     input_per_mtok: 3.00,  output_per_mtok: 12.00 },
-    Pricing { prefix: "o1",          input_per_mtok: 15.00, output_per_mtok: 60.00 },
-    Pricing { prefix: "gpt",         input_per_mtok: 2.50, output_per_mtok: 10.00 },
+    Pricing {
+        prefix: "gpt-4o-mini",
+        input_per_mtok: 0.15,
+        output_per_mtok: 0.60,
+    },
+    Pricing {
+        prefix: "gpt-4o",
+        input_per_mtok: 2.50,
+        output_per_mtok: 10.00,
+    },
+    Pricing {
+        prefix: "gpt-4.1",
+        input_per_mtok: 2.00,
+        output_per_mtok: 8.00,
+    },
+    Pricing {
+        prefix: "gpt-4",
+        input_per_mtok: 30.00,
+        output_per_mtok: 60.00,
+    },
+    Pricing {
+        prefix: "o3-mini",
+        input_per_mtok: 1.10,
+        output_per_mtok: 4.40,
+    },
+    Pricing {
+        prefix: "o3",
+        input_per_mtok: 15.00,
+        output_per_mtok: 60.00,
+    },
+    Pricing {
+        prefix: "o1-mini",
+        input_per_mtok: 3.00,
+        output_per_mtok: 12.00,
+    },
+    Pricing {
+        prefix: "o1",
+        input_per_mtok: 15.00,
+        output_per_mtok: 60.00,
+    },
+    Pricing {
+        prefix: "gpt",
+        input_per_mtok: 2.50,
+        output_per_mtok: 10.00,
+    },
 ];
 
 /// Estimate USD cost for a single LLM call. Returns 0.0 for unknown models.

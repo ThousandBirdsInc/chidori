@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Schema for a tool parameter, derived from Starlark function signatures.
+use crate::runtime::snapshot::SourceFingerprint;
+
+/// Schema for a tool parameter, derived from tool metadata or signatures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolParam {
     pub name: String,
@@ -17,50 +20,42 @@ pub struct ToolParam {
     pub required: bool,
 }
 
-/// How a tool is executed. File-backed Starlark tools were the original
-/// (and still default) path; MCP-backed tools are dispatched to a running
-/// MCP server child process via `McpManager`.
+/// How a tool is executed. File-backed tools are local `.ts` files; MCP-backed
+/// tools are dispatched to a running MCP server child process via `McpManager`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolBackend {
-    /// The tool's body lives in a local .star file. `source_path` + `source`
-    /// on ToolDef hold the evaluable source.
-    Starlark,
+    /// The tool's body lives in a local .ts file with `export const tool` and
+    /// `export async function run(args, chidori)`.
+    TypeScript,
     /// The tool is remote-hosted by an MCP server.
     Mcp {
         server_id: String,
         remote_name: String,
     },
+    /// The tool is implemented as a Rust callback registered by an embedding
+    /// application.
+    Native,
 }
 
 impl Default for ToolBackend {
     fn default() -> Self {
-        ToolBackend::Starlark
+        ToolBackend::TypeScript
     }
 }
 
-/// A registered tool with its metadata and source.
+/// A registered tool with its metadata and execution backend.
 #[derive(Debug, Clone)]
 pub struct ToolDef {
     pub name: String,
     pub description: String,
     pub params: Vec<ToolParam>,
     pub source_path: PathBuf,
-    /// The raw Starlark source code of the tool file.
-    pub source: String,
+    #[allow(dead_code)]
+    pub source_fingerprint: Option<SourceFingerprint>,
     pub backend: ToolBackend,
 }
 
-impl ToolDef {
-    /// If this is an MCP-backed tool, return (server_id, remote_name).
-    pub fn mcp_backend(&self) -> Option<(String, String)> {
-        match &self.backend {
-            ToolBackend::Mcp { server_id, remote_name } => {
-                Some((server_id.clone(), remote_name.clone()))
-            }
-            ToolBackend::Starlark => None,
-        }
-    }
-}
+pub type NativeToolHandler = Arc<dyn Fn(Value) -> Result<Value> + Send + Sync>;
 
 impl ToolDef {
     /// Generate a JSON schema suitable for LLM function-calling.
@@ -71,10 +66,7 @@ impl ToolDef {
 
         for param in &self.params {
             let mut prop = serde_json::Map::new();
-            prop.insert(
-                "type".to_string(),
-                Value::String(param.param_type.clone()),
-            );
+            prop.insert("type".to_string(), Value::String(param.param_type.clone()));
             if let Some(ref desc) = param.description {
                 prop.insert("description".to_string(), Value::String(desc.clone()));
             }
@@ -96,20 +88,93 @@ impl ToolDef {
     }
 }
 
-/// Registry of available tools loaded from .star files.
+/// Registry of available tools loaded from local files and MCP servers.
 pub struct ToolRegistry {
     tools: HashMap<String, ToolDef>,
+    native_handlers: HashMap<String, NativeToolHandler>,
+    /// Tool files that were found but failed to load (path, reason). Retained so
+    /// a later "Unknown tool" error can explain *why* an expected tool isn't
+    /// available, instead of the failure being a silent stderr warn.
+    load_errors: Vec<(PathBuf, String)>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            native_handlers: HashMap::new(),
+            load_errors: Vec::new(),
         }
     }
 
     pub fn register(&mut self, tool: ToolDef) {
         self.tools.insert(tool.name.clone(), tool);
+    }
+
+    #[allow(dead_code)]
+    pub fn register_native(
+        &mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        params: Vec<ToolParam>,
+        handler: impl Fn(Value) -> Result<Value> + Send + Sync + 'static,
+    ) {
+        let name = name.into();
+        self.native_handlers.insert(name.clone(), Arc::new(handler));
+        self.register(ToolDef {
+            name: name.clone(),
+            description: description.into(),
+            params,
+            source_path: PathBuf::from(format!("native:{name}")),
+            source_fingerprint: None,
+            backend: ToolBackend::Native,
+        });
+    }
+
+    pub fn dispatch_native(&self, name: &str, args: Value) -> Result<Value> {
+        let Some(tool) = self.tools.get(name) else {
+            anyhow::bail!("{}", self.describe_miss(name));
+        };
+        if tool.backend != ToolBackend::Native {
+            anyhow::bail!("tool `{name}` is not registered as a native tool");
+        }
+        let Some(handler) = self.native_handlers.get(name) else {
+            anyhow::bail!("native tool `{name}` has no registered handler");
+        };
+        handler(args)
+    }
+
+    /// Build an actionable "unknown tool" message: the tools that ARE
+    /// registered plus any tool files that failed to load and why.
+    pub fn describe_miss(&self, name: &str) -> String {
+        let mut msg = format!("Unknown tool: {name}");
+        let mut available: Vec<&str> = self.tools.keys().map(String::as_str).collect();
+        available.sort_unstable();
+        if available.is_empty() {
+            msg.push_str(" (no tools are registered)");
+        } else {
+            msg.push_str(&format!(" (available: {})", available.join(", ")));
+        }
+        if !self.load_errors.is_empty() {
+            let failed: Vec<String> = self
+                .load_errors
+                .iter()
+                .map(|(path, reason)| {
+                    let file = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("<tool>");
+                    let first_line = reason.lines().next().unwrap_or(reason);
+                    format!("{file}: {first_line}")
+                })
+                .collect();
+            msg.push_str(&format!(
+                ". {} tool file(s) failed to load — {}",
+                failed.len(),
+                failed.join("; ")
+            ));
+        }
+        msg
     }
 
     pub fn get(&self, name: &str) -> Option<&ToolDef> {
@@ -122,12 +187,13 @@ impl ToolRegistry {
         tools
     }
 
-    /// Load all .star files from the given directories and parse tool definitions.
+    /// Load all .ts files from the given directories and parse tool definitions.
     pub fn load_from_dirs(dirs: &[PathBuf]) -> Result<Self> {
         let mut registry = Self::new();
 
         for dir in dirs {
             if !dir.exists() {
+                tracing::info!(dir = %dir.display(), "tool directory does not exist");
                 continue;
             }
             let entries = std::fs::read_dir(dir)
@@ -136,178 +202,205 @@ impl ToolRegistry {
             for entry in entries {
                 let entry = entry?;
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("star") {
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if ext == "ts" {
                     match parse_tool_file(&path) {
                         Ok(tool) => {
                             registry.register(tool);
                         }
                         Err(e) => {
+                            let reason = format!("{e:#}");
                             tracing::warn!(
-                                "Failed to parse tool file {}: {}",
-                                path.display(),
-                                e
+                                path = %path.display(),
+                                error = %reason,
+                                "failed to parse tool file"
                             );
+                            registry.load_errors.push((path.clone(), reason));
                         }
                     }
                 }
             }
         }
 
+        let tool_names: Vec<String> = registry
+            .list()
+            .into_iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        tracing::info!(
+            dirs = ?dirs,
+            tools = ?tool_names,
+            tool_count = tool_names.len(),
+            "loaded tool registry"
+        );
+
         Ok(registry)
     }
 }
 
-/// Parse a .star tool file to extract the tool name, docstring, and parameters.
-///
-/// The tool's public name is the filename stem (e.g. `fetch_url.star` →
-/// `fetch_url`). The parser scans for the matching `def fetch_url(...)`
-/// definition and records its parameters and docstring. Private helpers
-/// (whose names start with `_` or don't match the stem) are ignored.
-///
-/// This is intentionally lightweight — a full Starlark AST walk would be
-/// more robust but also more invasive; the name-matches-filename convention
-/// keeps tool authorship predictable.
 fn parse_tool_file(path: &Path) -> Result<ToolDef> {
+    parse_typescript_tool_file(path)
+}
+
+fn parse_typescript_tool_file(path: &Path) -> Result<ToolDef> {
     let source = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
-
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow::anyhow!("Invalid tool filename: {}", path.display()))?
-        .to_string();
-
-    let expected_prefix = format!("def {}(", stem);
-
-    let mut params = Vec::new();
-    let mut description = String::new();
-    let mut found = false;
-
-    let lines: Vec<&str> = source.lines().collect();
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with(&expected_prefix) {
-            continue;
-        }
-        // Parameters live between the first `(` and the matching `)`. For
-        // lightweight parsing we assume they fit on this line, which is the
-        // dominant style for tool functions.
-        if let Some(paren_start) = trimmed.find('(') {
-            if let Some(paren_end) = trimmed.rfind(')') {
-                let params_str = &trimmed[paren_start + 1..paren_end];
-                params = parse_params(params_str);
-            }
-        }
-
-        // Docstring: first non-empty line inside the body.
-        for next in lines.iter().skip(idx + 1) {
-            let t = next.trim();
-            if t.is_empty() {
-                continue;
-            }
-            if t.starts_with("\"\"\"") || t.starts_with("'''") {
-                let quote = &t[..3];
-                if let Some(end) = t[3..].find(quote) {
-                    description = t[3..3 + end].to_string();
-                } else {
-                    description = t[3..].to_string();
-                }
-            } else if t.starts_with('"') || t.starts_with('\'') {
-                let quote = &t[..1];
-                if let Some(end) = t[1..].find(quote) {
-                    description = t[1..1 + end].to_string();
-                }
-            }
-            break;
-        }
-
-        found = true;
-        break;
-    }
-
-    if !found {
-        anyhow::bail!(
-            "No `def {}(...)` found in {}. The tool function's name must match the file stem.",
-            stem,
-            path.display()
-        );
-    }
+    let source_fingerprint = SourceFingerprint::from_source(path, &source);
+    let policy = crate::runtime::snapshot::RuntimePolicy::durable_default("tool-discovery");
+    let checked = crate::runtime::typescript::tools::check_tool_source(path, &source, &policy)?;
+    let params = params_from_json_schema(&checked.tool.parameters);
 
     Ok(ToolDef {
-        name: stem,
-        description,
+        name: checked.tool.name,
+        description: checked.tool.description,
         params,
         source_path: path.to_path_buf(),
-        source,
-        backend: ToolBackend::Starlark,
+        source_fingerprint: Some(source_fingerprint),
+        backend: ToolBackend::TypeScript,
     })
 }
 
-/// Parse a simple parameter list like "query, max_results = 5".
-fn parse_params(params_str: &str) -> Vec<ToolParam> {
-    params_str
-        .split(',')
-        .filter_map(|p| {
-            let p = p.trim();
-            if p.is_empty() {
-                return None;
-            }
-
-            if let Some((name, default)) = p.split_once('=') {
-                let name = name.trim().to_string();
-                let default = default.trim();
-                Some(ToolParam {
-                    name,
-                    description: None,
-                    param_type: infer_type(default),
-                    default: parse_default(default),
-                    required: false,
-                })
-            } else {
-                Some(ToolParam {
-                    name: p.to_string(),
-                    description: None,
-                    param_type: "string".to_string(),
-                    default: None,
-                    required: true,
-                })
-            }
+fn params_from_json_schema(schema: &Value) -> Vec<ToolParam> {
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<std::collections::HashSet<_>>()
         })
-        .collect()
+        .unwrap_or_default();
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+
+    let mut params: Vec<ToolParam> = properties
+        .iter()
+        .map(|(name, property)| ToolParam {
+            name: name.clone(),
+            description: property
+                .get("description")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            param_type: property
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("string")
+                .to_string(),
+            default: property.get("default").cloned(),
+            required: required.contains(name.as_str()),
+        })
+        .collect();
+    params.sort_by(|a, b| a.name.cmp(&b.name));
+    params
 }
 
-fn infer_type(default_str: &str) -> String {
-    if default_str == "True" || default_str == "False" {
-        "boolean".to_string()
-    } else if default_str.parse::<i64>().is_ok() {
-        "integer".to_string()
-    } else if default_str.parse::<f64>().is_ok() {
-        "number".to_string()
-    } else {
-        "string".to_string()
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn parse_default(default_str: &str) -> Option<Value> {
-    if default_str == "None" {
-        return Some(Value::Null);
+    #[test]
+    fn registry_loads_typescript_tool_metadata() {
+        let dir =
+            std::env::temp_dir().join(format!("chidori-ts-tool-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("web_search.ts"),
+            r#"
+                import type { Chidori, ToolDefinition } from "chidori";
+
+                export const tool: ToolDefinition = {
+                  name: "web_search",
+                  description: "Search the web",
+                  parameters: {
+                    type: "object",
+                    properties: {
+                      query: { type: "string", description: "Search query" },
+                      limit: { type: "integer", default: 3 },
+                    },
+                    required: ["query"],
+                  },
+                };
+
+                export async function run(args: { query: string }, chidori: Chidori) {
+                  return { query: args.query };
+                }
+            "#,
+        )
+        .unwrap();
+
+        let registry = ToolRegistry::load_from_dirs(&[dir.clone()]).unwrap();
+        let tool = registry.get("web_search").unwrap();
+
+        assert_eq!(tool.backend, ToolBackend::TypeScript);
+        assert_eq!(
+            tool.source_fingerprint.as_ref().unwrap(),
+            &crate::runtime::snapshot::SourceFingerprint::from_source(
+                dir.join("web_search.ts"),
+                &std::fs::read_to_string(dir.join("web_search.ts")).unwrap()
+            )
+        );
+        assert_eq!(tool.description, "Search the web");
+        assert_eq!(tool.params.len(), 2);
+        assert!(tool.params.iter().any(|param| param.name == "query"
+            && param.required
+            && param.description.as_deref() == Some("Search query")));
+        assert!(tool.params.iter().any(|param| param.name == "limit"
+            && !param.required
+            && param.default == Some(Value::Number(3.into()))));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
-    if default_str == "True" {
-        return Some(Value::Bool(true));
+
+    #[test]
+    fn registry_ignores_starlark_tool_files_on_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-ignore-star-tool-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("legacy.star"),
+            r#"
+                def legacy(query):
+                    "Legacy tool"
+                    return query
+            "#,
+        )
+        .unwrap();
+
+        let registry = ToolRegistry::load_from_dirs(&[dir.clone()]).unwrap();
+
+        assert!(registry.get("legacy").is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
-    if default_str == "False" {
-        return Some(Value::Bool(false));
+
+    #[test]
+    fn registry_dispatches_native_tool_handler() {
+        let mut registry = ToolRegistry::new();
+        registry.register_native(
+            "echo",
+            "Echo input",
+            vec![ToolParam {
+                name: "value".to_string(),
+                description: Some("Value to echo".to_string()),
+                param_type: "string".to_string(),
+                default: None,
+                required: true,
+            }],
+            |args| Ok(args),
+        );
+
+        let tool = registry.get("echo").unwrap();
+        assert_eq!(tool.backend, ToolBackend::Native);
+        assert_eq!(tool.source_path, PathBuf::from("native:echo"));
+        assert_eq!(
+            registry
+                .dispatch_native("echo", serde_json::json!({ "value": "ok" }))
+                .unwrap(),
+            serde_json::json!({ "value": "ok" })
+        );
     }
-    if let Ok(i) = default_str.parse::<i64>() {
-        return Some(Value::Number(i.into()));
-    }
-    if let Ok(f) = default_str.parse::<f64>() {
-        return Some(serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null));
-    }
-    // String literal.
-    let trimmed = default_str.trim_matches(|c| c == '"' || c == '\'');
-    if trimmed != default_str {
-        return Some(Value::String(trimmed.to_string()));
-    }
-    Some(Value::String(default_str.to_string()))
 }

@@ -1,4 +1,4 @@
-"""App Agent Framework — Python SDK.
+"""Chidori TypeScript runtime — Python SDK.
 
 Connect to a running chidori server to create sessions,
 run agents, checkpoint execution, and replay from saved state.
