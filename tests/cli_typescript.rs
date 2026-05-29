@@ -393,9 +393,11 @@ fn cli_stream_failure_done_event_includes_full_error_chain() {
         .find(|event| event["type"] == "done")
         .expect("missing done event");
     let error = done["error"].as_str().unwrap_or_default();
-    assert!(error.contains("evaluating"), "{error}");
-    assert!(error.contains("QuickJS evaluation failed"), "{error}");
-    assert!(error.contains("transpiled bundle written to"), "{error}");
+    // oxc surfaces malformed agent code as a parse error before we ever reach
+    // QuickJS; the done event still has to name what failed and where so the
+    // CLI user can find the broken file.
+    assert!(error.contains("agent.ts"), "{error}");
+    assert!(error.contains("TypeScript parse error"), "{error}");
 
     fs::remove_dir_all(dir).ok();
 }

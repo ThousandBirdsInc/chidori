@@ -1,0 +1,6 @@
+[toolchain]
+# oxc_transformer 0.133 uses `if let` match-arm guards, an unstable feature
+# until Rust 1.97 (currently in beta). Pin to nightly until 1.97 ships stable,
+# then this file can be deleted. rustup auto-fetches the channel on first
+# build, including inside the rust:1-bookworm grpc image.
+channel = "nightly"

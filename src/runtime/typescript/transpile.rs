@@ -1,6 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use oxc::allocator::Allocator;
+use oxc::codegen::{Codegen, CodegenOptions};
+use oxc::parser::Parser;
+use oxc::semantic::SemanticBuilder;
+use oxc::span::SourceType;
+use oxc::transformer::{TransformOptions, Transformer};
 
 use crate::runtime::snapshot::TypeScriptImportPolicy;
 
@@ -18,56 +24,188 @@ pub struct ModuleImport {
 pub fn transpile_module(path: &Path, source: &str, options: &TranspileOptions) -> Result<String> {
     validate_imports(path, source, options.import_policy)?;
 
-    let mut out = String::with_capacity(source.len());
-    let mut param_state = ParameterStripState::default();
-    let mut type_skip_state: Option<TypeDeclarationSkipState> = None;
-    let mut assertion_skip_state: Option<TypeAssertionSkipState> = None;
-    for line in source.lines() {
-        let trimmed = line.trim_start();
-        if let Some(state) = type_skip_state.as_mut() {
-            state.observe_line(trimmed);
-            if state.is_done() {
-                type_skip_state = None;
-            }
-            out.push('\n');
+    // Treat input as TypeScript regardless of extension — agents may live in
+    // `agent.ts` / `tools/*.ts` and the snapshot pipeline only calls us with TS.
+    let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::ts());
+    let allocator = Allocator::default();
+
+    let parser_ret = Parser::new(&allocator, source, source_type).parse();
+    if !parser_ret.errors.is_empty() {
+        let messages: Vec<String> =
+            parser_ret.errors.iter().map(|err| err.to_string()).collect();
+        anyhow::bail!(
+            "{}: TypeScript parse error: {}",
+            path.display(),
+            messages.join("; ")
+        );
+    }
+    let mut program = parser_ret.program;
+
+    let semantic_ret = SemanticBuilder::new()
+        // Transformer roughly triples scope/symbol/reference allocations.
+        .with_excess_capacity(2.0)
+        .build(&program);
+    if !semantic_ret.errors.is_empty() {
+        let messages: Vec<String> =
+            semantic_ret.errors.iter().map(|err| err.to_string()).collect();
+        anyhow::bail!(
+            "{}: TypeScript semantic error: {}",
+            path.display(),
+            messages.join("; ")
+        );
+    }
+    let scoping = semantic_ret.semantic.into_scoping();
+
+    // Defaults strip TypeScript syntax (types, interfaces, `as`/`satisfies`,
+    // `import type`) and leave modern JS untouched. `enable_all()` would also
+    // downlevel async/await, optional chaining, and nullish coalescing into
+    // helper-import-heavy generator code — the quickjs runtime supports the
+    // modern forms natively, so we explicitly avoid that.
+    let transform_options = TransformOptions::default();
+    let transformer_ret = Transformer::new(&allocator, path, &transform_options)
+        .build_with_scoping(scoping, &mut program);
+    if !transformer_ret.errors.is_empty() {
+        let messages: Vec<String> = transformer_ret
+            .errors
+            .iter()
+            .map(|err| err.to_string())
+            .collect();
+        anyhow::bail!(
+            "{}: TypeScript transform error: {}",
+            path.display(),
+            messages.join("; ")
+        );
+    }
+
+    let codegen_ret = Codegen::new()
+        .with_options(CodegenOptions::default())
+        .build(&program);
+
+    // The `chidori` SDK import marks host-injected globals (Chidori, ToolDefinition,
+    // etc.) — there's no real module at module-resolution time, so any surviving
+    // `import ... from "chidori"` would crash the loader. oxc's TS pass elides
+    // import-of-type-only specifiers but keeps value imports, so we filter the
+    // remaining `from "chidori"` lines out of the emitted code.
+    let js = strip_chidori_sdk_imports(&codegen_ret.code);
+    // The snapshot bundler line-walks the output to rewrite `import` / `export`
+    // statements. oxc splits object literals and function bodies across many
+    // lines, so we join everything inside nested braces/parens/brackets onto
+    // the same line. That keeps each top-level statement on a single line
+    // while leaving string and template-literal contents untouched.
+    Ok(collapse_top_level_statements(&js))
+}
+
+fn strip_chidori_sdk_imports(js: &str) -> String {
+    let mut out = String::with_capacity(js.len());
+    for line in js.lines() {
+        if is_chidori_sdk_import(line.trim_start()) {
             continue;
         }
-        if let Some(state) = assertion_skip_state.as_mut() {
-            state.observe_line(line);
-            if state.is_done() {
-                assertion_skip_state = None;
-            }
-            out.push('\n');
-            continue;
-        }
-        if trimmed.starts_with("import type ") || is_chidori_sdk_import(trimmed) {
-            out.push('\n');
-            continue;
-        }
-        if trimmed.starts_with("import ") {
-            out.push_str(line);
-            out.push('\n');
-            continue;
-        }
-        if is_type_declaration(trimmed) {
-            let mut state = TypeDeclarationSkipState::new(trimmed);
-            state.observe_line(trimmed);
-            if !state.is_done() {
-                type_skip_state = Some(state);
-            }
-            out.push('\n');
-            continue;
-        }
-        if let Some((stripped, state)) = strip_multiline_type_assertion_start(line) {
-            out.push_str(&stripped);
-            out.push('\n');
-            assertion_skip_state = Some(state);
-            continue;
-        }
-        out.push_str(&strip_type_syntax(line, &mut param_state));
+        out.push_str(line);
         out.push('\n');
     }
-    Ok(out)
+    out
+}
+
+/// Walk `js` and replace newlines that sit inside `{...}`, `(...)`, `[...]`,
+/// or template-literal interpolations with spaces, so each top-level
+/// statement ends up on a single line. Quoted strings and template-literal
+/// text are passed through untouched.
+fn collapse_top_level_statements(js: &str) -> String {
+    enum Mode {
+        Code,
+        DoubleQuote,
+        SingleQuote,
+        TemplateText,
+    }
+    let mut out = String::with_capacity(js.len());
+    let mut mode = Mode::Code;
+    let mut depth: i32 = 0;
+    // Stack of template literals we're currently inside, so we know when a `}`
+    // closes a `${...}` interpolation vs. an object/block.
+    let mut template_interp_starts: Vec<i32> = Vec::new();
+    let mut chars = js.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match mode {
+            Mode::Code => match ch {
+                '"' => {
+                    mode = Mode::DoubleQuote;
+                    out.push(ch);
+                }
+                '\'' => {
+                    mode = Mode::SingleQuote;
+                    out.push(ch);
+                }
+                '`' => {
+                    mode = Mode::TemplateText;
+                    out.push(ch);
+                }
+                '{' | '(' | '[' => {
+                    depth += 1;
+                    out.push(ch);
+                }
+                '}' => {
+                    // If this `}` closes a `${...}` interpolation, drop back into the
+                    // surrounding template literal. The matching `${` already
+                    // incremented depth, so we always decrement here.
+                    depth -= 1;
+                    out.push(ch);
+                    if template_interp_starts
+                        .last()
+                        .is_some_and(|&start| start == depth + 1)
+                    {
+                        template_interp_starts.pop();
+                        mode = Mode::TemplateText;
+                    }
+                }
+                ')' | ']' => {
+                    depth -= 1;
+                    out.push(ch);
+                }
+                '\n' if depth > 0 => {
+                    out.push(' ');
+                }
+                _ => out.push(ch),
+            },
+            Mode::DoubleQuote => {
+                out.push(ch);
+                if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                } else if ch == '"' {
+                    mode = Mode::Code;
+                }
+            }
+            Mode::SingleQuote => {
+                out.push(ch);
+                if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                } else if ch == '\'' {
+                    mode = Mode::Code;
+                }
+            }
+            Mode::TemplateText => {
+                out.push(ch);
+                if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                } else if ch == '`' {
+                    mode = Mode::Code;
+                } else if ch == '$' && chars.peek() == Some(&'{') {
+                    let brace = chars.next().unwrap();
+                    out.push(brace);
+                    depth += 1;
+                    template_interp_starts.push(depth);
+                    mode = Mode::Code;
+                }
+            }
+        }
+    }
+    out
 }
 
 pub fn validate_imports(
@@ -162,13 +300,6 @@ fn is_chidori_sdk_import(line: &str) -> bool {
     line.starts_with("import ") && specifier_after_from(line).as_deref() == Some("chidori")
 }
 
-fn is_type_declaration(line: &str) -> bool {
-    line.starts_with("type ")
-        || line.starts_with("interface ")
-        || line.starts_with("export type ")
-        || line.starts_with("export interface ")
-}
-
 fn specifier_after_from(line: &str) -> Option<String> {
     let from_index = line.find(" from ")?;
     quoted_specifier(&line[from_index + 6..])
@@ -257,516 +388,6 @@ fn normalize_path(path: &Path) -> PathBuf {
     out
 }
 
-#[derive(Default)]
-struct ParameterStripState {
-    active: bool,
-    paren_depth: usize,
-}
-
-struct TypeAssertionSkipState {
-    brace_depth: usize,
-    saw_semicolon: bool,
-}
-
-enum TypeDeclarationSkipState {
-    Interface {
-        brace_depth: usize,
-        saw_brace: bool,
-    },
-    TypeAlias {
-        brace_depth: usize,
-        saw_semicolon: bool,
-    },
-}
-
-impl TypeDeclarationSkipState {
-    fn new(line: &str) -> Self {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("interface ") || trimmed.starts_with("export interface ") {
-            Self::Interface {
-                brace_depth: 0,
-                saw_brace: false,
-            }
-        } else {
-            Self::TypeAlias {
-                brace_depth: 0,
-                saw_semicolon: false,
-            }
-        }
-    }
-
-    fn observe_line(&mut self, line: &str) {
-        let (open, close) = brace_delta(line);
-        match self {
-            Self::Interface {
-                brace_depth,
-                saw_brace,
-            } => {
-                *saw_brace |= open > 0;
-                *brace_depth = brace_depth.saturating_add(open).saturating_sub(close);
-            }
-            Self::TypeAlias {
-                brace_depth,
-                saw_semicolon,
-            } => {
-                *brace_depth = brace_depth.saturating_add(open).saturating_sub(close);
-                *saw_semicolon |= line.trim_end().ends_with(';');
-            }
-        }
-    }
-
-    fn is_done(&self) -> bool {
-        match self {
-            Self::Interface {
-                brace_depth,
-                saw_brace,
-            } => *saw_brace && *brace_depth == 0,
-            Self::TypeAlias {
-                brace_depth,
-                saw_semicolon,
-            } => *saw_semicolon && *brace_depth == 0,
-        }
-    }
-}
-
-fn brace_delta(line: &str) -> (usize, usize) {
-    line.chars().fold((0, 0), |(open, close), ch| match ch {
-        '{' => (open + 1, close),
-        '}' => (open, close + 1),
-        _ => (open, close),
-    })
-}
-
-fn strip_type_syntax(line: &str, param_state: &mut ParameterStripState) -> String {
-    let without_catch = strip_catch_parameter_annotations(line);
-    let without_returns = strip_return_type(&without_catch);
-    let without_params = strip_parameter_annotations(&without_returns, param_state);
-    let without_multiline_return = strip_return_type_after_any_close_paren(&without_params);
-    let without_arrow_params = strip_arrow_parameter_annotations(&without_multiline_return);
-    let without_variables = strip_variable_annotations(&without_arrow_params);
-    strip_type_assertions(&without_variables)
-}
-
-fn strip_multiline_type_assertion_start(line: &str) -> Option<(String, TypeAssertionSkipState)> {
-    let idx = find_outside_string(line, " as ")?;
-    if line[idx..].contains(';') {
-        return None;
-    }
-    let asserted_type = &line[idx + " as ".len()..];
-    if !asserted_type.contains('{') && !asserted_type.contains('<') {
-        return None;
-    }
-    let (open, close) = brace_delta(asserted_type);
-    let mut stripped = line[..idx].trim_end().to_string();
-    stripped.push(';');
-    Some((
-        stripped,
-        TypeAssertionSkipState {
-            brace_depth: open.saturating_sub(close),
-            saw_semicolon: false,
-        },
-    ))
-}
-
-impl TypeAssertionSkipState {
-    fn observe_line(&mut self, line: &str) {
-        let (open, close) = brace_delta(line);
-        self.brace_depth = self.brace_depth.saturating_add(open).saturating_sub(close);
-        self.saw_semicolon |= line.trim_end().ends_with(';');
-    }
-
-    fn is_done(&self) -> bool {
-        self.brace_depth == 0 && self.saw_semicolon
-    }
-}
-
-fn strip_catch_parameter_annotations(line: &str) -> String {
-    let Some(catch_idx) = line.find("catch") else {
-        return line.to_string();
-    };
-    let Some(open_rel) = line[catch_idx..].find('(') else {
-        return line.to_string();
-    };
-    let open_paren = catch_idx + open_rel;
-    let Some(close_paren) = matching_close_paren(line, open_paren) else {
-        return line.to_string();
-    };
-    if !line[open_paren + 1..close_paren].contains(':') {
-        return line.to_string();
-    }
-    format!(
-        "{}{}{}",
-        &line[..open_paren + 1],
-        strip_colon_annotations(&line[open_paren + 1..close_paren]),
-        &line[close_paren..]
-    )
-}
-
-fn strip_return_type(line: &str) -> String {
-    let Some(function_start) = line.find("function ") else {
-        return line.to_string();
-    };
-    let Some(open_rel) = line[function_start..].find('(') else {
-        return line.to_string();
-    };
-    let open_paren = function_start + open_rel;
-    let Some(close_paren) = matching_close_paren(line, open_paren) else {
-        return line.to_string();
-    };
-    strip_return_type_after_close_paren(line, close_paren).unwrap_or_else(|| line.to_string())
-}
-
-fn strip_return_type_after_any_close_paren(line: &str) -> String {
-    let mut cursor = 0usize;
-    while let Some(close_rel) = line[cursor..].find(')') {
-        let close_paren = cursor + close_rel;
-        if let Some(stripped) = strip_return_type_after_close_paren(line, close_paren) {
-            return stripped;
-        }
-        cursor = close_paren + 1;
-    }
-    line.to_string()
-}
-
-fn strip_return_type_after_close_paren(line: &str, close_paren: usize) -> Option<String> {
-    let tail = &line[close_paren + 1..];
-    let trimmed = tail.trim_start();
-    if !trimmed.starts_with(':') {
-        return None;
-    }
-    let whitespace = tail.len() - trimmed.len();
-    let type_start = close_paren + 1 + whitespace;
-    let Some(body_start) = find_function_body_start(line, type_start + 1) else {
-        return None;
-    };
-    Some(format!(
-        "{} {}",
-        &line[..close_paren + 1],
-        &line[body_start..]
-    ))
-}
-
-fn matching_close_paren(source: &str, open_paren: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (idx, ch) in source[open_paren..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(open_paren + idx);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn find_function_body_start(line: &str, return_type_start: usize) -> Option<usize> {
-    let mut angle_depth = 0usize;
-    let mut brace_depth = 0usize;
-    let mut paren_depth = 0usize;
-    let mut bracket_depth = 0usize;
-    for (idx, ch) in line[return_type_start..].char_indices() {
-        let abs = return_type_start + idx;
-        match ch {
-            '<' if brace_depth == 0 && paren_depth == 0 && bracket_depth == 0 => {
-                angle_depth += 1;
-            }
-            '>' if angle_depth > 0
-                && brace_depth == 0
-                && paren_depth == 0
-                && bracket_depth == 0 =>
-            {
-                angle_depth -= 1;
-            }
-            '{' if angle_depth == 0
-                && brace_depth == 0
-                && paren_depth == 0
-                && bracket_depth == 0 =>
-            {
-                let previous = previous_nonspace(line, abs);
-                if matches!(
-                    previous,
-                    Some(':')
-                        | Some('<')
-                        | Some('|')
-                        | Some('&')
-                        | Some('(')
-                        | Some('[')
-                        | Some(',')
-                ) {
-                    brace_depth += 1;
-                } else {
-                    return Some(abs);
-                }
-            }
-            '{' => brace_depth += 1,
-            '}' if brace_depth > 0 => brace_depth -= 1,
-            '(' => paren_depth += 1,
-            ')' if paren_depth > 0 => paren_depth -= 1,
-            '[' => bracket_depth += 1,
-            ']' if bracket_depth > 0 => bracket_depth -= 1,
-            _ => {}
-        }
-    }
-    None
-}
-
-fn previous_nonspace(source: &str, before: usize) -> Option<char> {
-    source[..before]
-        .chars()
-        .rev()
-        .find(|ch| !ch.is_whitespace())
-}
-
-fn strip_parameter_annotations(line: &str, state: &mut ParameterStripState) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut cursor = 0usize;
-
-    while cursor < line.len() {
-        if !state.active {
-            let Some(function_rel) = line[cursor..].find("function ") else {
-                out.push_str(&line[cursor..]);
-                break;
-            };
-            let function_start = cursor + function_rel;
-            let Some(open_rel) = line[function_start..].find('(') else {
-                out.push_str(&line[cursor..]);
-                break;
-            };
-            let open_paren = function_start + open_rel;
-            out.push_str(&line[cursor..open_paren + 1]);
-            cursor = open_paren + 1;
-            state.active = true;
-            state.paren_depth = 1;
-        }
-
-        let segment_start = cursor;
-        let mut segment = String::new();
-        while cursor < line.len() {
-            let Some(ch) = line[cursor..].chars().next() else {
-                break;
-            };
-            let next = cursor + ch.len_utf8();
-            match ch {
-                '(' => {
-                    state.paren_depth += 1;
-                    segment.push(ch);
-                }
-                ')' => {
-                    state.paren_depth = state.paren_depth.saturating_sub(1);
-                    if state.paren_depth == 0 {
-                        out.push_str(&strip_colon_annotations(&segment));
-                        out.push(')');
-                        cursor = next;
-                        state.active = false;
-                        break;
-                    }
-                    segment.push(ch);
-                }
-                _ => segment.push(ch),
-            }
-            cursor = next;
-        }
-
-        if state.active {
-            out.push_str(&strip_colon_annotations(&line[segment_start..cursor]));
-            break;
-        }
-    }
-
-    out
-}
-
-fn strip_variable_annotations(line: &str) -> String {
-    let trimmed = line.trim_start();
-    let indent = line.len() - trimmed.len();
-    let Some(keyword) = [
-        "export const ",
-        "export let ",
-        "export var ",
-        "const ",
-        "let ",
-        "var ",
-    ]
-    .iter()
-    .find(|keyword| trimmed.starts_with(**keyword)) else {
-        return line.to_string();
-    };
-
-    let name_start = indent + keyword.len();
-    let rest = &line[name_start..];
-    let Some(colon_rel) = rest.find(':') else {
-        return line.to_string();
-    };
-    if rest.find('=').is_some_and(|eq_rel| eq_rel < colon_rel) {
-        return line.to_string();
-    }
-    let colon = name_start + colon_rel;
-    if let Some(eq_rel) = line[colon + 1..].find('=') {
-        let eq = colon + 1 + eq_rel;
-        return format!("{} {}", &line[..colon], &line[eq..]);
-    }
-
-    if let Some(semicolon_rel) = line[colon + 1..].find(';') {
-        let semicolon = colon + 1 + semicolon_rel;
-        return format!("{}{}", &line[..colon], &line[semicolon..]);
-    }
-
-    line[..colon].to_string()
-}
-
-fn strip_type_assertions(line: &str) -> String {
-    let without_satisfies = strip_satisfies_operator(line);
-    let without_as_const = strip_as_const_assertion(&without_satisfies);
-    strip_as_type_assertion(&without_as_const)
-}
-
-fn strip_satisfies_operator(line: &str) -> String {
-    let Some(idx) = find_outside_string(line, " satisfies ") else {
-        return line.to_string();
-    };
-    let statement_end = line[idx..]
-        .find(';')
-        .map(|rel| idx + rel)
-        .unwrap_or(line.len());
-    format!("{}{}", &line[..idx], &line[statement_end..])
-}
-
-fn strip_as_const_assertion(line: &str) -> String {
-    let mut out = line.to_string();
-    while let Some(idx) = find_outside_string(&out, " as const") {
-        let end = idx + " as const".len();
-        out.replace_range(idx..end, "");
-    }
-    out
-}
-
-fn strip_as_type_assertion(line: &str) -> String {
-    let Some(idx) = find_outside_string(line, " as ") else {
-        return line.to_string();
-    };
-    let statement_end = line[idx..]
-        .find(';')
-        .map(|rel| idx + rel)
-        .unwrap_or(line.len());
-    format!("{}{}", &line[..idx], &line[statement_end..])
-}
-
-fn find_outside_string(source: &str, needle: &str) -> Option<usize> {
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for (idx, ch) in source.char_indices() {
-        if let Some(active_quote) = quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == active_quote {
-                quote = None;
-            }
-            continue;
-        }
-
-        if ch == '"' || ch == '\'' || ch == '`' {
-            quote = Some(ch);
-            continue;
-        }
-        if source[idx..].starts_with(needle) {
-            return Some(idx);
-        }
-    }
-    None
-}
-
-fn strip_arrow_parameter_annotations(line: &str) -> String {
-    let Some(arrow) = line.find("=>") else {
-        return line.to_string();
-    };
-    let Some(close_paren) = line[..arrow].rfind(')') else {
-        return line.to_string();
-    };
-    let Some(open_paren) = matching_open_paren(&line[..=close_paren], close_paren) else {
-        return line.to_string();
-    };
-    if !line[open_paren + 1..close_paren].contains(':') {
-        return line.to_string();
-    }
-
-    format!(
-        "{}{}{}",
-        &line[..open_paren + 1],
-        strip_colon_annotations(&line[open_paren + 1..close_paren]),
-        &line[close_paren..]
-    )
-}
-
-fn matching_open_paren(source: &str, close_paren: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (idx, ch) in source[..=close_paren].char_indices().rev() {
-        match ch {
-            ')' => depth += 1,
-            '(' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(idx);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn strip_colon_annotations(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let chars: Vec<char> = source.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == ':' && is_probable_type_annotation(&chars, i) {
-            i += 1;
-            let mut brace_depth = 0usize;
-            while i < chars.len() {
-                match chars[i] {
-                    '{' | '<' => {
-                        brace_depth += 1;
-                        i += 1;
-                    }
-                    '}' | '>' if brace_depth > 0 => {
-                        brace_depth -= 1;
-                        i += 1;
-                    }
-                    ',' | ')' | '=' if brace_depth == 0 => break,
-                    _ => i += 1,
-                }
-            }
-            if i < chars.len() && chars[i] == '=' && !out.ends_with(' ') {
-                out.push(' ');
-            }
-            continue;
-        }
-        out.push(chars[i]);
-        i += 1;
-    }
-    out
-}
-
-fn is_probable_type_annotation(chars: &[char], colon_index: usize) -> bool {
-    if colon_index == 0 {
-        return false;
-    }
-    let mut i = colon_index;
-    while i > 0 {
-        i -= 1;
-        if chars[i].is_whitespace() {
-            continue;
-        }
-        return chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '}';
-    }
-    false
-}
 
 #[cfg(test)]
 mod tests {
@@ -795,7 +416,6 @@ mod tests {
 
         assert!(!js.contains("import type"));
         assert!(!js.contains("type Input"));
-        assert_eq!(source.lines().count(), js.lines().count());
         assert!(js.contains("export async function agent(input, chidori) {"));
         assert!(js.contains("const greeting = input.name;"));
     }
@@ -824,9 +444,10 @@ mod tests {
 
         assert!(!js.contains("name?: string"));
         assert!(!js.contains("chidori: Chidori"));
-        assert!(js.contains("input,"));
-        assert!(js.contains("chidori,"));
-        assert_eq!(source.lines().count(), js.lines().count());
+        // oxc collapses the multi-line parameter list into `(input, chidori)`;
+        // the relevant invariant is that both names survive untyped.
+        assert!(js.contains("export async function agent(input, chidori)"));
+        assert!(js.contains("const name = input.name ?? \"world\";"));
     }
 
     #[test]
@@ -863,7 +484,6 @@ mod tests {
         assert!(!js.contains("ok: true;"));
         assert!(js.contains("topic: input.topic"));
         assert!(js.contains("export async function agent(input, chidori) {"));
-        assert_eq!(source.lines().count(), js.lines().count());
     }
 
     #[test]
@@ -902,6 +522,36 @@ mod tests {
         assert!(js.contains("(p, i) => ({"));
         assert!(js.contains("url: result.url"));
         assert!(js.contains("label: `${i}: ${p.title}`"));
+    }
+
+    #[test]
+    fn transpile_strips_arrow_function_return_types_and_predicates() {
+        let source = r#"
+            export async function agent(input, chidori) {
+                const titles = [1, null, 2]
+                    .map((x) => (typeof x === "number" ? String(x) : null))
+                    .filter((t): t is string => t !== null);
+                const double = (n: number): number => n * 2;
+                const obj = (k): { v: number } => ({ v: 1 });
+                return { titles, doubled: double(3), obj: obj("a") };
+            }
+        "#;
+
+        let js = transpile_module(
+            Path::new("/tmp/project/agent.ts"),
+            source,
+            &TranspileOptions {
+                import_policy: TypeScriptImportPolicy::Relative,
+            },
+        )
+        .unwrap();
+
+        assert!(!js.contains(": t is string"), "type predicate not stripped:\n{js}");
+        assert!(!js.contains(": number =>"), "primitive arrow return not stripped:\n{js}");
+        assert!(!js.contains(": { v: number }"), "object arrow return not stripped:\n{js}");
+        assert!(js.contains(".filter((t) => t !== null)"));
+        assert!(js.contains("const double = (n) => n * 2;"));
+        assert!(js.contains("const obj = (k) => ({ v: 1 });"));
     }
 
     #[test]

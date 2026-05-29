@@ -277,9 +277,7 @@ mod tests {
 
         assert_eq!(result.tool.name, "web_search");
         assert_eq!(result.tool.description, "Search the web");
-        assert!(result.javascript.contains("export async function run("));
-        assert!(result.javascript.contains("args,"));
-        assert!(result.javascript.contains("chidori,"));
+        assert!(result.javascript.contains("export async function run(args, chidori)"));
         assert!(!result.javascript.contains("satisfies ToolDefinition"));
         assert!(!result.javascript.contains("Promise<{"));
     }

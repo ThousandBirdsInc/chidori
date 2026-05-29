@@ -583,6 +583,17 @@ pub fn execute_call_agent(
     execute_durable_json_call(ctx, "call_agent", args, live)
 }
 
+/// User-Agent that identifies chidori-issued requests to the wider internet.
+/// Hosts like Wikimedia reject the bare `reqwest/X.Y` default with a 403 and a
+/// link to their robot policy, so we ship a UA that names the runtime, its
+/// version, and a contact URL by default. Callers can still override it by
+/// including a `User-Agent` header in the http args.
+const DEFAULT_USER_AGENT: &str = concat!(
+    "chidori/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/ThousandBirdsInc/chidori)",
+);
+
 pub fn execute_http(tokio_rt: &tokio::runtime::Runtime, args: &Value) -> Result<Value> {
     let method = args
         .get("method")
@@ -604,12 +615,22 @@ pub fn execute_http(tokio_rt: &tokio::runtime::Runtime, args: &Value) -> Result<
         _ => None,
     });
 
+    let caller_set_user_agent = headers
+        .as_ref()
+        .is_some_and(|map| map.keys().any(|key| key.eq_ignore_ascii_case("user-agent")));
+
     tokio_rt.block_on(async move {
         // `gzip(true)` (with the reqwest `gzip` feature) sends Accept-Encoding
         // and transparently decompresses gzipped response bodies, so tools get
         // readable text instead of a binary blob.
-        let client = reqwest::Client::builder()
-            .gzip(true)
+        let mut client_builder = reqwest::Client::builder().gzip(true);
+        // Only install the default UA when the caller hasn't named their own —
+        // reqwest's `header()` appends rather than replaces, so setting both
+        // would put two User-Agent headers on the wire.
+        if !caller_set_user_agent {
+            client_builder = client_builder.user_agent(DEFAULT_USER_AGENT);
+        }
+        let client = client_builder
             .build()
             .map_err(|err| anyhow::anyhow!(err))?;
         let request_method =
@@ -1005,6 +1026,87 @@ mod tests {
         assert!(result["error"].as_str().unwrap_or_default().len() > 0);
         assert!(result["headers"].as_object().unwrap().is_empty());
         assert!(result["body"].is_null());
+    }
+
+    /// Spin up a one-shot TCP server that captures the raw request bytes from
+    /// the first connection. Returns the `(url, JoinHandle<raw_request>)` so
+    /// the test can issue a request to `url` and then read what landed on the
+    /// wire. The server replies with a minimal 200 response so reqwest doesn't
+    /// surface a transport error.
+    async fn one_shot_http_capture() -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/ua-check");
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            let _ = stream.shutdown().await;
+            request
+        });
+        (url, handle)
+    }
+
+    fn user_agent_header(request: &str) -> Option<String> {
+        request
+            .lines()
+            .find_map(|line| line.strip_prefix("user-agent: ").or_else(|| line.strip_prefix("User-Agent: ")))
+            .map(ToOwned::to_owned)
+    }
+
+    #[test]
+    fn execute_http_sends_default_chidori_user_agent() {
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+        let (url, server) = tokio_rt.block_on(one_shot_http_capture());
+        execute_http(&tokio_rt, &json!({ "url": url, "method": "GET" })).unwrap();
+        let request = tokio_rt.block_on(server).unwrap();
+        let ua = user_agent_header(&request).expect("missing User-Agent header");
+        assert!(
+            ua.starts_with("chidori/"),
+            "expected chidori-prefixed UA, got {ua:?}"
+        );
+        assert!(
+            ua.contains("github.com/ThousandBirdsInc/chidori"),
+            "default UA should include contact URL, got {ua:?}"
+        );
+        // Exactly one User-Agent header should be on the wire — Wikimedia
+        // rejects requests that send the bare `reqwest/` default *or* two UAs.
+        let ua_count = request
+            .lines()
+            .filter(|line| {
+                line.to_ascii_lowercase().starts_with("user-agent:")
+            })
+            .count();
+        assert_eq!(ua_count, 1, "request had {ua_count} User-Agent headers");
+    }
+
+    #[test]
+    fn execute_http_caller_user_agent_overrides_default() {
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+        let (url, server) = tokio_rt.block_on(one_shot_http_capture());
+        execute_http(
+            &tokio_rt,
+            &json!({
+                "url": url,
+                "method": "GET",
+                "headers": { "User-Agent": "my-agent/1.0 (contact@example.com)" },
+            }),
+        )
+        .unwrap();
+        let request = tokio_rt.block_on(server).unwrap();
+        let ua = user_agent_header(&request).expect("missing User-Agent header");
+        assert_eq!(ua, "my-agent/1.0 (contact@example.com)");
+        // The default mustn't tag along behind the caller-supplied override.
+        let ua_count = request
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("user-agent:"))
+            .count();
+        assert_eq!(ua_count, 1, "request had {ua_count} User-Agent headers");
     }
 
     #[test]

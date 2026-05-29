@@ -237,6 +237,22 @@ impl Engine {
         self.run_with_context(path, inputs, ctx)
     }
 
+    /// Run an agent while forwarding live events and pausing on input or
+    /// approval requests. This is the in-process equivalent of the session
+    /// server's interactive execution path for embedders that already own
+    /// their UI/event loop.
+    pub fn run_streaming_pausable(
+        &self,
+        path: &Path,
+        inputs: &Value,
+        sender: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+    ) -> Result<RunResult> {
+        let ctx = RuntimeContext::new();
+        ctx.set_event_sender(sender);
+        ctx.set_input_mode(InputMode::Pause);
+        self.run_with_context(path, inputs, ctx)
+    }
+
     /// Run an agent in Pause-on-input mode. When the agent calls `input()`
     /// and no cached response exists, the engine catches the pause sentinel
     /// and returns a RunResult whose `paused` field is set.
@@ -269,6 +285,23 @@ impl Engine {
         host_promises: Vec<HostPromiseRecord>,
     ) -> Result<RunResult> {
         let ctx = RuntimeContext::with_replay_and_host_promises(replay_log, host_promises);
+        ctx.set_input_mode(InputMode::Pause);
+        self.run_with_context(path, inputs, ctx)
+    }
+
+    /// Resume/replay an interactive streaming run with persisted host-promise
+    /// state. Used by embedders that mirror the server session interaction
+    /// without routing through HTTP.
+    pub fn run_streaming_replay_pausable_with_host_promises(
+        &self,
+        path: &Path,
+        inputs: &Value,
+        replay_log: Vec<CallRecord>,
+        host_promises: Vec<HostPromiseRecord>,
+        sender: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+    ) -> Result<RunResult> {
+        let ctx = RuntimeContext::with_replay_and_host_promises(replay_log, host_promises);
+        ctx.set_event_sender(sender);
         ctx.set_input_mode(InputMode::Pause);
         self.run_with_context(path, inputs, ctx)
     }
@@ -1630,7 +1663,10 @@ mod tests {
             Ok(_) => panic!("expected JavaScript error after tool result"),
             Err(err) => err,
         };
-        assert!(err.to_string().contains("after tool result"));
+        assert!(
+            err.to_string().contains("after tool result"),
+            "unexpected error: {err}"
+        );
 
         let run_dir = std::fs::read_dir(&run_base)
             .unwrap()

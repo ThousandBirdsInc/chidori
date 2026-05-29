@@ -722,6 +722,10 @@ impl<'policy> SnapshotModuleBuilder<'policy> {
                 self.import_statement(Path::new("<entry>"), line_no + 1, line, imports, "const")?
             {
                 out.push_str(&statement);
+            } else if let Some(statement) =
+                export_statement(line, "globalThis.__chidori_exports")?
+            {
+                out.push_str(&statement);
             } else {
                 out.push_str(line);
                 out.push('\n');

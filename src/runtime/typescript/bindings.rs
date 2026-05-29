@@ -252,6 +252,7 @@ impl HostBindingBackend {
                                 .unwrap_or_else(|_| value.to_string()),
                             is_error: false,
                         }),
+                        Err(err) if err.contains(PAUSE_MARKER) => return Err(err),
                         Err(err) => result_blocks.push(ContentBlock::ToolResult {
                             tool_use_id: call.id,
                             content: err,

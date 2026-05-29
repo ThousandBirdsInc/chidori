@@ -64,7 +64,7 @@ sha2 = "0.10"
 wasmer = "4"
 wasmer-middlewares = "4"
 
-chidori-quickjs = { path = "crates/chidori-quickjs" }
+chidori-quickjs = { path = "crates/chidori-quickjs", version = "0.1.0" }
 async-trait = "0.1"
 derive_more = { version = "1", features = ["display"] }
 
@@ -83,6 +83,12 @@ serde_yaml = "0.9"
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
+
+# TypeScript-to-JavaScript stripping. Replaces a hand-rolled line-based stripper
+# that missed constructs like type predicates (`(t): t is string => ...`),
+# `satisfies` in odd positions, and overload signatures. oxc parses to a real
+# AST and emits JS via codegen, so unsupported sugar can't slip through.
+oxc = { version = "0.133", features = ["transformer", "codegen", "semantic"] }
 
 [dev-dependencies]
 # Legacy host-binding parity tests only. Production TypeScript execution uses

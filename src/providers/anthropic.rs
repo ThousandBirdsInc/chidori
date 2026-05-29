@@ -412,8 +412,18 @@ impl LlmProvider for AnthropicProvider {
                             pending_text.clear();
                         }
                         if let Some((id, name, json_buf)) = pending_tool.take() {
-                            let input: Value =
-                                serde_json::from_str(&json_buf).unwrap_or(Value::Null);
+                            // Zero-argument tools (e.g. list_subagents) emit no
+                            // input_json_delta events, leaving json_buf empty.
+                            // Anthropic's API rejects replayed conversations
+                            // whose tool_use blocks carry `input: null` with
+                            // "messages.input: Input should be an object", so
+                            // coerce empty / unparsable / non-object payloads
+                            // to `{}` here at the source.
+                            let parsed = serde_json::from_str::<Value>(&json_buf).ok();
+                            let input = match parsed {
+                                Some(v) if v.is_object() => v,
+                                _ => json!({}),
+                            };
                             tool_calls.push(ToolCall {
                                 id: id.clone(),
                                 name: name.clone(),
@@ -467,12 +477,23 @@ fn retry_after_duration(headers: &reqwest::header::HeaderMap, attempt: u32) -> D
 fn content_block_to_anthropic_json(block: &ContentBlock) -> Value {
     match block {
         ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
-        ContentBlock::ToolUse { id, name, input } => json!({
-            "type": "tool_use",
-            "id": id,
-            "name": name,
-            "input": input,
-        }),
+        ContentBlock::ToolUse { id, name, input } => {
+            // Anthropic requires `input` to be an object. Defense in depth
+            // against any already-stored history (or non-streaming producer)
+            // that left a null / non-object here; see the parse-time guard
+            // in the stream handler for the original failure mode.
+            let input_obj = if input.is_object() {
+                input.clone()
+            } else {
+                json!({})
+            };
+            json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input_obj,
+            })
+        }
         ContentBlock::ToolResult {
             tool_use_id,
             content,

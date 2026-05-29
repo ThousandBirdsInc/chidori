@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use minijinja::Environment;
+use minijinja::{Environment, UndefinedBehavior};
 use serde_json::Value;
 
 /// Template engine backed by minijinja.
@@ -67,6 +67,7 @@ impl TemplateEngine {
 
     fn create_env(&self) -> Environment<'static> {
         let mut env = Environment::new();
+        env.set_undefined_behavior(UndefinedBehavior::SemiStrict);
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
         env
@@ -109,5 +110,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, "Full details");
+    }
+
+    #[test]
+    fn test_render_missing_variable_errors() {
+        let engine = TemplateEngine::new(".");
+        let result = engine.render_string("Hello {{ name }}!", &json!({}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_render_wrong_shape_in_loop_errors() {
+        let engine = TemplateEngine::new(".");
+        let result = engine.render_string(
+            "{% for source in sources %}{{ source.title }}{% endfor %}",
+            &json!({"sources": "not a source list"}),
+        );
+        assert!(result.is_err());
     }
 }

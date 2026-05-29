@@ -538,6 +538,44 @@ mod tests {
     }
 
     #[test]
+    fn runtime_context_rejects_wrong_shape_template_vars() {
+        let source = r#"
+            export async function agent(input, chidori) {
+                return await chidori.template(
+                    "{% for source in sources %}{{ source.title }}{% endfor %}",
+                    { sources: "not a source list" }
+                );
+            }
+        "#;
+        let runtime_ctx = RuntimeContext::new();
+        let (tokio_rt, policy, policy_cache) = runtime_host();
+
+        let error = runtime()
+            .run_agent_source_with_context(
+                Path::new("/tmp/agent.ts"),
+                source,
+                &serde_json::json!({}),
+                runtime_ctx.clone(),
+                Arc::new(ProviderRegistry::new()),
+                template_engine(),
+                tokio_rt,
+                policy,
+                policy_cache,
+                Arc::new(ToolRegistry::new()),
+                Arc::new(McpManager::new()),
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Failed to render inline template"));
+        let records = runtime_ctx.call_log().into_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].function, "template");
+        assert!(records[0].error.is_some());
+    }
+
+    #[test]
     fn runtime_context_runs_try_call_and_retry_helpers() {
         let source = r#"
             export async function agent(input, chidori) {
