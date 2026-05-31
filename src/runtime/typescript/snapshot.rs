@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 
 use crate::mcp::McpManager;
 use crate::policy::{Decision, PolicyCache, PolicyConfig};
@@ -13,6 +14,7 @@ use crate::providers::{
     ContentBlock, LlmRequest, Message as LlmMessage, ProviderRegistry, ToolSchema,
 };
 use crate::runtime::call_log::CallRecord;
+use crate::runtime::capability::Capability;
 use crate::runtime::context::{InputMode, PendingApproval, RuntimeContext, PAUSE_MARKER};
 use crate::runtime::host_core;
 use crate::runtime::snapshot::{
@@ -639,8 +641,17 @@ impl<'policy> SnapshotModuleBuilder<'policy> {
             .iter()
             .filter_map(|import| import.resolved_path.as_ref())
         {
-            let module_source = std::fs::read_to_string(module_path)
-                .with_context(|| format!("Failed to read {}", module_path.display()))?;
+            // node:* builtins resolve to synthetic paths under
+            // `__node_builtins__/`; their bodies come from the shim registry,
+            // not the filesystem.
+            let module_source = if let Some(shim) =
+                crate::runtime::typescript::builtins::source_for(module_path)
+            {
+                shim.to_string()
+            } else {
+                std::fs::read_to_string(module_path)
+                    .with_context(|| format!("Failed to read {}", module_path.display()))?
+            };
             self.collect(module_path, &module_source)?;
         }
 
@@ -801,6 +812,175 @@ pub(crate) fn chidori_agent_env_json() -> String {
     }
 }
 
+/// UTF-8 + base64 text primitives. The QuickJS runtime ships no Web encoding
+/// APIs, but `node:buffer` and `node:fs` shims (and lots of real packages) need
+/// `TextEncoder`/`TextDecoder`/`atob`/`btoa`. Pure-JS, deterministic, no host
+/// access — safe to install unconditionally like `URLSearchParams`.
+pub(crate) const TEXT_ENCODING_POLYFILL: &str = r#"
+(function () {
+    const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (typeof globalThis.btoa !== "function") {
+        globalThis.btoa = function (bin) {
+            bin = String(bin);
+            let out = "";
+            for (let i = 0; i < bin.length; i += 3) {
+                const a = bin.charCodeAt(i);
+                const b = bin.charCodeAt(i + 1);
+                const c = bin.charCodeAt(i + 2);
+                const e1 = a >> 2;
+                const e2 = ((a & 3) << 4) | (b >> 4);
+                const e3 = isNaN(b) ? 64 : (((b & 15) << 2) | (c >> 6));
+                const e4 = isNaN(c) ? 64 : (c & 63);
+                out += B64[e1] + B64[e2] + (e3 === 64 ? "=" : B64[e3]) + (e4 === 64 ? "=" : B64[e4]);
+            }
+            return out;
+        };
+    }
+    if (typeof globalThis.atob !== "function") {
+        globalThis.atob = function (b64) {
+            b64 = String(b64).replace(/[^A-Za-z0-9+/]/g, "");
+            let out = "";
+            let buffer = 0;
+            let bits = 0;
+            for (let i = 0; i < b64.length; i++) {
+                const idx = B64.indexOf(b64[i]);
+                if (idx < 0) continue;
+                buffer = (buffer << 6) | idx;
+                bits += 6;
+                if (bits >= 8) {
+                    bits -= 8;
+                    out += String.fromCharCode((buffer >> bits) & 0xff);
+                }
+            }
+            return out;
+        };
+    }
+    if (typeof globalThis.TextEncoder !== "function") {
+        globalThis.TextEncoder = class TextEncoder {
+            get encoding() { return "utf-8"; }
+            encode(str) {
+                str = String(str === undefined ? "" : str);
+                const out = [];
+                for (let i = 0; i < str.length; i++) {
+                    let c = str.charCodeAt(i);
+                    if (c < 0x80) {
+                        out.push(c);
+                    } else if (c < 0x800) {
+                        out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+                    } else if (c >= 0xd800 && c <= 0xdbff) {
+                        const c2 = str.charCodeAt(++i);
+                        const cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+                        out.push(
+                            0xf0 | (cp >> 18),
+                            0x80 | ((cp >> 12) & 0x3f),
+                            0x80 | ((cp >> 6) & 0x3f),
+                            0x80 | (cp & 0x3f)
+                        );
+                    } else {
+                        out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+                    }
+                }
+                return new Uint8Array(out);
+            }
+        };
+    }
+    if (typeof globalThis.TextDecoder !== "function") {
+        globalThis.TextDecoder = class TextDecoder {
+            get encoding() { return "utf-8"; }
+            decode(buf) {
+                if (buf === undefined) return "";
+                const bytes = buf instanceof Uint8Array
+                    ? buf
+                    : new Uint8Array(buf.buffer ? buf.buffer : buf);
+                let out = "";
+                let i = 0;
+                while (i < bytes.length) {
+                    const c = bytes[i++];
+                    if (c < 0x80) {
+                        out += String.fromCharCode(c);
+                    } else if (c < 0xe0) {
+                        out += String.fromCharCode(((c & 0x1f) << 6) | (bytes[i++] & 0x3f));
+                    } else if (c < 0xf0) {
+                        out += String.fromCharCode(
+                            ((c & 0x0f) << 12) | ((bytes[i++] & 0x3f) << 6) | (bytes[i++] & 0x3f)
+                        );
+                    } else {
+                        const cp =
+                            ((c & 0x07) << 18) |
+                            ((bytes[i++] & 0x3f) << 12) |
+                            ((bytes[i++] & 0x3f) << 6) |
+                            (bytes[i++] & 0x3f);
+                        const u = cp - 0x10000;
+                        out += String.fromCharCode(0xd800 + (u >> 10), 0xdc00 + (u & 0x3ff));
+                    }
+                }
+                return out;
+            }
+        };
+    }
+})();
+"#;
+
+/// `globalThis.crypto` (Web Crypto subset): `getRandomValues`, `randomUUID`,
+/// and `subtle.digest`. Randomness routes through the captured native, so it is
+/// flagged and replayed like `node:crypto`. Installed unconditionally; the
+/// native throws if the crypto policy is `disabled`.
+pub(crate) const WEB_CRYPTO_POLYFILL: &str = r#"
+(function () {
+    if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === "function") return;
+    function base64ToBytes(b64) {
+        const bin = atob(b64);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+        return out;
+    }
+    function bytesToBase64(bytes) {
+        let s = "";
+        for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+        return btoa(s);
+    }
+    const cryptoObj = {
+        getRandomValues(typedArray) {
+            if (!ArrayBuffer.isView(typedArray)) {
+                throw new TypeError("crypto.getRandomValues expects a typed array");
+            }
+            const view = new Uint8Array(
+                typedArray.buffer,
+                typedArray.byteOffset,
+                typedArray.byteLength
+            );
+            const bytes = base64ToBytes(globalThis.__chidori_crypto_random(view.length));
+            view.set(bytes.subarray(0, view.length));
+            return typedArray;
+        },
+        randomUUID() {
+            const b = base64ToBytes(globalThis.__chidori_crypto_random(16));
+            b[6] = (b[6] & 0x0f) | 0x40;
+            b[8] = (b[8] & 0x3f) | 0x80;
+            const h = [];
+            for (let i = 0; i < 16; i++) h.push(b[i].toString(16).padStart(2, "0"));
+            return `${h[0]}${h[1]}${h[2]}${h[3]}-${h[4]}${h[5]}-${h[6]}${h[7]}-${h[8]}${h[9]}-${h[10]}${h[11]}${h[12]}${h[13]}${h[14]}${h[15]}`;
+        },
+        subtle: {
+            async digest(algorithm, data) {
+                const alg = typeof algorithm === "string" ? algorithm : (algorithm && algorithm.name);
+                let bytes;
+                if (typeof data === "string") bytes = new TextEncoder().encode(data);
+                else if (ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+                else bytes = new Uint8Array(data);
+                const out = base64ToBytes(globalThis.__chidori_crypto_hash(alg, bytesToBase64(bytes)));
+                return out.buffer;
+            },
+        },
+    };
+    Object.defineProperty(globalThis, "crypto", {
+        value: cryptoObj,
+        writable: true,
+        configurable: true,
+    });
+})();
+"#;
+
 pub(crate) const URL_SEARCH_PARAMS_POLYFILL: &str = r#"
 globalThis.URLSearchParams = class URLSearchParams {
     constructor(init) {
@@ -850,6 +1030,10 @@ globalThis.SharedArrayBuffer = function SharedArrayBuffer() {
     throw new Error("SharedArrayBuffer is disabled by Chidori snapshot policy");
 };
 globalThis.Atomics = undefined;
+// Logical clock (milliseconds). Driven forward by the virtual timer queue and
+// read by the fixed-Date shim, so `Date.now()` advances as timers fire while
+// staying fully deterministic. See docs/captured-effects-vfs-crypto-timers.md.
+if (typeof globalThis.__chidori_now !== "number") globalThis.__chidori_now = 0;
 "#,
     );
 
@@ -865,6 +1049,14 @@ globalThis.Atomics = undefined;
     // Minimal `URLSearchParams` — the QuickJS runtime ships no Web APIs, and
     // generated agents commonly build query strings with it.
     out.push_str(URL_SEARCH_PARAMS_POLYFILL);
+
+    // UTF-8 + base64 text primitives, needed by `node:buffer`/`node:fs` shims
+    // and common packages.
+    out.push_str(TEXT_ENCODING_POLYFILL);
+
+    // `globalThis.crypto` (Web Crypto subset). Routes randomness through the
+    // captured native so it is flagged and replayable.
+    out.push_str(WEB_CRYPTO_POLYFILL);
 
     match policy.date {
         DatePolicy::Disabled => out.push_str(
@@ -889,14 +1081,14 @@ const ChidoriHostDate = globalThis.Date;
 function ChidoriFixedDate(...args) {
     if (this instanceof ChidoriFixedDate) {
         return args.length === 0
-            ? new ChidoriHostDate(0)
+            ? new ChidoriHostDate(globalThis.__chidori_now)
             : new ChidoriHostDate(...args);
     }
     return args.length === 0
-        ? new ChidoriHostDate(0).toString()
+        ? new ChidoriHostDate(globalThis.__chidori_now).toString()
         : ChidoriHostDate(...args);
 }
-ChidoriFixedDate.now = function now() { return 0; };
+ChidoriFixedDate.now = function now() { return globalThis.__chidori_now; };
 ChidoriFixedDate.parse = ChidoriHostDate.parse;
 ChidoriFixedDate.UTC = ChidoriHostDate.UTC;
 ChidoriFixedDate.prototype = ChidoriHostDate.prototype;
@@ -945,8 +1137,120 @@ globalThis.Set = function Set() {
         MapSetSnapshotPolicy::Serialize => {}
     }
 
+    match policy.timers {
+        crate::runtime::snapshot::TimerPolicy::Disabled => out.push_str(TIMER_DISABLED_POLYFILL),
+        // Host is rejected for durable runs; absent a real OS event loop we run
+        // it through the same deterministic virtual queue as Virtual.
+        crate::runtime::snapshot::TimerPolicy::Virtual
+        | crate::runtime::snapshot::TimerPolicy::Host => out.push_str(TIMER_VIRTUAL_POLYFILL),
+    }
+
     Ok(out)
 }
+
+/// Virtual timer queue: deterministic, driven by the logical clock. Timers fire
+/// in `(deadline, id)` order via a self-rescheduling microtask pump, so they
+/// run inside the engine's normal job drain without any real wall-clock sleep.
+/// Uses plain arrays (not `Map`/`Set`, which the snapshot policy may disable).
+pub(crate) const TIMER_VIRTUAL_POLYFILL: &str = r#"
+(function () {
+    const tasks = [];
+    let nextId = 1;
+    let pumping = false;
+    let fired = 0;
+    const MAX_FIRES = 1000000;
+    function schedule(cb, delay, args, repeat) {
+        if (typeof cb !== "function") {
+            throw new TypeError("timer callback must be a function");
+        }
+        const d = Math.max(0, Math.floor(Number(delay) || 0));
+        const id = nextId++;
+        tasks.push({ id, deadline: globalThis.__chidori_now + d, interval: repeat ? d : null, cb, args });
+        if (typeof globalThis.__chidori_note_capability === "function") {
+            globalThis.__chidori_note_capability("timer");
+        }
+        if (!pumping) {
+            pumping = true;
+            Promise.resolve().then(pump);
+        }
+        return id;
+    }
+    function earliestIndex() {
+        let best = -1;
+        for (let i = 0; i < tasks.length; i++) {
+            if (best === -1 ||
+                tasks[i].deadline < tasks[best].deadline ||
+                (tasks[i].deadline === tasks[best].deadline && tasks[i].id < tasks[best].id)) {
+                best = i;
+            }
+        }
+        return best;
+    }
+    function pump() {
+        if (tasks.length === 0) { pumping = false; return; }
+        if (fired++ > MAX_FIRES) {
+            pumping = false;
+            tasks.length = 0;
+            throw new Error("Chidori timer pump exceeded " + MAX_FIRES + " firings (runaway setInterval?)");
+        }
+        const idx = earliestIndex();
+        const task = tasks[idx];
+        if (task.deadline > globalThis.__chidori_now) {
+            globalThis.__chidori_now = task.deadline;
+        }
+        if (task.interval != null) {
+            task.deadline = globalThis.__chidori_now + task.interval;
+        } else {
+            tasks.splice(idx, 1);
+        }
+        // Reschedule before invoking so the pump survives a throwing callback.
+        Promise.resolve().then(pump);
+        task.cb.apply(undefined, task.args);
+    }
+    globalThis.setTimeout = function setTimeout(cb, delay, ...args) {
+        return schedule(cb, delay, args, false);
+    };
+    globalThis.setInterval = function setInterval(cb, delay, ...args) {
+        return schedule(cb, delay, args, true);
+    };
+    globalThis.setImmediate = function setImmediate(cb, ...args) {
+        return schedule(cb, 0, args, false);
+    };
+    function clear(id) {
+        for (let i = 0; i < tasks.length; i++) {
+            if (tasks[i].id === id) { tasks.splice(i, 1); return; }
+        }
+    }
+    globalThis.clearTimeout = clear;
+    globalThis.clearInterval = clear;
+    globalThis.clearImmediate = clear;
+    if (typeof globalThis.queueMicrotask !== "function") {
+        globalThis.queueMicrotask = function queueMicrotask(cb) {
+            if (typeof cb !== "function") throw new TypeError("queueMicrotask callback must be a function");
+            if (typeof globalThis.__chidori_note_capability === "function") {
+                globalThis.__chidori_note_capability("microtask");
+            }
+            Promise.resolve().then(cb);
+        };
+    }
+})();
+"#;
+
+/// Timer surface under `timers=disabled`: scheduling throws, so an agent that
+/// must not schedule fails loudly rather than silently no-op'ing.
+pub(crate) const TIMER_DISABLED_POLYFILL: &str = r#"
+(function () {
+    const blocked = function () {
+        throw new Error("timers are disabled by Chidori runtime policy (timers=disabled)");
+    };
+    globalThis.setTimeout = blocked;
+    globalThis.setInterval = blocked;
+    globalThis.setImmediate = blocked;
+    globalThis.clearTimeout = function () {};
+    globalThis.clearInterval = function () {};
+    globalThis.clearImmediate = function () {};
+})();
+"#;
 
 fn resolved_snapshot_imports(
     path: &Path,
@@ -1009,11 +1313,35 @@ impl ParsedImport {
             let bindings = import_named_bindings(path, line_no, &clause[1..clause.len() - 1])?;
             return Ok(format!("{declaration} {{ {bindings} }} = {namespace};\n"));
         }
-        anyhow::bail!(
-            "{}:{}: default TypeScript imports are not supported by the snapshot scaffold",
-            path.display(),
-            line_no
-        );
+        // A default import, optionally combined with a namespace or named
+        // clause: `import D from`, `import D, * as ns from`, `import D, { a } from`.
+        // The module namespace object exposes the default export under
+        // `.default` (see `export_statement`).
+        let (default_name, remainder) = match clause.split_once(',') {
+            Some((default_name, remainder)) => (default_name.trim(), Some(remainder.trim())),
+            None => (clause, None),
+        };
+        validate_identifier(path, line_no, default_name)?;
+        let mut out = format!("{declaration} {default_name} = {namespace}.default;\n");
+        if let Some(remainder) = remainder {
+            if let Some(rest) = remainder.strip_prefix("* as ") {
+                let name = rest.trim();
+                validate_identifier(path, line_no, name)?;
+                out.push_str(&format!("{declaration} {name} = {namespace};\n"));
+            } else if remainder.starts_with('{') && remainder.ends_with('}') {
+                let bindings =
+                    import_named_bindings(path, line_no, &remainder[1..remainder.len() - 1])?;
+                out.push_str(&format!("{declaration} {{ {bindings} }} = {namespace};\n"));
+            } else {
+                anyhow::bail!(
+                    "{}:{}: unsupported TypeScript import clause `{}` for snapshot scaffold",
+                    path.display(),
+                    line_no,
+                    clause
+                );
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -1128,8 +1456,13 @@ fn export_statement(line: &str, namespace: &str) -> Result<Option<String>> {
         }
         return Ok(Some(out));
     }
-    if trimmed.starts_with("export default ") {
-        anyhow::bail!("default exports are not supported by the snapshot scaffold");
+    if let Some(rest) = trimmed.strip_prefix("export default ") {
+        // Assign the default export onto the module namespace under `.default`,
+        // which `binding_statement` reads for default imports. `rest` keeps the
+        // expression and its trailing semicolon, so `export default fs;` becomes
+        // `<namespace>.default = fs;` and `export default function f(){}` becomes
+        // a function-expression assignment.
+        return Ok(Some(format!("{prefix}{namespace}.default = {rest}\n")));
     }
     Ok(None)
 }
@@ -1536,6 +1869,518 @@ unsafe extern "C" fn native_runtime_workspace_manifest(
             .unwrap_or_else(|err| unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) }),
         Err(err) => unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) },
     }
+}
+
+/// Reject filesystem access unless the policy permits the captured VFS. Host
+/// (uncaptured disk) mode is intentionally unimplemented here — it is rejected
+/// for durable runs and out of scope for the captured-effects model.
+fn fs_policy_guard(state: &TypeScriptSnapshotHostState) -> Result<()> {
+    match state.runtime_policy.fs {
+        crate::runtime::snapshot::FsPolicy::Captured => Ok(()),
+        crate::runtime::snapshot::FsPolicy::Disabled => {
+            anyhow::bail!("node:fs is disabled by Chidori runtime policy (fs=disabled)")
+        }
+        crate::runtime::snapshot::FsPolicy::Host => {
+            anyhow::bail!("node:fs host-disk mode (fs=host) is not implemented in this runtime")
+        }
+    }
+}
+
+/// Bytes cross the JS↔Rust boundary base64-encoded so binary content survives
+/// the JSON value bridge intact.
+fn b64_encode(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn b64_decode(s: &str) -> Result<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(s.as_bytes())
+        .map_err(|err| anyhow::anyhow!("invalid base64 payload: {err}"))
+}
+
+unsafe extern "C" fn native_runtime_fs_read(
+    ctx: *mut chidori_quickjs::sys::JSContext,
+    _this_val: chidori_quickjs::sys::JSValue,
+    argc: std::ffi::c_int,
+    argv: *mut chidori_quickjs::sys::JSValue,
+) -> chidori_quickjs::sys::JSValue {
+    let Some(state) =
+        (unsafe { chidori_quickjs::context_opaque_mut::<TypeScriptSnapshotHostState>(ctx) })
+    else {
+        return unsafe {
+            chidori_quickjs::throw_string(ctx, "missing TypeScript snapshot host state")
+        };
+    };
+    let result = (|| -> Result<serde_json::Value> {
+        fs_policy_guard(state)?;
+        let path = unsafe { chidori_quickjs::callback_arg_to_string(ctx, argc, argv, 0) }
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let bytes = state
+            .runtime_ctx
+            .vfs_read(&path)
+            .map_err(|err| anyhow::anyhow!(err))?;
+        Ok(serde_json::Value::String(b64_encode(&bytes)))
+    })();
+    match result {
+        Ok(value) => unsafe { chidori_quickjs::json_to_js_value(ctx, value) }
+            .unwrap_or_else(|err| unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) }),
+        Err(err) => unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) },
+    }
+}
+
+unsafe extern "C" fn native_runtime_fs_write(
+    ctx: *mut chidori_quickjs::sys::JSContext,
+    _this_val: chidori_quickjs::sys::JSValue,
+    argc: std::ffi::c_int,
+    argv: *mut chidori_quickjs::sys::JSValue,
+) -> chidori_quickjs::sys::JSValue {
+    let Some(state) =
+        (unsafe { chidori_quickjs::context_opaque_mut::<TypeScriptSnapshotHostState>(ctx) })
+    else {
+        return unsafe {
+            chidori_quickjs::throw_string(ctx, "missing TypeScript snapshot host state")
+        };
+    };
+    let result = (|| -> Result<serde_json::Value> {
+        fs_policy_guard(state)?;
+        let path = unsafe { chidori_quickjs::callback_arg_to_string(ctx, argc, argv, 0) }
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let data_b64 = unsafe { chidori_quickjs::callback_arg_to_string(ctx, argc, argv, 1) }
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let bytes = b64_decode(&data_b64)?;
+        state
+            .runtime_ctx
+            .vfs_write(&path, bytes)
+            .map_err(|err| anyhow::anyhow!(err))?;
+        Ok(serde_json::Value::Null)
+    })();
+    match result {
+        Ok(value) => unsafe { chidori_quickjs::json_to_js_value(ctx, value) }
+            .unwrap_or_else(|err| unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) }),
+        Err(err) => unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) },
+    }
+}
+
+unsafe extern "C" fn native_runtime_fs_append(
+    ctx: *mut chidori_quickjs::sys::JSContext,
+    _this_val: chidori_quickjs::sys::JSValue,
+    argc: std::ffi::c_int,
+    argv: *mut chidori_quickjs::sys::JSValue,
+) -> chidori_quickjs::sys::JSValue {
+    let Some(state) =
+        (unsafe { chidori_quickjs::context_opaque_mut::<TypeScriptSnapshotHostState>(ctx) })
+    else {
+        return unsafe {
+            chidori_quickjs::throw_string(ctx, "missing TypeScript snapshot host state")
+        };
+    };
+    let result = (|| -> Result<serde_json::Value> {
+        fs_policy_guard(state)?;
+        let path = unsafe { chidori_quickjs::callback_arg_to_string(ctx, argc, argv, 0) }
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let data_b64 = unsafe { chidori_quickjs::callback_arg_to_string(ctx, argc, argv, 1) }
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let bytes = b64_decode(&data_b64)?;
+        state
+            .runtime_ctx
+            .vfs_append(&path, &bytes)
+            .map_err(|err| anyhow::anyhow!(err))?;
+        Ok(serde_json::Value::Null)
+    })();
+    match result {
+        Ok(value) => unsafe { chidori_quickjs::json_to_js_value(ctx, value) }
+            .unwrap_or_else(|err| unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) }),
+        Err(err) => unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) },
+    }
+}
+
+unsafe extern "C" fn native_runtime_fs_readdir(
+    ctx: *mut chidori_quickjs::sys::JSContext,
+    _this_val: chidori_quickjs::sys::JSValue,
+    argc: std::ffi::c_int,
+    argv: *mut chidori_quickjs::sys::JSValue,
+) -> chidori_quickjs::sys::JSValue {
+    let Some(state) =
+        (unsafe { chidori_quickjs::context_opaque_mut::<TypeScriptSnapshotHostState>(ctx) })
+    else {
+        return unsafe {
+            chidori_quickjs::throw_string(ctx, "missing TypeScript snapshot host state")
+        };
+    };
+    let result = (|| -> Result<serde_json::Value> {
+        fs_policy_guard(state)?;
+        let path = unsafe { chidori_quickjs::callback_arg_to_string(ctx, argc, argv, 0) }
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let names = state
+            .runtime_ctx
+            .vfs_readdir(&path)
+            .map_err(|err| anyhow::anyhow!(err))?;
+        Ok(serde_json::Value::Array(
+            names.into_iter().map(serde_json::Value::String).collect(),
+        ))
+    })();
+    match result {
+        Ok(value) => unsafe { chidori_quickjs::json_to_js_value(ctx, value) }
+            .unwrap_or_else(|err| unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) }),
+        Err(err) => unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) },
+    }
+}
+
+unsafe extern "C" fn native_runtime_fs_mkdir(
+    ctx: *mut chidori_quickjs::sys::JSContext,
+    _this_val: chidori_quickjs::sys::JSValue,
+    argc: std::ffi::c_int,
+    argv: *mut chidori_quickjs::sys::JSValue,
+) -> chidori_quickjs::sys::JSValue {
+    let Some(state) =
+        (unsafe { chidori_quickjs::context_opaque_mut::<TypeScriptSnapshotHostState>(ctx) })
+    else {
+        return unsafe {
+            chidori_quickjs::throw_string(ctx, "missing TypeScript snapshot host state")
+        };
+    };
+    let result = (|| -> Result<serde_json::Value> {
+        fs_policy_guard(state)?;
+        let path = unsafe { chidori_quickjs::callback_arg_to_string(ctx, argc, argv, 0) }
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let recursive = if argc > 1 {
+            unsafe { chidori_quickjs::callback_arg_to_json(ctx, argc, argv, 1) }
+                .map_err(|err| anyhow::anyhow!(err))?
+                .as_bool()
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        state
+            .runtime_ctx
+            .vfs_mkdir(&path, recursive)
+            .map_err(|err| anyhow::anyhow!(err))?;
+        Ok(serde_json::Value::Null)
+    })();
+    match result {
+        Ok(value) => unsafe { chidori_quickjs::json_to_js_value(ctx, value) }
+            .unwrap_or_else(|err| unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) }),
+        Err(err) => unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) },
+    }
+}
+
+unsafe extern "C" fn native_runtime_fs_rm(
+    ctx: *mut chidori_quickjs::sys::JSContext,
+    _this_val: chidori_quickjs::sys::JSValue,
+    argc: std::ffi::c_int,
+    argv: *mut chidori_quickjs::sys::JSValue,
+) -> chidori_quickjs::sys::JSValue {
+    let Some(state) =
+        (unsafe { chidori_quickjs::context_opaque_mut::<TypeScriptSnapshotHostState>(ctx) })
+    else {
+        return unsafe {
+            chidori_quickjs::throw_string(ctx, "missing TypeScript snapshot host state")
+        };
+    };
+    let result = (|| -> Result<serde_json::Value> {
+        fs_policy_guard(state)?;
+        let path = unsafe { chidori_quickjs::callback_arg_to_string(ctx, argc, argv, 0) }
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let recursive = if argc > 1 {
+            unsafe { chidori_quickjs::callback_arg_to_json(ctx, argc, argv, 1) }
+                .map_err(|err| anyhow::anyhow!(err))?
+                .as_bool()
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        let force = if argc > 2 {
+            unsafe { chidori_quickjs::callback_arg_to_json(ctx, argc, argv, 2) }
+                .map_err(|err| anyhow::anyhow!(err))?
+                .as_bool()
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        state
+            .runtime_ctx
+            .vfs_remove(&path, recursive, force)
+            .map_err(|err| anyhow::anyhow!(err))?;
+        Ok(serde_json::Value::Null)
+    })();
+    match result {
+        Ok(value) => unsafe { chidori_quickjs::json_to_js_value(ctx, value) }
+            .unwrap_or_else(|err| unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) }),
+        Err(err) => unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) },
+    }
+}
+
+unsafe extern "C" fn native_runtime_fs_stat(
+    ctx: *mut chidori_quickjs::sys::JSContext,
+    _this_val: chidori_quickjs::sys::JSValue,
+    argc: std::ffi::c_int,
+    argv: *mut chidori_quickjs::sys::JSValue,
+) -> chidori_quickjs::sys::JSValue {
+    let Some(state) =
+        (unsafe { chidori_quickjs::context_opaque_mut::<TypeScriptSnapshotHostState>(ctx) })
+    else {
+        return unsafe {
+            chidori_quickjs::throw_string(ctx, "missing TypeScript snapshot host state")
+        };
+    };
+    let result = (|| -> Result<serde_json::Value> {
+        fs_policy_guard(state)?;
+        let path = unsafe { chidori_quickjs::callback_arg_to_string(ctx, argc, argv, 0) }
+            .map_err(|err| anyhow::anyhow!(err))?;
+        state
+            .runtime_ctx
+            .vfs_stat(&path)
+            .map_err(|err| anyhow::anyhow!(err))
+    })();
+    match result {
+        Ok(value) => unsafe { chidori_quickjs::json_to_js_value(ctx, value) }
+            .unwrap_or_else(|err| unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) }),
+        Err(err) => unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) },
+    }
+}
+
+unsafe extern "C" fn native_runtime_fs_exists(
+    ctx: *mut chidori_quickjs::sys::JSContext,
+    _this_val: chidori_quickjs::sys::JSValue,
+    argc: std::ffi::c_int,
+    argv: *mut chidori_quickjs::sys::JSValue,
+) -> chidori_quickjs::sys::JSValue {
+    let Some(state) =
+        (unsafe { chidori_quickjs::context_opaque_mut::<TypeScriptSnapshotHostState>(ctx) })
+    else {
+        return unsafe {
+            chidori_quickjs::throw_string(ctx, "missing TypeScript snapshot host state")
+        };
+    };
+    let result = (|| -> Result<serde_json::Value> {
+        fs_policy_guard(state)?;
+        let path = unsafe { chidori_quickjs::callback_arg_to_string(ctx, argc, argv, 0) }
+            .map_err(|err| anyhow::anyhow!(err))?;
+        Ok(serde_json::Value::Bool(state.runtime_ctx.vfs_exists(&path)))
+    })();
+    match result {
+        Ok(value) => unsafe { chidori_quickjs::json_to_js_value(ctx, value) }
+            .unwrap_or_else(|err| unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) }),
+        Err(err) => unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) },
+    }
+}
+
+unsafe extern "C" fn native_runtime_fs_rename(
+    ctx: *mut chidori_quickjs::sys::JSContext,
+    _this_val: chidori_quickjs::sys::JSValue,
+    argc: std::ffi::c_int,
+    argv: *mut chidori_quickjs::sys::JSValue,
+) -> chidori_quickjs::sys::JSValue {
+    let Some(state) =
+        (unsafe { chidori_quickjs::context_opaque_mut::<TypeScriptSnapshotHostState>(ctx) })
+    else {
+        return unsafe {
+            chidori_quickjs::throw_string(ctx, "missing TypeScript snapshot host state")
+        };
+    };
+    let result = (|| -> Result<serde_json::Value> {
+        fs_policy_guard(state)?;
+        let from = unsafe { chidori_quickjs::callback_arg_to_string(ctx, argc, argv, 0) }
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let to = unsafe { chidori_quickjs::callback_arg_to_string(ctx, argc, argv, 1) }
+            .map_err(|err| anyhow::anyhow!(err))?;
+        state
+            .runtime_ctx
+            .vfs_rename(&from, &to)
+            .map_err(|err| anyhow::anyhow!(err))?;
+        Ok(serde_json::Value::Null)
+    })();
+    match result {
+        Ok(value) => unsafe { chidori_quickjs::json_to_js_value(ctx, value) }
+            .unwrap_or_else(|err| unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) }),
+        Err(err) => unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) },
+    }
+}
+
+/// Reject crypto access when the policy disables it.
+fn crypto_policy_guard(state: &TypeScriptSnapshotHostState) -> Result<()> {
+    if state.runtime_policy.crypto == crate::runtime::snapshot::CryptoPolicy::Disabled {
+        anyhow::bail!("node:crypto is disabled by Chidori runtime policy (crypto=disabled)");
+    }
+    Ok(())
+}
+
+/// Draw `n` random bytes honoring the crypto policy, with capture/replay so a
+/// resume reproduces the exact bytes. `Captured`/`Host` draw from the host
+/// CSPRNG (only `Captured` records); `Seeded` derives deterministically from
+/// the run seed (and records, so replay is exact). Raises `CryptoRandom`.
+fn execute_captured_random(state: &TypeScriptSnapshotHostState, n: usize) -> Result<Vec<u8>> {
+    use crate::runtime::snapshot::CryptoPolicy;
+    let ctx = &state.runtime_ctx;
+    let seq = ctx.next_seq();
+    match ctx.try_replay_checked(seq, "crypto.random") {
+        Ok(Some(record)) => {
+            ctx.note_capability(Capability::CryptoRandom, seq);
+            let b64 = record
+                .result
+                .get("bytes")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("crypto replay record is missing bytes"))?;
+            return b64_decode(b64);
+        }
+        Ok(None) => {}
+        Err(message) => anyhow::bail!(message),
+    }
+    let bytes = match state.runtime_policy.crypto {
+        CryptoPolicy::Seeded => crate::runtime::crypto::seeded_bytes(
+            &state.runtime_policy.deterministic_seed,
+            seq,
+            n,
+        ),
+        CryptoPolicy::Captured | CryptoPolicy::Host => crate::runtime::crypto::random_bytes(n),
+        CryptoPolicy::Disabled => unreachable!("guarded by crypto_policy_guard"),
+    };
+    if state.runtime_policy.crypto != CryptoPolicy::Host {
+        ctx.record_call(CallRecord {
+            seq,
+            parent_seq: None,
+            function: "crypto.random".to_string(),
+            args: serde_json::json!({ "n": n }),
+            result: serde_json::json!({ "bytes": b64_encode(&bytes) }),
+            duration_ms: 0,
+            token_usage: None,
+            timestamp: chrono::Utc::now(),
+            error: None,
+        });
+    }
+    ctx.note_capability(Capability::CryptoRandom, seq);
+    Ok(bytes)
+}
+
+unsafe extern "C" fn native_runtime_crypto_random(
+    ctx: *mut chidori_quickjs::sys::JSContext,
+    _this_val: chidori_quickjs::sys::JSValue,
+    argc: std::ffi::c_int,
+    argv: *mut chidori_quickjs::sys::JSValue,
+) -> chidori_quickjs::sys::JSValue {
+    let Some(state) =
+        (unsafe { chidori_quickjs::context_opaque_mut::<TypeScriptSnapshotHostState>(ctx) })
+    else {
+        return unsafe {
+            chidori_quickjs::throw_string(ctx, "missing TypeScript snapshot host state")
+        };
+    };
+    let result = (|| -> Result<serde_json::Value> {
+        crypto_policy_guard(state)?;
+        let n = unsafe { chidori_quickjs::callback_arg_to_json(ctx, argc, argv, 0) }
+            .map_err(|err| anyhow::anyhow!(err))?
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("crypto random length must be a non-negative integer"))?
+            as usize;
+        if n > 1_048_576 {
+            anyhow::bail!("crypto random length {n} exceeds the 1MiB cap");
+        }
+        let bytes = execute_captured_random(state, n)?;
+        Ok(serde_json::Value::String(b64_encode(&bytes)))
+    })();
+    match result {
+        Ok(value) => unsafe { chidori_quickjs::json_to_js_value(ctx, value) }
+            .unwrap_or_else(|err| unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) }),
+        Err(err) => unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) },
+    }
+}
+
+unsafe extern "C" fn native_runtime_crypto_hash(
+    ctx: *mut chidori_quickjs::sys::JSContext,
+    _this_val: chidori_quickjs::sys::JSValue,
+    argc: std::ffi::c_int,
+    argv: *mut chidori_quickjs::sys::JSValue,
+) -> chidori_quickjs::sys::JSValue {
+    let Some(state) =
+        (unsafe { chidori_quickjs::context_opaque_mut::<TypeScriptSnapshotHostState>(ctx) })
+    else {
+        return unsafe {
+            chidori_quickjs::throw_string(ctx, "missing TypeScript snapshot host state")
+        };
+    };
+    let result = (|| -> Result<serde_json::Value> {
+        crypto_policy_guard(state)?;
+        let alg = unsafe { chidori_quickjs::callback_arg_to_string(ctx, argc, argv, 0) }
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let data_b64 = unsafe { chidori_quickjs::callback_arg_to_string(ctx, argc, argv, 1) }
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let data = b64_decode(&data_b64)?;
+        let digest = crate::runtime::crypto::hash(&alg, &data)?;
+        // Hashing is a pure function of its input: flag for visibility but do
+        // not call-log (nothing nondeterministic to replay).
+        state
+            .runtime_ctx
+            .note_capability(Capability::CryptoHash, state.runtime_ctx.current_seq());
+        Ok(serde_json::Value::String(b64_encode(&digest)))
+    })();
+    match result {
+        Ok(value) => unsafe { chidori_quickjs::json_to_js_value(ctx, value) }
+            .unwrap_or_else(|err| unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) }),
+        Err(err) => unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) },
+    }
+}
+
+unsafe extern "C" fn native_runtime_crypto_hmac(
+    ctx: *mut chidori_quickjs::sys::JSContext,
+    _this_val: chidori_quickjs::sys::JSValue,
+    argc: std::ffi::c_int,
+    argv: *mut chidori_quickjs::sys::JSValue,
+) -> chidori_quickjs::sys::JSValue {
+    let Some(state) =
+        (unsafe { chidori_quickjs::context_opaque_mut::<TypeScriptSnapshotHostState>(ctx) })
+    else {
+        return unsafe {
+            chidori_quickjs::throw_string(ctx, "missing TypeScript snapshot host state")
+        };
+    };
+    let result = (|| -> Result<serde_json::Value> {
+        crypto_policy_guard(state)?;
+        let alg = unsafe { chidori_quickjs::callback_arg_to_string(ctx, argc, argv, 0) }
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let key_b64 = unsafe { chidori_quickjs::callback_arg_to_string(ctx, argc, argv, 1) }
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let data_b64 = unsafe { chidori_quickjs::callback_arg_to_string(ctx, argc, argv, 2) }
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let key = b64_decode(&key_b64)?;
+        let data = b64_decode(&data_b64)?;
+        let digest = crate::runtime::crypto::hmac(&alg, &key, &data)?;
+        state
+            .runtime_ctx
+            .note_capability(Capability::CryptoHash, state.runtime_ctx.current_seq());
+        Ok(serde_json::Value::String(b64_encode(&digest)))
+    })();
+    match result {
+        Ok(value) => unsafe { chidori_quickjs::json_to_js_value(ctx, value) }
+            .unwrap_or_else(|err| unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) }),
+        Err(err) => unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) },
+    }
+}
+
+/// Raise a capability flag from JS (used by the timer polyfill for
+/// `Timer`/`Microtask`). The flag name is the snake_case `Capability::as_str`
+/// form; unknown names are ignored so a forward-compatible prelude can't crash.
+unsafe extern "C" fn native_runtime_note_capability(
+    ctx: *mut chidori_quickjs::sys::JSContext,
+    _this_val: chidori_quickjs::sys::JSValue,
+    argc: std::ffi::c_int,
+    argv: *mut chidori_quickjs::sys::JSValue,
+) -> chidori_quickjs::sys::JSValue {
+    let Some(state) =
+        (unsafe { chidori_quickjs::context_opaque_mut::<TypeScriptSnapshotHostState>(ctx) })
+    else {
+        return unsafe {
+            chidori_quickjs::throw_string(ctx, "missing TypeScript snapshot host state")
+        };
+    };
+    if let Ok(name) = unsafe { chidori_quickjs::callback_arg_to_string(ctx, argc, argv, 0) } {
+        if let Some(cap) = Capability::from_str(&name) {
+            state
+                .runtime_ctx
+                .note_capability(cap, state.runtime_ctx.current_seq());
+        }
+    }
+    unsafe { chidori_quickjs::json_to_js_value(ctx, serde_json::Value::Null) }
+        .unwrap_or_else(|err| unsafe { chidori_quickjs::throw_string(ctx, &err.to_string()) })
 }
 
 unsafe extern "C" fn native_runtime_log(
@@ -2855,6 +3700,51 @@ impl TypeScriptSnapshotContext<'_> {
             Some(native_runtime_workspace_manifest),
             0,
         )?;
+        self.install_global_native_function("__chidori_fs_read", Some(native_runtime_fs_read), 1)?;
+        self.install_global_native_function("__chidori_fs_write", Some(native_runtime_fs_write), 2)?;
+        self.install_global_native_function(
+            "__chidori_fs_append",
+            Some(native_runtime_fs_append),
+            2,
+        )?;
+        self.install_global_native_function(
+            "__chidori_fs_readdir",
+            Some(native_runtime_fs_readdir),
+            1,
+        )?;
+        self.install_global_native_function("__chidori_fs_mkdir", Some(native_runtime_fs_mkdir), 2)?;
+        self.install_global_native_function("__chidori_fs_rm", Some(native_runtime_fs_rm), 3)?;
+        self.install_global_native_function("__chidori_fs_stat", Some(native_runtime_fs_stat), 1)?;
+        self.install_global_native_function(
+            "__chidori_fs_exists",
+            Some(native_runtime_fs_exists),
+            1,
+        )?;
+        self.install_global_native_function(
+            "__chidori_fs_rename",
+            Some(native_runtime_fs_rename),
+            2,
+        )?;
+        self.install_global_native_function(
+            "__chidori_crypto_random",
+            Some(native_runtime_crypto_random),
+            1,
+        )?;
+        self.install_global_native_function(
+            "__chidori_crypto_hash",
+            Some(native_runtime_crypto_hash),
+            2,
+        )?;
+        self.install_global_native_function(
+            "__chidori_crypto_hmac",
+            Some(native_runtime_crypto_hmac),
+            3,
+        )?;
+        self.install_global_native_function(
+            "__chidori_note_capability",
+            Some(native_runtime_note_capability),
+            1,
+        )?;
         self.install_js_helpers()
     }
 
@@ -3127,6 +4017,9 @@ fn snapshot_method_for_host_operation(operation: &PendingHostOperation) -> Resul
         PendingHostOperationKind::PolicyApproval => {
             anyhow::bail!("policy approval is resolved outside the snapshot chidori host object")
         }
+        PendingHostOperationKind::Timer => {
+            anyhow::bail!("virtual timers fire inside the job drain, not as snapshot host calls")
+        }
         PendingHostOperationKind::Sandbox => match operation.function.as_deref() {
             Some("exec_js") => Ok("execJs"),
             Some("exec_python") => Ok("execPython"),
@@ -3148,9 +4041,45 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::providers::{ContentBlock, LlmProvider, LlmResponse};
-    use crate::runtime::snapshot::SnapshotBlobKind;
+    use crate::runtime::snapshot::{
+        DatePolicy, MapSetSnapshotPolicy, RandomPolicy, SnapshotBlobKind, TypeScriptImportPolicy,
+    };
 
     use super::*;
+    use crate::runtime::snapshot::{CryptoPolicy, FsPolicy, TimerPolicy};
+
+    #[test]
+    fn export_default_assigns_namespace_default() {
+        let out = export_statement("export default fs;", "__chidori_module")
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, "__chidori_module.default = fs;\n");
+        let obj = export_statement("export default { Buffer };", "ns")
+            .unwrap()
+            .unwrap();
+        assert_eq!(obj, "ns.default = { Buffer };\n");
+    }
+
+    #[test]
+    fn default_import_binds_namespace_default() {
+        let parsed = parse_import_line("import fs from \"node:fs\";").unwrap();
+        let stmt = parsed
+            .binding_statement(Path::new("a.ts"), 1, "NS", "const")
+            .unwrap();
+        assert_eq!(stmt, "const fs = NS.default;\n");
+    }
+
+    #[test]
+    fn default_plus_named_import_binds_both() {
+        let parsed = parse_import_line("import fs, { readFileSync } from \"node:fs\";").unwrap();
+        let stmt = parsed
+            .binding_statement(Path::new("a.ts"), 1, "NS", "const")
+            .unwrap();
+        assert_eq!(
+            stmt,
+            "const fs = NS.default;\nconst { readFileSync } = NS;\n"
+        );
+    }
 
     struct SnapshotPromptProvider;
 
@@ -5750,5 +6679,85 @@ mod tests {
             .contains("runtime snapshot branch metadata mismatch"));
 
         let _ = std::fs::remove_dir_all(run_dir);
+    }
+
+    /// End-to-end bundling test for the `Node` import policy: an agent that
+    /// imports both a bare npm package (from a fixture `node_modules`) and a
+    /// `node:process` builtin should bundle into a single string whose
+    /// `__chidori_modules` table contains entries for each resolved path.
+    #[test]
+    fn build_snapshot_bundle_resolves_node_packages_and_builtins() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Anchor the workspace with a package.json so `find_workspace_root`
+        // picks this directory rather than walking past it.
+        std::fs::write(root.join("package.json"), r#"{"name":"agent-fixture"}"#).unwrap();
+        // A fake npm package with `exports` and a real on-disk module.
+        let pkg_dir = root.join("node_modules/@chidori-integrations/example");
+        std::fs::create_dir_all(pkg_dir.join("dist")).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"@chidori-integrations/example","exports":"./dist/index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pkg_dir.join("dist/index.js"),
+            "export const greeting = \"hello from example pkg\";\n",
+        )
+        .unwrap();
+
+        let agent_path = root.join("agent.ts");
+        let agent_source = r#"
+            import { greeting } from "@chidori-integrations/example";
+            import { env } from "node:process";
+            export async function agent(_input, _chidori) {
+                return { greeting, hasEnv: !!env };
+            }
+        "#;
+        std::fs::write(&agent_path, agent_source).unwrap();
+
+        let policy = RuntimePolicy {
+            typescript_imports: TypeScriptImportPolicy::Node,
+            date: DatePolicy::Fixed,
+            random: RandomPolicy::Seeded,
+            maps_sets: MapSetSnapshotPolicy::Reject,
+            fs: FsPolicy::Captured,
+            crypto: CryptoPolicy::Captured,
+            timers: TimerPolicy::Virtual,
+            deterministic_seed: "0000000000000000".to_string(),
+        };
+        let bundle = build_snapshot_bundle(&agent_path, agent_source, &policy).unwrap();
+
+        // The package module should be bundled under its resolved path.
+        assert!(
+            bundle.contains("dist/index.js"),
+            "bundle missing package module:\n{bundle}"
+        );
+        assert!(
+            bundle.contains("hello from example pkg"),
+            "bundle missing package source:\n{bundle}"
+        );
+        // The node:process shim should be inlined under the synthetic
+        // builtin path; we only need to confirm the shim's marker line shows
+        // up so we know the builtin source took the place of an FS read.
+        assert!(
+            bundle.contains("__node_builtins__"),
+            "bundle missing node builtin path:\n{bundle}"
+        );
+        assert!(
+            bundle.contains("globalThis.process"),
+            "bundle missing node:process shim body:\n{bundle}"
+        );
+        // The agent's own import bindings should rewrite into
+        // __chidori_modules lookups instead of staying as raw `import`s. We
+        // can't grep the specifier string directly because the shim source
+        // mentions `node:process` in a comment, so check that no statement
+        // line begins with `import ` (the bundler rewrites them all).
+        for line in bundle.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("import ") && !trimmed.starts_with("import type ") {
+                panic!("bundle leaked raw import statement: {line}\nfull bundle:\n{bundle}");
+            }
+        }
     }
 }

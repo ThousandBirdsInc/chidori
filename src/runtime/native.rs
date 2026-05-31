@@ -19,12 +19,31 @@ use crate::tools::ToolRegistry;
 
 pub const NATIVE_AGENT_CHECKPOINT_FILE: &str = "native_checkpoint.json";
 
+/// Refreshed request state pulled at each tool-loop turn boundary. Mirrors Pi's
+/// harness "save point": the host can change the model, system prompt, or tool
+/// schemas mid-run, and the change takes effect on the *next* provider request
+/// within the same tool loop rather than only on the next top-level run. Each
+/// field is optional; `None` keeps the value the run started with.
+#[derive(Debug, Clone, Default)]
+pub struct TurnSavePoint {
+    pub model: Option<String>,
+    pub system: Option<Option<String>>,
+    pub tool_schemas: Option<Vec<ToolSchema>>,
+}
+
+/// Host-supplied callback consulted before each provider request in the tool
+/// loop. Returning a `TurnSavePoint` with some fields set overrides those fields
+/// for the upcoming request. Kept off `NativeAgentRequest` because it is a live
+/// runtime handle, not serializable checkpoint state.
+pub type SavePointHook = Arc<dyn Fn() -> TurnSavePoint + Send + Sync>;
+
 pub struct NativeAgentRunner {
     providers: Arc<ProviderRegistry>,
     tokio_rt: Arc<tokio::runtime::Runtime>,
     tools: Arc<ToolRegistry>,
     policy: Arc<PolicyConfig>,
     approvals: Vec<(String, Value)>,
+    save_point: Option<SavePointHook>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,11 +179,19 @@ impl NativeAgentRunner {
             tools,
             policy: PolicyConfig::from_env(),
             approvals: Vec::new(),
+            save_point: None,
         }
     }
 
     pub fn with_policy(mut self, policy: Arc<PolicyConfig>) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Install a save-point hook consulted before each tool-loop turn so the
+    /// host can refresh the model / system prompt / tool schemas mid-run.
+    pub fn with_save_point(mut self, save_point: SavePointHook) -> Self {
+        self.save_point = Some(save_point);
         self
     }
 
@@ -326,15 +353,37 @@ impl NativeAgentRunner {
             policy_cache.lock().unwrap().approve(target, args);
         }
 
+        // Request state that the save-point hook may refresh between turns. These
+        // start from the run's request and are overridden per-turn when the host
+        // changes model / system / tools mid-run (Pi-style save points).
+        let mut current_model = request.model.clone();
+        let mut current_system = request.system.clone();
+        let mut current_tools = request.tool_schemas.clone();
+
         for turn in 0..request.max_turns {
+            // Pull the latest save point before issuing this turn's request, so a
+            // mid-run config change takes effect on the next provider request
+            // inside the same tool loop, not just the next top-level run.
+            if let Some(save_point) = &self.save_point {
+                let refreshed = save_point();
+                if let Some(model) = refreshed.model {
+                    current_model = model;
+                }
+                if let Some(system) = refreshed.system {
+                    current_system = system;
+                }
+                if let Some(tools) = refreshed.tool_schemas {
+                    current_tools = tools;
+                }
+            }
             let prompt_type = if turn == 0 { "analysis" } else { "final" };
             let llm_request = LlmRequest {
-                model: request.model.clone(),
+                model: current_model.clone(),
                 messages: messages.clone(),
-                system: request.system.clone(),
+                system: current_system.clone(),
                 temperature: request.temperature,
                 max_tokens: request.max_tokens,
-                tools: request.tool_schemas.clone(),
+                tools: current_tools.clone(),
             };
             let response = execute_prompt_response(
                 &ctx,
@@ -342,10 +391,10 @@ impl NativeAgentRunner {
                 &self.tokio_rt,
                 llm_request,
                 serde_json::json!({
-                    "model": request.model.clone(),
+                    "model": current_model.clone(),
                     "type": prompt_type,
                     "messages": messages.clone(),
-                    "tools": request.tool_schemas.clone(),
+                    "tools": current_tools.clone(),
                 }),
                 Some(prompt_type.to_string()),
             )?;
@@ -699,6 +748,117 @@ mod tests {
         assert_eq!(records[1].function, "tool");
         assert_eq!(records[1].args["name"], "echo");
         assert_eq!(records[2].function, "prompt");
+    }
+
+    /// Records the model of every provider request so a test can assert which
+    /// model each tool-loop turn used. First call returns a tool use; second
+    /// returns done.
+    struct ModelRecordingProvider {
+        calls: AtomicUsize,
+        models: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ModelRecordingProvider {
+        fn supports_model(&self, _model: &str) -> bool {
+            true
+        }
+
+        async fn send(&self, request: &LlmRequest) -> Result<LlmResponse> {
+            self.models.lock().unwrap().push(request.model.clone());
+            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call_index == 0 {
+                return Ok(LlmResponse {
+                    content: String::new(),
+                    blocks: vec![ContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "echo".to_string(),
+                        input: serde_json::json!({ "value": 1 }),
+                    }],
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".to_string(),
+                        name: "echo".to_string(),
+                        input: serde_json::json!({ "value": 1 }),
+                    }],
+                    stop_reason: "tool_use".to_string(),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                });
+            }
+            Ok(LlmResponse {
+                content: "done".to_string(),
+                blocks: vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                stop_reason: "end_turn".to_string(),
+                input_tokens: 1,
+                output_tokens: 1,
+            })
+        }
+
+        async fn stream(
+            &self,
+            request: &LlmRequest,
+            _on_delta: &mut TokenSink,
+        ) -> Result<LlmResponse> {
+            self.send(request).await
+        }
+    }
+
+    #[test]
+    fn save_point_refreshes_model_between_tool_loop_turns() {
+        let models = Arc::new(StdMutex::new(Vec::new()));
+        let mut providers = ProviderRegistry::new();
+        providers.register(Box::new(ModelRecordingProvider {
+            calls: AtomicUsize::new(0),
+            models: Arc::clone(&models),
+        }));
+        let mut tools = ToolRegistry::new();
+        tools.register_native("echo", "Echo input", Vec::new(), Ok);
+
+        // The host flips the model to "model-b" after the first turn. The hook is
+        // consulted before each turn, so the second provider request must use it.
+        let turn = Arc::new(AtomicUsize::new(0));
+        let turn_for_hook = Arc::clone(&turn);
+        let save_point: SavePointHook = Arc::new(move || {
+            let n = turn_for_hook.fetch_add(1, Ordering::SeqCst);
+            TurnSavePoint {
+                model: Some(if n == 0 {
+                    "model-a".to_string()
+                } else {
+                    "model-b".to_string()
+                }),
+                ..TurnSavePoint::default()
+            }
+        });
+
+        let runner = NativeAgentRunner::new(
+            Arc::new(providers),
+            Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            Arc::new(tools),
+        )
+        .with_save_point(save_point);
+
+        let result = runner
+            .run_pausable(NativeAgentRequest {
+                model: "original-model".to_string(),
+                messages: vec![Message::user_text("use a tool")],
+                system: None,
+                temperature: 0.0,
+                max_tokens: 100,
+                tool_schemas: Vec::new(),
+                max_turns: 4,
+            })
+            .unwrap();
+
+        assert_eq!(result.answer, "done");
+        let seen = models.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec!["model-a".to_string(), "model-b".to_string()],
+            "each tool-loop turn must use the save-point model, not the request model"
+        );
     }
 
     #[test]

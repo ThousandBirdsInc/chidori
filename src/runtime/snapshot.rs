@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::runtime::call_log::CallRecord;
+use crate::runtime::capability::CapabilityLedger;
 
 pub const SNAPSHOT_MANIFEST_FILE: &str = "runtime.snapshot.json";
 pub const SNAPSHOT_BLOB_FILE: &str = "runtime.snapshot";
@@ -26,6 +27,12 @@ pub enum TypeScriptImportPolicy {
     None,
     Relative,
     Project,
+    /// Node-style ESM resolution: relative imports work as before, and bare
+    /// specifiers are resolved through `node_modules` walk-up, `package.json`
+    /// `exports`/`main`, and the `node:` builtin shim allowlist. The
+    /// behavioral target is bun/deno/node compatibility for the well-formed
+    /// ESM subset described in `runtime::typescript::resolver`.
+    Node,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,12 +58,78 @@ pub enum MapSetSnapshotPolicy {
     Serialize,
 }
 
+/// How the runtime backs `node:fs` / `node:fs/promises`. See
+/// `docs/captured-effects-vfs-crypto-timers.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FsPolicy {
+    /// Filesystem access throws — the pre-captured-effects behavior.
+    Disabled,
+    /// In-memory, snapshot-resident virtual filesystem. Reads/writes never
+    /// touch the host disk; every operation raises an `Fs*` capability flag.
+    Captured,
+    /// Direct host-disk access (uncaptured). Rejected for durable runs.
+    Host,
+}
+
+/// How the runtime backs `globalThis.crypto` / `node:crypto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CryptoPolicy {
+    /// Crypto APIs throw.
+    Disabled,
+    /// Randomness is drawn from the deterministic seed PRNG — reproducible but
+    /// not cryptographically strong. Hashing always runs inline.
+    Seeded,
+    /// Randomness is drawn from the host CSPRNG on first run and captured into
+    /// the call log so resume replays the exact bytes. Durable default.
+    Captured,
+    /// Live host randomness with no capture. Rejected for durable runs.
+    Host,
+}
+
+/// How the runtime backs timers (`setTimeout`/`setInterval`/...) and the clock
+/// that drives `Date`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimerPolicy {
+    /// Scheduling a timer throws.
+    Disabled,
+    /// Timers fire against a deterministic logical clock that fast-forwards to
+    /// the next deadline; no real wall-clock sleeping occurs. Durable default.
+    Virtual,
+    /// Real wall-clock timers. Rejected for durable runs.
+    Host,
+}
+
+fn default_fs_policy() -> FsPolicy {
+    FsPolicy::Captured
+}
+
+fn default_crypto_policy() -> CryptoPolicy {
+    CryptoPolicy::Captured
+}
+
+fn default_timer_policy() -> TimerPolicy {
+    TimerPolicy::Virtual
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimePolicy {
     pub typescript_imports: TypeScriptImportPolicy,
     pub date: DatePolicy,
     pub random: RandomPolicy,
     pub maps_sets: MapSetSnapshotPolicy,
+    /// Filesystem backing. Defaulted for snapshots written before captured
+    /// effects existed so old manifests stay loadable.
+    #[serde(default = "default_fs_policy")]
+    pub fs: FsPolicy,
+    /// Crypto backing. Defaulted for back-compat (see above).
+    #[serde(default = "default_crypto_policy")]
+    pub crypto: CryptoPolicy,
+    /// Timer backing. Defaulted for back-compat (see above).
+    #[serde(default = "default_timer_policy")]
+    pub timers: TimerPolicy,
     pub deterministic_seed: String,
 }
 
@@ -67,6 +140,9 @@ impl RuntimePolicy {
             date: DatePolicy::Fixed,
             random: RandomPolicy::Seeded,
             maps_sets: MapSetSnapshotPolicy::Reject,
+            fs: FsPolicy::Captured,
+            crypto: CryptoPolicy::Captured,
+            timers: TimerPolicy::Virtual,
             deterministic_seed: stable_source_hash(run_id.as_bytes()),
         }
     }
@@ -89,6 +165,13 @@ impl RuntimePolicy {
                 MapSetSnapshotPolicy::Reject,
                 parse_maps_sets_policy,
             )?,
+            fs: parse_policy_env("CHIDORI_TS_FS", FsPolicy::Captured, parse_fs_policy)?,
+            crypto: parse_policy_env(
+                "CHIDORI_TS_CRYPTO",
+                CryptoPolicy::Captured,
+                parse_crypto_policy,
+            )?,
+            timers: parse_policy_env("CHIDORI_TS_TIMERS", TimerPolicy::Virtual, parse_timer_policy)?,
             deterministic_seed: stable_source_hash(run_id.as_bytes()),
         };
         policy.ensure_durable_safe()?;
@@ -101,6 +184,15 @@ impl RuntimePolicy {
         }
         if self.random == RandomPolicy::Host {
             anyhow::bail!("runtime.random=host is not allowed for durable snapshot runs");
+        }
+        if self.fs == FsPolicy::Host {
+            anyhow::bail!("runtime.fs=host is not allowed for durable snapshot runs");
+        }
+        if self.crypto == CryptoPolicy::Host {
+            anyhow::bail!("runtime.crypto=host is not allowed for durable snapshot runs");
+        }
+        if self.timers == TimerPolicy::Host {
+            anyhow::bail!("runtime.timers=host is not allowed for durable snapshot runs");
         }
         Ok(())
     }
@@ -134,6 +226,11 @@ pub enum PendingHostOperationKind {
     Checkpoint,
     Log,
     Sandbox,
+    /// A virtual timer pending across a snapshot boundary. The in-run virtual
+    /// timer queue fires inside the job drain; this kind reserves the slot for
+    /// timers that must survive suspend → restore (see
+    /// `docs/captured-effects-vfs-crypto-timers.md`).
+    Timer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -587,6 +684,15 @@ pub struct SnapshotManifest {
     pub host_promises: Vec<HostPromiseRecord>,
     #[serde(default)]
     pub branch: Option<SnapshotBranchMetadata>,
+    /// Capability flags the run touched (filesystem, crypto, timers). Defaulted
+    /// (empty) for manifests written before captured effects existed.
+    #[serde(default)]
+    pub capabilities: CapabilityLedger,
+    /// The snapshot-resident virtual filesystem state. Defaulted (empty) for
+    /// manifests written before the VFS existed; restored into the runtime
+    /// context on resume so reads/writes survive suspend identically.
+    #[serde(default)]
+    pub vfs: crate::runtime::vfs::Vfs,
     pub call_log_len: usize,
     pub snapshot_file: String,
     pub created_at: DateTime<Utc>,
@@ -613,6 +719,8 @@ impl SnapshotManifest {
             pending,
             host_promises: Vec::new(),
             branch: None,
+            capabilities: CapabilityLedger::new(),
+            vfs: crate::runtime::vfs::Vfs::new(),
             call_log_len,
             snapshot_file: SNAPSHOT_BLOB_FILE.to_string(),
             created_at: Utc::now(),
@@ -621,6 +729,16 @@ impl SnapshotManifest {
 
     pub fn with_host_promises(mut self, host_promises: Vec<HostPromiseRecord>) -> Self {
         self.host_promises = host_promises;
+        self
+    }
+
+    pub fn with_capabilities(mut self, capabilities: CapabilityLedger) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    pub fn with_vfs(mut self, vfs: crate::runtime::vfs::Vfs) -> Self {
+        self.vfs = vfs;
         self
     }
 
@@ -1241,6 +1359,7 @@ fn parse_import_policy(value: &str) -> Option<TypeScriptImportPolicy> {
         "none" => Some(TypeScriptImportPolicy::None),
         "relative" => Some(TypeScriptImportPolicy::Relative),
         "project" => Some(TypeScriptImportPolicy::Project),
+        "node" => Some(TypeScriptImportPolicy::Node),
         _ => None,
     }
 }
@@ -1271,6 +1390,34 @@ fn parse_maps_sets_policy(value: &str) -> Option<MapSetSnapshotPolicy> {
     }
 }
 
+fn parse_fs_policy(value: &str) -> Option<FsPolicy> {
+    match value {
+        "disabled" => Some(FsPolicy::Disabled),
+        "captured" => Some(FsPolicy::Captured),
+        "host" => Some(FsPolicy::Host),
+        _ => None,
+    }
+}
+
+fn parse_crypto_policy(value: &str) -> Option<CryptoPolicy> {
+    match value {
+        "disabled" => Some(CryptoPolicy::Disabled),
+        "seeded" => Some(CryptoPolicy::Seeded),
+        "captured" => Some(CryptoPolicy::Captured),
+        "host" => Some(CryptoPolicy::Host),
+        _ => None,
+    }
+}
+
+fn parse_timer_policy(value: &str) -> Option<TimerPolicy> {
+    match value {
+        "disabled" => Some(TimerPolicy::Disabled),
+        "virtual" => Some(TimerPolicy::Virtual),
+        "host" => Some(TimerPolicy::Host),
+        _ => None,
+    }
+}
+
 fn stable_source_hash(bytes: &[u8]) -> String {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
@@ -1287,6 +1434,104 @@ fn stable_source_hash(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::runtime::call_log::CallRecord;
+
+    #[test]
+    fn policy_deserializes_pre_captured_effects_manifest_with_defaults() {
+        // A policy blob written before fs/crypto/timers existed must still load,
+        // defaulting the new fields to the durable defaults.
+        let legacy = r#"{
+            "typescript_imports": "relative",
+            "date": "fixed",
+            "random": "seeded",
+            "maps_sets": "reject",
+            "deterministic_seed": "fnv1a64:0000000000000000"
+        }"#;
+        let policy: RuntimePolicy = serde_json::from_str(legacy).unwrap();
+        assert_eq!(policy.fs, FsPolicy::Captured);
+        assert_eq!(policy.crypto, CryptoPolicy::Captured);
+        assert_eq!(policy.timers, TimerPolicy::Virtual);
+    }
+
+    #[test]
+    fn durable_default_uses_captured_effects() {
+        let policy = RuntimePolicy::durable_default("run");
+        assert_eq!(policy.fs, FsPolicy::Captured);
+        assert_eq!(policy.crypto, CryptoPolicy::Captured);
+        assert_eq!(policy.timers, TimerPolicy::Virtual);
+        // Captured/Virtual are durable-safe.
+        policy.ensure_durable_safe().unwrap();
+    }
+
+    #[test]
+    fn host_backed_captured_effects_are_rejected_for_durable_runs() {
+        for mutate in [
+            (|p: &mut RuntimePolicy| p.fs = FsPolicy::Host) as fn(&mut RuntimePolicy),
+            |p: &mut RuntimePolicy| p.crypto = CryptoPolicy::Host,
+            |p: &mut RuntimePolicy| p.timers = TimerPolicy::Host,
+        ] {
+            let mut policy = RuntimePolicy::durable_default("run");
+            mutate(&mut policy);
+            assert!(policy.ensure_durable_safe().is_err());
+        }
+    }
+
+    #[test]
+    fn manifest_round_trips_vfs_and_capabilities_through_store() {
+        use crate::runtime::capability::Capability;
+        use crate::runtime::vfs::Vfs;
+
+        // A run that wrote a file and touched fs surfaces should persist that
+        // state into the manifest and reload it intact — the "survives suspend"
+        // contract for the captured VFS and capability ledger.
+        let mut vfs = Vfs::new();
+        vfs.mkdir("/work", true).unwrap();
+        vfs.write("/work/state.txt", b"persisted".to_vec(), 1).unwrap();
+        let mut caps = CapabilityLedger::new();
+        caps.note(Capability::FsWrite, 1);
+        caps.note(Capability::CryptoRandom, 2);
+
+        let manifest = SnapshotManifest::new(
+            "run-persist",
+            SnapshotAbi::current("chidori-quickjs"),
+            RuntimePolicy::durable_default("run-persist"),
+            SourceFingerprint::from_source(Path::new("agent.ts"), "export const run = () => {};"),
+            Vec::new(),
+            None,
+            0,
+        )
+        .with_vfs(vfs)
+        .with_capabilities(caps);
+
+        let dir = std::env::temp_dir().join(format!("chidori-vfs-manifest-{}", stable_source_hash(b"x")));
+        let store = SnapshotStore::new(&dir);
+        store.save_manifest_only(&manifest, &[]).unwrap();
+        let reloaded = store.load_manifest().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(reloaded.vfs.read_text("/work/state.txt").unwrap(), "persisted");
+        assert!(reloaded.capabilities.contains(Capability::FsWrite));
+        assert!(reloaded.capabilities.contains(Capability::CryptoRandom));
+        assert_eq!(reloaded.capabilities.first_seen(Capability::FsWrite), Some(1));
+    }
+
+    #[test]
+    fn manifest_without_capabilities_defaults_to_empty() {
+        let policy = RuntimePolicy::durable_default("run");
+        let manifest = SnapshotManifest::new(
+            "run",
+            SnapshotAbi::current("chidori-quickjs"),
+            policy,
+            SourceFingerprint::from_source(Path::new("agent.ts"), "export const run = () => {};"),
+            Vec::new(),
+            None,
+            0,
+        );
+        assert!(manifest.capabilities.is_empty());
+        // Round-trips through JSON, and a blob missing the field still loads.
+        let json = serde_json::to_string(&manifest).unwrap();
+        let reparsed: SnapshotManifest = serde_json::from_str(&json).unwrap();
+        assert!(reparsed.capabilities.is_empty());
+    }
 
     fn call_record(seq: u64, function: &str) -> CallRecord {
         CallRecord {

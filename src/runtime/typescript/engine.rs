@@ -500,6 +500,396 @@ mod tests {
         assert_eq!(records[1].result, serde_json::json!({ "value": 42 }));
     }
 
+    fn node_imports_runtime() -> TypeScriptVmRuntime {
+        let mut policy = RuntimePolicy::durable_default("ts-fs-test");
+        policy.typescript_imports = crate::runtime::snapshot::TypeScriptImportPolicy::Node;
+        TypeScriptVmRuntime::new(policy).unwrap()
+    }
+
+    #[test]
+    fn node_fs_round_trips_through_captured_vfs() {
+        use crate::runtime::capability::Capability;
+        let source = r#"
+            import * as fs from "node:fs";
+            export async function agent(input, chidori) {
+                fs.mkdirSync("/work", { recursive: true });
+                fs.writeFileSync("/work/note.txt", "hello vfs");
+                const text = fs.readFileSync("/work/note.txt", "utf8");
+                const exists = fs.existsSync("/work/note.txt");
+                const entries = fs.readdirSync("/work");
+                return { text, exists, entries };
+            }
+        "#;
+        let runtime_ctx = RuntimeContext::new();
+        let (tokio_rt, policy, policy_cache) = runtime_host();
+
+        let output = node_imports_runtime()
+            .run_agent_source_with_context(
+                Path::new("/tmp/agent.ts"),
+                source,
+                &serde_json::json!({}),
+                runtime_ctx.clone(),
+                Arc::new(ProviderRegistry::new()),
+                template_engine(),
+                tokio_rt,
+                policy,
+                policy_cache,
+                Arc::new(ToolRegistry::new()),
+                Arc::new(McpManager::new()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            output,
+            serde_json::json!({
+                "text": "hello vfs",
+                "exists": true,
+                "entries": ["note.txt"],
+            })
+        );
+        // Capability flags are raised, but VFS ops are not call-logged (the
+        // tree rides the snapshot, so there is nothing to replay).
+        let caps = runtime_ctx.capabilities();
+        assert!(caps.contains(Capability::FsWrite));
+        assert!(caps.contains(Capability::FsRead));
+        assert!(runtime_ctx.vfs_snapshot().exists("/work/note.txt"));
+        assert!(runtime_ctx
+            .call_log()
+            .into_records()
+            .iter()
+            .all(|r| r.function != "fs"));
+    }
+
+    fn run_agent(rt: &TypeScriptVmRuntime, source: &str, ctx: RuntimeContext) -> serde_json::Value {
+        let (tokio_rt, policy, policy_cache) = runtime_host();
+        rt.run_agent_source_with_context(
+            Path::new("/tmp/agent.ts"),
+            source,
+            &serde_json::json!({}),
+            ctx,
+            Arc::new(ProviderRegistry::new()),
+            template_engine(),
+            tokio_rt,
+            policy,
+            policy_cache,
+            Arc::new(ToolRegistry::new()),
+            Arc::new(McpManager::new()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn virtual_timers_fire_in_deadline_order_and_advance_clock() {
+        use crate::runtime::capability::Capability;
+        // Timers scheduled out of deadline order must fire in deadline order,
+        // and Date.now() must reflect the logical clock advanced by the timers.
+        let source = r#"
+            export async function agent(input, chidori) {
+                const order = [];
+                const t0 = Date.now();
+                await new Promise((resolve) => {
+                    setTimeout(() => { order.push("b@" + Date.now()); }, 50);
+                    setTimeout(() => { order.push("a@" + Date.now()); }, 10);
+                    setTimeout(() => { order.push("c@" + Date.now()); resolve(); }, 100);
+                });
+                return { order, t0, tEnd: Date.now() };
+            }
+        "#;
+        let ctx = RuntimeContext::new();
+        let out = run_agent(&runtime(), source, ctx.clone());
+        assert_eq!(
+            out["order"],
+            serde_json::json!(["a@10", "b@50", "c@100"])
+        );
+        assert_eq!(out["t0"], 0);
+        assert_eq!(out["tEnd"], 100);
+        assert!(ctx.capabilities().contains(Capability::Timer));
+    }
+
+    #[test]
+    fn set_interval_repeats_until_cleared() {
+        let source = r#"
+            export async function agent(input, chidori) {
+                let ticks = 0;
+                await new Promise((resolve) => {
+                    const handle = setInterval(() => {
+                        ticks += 1;
+                        if (ticks === 3) { clearInterval(handle); resolve(); }
+                    }, 20);
+                });
+                return { ticks, now: Date.now() };
+            }
+        "#;
+        let out = run_agent(&runtime(), source, RuntimeContext::new());
+        assert_eq!(out["ticks"], 3);
+        assert_eq!(out["now"], 60);
+    }
+
+    #[test]
+    fn timers_coexist_with_recorded_host_calls_and_replay_identically() {
+        // Timers interleaved with recorded host calls must reconstruct
+        // deterministically on the replay-from-top path: the host calls replay
+        // from the log while the timer queue is rebuilt by re-execution.
+        let source = r#"
+            export async function agent(input, chidori) {
+                const events = [];
+                await chidori.log("start");
+                await new Promise((resolve) => {
+                    setTimeout(() => { events.push("b@" + Date.now()); }, 10);
+                    setTimeout(() => { events.push("a@" + Date.now()); resolve(); }, 5);
+                });
+                await chidori.log("end");
+                return { events, now: Date.now() };
+            }
+        "#;
+        let ctx = RuntimeContext::new();
+        let first = run_agent(&runtime(), source, ctx.clone());
+        assert_eq!(first["events"], serde_json::json!(["a@5", "b@10"]));
+        assert_eq!(first["now"], 10);
+        let records = ctx.call_log().into_records();
+        assert_eq!(
+            records.iter().filter(|r| r.function == "log").count(),
+            2,
+            "both log host calls are recorded"
+        );
+
+        // Replay from the recorded log: host calls replay, timers re-run.
+        let replay_ctx = RuntimeContext::with_replay(records);
+        let second = run_agent(&runtime(), source, replay_ctx);
+        assert_eq!(first, second, "replay reproduces timer-driven output");
+    }
+
+    #[test]
+    fn timers_disabled_policy_throws() {
+        let source = r#"
+            export async function agent(input, chidori) {
+                setTimeout(() => {}, 0);
+                return { ok: true };
+            }
+        "#;
+        let mut policy = RuntimePolicy::durable_default("ts-timers-disabled");
+        policy.timers = crate::runtime::snapshot::TimerPolicy::Disabled;
+        let (tokio_rt, pol, cache) = runtime_host();
+        let err = TypeScriptVmRuntime::new(policy)
+            .unwrap()
+            .run_agent_source_with_context(
+                Path::new("/tmp/agent.ts"),
+                source,
+                &serde_json::json!({}),
+                RuntimeContext::new(),
+                Arc::new(ProviderRegistry::new()),
+                template_engine(),
+                tokio_rt,
+                pol,
+                cache,
+                Arc::new(ToolRegistry::new()),
+                Arc::new(McpManager::new()),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("timers are disabled"));
+    }
+
+    #[test]
+    fn node_crypto_hash_is_inline_and_flagged() {
+        use crate::runtime::capability::Capability;
+        // sha256("abc") known vector, hex-encoded.
+        let source = r#"
+            import { createHash } from "node:crypto";
+            export async function agent(input, chidori) {
+                const hex = createHash("sha256").update("abc").digest("hex");
+                return { hex };
+            }
+        "#;
+        let runtime_ctx = RuntimeContext::new();
+        let (tokio_rt, policy, policy_cache) = runtime_host();
+        let output = node_imports_runtime()
+            .run_agent_source_with_context(
+                Path::new("/tmp/agent.ts"),
+                source,
+                &serde_json::json!({}),
+                runtime_ctx.clone(),
+                Arc::new(ProviderRegistry::new()),
+                template_engine(),
+                tokio_rt,
+                policy,
+                policy_cache,
+                Arc::new(ToolRegistry::new()),
+                Arc::new(McpManager::new()),
+            )
+            .unwrap();
+        assert_eq!(
+            output["hex"],
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(runtime_ctx.capabilities().contains(Capability::CryptoHash));
+        // Hashing is deterministic, so nothing is call-logged.
+        assert!(runtime_ctx
+            .call_log()
+            .into_records()
+            .iter()
+            .all(|r| !r.function.starts_with("crypto")));
+    }
+
+    #[test]
+    fn node_crypto_random_is_captured_and_replays() {
+        use crate::runtime::capability::Capability;
+        let source = r#"
+            import { randomBytes } from "node:crypto";
+            export async function agent(input, chidori) {
+                return { hex: randomBytes(16).toString("hex") };
+            }
+        "#;
+        // First run: captures real random bytes into the call log.
+        let ctx = RuntimeContext::new();
+        let (tokio_rt, policy, policy_cache) = runtime_host();
+        let first = node_imports_runtime()
+            .run_agent_source_with_context(
+                Path::new("/tmp/agent.ts"),
+                source,
+                &serde_json::json!({}),
+                ctx.clone(),
+                Arc::new(ProviderRegistry::new()),
+                template_engine(),
+                tokio_rt,
+                policy,
+                policy_cache,
+                Arc::new(ToolRegistry::new()),
+                Arc::new(McpManager::new()),
+            )
+            .unwrap();
+        assert!(ctx.capabilities().contains(Capability::CryptoRandom));
+        let records = ctx.call_log().into_records();
+        let random_records: Vec<_> = records
+            .iter()
+            .filter(|r| r.function == "crypto.random")
+            .collect();
+        assert_eq!(random_records.len(), 1, "random draw is captured once");
+
+        // Replay run: feeding the recorded log back reproduces the exact bytes
+        // without drawing fresh randomness.
+        let (tokio_rt2, policy2, policy_cache2) = runtime_host();
+        let replay_ctx = RuntimeContext::with_replay(records.clone());
+        let second = node_imports_runtime()
+            .run_agent_source_with_context(
+                Path::new("/tmp/agent.ts"),
+                source,
+                &serde_json::json!({}),
+                replay_ctx,
+                Arc::new(ProviderRegistry::new()),
+                template_engine(),
+                tokio_rt2,
+                policy2,
+                policy_cache2,
+                Arc::new(ToolRegistry::new()),
+                Arc::new(McpManager::new()),
+            )
+            .unwrap();
+        assert_eq!(first["hex"], second["hex"], "replay reproduces bytes");
+    }
+
+    #[test]
+    fn web_crypto_global_digest_and_uuid() {
+        // globalThis.crypto (no import) must provide subtle.digest, randomUUID,
+        // and getRandomValues, routed through the captured native.
+        let source = r#"
+            export async function agent(input, chidori) {
+                const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("abc"));
+                const bytes = new Uint8Array(buf);
+                let hex = "";
+                for (let i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, "0");
+                const arr = new Uint8Array(4);
+                crypto.getRandomValues(arr);
+                return { hex, uuid: crypto.randomUUID(), filled: arr.length };
+            }
+        "#;
+        let out = run_agent(&node_imports_runtime(), source, RuntimeContext::new());
+        assert_eq!(
+            out["hex"],
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // UUID v4 shape: 8-4-4-4-12 with version nibble 4.
+        let uuid = out["uuid"].as_str().unwrap();
+        assert_eq!(uuid.len(), 36);
+        assert_eq!(&uuid[14..15], "4");
+        assert_eq!(out["filled"], 4);
+    }
+
+    #[test]
+    fn node_fs_promises_async_api() {
+        let source = r#"
+            import { mkdir, writeFile, readFile, readdir } from "node:fs/promises";
+            export async function agent(input, chidori) {
+                await mkdir("/p", { recursive: true });
+                await writeFile("/p/a.txt", "async");
+                const text = await readFile("/p/a.txt", "utf8");
+                const entries = await readdir("/p");
+                return { text, entries };
+            }
+        "#;
+        let out = run_agent(&node_imports_runtime(), source, RuntimeContext::new());
+        assert_eq!(
+            out,
+            serde_json::json!({ "text": "async", "entries": ["a.txt"] })
+        );
+    }
+
+    #[test]
+    fn seeded_crypto_is_reproducible_across_runs() {
+        // Under CryptoPolicy::Seeded, two independent runs with the same seed
+        // draw identical bytes (no capture needed for reproducibility).
+        let source = r#"
+            import { randomBytes } from "node:crypto";
+            export async function agent(input, chidori) {
+                return { hex: randomBytes(16).toString("hex") };
+            }
+        "#;
+        let mut policy = RuntimePolicy::durable_default("seed-fixed");
+        policy.typescript_imports = crate::runtime::snapshot::TypeScriptImportPolicy::Node;
+        policy.crypto = crate::runtime::snapshot::CryptoPolicy::Seeded;
+
+        let run_once = || {
+            let rt = TypeScriptVmRuntime::new(policy.clone()).unwrap();
+            run_agent(&rt, source, RuntimeContext::new())
+        };
+        let a = run_once();
+        let b = run_once();
+        assert_eq!(a["hex"], b["hex"], "seeded crypto is reproducible");
+    }
+
+    #[test]
+    fn node_fs_disabled_policy_throws() {
+        let source = r#"
+            import * as fs from "node:fs";
+            export async function agent(input, chidori) {
+                fs.writeFileSync("/x.txt", "nope");
+                return { ok: true };
+            }
+        "#;
+        let mut policy = RuntimePolicy::durable_default("ts-fs-disabled");
+        policy.typescript_imports = crate::runtime::snapshot::TypeScriptImportPolicy::Node;
+        policy.fs = crate::runtime::snapshot::FsPolicy::Disabled;
+        let runtime_ctx = RuntimeContext::new();
+        let (tokio_rt, pol, cache) = runtime_host();
+
+        let err = TypeScriptVmRuntime::new(policy)
+            .unwrap()
+            .run_agent_source_with_context(
+                Path::new("/tmp/agent.ts"),
+                source,
+                &serde_json::json!({}),
+                runtime_ctx,
+                Arc::new(ProviderRegistry::new()),
+                template_engine(),
+                tokio_rt,
+                pol,
+                cache,
+                Arc::new(ToolRegistry::new()),
+                Arc::new(McpManager::new()),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("fs=disabled") || err.to_string().contains("disabled"));
+    }
+
     #[test]
     fn runtime_context_records_template_calls() {
         let source = r#"

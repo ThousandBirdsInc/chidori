@@ -26,6 +26,8 @@ use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 use opentelemetry_sdk::runtime;
 use opentelemetry_sdk::trace::TracerProvider as SdkTracerProvider;
 use opentelemetry_sdk::Resource;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::runtime::call_log::CallRecord;
 
@@ -42,12 +44,8 @@ pub struct OtelHandle {
 }
 
 impl OtelHandle {
-    /// Flush any buffered spans and shut the exporter down cleanly.
-    ///
-    /// Errors are printed to stderr only when `CHIDORI_OTEL_DEBUG=1`; the
-    /// normal unreachable-endpoint case doesn't need to alarm users whose
-    /// agents ran fine.
-    pub fn shutdown(&self) {
+    /// Flush any buffered spans while keeping the exporter alive for later runs.
+    pub fn force_flush(&self) {
         let debug = std::env::var("CHIDORI_OTEL_DEBUG").as_deref() == Ok("1");
         for r in self.provider.force_flush() {
             if let Err(e) = r {
@@ -56,6 +54,16 @@ impl OtelHandle {
                 }
             }
         }
+    }
+
+    /// Flush any buffered spans and shut the exporter down cleanly.
+    ///
+    /// Errors are printed to stderr only when `CHIDORI_OTEL_DEBUG=1`; the
+    /// normal unreachable-endpoint case doesn't need to alarm users whose
+    /// agents ran fine.
+    pub fn shutdown(&self) {
+        let debug = std::env::var("CHIDORI_OTEL_DEBUG").as_deref() == Ok("1");
+        self.force_flush();
         if let Err(e) = self.provider.shutdown() {
             if debug {
                 eprintln!("otel: shutdown error: {e:?}");
@@ -84,6 +92,17 @@ pub fn init_from_env() -> Option<&'static OtelHandle> {
 pub fn shutdown_on_exit() {
     if let Some(Some(h)) = HANDLE.get() {
         h.shutdown();
+    }
+}
+
+/// Flush any currently buffered spans without shutting down the exporter.
+///
+/// Long-lived embedders can call this after an agent turn when traces should be
+/// visible immediately in an OTLP backend such as Tael.
+#[allow(dead_code)]
+pub fn force_flush() {
+    if let Some(Some(h)) = HANDLE.get() {
+        h.force_flush();
     }
 }
 
@@ -153,6 +172,16 @@ pub fn start_run_span(agent_name: &str, run_id: &str) -> Option<Arc<RunSpan>> {
 }
 
 impl RunSpan {
+    /// Stamp a capability flag on the run span as a boolean attribute, e.g.
+    /// `chidori.capability.crypto_random=true`. Called once per capability the
+    /// first time the agent touches that surface.
+    pub fn record_capability(&self, cap: crate::runtime::capability::Capability) {
+        self.parent_cx.span().set_attribute(KeyValue::new(
+            format!("chidori.capability.{}", cap.as_str()),
+            true,
+        ));
+    }
+
     /// Emit a child span for a completed host function call. The span is
     /// opened with the recorded start time and closed with start+duration,
     /// so replay won't skew wall-clock timing.
@@ -191,7 +220,11 @@ impl RunSpan {
                 .fetch_add(usage.output_tokens, Ordering::Relaxed);
         }
 
-        let builder = SpanBuilder::from_name(format!("host.{}", record.function))
+        if record.function == "tool" {
+            append_tool_attributes(&mut attrs, record);
+        }
+
+        let builder = SpanBuilder::from_name(span_name_for(record))
             .with_kind(span_kind_for(&record.function))
             .with_start_time(start_time)
             .with_end_time(end_time)
@@ -251,5 +284,153 @@ fn span_kind_for(function: &str) -> SpanKind {
     match function {
         "prompt" | "http" | "tool" | "agent" | "exec" | "memory" => SpanKind::Client,
         _ => SpanKind::Internal,
+    }
+}
+
+fn span_name_for(record: &CallRecord) -> String {
+    if record.function == "tool" {
+        "tool.call".to_string()
+    } else {
+        format!("host.{}", record.function)
+    }
+}
+
+fn append_tool_attributes(attrs: &mut Vec<KeyValue>, record: &CallRecord) {
+    let tool_name = record
+        .args
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("tool")
+        .to_string();
+    let kwargs = record.args.get("kwargs").unwrap_or(&Value::Null);
+    let arguments_json = serde_json::to_string(kwargs).unwrap_or_else(|_| "null".to_string());
+    let result_count = infer_result_count(&record.result);
+    let source = extract_tool_source(&record.result).unwrap_or_else(|| tool_name.clone());
+    let status = if record.error.is_some() {
+        "error"
+    } else if result_count == 0 {
+        "empty"
+    } else {
+        "ok"
+    };
+
+    attrs.push(KeyValue::new("tool.name", tool_name.clone()));
+    attrs.push(KeyValue::new("tool.integration.name", tool_name));
+    attrs.push(KeyValue::new("tool.arguments_json", arguments_json.clone()));
+    attrs.push(KeyValue::new("tool.args_json", arguments_json.clone()));
+    attrs.push(KeyValue::new(
+        "tool.arguments_hash",
+        sha256_hex(arguments_json.as_bytes()),
+    ));
+    attrs.push(KeyValue::new("tool.status", status));
+    attrs.push(KeyValue::new("tool.result_count", result_count as i64));
+    attrs.push(KeyValue::new("tool.source", source));
+    attrs.push(KeyValue::new("tool.latency_ms", record.duration_ms as i64));
+    attrs.push(KeyValue::new("tool.cache_hit", false));
+    if record.error.is_some() {
+        attrs.push(KeyValue::new("tool.error_code", "tool_error"));
+    }
+}
+
+fn extract_tool_source(result: &Value) -> Option<String> {
+    result
+        .get("source")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn infer_result_count(result: &Value) -> usize {
+    match result {
+        Value::Null => 0,
+        Value::Array(values) => values.len(),
+        Value::Object(map) if map.is_empty() => 0,
+        Value::Object(map) => {
+            for key in [
+                "results",
+                "matches",
+                "items",
+                "recalls",
+                "trials",
+                "providers",
+                "plans",
+                "labels",
+                "drugs",
+            ] {
+                if let Some(Value::Array(values)) = map.get(key) {
+                    return values.len();
+                }
+            }
+            for key in ["result_count", "count", "total"] {
+                if let Some(count) = map.get(key).and_then(Value::as_u64) {
+                    return count as usize;
+                }
+            }
+            1
+        }
+        _ => 1,
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::call_log::CallRecord;
+    use chrono::Utc;
+    use serde_json::json;
+
+    #[test]
+    fn tool_span_name_uses_tael_tool_call_name() {
+        let record = CallRecord {
+            seq: 1,
+            parent_seq: None,
+            function: "tool".to_string(),
+            args: json!({"name": "search_medlineplus_health_topics", "kwargs": {"query": "asthma"}}),
+            result: json!({"source": "MedlinePlus", "results": [{"title": "Asthma"}]}),
+            duration_ms: 12,
+            token_usage: None,
+            timestamp: Utc::now(),
+            error: None,
+        };
+
+        assert_eq!(span_name_for(&record), "tool.call");
+    }
+
+    #[test]
+    fn tool_attributes_include_invoked_name_args_and_source() {
+        let record = CallRecord {
+            seq: 1,
+            parent_seq: None,
+            function: "tool".to_string(),
+            args: json!({"name": "search_medlineplus_health_topics", "kwargs": {"query": "asthma", "limit": 2}}),
+            result: json!({"source": "MedlinePlus", "results": [{"title": "Asthma"}]}),
+            duration_ms: 12,
+            token_usage: None,
+            timestamp: Utc::now(),
+            error: None,
+        };
+        let mut attrs = Vec::new();
+
+        append_tool_attributes(&mut attrs, &record);
+        let rendered = attrs
+            .iter()
+            .map(|attr| format!("{}={}", attr.key, attr.value))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("tool.name=search_medlineplus_health_topics"));
+        assert!(rendered.contains("tool.arguments_json={\"limit\":2,\"query\":\"asthma\"}"));
+        assert!(rendered.contains("tool.source=MedlinePlus"));
+        assert!(rendered.contains("tool.result_count=1"));
+        assert!(rendered.contains("tool.status=ok"));
     }
 }

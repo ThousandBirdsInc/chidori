@@ -251,14 +251,26 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
     }
 }
 
+/// Apply the runtime context's model override (Pi-style save point) to an
+/// outgoing prompt request. A no-op unless the host installed an override hook
+/// that currently yields a model. This is the single point where a mid-run
+/// model change takes effect for every prompt path — the native agent loop and
+/// the TypeScript interactive engine both call the prompt bindings below.
+fn apply_model_override(ctx: &RuntimeContext, request: &mut LlmRequest) {
+    if let Some(model) = ctx.resolve_model_override() {
+        request.model = model;
+    }
+}
+
 pub fn execute_prompt_text(
     ctx: &RuntimeContext,
     providers: &ProviderRegistry,
     tokio_rt: &tokio::runtime::Runtime,
-    request: LlmRequest,
+    mut request: LlmRequest,
     args: Value,
     prompt_type: Option<String>,
 ) -> Result<Value> {
+    apply_model_override(ctx, &mut request);
     let seq = ctx.next_seq();
     if let Some(record) = ctx
         .try_replay_checked(seq, "prompt")
@@ -336,10 +348,11 @@ pub fn execute_prompt_response(
     ctx: &RuntimeContext,
     providers: &ProviderRegistry,
     tokio_rt: &tokio::runtime::Runtime,
-    request: LlmRequest,
+    mut request: LlmRequest,
     args: Value,
     prompt_type: Option<String>,
 ) -> Result<LlmResponse> {
+    apply_model_override(ctx, &mut request);
     let seq = ctx.next_seq();
     if let Some(record) = ctx
         .try_replay_checked(seq, "prompt")
@@ -910,6 +923,72 @@ mod tests {
         assert_eq!(
             call_log[0].error.as_deref(),
             Some("network failed after persistence")
+        );
+    }
+
+    #[test]
+    fn model_override_swaps_request_model_before_send() {
+        use crate::providers::{LlmProvider, LlmResponse, TokenSink};
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        struct RecordingProvider {
+            seen_model: StdArc<StdMutex<Option<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for RecordingProvider {
+            fn supports_model(&self, _model: &str) -> bool {
+                true
+            }
+            async fn send(&self, request: &LlmRequest) -> Result<LlmResponse> {
+                *self.seen_model.lock().unwrap() = Some(request.model.clone());
+                Ok(LlmResponse {
+                    content: "ok".to_string(),
+                    blocks: vec![ContentBlock::Text {
+                        text: "ok".to_string(),
+                    }],
+                    tool_calls: Vec::new(),
+                    stop_reason: "end_turn".to_string(),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                })
+            }
+            async fn stream(
+                &self,
+                request: &LlmRequest,
+                _on_delta: &mut TokenSink,
+            ) -> Result<LlmResponse> {
+                self.send(request).await
+            }
+        }
+
+        let seen_model = StdArc::new(StdMutex::new(None));
+        let mut providers = ProviderRegistry::new();
+        providers.register(Box::new(RecordingProvider {
+            seen_model: StdArc::clone(&seen_model),
+        }));
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+
+        let ctx = RuntimeContext::new();
+        ctx.set_model_override(crate::runtime::context::ModelOverride::new(|| {
+            Some("override-model".to_string())
+        }));
+
+        let request = LlmRequest {
+            model: "request-model".to_string(),
+            messages: vec![LlmMessage::user_text("hi".to_string())],
+            system: None,
+            temperature: 0.0,
+            max_tokens: 16,
+            tools: Vec::new(),
+        };
+        let _ = execute_prompt_response(&ctx, &providers, &tokio_rt, request, json!({}), None)
+            .unwrap();
+
+        assert_eq!(
+            seen_model.lock().unwrap().as_deref(),
+            Some("override-model"),
+            "the provider must receive the overridden model, not the request model"
         );
     }
 

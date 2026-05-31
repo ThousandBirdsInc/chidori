@@ -78,7 +78,9 @@ fn persist_ts_snapshot_manifest_scaffold(
         call_log.len(),
     )
     .with_module_graph(module_graph)
-    .with_host_promises(host_promises.clone());
+    .with_host_promises(host_promises.clone())
+    .with_capabilities(ctx.capabilities())
+    .with_vfs(ctx.vfs_snapshot());
 
     if let Some(snapshot) = ctx.capture_live_vm_snapshot() {
         let snapshot = snapshot.with_context(|| {
@@ -219,7 +221,27 @@ impl Engine {
         replay_log: Vec<CallRecord>,
         host_promises: Vec<HostPromiseRecord>,
     ) -> Result<RunResult> {
-        let ctx = RuntimeContext::with_replay_and_host_promises(replay_log, host_promises);
+        self.run_with_replay_host_promises_and_vfs(
+            path,
+            inputs,
+            replay_log,
+            host_promises,
+            crate::runtime::vfs::Vfs::new(),
+        )
+    }
+
+    /// Resume with a virtual filesystem restored from a snapshot manifest, so
+    /// the resumed run observes the file state captured at suspend.
+    pub fn run_with_replay_host_promises_and_vfs(
+        &self,
+        path: &Path,
+        inputs: &Value,
+        replay_log: Vec<CallRecord>,
+        host_promises: Vec<HostPromiseRecord>,
+        vfs: crate::runtime::vfs::Vfs,
+    ) -> Result<RunResult> {
+        let ctx =
+            RuntimeContext::with_replay_host_promises_and_vfs(replay_log, host_promises, vfs);
         self.run_with_context(path, inputs, ctx)
     }
 
@@ -247,9 +269,25 @@ impl Engine {
         inputs: &Value,
         sender: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
     ) -> Result<RunResult> {
+        self.run_streaming_pausable_with_model_override(path, inputs, sender, None)
+    }
+
+    /// As `run_streaming_pausable`, but installs an optional model-override hook
+    /// (Pi-style save point) so a mid-run model change refreshes the model on
+    /// the next provider request inside this run's tool loop.
+    pub fn run_streaming_pausable_with_model_override(
+        &self,
+        path: &Path,
+        inputs: &Value,
+        sender: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+        model_override: Option<crate::runtime::context::ModelOverride>,
+    ) -> Result<RunResult> {
         let ctx = RuntimeContext::new();
         ctx.set_event_sender(sender);
         ctx.set_input_mode(InputMode::Pause);
+        if let Some(model_override) = model_override {
+            ctx.set_model_override(model_override);
+        }
         self.run_with_context(path, inputs, ctx)
     }
 
@@ -284,7 +322,27 @@ impl Engine {
         replay_log: Vec<CallRecord>,
         host_promises: Vec<HostPromiseRecord>,
     ) -> Result<RunResult> {
-        let ctx = RuntimeContext::with_replay_and_host_promises(replay_log, host_promises);
+        self.run_replay_pausable_with_host_promises_and_vfs(
+            path,
+            inputs,
+            replay_log,
+            host_promises,
+            crate::runtime::vfs::Vfs::new(),
+        )
+    }
+
+    /// As `run_replay_pausable_with_host_promises`, restoring a snapshot
+    /// manifest's virtual filesystem for the resumed run.
+    pub fn run_replay_pausable_with_host_promises_and_vfs(
+        &self,
+        path: &Path,
+        inputs: &Value,
+        replay_log: Vec<CallRecord>,
+        host_promises: Vec<HostPromiseRecord>,
+        vfs: crate::runtime::vfs::Vfs,
+    ) -> Result<RunResult> {
+        let ctx =
+            RuntimeContext::with_replay_host_promises_and_vfs(replay_log, host_promises, vfs);
         ctx.set_input_mode(InputMode::Pause);
         self.run_with_context(path, inputs, ctx)
     }

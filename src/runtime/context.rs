@@ -1,11 +1,14 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::runtime::call_log::{CallLog, CallRecord};
+use crate::runtime::capability::{Capability, CapabilityLedger};
 use crate::runtime::otel::RunSpan;
+use crate::runtime::vfs::Vfs;
 use crate::runtime::snapshot::{
     HostOperationId, HostPromiseRecord, HostPromiseTable, PendingHostOperation,
     PendingHostOperationKind, HOST_PROMISE_TABLE_FILE, PENDING_HOST_OPERATION_FILE,
@@ -182,6 +185,45 @@ struct RuntimeContextInner {
     /// this is how sub-agent calls (made inside `call_agent`'s execution)
     /// get stamped with their enclosing `call_agent`'s seq.
     pub call_stack: Vec<u64>,
+    /// Accumulated capability flags raised when agent code touches a
+    /// captured-effect surface (filesystem, crypto, timers). Surfaced on the
+    /// snapshot manifest and as OTEL span attributes; recomputed and checked
+    /// against the stored set on replay.
+    pub capabilities: CapabilityLedger,
+    /// In-memory, snapshot-resident virtual filesystem backing `node:fs`.
+    /// Reads/writes never touch the host disk; the tree rides the snapshot
+    /// manifest so it survives suspend → restore identically.
+    pub vfs: Vfs,
+    /// Optional host-supplied model override (Pi-style save point). When set,
+    /// every prompt host call (`execute_prompt_text` / `execute_prompt_response`)
+    /// consults it just before sending and, if it yields `Some(model)`, swaps
+    /// the request's model. This refreshes the model between provider requests
+    /// for *every* execution path that runs through the prompt bindings — the
+    /// native agent loop and the TypeScript interactive engine alike.
+    pub model_override: Option<ModelOverride>,
+}
+
+/// Host-supplied callback returning the current model override, or `None` to
+/// leave the request's model unchanged. Wrapped like the safepoint callbacks so
+/// `RuntimeContextInner` can keep deriving `Debug`.
+#[derive(Clone)]
+pub struct ModelOverride(Arc<dyn Fn() -> Option<String> + Send + Sync>);
+
+impl std::fmt::Debug for ModelOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelOverride").finish_non_exhaustive()
+    }
+}
+
+impl ModelOverride {
+    pub fn new(callback: impl Fn() -> Option<String> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    /// Invoke the override, returning the current model (or `None`).
+    pub fn resolve(&self) -> Option<String> {
+        (self.0)()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +300,9 @@ impl RuntimeContext {
                 live_vm_snapshotter: None,
                 workspace_root: default_workspace_root(),
                 call_stack: Vec::new(),
+                capabilities: CapabilityLedger::new(),
+                vfs: vfs_from_seed_env(),
+                model_override: None,
             })),
         }
     }
@@ -271,6 +316,17 @@ impl RuntimeContext {
     pub fn with_replay_and_host_promises(
         replay_log: Vec<CallRecord>,
         host_promises: Vec<HostPromiseRecord>,
+    ) -> Self {
+        Self::with_replay_host_promises_and_vfs(replay_log, host_promises, vfs_from_seed_env())
+    }
+
+    /// As `with_replay_and_host_promises`, but restores a virtual filesystem
+    /// captured in a snapshot manifest so a resumed run sees the exact file
+    /// state it had at suspend (rather than re-seeding from the environment).
+    pub fn with_replay_host_promises_and_vfs(
+        replay_log: Vec<CallRecord>,
+        host_promises: Vec<HostPromiseRecord>,
+        vfs: Vfs,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(RuntimeContextInner {
@@ -292,6 +348,9 @@ impl RuntimeContext {
                 live_vm_snapshotter: None,
                 workspace_root: default_workspace_root(),
                 call_stack: Vec::new(),
+                capabilities: CapabilityLedger::new(),
+                vfs,
+                model_override: None,
             })),
         }
     }
@@ -323,6 +382,9 @@ impl RuntimeContext {
                 live_vm_snapshotter: None,
                 workspace_root: default_workspace_root(),
                 call_stack: Vec::new(),
+                capabilities: CapabilityLedger::new(),
+                vfs: vfs_from_seed_env(),
+                model_override: None,
             })),
         }
     }
@@ -350,6 +412,13 @@ impl RuntimeContext {
         let mut inner = self.inner.lock().unwrap();
         inner.seq += 1;
         inner.seq
+    }
+
+    /// The current sequence number without advancing it. Used to stamp a
+    /// capability flag's first-touch seq for inline (non-call-logged) effects
+    /// like hashing, which must not consume a sequence slot.
+    pub fn current_seq(&self) -> u64 {
+        self.inner.lock().unwrap().seq
     }
 
     /// Mark `seq`'s `live()` as executing: any call recorded until the
@@ -435,6 +504,113 @@ impl RuntimeContext {
         }
     }
 
+    /// Raise a capability flag for a captured-effect surface the agent touched.
+    /// Idempotent per capability — only the first touch records its `seq`. When
+    /// a flag is newly raised and OTEL is active, it's also stamped on the run
+    /// span so traces advertise the surface.
+    pub fn note_capability(&self, cap: Capability, seq: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.capabilities.note(cap, seq) {
+            if let Some(ref otel) = inner.otel_run {
+                otel.record_capability(cap);
+            }
+        }
+    }
+
+    /// Snapshot of the capabilities touched so far, for the manifest / status.
+    pub fn capabilities(&self) -> CapabilityLedger {
+        self.inner.lock().unwrap().capabilities.clone()
+    }
+
+    /// A clone of the current virtual filesystem, for persisting into the
+    /// snapshot manifest. Restoration on resume happens via
+    /// [`RuntimeContext::with_replay_host_promises_and_vfs`].
+    pub fn vfs_snapshot(&self) -> Vfs {
+        self.inner.lock().unwrap().vfs.clone()
+    }
+
+    // --- Virtual filesystem operations -------------------------------------
+    //
+    // VFS state rides the snapshot, so these are *not* call-logged: a restore
+    // reconstructs the tree directly. Each operation raises its capability flag
+    // for visibility. The logical mtime stamped on writes is the current
+    // sequence number, keeping `stat` times deterministic without consuming a
+    // sequence slot (which would risk replay misalignment with the call log).
+
+    /// Read a file's raw bytes from the VFS. Raises `FsRead`.
+    pub fn vfs_read(&self, path: &str) -> Result<Vec<u8>, String> {
+        let mut inner = self.inner.lock().unwrap();
+        let res = inner.vfs.read(path);
+        note_cap(&mut inner, Capability::FsRead);
+        res
+    }
+
+    /// Write bytes to the VFS (create or truncate). Raises `FsWrite`.
+    pub fn vfs_write(&self, path: &str, bytes: Vec<u8>) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap();
+        let seq = inner.seq;
+        let res = inner.vfs.write(path, bytes, seq);
+        note_cap(&mut inner, Capability::FsWrite);
+        res
+    }
+
+    /// Append bytes to a VFS file (create if absent). Raises `FsWrite`.
+    pub fn vfs_append(&self, path: &str, extra: &[u8]) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap();
+        let seq = inner.seq;
+        let res = inner.vfs.append(path, extra, seq);
+        note_cap(&mut inner, Capability::FsWrite);
+        res
+    }
+
+    /// Create a directory in the VFS. Raises `FsWrite`.
+    pub fn vfs_mkdir(&self, path: &str, recursive: bool) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap();
+        let res = inner.vfs.mkdir(path, recursive);
+        note_cap(&mut inner, Capability::FsWrite);
+        res
+    }
+
+    /// List a directory's immediate children. Raises `FsRead`.
+    pub fn vfs_readdir(&self, path: &str) -> Result<Vec<String>, String> {
+        let mut inner = self.inner.lock().unwrap();
+        let res = inner.vfs.readdir(path);
+        note_cap(&mut inner, Capability::FsRead);
+        res
+    }
+
+    /// Remove a path from the VFS. Raises `FsDelete`.
+    pub fn vfs_remove(&self, path: &str, recursive: bool, force: bool) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap();
+        let res = inner.vfs.remove(path, recursive, force);
+        note_cap(&mut inner, Capability::FsDelete);
+        res
+    }
+
+    /// Rename/move a VFS path. Raises `FsWrite`.
+    pub fn vfs_rename(&self, from: &str, to: &str) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap();
+        let res = inner.vfs.rename(from, to);
+        note_cap(&mut inner, Capability::FsWrite);
+        res
+    }
+
+    /// Whether a path exists in the VFS. Raises `FsRead`.
+    pub fn vfs_exists(&self, path: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let res = inner.vfs.exists(path);
+        note_cap(&mut inner, Capability::FsRead);
+        res
+    }
+
+    /// `stat`-style metadata for a VFS path. Raises `FsRead`.
+    pub fn vfs_stat(&self, path: &str) -> Result<serde_json::Value, String> {
+        let mut inner = self.inner.lock().unwrap();
+        let res = inner.vfs.stat(path);
+        note_cap(&mut inner, Capability::FsRead);
+        res
+    }
+
     pub fn begin_prompt_stream(
         &self,
         seq: u64,
@@ -497,6 +673,19 @@ impl RuntimeContext {
 
     pub fn set_event_sender(&self, tx: UnboundedSender<RuntimeEvent>) {
         self.inner.lock().unwrap().event_sender = Some(tx);
+    }
+
+    /// Install a model-override hook consulted before every prompt host call,
+    /// so a mid-run model change refreshes the model on the next provider
+    /// request across all execution paths.
+    pub fn set_model_override(&self, model_override: ModelOverride) {
+        self.inner.lock().unwrap().model_override = Some(model_override);
+    }
+
+    /// Resolve the current model override, if a hook is installed and yields one.
+    pub fn resolve_model_override(&self) -> Option<String> {
+        let hook = self.inner.lock().unwrap().model_override.clone();
+        hook.and_then(|hook| hook.resolve())
     }
 
     pub fn set_otel_run(&self, run: Arc<RunSpan>) {
@@ -766,6 +955,63 @@ fn default_workspace_root() -> Option<PathBuf> {
     std::env::var_os("CHIDORI_WORKSPACE_ROOT")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+/// Raise a capability flag on `inner`, stamping the current sequence number as
+/// the first-touch seq and mirroring it onto the OTEL run span. Idempotent per
+/// capability. Split out so the VFS/crypto/timer methods stay one-liners while
+/// holding the inner lock exactly once.
+fn note_cap(inner: &mut RuntimeContextInner, cap: Capability) {
+    let seq = inner.seq;
+    if inner.capabilities.note(cap, seq) {
+        if let Some(ref otel) = inner.otel_run {
+            otel.record_capability(cap);
+        }
+    }
+}
+
+/// Construct the initial virtual filesystem, pre-populated from the
+/// `CHIDORI_VFS_SEED` channel if present. The seed is a JSON object mapping an
+/// absolute path to its contents — either a UTF-8 string, or an object
+/// `{ "base64": "..." }` for binary. This is the only host-disk-adjacent input
+/// to the VFS and it is read once, before agent code runs, so the seeded tree
+/// is identical on every (re)construction and therefore deterministic.
+fn vfs_from_seed_env() -> Vfs {
+    let mut vfs = Vfs::new();
+    let Ok(raw) = std::env::var("CHIDORI_VFS_SEED") else {
+        return vfs;
+    };
+    if raw.trim().is_empty() {
+        return vfs;
+    }
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        tracing::warn!("CHIDORI_VFS_SEED is not a JSON object; ignoring");
+        return vfs;
+    };
+    for (path, value) in map {
+        let bytes = match &value {
+            serde_json::Value::String(s) => s.clone().into_bytes(),
+            serde_json::Value::Object(obj) => match obj.get("base64").and_then(|v| v.as_str()) {
+                Some(b64) => match base64::engine::general_purpose::STANDARD.decode(b64) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        tracing::warn!(path = %path, error = %err, "skipping VFS seed entry with invalid base64");
+                        continue;
+                    }
+                },
+                None => {
+                    tracing::warn!(path = %path, "skipping VFS seed entry: object without `base64`");
+                    continue;
+                }
+            },
+            _ => {
+                tracing::warn!(path = %path, "skipping VFS seed entry: unsupported value type");
+                continue;
+            }
+        };
+        vfs.seed_file(&path, bytes);
+    }
+    vfs
 }
 
 #[cfg(test)]

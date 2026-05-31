@@ -2327,6 +2327,22 @@ fn load_persisted_host_promises(
         .map_err(|err| anyhow::anyhow!("parsing {}: {}", table_path.display(), err))
 }
 
+/// Load the virtual filesystem captured in a run's snapshot manifest so a
+/// resumed run sees the file state it had at suspend. Returns an empty VFS if
+/// the run has no persisted manifest yet (e.g. it never reached a safepoint).
+fn load_persisted_vfs(
+    run_base: &FsPath,
+    run_id: Option<&str>,
+) -> crate::runtime::vfs::Vfs {
+    let Some(run_id) = run_id else {
+        return crate::runtime::vfs::Vfs::new();
+    };
+    match crate::runtime::snapshot::SnapshotStore::new(run_base.join(run_id)).load_manifest() {
+        Ok(manifest) => manifest.vfs,
+        Err(_) => crate::runtime::vfs::Vfs::new(),
+    }
+}
+
 #[allow(dead_code)]
 fn resolve_persisted_pending_host_operation(
     run_base: &FsPath,
@@ -3030,15 +3046,17 @@ async fn replay_session(State(state): State<AppState>, Path(id): Path<String>) -
         };
     let input_clone = input.clone();
     let approvals = original.approvals.clone();
+    let vfs = load_persisted_vfs(&state.run_base, original.run_id.as_deref());
     let app_state = state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         let engine = build_engine(&app_state).with_approvals(approvals);
-        engine.run_with_replay_and_host_promises(
+        engine.run_with_replay_host_promises_and_vfs(
             &app_state.agent_path,
             &input_clone,
             call_log,
             host_promises,
+            vfs,
         )
     })
     .await
@@ -3956,15 +3974,17 @@ async fn resume_session(
             }
         };
     let approvals = original.approvals.clone();
+    let vfs = load_persisted_vfs(&state.run_base, original.run_id.as_deref());
     let app_state = state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         let engine = build_engine(&app_state).with_approvals(approvals);
-        engine.run_replay_pausable_with_host_promises(
+        engine.run_replay_pausable_with_host_promises_and_vfs(
             &app_state.agent_path,
             &input_clone,
             call_log,
             host_promises,
+            vfs,
         )
     })
     .await

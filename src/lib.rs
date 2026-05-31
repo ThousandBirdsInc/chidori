@@ -18,7 +18,7 @@ pub mod framework {
     };
     pub use crate::runtime::call_log::{CallLog, CallRecord, TokenUsage};
     pub use crate::runtime::context::{
-        PendingApproval, PendingInput, RuntimeContext, RuntimeEvent,
+        ModelOverride, PendingApproval, PendingInput, RuntimeContext, RuntimeEvent,
     };
     pub use crate::runtime::engine::{Engine, RunResult};
     pub use crate::runtime::host_core::{
@@ -26,7 +26,8 @@ pub mod framework {
     };
     pub use crate::runtime::native::{
         NativeAgentCheckpoint, NativeAgentRequest, NativeAgentRunResult, NativeAgentRunner,
-        NativePendingApproval, NativePendingInput, PendingBatch, NATIVE_AGENT_CHECKPOINT_FILE,
+        NativePendingApproval, NativePendingInput, PendingBatch, SavePointHook, TurnSavePoint,
+        NATIVE_AGENT_CHECKPOINT_FILE,
     };
     pub use crate::runtime::snapshot::{HostPromiseRecord, HostPromiseState};
     pub use crate::runtime::template::TemplateEngine;

@@ -58,6 +58,11 @@ futures = "0.3"
 tokio-stream = "0.1"
 async-stream = "0.3"
 sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+hex = "0.4"
+rand = "0.8"
 
 # WebAssembly sandbox for exec() host function.
 # Cranelift compiler + metering middleware give us fuel-based timeouts.
@@ -94,3 +99,4 @@ oxc = { version = "0.133", features = ["transformer", "codegen", "semantic"] }
 # Legacy host-binding parity tests only. Production TypeScript execution uses
 # the in-repo `chidori-quickjs` fork.
 rquickjs = { version = "0.9", features = ["macro"] }
+tempfile = "3"

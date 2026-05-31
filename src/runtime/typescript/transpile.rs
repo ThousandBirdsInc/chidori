@@ -9,6 +9,9 @@ use oxc::span::SourceType;
 use oxc::transformer::{TransformOptions, Transformer};
 
 use crate::runtime::snapshot::TypeScriptImportPolicy;
+use crate::runtime::typescript::resolver::{
+    DEFAULT_CONDITIONS, Resolution, ResolutionKind, Resolver,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct TranspileOptions {
@@ -19,6 +22,56 @@ pub struct TranspileOptions {
 pub struct ModuleImport {
     pub specifier: String,
     pub resolved_path: Option<PathBuf>,
+    /// Kind of resolution, when the resolver was used. `None` for legacy
+    /// `Relative`/`Project` paths where resolution shape isn't tracked.
+    pub kind: Option<ResolutionKindTag>,
+}
+
+/// Plain-data mirror of `resolver::ResolutionKind` for callers that don't want
+/// to depend on the resolver module directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolutionKindTag {
+    Relative,
+    Package { name: String, subpath: String },
+    NodeBuiltin { name: String },
+}
+
+impl From<&ResolutionKind> for ResolutionKindTag {
+    fn from(kind: &ResolutionKind) -> Self {
+        match kind {
+            ResolutionKind::Relative => ResolutionKindTag::Relative,
+            ResolutionKind::Package { name, subpath } => ResolutionKindTag::Package {
+                name: name.clone(),
+                subpath: subpath.clone(),
+            },
+            ResolutionKind::NodeBuiltin { name } => ResolutionKindTag::NodeBuiltin {
+                name: name.clone(),
+            },
+        }
+    }
+}
+
+/// Allowlist of `node:` builtins the resolver will accept under the `Node`
+/// policy. The corresponding shim sources are registered by
+/// `runtime::typescript::snapshot` when bundling.
+pub const NODE_BUILTIN_ALLOWLIST: &[&str] =
+    &["process", "buffer", "util", "fs", "fs/promises", "crypto"];
+
+/// Walk up from `start` looking for a `package.json` and return the directory
+/// that contains it. Falls back to `start`'s parent (or the cwd) if none
+/// exists in the chain — this keeps single-file agent harnesses working.
+pub fn find_workspace_root(start: &Path) -> PathBuf {
+    let mut dir = start.parent().map(Path::to_path_buf);
+    while let Some(current) = dir {
+        if current.join("package.json").is_file() {
+            return current;
+        }
+        dir = current.parent().map(Path::to_path_buf);
+    }
+    start
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 pub fn transpile_module(path: &Path, source: &str, options: &TranspileOptions) -> Result<String> {
@@ -226,11 +279,17 @@ pub fn validate_imports(
         }
     }
 
+    // Lazily construct the Node resolver only when needed — it touches the
+    // filesystem to read package.json files, which we don't want under the
+    // legacy policies.
+    let mut node_resolver: Option<Resolver> = None;
+
     for (line_no, specifier) in import_specifiers(source) {
         if specifier == "chidori" {
             imports.push(ModuleImport {
                 specifier,
                 resolved_path: None,
+                kind: None,
             });
             continue;
         }
@@ -257,6 +316,7 @@ pub fn validate_imports(
                 imports.push(ModuleImport {
                     specifier,
                     resolved_path: Some(resolved),
+                    kind: None,
                 });
             }
             TypeScriptImportPolicy::Project => {
@@ -266,13 +326,42 @@ pub fn validate_imports(
                     imports.push(ModuleImport {
                         specifier,
                         resolved_path: Some(resolved),
+                        kind: None,
                     });
                 } else {
                     imports.push(ModuleImport {
                         specifier,
                         resolved_path: None,
+                        kind: None,
                     });
                 }
+            }
+            TypeScriptImportPolicy::Node => {
+                let resolver = node_resolver.get_or_insert_with(|| {
+                    let root = find_workspace_root(path);
+                    Resolver::new(
+                        root,
+                        DEFAULT_CONDITIONS.iter().copied(),
+                        NODE_BUILTIN_ALLOWLIST.iter().copied(),
+                    )
+                });
+                let Resolution {
+                    kind,
+                    resolved_path,
+                } = resolver.resolve(&specifier, path).map_err(|err| {
+                    anyhow::anyhow!(
+                        "{}:{}: cannot resolve `{}`: {}",
+                        path.display(),
+                        line_no,
+                        specifier,
+                        err
+                    )
+                })?;
+                imports.push(ModuleImport {
+                    specifier,
+                    resolved_path: Some(resolved_path),
+                    kind: Some(ResolutionKindTag::from(&kind)),
+                });
             }
         }
     }
