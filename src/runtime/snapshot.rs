@@ -136,7 +136,12 @@ pub struct RuntimePolicy {
 impl RuntimePolicy {
     pub fn durable_default(run_id: &str) -> Self {
         Self {
-            typescript_imports: TypeScriptImportPolicy::Relative,
+            // Node-style resolution by default so `node:` builtins (notably
+            // `node:fs`, the only surface the captured VFS is exposed through)
+            // resolve in the durable path. `Node` is a behavioral superset of
+            // `Relative` — relative imports resolve identically — so this is
+            // safe for relative-only agents.
+            typescript_imports: TypeScriptImportPolicy::Node,
             date: DatePolicy::Fixed,
             random: RandomPolicy::Seeded,
             maps_sets: MapSetSnapshotPolicy::Reject,
@@ -151,7 +156,7 @@ impl RuntimePolicy {
         let policy = Self {
             typescript_imports: parse_policy_env(
                 "CHIDORI_TS_IMPORTS",
-                TypeScriptImportPolicy::Relative,
+                TypeScriptImportPolicy::Node,
                 parse_import_policy,
             )?,
             date: parse_policy_env("CHIDORI_TS_DATE", DatePolicy::Fixed, parse_date_policy)?,

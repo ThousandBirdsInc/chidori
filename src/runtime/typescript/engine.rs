@@ -507,6 +507,22 @@ mod tests {
     }
 
     #[test]
+    fn vfs_is_reachable_under_durable_default_policy() {
+        // Regression guard: the durable default policy must resolve `node:fs`
+        // so the captured VFS is usable in production without setting
+        // CHIDORI_TS_IMPORTS. `runtime()` uses RuntimePolicy::durable_default.
+        let source = r#"
+            import { writeFileSync, readFileSync } from "node:fs";
+            export async function agent(input, chidori) {
+                writeFileSync("/note.txt", "reachable");
+                return { text: readFileSync("/note.txt", "utf8") };
+            }
+        "#;
+        let out = run_agent(&runtime(), source, RuntimeContext::new());
+        assert_eq!(out, serde_json::json!({ "text": "reachable" }));
+    }
+
+    #[test]
     fn node_fs_round_trips_through_captured_vfs() {
         use crate::runtime::capability::Capability;
         let source = r#"
