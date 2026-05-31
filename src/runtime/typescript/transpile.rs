@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use oxc::allocator::Allocator;
-use oxc::codegen::{Codegen, CodegenOptions};
+use oxc::codegen::{Codegen, CodegenOptions, CommentOptions};
 use oxc::parser::Parser;
 use oxc::semantic::SemanticBuilder;
 use oxc::span::SourceType;
@@ -130,8 +130,16 @@ pub fn transpile_module(path: &Path, source: &str, options: &TranspileOptions) -
         );
     }
 
+    // Emit no comments. The bundler collapses each top-level statement onto a
+    // single line (see `collapse_top_level_statements`); a surviving `//` line
+    // comment would then swallow the rest of that line — including closing
+    // braces — corrupting the bundle. Comments serve no runtime purpose, so we
+    // drop them at codegen rather than trying to rewrite them during collapse.
     let codegen_ret = Codegen::new()
-        .with_options(CodegenOptions::default())
+        .with_options(CodegenOptions {
+            comments: CommentOptions::disabled(),
+            ..CodegenOptions::default()
+        })
         .build(&program);
 
     // The `chidori` SDK import marks host-injected globals (Chidori, ToolDefinition,
@@ -641,6 +649,41 @@ mod tests {
         assert!(js.contains(".filter((t) => t !== null)"));
         assert!(js.contains("const double = (n) => n * 2;"));
         assert!(js.contains("const obj = (k) => ({ v: 1 });"));
+    }
+
+    #[test]
+    fn transpile_drops_line_comments_so_collapse_does_not_swallow_code() {
+        // Regression: line comments inside a function body must not survive
+        // codegen. The bundler collapses each top-level statement onto one
+        // physical line, so a `//` comment would otherwise comment out the rest
+        // of the line — including the function's closing braces — corrupting
+        // the bundle. (Found via end-to-end package validation.)
+        let source = r#"
+            export async function agent(input, chidori) {
+                const before = 1; // a trailing comment
+                // a full-line comment
+                const after = 2;
+                return { before, after };
+            }
+        "#;
+        let js = transpile_module(
+            Path::new("/tmp/project/agent.ts"),
+            source,
+            &TranspileOptions {
+                import_policy: TypeScriptImportPolicy::Relative,
+            },
+        )
+        .unwrap();
+
+        assert!(!js.contains("//"), "line comments must be stripped:\n{js}");
+        assert!(js.contains("const after = 2"), "code after a comment survived:\n{js}");
+        assert!(js.contains("return {"), "return survived:\n{js}");
+        // Braces stay balanced after collapse.
+        assert_eq!(
+            js.matches('{').count(),
+            js.matches('}').count(),
+            "balanced braces:\n{js}"
+        );
     }
 
     #[test]
