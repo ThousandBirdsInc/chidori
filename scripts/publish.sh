@@ -8,7 +8,7 @@
 #   CARGO_REGISTRY_TOKEN=... PACKAGES="chidori" ./publish.sh
 #
 # The default package order is dependency-first:
-#   chidori-quickjs-sys -> chidori-quickjs -> chidori
+#   chidori-js -> chidori
 
 set -euo pipefail
 
@@ -67,7 +67,7 @@ require python3
 
 # Publish leaves first so each dependent can resolve its internal dependency
 # from crates.io when cargo verifies the packaged crate.
-PACKAGES="${PACKAGES:-chidori-quickjs-sys chidori-quickjs chidori}"
+PACKAGES="${PACKAGES:-chidori-js chidori}"
 
 if [[ "$DRY_RUN" -eq 0 && -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
   echo "CARGO_REGISTRY_TOKEN is not set. Create one at https://crates.io/me and re-run." >&2

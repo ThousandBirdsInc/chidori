@@ -16,22 +16,12 @@
 //! `test/language` and `test/built-ins`). The suite is located via `--test262`,
 //! then `$TEST262_DIR`, then `./vendor/test262`.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{c_char, c_void, CStr, CString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::ptr;
 
-use chidori_quickjs::{sys, EvalMode, JsThrow, RuntimeLimits, SnapshotRuntime};
 use serde::Deserialize;
-
-thread_local! {
-    /// Directory that `import(specifier)` and module imports resolve against —
-    /// the directory of the test file currently executing. Set per run.
-    static CURRENT_MODULE_DIR: RefCell<PathBuf> = RefCell::new(PathBuf::new());
-}
 
 const USAGE: &str = "\
 test262-runner — run Test262 against chidori's embedded QuickJS runtime
@@ -54,51 +44,6 @@ options:
   --intl            also run intl402 tests
   --help, -h        show this help";
 
-const JS_TAG_EXCEPTION: i64 = 6;
-const JS_EVAL_TYPE_MODULE: i32 = 1;
-const JS_EVAL_FLAG_COMPILE_ONLY: i32 = 1 << 5;
-
-/// QuickJS module loader: resolves a (already-normalized) specifier against the
-/// current test's directory, reads it, and compiles it as a module. This is
-/// what makes `import()` and module-flag tests load their `_FIXTURE` files —
-/// the engine already parses `import()`, it just had no loader registered.
-/// Returns null (engine then throws) when the file is missing or fails to
-/// compile, mirroring the reference qjs loader.
-unsafe extern "C" fn module_loader(
-    ctx: *mut sys::JSContext,
-    module_name: *const c_char,
-    _opaque: *mut c_void,
-) -> *mut sys::JSModuleDef {
-    let name = match CStr::from_ptr(module_name).to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return ptr::null_mut(),
-    };
-    let path = CURRENT_MODULE_DIR.with(|d| d.borrow().join(&name));
-    let bytes = match fs::read(&path) {
-        Ok(b) => b,
-        Err(_) => return ptr::null_mut(),
-    };
-    let (Ok(csrc), Ok(cname)) = (CString::new(bytes), CString::new(name)) else {
-        return ptr::null_mut();
-    };
-    let val = sys::JS_Eval(
-        ctx,
-        csrc.as_ptr(),
-        csrc.as_bytes().len(),
-        cname.as_ptr(),
-        JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
-    );
-    if val.tag == JS_TAG_EXCEPTION {
-        return ptr::null_mut();
-    }
-    // On success the value carries the JSModuleDef*; free the wrapper (the
-    // module stays registered in the context) and hand back the pointer.
-    let module = val.u.ptr as *mut sys::JSModuleDef;
-    sys::JS_FreeValue(ctx, val);
-    module
-}
-
-/// Per-test metadata parsed from the `/*--- ... ---*/` YAML frontmatter.
 #[derive(Debug, Default, Deserialize)]
 struct Meta {
     #[serde(default)]
@@ -187,14 +132,14 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     // Stage-2/3 proposals not implemented by this QuickJS build. Verified absent
     // (no implemented-surface passes to hide), so counting them as failures
     // would understate conformance of what IS implemented.
-    "joint-iteration",         // Iterator.zip / Iterator.zipKeyed
-    "iterator-sequencing",     // Iterator.concat
-    "import-defer",            // import defer
-    "upsert",                  // Map/WeakMap.prototype.getOrInsert
-    "immutable-arraybuffer",   // ArrayBuffer immutable / transfer-to-immutable
-    "error-stack-accessor",    // Error.prototype.stack accessor semantics
-    "await-dictionary",        // Promise.{all,allSettled,...}Keyed
-    "json-parse-with-source",  // JSON.parse source / rawJSON
+    "joint-iteration",        // Iterator.zip / Iterator.zipKeyed
+    "iterator-sequencing",    // Iterator.concat
+    "import-defer",           // import defer
+    "upsert",                 // Map/WeakMap.prototype.getOrInsert
+    "immutable-arraybuffer",  // ArrayBuffer immutable / transfer-to-immutable
+    "error-stack-accessor",   // Error.prototype.stack accessor semantics
+    "await-dictionary",       // Promise.{all,allSettled,...}Keyed
+    "json-parse-with-source", // JSON.parse source / rawJSON
 ];
 
 #[derive(Default)]
@@ -202,12 +147,6 @@ struct Tally {
     pass: u64,
     fail: u64,
     skip: u64,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum EngineKind {
-    QuickJs,
-    Rust,
 }
 
 struct Args {
@@ -219,7 +158,6 @@ struct Args {
     verbose: bool,
     modules: bool,
     intl: bool,
-    engine: EngineKind,
     /// Persistent per-test result store. When set, this run UPDATES only the
     /// entries for the tests it executes, then recomputes and prints the
     /// whole-suite total from the merged store — so a targeted re-run (e.g. one
@@ -271,7 +209,10 @@ fn run() -> ExitCode {
             args.root.join("test/built-ins"),
         ]
     } else {
-        args.paths.iter().map(|p| resolve_path(&args.root, p)).collect()
+        args.paths
+            .iter()
+            .map(|p| resolve_path(&args.root, p))
+            .collect()
     };
     for r in &roots {
         collect_tests(r, &mut files);
@@ -390,13 +331,14 @@ fn run() -> ExitCode {
     // Persist the merged state and report the WHOLE-SUITE total from it, so a
     // targeted re-run refreshes the global stats without re-running everything.
     if let (Some(path), Some(state)) = (&args.state, &state) {
-        let (sp, sf, sk) = state.values().fold((0u64, 0u64, 0u64), |(p, f, k), v| {
-            match v.as_str() {
-                "pass" => (p + 1, f, k),
-                "fail" => (p, f + 1, k),
-                _ => (p, f, k + 1),
-            }
-        });
+        let (sp, sf, sk) =
+            state
+                .values()
+                .fold((0u64, 0u64, 0u64), |(p, f, k), v| match v.as_str() {
+                    "pass" => (p + 1, f, k),
+                    "fail" => (p, f + 1, k),
+                    _ => (p, f, k + 1),
+                });
         let stotal = sp + sf;
         let spct = if stotal > 0 {
             (sp as f64) * 100.0 / (stotal as f64)
@@ -468,10 +410,7 @@ fn run_test(
     variants
         .into_iter()
         .map(|v| {
-            let outcome = match args.engine {
-                EngineKind::QuickJs => run_variant(source, &meta, v, test_dir, harness),
-                EngineKind::Rust => run_variant_rust(source, &meta, v, test_dir, rel, harness),
-            };
+            let outcome = run_variant_rust(source, &meta, v, test_dir, rel, harness);
             (v, outcome)
         })
         .collect()
@@ -496,158 +435,6 @@ fn select_variants(meta: &Meta, args: &Args) -> Vec<Variant> {
         out.push(Variant::Strict);
     }
     out
-}
-
-/// Bootstrap installed before the harness includes in every (non-raw) context:
-/// a capturing `print`, and a minimal `$262` host hook. Tests that need `$262`
-/// features we cannot provide (e.g. `detachArrayBuffer`) fail loudly rather
-/// than silently passing.
-const BOOTSTRAP: &str = r#"
-globalThis.__t262_print = [];
-globalThis.print = function (msg) { globalThis.__t262_print.push(String(msg)); };
-globalThis.$262 = {
-  global: globalThis,
-  evalScript: function (src) { return (0, eval)(src); },
-  gc: function () {},
-  // Backed by the real QuickJS JS_DetachArrayBuffer, installed natively as
-  // __t262_detachArrayBuffer before this bootstrap runs.
-  detachArrayBuffer: globalThis.__t262_detachArrayBuffer,
-  agent: undefined,
-};
-"#;
-
-/// `$262.detachArrayBuffer(buffer)` — detaches `argv[0]` via the engine's real
-/// `JS_DetachArrayBuffer`, so detached-buffer conformance tests exercise actual
-/// engine behavior instead of a throwing stub. Returns `undefined`.
-unsafe extern "C" fn t262_detach_array_buffer(
-    ctx: *mut chidori_quickjs::sys::JSContext,
-    _this: chidori_quickjs::sys::JSValue,
-    argc: std::ffi::c_int,
-    argv: *mut chidori_quickjs::sys::JSValue,
-) -> chidori_quickjs::sys::JSValue {
-    if argc >= 1 && !argv.is_null() {
-        chidori_quickjs::sys::JS_DetachArrayBuffer(ctx, *argv);
-    }
-    chidori_quickjs::sys::JSValue {
-        u: chidori_quickjs::sys::JSValueUnion { int32: 0 },
-        tag: 3, // JS_TAG_UNDEFINED
-    }
-}
-
-fn run_variant(
-    source: &str,
-    meta: &Meta,
-    variant: Variant,
-    test_dir: &Path,
-    harness: &mut HarnessCache,
-) -> Outcome {
-    let limits = RuntimeLimits {
-        memory_limit_bytes: 256 * 1024 * 1024,
-        interrupt_budget: 2_000_000_000,
-    };
-    let runtime = match SnapshotRuntime::new(limits) {
-        Ok(r) => r,
-        Err(e) => return Outcome::Fail(format!("runtime init: {e}")),
-    };
-    // Resolve `import()` / module imports against this test's directory.
-    CURRENT_MODULE_DIR.with(|d| *d.borrow_mut() = test_dir.to_path_buf());
-    unsafe {
-        sys::JS_SetModuleLoaderFunc(
-            runtime.raw_runtime(),
-            None,
-            Some(module_loader),
-            ptr::null_mut(),
-        );
-    }
-    let mut ctx = match runtime.new_context() {
-        Ok(c) => c,
-        Err(e) => return Outcome::Fail(format!("context init: {e}")),
-    };
-
-    let is_async = meta.has_flag("async");
-
-    // 1. Install harness, unless this is a raw test (which runs alone).
-    if variant != Variant::Raw {
-        if let Err(e) = ctx.install_global_native_function(
-            "__t262_detachArrayBuffer",
-            Some(t262_detach_array_buffer),
-            1,
-        ) {
-            return Outcome::Fail(format!("install detachArrayBuffer: {e}"));
-        }
-        if let Err(e) = ctx.eval_for_conformance("<bootstrap>", BOOTSTRAP, EvalMode::Script) {
-            return Outcome::Fail(format!("bootstrap threw: {e}"));
-        }
-        let mut includes = vec!["assert.js".to_string(), "sta.js".to_string()];
-        if is_async {
-            includes.push("doneprintHandle.js".to_string());
-        }
-        includes.extend(meta.includes.iter().cloned());
-        for inc in &includes {
-            let body = match harness.load(inc) {
-                Ok(b) => b,
-                Err(e) => return Outcome::Fail(format!("harness {inc}: {e}")),
-            };
-            if let Err(e) = ctx.eval_for_conformance(inc, &body, EvalMode::Script) {
-                return Outcome::Fail(format!("harness {inc} threw: {e}"));
-            }
-        }
-    }
-
-    // 2. Execute the test body in the right mode.
-    let negative = meta.negative.as_ref();
-    let run_mode = match variant {
-        Variant::Raw | Variant::Sloppy => EvalMode::Script,
-        Variant::Strict => EvalMode::StrictScript,
-        Variant::Module => EvalMode::Module,
-    };
-
-    if let Some(neg) = negative {
-        // Negative test: a throw is required, with a matching constructor name.
-        // Only parse/early errors are catchable by compile-only; `resolution`
-        // (module link) errors surface when the module is actually instantiated,
-        // so they run the full pipeline like runtime errors.
-        let is_parse = neg.phase == "parse" || neg.phase == "early";
-        let mode = if is_parse {
-            match variant {
-                Variant::Strict => EvalMode::CompileStrictScript,
-                Variant::Module => EvalMode::CompileModule,
-                _ => EvalMode::CompileScript,
-            }
-        } else {
-            run_mode
-        };
-        match ctx.eval_for_conformance("<test>", source, mode) {
-            Ok(()) => {
-                // Runtime-phase rejections may surface only after jobs drain.
-                if !is_parse {
-                    if let Err(thrown) = ctx.run_pending_jobs() {
-                        return match_negative(neg, &thrown);
-                    }
-                }
-                Outcome::Fail(format!(
-                    "expected {} ({}) but no error was thrown",
-                    neg.type_, neg.phase
-                ))
-            }
-            Err(thrown) => match_negative(neg, &thrown),
-        }
-    } else {
-        // Positive test: no throw, and async tests must signal completion.
-        match ctx.eval_for_conformance("<test>", source, run_mode) {
-            Ok(()) => {
-                if let Err(thrown) = ctx.run_pending_jobs() {
-                    return Outcome::Fail(format!("threw during jobs: {thrown}"));
-                }
-                if is_async {
-                    check_async_done(&mut ctx)
-                } else {
-                    Outcome::Pass
-                }
-            }
-            Err(thrown) => Outcome::Fail(format!("{}: {}", thrown.name, thrown.message)),
-        }
-    }
 }
 
 /// Bootstrap for the pure-Rust engine: a capturing `print` and a minimal `$262`.
@@ -838,15 +625,17 @@ fn evaluate_rust_module(
         engine.vm.interrupt = Some(interrupt);
         {
             use chidori_js::value::{Internal, Value as JsValue};
-            let detach = engine.vm.new_native("detachArrayBuffer", 1, |_vm, _this, args| {
-                if let Some(JsValue::Object(o)) = args.first() {
-                    let is_ab = matches!(o.borrow().internal, Internal::ArrayBuffer(_));
-                    if is_ab {
-                        o.borrow_mut().internal = Internal::ArrayBuffer(None);
+            let detach = engine
+                .vm
+                .new_native("detachArrayBuffer", 1, |_vm, _this, args| {
+                    if let Some(JsValue::Object(o)) = args.first() {
+                        let is_ab = matches!(o.borrow().internal, Internal::ArrayBuffer(_));
+                        if is_ab {
+                            o.borrow_mut().internal = Internal::ArrayBuffer(None);
+                        }
                     }
-                }
-                Ok(JsValue::Undefined)
-            });
+                    Ok(JsValue::Undefined)
+                });
             let g = engine.vm.realm.global.clone();
             engine
                 .vm
@@ -885,10 +674,14 @@ fn evaluate_rust_module(
             Ok(_) => {
                 if is_async {
                     let prints = read_rust_print(&mut engine);
-                    if prints.iter().any(|l| l.contains("Test262:AsyncTestComplete")) {
+                    if prints
+                        .iter()
+                        .any(|l| l.contains("Test262:AsyncTestComplete"))
+                    {
                         Outcome::Pass
-                    } else if let Some(f) =
-                        prints.iter().find(|l| l.contains("Test262:AsyncTestFailure"))
+                    } else if let Some(f) = prints
+                        .iter()
+                        .find(|l| l.contains("Test262:AsyncTestFailure"))
                     {
                         Outcome::Fail(f.clone())
                     } else {
@@ -954,7 +747,9 @@ fn load_module_into(
     // compile_module already returns "SyntaxError: …" on parse/early errors.
     let compiled = chidori_js::compiler::compile_module(&src)?;
     let requested = compiled.requested.clone();
-    let rec = Rc::new(RefCell::new(chidori_js::module::ModuleRecord::new(compiled)));
+    let rec = Rc::new(RefCell::new(chidori_js::module::ModuleRecord::new(
+        compiled,
+    )));
     registry.modules.insert(key.to_string(), rec.clone());
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     for req in &requested {
@@ -998,15 +793,17 @@ fn evaluate_rust(
         // detached-buffer behavior instead of failing at the harness gate.
         {
             use chidori_js::value::{Internal, Value as JsValue};
-            let detach = engine.vm.new_native("detachArrayBuffer", 1, |_vm, _this, args| {
-                if let Some(JsValue::Object(o)) = args.first() {
-                    let is_ab = matches!(o.borrow().internal, Internal::ArrayBuffer(_));
-                    if is_ab {
-                        o.borrow_mut().internal = Internal::ArrayBuffer(None);
+            let detach = engine
+                .vm
+                .new_native("detachArrayBuffer", 1, |_vm, _this, args| {
+                    if let Some(JsValue::Object(o)) = args.first() {
+                        let is_ab = matches!(o.borrow().internal, Internal::ArrayBuffer(_));
+                        if is_ab {
+                            o.borrow_mut().internal = Internal::ArrayBuffer(None);
+                        }
                     }
-                }
-                Ok(JsValue::Undefined)
-            });
+                    Ok(JsValue::Undefined)
+                });
             let g = engine.vm.realm.global.clone();
             engine
                 .vm
@@ -1043,10 +840,14 @@ fn evaluate_rust(
                 if is_async {
                     // Inspect the captured print buffer for the async sentinel.
                     let prints = read_rust_print(&mut engine);
-                    if prints.iter().any(|l| l.contains("Test262:AsyncTestComplete")) {
+                    if prints
+                        .iter()
+                        .any(|l| l.contains("Test262:AsyncTestComplete"))
+                    {
                         Outcome::Pass
-                    } else if let Some(f) =
-                        prints.iter().find(|l| l.contains("Test262:AsyncTestFailure"))
+                    } else if let Some(f) = prints
+                        .iter()
+                        .find(|l| l.contains("Test262:AsyncTestFailure"))
                     {
                         Outcome::Fail(f.clone())
                     } else {
@@ -1070,10 +871,10 @@ fn evaluate_rust(
 fn read_rust_print(engine: &mut chidori_js::Engine) -> Vec<String> {
     use chidori_js::value::PropertyKey;
     let global = engine.vm.realm.global.clone();
-    let arr = match engine
-        .vm
-        .get_prop(&chidori_js::Value::Object(global), &PropertyKey::str("__t262_print"))
-    {
+    let arr = match engine.vm.get_prop(
+        &chidori_js::Value::Object(global),
+        &PropertyKey::str("__t262_print"),
+    ) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
@@ -1087,38 +888,6 @@ fn read_rust_print(engine: &mut chidori_js::Engine) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn match_negative(neg: &Negative, thrown: &JsThrow) -> Outcome {
-    if thrown.name == neg.type_ {
-        Outcome::Pass
-    } else {
-        Outcome::Fail(format!(
-            "expected {} but got {} ({})",
-            neg.type_, thrown.name, thrown.to_string
-        ))
-    }
-}
-
-/// After draining jobs, an async test must have called `$DONE()` with no error,
-/// which `doneprintHandle.js` turns into a `Test262:AsyncTestComplete` print.
-fn check_async_done(ctx: &mut chidori_quickjs::SnapshotContext<'_>) -> Outcome {
-    let lines = ctx
-        .read_global_json("__t262_print")
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-    let joined: Vec<String> = lines
-        .iter()
-        .map(|v| v.as_str().unwrap_or_default().to_string())
-        .collect();
-    if joined.iter().any(|l| l.contains("Test262:AsyncTestComplete")) {
-        Outcome::Pass
-    } else if let Some(fail) = joined.iter().find(|l| l.contains("Test262:AsyncTestFailure")) {
-        Outcome::Fail(fail.clone())
-    } else {
-        Outcome::Fail("async test never signalled $DONE".into())
-    }
-}
-
-/// Caches harness include files (`assert.js`, `sta.js`, ...) read from disk.
 struct HarnessCache {
     dir: PathBuf,
     files: HashMap<String, String>,
@@ -1201,7 +970,10 @@ fn load_state(path: &Path) -> std::collections::BTreeMap<String, String> {
         return map;
     };
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
-        eprintln!("warning: state file {} is not valid JSON; starting fresh", path.display());
+        eprintln!(
+            "warning: state file {} is not valid JSON; starting fresh",
+            path.display()
+        );
         return map;
     };
     if let Some(results) = doc.get("results").and_then(|r| r.as_object()) {
@@ -1217,11 +989,13 @@ fn load_state(path: &Path) -> std::collections::BTreeMap<String, String> {
 /// Write the merged state store (with a human-readable summary header).
 fn save_state(path: &Path, state: &std::collections::BTreeMap<String, String>, pass_pct: f64) {
     let (pass, fail, skip) =
-        state.values().fold((0u64, 0u64, 0u64), |(p, f, k), v| match v.as_str() {
-            "pass" => (p + 1, f, k),
-            "fail" => (p, f + 1, k),
-            _ => (p, f, k + 1),
-        });
+        state
+            .values()
+            .fold((0u64, 0u64, 0u64), |(p, f, k), v| match v.as_str() {
+                "pass" => (p + 1, f, k),
+                "fail" => (p, f + 1, k),
+                _ => (p, f, k + 1),
+            });
     let results: serde_json::Map<String, serde_json::Value> = state
         .iter()
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
@@ -1245,20 +1019,12 @@ fn parse_args() -> Result<Args, String> {
     let mut verbose = false;
     let mut modules = true;
     let mut intl = false;
-    let mut engine = EngineKind::QuickJs;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--test262" => {
                 root = Some(PathBuf::from(it.next().ok_or("--test262 needs a value")?));
-            }
-            "--engine" => {
-                engine = match it.next().ok_or("--engine needs a value")?.as_str() {
-                    "quickjs" => EngineKind::QuickJs,
-                    "rust" => EngineKind::Rust,
-                    other => return Err(format!("unknown engine '{other}' (quickjs|rust)")),
-                };
             }
             "--filter" => filter = Some(it.next().ok_or("--filter needs a value")?),
             "--max" => {
@@ -1270,6 +1036,11 @@ fn parse_args() -> Result<Args, String> {
                 );
             }
             "--json" => json = Some(PathBuf::from(it.next().ok_or("--json needs a value")?)),
+            // Accepted for backward compatibility; the pure-Rust engine is the
+            // only engine, so the value is ignored.
+            "--engine" => {
+                let _ = it.next().ok_or("--engine needs a value")?;
+            }
             "--state" => state = Some(PathBuf::from(it.next().ok_or("--state needs a value")?)),
             "--verbose" | "-v" => verbose = true,
             "--modules" => modules = true,
@@ -1299,7 +1070,6 @@ fn parse_args() -> Result<Args, String> {
         verbose,
         modules,
         intl,
-        engine,
         state,
     })
 }

@@ -52,89 +52,6 @@ pub struct RunResult {
     pub paused_approval: Option<PendingApproval>,
 }
 
-fn persist_ts_snapshot_manifest_scaffold(
-    base: &Path,
-    run_id: &str,
-    path: &Path,
-    source: &str,
-    inputs: &Value,
-    policy: &RuntimePolicy,
-    ctx: &RuntimeContext,
-) -> Result<()> {
-    let call_log = ctx.call_log().into_records();
-    let pending = ctx.active_pending_host_operation();
-    let host_promises = ctx.host_promise_records();
-    let modules =
-        crate::runtime::typescript::snapshot::snapshot_module_fingerprints(path, source, policy)?;
-    let module_graph =
-        crate::runtime::typescript::snapshot::snapshot_module_graph(path, source, policy)?;
-    let manifest = SnapshotManifest::new(
-        run_id,
-        SnapshotAbi::current("chidori-quickjs"),
-        policy.clone(),
-        SourceFingerprint::from_source(path, source),
-        modules,
-        pending.clone(),
-        call_log.len(),
-    )
-    .with_module_graph(module_graph)
-    .with_host_promises(host_promises.clone())
-    .with_capabilities(ctx.capabilities())
-    .with_vfs(ctx.vfs_snapshot());
-
-    if let Some(snapshot) = ctx.capture_live_vm_snapshot() {
-        let snapshot = snapshot.with_context(|| {
-            format!(
-                "capturing live TypeScript VM snapshot for persisted run {}",
-                run_id
-            )
-        })?;
-        return SnapshotStore::new(base.join(run_id))
-            .save_live_vm_snapshot(&manifest, &snapshot, &call_log);
-    }
-
-    if !host_promises.is_empty() {
-        match crate::runtime::typescript::snapshot::snapshot_live_agent_state(
-            path,
-            source,
-            inputs.clone(),
-            policy.clone(),
-            &host_promises,
-            pending.as_ref(),
-        ) {
-            Ok(snapshot) => {
-                return SnapshotStore::new(base.join(run_id))
-                    .save_live_vm_snapshot(&manifest, &snapshot, &call_log);
-            }
-            Err(err) => {
-                tracing::warn!(
-                    run_id = %run_id,
-                    error = %err,
-                    "failed to persist live TypeScript VM snapshot from host promise records; falling back to initial snapshot scaffold"
-                );
-            }
-        }
-    }
-
-    match crate::runtime::typescript::snapshot::snapshot_initial_agent_state(
-        path,
-        source,
-        policy.clone(),
-    ) {
-        Ok(snapshot_blob) => {
-            SnapshotStore::new(base.join(run_id)).save(&manifest, &snapshot_blob, &call_log)
-        }
-        Err(err) => {
-            tracing::warn!(
-                run_id = %run_id,
-                error = %err,
-                "failed to persist initial TypeScript VM snapshot; saving manifest only"
-            );
-            SnapshotStore::new(base.join(run_id)).save_manifest_only(&manifest, &call_log)
-        }
-    }
-}
-
 /// Persist a resume scaffold for a run on the pure-Rust engine (G2).
 ///
 /// Unlike the QuickJS path, the rust live path's durability is the
@@ -151,7 +68,6 @@ fn persist_ts_snapshot_manifest_scaffold(
 /// and the existing QuickJS *scaffold* fallback uses the same token and resumes
 /// the same engine-agnostic way (call-log replay, not a VM image). Reusing it
 /// keeps the rust manifest acceptable to the unchanged resume gate.
-#[cfg(feature = "rust-engine")]
 fn persist_rust_journal_scaffold(
     base: &Path,
     run_id: &str,
@@ -163,10 +79,11 @@ fn persist_rust_journal_scaffold(
     let call_log = ctx.call_log().into_records();
     let pending = ctx.active_pending_host_operation();
     let host_promises = ctx.host_promise_records();
-    let modules =
-        crate::runtime::typescript::snapshot::snapshot_module_fingerprints(path, source, policy)?;
+    let modules = crate::runtime::typescript::module_graph::snapshot_module_fingerprints(
+        path, source, policy,
+    )?;
     let module_graph =
-        crate::runtime::typescript::snapshot::snapshot_module_graph(path, source, policy)?;
+        crate::runtime::typescript::module_graph::snapshot_module_graph(path, source, policy)?;
     let manifest = SnapshotManifest::new(
         run_id,
         SnapshotAbi::current("chidori-quickjs"),
@@ -298,8 +215,7 @@ impl Engine {
         host_promises: Vec<HostPromiseRecord>,
         vfs: crate::runtime::vfs::Vfs,
     ) -> Result<RunResult> {
-        let ctx =
-            RuntimeContext::with_replay_host_promises_and_vfs(replay_log, host_promises, vfs);
+        let ctx = RuntimeContext::with_replay_host_promises_and_vfs(replay_log, host_promises, vfs);
         self.run_with_context(path, inputs, ctx)
     }
 
@@ -399,8 +315,7 @@ impl Engine {
         host_promises: Vec<HostPromiseRecord>,
         vfs: crate::runtime::vfs::Vfs,
     ) -> Result<RunResult> {
-        let ctx =
-            RuntimeContext::with_replay_host_promises_and_vfs(replay_log, host_promises, vfs);
+        let ctx = RuntimeContext::with_replay_host_promises_and_vfs(replay_log, host_promises, vfs);
         ctx.set_input_mode(InputMode::Pause);
         self.run_with_context(path, inputs, ctx)
     }
@@ -419,8 +334,7 @@ impl Engine {
         vfs: crate::runtime::vfs::Vfs,
         run_id: String,
     ) -> Result<RunResult> {
-        let ctx =
-            RuntimeContext::with_replay_host_promises_and_vfs(replay_log, host_promises, vfs);
+        let ctx = RuntimeContext::with_replay_host_promises_and_vfs(replay_log, host_promises, vfs);
         ctx.set_run_id(run_id);
         ctx.set_input_mode(InputMode::Pause);
         self.run_with_context(path, inputs, ctx)
@@ -501,184 +415,41 @@ impl Engine {
             // durable call log and the host-call span tree behave identically;
             // this path additionally emits JS-level function spans when tracing
             // is on. Only compiled with `--features rust-engine`.
-            #[cfg(feature = "rust-engine")]
-            if matches!(
-                crate::runtime::rust_engine::selected_engine(),
-                crate::runtime::rust_engine::EngineKind::Rust
-            ) {
-                // Build the same runtime host backend the QuickJS path uses, so
-                // every `chidori.*` effect routes through identical durable
-                // machinery (call log, replay, policy, MCP, OTEL).
-                let mut seeded = PolicyCache::default();
-                for (target, args) in &self.approvals {
-                    seeded.approve(target, args);
-                }
-                let backend = crate::runtime::typescript::bindings::HostBindingBackend::for_runtime(
-                    ctx.clone(),
-                    self.providers.clone(),
-                    self.template_engine.clone(),
-                    self.tokio_rt.clone(),
-                    self.policy.clone(),
-                    Arc::new(StdMutex::new(seeded)),
-                    policy.clone(),
-                    self.tools.clone(),
-                    self.mcp.clone(),
-                );
-                // Persist a durable journal scaffold before the run and at each
-                // host-operation safepoint, so a pause/crash has a resumable
-                // artifact on disk (G2). Mirrors the QuickJS safepoint wiring
-                // below, but stores the rust engine's journal-shaped manifest.
-                if let Some(ref base) = self.persist_base {
-                    let safepoint_base = base.clone();
-                    let safepoint_run_id = run_id.clone();
-                    let safepoint_path = path.to_path_buf();
-                    let safepoint_source = source.clone();
-                    let safepoint_policy = policy.clone();
-                    let safepoint_ctx = ctx.clone();
-                    ctx.set_host_operation_safepoint(HostOperationSafepoint::new(
-                        move |_operation| {
-                            persist_rust_journal_scaffold(
-                                &safepoint_base,
-                                &safepoint_run_id,
-                                &safepoint_path,
-                                &safepoint_source,
-                                &safepoint_policy,
-                                &safepoint_ctx,
-                            )
-                        },
-                    ));
-                    let completion_base = base.clone();
-                    let completion_run_id = run_id.clone();
-                    let completion_path = path.to_path_buf();
-                    let completion_source = source.clone();
-                    let completion_policy = policy.clone();
-                    let completion_ctx = ctx.clone();
-                    ctx.set_host_operation_completion_safepoint(
-                        HostOperationCompletionSafepoint::new(move |_record| {
-                            persist_rust_journal_scaffold(
-                                &completion_base,
-                                &completion_run_id,
-                                &completion_path,
-                                &completion_source,
-                                &completion_policy,
-                                &completion_ctx,
-                            )
-                        }),
-                    );
-                    persist_rust_journal_scaffold(
-                        base, &run_id, path, &source, &policy, &ctx,
-                    )?;
-                }
-
-                // Pause surfacing on the rust path (G1). A `chidori.input()` in
-                // Pause mode or a policy-approval block sets `pending_input` /
-                // `pending_approval` on the ctx and signals a pause by returning
-                // the `PAUSE_MARKER` sentinel from the host effect — which the
-                // rust engine throws as a JS error and bubbles up here as `Err`.
-                // We surface that as a paused `RunResult` so the resume flow has
-                // something to resume, mirroring the QuickJS arm. The check runs
-                // on `Ok` too in case the agent caught the sentinel and returned.
-                let surface_pause = |ctx: &RuntimeContext| -> Option<RunResult> {
-                    if let Some(pending) = ctx.take_pending_input() {
-                        if let Some(ref base) = self.persist_base {
-                            let _ = persist_rust_journal_scaffold(
-                                base, &run_id, path, &source, &policy, ctx,
-                            );
-                        }
-                        emit_otel(ctx, None);
-                        return Some(RunResult {
-                            output: Value::Null,
-                            call_log: ctx.call_log(),
-                            run_id: ctx.run_id(),
-                            paused: Some(pending),
-                            paused_approval: None,
-                        });
-                    }
-                    if let Some(approval) = ctx.take_pending_approval() {
-                        if let Some(ref base) = self.persist_base {
-                            let _ = persist_rust_journal_scaffold(
-                                base, &run_id, path, &source, &policy, ctx,
-                            );
-                        }
-                        emit_otel(ctx, None);
-                        return Some(RunResult {
-                            output: Value::Null,
-                            call_log: ctx.call_log(),
-                            run_id: ctx.run_id(),
-                            paused: None,
-                            paused_approval: Some(approval),
-                        });
-                    }
-                    None
-                };
-
-                let rust_result =
-                    crate::runtime::rust_engine::run_agent(path, &source, inputs, &backend);
-                // Release the streaming event sender now that the run is over.
-                // The chidori-js VM can leak its heap on drop (Rc cycles), which
-                // would keep `backend` — and through it this ctx and the sender —
-                // alive, hanging a `--stream` drain loop that waits for the
-                // channel to close. Dropping our own `backend` handle plus
-                // clearing the ctx-held sender closes the channel regardless.
-                ctx.clear_event_sender();
-                drop(backend);
-                return match rust_result {
-                    Ok(output) => {
-                        if let Some(paused) = surface_pause(&ctx) {
-                            return Ok(paused);
-                        }
-                        info!(agent = %agent_name, run_id = %run_id, "rust-engine agent run ok");
-                        if let Some(ref base) = self.persist_base {
-                            let run_dir = base.join(ctx.run_id());
-                            let _ = std::fs::write(
-                                run_dir.join("output.json"),
-                                serde_json::to_string_pretty(&output).unwrap_or_default(),
-                            );
-                            let _ = persist_rust_journal_scaffold(
-                                base, &run_id, path, &source, &policy, &ctx,
-                            );
-                        }
-                        emit_otel(&ctx, None);
-                        Ok(RunResult {
-                            output,
-                            call_log: ctx.call_log(),
-                            run_id: ctx.run_id(),
-                            paused: None,
-                            paused_approval: None,
-                        })
-                    }
-                    Err(e) => {
-                        if let Some(paused) = surface_pause(&ctx) {
-                            return Ok(paused);
-                        }
-                        let err_msg = e.to_string();
-                        tracing_error!(agent = %agent_name, run_id = %run_id, error = %err_msg, "rust-engine agent run failed");
-                        if let Some(ref base) = self.persist_base {
-                            let _ = persist_rust_journal_scaffold(
-                                base, &run_id, path, &source, &policy, &ctx,
-                            );
-                        }
-                        emit_otel(&ctx, Some(&err_msg));
-                        Err(e)
-                    }
-                };
+            // Build the same runtime host backend the QuickJS path uses, so
+            // every `chidori.*` effect routes through identical durable
+            // machinery (call log, replay, policy, MCP, OTEL).
+            let mut seeded = PolicyCache::default();
+            for (target, args) in &self.approvals {
+                seeded.approve(target, args);
             }
-
+            let backend = crate::runtime::typescript::bindings::HostBindingBackend::for_runtime(
+                ctx.clone(),
+                self.providers.clone(),
+                self.template_engine.clone(),
+                self.tokio_rt.clone(),
+                self.policy.clone(),
+                Arc::new(StdMutex::new(seeded)),
+                policy.clone(),
+                self.tools.clone(),
+                self.mcp.clone(),
+            );
+            // Persist a durable journal scaffold before the run and at each
+            // host-operation safepoint, so a pause/crash has a resumable
+            // artifact on disk (G2). Mirrors the QuickJS safepoint wiring
+            // below, but stores the rust engine's journal-shaped manifest.
             if let Some(ref base) = self.persist_base {
                 let safepoint_base = base.clone();
                 let safepoint_run_id = run_id.clone();
                 let safepoint_path = path.to_path_buf();
                 let safepoint_source = source.clone();
-                let safepoint_inputs = inputs.clone();
                 let safepoint_policy = policy.clone();
                 let safepoint_ctx = ctx.clone();
                 ctx.set_host_operation_safepoint(HostOperationSafepoint::new(move |_operation| {
-                    persist_ts_snapshot_manifest_scaffold(
+                    persist_rust_journal_scaffold(
                         &safepoint_base,
                         &safepoint_run_id,
                         &safepoint_path,
                         &safepoint_source,
-                        &safepoint_inputs,
                         &safepoint_policy,
                         &safepoint_ctx,
                     )
@@ -687,90 +458,91 @@ impl Engine {
                 let completion_run_id = run_id.clone();
                 let completion_path = path.to_path_buf();
                 let completion_source = source.clone();
-                let completion_inputs = inputs.clone();
                 let completion_policy = policy.clone();
                 let completion_ctx = ctx.clone();
                 ctx.set_host_operation_completion_safepoint(HostOperationCompletionSafepoint::new(
                     move |_record| {
-                        persist_ts_snapshot_manifest_scaffold(
+                        persist_rust_journal_scaffold(
                             &completion_base,
                             &completion_run_id,
                             &completion_path,
                             &completion_source,
-                            &completion_inputs,
                             &completion_policy,
                             &completion_ctx,
                         )
                     },
                 ));
-                persist_ts_snapshot_manifest_scaffold(
-                    base, &run_id, path, &source, inputs, &policy, &ctx,
-                )?;
+                persist_rust_journal_scaffold(base, &run_id, path, &source, &policy, &ctx)?;
             }
-            let runtime =
-                crate::runtime::typescript::engine::TypeScriptVmRuntime::new(policy.clone())?;
-            let mut seeded = PolicyCache::default();
-            for (target, args) in &self.approvals {
-                seeded.approve(target, args);
-            }
-            let result = runtime.run_agent_source_with_context(
-                path,
-                &source,
-                inputs,
-                ctx.clone(),
-                self.providers.clone(),
-                self.template_engine.clone(),
-                self.tokio_rt.clone(),
-                self.policy.clone(),
-                Arc::new(StdMutex::new(seeded)),
-                self.tools.clone(),
-                self.mcp.clone(),
-            );
 
-            return match result {
+            // Pause surfacing on the rust path (G1). A `chidori.input()` in
+            // Pause mode or a policy-approval block sets `pending_input` /
+            // `pending_approval` on the ctx and signals a pause by returning
+            // the `PAUSE_MARKER` sentinel from the host effect — which the
+            // rust engine throws as a JS error and bubbles up here as `Err`.
+            // We surface that as a paused `RunResult` so the resume flow has
+            // something to resume, mirroring the QuickJS arm. The check runs
+            // on `Ok` too in case the agent caught the sentinel and returned.
+            let surface_pause = |ctx: &RuntimeContext| -> Option<RunResult> {
+                if let Some(pending) = ctx.take_pending_input() {
+                    if let Some(ref base) = self.persist_base {
+                        let _ = persist_rust_journal_scaffold(
+                            base, &run_id, path, &source, &policy, ctx,
+                        );
+                    }
+                    emit_otel(ctx, None);
+                    return Some(RunResult {
+                        output: Value::Null,
+                        call_log: ctx.call_log(),
+                        run_id: ctx.run_id(),
+                        paused: Some(pending),
+                        paused_approval: None,
+                    });
+                }
+                if let Some(approval) = ctx.take_pending_approval() {
+                    if let Some(ref base) = self.persist_base {
+                        let _ = persist_rust_journal_scaffold(
+                            base, &run_id, path, &source, &policy, ctx,
+                        );
+                    }
+                    emit_otel(ctx, None);
+                    return Some(RunResult {
+                        output: Value::Null,
+                        call_log: ctx.call_log(),
+                        run_id: ctx.run_id(),
+                        paused: None,
+                        paused_approval: Some(approval),
+                    });
+                }
+                None
+            };
+
+            let rust_result =
+                crate::runtime::rust_engine::run_agent(path, &source, inputs, &backend);
+            // Release the streaming event sender now that the run is over.
+            // The chidori-js VM can leak its heap on drop (Rc cycles), which
+            // would keep `backend` — and through it this ctx and the sender —
+            // alive, hanging a `--stream` drain loop that waits for the
+            // channel to close. Dropping our own `backend` handle plus
+            // clearing the ctx-held sender closes the channel regardless.
+            ctx.clear_event_sender();
+            drop(backend);
+            return match rust_result {
                 Ok(output) => {
-                    if let Some(pending) = ctx.take_pending_input() {
-                        if let Some(ref base) = self.persist_base {
-                            let _ = persist_ts_snapshot_manifest_scaffold(
-                                base, &run_id, path, &source, inputs, &policy, &ctx,
-                            );
-                        }
-                        emit_otel(&ctx, None);
-                        return Ok(RunResult {
-                            output: Value::Null,
-                            call_log: ctx.call_log(),
-                            run_id: ctx.run_id(),
-                            paused: Some(pending),
-                            paused_approval: None,
-                        });
+                    if let Some(paused) = surface_pause(&ctx) {
+                        return Ok(paused);
                     }
-                    if let Some(approval) = ctx.take_pending_approval() {
-                        if let Some(ref base) = self.persist_base {
-                            let _ = persist_ts_snapshot_manifest_scaffold(
-                                base, &run_id, path, &source, inputs, &policy, &ctx,
-                            );
-                        }
-                        emit_otel(&ctx, None);
-                        return Ok(RunResult {
-                            output: Value::Null,
-                            call_log: ctx.call_log(),
-                            run_id: ctx.run_id(),
-                            paused: None,
-                            paused_approval: Some(approval),
-                        });
-                    }
+                    info!(agent = %agent_name, run_id = %run_id, "rust-engine agent run ok");
                     if let Some(ref base) = self.persist_base {
                         let run_dir = base.join(ctx.run_id());
                         let _ = std::fs::write(
                             run_dir.join("output.json"),
                             serde_json::to_string_pretty(&output).unwrap_or_default(),
                         );
-                        let _ = persist_ts_snapshot_manifest_scaffold(
-                            base, &run_id, path, &source, inputs, &policy, &ctx,
+                        let _ = persist_rust_journal_scaffold(
+                            base, &run_id, path, &source, &policy, &ctx,
                         );
                     }
-
-                    info!(agent = %agent_name, run_id = %run_id, "typescript agent run ok");
                     emit_otel(&ctx, None);
                     Ok(RunResult {
                         output,
@@ -781,38 +553,16 @@ impl Engine {
                     })
                 }
                 Err(e) => {
-                    if let Some(pending) = ctx.take_pending_input() {
-                        if let Some(ref base) = self.persist_base {
-                            let _ = persist_ts_snapshot_manifest_scaffold(
-                                base, &run_id, path, &source, inputs, &policy, &ctx,
-                            );
-                        }
-                        emit_otel(&ctx, None);
-                        return Ok(RunResult {
-                            output: Value::Null,
-                            call_log: ctx.call_log(),
-                            run_id: ctx.run_id(),
-                            paused: Some(pending),
-                            paused_approval: None,
-                        });
-                    }
-                    if let Some(approval) = ctx.take_pending_approval() {
-                        if let Some(ref base) = self.persist_base {
-                            let _ = persist_ts_snapshot_manifest_scaffold(
-                                base, &run_id, path, &source, inputs, &policy, &ctx,
-                            );
-                        }
-                        emit_otel(&ctx, None);
-                        return Ok(RunResult {
-                            output: Value::Null,
-                            call_log: ctx.call_log(),
-                            run_id: ctx.run_id(),
-                            paused: None,
-                            paused_approval: Some(approval),
-                        });
+                    if let Some(paused) = surface_pause(&ctx) {
+                        return Ok(paused);
                     }
                     let err_msg = e.to_string();
-                    tracing_error!(agent = %agent_name, run_id = %run_id, error = %err_msg, "typescript agent run failed");
+                    tracing_error!(agent = %agent_name, run_id = %run_id, error = %err_msg, "rust-engine agent run failed");
+                    if let Some(ref base) = self.persist_base {
+                        let _ = persist_rust_journal_scaffold(
+                            base, &run_id, path, &source, &policy, &ctx,
+                        );
+                    }
                     emit_otel(&ctx, Some(&err_msg));
                     Err(e)
                 }
@@ -837,15 +587,11 @@ mod tests {
     };
     use crate::runtime::template::TemplateEngine;
 
-    /// True when the pure-Rust engine is the active runtime. Tests that assert
-    /// QuickJS-specific live-VM snapshot internals (a `LiveVmSnapshotter`, the
-    /// `LiveQuickJsVm` blob kind, or a byte-exact `chidori_quickjs` VM blob)
-    /// early-return under it: the rust engine's durability is call-log replay
-    /// over a scaffold manifest, not a VM image, and these assertions validate
-    /// the QuickJS serialization path specifically. They remain live QuickJS
-    /// tests until that engine is removed.
+    /// The pure-Rust engine is the only runtime. Its durability is call-log
+    /// replay over a scaffold manifest (`InitialTypeScriptStateScaffold`), not a
+    /// VM image, so persistence tests assert that shape.
     fn rust_engine_active() -> bool {
-        std::env::var("CHIDORI_JS_ENGINE").as_deref() == Ok("rust")
+        true
     }
 
     struct FixedTestProvider {
@@ -1233,175 +979,6 @@ mod tests {
     }
 
     #[test]
-    fn engine_persists_typescript_snapshot_manifest_on_pause() {
-        if rust_engine_active() {
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!(
-            "chidori-engine-ts-snapshot-manifest-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("agent.ts");
-        std::fs::write(
-            &path,
-            r#"
-                export async function agent(input, chidori) {
-                    const answer = await chidori.input("Continue?");
-                    return { answer };
-                }
-            "#,
-        )
-        .unwrap();
-        let run_base = dir.join(".chidori").join("runs");
-
-        let engine = Engine::new(
-            Arc::new(ProviderRegistry::new()),
-            Arc::new(TemplateEngine::new(&dir)),
-            Arc::new(tokio::runtime::Runtime::new().unwrap()),
-        )
-        .with_persist_base(run_base.clone());
-        let paused = engine.run_pausable(&path, &serde_json::json!({})).unwrap();
-
-        let loaded = SnapshotStore::new(run_base.join(&paused.run_id))
-            .load()
-            .unwrap();
-        let manifest = &loaded.manifest;
-        assert_eq!(manifest.run_id, paused.run_id);
-        assert_eq!(manifest.entry.path, path);
-        assert_eq!(
-            manifest.snapshot_kind,
-            crate::runtime::snapshot::SnapshotBlobKind::LiveQuickJsVm
-        );
-        assert_eq!(manifest.call_log_len, 0);
-        let pending = manifest.pending.as_ref().unwrap();
-        assert_eq!(
-            pending.kind,
-            crate::runtime::snapshot::PendingHostOperationKind::Input
-        );
-        assert_eq!(pending.args, serde_json::json!({ "prompt": "Continue?" }));
-        assert_eq!(manifest.host_promises.len(), 1);
-        assert_eq!(manifest.host_promises[0].operation.id, pending.id);
-        assert_eq!(
-            manifest.host_promises[0].operation.kind,
-            crate::runtime::snapshot::PendingHostOperationKind::Input
-        );
-        assert!(matches!(
-            manifest.host_promises[0].state,
-            crate::runtime::snapshot::HostPromiseState::Pending
-        ));
-        assert!(!loaded.blob.is_empty());
-        chidori_quickjs::RuntimeSnapshot(loaded.blob.clone())
-            .ensure_restorable()
-            .unwrap();
-        let mut live_runtime = chidori_quickjs::SnapshotRuntime::restore(&loaded.blob).unwrap();
-        live_runtime
-            .resolve_host_promise(
-                chidori_quickjs::HostPromiseId(pending.id.0),
-                serde_json::json!("yes"),
-            )
-            .unwrap();
-        assert_eq!(
-            live_runtime.run_jobs_until_blocked().unwrap(),
-            chidori_quickjs::RunState::Completed(serde_json::json!({ "answer": "yes" }))
-        );
-        let persisted_pending: crate::runtime::snapshot::PendingHostOperation =
-            serde_json::from_slice(
-                &std::fs::read(
-                    run_base
-                        .join(&paused.run_id)
-                        .join(crate::runtime::snapshot::PENDING_HOST_OPERATION_FILE),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(persisted_pending.id, pending.id);
-        assert_eq!(
-            persisted_pending.kind,
-            crate::runtime::snapshot::PendingHostOperationKind::Input
-        );
-        let persisted_host_promises: Vec<crate::runtime::snapshot::HostPromiseRecord> =
-            serde_json::from_slice(
-                &std::fs::read(
-                    run_base
-                        .join(&paused.run_id)
-                        .join(crate::runtime::snapshot::HOST_PROMISE_TABLE_FILE),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(persisted_host_promises.len(), 1);
-        assert_eq!(persisted_host_promises[0].operation.id, pending.id);
-        assert!(matches!(
-            persisted_host_promises[0].state,
-            crate::runtime::snapshot::HostPromiseState::Pending
-        ));
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn engine_live_vm_snapshotter_persists_live_blob_on_input_pause() {
-        if rust_engine_active() {
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!(
-            "chidori-engine-ts-live-input-pause-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("agent.ts");
-        std::fs::write(
-            &path,
-            r#"
-                export async function agent(input, chidori) {
-                    const answer = await chidori.input("Continue?");
-                    return { answer };
-                }
-            "#,
-        )
-        .unwrap();
-        let live_snapshot = chidori_quickjs::RuntimeSnapshot::from_payload(b"live-input-vm");
-        let run_base = dir.join(".chidori").join("runs");
-        let engine = Engine::new(
-            Arc::new(ProviderRegistry::new()),
-            Arc::new(TemplateEngine::new(&dir)),
-            Arc::new(tokio::runtime::Runtime::new().unwrap()),
-        )
-        .with_persist_base(run_base.clone());
-        let ctx = RuntimeContext::new();
-        ctx.set_input_mode(InputMode::Pause);
-        ctx.set_live_vm_snapshotter(crate::runtime::context::LiveVmSnapshotter::new({
-            let live_snapshot = live_snapshot.clone();
-            move || Ok(live_snapshot.clone())
-        }));
-
-        let paused = engine
-            .run_with_context(&path, &serde_json::json!({}), ctx)
-            .unwrap();
-
-        assert!(paused.paused.is_some());
-        let loaded = SnapshotStore::new(run_base.join(&paused.run_id))
-            .load()
-            .unwrap();
-        assert_eq!(
-            loaded.manifest.snapshot_kind,
-            crate::runtime::snapshot::SnapshotBlobKind::LiveQuickJsVm
-        );
-        assert_eq!(
-            loaded
-                .manifest
-                .pending
-                .as_ref()
-                .map(|pending| pending.kind.clone()),
-            Some(crate::runtime::snapshot::PendingHostOperationKind::Input)
-        );
-        assert_eq!(loaded.blob, live_snapshot.0);
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn engine_persists_typescript_snapshot_blob_on_policy_approval_pause() {
         if rust_engine_active() {
             return;
@@ -1509,77 +1086,6 @@ mod tests {
     }
 
     #[test]
-    fn engine_live_vm_snapshotter_persists_live_blob_on_policy_approval_pause() {
-        if rust_engine_active() {
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!(
-            "chidori-engine-ts-live-approval-pause-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("agent.ts");
-        std::fs::write(
-            &path,
-            r#"
-                export async function agent(input, chidori) {
-                    await chidori.http("https://example.invalid");
-                    return { ok: true };
-                }
-            "#,
-        )
-        .unwrap();
-        let live_snapshot = chidori_quickjs::RuntimeSnapshot::from_payload(b"live-approval-vm");
-        let run_base = dir.join(".chidori").join("runs");
-        let policy = Arc::new(PolicyConfig {
-            rules: vec![crate::policy::PolicyRule {
-                target: "http".to_string(),
-                decision: crate::policy::Decision::AskBefore,
-                match_args: None,
-                reason: Some("test approval".to_string()),
-            }],
-            default: crate::policy::Decision::AlwaysAllow,
-        });
-        let engine = Engine::new(
-            Arc::new(ProviderRegistry::new()),
-            Arc::new(TemplateEngine::new(&dir)),
-            Arc::new(tokio::runtime::Runtime::new().unwrap()),
-        )
-        .with_policy(policy)
-        .with_persist_base(run_base.clone());
-        let ctx = RuntimeContext::new();
-        ctx.set_input_mode(InputMode::Pause);
-        ctx.set_live_vm_snapshotter(crate::runtime::context::LiveVmSnapshotter::new({
-            let live_snapshot = live_snapshot.clone();
-            move || Ok(live_snapshot.clone())
-        }));
-
-        let paused = engine
-            .run_with_context(&path, &serde_json::json!({}), ctx)
-            .unwrap();
-
-        assert!(paused.paused_approval.is_some());
-        let loaded = SnapshotStore::new(run_base.join(&paused.run_id))
-            .load()
-            .unwrap();
-        assert_eq!(
-            loaded.manifest.snapshot_kind,
-            crate::runtime::snapshot::SnapshotBlobKind::LiveQuickJsVm
-        );
-        assert_eq!(
-            loaded
-                .manifest
-                .pending
-                .as_ref()
-                .map(|pending| pending.kind.clone()),
-            Some(crate::runtime::snapshot::PendingHostOperationKind::Http)
-        );
-        assert_eq!(loaded.blob, live_snapshot.0);
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn engine_safepoints_persist_snapshot_around_failed_host_side_effect() {
         let dir = std::env::temp_dir().join(format!(
             "chidori-engine-ts-host-safepoint-{}",
@@ -1630,70 +1136,6 @@ mod tests {
     }
 
     #[test]
-    fn engine_live_vm_snapshotter_persists_live_blob_around_failed_host_side_effect() {
-        if rust_engine_active() {
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!(
-            "chidori-engine-ts-live-host-safepoint-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("agent.ts");
-        std::fs::write(
-            &path,
-            r#"
-                export async function agent(input, chidori) {
-                    await chidori.http("not a url");
-                    return { ok: true };
-                }
-            "#,
-        )
-        .unwrap();
-        let live_snapshot = chidori_quickjs::RuntimeSnapshot::from_payload(b"live-http-vm");
-        let run_base = dir.join(".chidori").join("runs");
-        let engine = Engine::new(
-            Arc::new(ProviderRegistry::new()),
-            Arc::new(TemplateEngine::new(&dir)),
-            Arc::new(tokio::runtime::Runtime::new().unwrap()),
-        )
-        .with_persist_base(run_base.clone());
-        let ctx = RuntimeContext::new();
-        ctx.set_live_vm_snapshotter(crate::runtime::context::LiveVmSnapshotter::new({
-            let live_snapshot = live_snapshot.clone();
-            move || Ok(live_snapshot.clone())
-        }));
-
-        let err = match engine.run_with_context(&path, &serde_json::json!({}), ctx) {
-            Ok(_) => panic!("expected invalid URL host operation to fail"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("builder error"));
-
-        let run_dir = std::fs::read_dir(&run_base)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let loaded = SnapshotStore::new(run_dir).load().unwrap();
-        assert_eq!(
-            loaded.manifest.snapshot_kind,
-            crate::runtime::snapshot::SnapshotBlobKind::LiveQuickJsVm
-        );
-        assert_eq!(loaded.manifest.call_log_len, 1);
-        assert!(loaded.manifest.pending.is_none());
-        assert_eq!(loaded.manifest.host_promises.len(), 1);
-        assert!(matches!(
-            loaded.manifest.host_promises[0].state,
-            crate::runtime::snapshot::HostPromiseState::Rejected { .. }
-        ));
-        assert_eq!(loaded.blob, live_snapshot.0);
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn engine_prompt_safepoint_persists_pending_snapshot_before_provider_call() {
         let dir = std::env::temp_dir().join(format!(
             "chidori-engine-ts-prompt-pre-provider-safepoint-{}",
@@ -1734,76 +1176,6 @@ mod tests {
             serde_json::json!({ "text": "provider result" })
         );
         assert!(*observed_pending_prompt.lock().unwrap());
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn engine_live_vm_snapshotter_persists_live_blob_around_prompt_provider_call() {
-        if rust_engine_active() {
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!(
-            "chidori-engine-ts-live-prompt-safepoint-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("agent.ts");
-        std::fs::write(
-            &path,
-            r#"
-                export async function agent(input, chidori) {
-                    const text = await chidori.prompt("write status", { type: "progress" });
-                    return { text };
-                }
-            "#,
-        )
-        .unwrap();
-        let live_snapshot = chidori_quickjs::RuntimeSnapshot::from_payload(b"live-prompt-vm");
-        let run_base = dir.join(".chidori").join("runs");
-        let observed_pending_prompt = Arc::new(std::sync::Mutex::new(false));
-        let mut providers = ProviderRegistry::new();
-        providers.register(Box::new(InspectingTestProvider {
-            run_base: run_base.clone(),
-            observed_pending_prompt: observed_pending_prompt.clone(),
-            expected_snapshot_kind: Some(crate::runtime::snapshot::SnapshotBlobKind::LiveQuickJsVm),
-            expected_blob: Some(live_snapshot.0.clone()),
-        }));
-        let engine = Engine::new(
-            Arc::new(providers),
-            Arc::new(TemplateEngine::new(&dir)),
-            Arc::new(tokio::runtime::Runtime::new().unwrap()),
-        )
-        .with_persist_base(run_base.clone());
-        let ctx = RuntimeContext::new();
-        ctx.set_live_vm_snapshotter(crate::runtime::context::LiveVmSnapshotter::new({
-            let live_snapshot = live_snapshot.clone();
-            move || Ok(live_snapshot.clone())
-        }));
-
-        let result = engine
-            .run_with_context(&path, &serde_json::json!({}), ctx)
-            .unwrap();
-
-        assert_eq!(
-            result.output,
-            serde_json::json!({ "text": "provider result" })
-        );
-        assert!(*observed_pending_prompt.lock().unwrap());
-        let run_dir = std::fs::read_dir(&run_base)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let loaded = SnapshotStore::new(run_dir).load().unwrap();
-        assert_eq!(
-            loaded.manifest.snapshot_kind,
-            crate::runtime::snapshot::SnapshotBlobKind::LiveQuickJsVm
-        );
-        assert_eq!(loaded.manifest.call_log_len, 1);
-        assert!(loaded.manifest.pending.is_none());
-        assert_eq!(loaded.blob, live_snapshot.0);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2331,147 +1703,6 @@ mod tests {
     }
 
     #[test]
-    fn typescript_snapshot_manifest_records_local_module_fingerprints() {
-        let dir = std::env::temp_dir().join(format!(
-            "chidori-engine-ts-module-manifest-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("agent.ts");
-        let module_path = dir.join("lib.ts");
-        let source = r#"
-            import { value } from "./lib.ts";
-            export async function agent() { return value; }
-        "#;
-        let module_source = "export const value = 1;";
-        std::fs::write(&path, source).unwrap();
-        std::fs::write(&module_path, module_source).unwrap();
-        let run_id = "run-with-module";
-        let run_base = dir.join(".chidori").join("runs");
-        let ctx = RuntimeContext::new();
-        ctx.enable_persistence(run_base.clone());
-        let policy = RuntimePolicy::durable_default(run_id);
-
-        persist_ts_snapshot_manifest_scaffold(
-            &run_base,
-            run_id,
-            &path,
-            source,
-            &serde_json::Value::Null,
-            &policy,
-            &ctx,
-        )
-        .unwrap();
-
-        let manifest = SnapshotStore::new(run_base.join(run_id))
-            .load_manifest()
-            .unwrap();
-        assert_eq!(
-            manifest.snapshot_kind,
-            crate::runtime::snapshot::SnapshotBlobKind::InitialTypeScriptStateScaffold
-        );
-        assert_eq!(manifest.modules.len(), 1);
-        assert_eq!(
-            manifest.modules[0],
-            SourceFingerprint::from_source(&module_path, module_source)
-        );
-        assert_eq!(manifest.module_graph.len(), 2);
-        let entry = manifest
-            .module_graph
-            .iter()
-            .find(|entry| entry.path == path)
-            .unwrap();
-        assert_eq!(entry.imports[0].specifier, "./lib.ts");
-        assert_eq!(entry.imports[0].resolved_path, Some(module_path));
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn typescript_persistence_prefers_registered_live_vm_snapshotter() {
-        let dir = std::env::temp_dir().join(format!(
-            "chidori-engine-ts-live-vm-snapshotter-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("agent.ts");
-        let source = "export async function agent() { return { ok: true }; }";
-        std::fs::write(&path, source).unwrap();
-        let run_id = "run-with-live-vm";
-        let run_base = dir.join(".chidori").join("runs");
-        let ctx = RuntimeContext::new();
-        ctx.enable_persistence(run_base.clone());
-        ctx.set_live_vm_snapshotter(crate::runtime::context::LiveVmSnapshotter::new(|| {
-            Ok(chidori_quickjs::RuntimeSnapshot::from_payload(
-                b"live-vm-payload",
-            ))
-        }));
-        let policy = RuntimePolicy::durable_default(run_id);
-
-        persist_ts_snapshot_manifest_scaffold(
-            &run_base,
-            run_id,
-            &path,
-            source,
-            &serde_json::Value::Null,
-            &policy,
-            &ctx,
-        )
-        .unwrap();
-
-        let loaded = SnapshotStore::new(run_base.join(run_id)).load().unwrap();
-        assert_eq!(
-            loaded.manifest.snapshot_kind,
-            crate::runtime::snapshot::SnapshotBlobKind::LiveQuickJsVm
-        );
-        assert_eq!(
-            loaded.blob,
-            chidori_quickjs::RuntimeSnapshot::from_payload(b"live-vm-payload").0
-        );
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn typescript_live_vm_snapshotter_failure_blocks_persisted_run() {
-        if rust_engine_active() {
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!(
-            "chidori-engine-ts-live-vm-snapshotter-fail-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("agent.ts");
-        std::fs::write(
-            &path,
-            "export async function agent() { return { should_not_run: true }; }",
-        )
-        .unwrap();
-        let ctx = RuntimeContext::new();
-        ctx.set_live_vm_snapshotter(crate::runtime::context::LiveVmSnapshotter::new(|| {
-            anyhow::bail!("snapshot capture failed")
-        }));
-        let run_base = dir.join(".chidori").join("runs");
-        let engine = Engine::new(
-            Arc::new(ProviderRegistry::new()),
-            Arc::new(TemplateEngine::new(dir.clone())),
-            Arc::new(tokio::runtime::Runtime::new().unwrap()),
-        )
-        .with_persist_base(run_base);
-
-        let err = match engine.run_with_context(&path, &serde_json::json!({}), ctx) {
-            Ok(_) => panic!("expected live snapshotter failure"),
-            Err(err) => err,
-        };
-        assert!(err
-            .to_string()
-            .contains("capturing live TypeScript VM snapshot"));
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn engine_runs_typescript_sub_agent_with_shared_call_log() {
         let dir = std::env::temp_dir().join(format!(
             "chidori-engine-ts-call-agent-{}",
@@ -2577,8 +1808,10 @@ def agent(value):
     /// `CHIDORI_JS_ENGINE` selects, so it guards both the QuickJS and rust paths.
     #[test]
     fn engine_node_builtins_crypto_fs_record_replay_parity() {
-        let dir = std::env::temp_dir()
-            .join(format!("chidori-engine-node-builtins-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-engine-node-builtins-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("agent.ts");
         std::fs::write(

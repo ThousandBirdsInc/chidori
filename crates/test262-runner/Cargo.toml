@@ -3,18 +3,16 @@ name = "test262-runner"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Run the official Test262 ECMAScript conformance suite against chidori's embedded QuickJS runtime, the same suite Bun and Node measure language conformance with."
+description = "Run the official Test262 ECMAScript conformance suite against chidori's pure-Rust JS engine, the same suite Bun and Node measure language conformance with."
 
 [[bin]]
 name = "test262-runner"
 path = "src/main.rs"
 
 [dependencies]
-# The bare ECMAScript context under test. No chidori host object is installed,
-# so we measure pure language conformance — apples-to-apples with how Bun/Node
-# report Test262 numbers.
-chidori-quickjs = { path = "../chidori-quickjs" }
-# The pure-Rust engine, measured against the same suite (run with --engine rust).
+# The pure-Rust engine under test. No chidori host object is installed, so we
+# measure pure language conformance — apples-to-apples with how Bun/Node report
+# Test262 numbers.
 chidori-js = { path = "../chidori-js" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

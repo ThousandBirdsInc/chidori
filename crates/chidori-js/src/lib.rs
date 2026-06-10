@@ -374,6 +374,61 @@ impl Engine {
         let settled = self.vm.settle(ret).map_err(|e| self.vm.error_to_string(&e))?;
         Ok(self.vm.value_to_json(&settled))
     }
+
+    /// Compile, link, and evaluate the module graph rooted at `entry_src`, then
+    /// return the JSON value of the entry module's named export WITHOUT invoking
+    /// it. Used for tool-metadata discovery, where the exported `tool` value is a
+    /// plain object, not a callable entrypoint.
+    pub fn eval_module_export(
+        &mut self,
+        entry_key: &str,
+        entry_src: &str,
+        export_name: &str,
+        load: &mut dyn FnMut(&str, &str) -> Result<(String, String), String>,
+    ) -> Result<serde_json::Value, String> {
+        let mut registry = module::ModuleRegistry::default();
+        let mut queue: Vec<(String, String)> =
+            vec![(entry_key.to_string(), entry_src.to_string())];
+        let mut entry_cell_of_name = None;
+        let mut entry_rec = None;
+        while let Some((key, src)) = queue.pop() {
+            if registry.modules.contains_key(&key) {
+                continue;
+            }
+            let compiled = compiler::compile_module(&src)
+                .map_err(|e| format!("compiling module '{key}': {e}"))?;
+            let cell_of_name = compiled.cell_of_name.clone();
+            let requested = compiled.requested.clone();
+            let mut rec = module::ModuleRecord::new(compiled);
+            for spec in &requested {
+                let (dep_key, dep_src) = load(spec, &key)?;
+                rec.resolved.insert(spec.clone(), dep_key.clone());
+                if !registry.modules.contains_key(&dep_key) {
+                    queue.push((dep_key, dep_src));
+                }
+            }
+            let rec = std::rc::Rc::new(std::cell::RefCell::new(rec));
+            if key == entry_key {
+                entry_cell_of_name = Some(cell_of_name);
+                entry_rec = Some(rec.clone());
+            }
+            registry.modules.insert(key, rec);
+        }
+
+        self.vm
+            .run_module_graph(&registry, entry_key)
+            .map_err(|e| self.vm.error_to_string(&e))?;
+
+        let entry_rec = entry_rec.ok_or_else(|| "entry module was not loaded".to_string())?;
+        let cell_of_name =
+            entry_cell_of_name.ok_or_else(|| "entry module was not compiled".to_string())?;
+        let idx = cell_of_name
+            .get(export_name)
+            .ok_or_else(|| format!("missing exported `{export_name}` value"))?;
+        let val = entry_rec.borrow().cells[*idx as usize].borrow().clone();
+        let settled = self.vm.settle(val).map_err(|e| self.vm.error_to_string(&e))?;
+        Ok(self.vm.value_to_json(&settled))
+    }
 }
 
 /// Forward a host-effect call through `dispatch`, converting the JSON result to

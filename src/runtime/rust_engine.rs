@@ -1,10 +1,7 @@
-//! Pure-Rust JS engine integration (feature `rust-engine`, ON by default).
+//! Pure-Rust JS engine integration — the only JavaScript engine.
 //!
-//! This adapter slots the in-tree `chidori-js` engine into the existing
-//! [`SnapshotCapableJsEngine`] seam so high-level consumers (`engine.rs`,
-//! `server.rs`) can route through the same trait. Selection is a construction-site
-//! choice driven by `CHIDORI_JS_ENGINE` (default `quickjs`); nothing about the
-//! QuickJS/C path changes unless a deployment opts in.
+//! This adapter drives the in-tree `chidori-js` engine for all TypeScript
+//! agent, tool, and sub-agent execution (`engine.rs`, `server.rs`, `bindings.rs`).
 //!
 //! Durability here is the deterministic-replay journal (see
 //! `docs/pure-rust-js-engine-plan.md`), not a VM-image snapshot. Because the
@@ -31,29 +28,6 @@ use crate::runtime::typescript::bindings::HostBindingBackend;
 use crate::runtime::typescript::transpile::{transpile_module, TranspileOptions};
 
 pub use chidori_js::replay::ReplayRuntime;
-
-/// Which JS engine a construction site should build.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EngineKind {
-    QuickJs,
-    Rust,
-}
-
-/// Read `CHIDORI_JS_ENGINE` (default `quickjs`). Selects the pure-Rust engine
-/// only on the explicit value `rust`; unknown values fall back to QuickJS so a
-/// typo never silently switches engines.
-///
-/// The runtime default stays QuickJS until the rust engine reaches parity on
-/// pause/resume + snapshot persistence, `node:` builtins, and conformance — see
-/// `docs/rust-engine-quickjs-removal-gaps.md` (gates G1–G5). The engine is
-/// compiled into every build (the default `rust-engine` feature), so opting in is
-/// just `CHIDORI_JS_ENGINE=rust`.
-pub fn selected_engine() -> EngineKind {
-    match std::env::var("CHIDORI_JS_ENGINE").as_deref() {
-        Ok("rust") => EngineKind::Rust,
-        _ => EngineKind::QuickJs,
-    }
-}
 
 /// A durable Rust-engine instance behind the `SnapshotCapableJsEngine` trait.
 pub struct RustReplayEngine {
@@ -104,22 +78,19 @@ const JS_TRACE_MAX_DEPTH: usize = 64;
 /// Run a TypeScript agent through the pure-Rust `chidori-js` engine end-to-end,
 /// returning the agent's output.
 ///
-/// Host effects are routed through the SAME `host_core` / `RuntimeContext`
-/// machinery as the QuickJS path, so the durable call log, replay, and the
-/// host-call OTEL span tree (including nesting under `tool` calls) all behave
-/// identically — only the JS execution engine differs. When [`js_tracing_enabled`],
-/// a JS-level trace observer is installed so function enter/exit becomes spans
+/// Host effects are routed through `host_core` / `RuntimeContext`, so the
+/// durable call log, replay, and the host-call OTEL span tree (including nesting
+/// under `tool` calls) all behave consistently. When [`js_tracing_enabled`], a
+/// JS-level trace observer is installed so function enter/exit becomes spans
 /// nested under the run's host-call tree.
 ///
-/// Scope: single-file agents that export an async/sync `agent(input)` (or call
-/// `run(handler)`) and use the global `chidori` object. The full `chidori.*`
-/// effect surface (`log`, `input`, `prompt`, `tool`, `callAgent`, `http`,
-/// `memory`, `template`, `checkpoint`, `execJs`/`execPython`/`execWasm`,
-/// `workspace.*`) is wired through the shared [`HostBindingBackend`], so the
-/// durable call log, replay, policy enforcement, MCP, and the host-call OTEL
-/// span tree behave identically to the QuickJS path — only the top-level agent's
-/// JS runs on the pure-Rust engine. Nested TypeScript tools and sub-agents reuse
-/// the mature QuickJS host backend. Multi-file imports are not yet supported.
+/// Agents export an async/sync `agent(input)` (or call `run(handler)`) and use
+/// the global `chidori` object. The full `chidori.*` effect surface (`log`,
+/// `input`, `prompt`, `tool`, `callAgent`, `http`, `memory`, `template`,
+/// `checkpoint`, `workspace.*`) is wired through the shared
+/// [`HostBindingBackend`], with policy enforcement and MCP. Relative and `node:`
+/// multi-file imports are resolved and linked by the engine; nested TypeScript
+/// tools and sub-agents run natively on this same engine.
 pub fn run_agent(
     path: &Path,
     source: &str,
@@ -219,7 +190,9 @@ struct ExecutionLimits {
 impl ExecutionLimits {
     fn from_env() -> Self {
         fn env_u64(key: &str) -> Option<u64> {
-            std::env::var(key).ok().and_then(|v| v.trim().parse::<u64>().ok())
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
         }
         let op_budget = match env_u64("CHIDORI_JS_OP_BUDGET").unwrap_or(5_000_000_000) {
             0 => None,
@@ -233,7 +206,11 @@ impl ExecutionLimits {
             0 => None,
             ms => Some(Duration::from_millis(ms)),
         };
-        ExecutionLimits { op_budget, mem_cap, deadline }
+        ExecutionLimits {
+            op_budget,
+            mem_cap,
+            deadline,
+        }
     }
 }
 
@@ -275,8 +252,7 @@ impl ExecutionGuard {
                     }
                 }
                 if let Some(cap) = mem_cap {
-                    let used =
-                        crate::mem_guard::current_allocated_bytes().saturating_sub(baseline);
+                    let used = crate::mem_guard::current_allocated_bytes().saturating_sub(baseline);
                     if used > cap {
                         interrupt.store(true, Ordering::Relaxed);
                         return;
@@ -366,7 +342,7 @@ fn run_module(
     // Without this the meta-agent's `chidori.retry(...)`/`chidori.parallel(...)`
     // calls hit `undefined is not a function`.
     engine
-        .eval(crate::runtime::typescript::snapshot::CHIDORI_JS_HELPERS_SCRIPT)
+        .eval(crate::runtime::typescript::helpers::CHIDORI_JS_HELPERS_SCRIPT)
         .map_err(|e| anyhow::anyhow!("installing chidori JS SDK helpers: {e}"))?;
     let slot = engine.install_entrypoint();
 
@@ -374,17 +350,18 @@ fn run_module(
     // Resolve each `(specifier, importer)` to a sibling `.ts`/`.js` file (or, for
     // `node:` specifiers, the synthetic builtin shim) and hand the linker its
     // transpiled ES module source.
-    let mut load = |specifier: &str, importer_key: &str| -> std::result::Result<(String, String), String> {
-        if let Some(name) = specifier.strip_prefix("node:") {
-            // Serve the shim by name under a stable synthetic key. The shim's own
-            // `node:` imports (e.g. `node:buffer`) recurse through this same
-            // branch; its body is plain JS, so it needs no transpilation.
-            let src = crate::runtime::typescript::builtins::shim_source(name)
-                .ok_or_else(|| format!("unsupported node: builtin '{specifier}'"))?;
-            return Ok((format!("node:{name}"), src.to_string()));
-        }
-        load_module_source(specifier, importer_key)
-    };
+    let mut load =
+        |specifier: &str, importer_key: &str| -> std::result::Result<(String, String), String> {
+            if let Some(name) = specifier.strip_prefix("node:") {
+                // Serve the shim by name under a stable synthetic key. The shim's own
+                // `node:` imports (e.g. `node:buffer`) recurse through this same
+                // branch; its body is plain JS, so it needs no transpilation.
+                let src = crate::runtime::typescript::builtins::shim_source(name)
+                    .ok_or_else(|| format!("unsupported node: builtin '{specifier}'"))?;
+                return Ok((format!("node:{name}"), src.to_string()));
+            }
+            load_module_source(specifier, importer_key)
+        };
 
     // Install per-run resource limits (opcode budget + memory/deadline watchdog)
     // before any agent code runs, and isolate the host from an engine panic: a
@@ -411,10 +388,9 @@ fn load_module_source(
 ) -> std::result::Result<(String, String), String> {
     let importer = Path::new(importer_key);
     let dir = importer.parent().unwrap_or_else(|| Path::new("."));
-    let resolved = crate::runtime::typescript::transpile::resolve_relative_import(
-        importer, dir, specifier, 0,
-    )
-    .map_err(|e| e.to_string())?;
+    let resolved =
+        crate::runtime::typescript::transpile::resolve_relative_import(importer, dir, specifier, 0)
+            .map_err(|e| e.to_string())?;
     let key = resolved.to_string_lossy().to_string();
     let src = std::fs::read_to_string(&resolved)
         .map_err(|e| format!("reading module {}: {e}", resolved.display()))?;
@@ -536,103 +512,108 @@ fn build_sync_native_dispatch(
     policy: RuntimePolicy,
 ) -> Rc<dyn Fn(&str, &Value) -> std::result::Result<Value, String>> {
     use crate::runtime::capability::Capability;
-    Rc::new(move |name: &str, args: &Value| -> std::result::Result<Value, String> {
-        let str_arg = |i: usize| -> std::result::Result<String, String> {
-            args.get(i)
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .ok_or_else(|| format!("{name}: argument {i} must be a string"))
-        };
-        let bool_arg = |i: usize| args.get(i).and_then(|v| v.as_bool()).unwrap_or(false);
-        match name {
-            "__chidori_crypto_hash" => {
-                crypto_policy_guard(&policy)?;
-                let alg = str_arg(0)?;
-                let data = b64_decode(&str_arg(1)?)?;
-                let digest = crate::runtime::crypto::hash(&alg, &data).map_err(|e| e.to_string())?;
-                ctx.note_capability(Capability::CryptoHash, ctx.current_seq());
-                Ok(Value::String(b64_encode(&digest)))
-            }
-            "__chidori_crypto_hmac" => {
-                crypto_policy_guard(&policy)?;
-                let alg = str_arg(0)?;
-                let key = b64_decode(&str_arg(1)?)?;
-                let data = b64_decode(&str_arg(2)?)?;
-                let digest =
-                    crate::runtime::crypto::hmac(&alg, &key, &data).map_err(|e| e.to_string())?;
-                ctx.note_capability(Capability::CryptoHash, ctx.current_seq());
-                Ok(Value::String(b64_encode(&digest)))
-            }
-            "__chidori_crypto_random" => {
-                crypto_policy_guard(&policy)?;
-                let n = args
-                    .get(0)
-                    .and_then(|v| v.as_u64())
-                    .ok_or("crypto random length must be a non-negative integer")?
-                    as usize;
-                if n > 1_048_576 {
-                    return Err(format!("crypto random length {n} exceeds the 1MiB cap"));
+    Rc::new(
+        move |name: &str, args: &Value| -> std::result::Result<Value, String> {
+            let str_arg = |i: usize| -> std::result::Result<String, String> {
+                args.get(i)
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| format!("{name}: argument {i} must be a string"))
+            };
+            let bool_arg = |i: usize| args.get(i).and_then(|v| v.as_bool()).unwrap_or(false);
+            match name {
+                "__chidori_crypto_hash" => {
+                    crypto_policy_guard(&policy)?;
+                    let alg = str_arg(0)?;
+                    let data = b64_decode(&str_arg(1)?)?;
+                    let digest =
+                        crate::runtime::crypto::hash(&alg, &data).map_err(|e| e.to_string())?;
+                    ctx.note_capability(Capability::CryptoHash, ctx.current_seq());
+                    Ok(Value::String(b64_encode(&digest)))
                 }
-                let bytes = execute_captured_random(&ctx, &policy, n)?;
-                Ok(Value::String(b64_encode(&bytes)))
+                "__chidori_crypto_hmac" => {
+                    crypto_policy_guard(&policy)?;
+                    let alg = str_arg(0)?;
+                    let key = b64_decode(&str_arg(1)?)?;
+                    let data = b64_decode(&str_arg(2)?)?;
+                    let digest = crate::runtime::crypto::hmac(&alg, &key, &data)
+                        .map_err(|e| e.to_string())?;
+                    ctx.note_capability(Capability::CryptoHash, ctx.current_seq());
+                    Ok(Value::String(b64_encode(&digest)))
+                }
+                "__chidori_crypto_random" => {
+                    crypto_policy_guard(&policy)?;
+                    let n = args
+                        .get(0)
+                        .and_then(|v| v.as_u64())
+                        .ok_or("crypto random length must be a non-negative integer")?
+                        as usize;
+                    if n > 1_048_576 {
+                        return Err(format!("crypto random length {n} exceeds the 1MiB cap"));
+                    }
+                    let bytes = execute_captured_random(&ctx, &policy, n)?;
+                    Ok(Value::String(b64_encode(&bytes)))
+                }
+                "__chidori_fs_read" => {
+                    fs_policy_guard(&policy)?;
+                    let bytes = ctx.vfs_read(&str_arg(0)?)?;
+                    Ok(Value::String(b64_encode(&bytes)))
+                }
+                "__chidori_fs_write" => {
+                    fs_policy_guard(&policy)?;
+                    let bytes = b64_decode(&str_arg(1)?)?;
+                    ctx.vfs_write(&str_arg(0)?, bytes)?;
+                    Ok(Value::Null)
+                }
+                "__chidori_fs_append" => {
+                    fs_policy_guard(&policy)?;
+                    let bytes = b64_decode(&str_arg(1)?)?;
+                    ctx.vfs_append(&str_arg(0)?, &bytes)?;
+                    Ok(Value::Null)
+                }
+                "__chidori_fs_exists" => {
+                    fs_policy_guard(&policy)?;
+                    Ok(Value::Bool(ctx.vfs_exists(&str_arg(0)?)))
+                }
+                "__chidori_fs_readdir" => {
+                    fs_policy_guard(&policy)?;
+                    let entries = ctx.vfs_readdir(&str_arg(0)?)?;
+                    Ok(Value::Array(
+                        entries.into_iter().map(Value::String).collect(),
+                    ))
+                }
+                "__chidori_fs_mkdir" => {
+                    fs_policy_guard(&policy)?;
+                    ctx.vfs_mkdir(&str_arg(0)?, bool_arg(1))?;
+                    Ok(Value::Null)
+                }
+                "__chidori_fs_rm" => {
+                    fs_policy_guard(&policy)?;
+                    ctx.vfs_remove(&str_arg(0)?, bool_arg(1), bool_arg(2))?;
+                    Ok(Value::Null)
+                }
+                "__chidori_fs_rename" => {
+                    fs_policy_guard(&policy)?;
+                    ctx.vfs_rename(&str_arg(0)?, &str_arg(1)?)?;
+                    Ok(Value::Null)
+                }
+                "__chidori_fs_stat" => {
+                    fs_policy_guard(&policy)?;
+                    ctx.vfs_stat(&str_arg(0)?)
+                }
+                "__chidori_note_capability" => {
+                    let cap = match str_arg(0)?.as_str() {
+                        "timer" => Capability::Timer,
+                        "microtask" => Capability::Microtask,
+                        _ => return Ok(Value::Null),
+                    };
+                    ctx.note_capability(cap, ctx.current_seq());
+                    Ok(Value::Null)
+                }
+                _ => Err(format!("unknown captured-effect native `{name}`")),
             }
-            "__chidori_fs_read" => {
-                fs_policy_guard(&policy)?;
-                let bytes = ctx.vfs_read(&str_arg(0)?)?;
-                Ok(Value::String(b64_encode(&bytes)))
-            }
-            "__chidori_fs_write" => {
-                fs_policy_guard(&policy)?;
-                let bytes = b64_decode(&str_arg(1)?)?;
-                ctx.vfs_write(&str_arg(0)?, bytes)?;
-                Ok(Value::Null)
-            }
-            "__chidori_fs_append" => {
-                fs_policy_guard(&policy)?;
-                let bytes = b64_decode(&str_arg(1)?)?;
-                ctx.vfs_append(&str_arg(0)?, &bytes)?;
-                Ok(Value::Null)
-            }
-            "__chidori_fs_exists" => {
-                fs_policy_guard(&policy)?;
-                Ok(Value::Bool(ctx.vfs_exists(&str_arg(0)?)))
-            }
-            "__chidori_fs_readdir" => {
-                fs_policy_guard(&policy)?;
-                let entries = ctx.vfs_readdir(&str_arg(0)?)?;
-                Ok(Value::Array(entries.into_iter().map(Value::String).collect()))
-            }
-            "__chidori_fs_mkdir" => {
-                fs_policy_guard(&policy)?;
-                ctx.vfs_mkdir(&str_arg(0)?, bool_arg(1))?;
-                Ok(Value::Null)
-            }
-            "__chidori_fs_rm" => {
-                fs_policy_guard(&policy)?;
-                ctx.vfs_remove(&str_arg(0)?, bool_arg(1), bool_arg(2))?;
-                Ok(Value::Null)
-            }
-            "__chidori_fs_rename" => {
-                fs_policy_guard(&policy)?;
-                ctx.vfs_rename(&str_arg(0)?, &str_arg(1)?)?;
-                Ok(Value::Null)
-            }
-            "__chidori_fs_stat" => {
-                fs_policy_guard(&policy)?;
-                ctx.vfs_stat(&str_arg(0)?)
-            }
-            "__chidori_note_capability" => {
-                let cap = match str_arg(0)?.as_str() {
-                    "timer" => Capability::Timer,
-                    "microtask" => Capability::Microtask,
-                    _ => return Ok(Value::Null),
-                };
-                ctx.note_capability(cap, ctx.current_seq());
-                Ok(Value::Null)
-            }
-            _ => Err(format!("unknown captured-effect native `{name}`")),
-        }
-    })
+        },
+    )
 }
 
 /// The determinism prelude installed on the rust engine before an agent runs:
@@ -642,12 +623,14 @@ fn build_sync_native_dispatch(
 /// prelude) this installs no Date/random shims. The polyfill sources are shared
 /// verbatim with the QuickJS path.
 fn rust_engine_prelude(policy: &RuntimePolicy) -> String {
-    use crate::runtime::typescript::snapshot::{
+    use crate::runtime::typescript::helpers::{
         chidori_agent_env_json, TEXT_ENCODING_POLYFILL, TIMER_DISABLED_POLYFILL,
         TIMER_VIRTUAL_POLYFILL, WEB_CRYPTO_POLYFILL,
     };
     let mut out = String::new();
-    out.push_str("if (typeof globalThis.__chidori_now !== \"number\") globalThis.__chidori_now = 0;\n");
+    out.push_str(
+        "if (typeof globalThis.__chidori_now !== \"number\") globalThis.__chidori_now = 0;\n",
+    );
     let env_json = chidori_agent_env_json();
     out.push_str(&format!(
         "globalThis.process = Object.freeze({{ env: Object.freeze({env_json}) }});\n"
@@ -690,7 +673,11 @@ impl SnapshotCapableJsEngine for RustReplayEngine {
     }
 
     fn run_jobs_until_blocked(&mut self) -> Result<JsRunState> {
-        match self.rt.run_until_blocked().map_err(|e| anyhow::anyhow!(e))? {
+        match self
+            .rt
+            .run_until_blocked()
+            .map_err(|e| anyhow::anyhow!(e))?
+        {
             chidori_js::RunOutcome::Completed => Ok(JsRunState::Completed),
             chidori_js::RunOutcome::BlockedOnHost(id) => {
                 Ok(JsRunState::BlockedOnHostOperation(HostOperationId(id)))
@@ -749,8 +736,7 @@ mod tests {
 
         let tools = Arc::new(ToolRegistry::new());
         let backend = test_backend(ctx.clone(), tools);
-        let output =
-            run_agent(&path, src, &serde_json::json!({ "value": 21 }), &backend).unwrap();
+        let output = run_agent(&path, src, &serde_json::json!({ "value": 21 }), &backend).unwrap();
         assert_eq!(output, serde_json::json!({ "value": 42 }));
 
         // The host effect flowed through host_core → the RuntimeContext call log,
@@ -772,8 +758,7 @@ mod tests {
         // import is stripped, both resolve to globals) and `run(handler)` as the
         // entrypoint — no second `chidori` param, no magic `agent` export.
         let ctx = RuntimeContext::new();
-        let dir =
-            std::env::temp_dir().join(format!("chidori-rust-run-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("chidori-rust-run-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("agent.ts");
         let src = r#"
@@ -787,8 +772,7 @@ mod tests {
 
         let tools = Arc::new(ToolRegistry::new());
         let backend = test_backend(ctx.clone(), tools);
-        let output =
-            run_agent(&path, src, &serde_json::json!({ "value": 41 }), &backend).unwrap();
+        let output = run_agent(&path, src, &serde_json::json!({ "value": 41 }), &backend).unwrap();
         assert_eq!(output, serde_json::json!({ "value": 42 }));
 
         let records = ctx.call_log().into_records();
@@ -804,8 +788,7 @@ mod tests {
         // must be recorded as CHILDREN of the tool call (parent_seq = tool seq),
         // exactly like the QuickJS path — so the trace nests on the rust engine.
         let ctx = RuntimeContext::new();
-        let dir =
-            std::env::temp_dir().join(format!("chidori-rust-tool-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("chidori-rust-tool-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("tools")).unwrap();
 
         let tool_path = dir.join("tools").join("echo2.ts");
@@ -843,9 +826,13 @@ mod tests {
         let tools = Arc::new(registry);
 
         let backend = test_backend(ctx.clone(), tools);
-        let output =
-            run_agent(&agent_path, agent_src, &serde_json::json!({ "value": 5 }), &backend)
-                .unwrap();
+        let output = run_agent(
+            &agent_path,
+            agent_src,
+            &serde_json::json!({ "value": 5 }),
+            &backend,
+        )
+        .unwrap();
         assert_eq!(output, serde_json::json!({ "value": 10 }));
 
         let records = ctx.call_log().into_records();
@@ -892,8 +879,13 @@ mod tests {
 
         let tools = Arc::new(ToolRegistry::new());
         let backend = test_backend(ctx.clone(), tools);
-        let output =
-            run_agent(&path, &src, &serde_json::json!({ "name": "world" }), &backend).unwrap();
+        let output = run_agent(
+            &path,
+            &src,
+            &serde_json::json!({ "name": "world" }),
+            &backend,
+        )
+        .unwrap();
         assert_eq!(
             output,
             serde_json::json!({ "greeting": "Hello world", "back": "Hello world" })
@@ -996,9 +988,13 @@ mod tests {
 
         let tools = Arc::new(ToolRegistry::new());
         let backend = test_backend(ctx.clone(), tools);
-        let output =
-            run_agent(&agent_path, agent_src, &serde_json::json!({ "value": 10 }), &backend)
-                .unwrap();
+        let output = run_agent(
+            &agent_path,
+            agent_src,
+            &serde_json::json!({ "value": 10 }),
+            &backend,
+        )
+        .unwrap();
         assert_eq!(output, serde_json::json!({ "value": 31 }));
 
         let records = ctx.call_log().into_records();
@@ -1077,16 +1073,21 @@ mod tests {
             JsRunState::BlockedOnHostOperation(id) => id,
             JsRunState::Completed => panic!("expected to block on the second fetchValue"),
         };
-        eng2.resolve_host_promise(id2, serde_json::json!(32)).unwrap();
+        eng2.resolve_host_promise(id2, serde_json::json!(32))
+            .unwrap();
         // The report effect now blocks; resolve it and finish.
         if let JsRunState::BlockedOnHostOperation(id3) = eng2.run_jobs_until_blocked().unwrap() {
             let (n, args) = eng2.pending_op(id3).unwrap();
             assert_eq!(n, "report");
             assert_eq!(args[0], serde_json::json!(42));
-            eng2.resolve_host_promise(id3, serde_json::json!(null)).unwrap();
+            eng2.resolve_host_promise(id3, serde_json::json!(null))
+                .unwrap();
         } else {
             panic!("expected report effect");
         }
-        assert!(matches!(eng2.run_jobs_until_blocked().unwrap(), JsRunState::Completed));
+        assert!(matches!(
+            eng2.run_jobs_until_blocked().unwrap(),
+            JsRunState::Completed
+        ));
     }
 }

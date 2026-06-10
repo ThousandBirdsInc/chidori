@@ -382,7 +382,6 @@ impl RunSpan {
 /// Feature-gated to `rust-engine`: only the pure-Rust engine can be observed at
 /// this granularity. Install on `ReplayRuntime.vm.trace_sink` for a run that has
 /// a [`RunSpan`]. A pure consumer of trace events — never affects execution.
-#[cfg(feature = "rust-engine")]
 pub struct JsTraceObserver {
     run_cx: Context,
     agent_name: String,
@@ -403,7 +402,6 @@ pub struct JsTraceObserver {
     max_depth: usize,
 }
 
-#[cfg(feature = "rust-engine")]
 impl JsTraceObserver {
     /// 1-based source line for a byte offset.
     fn line_of(&self, offset: u32) -> u32 {
@@ -411,7 +409,6 @@ impl JsTraceObserver {
     }
 }
 
-#[cfg(feature = "rust-engine")]
 impl chidori_js::TraceObserver for JsTraceObserver {
     fn on_enter(&mut self, info: chidori_js::TraceEnter<'_>) -> u64 {
         let token = self.next;
@@ -482,7 +479,6 @@ impl chidori_js::TraceObserver for JsTraceObserver {
     }
 }
 
-#[cfg(feature = "rust-engine")]
 impl RunSpan {
     /// Build a JS-level trace observer that nests function spans under this run
     /// span. `source` is the module text (for line resolution); `max_depth`
@@ -902,7 +898,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "rust-engine")]
     #[test]
     fn js_trace_observer_emits_nested_spans_through_engine() {
         let _guard = PROVIDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
