@@ -193,21 +193,6 @@ if (!result.ok) {
 }
 ```
 
-### Sandboxed Execution
-
-```ts
-const js = await chidori.execJs("return input.x + 1", { timeoutMs: 1000 });
-const py = await chidori.execPython("result = input['x'] + 1", { timeoutMs: 1000 });
-const wasm = await chidori.execWasm(wasmBytesBase64, {
-  function: "add",
-  args: [1, 2],
-  memoryPages: 1,
-});
-```
-
-Generated or untrusted code should run through sandbox helpers, not directly in
-the agent runtime.
-
 ## TypeScript Tool Shape
 
 A TypeScript tool exports JSON-compatible metadata and an async

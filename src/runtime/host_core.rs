@@ -8,7 +8,6 @@ use crate::providers::{
 use crate::runtime::call_log::{CallRecord, TokenUsage};
 use crate::runtime::context::{InputMode, PendingInput, RuntimeContext, PAUSE_MARKER};
 use crate::runtime::memory::execute_memory_action;
-use crate::runtime::sandbox;
 use crate::runtime::snapshot::{HostPromiseState, PendingHostOperationKind};
 use crate::runtime::template::TemplateEngine;
 use crate::tools::ToolRegistry;
@@ -194,7 +193,6 @@ fn host_operation_kind(function: &str) -> Option<PendingHostOperationKind> {
         "memory" => Some(PendingHostOperationKind::Memory),
         "checkpoint" => Some(PendingHostOperationKind::Checkpoint),
         "log" => Some(PendingHostOperationKind::Log),
-        "exec" | "exec_js" | "exec_python" | "exec_expr" => Some(PendingHostOperationKind::Sandbox),
         _ => None,
     }
 }
@@ -649,9 +647,7 @@ pub fn execute_http(tokio_rt: &tokio::runtime::Runtime, args: &Value) -> Result<
         if !caller_set_user_agent {
             client_builder = client_builder.user_agent(DEFAULT_USER_AGENT);
         }
-        let client = client_builder
-            .build()
-            .map_err(|err| anyhow::anyhow!(err))?;
+        let client = client_builder.build().map_err(|err| anyhow::anyhow!(err))?;
         let request_method =
             reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
         let mut req = client.request(request_method, &url);
@@ -737,75 +733,6 @@ pub fn execute_http(tokio_rt: &tokio::runtime::Runtime, args: &Value) -> Result<
             "body": body,
         }))
     })
-}
-
-pub fn execute_sandbox_string(function: &str, args: &Value) -> Result<Value> {
-    let source = args
-        .get("source")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("{function} requires string source"))?;
-    let fuel = args
-        .get("fuel")
-        .and_then(Value::as_u64)
-        .unwrap_or(match function {
-            "exec_expr" => 1_000_000,
-            _ => 200_000_000,
-        });
-
-    let output = match function {
-        "exec_js" => sandbox::exec_js(source, fuel),
-        "exec_python" => sandbox::exec_python(source, fuel),
-        "exec_expr" => {
-            let vars = match args.get("vars") {
-                Some(Value::Object(vars)) => vars.clone(),
-                _ => serde_json::Map::new(),
-            };
-            sandbox::exec_expr(source, &vars, fuel)
-        }
-        _ => Err(anyhow::anyhow!("unsupported sandbox function `{function}`")),
-    }?;
-
-    Ok(Value::String(output))
-}
-
-pub fn execute_sandbox_wasm(args: &Value) -> Result<Value> {
-    let source = args
-        .get("source")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("exec requires string source"))?;
-    let function = args
-        .get("function")
-        .and_then(Value::as_str)
-        .unwrap_or("main")
-        .to_string();
-    let wasm_args = args.get("args").cloned().unwrap_or_else(|| json!([]));
-    let fuel = args
-        .get("fuel")
-        .and_then(Value::as_u64)
-        .unwrap_or(1_000_000);
-    let memory_pages = args
-        .get("memory_pages")
-        .and_then(Value::as_u64)
-        .unwrap_or(16)
-        .max(1)
-        .min(u64::from(u32::MAX)) as u32;
-    let wasm_args = sandbox::parse_args(&wasm_args)?;
-
-    let exec_result = sandbox::exec_wasm(sandbox::ExecRequest {
-        wasm_source: source.as_bytes().to_vec(),
-        function,
-        args: wasm_args,
-        fuel,
-        memory_pages,
-        log_callback: Some(std::sync::Arc::new(|msg: &str| {
-            tracing::info!(target: "wasm_sandbox", "{}", msg);
-        })),
-    })?;
-
-    Ok(json!({
-        "returns": exec_result.returns,
-        "fuel_remaining": exec_result.fuel_remaining,
-    }))
 }
 
 #[cfg(test)]
@@ -1065,8 +992,8 @@ mod tests {
             max_tokens: 16,
             tools: Vec::new(),
         };
-        let _ = execute_prompt_response(&ctx, &providers, &tokio_rt, request, json!({}), None)
-            .unwrap();
+        let _ =
+            execute_prompt_response(&ctx, &providers, &tokio_rt, request, json!({}), None).unwrap();
 
         assert_eq!(
             seen_model.lock().unwrap().as_deref(),
@@ -1217,7 +1144,10 @@ mod tests {
     fn user_agent_header(request: &str) -> Option<String> {
         request
             .lines()
-            .find_map(|line| line.strip_prefix("user-agent: ").or_else(|| line.strip_prefix("User-Agent: ")))
+            .find_map(|line| {
+                line.strip_prefix("user-agent: ")
+                    .or_else(|| line.strip_prefix("User-Agent: "))
+            })
             .map(ToOwned::to_owned)
     }
 
@@ -1240,9 +1170,7 @@ mod tests {
         // rejects requests that send the bare `reqwest/` default *or* two UAs.
         let ua_count = request
             .lines()
-            .filter(|line| {
-                line.to_ascii_lowercase().starts_with("user-agent:")
-            })
+            .filter(|line| line.to_ascii_lowercase().starts_with("user-agent:"))
             .count();
         assert_eq!(ua_count, 1, "request had {ua_count} User-Agent headers");
     }

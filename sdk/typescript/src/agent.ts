@@ -120,14 +120,6 @@ export interface WorkspaceHost {
   manifest(): Promise<AgentJson>;
 }
 
-export interface ExecOptions {
-  timeoutMs?: number;
-  fuel?: number;
-  function?: string;
-  args?: number[];
-  memoryPages?: number;
-}
-
 export type TypeScriptImportPolicy = "none" | "relative" | "project";
 export type DatePolicy = "disabled" | "fixed" | "host";
 export type RandomPolicy = "disabled" | "seeded" | "host";
@@ -174,9 +166,6 @@ export interface Chidori {
     options?: JsonObject,
   ): Promise<T | AgentJson[] | null>;
   checkpoint(label?: string, data?: AgentJson): Promise<void>;
-  execJs<T extends AgentJson = AgentJson>(source: string, options?: ExecOptions): Promise<T>;
-  execPython<T extends AgentJson = AgentJson>(source: string, options?: ExecOptions): Promise<T>;
-  execWasm<T extends AgentJson = AgentJson>(source: string, options?: ExecOptions): Promise<T>;
 }
 
 export type AgentFunction<TInput extends AgentJson = JsonObject, TOutput extends AgentJson = AgentJson> = (

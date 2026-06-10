@@ -66,11 +66,14 @@ fn exports_async_function(source: &str, name: &str) -> bool {
 }
 
 fn evaluate_tool_definition(path: &Path, javascript: &str) -> Result<TypeScriptToolDefinition> {
-    let runtime = chidori_quickjs::SnapshotRuntime::new(chidori_quickjs::RuntimeLimits::default())
-        .map_err(|err| anyhow::anyhow!(err))?;
-    let mut context = runtime.new_context().map_err(|err| anyhow::anyhow!(err))?;
-    let module_name = path.display().to_string();
-    let mut source = String::from(
+    use crate::runtime::snapshot::TypeScriptImportPolicy;
+
+    let mut engine = chidori_js::Engine::new();
+    // Deterministic, side-effect-free metadata evaluation: disable host effects,
+    // network, timers, Date, and randomness. Mirror the agent runtime's benign
+    // globals (process.env from CHIDORI_AGENT_ENV, URLSearchParams) so a tool
+    // that's valid at run time isn't rejected at discovery.
+    let mut prelude = String::from(
         r#"
             globalThis.chidori = undefined;
             globalThis.fetch = undefined;
@@ -85,39 +88,53 @@ fn evaluate_tool_definition(path: &Path, javascript: &str) -> Result<TypeScriptT
             };
             "#,
     );
-    // Mirror the agent runtime's globals so a tool that's valid at run time
-    // isn't rejected at discovery: populate process.env from CHIDORI_AGENT_ENV
-    // and provide URLSearchParams. (chidori/fetch/Date/Math.random stay
-    // disabled — metadata evaluation must be deterministic and side-effect free.)
-    source.push_str(&format!(
+    prelude.push_str(&format!(
         "globalThis.process = Object.freeze({{ env: Object.freeze({}) }});\n",
-        super::snapshot::chidori_agent_env_json()
+        super::helpers::chidori_agent_env_json()
     ));
-    source.push_str(super::snapshot::URL_SEARCH_PARAMS_POLYFILL);
-    source.push_str(javascript);
+    prelude.push_str(super::helpers::URL_SEARCH_PARAMS_POLYFILL);
+    engine
+        .eval(&prelude)
+        .map_err(|err| anyhow::anyhow!("installing tool metadata prelude: {err}"))?;
 
-    context
-        .eval_module(&module_name, &source)
+    // Resolve relative + `node:` imports the same way the runtime engine does,
+    // so a tool that splits its schema across sibling modules still discovers.
+    let mut load =
+        |specifier: &str, importer_key: &str| -> std::result::Result<(String, String), String> {
+            if let Some(name) = specifier.strip_prefix("node:") {
+                let src = super::builtins::shim_source(name)
+                    .ok_or_else(|| format!("unsupported node: builtin '{specifier}'"))?;
+                return Ok((format!("node:{name}"), src.to_string()));
+            }
+            let importer = Path::new(importer_key);
+            let dir = importer.parent().unwrap_or_else(|| Path::new("."));
+            let resolved = crate::runtime::typescript::transpile::resolve_relative_import(
+                importer, dir, specifier, 0,
+            )
+            .map_err(|e| e.to_string())?;
+            let key = resolved.to_string_lossy().to_string();
+            let src = std::fs::read_to_string(&resolved)
+                .map_err(|e| format!("reading module {}: {e}", resolved.display()))?;
+            let js = transpile_module(
+                &resolved,
+                &src,
+                &TranspileOptions {
+                    import_policy: TypeScriptImportPolicy::Node,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            Ok((key, js))
+        };
+
+    let entry_key = path.display().to_string();
+    let tool = engine
+        .eval_module_export(&entry_key, javascript, "tool", &mut load)
         .map_err(|err| {
-            let bundle = write_tool_eval_failure_bundle(path, &source)
+            let bundle = write_tool_eval_failure_bundle(path, javascript)
                 .map(|path| format!("; transpiled tool bundle written to {}", path.display()))
                 .unwrap_or_default();
             anyhow::anyhow!("{err}{bundle}")
         })
-        .with_context(|| format!("evaluating {}", path.display()))?;
-    let tool = context
-        .eval_json_expression(
-            "tool-metadata.js",
-            r#"
-            (() => {
-                if (!Object.prototype.hasOwnProperty.call(globalThis.__chidori_exports || {}, "tool")) {
-                    throw new Error("missing exported `tool` value");
-                }
-                return globalThis.__chidori_exports.tool;
-            })()
-            "#,
-        )
-        .map_err(|err| anyhow::anyhow!(err))
         .with_context(|| {
             format!(
                 "{}: exported `tool` metadata must be JSON-compatible",
@@ -277,7 +294,9 @@ mod tests {
 
         assert_eq!(result.tool.name, "web_search");
         assert_eq!(result.tool.description, "Search the web");
-        assert!(result.javascript.contains("export async function run(args, chidori)"));
+        assert!(result
+            .javascript
+            .contains("export async function run(args, chidori)"));
         assert!(!result.javascript.contains("satisfies ToolDefinition"));
         assert!(!result.javascript.contains("Promise<{"));
     }

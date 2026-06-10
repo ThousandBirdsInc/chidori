@@ -15,8 +15,6 @@ categories = ["development-tools", "command-line-utilities"]
 members = [
     ".",
     "crates/chidori-js",
-    "crates/chidori-quickjs",
-    "crates/chidori-quickjs-sys",
     "crates/test262-runner",
 ]
 resolver = "2"
@@ -66,16 +64,8 @@ base64 = "0.22"
 hex = "0.4"
 rand = "0.8"
 
-# WebAssembly sandbox for exec() host function.
-# Cranelift compiler + metering middleware give us fuel-based timeouts.
-wasmer = "4"
-wasmer-middlewares = "4"
-
-chidori-quickjs = { path = "crates/chidori-quickjs", version = "0.1.0" }
-# Pure-Rust JS engine + deterministic-replay durable runtime. Compiled in by
-# default (see the `default` feature); select at runtime via CHIDORI_JS_ENGINE.
-# Drop it with `--no-default-features` to build the QuickJS/C engine alone.
-chidori-js = { path = "crates/chidori-js", version = "0.1.0", optional = true }
+# Pure-Rust JS engine + deterministic-replay durable runtime. The only JS engine.
+chidori-js = { path = "crates/chidori-js", version = "0.1.0" }
 async-trait = "0.1"
 derive_more = { version = "1", features = ["display"] }
 
@@ -101,19 +91,7 @@ opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 # AST and emits JS via codegen, so unsupported sugar can't slip through.
 oxc = { version = "0.133", features = ["transformer", "codegen", "semantic"] }
 
-[features]
-# The in-tree pure-Rust JS engine ships in every build by default and is
-# selectable at runtime via `CHIDORI_JS_ENGINE=rust`. The QuickJS/C engine stays
-# the runtime default until the rust engine reaches parity on pause/resume +
-# snapshot persistence and `node:` builtins (see docs/pure-rust-js-engine-plan.md).
-# Build with `--no-default-features` to drop it.
-default = ["rust-engine"]
-rust-engine = ["dep:chidori-js"]
-
 [dev-dependencies]
-# Legacy host-binding parity tests only. Production TypeScript execution uses
-# the in-repo `chidori-quickjs` fork.
-rquickjs = { version = "0.9", features = ["macro"] }
 tempfile = "3"
 # In-memory span exporter for asserting OTEL span-tree shape in tests. Unions
 # with the runtime `opentelemetry_sdk` features for test builds.

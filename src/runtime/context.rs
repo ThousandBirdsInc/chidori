@@ -8,11 +8,11 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::runtime::call_log::{CallLog, CallRecord};
 use crate::runtime::capability::{Capability, CapabilityLedger};
 use crate::runtime::otel::RunSpan;
-use crate::runtime::vfs::Vfs;
 use crate::runtime::snapshot::{
     HostOperationId, HostPromiseRecord, HostPromiseTable, PendingHostOperation,
     PendingHostOperationKind, HOST_PROMISE_TABLE_FILE, PENDING_HOST_OPERATION_FILE,
 };
+use crate::runtime::vfs::Vfs;
 
 /// A streaming event the runtime emits while an agent runs. CallRecord is
 /// the original per-call event; prompt stream events carry LLM output as the
@@ -61,11 +61,6 @@ pub struct HostOperationCompletionSafepoint(
     Arc<dyn Fn(&HostPromiseRecord) -> anyhow::Result<()> + Send + Sync>,
 );
 
-#[derive(Clone)]
-pub struct LiveVmSnapshotter(
-    Arc<dyn Fn() -> anyhow::Result<chidori_quickjs::RuntimeSnapshot> + Send + Sync>,
-);
-
 impl std::fmt::Debug for HostOperationSafepoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostOperationSafepoint")
@@ -77,12 +72,6 @@ impl std::fmt::Debug for HostOperationCompletionSafepoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostOperationCompletionSafepoint")
             .finish_non_exhaustive()
-    }
-}
-
-impl std::fmt::Debug for LiveVmSnapshotter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LiveVmSnapshotter").finish_non_exhaustive()
     }
 }
 
@@ -109,19 +98,6 @@ impl HostOperationCompletionSafepoint {
 
     fn call(&self, record: &HostPromiseRecord) -> anyhow::Result<()> {
         (self.0)(record)
-    }
-}
-
-impl LiveVmSnapshotter {
-    #[allow(dead_code)]
-    pub fn new(
-        callback: impl Fn() -> anyhow::Result<chidori_quickjs::RuntimeSnapshot> + Send + Sync + 'static,
-    ) -> Self {
-        Self(Arc::new(callback))
-    }
-
-    fn capture(&self) -> anyhow::Result<chidori_quickjs::RuntimeSnapshot> {
-        (self.0)()
     }
 }
 
@@ -174,10 +150,6 @@ struct RuntimeContextInner {
     /// Optional durable safepoint invoked after a host operation result is
     /// persisted and recorded, before control returns to JavaScript.
     pub host_operation_completion_safepoint: Option<HostOperationCompletionSafepoint>,
-    /// Optional live VM snapshotter registered by snapshot-capable runtimes.
-    /// When present, durable safepoints persist its live continuation bytes
-    /// instead of the initial TypeScript state scaffold.
-    pub live_vm_snapshotter: Option<LiveVmSnapshotter>,
     /// Optional scoped workspace root exposed through `chidori.workspace`.
     pub workspace_root: Option<PathBuf>,
     /// Seqs of host calls currently executing (their `live()` is on the
@@ -297,7 +269,6 @@ impl RuntimeContext {
                 otel_run: None,
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
-                live_vm_snapshotter: None,
                 workspace_root: default_workspace_root(),
                 call_stack: Vec::new(),
                 capabilities: CapabilityLedger::new(),
@@ -345,7 +316,6 @@ impl RuntimeContext {
                 otel_run: None,
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
-                live_vm_snapshotter: None,
                 workspace_root: default_workspace_root(),
                 call_stack: Vec::new(),
                 capabilities: CapabilityLedger::new(),
@@ -379,7 +349,6 @@ impl RuntimeContext {
                 otel_run: None,
                 host_operation_safepoint: None,
                 host_operation_completion_safepoint: None,
-                live_vm_snapshotter: None,
                 workspace_root: default_workspace_root(),
                 call_stack: Vec::new(),
                 capabilities: CapabilityLedger::new(),
@@ -800,24 +769,12 @@ impl RuntimeContext {
     }
 
     #[allow(dead_code)]
-    pub fn set_live_vm_snapshotter(&self, snapshotter: LiveVmSnapshotter) {
-        self.inner.lock().unwrap().live_vm_snapshotter = Some(snapshotter);
-    }
-
-    #[allow(dead_code)]
     pub fn set_workspace_root(&self, root: impl Into<PathBuf>) {
         self.inner.lock().unwrap().workspace_root = Some(root.into());
     }
 
     pub fn workspace_root(&self) -> Option<PathBuf> {
         self.inner.lock().unwrap().workspace_root.clone()
-    }
-
-    pub fn capture_live_vm_snapshot(
-        &self,
-    ) -> Option<anyhow::Result<chidori_quickjs::RuntimeSnapshot>> {
-        let snapshotter = self.inner.lock().unwrap().live_vm_snapshotter.clone()?;
-        Some(snapshotter.capture())
     }
 
     pub fn call_log(&self) -> CallLog {
@@ -1192,17 +1149,17 @@ mod tests {
         let ctx = RuntimeContext::new();
         let id = ctx.begin_host_operation_with_function(
             1,
-            PendingHostOperationKind::Sandbox,
-            Some("exec_js".to_string()),
-            serde_json::json!({ "source": "1 + 1" }),
+            PendingHostOperationKind::Tool,
+            Some("tool".to_string()),
+            serde_json::json!({ "name": "do_thing" }),
         );
 
         let pending = ctx.pending_host_operation(id).unwrap();
-        assert_eq!(pending.kind, PendingHostOperationKind::Sandbox);
-        assert_eq!(pending.function.as_deref(), Some("exec_js"));
+        assert_eq!(pending.kind, PendingHostOperationKind::Tool);
+        assert_eq!(pending.function.as_deref(), Some("tool"));
 
         let records = ctx.host_promise_records();
-        assert_eq!(records[0].operation.function.as_deref(), Some("exec_js"));
+        assert_eq!(records[0].operation.function.as_deref(), Some("tool"));
     }
 
     #[test]

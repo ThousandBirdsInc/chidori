@@ -153,9 +153,6 @@ The injected `chidori` object provides:
 - `log(message, fields?)`
 - `memory(action, key?, value?, options?)`
 - `checkpoint(label?, data?)`
-- `execJs(source, options?)`
-- `execPython(source, options?)`
-- `execWasm(source, options?)`
 
 All side-effecting APIs are promise-returning durable host operations. Pure
 helpers may return synchronously only when they cannot suspend and do not need a

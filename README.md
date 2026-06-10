@@ -203,7 +203,6 @@ An agent is a `.ts` file that exports an async `agent(input, chidori)` function.
 | `chidori.callAgent(path, input)` | Call a sub-agent |
 | `chidori.parallel(fns)` | Run functions concurrently |
 | `chidori.input(msg, options)` | Human-in-the-loop — pauses execution |
-| `chidori.execJs(...)`, `chidori.execPython(...)`, `chidori.execWasm(...)` | Run generated code in a sandbox |
 | `chidori.http(url, options)` | Make an HTTP request |
 | `chidori.memory(action, ...)` | Persistent storage (key-value + vector) |
 | `chidori.log(msg, data)` | Structured logging |
