@@ -55,14 +55,44 @@ echo "Building runner ..."
 cargo build --release -p test262-runner
 RUNNER="$REPO_ROOT/target/release/test262-runner"
 
+# The runner's reference-counting GC cannot reclaim every object cycle, so a
+# single process that walks all ~47k tests grows until it is OOM-killed. We
+# therefore run the suite one second-level directory at a time, in a fresh
+# process each, so memory is reclaimed between chunks. The --state file merges
+# results across chunks; --baseline gates each chunk against the full baseline.
+chunk_dirs() {
+  if [[ ${#forward[@]} -gt 0 ]]; then
+    printf '%s\n' "${forward[@]}"
+  else
+    (cd "$VENDOR_DIR" && ls -d test/language/*/ test/built-ins/*/)
+  fi
+}
+
 if [[ "$update_baseline" == "1" ]]; then
-  echo "Recording baseline -> $BASELINE"
-  exec "$RUNNER" --test262 "$VENDOR_DIR" --state "$BASELINE" "${forward[@]}"
+  echo "Recording baseline (chunked) -> $BASELINE"
+  rm -f "$BASELINE"
+  while IFS= read -r d; do
+    echo "  $d"
+    "$RUNNER" --test262 "$VENDOR_DIR" --state "$BASELINE" "$d" >/dev/null
+  done < <(chunk_dirs)
+  echo "Baseline recorded -> $BASELINE"
+  exec "$RUNNER" --test262 "$VENDOR_DIR" --state "$BASELINE" --max 0
 fi
 
 if [[ "$gate" == "1" ]]; then
-  echo "Gating against baseline -> $BASELINE"
-  exec "$RUNNER" --test262 "$VENDOR_DIR" --baseline "$BASELINE" "${forward[@]}"
+  echo "Gating against baseline (chunked) -> $BASELINE"
+  current="$(mktemp)"
+  status=0
+  while IFS= read -r d; do
+    "$RUNNER" --test262 "$VENDOR_DIR" --state "$current" --baseline "$BASELINE" "$d" || status=1
+  done < <(chunk_dirs)
+  echo
+  echo "Aggregated current results:"
+  "$RUNNER" --test262 "$VENDOR_DIR" --state "$current" --max 0
+  [[ "$status" -eq 0 ]] && echo "PASS: no conformance regressions." \
+    || echo "FAIL: conformance regression(s) above."
+  exit "$status"
 fi
 
 exec "$RUNNER" --test262 "$VENDOR_DIR" "${forward[@]}"
+

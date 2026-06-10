@@ -37,12 +37,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Run Test262 against the committed baseline
-        run: scripts/test262.sh --gate --json test262-report.json
-
-      - name: Upload conformance report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test262-report
-          path: test262-report.json
-          if-no-files-found: ignore
+        run: scripts/test262.sh --gate

@@ -1,4 +1,4 @@
-//! Test262 conformance runner for chidori's embedded QuickJS runtime.
+//! Test262 conformance runner for chidori's pure-Rust JavaScript engine.
 //!
 //! Test262 is the official TC39 ECMAScript conformance suite. It is the one
 //! test corpus that both Bun (JavaScriptCore) and Node (V8) publish numbers
@@ -239,8 +239,7 @@ fn run() -> ExitCode {
 
     // This run's per-test results, always recorded so `--baseline` can diff
     // against committed expectations regardless of `--state`.
-    let mut current: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
+    let mut current: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 
     for file in &files {
         let rel = file
