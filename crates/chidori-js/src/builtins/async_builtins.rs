@@ -108,7 +108,11 @@ fn install_promise(vm: &mut Vm) {
         // Non-callable onFinally: behaves like then(onFinally, onFinally), which
         // (since neither is callable) passes the value/reason straight through.
         if !vm.is_callable(&on_finally) {
-            return Ok(Value::Object(vm.promise_then(&p, on_finally.clone(), on_finally)));
+            return Ok(Value::Object(vm.promise_then(
+                &p,
+                on_finally.clone(),
+                on_finally,
+            )));
         }
         // onFulfilled(value): call onFinally(), and once Promise.resolve of its
         // result settles, fulfil with the original value (pass-through after the
@@ -120,7 +124,11 @@ fn install_promise(vm: &mut Vm) {
             let result = vm.call(f1.clone(), Value::Undefined, &[])?;
             let p = vm.promise_resolve(result);
             let thunk = vm.new_native("", 0, move |_vm, _t, _a| Ok(value.clone()));
-            Ok(Value::Object(vm.promise_then(&p, Value::Object(thunk), Value::Undefined)))
+            Ok(Value::Object(vm.promise_then(
+                &p,
+                Value::Object(thunk),
+                Value::Undefined,
+            )))
         });
         // onRejected(reason): call onFinally(), and once Promise.resolve of its
         // result settles, re-throw the original reason.
@@ -130,9 +138,17 @@ fn install_promise(vm: &mut Vm) {
             let result = vm.call(f2.clone(), Value::Undefined, &[])?;
             let p = vm.promise_resolve(result);
             let thrower = vm.new_native("", 0, move |_vm, _t, _a| Err(reason.clone()));
-            Ok(Value::Object(vm.promise_then(&p, Value::Object(thrower), Value::Undefined)))
+            Ok(Value::Object(vm.promise_then(
+                &p,
+                Value::Object(thrower),
+                Value::Undefined,
+            )))
         });
-        Ok(Value::Object(vm.promise_then(&p, Value::Object(on_f), Value::Object(on_r))))
+        Ok(Value::Object(vm.promise_then(
+            &p,
+            Value::Object(on_f),
+            Value::Object(on_r),
+        )))
     });
 
     // Promise.resolve: returns the argument unchanged if it is already a native
@@ -187,9 +203,7 @@ fn install_promise(vm: &mut Vm) {
 
     vm.define_method(&ctor, "race", 1, |vm, this, args| {
         let (promise, resolve, reject) = new_promise_capability(vm, &this)?;
-        if let Err(e) =
-            perform_promise_race(vm, &this, &arg(args, 0), resolve, reject.clone())
-        {
+        if let Err(e) = perform_promise_race(vm, &this, &arg(args, 0), resolve, reject.clone()) {
             let _ = vm.call(reject, Value::Undefined, &[e]);
         }
         Ok(promise)
@@ -197,9 +211,7 @@ fn install_promise(vm: &mut Vm) {
 
     vm.define_method(&ctor, "any", 1, |vm, this, args| {
         let (promise, resolve, reject) = new_promise_capability(vm, &this)?;
-        if let Err(e) =
-            perform_promise_any(vm, &this, &arg(args, 0), resolve, reject.clone())
-        {
+        if let Err(e) = perform_promise_any(vm, &this, &arg(args, 0), resolve, reject.clone()) {
             let _ = vm.call(reject, Value::Undefined, &[e]);
         }
         Ok(promise)
@@ -370,8 +382,10 @@ fn perform_promise_all_settled(
                     let o = vm.new_object();
                     {
                         let mut b = o.borrow_mut();
-                        b.props
-                            .insert(PropertyKey::str("status"), Property::data(Value::str(status)));
+                        b.props.insert(
+                            PropertyKey::str("status"),
+                            Property::data(Value::str(status)),
+                        );
                         b.props.insert(PropertyKey::str(key), Property::data(v));
                     }
                     Value::Object(o)
@@ -394,8 +408,13 @@ fn perform_promise_all_settled(
                     }
                     Ok(Value::Undefined)
                 });
-                let (vc, rc, res, idx, g) =
-                    (values.clone(), remaining.clone(), resolve.clone(), index, already);
+                let (vc, rc, res, idx, g) = (
+                    values.clone(),
+                    remaining.clone(),
+                    resolve.clone(),
+                    index,
+                    already,
+                );
                 let on_r = vm.new_native("", 1, move |vm, _t, a| {
                     if take_guard(&g) {
                         return Ok(Value::Undefined);
@@ -472,8 +491,13 @@ fn perform_promise_any(
                     vm.call(res.clone(), Value::Undefined, &[arg(a, 0)])?;
                     Ok(Value::Undefined)
                 });
-                let (ec, rc, rej, idx, g) =
-                    (errors.clone(), remaining.clone(), reject.clone(), index, already);
+                let (ec, rc, rej, idx, g) = (
+                    errors.clone(),
+                    remaining.clone(),
+                    reject.clone(),
+                    index,
+                    already,
+                );
                 let on_r = vm.new_native("", 1, move |vm, _t, a| {
                     if take_guard(&g) {
                         return Ok(Value::Undefined);
@@ -521,13 +545,24 @@ fn make_aggregate_error(vm: &mut Vm, errors: Vec<Value>) -> Value {
     if let Value::Object(o) = &agg {
         let arr = vm.new_array(errors);
         let mut b = o.borrow_mut();
-        b.props.insert(PropertyKey::str("errors"), Property::data(Value::Object(arr)));
-        b.props.insert(PropertyKey::str("name"), Property::builtin(Value::str("AggregateError")));
+        b.props.insert(
+            PropertyKey::str("errors"),
+            Property::data(Value::Object(arr)),
+        );
+        b.props.insert(
+            PropertyKey::str("name"),
+            Property::builtin(Value::str("AggregateError")),
+        );
     }
     agg
 }
 
-fn settle_one(vm: &mut Vm, remaining: &Rc<RefCell<usize>>, values: &Rc<RefCell<Vec<Value>>>, result: &JsObject) {
+fn settle_one(
+    vm: &mut Vm,
+    remaining: &Rc<RefCell<usize>>,
+    values: &Rc<RefCell<Vec<Value>>>,
+    result: &JsObject,
+) {
     let done = {
         let mut r = remaining.borrow_mut();
         *r -= 1;

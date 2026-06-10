@@ -68,7 +68,10 @@ fn main() {
         let outcome = rt.drive(&mut handler).expect("record drive");
         assert!(matches!(outcome, DriveOutcome::Completed));
     }
-    assert_eq!(live_attempts, 3, "service hit exactly 3 times (2 fail, 1 ok)");
+    assert_eq!(
+        live_attempts, 3,
+        "service hit exactly 3 times (2 fail, 1 ok)"
+    );
     let recorded = result_line(rt.console());
     println!("  recorded path: {recorded}");
 
@@ -87,7 +90,10 @@ fn main() {
 
     assert_eq!(rt2.divergence(), None);
     let replayed = result_line(rt2.console());
-    assert_eq!(recorded, replayed, "the retry history is reproduced exactly");
+    assert_eq!(
+        recorded, replayed,
+        "the retry history is reproduced exactly"
+    );
     println!("  replayed path: {replayed}");
     println!("\nOK: 2 failures + 1 success reproduced from the journal, 0 live calls.");
 }

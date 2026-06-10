@@ -95,7 +95,10 @@ mod tests {
 
     #[test]
     fn sha256_accepts_dashed_and_uppercase_name() {
-        assert_eq!(hash("SHA-256", b"abc").unwrap(), hash("sha256", b"abc").unwrap());
+        assert_eq!(
+            hash("SHA-256", b"abc").unwrap(),
+            hash("sha256", b"abc").unwrap()
+        );
     }
 
     #[test]
@@ -127,5 +130,4 @@ mod tests {
         // Different nonce → different stream.
         assert_ne!(seeded_bytes("seed", 8, 40), a);
     }
-
 }

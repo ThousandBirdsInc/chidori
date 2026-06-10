@@ -657,7 +657,10 @@ mod tests {
     #[test]
     fn matches_nested_builtin_path() {
         let path = PathBuf::from("/ws/__node_builtins__/fs/promises.js");
-        assert_eq!(builtin_name_from_path(&path).as_deref(), Some("fs/promises"));
+        assert_eq!(
+            builtin_name_from_path(&path).as_deref(),
+            Some("fs/promises")
+        );
         assert!(source_for(&path).unwrap().contains("from \"node:fs\""));
     }
 
@@ -673,7 +676,9 @@ mod tests {
         let http = PathBuf::from("/ws/__node_builtins__/http.js");
         assert_eq!(builtin_name_from_path(&http).as_deref(), Some("http"));
         // The shim must perform requests via the policy-gated host op.
-        assert!(source_for(&http).unwrap().contains("globalThis.chidori.http"));
+        assert!(source_for(&http)
+            .unwrap()
+            .contains("globalThis.chidori.http"));
 
         let https = PathBuf::from("/ws/__node_builtins__/https.js");
         assert_eq!(builtin_name_from_path(&https).as_deref(), Some("https"));

@@ -235,7 +235,9 @@ fn require_object(vm: &mut Vm, this: &Value, method: &str) -> Result<(), Value> 
     if matches!(this, Value::Object(_)) {
         Ok(())
     } else {
-        Err(vm.throw_type(&format!("RegExp.prototype[{method}] called on a non-object")))
+        Err(vm.throw_type(&format!(
+            "RegExp.prototype[{method}] called on a non-object"
+        )))
     }
 }
 
@@ -277,16 +279,14 @@ fn encode_for_regexp_escape(c: char) -> String {
     const OTHER_PUNCTUATORS: &str = ",-=<>#&!%:;@~'`\"";
     let is_ws_or_lt = matches!(
         c,
-        '\u{20}'
-            | '\u{A0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200A}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202F}'
-            | '\u{205F}'
-            | '\u{3000}'
-            | '\u{FEFF}'
+        '\u{20}' | '\u{A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
     );
     if OTHER_PUNCTUATORS.contains(c) || is_ws_or_lt {
         let cp = c as u32;
@@ -372,7 +372,14 @@ pub fn regexp_exec_impl(vm: &mut Vm, re: &JsObject, input: &str) -> Result<Value
             }
             let names = regexp_group_names(&source, &flags);
             let has_indices = flags.contains('d');
-            Ok(build_match_array(vm, &chars, &mat, input, &names, has_indices))
+            Ok(build_match_array(
+                vm,
+                &chars,
+                &mat,
+                input,
+                &names,
+                has_indices,
+            ))
         }
     }
 }
@@ -392,7 +399,9 @@ fn regexp_exec_abstract(vm: &mut Vm, rx: &Value, s: &str) -> Result<Value, Value
     }
     let o = match rx {
         Value::Object(o)
-            if o.borrow().props.contains_key(&PropertyKey::str(REGEXP_MARK)) =>
+            if o.borrow()
+                .props
+                .contains_key(&PropertyKey::str(REGEXP_MARK)) =>
         {
             o.clone()
         }
@@ -433,7 +442,11 @@ pub fn sym_match_generic(vm: &mut Vm, rx: &Value, s: &str) -> Result<Value, Valu
             let li = vm.get_prop(rx, &PropertyKey::str("lastIndex"))?;
             let li = vm.to_length(&li)?;
             let next = advance_string_index(li, unicode);
-            vm.set_prop(rx, &PropertyKey::str("lastIndex"), Value::Number(next as f64))?;
+            vm.set_prop(
+                rx,
+                &PropertyKey::str("lastIndex"),
+                Value::Number(next as f64),
+            )?;
         }
     }
     if out.is_empty() {
@@ -462,11 +475,7 @@ pub fn sym_search_generic(vm: &mut Vm, rx: &Value, s: &str) -> Result<Value, Val
 }
 
 /// `SpeciesConstructor(O, defaultConstructor)` (spec 7.3.23).
-fn species_constructor(
-    vm: &mut Vm,
-    o: &Value,
-    default_ctor: &Value,
-) -> Result<Value, Value> {
+fn species_constructor(vm: &mut Vm, o: &Value, default_ctor: &Value) -> Result<Value, Value> {
     let c = vm.get_prop(o, &PropertyKey::str("constructor"))?;
     if c.is_undefined() {
         return Ok(default_ctor.clone());
@@ -490,15 +499,21 @@ fn species_constructor(
 /// via the species constructor, copy `lastIndex`, and return a lazy
 /// RegExpStringIterator over it.
 pub fn sym_match_all_generic(vm: &mut Vm, rx: &Value, s: &str) -> Result<Value, Value> {
-    let default_ctor =
-        vm.get_prop(&Value::Object(vm.realm.regexp_proto.clone()), &PropertyKey::str("constructor"))?;
+    let default_ctor = vm.get_prop(
+        &Value::Object(vm.realm.regexp_proto.clone()),
+        &PropertyKey::str("constructor"),
+    )?;
     let c = species_constructor(vm, rx, &default_ctor)?;
     let flags_v = vm.get_prop(rx, &PropertyKey::str("flags"))?;
     let flags = vm.to_js_string(&flags_v)?.as_str().to_string();
     let matcher = vm.construct(&c, &[rx.clone(), Value::str(&flags)], &c)?;
     let li_v = vm.get_prop(rx, &PropertyKey::str("lastIndex"))?;
     let li = vm.to_length(&li_v)?;
-    vm.set_prop(&matcher, &PropertyKey::str("lastIndex"), Value::Number(li as f64))?;
+    vm.set_prop(
+        &matcher,
+        &PropertyKey::str("lastIndex"),
+        Value::Number(li as f64),
+    )?;
     let global = flags.contains('g');
     let unicode = flags.contains('u') || flags.contains('v');
     Ok(make_regexp_string_iterator(vm, matcher, s, global, unicode))
@@ -518,8 +533,13 @@ fn make_regexp_string_iterator(
     let proto = vm.realm.iterator_proto.clone();
     let iter = vm.new_object_proto(Some(proto));
     // (matcher, S, global, unicode, done)
-    let state: Rc<RefCell<(Value, String, bool, bool, bool)>> =
-        Rc::new(RefCell::new((matcher, s.to_string(), global, unicode, false)));
+    let state: Rc<RefCell<(Value, String, bool, bool, bool)>> = Rc::new(RefCell::new((
+        matcher,
+        s.to_string(),
+        global,
+        unicode,
+        false,
+    )));
     let next = vm.new_native("next", 0, move |vm, _this, _a| {
         let (matcher, s, global, unicode, done) = {
             let st = state.borrow();
@@ -543,7 +563,11 @@ fn make_regexp_string_iterator(
             let li = vm.get_prop(&matcher, &PropertyKey::str("lastIndex"))?;
             let li = vm.to_length(&li)?;
             let next_i = advance_string_index(li, unicode);
-            vm.set_prop(&matcher, &PropertyKey::str("lastIndex"), Value::Number(next_i as f64))?;
+            vm.set_prop(
+                &matcher,
+                &PropertyKey::str("lastIndex"),
+                Value::Number(next_i as f64),
+            )?;
         }
         Ok(vm.make_iter_result(result, false))
     });
@@ -557,12 +581,7 @@ fn make_regexp_string_iterator(
 /// Generic `RegExp.prototype[@@replace]` (spec 22.2.6.11): honors a user
 /// `exec`, the `global`/`unicode` flags, and reads each result's
 /// `index`/`length`/captures/`groups` via property access.
-pub fn sym_replace_generic(
-    vm: &mut Vm,
-    rx: &Value,
-    s: &str,
-    repl: &Value,
-) -> Result<Value, Value> {
+pub fn sym_replace_generic(vm: &mut Vm, rx: &Value, s: &str, repl: &Value) -> Result<Value, Value> {
     let s_chars: Vec<char> = s.chars().collect();
     let length_s = s_chars.len();
     let functional = vm.is_callable(repl);
@@ -598,7 +617,11 @@ pub fn sym_replace_generic(
             let li = vm.get_prop(rx, &PropertyKey::str("lastIndex"))?;
             let li = vm.to_length(&li)?;
             let next = advance_string_index(li, unicode);
-            vm.set_prop(rx, &PropertyKey::str("lastIndex"), Value::Number(next as f64))?;
+            vm.set_prop(
+                rx,
+                &PropertyKey::str("lastIndex"),
+                Value::Number(next as f64),
+            )?;
         }
     }
     let mut accumulated = String::new();
@@ -647,7 +670,9 @@ pub fn sym_replace_generic(
             } else {
                 Value::Object(vm.to_object(&named)?)
             };
-            get_substitution(vm, &matched, &s_chars, position, &captures, &named_obj, &repl_str)?
+            get_substitution(
+                vm, &matched, &s_chars, position, &captures, &named_obj, &repl_str,
+            )?
         };
         if position >= next_pos {
             accumulated.extend(s_chars[next_pos..position].iter());
@@ -786,8 +811,7 @@ pub fn build_match_array(
                     Some((s, e)) => Value::str(chars[s..e].iter().collect::<String>()),
                     None => Value::Undefined,
                 };
-                gb.props
-                    .insert(PropertyKey::str(name), Property::data(val));
+                gb.props.insert(PropertyKey::str(name), Property::data(val));
             }
         }
         Value::Object(obj)
@@ -855,14 +879,8 @@ pub fn build_match_array(
 // Symbol protocol implementations (operate on a branded RegExp `re`)
 // =========================================================================
 
-
 /// `RegExp.prototype[@@split]`: split honoring capture groups and `limit`.
-pub fn sym_split(
-    vm: &mut Vm,
-    re: &JsObject,
-    s: &str,
-    limit_arg: &Value,
-) -> Result<Value, Value> {
+pub fn sym_split(vm: &mut Vm, re: &JsObject, s: &str, limit_arg: &Value) -> Result<Value, Value> {
     let limit = if limit_arg.is_undefined() {
         u32::MAX as usize
     } else {

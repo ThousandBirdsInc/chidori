@@ -145,7 +145,10 @@ enum Node {
     /// `.` — any char (line terminators excluded unless dotAll).
     AnyChar,
     /// A character class.
-    Class { negated: bool, items: Vec<ClassItem> },
+    Class {
+        negated: bool,
+        items: Vec<ClassItem>,
+    },
     /// `^`
     Start,
     /// `$`
@@ -267,9 +270,7 @@ impl<'a> Parser<'a> {
                 .map(|(_, idx)| *idx);
             match target {
                 Some(idx) => self.named_backref_targets[*slot] = idx,
-                None => {
-                    return Err(format!("Invalid named capture referenced: '{name}'"))
-                }
+                None => return Err(format!("Invalid named capture referenced: '{name}'")),
             }
         }
         // Rewrite placeholder backrefs (encoded as Backref(usize::MAX - slot))
@@ -412,7 +413,9 @@ impl<'a> Parser<'a> {
         let mut n: usize = 0;
         while let Some(c) = self.peek() {
             if c.is_ascii_digit() {
-                n = n.saturating_mul(10).saturating_add((c as u8 - b'0') as usize);
+                n = n
+                    .saturating_mul(10)
+                    .saturating_add((c as u8 - b'0') as usize);
                 self.pos += 1;
             } else {
                 break;
@@ -898,7 +901,8 @@ impl<'a> Parser<'a> {
                 // `\0` is NUL unless followed by a digit, in which case it is an
                 // octal escape (Annex B). In unicode mode octal escapes are
                 // forbidden: `\0` followed by a digit is a SyntaxError.
-                if self.unicode && matches!(self.src.get(self.pos + 1), Some(d) if d.is_ascii_digit())
+                if self.unicode
+                    && matches!(self.src.get(self.pos + 1), Some(d) if d.is_ascii_digit())
                 {
                     return Err("Invalid octal escape in unicode mode".to_string());
                 }
@@ -929,7 +933,9 @@ impl<'a> Parser<'a> {
                 // only SyntaxCharacters (and `/`) may be escaped this way; any
                 // other identity escape is a SyntaxError.
                 if self.unicode && !is_syntax_char(other) && other != '/' {
-                    return Err(format!("Invalid identity escape '\\{other}' in unicode mode"));
+                    return Err(format!(
+                        "Invalid identity escape '\\{other}' in unicode mode"
+                    ));
                 }
                 self.pos += 1;
                 Node::Char(other)
@@ -1051,9 +1057,7 @@ fn resolve_named_backrefs(node: &mut Node, targets: &[usize]) {
                 *i = targets.get(slot).copied().unwrap_or(0);
             }
         }
-        Node::Group { node, .. } | Node::Look { node, .. } => {
-            resolve_named_backrefs(node, targets)
-        }
+        Node::Group { node, .. } | Node::Look { node, .. } => resolve_named_backrefs(node, targets),
         Node::Repeat { node, .. } => resolve_named_backrefs(node, targets),
         Node::Alt(branches) | Node::Concat(branches) => {
             for b in branches {
@@ -1085,9 +1089,9 @@ fn has_out_of_range_backref(node: &Node, group_count: usize) -> bool {
         Node::Group { node, .. } | Node::Look { node, .. } | Node::Repeat { node, .. } => {
             has_out_of_range_backref(node, group_count)
         }
-        Node::Alt(items) | Node::Concat(items) => {
-            items.iter().any(|n| has_out_of_range_backref(n, group_count))
-        }
+        Node::Alt(items) | Node::Concat(items) => items
+            .iter()
+            .any(|n| has_out_of_range_backref(n, group_count)),
         _ => false,
     }
 }
@@ -1198,13 +1202,7 @@ impl<'a> MatchCtx<'a> {
         false
     }
 
-    fn match_node(
-        &self,
-        node: &Node,
-        pos: usize,
-        caps: &mut Caps,
-        k: &Cont<'_>,
-    ) -> Option<usize> {
+    fn match_node(&self, node: &Node, pos: usize, caps: &mut Caps, k: &Cont<'_>) -> Option<usize> {
         let s = self.steps.get();
         if s > REGEX_STEP_LIMIT {
             return None;
@@ -1647,9 +1645,7 @@ fn resolve_unicode_property(name: &str) -> Result<std::rc::Rc<Vec<(char, char)>>
                 // gc=Cs / Any tables never reach as match targets (JS strings
                 // are UTF-16, but the matcher iterates scalar values). Clamp
                 // defensively by skipping any unrepresentable endpoint pair.
-                .filter_map(|&(lo, hi)| {
-                    Some((char::from_u32(lo)?, char::from_u32(hi)?))
-                })
+                .filter_map(|&(lo, hi)| Some((char::from_u32(lo)?, char::from_u32(hi)?)))
                 .collect(),
         )
     });

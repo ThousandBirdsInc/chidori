@@ -30,7 +30,10 @@ pub fn install(vm: &mut Vm) {
                 Ok(Value::str(""))
             } else {
                 if let Value::Symbol(s) = &args[0] {
-                    return Ok(Value::str(format!("Symbol({})", s.description().unwrap_or(""))));
+                    return Ok(Value::str(format!(
+                        "Symbol({})",
+                        s.description().unwrap_or("")
+                    )));
                 }
                 Ok(Value::String(vm.to_js_string(&args[0])?))
             }
@@ -60,7 +63,10 @@ pub fn install(vm: &mut Vm) {
             let num = vm.to_number(a)?;
             // CodePoint must be an integer in [0, 0x10FFFF].
             if num.is_nan() || num != num.trunc() || num < 0.0 || num > 0x10_FFFF as f64 {
-                return Err(vm.throw_range(&format!("Invalid code point {}", crate::vm::number_to_string(num))));
+                return Err(vm.throw_range(&format!(
+                    "Invalid code point {}",
+                    crate::vm::number_to_string(num)
+                )));
             }
             s.push(char::from_u32(num as u32).unwrap_or('\u{fffd}'));
         }
@@ -186,13 +192,11 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
     vm.define_method(proto, "charAt", 1, |vm, this, args| {
         let s = chars(&str_this(vm, &this)?);
         let i = vm.to_int32(&arg(args, 0))?;
-        Ok(Value::str(
-            if i >= 0 && (i as usize) < s.len() {
-                s[i as usize].to_string()
-            } else {
-                String::new()
-            },
-        ))
+        Ok(Value::str(if i >= 0 && (i as usize) < s.len() {
+            s[i as usize].to_string()
+        } else {
+            String::new()
+        }))
     });
     vm.define_method(proto, "charCodeAt", 1, |vm, this, args| {
         let s = chars(&str_this(vm, &this)?);
@@ -318,7 +322,9 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
         if start > end {
             std::mem::swap(&mut start, &mut end);
         }
-        Ok(Value::str(s[start as usize..end as usize].iter().collect::<String>()))
+        Ok(Value::str(
+            s[start as usize..end as usize].iter().collect::<String>(),
+        ))
     });
     vm.define_method(proto, "substr", 2, |vm, this, args| {
         let s = chars(&str_this(vm, &this)?);
@@ -356,13 +362,21 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
         Ok(Value::str(str_this(vm, &this)?.to_lowercase()))
     });
     vm.define_method(proto, "trim", 0, |vm, this, _a| {
-        Ok(Value::str(str_this(vm, &this)?.trim_matches(is_js_ws).to_string()))
+        Ok(Value::str(
+            str_this(vm, &this)?.trim_matches(is_js_ws).to_string(),
+        ))
     });
     vm.define_method(proto, "trimStart", 0, |vm, this, _a| {
-        Ok(Value::str(str_this(vm, &this)?.trim_start_matches(is_js_ws).to_string()))
+        Ok(Value::str(
+            str_this(vm, &this)?
+                .trim_start_matches(is_js_ws)
+                .to_string(),
+        ))
     });
     vm.define_method(proto, "trimEnd", 0, |vm, this, _a| {
-        Ok(Value::str(str_this(vm, &this)?.trim_end_matches(is_js_ws).to_string()))
+        Ok(Value::str(
+            str_this(vm, &this)?.trim_end_matches(is_js_ws).to_string(),
+        ))
     });
     vm.define_method(proto, "repeat", 1, |vm, this, args| {
         let s = str_this(vm, &this)?;
@@ -513,9 +527,7 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
                 }
                 let flags = vm.to_js_string(&flags_v)?;
                 if !flags.as_str().contains('g') {
-                    return Err(vm.throw_type(
-                        "replaceAll must be called with a global RegExp",
-                    ));
+                    return Err(vm.throw_type("replaceAll must be called with a global RegExp"));
                 }
             }
             let key = PropertyKey::Sym(vm.realm.symbol_replace.clone());
@@ -618,9 +630,15 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
         ))
     });
     let it = vm
-        .get_prop(&Value::Object(proto.clone()), &PropertyKey::str("[Symbol.iterator]"))
+        .get_prop(
+            &Value::Object(proto.clone()),
+            &PropertyKey::str("[Symbol.iterator]"),
+        )
         .unwrap();
-    proto.borrow_mut().props.shift_remove(&PropertyKey::str("[Symbol.iterator]"));
+    proto
+        .borrow_mut()
+        .props
+        .shift_remove(&PropertyKey::str("[Symbol.iterator]"));
     vm.define_value_sym(proto, sym, it);
 }
 
@@ -646,7 +664,9 @@ fn pad(vm: &mut Vm, this: &Value, args: &[Value], start: bool) -> Result<Value, 
     }
     let pad_len = target - s.len();
     let fill_chars: Vec<char> = filler.chars().collect();
-    let pad: String = (0..pad_len).map(|i| fill_chars[i % fill_chars.len()]).collect();
+    let pad: String = (0..pad_len)
+        .map(|i| fill_chars[i % fill_chars.len()])
+        .collect();
     let base: String = s.into_iter().collect();
     Ok(Value::str(if start {
         format!("{pad}{base}")

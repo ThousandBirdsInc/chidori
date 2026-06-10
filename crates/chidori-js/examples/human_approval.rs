@@ -31,12 +31,7 @@ const AGENT: &str = r#"
     main();
 "#;
 
-const EFFECTS: &[&str] = &[
-    "computeRefund",
-    "requestApproval",
-    "issueRefund",
-    "report",
-];
+const EFFECTS: &[&str] = &["computeRefund", "requestApproval", "issueRefund", "report"];
 
 fn main() {
     // ---- Process #1: run until the approval is needed, then SUSPEND. ----

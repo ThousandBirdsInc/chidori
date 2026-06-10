@@ -40,9 +40,11 @@ impl Vm {
 
     fn value_to_json_inner(&mut self, v: &Value, seen: &mut Vec<usize>) -> Json {
         match v {
-            Value::Undefined | Value::Uninitialized | Value::Hole | Value::Symbol(_) | Value::BigInt(_) => {
-                Json::Null
-            }
+            Value::Undefined
+            | Value::Uninitialized
+            | Value::Hole
+            | Value::Symbol(_)
+            | Value::BigInt(_) => Json::Null,
             Value::Null => Json::Null,
             Value::Bool(b) => Json::Bool(*b),
             Value::Number(n) => {
@@ -90,7 +92,10 @@ impl Vm {
                             .get_prop(v, &PropertyKey::Str(k.clone()))
                             .unwrap_or(Value::Undefined);
                         if !matches!(val, Value::Undefined) {
-                            map.insert(k.as_str().to_string(), self.value_to_json_inner(&val, seen));
+                            map.insert(
+                                k.as_str().to_string(),
+                                self.value_to_json_inner(&val, seen),
+                            );
                         }
                     }
                     Json::Object(map)

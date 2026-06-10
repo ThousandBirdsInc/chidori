@@ -311,9 +311,7 @@ impl NativeAgentRunner {
             results: vec![None],
             pending_index: 0,
         });
-        if batch.pending_index >= batch.calls.len()
-            || batch.results.len() != batch.calls.len()
-        {
+        if batch.pending_index >= batch.calls.len() || batch.results.len() != batch.calls.len() {
             anyhow::bail!("resumed batch has inconsistent pending_index/results state");
         }
         batch.results[batch.pending_index] = Some(tool_result);
@@ -557,9 +555,12 @@ impl NativeAgentRunner {
 
         let mut content = Vec::with_capacity(batch.calls.len());
         for (call, result_opt) in batch.calls.iter().zip(batch.results.iter()) {
-            let result = result_opt
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("batch completed without a result for tool_use_id {}", call.id))?;
+            let result = result_opt.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "batch completed without a result for tool_use_id {}",
+                    call.id
+                )
+            })?;
             content.push(ContentBlock::ToolResult {
                 tool_use_id: call.id.clone(),
                 content: result.to_string(),
@@ -1029,7 +1030,12 @@ mod tests {
                 .messages
                 .iter()
                 .rev()
-                .find(|m| m.role == "user" && m.content.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. })))
+                .find(|m| {
+                    m.role == "user"
+                        && m.content
+                            .iter()
+                            .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                })
                 .expect("resumed request must contain a user message with tool_result blocks");
             let result_ids: std::collections::HashSet<&str> = last_user_with_results
                 .content
@@ -1113,7 +1119,10 @@ mod tests {
             .as_ref()
             .expect("must pause on the edit call");
         assert_eq!(pending.call.id, "tu_edit");
-        let batch = pending.batch.as_ref().expect("pause must carry batch state");
+        let batch = pending
+            .batch
+            .as_ref()
+            .expect("pause must carry batch state");
         assert_eq!(batch.calls.len(), 3);
         assert_eq!(batch.pending_index, 1);
         // The first read already ran before the pause.
@@ -1124,13 +1133,10 @@ mod tests {
         // At pause time we must NOT have flushed a half-batch user message —
         // otherwise the resumed prompt would carry an orphaned tool_use.
         assert!(
-            !paused
-                .messages
-                .iter()
-                .any(|m| m.role == "user"
-                    && m.content
-                        .iter()
-                        .any(|b| matches!(b, ContentBlock::ToolResult { .. }))),
+            !paused.messages.iter().any(|m| m.role == "user"
+                && m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { .. }))),
             "no tool_result user message should be pushed mid-batch"
         );
 

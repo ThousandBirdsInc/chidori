@@ -16,7 +16,9 @@ pub fn install(vm: &mut Vm) {
     vm.install_species(&ctor);
 
     vm.define_method(&ctor, "isArray", 1, |_vm, _t, args| {
-        Ok(Value::Bool(matches!(arg(args, 0), Value::Object(o) if o.borrow().is_array())))
+        Ok(Value::Bool(
+            matches!(arg(args, 0), Value::Object(o) if o.borrow().is_array()),
+        ))
     });
     vm.define_method(&ctor, "of", 0, |vm, t, args| {
         // C = this; A = IsConstructor(C) ? Construct(C, «len») : ArrayCreate(len).
@@ -68,7 +70,11 @@ pub fn install(vm: &mut Vm) {
                     None => break,
                 };
                 let mapped = if has_map {
-                    match vm.call(map_fn.clone(), this_arg.clone(), &[val, Value::Number(k as f64)]) {
+                    match vm.call(
+                        map_fn.clone(),
+                        this_arg.clone(),
+                        &[val, Value::Number(k as f64)],
+                    ) {
                         Ok(v) => v,
                         Err(e) => {
                             let _ = vm.iterator_close(&it);
@@ -78,9 +84,12 @@ pub fn install(vm: &mut Vm) {
                 } else {
                     val
                 };
-                if let Err(e) =
-                    create_data_property_or_throw(vm, &ao, &PropertyKey::from_index(k as u32), mapped)
-                {
+                if let Err(e) = create_data_property_or_throw(
+                    vm,
+                    &ao,
+                    &PropertyKey::from_index(k as u32),
+                    mapped,
+                ) {
                     let _ = vm.iterator_close(&it);
                     return Err(e);
                 }
@@ -105,7 +114,11 @@ pub fn install(vm: &mut Vm) {
             for k in 0..len {
                 let kv = vm.get_prop(&ov, &PropertyKey::from_index(k as u32))?;
                 let mapped = if has_map {
-                    vm.call(map_fn.clone(), this_arg.clone(), &[kv, Value::Number(k as f64)])?
+                    vm.call(
+                        map_fn.clone(),
+                        this_arg.clone(),
+                        &[kv, Value::Number(k as f64)],
+                    )?
                 } else {
                     kv
                 };
@@ -258,7 +271,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             }
         }
         delete_or_throw(vm, &ov, &elem_key((len - 1) as f64))?;
-        vm.set_prop_strict(&ov, &PropertyKey::str("length"), Value::Number((len - 1) as f64))?;
+        vm.set_prop_strict(
+            &ov,
+            &PropertyKey::str("length"),
+            Value::Number((len - 1) as f64),
+        )?;
         Ok(first)
     });
     vm.define_method(proto, "unshift", 1, |vm, this, args| {
@@ -405,7 +422,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         for (i, v) in inserts.into_iter().enumerate() {
             vm.set_prop_strict(&ov, &PropertyKey::from_index((s + i) as u32), v)?;
         }
-        vm.set_prop_strict(&ov, &PropertyKey::str("length"), Value::Number((ulen - dc + ins) as f64))?;
+        vm.set_prop_strict(
+            &ov,
+            &PropertyKey::str("length"),
+            Value::Number((ulen - dc + ins) as f64),
+        )?;
         Ok(a)
     });
     vm.define_method(proto, "concat", 1, |vm, this, args| {
@@ -575,7 +596,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         let items = elements(vm, &this)?;
         for v in items.iter().skip(start) {
             // `includes` reads holes as undefined (it does not skip them).
-            let probe = if matches!(v, Value::Hole) { &Value::Undefined } else { v };
+            let probe = if matches!(v, Value::Hole) {
+                &Value::Undefined
+            } else {
+                v
+            };
             if same_value_zero(probe, &target) {
                 return Ok(Value::Bool(true));
             }
@@ -588,7 +613,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             let key = PropertyKey::from_index(k as u32);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
-                vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(k as f64), ov.clone()])?;
+                vm.call(
+                    cb.clone(),
+                    this_arg.clone(),
+                    &[v, Value::Number(k as f64), ov.clone()],
+                )?;
             }
         }
         Ok(Value::Undefined)
@@ -602,8 +631,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             let key = PropertyKey::from_index(k as u32);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
-                let mapped =
-                    vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(k as f64), ov.clone()])?;
+                let mapped = vm.call(
+                    cb.clone(),
+                    this_arg.clone(),
+                    &[v, Value::Number(k as f64), ov.clone()],
+                )?;
                 vm.set_prop_strict(&a, &key, mapped)?;
             }
         }
@@ -635,7 +667,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
         for k in 0..len {
             let v = vm.get_prop(&ov, &PropertyKey::from_index(k as u32))?;
-            let r = vm.call(cb.clone(), this_arg.clone(), &[v.clone(), Value::Number(k as f64), ov.clone()])?;
+            let r = vm.call(
+                cb.clone(),
+                this_arg.clone(),
+                &[v.clone(), Value::Number(k as f64), ov.clone()],
+            )?;
             if vm.to_boolean(&r) {
                 return Ok(v);
             }
@@ -646,7 +682,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
         for k in 0..len {
             let v = vm.get_prop(&ov, &PropertyKey::from_index(k as u32))?;
-            let r = vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(k as f64), ov.clone()])?;
+            let r = vm.call(
+                cb.clone(),
+                this_arg.clone(),
+                &[v, Value::Number(k as f64), ov.clone()],
+            )?;
             if vm.to_boolean(&r) {
                 return Ok(Value::Number(k as f64));
             }
@@ -657,7 +697,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
         for k in (0..len).rev() {
             let v = vm.get_prop(&ov, &PropertyKey::from_index(k as u32))?;
-            let r = vm.call(cb.clone(), this_arg.clone(), &[v.clone(), Value::Number(k as f64), ov.clone()])?;
+            let r = vm.call(
+                cb.clone(),
+                this_arg.clone(),
+                &[v.clone(), Value::Number(k as f64), ov.clone()],
+            )?;
             if vm.to_boolean(&r) {
                 return Ok(v);
             }
@@ -668,7 +712,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
         for k in (0..len).rev() {
             let v = vm.get_prop(&ov, &PropertyKey::from_index(k as u32))?;
-            let r = vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(k as f64), ov.clone()])?;
+            let r = vm.call(
+                cb.clone(),
+                this_arg.clone(),
+                &[v, Value::Number(k as f64), ov.clone()],
+            )?;
             if vm.to_boolean(&r) {
                 return Ok(Value::Number(k as f64));
             }
@@ -681,7 +729,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             let key = PropertyKey::from_index(k as u32);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
-                let r = vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(k as f64), ov.clone()])?;
+                let r = vm.call(
+                    cb.clone(),
+                    this_arg.clone(),
+                    &[v, Value::Number(k as f64), ov.clone()],
+                )?;
                 if vm.to_boolean(&r) {
                     return Ok(Value::Bool(true));
                 }
@@ -695,7 +747,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             let key = PropertyKey::from_index(k as u32);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
-                let r = vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(k as f64), ov.clone()])?;
+                let r = vm.call(
+                    cb.clone(),
+                    this_arg.clone(),
+                    &[v, Value::Number(k as f64), ov.clone()],
+                )?;
                 if !vm.to_boolean(&r) {
                     return Ok(Value::Bool(false));
                 }
@@ -728,7 +784,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             let key = PropertyKey::from_index(k as u32);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
-                acc = vm.call(cb.clone(), Value::Undefined, &[acc, v, Value::Number(k as f64), ov.clone()])?;
+                acc = vm.call(
+                    cb.clone(),
+                    Value::Undefined,
+                    &[acc, v, Value::Number(k as f64), ov.clone()],
+                )?;
             }
             k += 1;
         }
@@ -758,7 +818,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             let key = PropertyKey::from_index(k as u32);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
-                acc = vm.call(cb.clone(), Value::Undefined, &[acc, v, Value::Number(k as f64), ov.clone()])?;
+                acc = vm.call(
+                    cb.clone(),
+                    Value::Undefined,
+                    &[acc, v, Value::Number(k as f64), ov.clone()],
+                )?;
             }
             k -= 1;
         }
@@ -916,7 +980,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             if matches!(v, Value::Hole) {
                 continue;
             }
-            let r = vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(i as f64), this.clone()])?;
+            let r = vm.call(
+                cb.clone(),
+                this_arg.clone(),
+                &[v, Value::Number(i as f64), this.clone()],
+            )?;
             // Spread a one-level array result; everything else is pushed as-is.
             if let Value::Object(ro) = &r {
                 if ro.borrow().is_array() {
@@ -953,8 +1021,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         }
         let item_count = items.len();
         // Undefineds sort to the end without the comparator ever seeing them.
-        let mut defined: Vec<Value> =
-            items.iter().filter(|v| !v.is_undefined()).cloned().collect();
+        let mut defined: Vec<Value> = items
+            .iter()
+            .filter(|v| !v.is_undefined())
+            .cloned()
+            .collect();
         let undef_count = item_count - defined.len();
         merge_sort(vm, &mut defined, &cmp, has_cmp)?;
         let mut j = 0usize;
@@ -980,7 +1051,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         }
         let has_cmp = vm.is_callable(&cmp);
         let items = elements(vm, &this)?;
-        let mut defined: Vec<Value> = items.iter().filter(|v| !v.is_undefined()).cloned().collect();
+        let mut defined: Vec<Value> = items
+            .iter()
+            .filter(|v| !v.is_undefined())
+            .cloned()
+            .collect();
         let undef_count = items.len() - defined.len();
         merge_sort(vm, &mut defined, &cmp, has_cmp)?;
         defined.extend(std::iter::repeat(Value::Undefined).take(undef_count));
@@ -1029,18 +1104,35 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     });
     vm.define_method(proto, "keys", 0, |vm, this, _a| {
         let o = dense(vm, &this)?;
-        Ok(vm.make_iterator(&vm.realm.array_iterator_proto.clone(), Some(o), None, IterKind::ArrayKeys))
+        Ok(vm.make_iterator(
+            &vm.realm.array_iterator_proto.clone(),
+            Some(o),
+            None,
+            IterKind::ArrayKeys,
+        ))
     });
     vm.define_method(proto, "values", 0, |vm, this, _a| {
         let o = dense(vm, &this)?;
-        Ok(vm.make_iterator(&vm.realm.array_iterator_proto.clone(), Some(o), None, IterKind::ArrayValues))
+        Ok(vm.make_iterator(
+            &vm.realm.array_iterator_proto.clone(),
+            Some(o),
+            None,
+            IterKind::ArrayValues,
+        ))
     });
     vm.define_method(proto, "entries", 0, |vm, this, _a| {
         let o = dense(vm, &this)?;
-        Ok(vm.make_iterator(&vm.realm.array_iterator_proto.clone(), Some(o), None, IterKind::ArrayEntries))
+        Ok(vm.make_iterator(
+            &vm.realm.array_iterator_proto.clone(),
+            Some(o),
+            None,
+            IterKind::ArrayEntries,
+        ))
     });
     // [Symbol.iterator] = values
-    let values = vm.get_prop(&Value::Object(proto.clone()), &PropertyKey::str("values")).unwrap();
+    let values = vm
+        .get_prop(&Value::Object(proto.clone()), &PropertyKey::str("values"))
+        .unwrap();
     let sym = vm.realm.symbol_iterator.clone();
     vm.define_value_sym(proto, sym, values);
 }
@@ -1065,7 +1157,12 @@ fn flatten(vm: &mut Vm, items: Vec<Value>, depth: f64, out: &mut Vec<Value>) {
     }
 }
 
-fn merge_sort(vm: &mut Vm, items: &mut Vec<Value>, cmp: &Value, has_cmp: bool) -> Result<(), Value> {
+fn merge_sort(
+    vm: &mut Vm,
+    items: &mut Vec<Value>,
+    cmp: &Value,
+    has_cmp: bool,
+) -> Result<(), Value> {
     let n = items.len();
     if n <= 1 {
         return Ok(());
@@ -1245,7 +1342,10 @@ fn elements_with_holes(vm: &mut Vm, this: &Value) -> Result<Vec<Value>, Value> {
     }
     let mut out = Vec::with_capacity(len.min(1 << 16));
     for i in 0..len {
-        out.push(vm.get_prop(&Value::Object(o.clone()), &PropertyKey::from_index(i as u32))?);
+        out.push(vm.get_prop(
+            &Value::Object(o.clone()),
+            &PropertyKey::from_index(i as u32),
+        )?);
     }
     Ok(out)
 }

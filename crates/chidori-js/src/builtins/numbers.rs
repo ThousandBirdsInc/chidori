@@ -78,7 +78,11 @@ fn install_number(vm: &mut Vm) {
     vm.install_ctor("Number", &ctor, &proto);
 
     vm.define_constant(&ctor, "MAX_SAFE_INTEGER", Value::Number(9007199254740991.0));
-    vm.define_constant(&ctor, "MIN_SAFE_INTEGER", Value::Number(-9007199254740991.0));
+    vm.define_constant(
+        &ctor,
+        "MIN_SAFE_INTEGER",
+        Value::Number(-9007199254740991.0),
+    );
     vm.define_constant(&ctor, "MAX_VALUE", Value::Number(f64::MAX));
     vm.define_constant(&ctor, "MIN_VALUE", Value::Number(5e-324));
     vm.define_constant(&ctor, "EPSILON", Value::Number(f64::EPSILON));
@@ -87,17 +91,23 @@ fn install_number(vm: &mut Vm) {
     vm.define_constant(&ctor, "NaN", Value::Number(f64::NAN));
 
     vm.define_method(&ctor, "isInteger", 1, |_vm, _t, args| {
-        Ok(Value::Bool(matches!(arg(args, 0), Value::Number(n) if n.is_finite() && n.fract() == 0.0)))
+        Ok(Value::Bool(
+            matches!(arg(args, 0), Value::Number(n) if n.is_finite() && n.fract() == 0.0),
+        ))
     });
     vm.define_method(&ctor, "isSafeInteger", 1, |_vm, _t, args| {
         Ok(Value::Bool(matches!(arg(args, 0), Value::Number(n)
             if n.is_finite() && n.fract() == 0.0 && n.abs() <= 9007199254740991.0)))
     });
     vm.define_method(&ctor, "isFinite", 1, |_vm, _t, args| {
-        Ok(Value::Bool(matches!(arg(args, 0), Value::Number(n) if n.is_finite())))
+        Ok(Value::Bool(
+            matches!(arg(args, 0), Value::Number(n) if n.is_finite()),
+        ))
     });
     vm.define_method(&ctor, "isNaN", 1, |_vm, _t, args| {
-        Ok(Value::Bool(matches!(arg(args, 0), Value::Number(n) if n.is_nan())))
+        Ok(Value::Bool(
+            matches!(arg(args, 0), Value::Number(n) if n.is_nan()),
+        ))
     });
     vm.define_method(&ctor, "parseFloat", 1, |vm, _t, args| {
         let s = vm.to_js_string(&arg(args, 0))?;
@@ -116,7 +126,9 @@ fn install_number(vm: &mut Vm) {
         Ok(Value::Number(super::parse_int(s.as_str(), radix)))
     });
 
-    vm.define_method(&proto, "valueOf", 0, |vm, this, _a| Ok(Value::Number(num_this(vm, &this)?)));
+    vm.define_method(&proto, "valueOf", 0, |vm, this, _a| {
+        Ok(Value::Number(num_this(vm, &this)?))
+    });
     vm.define_method(&proto, "toString", 1, |vm, this, args| {
         let n = num_this(vm, &this)?;
         let r = arg(args, 0);
@@ -156,7 +168,6 @@ fn install_number(vm: &mut Vm) {
     });
 }
 
-
 // ---- additional Number.prototype methods (installed below) ----
 
 fn install_number_extra(vm: &mut Vm) {
@@ -190,7 +201,10 @@ fn install_number_extra(vm: &mut Vm) {
         if !f_undef && !(0.0..=100.0).contains(&f) {
             return Err(vm.throw_range("toExponential() argument must be between 0 and 100"));
         }
-        Ok(Value::str(to_exponential_string(n, if f_undef { None } else { Some(f as usize) })))
+        Ok(Value::str(to_exponential_string(
+            n,
+            if f_undef { None } else { Some(f as usize) },
+        )))
     });
 
     // Number.prototype.toPrecision(precision?) — corrected significant-digit
@@ -311,7 +325,10 @@ fn round_decimal(x: f64, frac: usize) -> String {
     }
     // A carry may have grown the integer portion by one digit.
     let new_int_len = digits.len() - frac;
-    let int_digits: String = digits[..new_int_len].iter().map(|d| (d + b'0') as char).collect();
+    let int_digits: String = digits[..new_int_len]
+        .iter()
+        .map(|d| (d + b'0') as char)
+        .collect();
     let int_digits = if int_digits.is_empty() {
         "0".to_string()
     } else {
@@ -320,8 +337,10 @@ fn round_decimal(x: f64, frac: usize) -> String {
     if frac == 0 {
         int_digits
     } else {
-        let frac_digits: String =
-            digits[new_int_len..].iter().map(|d| (d + b'0') as char).collect();
+        let frac_digits: String = digits[new_int_len..]
+            .iter()
+            .map(|d| (d + b'0') as char)
+            .collect();
         format!("{int_digits}.{frac_digits}")
     }
 }
@@ -468,7 +487,11 @@ fn install_math(vm: &mut Vm) {
     vm.define_constant(&math, "LOG2E", Value::Number(std::f64::consts::LOG2_E));
     vm.define_constant(&math, "LOG10E", Value::Number(std::f64::consts::LOG10_E));
     vm.define_constant(&math, "SQRT2", Value::Number(std::f64::consts::SQRT_2));
-    vm.define_constant(&math, "SQRT1_2", Value::Number(std::f64::consts::FRAC_1_SQRT_2));
+    vm.define_constant(
+        &math,
+        "SQRT1_2",
+        Value::Number(std::f64::consts::FRAC_1_SQRT_2),
+    );
 
     macro_rules! unary {
         ($name:expr, $f:expr) => {
@@ -515,7 +538,6 @@ fn install_math(vm: &mut Vm) {
         let u = crate::vm::to_uint32(n);
         u.leading_zeros() as f64
     });
-
 
     // Math.imul(a, b): 32-bit integer multiplication.
     vm.define_method(&math, "imul", 2, |vm, _t, args| {
@@ -593,7 +615,10 @@ fn install_math(vm: &mut Vm) {
     // Until a host clock/RNG is installed, fall back to a fixed sequence so pure
     // engine tests stay reproducible. The replay layer overrides this.
     vm.define_method(&math, "random", 0, |vm, _t, _a| {
-        vm.rng_state = vm.rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        vm.rng_state = vm
+            .rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let bits = (vm.rng_state >> 11) as f64;
         Ok(Value::Number(bits / (1u64 << 53) as f64))
     });
@@ -876,7 +901,11 @@ fn json_revive(vm: &mut Vm, holder: &JsObject, key: &str, reviver: &Value) -> Re
             }
         }
     }
-    vm.call(reviver.clone(), Value::Object(holder.clone()), &[Value::str(key), val])
+    vm.call(
+        reviver.clone(),
+        Value::Object(holder.clone()),
+        &[Value::str(key), val],
+    )
 }
 
 struct JsonParser<'a> {
@@ -1005,9 +1034,8 @@ impl<'a> JsonParser<'a> {
                                     self.pos += 2; // consume "\u"
                                     let low = self.parse_hex4(vm)?;
                                     if (0xDC00..=0xDFFF).contains(&low) {
-                                        let combined = 0x10000
-                                            + ((code - 0xD800) << 10)
-                                            + (low - 0xDC00);
+                                        let combined =
+                                            0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
                                         s.push(char::from_u32(combined).unwrap_or('\u{fffd}'));
                                     } else {
                                         // Not a low surrogate: emit replacement for the
@@ -1197,7 +1225,11 @@ fn json_stringify(
         return Err(vm.throw_type("Do not know how to serialize a BigInt"));
     }
     Ok(match &value {
-        Value::Undefined | Value::Uninitialized | Value::Hole | Value::Symbol(_) | Value::BigInt(_) => None,
+        Value::Undefined
+        | Value::Uninitialized
+        | Value::Hole
+        | Value::Symbol(_)
+        | Value::BigInt(_) => None,
         Value::Null => Some("null".into()),
         Value::Bool(b) => Some(b.to_string()),
         Value::Number(n) => Some(if n.is_finite() {

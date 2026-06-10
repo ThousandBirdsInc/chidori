@@ -67,7 +67,10 @@ fn main() {
     println!("== record ==");
     let (recorded, rec_calls, journal) = run("record", None);
     println!("  stamped: {recorded}");
-    assert_eq!(rec_calls, 3, "all three primitives sampled live during record");
+    assert_eq!(
+        rec_calls, 3,
+        "all three primitives sampled live during record"
+    );
 
     println!("== replay ==");
     let (replayed, replay_calls, _) = run("replay", Some(&journal));

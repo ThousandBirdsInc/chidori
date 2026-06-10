@@ -4,3 +4,8 @@
 # then this file can be deleted. rustup auto-fetches the channel on first
 # build, including inside the rust:1-bookworm grpc image.
 channel = "nightly"
+# Ensure `cargo fmt`/`cargo clippy` work on the pinned channel: the
+# auto-fetched nightly otherwise omits these components, which breaks the
+# CI "Check formatting" step (it runs against this pinned toolchain, not
+# the stable one the workflow installs).
+components = ["rustfmt", "clippy"]

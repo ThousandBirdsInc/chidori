@@ -55,7 +55,11 @@ const AB_MAX: &str = "[[ArrayBufferMaxByteLength]]";
 fn ab_max_byte_length(o: &JsObject) -> Option<usize> {
     match o.borrow().props.get(&PropertyKey::str(AB_MAX)) {
         Some(Property {
-            kind: PropertyKind::Data { value: Value::Number(n), .. },
+            kind:
+                PropertyKind::Data {
+                    value: Value::Number(n),
+                    ..
+                },
             ..
         }) => Some(*n as usize),
         _ => None,
@@ -73,7 +77,11 @@ fn ab_transfer(
 ) -> Result<Value, Value> {
     let o = match this {
         Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => o.clone(),
-        _ => return Err(vm.throw_type("ArrayBuffer.prototype.transfer called on incompatible receiver")),
+        _ => {
+            return Err(
+                vm.throw_type("ArrayBuffer.prototype.transfer called on incompatible receiver")
+            )
+        }
     };
     let (old_bytes, max) = {
         let b = o.borrow();
@@ -179,7 +187,10 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
         Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => {
             Ok(Value::Number(buffer_byte_length(o) as f64))
         }
-        _ => Err(vm.throw_type("get ArrayBuffer.prototype.byteLength called on incompatible receiver")),
+        _ => {
+            Err(vm
+                .throw_type("get ArrayBuffer.prototype.byteLength called on incompatible receiver"))
+        }
     });
     vm.define_accessor(
         &Value::Object(proto.clone()),
@@ -193,9 +204,12 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
     let mbl_getter = vm.new_native("get maxByteLength", 0, |vm, this, _a| match &this {
         Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => {
             let max = ab_max_byte_length(o);
-            Ok(Value::Number(max.unwrap_or_else(|| buffer_byte_length(o)) as f64))
+            Ok(Value::Number(
+                max.unwrap_or_else(|| buffer_byte_length(o)) as f64
+            ))
         }
-        _ => Err(vm.throw_type("get ArrayBuffer.prototype.maxByteLength called on incompatible receiver")),
+        _ => Err(vm
+            .throw_type("get ArrayBuffer.prototype.maxByteLength called on incompatible receiver")),
     });
     vm.define_accessor(
         &Value::Object(proto.clone()),
@@ -205,12 +219,14 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
     );
 
     // get ArrayBuffer.prototype.resizable
-    let rsz_getter = vm.new_native("get resizable", 0, |vm, this, _a| match &this {
-        Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => {
-            Ok(Value::Bool(ab_max_byte_length(o).is_some()))
-        }
-        _ => Err(vm.throw_type("get ArrayBuffer.prototype.resizable called on incompatible receiver")),
-    });
+    let rsz_getter =
+        vm.new_native("get resizable", 0, |vm, this, _a| match &this {
+            Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => {
+                Ok(Value::Bool(ab_max_byte_length(o).is_some()))
+            }
+            _ => Err(vm
+                .throw_type("get ArrayBuffer.prototype.resizable called on incompatible receiver")),
+        });
     vm.define_accessor(
         &Value::Object(proto.clone()),
         PropertyKey::str("resizable"),
@@ -223,7 +239,9 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
         Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => Ok(
             Value::Bool(matches!(o.borrow().internal, Internal::ArrayBuffer(None))),
         ),
-        _ => Err(vm.throw_type("get ArrayBuffer.prototype.detached called on incompatible receiver")),
+        _ => {
+            Err(vm.throw_type("get ArrayBuffer.prototype.detached called on incompatible receiver"))
+        }
     });
     vm.define_accessor(
         &Value::Object(proto.clone()),
@@ -235,16 +253,26 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
     // ArrayBuffer.prototype.resize(newByteLength)
     vm.define_method(&proto, "resize", 1, |vm, this, args| {
         let o = match &this {
-            Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => o.clone(),
-            _ => return Err(vm.throw_type("ArrayBuffer.prototype.resize called on incompatible receiver")),
+            Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => {
+                o.clone()
+            }
+            _ => {
+                return Err(
+                    vm.throw_type("ArrayBuffer.prototype.resize called on incompatible receiver")
+                )
+            }
         };
         let max = match ab_max_byte_length(&o) {
             Some(m) => m,
-            None => return Err(vm.throw_type("ArrayBuffer.prototype.resize: buffer is not resizable")),
+            None => {
+                return Err(vm.throw_type("ArrayBuffer.prototype.resize: buffer is not resizable"))
+            }
         };
         let new_len = byte_length_arg(vm, &arg(args, 0))?;
         if new_len > max {
-            return Err(vm.throw_range("ArrayBuffer.prototype.resize: length exceeds maxByteLength"));
+            return Err(
+                vm.throw_range("ArrayBuffer.prototype.resize: length exceeds maxByteLength")
+            );
         }
         let mut b = o.borrow_mut();
         match &mut b.internal {
@@ -267,8 +295,14 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
     // ArrayBuffer.prototype.slice(begin, end)
     vm.define_method(&proto, "slice", 2, |vm, this, args| {
         let o = match &this {
-            Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => o.clone(),
-            _ => return Err(vm.throw_type("ArrayBuffer.prototype.slice called on incompatible receiver")),
+            Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => {
+                o.clone()
+            }
+            _ => {
+                return Err(
+                    vm.throw_type("ArrayBuffer.prototype.slice called on incompatible receiver")
+                )
+            }
         };
         if matches!(o.borrow().internal, Internal::ArrayBuffer(None)) {
             return Err(vm.throw_type("ArrayBuffer.prototype.slice called on a detached buffer"));
@@ -355,9 +389,9 @@ fn ta_this(vm: &mut Vm, this: &Value) -> Result<JsObject, Value> {
     match this {
         Value::Object(o) if matches!(o.borrow().internal, Internal::TypedArray(_)) => {
             if ta_out_of_bounds(o) {
-                return Err(vm.throw_type(
-                    "Cannot operate on a detached or out-of-bounds TypedArray",
-                ));
+                return Err(
+                    vm.throw_type("Cannot operate on a detached or out-of-bounds TypedArray")
+                );
             }
             Ok(o.clone())
         }
@@ -408,11 +442,7 @@ fn ta_out_of_bounds(o: &JsObject) -> bool {
 }
 
 /// `SpeciesConstructor(O, defaultConstructor)` (spec 7.3.23) for typed arrays.
-fn ta_species_constructor(
-    vm: &mut Vm,
-    o: &JsObject,
-    default: &Value,
-) -> Result<Value, Value> {
+fn ta_species_constructor(vm: &mut Vm, o: &JsObject, default: &Value) -> Result<Value, Value> {
     let c = vm.get_prop(&Value::Object(o.clone()), &PropertyKey::str("constructor"))?;
     if c.is_undefined() {
         return Ok(default.clone());
@@ -456,18 +486,13 @@ fn ta_create(vm: &mut Vm, c: &Value, args: &[Value]) -> Result<JsObject, Value> 
 
 /// `TypedArraySpeciesCreate(exemplar, argumentList)` (spec 23.2.4.1): create the
 /// result of map/filter/slice/subarray via the exemplar's species constructor.
-fn ta_species_create(
-    vm: &mut Vm,
-    exemplar: &JsObject,
-    args: &[Value],
-) -> Result<JsObject, Value> {
+fn ta_species_create(vm: &mut Vm, exemplar: &JsObject, args: &[Value]) -> Result<JsObject, Value> {
     let kind = match vm.ta_kind(exemplar) {
         Some(k) => k,
         None => return Err(vm.throw_type("not a TypedArray")),
     };
     let proto = per_kind_proto(vm, kind);
-    let default_ctor =
-        vm.get_prop(&Value::Object(proto), &PropertyKey::str("constructor"))?;
+    let default_ctor = vm.get_prop(&Value::Object(proto), &PropertyKey::str("constructor"))?;
     let c = ta_species_constructor(vm, exemplar, &default_ctor)?;
     ta_create(vm, &c, args)
 }
@@ -551,14 +576,21 @@ fn install_typed_array_base(vm: &mut Vm, species: &JsSymbol) -> JsObject {
             }
             let mut v = Vec::with_capacity(len.min(1 << 16));
             for i in 0..len {
-                v.push(vm.get_prop(&Value::Object(o.clone()), &PropertyKey::from_index(i as u32))?);
+                v.push(vm.get_prop(
+                    &Value::Object(o.clone()),
+                    &PropertyKey::from_index(i as u32),
+                )?);
             }
             v
         };
         let result = ta_create(vm, &this, &[Value::Number(items.len() as f64)])?;
         for (i, item) in items.into_iter().enumerate() {
             let val = if has_map {
-                vm.call(map_fn.clone(), this_arg.clone(), &[item, Value::Number(i as f64)])?
+                vm.call(
+                    map_fn.clone(),
+                    this_arg.clone(),
+                    &[item, Value::Number(i as f64)],
+                )?
             } else {
                 item
             };
@@ -590,15 +622,9 @@ fn install_typed_array_base(vm: &mut Vm, species: &JsSymbol) -> JsObject {
 }
 
 fn install_ta_accessors(vm: &mut Vm, proto: &JsObject) {
-    fn getter(
-        vm: &mut Vm,
-        name: &str,
-        f: fn(&JsObject) -> Value,
-    ) -> Value {
+    fn getter(vm: &mut Vm, name: &str, f: fn(&JsObject) -> Value) -> Value {
         Value::Object(vm.new_native(name, 0, move |vm, this, _a| match &this {
-            Value::Object(o) if matches!(o.borrow().internal, Internal::TypedArray(_)) => {
-                Ok(f(o))
-            }
+            Value::Object(o) if matches!(o.borrow().internal, Internal::TypedArray(_)) => Ok(f(o)),
             _ => Err(vm.throw_type("TypedArray prototype getter called on incompatible receiver")),
         }))
     }
@@ -610,19 +636,25 @@ fn install_ta_accessors(vm: &mut Vm, proto: &JsObject) {
         }
         Value::Number(ta_fields(o).map(|(_, _, l, _)| l).unwrap_or(0) as f64)
     });
-    vm.define_accessor(&Value::Object(proto.clone()), PropertyKey::str("length"), Some(g), None);
+    vm.define_accessor(
+        &Value::Object(proto.clone()),
+        PropertyKey::str("length"),
+        Some(g),
+        None,
+    );
 
     let g = getter(vm, "get byteLength", |o| {
         if ta_out_of_bounds(o) {
             return Value::Number(0.0);
         }
-        Value::Number(
-            ta_fields(o)
-                .map(|(_, _, l, k)| l * k.bytes())
-                .unwrap_or(0) as f64,
-        )
+        Value::Number(ta_fields(o).map(|(_, _, l, k)| l * k.bytes()).unwrap_or(0) as f64)
     });
-    vm.define_accessor(&Value::Object(proto.clone()), PropertyKey::str("byteLength"), Some(g), None);
+    vm.define_accessor(
+        &Value::Object(proto.clone()),
+        PropertyKey::str("byteLength"),
+        Some(g),
+        None,
+    );
 
     let g = getter(vm, "get byteOffset", |o| {
         if ta_out_of_bounds(o) {
@@ -630,14 +662,24 @@ fn install_ta_accessors(vm: &mut Vm, proto: &JsObject) {
         }
         Value::Number(ta_fields(o).map(|(_, off, _, _)| off).unwrap_or(0) as f64)
     });
-    vm.define_accessor(&Value::Object(proto.clone()), PropertyKey::str("byteOffset"), Some(g), None);
+    vm.define_accessor(
+        &Value::Object(proto.clone()),
+        PropertyKey::str("byteOffset"),
+        Some(g),
+        None,
+    );
 
     let g = getter(vm, "get buffer", |o| {
         ta_fields(o)
             .map(|(buf, _, _, _)| Value::Object(buf))
             .unwrap_or(Value::Undefined)
     });
-    vm.define_accessor(&Value::Object(proto.clone()), PropertyKey::str("buffer"), Some(g), None);
+    vm.define_accessor(
+        &Value::Object(proto.clone()),
+        PropertyKey::str("buffer"),
+        Some(g),
+        None,
+    );
 }
 
 fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
@@ -719,7 +761,10 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
             }
             let mut v = Vec::with_capacity(len.min(1 << 16));
             for i in 0..len {
-                v.push(vm.get_prop(&Value::Object(so.clone()), &PropertyKey::from_index(i as u32))?);
+                v.push(vm.get_prop(
+                    &Value::Object(so.clone()),
+                    &PropertyKey::from_index(i as u32),
+                )?);
             }
             v
         };
@@ -807,7 +852,11 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         let result = ta_species_create(vm, &o, &[Value::Number(len as f64)])?;
         for i in 0..len {
             let v = vm.ta_get(&o, i);
-            let mapped = vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(i as f64), this.clone()])?;
+            let mapped = vm.call(
+                cb.clone(),
+                this_arg.clone(),
+                &[v, Value::Number(i as f64), this.clone()],
+            )?;
             vm.ta_write(&result, i, &mapped)?;
         }
         Ok(Value::Object(result))
@@ -826,7 +875,11 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         let mut kept: Vec<Value> = Vec::new();
         for i in 0..len {
             let v = vm.ta_get(&o, i);
-            let keep = vm.call(cb.clone(), this_arg.clone(), &[v.clone(), Value::Number(i as f64), this.clone()])?;
+            let keep = vm.call(
+                cb.clone(),
+                this_arg.clone(),
+                &[v.clone(), Value::Number(i as f64), this.clone()],
+            )?;
             if vm.to_boolean(&keep) {
                 kept.push(v);
             }
@@ -850,7 +903,11 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         let len = vm.ta_length(&o).unwrap_or(0);
         for i in 0..len {
             let v = vm.ta_get(&o, i);
-            vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(i as f64), this.clone()])?;
+            vm.call(
+                cb.clone(),
+                this_arg.clone(),
+                &[v, Value::Number(i as f64), this.clone()],
+            )?;
         }
         Ok(Value::Undefined)
     });
@@ -876,7 +933,11 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         }
         for i in start..len {
             let v = vm.ta_get(&o, i);
-            acc = vm.call(cb.clone(), Value::Undefined, &[acc, v, Value::Number(i as f64), this.clone()])?;
+            acc = vm.call(
+                cb.clone(),
+                Value::Undefined,
+                &[acc, v, Value::Number(i as f64), this.clone()],
+            )?;
         }
         Ok(acc)
     });
@@ -904,7 +965,11 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         while start >= 0 {
             let i = start as usize;
             let v = vm.ta_get(&o, i);
-            acc = vm.call(cb.clone(), Value::Undefined, &[acc, v, Value::Number(i as f64), this.clone()])?;
+            acc = vm.call(
+                cb.clone(),
+                Value::Undefined,
+                &[acc, v, Value::Number(i as f64), this.clone()],
+            )?;
             start -= 1;
         }
         Ok(acc)
@@ -920,7 +985,11 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         let len = vm.ta_length(&o).unwrap_or(0);
         for i in 0..len {
             let v = vm.ta_get(&o, i);
-            let r = vm.call(cb.clone(), arg(args, 1), &[v, Value::Number(i as f64), this.clone()])?;
+            let r = vm.call(
+                cb.clone(),
+                arg(args, 1),
+                &[v, Value::Number(i as f64), this.clone()],
+            )?;
             if vm.to_boolean(&r) {
                 return Ok(Value::Bool(true));
             }
@@ -938,7 +1007,11 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         let len = vm.ta_length(&o).unwrap_or(0);
         for i in 0..len {
             let v = vm.ta_get(&o, i);
-            let r = vm.call(cb.clone(), arg(args, 1), &[v, Value::Number(i as f64), this.clone()])?;
+            let r = vm.call(
+                cb.clone(),
+                arg(args, 1),
+                &[v, Value::Number(i as f64), this.clone()],
+            )?;
             if !vm.to_boolean(&r) {
                 return Ok(Value::Bool(false));
             }
@@ -956,7 +1029,11 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         let len = vm.ta_length(&o).unwrap_or(0);
         for i in 0..len {
             let v = vm.ta_get(&o, i);
-            let r = vm.call(cb.clone(), arg(args, 1), &[v.clone(), Value::Number(i as f64), this.clone()])?;
+            let r = vm.call(
+                cb.clone(),
+                arg(args, 1),
+                &[v.clone(), Value::Number(i as f64), this.clone()],
+            )?;
             if vm.to_boolean(&r) {
                 return Ok(v);
             }
@@ -974,7 +1051,11 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         let len = vm.ta_length(&o).unwrap_or(0);
         for i in 0..len {
             let v = vm.ta_get(&o, i);
-            let r = vm.call(cb.clone(), arg(args, 1), &[v, Value::Number(i as f64), this.clone()])?;
+            let r = vm.call(
+                cb.clone(),
+                arg(args, 1),
+                &[v, Value::Number(i as f64), this.clone()],
+            )?;
             if vm.to_boolean(&r) {
                 return Ok(Value::Number(i as f64));
             }
@@ -992,7 +1073,11 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         let len = vm.ta_length(&o).unwrap_or(0);
         for i in (0..len).rev() {
             let v = vm.ta_get(&o, i);
-            let r = vm.call(cb.clone(), arg(args, 1), &[v.clone(), Value::Number(i as f64), this.clone()])?;
+            let r = vm.call(
+                cb.clone(),
+                arg(args, 1),
+                &[v.clone(), Value::Number(i as f64), this.clone()],
+            )?;
             if vm.to_boolean(&r) {
                 return Ok(v);
             }
@@ -1010,7 +1095,11 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         let len = vm.ta_length(&o).unwrap_or(0);
         for i in (0..len).rev() {
             let v = vm.ta_get(&o, i);
-            let r = vm.call(cb.clone(), arg(args, 1), &[v, Value::Number(i as f64), this.clone()])?;
+            let r = vm.call(
+                cb.clone(),
+                arg(args, 1),
+                &[v, Value::Number(i as f64), this.clone()],
+            )?;
             if vm.to_boolean(&r) {
                 return Ok(Value::Number(i as f64));
             }
@@ -1231,18 +1320,35 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
     // mutations during iteration are observed — spec CreateArrayIterator).
     vm.define_method(proto, "keys", 0, |vm, this, _a| {
         let o = ta_this(vm, &this)?;
-        Ok(vm.make_iterator(&vm.realm.array_iterator_proto.clone(), Some(o), None, IterKind::ArrayKeys))
+        Ok(vm.make_iterator(
+            &vm.realm.array_iterator_proto.clone(),
+            Some(o),
+            None,
+            IterKind::ArrayKeys,
+        ))
     });
     vm.define_method(proto, "values", 0, |vm, this, _a| {
         let o = ta_this(vm, &this)?;
-        Ok(vm.make_iterator(&vm.realm.array_iterator_proto.clone(), Some(o), None, IterKind::ArrayValues))
+        Ok(vm.make_iterator(
+            &vm.realm.array_iterator_proto.clone(),
+            Some(o),
+            None,
+            IterKind::ArrayValues,
+        ))
     });
     vm.define_method(proto, "entries", 0, |vm, this, _a| {
         let o = ta_this(vm, &this)?;
-        Ok(vm.make_iterator(&vm.realm.array_iterator_proto.clone(), Some(o), None, IterKind::ArrayEntries))
+        Ok(vm.make_iterator(
+            &vm.realm.array_iterator_proto.clone(),
+            Some(o),
+            None,
+            IterKind::ArrayEntries,
+        ))
     });
     // [Symbol.iterator] = values
-    let values = vm.get_prop(&Value::Object(proto.clone()), &PropertyKey::str("values")).unwrap();
+    let values = vm
+        .get_prop(&Value::Object(proto.clone()), &PropertyKey::str("values"))
+        .unwrap();
     let sym = vm.realm.symbol_iterator.clone();
     vm.define_value_sym(proto, sym, values);
 
@@ -1626,7 +1732,11 @@ fn install_data_view(vm: &mut Vm) {
     let construct = |vm: &mut Vm, _t: Value, args: &[Value]| -> Result<Value, Value> {
         let buffer = match arg(args, 0) {
             Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => o,
-            _ => return Err(vm.throw_type("First argument to DataView constructor must be an ArrayBuffer")),
+            _ => {
+                return Err(
+                    vm.throw_type("First argument to DataView constructor must be an ArrayBuffer")
+                )
+            }
         };
         let buf_len = buffer_byte_length(&buffer);
         let byte_offset = {
@@ -1674,29 +1784,54 @@ fn install_data_view(vm: &mut Vm) {
     let g = vm.new_native("get buffer", 0, |vm, this, _a| match &this {
         Value::Object(o) => match &o.borrow().internal {
             Internal::DataView(d) => Ok(Value::Object(d.buffer.clone())),
-            _ => Err(vm.throw_type("get DataView.prototype.buffer called on incompatible receiver")),
+            _ => {
+                Err(vm.throw_type("get DataView.prototype.buffer called on incompatible receiver"))
+            }
         },
         _ => Err(vm.throw_type("get DataView.prototype.buffer called on incompatible receiver")),
     });
-    vm.define_accessor(&Value::Object(proto.clone()), PropertyKey::str("buffer"), Some(Value::Object(g)), None);
+    vm.define_accessor(
+        &Value::Object(proto.clone()),
+        PropertyKey::str("buffer"),
+        Some(Value::Object(g)),
+        None,
+    );
 
     let g = vm.new_native("get byteLength", 0, |vm, this, _a| match &this {
         Value::Object(o) => match &o.borrow().internal {
             Internal::DataView(d) => Ok(Value::Number(d.byte_length as f64)),
-            _ => Err(vm.throw_type("get DataView.prototype.byteLength called on incompatible receiver")),
+            _ => Err(
+                vm.throw_type("get DataView.prototype.byteLength called on incompatible receiver")
+            ),
         },
-        _ => Err(vm.throw_type("get DataView.prototype.byteLength called on incompatible receiver")),
+        _ => {
+            Err(vm.throw_type("get DataView.prototype.byteLength called on incompatible receiver"))
+        }
     });
-    vm.define_accessor(&Value::Object(proto.clone()), PropertyKey::str("byteLength"), Some(Value::Object(g)), None);
+    vm.define_accessor(
+        &Value::Object(proto.clone()),
+        PropertyKey::str("byteLength"),
+        Some(Value::Object(g)),
+        None,
+    );
 
     let g = vm.new_native("get byteOffset", 0, |vm, this, _a| match &this {
         Value::Object(o) => match &o.borrow().internal {
             Internal::DataView(d) => Ok(Value::Number(d.byte_offset as f64)),
-            _ => Err(vm.throw_type("get DataView.prototype.byteOffset called on incompatible receiver")),
+            _ => Err(
+                vm.throw_type("get DataView.prototype.byteOffset called on incompatible receiver")
+            ),
         },
-        _ => Err(vm.throw_type("get DataView.prototype.byteOffset called on incompatible receiver")),
+        _ => {
+            Err(vm.throw_type("get DataView.prototype.byteOffset called on incompatible receiver"))
+        }
     });
-    vm.define_accessor(&Value::Object(proto.clone()), PropertyKey::str("byteOffset"), Some(Value::Object(g)), None);
+    vm.define_accessor(
+        &Value::Object(proto.clone()),
+        PropertyKey::str("byteOffset"),
+        Some(Value::Object(g)),
+        None,
+    );
 
     // get/set methods for each element kind.
     define_dv_get(vm, &proto, "getInt8", DvKind::I8);
@@ -1777,7 +1912,11 @@ fn define_dv_get(vm: &mut Vm, proto: &JsObject, name: &str, kind: DvKind) {
     vm.define_method(proto, name, 1, move |vm, this, args| {
         let o = match &this {
             Value::Object(o) if matches!(o.borrow().internal, Internal::DataView(_)) => o.clone(),
-            _ => return Err(vm.throw_type("DataView.prototype method called on incompatible receiver")),
+            _ => {
+                return Err(
+                    vm.throw_type("DataView.prototype method called on incompatible receiver")
+                )
+            }
         };
         let (buffer, base_off, view_len) =
             dv_fields(&o).ok_or_else(|| vm.throw_type("not a DataView"))?;
@@ -1795,7 +1934,9 @@ fn define_dv_get(vm: &mut Vm, proto: &JsObject, name: &str, kind: DvKind) {
         // IsDetachedBuffer (TypeError) is checked before the bounds (RangeError).
         let bytes = match &buf.internal {
             Internal::ArrayBuffer(Some(b)) => b,
-            _ => return Err(vm.throw_type("Cannot perform DataView read on a detached ArrayBuffer")),
+            _ => {
+                return Err(vm.throw_type("Cannot perform DataView read on a detached ArrayBuffer"))
+            }
         };
         if get_index + size > view_len || off + size > bytes.len() {
             return Err(vm.throw_range("Offset is outside the bounds of the DataView"));
@@ -1809,7 +1950,11 @@ fn define_dv_set(vm: &mut Vm, proto: &JsObject, name: &str, kind: DvKind) {
     vm.define_method(proto, name, 2, move |vm, this, args| {
         let o = match &this {
             Value::Object(o) if matches!(o.borrow().internal, Internal::DataView(_)) => o.clone(),
-            _ => return Err(vm.throw_type("DataView.prototype method called on incompatible receiver")),
+            _ => {
+                return Err(
+                    vm.throw_type("DataView.prototype method called on incompatible receiver")
+                )
+            }
         };
         let (buffer, base_off, view_len) =
             dv_fields(&o).ok_or_else(|| vm.throw_type("not a DataView"))?;
@@ -1829,7 +1974,9 @@ fn define_dv_set(vm: &mut Vm, proto: &JsObject, name: &str, kind: DvKind) {
         // IsDetachedBuffer (TypeError) is checked before the bounds (RangeError).
         let bytes = match &mut buf.internal {
             Internal::ArrayBuffer(Some(b)) => b,
-            _ => return Err(vm.throw_type("Cannot perform DataView write on a detached ArrayBuffer")),
+            _ => {
+                return Err(vm.throw_type("Cannot perform DataView write on a detached ArrayBuffer"))
+            }
         };
         if set_index + size > view_len || off + size > bytes.len() {
             return Err(vm.throw_range("Offset is outside the bounds of the DataView"));
@@ -1844,7 +1991,11 @@ fn define_dv_get_big(vm: &mut Vm, proto: &JsObject, name: &str, kind: TAKind) {
     vm.define_method(proto, name, 1, move |vm, this, args| {
         let o = match &this {
             Value::Object(o) if matches!(o.borrow().internal, Internal::DataView(_)) => o.clone(),
-            _ => return Err(vm.throw_type("DataView.prototype method called on incompatible receiver")),
+            _ => {
+                return Err(
+                    vm.throw_type("DataView.prototype method called on incompatible receiver")
+                )
+            }
         };
         let (buffer, base_off, view_len) =
             dv_fields(&o).ok_or_else(|| vm.throw_type("not a DataView"))?;
@@ -1861,7 +2012,9 @@ fn define_dv_get_big(vm: &mut Vm, proto: &JsObject, name: &str, kind: TAKind) {
         // Detached (TypeError) before bounds (RangeError).
         let bytes = match &buf.internal {
             Internal::ArrayBuffer(Some(b)) => b,
-            _ => return Err(vm.throw_type("Cannot perform DataView read on a detached ArrayBuffer")),
+            _ => {
+                return Err(vm.throw_type("Cannot perform DataView read on a detached ArrayBuffer"))
+            }
         };
         if get_index + 8 > view_len || off + 8 > bytes.len() {
             return Err(vm.throw_range("Offset is outside the bounds of the DataView"));
@@ -1889,7 +2042,11 @@ fn define_dv_set_big(vm: &mut Vm, proto: &JsObject, name: &str, kind: TAKind) {
     vm.define_method(proto, name, 2, move |vm, this, args| {
         let o = match &this {
             Value::Object(o) if matches!(o.borrow().internal, Internal::DataView(_)) => o.clone(),
-            _ => return Err(vm.throw_type("DataView.prototype method called on incompatible receiver")),
+            _ => {
+                return Err(
+                    vm.throw_type("DataView.prototype method called on incompatible receiver")
+                )
+            }
         };
         let (buffer, base_off, view_len) =
             dv_fields(&o).ok_or_else(|| vm.throw_type("not a DataView"))?;
@@ -1908,7 +2065,9 @@ fn define_dv_set_big(vm: &mut Vm, proto: &JsObject, name: &str, kind: TAKind) {
         // Detached (TypeError) before bounds (RangeError).
         let bytes = match &mut buf.internal {
             Internal::ArrayBuffer(Some(b)) => b,
-            _ => return Err(vm.throw_type("Cannot perform DataView write on a detached ArrayBuffer")),
+            _ => {
+                return Err(vm.throw_type("Cannot perform DataView write on a detached ArrayBuffer"))
+            }
         };
         if set_index + 8 > view_len || off + 8 > bytes.len() {
             return Err(vm.throw_range("Offset is outside the bounds of the DataView"));

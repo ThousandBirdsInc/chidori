@@ -19,10 +19,10 @@ pub mod promise;
 pub mod proxy;
 pub mod realm;
 pub mod regexp;
-pub mod typed_array;
-mod unicode_tables;
 pub mod replay;
 pub mod trace;
+pub mod typed_array;
+mod unicode_tables;
 pub mod value;
 pub mod vm;
 
@@ -59,9 +59,7 @@ impl Engine {
     /// the completion value. Errors are returned as their string form.
     pub fn eval(&mut self, src: &str) -> Result<Value, String> {
         let proto = compiler::compile_script(src).map_err(|e| e)?;
-        let func = self
-            .vm
-            .make_closure(std::rc::Rc::new(proto), Vec::new());
+        let func = self.vm.make_closure(std::rc::Rc::new(proto), Vec::new());
         let result = self
             .vm
             .call(Value::Object(func), Value::Undefined, &[])
@@ -85,47 +83,92 @@ impl Engine {
     /// error here.
     pub fn install_chidori_effects(
         &mut self,
-        dispatch: std::rc::Rc<dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>>,
+        dispatch: std::rc::Rc<
+            dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>,
+        >,
     ) {
         let chidori = self.vm.new_object();
         let d = dispatch.clone();
-        self.vm.define_method(&chidori, "log", 1, move |vm, _t, args| {
-            let msg = args.first().map(|v| vm.to_string_lossy(v)).unwrap_or_default();
-            forward_effect(vm, &d, "log", serde_json::json!({ "message": msg }))
-        });
+        self.vm
+            .define_method(&chidori, "log", 1, move |vm, _t, args| {
+                let msg = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                forward_effect(vm, &d, "log", serde_json::json!({ "message": msg }))
+            });
         let d = dispatch.clone();
-        self.vm.define_method(&chidori, "tool", 2, move |vm, _t, args| {
-            let name = args.first().map(|v| vm.to_string_lossy(v)).unwrap_or_default();
-            let kwargs = args
-                .get(1)
-                .map(|v| vm.value_to_json(v))
-                .unwrap_or(serde_json::Value::Null);
-            forward_effect(vm, &d, "tool", serde_json::json!({ "name": name, "kwargs": kwargs }))
-        });
+        self.vm
+            .define_method(&chidori, "tool", 2, move |vm, _t, args| {
+                let name = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let kwargs = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "tool",
+                    serde_json::json!({ "name": name, "kwargs": kwargs }),
+                )
+            });
         let d = dispatch.clone();
-        self.vm.define_method(&chidori, "prompt", 2, move |vm, _t, args| {
-            let text = args.first().map(|v| vm.to_string_lossy(v)).unwrap_or_default();
-            let opts = args
-                .get(1)
-                .map(|v| vm.value_to_json(v))
-                .unwrap_or(serde_json::Value::Null);
-            forward_effect(vm, &d, "prompt", serde_json::json!({ "text": text, "opts": opts }))
-        });
+        self.vm
+            .define_method(&chidori, "prompt", 2, move |vm, _t, args| {
+                let text = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let opts = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "prompt",
+                    serde_json::json!({ "text": text, "opts": opts }),
+                )
+            });
         let d = dispatch.clone();
-        self.vm.define_method(&chidori, "input", 2, move |vm, _t, args| {
-            let prompt = args.first().map(|v| vm.to_string_lossy(v)).unwrap_or_default();
-            let opts = args
-                .get(1)
-                .map(|v| vm.value_to_json(v))
-                .unwrap_or(serde_json::Value::Null);
-            forward_effect(vm, &d, "input", serde_json::json!({ "prompt": prompt, "opts": opts }))
-        });
+        self.vm
+            .define_method(&chidori, "input", 2, move |vm, _t, args| {
+                let prompt = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let opts = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "input",
+                    serde_json::json!({ "prompt": prompt, "opts": opts }),
+                )
+            });
         let d = dispatch.clone();
-        self.vm.define_method(&chidori, "checkpoint", 2, move |vm, _t, args| {
-            let label = args.first().map(|v| vm.value_to_json(v)).unwrap_or(serde_json::Value::Null);
-            let data = args.get(1).map(|v| vm.value_to_json(v)).unwrap_or(serde_json::Value::Null);
-            forward_effect(vm, &d, "checkpoint", serde_json::json!({ "label": label, "data": data }))
-        });
+        self.vm
+            .define_method(&chidori, "checkpoint", 2, move |vm, _t, args| {
+                let label = args
+                    .first()
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                let data = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "checkpoint",
+                    serde_json::json!({ "label": label, "data": data }),
+                )
+            });
         let d = dispatch.clone();
         self.vm.define_method(&chidori, "memory", 4, move |vm, _t, args| {
             let action = args.first().map(|v| vm.to_string_lossy(v)).unwrap_or_default();
@@ -135,54 +178,144 @@ impl Engine {
             forward_effect(vm, &d, "memory", serde_json::json!({ "action": action, "key": key, "value": value, "opts": opts }))
         });
         let d = dispatch.clone();
-        self.vm.define_method(&chidori, "template", 3, move |vm, _t, args| {
-            let template = args.first().map(|v| vm.to_string_lossy(v)).unwrap_or_default();
-            let vars = args.get(1).map(|v| vm.value_to_json(v)).unwrap_or(serde_json::Value::Null);
-            forward_effect(vm, &d, "template", serde_json::json!({ "template": template, "vars": vars }))
-        });
+        self.vm
+            .define_method(&chidori, "template", 3, move |vm, _t, args| {
+                let template = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let vars = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "template",
+                    serde_json::json!({ "template": template, "vars": vars }),
+                )
+            });
         let d = dispatch.clone();
-        self.vm.define_method(&chidori, "http", 2, move |vm, _t, args| {
-            let arg0 = args.first().map(|v| vm.value_to_json(v)).unwrap_or(serde_json::Value::Null);
-            let arg1 = args.get(1).map(|v| vm.value_to_json(v)).unwrap_or(serde_json::Value::Null);
-            forward_effect(vm, &d, "http", serde_json::json!({ "arg0": arg0, "arg1": arg1 }))
-        });
+        self.vm
+            .define_method(&chidori, "http", 2, move |vm, _t, args| {
+                let arg0 = args
+                    .first()
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                let arg1 = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "http",
+                    serde_json::json!({ "arg0": arg0, "arg1": arg1 }),
+                )
+            });
         let d = dispatch.clone();
-        self.vm.define_method(&chidori, "callAgent", 2, move |vm, _t, args| {
-            let path = args.first().map(|v| vm.to_string_lossy(v)).unwrap_or_default();
-            let input = args.get(1).map(|v| vm.value_to_json(v)).unwrap_or(serde_json::Value::Null);
-            forward_effect(vm, &d, "callAgent", serde_json::json!({ "path": path, "input": input }))
-        });
+        self.vm
+            .define_method(&chidori, "callAgent", 2, move |vm, _t, args| {
+                let path = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let input = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "callAgent",
+                    serde_json::json!({ "path": path, "input": input }),
+                )
+            });
         let d = dispatch.clone();
-        self.vm.define_method(&chidori, "execJs", 2, move |vm, _t, args| {
-            let source = args.first().map(|v| vm.to_string_lossy(v)).unwrap_or_default();
-            let opts = args.get(1).map(|v| vm.value_to_json(v)).unwrap_or(serde_json::Value::Null);
-            forward_effect(vm, &d, "execJs", serde_json::json!({ "source": source, "opts": opts }))
-        });
+        self.vm
+            .define_method(&chidori, "execJs", 2, move |vm, _t, args| {
+                let source = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let opts = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "execJs",
+                    serde_json::json!({ "source": source, "opts": opts }),
+                )
+            });
         let d = dispatch.clone();
-        self.vm.define_method(&chidori, "execPython", 2, move |vm, _t, args| {
-            let source = args.first().map(|v| vm.to_string_lossy(v)).unwrap_or_default();
-            let opts = args.get(1).map(|v| vm.value_to_json(v)).unwrap_or(serde_json::Value::Null);
-            forward_effect(vm, &d, "execPython", serde_json::json!({ "source": source, "opts": opts }))
-        });
+        self.vm
+            .define_method(&chidori, "execPython", 2, move |vm, _t, args| {
+                let source = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let opts = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "execPython",
+                    serde_json::json!({ "source": source, "opts": opts }),
+                )
+            });
         let d = dispatch.clone();
-        self.vm.define_method(&chidori, "execWasm", 2, move |vm, _t, args| {
-            let source = args.first().map(|v| vm.to_string_lossy(v)).unwrap_or_default();
-            let opts = args.get(1).map(|v| vm.value_to_json(v)).unwrap_or(serde_json::Value::Null);
-            forward_effect(vm, &d, "execWasm", serde_json::json!({ "source": source, "opts": opts }))
-        });
+        self.vm
+            .define_method(&chidori, "execWasm", 2, move |vm, _t, args| {
+                let source = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let opts = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "execWasm",
+                    serde_json::json!({ "source": source, "opts": opts }),
+                )
+            });
         // chidori.workspace.<action>(...) — a nested object whose methods all
         // forward the "workspace" effect tagged with their action.
         let workspace = self.vm.new_object();
         let d = dispatch.clone();
-        self.vm.define_method(&workspace, "list", 1, move |vm, _t, args| {
-            let opts = args.first().map(|v| vm.value_to_json(v)).unwrap_or(serde_json::Value::Null);
-            forward_effect(vm, &d, "workspace", serde_json::json!({ "action": "list", "args": opts }))
-        });
+        self.vm
+            .define_method(&workspace, "list", 1, move |vm, _t, args| {
+                let opts = args
+                    .first()
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "workspace",
+                    serde_json::json!({ "action": "list", "args": opts }),
+                )
+            });
         let d = dispatch.clone();
-        self.vm.define_method(&workspace, "read", 1, move |vm, _t, args| {
-            let path = args.first().map(|v| vm.to_string_lossy(v)).unwrap_or_default();
-            forward_effect(vm, &d, "workspace", serde_json::json!({ "action": "read", "args": { "path": path } }))
-        });
+        self.vm
+            .define_method(&workspace, "read", 1, move |vm, _t, args| {
+                let path = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                forward_effect(
+                    vm,
+                    &d,
+                    "workspace",
+                    serde_json::json!({ "action": "read", "args": { "path": path } }),
+                )
+            });
         let d = dispatch.clone();
         self.vm.define_method(&workspace, "write", 3, move |vm, _t, args| {
             let path = args.first().map(|v| vm.to_string_lossy(v)).unwrap_or_default();
@@ -203,10 +336,17 @@ impl Engine {
             forward_effect(vm, &d, "workspace", serde_json::json!({ "action": "remove", "args": { "path": path, "reason": reason } }))
         });
         let d = dispatch.clone();
-        self.vm.define_method(&workspace, "manifest", 0, move |vm, _t, _args| {
-            forward_effect(vm, &d, "workspace", serde_json::json!({ "action": "manifest", "args": {} }))
-        });
-        self.vm.define_value(&chidori, "workspace", Value::Object(workspace));
+        self.vm
+            .define_method(&workspace, "manifest", 0, move |vm, _t, _args| {
+                forward_effect(
+                    vm,
+                    &d,
+                    "workspace",
+                    serde_json::json!({ "action": "manifest", "args": {} }),
+                )
+            });
+        self.vm
+            .define_value(&chidori, "workspace", Value::Object(workspace));
         let global = self.vm.realm.global.clone();
         self.vm
             .define_value(&global, "chidori", Value::Object(chidori.clone()));
@@ -233,15 +373,16 @@ impl Engine {
         let global = self.vm.realm.global.clone();
         for &(name, arity) in names {
             let d = dispatch.clone();
-            self.vm.define_method(&global, name, arity, move |vm, _t, args| {
-                let json_args = serde_json::Value::Array(
-                    args.iter().map(|v| vm.value_to_json(v)).collect(),
-                );
-                match d(name, &json_args) {
-                    Ok(j) => Ok(vm.json_to_value(&j)),
-                    Err(e) => Err(vm.make_error(crate::vm::ErrorKind::Error, &e)),
-                }
-            });
+            self.vm
+                .define_method(&global, name, arity, move |vm, _t, args| {
+                    let json_args = serde_json::Value::Array(
+                        args.iter().map(|v| vm.value_to_json(v)).collect(),
+                    );
+                    match d(name, &json_args) {
+                        Ok(j) => Ok(vm.json_to_value(&j)),
+                        Err(e) => Err(vm.make_error(crate::vm::ErrorKind::Error, &e)),
+                    }
+                });
         }
     }
 
@@ -252,10 +393,11 @@ impl Engine {
         let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
         let captured = slot.clone();
         let global = self.vm.realm.global.clone();
-        self.vm.define_method(&global, "run", 1, move |_vm, _t, args| {
-            *captured.borrow_mut() = args.first().cloned();
-            Ok(Value::Undefined)
-        });
+        self.vm
+            .define_method(&global, "run", 1, move |_vm, _t, args| {
+                *captured.borrow_mut() = args.first().cloned();
+                Ok(Value::Undefined)
+            });
         slot
     }
 
@@ -299,7 +441,10 @@ impl Engine {
             .vm
             .call(handler, Value::Undefined, &[arg, chidori])
             .map_err(|e| self.vm.error_to_string(&e))?;
-        let settled = self.vm.settle(ret).map_err(|e| self.vm.error_to_string(&e))?;
+        let settled = self
+            .vm
+            .settle(ret)
+            .map_err(|e| self.vm.error_to_string(&e))?;
         Ok(self.vm.value_to_json(&settled))
     }
 
@@ -321,8 +466,7 @@ impl Engine {
         let mut registry = module::ModuleRegistry::default();
         // BFS the import graph, compiling each module once and recording how its
         // requested specifiers resolved (the linker reads `resolved` per record).
-        let mut queue: Vec<(String, String)> =
-            vec![(entry_key.to_string(), entry_src.to_string())];
+        let mut queue: Vec<(String, String)> = vec![(entry_key.to_string(), entry_src.to_string())];
         let mut entry_cell_of_name = None;
         let mut entry_rec = None;
         while let Some((key, src)) = queue.pop() {
@@ -371,7 +515,10 @@ impl Engine {
             .vm
             .call(handler, Value::Undefined, &[arg, chidori])
             .map_err(|e| self.vm.error_to_string(&e))?;
-        let settled = self.vm.settle(ret).map_err(|e| self.vm.error_to_string(&e))?;
+        let settled = self
+            .vm
+            .settle(ret)
+            .map_err(|e| self.vm.error_to_string(&e))?;
         Ok(self.vm.value_to_json(&settled))
     }
 
@@ -387,8 +534,7 @@ impl Engine {
         load: &mut dyn FnMut(&str, &str) -> Result<(String, String), String>,
     ) -> Result<serde_json::Value, String> {
         let mut registry = module::ModuleRegistry::default();
-        let mut queue: Vec<(String, String)> =
-            vec![(entry_key.to_string(), entry_src.to_string())];
+        let mut queue: Vec<(String, String)> = vec![(entry_key.to_string(), entry_src.to_string())];
         let mut entry_cell_of_name = None;
         let mut entry_rec = None;
         while let Some((key, src)) = queue.pop() {
@@ -426,7 +572,10 @@ impl Engine {
             .get(export_name)
             .ok_or_else(|| format!("missing exported `{export_name}` value"))?;
         let val = entry_rec.borrow().cells[*idx as usize].borrow().clone();
-        let settled = self.vm.settle(val).map_err(|e| self.vm.error_to_string(&e))?;
+        let settled = self
+            .vm
+            .settle(val)
+            .map_err(|e| self.vm.error_to_string(&e))?;
         Ok(self.vm.value_to_json(&settled))
     }
 }

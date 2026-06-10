@@ -53,7 +53,10 @@ pub enum Completion {
     Throw(Value),
     /// `break`/`continue`: jump to `target` once finallys down to the target
     /// loop's handler depth (`boundary`) have run.
-    Jump { target: u32, boundary: u32 },
+    Jump {
+        target: u32,
+        boundary: u32,
+    },
 }
 
 /// A try/catch/finally region active in a frame.
@@ -127,7 +130,7 @@ pub enum PromiseState {
 pub enum Reaction {
     /// `.then(onFulfilled, onRejected)` style: capability + handler.
     Then {
-        handler: Option<Value>, // the JS callback, or None for passthrough
+        handler: Option<Value>,      // the JS callback, or None for passthrough
         result_capability: JsObject, // the dependent promise
         is_reject: bool,
     },
@@ -423,10 +426,10 @@ impl Vm {
         func: impl Fn(&mut Vm, Value, &[Value]) -> Result<Value, Value> + 'static,
     ) {
         let f = self.new_native(name, length, func);
-        target.borrow_mut().props.insert(
-            PropertyKey::str(name),
-            Property::builtin(Value::Object(f)),
-        );
+        target
+            .borrow_mut()
+            .props
+            .insert(PropertyKey::str(name), Property::builtin(Value::Object(f)));
     }
 
     pub fn define_value(&self, target: &JsObject, name: &str, value: Value) {
@@ -557,7 +560,9 @@ impl Vm {
             Value::Number(n) => *n,
             Value::String(s) => string_to_number(s.as_str()),
             Value::Symbol(_) => return Err(self.throw_type("Cannot convert a Symbol to a number")),
-            Value::BigInt(_) => return Err(self.throw_type("Cannot convert a BigInt value to a number")),
+            Value::BigInt(_) => {
+                return Err(self.throw_type("Cannot convert a BigInt value to a number"))
+            }
             Value::Object(_) => {
                 let prim = self.to_primitive(v, Hint::Number)?;
                 self.to_number(&prim)?
@@ -691,7 +696,9 @@ impl Vm {
                 Some(FunctionInner::Native(nf)) => Verdict::Is(nf.construct.is_some()),
                 Some(FunctionInner::Bytecode(bf)) => {
                     let k = bf.proto.kind;
-                    Verdict::Is(!(k.is_async() || k.is_generator() || k.is_arrow() || k.is_method()))
+                    Verdict::Is(
+                        !(k.is_async() || k.is_generator() || k.is_arrow() || k.is_method()),
+                    )
                 }
                 Some(FunctionInner::Bound(bound)) => Verdict::Bound(bound.target.clone()),
                 None => match &b.internal {
@@ -844,12 +851,7 @@ impl Vm {
     /// Ordinary [[Set]].
     /// `[[Set]]` with sloppy-mode semantics: a failed write (non-writable,
     /// setter-less accessor, primitive base, non-extensible add) silently no-ops.
-    pub fn set_prop(
-        &mut self,
-        base: &Value,
-        key: &PropertyKey,
-        value: Value,
-    ) -> Result<(), Value> {
+    pub fn set_prop(&mut self, base: &Value, key: &PropertyKey, value: Value) -> Result<(), Value> {
         self.set_prop_mode(base, key, value, false)
     }
 
@@ -1236,7 +1238,8 @@ impl Vm {
         }
         int_keys.sort_unstable();
         int_keys.dedup();
-        let mut out: Vec<PropertyKey> = Vec::with_capacity(int_keys.len() + str_keys.len() + sym_keys.len());
+        let mut out: Vec<PropertyKey> =
+            Vec::with_capacity(int_keys.len() + str_keys.len() + sym_keys.len());
         for i in int_keys {
             out.push(PropertyKey::from_index(i));
         }
@@ -1520,7 +1523,11 @@ pub fn to_int32(n: f64) -> i32 {
     }
     let n = n.trunc();
     let m = n.rem_euclid(4294967296.0);
-    let m = if m >= 2147483648.0 { m - 4294967296.0 } else { m };
+    let m = if m >= 2147483648.0 {
+        m - 4294967296.0
+    } else {
+        m
+    };
     m as i32
 }
 
@@ -1543,13 +1550,19 @@ pub fn string_to_number(s: &str) -> f64 {
         _ => {}
     }
     if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        return i64::from_str_radix(hex, 16).map(|n| n as f64).unwrap_or(f64::NAN);
+        return i64::from_str_radix(hex, 16)
+            .map(|n| n as f64)
+            .unwrap_or(f64::NAN);
     }
     if let Some(oct) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
-        return i64::from_str_radix(oct, 8).map(|n| n as f64).unwrap_or(f64::NAN);
+        return i64::from_str_radix(oct, 8)
+            .map(|n| n as f64)
+            .unwrap_or(f64::NAN);
     }
     if let Some(bin) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
-        return i64::from_str_radix(bin, 2).map(|n| n as f64).unwrap_or(f64::NAN);
+        return i64::from_str_radix(bin, 2)
+            .map(|n| n as f64)
+            .unwrap_or(f64::NAN);
     }
     t.parse::<f64>().unwrap_or(f64::NAN)
 }

@@ -91,10 +91,11 @@ impl Vm {
                 let promise2 = promise.clone();
                 let value2 = value.clone();
                 let then2 = then.clone();
-                self.microtasks.push_back(Microtask::Job(Box::new(move |vm: &mut Vm| {
-                    vm.run_thenable_job(&promise2, value2, then2);
-                    Ok(())
-                })));
+                self.microtasks
+                    .push_back(Microtask::Job(Box::new(move |vm: &mut Vm| {
+                        vm.run_thenable_job(&promise2, value2, then2);
+                        Ok(())
+                    })));
                 return;
             }
         }
@@ -201,12 +202,20 @@ impl Vm {
     pub fn promise_then(&mut self, promise: &JsObject, on_f: Value, on_r: Value) -> JsObject {
         let result = self.new_promise();
         let on_fulfill = Reaction::Then {
-            handler: if self.is_callable(&on_f) { Some(on_f) } else { None },
+            handler: if self.is_callable(&on_f) {
+                Some(on_f)
+            } else {
+                None
+            },
             result_capability: result.clone(),
             is_reject: false,
         };
         let on_reject = Reaction::Then {
-            handler: if self.is_callable(&on_r) { Some(on_r) } else { None },
+            handler: if self.is_callable(&on_r) {
+                Some(on_r)
+            } else {
+                None
+            },
             result_capability: result.clone(),
             is_reject: true,
         };

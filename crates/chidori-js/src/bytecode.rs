@@ -220,11 +220,17 @@ pub enum Op {
     /// (innermost first, honoring @@unscopables); if a scope HasProperty(name)
     /// the value is read from it, otherwise `fallback` (the static
     /// Load{Cell,Upvalue,Global,GlobalTypeof}) is executed instead.
-    LoadName { name: u32, fallback: Box<Op> },
+    LoadName {
+        name: u32,
+        fallback: Box<Op>,
+    },
     /// Dynamic identifier write inside a `with` block. Consumes the value on top
     /// of the stack. If a with-scope HasProperty(name) the value is written to
     /// it; otherwise `fallback` (the static Store{Cell,Upvalue,Global}) runs.
-    StoreName { name: u32, fallback: Box<Op> },
+    StoreName {
+        name: u32,
+        fallback: Box<Op>,
+    },
     /// `delete name` inside a `with` block. If a with-scope HasProperty(name),
     /// deletes the property from that object and pushes the result; otherwise
     /// pushes `true` (deleting an unresolvable/lexical reference is reported as
@@ -269,15 +275,15 @@ pub enum Op {
     GetSuperPropDynamic,
     /// Spread source object into target ( target source -> target ).
     ObjectSpread,
-    GetProp(u32),         // const index of name; obj -> value
+    GetProp(u32), // const index of name; obj -> value
     /// Private field/method read `obj.#x`: brand-checks (the object must have the
     /// private name in its chain, else a TypeError) then reads it. obj -> value.
     PrivateGet(u32),
-    SetProp(u32),         // const index of name; obj value -> value
+    SetProp(u32), // const index of name; obj value -> value
     /// Private field write `obj.#x = v`: brand-checks then writes. obj value -> value.
     PrivateSet(u32),
-    GetPropDynamic,       // obj key -> value
-    SetPropDynamic,       // obj key value -> value
+    GetPropDynamic, // obj key -> value
+    SetPropDynamic, // obj key value -> value
     /// Delete: obj key -> bool
     DeleteProp(u32),
     DeletePropDynamic,
@@ -336,8 +342,8 @@ pub enum Op {
     TypeofExpr, // typeof of value on stack
 
     // ---- comparison ----
-    Eq,    // ==
-    Ne,    // !=
+    Eq, // ==
+    Ne, // !=
     StrictEq,
     StrictNe,
     Lt,
@@ -359,12 +365,18 @@ pub enum Op {
     // ---- exceptions ----
     Throw,
     /// Push a try handler: catch target, finally target (u32::MAX if none).
-    PushTryHandler { catch: u32, finally: u32 },
+    PushTryHandler {
+        catch: u32,
+        finally: u32,
+    },
     PopTryHandler,
     /// `break`/`continue` that crosses one or more enclosing `finally` regions:
     /// park a `Jump` completion and run the crossed finallys (down to the target
     /// loop's handler depth `boundary`) before jumping to `target`.
-    CompletionJump { target: u32, boundary: u32 },
+    CompletionJump {
+        target: u32,
+        boundary: u32,
+    },
     /// End of a `finally` body: if a non-local completion is parked, resume it
     /// (run the next outer finally, or perform return/throw/break/continue);
     /// otherwise the finalizer ran on the normal path and execution falls through.
@@ -408,7 +420,10 @@ pub enum Op {
     /// Concatenate `n` strings on the stack into one (template literals).
     ConcatStrings(u32),
     /// Build a RegExp from (pattern, flags) consts.
-    NewRegExp { pattern: u32, flags: u32 },
+    NewRegExp {
+        pattern: u32,
+        flags: u32,
+    },
     /// no-op / line marker
     Nop,
     /// Push the current function's `home object`'s prototype for `super.x`.
