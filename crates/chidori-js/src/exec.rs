@@ -1,0 +1,2059 @@
+//! VM execution: the per-frame interpreter loop, binary/unary operators, and the
+//! call/construct/closure machinery.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use crate::bytecode::{Const, FuncKind, Op, UpvalueSource};
+use crate::value::*;
+use crate::vm::*;
+
+/// Control-flow signal from a single opcode step.
+enum Ctl {
+    Next,
+    Jump(usize),
+    Return(Value),
+    Await(Value),
+    Yield(Value),
+    YieldStar(Value),
+    GeneratorStart,
+}
+
+impl Vm {
+    // =====================================================================
+    // Calling
+    // =====================================================================
+
+    /// Call `func` with `this` and `args`. Never suspends the caller: async
+    /// callees return a promise, generator callees return a generator object.
+    pub fn call(&mut self, func: Value, this: Value, args: &[Value]) -> Result<Value, Value> {
+        if let Value::Object(o) = &func {
+            let o = o.clone();
+            let (callable, is_proxy) = {
+                let b = o.borrow();
+                (b.is_callable(), matches!(b.internal, Internal::Proxy(_)))
+            };
+            if callable {
+                return self.call_object(&o, this, args, Value::Undefined);
+            }
+            // A callable Proxy ([[Call]] forwards to the apply trap / target).
+            if is_proxy && self.is_callable(&func) {
+                return self.proxy_call(&o, this, args);
+            }
+        }
+        let desc = self.describe(&func);
+        Err(self.throw_type(&format!("{desc} is not a function")))
+    }
+
+    fn describe(&self, v: &Value) -> String {
+        match v {
+            Value::Undefined | Value::Uninitialized | Value::Hole => "undefined".into(),
+            Value::Null => "null".into(),
+            Value::String(s) => format!("\"{}\"", s.as_str()),
+            Value::Number(n) => number_to_string(*n),
+            Value::Bool(b) => b.to_string(),
+            Value::Symbol(_) => "Symbol".into(),
+            Value::BigInt(_) => "BigInt".into(),
+            Value::Object(_) => "object".into(),
+        }
+    }
+
+    pub fn call_object(
+        &mut self,
+        obj: &JsObject,
+        this: Value,
+        args: &[Value],
+        new_target: Value,
+    ) -> Result<Value, Value> {
+        self.call_depth += 1;
+        if self.call_depth > self.max_call_depth {
+            self.call_depth -= 1;
+            return Err(self.throw_range("Maximum call stack size exceeded"));
+        }
+        let result = self.call_object_inner(obj, this, args, new_target);
+        self.call_depth -= 1;
+        result
+    }
+
+    fn call_object_inner(
+        &mut self,
+        obj: &JsObject,
+        this: Value,
+        args: &[Value],
+        new_target: Value,
+    ) -> Result<Value, Value> {
+        // Extract the function kind / data without holding the borrow across the
+        // recursive call.
+        enum Disp {
+            Native(NativeFn),
+            Bytecode(BytecodeFunction),
+            Bound(JsObject, Value, Vec<Value>),
+        }
+        let disp = {
+            let b = obj.borrow();
+            match b.as_function() {
+                Some(FunctionInner::Native(nf)) => Disp::Native(nf.func.clone()),
+                Some(FunctionInner::Bytecode(bf)) => Disp::Bytecode(bf.clone()),
+                Some(FunctionInner::Bound(bound)) => Disp::Bound(
+                    bound.target.clone(),
+                    bound.bound_this.clone(),
+                    bound.bound_args.clone(),
+                ),
+                None => return Err(self.throw_type("not a function")),
+            }
+        };
+        match disp {
+            Disp::Native(f) => f(self, this, args),
+            Disp::Bound(target, bthis, bargs) => {
+                let mut all = bargs;
+                all.extend_from_slice(args);
+                self.call_object(&target, bthis, &all, new_target)
+            }
+            Disp::Bytecode(bf) => self.call_bytecode(obj, bf, this, args, new_target),
+        }
+    }
+
+    fn call_bytecode(
+        &mut self,
+        func_obj: &JsObject,
+        bf: BytecodeFunction,
+        this: Value,
+        args: &[Value],
+        new_target: Value,
+    ) -> Result<Value, Value> {
+        let kind = bf.proto.kind;
+        if kind.is_generator() {
+            return self.make_generator(func_obj, bf, this, args, new_target);
+        }
+        let mut frame = self.make_frame(bf, this, args, new_target);
+        let token = self.trace_enter(&frame.func.proto);
+        frame.trace_token = token;
+        if kind.is_async() {
+            // start_async owns the exit/suspend bookkeeping for this token.
+            Ok(self.start_async(frame))
+        } else {
+            match self.run_frame(frame) {
+                Flow::Return(v) => {
+                    self.trace_exit(token, false);
+                    Ok(v)
+                }
+                Flow::Throw(e) => {
+                    self.trace_exit(token, true);
+                    Err(e)
+                }
+                Flow::Suspend(_) => {
+                    let _ = func_obj;
+                    Err(self.throw_type("internal: sync function suspended"))
+                }
+            }
+        }
+    }
+
+    pub fn make_frame(
+        &self,
+        bf: BytecodeFunction,
+        this: Value,
+        args: &[Value],
+        new_target: Value,
+    ) -> Frame {
+        let proto = bf.proto.clone();
+        let cells = (0..proto.num_cells)
+            .map(|_| Rc::new(RefCell::new(Value::Undefined)))
+            .collect();
+        Frame {
+            func: bf,
+            ip: 0,
+            stack: Vec::with_capacity(8),
+            locals: vec![Value::Undefined; proto.num_locals as usize],
+            cells,
+            this,
+            new_target,
+            handlers: Vec::new(),
+            pending_completion: None,
+            pending_throw: None,
+            pending_return: None,
+            args: args.to_vec(),
+            completion: Value::Undefined,
+            enumerators: Vec::new(),
+            with_scope: Vec::new(),
+            trace_token: None,
+        }
+    }
+
+    // =====================================================================
+    // Construct
+    // =====================================================================
+
+    pub fn construct(
+        &mut self,
+        ctor: &Value,
+        args: &[Value],
+        new_target: &Value,
+    ) -> Result<Value, Value> {
+        let cobj = match ctor {
+            Value::Object(o) if o.borrow().is_callable() => o.clone(),
+            // A constructable Proxy ([[Construct]] forwards to the construct trap).
+            Value::Object(o) if matches!(o.borrow().internal, Internal::Proxy(_)) => {
+                if !self.is_constructor(ctor) {
+                    return Err(self.throw_type("not a constructor"));
+                }
+                return self.proxy_construct(&o.clone(), args, new_target.clone());
+            }
+            _ => return Err(self.throw_type("not a constructor")),
+        };
+        self.call_depth += 1;
+        if self.call_depth > self.max_call_depth {
+            self.call_depth -= 1;
+            return Err(self.throw_range("Maximum call stack size exceeded"));
+        }
+        let r = self.construct_inner(&cobj, args, new_target);
+        self.call_depth -= 1;
+        r
+    }
+
+    fn construct_inner(
+        &mut self,
+        cobj: &JsObject,
+        args: &[Value],
+        new_target: &Value,
+    ) -> Result<Value, Value> {
+        enum Disp {
+            Native(NativeFn),
+            Bytecode(BytecodeFunction),
+            Bound(JsObject, Vec<Value>),
+            NotCtor,
+        }
+        let disp = {
+            let b = cobj.borrow();
+            match b.as_function() {
+                Some(FunctionInner::Native(nf)) => match &nf.construct {
+                    Some(c) => Disp::Native(c.clone()),
+                    None => Disp::NotCtor,
+                },
+                Some(FunctionInner::Bytecode(bf)) => {
+                    if bf.proto.kind.is_async() || bf.proto.kind.is_generator() || bf.proto.kind.is_arrow() {
+                        Disp::NotCtor
+                    } else {
+                        Disp::Bytecode(bf.clone())
+                    }
+                }
+                Some(FunctionInner::Bound(bound)) => {
+                    Disp::Bound(bound.target.clone(), bound.bound_args.clone())
+                }
+                None => Disp::NotCtor,
+            }
+        };
+        match disp {
+            Disp::NotCtor => {
+                let name = self.get_prop(&Value::Object(cobj.clone()), &PropertyKey::str("name"))?;
+                let n = self.to_string_lossy(&name);
+                Err(self.throw_type(&format!("{n} is not a constructor")))
+            }
+            Disp::Native(c) => c(self, Value::Undefined, args),
+            Disp::Bound(target, bargs) => {
+                let mut all = bargs;
+                all.extend_from_slice(args);
+                let nt = if new_target.same_obj(cobj) {
+                    Value::Object(target.clone())
+                } else {
+                    new_target.clone()
+                };
+                self.construct(&Value::Object(target), &all, &nt)
+            }
+            Disp::Bytecode(bf) => {
+                // Create `this` with prototype from new_target.prototype.
+                let nt_obj = match new_target {
+                    Value::Object(o) => o.clone(),
+                    _ => cobj.clone(),
+                };
+                let proto_val =
+                    self.get_prop(&Value::Object(nt_obj.clone()), &PropertyKey::str("prototype"))?;
+                let proto = match proto_val {
+                    Value::Object(o) => Some(o),
+                    _ => Some(self.realm.object_proto.clone()),
+                };
+                let this_obj = JsObject::ordinary(proto);
+                let this = Value::Object(this_obj.clone());
+                let frame = self.make_frame(bf, this.clone(), args, new_target.clone());
+                match self.run_frame(frame) {
+                    Flow::Return(v) => {
+                        if matches!(v, Value::Object(_)) {
+                            Ok(v)
+                        } else {
+                            Ok(this)
+                        }
+                    }
+                    Flow::Throw(e) => Err(e),
+                    Flow::Suspend(_) => Err(self.throw_type("internal: constructor suspended")),
+                }
+            }
+        }
+    }
+
+    // =====================================================================
+    // The interpreter loop
+    // =====================================================================
+
+    pub fn run_frame(&mut self, mut frame: Frame) -> Flow {
+        let mut interrupt_poll: u32 = 0;
+        loop {
+            if let Some(budget) = self.op_budget.as_mut() {
+                if *budget == 0 {
+                    // Uncatchable so execution is guaranteed to terminate.
+                    return Flow::Throw(self.throw_range("execution budget exceeded"));
+                }
+                *budget -= 1;
+            }
+            // Cooperative cancellation: poll the interrupt flag every 256 ops to
+            // keep the atomic load off the hot per-op path while still reacting
+            // promptly even when individual ops are expensive (e.g. O(n) string
+            // concatenation in a loop). Once observed, latch it by zeroing the op
+            // budget so a JS `try/catch` around the slow loop can't resume
+            // execution — guaranteeing a prompt, terminating unwind.
+            if self.interrupt.is_some() {
+                interrupt_poll = interrupt_poll.wrapping_add(1);
+                if interrupt_poll & 0xFF == 0 {
+                    if let Some(flag) = &self.interrupt {
+                        if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                            self.op_budget = Some(0);
+                            return Flow::Throw(self.throw_range("execution interrupted"));
+                        }
+                    }
+                }
+            }
+            if let Some(e) = frame.pending_throw.take() {
+                match self.do_completion(&mut frame, Completion::Throw(e)) {
+                    Ok(Ctl::Jump(t)) => {
+                        frame.ip = t;
+                        continue;
+                    }
+                    Ok(Ctl::Return(v)) => return Flow::Return(v),
+                    Ok(_) => unreachable!("throw completion yields jump or return"),
+                    Err(e) => return Flow::Throw(e),
+                }
+            }
+            // Injected `.return(v)` on a suspended generator: dispatch a Return
+            // completion so enclosing `finally` blocks run before the frame ends
+            // (a `yield` in a finally re-suspends here as a normal yield).
+            if let Some(v) = frame.pending_return.take() {
+                match self.do_completion(&mut frame, Completion::Return(v)) {
+                    Ok(Ctl::Jump(t)) => {
+                        frame.ip = t;
+                        continue;
+                    }
+                    Ok(Ctl::Return(rv)) => return Flow::Return(rv),
+                    Ok(_) => unreachable!("return completion yields jump or return"),
+                    Err(e) => match self.do_completion(&mut frame, Completion::Throw(e)) {
+                        Ok(Ctl::Jump(t)) => {
+                            frame.ip = t;
+                            continue;
+                        }
+                        Ok(Ctl::Return(rv)) => return Flow::Return(rv),
+                        Ok(_) => unreachable!(),
+                        Err(e) => return Flow::Throw(e),
+                    },
+                }
+            }
+            let ip = frame.ip;
+            if ip >= frame.func.proto.code.len() {
+                return Flow::Return(Value::Undefined);
+            }
+            let op = frame.func.proto.code[ip].clone();
+            frame.ip = ip + 1;
+            match self.step(&mut frame, op) {
+                Ok(Ctl::Next) => continue,
+                Ok(Ctl::Jump(target)) => {
+                    frame.ip = target;
+                    continue;
+                }
+                Ok(Ctl::Return(v)) => {
+                    // Module linker hook: snapshot this frame's final cells when it
+                    // is the module body being evaluated (matched by proto pointer).
+                    if let Some(p) = &self.module_capture_proto {
+                        if Rc::ptr_eq(&frame.func.proto, p) {
+                            self.module_capture = Some(frame.cells.clone());
+                        }
+                    }
+                    return Flow::Return(v);
+                }
+                Ok(Ctl::Await(v)) => {
+                    return Flow::Suspend(Suspension {
+                        frame: Box::new(frame),
+                        kind: SuspendKind::Await(v),
+                    })
+                }
+                Ok(Ctl::Yield(v)) => {
+                    return Flow::Suspend(Suspension {
+                        frame: Box::new(frame),
+                        kind: SuspendKind::Yield(v),
+                    })
+                }
+                Ok(Ctl::YieldStar(v)) => {
+                    return Flow::Suspend(Suspension {
+                        frame: Box::new(frame),
+                        kind: SuspendKind::YieldStar(v),
+                    })
+                }
+                Ok(Ctl::GeneratorStart) => {
+                    return Flow::Suspend(Suspension {
+                        frame: Box::new(frame),
+                        kind: SuspendKind::GeneratorStart,
+                    })
+                }
+                Err(e) => match self.do_completion(&mut frame, Completion::Throw(e)) {
+                    Ok(Ctl::Jump(t)) => {
+                        frame.ip = t;
+                        continue;
+                    }
+                    Ok(Ctl::Return(v)) => return Flow::Return(v),
+                    Ok(_) => unreachable!("throw completion yields jump or return"),
+                    Err(e) => return Flow::Throw(e),
+                },
+            }
+        }
+    }
+
+    /// Drive a non-local completion (`return`/`break`/`continue`/throw) through
+    /// the handler stack, running each enclosing `finally` it crosses. Pops
+    /// handlers down to the completion's boundary (0 for return/throw; the target
+    /// loop's handler depth for break/continue):
+    /// - a `throw` that meets a handler with a `catch` jumps into the catch;
+    /// - any handler with a `finally` parks the completion and jumps into the
+    ///   finalizer (whose `EndFinally` resumes this dispatch);
+    /// - once no more crossing handlers remain, the action is performed
+    ///   (`Ctl::Return` / re-`throw` as `Err` / `Ctl::Jump` to the loop target).
+    fn do_completion(&mut self, frame: &mut Frame, comp: Completion) -> Result<Ctl, Value> {
+        let boundary = match &comp {
+            Completion::Jump { boundary, .. } => *boundary as usize,
+            _ => 0,
+        };
+        while frame.handlers.len() > boundary {
+            let h = frame.handlers.pop().unwrap();
+            frame.stack.truncate(h.stack_depth);
+            // Discard any `with` environments entered after this handler.
+            frame.with_scope.truncate(h.with_depth);
+            if let Completion::Throw(err) = &comp {
+                if let Some(catch_ip) = h.catch_ip {
+                    frame.stack.push(err.clone());
+                    return Ok(Ctl::Jump(catch_ip as usize));
+                }
+            }
+            if let Some(finally_ip) = h.finally_ip {
+                frame.pending_completion = Some(comp);
+                return Ok(Ctl::Jump(finally_ip as usize));
+            }
+        }
+        match comp {
+            Completion::Return(v) => Ok(Ctl::Return(v)),
+            Completion::Throw(e) => Err(e),
+            Completion::Jump { target, .. } => Ok(Ctl::Jump(target as usize)),
+        }
+    }
+
+    fn const_val(&self, frame: &Frame, idx: u32) -> Value {
+        match &frame.func.proto.consts[idx as usize] {
+            Const::Undefined => Value::Undefined,
+            Const::Null => Value::Null,
+            Const::Bool(b) => Value::Bool(*b),
+            Const::Number(n) => Value::Number(*n),
+            Const::String(s) => Value::String(JsString(s.clone())),
+            Const::Func(_) => Value::Undefined, // handled by Closure
+            Const::BigInt(s) => {
+                Value::bigint(parse_string_bigint(s).unwrap_or_else(|| num_bigint::BigInt::from(0)))
+            }
+        }
+    }
+
+    fn const_name(&self, frame: &Frame, idx: u32) -> JsString {
+        match &frame.func.proto.consts[idx as usize] {
+            Const::String(s) => JsString(s.clone()),
+            _ => JsString::new(""),
+        }
+    }
+
+    /// PutValue: strict-mode assignment (`Throw=true`) routes failed writes
+    /// through `set_prop_strict` (which throws a TypeError); sloppy no-ops.
+    fn put_value(
+        &mut self,
+        base: &Value,
+        key: &PropertyKey,
+        value: Value,
+        strict: bool,
+    ) -> Result<(), Value> {
+        if strict {
+            self.set_prop_strict(base, key, value)
+        } else {
+            self.set_prop(base, key, value)
+        }
+    }
+
+    fn step(&mut self, frame: &mut Frame, op: Op) -> Result<Ctl, Value> {
+        macro_rules! pop {
+            () => {
+                frame.stack.pop().unwrap_or(Value::Undefined)
+            };
+        }
+        macro_rules! push {
+            ($v:expr) => {
+                frame.stack.push($v)
+            };
+        }
+        match op {
+            Op::Nop => {}
+            Op::LoadConst(i) => push!(self.const_val(frame, i)),
+            Op::LoadUndefined => push!(Value::Undefined),
+            Op::LoadHole => push!(Value::Hole),
+            Op::LoadNull => push!(Value::Null),
+            Op::LoadTrue => push!(Value::Bool(true)),
+            Op::LoadFalse => push!(Value::Bool(false)),
+            Op::LoadThis => push!(frame.this.clone()),
+            Op::RequireObjectCoercible => {
+                if frame.stack.last().map(|v| v.is_nullish()).unwrap_or(true) {
+                    return Err(self.throw_type("Cannot destructure a null or undefined value"));
+                }
+            }
+            Op::BindThisSloppy => {
+                let t = pop!();
+                let bound = match t {
+                    Value::Undefined | Value::Null => {
+                        Value::Object(self.realm.global.clone())
+                    }
+                    Value::Object(_) => t,
+                    // A primitive `this` is boxed (ToObject) in sloppy mode.
+                    other => Value::Object(self.to_object(&other)?),
+                };
+                push!(bound);
+            }
+            Op::LoadNewTarget => push!(frame.new_target.clone()),
+            Op::LoadArg(i) => push!(frame.args.get(i as usize).cloned().unwrap_or(Value::Undefined)),
+            Op::LoadRestArgs(n) => {
+                let rest: Vec<Value> = if (n as usize) < frame.args.len() {
+                    frame.args[n as usize..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                push!(Value::Object(self.new_array(rest)));
+            }
+            Op::LoadArguments => {
+                let arr = self.new_array(frame.args.clone());
+                push!(Value::Object(arr));
+            }
+
+            Op::LoadLocal(i) => push!(frame.locals[i as usize].clone()),
+            Op::StoreLocal(i) => {
+                let v = pop!();
+                frame.locals[i as usize] = v;
+            }
+            Op::LoadCell(i) => {
+                let v = frame.cells[i as usize].borrow().clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self
+                        .throw_reference("Cannot access binding before initialization"));
+                }
+                push!(v);
+            }
+            Op::StoreCell(i) => {
+                let v = pop!();
+                *frame.cells[i as usize].borrow_mut() = v;
+            }
+            Op::StoreCellChecked(i) => {
+                let v = pop!();
+                let mut slot = frame.cells[i as usize].borrow_mut();
+                if matches!(*slot, Value::Uninitialized) {
+                    drop(slot);
+                    return Err(self
+                        .throw_reference("Cannot access binding before initialization"));
+                }
+                *slot = v;
+            }
+            Op::InitCell(i) => {
+                let v = pop!();
+                // A module's top-level cells are STABLE: mutate in place so a
+                // pre-wired import binding (or self-reference) keeps pointing at
+                // the live cell. All other bindings get a fresh `Rc` (needed for
+                // per-iteration `let` semantics).
+                if frame.func.proto.stable_cells.contains(&i) {
+                    *frame.cells[i as usize].borrow_mut() = v;
+                } else {
+                    frame.cells[i as usize] = Rc::new(RefCell::new(v));
+                }
+            }
+            Op::InitCellTdz(i) => {
+                // Fresh cell holding the Temporal Dead Zone marker (a hoisted
+                // `let`/`const`/`class` binding before its initializer runs).
+                if frame.func.proto.stable_cells.contains(&i) {
+                    *frame.cells[i as usize].borrow_mut() = Value::Uninitialized;
+                } else {
+                    frame.cells[i as usize] = Rc::new(RefCell::new(Value::Uninitialized));
+                }
+            }
+            Op::LoadUpvalue(i) => {
+                let v = frame.func.upvalues[i as usize].borrow().clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self
+                        .throw_reference("Cannot access binding before initialization"));
+                }
+                push!(v);
+            }
+            Op::StoreUpvalue(i) => {
+                let v = pop!();
+                *frame.func.upvalues[i as usize].borrow_mut() = v;
+            }
+            Op::StoreUpvalueChecked(i) => {
+                let v = pop!();
+                let mut slot = frame.func.upvalues[i as usize].borrow_mut();
+                if matches!(*slot, Value::Uninitialized) {
+                    drop(slot);
+                    return Err(self
+                        .throw_reference("Cannot access binding before initialization"));
+                }
+                *slot = v;
+            }
+            Op::LoadGlobal(i) => {
+                let name = self.const_name(frame, i);
+                let key = PropertyKey::Str(name.clone());
+                let g = self.realm.global.clone();
+                if !self.has_own_or_proto(&g, &key) {
+                    return Err(self.throw_reference(&format!("{} is not defined", name.as_str())));
+                }
+                let v = self.get_prop(&Value::Object(g), &key)?;
+                push!(v);
+            }
+            Op::LoadGlobalTypeof(i) => {
+                let name = self.const_name(frame, i);
+                let key = PropertyKey::Str(name);
+                let g = self.realm.global.clone();
+                let v = self.get_prop(&Value::Object(g), &key)?;
+                push!(v);
+            }
+            Op::StoreGlobal(i) => {
+                let name = self.const_name(frame, i);
+                let v = pop!();
+                let g = self.realm.global.clone();
+                let strict = frame.func.proto.is_strict;
+                let key = PropertyKey::Str(name.clone());
+                // A bare assignment to a name bound nowhere is an unresolvable
+                // reference; PutValue on one throws ReferenceError in strict mode
+                // (a global-object property anywhere on the proto chain counts as
+                // resolvable). Sloppy mode creates the global property instead.
+                if strict && !self.has_prop(&Value::Object(g.clone()), &key)? {
+                    return Err(
+                        self.throw_reference(&format!("{} is not defined", name.as_str()))
+                    );
+                }
+                self.put_value(&Value::Object(g), &key, v, strict)?;
+            }
+            Op::DeclareGlobal(i) => {
+                let name = self.const_name(frame, i);
+                let g = self.realm.global.clone();
+                let key = PropertyKey::Str(name);
+                if !g.borrow().props.contains_key(&key) {
+                    g.borrow_mut().props.insert(key, Property::data(Value::Undefined));
+                }
+            }
+
+            Op::PushWithScope => {
+                let v = pop!();
+                let obj = self.to_object(&v)?;
+                frame.with_scope.push(obj);
+            }
+            Op::PopWithScope => {
+                frame.with_scope.pop();
+            }
+            Op::LoadName { name, fallback } => {
+                let nm = self.const_name(frame, name);
+                let key = PropertyKey::Str(nm);
+                if let Some(obj) = self.with_lookup(frame, &key)? {
+                    // Object Environment Record GetBindingValue: re-check
+                    // HasProperty (the binding could have been removed by the
+                    // @@unscopables getter), then read.
+                    let base = Value::Object(obj);
+                    if self.has_prop(&base, &key)? {
+                        let v = self.get_prop(&base, &key)?;
+                        push!(v);
+                    } else {
+                        push!(Value::Undefined);
+                    }
+                } else {
+                    return self.step(frame, (*fallback).clone());
+                }
+            }
+            Op::StoreName { name, fallback } => {
+                let nm = self.const_name(frame, name);
+                let key = PropertyKey::Str(nm);
+                if let Some(obj) = self.with_lookup(frame, &key)? {
+                    let v = pop!();
+                    let strict = frame.func.proto.is_strict;
+                    self.put_value(&Value::Object(obj), &key, v, strict)?;
+                } else {
+                    return self.step(frame, (*fallback).clone());
+                }
+            }
+            Op::DeleteName(name) => {
+                let nm = self.const_name(frame, name);
+                let key = PropertyKey::Str(nm);
+                if let Some(obj) = self.with_lookup(frame, &key)? {
+                    let r = self.delete_prop(&Value::Object(obj), &key)?;
+                    push!(Value::Bool(r));
+                } else {
+                    // Deleting an unresolvable/lexical bare name reports success.
+                    push!(Value::Bool(true));
+                }
+            }
+
+            Op::Pop => {
+                frame.stack.pop();
+            }
+            Op::Dup => {
+                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                push!(v);
+            }
+            Op::Swap => {
+                let n = frame.stack.len();
+                if n >= 2 {
+                    frame.stack.swap(n - 1, n - 2);
+                }
+            }
+            Op::Rot3 => {
+                let n = frame.stack.len();
+                if n >= 3 {
+                    // a b c -> b c a
+                    frame.stack[n - 3..].rotate_left(1);
+                }
+            }
+
+            Op::NewObject => push!(Value::Object(self.new_object())),
+            Op::NewArray(n) => {
+                let n = n as usize;
+                let at = frame.stack.len() - n;
+                let elems = frame.stack.split_off(at);
+                push!(Value::Object(self.new_array(elems)));
+            }
+            Op::ArrayPushElision => {
+                // For array literals we build via NewArray; elisions handled by
+                // pushing undefined holes at compile time.
+                push!(Value::Undefined);
+            }
+            Op::ArraySpread => {
+                let src = pop!();
+                let arr_v = pop!();
+                let items = self.iterate_to_vec(&src)?;
+                if let Value::Object(a) = &arr_v {
+                    let mut b = a.borrow_mut();
+                    if let Internal::Array(elems) = &mut b.internal {
+                        elems.extend(items);
+                    }
+                }
+                push!(arr_v);
+            }
+            Op::DefineField => {
+                let value = pop!();
+                let key_v = pop!();
+                let obj = pop!();
+                let key = self.to_property_key(&key_v)?;
+                if let Value::Object(o) = &obj {
+                    o.borrow_mut().props.insert(key, Property::data(value));
+                }
+                push!(obj);
+            }
+            Op::DefineMethod => {
+                // Class methods are non-enumerable (writable, configurable).
+                let value = pop!();
+                let key_v = pop!();
+                let obj = pop!();
+                let key = self.to_property_key(&key_v)?;
+                if let Value::Object(o) = &obj {
+                    o.borrow_mut().props.insert(key, Property::builtin(value));
+                }
+                push!(obj);
+            }
+            Op::DefineGetter => {
+                let getter = pop!();
+                let key_v = pop!();
+                let obj = pop!();
+                let key = self.to_property_key(&key_v)?;
+                self.define_accessor_with(&obj, key, Some(getter), None, true);
+                push!(obj);
+            }
+            Op::DefineSetter => {
+                let setter = pop!();
+                let key_v = pop!();
+                let obj = pop!();
+                let key = self.to_property_key(&key_v)?;
+                self.define_accessor_with(&obj, key, None, Some(setter), true);
+                push!(obj);
+            }
+            Op::DefineMethodGetter => {
+                let getter = pop!();
+                let key_v = pop!();
+                let obj = pop!();
+                let key = self.to_property_key(&key_v)?;
+                self.define_accessor_with(&obj, key, Some(getter), None, false);
+                push!(obj);
+            }
+            Op::DefineMethodSetter => {
+                let setter = pop!();
+                let key_v = pop!();
+                let obj = pop!();
+                let key = self.to_property_key(&key_v)?;
+                self.define_accessor_with(&obj, key, None, Some(setter), false);
+                push!(obj);
+            }
+            Op::SetHomeObject => {
+                // Stack [obj, key, value] unchanged; stamp the value closure's
+                // [[HomeObject]] = obj (MakeMethod) so its `super.prop` resolves.
+                let n = frame.stack.len();
+                if n >= 3 {
+                    let home = frame.stack[n - 3].clone();
+                    if let (Value::Object(home), Value::Object(m)) =
+                        (home, frame.stack[n - 1].clone())
+                    {
+                        if let Internal::Function(FunctionInner::Bytecode(bf)) =
+                            &mut m.borrow_mut().internal
+                        {
+                            bf.home_object = Some(home);
+                        }
+                    }
+                }
+            }
+            Op::GetSuperProp(k) => {
+                let name = self.const_name(frame, k);
+                let key = PropertyKey::Str(name);
+                let recv = frame.this.clone();
+                let base = frame
+                    .func
+                    .home_object
+                    .as_ref()
+                    .and_then(|h| h.borrow().proto.clone());
+                let v = match base {
+                    Some(proto) => self.get_from_object(&proto, &key, recv)?,
+                    None => Value::Undefined,
+                };
+                push!(v);
+            }
+            Op::GetSuperPropDynamic => {
+                let key_v = pop!();
+                let key = self.to_property_key(&key_v)?;
+                let recv = frame.this.clone();
+                let base = frame
+                    .func
+                    .home_object
+                    .as_ref()
+                    .and_then(|h| h.borrow().proto.clone());
+                let v = match base {
+                    Some(proto) => self.get_from_object(&proto, &key, recv)?,
+                    None => Value::Undefined,
+                };
+                push!(v);
+            }
+            Op::ObjectSpread => {
+                let src = pop!();
+                let target = pop!();
+                if let Value::Object(t) = &target {
+                    if let Value::Object(s) = &src {
+                        for k in self.enumerable_own_keys_dyn(s)? {
+                            let val = self.get_prop(&src, &k)?;
+                            t.borrow_mut().props.insert(k, Property::data(val));
+                        }
+                    } else if let Value::String(st) = &src {
+                        for (i, c) in st.as_str().chars().enumerate() {
+                            t.borrow_mut().props.insert(
+                                PropertyKey::from_index(i as u32),
+                                Property::data(Value::str(c.to_string())),
+                            );
+                        }
+                    }
+                }
+                push!(target);
+            }
+            Op::GetProp(i) => {
+                let name = self.const_name(frame, i);
+                let obj = pop!();
+                let v = self.get_prop(&obj, &PropertyKey::Str(name))?;
+                push!(v);
+            }
+            Op::PrivateGet(i) => {
+                let name = self.const_name(frame, i);
+                let obj = pop!();
+                let key = PropertyKey::Str(name.clone());
+                // PrivateBrandCheck: the receiver must possess the private name
+                // (own field, or method on the class prototype); else TypeError.
+                if !self.has_prop(&obj, &key)? {
+                    return Err(self.throw_type(&format!(
+                        "Cannot read private member {} from an object whose class did not declare it",
+                        name.as_str()
+                    )));
+                }
+                // A private accessor with only a setter has no [[Get]] (spec
+                // PrivateFieldGet step 6.b) — reading it is a TypeError.
+                if let Some((has_get, _)) = private_accessor_kind(&obj, &key) {
+                    if !has_get {
+                        return Err(self.throw_type(&format!(
+                            "'{}' was defined without a getter",
+                            name.as_str()
+                        )));
+                    }
+                }
+                let v = self.get_prop(&obj, &key)?;
+                push!(v);
+            }
+            Op::PrivateSet(i) => {
+                let name = self.const_name(frame, i);
+                let value = pop!();
+                let obj = pop!();
+                let key = PropertyKey::Str(name.clone());
+                if !self.has_prop(&obj, &key)? {
+                    return Err(self.throw_type(&format!(
+                        "Cannot write private member {} to an object whose class did not declare it",
+                        name.as_str()
+                    )));
+                }
+                // A private accessor with no [[Set]] is a TypeError to assign.
+                if let Some((_, has_set)) = private_accessor_kind(&obj, &key) {
+                    if !has_set {
+                        return Err(self.throw_type(&format!(
+                            "'{}' was defined without a setter",
+                            name.as_str()
+                        )));
+                    }
+                }
+                self.set_prop(&obj, &key, value.clone())?;
+                push!(value);
+            }
+            Op::SetProp(i) => {
+                let name = self.const_name(frame, i);
+                let value = pop!();
+                let obj = pop!();
+                let strict = frame.func.proto.is_strict;
+                self.put_value(&obj, &PropertyKey::Str(name), value.clone(), strict)?;
+                push!(value);
+            }
+            Op::GetPropDynamic => {
+                let key_v = pop!();
+                let obj = pop!();
+                let key = self.to_property_key(&key_v)?;
+                let v = self.get_prop(&obj, &key)?;
+                push!(v);
+            }
+            Op::SetPropDynamic => {
+                let value = pop!();
+                let key_v = pop!();
+                let obj = pop!();
+                let key = self.to_property_key(&key_v)?;
+                let strict = frame.func.proto.is_strict;
+                self.put_value(&obj, &key, value.clone(), strict)?;
+                push!(value);
+            }
+            Op::DeleteProp(i) => {
+                let name = self.const_name(frame, i);
+                let obj = pop!();
+                let r = self.delete_prop(&obj, &PropertyKey::Str(name))?;
+                push!(Value::Bool(r));
+            }
+            Op::DeletePropDynamic => {
+                let key_v = pop!();
+                let obj = pop!();
+                let key = self.to_property_key(&key_v)?;
+                let r = self.delete_prop(&obj, &key)?;
+                push!(Value::Bool(r));
+            }
+            Op::HasProp => {
+                let obj = pop!();
+                let key_v = pop!();
+                let key = self.to_property_key(&key_v)?;
+                let r = self.has_prop(&obj, &key)?;
+                push!(Value::Bool(r));
+            }
+            Op::JumpIfNullish(t) => {
+                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                if v.is_nullish() {
+                    return Ok(Ctl::Jump(t as usize));
+                }
+            }
+
+            Op::Call(argc) => {
+                let n = argc as usize;
+                let at = frame.stack.len() - n;
+                let args = frame.stack.split_off(at);
+                let this = pop!();
+                let func = pop!();
+                let r = self.call(func, this, &args)?;
+                push!(r);
+            }
+            Op::CallMethodless(argc) => {
+                let n = argc as usize;
+                let at = frame.stack.len() - n;
+                let args = frame.stack.split_off(at);
+                let func = pop!();
+                let r = self.call(func, Value::Undefined, &args)?;
+                push!(r);
+            }
+            Op::CallSpread => {
+                let args_arr = pop!();
+                let this = pop!();
+                let func = pop!();
+                let args = self.iterate_to_vec(&args_arr)?;
+                let r = self.call(func, this, &args)?;
+                push!(r);
+            }
+            Op::New(argc) => {
+                let n = argc as usize;
+                let at = frame.stack.len() - n;
+                let args = frame.stack.split_off(at);
+                let ctor = pop!();
+                let r = self.construct(&ctor, &args, &ctor)?;
+                push!(r);
+            }
+            Op::NewSpread => {
+                let args_arr = pop!();
+                let ctor = pop!();
+                let args = self.iterate_to_vec(&args_arr)?;
+                let r = self.construct(&ctor, &args, &ctor)?;
+                push!(r);
+            }
+            Op::Return => {
+                let v = pop!();
+                // Route through any enclosing `finally` blocks before returning.
+                return self.do_completion(frame, Completion::Return(v));
+            }
+            Op::ReturnUndefined => {
+                let v = frame.completion.clone();
+                return self.do_completion(frame, Completion::Return(v));
+            }
+
+            Op::Closure(i) => {
+                let proto = match &frame.func.proto.consts[i as usize] {
+                    Const::Func(p) => p.clone(),
+                    _ => return Err(self.throw_type("internal: bad closure const")),
+                };
+                let upvalues = proto
+                    .upvalues
+                    .iter()
+                    .map(|src| match src {
+                        UpvalueSource::ParentCell(idx) => frame.cells[*idx as usize].clone(),
+                        UpvalueSource::ParentUpvalue(idx) => {
+                            frame.func.upvalues[*idx as usize].clone()
+                        }
+                    })
+                    .collect();
+                let f = self.make_closure(proto, upvalues);
+                push!(Value::Object(f));
+            }
+
+            // ---- arithmetic ----
+            Op::Add => {
+                let b = pop!();
+                let a = pop!();
+                let r = self.op_add(a, b)?;
+                push!(r);
+            }
+            Op::Sub => bin_arith(self, frame, ArithKind::Sub)?,
+            Op::Mul => bin_arith(self, frame, ArithKind::Mul)?,
+            Op::Div => bin_arith(self, frame, ArithKind::Div)?,
+            Op::Mod => bin_arith(self, frame, ArithKind::Mod)?,
+            Op::Pow => bin_arith(self, frame, ArithKind::Pow)?,
+            Op::Neg => {
+                let a = pop!();
+                push!(self.unary_arith(a, UnaryKind::Neg)?);
+            }
+            Op::Pos => {
+                // ToNumber throws TypeError for BigInt (unary + is invalid on it).
+                let a = pop!();
+                let n = self.to_number(&a)?;
+                push!(Value::Number(n));
+            }
+            Op::ToNumeric => {
+                // ToNumeric: like ToNumber but keeps BigInt (used by ++/-- to
+                // produce the coerced old value).
+                let a = pop!();
+                push!(self.to_numeric(&a)?);
+            }
+            Op::ThrowConstAssign => {
+                return Err(self.throw_type("Assignment to constant variable."));
+            }
+            Op::DynamicImport => {
+                // Specifier already evaluated (and on the stack); coerce it to a
+                // string per spec (a Symbol specifier must reject), then reject —
+                // module loading is unsupported in this engine.
+                let spec = pop!();
+                let reason = match self.to_js_string(&spec) {
+                    Ok(_) => self.make_error(
+                        crate::vm::ErrorKind::Type,
+                        "dynamic import is not supported",
+                    ),
+                    Err(e) => e,
+                };
+                let p = self.new_rejected(reason);
+                push!(Value::Object(p));
+            }
+            Op::Inc => {
+                let a = pop!();
+                push!(self.unary_arith(a, UnaryKind::Inc)?);
+            }
+            Op::Dec => {
+                let a = pop!();
+                push!(self.unary_arith(a, UnaryKind::Dec)?);
+            }
+            Op::BitNot => {
+                let a = pop!();
+                push!(self.unary_arith(a, UnaryKind::BitNot)?);
+            }
+            Op::Not => {
+                let a = pop!();
+                push!(Value::Bool(!self.to_boolean(&a)));
+            }
+            Op::BitAnd => bin_arith(self, frame, ArithKind::BitAnd)?,
+            Op::BitOr => bin_arith(self, frame, ArithKind::BitOr)?,
+            Op::BitXor => bin_arith(self, frame, ArithKind::BitXor)?,
+            Op::Shl => bin_arith(self, frame, ArithKind::Shl)?,
+            Op::Shr => bin_arith(self, frame, ArithKind::Shr)?,
+            Op::UShr => bin_arith(self, frame, ArithKind::UShr)?,
+            Op::TypeofExpr => {
+                let a = pop!();
+                push!(Value::str(a.type_of()));
+            }
+
+            // ---- comparison ----
+            Op::Eq => {
+                let b = pop!();
+                let a = pop!();
+                let r = self.loose_equals(&a, &b)?;
+                push!(Value::Bool(r));
+            }
+            Op::Ne => {
+                let b = pop!();
+                let a = pop!();
+                let r = self.loose_equals(&a, &b)?;
+                push!(Value::Bool(!r));
+            }
+            Op::StrictEq => {
+                let b = pop!();
+                let a = pop!();
+                push!(Value::Bool(self.strict_equals(&a, &b)));
+            }
+            Op::StrictNe => {
+                let b = pop!();
+                let a = pop!();
+                push!(Value::Bool(!self.strict_equals(&a, &b)));
+            }
+            Op::Lt => {
+                let b = pop!();
+                let a = pop!();
+                let r = self.less_than(&a, &b)?;
+                push!(Value::Bool(r == Some(true)));
+            }
+            Op::Gt => {
+                let b = pop!();
+                let a = pop!();
+                let r = self.less_than(&b, &a)?;
+                push!(Value::Bool(r == Some(true)));
+            }
+            Op::Le => {
+                let b = pop!();
+                let a = pop!();
+                let r = self.less_than(&b, &a)?;
+                push!(Value::Bool(r == Some(false)));
+            }
+            Op::Ge => {
+                let b = pop!();
+                let a = pop!();
+                let r = self.less_than(&a, &b)?;
+                push!(Value::Bool(r == Some(false)));
+            }
+            Op::InstanceOf => {
+                let ctor = pop!();
+                let obj = pop!();
+                let r = self.instance_of(&obj, &ctor)?;
+                push!(Value::Bool(r));
+            }
+
+            // ---- control flow ----
+            Op::Jump(t) => return Ok(Ctl::Jump(t as usize)),
+            Op::JumpIfTrue(t) => {
+                let v = pop!();
+                if self.to_boolean(&v) {
+                    return Ok(Ctl::Jump(t as usize));
+                }
+            }
+            Op::JumpIfFalse(t) => {
+                let v = pop!();
+                if !self.to_boolean(&v) {
+                    return Ok(Ctl::Jump(t as usize));
+                }
+            }
+            Op::JumpIfFalsyPeek(t) => {
+                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                if !self.to_boolean(&v) {
+                    return Ok(Ctl::Jump(t as usize));
+                }
+                frame.stack.pop();
+            }
+            Op::JumpIfTruthyPeek(t) => {
+                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                if self.to_boolean(&v) {
+                    return Ok(Ctl::Jump(t as usize));
+                }
+                frame.stack.pop();
+            }
+            Op::JumpIfNullishPeek(t) => {
+                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                if !v.is_nullish() {
+                    return Ok(Ctl::Jump(t as usize));
+                }
+                frame.stack.pop();
+            }
+
+            // ---- exceptions ----
+            Op::Throw => {
+                let v = pop!();
+                return Err(v);
+            }
+            Op::PushTryHandler { catch, finally } => {
+                frame.handlers.push(TryHandler {
+                    catch_ip: if catch == u32::MAX { None } else { Some(catch) },
+                    finally_ip: if finally == u32::MAX { None } else { Some(finally) },
+                    stack_depth: frame.stack.len(),
+                    with_depth: frame.with_scope.len(),
+                });
+            }
+            Op::PopTryHandler => {
+                frame.handlers.pop();
+            }
+            Op::CompletionJump { target, boundary } => {
+                return self.do_completion(frame, Completion::Jump { target, boundary });
+            }
+            Op::EndFinally => {
+                // If a non-local completion is parked, resume it (run the next
+                // outer finally, or perform the action). Otherwise the finalizer
+                // ran on the normal path: fall through.
+                if let Some(c) = frame.pending_completion.take() {
+                    return self.do_completion(frame, c);
+                }
+            }
+
+            // ---- iteration ----
+            Op::GetIterator => {
+                let v = pop!();
+                let it = self.get_iterator(&v)?;
+                push!(it);
+            }
+            Op::IteratorNext => {
+                let it = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                let next = self.get_prop(&it, &PropertyKey::str("next"))?;
+                let res = self.call(next, it, &[])?;
+                push!(res);
+            }
+            Op::IteratorClose => {
+                // Reached only on an abrupt completion of a `for-of` loop, with
+                // that completion parked in `pending_completion`. Per spec
+                // (IteratorClose), if the completion is a throw, any error from
+                // `return()` is suppressed (the original throw wins); otherwise a
+                // `return()` error propagates and a non-object result is a
+                // TypeError.
+                let it = pop!();
+                let completion_is_throw =
+                    matches!(frame.pending_completion, Some(Completion::Throw(_)));
+                let ret = match self.get_prop(&it, &PropertyKey::str("return")) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if completion_is_throw {
+                            Value::Undefined
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                };
+                if self.is_callable(&ret) {
+                    match self.call(ret, it.clone(), &[]) {
+                        Ok(v) => {
+                            if !completion_is_throw && !matches!(v, Value::Object(_)) {
+                                return Err(
+                                    self.throw_type("iterator return() result is not an object")
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if !completion_is_throw {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+            }
+            Op::ForInEnumerate => {
+                let v = pop!();
+                let keys = self.for_in_keys(&v)?;
+                frame.enumerators.push((keys, 0));
+                push!(Value::Number((frame.enumerators.len() - 1) as f64));
+            }
+            Op::ForInPop => {
+                frame.enumerators.pop();
+            }
+            Op::ForInNext => {
+                let idx = frame.enumerators.len() - 1;
+                let (keys, cursor) = &mut frame.enumerators[idx];
+                if *cursor < keys.len() {
+                    let k = keys[*cursor].clone();
+                    *cursor += 1;
+                    push!(Value::String(k));
+                    push!(Value::Bool(true));
+                } else {
+                    push!(Value::Undefined);
+                    push!(Value::Bool(false));
+                }
+            }
+
+            // ---- generators / async ----
+            Op::Await => {
+                let v = pop!();
+                return Ok(Ctl::Await(v));
+            }
+            Op::Yield => {
+                let v = pop!();
+                return Ok(Ctl::Yield(v));
+            }
+            Op::GeneratorStart => return Ok(Ctl::GeneratorStart),
+            Op::YieldStar => {
+                let v = pop!();
+                return Ok(Ctl::YieldStar(v));
+            }
+            Op::AsyncReturn => {
+                let v = pop!();
+                return Ok(Ctl::Return(v));
+            }
+
+            // ---- misc ----
+            Op::ToPropertyKey => {
+                let v = pop!();
+                let k = self.to_property_key(&v)?;
+                push!(match k {
+                    PropertyKey::Str(s) => Value::String(s),
+                    PropertyKey::Sym(s) => Value::Symbol(s),
+                });
+            }
+            Op::ToStringOp => {
+                let v = pop!();
+                let s = self.to_js_string(&v)?;
+                push!(Value::String(s));
+            }
+            Op::ConcatStrings(n) => {
+                let n = n as usize;
+                let at = frame.stack.len() - n;
+                let parts = frame.stack.split_off(at);
+                let mut out = String::new();
+                for p in &parts {
+                    let s = self.to_js_string(p)?;
+                    // Same bound as `op_add`: a template-literal join in a doubling
+                    // loop (`` s = `${s}${s}` ``) must not grow without limit.
+                    if out.len() + s.as_str().len() > crate::value::MAX_STRING_LEN {
+                        return Err(self.throw_range("invalid string length"));
+                    }
+                    out.push_str(s.as_str());
+                }
+                push!(Value::str(out));
+            }
+            Op::NewRegExp { pattern, flags } => {
+                let p = self.const_name(frame, pattern);
+                let f = self.const_name(frame, flags);
+                let re = self.make_regexp(p.as_str(), f.as_str())?;
+                push!(re);
+            }
+            Op::GetAsyncIterator => {
+                let v = pop!();
+                let it = self.get_async_iterator(&v)?;
+                push!(it);
+            }
+            Op::SuperCall(_)
+            | Op::SuperCallSpread
+            | Op::LoadSuperBase
+            | Op::SuperGet(_)
+            | Op::SuperGetDynamic
+            | Op::SuperSet(_)
+            | Op::SpreadIntoArray => {
+                return Err(self.throw_type("unsupported opcode (super/spread-internal)"));
+            }
+        }
+        Ok(Ctl::Next)
+    }
+
+    /// Resolve `key` against the frame's active `with` scopes (innermost first).
+    /// Returns the with-object that should service the binding, or `None` if no
+    /// with-object provides it (so the caller falls back to lexical/global).
+    ///
+    /// Implements the object Environment Record `HasBinding`: a name binds to a
+    /// with-object iff `HasProperty(obj, key)` is true AND it is not excluded by
+    /// the object's `@@unscopables` (a name whose @@unscopables entry is truthy
+    /// is treated as absent).
+    fn with_lookup(
+        &mut self,
+        frame: &Frame,
+        key: &PropertyKey,
+    ) -> Result<Option<JsObject>, Value> {
+        // Snapshot the scope objects so we don't borrow `frame` across the
+        // `&mut self` calls below.
+        let scopes: Vec<JsObject> = frame.with_scope.iter().rev().cloned().collect();
+        for obj in scopes {
+            let base = Value::Object(obj.clone());
+            if !self.has_prop(&base, key)? {
+                continue;
+            }
+            // @@unscopables filter.
+            let unscm = self.realm.symbol_unscopables.clone();
+            let unsc = self.get_prop(&base, &PropertyKey::Sym(unscm))?;
+            if let Value::Object(_) = &unsc {
+                let blocked = self.get_prop(&unsc, key)?;
+                if self.to_boolean(&blocked) {
+                    continue;
+                }
+            }
+            return Ok(Some(obj));
+        }
+        Ok(None)
+    }
+
+    fn has_own_or_proto(&self, obj: &JsObject, key: &PropertyKey) -> bool {
+        let mut cur = obj.clone();
+        loop {
+            let proto = {
+                let b = cur.borrow();
+                if b.props.contains_key(key) {
+                    return true;
+                }
+                b.proto.clone()
+            };
+            match proto {
+                Some(p) => cur = p,
+                None => return false,
+            }
+        }
+    }
+
+    pub fn define_accessor(
+        &self,
+        obj: &Value,
+        key: PropertyKey,
+        get: Option<Value>,
+        set: Option<Value>,
+    ) {
+        self.define_accessor_with(obj, key, get, set, true);
+    }
+
+    /// Install a non-enumerable `get [Symbol.species]` accessor on `ctor` that
+    /// returns the receiver (`this`), the default for the species-aware builtins
+    /// (`Array`, `Map`, `Set`, `Promise`, `RegExp`, `ArrayBuffer`, `%TypedArray%`).
+    pub fn install_species(&mut self, ctor: &JsObject) {
+        let sym = self.realm.symbol_species.clone();
+        let getter = self.new_native("get [Symbol.species]", 0, |_vm, this, _a| Ok(this));
+        self.define_accessor_with(
+            &Value::Object(ctor.clone()),
+            PropertyKey::Sym(sym),
+            Some(Value::Object(getter)),
+            None,
+            false,
+        );
+    }
+
+    /// Define (or merge into) an accessor property, choosing its `enumerable`
+    /// attribute. Object-literal accessors are enumerable; class and builtin
+    /// accessors are not. Merging a get/set pair preserves the existing flag.
+    pub fn define_accessor_with(
+        &self,
+        obj: &Value,
+        key: PropertyKey,
+        get: Option<Value>,
+        set: Option<Value>,
+        enumerable: bool,
+    ) {
+        if let Value::Object(o) = obj {
+            let mut b = o.borrow_mut();
+            match b.props.get_mut(&key) {
+                Some(Property {
+                    kind: PropertyKind::Accessor { get: g, set: s },
+                    ..
+                }) => {
+                    if get.is_some() {
+                        *g = get;
+                    }
+                    if set.is_some() {
+                        *s = set;
+                    }
+                }
+                _ => {
+                    b.props.insert(
+                        key,
+                        Property {
+                            kind: PropertyKind::Accessor { get, set },
+                            enumerable,
+                            configurable: true,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    pub fn make_closure(
+        &self,
+        proto: Rc<crate::bytecode::FuncProto>,
+        upvalues: Vec<Rc<RefCell<Value>>>,
+    ) -> JsObject {
+        // `num_params` already holds ExpectedArgumentCount (leading params before
+        // the first default/rest), so it is the function's `length` directly.
+        let length = proto.num_params;
+        let name = proto.name.clone();
+        let kind = proto.kind;
+        let bf = BytecodeFunction {
+            proto,
+            upvalues,
+            home_object: None,
+            is_class_ctor: kind == FuncKind::ClassCtor,
+        };
+        // [[Prototype]] is the function-kind intrinsic: %GeneratorFunction.prototype%,
+        // %AsyncFunction.prototype%, %AsyncGeneratorFunction.prototype%, or
+        // %Function.prototype% for ordinary/arrow/method functions.
+        let func_proto = if matches!(
+            kind,
+            FuncKind::AsyncGenerator | FuncKind::AsyncGeneratorMethod
+        ) {
+            self.realm.async_generator_function_proto.clone()
+        } else if matches!(kind, FuncKind::Generator | FuncKind::GeneratorMethod) {
+            self.realm.generator_function_proto.clone()
+        } else if kind.is_async() {
+            self.realm.async_function_proto.clone()
+        } else {
+            self.realm.function_proto.clone()
+        };
+        let obj = JsObject::new(ObjectData::new(
+            Some(func_proto),
+            Internal::Function(FunctionInner::Bytecode(bf)),
+        ));
+        {
+            let mut b = obj.borrow_mut();
+            b.props.insert(
+                PropertyKey::str("length"),
+                Property {
+                    kind: PropertyKind::Data {
+                        value: Value::Number(length as f64),
+                        writable: false,
+                    },
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+            b.props.insert(
+                PropertyKey::str("name"),
+                Property {
+                    kind: PropertyKind::Data {
+                        value: Value::str(&name),
+                        writable: false,
+                    },
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
+        // Ordinary (non-arrow, non-method) functions get a fresh `.prototype`.
+        if matches!(kind, FuncKind::Normal | FuncKind::ClassCtor) {
+            let proto_obj = self.new_object();
+            proto_obj.borrow_mut().props.insert(
+                PropertyKey::str("constructor"),
+                Property::builtin(Value::Object(obj.clone())),
+            );
+            obj.borrow_mut().props.insert(
+                PropertyKey::str("prototype"),
+                Property {
+                    kind: PropertyKind::Data {
+                        value: Value::Object(proto_obj),
+                        writable: true,
+                    },
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+        } else if matches!(
+            kind,
+            FuncKind::Generator
+                | FuncKind::GeneratorMethod
+                | FuncKind::AsyncGenerator
+                | FuncKind::AsyncGeneratorMethod
+        ) {
+            // A generator/async-generator function's `.prototype` is an object
+            // whose [[Prototype]] is %Generator%/%AsyncGenerator% — and it has no
+            // `constructor` property (spec 27.3.3 / 27.4.3).
+            let instance_proto = if kind.is_async() {
+                self.realm.async_generator_proto.clone()
+            } else {
+                self.realm.generator_proto.clone()
+            };
+            let proto_obj = JsObject::ordinary(Some(instance_proto));
+            obj.borrow_mut().props.insert(
+                PropertyKey::str("prototype"),
+                Property {
+                    kind: PropertyKind::Data {
+                        value: Value::Object(proto_obj),
+                        writable: true,
+                    },
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+        }
+        obj
+    }
+
+    // =====================================================================
+    // Operators
+    // =====================================================================
+
+    pub fn op_add(&mut self, a: Value, b: Value) -> Result<Value, Value> {
+        let pa = self.to_primitive(&a, Hint::Default)?;
+        let pb = self.to_primitive(&b, Hint::Default)?;
+        if matches!(pa, Value::String(_)) || matches!(pb, Value::String(_)) {
+            let sa = self.to_js_string(&pa)?;
+            let sb = self.to_js_string(&pb)?;
+            let total = sa.as_str().len() + sb.as_str().len();
+            // Bound a single concatenation so a doubling loop (`s += s`) cannot
+            // grow a string without limit and OOM the host. The cap is well above
+            // any legitimate string; exceeding it throws RangeError, matching how
+            // `repeat`/`padStart` already guard eager string growth.
+            if total > crate::value::MAX_STRING_LEN {
+                return Err(self.throw_range("invalid string length"));
+            }
+            let mut s = String::with_capacity(total);
+            s.push_str(sa.as_str());
+            s.push_str(sb.as_str());
+            Ok(Value::str(s))
+        } else {
+            let xa = self.to_numeric(&pa)?;
+            let xb = self.to_numeric(&pb)?;
+            match (xa, xb) {
+                (Value::BigInt(x), Value::BigInt(y)) => {
+                    Ok(Value::bigint((*x).clone() + (*y).clone()))
+                }
+                (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x + y)),
+                _ => Err(self.throw_type("Cannot mix BigInt and other types, use explicit conversions")),
+            }
+        }
+    }
+
+    /// ToNumeric: ToPrimitive(number) then keep BigInt, else ToNumber.
+    pub fn to_numeric(&mut self, v: &Value) -> Result<Value, Value> {
+        let p = self.to_primitive(v, Hint::Number)?;
+        if let Value::BigInt(_) = p {
+            Ok(p)
+        } else {
+            Ok(Value::Number(self.to_number(&p)?))
+        }
+    }
+
+    /// ToBigInt: ToPrimitive(number) then coerce. A Number throws a TypeError
+    /// (unlike the `BigInt()` constructor, which converts integral Numbers).
+    pub fn to_bigint(&mut self, v: &Value) -> Result<num_bigint::BigInt, Value> {
+        let p = self.to_primitive(v, Hint::Number)?;
+        match &p {
+            Value::BigInt(n) => Ok((**n).clone()),
+            Value::Bool(b) => Ok(num_bigint::BigInt::from(if *b { 1 } else { 0 })),
+            Value::String(s) => parse_string_bigint(s.as_str())
+                .ok_or_else(|| self.throw_syntax("Cannot convert string to a BigInt")),
+            Value::Number(_) => Err(self.throw_type("Cannot convert a Number to a BigInt")),
+            Value::Symbol(_) => Err(self.throw_type("Cannot convert a Symbol to a BigInt")),
+            _ => Err(self.throw_type("Cannot convert undefined or null to a BigInt")),
+        }
+    }
+
+    /// Binary numeric/bigint operation (already-popped operands).
+    pub fn arith(&mut self, a: Value, b: Value, kind: ArithKind) -> Result<Value, Value> {
+        let xa = self.to_numeric(&a)?;
+        let xb = self.to_numeric(&b)?;
+        match (&xa, &xb) {
+            (Value::BigInt(x), Value::BigInt(y)) => self.bigint_arith(x, y, kind),
+            (Value::Number(x), Value::Number(y)) => Ok(number_arith(*x, *y, kind)),
+            _ => Err(self.throw_type("Cannot mix BigInt and other types, use explicit conversions")),
+        }
+    }
+
+    fn bigint_arith(
+        &mut self,
+        x: &num_bigint::BigInt,
+        y: &num_bigint::BigInt,
+        kind: ArithKind,
+    ) -> Result<Value, Value> {
+        use num_traits::{Signed, Zero};
+        let x = x.clone();
+        let y = y.clone();
+        let v = match kind {
+            ArithKind::Sub => x - y,
+            ArithKind::Mul => x * y,
+            ArithKind::Div => {
+                if y.is_zero() {
+                    return Err(self.throw_range("Division by zero"));
+                }
+                x / y
+            }
+            ArithKind::Mod => {
+                if y.is_zero() {
+                    return Err(self.throw_range("Division by zero"));
+                }
+                x % y
+            }
+            ArithKind::Pow => {
+                if y.is_negative() {
+                    return Err(self.throw_range("Exponent must be non-negative"));
+                }
+                match u32::try_from(y) {
+                    Ok(e) if e <= 1_000_000 => num_traits::Pow::pow(x, e),
+                    _ => return Err(self.throw_range("BigInt exponent too large")),
+                }
+            }
+            ArithKind::BitAnd => x & y,
+            ArithKind::BitOr => x | y,
+            ArithKind::BitXor => x ^ y,
+            ArithKind::Shl | ArithKind::Shr => {
+                // JS BigInt: `<<` by negative shifts right and vice-versa.
+                let right = matches!(kind, ArithKind::Shr);
+                let neg = y.is_negative();
+                let mag = y.abs();
+                let amt = match u32::try_from(&mag) {
+                    Ok(a) if a <= 4096 => a,
+                    _ => {
+                        // Huge shift: left -> 0 collapses only for right; bound it.
+                        if (right ^ neg) && !x.is_zero() {
+                            return Err(self.throw_range("BigInt shift too large"));
+                        }
+                        0
+                    }
+                };
+                if right ^ neg {
+                    x >> amt
+                } else {
+                    x << amt
+                }
+            }
+            ArithKind::UShr => {
+                return Err(self.throw_type("BigInts have no unsigned right shift, use >> instead"))
+            }
+        };
+        Ok(Value::bigint(v))
+    }
+
+    /// Unary numeric/bigint operation.
+    pub fn unary_arith(&mut self, a: Value, kind: UnaryKind) -> Result<Value, Value> {
+        let x = self.to_numeric(&a)?;
+        match x {
+            Value::BigInt(n) => {
+                let n = (*n).clone();
+                let r = match kind {
+                    UnaryKind::Neg => -n,
+                    UnaryKind::Inc => n + 1,
+                    UnaryKind::Dec => n - 1,
+                    UnaryKind::BitNot => !n,
+                };
+                Ok(Value::bigint(r))
+            }
+            Value::Number(n) => Ok(Value::Number(match kind {
+                UnaryKind::Neg => -n,
+                UnaryKind::Inc => n + 1.0,
+                UnaryKind::Dec => n - 1.0,
+                UnaryKind::BitNot => !crate::vm::to_int32(n) as f64,
+            })),
+            _ => Ok(Value::Number(f64::NAN)),
+        }
+    }
+
+    pub fn strict_equals(&self, a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Number(x), Value::Number(y)) => x == y,
+            _ => strict_equals_nonnumeric(a, b),
+        }
+    }
+
+    pub fn loose_equals(&mut self, a: &Value, b: &Value) -> Result<bool, Value> {
+        use Value::*;
+        Ok(match (a, b) {
+            (Undefined | Null, Undefined | Null) => true,
+            (Number(x), Number(y)) => x == y,
+            (String(x), String(y)) => x == y,
+            (Bool(x), Bool(y)) => x == y,
+            (Symbol(x), Symbol(y)) => x == y,
+            (BigInt(x), BigInt(y)) => x == y,
+            (Object(x), Object(y)) => x.same(y),
+            (BigInt(x), Number(y)) => bigint_eq_f64(x, *y),
+            (Number(x), BigInt(y)) => bigint_eq_f64(y, *x),
+            (BigInt(x), String(s)) => bigint_eq_str(x, s.as_str()),
+            (String(s), BigInt(y)) => bigint_eq_str(y, s.as_str()),
+            (Number(_), String(_)) => {
+                let nb = self.to_number(b)?;
+                a.as_number().unwrap() == nb
+            }
+            (String(_), Number(_)) => {
+                let na = self.to_number(a)?;
+                na == b.as_number().unwrap()
+            }
+            (Bool(_), _) => {
+                let na = self.to_number(a)?;
+                self.loose_equals(&Number(na), b)?
+            }
+            (_, Bool(_)) => {
+                let nb = self.to_number(b)?;
+                self.loose_equals(a, &Number(nb))?
+            }
+            (Object(_), Number(_) | String(_) | Symbol(_)) => {
+                let pa = self.to_primitive(a, Hint::Default)?;
+                self.loose_equals(&pa, b)?
+            }
+            (Number(_) | String(_) | Symbol(_), Object(_)) => {
+                let pb = self.to_primitive(b, Hint::Default)?;
+                self.loose_equals(a, &pb)?
+            }
+            _ => false,
+        })
+    }
+
+    /// Abstract Relational Comparison `a < b`. Returns None for unordered (NaN).
+    pub fn less_than(&mut self, a: &Value, b: &Value) -> Result<Option<bool>, Value> {
+        let pa = self.to_primitive(a, Hint::Number)?;
+        let pb = self.to_primitive(b, Hint::Number)?;
+        if let (Value::String(x), Value::String(y)) = (&pa, &pb) {
+            return Ok(Some(x.as_str() < y.as_str()));
+        }
+        // BigInt comparisons (incl. BigInt vs Number / numeric String).
+        match (&pa, &pb) {
+            (Value::BigInt(x), Value::BigInt(y)) => return Ok(Some(x < y)),
+            (Value::BigInt(x), _) => {
+                if let Value::String(s) = &pb {
+                    return Ok(bigint_cmp_str(x, s.as_str(), true));
+                }
+                let nb = self.to_number(&pb)?;
+                return Ok(bigint_cmp_f64(x, nb, true));
+            }
+            (_, Value::BigInt(y)) => {
+                if let Value::String(s) = &pa {
+                    return Ok(bigint_cmp_str(y, s.as_str(), false));
+                }
+                let na = self.to_number(&pa)?;
+                return Ok(bigint_cmp_f64(y, na, false));
+            }
+            _ => {}
+        }
+        let na = self.to_number(&pa)?;
+        let nb = self.to_number(&pb)?;
+        if na.is_nan() || nb.is_nan() {
+            Ok(None)
+        } else {
+            Ok(Some(na < nb))
+        }
+    }
+
+    pub fn instance_of(&mut self, obj: &Value, ctor: &Value) -> Result<bool, Value> {
+        let cobj = match ctor {
+            Value::Object(o) => o.clone(),
+            _ => return Err(self.throw_type("Right-hand side of 'instanceof' is not callable")),
+        };
+        // Symbol.hasInstance
+        let has_inst = self.realm.symbol_has_instance.clone();
+        let method = self.get_prop(ctor, &PropertyKey::Sym(has_inst))?;
+        if self.is_callable(&method) {
+            let r = self.call(method, ctor.clone(), &[obj.clone()])?;
+            return Ok(self.to_boolean(&r));
+        }
+        if !cobj.borrow().is_callable() {
+            return Err(self.throw_type("Right-hand side of 'instanceof' is not callable"));
+        }
+        let target_proto = self.get_prop(ctor, &PropertyKey::str("prototype"))?;
+        let target_proto = match target_proto {
+            Value::Object(o) => o,
+            _ => return Err(self.throw_type("prototype is not an object")),
+        };
+        let mut cur = match obj {
+            Value::Object(o) => o.borrow().proto.clone(),
+            _ => return Ok(false),
+        };
+        while let Some(p) = cur {
+            if p.same(&target_proto) {
+                return Ok(true);
+            }
+            cur = p.borrow().proto.clone();
+        }
+        Ok(false)
+    }
+}
+
+fn js_mod(a: f64, b: f64) -> f64 {
+    if b == 0.0 || a.is_nan() || b.is_nan() || a.is_infinite() {
+        f64::NAN
+    } else if b.is_infinite() {
+        a
+    } else if a == 0.0 {
+        a
+    } else {
+        a % b
+    }
+}
+
+/// Binary arithmetic/bitwise operations dispatched by kind (Number or BigInt).
+#[derive(Clone, Copy)]
+pub enum ArithKind {
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Pow,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    UShr,
+}
+
+#[derive(Clone, Copy)]
+pub enum UnaryKind {
+    Neg,
+    Inc,
+    Dec,
+    BitNot,
+}
+
+fn bin_arith(vm: &mut Vm, frame: &mut Frame, kind: ArithKind) -> Result<(), Value> {
+    let b = frame.stack.pop().unwrap_or(Value::Undefined);
+    let a = frame.stack.pop().unwrap_or(Value::Undefined);
+    let r = vm.arith(a, b, kind)?;
+    frame.stack.push(r);
+    Ok(())
+}
+
+/// Number (f64) arithmetic preserving the original JS semantics.
+fn number_arith(x: f64, y: f64, kind: ArithKind) -> Value {
+    use crate::vm::{to_int32, to_uint32};
+    Value::Number(match kind {
+        ArithKind::Sub => x - y,
+        ArithKind::Mul => x * y,
+        ArithKind::Div => x / y,
+        ArithKind::Mod => js_mod(x, y),
+        ArithKind::Pow => x.powf(y),
+        ArithKind::BitAnd => (to_int32(x) & to_int32(y)) as f64,
+        ArithKind::BitOr => (to_int32(x) | to_int32(y)) as f64,
+        ArithKind::BitXor => (to_int32(x) ^ to_int32(y)) as f64,
+        ArithKind::Shl => to_int32(x).wrapping_shl(to_uint32(y) & 31) as f64,
+        ArithKind::Shr => to_int32(x).wrapping_shr(to_uint32(y) & 31) as f64,
+        ArithKind::UShr => (to_uint32(x) >> (to_uint32(y) & 31)) as f64,
+    })
+}
+
+// ---- BigInt comparison helpers (relational + loose-equality) ----
+
+fn bigint_eq_f64(x: &num_bigint::BigInt, y: f64) -> bool {
+    if !y.is_finite() || y.fract() != 0.0 {
+        return false;
+    }
+    // y is an integer-valued finite f64; convert it exactly and compare.
+    match <num_bigint::BigInt as num_traits::FromPrimitive>::from_f64(y) {
+        Some(yb) => *x == yb,
+        None => false,
+    }
+}
+
+fn big_to_f64(x: &num_bigint::BigInt) -> f64 {
+    num_traits::ToPrimitive::to_f64(x).unwrap_or(f64::NAN)
+}
+
+fn bigint_eq_str(x: &num_bigint::BigInt, s: &str) -> bool {
+    match parse_string_bigint(s) {
+        Some(b) => b == *x,
+        None => false,
+    }
+}
+
+/// `bigint < other` (or `other < bigint` when `bigint_left` is false) against an
+/// f64. Returns None when the f64 is NaN.
+fn bigint_cmp_f64(x: &num_bigint::BigInt, y: f64, bigint_left: bool) -> Option<bool> {
+    if y.is_nan() {
+        return None;
+    }
+    let xf = big_to_f64(x);
+    Some(if bigint_left { xf < y } else { y < xf })
+}
+
+fn bigint_cmp_str(x: &num_bigint::BigInt, s: &str, bigint_left: bool) -> Option<bool> {
+    let y = parse_string_bigint(s)?;
+    Some(if bigint_left { *x < y } else { y < *x })
+}
+
+/// StringToBigInt: trims, parses an integer literal (decimal or 0x/0o/0b), or the
+/// empty string as 0. Returns None on failure.
+pub fn parse_string_bigint(s: &str) -> Option<num_bigint::BigInt> {
+    use num_bigint::BigInt;
+    use num_traits::Num;
+    let t = s.trim();
+    if t.is_empty() {
+        return Some(BigInt::from(0));
+    }
+    let (signed, neg, body) = match t.strip_prefix('-') {
+        Some(r) => (true, true, r),
+        None => match t.strip_prefix('+') {
+            Some(r) => (true, false, r),
+            None => (false, false, t),
+        },
+    };
+    // Non-decimal literals (0x/0o/0b) must not carry a sign per StringToBigInt.
+    let radix_prefixed = |b: &str| {
+        let lower = b.as_bytes().get(1).map(|c| c.to_ascii_lowercase());
+        b.starts_with('0') && matches!(lower, Some(b'x') | Some(b'o') | Some(b'b'))
+    };
+    let parsed = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        if signed {
+            return None;
+        }
+        BigInt::from_str_radix(h, 16).ok()
+    } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+        if signed {
+            return None;
+        }
+        BigInt::from_str_radix(o, 8).ok()
+    } else if let Some(bny) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+        if signed {
+            return None;
+        }
+        BigInt::from_str_radix(bny, 2).ok()
+    } else if radix_prefixed(body) {
+        // e.g. a bare "0x" with no digits already handled above; this guards a
+        // signed form whose body still looks radix-prefixed.
+        return None;
+    } else {
+        BigInt::from_str_radix(body, 10).ok()
+    }?;
+    Some(if neg { -parsed } else { parsed })
+}
+
+impl Value {
+    fn same_obj(&self, other: &JsObject) -> bool {
+        matches!(self, Value::Object(o) if o.same(other))
+    }
+}
+
+/// If `key` (a private `#name`) resolves on `obj` or its prototype chain to an
+/// accessor property, return `(has_getter, has_setter)`; otherwise `None` (a data
+/// field/method). Used by `PrivateGet`/`PrivateSet` to enforce the spec's
+/// accessor-without-getter / accessor-without-setter TypeErrors.
+fn private_accessor_kind(obj: &Value, key: &PropertyKey) -> Option<(bool, bool)> {
+    let mut cur = match obj {
+        Value::Object(o) => o.clone(),
+        _ => return None,
+    };
+    loop {
+        let next = {
+            let b = cur.borrow();
+            if let Some(p) = b.props.get(key) {
+                return match &p.kind {
+                    PropertyKind::Accessor { get, set } => Some((get.is_some(), set.is_some())),
+                    PropertyKind::Data { .. } => None,
+                };
+            }
+            b.proto.clone()
+        };
+        match next {
+            Some(p) => cur = p,
+            None => return None,
+        }
+    }
+}

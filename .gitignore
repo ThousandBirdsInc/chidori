@@ -4,12 +4,23 @@
 /sandbox-python/target
 /sandbox-js/target
 
+# Vendored Test262 conformance suite (fetched by scripts/test262.sh, ~56k files)
+/vendor/test262/
+
 # macOS
 .DS_Store
 
 # Editor / IDE
 .idea/
 .vscode/
+
+# Claude Code local state (transient; share settings.json explicitly if desired)
+.claude/worktrees/
+.claude/settings.local.json
+.claude/projects/
+.claude/todos/
+.claude/shell-snapshots/
+.claude/statsig/
 
 # Run artifacts and runtime state produced by `chidori run`
 # (kept out of source control)
@@ -35,3 +46,6 @@ node_modules/
 .envrc
 .env*.local
 .env.local
+
+# Test262 conformance state store (generated; regenerate with scripts/conformance.sh)
+conformance-state.*.json

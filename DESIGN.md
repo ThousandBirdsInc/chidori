@@ -16,6 +16,11 @@ For the detailed durable VM snapshot architecture, see
 [`docs/typescript-vm-snapshot-runtime.md`](./docs/typescript-vm-snapshot-runtime.md).
 For the prompt-to-artifact migration checklist, see
 [`docs/typescript-migration-audit.md`](./docs/typescript-migration-audit.md).
+For running the runtime against the official ECMAScript conformance suite
+(the same Test262 corpus Bun and Node measure language parity with), see
+[`docs/conformance.md`](./docs/conformance.md).
+For what the pure-Rust engine confines (capability injection, resource limits)
+and the gaps that remain, see [`docs/sandbox-model.md`](./docs/sandbox-model.md).
 
 ## Design Goals
 
@@ -230,6 +235,7 @@ src/
 crates/
   chidori-quickjs-sys/     # vendored QuickJS fork and raw FFI
   chidori-quickjs/         # safe Rust wrapper
+  test262-runner/          # Test262 conformance runner (bun/node JS parity)
 examples/
   agents/                  # TypeScript examples
   tools/                   # TypeScript tool examples

@@ -1,5 +1,6 @@
 mod acp;
 mod mcp;
+mod mem_guard;
 mod policy;
 mod providers;
 mod recipes;
@@ -18,6 +19,12 @@ use serde_json::Value;
 
 use crate::providers::ProviderRegistry;
 use crate::runtime::engine::Engine;
+
+/// Track live heap usage process-wide so the rust-engine watchdog can enforce a
+/// per-run memory ceiling (see `mem_guard` and `runtime::rust_engine`). The
+/// overhead is one relaxed atomic per allocation.
+#[global_allocator]
+static GLOBAL: mem_guard::CountingAllocator = mem_guard::CountingAllocator;
 use crate::runtime::template::TemplateEngine;
 use crate::tools::ToolRegistry;
 

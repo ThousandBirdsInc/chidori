@@ -257,6 +257,69 @@ pub type Result<T> = std::result::Result<T, QuickJsError>;
 const CONTEXT_SNAPSHOT_MAGIC: &[u8; 8] = b"CHQJSC01";
 const RUNTIME_SNAPSHOT_MAGIC: &[u8; 8] = b"CHQJSR01";
 
+/// How a source string fed to [`SnapshotContext::eval_for_conformance`] should
+/// be parsed and (optionally) executed. Mirrors the Test262 `flags` metadata:
+/// scripts can be sloppy or strict, modules are always strict, and the
+/// `Compile*` variants parse without running for `negative: { phase: parse }`
+/// tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalMode {
+    /// Global script in sloppy mode.
+    Script,
+    /// Global script forced into strict mode (as if `"use strict";` led it).
+    StrictScript,
+    /// ECMAScript module (implicitly strict).
+    Module,
+    /// Parse a sloppy global script without executing it.
+    CompileScript,
+    /// Parse a strict global script without executing it.
+    CompileStrictScript,
+    /// Parse a module without executing it.
+    CompileModule,
+}
+
+impl EvalMode {
+    fn eval_flags(self) -> i32 {
+        match self {
+            EvalMode::Script => JS_EVAL_TYPE_GLOBAL,
+            EvalMode::StrictScript => JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT,
+            EvalMode::Module => JS_EVAL_TYPE_MODULE,
+            EvalMode::CompileScript => JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY,
+            EvalMode::CompileStrictScript => {
+                JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT | JS_EVAL_FLAG_COMPILE_ONLY
+            }
+            EvalMode::CompileModule => JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
+        }
+    }
+}
+
+/// A value thrown by JavaScript, captured for conformance assertions. `name` is
+/// the thrown value's `name` property (or constructor name) — e.g.
+/// `"SyntaxError"`, `"TypeError"`, or `"Test262Error"` — which is exactly what
+/// Test262 negative tests match against.
+#[derive(Debug, Clone)]
+pub struct JsThrow {
+    pub name: String,
+    pub message: String,
+    pub to_string: String,
+}
+
+impl JsThrow {
+    fn host(message: &str) -> Self {
+        JsThrow {
+            name: "HostError".to_string(),
+            message: message.to_string(),
+            to_string: message.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for JsThrow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_string)
+    }
+}
+
 #[derive(Debug)]
 pub struct SnapshotRuntime {
     rt: NonNull<sys::JSRuntime>,
@@ -747,6 +810,92 @@ impl SnapshotContext<'_> {
     pub fn eval_module(&mut self, name: &str, source: &str) -> Result<()> {
         let source = module_facade_source(source);
         self.eval(name, &source, JS_EVAL_TYPE_GLOBAL)
+    }
+
+    /// Evaluate raw source for conformance testing (e.g. Test262) against the
+    /// bare ECMAScript context, with no chidori module facade or host object.
+    ///
+    /// Unlike [`SnapshotContext::eval`], a thrown value is returned as a
+    /// structured [`JsThrow`] (carrying the error's `name`/constructor, message,
+    /// and string form) instead of being flattened to a single string. That
+    /// distinction is what conformance negative tests assert on. The pending
+    /// job (microtask) queue is *not* drained here; call
+    /// [`SnapshotContext::run_pending_jobs`] afterward for async tests.
+    pub fn eval_for_conformance(
+        &mut self,
+        name: &str,
+        source: &str,
+        mode: EvalMode,
+    ) -> std::result::Result<(), JsThrow> {
+        let source = CString::new(source).map_err(|_| JsThrow::host("source contains a NUL byte"))?;
+        let name = CString::new(name).map_err(|_| JsThrow::host("name contains a NUL byte"))?;
+        let value = unsafe {
+            sys::JS_Eval(
+                self.ctx.as_ptr(),
+                source.as_ptr(),
+                source.as_bytes().len(),
+                name.as_ptr(),
+                mode.eval_flags(),
+            )
+        };
+        if js_value_is_exception(value) {
+            return Err(self.take_exception());
+        }
+        unsafe {
+            sys::JS_FreeValue(self.ctx.as_ptr(), value);
+        }
+        Ok(())
+    }
+
+    /// Drain the pending job (microtask/promise) queue. Returns the first
+    /// thrown value if a job rejects/throws. Used to settle async conformance
+    /// tests before reading their `$DONE` signal.
+    pub fn run_pending_jobs(&mut self) -> std::result::Result<(), JsThrow> {
+        loop {
+            let mut ctx = std::ptr::null_mut();
+            let status = unsafe { sys::JS_ExecutePendingJob(self.rt.as_ptr(), &mut ctx) };
+            if status > 0 {
+                continue;
+            }
+            if status < 0 {
+                return Err(self.take_exception());
+            }
+            return Ok(());
+        }
+    }
+
+    /// Read a global property as JSON, returning `None` when it is absent or
+    /// `undefined`. Used by the conformance harness to read the captured
+    /// `print()` buffer that async tests signal completion through.
+    pub fn read_global_json(&mut self, prop: &str) -> Option<Value> {
+        self.global_json(prop).ok().flatten()
+    }
+
+    /// Pull the currently-pending exception off the context and describe it.
+    fn take_exception(&mut self) -> JsThrow {
+        let ctx = self.ctx.as_ptr();
+        unsafe {
+            let exception = sys::JS_GetException(ctx);
+            let to_string =
+                js_value_to_string(ctx, exception).unwrap_or_else(|_| "<exception>".to_string());
+            let name = read_property_string(ctx, exception, "name");
+            let message = read_property_string(ctx, exception, "message");
+            let constructor_name = read_constructor_name(ctx, exception);
+            sys::JS_FreeValue(ctx, exception);
+            // Reading properties off a thrown primitive (e.g. `throw null`) can
+            // leave a fresh exception pending; clear it so the next eval starts
+            // clean.
+            let leftover = sys::JS_GetException(ctx);
+            sys::JS_FreeValue(ctx, leftover);
+            let name = name
+                .or(constructor_name)
+                .unwrap_or_else(|| to_string.clone());
+            JsThrow {
+                name,
+                message: message.unwrap_or_default(),
+                to_string,
+            }
+        }
     }
 
     pub fn call_export_json(&mut self, export: &str, args: Value) -> Result<RunState> {
@@ -1828,6 +1977,38 @@ fn string_to_js(ctx: *mut sys::JSContext, value: &str) -> Result<sys::JSValue> {
     Ok(js)
 }
 
+/// Read `obj[prop]` as a string, returning `None` when it is absent,
+/// `undefined`, or unreadable. Does not consume `obj`.
+unsafe fn read_property_string(
+    ctx: *mut sys::JSContext,
+    obj: sys::JSValue,
+    prop: &str,
+) -> Option<String> {
+    let prop = CString::new(prop).ok()?;
+    let value = sys::JS_GetPropertyStr(ctx, obj, prop.as_ptr());
+    if value.tag == JS_TAG_EXCEPTION || value.tag == JS_TAG_UNDEFINED {
+        sys::JS_FreeValue(ctx, value);
+        return None;
+    }
+    let text = js_value_to_string(ctx, value).ok();
+    sys::JS_FreeValue(ctx, value);
+    text
+}
+
+/// Best-effort read of `obj.constructor.name`, the fallback identity for a
+/// thrown value whose own `name` property is absent. Does not consume `obj`.
+unsafe fn read_constructor_name(ctx: *mut sys::JSContext, obj: sys::JSValue) -> Option<String> {
+    let constructor = CString::new("constructor").ok()?;
+    let ctor = sys::JS_GetPropertyStr(ctx, obj, constructor.as_ptr());
+    if ctor.tag == JS_TAG_EXCEPTION || ctor.tag == JS_TAG_UNDEFINED {
+        sys::JS_FreeValue(ctx, ctor);
+        return None;
+    }
+    let name = read_property_string(ctx, ctor, "name");
+    sys::JS_FreeValue(ctx, ctor);
+    name
+}
+
 fn exception_string(ctx: *mut sys::JSContext) -> String {
     unsafe {
         let exception = sys::JS_GetException(ctx);
@@ -1917,6 +2098,7 @@ const JS_TAG_UNDEFINED: sys::JSValueTag = 3;
 const JS_CFUNC_GENERIC: i32 = 0;
 const JS_EVAL_TYPE_GLOBAL: i32 = 0;
 const JS_EVAL_TYPE_MODULE: i32 = 1 << 0;
+const JS_EVAL_FLAG_STRICT: i32 = 1 << 3;
 const JS_EVAL_FLAG_COMPILE_ONLY: i32 = 1 << 5;
 const JS_WRITE_OBJ_BYTECODE: i32 = 1 << 0;
 const JS_WRITE_OBJ_REFERENCE: i32 = 1 << 3;

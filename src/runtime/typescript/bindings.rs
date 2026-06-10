@@ -4,8 +4,15 @@ use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex as StdMutex};
 
+// Only the test-only JS-glue installers below use the anyhow `Result` alias.
+#[cfg(test)]
 use anyhow::Result;
+// rquickjs is a dev-dependency; the JS-glue installers below are test-only. The
+// host backend itself (used by the pure-Rust engine under `rust-engine`) is
+// rquickjs-free.
+#[cfg(test)]
 use rquickjs::function::{Func, MutFn, Opt};
+#[cfg(test)]
 use rquickjs::{Ctx, Exception, Function, Object, Value};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,7 +32,7 @@ use crate::tools::{ToolBackend, ToolDef, ToolRegistry};
 
 #[derive(Clone)]
 #[allow(dead_code)]
-enum HostBindingBackend {
+pub(crate) enum HostBindingBackend {
     Recorder(HostBindingRecorder),
     Runtime {
         runtime_ctx: RuntimeContext,
@@ -434,19 +441,37 @@ impl HostBindingBackend {
                         mcp.call_tool(&server_id, &remote_name, &serde_json::Value::Object(kwargs))
                             .await
                     }),
-                    ToolBackend::TypeScript => TypeScriptVmRuntime::new(runtime_policy.clone())?
-                        .run_tool_file_with_context(
-                            &tool_def.source_path,
-                            &serde_json::Value::Object(kwargs),
-                            runtime_ctx.clone(),
-                            providers.clone(),
-                            template_engine.clone(),
-                            tokio_rt.clone(),
-                            policy.clone(),
-                            policy_cache.clone(),
-                            tools.clone(),
-                            mcp.clone(),
-                        ),
+                    ToolBackend::TypeScript => {
+                        // Native nested execution (G4): when the rust engine is
+                        // the active runtime, run the nested TS tool on it too,
+                        // threading the same backend (`self`) so host effects
+                        // nest under this tool call and a suspension propagates.
+                        // Otherwise re-enter the QuickJS `TypeScriptVmRuntime`.
+                        #[cfg(feature = "rust-engine")]
+                        if matches!(
+                            crate::runtime::rust_engine::selected_engine(),
+                            crate::runtime::rust_engine::EngineKind::Rust
+                        ) {
+                            return crate::runtime::rust_engine::run_tool_file(
+                                &tool_def.source_path,
+                                &serde_json::Value::Object(kwargs),
+                                self,
+                            );
+                        }
+                        TypeScriptVmRuntime::new(runtime_policy.clone())?
+                            .run_tool_file_with_context(
+                                &tool_def.source_path,
+                                &serde_json::Value::Object(kwargs),
+                                runtime_ctx.clone(),
+                                providers.clone(),
+                                template_engine.clone(),
+                                tokio_rt.clone(),
+                                policy.clone(),
+                                policy_cache.clone(),
+                                tools.clone(),
+                                mcp.clone(),
+                            )
+                    }
                     ToolBackend::Native => {
                         tools.dispatch_native(tool_name, serde_json::Value::Object(kwargs))
                     }
@@ -487,6 +512,21 @@ impl HostBindingBackend {
             let input = args.get("input").unwrap_or(&serde_json::Value::Null);
             match Path::new(path).extension().and_then(|ext| ext.to_str()) {
                 Some("ts") => {
+                    // Native nested execution (G4): run the sub-agent on the
+                    // rust engine when it's active, sharing this backend so the
+                    // child's host effects nest under the callAgent and a
+                    // suspension propagates to the parent run.
+                    #[cfg(feature = "rust-engine")]
+                    if matches!(
+                        crate::runtime::rust_engine::selected_engine(),
+                        crate::runtime::rust_engine::EngineKind::Rust
+                    ) {
+                        return crate::runtime::rust_engine::run_agent_file(
+                            Path::new(path),
+                            input,
+                            self,
+                        );
+                    }
                     let runtime = TypeScriptVmRuntime::new(runtime_policy.clone())?;
                     runtime.run_agent_file_with_context(
                         Path::new(path),
@@ -575,6 +615,376 @@ impl HostBindingBackend {
         )?;
         Ok(result.unwrap_or(serde_json::Value::Null))
     }
+
+    /// Build the runtime backend. Shared by the QuickJS bindings and the
+    /// pure-Rust engine's effect dispatcher so both route host effects through
+    /// identical durable machinery.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_runtime(
+        runtime_ctx: RuntimeContext,
+        providers: Arc<ProviderRegistry>,
+        template_engine: Arc<TemplateEngine>,
+        tokio_rt: Arc<tokio::runtime::Runtime>,
+        policy: Arc<PolicyConfig>,
+        policy_cache: Arc<StdMutex<PolicyCache>>,
+        runtime_policy: RuntimePolicy,
+        tools: Arc<ToolRegistry>,
+        mcp: Arc<McpManager>,
+    ) -> Self {
+        HostBindingBackend::Runtime {
+            runtime_ctx,
+            providers,
+            template_engine,
+            tokio_rt,
+            policy,
+            policy_cache,
+            runtime_policy,
+            tools,
+            mcp,
+        }
+    }
+
+    /// The runtime context, when this is the runtime backend.
+    pub(crate) fn runtime_ctx(&self) -> Option<&RuntimeContext> {
+        match self {
+            HostBindingBackend::Runtime { runtime_ctx, .. } => Some(runtime_ctx),
+            HostBindingBackend::Recorder(_) => None,
+        }
+    }
+
+    /// The durable runtime policy, when this is the runtime backend. The rust
+    /// engine reads it to install the captured-effect natives (`node:` crypto /
+    /// fs / timers) under the same fs/crypto/timer gates the QuickJS path honors.
+    pub(crate) fn runtime_policy(&self) -> Option<crate::runtime::snapshot::RuntimePolicy> {
+        match self {
+            HostBindingBackend::Runtime { runtime_policy, .. } => Some(runtime_policy.clone()),
+            HostBindingBackend::Recorder(_) => None,
+        }
+    }
+
+    /// Route one `chidori.<effect>(args)` call from the pure-Rust engine through
+    /// the same durable host machinery the QuickJS bindings use. The arg shapes
+    /// mirror what `chidori-js`'s `install_chidori_effects` forwards, so the two
+    /// engines produce identical call logs.
+    pub(crate) fn dispatch(
+        &self,
+        effect: &str,
+        a: &serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let opt_null =
+            |v: Option<serde_json::Value>| v.unwrap_or(serde_json::Value::Null);
+        match effect {
+            "log" => {
+                let message = a.get("message").cloned().unwrap_or(serde_json::Value::Null);
+                let args = serde_json::json!({ "message": message });
+                self.durable_call("log", args.clone(), || {
+                    host_core::execute_log(&args).map_err(|err| err.to_string())
+                })
+                .map(opt_null)
+            }
+            "input" => {
+                let prompt = a
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                self.input(prompt).map(serde_json::Value::String)
+            }
+            "checkpoint" => {
+                let args = serde_json::json!({
+                    "label": a.get("label").cloned().unwrap_or(serde_json::Value::Null),
+                    "data": a.get("data").cloned().unwrap_or(serde_json::Value::Null),
+                });
+                self.durable_call("checkpoint", args, || Ok(serde_json::Value::Null))
+                    .map(opt_null)
+            }
+            "prompt" => {
+                let text = a
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let options = a
+                    .get("opts")
+                    .cloned()
+                    .filter(|v| !v.is_null())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                self.prompt(text, options)
+            }
+            "tool" => {
+                let name = a
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let kwargs = a
+                    .get("kwargs")
+                    .cloned()
+                    .filter(|v| !v.is_null())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                self.tool(name, kwargs)
+            }
+            "memory" => {
+                let action = a
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let key = a.get("key").cloned().filter(|v| !v.is_null());
+                let value = a.get("value").cloned().filter(|v| !v.is_null());
+                let options = a.get("opts").cloned().unwrap_or(serde_json::Value::Null);
+                let namespace = options
+                    .get("namespace")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("default");
+                let prefix = options
+                    .get("prefix")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let args = serde_json::json!({
+                    "action": action,
+                    "key": key,
+                    "namespace": namespace,
+                    "prefix": prefix,
+                    "value": value,
+                });
+                self.durable_call("memory", args.clone(), || {
+                    host_core::execute_memory(&args).map_err(|err| err.to_string())
+                })
+                .map(opt_null)
+            }
+            "template" => {
+                let template = a
+                    .get("template")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let vars = a
+                    .get("vars")
+                    .cloned()
+                    .filter(|v| !v.is_null())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let args = serde_json::json!({ "template": template, "vars": vars });
+                let template_engine = self.template_engine();
+                self.durable_call("template", args.clone(), || {
+                    host_core::execute_template(&template_engine, &args)
+                        .map_err(|err| err.to_string())
+                })
+                .map(opt_null)
+            }
+            "http" => {
+                let first = a.get("arg0").cloned().unwrap_or(serde_json::Value::Null);
+                let second = a.get("arg1").cloned().unwrap_or(serde_json::Value::Null);
+                let (url, options) = if let Some(url) = first.as_str() {
+                    let options = if second.is_null() {
+                        serde_json::json!({})
+                    } else {
+                        second
+                    };
+                    (url.to_string(), options)
+                } else if let serde_json::Value::Object(ref map) = first {
+                    let url = map
+                        .get("url")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| "chidori.http options must include string url".to_string())?
+                        .to_string();
+                    (url, first.clone())
+                } else {
+                    return Err(
+                        "chidori.http requires a URL string or options object".to_string()
+                    );
+                };
+                let mut method = options
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("GET")
+                    .to_uppercase();
+                if method.is_empty() {
+                    method = "GET".to_string();
+                }
+                let headers = options.get("headers").and_then(|v| match v {
+                    serde_json::Value::Object(m) => Some(m.clone()),
+                    _ => None,
+                });
+                let body = options.get("body").cloned();
+                let params = options
+                    .get("params")
+                    .or_else(|| options.get("query"))
+                    .and_then(|v| match v {
+                        serde_json::Value::Object(m) => Some(m.clone()),
+                        _ => None,
+                    });
+                let args = serde_json::json!({
+                    "url": url,
+                    "method": method,
+                    "headers": headers,
+                    "body": body,
+                    "params": params,
+                });
+                self.durable_call("http", args.clone(), || {
+                    self.enforce_policy(
+                        "http",
+                        &serde_json::json!({
+                            "url": args.get("url").cloned().unwrap_or_default(),
+                            "method": args.get("method").cloned().unwrap_or_default(),
+                        }),
+                    )?;
+                    self.block_on_http(&args)
+                })
+                .map(opt_null)
+            }
+            "callAgent" => {
+                let path = a
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let input = a
+                    .get("input")
+                    .cloned()
+                    .filter(|v| !v.is_null())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                self.call_agent(path, input)
+            }
+            "execJs" | "execPython" => {
+                let source = a
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let options = a.get("opts").cloned().unwrap_or(serde_json::Value::Null);
+                let fuel = options
+                    .get("fuel")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(200_000_000)
+                    .max(1);
+                let function = if effect == "execJs" {
+                    "exec_js"
+                } else {
+                    "exec_python"
+                };
+                self.sandbox_exec(function, source, fuel)
+                    .map(serde_json::Value::String)
+            }
+            "execWasm" => {
+                let source = a
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let options = a.get("opts").cloned().unwrap_or(serde_json::Value::Null);
+                let function = options
+                    .get("function")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("main")
+                    .to_string();
+                let args = options
+                    .get("args")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+                let fuel = options
+                    .get("fuel")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1_000_000)
+                    .max(1);
+                let memory_pages = options
+                    .get("memoryPages")
+                    .or_else(|| options.get("memory_pages"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(16)
+                    .max(1) as u32;
+                self.sandbox_exec_wasm(source, function, args, fuel, memory_pages)
+            }
+            "workspace" => self.dispatch_workspace(a),
+            other => Err(format!(
+                "chidori.{other} is not supported on the rust engine"
+            )),
+        }
+    }
+
+    /// Sub-dispatch for `chidori.workspace.<action>(args)`.
+    fn dispatch_workspace(
+        &self,
+        a: &serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let action = a.get("action").and_then(serde_json::Value::as_str).unwrap_or("");
+        let args = a.get("args").cloned().unwrap_or(serde_json::Value::Null);
+        match action {
+            "list" => {
+                let complete_only = args
+                    .get("completeOnly")
+                    .or_else(|| args.get("complete_only"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                self.workspace_call("list", args.clone(), || {
+                    let root = workspace_root(self)?;
+                    workspace_list(&root, complete_only)
+                })
+            }
+            "read" => {
+                let path = args
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                self.workspace_call("read", serde_json::json!({ "path": path }), || {
+                    let root = workspace_root(self)?;
+                    workspace_read(&root, &path).map(serde_json::Value::String)
+                })
+            }
+            "write" => {
+                let path = args
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let content = args
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let options = args
+                    .get("options")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let call_args = serde_json::json!({
+                    "path": path,
+                    "bytes": content.len(),
+                    "options": options,
+                });
+                self.workspace_call("write", call_args, || {
+                    let root = workspace_root(self)?;
+                    workspace_write(&root, &path, &content, &options)
+                })
+            }
+            "delete" | "remove" => {
+                let path = args
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let reason = args
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned);
+                self.workspace_call(
+                    "delete",
+                    serde_json::json!({ "path": path, "reason": reason }),
+                    || {
+                        let root = workspace_root(self)?;
+                        workspace_delete(&root, &path, reason.as_deref())
+                    },
+                )
+            }
+            "manifest" => self.workspace_call("manifest", serde_json::json!({}), || {
+                let root = workspace_root(self)?;
+                workspace_manifest(&root)
+            }),
+            other => Err(format!(
+                "chidori.workspace.{other} is not supported on the rust engine"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -596,6 +1006,7 @@ impl HostBindingRecorder {
     }
 }
 
+#[cfg(test)]
 #[allow(dead_code)]
 pub fn install_chidori_object<'js>(
     ctx: &Ctx<'js>,
@@ -604,6 +1015,7 @@ pub fn install_chidori_object<'js>(
     install_chidori_object_with_backend(ctx, HostBindingBackend::Recorder(recorder))
 }
 
+#[cfg(test)]
 pub fn install_chidori_object_for_runtime<'js>(
     ctx: &Ctx<'js>,
     runtime_ctx: RuntimeContext,
@@ -632,6 +1044,7 @@ pub fn install_chidori_object_for_runtime<'js>(
     )
 }
 
+#[cfg(test)]
 fn install_chidori_object_with_backend<'js>(
     ctx: &Ctx<'js>,
     backend: HostBindingBackend,
@@ -956,6 +1369,7 @@ fn install_chidori_object_with_backend<'js>(
     Ok(chidori)
 }
 
+#[cfg(test)]
 fn install_sandbox_binding<'js>(
     _ctx: &Ctx<'js>,
     chidori: &Object<'js>,
@@ -988,6 +1402,7 @@ fn install_sandbox_binding<'js>(
     Ok(())
 }
 
+#[cfg(test)]
 fn install_workspace_binding<'js>(
     ctx: &Ctx<'js>,
     chidori: &Object<'js>,
@@ -1455,6 +1870,7 @@ fn language_for_path(path: &Path) -> String {
     .to_string()
 }
 
+#[cfg(test)]
 fn install_js_helpers<'js>(ctx: &Ctx<'js>, chidori: &Object<'js>) -> Result<()> {
     let install: Function = ctx.eval(
         r#"
@@ -1543,6 +1959,7 @@ fn install_js_helpers<'js>(ctx: &Ctx<'js>, chidori: &Object<'js>) -> Result<()> 
     Ok(())
 }
 
+#[cfg(test)]
 fn js_value_to_json<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<serde_json::Value> {
     let Some(json) = ctx.json_stringify(value)? else {
         return Ok(serde_json::Value::Null);
@@ -1553,6 +1970,7 @@ fn js_value_to_json<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<
     })
 }
 
+#[cfg(test)]
 fn json_to_js_value<'js>(
     ctx: &Ctx<'js>,
     value: &serde_json::Value,

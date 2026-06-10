@@ -135,6 +135,64 @@ fn persist_ts_snapshot_manifest_scaffold(
     }
 }
 
+/// Persist a resume scaffold for a run on the pure-Rust engine (G2).
+///
+/// Unlike the QuickJS path, the rust live path's durability is the
+/// `RuntimeContext` call log, not a VM image: resume re-executes the agent from
+/// the top and feeds each host effect its recorded result via the call-log
+/// replay (`try_replay`), blocking again at the pending frontier. So there is no
+/// VM blob to store — we persist a manifest (`InitialTypeScriptStateScaffold`
+/// kind) plus the call log, pending operation, host-promise table, capabilities,
+/// and VFS, which is exactly what the server's call-log replay resume path
+/// consumes.
+///
+/// The ABI token is `chidori-quickjs` on purpose: the server's resume gate
+/// validates the manifest ABI against `SnapshotAbi::current("chidori-quickjs")`,
+/// and the existing QuickJS *scaffold* fallback uses the same token and resumes
+/// the same engine-agnostic way (call-log replay, not a VM image). Reusing it
+/// keeps the rust manifest acceptable to the unchanged resume gate.
+#[cfg(feature = "rust-engine")]
+fn persist_rust_journal_scaffold(
+    base: &Path,
+    run_id: &str,
+    path: &Path,
+    source: &str,
+    policy: &RuntimePolicy,
+    ctx: &RuntimeContext,
+) -> Result<()> {
+    let call_log = ctx.call_log().into_records();
+    let pending = ctx.active_pending_host_operation();
+    let host_promises = ctx.host_promise_records();
+    let modules =
+        crate::runtime::typescript::snapshot::snapshot_module_fingerprints(path, source, policy)?;
+    let module_graph =
+        crate::runtime::typescript::snapshot::snapshot_module_graph(path, source, policy)?;
+    let manifest = SnapshotManifest::new(
+        run_id,
+        SnapshotAbi::current("chidori-quickjs"),
+        policy.clone(),
+        SourceFingerprint::from_source(path, source),
+        modules,
+        pending.clone(),
+        call_log.len(),
+    )
+    .with_module_graph(module_graph)
+    .with_host_promises(host_promises)
+    .with_capabilities(ctx.capabilities())
+    .with_vfs(ctx.vfs_snapshot());
+    // The rust engine has no VM image to serialize; resume is call-log replay.
+    // We still write a non-empty blob — the durable code bundle the journal keys
+    // reference — so `SnapshotStore::load()` round-trips and the on-disk shape
+    // matches the QuickJS scaffold (manifest + blob + checkpoint + pending).
+    let blob = chidori_js::replay::DurableBlob {
+        bundle: source.to_string(),
+        effects: Vec::new(),
+        journal: Vec::new(),
+    };
+    let blob_bytes = serde_json::to_vec(&blob).unwrap_or_default();
+    SnapshotStore::new(base.join(run_id)).save(&manifest, &blob_bytes, &call_log)
+}
+
 impl Engine {
     pub fn new(
         providers: Arc<ProviderRegistry>,
@@ -347,6 +405,27 @@ impl Engine {
         self.run_with_context(path, inputs, ctx)
     }
 
+    /// As `run_replay_pausable_with_host_promises_and_vfs`, but continues the run
+    /// under `run_id` instead of minting a fresh one. The server's call-log
+    /// replay resume uses this so a resumed run keeps its original id (and its
+    /// persisted run directory), matching the live-VM resume path — a resumed
+    /// run is the same durable run, not a new one.
+    pub fn run_replay_pausable_with_host_promises_and_vfs_preserving_run_id(
+        &self,
+        path: &Path,
+        inputs: &Value,
+        replay_log: Vec<CallRecord>,
+        host_promises: Vec<HostPromiseRecord>,
+        vfs: crate::runtime::vfs::Vfs,
+        run_id: String,
+    ) -> Result<RunResult> {
+        let ctx =
+            RuntimeContext::with_replay_host_promises_and_vfs(replay_log, host_promises, vfs);
+        ctx.set_run_id(run_id);
+        ctx.set_input_mode(InputMode::Pause);
+        self.run_with_context(path, inputs, ctx)
+    }
+
     /// Resume/replay an interactive streaming run with persisted host-promise
     /// state. Used by embedders that mirror the server session interaction
     /// without routing through HTTP.
@@ -399,10 +478,192 @@ impl Engine {
             ctx.set_otel_run(run_span);
         }
 
+        // Close out OTEL at a terminal/pause boundary. Host-call spans stream
+        // out during the run (`record_call` → `RunSpan::stream_record`), and
+        // only for LIVE execution — replayed calls (try_replay / absorb) don't
+        // re-emit, since their spans shipped when they first ran live (this is
+        // what keeps a resume from duplicating the prior turn's spans). `finish`
+        // flushes any buffered stragglers and ends the run span. No-op when OTEL
+        // is off (otel_run is None).
+        let emit_otel = |ctx: &RuntimeContext, error: Option<&str>| {
+            if let Some(otel) = ctx.otel_run() {
+                otel.finish(error);
+            }
+        };
+
         if path.extension().and_then(|e| e.to_str()) == Some("ts") {
             let policy = RuntimePolicy::from_env_for_durable_run(&run_id)?;
             let source = std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read {}", path.display()))?;
+
+            // Route to the pure-Rust engine when selected (CHIDORI_JS_ENGINE=rust).
+            // Host effects still flow through host_core/RuntimeContext, so the
+            // durable call log and the host-call span tree behave identically;
+            // this path additionally emits JS-level function spans when tracing
+            // is on. Only compiled with `--features rust-engine`.
+            #[cfg(feature = "rust-engine")]
+            if matches!(
+                crate::runtime::rust_engine::selected_engine(),
+                crate::runtime::rust_engine::EngineKind::Rust
+            ) {
+                // Build the same runtime host backend the QuickJS path uses, so
+                // every `chidori.*` effect routes through identical durable
+                // machinery (call log, replay, policy, MCP, OTEL).
+                let mut seeded = PolicyCache::default();
+                for (target, args) in &self.approvals {
+                    seeded.approve(target, args);
+                }
+                let backend = crate::runtime::typescript::bindings::HostBindingBackend::for_runtime(
+                    ctx.clone(),
+                    self.providers.clone(),
+                    self.template_engine.clone(),
+                    self.tokio_rt.clone(),
+                    self.policy.clone(),
+                    Arc::new(StdMutex::new(seeded)),
+                    policy.clone(),
+                    self.tools.clone(),
+                    self.mcp.clone(),
+                );
+                // Persist a durable journal scaffold before the run and at each
+                // host-operation safepoint, so a pause/crash has a resumable
+                // artifact on disk (G2). Mirrors the QuickJS safepoint wiring
+                // below, but stores the rust engine's journal-shaped manifest.
+                if let Some(ref base) = self.persist_base {
+                    let safepoint_base = base.clone();
+                    let safepoint_run_id = run_id.clone();
+                    let safepoint_path = path.to_path_buf();
+                    let safepoint_source = source.clone();
+                    let safepoint_policy = policy.clone();
+                    let safepoint_ctx = ctx.clone();
+                    ctx.set_host_operation_safepoint(HostOperationSafepoint::new(
+                        move |_operation| {
+                            persist_rust_journal_scaffold(
+                                &safepoint_base,
+                                &safepoint_run_id,
+                                &safepoint_path,
+                                &safepoint_source,
+                                &safepoint_policy,
+                                &safepoint_ctx,
+                            )
+                        },
+                    ));
+                    let completion_base = base.clone();
+                    let completion_run_id = run_id.clone();
+                    let completion_path = path.to_path_buf();
+                    let completion_source = source.clone();
+                    let completion_policy = policy.clone();
+                    let completion_ctx = ctx.clone();
+                    ctx.set_host_operation_completion_safepoint(
+                        HostOperationCompletionSafepoint::new(move |_record| {
+                            persist_rust_journal_scaffold(
+                                &completion_base,
+                                &completion_run_id,
+                                &completion_path,
+                                &completion_source,
+                                &completion_policy,
+                                &completion_ctx,
+                            )
+                        }),
+                    );
+                    persist_rust_journal_scaffold(
+                        base, &run_id, path, &source, &policy, &ctx,
+                    )?;
+                }
+
+                // Pause surfacing on the rust path (G1). A `chidori.input()` in
+                // Pause mode or a policy-approval block sets `pending_input` /
+                // `pending_approval` on the ctx and signals a pause by returning
+                // the `PAUSE_MARKER` sentinel from the host effect — which the
+                // rust engine throws as a JS error and bubbles up here as `Err`.
+                // We surface that as a paused `RunResult` so the resume flow has
+                // something to resume, mirroring the QuickJS arm. The check runs
+                // on `Ok` too in case the agent caught the sentinel and returned.
+                let surface_pause = |ctx: &RuntimeContext| -> Option<RunResult> {
+                    if let Some(pending) = ctx.take_pending_input() {
+                        if let Some(ref base) = self.persist_base {
+                            let _ = persist_rust_journal_scaffold(
+                                base, &run_id, path, &source, &policy, ctx,
+                            );
+                        }
+                        emit_otel(ctx, None);
+                        return Some(RunResult {
+                            output: Value::Null,
+                            call_log: ctx.call_log(),
+                            run_id: ctx.run_id(),
+                            paused: Some(pending),
+                            paused_approval: None,
+                        });
+                    }
+                    if let Some(approval) = ctx.take_pending_approval() {
+                        if let Some(ref base) = self.persist_base {
+                            let _ = persist_rust_journal_scaffold(
+                                base, &run_id, path, &source, &policy, ctx,
+                            );
+                        }
+                        emit_otel(ctx, None);
+                        return Some(RunResult {
+                            output: Value::Null,
+                            call_log: ctx.call_log(),
+                            run_id: ctx.run_id(),
+                            paused: None,
+                            paused_approval: Some(approval),
+                        });
+                    }
+                    None
+                };
+
+                let rust_result =
+                    crate::runtime::rust_engine::run_agent(path, &source, inputs, &backend);
+                // Release the streaming event sender now that the run is over.
+                // The chidori-js VM can leak its heap on drop (Rc cycles), which
+                // would keep `backend` — and through it this ctx and the sender —
+                // alive, hanging a `--stream` drain loop that waits for the
+                // channel to close. Dropping our own `backend` handle plus
+                // clearing the ctx-held sender closes the channel regardless.
+                ctx.clear_event_sender();
+                drop(backend);
+                return match rust_result {
+                    Ok(output) => {
+                        if let Some(paused) = surface_pause(&ctx) {
+                            return Ok(paused);
+                        }
+                        info!(agent = %agent_name, run_id = %run_id, "rust-engine agent run ok");
+                        if let Some(ref base) = self.persist_base {
+                            let run_dir = base.join(ctx.run_id());
+                            let _ = std::fs::write(
+                                run_dir.join("output.json"),
+                                serde_json::to_string_pretty(&output).unwrap_or_default(),
+                            );
+                            let _ = persist_rust_journal_scaffold(
+                                base, &run_id, path, &source, &policy, &ctx,
+                            );
+                        }
+                        emit_otel(&ctx, None);
+                        Ok(RunResult {
+                            output,
+                            call_log: ctx.call_log(),
+                            run_id: ctx.run_id(),
+                            paused: None,
+                            paused_approval: None,
+                        })
+                    }
+                    Err(e) => {
+                        if let Some(paused) = surface_pause(&ctx) {
+                            return Ok(paused);
+                        }
+                        let err_msg = e.to_string();
+                        tracing_error!(agent = %agent_name, run_id = %run_id, error = %err_msg, "rust-engine agent run failed");
+                        if let Some(ref base) = self.persist_base {
+                            let _ = persist_rust_journal_scaffold(
+                                base, &run_id, path, &source, &policy, &ctx,
+                            );
+                        }
+                        emit_otel(&ctx, Some(&err_msg));
+                        Err(e)
+                    }
+                };
+            }
+
             if let Some(ref base) = self.persist_base {
                 let safepoint_base = base.clone();
                 let safepoint_run_id = run_id.clone();
@@ -474,9 +735,7 @@ impl Engine {
                                 base, &run_id, path, &source, inputs, &policy, &ctx,
                             );
                         }
-                        if let Some(otel) = ctx.otel_run() {
-                            otel.finish(None);
-                        }
+                        emit_otel(&ctx, None);
                         return Ok(RunResult {
                             output: Value::Null,
                             call_log: ctx.call_log(),
@@ -491,9 +750,7 @@ impl Engine {
                                 base, &run_id, path, &source, inputs, &policy, &ctx,
                             );
                         }
-                        if let Some(otel) = ctx.otel_run() {
-                            otel.finish(None);
-                        }
+                        emit_otel(&ctx, None);
                         return Ok(RunResult {
                             output: Value::Null,
                             call_log: ctx.call_log(),
@@ -514,9 +771,7 @@ impl Engine {
                     }
 
                     info!(agent = %agent_name, run_id = %run_id, "typescript agent run ok");
-                    if let Some(otel) = ctx.otel_run() {
-                        otel.finish(None);
-                    }
+                    emit_otel(&ctx, None);
                     Ok(RunResult {
                         output,
                         call_log: ctx.call_log(),
@@ -532,9 +787,7 @@ impl Engine {
                                 base, &run_id, path, &source, inputs, &policy, &ctx,
                             );
                         }
-                        if let Some(otel) = ctx.otel_run() {
-                            otel.finish(None);
-                        }
+                        emit_otel(&ctx, None);
                         return Ok(RunResult {
                             output: Value::Null,
                             call_log: ctx.call_log(),
@@ -549,9 +802,7 @@ impl Engine {
                                 base, &run_id, path, &source, inputs, &policy, &ctx,
                             );
                         }
-                        if let Some(otel) = ctx.otel_run() {
-                            otel.finish(None);
-                        }
+                        emit_otel(&ctx, None);
                         return Ok(RunResult {
                             output: Value::Null,
                             call_log: ctx.call_log(),
@@ -562,9 +813,7 @@ impl Engine {
                     }
                     let err_msg = e.to_string();
                     tracing_error!(agent = %agent_name, run_id = %run_id, error = %err_msg, "typescript agent run failed");
-                    if let Some(otel) = ctx.otel_run() {
-                        otel.finish(Some(&err_msg));
-                    }
+                    emit_otel(&ctx, Some(&err_msg));
                     Err(e)
                 }
             };
@@ -575,9 +824,7 @@ impl Engine {
             path.display()
         );
         tracing_error!(agent = %agent_name, run_id = %run_id, error = %err_msg, "agent run failed");
-        if let Some(otel) = ctx.otel_run() {
-            otel.finish(Some(&err_msg));
-        }
+        emit_otel(&ctx, Some(&err_msg));
         Err(anyhow::anyhow!(err_msg))
     }
 }
@@ -589,6 +836,17 @@ mod tests {
         ContentBlock, LlmProvider, LlmRequest, LlmResponse, ProviderRegistry, TokenSink,
     };
     use crate::runtime::template::TemplateEngine;
+
+    /// True when the pure-Rust engine is the active runtime. Tests that assert
+    /// QuickJS-specific live-VM snapshot internals (a `LiveVmSnapshotter`, the
+    /// `LiveQuickJsVm` blob kind, or a byte-exact `chidori_quickjs` VM blob)
+    /// early-return under it: the rust engine's durability is call-log replay
+    /// over a scaffold manifest, not a VM image, and these assertions validate
+    /// the QuickJS serialization path specifically. They remain live QuickJS
+    /// tests until that engine is removed.
+    fn rust_engine_active() -> bool {
+        std::env::var("CHIDORI_JS_ENGINE").as_deref() == Ok("rust")
+    }
 
     struct FixedTestProvider {
         content: String,
@@ -976,6 +1234,9 @@ mod tests {
 
     #[test]
     fn engine_persists_typescript_snapshot_manifest_on_pause() {
+        if rust_engine_active() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!(
             "chidori-engine-ts-snapshot-manifest-{}",
             uuid::Uuid::new_v4()
@@ -1081,6 +1342,9 @@ mod tests {
 
     #[test]
     fn engine_live_vm_snapshotter_persists_live_blob_on_input_pause() {
+        if rust_engine_active() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!(
             "chidori-engine-ts-live-input-pause-{}",
             uuid::Uuid::new_v4()
@@ -1139,6 +1403,9 @@ mod tests {
 
     #[test]
     fn engine_persists_typescript_snapshot_blob_on_policy_approval_pause() {
+        if rust_engine_active() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!(
             "chidori-engine-ts-approval-snapshot-{}",
             uuid::Uuid::new_v4()
@@ -1243,6 +1510,9 @@ mod tests {
 
     #[test]
     fn engine_live_vm_snapshotter_persists_live_blob_on_policy_approval_pause() {
+        if rust_engine_active() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!(
             "chidori-engine-ts-live-approval-pause-{}",
             uuid::Uuid::new_v4()
@@ -1361,6 +1631,9 @@ mod tests {
 
     #[test]
     fn engine_live_vm_snapshotter_persists_live_blob_around_failed_host_side_effect() {
+        if rust_engine_active() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!(
             "chidori-engine-ts-live-host-safepoint-{}",
             uuid::Uuid::new_v4()
@@ -1467,6 +1740,9 @@ mod tests {
 
     #[test]
     fn engine_live_vm_snapshotter_persists_live_blob_around_prompt_provider_call() {
+        if rust_engine_active() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!(
             "chidori-engine-ts-live-prompt-safepoint-{}",
             uuid::Uuid::new_v4()
@@ -2158,6 +2434,9 @@ mod tests {
 
     #[test]
     fn typescript_live_vm_snapshotter_failure_blocks_persisted_run() {
+        if rust_engine_active() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!(
             "chidori-engine-ts-live-vm-snapshotter-fail-{}",
             uuid::Uuid::new_v4()
@@ -2287,6 +2566,69 @@ def agent(value):
         assert!(err
             .to_string()
             .contains("chidori.callAgent supports .ts agents"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `node:` captured effects (crypto + fs) run on the active engine and a
+    /// record→replay round-trip reproduces identical output — including the
+    /// captured randomness, which is journaled as a `crypto.random` call so a
+    /// resumed run draws the exact same bytes. Runs under whichever engine
+    /// `CHIDORI_JS_ENGINE` selects, so it guards both the QuickJS and rust paths.
+    #[test]
+    fn engine_node_builtins_crypto_fs_record_replay_parity() {
+        let dir = std::env::temp_dir()
+            .join(format!("chidori-engine-node-builtins-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(
+            &path,
+            r#"
+                import { createHash, randomBytes } from "node:crypto";
+                import { writeFileSync, readFileSync } from "node:fs";
+                export async function agent(input: { msg: string }, chidori) {
+                    const hash = createHash("sha256").update(input.msg).digest("hex");
+                    const rnd = randomBytes(8).toString("hex");
+                    writeFileSync("/work.txt", input.msg + ":" + rnd);
+                    const back = readFileSync("/work.txt", "utf8");
+                    return { hash, rnd, back };
+                }
+            "#,
+        )
+        .unwrap();
+
+        let engine = || {
+            Engine::new(
+                Arc::new(ProviderRegistry::new()),
+                Arc::new(TemplateEngine::new(&dir)),
+                Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            )
+        };
+
+        let recorded = engine()
+            .run(&path, &serde_json::json!({ "msg": "hello" }))
+            .unwrap();
+        let out = recorded.output.clone();
+        // sha256("hello") is fixed; the captured random and the file contents are
+        // present in the output and must survive replay unchanged.
+        assert_eq!(
+            out.get("hash").and_then(|v| v.as_str()).unwrap(),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        let rnd = out.get("rnd").and_then(|v| v.as_str()).unwrap().to_string();
+        assert_eq!(rnd.len(), 16);
+
+        // The captured `crypto.random` is in the log; replaying re-derives the
+        // same bytes, so the whole output is byte-identical.
+        let replay_log = recorded.call_log.into_records();
+        assert!(
+            replay_log.iter().any(|r| r.function == "crypto.random"),
+            "captured randomness should be journaled as crypto.random"
+        );
+        let replayed = engine()
+            .run_with_replay(&path, &serde_json::json!({ "msg": "hello" }), replay_log)
+            .unwrap();
+        assert_eq!(replayed.output, out);
 
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -2,7 +2,14 @@
 
 ## Implementation status (Phases 1–4 landed)
 
-This design is implemented. What shipped, by phase:
+This design is implemented. It originally shipped on the QuickJS path; the
+pure-Rust `chidori-js` engine now runs the same surface (`node:` crypto/fs/timers,
+`TextEncoder`, Web Crypto, virtual timers), reusing the same shim sources and
+polyfills and capturing through the same `RuntimeContext` call log + VFS — so a
+captured-effects agent records and replays identically on either engine. See the
+G3 section of `docs/rust-engine-quickjs-removal-gaps.md` for the rust-path wiring.
+
+What shipped, by phase:
 
 - **Phase 1 — policy + capability ledger.** `RuntimePolicy` gained `fs`,
   `crypto`, `timers` fields (`FsPolicy`/`CryptoPolicy`/`TimerPolicy` in
@@ -147,9 +154,15 @@ parallel path.
 
 ## Non-Goals
 
-- No `node:net`, `node:child_process`, `node:worker_threads`, `node:dns`,
-  `node:http(s)` server sockets in this work. Outbound HTTP already has a
-  first-class captured host op (`http`); these others stay rejected for now.
+- No `node:net`, `node:child_process`, `node:worker_threads`, `node:dns`, or
+  `node:http(s)` *server* sockets in this work. These stay rejected for now.
+- Outbound HTTP is served by the first-class captured host op (`http`). The
+  stdlib net surface is built on top of it: `globalThis.fetch`
+  (+ `Headers`/`Request`/`Response`) and the `node:http`/`node:https` *client*
+  APIs (`request`/`get`) all delegate to `chidori.http`, so every network call
+  inherits its security-policy enforcement (allow / ask / deny) and the
+  approval-pause path. See `FETCH_POLYFILL` in `runtime::typescript::snapshot`
+  and the `HTTP_SHIM`/`HTTPS_SHIM` in `runtime::typescript::builtins`.
 - No real concurrent wall-clock scheduling. Timers are virtualized against a
   logical clock (see Timers); we do not run a real OS timer wheel.
 - No POSIX completeness for the VFS (no permissions bits enforcement, symlink

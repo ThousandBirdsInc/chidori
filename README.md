@@ -27,6 +27,7 @@ Star us on GitHub! Join us on [Discord](https://discord.gg/CJwKsPSgew).
 - [🐍 Python SDK](#-python-sdk)
 - [⏪ How Replay Works](#-how-replay-works)
 - [🧪 Examples](#-examples)
+- [✅ JavaScript Conformance (Test262)](#-javascript-conformance-test262)
 - [🏗 Architecture](#-architecture)
 - [📦 Project Structure](#-project-structure)
 
@@ -352,6 +353,181 @@ See [`examples/`](./examples):
 - [`prompts/analysis.jinja`](./examples/prompts/analysis.jinja) — shared prompt template
 - [`tools/web_search.ts`](./examples/tools/web_search.ts) — simple tool definition
 - [`legacy-starlark/`](./examples/legacy-starlark) — archived Starlark examples kept for migration reference
+
+## ✅ JavaScript Conformance (Test262)
+
+Chidori runs agents in an embedded QuickJS runtime. To check that runtime
+against the same yardstick Bun and Node use, we run [**Test262**](https://github.com/tc39/test262) —
+the official TC39 ECMAScript conformance suite.
+
+```bash
+# Vendor the suite (shallow clone of tc39/test262) and run language + built-ins.
+# First run clones ~56k files; subsequent runs reuse the checkout.
+scripts/test262.sh
+
+# Run a subset:
+scripts/test262.sh test/built-ins/Array
+scripts/test262.sh --filter Promise
+
+# Full machine-readable report + per-failure detail:
+scripts/test262.sh --json target/test262-report.json --verbose
+```
+
+The runner prints a pass/fail/skip summary:
+
+```
+Test262 (chidori/QuickJS bare context)
+  pass 39178  fail 202  skip 7885  =>  99.49% of executed
+```
+
+It drives the **bare ECMAScript context** (no `chidori` host object), so the
+number is pure language conformance — directly comparable to how Bun and Node
+report it. Modules and dynamic `import()` run by default; features the engine
+does not implement (and that Bun/Node also skip) are reported as `skip`, never
+hidden.
+
+You can also run the runner directly (after `cargo build --release -p test262-runner`):
+
+```bash
+target/release/test262-runner --test262 vendor/test262 --help
+```
+
+See [`docs/conformance.md`](./docs/conformance.md) for how it works, the honest
+skip policy, and the remaining engine-level gaps.
+
+### In-tree pure-Rust engine (experimental)
+
+Alongside the embedded QuickJS runtime, the tree ships an **independent,
+pure-Rust JavaScript engine** (`crates/chidori-js`) — oxc parser → bytecode →
+stack VM, with deterministic-replay durable execution and **no C and no
+`boa_engine`**. It is selectable with `--engine rust`:
+
+```bash
+target/release/test262-runner --test262 vendor/test262 --engine rust
+```
+
+It is younger than the QuickJS path (which scores **99.5%** above), but already
+runs the full language + built-ins suite. Each test executes on its own
+worker thread with a wall-clock timeout and cooperative cancellation, so the
+whole suite completes in **~5 minutes** instead of hanging on pathological cases.
+
+**Latest run: `84.65%` of executed — 32,775 pass / 5,944 fail / 8,546 skip.**
+(Language **86.9%**, Built-ins **80.9%**.)
+
+#### Language — 80.1% (17,686 / 22,089 executed)
+
+| Category | Pass | Fail | Skip | Pass-rate |
+|---|--:|--:|--:|:--|
+| `expressions` | 8,380 | 2,143 | 515 | ████████░░ 80% |
+| `statements` | 7,283 | 1,828 | 226 | ████████░░ 80% |
+| `literals` | 411 | 40 | 83 | █████████░ 91% |
+| `arguments-object` | 206 | 57 | 0 | ████████░░ 78% |
+| `function-code` | 159 | 58 | 0 | ███████░░░ 73% |
+| `block-scope` | 143 | 2 | 0 | ██████████ 99% |
+| `types` | 99 | 12 | 2 | █████████░ 89% |
+| `white-space` | 62 | 5 | 0 | █████████░ 93% |
+| `computed-property-names` | 40 | 8 | 0 | ████████░░ 83% |
+| `destructuring` | 15 | 4 | 0 | ████████░░ 79% |
+| `rest-parameters` | 10 | 1 | 0 | █████████░ 91% |
+| `directive-prologue` | 40 | 22 | 0 | ██████░░░░ 65% |
+| `global-code` | 27 | 15 | 0 | ██████░░░░ 64% |
+| `identifier-resolution` | 8 | 6 | 0 | ██████░░░░ 57% |
+| `eval-code` | 142 | 200 | 5 | ████░░░░░░ 42% |
+| lexical & syntax¹ | 660 | 0 | 1 | ██████████ 100% |
+| `module-code` / `export` / `import` / `source-text` | 1 | 2 | 727 | _modules not yet supported_ |
+
+¹ `asi`, `comments`, `identifiers`, `keywords`, `line-terminators`,
+`punctuators`, `reserved-words`, `future-reserved-words`, `statementList`.
+
+#### Built-ins — 76.6% (12,745 / 16,630 executed)
+
+**Core objects & primitives**
+
+| Category | Pass | Fail | Skip | Pass-rate |
+|---|--:|--:|--:|:--|
+| `Object` | 3,042 | 361 | 8 | █████████░ 89% |
+| `Array` | 2,148 | 822 | 111 | ███████░░░ 72% |
+| `String` | 1,050 | 163 | 10 | █████████░ 87% |
+| `RegExp` | 834 | 692 | 353 | █████░░░░░ 55% |
+| `Date` | 561 | 22 | 11 | ██████████ 96% |
+| `Function` | 341 | 155 | 13 | ███████░░░ 69% |
+| `Number` | 322 | 17 | 1 | ██████████ 95% |
+| `Math` | 302 | 25 | 0 | █████████░ 92% |
+| `JSON` | 115 | 27 | 23 | ████████░░ 81% |
+| `BigInt` | 75 | 1 | 1 | ██████████ 99% |
+| `Symbol` | 68 | 9 | 21 | █████████░ 88% |
+| `NativeErrors` | 76 | 12 | 6 | █████████░ 86% |
+| `Boolean` | 49 | 1 | 1 | ██████████ 98% |
+| `Error` | 38 | 17 | 38 | ███████░░░ 69% |
+| `AggregateError` | 21 | 3 | 1 | █████████░ 88% |
+
+**Collections & iterators**
+
+| Category | Pass | Fail | Skip | Pass-rate |
+|---|--:|--:|--:|:--|
+| `Set` | 332 | 49 | 2 | █████████░ 87% |
+| `Map` | 144 | 25 | 35 | █████████░ 85% |
+| `WeakSet` | 78 | 6 | 1 | █████████░ 93% |
+| `WeakMap` | 92 | 9 | 40 | █████████░ 91% |
+| `ArrayIteratorPrototype` | 23 | 4 | 0 | █████████░ 85% |
+| `MapIteratorPrototype` | 10 | 1 | 0 | █████████░ 91% |
+| `SetIteratorPrototype` | 10 | 1 | 0 | █████████░ 91% |
+| `GeneratorPrototype` | 29 | 32 | 0 | █████░░░░░ 48% |
+| `GeneratorFunction` | 7 | 14 | 2 | ███░░░░░░░ 33% |
+| `StringIteratorPrototype` | 5 | 2 | 0 | ███████░░░ 71% |
+| `RegExpStringIteratorPrototype` | 4 | 13 | 0 | ██░░░░░░░░ 24% |
+| `Iterator` | 5 | 0 | 509 | _mostly helper proposals (skipped)_ |
+
+**Typed arrays & binary data**
+
+| Category | Pass | Fail | Skip | Pass-rate |
+|---|--:|--:|--:|:--|
+| `TypedArray` | 957 | 474 | 15 | ███████░░░ 67% |
+| `TypedArrayConstructors` | 496 | 164 | 78 | ████████░░ 75% |
+| `DataView` | 406 | 104 | 51 | ████████░░ 80% |
+| `ArrayBuffer` | 67 | 115 | 39 | ████░░░░░░ 37% |
+
+`TypedArrayConstructors` includes `Int8Array`…`Float64Array` plus the
+`BigInt64Array`/`BigUint64Array` pair, which pass **100%**.
+
+**Async, reflection & meta**
+
+| Category | Pass | Fail | Skip | Pass-rate |
+|---|--:|--:|--:|:--|
+| `Reflect` | 143 | 10 | 0 | █████████░ 93% |
+| `Proxy` | 193 | 80 | 38 | ███████░░░ 71% |
+| `Promise` | 392 | 247 | 38 | ██████░░░░ 61% |
+| `AsyncFunction` | 9 | 8 | 1 | █████░░░░░ 53% |
+| `AsyncGeneratorPrototype` | 17 | 31 | 0 | ████░░░░░░ 35% |
+| `AsyncGeneratorFunction` | 7 | 14 | 2 | ███░░░░░░░ 33% |
+| `AsyncFromSyncIteratorPrototype` | 9 | 29 | 0 | ██░░░░░░░░ 24% |
+| `AsyncIteratorPrototype` | 0 | 4 | 9 | ░░░░░░░░░░ 0% |
+
+**Globals, coercion & URI**
+
+| Category | Pass | Fail | Skip | Pass-rate |
+|---|--:|--:|--:|:--|
+| `parseFloat` / `isNaN` / `isFinite` | 84 | 0 | 0 | ██████████ 100% |
+| `parseInt` | 53 | 2 | 0 | █████████░ 96% |
+| `global` | 27 | 2 | 0 | █████████░ 93% |
+| `eval` | 9 | 1 | 0 | █████████░ 90% |
+| `encodeURI` / `encodeURIComponent` | 46 | 16 | 0 | ███████░░░ 74% |
+| `decodeURI` / `decodeURIComponent` | 107 | 4 | 0 | ██████████ 96% |
+| `NaN` / `Infinity` / `undefined` (value props) | 7 | 13 | 0 | ████░░░░░░ 35% |
+| `ThrowTypeError` | 0 | 13 | 1 | ░░░░░░░░░░ 0% |
+
+**Not yet implemented** (reported as `skip`, never hidden): ES modules
+(`import`/`export`), `Temporal`, `Intl`, `Atomics` / `SharedArrayBuffer`,
+`WeakRef` / `FinalizationRegistry` (intentionally unsupported under the
+deterministic-replay contract), `ShadowRealm`, and the
+`DisposableStack` / `SuppressedError` proposals.
+
+**Reading the table.** Strong areas (≥ 85%) include `Object`, `String`, `Date`,
+`Number`, `Math`, `BigInt`, `Set`/`Map`/`WeakMap`/`WeakSet`, `Reflect`, and the
+typed-array constructors. The biggest open gaps are `RegExp` (Unicode property
+escapes `\p{}` need Unicode tables), `ArrayBuffer` (resizable buffers), and the
+async-iterator/generator surfaces — see the long-tail list in
+[`docs/pure-rust-js-engine-plan.md`](./docs/pure-rust-js-engine-plan.md).
 
 ## 🏗 Architecture
 

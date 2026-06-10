@@ -1,5 +1,6 @@
 pub mod acp;
 pub mod mcp;
+pub mod mem_guard;
 pub mod policy;
 pub mod providers;
 pub mod recipes;

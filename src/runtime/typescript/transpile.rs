@@ -54,8 +54,16 @@ impl From<&ResolutionKind> for ResolutionKindTag {
 /// Allowlist of `node:` builtins the resolver will accept under the `Node`
 /// policy. The corresponding shim sources are registered by
 /// `runtime::typescript::snapshot` when bundling.
-pub const NODE_BUILTIN_ALLOWLIST: &[&str] =
-    &["process", "buffer", "util", "fs", "fs/promises", "crypto"];
+pub const NODE_BUILTIN_ALLOWLIST: &[&str] = &[
+    "process",
+    "buffer",
+    "util",
+    "fs",
+    "fs/promises",
+    "crypto",
+    "http",
+    "https",
+];
 
 /// Walk up from `start` looking for a `package.json` and return the directory
 /// that contains it. Falls back to `start`'s parent (or the cwd) if none
@@ -421,7 +429,7 @@ fn is_relative_import(specifier: &str) -> bool {
     specifier.starts_with("./") || specifier.starts_with("../")
 }
 
-fn resolve_relative_import(
+pub(crate) fn resolve_relative_import(
     source_path: &Path,
     project_root: &Path,
     specifier: &str,

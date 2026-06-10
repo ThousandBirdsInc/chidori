@@ -23,6 +23,8 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "fs",
     "fs/promises",
     "crypto",
+    "http",
+    "https",
 ];
 
 const PROCESS_SHIM: &str = r#"
@@ -388,18 +390,230 @@ export const realpath = promises.realpath;
 export default promises;
 "#;
 
+// node:http client shim. Only the *client* surface is provided (request/get);
+// there are no listening sockets. Every request is performed by the captured
+// `chidori.http` host op, so a `node:http` request is subject to the security
+// policy and the approval-pause path exactly like `chidori.http`/`fetch`: the
+// network call happens synchronously inside `ClientRequest.end()`, so an
+// AskBefore policy throws the pause sentinel from there and the engine pauses
+// the run. Response events (`response`/`data`/`end`) are emitted after the
+// blocking call resolves, on a microtask, so listeners registered inside the
+// response callback still fire. `createHttpModule` is exported so `node:https`
+// can reuse this implementation with an `https:` default protocol.
+const HTTP_SHIM: &str = r#"
+class EventEmitter {
+    constructor() { this._ev = {}; }
+    on(type, cb) { (this._ev[type] = this._ev[type] || []).push(cb); return this; }
+    addListener(type, cb) { return this.on(type, cb); }
+    once(type, cb) {
+        const self = this;
+        function wrapper() { self.off(type, wrapper); return cb.apply(this, arguments); }
+        return this.on(type, wrapper);
+    }
+    off(type, cb) {
+        if (this._ev[type]) this._ev[type] = this._ev[type].filter((f) => f !== cb);
+        return this;
+    }
+    removeListener(type, cb) { return this.off(type, cb); }
+    emit(type) {
+        const args = Array.prototype.slice.call(arguments, 1);
+        const list = this._ev[type] ? this._ev[type].slice() : [];
+        // Node throws when an 'error' event has no listener. Preserving that
+        // keeps policy denials / transport failures fail-closed: an agent that
+        // ignores errors still sees the run fail rather than silently continue.
+        if (list.length === 0 && type === "error") {
+            const err = args[0];
+            throw err instanceof Error ? err : new Error("Unhandled 'error' event: " + String(err));
+        }
+        for (const f of list) f.apply(this, args);
+        return list.length > 0;
+    }
+}
+
+class IncomingMessage extends EventEmitter {
+    constructor(res) {
+        super();
+        this.statusCode = res ? res.status : 0;
+        this.statusMessage = "";
+        this.headers = (res && res.headers) || {};
+        this.complete = false;
+    }
+}
+
+function normalizeBody(body) {
+    if (body === undefined || body === null) return undefined;
+    if (typeof body === "string") return body;
+    return JSON.stringify(body);
+}
+
+function createHttpModule(defaultProtocol) {
+    class ClientRequest extends EventEmitter {
+        constructor(url, options, cb) {
+            super();
+            this._url = url;
+            this._method = String((options && options.method) || "GET").toUpperCase();
+            this._headers = {};
+            const hdrs = (options && options.headers) || {};
+            for (const k of Object.keys(hdrs)) this._headers[String(k).toLowerCase()] = String(hdrs[k]);
+            this._chunks = [];
+            this._ended = false;
+            if (typeof cb === "function") this.on("response", cb);
+        }
+        setHeader(name, value) { this._headers[String(name).toLowerCase()] = String(value); return this; }
+        getHeader(name) { return this._headers[String(name).toLowerCase()]; }
+        removeHeader(name) { delete this._headers[String(name).toLowerCase()]; }
+        write(chunk) { if (chunk !== undefined && chunk !== null) this._chunks.push(chunk); return true; }
+        end(chunk) {
+            if (this._ended) return this;
+            this._ended = true;
+            if (chunk !== undefined && chunk !== null) this._chunks.push(chunk);
+            const body = this._chunks.length ? this._chunks.join("") : undefined;
+            const options = { method: this._method, headers: this._headers };
+            const normalized = normalizeBody(body);
+            if (normalized !== undefined) options.body = normalized;
+            let res;
+            try {
+                // Synchronous, policy-gated host call. An AskBefore policy throws
+                // the pause sentinel here; we let it propagate so the run pauses.
+                res = globalThis.chidori.http(this._url, options);
+            } catch (err) {
+                // Surface transport-style failures through the 'error' event, the
+                // node convention — but never swallow the pause sentinel, which
+                // must keep unwinding to the engine.
+                if (err && typeof err.message === "string" && err.message.indexOf("__CHIDORI_PAUSED_FOR_INPUT__") !== -1) {
+                    throw err;
+                }
+                const self = this;
+                queueMicrotask(() => self.emit("error", err instanceof Error ? err : new Error(String(err))));
+                return this;
+            }
+            if (res && res.status === 0 && res.error) {
+                const self = this;
+                queueMicrotask(() => self.emit("error", new Error(res.error)));
+                return this;
+            }
+            const incoming = new IncomingMessage(res);
+            this.emit("response", incoming);
+            queueMicrotask(() => {
+                const b = res ? res.body : null;
+                if (b !== undefined && b !== null) {
+                    incoming.emit("data", typeof b === "string" ? b : JSON.stringify(b));
+                }
+                incoming.complete = true;
+                incoming.emit("end");
+            });
+            return this;
+        }
+        abort() { return this; }
+        destroy() { return this; }
+        setTimeout() { return this; }
+    }
+
+    function buildUrl(input, options) {
+        if (typeof input === "string") return input;
+        // URL instance.
+        if (input && typeof input.href === "string") return input.href;
+        // Options object (node style): { protocol, host/hostname, port, path }.
+        const opts = input || {};
+        const protocol = opts.protocol || defaultProtocol;
+        const host = opts.hostname || opts.host || "localhost";
+        const port = opts.port ? ":" + opts.port : "";
+        const path = opts.path || "/";
+        return protocol + "//" + host + port + path;
+    }
+
+    // node signatures: request(url[, options][, cb]) | request(options[, cb]).
+    function request(input, options, cb) {
+        if (typeof options === "function") { cb = options; options = undefined; }
+        let opts;
+        if (typeof input === "string" || (input && typeof input.href === "string")) {
+            opts = options || {};
+        } else {
+            opts = input || {};
+        }
+        const url = buildUrl(input, opts);
+        return new ClientRequest(url, opts, cb);
+    }
+
+    function get(input, options, cb) {
+        const req = request(input, options, cb);
+        req.end();
+        return req;
+    }
+
+    function unsupportedServer() {
+        throw new Error("node:http server APIs are not supported in the Chidori runtime");
+    }
+
+    return {
+        request,
+        get,
+        ClientRequest,
+        IncomingMessage,
+        createServer: unsupportedServer,
+        Server: unsupportedServer,
+        Agent: class Agent {},
+        globalAgent: {},
+        METHODS: ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+        STATUS_CODES: {},
+    };
+}
+
+const __httpModule = createHttpModule("http:");
+export const request = __httpModule.request;
+export const get = __httpModule.get;
+export const ClientRequest = __httpModule.ClientRequest;
+export { IncomingMessage };
+export const createServer = __httpModule.createServer;
+export const Server = __httpModule.Server;
+export const Agent = __httpModule.Agent;
+export const globalAgent = __httpModule.globalAgent;
+export const METHODS = __httpModule.METHODS;
+export const STATUS_CODES = __httpModule.STATUS_CODES;
+export { createHttpModule };
+export default __httpModule;
+"#;
+
+// node:https client shim. Reuses the node:http implementation with an `https:`
+// default protocol so policy + pause behavior is identical.
+const HTTPS_SHIM: &str = r#"
+import { createHttpModule } from "node:http";
+const __httpsModule = createHttpModule("https:");
+export const request = __httpsModule.request;
+export const get = __httpsModule.get;
+export const ClientRequest = __httpsModule.ClientRequest;
+export const IncomingMessage = __httpsModule.IncomingMessage;
+export const createServer = __httpsModule.createServer;
+export const Server = __httpsModule.Server;
+export const Agent = __httpsModule.Agent;
+export const globalAgent = __httpsModule.globalAgent;
+export const METHODS = __httpsModule.METHODS;
+export const STATUS_CODES = __httpsModule.STATUS_CODES;
+export default __httpsModule;
+"#;
+
 /// Return the synthetic builtin source for a resolved path that lives under
 /// `__node_builtins__/`, or `None` if the path doesn't match. The bundler
 /// uses this to short-circuit a filesystem read for builtin shim paths.
 pub fn source_for(path: &Path) -> Option<&'static str> {
-    let name = builtin_name_from_path(path)?;
-    match name.as_str() {
+    shim_source(&builtin_name_from_path(path)?)
+}
+
+/// Return the synthetic builtin source for a `node:` builtin *name* (e.g.
+/// `"crypto"` or `"fs/promises"`), or `None` if the name isn't an allowlisted
+/// builtin. The rust engine's module loader serves `node:` specifiers straight
+/// from this (no synthetic filesystem path), while the QuickJS bundler reaches
+/// it through [`source_for`].
+pub fn shim_source(name: &str) -> Option<&'static str> {
+    match name {
         "process" => Some(PROCESS_SHIM),
         "buffer" => Some(BUFFER_SHIM),
         "util" => Some(UTIL_SHIM),
         "fs" => Some(FS_SHIM),
         "fs/promises" => Some(FS_PROMISES_SHIM),
         "crypto" => Some(CRYPTO_SHIM),
+        "http" => Some(HTTP_SHIM),
+        "https" => Some(HTTPS_SHIM),
         _ => None,
     }
 }
@@ -452,6 +666,23 @@ mod tests {
         let path = PathBuf::from("/ws/__node_builtins__/fs.js");
         assert_eq!(builtin_name_from_path(&path).as_deref(), Some("fs"));
         assert!(source_for(&path).unwrap().contains("__chidori_fs_read"));
+    }
+
+    #[test]
+    fn http_and_https_shims_are_registered_and_route_through_chidori_http() {
+        let http = PathBuf::from("/ws/__node_builtins__/http.js");
+        assert_eq!(builtin_name_from_path(&http).as_deref(), Some("http"));
+        // The shim must perform requests via the policy-gated host op.
+        assert!(source_for(&http).unwrap().contains("globalThis.chidori.http"));
+
+        let https = PathBuf::from("/ws/__node_builtins__/https.js");
+        assert_eq!(builtin_name_from_path(&https).as_deref(), Some("https"));
+        // node:https reuses node:http's implementation.
+        assert!(source_for(&https).unwrap().contains("from \"node:http\""));
+
+        // Both names are in the import allowlist so the resolver accepts them.
+        assert!(BUILTIN_NAMES.contains(&"http"));
+        assert!(BUILTIN_NAMES.contains(&"https"));
     }
 
     #[test]

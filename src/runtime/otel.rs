@@ -9,12 +9,18 @@
 //! Activation is env-driven: set `OTEL_EXPORTER_OTLP_ENDPOINT` to turn
 //! tracing on; leave it unset to keep the runtime silent. No CLI flags.
 //!
-//! Each agent run produces one parent span (`agent.run`) with one child
-//! span per host function call. Attributes include agent name, run id,
-//! call sequence, model, token counts, and duration.
+//! Each agent run produces one parent span (`agent.run`) with one child span
+//! per host function call. Call spans STREAM out during the run (see
+//! [`RunSpan::stream_record`], driven from `record_call`): each span ships as
+//! its call completes, buffered only until its parent span exists so it can be
+//! nested by `CallRecord::parent_seq` (the only hierarchy signal app-tael
+//! reads). Spans are emitted for LIVE execution only — replayed calls don't
+//! re-emit, so a resume doesn't duplicate a prior turn's spans. Attributes
+//! include agent name, run id, call sequence, model, token counts, and duration.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use opentelemetry::global;
@@ -134,9 +140,23 @@ fn try_init() -> Option<OtelHandle> {
     Some(OtelHandle { provider })
 }
 
-/// A live parent span for one agent run. Each call to
-/// [`record_call_span`](RunSpan::record_call_span) emits a child span
-/// anchored under the parent; [`finish`](RunSpan::finish) ends the parent.
+/// Incremental span-emission state for a run. Records stream in as calls
+/// complete; a record whose parent span isn't emitted yet waits in `pending`
+/// until the parent arrives (a child is recorded before its parent during live
+/// runs), so spans ship during the run instead of all at once at the end.
+#[derive(Debug, Default)]
+struct EmitState {
+    /// seq -> the Context to parent that seq's children under.
+    ctx_by_seq: HashMap<u64, Context>,
+    /// seqs already emitted as spans (idempotency + parent-ready checks).
+    emitted: HashSet<u64>,
+    /// Records whose parent span hasn't been emitted yet, awaiting it.
+    pending: Vec<CallRecord>,
+}
+
+/// A live parent span for one agent run. [`stream_record`](RunSpan::stream_record)
+/// emits each host call's span as it completes (nested by `parent_seq`), and
+/// [`finish`](RunSpan::finish) flushes any stragglers and ends the parent.
 #[derive(Debug)]
 pub struct RunSpan {
     parent_cx: Context,
@@ -144,6 +164,7 @@ pub struct RunSpan {
     run_id: String,
     total_input_tokens: AtomicU64,
     total_output_tokens: AtomicU64,
+    emit: Mutex<EmitState>,
 }
 
 /// Start a root span for an agent run if OTEL is active. Returns None when
@@ -168,6 +189,7 @@ pub fn start_run_span(agent_name: &str, run_id: &str) -> Option<Arc<RunSpan>> {
         run_id: run_id.to_string(),
         total_input_tokens: AtomicU64::new(0),
         total_output_tokens: AtomicU64::new(0),
+        emit: Mutex::new(EmitState::default()),
     }))
 }
 
@@ -182,10 +204,77 @@ impl RunSpan {
         ));
     }
 
-    /// Emit a child span for a completed host function call. The span is
-    /// opened with the recorded start time and closed with start+duration,
-    /// so replay won't skew wall-clock timing.
-    pub fn record_call_span(&self, record: &CallRecord) {
+    /// Stream one completed call record as a span, emitting it as soon as its
+    /// parent span exists. A record whose `parent_seq` hasn't been emitted yet
+    /// is buffered and flushed when the parent arrives (children are recorded
+    /// before their parent during live runs) — so spans ship incrementally
+    /// during the run, with the OTLP batch processor handling the wire batching,
+    /// instead of all at once at the end. Idempotent per seq; safe to call from
+    /// `record_call`.
+    pub fn stream_record(&self, record: CallRecord) {
+        let mut state = self.emit.lock().unwrap();
+        if state.emitted.contains(&record.seq) {
+            return;
+        }
+        state.pending.push(record);
+        self.drain_ready(&mut state);
+    }
+
+    /// Emit every pending record whose parent is already emitted (or is a root),
+    /// to a fixpoint. Records still waiting on a parent stay buffered.
+    fn drain_ready(&self, state: &mut EmitState) {
+        while let Some(pos) = state
+            .pending
+            .iter()
+            .position(|r| r.parent_seq.map_or(true, |p| state.emitted.contains(&p)))
+        {
+            let record = state.pending.remove(pos);
+            self.emit_one(state, &record);
+        }
+    }
+
+    /// Flush ALL buffered records, treating any still-missing parent as a root
+    /// (parented to the run span) so nothing is dropped at run end.
+    fn drain_all(&self, state: &mut EmitState) {
+        while !state.pending.is_empty() {
+            // Prefer a record whose parent is ready (keeps nesting correct);
+            // otherwise take the first orphan and parent it to the run span.
+            let pos = state
+                .pending
+                .iter()
+                .position(|r| r.parent_seq.map_or(true, |p| state.emitted.contains(&p)))
+                .unwrap_or(0);
+            let record = state.pending.remove(pos);
+            self.emit_one(state, &record);
+        }
+    }
+
+    /// Build and emit `record`'s span under its parent's context (or the run
+    /// span), recording its context for descendants.
+    fn emit_one(&self, state: &mut EmitState, record: &CallRecord) {
+        let span_ctx = {
+            let parent_cx = record
+                .parent_seq
+                .and_then(|p| state.ctx_by_seq.get(&p))
+                .unwrap_or(&self.parent_cx);
+            self.build_call_span(record, parent_cx)
+        };
+        state
+            .ctx_by_seq
+            .insert(record.seq, Context::new().with_remote_span_context(span_ctx));
+        state.emitted.insert(record.seq);
+    }
+
+    /// Build one child span for `record` under `parent_cx`, end it at its
+    /// explicit end time, and return its `SpanContext` so descendants can
+    /// parent to it without keeping the `Span` object alive. Token totals are
+    /// accumulated here so [`finish`](Self::finish) sees them regardless of
+    /// emission path.
+    fn build_call_span(
+        &self,
+        record: &CallRecord,
+        parent_cx: &Context,
+    ) -> opentelemetry::trace::SpanContext {
         let tracer = global::tracer(TRACER_NAME);
 
         let start_time: SystemTime = record.timestamp.into();
@@ -230,7 +319,7 @@ impl RunSpan {
             .with_end_time(end_time)
             .with_attributes(attrs);
 
-        let mut span = tracer.build_with_context(builder, &self.parent_cx);
+        let mut span = tracer.build_with_context(builder, parent_cx);
         if let Some(err) = &record.error {
             span.set_attribute(KeyValue::new("error.type", record.function.clone()));
             span.set_attribute(KeyValue::new("exception.message", err.clone()));
@@ -245,13 +334,21 @@ impl RunSpan {
         } else {
             span.set_status(SpanStatus::Ok);
         }
-        // Drop closes the span at the explicit end_time we set above, so
-        // recorded wall-clock duration survives even when replay fires the
-        // span emission long after the original call happened.
+        let span_ctx = span.span_context().clone();
+        // End at the recorded end time (a bare `end()` would stamp *now* and
+        // discard the faithful duration). Capturing the SpanContext first lets
+        // children reference it after the span is gone.
+        span.end_with_timestamp(end_time);
+        span_ctx
     }
 
-    /// Close the parent span. Sets overall status and releases resources.
+    /// Flush any remaining buffered records, then close the parent span. Sets
+    /// overall status and releases resources.
     pub fn finish(&self, error: Option<&str>) {
+        {
+            let mut state = self.emit.lock().unwrap();
+            self.drain_all(&mut state);
+        }
         let span = self.parent_cx.span();
         let input = self.total_input_tokens.load(Ordering::Relaxed);
         let output = self.total_output_tokens.load(Ordering::Relaxed);
@@ -276,13 +373,154 @@ impl RunSpan {
     }
 }
 
+/// JS-level trace observer: turns chidori-js function activations into a nested
+/// OTEL span tree under a run span. Spans open live on enter and close on exit;
+/// the active stack decides each new span's parent, and suspend/resume move an
+/// activation in and out of "current" WITHOUT closing its (still-open) span — so
+/// a function that awaits/yields keeps the right parentage when it resumes.
+///
+/// Feature-gated to `rust-engine`: only the pure-Rust engine can be observed at
+/// this granularity. Install on `ReplayRuntime.vm.trace_sink` for a run that has
+/// a [`RunSpan`]. A pure consumer of trace events — never affects execution.
+#[cfg(feature = "rust-engine")]
+pub struct JsTraceObserver {
+    run_cx: Context,
+    agent_name: String,
+    /// Byte offsets of each `\n` in the module source, for offset→line mapping.
+    newline_offsets: Vec<u32>,
+    next: u64,
+    /// Currently-executing activations (token → its span's child context). The
+    /// last entry is the parent for the next `on_enter`.
+    active: Vec<(u64, Context)>,
+    /// Open spans by token, ended on exit (kept open across suspension).
+    open: std::collections::HashMap<u64, opentelemetry::global::BoxedSpan>,
+    /// Suspended activations: removed from `active` but span still open.
+    parked: std::collections::HashMap<u64, Context>,
+    /// Tokens whose span was skipped (depth cap) — exit/suspend/resume no-op.
+    skipped: std::collections::HashSet<u64>,
+    /// Maximum nesting depth that gets spans; deeper calls are dropped to bound
+    /// span volume on deep recursion.
+    max_depth: usize,
+}
+
+#[cfg(feature = "rust-engine")]
+impl JsTraceObserver {
+    /// 1-based source line for a byte offset.
+    fn line_of(&self, offset: u32) -> u32 {
+        self.newline_offsets.partition_point(|&n| n < offset) as u32 + 1
+    }
+}
+
+#[cfg(feature = "rust-engine")]
+impl chidori_js::TraceObserver for JsTraceObserver {
+    fn on_enter(&mut self, info: chidori_js::TraceEnter<'_>) -> u64 {
+        let token = self.next;
+        self.next += 1;
+        if self.active.len() >= self.max_depth {
+            self.skipped.insert(token);
+            return token;
+        }
+        let name = if info.name.is_empty() {
+            "<anonymous>"
+        } else {
+            info.name
+        };
+        let parent_cx = self
+            .active
+            .last()
+            .map(|(_, c)| c)
+            .unwrap_or(&self.run_cx);
+        let mut attrs = vec![
+            KeyValue::new("agent.name", self.agent_name.clone()),
+            KeyValue::new("js.function", name.to_string()),
+            KeyValue::new("code.lineno", self.line_of(info.source_start) as i64),
+        ];
+        if info.is_async {
+            attrs.push(KeyValue::new("js.async", true));
+        }
+        if info.is_generator {
+            attrs.push(KeyValue::new("js.generator", true));
+        }
+        let tracer = global::tracer(TRACER_NAME);
+        let builder = SpanBuilder::from_name(name.to_string())
+            .with_kind(SpanKind::Internal)
+            .with_attributes(attrs);
+        let span = tracer.build_with_context(builder, parent_cx);
+        let child_cx = Context::new().with_remote_span_context(span.span_context().clone());
+        self.open.insert(token, span);
+        self.active.push((token, child_cx));
+        token
+    }
+
+    fn on_exit(&mut self, token: u64, threw: bool) {
+        if self.skipped.remove(&token) {
+            return;
+        }
+        if let Some(mut span) = self.open.remove(&token) {
+            span.set_status(if threw {
+                SpanStatus::error("threw")
+            } else {
+                SpanStatus::Ok
+            });
+            span.end();
+        }
+        self.active.retain(|(t, _)| *t != token);
+        self.parked.remove(&token);
+    }
+
+    fn on_suspend(&mut self, token: u64) {
+        if let Some(pos) = self.active.iter().position(|(t, _)| *t == token) {
+            let (_, cx) = self.active.remove(pos);
+            self.parked.insert(token, cx);
+        }
+    }
+
+    fn on_resume(&mut self, token: u64) {
+        if let Some(cx) = self.parked.remove(&token) {
+            self.active.push((token, cx));
+        }
+    }
+}
+
+#[cfg(feature = "rust-engine")]
+impl RunSpan {
+    /// Build a JS-level trace observer that nests function spans under this run
+    /// span. `source` is the module text (for line resolution); `max_depth`
+    /// bounds span volume on deep recursion. Install the result on the
+    /// chidori-js `Vm.trace_sink`.
+    pub fn js_trace_observer(&self, source: &str, max_depth: usize) -> JsTraceObserver {
+        JsTraceObserver {
+            run_cx: self.parent_cx.clone(),
+            agent_name: self.agent_name.clone(),
+            newline_offsets: source
+                .bytes()
+                .enumerate()
+                .filter(|&(_, b)| b == b'\n')
+                .map(|(i, _)| i as u32)
+                .collect(),
+            next: 0,
+            active: Vec::new(),
+            open: std::collections::HashMap::new(),
+            parked: std::collections::HashMap::new(),
+            skipped: std::collections::HashSet::new(),
+            max_depth,
+        }
+    }
+}
+
 /// Map known host function names to semantic span kinds so backends can
 /// filter/visualize by category. CLIENT is used for calls that reach
 /// external systems (LLM providers, HTTP, sub-agents, tools, the WASM
 /// sandbox, the memory store); INTERNAL is the default.
 fn span_kind_for(function: &str) -> SpanKind {
     match function {
-        "prompt" | "http" | "tool" | "agent" | "exec" | "memory" => SpanKind::Client,
+        // External-system calls. Function names here must match the strings
+        // actually recorded on `CallRecord::function` (see host_core.rs):
+        // sub-agents are recorded as `call_agent`, and the string/expr
+        // sandboxes as `exec_js`/`exec_python`/`exec_expr` (with `exec` for
+        // the WASM sandbox) — so all of those are spelled out explicitly.
+        "prompt" | "http" | "tool" | "call_agent" | "exec" | "exec_js" | "exec_python"
+        | "exec_expr" | "memory" => SpanKind::Client,
         _ => SpanKind::Internal,
     }
 }
@@ -432,5 +670,277 @@ mod tests {
         assert!(rendered.contains("tool.source=MedlinePlus"));
         assert!(rendered.contains("tool.result_count=1"));
         assert!(rendered.contains("tool.status=ok"));
+    }
+
+    #[test]
+    fn span_kind_matches_recorded_function_names() {
+        // CLIENT for calls that reach external systems, using the exact
+        // function strings host_core records (regression guard against the
+        // old `agent`/`exec`-only mapping that missed `call_agent` and the
+        // `exec_js`/`exec_python`/`exec_expr` sandboxes).
+        for f in [
+            "prompt",
+            "http",
+            "tool",
+            "call_agent",
+            "exec",
+            "exec_js",
+            "exec_python",
+            "exec_expr",
+            "memory",
+        ] {
+            assert!(
+                matches!(span_kind_for(f), SpanKind::Client),
+                "{f} should map to SpanKind::Client"
+            );
+        }
+        for f in ["input", "template", "log", "checkpoint", "workspace"] {
+            assert!(
+                matches!(span_kind_for(f), SpanKind::Internal),
+                "{f} should map to SpanKind::Internal"
+            );
+        }
+    }
+
+    use opentelemetry::trace::SpanId;
+    use opentelemetry_sdk::export::trace::SpanData;
+    use opentelemetry_sdk::testing::trace::InMemorySpanExporter;
+    use opentelemetry_sdk::trace::SimpleSpanProcessor;
+    use std::sync::Mutex as StdMutex;
+
+    // Swapping the process-global tracer provider is not thread-safe across
+    // tests, so serialize every provider-based test through this lock.
+    static PROVIDER_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// Build a run span against the current (test) global tracer, bypassing the
+    /// OTLP-endpoint gate that `start_run_span` enforces.
+    fn run_span_for_test(agent: &str, run_id: &str) -> RunSpan {
+        let tracer = global::tracer(TRACER_NAME);
+        let span = tracer
+            .span_builder(format!("agent.run {agent}"))
+            .with_kind(SpanKind::Internal)
+            .with_attributes(vec![
+                KeyValue::new("agent.name", agent.to_string()),
+                KeyValue::new("agent.run_id", run_id.to_string()),
+            ])
+            .start(&tracer);
+        RunSpan {
+            parent_cx: Context::current_with_span(span),
+            agent_name: agent.to_string(),
+            run_id: run_id.to_string(),
+            total_input_tokens: AtomicU64::new(0),
+            total_output_tokens: AtomicU64::new(0),
+            emit: Mutex::new(EmitState::default()),
+        }
+    }
+
+    /// Stream `records` one at a time (the real per-call path), flush at finish,
+    /// and return the finished spans (the run span plus one per record).
+    fn emit_and_collect(records: &[CallRecord]) -> Vec<SpanData> {
+        let _guard = PROVIDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(SimpleSpanProcessor::new(Box::new(exporter.clone())))
+            .build();
+        global::set_tracer_provider(provider.clone());
+        let run = run_span_for_test("agent", "r1");
+        for r in records {
+            run.stream_record(r.clone());
+        }
+        run.finish(None);
+        let _ = provider.force_flush();
+        exporter.get_finished_spans().unwrap()
+    }
+
+    fn span_by_seq(spans: &[SpanData], seq: i64) -> &SpanData {
+        spans
+            .iter()
+            .find(|s| {
+                s.attributes.iter().any(|a| {
+                    a.key.as_str() == "call.seq"
+                        && matches!(&a.value, opentelemetry::Value::I64(v) if *v == seq)
+                })
+            })
+            .unwrap_or_else(|| panic!("no span for call.seq={seq}"))
+    }
+
+    fn run_root(spans: &[SpanData]) -> &SpanData {
+        spans
+            .iter()
+            .find(|s| s.name.as_ref() == "agent.run agent")
+            .expect("run span")
+    }
+
+    fn rec(seq: u64, parent: Option<u64>, function: &str) -> CallRecord {
+        CallRecord {
+            seq,
+            parent_seq: parent,
+            function: function.to_string(),
+            args: json!({}),
+            result: Value::Null,
+            duration_ms: 5,
+            token_usage: None,
+            timestamp: Utc::now(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn stream_record_ships_span_before_run_finishes() {
+        // The core streaming property: a completed call's span is exported while
+        // the run is still going — before `finish` and before the run span
+        // itself ships. (SimpleSpanProcessor exports synchronously on span end.)
+        let _guard = PROVIDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(SimpleSpanProcessor::new(Box::new(exporter.clone())))
+            .build();
+        global::set_tracer_provider(provider.clone());
+
+        let run = run_span_for_test("agent", "r1");
+        run.stream_record(rec(1, None, "prompt"));
+        let _ = provider.force_flush();
+
+        let mid = exporter.get_finished_spans().unwrap();
+        // The host call's span already shipped, mid-run.
+        assert!(mid.iter().any(|s| s.name.as_ref() == "host.prompt"));
+        // The run span has NOT shipped yet (it ends at finish).
+        assert!(!mid.iter().any(|s| s.name.as_ref() == "agent.run agent"));
+
+        run.finish(None);
+    }
+
+    #[test]
+    fn stream_records_nest_by_parent_seq_under_one_trace() {
+        // call_agent(seq1) → nested log(seq2, parent 1); sibling prompt(seq3).
+        // Feed child-before-parent (the order live runs record in).
+        let records = vec![
+            rec(2, Some(1), "log"),
+            rec(1, None, "call_agent"),
+            rec(3, None, "prompt"),
+        ];
+        let spans = emit_and_collect(&records);
+
+        let root = run_root(&spans);
+        let agent_call = span_by_seq(&spans, 1);
+        let log = span_by_seq(&spans, 2);
+        let prompt = span_by_seq(&spans, 3);
+
+        // Hierarchy via real OTEL parent_span_id (the only signal tael reads).
+        assert_eq!(agent_call.parent_span_id, root.span_context.span_id());
+        assert_eq!(log.parent_span_id, agent_call.span_context.span_id());
+        assert_eq!(prompt.parent_span_id, root.span_context.span_id());
+        assert_eq!(root.parent_span_id, SpanId::INVALID);
+
+        // One connected trace across the whole tree.
+        let tid = root.span_context.trace_id();
+        for s in [agent_call, log, prompt] {
+            assert_eq!(s.span_context.trace_id(), tid);
+        }
+    }
+
+    #[test]
+    fn stream_records_order_independent() {
+        // Any input order yields the same parentage — which is exactly what
+        // makes live (child-before-parent) and replay produce the same tree.
+        let chain = |records: &[CallRecord]| {
+            let spans = emit_and_collect(records);
+            let s1 = span_by_seq(&spans, 1).span_context.span_id();
+            let s2 = span_by_seq(&spans, 2).span_context.span_id();
+            (
+                span_by_seq(&spans, 2).parent_span_id == s1,
+                span_by_seq(&spans, 3).parent_span_id == s2,
+            )
+        };
+        let forward = vec![
+            rec(1, None, "call_agent"),
+            rec(2, Some(1), "log"),
+            rec(3, Some(2), "http"),
+        ];
+        let reversed = vec![
+            rec(3, Some(2), "http"),
+            rec(2, Some(1), "log"),
+            rec(1, None, "call_agent"),
+        ];
+        assert_eq!(chain(&forward), (true, true));
+        assert_eq!(chain(&reversed), (true, true));
+    }
+
+    #[test]
+    fn stream_records_preserve_timing_and_token_totals() {
+        let mut r = rec(1, None, "prompt");
+        let ts = Utc::now();
+        r.timestamp = ts;
+        r.duration_ms = 1234;
+        r.args = json!({ "model": "claude" });
+        r.token_usage = Some(crate::runtime::call_log::TokenUsage {
+            input_tokens: 10,
+            output_tokens: 7,
+        });
+
+        let spans = emit_and_collect(std::slice::from_ref(&r));
+        let call = span_by_seq(&spans, 1);
+        // Span carries the record's explicit start, and end == start + duration,
+        // so wall-clock timing survives the (now batch, post-hoc) emission.
+        let start: SystemTime = r.timestamp.into();
+        assert_eq!(call.start_time, start);
+        assert_eq!(
+            call.end_time.duration_since(call.start_time).unwrap(),
+            Duration::from_millis(1234)
+        );
+
+        // Token totals roll up onto the run span at finish, regardless of the
+        // (now batch) emission path.
+        let root = run_root(&spans);
+        let total = root
+            .attributes
+            .iter()
+            .find(|a| a.key.as_str() == "gen_ai.usage.total_tokens");
+        assert!(matches!(
+            total.map(|a| &a.value),
+            Some(opentelemetry::Value::I64(17))
+        ));
+    }
+
+    #[cfg(feature = "rust-engine")]
+    #[test]
+    fn js_trace_observer_emits_nested_spans_through_engine() {
+        let _guard = PROVIDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(SimpleSpanProcessor::new(Box::new(exporter.clone())))
+            .build();
+        global::set_tracer_provider(provider.clone());
+
+        let run = run_span_for_test("agent", "r1");
+        let src = "function b(){ return 1; } function a(){ return b(); } a();";
+        let observer = run.js_trace_observer(src, 64);
+        let mut engine = chidori_js::Engine::new();
+        engine.vm.trace_sink = Some(Box::new(observer));
+        engine.eval(src).expect("eval ok");
+        run.finish(None);
+        let _ = provider.force_flush();
+        let spans = exporter.get_finished_spans().unwrap();
+
+        let by_name = |n: &str| {
+            spans
+                .iter()
+                .find(|s| s.name.as_ref() == n)
+                .unwrap_or_else(|| panic!("no span named {n}"))
+        };
+        // a() is called by the top-level <script> frame; b() by a(). JS-level
+        // spans nest by real OTEL parent_span_id, rooted at the run span.
+        let run_span = by_name("agent.run agent");
+        let script = by_name("<script>");
+        let a = by_name("a");
+        let b = by_name("b");
+        assert_eq!(b.parent_span_id, a.span_context.span_id());
+        assert_eq!(a.parent_span_id, script.span_context.span_id());
+        assert_eq!(script.parent_span_id, run_span.span_context.span_id());
+
+        let tid = run_span.span_context.trace_id();
+        for s in [script, a, b] {
+            assert_eq!(s.span_context.trace_id(), tid);
+        }
     }
 }

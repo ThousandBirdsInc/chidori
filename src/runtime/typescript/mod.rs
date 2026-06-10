@@ -1,4 +1,7 @@
-#[cfg(test)]
+// The recorder/runtime host bindings double as the pure-Rust engine's effect
+// dispatcher (see `rust_engine::run_module`), so compile them whenever the
+// `rust-engine` feature is on, not just under test.
+#[cfg(any(test, feature = "rust-engine"))]
 pub mod bindings;
 pub mod check;
 pub mod builtins;

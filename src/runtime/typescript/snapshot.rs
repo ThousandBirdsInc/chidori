@@ -40,7 +40,13 @@ pub const DEFAULT_TS_SNAPSHOT_ROOTS: &[&str] = &[
     "__chidori_host_method_queues",
 ];
 
-const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
+/// JS-level `chidori` SDK sugar shared by both engines: the `tryCall`/`retry`/
+/// `parallel` control-flow helpers and the `memory.set/get/delete/clear` wrappers
+/// (and a workspace shim, guarded so it no-ops when the host already installed a
+/// native `chidori.workspace`). The QuickJS path evals this in
+/// `eval_agent_source`; the rust engine evals the same const after
+/// `install_chidori_effects` so the two engines never diverge on these APIs.
+pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
 (() => {
     globalThis.chidori = globalThis.chidori || {};
 
@@ -1017,6 +1023,185 @@ globalThis.URLSearchParams = class URLSearchParams {
 };
 "#;
 
+/// WHATWG `fetch` + `Headers`/`Request`/`Response`, implemented on top of the
+/// captured `chidori.http` host op. Routing through `chidori.http` is what makes
+/// the stdlib net surface honor the security policy and the approval-pause path:
+/// `chidori.http` runs `enforce_policy` (allow / ask / deny) and, on an
+/// AskBefore rule, records a pending approval and throws the pause sentinel
+/// before any bytes leave the process — exactly as a direct `chidori.http` call
+/// would. The synchronous host call below is therefore deliberately *not*
+/// wrapped in a Promise executor or a try/catch: the pause sentinel must
+/// propagate the same way it does for `await chidori.http(...)` so the engine
+/// can pause and resume the run after approval.
+pub(crate) const FETCH_POLYFILL: &str = r#"
+(function () {
+    class Headers {
+        constructor(init) {
+            this._h = [];
+            if (!init) return;
+            if (init instanceof Headers) {
+                for (const [k, v] of init._h) this._h.push([k, v]);
+                return;
+            }
+            if (Array.isArray(init)) {
+                for (const pair of init) this.append(pair[0], pair[1]);
+                return;
+            }
+            for (const k of Object.keys(init)) this.append(k, init[k]);
+        }
+        append(k, v) { this._h.push([String(k).toLowerCase(), String(v)]); }
+        set(k, v) { this.delete(k); this._h.push([String(k).toLowerCase(), String(v)]); }
+        get(k) {
+            k = String(k).toLowerCase();
+            const vals = this._h.filter((p) => p[0] === k).map((p) => p[1]);
+            return vals.length ? vals.join(", ") : null;
+        }
+        has(k) { k = String(k).toLowerCase(); return this._h.some((p) => p[0] === k); }
+        delete(k) { k = String(k).toLowerCase(); this._h = this._h.filter((p) => p[0] !== k); }
+        forEach(cb, thisArg) { for (const [k, v] of this._h) cb.call(thisArg, v, k, this); }
+        keys() { return this._h.map((p) => p[0])[Symbol.iterator](); }
+        values() { return this._h.map((p) => p[1])[Symbol.iterator](); }
+        entries() { return this._h.map((p) => [p[0], p[1]])[Symbol.iterator](); }
+        [Symbol.iterator]() { return this.entries(); }
+    }
+
+    function headersToObject(h) {
+        const obj = {};
+        if (!h) return obj;
+        if (h instanceof Headers) { h.forEach((v, k) => { obj[k] = v; }); return obj; }
+        if (Array.isArray(h)) {
+            for (const pair of h) obj[String(pair[0]).toLowerCase()] = String(pair[1]);
+            return obj;
+        }
+        for (const k of Object.keys(h)) obj[k.toLowerCase()] = String(h[k]);
+        return obj;
+    }
+
+    function bodyToString(body) {
+        if (body === undefined || body === null) return undefined;
+        if (typeof body === "string") return body;
+        if (globalThis.URLSearchParams && body instanceof globalThis.URLSearchParams) {
+            return body.toString();
+        }
+        if (ArrayBuffer.isView(body) || body instanceof ArrayBuffer) {
+            return new TextDecoder().decode(body);
+        }
+        // Plain objects are forwarded as-is; the host JSON-encodes them.
+        return body;
+    }
+
+    function responseBodyText(res) {
+        if (!res) return null;
+        const b = res.body;
+        if (b === undefined || b === null) return null;
+        return typeof b === "string" ? b : JSON.stringify(b);
+    }
+
+    class Request {
+        constructor(input, init) {
+            init = init || {};
+            if (input instanceof Request) {
+                this.url = input.url;
+                this.method = String(init.method || input.method || "GET").toUpperCase();
+                this.headers = new Headers(init.headers || input.headers);
+                this._bodyInit = "body" in init ? init.body : input._bodyInit;
+            } else {
+                this.url = String(input);
+                this.method = String(init.method || "GET").toUpperCase();
+                this.headers = new Headers(init.headers);
+                this._bodyInit = init.body;
+            }
+        }
+    }
+
+    class Response {
+        constructor(body, init) {
+            init = init || {};
+            this._bodyText =
+                body === undefined || body === null
+                    ? null
+                    : typeof body === "string"
+                        ? body
+                        : JSON.stringify(body);
+            this.status = init.status !== undefined ? init.status : 200;
+            this.statusText = init.statusText || "";
+            this.ok = this.status >= 200 && this.status < 300;
+            this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
+            this.url = init.url || "";
+            this.redirected = false;
+            this.bodyUsed = false;
+        }
+        text() { this.bodyUsed = true; return Promise.resolve(this._bodyText == null ? "" : this._bodyText); }
+        json() {
+            this.bodyUsed = true;
+            return Promise.resolve(this._bodyText == null ? null : JSON.parse(this._bodyText));
+        }
+        arrayBuffer() {
+            this.bodyUsed = true;
+            return Promise.resolve(new TextEncoder().encode(this._bodyText || "").buffer);
+        }
+        clone() {
+            return new Response(this._bodyText, {
+                status: this.status,
+                statusText: this.statusText,
+                headers: this.headers,
+                url: this.url,
+            });
+        }
+    }
+
+    function buildRequestArgs(input, init) {
+        init = init || {};
+        let url;
+        let method = "GET";
+        let headers = null;
+        let bodyInit;
+        if (input instanceof Request) {
+            url = input.url;
+            method = input.method;
+            headers = input.headers;
+            bodyInit = input._bodyInit;
+        } else {
+            url = String(input);
+        }
+        if (init.method) method = String(init.method).toUpperCase();
+        const headerObj = headersToObject(headers);
+        Object.assign(headerObj, headersToObject(init.headers));
+        if ("body" in init) bodyInit = init.body;
+        const options = { method: method.toUpperCase(), headers: headerObj };
+        const body = bodyToString(bodyInit);
+        if (body !== undefined) options.body = body;
+        return { url, options };
+    }
+
+    function fetch(input, init) {
+        if (!globalThis.chidori || typeof globalThis.chidori.http !== "function") {
+            return Promise.reject(new TypeError("fetch is unavailable: chidori.http host is not installed"));
+        }
+        const { url, options } = buildRequestArgs(input, init);
+        // Synchronous, blocking host call. If the security policy requires
+        // approval this throws the pause sentinel synchronously; letting it
+        // escape (no surrounding try/catch) preserves the engine's pause path.
+        const res = globalThis.chidori.http(url, options);
+        if (res && res.status === 0 && res.error) {
+            return Promise.reject(new TypeError("fetch failed: " + res.error));
+        }
+        return Promise.resolve(
+            new Response(responseBodyText(res), {
+                status: res ? res.status : 0,
+                headers: (res && res.headers) || {},
+                url,
+            })
+        );
+    }
+
+    globalThis.Headers = Headers;
+    globalThis.Request = Request;
+    globalThis.Response = Response;
+    globalThis.fetch = fetch;
+})();
+"#;
+
 fn snapshot_policy_prelude(policy: &RuntimePolicy) -> Result<String> {
     let mut out = String::from(
         r#"
@@ -1057,6 +1242,12 @@ if (typeof globalThis.__chidori_now !== "number") globalThis.__chidori_now = 0;
     // `globalThis.crypto` (Web Crypto subset). Routes randomness through the
     // captured native so it is flagged and replayable.
     out.push_str(WEB_CRYPTO_POLYFILL);
+
+    // `globalThis.fetch` + `Headers`/`Request`/`Response`. Implemented over the
+    // captured `chidori.http` host op so every network call from the stdlib net
+    // surface honors the security policy and the approval-pause path. Installed
+    // after `URLSearchParams`/`TextEncoder` since the polyfill relies on them.
+    out.push_str(FETCH_POLYFILL);
 
     match policy.date {
         DatePolicy::Disabled => out.push_str(
@@ -4775,6 +4966,299 @@ mod tests {
         assert_eq!(approval.args["method"], serde_json::json!("POST"));
         assert_eq!(approval.reason.as_deref(), Some("snapshot approval"));
         assert!(runtime_ctx.call_log().into_records().is_empty());
+
+        unsafe {
+            context.set_context_opaque(std::ptr::null_mut());
+        }
+    }
+
+    /// Spin up a one-shot loopback HTTP server (on its own thread, so it
+    /// doesn't contend with the host's tokio runtime) that replies to the first
+    /// connection with `200 OK` and the given JSON body. Returns the URL.
+    fn one_shot_json_server(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/echo", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        url
+    }
+
+    fn http_host_with_policy(
+        runtime_ctx: RuntimeContext,
+        policy: PolicyConfig,
+    ) -> TypeScriptSnapshotHostState {
+        let tokio_rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        TypeScriptSnapshotHostState::with_http(
+            runtime_ctx,
+            tokio_rt,
+            Arc::new(policy),
+            Arc::new(StdMutex::new(PolicyCache::default())),
+        )
+    }
+
+    #[test]
+    fn snapshot_runtime_fetch_routes_through_policy_deny() {
+        let runtime_ctx = RuntimeContext::new();
+        let runtime =
+            TypeScriptSnapshotRuntime::new(RuntimePolicy::durable_default("snapshot-test"))
+                .unwrap();
+        let mut host_state = http_host_with_policy(
+            runtime_ctx.clone(),
+            PolicyConfig {
+                rules: vec![crate::policy::PolicyRule {
+                    target: "http".to_string(),
+                    decision: Decision::NeverAllow,
+                    match_args: None,
+                    reason: Some("no net".to_string()),
+                }],
+                default: Decision::AlwaysAllow,
+            },
+        );
+        let mut context = runtime
+            .eval_agent_source(
+                Path::new("agent.ts"),
+                r#"
+                export async function agent(_input, _chidori) {
+                    await fetch("https://example.invalid");
+                    return { ok: true };
+                }
+                "#,
+            )
+            .unwrap();
+        unsafe {
+            context.install_runtime_http_host(&mut host_state).unwrap();
+        }
+
+        let err = context.call_agent(serde_json::json!({})).unwrap_err();
+        assert!(
+            err.to_string().contains("policy: `http` denied (no net)"),
+            "fetch must route through the http policy, got: {err}"
+        );
+        // The denied call is recorded against the `http` host op, proving fetch
+        // shares the policy-gated path rather than reaching the network directly.
+        let records = runtime_ctx.call_log().into_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].function, "http");
+
+        unsafe {
+            context.set_context_opaque(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn snapshot_runtime_fetch_sets_pending_policy_approval() {
+        let runtime_ctx = RuntimeContext::new();
+        runtime_ctx.set_input_mode(InputMode::Pause);
+        let runtime =
+            TypeScriptSnapshotRuntime::new(RuntimePolicy::durable_default("snapshot-test"))
+                .unwrap();
+        let mut host_state = http_host_with_policy(
+            runtime_ctx.clone(),
+            PolicyConfig {
+                rules: vec![crate::policy::PolicyRule {
+                    target: "http".to_string(),
+                    decision: Decision::AskBefore,
+                    match_args: None,
+                    reason: Some("confirm net".to_string()),
+                }],
+                default: Decision::AlwaysAllow,
+            },
+        );
+        let mut context = runtime
+            .eval_agent_source(
+                Path::new("agent.ts"),
+                r#"
+                export async function agent(_input, _chidori) {
+                    await fetch("https://example.invalid/data", { method: "post" });
+                    return { ok: true };
+                }
+                "#,
+            )
+            .unwrap();
+        unsafe {
+            context.install_runtime_http_host(&mut host_state).unwrap();
+        }
+
+        let err = context.call_agent(serde_json::json!({})).unwrap_err();
+        assert!(
+            err.to_string().contains(PAUSE_MARKER),
+            "fetch under an AskBefore policy must pause, got: {err}"
+        );
+        let approval = runtime_ctx
+            .take_pending_approval()
+            .expect("fetch should record a pending approval");
+        assert_eq!(approval.target, "http");
+        assert_eq!(approval.args["method"], serde_json::json!("POST"));
+        assert!(runtime_ctx.call_log().into_records().is_empty());
+
+        unsafe {
+            context.set_context_opaque(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn snapshot_runtime_fetch_success_roundtrips_json_body() {
+        let url = one_shot_json_server(r#"{"hello":"world"}"#);
+        let runtime_ctx = RuntimeContext::new();
+        let runtime =
+            TypeScriptSnapshotRuntime::new(RuntimePolicy::durable_default("snapshot-test"))
+                .unwrap();
+        let mut host_state = http_host_with_policy(
+            runtime_ctx.clone(),
+            PolicyConfig {
+                rules: vec![],
+                default: Decision::AlwaysAllow,
+            },
+        );
+        let mut context = runtime
+            .eval_agent_source(
+                Path::new("agent.ts"),
+                r#"
+                export async function agent(input, _chidori) {
+                    const res = await fetch(input.url);
+                    const data = await res.json();
+                    return { status: res.status, ok: res.ok, hello: data.hello };
+                }
+                "#,
+            )
+            .unwrap();
+        unsafe {
+            context.install_runtime_http_host(&mut host_state).unwrap();
+        }
+
+        let state = context
+            .call_agent(serde_json::json!({ "url": url }))
+            .unwrap();
+        match state {
+            chidori_quickjs::RunState::Completed(value) => {
+                assert_eq!(value["status"], serde_json::json!(200));
+                assert_eq!(value["ok"], serde_json::json!(true));
+                assert_eq!(value["hello"], serde_json::json!("world"));
+            }
+            other => panic!("expected fetch agent to complete, got {other:?}"),
+        }
+
+        unsafe {
+            context.set_context_opaque(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn snapshot_runtime_node_http_get_routes_through_policy_deny() {
+        let runtime_ctx = RuntimeContext::new();
+        let runtime =
+            TypeScriptSnapshotRuntime::new(RuntimePolicy::durable_default("snapshot-test"))
+                .unwrap();
+        let mut host_state = http_host_with_policy(
+            runtime_ctx.clone(),
+            PolicyConfig {
+                rules: vec![crate::policy::PolicyRule {
+                    target: "http".to_string(),
+                    decision: Decision::NeverAllow,
+                    match_args: None,
+                    reason: Some("no net".to_string()),
+                }],
+                default: Decision::AlwaysAllow,
+            },
+        );
+        let mut context = runtime
+            .eval_agent_source(
+                Path::new("agent.ts"),
+                r#"
+                import http from "node:http";
+                export async function agent(_input, _chidori) {
+                    return await new Promise((resolve) => {
+                        http.get("http://example.invalid/data", () => {})
+                            .on("error", (err) => resolve({ error: String(err.message || err) }));
+                    });
+                }
+                "#,
+            )
+            .unwrap();
+        unsafe {
+            context.install_runtime_http_host(&mut host_state).unwrap();
+        }
+
+        let state = context.call_agent(serde_json::json!({})).unwrap();
+        match state {
+            chidori_quickjs::RunState::Completed(value) => {
+                // node:http surfaces the policy denial as an 'error' event, the
+                // node convention — proving the request was gated before any
+                // bytes left the process.
+                let msg = value["error"].as_str().unwrap_or_default();
+                assert!(
+                    msg.contains("policy: `http` denied (no net)"),
+                    "node:http denial should carry the policy reason, got: {msg}"
+                );
+            }
+            other => panic!("expected node:http deny agent to complete, got {other:?}"),
+        }
+        let records = runtime_ctx.call_log().into_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].function, "http");
+
+        unsafe {
+            context.set_context_opaque(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn snapshot_runtime_node_http_get_success_emits_body() {
+        let url = one_shot_json_server(r#"{"value":42}"#);
+        let runtime_ctx = RuntimeContext::new();
+        let runtime =
+            TypeScriptSnapshotRuntime::new(RuntimePolicy::durable_default("snapshot-test"))
+                .unwrap();
+        let mut host_state = http_host_with_policy(
+            runtime_ctx.clone(),
+            PolicyConfig {
+                rules: vec![],
+                default: Decision::AlwaysAllow,
+            },
+        );
+        let mut context = runtime
+            .eval_agent_source(
+                Path::new("agent.ts"),
+                r#"
+                import http from "node:http";
+                export async function agent(input, _chidori) {
+                    return await new Promise((resolve, reject) => {
+                        http.get(input.url, (res) => {
+                            let body = "";
+                            res.on("data", (d) => { body += d; });
+                            res.on("end", () => resolve({ status: res.statusCode, body }));
+                        }).on("error", reject);
+                    });
+                }
+                "#,
+            )
+            .unwrap();
+        unsafe {
+            context.install_runtime_http_host(&mut host_state).unwrap();
+        }
+
+        let state = context
+            .call_agent(serde_json::json!({ "url": url }))
+            .unwrap();
+        match state {
+            chidori_quickjs::RunState::Completed(value) => {
+                assert_eq!(value["status"], serde_json::json!(200));
+                assert_eq!(value["body"], serde_json::json!(r#"{"value":42}"#));
+            }
+            other => panic!("expected node:http agent to complete, got {other:?}"),
+        }
 
         unsafe {
             context.set_context_opaque(std::ptr::null_mut());

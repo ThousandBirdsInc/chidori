@@ -181,10 +181,56 @@ export interface Chidori {
 
 export type AgentFunction<TInput extends AgentJson = JsonObject, TOutput extends AgentJson = AgentJson> = (
   input: TInput,
-  chidori: Chidori,
-) => Promise<TOutput>;
+) => TOutput | Promise<TOutput>;
 
 export type ToolFunction<TArgs extends JsonObject = JsonObject, TResult extends AgentJson = AgentJson> = (
   args: TArgs,
-  chidori: Chidori,
-) => Promise<TResult>;
+) => TResult | Promise<TResult>;
+
+/**
+ * The chidori host object — the durable surface your agents and tools call
+ * (`chidori.log`, `chidori.prompt`, `chidori.tool`, `chidori.input`, …).
+ *
+ * Import it for typed access; the runtime strips this import and supplies the
+ * real object at execution time, so there's no actual module dependency (and no
+ * need for a `(input, chidori)` second parameter):
+ *
+ * ```ts
+ * import { chidori, run } from "chidori";
+ * run(async (input: { topic: string }) => {
+ *   await chidori.log("starting", { topic: input.topic });
+ *   return { ok: true };
+ * });
+ * ```
+ *
+ * Accessing it from a plain import outside the runtime throws.
+ */
+export const chidori: Chidori = new Proxy({} as Chidori, {
+  get(_target, prop) {
+    throw new Error(
+      `chidori.${String(prop)} is only available inside the chidori runtime; ` +
+        `this import is replaced when an agent runs under chidori.`,
+    );
+  },
+});
+
+/**
+ * Define the agent entrypoint. Call it once at the top level of an agent module
+ * with your handler; the runtime invokes the handler with the run input and
+ * uses its return value as the output. This replaces the old "export a function
+ * named `agent`" convention.
+ *
+ * ```ts
+ * import { run } from "chidori";
+ * run(async (input) => ({ greeting: `hello ${input.name}` }));
+ * ```
+ */
+export function run<TInput extends AgentJson = JsonObject, TOutput extends AgentJson = AgentJson>(
+  handler: AgentFunction<TInput, TOutput>,
+): void {
+  void handler;
+  throw new Error(
+    "run() is only available inside the chidori runtime; this import is " +
+      "replaced when an agent runs under chidori.",
+  );
+}

@@ -18,6 +18,21 @@ pub type JSCFunction = Option<
         argv: *mut JSValue,
     ) -> JSValue,
 >;
+pub type JSModuleNormalizeFunc = Option<
+    unsafe extern "C" fn(
+        ctx: *mut JSContext,
+        module_base_name: *const c_char,
+        module_name: *const c_char,
+        opaque: *mut c_void,
+    ) -> *mut c_char,
+>;
+pub type JSModuleLoaderFunc = Option<
+    unsafe extern "C" fn(
+        ctx: *mut JSContext,
+        module_name: *const c_char,
+        opaque: *mut c_void,
+    ) -> *mut JSModuleDef,
+>;
 pub type CHIDORI_JSSnapshotWriteFn =
     Option<unsafe extern "C" fn(opaque: *mut c_void, buf: *const u8, len: usize) -> c_int>;
 pub type CHIDORI_JSSnapshotReadFn =
@@ -162,6 +177,13 @@ extern "C" {
     pub fn JS_EvalFunction(ctx: *mut JSContext, fun_obj: JSValue) -> JSValue;
     pub fn JS_ResolveModule(ctx: *mut JSContext, obj: JSValue) -> c_int;
     pub fn JS_GetModuleNamespace(ctx: *mut JSContext, m: *mut JSModuleDef) -> JSValue;
+    pub fn JS_DetachArrayBuffer(ctx: *mut JSContext, obj: JSValue);
+    pub fn JS_SetModuleLoaderFunc(
+        rt: *mut JSRuntime,
+        module_normalize: JSModuleNormalizeFunc,
+        module_loader: JSModuleLoaderFunc,
+        opaque: *mut c_void,
+    );
     pub fn JS_ExecutePendingJob(rt: *mut JSRuntime, pctx: *mut *mut JSContext) -> c_int;
 
     pub fn CHIDORI_JS_SnapshotRuntime(

@@ -400,6 +400,15 @@ impl RuntimeContext {
         run_dir
     }
 
+    /// Override the run id. Used by the server's replay-based resume to keep the
+    /// resumed run under the original run id (so persisted checkpoint/manifest
+    /// files stay in the same run directory and the durable run is continuous),
+    /// matching the live-VM resume path. Must be called before persistence is
+    /// enabled, since `enable_persistence` derives the run directory from it.
+    pub fn set_run_id(&self, run_id: String) {
+        self.inner.lock().unwrap().run_id = run_id;
+    }
+
     pub fn run_id(&self) -> String {
         self.inner.lock().unwrap().run_id.clone()
     }
@@ -444,7 +453,18 @@ impl RuntimeContext {
         let mut inner = self.inner.lock().unwrap();
         if let Some(ref replay_log) = inner.replay_log {
             if let Some(record) = replay_log.iter().find(|r| r.seq == seq) {
-                let record = record.clone();
+                let mut record = record.clone();
+                // Nest a replayed call under the call currently executing, exactly
+                // as `record_call` does for live calls. Without this a replayed
+                // *nested* host call — e.g. a tool's inner `input`, injected as a
+                // synthetic resume record with no parent — would record at top
+                // level, so a later resume's `absorb_replayed_subtree` wouldn't
+                // recognize it as part of the container's subtree and the
+                // sequence counter would collide with the next call (replay
+                // divergence on a second suspension).
+                if record.parent_seq.is_none() {
+                    record.parent_seq = inner.call_stack.last().copied();
+                }
                 // Record the replayed call in the new call log.
                 inner.call_log.push(record.clone());
                 return Some(record);
@@ -478,6 +498,56 @@ impl RuntimeContext {
         }
     }
 
+    /// Reconcile the sequence counter (and active log) with the nested host
+    /// calls a just-replayed call made during recording.
+    ///
+    /// Replay short-circuits a cached call by returning its stored result
+    /// WITHOUT re-running `live()`. For a leaf call that's exactly right. But a
+    /// *container* call — a `tool` or `call_agent` whose body itself made host
+    /// calls — consumed extra sequence numbers for those nested calls when it
+    /// was first recorded. Because `live()` is skipped on replay, those numbers
+    /// are never re-consumed, so without this the next outer call would collide
+    /// with a nested record's seq and the replay would diverge.
+    ///
+    /// We walk the `parent_seq` tree to find every descendant of `root_seq`,
+    /// preserve those nested records in the active log (so the replayed trace
+    /// keeps the same shape), and advance the counter past the maximum seq the
+    /// subtree used. A leaf call has no descendants, making this a no-op — so it
+    /// is safe to call unconditionally on every replay hit.
+    pub fn absorb_replayed_subtree(&self, root_seq: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(replay_log) = inner.replay_log.clone() else {
+            return;
+        };
+        // Transitive descendants of `root_seq` via `parent_seq`. Records may be
+        // in any order, so iterate to a fixpoint.
+        let mut subtree: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        subtree.insert(root_seq);
+        loop {
+            let mut grew = false;
+            for r in &replay_log {
+                if let Some(parent) = r.parent_seq {
+                    if subtree.contains(&parent) && subtree.insert(r.seq) {
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        let mut max_seq = root_seq;
+        for r in &replay_log {
+            if r.seq != root_seq && subtree.contains(&r.seq) {
+                // Keep the nested record in the replayed trace and advance the
+                // counter past it so the next outer call can't reuse its seq.
+                inner.call_log.push(r.clone());
+                max_seq = max_seq.max(r.seq);
+            }
+        }
+        inner.seq = inner.seq.max(max_seq);
+    }
+
     pub fn record_call(&self, mut record: CallRecord) {
         let mut inner = self.inner.lock().unwrap();
         // Stamp the enclosing call (the live-call stack top) as the parent,
@@ -494,13 +564,20 @@ impl RuntimeContext {
                 let _ = std::fs::write(dir.join("checkpoint.json"), json);
             }
         }
-        if let Some(ref otel) = inner.otel_run {
-            otel.record_call_span(&record);
-        }
+        // Stream this call's OTEL span now (buffered until its parent span
+        // exists), so spans ship incrementally during the run rather than as one
+        // tree at the end. Only live-executed calls reach `record_call`; replayed
+        // calls (try_replay / absorb_replayed_subtree) don't re-emit. The
+        // `RuntimeEvent::Call` stream below is the other real-time surface.
+        let otel = inner.otel_run.clone();
         if inner.emit_call_events {
             if let Some(ref tx) = inner.event_sender {
-                let _ = tx.send(RuntimeEvent::Call(record));
+                let _ = tx.send(RuntimeEvent::Call(record.clone()));
             }
+        }
+        drop(inner);
+        if let Some(otel) = otel {
+            otel.stream_record(record);
         }
     }
 
@@ -673,6 +750,16 @@ impl RuntimeContext {
 
     pub fn set_event_sender(&self, tx: UnboundedSender<RuntimeEvent>) {
         self.inner.lock().unwrap().event_sender = Some(tx);
+    }
+
+    /// Drop the streaming event sender, closing the channel once all other
+    /// clones are gone. Used by the rust-engine path after a run completes:
+    /// the chidori-js VM can leak its heap on drop (Rc cycles, no cycle
+    /// collector), which would otherwise keep the dispatch closure — and through
+    /// it this context and the sender — alive, hanging a drain loop that waits
+    /// for the channel to close. No-op when streaming isn't in use.
+    pub fn clear_event_sender(&self) {
+        self.inner.lock().unwrap().event_sender = None;
     }
 
     /// Install a model-override hook consulted before every prompt host call,

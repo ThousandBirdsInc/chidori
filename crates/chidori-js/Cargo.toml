@@ -1,0 +1,35 @@
+[package]
+name = "chidori-js"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Pure-Rust JavaScript engine with deterministic-replay durable execution. No C, no boa_engine."
+repository = "https://github.com/ThousandBirdsInc/chidori"
+
+[lib]
+name = "chidori_js"
+path = "src/lib.rs"
+
+[dependencies]
+# Front end only: we consume the oxc AST and write no lexer/parser of our own.
+oxc = { version = "0.133", features = ["semantic"] }
+# Deterministic, insertion-ordered property maps. Object/Map/Set iteration order
+# must be address-independent for replay to be correct (see determinism contract).
+indexmap = "2"
+# Journal serialization + the host-effect value boundary (serde_json::Value) that
+# matches the existing SnapshotCapableJsEngine seam.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Arbitrary-precision integers backing the JS BigInt primitive.
+num-bigint = "0.4"
+num-traits = "0.2"
+num-integer = "0.1"
+
+[dev-dependencies]
+criterion = "0.5"
+
+# Micro-benchmarks for the JS-execution hot paths (compile, interpreter loop,
+# property access, calls, arrays, strings). Run with `cargo bench -p chidori-js`.
+[[bench]]
+name = "execution"
+harness = false

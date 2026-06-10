@@ -34,6 +34,12 @@ pub fn execute_durable_json_call_at_seq(
         .try_replay_checked(seq, function)
         .map_err(|err| anyhow::anyhow!(err))?
     {
+        // A replayed call's `live()` is skipped. If it was a container (a tool
+        // or call_agent whose body made its own host calls), those nested calls
+        // burned sequence numbers that won't be re-consumed now — absorb the
+        // recorded subtree so the outer sequence stays aligned and the nested
+        // records survive in the trace. No-op for leaf calls.
+        ctx.absorb_replayed_subtree(seq);
         return Ok(record.result);
     }
 
@@ -673,7 +679,20 @@ pub fn execute_http(tokio_rt: &tokio::runtime::Runtime, args: &Value) -> Result<
         }
 
         if let Some(body) = body {
-            req = req.json(&body);
+            // A string body goes on the wire verbatim (so `fetch`/`node:http`
+            // callers that pre-serialize with `JSON.stringify` aren't double-
+            // encoded, and they keep control of `Content-Type` via headers).
+            // Any other JSON value is sent as a JSON body with reqwest setting
+            // `Content-Type: application/json` — the original `chidori.http`
+            // object-body convenience.
+            match body {
+                Value::String(text) => {
+                    req = req.body(text);
+                }
+                other => {
+                    req = req.json(&other);
+                }
+            }
         }
 
         let resp = match req.send().await {
@@ -826,6 +845,70 @@ mod tests {
 
         assert_eq!(result, json!("cached"));
         assert_eq!(ctx.call_log().into_records().len(), 1);
+    }
+
+    #[test]
+    fn replay_keeps_sequence_aligned_after_nested_host_call() {
+        // Record: a container call (call_agent) whose `live()` makes a nested
+        // host call (log), followed by an outer call (prompt). The nested log
+        // burns a sequence number that sits *between* the container and the
+        // next outer call.
+        let ctx = RuntimeContext::new();
+        let agent_result = execute_durable_json_call(
+            &ctx,
+            "call_agent",
+            json!({ "path": "/child.ts", "input": { "value": 1 } }),
+            || {
+                // Nested host call inside the container's execution.
+                execute_durable_json_call(&ctx, "log", json!({ "message": "inside" }), || {
+                    Ok(Value::Null)
+                })?;
+                Ok(json!({ "child": 2 }))
+            },
+        )
+        .unwrap();
+        assert_eq!(agent_result, json!({ "child": 2 }));
+        let prompt_result =
+            execute_durable_json_call(&ctx, "prompt", json!({ "model": "m" }), || {
+                Ok(json!("answer"))
+            })
+            .unwrap();
+        assert_eq!(prompt_result, json!("answer"));
+
+        let records = ctx.call_log().into_records();
+        // call_agent(seq 1), nested log(seq 2, parent 1), prompt(seq 3).
+        assert_eq!(records.len(), 3);
+        assert!(records
+            .iter()
+            .any(|r| r.function == "log" && r.parent_seq == Some(1)));
+
+        // Replay: the container short-circuits without re-running `live()`, so
+        // the nested log's seq is never re-consumed. Before the subtree-absorb
+        // fix the prompt would land on the log's seq and diverge.
+        let replay_ctx = RuntimeContext::with_replay(records);
+        let replayed_agent = execute_durable_json_call(
+            &replay_ctx,
+            "call_agent",
+            json!({ "path": "/child.ts", "input": { "value": 1 } }),
+            || anyhow::bail!("container live path must not run on replay"),
+        )
+        .unwrap();
+        assert_eq!(replayed_agent, json!({ "child": 2 }));
+
+        // This is the call that diverged before the fix.
+        let replayed_prompt =
+            execute_durable_json_call(&replay_ctx, "prompt", json!({ "model": "m" }), || {
+                anyhow::bail!("prompt live path must not run on replay")
+            })
+            .unwrap();
+        assert_eq!(replayed_prompt, json!("answer"));
+
+        // The nested record is preserved in the replayed trace.
+        let replayed_records = replay_ctx.call_log().into_records();
+        assert_eq!(replayed_records.len(), 3);
+        assert!(replayed_records
+            .iter()
+            .any(|r| r.function == "log" && r.parent_seq == Some(1)));
     }
 
     #[test]
@@ -1186,6 +1269,30 @@ mod tests {
             .filter(|line| line.to_ascii_lowercase().starts_with("user-agent:"))
             .count();
         assert_eq!(ua_count, 1, "request had {ua_count} User-Agent headers");
+    }
+
+    #[test]
+    fn execute_http_sends_string_body_verbatim() {
+        // A string body must land on the wire unchanged (no JSON quoting), so a
+        // `fetch`/`node:http` caller that pre-serialized with `JSON.stringify`
+        // isn't double-encoded.
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+        let (url, server) = tokio_rt.block_on(one_shot_http_capture());
+        execute_http(
+            &tokio_rt,
+            &json!({
+                "url": url,
+                "method": "POST",
+                "headers": { "content-type": "application/json" },
+                "body": "{\"a\":1}",
+            }),
+        )
+        .unwrap();
+        let request = tokio_rt.block_on(server).unwrap();
+        assert!(
+            request.ends_with("{\"a\":1}"),
+            "string body should be sent verbatim, got request:\n{request}"
+        );
     }
 
     #[test]

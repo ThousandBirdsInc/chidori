@@ -34,6 +34,10 @@ export type {
   WorkspaceWriteOptions,
 } from "./agent.js";
 
+// Authoring entrypoints: the host object and the `run(handler)` definer. These
+// are value exports (the runtime strips the import and supplies them).
+export { chidori, run } from "./agent.js";
+
 /** JSON-serialisable value — what agents produce as output and accept as input. */
 export type Json =
   | null

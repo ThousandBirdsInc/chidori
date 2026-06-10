@@ -86,8 +86,8 @@ fn session_view(s: &StoredSession) -> Value {
     })
 }
 
-fn store_or_500(store: &Arc<dyn SessionStore>, session: &StoredSession) -> Option<Response> {
-    if let Err(e) = store.put(session) {
+fn store_or_500(state: &AppState, session: &StoredSession) -> Option<Response> {
+    if let Err(e) = state.session_store.put(session) {
         return Some(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -522,6 +522,10 @@ fn drive_live_vm_runtime_with_pause_snapshot(
                 let Some(call) = live_vm_host_call(&mut runtime, id)? else {
                     return Ok(None);
                 };
+                // Wall-clock start for this host op so its recorded
+                // CallRecord (and the OTEL span derived from it) carries a real
+                // duration instead of the placeholder 0.
+                let op_started = chrono::Utc::now();
                 match call.get("method").and_then(Value::as_str) {
                     Some("input") => {
                         let Some(next_pending) = pending_input_from_live_vm_host_call(id, &call)
@@ -537,6 +541,7 @@ fn drive_live_vm_runtime_with_pause_snapshot(
                     Some("log") => {
                         let args = log_args_from_live_vm_host_call(&call)?;
                         complete_live_vm_host_result(
+                            op_started,
                             &mut runtime,
                             id,
                             call_log,
@@ -548,6 +553,7 @@ fn drive_live_vm_runtime_with_pause_snapshot(
                     Some("template") => {
                         let args = template_args_from_live_vm_host_call(&call)?;
                         complete_live_vm_host_result(
+                            op_started,
                             &mut runtime,
                             id,
                             call_log,
@@ -562,6 +568,7 @@ fn drive_live_vm_runtime_with_pause_snapshot(
                     Some("memory") => {
                         let args = memory_args_from_live_vm_host_call(&call)?;
                         complete_live_vm_host_result(
+                            op_started,
                             &mut runtime,
                             id,
                             call_log,
@@ -573,6 +580,7 @@ fn drive_live_vm_runtime_with_pause_snapshot(
                     Some("checkpoint") => {
                         let args = checkpoint_args_from_live_vm_host_call(&call)?;
                         complete_live_vm_host_result(
+                            op_started,
                             &mut runtime,
                             id,
                             call_log,
@@ -593,6 +601,7 @@ fn drive_live_vm_runtime_with_pause_snapshot(
                         };
                         let args = sandbox_string_args_from_live_vm_host_call(&call)?;
                         complete_live_vm_host_result(
+                            op_started,
                             &mut runtime,
                             id,
                             call_log,
@@ -604,6 +613,7 @@ fn drive_live_vm_runtime_with_pause_snapshot(
                     Some("execWasm") => {
                         let args = sandbox_wasm_args_from_live_vm_host_call(&call)?;
                         complete_live_vm_host_result(
+                            op_started,
                             &mut runtime,
                             id,
                             call_log,
@@ -633,6 +643,7 @@ fn drive_live_vm_runtime_with_pause_snapshot(
                             LiveVmPolicyDecision::Deny { error } => Err(anyhow::anyhow!(error)),
                         };
                         complete_live_vm_host_result(
+                            op_started,
                             &mut runtime,
                             id,
                             call_log,
@@ -653,6 +664,7 @@ fn drive_live_vm_runtime_with_pause_snapshot(
                             )? {
                                 LiveVmToolExecution::Completed(value) => {
                                     complete_live_vm_host_result(
+                                        op_started,
                                         &mut runtime,
                                         id,
                                         call_log,
@@ -689,6 +701,7 @@ fn drive_live_vm_runtime_with_pause_snapshot(
                             },
                             Err(err) => {
                                 complete_live_vm_host_result(
+                                    op_started,
                                     &mut runtime,
                                     id,
                                     call_log,
@@ -712,6 +725,7 @@ fn drive_live_vm_runtime_with_pause_snapshot(
                         {
                             LiveVmChildAgentExecution::Completed(value) => {
                                 complete_live_vm_host_result(
+                                    op_started,
                                     &mut runtime,
                                     id,
                                     call_log,
@@ -2114,7 +2128,22 @@ fn push_live_vm_call_record_with_usage(
     });
 }
 
+/// Backfill the most recently pushed record's start time and duration. The
+/// live-VM push helpers stamp `timestamp = now` and `duration_ms = 0`; this
+/// rewrites them with the real start instant and elapsed time so the OTEL span
+/// derived from the record shows true latency rather than a zero-width point.
+fn stamp_last_record_timing(call_log: &mut [CallRecord], started: chrono::DateTime<chrono::Utc>) {
+    if let Some(record) = call_log.last_mut() {
+        record.timestamp = started;
+        record.duration_ms = chrono::Utc::now()
+            .signed_duration_since(started)
+            .num_milliseconds()
+            .max(0) as u64;
+    }
+}
+
 fn complete_live_vm_host_result(
+    started: chrono::DateTime<chrono::Utc>,
     runtime: &mut chidori_quickjs::SnapshotRuntime,
     id: HostOperationId,
     call_log: &mut Vec<CallRecord>,
@@ -2125,6 +2154,7 @@ fn complete_live_vm_host_result(
     match result {
         Ok(value) => {
             push_live_vm_call_record(call_log, function, args, value.clone());
+            stamp_last_record_timing(call_log, started);
             runtime
                 .resolve_host_promise(chidori_quickjs::HostPromiseId(id.0), value)
                 .map_err(|err| anyhow::anyhow!(err))?;
@@ -2132,6 +2162,7 @@ fn complete_live_vm_host_result(
         Err(err) => {
             let message = err.to_string();
             push_live_vm_error_record(call_log, function, args, message.clone());
+            stamp_last_record_timing(call_log, started);
             runtime
                 .reject_host_promise(chidori_quickjs::HostPromiseId(id.0), message)
                 .map_err(|err| anyhow::anyhow!(err))?;
@@ -2629,7 +2660,12 @@ async fn health() -> impl IntoResponse {
 /// so the config surface stays in one place.
 fn build_engine(app: &AppState) -> Engine {
     let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
-    let providers = Arc::new(ProviderRegistry::from_env());
+    // Reuse the app's provider registry so a replay-based resume sees the same
+    // providers as the live-VM resume path (which drives `state.providers`
+    // directly). In production this is the env-derived registry passed to
+    // `serve`; re-deriving it here would drop any test-injected providers and
+    // break resume parity between the two paths.
+    let providers = app.providers.clone();
     let tools_dir = app
         .agent_path
         .parent()
@@ -2909,7 +2945,7 @@ async fn create_session(
         },
     };
 
-    if let Some(err) = store_or_500(&state.session_store, &session) {
+    if let Some(err) = store_or_500(&state, &session) {
         return err;
     }
     drop(permit);
@@ -3079,7 +3115,7 @@ async fn replay_session(State(state): State<AppState>, Path(id): Path<String>) -
                 approvals: original.approvals.clone(),
                 created_at: chrono::Utc::now(),
             };
-            if let Some(err) = store_or_500(&state.session_store, &session) {
+            if let Some(err) = store_or_500(&state, &session) {
                 return err;
             }
             (
@@ -3265,7 +3301,7 @@ async fn stream_session(
                 } else {
                     None
                 };
-                let _ = app_state.session_store.put(&StoredSession {
+                let completed_session = StoredSession {
                     id: session_id_for_task.clone(),
                     run_id: Some(run_result.run_id),
                     status,
@@ -3278,7 +3314,8 @@ async fn stream_session(
                     pending_approval: None,
                     approvals: Vec::new(),
                     created_at: chrono::Utc::now(),
-                });
+                };
+                let _ = app_state.session_store.put(&completed_session);
                 if cancelled {
                     json!({
                         "id": session_id_for_task,
@@ -3436,7 +3473,7 @@ async fn cancel_session(
     session.status = SessionStatus::Cancelled;
     session.error = Some(reason.clone());
     session.output = None;
-    if let Some(resp) = store_or_500(&state.session_store, &session) {
+    if let Some(resp) = store_or_500(&state, &session) {
         return resp;
     }
 
@@ -3562,7 +3599,7 @@ async fn resume_session(
                         serde_json::to_string_pretty(&output).unwrap_or_default(),
                     );
                 }
-                if let Some(err) = store_or_500(&state.session_store, &session) {
+                if let Some(err) = store_or_500(&state, &session) {
                     return err;
                 }
                 return (StatusCode::OK, Json(session_view(&session))).into_response();
@@ -3601,7 +3638,7 @@ async fn resume_session(
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
                 session.pending_approval = None;
-                if let Some(err) = store_or_500(&state.session_store, &session) {
+                if let Some(err) = store_or_500(&state, &session) {
                     return err;
                 }
                 return (StatusCode::OK, Json(session_view(&session))).into_response();
@@ -3637,7 +3674,7 @@ async fn resume_session(
                 session.pending_seq = None;
                 session.pending_prompt = None;
                 session.pending_approval = Some(approval);
-                if let Some(err) = store_or_500(&state.session_store, &session) {
+                if let Some(err) = store_or_500(&state, &session) {
                     return err;
                 }
                 return (StatusCode::OK, Json(session_view(&session))).into_response();
@@ -3674,7 +3711,7 @@ async fn resume_session(
                         serde_json::to_string_pretty(&output).unwrap_or_default(),
                     );
                 }
-                if let Some(err) = store_or_500(&state.session_store, &session) {
+                if let Some(err) = store_or_500(&state, &session) {
                     return err;
                 }
                 return (StatusCode::OK, Json(session_view(&session))).into_response();
@@ -3713,7 +3750,7 @@ async fn resume_session(
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
                 session.pending_approval = None;
-                if let Some(err) = store_or_500(&state.session_store, &session) {
+                if let Some(err) = store_or_500(&state, &session) {
                     return err;
                 }
                 return (StatusCode::OK, Json(session_view(&session))).into_response();
@@ -3749,7 +3786,7 @@ async fn resume_session(
                 session.pending_seq = None;
                 session.pending_prompt = None;
                 session.pending_approval = Some(approval);
-                if let Some(err) = store_or_500(&state.session_store, &session) {
+                if let Some(err) = store_or_500(&state, &session) {
                     return err;
                 }
                 return (StatusCode::OK, Json(session_view(&session))).into_response();
@@ -3787,7 +3824,7 @@ async fn resume_session(
                         serde_json::to_string_pretty(&output).unwrap_or_default(),
                     );
                 }
-                if let Some(err) = store_or_500(&state.session_store, &session) {
+                if let Some(err) = store_or_500(&state, &session) {
                     return err;
                 }
                 return (StatusCode::OK, Json(session_view(&session))).into_response();
@@ -3867,7 +3904,7 @@ async fn resume_session(
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
                 session.pending_approval = None;
-                if let Some(err) = store_or_500(&state.session_store, &session) {
+                if let Some(err) = store_or_500(&state, &session) {
                     return err;
                 }
                 return (StatusCode::OK, Json(session_view(&session))).into_response();
@@ -3944,7 +3981,7 @@ async fn resume_session(
                 session.pending_seq = None;
                 session.pending_prompt = None;
                 session.pending_approval = Some(approval);
-                if let Some(err) = store_or_500(&state.session_store, &session) {
+                if let Some(err) = store_or_500(&state, &session) {
                     return err;
                 }
                 return (StatusCode::OK, Json(session_view(&session))).into_response();
@@ -3975,17 +4012,33 @@ async fn resume_session(
         };
     let approvals = original.approvals.clone();
     let vfs = load_persisted_vfs(&state.run_base, original.run_id.as_deref());
+    let resume_run_id = original.run_id.clone();
     let app_state = state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         let engine = build_engine(&app_state).with_approvals(approvals);
-        engine.run_replay_pausable_with_host_promises_and_vfs(
-            &app_state.agent_path,
-            &input_clone,
-            call_log,
-            host_promises,
-            vfs,
-        )
+        // Continue under the original run id (when known) so the resumed run
+        // keeps its persisted run directory and stays a single durable run,
+        // matching the live-VM resume path. Falls back to a fresh id only when
+        // the session never recorded one.
+        match resume_run_id {
+            Some(run_id) => engine
+                .run_replay_pausable_with_host_promises_and_vfs_preserving_run_id(
+                    &app_state.agent_path,
+                    &input_clone,
+                    call_log,
+                    host_promises,
+                    vfs,
+                    run_id,
+                ),
+            None => engine.run_replay_pausable_with_host_promises_and_vfs(
+                &app_state.agent_path,
+                &input_clone,
+                call_log,
+                host_promises,
+                vfs,
+            ),
+        }
     })
     .await
     .unwrap();
@@ -4014,7 +4067,7 @@ async fn resume_session(
                 session.pending_prompt = None;
                 session.pending_approval = None;
             }
-            if let Some(err) = store_or_500(&state.session_store, &session) {
+            if let Some(err) = store_or_500(&state, &session) {
                 return err;
             }
             (StatusCode::OK, Json(session_view(&session))).into_response()
@@ -4119,11 +4172,11 @@ async fn approve_session(
         return (StatusCode::OK, Json(session_view(&original))).into_response();
     }
 
-    // Allow path: record the approval, then re-run the agent fresh (no
-    // replay log) so the policy cache is seeded and the blocked call runs.
-    // We deliberately re-run from scratch rather than replay: the paused
-    // run didn't record the blocked call, and replay would expect the same
-    // seq to now contain a tool record, which it doesn't.
+    // Allow path: record the approval. The live-VM resume below handles the
+    // QuickJS path by resuming the frozen VM; if that doesn't apply (e.g. the
+    // rust engine, whose durability is call-log replay), the fallback further
+    // down replays the recorded log with the approval seeded so prior host
+    // calls return their results and only the blocked call re-executes.
     original
         .approvals
         .push((pending.target.clone(), pending.args.clone()));
@@ -4160,7 +4213,7 @@ async fn approve_session(
                         serde_json::to_string_pretty(&output).unwrap_or_default(),
                     );
                 }
-                if let Some(err) = store_or_500(&state.session_store, &session) {
+                if let Some(err) = store_or_500(&state, &session) {
                     return err;
                 }
                 return (StatusCode::OK, Json(session_view(&session))).into_response();
@@ -4199,7 +4252,7 @@ async fn approve_session(
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
                 session.pending_approval = None;
-                if let Some(err) = store_or_500(&state.session_store, &session) {
+                if let Some(err) = store_or_500(&state, &session) {
                     return err;
                 }
                 return (StatusCode::OK, Json(session_view(&session))).into_response();
@@ -4235,7 +4288,7 @@ async fn approve_session(
                 session.pending_seq = None;
                 session.pending_prompt = None;
                 session.pending_approval = Some(approval);
-                if let Some(err) = store_or_500(&state.session_store, &session) {
+                if let Some(err) = store_or_500(&state, &session) {
                     return err;
                 }
                 return (StatusCode::OK, Json(session_view(&session))).into_response();
@@ -4269,10 +4322,38 @@ async fn approve_session(
 
     let input = original.input.clone();
     let approvals = original.approvals.clone();
+    let call_log = original.call_log.clone();
+    let resume_run_id = original.run_id.clone();
+    let vfs = load_persisted_vfs(&state.run_base, original.run_id.as_deref());
     let app_state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         let engine = build_engine(&app_state).with_approvals(approvals);
-        engine.run_pausable(&app_state.agent_path, &input)
+        // Replay the recorded call log (so any host calls the agent made before
+        // the policy block — e.g. a prior `input()` — return their recorded
+        // results instead of pausing again) with the approval seeded in the
+        // policy cache. The blocked call itself was never recorded, so its seq
+        // is past the log and it executes live, now passing the seeded policy.
+        // Host promises are intentionally empty so the gated call runs for real
+        // rather than replaying a placeholder resolution. Preserve the run id so
+        // the resumed run keeps its persisted directory.
+        match resume_run_id {
+            Some(run_id) => engine
+                .run_replay_pausable_with_host_promises_and_vfs_preserving_run_id(
+                    &app_state.agent_path,
+                    &input,
+                    call_log,
+                    Vec::new(),
+                    vfs,
+                    run_id,
+                ),
+            None => engine.run_replay_pausable_with_host_promises_and_vfs(
+                &app_state.agent_path,
+                &input,
+                call_log,
+                Vec::new(),
+                vfs,
+            ),
+        }
     })
     .await
     .unwrap();
@@ -4293,7 +4374,7 @@ async fn approve_session(
                 session.output = Some(run_result.output);
             }
             session.call_log = run_result.call_log.into_records();
-            if let Some(err) = store_or_500(&state.session_store, &session) {
+            if let Some(err) = store_or_500(&state, &session) {
                 return err;
             }
             (StatusCode::OK, Json(session_view(&session))).into_response()
@@ -4395,6 +4476,33 @@ mod tests {
     use super::*;
     use axum::body;
 
+    /// The snapshot blob kind a pause persists for the active engine. The
+    /// QuickJS path captures a live VM image (`LiveQuickJsVm`); the pure-Rust
+    /// path has no VM image and persists a call-log-replay scaffold
+    /// (`InitialTypeScriptStateScaffold`), resuming by replaying the call log.
+    /// Resume behavior (output, run-id continuity, call log) is identical; only
+    /// the on-disk durability shape differs, so these resume tests assert the
+    /// engine-appropriate kind and otherwise validate both paths end-to-end.
+    fn expected_pause_snapshot_kind() -> SnapshotBlobKind {
+        if std::env::var("CHIDORI_JS_ENGINE").as_deref() == Ok("rust") {
+            SnapshotBlobKind::InitialTypeScriptStateScaffold
+        } else {
+            SnapshotBlobKind::LiveQuickJsVm
+        }
+    }
+
+    /// True when the pure-Rust engine is the active runtime. A few resume tests
+    /// use this to assert engine-appropriate *internal* trace shape where the
+    /// two durability models legitimately differ — the live-VM continuation
+    /// model vs deterministic call-log replay — e.g. how many `call_agent`
+    /// container records a deeply-nested suspending sub-agent leaves in the log,
+    /// or the QuickJS-only mid-prompt-loop pause file and per-turn arg metadata.
+    /// The observable behavior (output, status, run id, pending prompt) is
+    /// asserted identically for both engines.
+    fn rust_engine_active() -> bool {
+        std::env::var("CHIDORI_JS_ENGINE").as_deref() == Ok("rust")
+    }
+
     fn test_run_base(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("{name}-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::remove_dir_all(&path);
@@ -4416,7 +4524,7 @@ mod tests {
             run_semaphore: Arc::new(Semaphore::new(1)),
             acquire_timeout: std::time::Duration::from_millis(1),
             active_sessions: Arc::new(StdMutex::new(HashMap::new())),
-        }
+            }
     }
 
     async fn response_json(response: Response) -> (StatusCode, Value) {
@@ -4433,6 +4541,7 @@ mod tests {
         let stamped = stamp_attempt(json!({"stream_id": "s1"}), Some(42));
         assert_eq!(stamped["attempt_number"], 42);
     }
+
 
     #[tokio::test]
     async fn cancel_session_marks_active_session_cancelled() {
@@ -5289,7 +5398,7 @@ mod tests {
         let loaded = SnapshotStore::new(run_base.join(&run_id)).load().unwrap();
         assert_eq!(
             loaded.manifest.snapshot_kind,
-            SnapshotBlobKind::LiveQuickJsVm
+            expected_pause_snapshot_kind()
         );
 
         let state = test_state(run_base.clone(), agent_path);
@@ -5395,7 +5504,7 @@ mod tests {
         let loaded = SnapshotStore::new(run_base.join(&run_id)).load().unwrap();
         assert_eq!(
             loaded.manifest.snapshot_kind,
-            SnapshotBlobKind::LiveQuickJsVm
+            expected_pause_snapshot_kind()
         );
         assert_eq!(loaded.manifest.modules.len(), 1);
         assert_eq!(loaded.manifest.modules[0].path, lib_path);
@@ -5494,7 +5603,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             loaded.manifest.snapshot_kind,
-            SnapshotBlobKind::LiveQuickJsVm
+            expected_pause_snapshot_kind()
         );
 
         let state = test_state(run_base.clone(), agent_path);
@@ -7237,18 +7346,38 @@ mod tests {
             json!({ "result": { "child": { "grandchild": "done" } } })
         );
         let stored = state.session_store.get("session-1").unwrap().unwrap();
-        assert_eq!(stored.call_log.len(), 3);
-        assert_eq!(stored.call_log[0].function, "input");
-        assert_eq!(stored.call_log[1].function, "input");
-        assert_eq!(stored.call_log[2].function, "call_agent");
+        // Both inputs (outer + grandchild) are recorded.
+        let inputs = stored
+            .call_log
+            .iter()
+            .filter(|r| r.function == "input")
+            .count();
+        assert_eq!(inputs, 2);
+        // The outer agent->child callAgent is recorded top-level with the full
+        // nested result.
+        let outer = stored
+            .call_log
+            .iter()
+            .find(|r| r.function == "call_agent" && r.parent_seq.is_none())
+            .expect("outer call_agent record");
         assert_eq!(
-            stored.call_log[2].args,
+            outer.args,
             json!({ "path": child_path.display().to_string(), "input": { "value": "go" } })
         );
-        assert_eq!(
-            stored.call_log[2].result,
-            json!({ "child": { "grandchild": "done" } })
-        );
+        assert_eq!(outer.result, json!({ "child": { "grandchild": "done" } }));
+        // Trace shape differs by durability model: deterministic replay preserves
+        // the inner child->grandchild callAgent nested under the outer one; the
+        // live-VM continuation model collapses it. Behavior (output above) is
+        // identical either way.
+        if rust_engine_active() {
+            assert_eq!(stored.call_log.len(), 4);
+            assert!(stored
+                .call_log
+                .iter()
+                .any(|r| r.function == "call_agent" && r.parent_seq.is_some()));
+        } else {
+            assert_eq!(stored.call_log.len(), 3);
+        }
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -7379,16 +7508,30 @@ mod tests {
             .unwrap()
             .contains("grandchild failed bad"));
         let stored = state.session_store.get("session-1").unwrap().unwrap();
-        assert_eq!(stored.call_log.len(), 3);
-        assert_eq!(stored.call_log[0].function, "input");
-        assert_eq!(stored.call_log[1].function, "input");
-        assert_eq!(stored.call_log[2].function, "call_agent");
-        assert_eq!(stored.call_log[2].result, Value::Null);
-        assert!(stored.call_log[2]
+        let inputs = stored
+            .call_log
+            .iter()
+            .filter(|r| r.function == "input")
+            .count();
+        assert_eq!(inputs, 2);
+        // The top-level callAgent records the propagated failure.
+        let outer = stored
+            .call_log
+            .iter()
+            .find(|r| r.function == "call_agent" && r.parent_seq.is_none())
+            .expect("outer call_agent record");
+        assert_eq!(outer.result, Value::Null);
+        assert!(outer
             .error
             .as_deref()
             .unwrap()
             .contains("grandchild failed bad"));
+        // Replay preserves the inner callAgent record; live-VM collapses it.
+        if rust_engine_active() {
+            assert_eq!(stored.call_log.len(), 4);
+        } else {
+            assert_eq!(stored.call_log.len(), 3);
+        }
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -7718,16 +7861,16 @@ mod tests {
         assert_eq!(stored.call_log.len(), 4);
         assert_eq!(stored.call_log[0].function, "input");
         assert_eq!(stored.call_log[1].function, "prompt");
-        assert_eq!(
-            stored.call_log[1].args,
-            json!({
-                "text": "use a tool",
-                "model": "test-model",
-                "type": null,
-                "tools": ["echo"],
-                "turn": 0,
-            })
-        );
+        // Assert the documented per-turn prompt arg fields. The rust backend
+        // additionally records `max_turns` (covered by its own unit test); the
+        // QuickJS live binding omits it. Checking fields individually keeps the
+        // meaningful contract for both engines without pinning that metadata.
+        let prompt_args = &stored.call_log[1].args;
+        assert_eq!(prompt_args["text"], json!("use a tool"));
+        assert_eq!(prompt_args["model"], json!("test-model"));
+        assert_eq!(prompt_args["type"], json!(null));
+        assert_eq!(prompt_args["tools"], json!(["echo"]));
+        assert_eq!(prompt_args["turn"], json!(0));
         assert_eq!(stored.call_log[2].function, "tool");
         assert_eq!(
             stored.call_log[2].args,
@@ -7851,10 +7994,16 @@ mod tests {
             manifest.pending.as_ref().map(|pending| &pending.kind),
             Some(&PendingHostOperationKind::Input)
         );
-        assert!(run_base
-            .join(&original_run_id)
-            .join(PROMPT_TOOL_PAUSE_FILE)
-            .exists());
+        // Mid-prompt-loop suspension is captured differently per model: QuickJS
+        // snapshots the in-flight loop to a pause file; the rust replay model
+        // re-runs the loop on resume, so the pending Input in the scaffold
+        // manifest (asserted above) is the durable record and there is no file.
+        if !rust_engine_active() {
+            assert!(run_base
+                .join(&original_run_id)
+                .join(PROMPT_TOOL_PAUSE_FILE)
+                .exists());
+        }
 
         let (status, body) = response_json(
             resume_session(
@@ -7889,10 +8038,12 @@ mod tests {
         assert_eq!(stored.call_log[3].result, json!({ "answer": "nested" }));
         assert_eq!(stored.call_log[4].function, "prompt");
         assert_eq!(stored.call_log[4].result["content"], json!("final answer"));
-        assert!(!run_base
-            .join(&original_run_id)
-            .join(PROMPT_TOOL_PAUSE_FILE)
-            .exists());
+        if !rust_engine_active() {
+            assert!(!run_base
+                .join(&original_run_id)
+                .join(PROMPT_TOOL_PAUSE_FILE)
+                .exists());
+        }
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -8013,10 +8164,12 @@ mod tests {
         assert_eq!(body["status"], json!("paused"));
         assert_eq!(body["run_id"], json!(original_run_id));
         assert_eq!(body["pending_prompt"], json!("second tool?"));
-        assert!(run_base
-            .join(&original_run_id)
-            .join(PROMPT_TOOL_PAUSE_FILE)
-            .exists());
+        if !rust_engine_active() {
+            assert!(run_base
+                .join(&original_run_id)
+                .join(PROMPT_TOOL_PAUSE_FILE)
+                .exists());
+        }
 
         let (status, body) = response_json(
             resume_session(
@@ -8035,33 +8188,36 @@ mod tests {
         assert_eq!(body["run_id"], json!(original_run_id));
         assert_eq!(body["output"], json!({ "text": "final repeated answer" }));
         let stored = state.session_store.get("session-1").unwrap().unwrap();
+        // Two suspending tool turns: agent input + 2 nested tool inputs (3
+        // `input`), 2 `tool`, and 3 `prompt` (turn 0, turn 1, final) = 8 records.
+        // The flat ordering of a tool relative to its own nested input differs by
+        // durability model (replay records the tool container before its nested
+        // input and nests it via parent_seq; the live-VM model records the inner
+        // input first), so assert by structure and value rather than fixed index.
         assert_eq!(stored.call_log.len(), 8);
-        assert_eq!(stored.call_log[0].function, "input");
-        assert_eq!(stored.call_log[1].function, "prompt");
-        assert_eq!(
-            stored.call_log[1].result["tool_calls"][0]["id"],
-            json!("toolu_1")
-        );
-        assert_eq!(stored.call_log[2].function, "input");
-        assert_eq!(stored.call_log[3].function, "tool");
-        assert_eq!(stored.call_log[3].result, json!({ "answer": "first" }));
-        assert_eq!(stored.call_log[4].function, "prompt");
-        assert_eq!(
-            stored.call_log[4].result["tool_calls"][0]["id"],
-            json!("toolu_2")
-        );
-        assert_eq!(stored.call_log[5].function, "input");
-        assert_eq!(stored.call_log[6].function, "tool");
-        assert_eq!(stored.call_log[6].result, json!({ "answer": "second" }));
-        assert_eq!(stored.call_log[7].function, "prompt");
-        assert_eq!(
-            stored.call_log[7].result["content"],
-            json!("final repeated answer")
-        );
-        assert!(!run_base
-            .join(&original_run_id)
-            .join(PROMPT_TOOL_PAUSE_FILE)
-            .exists());
+        let by_fn = |name: &str| -> Vec<&CallRecord> {
+            stored
+                .call_log
+                .iter()
+                .filter(|r| r.function == name)
+                .collect()
+        };
+        assert_eq!(by_fn("input").len(), 3);
+        let prompts = by_fn("prompt");
+        assert_eq!(prompts.len(), 3);
+        assert_eq!(prompts[0].result["tool_calls"][0]["id"], json!("toolu_1"));
+        assert_eq!(prompts[1].result["tool_calls"][0]["id"], json!("toolu_2"));
+        assert_eq!(prompts[2].result["content"], json!("final repeated answer"));
+        let tools = by_fn("tool");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].result, json!({ "answer": "first" }));
+        assert_eq!(tools[1].result, json!({ "answer": "second" }));
+        if !rust_engine_active() {
+            assert!(!run_base
+                .join(&original_run_id)
+                .join(PROMPT_TOOL_PAUSE_FILE)
+                .exists());
+        }
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -8145,7 +8301,7 @@ mod tests {
         let manifest = SnapshotStore::new(run_base.join(&run_id))
             .load_manifest()
             .unwrap();
-        assert_eq!(manifest.snapshot_kind, SnapshotBlobKind::LiveQuickJsVm);
+        assert_eq!(manifest.snapshot_kind, expected_pause_snapshot_kind());
         assert_eq!(
             manifest.pending.as_ref().map(|pending| pending.id),
             Some(HostOperationId(2))
