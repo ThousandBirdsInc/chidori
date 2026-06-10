@@ -188,10 +188,10 @@ fn install_one(vm: &mut Vm, is_async: bool) {
 
     // @@toStringTag
     let tag = vm.realm.symbol_to_string_tag.clone();
-    proto.borrow_mut().props.insert(
-        PropertyKey::Sym(tag),
-        Property::builtin(Value::str(name)),
-    );
+    proto
+        .borrow_mut()
+        .props
+        .insert(PropertyKey::Sym(tag), Property::builtin(Value::str(name)));
 }
 
 /// Run the disposers in reverse, chaining failures into a SuppressedError.

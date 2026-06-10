@@ -30,10 +30,11 @@ impl Vm {
             let own = func_obj.borrow();
             match own.props.get(&PropertyKey::str("prototype")) {
                 Some(Property {
-                    kind: PropertyKind::Data {
-                        value: Value::Object(p),
-                        ..
-                    },
+                    kind:
+                        PropertyKind::Data {
+                            value: Value::Object(p),
+                            ..
+                        },
                     ..
                 }) => p.clone(),
                 _ => {
@@ -97,9 +98,7 @@ impl Vm {
         let gobj = match gen {
             // Must be an *async* generator; a sync generator (or anything else)
             // rejects the returned promise (spec 27.6.1.2/.3/.4 brand check).
-            Value::Object(o)
-                if matches!(&o.borrow().internal, Internal::Generator(g) if g.is_async) =>
-            {
+            Value::Object(o) if matches!(&o.borrow().internal, Internal::Generator(g) if g.is_async) => {
                 o.clone()
             }
             _ => {
@@ -348,9 +347,7 @@ impl Vm {
         let gobj = match gen {
             // Must be a *sync* generator; an async generator (or anything else)
             // throws a TypeError (spec 27.5.1.2/.3/.4 brand check).
-            Value::Object(o)
-                if matches!(&o.borrow().internal, Internal::Generator(g) if !g.is_async) =>
-            {
+            Value::Object(o) if matches!(&o.borrow().internal, Internal::Generator(g) if !g.is_async) => {
                 o.clone()
             }
             _ => return Err(self.throw_type("not a generator")),

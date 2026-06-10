@@ -57,7 +57,11 @@ pub enum DriveOutcome {
     Completed,
     /// Blocked on a host effect the driver's handler declined to resolve inline
     /// (the process should persist the journal and suspend here).
-    Suspended { op_id: u64, name: String, args: Json },
+    Suspended {
+        op_id: u64,
+        name: String,
+        args: Json,
+    },
 }
 
 /// A durable JS runtime: a VM plus an effect journal.
@@ -96,7 +100,11 @@ impl ReplayRuntime {
     /// Restore a runtime from a persisted journal, re-evaluating `bundle` (which
     /// may differ from the recorded one — modify-and-resume). Replays recorded
     /// effects until the pending frontier.
-    pub fn restore(bundle: &str, journal_bytes: &[u8], effects: &[&str]) -> Result<ReplayRuntime, String> {
+    pub fn restore(
+        bundle: &str,
+        journal_bytes: &[u8],
+        effects: &[&str],
+    ) -> Result<ReplayRuntime, String> {
         let journal = Journal::from_bytes(journal_bytes)?;
         let bundle_hash = Journal::hash_bundle(bundle);
         let state = Rc::new(RefCell::new(JournalState {
@@ -140,75 +148,76 @@ impl ReplayRuntime {
         for name in effects {
             let nm = name.to_string();
             let state = self.state.clone();
-            self.vm.define_method(&global, name, 1, move |vm, _this, args| {
-                let args_json = Json::Array(args.iter().map(|a| vm.value_to_json(a)).collect());
-                // Allocate the deterministic key.
-                let (site, seq) = {
-                    let mut s = state.borrow_mut();
-                    let seq = *s.counters.get(&nm).unwrap_or(&0);
-                    s.counters.insert(nm.clone(), seq + 1);
-                    (nm.clone(), seq)
-                };
-                // Ordered journal consumption: the next recorded entry must match
-                // this call's key, else an edit changed already-executed effects
-                // (fail-loud divergence, the P4 default policy).
-                enum Decision {
-                    Resolve(Json),
-                    Reject(String),
-                    Frontier,
-                    Diverged(String),
-                }
-                let decision = {
-                    let mut s = state.borrow_mut();
-                    let cursor = s.cursor;
-                    if cursor < s.journal.entries.len() {
-                        let entry = s.journal.entries[cursor].clone();
-                        if entry.site == site && entry.seq == seq {
-                            s.cursor += 1;
-                            match entry.outcome {
-                                EffectOutcome::Resolved(j) => Decision::Resolve(j),
-                                EffectOutcome::Rejected(m) => Decision::Reject(m),
-                            }
-                        } else {
-                            let msg = format!(
+            self.vm
+                .define_method(&global, name, 1, move |vm, _this, args| {
+                    let args_json = Json::Array(args.iter().map(|a| vm.value_to_json(a)).collect());
+                    // Allocate the deterministic key.
+                    let (site, seq) = {
+                        let mut s = state.borrow_mut();
+                        let seq = *s.counters.get(&nm).unwrap_or(&0);
+                        s.counters.insert(nm.clone(), seq + 1);
+                        (nm.clone(), seq)
+                    };
+                    // Ordered journal consumption: the next recorded entry must match
+                    // this call's key, else an edit changed already-executed effects
+                    // (fail-loud divergence, the P4 default policy).
+                    enum Decision {
+                        Resolve(Json),
+                        Reject(String),
+                        Frontier,
+                        Diverged(String),
+                    }
+                    let decision = {
+                        let mut s = state.borrow_mut();
+                        let cursor = s.cursor;
+                        if cursor < s.journal.entries.len() {
+                            let entry = s.journal.entries[cursor].clone();
+                            if entry.site == site && entry.seq == seq {
+                                s.cursor += 1;
+                                match entry.outcome {
+                                    EffectOutcome::Resolved(j) => Decision::Resolve(j),
+                                    EffectOutcome::Rejected(m) => Decision::Reject(m),
+                                }
+                            } else {
+                                let msg = format!(
                                 "expected effect '{}'#{} from journal but program called '{}'#{} \
                                  (an edit changed already-executed code before the resume point)",
                                 entry.site, entry.seq, site, seq
                             );
-                            s.divergence = Some(msg.clone());
-                            Decision::Diverged(msg)
+                                s.divergence = Some(msg.clone());
+                                Decision::Diverged(msg)
+                            }
+                        } else {
+                            Decision::Frontier
                         }
-                    } else {
-                        Decision::Frontier
+                    };
+                    let (id, promise) = vm.register_host_op();
+                    state.borrow_mut().pending.insert(
+                        id,
+                        PendingOp {
+                            name: nm.clone(),
+                            args: args_json,
+                            site,
+                            seq,
+                        },
+                    );
+                    match decision {
+                        Decision::Resolve(j) => {
+                            let v = vm.json_to_value(&j);
+                            vm.resolve_host_op(id, v);
+                        }
+                        Decision::Reject(msg) => {
+                            let e = vm.make_error(ErrorKind::Error, &msg);
+                            vm.reject_host_op(id, e);
+                        }
+                        Decision::Diverged(msg) => {
+                            let e = vm.make_error(ErrorKind::Error, &msg);
+                            vm.reject_host_op(id, e);
+                        }
+                        Decision::Frontier => { /* stays pending; resolved live */ }
                     }
-                };
-                let (id, promise) = vm.register_host_op();
-                state.borrow_mut().pending.insert(
-                    id,
-                    PendingOp {
-                        name: nm.clone(),
-                        args: args_json,
-                        site,
-                        seq,
-                    },
-                );
-                match decision {
-                    Decision::Resolve(j) => {
-                        let v = vm.json_to_value(&j);
-                        vm.resolve_host_op(id, v);
-                    }
-                    Decision::Reject(msg) => {
-                        let e = vm.make_error(ErrorKind::Error, &msg);
-                        vm.reject_host_op(id, e);
-                    }
-                    Decision::Diverged(msg) => {
-                        let e = vm.make_error(ErrorKind::Error, &msg);
-                        vm.reject_host_op(id, e);
-                    }
-                    Decision::Frontier => { /* stays pending; resolved live */ }
-                }
-                Ok(Value::Object(promise))
-            });
+                    Ok(Value::Object(promise))
+                });
         }
     }
 
@@ -221,85 +230,86 @@ impl ReplayRuntime {
     fn install_memo(&mut self) {
         let global = self.vm.realm.global.clone();
         let state = self.state.clone();
-        self.vm.define_method(&global, "durableStep", 1, move |vm, _this, args| {
-            let f = args.get(0).cloned().unwrap_or(Value::Undefined);
-            let site = "durableStep".to_string();
-            let seq = {
-                let mut s = state.borrow_mut();
-                let seq = *s.counters.get(&site).unwrap_or(&0);
-                s.counters.insert(site.clone(), seq + 1);
-                seq
-            };
-            enum Decision {
-                Cached(Json),
-                CachedErr(String),
-                Run,
-                Diverged(String),
-            }
-            let decision = {
-                let mut s = state.borrow_mut();
-                let cursor = s.cursor;
-                if cursor < s.journal.entries.len() {
-                    let entry = s.journal.entries[cursor].clone();
-                    if entry.site == site && entry.seq == seq {
-                        s.cursor += 1;
-                        match entry.outcome {
-                            EffectOutcome::Resolved(j) => Decision::Cached(j),
-                            EffectOutcome::Rejected(m) => Decision::CachedErr(m),
+        self.vm
+            .define_method(&global, "durableStep", 1, move |vm, _this, args| {
+                let f = args.get(0).cloned().unwrap_or(Value::Undefined);
+                let site = "durableStep".to_string();
+                let seq = {
+                    let mut s = state.borrow_mut();
+                    let seq = *s.counters.get(&site).unwrap_or(&0);
+                    s.counters.insert(site.clone(), seq + 1);
+                    seq
+                };
+                enum Decision {
+                    Cached(Json),
+                    CachedErr(String),
+                    Run,
+                    Diverged(String),
+                }
+                let decision = {
+                    let mut s = state.borrow_mut();
+                    let cursor = s.cursor;
+                    if cursor < s.journal.entries.len() {
+                        let entry = s.journal.entries[cursor].clone();
+                        if entry.site == site && entry.seq == seq {
+                            s.cursor += 1;
+                            match entry.outcome {
+                                EffectOutcome::Resolved(j) => Decision::Cached(j),
+                                EffectOutcome::Rejected(m) => Decision::CachedErr(m),
+                            }
+                        } else {
+                            let msg = format!(
+                                "expected '{}'#{} from journal but program reached durableStep#{} \
+                             (edit changed already-executed code)",
+                                entry.site, entry.seq, seq
+                            );
+                            s.divergence = Some(msg.clone());
+                            Decision::Diverged(msg)
                         }
                     } else {
-                        let msg = format!(
-                            "expected '{}'#{} from journal but program reached durableStep#{} \
-                             (edit changed already-executed code)",
-                            entry.site, entry.seq, seq
-                        );
-                        s.divergence = Some(msg.clone());
-                        Decision::Diverged(msg)
+                        Decision::Run
                     }
-                } else {
-                    Decision::Run
-                }
-            };
-            let (id, promise) = vm.register_host_op();
-            let key = crate::host::HostKey { site, seq };
-            match decision {
-                Decision::Cached(j) => {
-                    let v = vm.json_to_value(&j);
-                    vm.resolve_host_op(id, v);
-                }
-                Decision::CachedErr(m) => {
-                    let e = vm.make_error(ErrorKind::Error, &m);
-                    vm.reject_host_op(id, e);
-                }
-                Decision::Diverged(m) => {
-                    let e = vm.make_error(ErrorKind::Error, &m);
-                    vm.reject_host_op(id, e);
-                }
-                Decision::Run => match vm.call(f, Value::Undefined, &[]) {
-                    Ok(v) => {
-                        let j = vm.value_to_json(&v);
-                        {
-                            let mut s = state.borrow_mut();
-                            s.journal.append(&key, EffectOutcome::Resolved(j.clone()));
-                            s.cursor = s.journal.entries.len();
+                };
+                let (id, promise) = vm.register_host_op();
+                let key = crate::host::HostKey { site, seq };
+                match decision {
+                    Decision::Cached(j) => {
+                        let v = vm.json_to_value(&j);
+                        vm.resolve_host_op(id, v);
+                    }
+                    Decision::CachedErr(m) => {
+                        let e = vm.make_error(ErrorKind::Error, &m);
+                        vm.reject_host_op(id, e);
+                    }
+                    Decision::Diverged(m) => {
+                        let e = vm.make_error(ErrorKind::Error, &m);
+                        vm.reject_host_op(id, e);
+                    }
+                    Decision::Run => match vm.call(f, Value::Undefined, &[]) {
+                        Ok(v) => {
+                            let j = vm.value_to_json(&v);
+                            {
+                                let mut s = state.borrow_mut();
+                                s.journal.append(&key, EffectOutcome::Resolved(j.clone()));
+                                s.cursor = s.journal.entries.len();
+                            }
+                            let rv = vm.json_to_value(&j);
+                            vm.resolve_host_op(id, rv);
                         }
-                        let rv = vm.json_to_value(&j);
-                        vm.resolve_host_op(id, rv);
-                    }
-                    Err(e) => {
-                        let msg = vm.error_to_string(&e);
-                        {
-                            let mut s = state.borrow_mut();
-                            s.journal.append(&key, EffectOutcome::Rejected(msg.clone()));
-                            s.cursor = s.journal.entries.len();
+                        Err(e) => {
+                            let msg = vm.error_to_string(&e);
+                            {
+                                let mut s = state.borrow_mut();
+                                s.journal.append(&key, EffectOutcome::Rejected(msg.clone()));
+                                s.cursor = s.journal.entries.len();
+                            }
+                            let err = vm.make_error(ErrorKind::Error, &msg);
+                            vm.reject_host_op(id, err);
                         }
-                        let err = vm.make_error(ErrorKind::Error, &msg);
-                        vm.reject_host_op(id, err);
-                    }
-                },
-            }
-            Ok(Value::Object(promise))
-        });
+                    },
+                }
+                Ok(Value::Object(promise))
+            });
     }
 
     fn start(&mut self) -> Result<(), String> {
@@ -355,7 +365,8 @@ impl ReplayRuntime {
                                 Ok(json) => {
                                     {
                                         let mut s = self.state.borrow_mut();
-                                        s.journal.append(&key, EffectOutcome::Resolved(json.clone()));
+                                        s.journal
+                                            .append(&key, EffectOutcome::Resolved(json.clone()));
                                         s.cursor = s.journal.entries.len();
                                     }
                                     let v = self.vm.json_to_value(&json);
@@ -364,7 +375,8 @@ impl ReplayRuntime {
                                 Err(msg) => {
                                     {
                                         let mut s = self.state.borrow_mut();
-                                        s.journal.append(&key, EffectOutcome::Rejected(msg.clone()));
+                                        s.journal
+                                            .append(&key, EffectOutcome::Rejected(msg.clone()));
                                         s.cursor = s.journal.entries.len();
                                     }
                                     let e = self.vm.make_error(ErrorKind::Error, &msg);
@@ -400,19 +412,20 @@ impl ReplayRuntime {
         match result {
             Ok(json) => {
                 {
-                                        let mut s = self.state.borrow_mut();
-                                        s.journal.append(&key, EffectOutcome::Resolved(json.clone()));
-                                        s.cursor = s.journal.entries.len();
-                                    }
+                    let mut s = self.state.borrow_mut();
+                    s.journal
+                        .append(&key, EffectOutcome::Resolved(json.clone()));
+                    s.cursor = s.journal.entries.len();
+                }
                 let v = self.vm.json_to_value(&json);
                 self.vm.resolve_host_op(op_id, v);
             }
             Err(msg) => {
                 {
-                                        let mut s = self.state.borrow_mut();
-                                        s.journal.append(&key, EffectOutcome::Rejected(msg.clone()));
-                                        s.cursor = s.journal.entries.len();
-                                    }
+                    let mut s = self.state.borrow_mut();
+                    s.journal.append(&key, EffectOutcome::Rejected(msg.clone()));
+                    s.cursor = s.journal.entries.len();
+                }
                 let e = self.vm.make_error(ErrorKind::Error, &msg);
                 self.vm.reject_host_op(op_id, e);
             }
@@ -467,7 +480,8 @@ impl ReplayRuntime {
             Ok(json) => {
                 {
                     let mut s = self.state.borrow_mut();
-                    s.journal.append(&key, EffectOutcome::Resolved(json.clone()));
+                    s.journal
+                        .append(&key, EffectOutcome::Resolved(json.clone()));
                     s.cursor = s.journal.entries.len();
                 }
                 let v = self.vm.json_to_value(&json);

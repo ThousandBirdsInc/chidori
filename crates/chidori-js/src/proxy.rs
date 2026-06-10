@@ -143,7 +143,10 @@ impl Vm {
                 if let Some(p) = own_property_descriptor(&target, key) {
                     if !p.configurable {
                         match &p.kind {
-                            PropertyKind::Data { value: tv, writable } if !writable => {
+                            PropertyKind::Data {
+                                value: tv,
+                                writable,
+                            } if !writable => {
                                 if !same_value(&value, tv) {
                                     return Err(self.throw_type(
                                         "proxy set: cannot change a non-configurable, non-writable property to a different value",
@@ -238,7 +241,11 @@ impl Vm {
                 Ok(self.own_keys(&target))
             }
             Some(trap) => {
-                let r = self.call(trap, Value::Object(handler), &[Value::Object(target.clone())])?;
+                let r = self.call(
+                    trap,
+                    Value::Object(handler),
+                    &[Value::Object(target.clone())],
+                )?;
                 // The trap must return an array-like of strings/symbols. Build the
                 // key list, rejecting non-key entries and duplicates.
                 let arr = match &r {
@@ -255,17 +262,17 @@ impl Vm {
                         Value::String(_) | Value::Symbol(_) => {
                             let k = self.to_property_key(&el)?;
                             if seen.iter().any(|s| keys_eq(s, &k)) {
-                                return Err(self.throw_type(
-                                    "proxy ownKeys trap returned duplicate keys",
-                                ));
+                                return Err(
+                                    self.throw_type("proxy ownKeys trap returned duplicate keys")
+                                );
                             }
                             seen.push(k.clone());
                             keys.push(k);
                         }
                         _ => {
-                            return Err(self.throw_type(
-                                "proxy ownKeys trap returned a non-key value",
-                            ))
+                            return Err(
+                                self.throw_type("proxy ownKeys trap returned a non-key value")
+                            )
                         }
                     }
                 }
@@ -364,9 +371,7 @@ impl Vm {
                     &[Value::Object(target), Value::Object(args_arr), new_target],
                 )?;
                 if !matches!(r, Value::Object(_)) {
-                    return Err(
-                        self.throw_type("proxy construct trap must return an object")
-                    );
+                    return Err(self.throw_type("proxy construct trap must return an object"));
                 }
                 Ok(r)
             }
@@ -394,9 +399,9 @@ impl Vm {
                     &[Value::Object(target.clone())],
                 )?;
                 if !matches!(r, Value::Object(_) | Value::Null) {
-                    return Err(self.throw_type(
-                        "proxy getPrototypeOf trap must return an object or null",
-                    ));
+                    return Err(
+                        self.throw_type("proxy getPrototypeOf trap must return an object or null")
+                    );
                 }
                 // Invariant (10.5.1): if the target is non-extensible, the trap
                 // result must be the SameValue as the target's actual prototype.
@@ -480,12 +485,16 @@ impl Vm {
                 Ok(target.borrow().extensible)
             }
             Some(trap) => {
-                let r = self.call(trap, Value::Object(handler), &[Value::Object(target.clone())])?;
+                let r = self.call(
+                    trap,
+                    Value::Object(handler),
+                    &[Value::Object(target.clone())],
+                )?;
                 let b = self.to_boolean(&r);
                 if b != target.borrow().extensible {
-                    return Err(self.throw_type(
-                        "proxy isExtensible trap result must match the target",
-                    ));
+                    return Err(
+                        self.throw_type("proxy isExtensible trap result must match the target")
+                    );
                 }
                 Ok(b)
             }
@@ -503,7 +512,11 @@ impl Vm {
                 Ok(true)
             }
             Some(trap) => {
-                let r = self.call(trap, Value::Object(handler), &[Value::Object(target.clone())])?;
+                let r = self.call(
+                    trap,
+                    Value::Object(handler),
+                    &[Value::Object(target.clone())],
+                )?;
                 let b = self.to_boolean(&r);
                 if b && target.borrow().extensible {
                     return Err(self.throw_type(
@@ -708,7 +721,11 @@ impl Vm {
         if matches!(o.borrow().internal, Internal::Proxy(_)) {
             self.proxy_get_prototype_of(o)
         } else {
-            Ok(o.borrow().proto.clone().map(Value::Object).unwrap_or(Value::Null))
+            Ok(o.borrow()
+                .proto
+                .clone()
+                .map(Value::Object)
+                .unwrap_or(Value::Null))
         }
     }
 
@@ -776,10 +793,8 @@ impl Vm {
                     let d = self.new_object();
                     {
                         let mut b = d.borrow_mut();
-                        b.props.insert(
-                            PropertyKey::str("value"),
-                            Property::data(value.clone()),
-                        );
+                        b.props
+                            .insert(PropertyKey::str("value"), Property::data(value.clone()));
                         if existing.is_undefined() {
                             b.props.insert(
                                 PropertyKey::str("writable"),
@@ -830,7 +845,11 @@ impl Vm {
                 let r = self.call(
                     trap,
                     Value::Object(handler),
-                    &[Value::Object(target.clone()), key_to_value(key), desc.clone()],
+                    &[
+                        Value::Object(target.clone()),
+                        key_to_value(key),
+                        desc.clone(),
+                    ],
                 )?;
                 if !self.to_boolean(&r) {
                     return Ok(false);
@@ -899,9 +918,7 @@ pub fn install(vm: &mut Vm) {
     fn obj_arg(vm: &mut Vm, args: &[Value], i: usize, what: &str) -> Result<JsObject, Value> {
         match args.get(i) {
             Some(Value::Object(o)) => Ok(o.clone()),
-            _ => Err(vm.throw_type(&format!(
-                "Cannot create proxy with a non-object as {what}"
-            ))),
+            _ => Err(vm.throw_type(&format!("Cannot create proxy with a non-object as {what}"))),
         }
     }
 
@@ -933,10 +950,14 @@ pub fn install(vm: &mut Vm) {
         let result = vm.new_object();
         {
             let mut b = result.borrow_mut();
-            b.props
-                .insert(PropertyKey::str("proxy"), Property::data(Value::Object(proxy)));
-            b.props
-                .insert(PropertyKey::str("revoke"), Property::data(Value::Object(revoke)));
+            b.props.insert(
+                PropertyKey::str("proxy"),
+                Property::data(Value::Object(proxy)),
+            );
+            b.props.insert(
+                PropertyKey::str("revoke"),
+                Property::data(Value::Object(revoke)),
+            );
         }
         Ok(Value::Object(result))
     });

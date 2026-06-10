@@ -121,18 +121,23 @@ pub fn install(vm: &mut Vm) {
     });
 
     // Reflect.getOwnPropertyDescriptor(target, propertyKey)
-    vm.define_method(&reflect, "getOwnPropertyDescriptor", 2, |vm, _this, args| {
-        let target = require_object(vm, &arg(args, 0))?;
-        let key = vm.to_property_key(&arg(args, 1))?;
-        if vm.is_proxy(&target) {
-            return vm.proxy_get_own_descriptor(&target, &key);
-        }
-        let prop = own_property_descriptor(&target, &key);
-        match prop {
-            None => Ok(Value::Undefined),
-            Some(p) => Ok(descriptor_to_object(vm, &p)),
-        }
-    });
+    vm.define_method(
+        &reflect,
+        "getOwnPropertyDescriptor",
+        2,
+        |vm, _this, args| {
+            let target = require_object(vm, &arg(args, 0))?;
+            let key = vm.to_property_key(&arg(args, 1))?;
+            if vm.is_proxy(&target) {
+                return vm.proxy_get_own_descriptor(&target, &key);
+            }
+            let prop = own_property_descriptor(&target, &key);
+            match prop {
+                None => Ok(Value::Undefined),
+                Some(p) => Ok(descriptor_to_object(vm, &p)),
+            }
+        },
+    );
 
     // Reflect.isExtensible(target) -> Boolean
     vm.define_method(&reflect, "isExtensible", 1, |vm, _this, args| {
@@ -212,7 +217,10 @@ fn create_list_from_array_like(vm: &mut Vm, v: &Value) -> Result<Vec<Value>, Val
     let len = vm.to_length(&len_v)?;
     let mut out = Vec::with_capacity(len);
     for i in 0..len {
-        out.push(vm.get_prop(&Value::Object(o.clone()), &PropertyKey::from_index(i as u32))?);
+        out.push(vm.get_prop(
+            &Value::Object(o.clone()),
+            &PropertyKey::from_index(i as u32),
+        )?);
     }
     Ok(out)
 }

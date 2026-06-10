@@ -231,7 +231,10 @@ impl Vm {
                     None => Disp::NotCtor,
                 },
                 Some(FunctionInner::Bytecode(bf)) => {
-                    if bf.proto.kind.is_async() || bf.proto.kind.is_generator() || bf.proto.kind.is_arrow() {
+                    if bf.proto.kind.is_async()
+                        || bf.proto.kind.is_generator()
+                        || bf.proto.kind.is_arrow()
+                    {
                         Disp::NotCtor
                     } else {
                         Disp::Bytecode(bf.clone())
@@ -245,7 +248,8 @@ impl Vm {
         };
         match disp {
             Disp::NotCtor => {
-                let name = self.get_prop(&Value::Object(cobj.clone()), &PropertyKey::str("name"))?;
+                let name =
+                    self.get_prop(&Value::Object(cobj.clone()), &PropertyKey::str("name"))?;
                 let n = self.to_string_lossy(&name);
                 Err(self.throw_type(&format!("{n} is not a constructor")))
             }
@@ -266,8 +270,10 @@ impl Vm {
                     Value::Object(o) => o.clone(),
                     _ => cobj.clone(),
                 };
-                let proto_val =
-                    self.get_prop(&Value::Object(nt_obj.clone()), &PropertyKey::str("prototype"))?;
+                let proto_val = self.get_prop(
+                    &Value::Object(nt_obj.clone()),
+                    &PropertyKey::str("prototype"),
+                )?;
                 let proto = match proto_val {
                     Value::Object(o) => Some(o),
                     _ => Some(self.realm.object_proto.clone()),
@@ -515,9 +521,7 @@ impl Vm {
             Op::BindThisSloppy => {
                 let t = pop!();
                 let bound = match t {
-                    Value::Undefined | Value::Null => {
-                        Value::Object(self.realm.global.clone())
-                    }
+                    Value::Undefined | Value::Null => Value::Object(self.realm.global.clone()),
                     Value::Object(_) => t,
                     // A primitive `this` is boxed (ToObject) in sloppy mode.
                     other => Value::Object(self.to_object(&other)?),
@@ -525,7 +529,11 @@ impl Vm {
                 push!(bound);
             }
             Op::LoadNewTarget => push!(frame.new_target.clone()),
-            Op::LoadArg(i) => push!(frame.args.get(i as usize).cloned().unwrap_or(Value::Undefined)),
+            Op::LoadArg(i) => push!(frame
+                .args
+                .get(i as usize)
+                .cloned()
+                .unwrap_or(Value::Undefined)),
             Op::LoadRestArgs(n) => {
                 let rest: Vec<Value> = if (n as usize) < frame.args.len() {
                     frame.args[n as usize..].to_vec()
@@ -547,8 +555,7 @@ impl Vm {
             Op::LoadCell(i) => {
                 let v = frame.cells[i as usize].borrow().clone();
                 if matches!(v, Value::Uninitialized) {
-                    return Err(self
-                        .throw_reference("Cannot access binding before initialization"));
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
                 }
                 push!(v);
             }
@@ -561,8 +568,7 @@ impl Vm {
                 let mut slot = frame.cells[i as usize].borrow_mut();
                 if matches!(*slot, Value::Uninitialized) {
                     drop(slot);
-                    return Err(self
-                        .throw_reference("Cannot access binding before initialization"));
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
                 }
                 *slot = v;
             }
@@ -590,8 +596,7 @@ impl Vm {
             Op::LoadUpvalue(i) => {
                 let v = frame.func.upvalues[i as usize].borrow().clone();
                 if matches!(v, Value::Uninitialized) {
-                    return Err(self
-                        .throw_reference("Cannot access binding before initialization"));
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
                 }
                 push!(v);
             }
@@ -604,8 +609,7 @@ impl Vm {
                 let mut slot = frame.func.upvalues[i as usize].borrow_mut();
                 if matches!(*slot, Value::Uninitialized) {
                     drop(slot);
-                    return Err(self
-                        .throw_reference("Cannot access binding before initialization"));
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
                 }
                 *slot = v;
             }
@@ -637,9 +641,7 @@ impl Vm {
                 // (a global-object property anywhere on the proto chain counts as
                 // resolvable). Sloppy mode creates the global property instead.
                 if strict && !self.has_prop(&Value::Object(g.clone()), &key)? {
-                    return Err(
-                        self.throw_reference(&format!("{} is not defined", name.as_str()))
-                    );
+                    return Err(self.throw_reference(&format!("{} is not defined", name.as_str())));
                 }
                 self.put_value(&Value::Object(g), &key, v, strict)?;
             }
@@ -648,7 +650,9 @@ impl Vm {
                 let g = self.realm.global.clone();
                 let key = PropertyKey::Str(name);
                 if !g.borrow().props.contains_key(&key) {
-                    g.borrow_mut().props.insert(key, Property::data(Value::Undefined));
+                    g.borrow_mut()
+                        .props
+                        .insert(key, Property::data(Value::Undefined));
                 }
             }
 
@@ -1211,7 +1215,11 @@ impl Vm {
             Op::PushTryHandler { catch, finally } => {
                 frame.handlers.push(TryHandler {
                     catch_ip: if catch == u32::MAX { None } else { Some(catch) },
-                    finally_ip: if finally == u32::MAX { None } else { Some(finally) },
+                    finally_ip: if finally == u32::MAX {
+                        None
+                    } else {
+                        Some(finally)
+                    },
                     stack_depth: frame.stack.len(),
                     with_depth: frame.with_scope.len(),
                 });
@@ -1384,11 +1392,7 @@ impl Vm {
     /// with-object iff `HasProperty(obj, key)` is true AND it is not excluded by
     /// the object's `@@unscopables` (a name whose @@unscopables entry is truthy
     /// is treated as absent).
-    fn with_lookup(
-        &mut self,
-        frame: &Frame,
-        key: &PropertyKey,
-    ) -> Result<Option<JsObject>, Value> {
+    fn with_lookup(&mut self, frame: &Frame, key: &PropertyKey) -> Result<Option<JsObject>, Value> {
         // Snapshot the scope objects so we don't borrow `frame` across the
         // `&mut self` calls below.
         let scopes: Vec<JsObject> = frame.with_scope.iter().rev().cloned().collect();
@@ -1631,7 +1635,10 @@ impl Vm {
                     Ok(Value::bigint((*x).clone() + (*y).clone()))
                 }
                 (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x + y)),
-                _ => Err(self.throw_type("Cannot mix BigInt and other types, use explicit conversions")),
+                _ => {
+                    Err(self
+                        .throw_type("Cannot mix BigInt and other types, use explicit conversions"))
+                }
             }
         }
     }
@@ -1668,7 +1675,9 @@ impl Vm {
         match (&xa, &xb) {
             (Value::BigInt(x), Value::BigInt(y)) => self.bigint_arith(x, y, kind),
             (Value::Number(x), Value::Number(y)) => Ok(number_arith(*x, *y, kind)),
-            _ => Err(self.throw_type("Cannot mix BigInt and other types, use explicit conversions")),
+            _ => {
+                Err(self.throw_type("Cannot mix BigInt and other types, use explicit conversions"))
+            }
         }
     }
 

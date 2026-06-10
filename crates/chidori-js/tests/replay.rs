@@ -16,19 +16,20 @@ fn record_then_replay_is_identical() {
     // ---- Record: produce results live, building the journal. ----
     let mut rt = ReplayRuntime::record(BUNDLE, &["fetchValue", "report"]);
     let mut reported = Vec::new();
-    let mut handler = |name: &str, args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
-        match name {
-            "fetchValue" => {
-                let key = args[0].as_str().unwrap();
-                Some(Ok(json!(if key == "a" { 10 } else { 32 })))
+    let mut handler =
+        |name: &str, args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
+            match name {
+                "fetchValue" => {
+                    let key = args[0].as_str().unwrap();
+                    Some(Ok(json!(if key == "a" { 10 } else { 32 })))
+                }
+                "report" => {
+                    reported.push(args[0].clone());
+                    Some(Ok(json!(null)))
+                }
+                _ => Some(Ok(json!(null))),
             }
-            "report" => {
-                reported.push(args[0].clone());
-                Some(Ok(json!(null)))
-            }
-            _ => Some(Ok(json!(null))),
-        }
-    };
+        };
     let outcome = rt.drive(&mut handler).unwrap();
     assert!(matches!(outcome, DriveOutcome::Completed));
     assert_eq!(reported, vec![json!(42)]);
@@ -38,11 +39,14 @@ fn record_then_replay_is_identical() {
     // if called, proving the effects are served from the journal, not re-run. ----
     let mut rt2 = ReplayRuntime::restore(BUNDLE, &journal, &["fetchValue", "report"]).unwrap();
     let mut replayed = Vec::new();
-    let mut replay_handler = |name: &str, args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
-        // `report` is also journaled, so it should not be invoked live either.
-        if name == "report" { replayed.push(args[0].clone()); }
-        Some(Ok(json!(null)))
-    };
+    let mut replay_handler =
+        |name: &str, args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
+            // `report` is also journaled, so it should not be invoked live either.
+            if name == "report" {
+                replayed.push(args[0].clone());
+            }
+            Some(Ok(json!(null)))
+        };
     let outcome2 = rt2.drive(&mut replay_handler).unwrap();
     assert!(matches!(outcome2, DriveOutcome::Completed));
     // The replayed run reproduces the same effect sequence from the journal.
@@ -54,16 +58,17 @@ fn suspend_persist_restore_resume() {
     // Record but suspend at the second fetch (handler returns None there).
     let mut rt = ReplayRuntime::record(BUNDLE, &["fetchValue", "report"]);
     let mut calls = 0;
-    let mut handler = |name: &str, args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
-        if name == "fetchValue" {
-            calls += 1;
-            if calls == 1 {
-                return Some(Ok(json!(10))); // resolve first fetch
+    let mut handler =
+        |name: &str, args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
+            if name == "fetchValue" {
+                calls += 1;
+                if calls == 1 {
+                    return Some(Ok(json!(10))); // resolve first fetch
+                }
+                return None; // suspend at the second fetch (the frontier)
             }
-            return None; // suspend at the second fetch (the frontier)
-        }
-        Some(Ok(json!(null)))
-    };
+            Some(Ok(json!(null)))
+        };
     let outcome = rt.drive(&mut handler).unwrap();
     let op_id = match outcome {
         DriveOutcome::Suspended { op_id, name, .. } => {
@@ -77,13 +82,17 @@ fn suspend_persist_restore_resume() {
     // A fresh process restores and resumes by providing the awaited result.
     let mut rt2 = ReplayRuntime::restore(BUNDLE, &journal, &["fetchValue", "report"]).unwrap();
     let mut reported = Vec::new();
-    let mut resume_handler = |name: &str, args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
-        match name {
-            "fetchValue" => Some(Ok(json!(32))), // the frontier fetch resolves now
-            "report" => { reported.push(args[0].clone()); Some(Ok(json!(null))) }
-            _ => Some(Ok(json!(null))),
-        }
-    };
+    let mut resume_handler =
+        |name: &str, args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
+            match name {
+                "fetchValue" => Some(Ok(json!(32))), // the frontier fetch resolves now
+                "report" => {
+                    reported.push(args[0].clone());
+                    Some(Ok(json!(null)))
+                }
+                _ => Some(Ok(json!(null))),
+            }
+        };
     // Re-run from the top: first fetch replays from journal (10), second is the
     // frontier and is provided live (32).
     let _ = op_id;
@@ -106,15 +115,21 @@ fn modify_and_resume_forward_edit() {
     // Record up to the second fetch, then suspend.
     let mut rt = ReplayRuntime::record(original, &["fetchValue", "report"]);
     let mut calls = 0;
-    let mut h = |name: &str, _args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
-        if name == "fetchValue" {
-            calls += 1;
-            if calls == 1 { return Some(Ok(json!(10))); }
-            return None;
-        }
-        Some(Ok(json!(null)))
-    };
-    assert!(matches!(rt.drive(&mut h).unwrap(), DriveOutcome::Suspended { .. }));
+    let mut h =
+        |name: &str, _args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
+            if name == "fetchValue" {
+                calls += 1;
+                if calls == 1 {
+                    return Some(Ok(json!(10)));
+                }
+                return None;
+            }
+            Some(Ok(json!(null)))
+        };
+    assert!(matches!(
+        rt.drive(&mut h).unwrap(),
+        DriveOutcome::Suspended { .. }
+    ));
     let journal = rt.journal_bytes();
 
     // Edit code AFTER the frontier: change how the result is combined/reported.
@@ -129,14 +144,21 @@ fn modify_and_resume_forward_edit() {
     "#;
     let mut rt2 = ReplayRuntime::restore(edited, &journal, &["fetchValue", "report"]).unwrap();
     let mut reported = Vec::new();
-    let mut h2 = |name: &str, args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
-        match name {
-            "fetchValue" => Some(Ok(json!(32))),
-            "report" => { reported.push(args[0].clone()); Some(Ok(json!(null))) }
-            _ => Some(Ok(json!(null))),
-        }
-    };
-    assert!(matches!(rt2.drive(&mut h2).unwrap(), DriveOutcome::Completed));
+    let mut h2 =
+        |name: &str, args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
+            match name {
+                "fetchValue" => Some(Ok(json!(32))),
+                "report" => {
+                    reported.push(args[0].clone());
+                    Some(Ok(json!(null)))
+                }
+                _ => Some(Ok(json!(null))),
+            }
+        };
+    assert!(matches!(
+        rt2.drive(&mut h2).unwrap(),
+        DriveOutcome::Completed
+    ));
     // New logic: 10 * 32 + 1 = 321 (proves edited post-frontier code ran while
     // the pre-frontier effect (a=10) was replayed from the journal).
     assert_eq!(reported, vec![json!(321)]);
@@ -155,14 +177,18 @@ fn pre_frontier_edit_diverges() {
         main();
     "#;
     let mut rt = ReplayRuntime::record(original, &["stepOne", "stepTwo", "report"]);
-    let mut h = |name: &str, _args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
-        match name {
-            "stepOne" => Some(Ok(json!(1))),
-            "stepTwo" => None, // suspend at the frontier (stepTwo)
-            _ => Some(Ok(json!(null))),
-        }
-    };
-    assert!(matches!(rt.drive(&mut h).unwrap(), DriveOutcome::Suspended { .. }));
+    let mut h =
+        |name: &str, _args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
+            match name {
+                "stepOne" => Some(Ok(json!(1))),
+                "stepTwo" => None, // suspend at the frontier (stepTwo)
+                _ => Some(Ok(json!(null))),
+            }
+        };
+    assert!(matches!(
+        rt.drive(&mut h).unwrap(),
+        DriveOutcome::Suspended { .. }
+    ));
     let journal = rt.journal_bytes();
 
     // Edit BEFORE the frontier: replace stepOne with a different effect call.
@@ -176,8 +202,15 @@ fn pre_frontier_edit_diverges() {
         }
         main();
     "#;
-    let mut rt2 = ReplayRuntime::restore(edited, &journal, &["stepOne", "stepTwo", "differentStep", "report"]).unwrap();
-    let mut h2 = |_n: &str, _a: &serde_json::Value| -> Option<Result<serde_json::Value, String>> { Some(Ok(json!(0))) };
+    let mut rt2 = ReplayRuntime::restore(
+        edited,
+        &journal,
+        &["stepOne", "stepTwo", "differentStep", "report"],
+    )
+    .unwrap();
+    let mut h2 = |_n: &str, _a: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
+        Some(Ok(json!(0)))
+    };
     let result = rt2.drive(&mut h2);
     assert!(result.is_err(), "expected divergence error, got {result:?}");
     assert!(rt2.divergence().is_some());
@@ -199,13 +232,17 @@ fn durable_step_memoizes() {
     let mut rt = ReplayRuntime::record(bundle, &["fetchValue", "report"]);
     let mut reported = Vec::new();
     {
-        let mut h = |name: &str, args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
-            match name {
-                "fetchValue" => Some(Ok(json!(100))),
-                "report" => { reported.push(args[0].clone()); Some(Ok(json!(null))) }
-                _ => Some(Ok(json!(null))),
-            }
-        };
+        let mut h =
+            |name: &str, args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
+                match name {
+                    "fetchValue" => Some(Ok(json!(100))),
+                    "report" => {
+                        reported.push(args[0].clone());
+                        Some(Ok(json!(null)))
+                    }
+                    _ => Some(Ok(json!(null))),
+                }
+            };
         assert!(matches!(rt.drive(&mut h).unwrap(), DriveOutcome::Completed));
     }
     assert_eq!(reported, vec![json!(106)]); // 2*3 + 100
@@ -217,11 +254,18 @@ fn durable_step_memoizes() {
     // from the journal, so the handler is never invoked.
     let mut rt2 = ReplayRuntime::restore(bundle, &journal, &["fetchValue", "report"]).unwrap();
     {
-        let mut h = |_n: &str, _a: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
-            panic!("no effect should be invoked live during full replay");
-        };
-        assert!(matches!(rt2.drive(&mut h).unwrap(), DriveOutcome::Completed));
+        let mut h =
+            |_n: &str, _a: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
+                panic!("no effect should be invoked live during full replay");
+            };
+        assert!(matches!(
+            rt2.drive(&mut h).unwrap(),
+            DriveOutcome::Completed
+        ));
     }
     assert_eq!(rt2.divergence(), None);
-    assert!(rt2.console().is_empty(), "durableStep should not re-run on replay");
+    assert!(
+        rt2.console().is_empty(),
+        "durableStep should not re-run on replay"
+    );
 }

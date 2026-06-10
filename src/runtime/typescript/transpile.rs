@@ -10,7 +10,7 @@ use oxc::transformer::{TransformOptions, Transformer};
 
 use crate::runtime::snapshot::TypeScriptImportPolicy;
 use crate::runtime::typescript::resolver::{
-    DEFAULT_CONDITIONS, Resolution, ResolutionKind, Resolver,
+    Resolution, ResolutionKind, Resolver, DEFAULT_CONDITIONS,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -44,9 +44,9 @@ impl From<&ResolutionKind> for ResolutionKindTag {
                 name: name.clone(),
                 subpath: subpath.clone(),
             },
-            ResolutionKind::NodeBuiltin { name } => ResolutionKindTag::NodeBuiltin {
-                name: name.clone(),
-            },
+            ResolutionKind::NodeBuiltin { name } => {
+                ResolutionKindTag::NodeBuiltin { name: name.clone() }
+            }
         }
     }
 }
@@ -92,8 +92,11 @@ pub fn transpile_module(path: &Path, source: &str, options: &TranspileOptions) -
 
     let parser_ret = Parser::new(&allocator, source, source_type).parse();
     if !parser_ret.errors.is_empty() {
-        let messages: Vec<String> =
-            parser_ret.errors.iter().map(|err| err.to_string()).collect();
+        let messages: Vec<String> = parser_ret
+            .errors
+            .iter()
+            .map(|err| err.to_string())
+            .collect();
         anyhow::bail!(
             "{}: TypeScript parse error: {}",
             path.display(),
@@ -107,8 +110,11 @@ pub fn transpile_module(path: &Path, source: &str, options: &TranspileOptions) -
         .with_excess_capacity(2.0)
         .build(&program);
     if !semantic_ret.errors.is_empty() {
-        let messages: Vec<String> =
-            semantic_ret.errors.iter().map(|err| err.to_string()).collect();
+        let messages: Vec<String> = semantic_ret
+            .errors
+            .iter()
+            .map(|err| err.to_string())
+            .collect();
         anyhow::bail!(
             "{}: TypeScript semantic error: {}",
             path.display(),
@@ -493,7 +499,6 @@ fn normalize_path(path: &Path) -> PathBuf {
     out
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,9 +656,18 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!js.contains(": t is string"), "type predicate not stripped:\n{js}");
-        assert!(!js.contains(": number =>"), "primitive arrow return not stripped:\n{js}");
-        assert!(!js.contains(": { v: number }"), "object arrow return not stripped:\n{js}");
+        assert!(
+            !js.contains(": t is string"),
+            "type predicate not stripped:\n{js}"
+        );
+        assert!(
+            !js.contains(": number =>"),
+            "primitive arrow return not stripped:\n{js}"
+        );
+        assert!(
+            !js.contains(": { v: number }"),
+            "object arrow return not stripped:\n{js}"
+        );
         assert!(js.contains(".filter((t) => t !== null)"));
         assert!(js.contains("const double = (n) => n * 2;"));
         assert!(js.contains("const obj = (k) => ({ v: 1 });"));
@@ -684,7 +698,10 @@ mod tests {
         .unwrap();
 
         assert!(!js.contains("//"), "line comments must be stripped:\n{js}");
-        assert!(js.contains("const after = 2"), "code after a comment survived:\n{js}");
+        assert!(
+            js.contains("const after = 2"),
+            "code after a comment survived:\n{js}"
+        );
         assert!(js.contains("return {"), "return survived:\n{js}");
         // Braces stay balanced after collapse.
         assert_eq!(

@@ -307,8 +307,14 @@ pub struct Property {
 
 #[derive(Clone)]
 pub enum PropertyKind {
-    Data { value: Value, writable: bool },
-    Accessor { get: Option<Value>, set: Option<Value> },
+    Data {
+        value: Value,
+        writable: bool,
+    },
+    Accessor {
+        get: Option<Value>,
+        set: Option<Value>,
+    },
 }
 
 impl Property {
@@ -603,9 +609,7 @@ impl std::hash::Hash for MapKey {
 /// `Array.prototype.includes`, etc.
 pub fn same_value_zero(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => {
-            (x.is_nan() && y.is_nan()) || x == y
-        }
+        (Value::Number(x), Value::Number(y)) => (x.is_nan() && y.is_nan()) || x == y,
         _ => strict_equals_nonnumeric(a, b),
     }
 }

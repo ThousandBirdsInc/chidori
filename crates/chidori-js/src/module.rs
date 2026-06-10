@@ -205,11 +205,7 @@ impl Vm {
 
     /// Phase 2: bind each import's local cell to the exporter's live export cell
     /// (or a namespace object). A missing/ambiguous export is a SyntaxError.
-    fn wire_module_imports(
-        &mut self,
-        registry: &ModuleRegistry,
-        key: &str,
-    ) -> Result<(), Value> {
+    fn wire_module_imports(&mut self, registry: &ModuleRegistry, key: &str) -> Result<(), Value> {
         let rec = self.get_module(registry, key)?;
         let (imports, resolved, cell_of_name) = {
             let b = rec.borrow();
@@ -271,7 +267,11 @@ impl Vm {
         // stable top-level cells mutate in place, so the wired bindings stay live.
         let (proto, cells, has_tla) = {
             let b = rec.borrow();
-            (b.compiled.proto.clone(), b.cells.clone(), b.compiled.has_tla)
+            (
+                b.compiled.proto.clone(),
+                b.cells.clone(),
+                b.compiled.has_tla,
+            )
         };
         let bf = BytecodeFunction {
             proto: proto.clone(),
@@ -418,9 +418,10 @@ impl Vm {
             }
         }
         let tag = self.realm.symbol_to_string_tag.clone();
-        obj.borrow_mut()
-            .props
-            .insert(PropertyKey::Sym(tag), Property::builtin(Value::str("Module")));
+        obj.borrow_mut().props.insert(
+            PropertyKey::Sym(tag),
+            Property::builtin(Value::str("Module")),
+        );
         let ns = Value::Object(obj);
         module.borrow_mut().namespace = Some(ns.clone());
         Ok(ns)

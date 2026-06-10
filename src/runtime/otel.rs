@@ -259,9 +259,10 @@ impl RunSpan {
                 .unwrap_or(&self.parent_cx);
             self.build_call_span(record, parent_cx)
         };
-        state
-            .ctx_by_seq
-            .insert(record.seq, Context::new().with_remote_span_context(span_ctx));
+        state.ctx_by_seq.insert(
+            record.seq,
+            Context::new().with_remote_span_context(span_ctx),
+        );
         state.emitted.insert(record.seq);
     }
 
@@ -422,11 +423,7 @@ impl chidori_js::TraceObserver for JsTraceObserver {
         } else {
             info.name
         };
-        let parent_cx = self
-            .active
-            .last()
-            .map(|(_, c)| c)
-            .unwrap_or(&self.run_cx);
+        let parent_cx = self.active.last().map(|(_, c)| c).unwrap_or(&self.run_cx);
         let mut attrs = vec![
             KeyValue::new("agent.name", self.agent_name.clone()),
             KeyValue::new("js.function", name.to_string()),

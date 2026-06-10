@@ -9,7 +9,6 @@ export type {
   AgentJson,
   Chidori,
   DatePolicy,
-  ExecOptions,
   HttpRequestOptions,
   HttpResponse,
   InputOptions,

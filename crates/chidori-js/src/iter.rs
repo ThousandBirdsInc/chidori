@@ -72,13 +72,23 @@ impl Vm {
                     // 0..length), so the produced list is fully dense.
                     return Ok(arr
                         .iter()
-                        .map(|v| if matches!(v, Value::Hole) { Value::Undefined } else { v.clone() })
+                        .map(|v| {
+                            if matches!(v, Value::Hole) {
+                                Value::Undefined
+                            } else {
+                                v.clone()
+                            }
+                        })
                         .collect());
                 }
             }
         }
         if let Value::String(s) = v {
-            return Ok(s.as_str().chars().map(|c| Value::str(c.to_string())).collect());
+            return Ok(s
+                .as_str()
+                .chars()
+                .map(|c| Value::str(c.to_string()))
+                .collect());
         }
         let it = self.get_iterator(v)?;
         let mut out = Vec::new();
@@ -185,7 +195,11 @@ impl Vm {
                                     // Live read: length and element are re-read each
                                     // step so mutations during iteration are seen.
                                     let len = self.ta_length(t).unwrap_or(0);
-                                    let val = if idx < len { self.ta_get(t, idx) } else { Value::Undefined };
+                                    let val = if idx < len {
+                                        self.ta_get(t, idx)
+                                    } else {
+                                        Value::Undefined
+                                    };
                                     (len, Some(val))
                                 } else {
                                     let tb = t.borrow();
@@ -207,7 +221,11 @@ impl Vm {
                                     None
                                 } else {
                                     st.index += 1;
-                                    Some(self.iter_entry(kind, idx, val.unwrap_or(Value::Undefined)))
+                                    Some(self.iter_entry(
+                                        kind,
+                                        idx,
+                                        val.unwrap_or(Value::Undefined),
+                                    ))
                                 }
                             }
                             None => None,
@@ -222,9 +240,9 @@ impl Vm {
                         let entry = target.as_ref().and_then(|t| {
                             let tb = t.borrow();
                             match &tb.internal {
-                                Internal::Map(m) => m
-                                    .get_index(idx)
-                                    .map(|(k, v)| (k.0.clone(), v.clone())),
+                                Internal::Map(m) => {
+                                    m.get_index(idx).map(|(k, v)| (k.0.clone(), v.clone()))
+                                }
                                 Internal::Set(s) => {
                                     s.get_index(idx).map(|(k, _)| (k.0.clone(), k.0.clone()))
                                 }

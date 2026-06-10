@@ -144,7 +144,9 @@ fn install_weakmap(vm: &mut Vm) {
         let o = weakmap_this(vm, &this)?;
         let b = o.borrow();
         if let Internal::WeakMap(m) = &b.internal {
-            Ok(m.get(&MapKey(arg(args, 0))).cloned().unwrap_or(Value::Undefined))
+            Ok(m.get(&MapKey(arg(args, 0)))
+                .cloned()
+                .unwrap_or(Value::Undefined))
         } else {
             Ok(Value::Undefined)
         }
@@ -270,7 +272,11 @@ fn install_map(vm: &mut Vm) {
         let values = vm.iterate_to_vec(&items)?;
         let mut groups: IndexMap<MapKey, Vec<Value>> = IndexMap::new();
         for (i, v) in values.into_iter().enumerate() {
-            let mut key = vm.call(cb.clone(), Value::Undefined, &[v.clone(), Value::Number(i as f64)])?;
+            let mut key = vm.call(
+                cb.clone(),
+                Value::Undefined,
+                &[v.clone(), Value::Number(i as f64)],
+            )?;
             if matches!(&key, Value::Number(n) if *n == 0.0) {
                 key = Value::Number(0.0); // canonicalize -0 to +0
             }
@@ -299,7 +305,9 @@ fn install_map(vm: &mut Vm) {
         let o = map_this(vm, &this)?;
         let b = o.borrow();
         if let Internal::Map(m) = &b.internal {
-            Ok(m.get(&MapKey(arg(args, 0))).cloned().unwrap_or(Value::Undefined))
+            Ok(m.get(&MapKey(arg(args, 0)))
+                .cloned()
+                .unwrap_or(Value::Undefined))
         } else {
             Ok(Value::Undefined)
         }
@@ -351,17 +359,34 @@ fn install_map(vm: &mut Vm) {
     define_size_getter(vm, &proto, true);
     vm.define_method(&proto, "keys", 0, |vm, this, _a| {
         let o = map_this(vm, &this)?;
-        Ok(vm.make_iterator(&vm.realm.map_iterator_proto.clone(), Some(o), None, IterKind::MapKeys))
+        Ok(vm.make_iterator(
+            &vm.realm.map_iterator_proto.clone(),
+            Some(o),
+            None,
+            IterKind::MapKeys,
+        ))
     });
     vm.define_method(&proto, "values", 0, |vm, this, _a| {
         let o = map_this(vm, &this)?;
-        Ok(vm.make_iterator(&vm.realm.map_iterator_proto.clone(), Some(o), None, IterKind::MapValues))
+        Ok(vm.make_iterator(
+            &vm.realm.map_iterator_proto.clone(),
+            Some(o),
+            None,
+            IterKind::MapValues,
+        ))
     });
     vm.define_method(&proto, "entries", 0, |vm, this, _a| {
         let o = map_this(vm, &this)?;
-        Ok(vm.make_iterator(&vm.realm.map_iterator_proto.clone(), Some(o), None, IterKind::MapEntries))
+        Ok(vm.make_iterator(
+            &vm.realm.map_iterator_proto.clone(),
+            Some(o),
+            None,
+            IterKind::MapEntries,
+        ))
     });
-    let entries = vm.get_prop(&Value::Object(proto.clone()), &PropertyKey::str("entries")).unwrap();
+    let entries = vm
+        .get_prop(&Value::Object(proto.clone()), &PropertyKey::str("entries"))
+        .unwrap();
     let sym = vm.realm.symbol_iterator.clone();
     vm.define_value_sym(&proto, sym, entries);
 
@@ -448,11 +473,21 @@ fn install_set(vm: &mut Vm) {
     define_size_getter(vm, &proto, false);
     vm.define_method(&proto, "values", 0, |vm, this, _a| {
         let o = set_this(vm, &this)?;
-        Ok(vm.make_iterator(&vm.realm.set_iterator_proto.clone(), Some(o), None, IterKind::SetValues))
+        Ok(vm.make_iterator(
+            &vm.realm.set_iterator_proto.clone(),
+            Some(o),
+            None,
+            IterKind::SetValues,
+        ))
     });
     vm.define_method(&proto, "entries", 0, |vm, this, _a| {
         let o = set_this(vm, &this)?;
-        Ok(vm.make_iterator(&vm.realm.set_iterator_proto.clone(), Some(o), None, IterKind::SetEntries))
+        Ok(vm.make_iterator(
+            &vm.realm.set_iterator_proto.clone(),
+            Some(o),
+            None,
+            IterKind::SetEntries,
+        ))
     });
 
     // ES2024 set-operation methods. Each takes a "set-like" argument.
@@ -590,7 +625,9 @@ fn install_set(vm: &mut Vm) {
         Ok(Value::Bool(true))
     });
 
-    let values = vm.get_prop(&Value::Object(proto.clone()), &PropertyKey::str("values")).unwrap();
+    let values = vm
+        .get_prop(&Value::Object(proto.clone()), &PropertyKey::str("values"))
+        .unwrap();
     vm.define_value(&proto, "keys", values.clone());
     let sym = vm.realm.symbol_iterator.clone();
     vm.define_value_sym(&proto, sym, values);

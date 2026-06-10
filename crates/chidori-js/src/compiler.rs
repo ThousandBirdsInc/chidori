@@ -107,15 +107,13 @@ pub fn compile_module(src: &str) -> Result<crate::module::CompiledModule, String
     let mut c = Compiler::new();
     c.source = src.to_string();
     c.is_module = true;
-    let (proto, cell_of_name) = c
-        .compile_module_toplevel(&program)
-        .map_err(|e| {
-            if e.starts_with("SyntaxError") {
-                e
-            } else {
-                format!("SyntaxError: {e}")
-            }
-        })?;
+    let (proto, cell_of_name) = c.compile_module_toplevel(&program).map_err(|e| {
+        if e.starts_with("SyntaxError") {
+            e
+        } else {
+            format!("SyntaxError: {e}")
+        }
+    })?;
     let num_cells = proto.num_cells;
     // Top-level await iff the module body's own code awaits (nested async
     // functions are separate protos, so this does not over-detect).
@@ -790,7 +788,10 @@ impl Compiler {
         match &d.declaration {
             ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
                 // An anonymous `export default function(){}` gets the name "default".
-                self.compile_function(f, Some(f.id.as_ref().map_or("default", |i| i.name.as_str())))?;
+                self.compile_function(
+                    f,
+                    Some(f.id.as_ref().map_or("default", |i| i.name.as_str())),
+                )?;
                 // A named `export default function f(){}` also binds `f` locally.
                 if let Some(id) = &f.id {
                     let c = self.declare(id.name.as_str(), false);
@@ -800,7 +801,10 @@ impl Compiler {
                 self.emit(Op::InitCell(star));
             }
             ExportDefaultDeclarationKind::ClassDeclaration(c) => {
-                self.compile_class(c, Some(c.id.as_ref().map_or("default", |i| i.name.as_str())))?;
+                self.compile_class(
+                    c,
+                    Some(c.id.as_ref().map_or("default", |i| i.name.as_str())),
+                )?;
                 if let Some(id) = &c.id {
                     let cell = self.declare(id.name.as_str(), false);
                     self.emit(Op::Dup);
@@ -955,8 +959,7 @@ impl Compiler {
                         for decl in &d.declarations {
                             if let BindingPattern::BindingIdentifier(id) = &decl.id {
                                 if self.current_scope_cell(id.name.as_str()).is_none() {
-                                    let cell =
-                                        self.declare_kind(id.name.as_str(), false, is_const);
+                                    let cell = self.declare_kind(id.name.as_str(), false, is_const);
                                     self.emit(Op::InitCellTdz(cell));
                                 }
                             }
@@ -1414,9 +1417,9 @@ impl Compiler {
                 self.emit(Op::StrictEq);
                 let jf = self.emit(Op::JumpIfFalse(0));
                 self.emit(Op::Pop); // drop undefined value
-                // Named evaluation: when the target is a plain identifier, an
-                // anonymous function/class/arrow default takes that name (spec
-                // BindingElement : SingleNameBinding Initializer).
+                                    // Named evaluation: when the target is a plain identifier, an
+                                    // anonymous function/class/arrow default takes that name (spec
+                                    // BindingElement : SingleNameBinding Initializer).
                 if let BindingPattern::BindingIdentifier(id) = &a.left {
                     self.compile_named_expr(&a.right, id.name.as_str())?;
                 } else {
@@ -1692,7 +1695,7 @@ impl Compiler {
         let top = self.here();
         self.emit(Op::ForInNext); // pushes (key, has_next)
         let jf = self.emit(Op::JumpIfFalse(0)); // consumes has_next; key remains
-        // not-done: bind key, run body
+                                                // not-done: bind key, run body
         self.enter_scope(false);
         self.bind_for_target(&f.left)?; // consumes key
         self.compile_stmt(&f.body)?;
@@ -1771,7 +1774,7 @@ impl Compiler {
         let top = self.here();
         self.emit(Op::LoadCell(iter_cell));
         self.emit(Op::IteratorNext); // [iter, result] -> result is pushed; iter stays
-        // IteratorNext leaves [iter, result]; drop the iter copy underneath.
+                                     // IteratorNext leaves [iter, result]; drop the iter copy underneath.
         self.emit(Op::Swap);
         self.emit(Op::Pop); // [result]
         if f.r#await {
@@ -2167,8 +2170,14 @@ impl Compiler {
     fn register_break(&mut self, at: usize, label: Option<String>) -> R {
         let loops = &mut self.cur().loops;
         let target = match &label {
-            Some(l) => loops.iter_mut().rev().find(|c| c.label.as_deref() == Some(l)),
-            None => loops.iter_mut().rev().find(|c| c.is_loop || c.label.is_none()),
+            Some(l) => loops
+                .iter_mut()
+                .rev()
+                .find(|c| c.label.as_deref() == Some(l)),
+            None => loops
+                .iter_mut()
+                .rev()
+                .find(|c| c.is_loop || c.label.is_none()),
         };
         match target {
             Some(c) => {
@@ -2393,9 +2402,7 @@ impl Compiler {
                 self.compile_function(f, Some(name))
             }
             Expression::ArrowFunctionExpression(a) => self.compile_arrow(a, Some(name)),
-            Expression::ClassExpression(c) if c.id.is_none() => {
-                self.compile_class(c, Some(name))
-            }
+            Expression::ClassExpression(c) if c.id.is_none() => self.compile_class(c, Some(name)),
             _ => self.compile_expr(expr),
         }
     }
@@ -2554,13 +2561,13 @@ impl Compiler {
         // Build the strings array.
         self.compile_expr(&t.tag)?; // [tag]
         self.emit(Op::LoadUndefined); // this
-        // strings array
+                                      // strings array
         for q in &t.quasi.quasis {
             let cooked = q.value.cooked.as_ref().map(|s| s.as_str()).unwrap_or("");
             self.load_str(cooked);
         }
         self.emit(Op::NewArray(t.quasi.quasis.len() as u32)); // [tag, this, strings]
-        // raw property = same strings (approx)
+                                                              // raw property = same strings (approx)
         self.emit(Op::Dup);
         self.emit(Op::Dup);
         let raw = self.str_const("raw");
@@ -3165,8 +3172,20 @@ impl Compiler {
         is_private: bool,
     ) -> R {
         use oxc::syntax::operator::AssignmentOperator as A;
-        let get = |c: &mut Self| c.emit(if is_private { Op::PrivateGet(k) } else { Op::GetProp(k) });
-        let set = |c: &mut Self| c.emit(if is_private { Op::PrivateSet(k) } else { Op::SetProp(k) });
+        let get = |c: &mut Self| {
+            c.emit(if is_private {
+                Op::PrivateGet(k)
+            } else {
+                Op::GetProp(k)
+            })
+        };
+        let set = |c: &mut Self| {
+            c.emit(if is_private {
+                Op::PrivateSet(k)
+            } else {
+                Op::SetProp(k)
+            })
+        };
         match a.operator {
             A::Assign => {
                 self.compile_expr(obj)?;
@@ -3511,7 +3530,11 @@ impl Compiler {
         // directive in this body, plus class bodies (always strict).
         let parent_strict = self.fns.last().map(|f| f.strict).unwrap_or(false);
         let own_strict = body
-            .map(|b| b.directives.iter().any(|d| d.directive.as_str() == "use strict"))
+            .map(|b| {
+                b.directives
+                    .iter()
+                    .any(|d| d.directive.as_str() == "use strict")
+            })
             .unwrap_or(false);
         let class_strict = matches!(kind, FuncKind::ClassCtor);
         fc.strict = parent_strict || own_strict || class_strict;
@@ -3976,7 +3999,9 @@ fn collect_module_var_names(stmt: &Statement, out: &mut Vec<String>) {
                 var_decl(d, out);
             }
         }
-        Statement::BlockStatement(b) => b.body.iter().for_each(|s| collect_module_var_names(s, out)),
+        Statement::BlockStatement(b) => {
+            b.body.iter().for_each(|s| collect_module_var_names(s, out))
+        }
         Statement::IfStatement(i) => {
             collect_module_var_names(&i.consequent, out);
             if let Some(a) = &i.alternate {

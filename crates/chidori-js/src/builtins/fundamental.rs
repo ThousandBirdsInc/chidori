@@ -138,7 +138,9 @@ fn array_exotic_current(b: &ObjectData, key: &PropertyKey) -> Option<Property> {
                     writable: b
                         .props
                         .get(key)
-                        .map(|p| matches!(&p.kind, PropertyKind::Data { writable, .. } if *writable))
+                        .map(
+                            |p| matches!(&p.kind, PropertyKind::Data { writable, .. } if *writable),
+                        )
                         .unwrap_or(true),
                 },
                 enumerable: false,
@@ -267,7 +269,8 @@ pub(crate) fn define_own_property(
     } else if !cur_is_accessor {
         // Both data descriptors.
         if !cur_configurable {
-            let cur_writable = matches!(&current.kind, PropertyKind::Data { writable, .. } if *writable);
+            let cur_writable =
+                matches!(&current.kind, PropertyKind::Data { writable, .. } if *writable);
             if !cur_writable {
                 if d.writable == Some(true) {
                     return fail(vm);
@@ -416,11 +419,27 @@ pub(crate) fn create_data_property_or_throw(
 ) -> Result<(), Value> {
     let ok = if vm.is_proxy(obj) {
         let desc = vm.new_object();
-        vm.set_prop(&Value::Object(desc.clone()), &PropertyKey::str("value"), value)?;
+        vm.set_prop(
+            &Value::Object(desc.clone()),
+            &PropertyKey::str("value"),
+            value,
+        )?;
         let t = Value::Bool(true);
-        vm.set_prop(&Value::Object(desc.clone()), &PropertyKey::str("writable"), t.clone())?;
-        vm.set_prop(&Value::Object(desc.clone()), &PropertyKey::str("enumerable"), t.clone())?;
-        vm.set_prop(&Value::Object(desc.clone()), &PropertyKey::str("configurable"), t)?;
+        vm.set_prop(
+            &Value::Object(desc.clone()),
+            &PropertyKey::str("writable"),
+            t.clone(),
+        )?;
+        vm.set_prop(
+            &Value::Object(desc.clone()),
+            &PropertyKey::str("enumerable"),
+            t.clone(),
+        )?;
+        vm.set_prop(
+            &Value::Object(desc.clone()),
+            &PropertyKey::str("configurable"),
+            t,
+        )?;
         vm.proxy_define_property(obj, key, Value::Object(desc))?
     } else {
         let d = PropDesc {
@@ -845,7 +864,11 @@ fn install_object(vm: &mut Vm) {
         let values = vm.iterate_to_vec(&items)?;
         let mut groups: indexmap::IndexMap<PropertyKey, Vec<Value>> = indexmap::IndexMap::new();
         for (i, v) in values.into_iter().enumerate() {
-            let key_v = vm.call(cb.clone(), Value::Undefined, &[v.clone(), Value::Number(i as f64)])?;
+            let key_v = vm.call(
+                cb.clone(),
+                Value::Undefined,
+                &[v.clone(), Value::Number(i as f64)],
+            )?;
             let key = vm.to_property_key(&key_v)?;
             groups.entry(key).or_default().push(v);
         }
@@ -925,7 +948,9 @@ fn install_object(vm: &mut Vm) {
                     let len_ok = b
                         .props
                         .get(&PropertyKey::str("length"))
-                        .map(|p| matches!(&p.kind, PropertyKind::Data { writable, .. } if !writable))
+                        .map(
+                            |p| matches!(&p.kind, PropertyKind::Data { writable, .. } if !writable),
+                        )
                         .unwrap_or(false);
                     if !len_ok {
                         return Ok(Value::Bool(false));
@@ -1101,7 +1126,10 @@ fn install_object(vm: &mut Vm) {
 }
 
 fn install_object_extra(vm: &mut Vm) {
-    let ctor = match vm.get_prop(&Value::Object(vm.realm.global.clone()), &PropertyKey::str("Object")) {
+    let ctor = match vm.get_prop(
+        &Value::Object(vm.realm.global.clone()),
+        &PropertyKey::str("Object"),
+    ) {
         Ok(Value::Object(o)) => o,
         _ => return,
     };
@@ -1691,7 +1719,10 @@ fn array_like_to_vec(vm: &mut Vm, v: &Value) -> Result<Vec<Value>, Value> {
     let len = vm.to_length(&len_v)?;
     let mut out = Vec::with_capacity(len);
     for i in 0..len {
-        out.push(vm.get_prop(&Value::Object(o.clone()), &PropertyKey::from_index(i as u32))?);
+        out.push(vm.get_prop(
+            &Value::Object(o.clone()),
+            &PropertyKey::from_index(i as u32),
+        )?);
     }
     Ok(out)
 }
@@ -1726,7 +1757,10 @@ fn install_symbol(vm: &mut Vm) {
         ("matchAll", vm.realm.symbol_match_all.clone()),
         ("species", vm.realm.symbol_species.clone()),
         ("unscopables", vm.realm.symbol_unscopables.clone()),
-        ("isConcatSpreadable", vm.realm.symbol_is_concat_spreadable.clone()),
+        (
+            "isConcatSpreadable",
+            vm.realm.symbol_is_concat_spreadable.clone(),
+        ),
         ("dispose", vm.realm.symbol_dispose.clone()),
         ("asyncDispose", vm.realm.symbol_async_dispose.clone()),
     ];
@@ -1754,41 +1788,45 @@ fn install_symbol(vm: &mut Vm) {
         vm.realm.symbol_registry.insert(key, s.clone());
         Ok(Value::Symbol(s))
     });
-    vm.define_method(&ctor, "keyFor", 1, |vm, _t, args| {
-        match arg(args, 0) {
-            Value::Symbol(s) => {
-                for (k, v) in &vm.realm.symbol_registry {
-                    if v == &s {
-                        return Ok(Value::str(k.clone()));
-                    }
+    vm.define_method(&ctor, "keyFor", 1, |vm, _t, args| match arg(args, 0) {
+        Value::Symbol(s) => {
+            for (k, v) in &vm.realm.symbol_registry {
+                if v == &s {
+                    return Ok(Value::str(k.clone()));
                 }
-                Ok(Value::Undefined)
             }
-            _ => Err(vm.throw_type("Symbol.keyFor requires a symbol")),
+            Ok(Value::Undefined)
         }
+        _ => Err(vm.throw_type("Symbol.keyFor requires a symbol")),
     });
 
     vm.define_method(&proto, "toString", 0, |vm, this, _args| {
         if let Value::Symbol(s) = sym_this(&this) {
-            return Ok(Value::str(format!("Symbol({})", s.description().unwrap_or(""))));
+            return Ok(Value::str(format!(
+                "Symbol({})",
+                s.description().unwrap_or("")
+            )));
         }
         Err(vm.throw_type("Symbol.prototype.toString requires a symbol"))
     });
-    vm.define_method(&proto, "valueOf", 0, |vm, this, _args| match sym_this(&this) {
-        Value::Symbol(s) => Ok(Value::Symbol(s)),
-        _ => Err(vm.throw_type("Symbol.prototype.valueOf requires a symbol")),
+    vm.define_method(&proto, "valueOf", 0, |vm, this, _args| {
+        match sym_this(&this) {
+            Value::Symbol(s) => Ok(Value::Symbol(s)),
+            _ => Err(vm.throw_type("Symbol.prototype.valueOf requires a symbol")),
+        }
     });
 
     // Symbol.prototype.description accessor getter.
-    let description_getter = vm.new_native("get description", 0, |vm, this, _args| {
-        match sym_this(&this) {
-            Value::Symbol(s) => Ok(match s.description() {
-                Some(d) => Value::str(d),
-                None => Value::Undefined,
-            }),
-            _ => Err(vm.throw_type("Symbol.prototype.description requires a symbol")),
-        }
-    });
+    let description_getter =
+        vm.new_native("get description", 0, |vm, this, _args| {
+            match sym_this(&this) {
+                Value::Symbol(s) => Ok(match s.description() {
+                    Some(d) => Value::str(d),
+                    None => Value::Undefined,
+                }),
+                _ => Err(vm.throw_type("Symbol.prototype.description requires a symbol")),
+            }
+        });
     proto.borrow_mut().props.insert(
         PropertyKey::str("description"),
         Property {
@@ -1803,12 +1841,14 @@ fn install_symbol(vm: &mut Vm) {
 
     // Symbol.prototype[Symbol.toPrimitive] returns the symbol (any hint).
     let to_primitive_sym = vm.realm.symbol_to_primitive.clone();
-    let to_primitive_fn = vm.new_native("[Symbol.toPrimitive]", 1, |vm, this, _args| {
-        match sym_this(&this) {
+    let to_primitive_fn = vm.new_native(
+        "[Symbol.toPrimitive]",
+        1,
+        |vm, this, _args| match sym_this(&this) {
             Value::Symbol(s) => Ok(Value::Symbol(s)),
             _ => Err(vm.throw_type("Symbol.prototype[Symbol.toPrimitive] requires a symbol")),
-        }
-    });
+        },
+    );
     proto.borrow_mut().props.insert(
         PropertyKey::Sym(to_primitive_sym),
         Property {

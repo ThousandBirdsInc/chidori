@@ -54,7 +54,9 @@ fn main() {
                 "sendEmail" => {
                     sends += 1;
                     println!("  [live] sending email (send #{sends})");
-                    Some(Ok(json!({ "delivered": true, "id": format!("msg-{sends}") })))
+                    Some(Ok(
+                        json!({ "delivered": true, "id": format!("msg-{sends}") }),
+                    ))
                 }
                 _ => Some(Ok(Json::Null)),
             }

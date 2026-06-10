@@ -86,9 +86,7 @@ impl Vfs {
                 return Err(format!("ENOTDIR: not a directory, {parent}"));
             }
             None => {
-                return Err(format!(
-                    "ENOENT: no such file or directory, open '{path}'"
-                ));
+                return Err(format!("ENOENT: no such file or directory, open '{path}'"));
             }
         }
         self.nodes.insert(path, VfsNode::File { bytes, mtime_seq });
@@ -125,7 +123,9 @@ impl Vfs {
         let parent = parent_of(&path);
         match self.nodes.get(&parent) {
             Some(VfsNode::Dir) => {}
-            Some(VfsNode::File { .. }) => return Err(format!("ENOTDIR: not a directory, {parent}")),
+            Some(VfsNode::File { .. }) => {
+                return Err(format!("ENOTDIR: not a directory, {parent}"))
+            }
             None => {
                 if recursive {
                     self.mkdir(&parent, true)?;
@@ -146,7 +146,11 @@ impl Vfs {
             Some(VfsNode::File { .. }) => {
                 return Err(format!("ENOTDIR: not a directory, scandir '{path}'"))
             }
-            None => return Err(format!("ENOENT: no such file or directory, scandir '{path}'")),
+            None => {
+                return Err(format!(
+                    "ENOENT: no such file or directory, scandir '{path}'"
+                ))
+            }
         }
         let prefix = if path == "/" {
             "/".to_string()
@@ -180,7 +184,9 @@ impl Vfs {
                 if force {
                     return Ok(());
                 }
-                return Err(format!("ENOENT: no such file or directory, unlink '{path}'"));
+                return Err(format!(
+                    "ENOENT: no such file or directory, unlink '{path}'"
+                ));
             }
             Some(VfsNode::File { .. }) => {
                 self.nodes.remove(&path);
@@ -214,7 +220,9 @@ impl Vfs {
             return Err("EBUSY: cannot rename the filesystem root".to_string());
         }
         if !self.nodes.contains_key(&from) {
-            return Err(format!("ENOENT: no such file or directory, rename '{from}'"));
+            return Err(format!(
+                "ENOENT: no such file or directory, rename '{from}'"
+            ));
         }
         let to_parent = parent_of(&to);
         if !matches!(self.nodes.get(&to_parent), Some(VfsNode::Dir)) {
@@ -272,7 +280,13 @@ impl Vfs {
         let path = normalize(path);
         let parent = parent_of(&path);
         let _ = self.mkdir(&parent, true);
-        self.nodes.insert(path, VfsNode::File { bytes, mtime_seq: 0 });
+        self.nodes.insert(
+            path,
+            VfsNode::File {
+                bytes,
+                mtime_seq: 0,
+            },
+        );
     }
 }
 

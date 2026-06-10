@@ -106,7 +106,9 @@ fn to_bigint_ctor(vm: &mut Vm, v: &Value) -> Result<BigInt, Value> {
 
 fn number_to_bigint(vm: &mut Vm, n: f64) -> Result<BigInt, Value> {
     if !n.is_finite() || n.fract() != 0.0 {
-        return Err(vm.throw_range("The number is not a safe integer and cannot be converted to a BigInt"));
+        return Err(
+            vm.throw_range("The number is not a safe integer and cannot be converted to a BigInt")
+        );
     }
     <BigInt as num_traits::FromPrimitive>::from_f64(n)
         .ok_or_else(|| vm.throw_range("Cannot convert number to a BigInt"))

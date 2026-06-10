@@ -119,8 +119,10 @@ fn install_kind_function(
         fp.props
             .insert(tag_key.clone(), ro_c(Value::str(ctor_name)));
         if let Some((ip, _)) = &instance {
-            fp.props
-                .insert(PropertyKey::str("prototype"), ro_c(Value::Object(ip.clone())));
+            fp.props.insert(
+                PropertyKey::str("prototype"),
+                ro_c(Value::Object(ip.clone())),
+            );
         }
     }
     if let Some((ip, instance_tag)) = instance {
@@ -305,7 +307,6 @@ fn install_globals(vm: &mut Vm) {
         Ok(Value::Bool(n.is_finite()))
     });
 
-
     // URI handling: encodeURI / decodeURI / encodeURIComponent /
     // decodeURIComponent. Percent-encoding operates on the UTF-8 bytes of the
     // string (Rust strings are already valid UTF-8, so lone surrogates cannot
@@ -479,7 +480,8 @@ pub(crate) fn parse_int(s: &str, mut radix: i32) -> f64 {
             i += 2;
             radix = 16;
         }
-    } else if i + 1 < bytes.len() && bytes[i] == b'0' && (bytes[i + 1] | 32) == b'x' && radix == 16 {
+    } else if i + 1 < bytes.len() && bytes[i] == b'0' && (bytes[i + 1] | 32) == b'x' && radix == 16
+    {
         i += 2;
     }
     if !(2..=36).contains(&radix) {

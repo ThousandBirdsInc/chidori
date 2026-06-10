@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
 /// Default ESM conditions matched against the `exports` field, in priority
@@ -187,8 +187,9 @@ impl Resolver {
         // exports is present), resolve through it.
         if let Some(pkg) = self.find_self_package(parent, &name)? {
             if pkg.exports.is_some() {
-                let resolved =
-                    self.resolve_package_subpath(&pkg, &subpath).with_context(|| {
+                let resolved = self
+                    .resolve_package_subpath(&pkg, &subpath)
+                    .with_context(|| {
                         format!("resolving self-import `{}` for package `{}`", subpath, name)
                     })?;
                 return Ok(Resolution {
@@ -205,14 +206,15 @@ impl Resolver {
             if candidate.is_dir() {
                 if let Some(pkg) = self.load_package_json(&candidate)? {
                     let resolved =
-                        self.resolve_package_subpath(&pkg, &subpath).with_context(|| {
-                            format!(
-                                "resolving `{}` from package `{}` at {}",
-                                subpath,
-                                name,
-                                candidate.display()
-                            )
-                        })?;
+                        self.resolve_package_subpath(&pkg, &subpath)
+                            .with_context(|| {
+                                format!(
+                                    "resolving `{}` from package `{}` at {}",
+                                    subpath,
+                                    name,
+                                    candidate.display()
+                                )
+                            })?;
                     return Ok(Resolution {
                         kind: ResolutionKind::Package { name, subpath },
                         resolved_path: resolved,
@@ -266,7 +268,10 @@ impl Resolver {
                 dir: dir.to_path_buf(),
                 name: value.get("name").and_then(|v| v.as_str()).map(String::from),
                 main: value.get("main").and_then(|v| v.as_str()).map(String::from),
-                module: value.get("module").and_then(|v| v.as_str()).map(String::from),
+                module: value
+                    .get("module")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
                 types: value
                     .get("types")
                     .or_else(|| value.get("typings"))
@@ -350,9 +355,9 @@ impl Resolver {
         if sugar_for_dot {
             return Ok(None);
         }
-        let map = exports.as_object().ok_or_else(|| {
-            anyhow!("exports field must be an object when matching subpaths")
-        })?;
+        let map = exports
+            .as_object()
+            .ok_or_else(|| anyhow!("exports field must be an object when matching subpaths"))?;
         // Exact match.
         if let Some(value) = map.get(subpath) {
             return self.resolve_exports_target(pkg_dir, value, "");
@@ -372,10 +377,9 @@ impl Resolver {
                     continue;
                 }
                 let body = &subpath[prefix.len()..prefix.len() + body_len];
-                if best
-                    .as_ref()
-                    .is_none_or(|(best_key, _, _)| prefix.len() > best_key.split_once('*').unwrap().0.len())
-                {
+                if best.as_ref().is_none_or(|(best_key, _, _)| {
+                    prefix.len() > best_key.split_once('*').unwrap().0.len()
+                }) {
                     best = Some((key, value, body.to_string()));
                 }
             }
@@ -398,7 +402,10 @@ impl Resolver {
         match target {
             Value::String(s) => {
                 if !s.starts_with("./") {
-                    bail!("exports target `{}` must be a relative path starting with ./", s);
+                    bail!(
+                        "exports target `{}` must be a relative path starting with ./",
+                        s
+                    );
                 }
                 let substituted = s.replace('*', pattern_body);
                 let path = pkg_dir.join(substituted.trim_start_matches("./"));
@@ -600,7 +607,10 @@ mod tests {
             }
             other => panic!("expected Package, got {:?}", other),
         }
-        assert_eq!(res.resolved_path, root.join("node_modules/foo/dist/index.js"));
+        assert_eq!(
+            res.resolved_path,
+            root.join("node_modules/foo/dist/index.js")
+        );
     }
 
     #[test]
@@ -634,7 +644,10 @@ mod tests {
             }"#,
         );
         write(&root.join("node_modules/@chidori/x/dist/index.js"), "");
-        write(&root.join("node_modules/@chidori/x/dist/sub.chidori.js"), "");
+        write(
+            &root.join("node_modules/@chidori/x/dist/sub.chidori.js"),
+            "",
+        );
         write(&root.join("node_modules/@chidori/x/dist/sub.js"), "");
         let resolver = make_resolver(root);
 
