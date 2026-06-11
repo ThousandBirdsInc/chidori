@@ -34,7 +34,7 @@ The runner prints, e.g.:
 
 ```
 Test262 (chidori pure-Rust engine, bare context)
-  pass 37218  fail 2579  skip 7494  =>  93.52% of executed
+  pass 37445  fail 2352  skip 7494  =>  94.09% of executed
 ```
 
 ## Current result
@@ -44,7 +44,7 @@ pinned suite commit:
 
 | | pass | fail | skip | % of executed |
 |---|---|---|---|---|
-| chidori pure-Rust engine, bare context | 37,218 | 2,579 | 7,494 | **93.52%** |
+| chidori pure-Rust engine, bare context | 37,445 | 2,352 | 7,494 | **94.09%** |
 
 The headline percentage is `pass / (pass + fail)` over *executed* tests; the
 skip count is reported alongside so the denominator is never hidden.
@@ -134,19 +134,19 @@ a single readable line in review).
 
 ## Remaining gaps
 
-The residual failures, by area (top clusters of the 2,579 total):
+The residual failures, by area (top clusters of the 2,352 total):
 
 | count | area | nature |
 |--:|---|---|
-| 564 | `language/expressions` | class private brands, derived-ctor `this`-TDZ, module-namespace exotic semantics for `dynamic-import` |
-| 543 | `language/statements` | class fields/accessors, `for`-loop scope, labelled edge cases |
+| 488 | `language/statements` | class field/accessor corners, derived-ctor `this`-TDZ, `for`-loop scope |
+| 467 | `language/expressions` | class element corners, async-generator ordering, `super` edge cases |
 | 194 | `language/eval-code` | direct `eval` does not see the caller's scope (declares into the global) |
-| 181 | `built-ins/RegExp` | incomplete Unicode `\p{…}` property tables; `v`-flag |
+| 157 | `built-ins/RegExp` | incomplete Unicode `\p{…}` property tables; `v`-flag |
 | 150 | `built-ins/Array` | species/proxy interplay, length-boundary semantics |
 | 96 | `built-ins/TypedArray` | resizable-`ArrayBuffer` / out-of-bounds tracking |
-| 77 | `built-ins/Promise` | spec-detailed async ordering combinations |
 | 69 | `built-ins/String` | `normalize`, Unicode/surrogate edge cases |
-| 63 | `language/module-code` | namespace exotic object, re-export corner cases |
+| 55 | `built-ins/Promise` | spec-detailed async ordering combinations |
+| 51 | `language/module-code` | TLA ordering, cyclic-graph corner cases |
 
 Each failure is individually identifiable from a `--json` report, so the
 clusters can be picked off as engine work warrants. See

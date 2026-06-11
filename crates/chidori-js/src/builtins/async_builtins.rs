@@ -23,9 +23,13 @@ fn install_promise(vm: &mut Vm) {
             // construct handler serves `new Promise`): initialize the subclass
             // instance's promise internals in place, like Set/Map/TypedArray.
             let proto = vm.realm.promise_proto.clone();
-            let target = super_target(&t, &proto).ok_or_else(|| {
-                vm.throw_type("Promise constructor cannot be invoked without 'new'")
-            })?;
+            // The target must be an UNinitialized instance (Internal::Ordinary):
+            // `Promise.call(existingPromise, ...)` throws rather than re-init.
+            let target = super_target(&t, &proto)
+                .filter(|o| matches!(o.borrow().internal, Internal::Ordinary))
+                .ok_or_else(|| {
+                    vm.throw_type("Promise constructor cannot be invoked without 'new'")
+                })?;
             let executor = arg(args, 0);
             if !vm.is_callable(&executor) {
                 return Err(vm.throw_type("Promise resolver is not a function"));
@@ -155,7 +159,7 @@ fn install_promise(vm: &mut Vm) {
             let result = vm.call(f1.clone(), Value::Undefined, &[])?;
             let p = promise_resolve_with(vm, &c1, result)?;
             let thunk = vm.new_native("", 0, move |_vm, _t, _a| Ok(value.clone()));
-            invoke_then(vm, &p, Value::Object(thunk), Value::Undefined)
+            invoke_then_one(vm, &p, Value::Object(thunk))
         });
         // catchFinally(reason): same, then re-throw the original reason.
         let f2 = on_finally;
@@ -164,7 +168,7 @@ fn install_promise(vm: &mut Vm) {
             let result = vm.call(f2.clone(), Value::Undefined, &[])?;
             let p = promise_resolve_with(vm, &c, result)?;
             let thrower = vm.new_native("", 0, move |_vm, _t, _a| Err(reason.clone()));
-            invoke_then(vm, &p, Value::Object(thrower), Value::Undefined)
+            invoke_then_one(vm, &p, Value::Object(thrower))
         });
         invoke_then(vm, &this, Value::Object(on_f), Value::Object(on_r))
     });
@@ -311,6 +315,13 @@ fn get_promise_resolve(vm: &mut Vm, c: &Value) -> Result<Value, Value> {
         return Err(vm.throw_type("Promise.resolve is not callable"));
     }
     Ok(r)
+}
+
+/// `Invoke(p, "then", [handler])` — exactly one argument (the spec's
+/// finally thunks call `then` unary, observable via `arguments.length`).
+fn invoke_then_one(vm: &mut Vm, p: &Value, handler: Value) -> Result<Value, Value> {
+    let then = vm.get_prop(p, &PropertyKey::str("then"))?;
+    vm.call(then, p.clone(), &[handler])
 }
 
 /// `Invoke(p, "then", [onF, onR])`.
