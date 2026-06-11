@@ -34,7 +34,7 @@ The runner prints, e.g.:
 
 ```
 Test262 (chidori pure-Rust engine, bare context)
-  pass 36787  fail 3010  skip 7494  =>  92.44% of executed
+  pass 37218  fail 2579  skip 7494  =>  93.52% of executed
 ```
 
 ## Current result
@@ -44,7 +44,7 @@ pinned suite commit:
 
 | | pass | fail | skip | % of executed |
 |---|---|---|---|---|
-| chidori pure-Rust engine, bare context | 36,787 | 3,010 | 7,494 | **92.44%** |
+| chidori pure-Rust engine, bare context | 37,218 | 2,579 | 7,494 | **93.52%** |
 
 The headline percentage is `pass / (pass + fail)` over *executed* tests; the
 skip count is reported alongside so the denominator is never hidden.
@@ -126,19 +126,19 @@ a single readable line in review).
 
 ## Remaining gaps
 
-The residual failures, by area (top clusters of the 3,010 total):
+The residual failures, by area (top clusters of the 2,579 total):
 
 | count | area | nature |
 |--:|---|---|
-| 891 | `language/expressions` | class private brands, derived-ctor `this`-TDZ, optional-chaining/assignment corners |
-| 580 | `language/statements` | class fields/accessors, `for`-loop scope, labelled/`with` edge cases |
-| 194 | `language/eval-code` | direct/indirect `eval` scoping details |
+| 564 | `language/expressions` | class private brands, derived-ctor `this`-TDZ, module-namespace exotic semantics for `dynamic-import` |
+| 543 | `language/statements` | class fields/accessors, `for`-loop scope, labelled edge cases |
+| 194 | `language/eval-code` | direct `eval` does not see the caller's scope (declares into the global) |
 | 181 | `built-ins/RegExp` | incomplete Unicode `\p{…}` property tables; `v`-flag |
-| 179 | `built-ins/Array` | iteration-method hole semantics (`HasProperty`-gating); `copyWithin` |
-| 102 | `built-ins/String` | `Symbol.replace`/`match`/`search` & Unicode edge cases |
+| 150 | `built-ins/Array` | species/proxy interplay, length-boundary semantics |
 | 96 | `built-ins/TypedArray` | resizable-`ArrayBuffer` / out-of-bounds tracking |
 | 77 | `built-ins/Promise` | spec-detailed async ordering combinations |
-| 68 | `language/module-code` | namespace/re-export corner cases |
+| 69 | `built-ins/String` | `normalize`, Unicode/surrogate edge cases |
+| 63 | `language/module-code` | namespace exotic object, re-export corner cases |
 
 Each failure is individually identifiable from a `--json` report, so the
 clusters can be picked off as engine work warrants. See
