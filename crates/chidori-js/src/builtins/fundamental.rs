@@ -575,7 +575,9 @@ fn store_property(
                                     drop(b);
                                     return Err(vm.throw_range("Array index exceeds engine limit"));
                                 }
-                                arr.resize(idx + 1, Value::Undefined);
+                                // Growing past length introduces HOLES at the
+                                // intermediate indices (absent, not undefined).
+                                arr.resize(idx + 1, Value::Hole);
                             }
                             arr[idx] = value.clone();
                         }

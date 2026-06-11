@@ -141,6 +141,11 @@ struct Binding {
 struct Scope {
     bindings: Vec<Binding>,
     is_function_scope: bool,
+    /// `with` nesting depth in effect when this scope was entered. A binding in
+    /// a scope at the CURRENT depth has no `with` between it and a reference,
+    /// so the inner declarative binding shadows any with-object and compiles to
+    /// the static op.
+    with_depth: u32,
 }
 
 struct LoopCtx {
@@ -202,6 +207,10 @@ struct FnCtx {
     /// > 0, unqualified identifier reads/writes compile to dynamic name ops that
     /// consult the runtime with-scope stack before the static binding.
     with_depth: u32,
+    /// True when this function is textually nested inside a `with` block of an
+    /// enclosing function: its free identifiers must also resolve dynamically
+    /// (against the closure's captured with-scope chain).
+    enclosed_in_with: bool,
     /// Strict-mode code (a `"use strict"` directive here, an enclosing strict
     /// function, or a class body). Propagated to `FuncProto.is_strict` so the VM
     /// makes assignment failures throw.
@@ -237,6 +246,7 @@ impl FnCtx {
             loops: Vec::new(),
             track_completion: false,
             with_depth: 0,
+            enclosed_in_with: false,
             handler_depth: 0,
             finally_depth: 0,
             strict: false,
@@ -368,9 +378,11 @@ impl Compiler {
     // ---- scopes & bindings ----
 
     fn enter_scope(&mut self, is_function: bool) {
+        let with_depth = self.cur_ref().with_depth;
         self.cur().scopes.push(Scope {
             bindings: Vec::new(),
             is_function_scope: is_function,
+            with_depth,
         });
     }
     fn exit_scope(&mut self) {
@@ -500,19 +512,34 @@ impl Compiler {
         (fc.upvalues.len() - 1) as u32
     }
 
-    /// True when the current identifier reference is textually inside a `with`
-    /// block (in this function) and could shadow against the with-object. We
-    /// skip synthetic compiler-internal names (`%this`, `%completion`, ...)
-    /// which can never be shadowed by a real object property.
+    /// True when the current identifier reference could resolve against a
+    /// `with`-object at runtime — textually inside a `with` block in this
+    /// function, or in a function nested inside one (whose closure captures the
+    /// with-scope chain). We skip synthetic compiler-internal names (`%this`,
+    /// `%completion`, ...) which can never be shadowed by a real object
+    /// property, and bindings of THIS function declared with no intervening
+    /// `with`: the inner declarative binding shadows any with-object, so the
+    /// static op is both correct and faster.
     fn in_with(&self, name: &str) -> bool {
-        self.fns.last().unwrap().with_depth > 0 && !name.starts_with('%')
+        let fc = self.fns.last().unwrap();
+        if name.starts_with('%') || (fc.with_depth == 0 && !fc.enclosed_in_with) {
+            return false;
+        }
+        for scope in fc.scopes.iter().rev() {
+            if scope.bindings.iter().any(|b| b.name == name) {
+                return scope.with_depth != fc.with_depth;
+            }
+        }
+        true
     }
 
-    fn store_binding(&mut self, name: &str) {
+    /// The static (non-`with`) store op for `name`: plain store, used by
+    /// declaration/initialization paths.
+    fn store_fallback(&mut self, name: &str) -> Op {
         // Assignment to a `const` binding is a runtime TypeError. Inside a
         // `with` the const cell is still the fallback target, so the dynamic op
         // carries the const-assign throw as its fallback.
-        let fallback = if self.binding_is_const(name) {
+        if self.binding_is_const(name) {
             Op::ThrowConstAssign
         } else {
             match self.resolve(name) {
@@ -523,7 +550,41 @@ impl Compiler {
                     Op::StoreGlobal(n)
                 }
             }
-        };
+        }
+    }
+
+    /// The static store op for assignment *expressions*: TDZ-checked, so
+    /// `x = 1; let x;` throws (PutValue → SetMutableBinding on an
+    /// uninitialized binding).
+    fn store_assign_fallback(&mut self, name: &str) -> Op {
+        if self.binding_is_const(name) {
+            Op::ThrowConstAssign
+        } else {
+            match self.resolve(name) {
+                Resolved::Cell(i) => Op::StoreCellChecked(i),
+                Resolved::Upvalue(i) => Op::StoreUpvalueChecked(i),
+                Resolved::Global => {
+                    let n = self.str_const(name);
+                    Op::StoreGlobal(n)
+                }
+            }
+        }
+    }
+
+    /// The static load op for `name`.
+    fn load_fallback(&mut self, name: &str) -> Op {
+        match self.resolve(name) {
+            Resolved::Cell(i) => Op::LoadCell(i),
+            Resolved::Upvalue(i) => Op::LoadUpvalue(i),
+            Resolved::Global => {
+                let n = self.str_const(name);
+                Op::LoadGlobal(n)
+            }
+        }
+    }
+
+    fn store_binding(&mut self, name: &str) {
+        let fallback = self.store_fallback(name);
         if self.in_with(name) {
             let n = self.str_const(name);
             self.emit(Op::StoreName {
@@ -541,18 +602,7 @@ impl Compiler {
     /// Declaration/initialization paths keep calling `store_binding` (plain
     /// store) so they can fill a binding that is intentionally still in TDZ.
     fn store_binding_assign(&mut self, name: &str) {
-        let fallback = if self.binding_is_const(name) {
-            Op::ThrowConstAssign
-        } else {
-            match self.resolve(name) {
-                Resolved::Cell(i) => Op::StoreCellChecked(i),
-                Resolved::Upvalue(i) => Op::StoreUpvalueChecked(i),
-                Resolved::Global => {
-                    let n = self.str_const(name);
-                    Op::StoreGlobal(n)
-                }
-            }
-        };
+        let fallback = self.store_assign_fallback(name);
         if self.in_with(name) {
             let n = self.str_const(name);
             self.emit(Op::StoreName {
@@ -565,14 +615,7 @@ impl Compiler {
     }
 
     fn load_binding(&mut self, name: &str) {
-        let fallback = match self.resolve(name) {
-            Resolved::Cell(i) => Op::LoadCell(i),
-            Resolved::Upvalue(i) => Op::LoadUpvalue(i),
-            Resolved::Global => {
-                let n = self.str_const(name);
-                Op::LoadGlobal(n)
-            }
-        };
+        let fallback = self.load_fallback(name);
         if self.in_with(name) {
             let n = self.str_const(name);
             self.emit(Op::LoadName {
@@ -582,6 +625,51 @@ impl Compiler {
         } else {
             self.emit(fallback);
         }
+    }
+
+    // ---- once-resolved references (with-scope) ----
+    //
+    // Assignment/update expressions evaluate their LHS Reference ONCE; a side
+    // effect during the RHS (or a with-object getter) that deletes/shadows the
+    // binding must not redirect the final write. Inside a `with` we therefore
+    // capture the resolved base object up front and read/write through it.
+
+    /// Capture the with-aware Reference base for `name` into a fresh temp cell
+    /// (the with-object holding `name`, or `undefined` for a static binding).
+    fn capture_name_base(&mut self, name: &str) -> u32 {
+        let n = self.str_const(name);
+        let t = self.temp();
+        self.emit(Op::ResolveNameBase(n));
+        self.emit(Op::InitCell(t));
+        t
+    }
+
+    /// Read `name` through the captured base in `t_base`.
+    fn load_via_base(&mut self, name: &str, t_base: u32) {
+        let fallback = self.load_fallback(name);
+        let n = self.str_const(name);
+        self.emit(Op::LoadCell(t_base));
+        self.emit(Op::LoadFromBase {
+            name: n,
+            fallback: Box::new(fallback),
+        });
+    }
+
+    /// Store the value on top of the stack to `name` through the captured base
+    /// in `t_base`, leaving the stored value on the stack (the assignment
+    /// expression's result).
+    fn store_via_base_keep(&mut self, name: &str, t_base: u32) {
+        let fallback = self.store_assign_fallback(name);
+        let n = self.str_const(name);
+        let t_val = self.temp();
+        self.emit(Op::InitCell(t_val));
+        self.emit(Op::LoadCell(t_base));
+        self.emit(Op::LoadCell(t_val));
+        self.emit(Op::StoreToBase {
+            name: n,
+            fallback: Box::new(fallback),
+        });
+        self.emit(Op::LoadCell(t_val));
     }
 
     // ---- top level ----
@@ -787,14 +875,17 @@ impl Compiler {
         let star = self.declare_kind("*default*", false, true);
         match &d.declaration {
             ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                // A named `export default function f(){}` also binds `f` locally.
+                // Declare that binding BEFORE compiling the body so a
+                // self-reference inside (e.g. `f = 2`) captures the module-level
+                // cell instead of falling through to the global scope.
+                let local = f.id.as_ref().map(|id| self.declare(id.name.as_str(), false));
                 // An anonymous `export default function(){}` gets the name "default".
                 self.compile_function(
                     f,
                     Some(f.id.as_ref().map_or("default", |i| i.name.as_str())),
                 )?;
-                // A named `export default function f(){}` also binds `f` locally.
-                if let Some(id) = &f.id {
-                    let c = self.declare(id.name.as_str(), false);
+                if let Some(c) = local {
                     self.emit(Op::Dup);
                     self.emit(Op::InitCell(c));
                 }
@@ -819,11 +910,26 @@ impl Compiler {
                 self.emit(Op::InitCell(star));
             }
         }
+        // A NAMED default function/class declaration has ONE live binding (the
+        // name); the `default` export resolves to it, so later reassignment of
+        // the name is visible through the export (live bindings). Anonymous
+        // defaults export the synthetic `*default*` cell.
+        let local_name = match &d.declaration {
+            ExportDefaultDeclarationKind::FunctionDeclaration(f) => f
+                .id
+                .as_ref()
+                .map(|i| i.name.as_str().to_string())
+                .unwrap_or_else(|| "*default*".to_string()),
+            ExportDefaultDeclarationKind::ClassDeclaration(c) => c
+                .id
+                .as_ref()
+                .map(|i| i.name.as_str().to_string())
+                .unwrap_or_else(|| "*default*".to_string()),
+            _ => "*default*".to_string(),
+        };
         self.module_exports.push(ExportEntry {
             export_name: Some("default".to_string()),
-            kind: ExportKind::Local {
-                local_name: "*default*".to_string(),
-            },
+            kind: ExportKind::Local { local_name },
         });
         Ok(())
     }
@@ -2737,6 +2843,26 @@ impl Compiler {
         match &u.argument {
             SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
                 let name = id.name.as_str();
+                if self.in_with(name) {
+                    // Once-resolved Reference: capture the with-aware base before
+                    // the read so the write can't be redirected in between.
+                    let t_base = self.capture_name_base(name);
+                    self.load_via_base(name, t_base);
+                    self.emit(Op::ToNumeric);
+                    if u.prefix {
+                        self.emit(if inc { Op::Inc } else { Op::Dec });
+                        self.store_via_base_keep(name, t_base);
+                    } else {
+                        let t_old = self.temp();
+                        self.emit(Op::Dup);
+                        self.emit(Op::InitCell(t_old));
+                        self.emit(if inc { Op::Inc } else { Op::Dec });
+                        self.store_via_base_keep(name, t_base);
+                        self.emit(Op::Pop);
+                        self.emit(Op::LoadCell(t_old));
+                    }
+                    return Ok(());
+                }
                 self.load_binding(name);
                 self.emit(Op::ToNumeric); // old value (BigInt-preserving)
                 if u.prefix {
@@ -2777,6 +2903,13 @@ impl Compiler {
                 self.compile_expr(&m.object)?;
                 self.emit(Op::InitCell(t_obj));
                 self.compile_expr(&m.expression)?;
+                self.emit(Op::InitCell(t_key));
+                // Coerce the key once (after the base coercibility check); the
+                // write below reuses the coerced key with no re-`toString`.
+                self.emit(Op::LoadCell(t_obj));
+                self.emit(Op::RequireCoercible);
+                self.emit(Op::LoadCell(t_key));
+                self.emit(Op::ToPropertyKey);
                 self.emit(Op::InitCell(t_key));
                 self.emit(Op::LoadCell(t_obj));
                 self.emit(Op::LoadCell(t_key));
@@ -3071,6 +3204,38 @@ impl Compiler {
         match &a.left {
             AssignmentTarget::AssignmentTargetIdentifier(id) => {
                 let name = id.name.as_str().to_string();
+                if self.in_with(&name) {
+                    // Inside a `with`, resolve the Reference base once — before
+                    // the RHS runs — and write through the captured base.
+                    match a.operator {
+                        A::Assign => {
+                            let t_base = self.capture_name_base(&name);
+                            self.compile_named_expr(&a.right, &name)?;
+                            self.store_via_base_keep(&name, t_base);
+                        }
+                        A::LogicalAnd | A::LogicalOr | A::LogicalNullish => {
+                            let t_base = self.capture_name_base(&name);
+                            self.load_via_base(&name, t_base);
+                            let j = match a.operator {
+                                A::LogicalAnd => self.emit(Op::JumpIfFalsyPeek(0)),
+                                A::LogicalOr => self.emit(Op::JumpIfTruthyPeek(0)),
+                                _ => self.emit(Op::JumpIfNullishPeek(0)),
+                            };
+                            self.compile_expr(&a.right)?;
+                            self.store_via_base_keep(&name, t_base);
+                            let end = self.here();
+                            self.patch_jump(j, end);
+                        }
+                        other => {
+                            let t_base = self.capture_name_base(&name);
+                            self.load_via_base(&name, t_base);
+                            self.compile_expr(&a.right)?;
+                            self.emit(compound_op(other));
+                            self.store_via_base_keep(&name, t_base);
+                        }
+                    }
+                    return Ok(());
+                }
                 match a.operator {
                     A::Assign => {
                         self.compile_named_expr(&a.right, &name)?;
@@ -3120,6 +3285,14 @@ impl Compiler {
                     self.compile_expr(&m.object)?;
                     self.emit(Op::InitCell(t_obj));
                     self.compile_expr(&m.expression)?;
+                    self.emit(Op::InitCell(t_key));
+                    // GetValue order: RequireObjectCoercible(base) first, then
+                    // ToPropertyKey exactly once (its `toString` must not run
+                    // again at the write).
+                    self.emit(Op::LoadCell(t_obj));
+                    self.emit(Op::RequireCoercible);
+                    self.emit(Op::LoadCell(t_key));
+                    self.emit(Op::ToPropertyKey);
                     self.emit(Op::InitCell(t_key));
                     self.emit(Op::LoadCell(t_obj));
                     self.emit(Op::LoadCell(t_key));
@@ -3516,6 +3689,13 @@ impl Compiler {
         ctor_fields: Option<&[&PropertyDefinition]>,
     ) -> R {
         let mut fc = FnCtx::new(name.unwrap_or(""), kind);
+        // A function defined inside a `with` block (directly or transitively)
+        // resolves free identifiers against the captured with-scope chain.
+        fc.enclosed_in_with = self
+            .fns
+            .last()
+            .map(|f| f.with_depth > 0 || f.enclosed_in_with)
+            .unwrap_or(false);
         // `num_params` carries the function's `length` (ExpectedArgumentCount):
         // the count of leading formal parameters before the first one with a
         // default initializer or the rest element. A destructuring param with no
@@ -3766,6 +3946,11 @@ impl Compiler {
         fields: &[&PropertyDefinition],
     ) -> R {
         let mut fc = FnCtx::new(name.unwrap_or(""), FuncKind::ClassCtor);
+        fc.enclosed_in_with = self
+            .fns
+            .last()
+            .map(|f| f.with_depth > 0 || f.enclosed_in_with)
+            .unwrap_or(false);
         fc.has_rest = has_super;
         fc.num_params = 0;
         self.fns.push(fc);

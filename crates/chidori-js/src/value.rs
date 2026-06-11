@@ -672,6 +672,11 @@ pub struct BytecodeFunction {
     pub home_object: Option<JsObject>,
     /// For class constructors only.
     pub is_class_ctor: bool,
+    /// The `with`-scope chain active when this closure was created (innermost
+    /// last). A function defined inside `with (o) { … }` resolves its free
+    /// identifiers against `o` even when called after the block; the chain
+    /// seeds the callee frame's with-scope stack.
+    pub captured_with: Vec<JsObject>,
 }
 
 pub struct BoundFunction {

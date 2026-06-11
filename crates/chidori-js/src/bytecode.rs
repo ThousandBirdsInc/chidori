@@ -236,6 +236,29 @@ pub enum Op {
     /// pushes `true` (deleting an unresolvable/lexical reference is reported as
     /// success in sloppy mode).
     DeleteName(u32),
+    /// Resolve the Reference base for `name` ONCE (spec: compound assignment /
+    /// update expressions evaluate the LHS reference a single time). Pushes the
+    /// with-object holding `name` per the current with-scope chain, or
+    /// `undefined` when the name resolves statically. The captured base is then
+    /// consumed by `LoadFromBase`/`StoreToBase`, so a getter/RHS side effect
+    /// that deletes the binding can't redirect the later read/write.
+    ResolveNameBase(u32),
+    /// `[base] -> [value]`: object-environment GetBindingValue against a base
+    /// captured by `ResolveNameBase`; a non-object base runs `fallback` (the
+    /// static Load{Cell,Upvalue,Global}).
+    LoadFromBase {
+        name: u32,
+        fallback: Box<Op>,
+    },
+    /// `[base, value] -> []`: PutValue against a captured base; a non-object
+    /// base re-pushes the value and runs `fallback` (the static checked store).
+    StoreToBase {
+        name: u32,
+        fallback: Box<Op>,
+    },
+    /// Pop a base value and throw TypeError if it is null/undefined
+    /// (RequireObjectCoercible, run before a computed key's ToPropertyKey).
+    RequireCoercible,
 
     // ---- stack manipulation ----
     Pop,

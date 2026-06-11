@@ -231,6 +231,13 @@ pub struct Vm {
     /// replay. `None` (default) makes tracing a single predictable-not-taken
     /// branch per call.
     pub trace_sink: Option<Box<dyn crate::trace::TraceObserver>>,
+    /// Host hook for dynamic `import(specifier)`. Receives the coerced specifier
+    /// string and must load/link/evaluate the module, returning its namespace
+    /// object (`Err` is the thrown error value, which rejects the `import()`
+    /// promise). Installed by hosts that can load modules (the test262 runner,
+    /// the chidori module loader); when absent, `import()` rejects with a
+    /// TypeError.
+    pub dynamic_import: Option<std::rc::Rc<dyn Fn(&mut Vm, &str) -> Result<Value, Value>>>,
 }
 
 impl Vm {
@@ -252,6 +259,7 @@ impl Vm {
             module_capture_proto: None,
             module_capture: None,
             trace_sink: None,
+            dynamic_import: None,
         };
         crate::realm::init_realm(&mut vm);
         vm
@@ -602,6 +610,18 @@ impl Vm {
             .unwrap_or_else(|_| "<error>".to_string())
     }
 
+    /// `RequireObjectCoercible(v)`: a nullish base throws TypeError before any
+    /// further coercion (notably before ToPropertyKey of a computed key, whose
+    /// `toString` side effects must not run). `action` reads like
+    /// "read properties of" in the message.
+    pub fn require_object_coercible(&mut self, v: &Value, action: &str) -> Result<(), Value> {
+        match v {
+            Value::Undefined => Err(self.throw_type(&format!("Cannot {action} undefined"))),
+            Value::Null => Err(self.throw_type(&format!("Cannot {action} null"))),
+            _ => Ok(()),
+        }
+    }
+
     pub fn to_property_key(&mut self, v: &Value) -> Result<PropertyKey, Value> {
         match v {
             Value::Symbol(s) => Ok(PropertyKey::Sym(s.clone())),
@@ -931,6 +951,30 @@ impl Vm {
             if matches!(cur.borrow().internal, Internal::Proxy(_)) {
                 self.proxy_set(&cur, key, value, base.clone())?;
                 return Ok(());
+            }
+            // TypedArray exotic [[Set]] reached via the proto chain (receiver is
+            // an ordinary object): a canonical numeric key that is NOT a valid
+            // index is absorbed (returns true, no receiver property created); a
+            // valid index behaves like an inherited writable data property
+            // (shadows on the receiver).
+            if !cur.same(&obj) && matches!(cur.borrow().internal, Internal::TypedArray(_)) {
+                let n: Option<f64> = if let Some(i) = key.array_index() {
+                    Some(i as f64)
+                } else {
+                    key.as_str().and_then(|s| {
+                        if is_canonical_numeric(s) {
+                            Some(s.parse::<f64>().unwrap_or(f64::NAN))
+                        } else {
+                            None
+                        }
+                    })
+                };
+                if let Some(n) = n {
+                    if self.ta_valid_index(&cur, n) {
+                        break;
+                    }
+                    return Ok(());
+                }
             }
             let accessor = {
                 let b = cur.borrow();
@@ -1379,6 +1423,9 @@ impl Vm {
         self.pending_host.clear();
         self.unhandled_rejections.clear();
         self.console_log.clear();
+        // The dynamic-import hook closes over host module state (registries whose
+        // records hold realm values); drop it so those cells don't keep cycles.
+        self.dynamic_import = None;
 
         let mut seen: HashSet<usize> = HashSet::new();
         let mut stack: Vec<JsObject> = self.realm.object_roots();
@@ -1453,6 +1500,9 @@ fn break_internal_cycles(internal: &mut Internal, stack: &mut Vec<JsObject>) {
                 for cell in std::mem::take(&mut bf.upvalues) {
                     let v = cell.borrow().clone();
                     push_dispose_obj(v, stack);
+                }
+                for o in std::mem::take(&mut bf.captured_with) {
+                    stack.push(o);
                 }
             }
             FunctionInner::Bound(b) => {

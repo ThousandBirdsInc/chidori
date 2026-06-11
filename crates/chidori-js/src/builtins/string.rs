@@ -447,7 +447,7 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
         let sep = arg(args, 0);
         let limit_arg = arg(args, 1);
         // Symbol dispatch first — before ToString(this): separator[@@split](O, limit).
-        if !sep.is_nullish() {
+        if matches!(sep, Value::Object(_)) {
             let key = PropertyKey::Sym(vm.realm.symbol_split.clone());
             if let Some(m) = get_method(vm, &sep, &key)? {
                 return vm.call(m, sep.clone(), &[this.clone(), limit_arg]);
@@ -500,7 +500,7 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
         }
         let search = arg(args, 0);
         let repl = arg(args, 1);
-        if !search.is_nullish() {
+        if matches!(search, Value::Object(_)) {
             let key = PropertyKey::Sym(vm.realm.symbol_replace.clone());
             if let Some(m) = get_method(vm, &search, &key)? {
                 // The @@replace receives the (coercible) `this`, not its string.
@@ -518,7 +518,7 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
         }
         let search = arg(args, 0);
         let repl = arg(args, 1);
-        if !search.is_nullish() {
+        if matches!(search, Value::Object(_)) {
             // IsRegExp(searchValue): a non-global RegExp-like is a TypeError.
             if is_regexp_spec(vm, &search)? {
                 let flags_v = vm.get_prop(&search, &PropertyKey::str("flags"))?;
@@ -546,7 +546,7 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
             return Err(vm.throw_type("String.prototype.search called on null or undefined"));
         }
         let regexp = arg(args, 0);
-        if !regexp.is_nullish() {
+        if matches!(regexp, Value::Object(_)) {
             let key = PropertyKey::Sym(vm.realm.symbol_search.clone());
             if let Some(m) = get_method(vm, &regexp, &key)? {
                 return vm.call(m, regexp.clone(), &[this.clone()]);
@@ -567,7 +567,7 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
             return Err(vm.throw_type("String.prototype.match called on null or undefined"));
         }
         let regexp = arg(args, 0);
-        if !regexp.is_nullish() {
+        if matches!(regexp, Value::Object(_)) {
             let key = PropertyKey::Sym(vm.realm.symbol_match.clone());
             if let Some(m) = get_method(vm, &regexp, &key)? {
                 return vm.call(m, regexp.clone(), &[this.clone()]);
@@ -586,7 +586,7 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
             return Err(vm.throw_type("String.prototype.matchAll called on null or undefined"));
         }
         let regexp = arg(args, 0);
-        if !regexp.is_nullish() {
+        if matches!(regexp, Value::Object(_)) {
             // IsRegExp + a non-global flags string is a TypeError (spec 22.1.3.13),
             // checked via Get(regexp, "flags") before any @@matchAll dispatch.
             if is_regexp_spec(vm, &regexp)? {
@@ -677,9 +677,17 @@ fn pad(vm: &mut Vm, this: &Value, args: &[Value], start: bool) -> Result<Value, 
 
 fn replace_impl(vm: &mut Vm, this: &Value, args: &[Value], all: bool) -> Result<Value, Value> {
     let s = str_this(vm, this)?;
-    let pattern = vm.to_string_lossy(&arg(args, 0));
+    // Spec order: ToString(searchValue), IsCallable(replaceValue), then a
+    // non-functional replaceValue is coerced ONCE — eagerly, before any match
+    // is attempted — with coercion errors propagating.
+    let pattern = vm.to_js_string(&arg(args, 0))?.as_str().to_string();
     let repl = arg(args, 1);
     let is_fn = vm.is_callable(&repl);
+    let repl_str: Option<String> = if is_fn {
+        None
+    } else {
+        Some(vm.to_js_string(&repl)?.as_str().to_string())
+    };
 
     let mut result = String::new();
     let mut rest = s.as_str();
@@ -687,7 +695,7 @@ fn replace_impl(vm: &mut Vm, this: &Value, args: &[Value], all: bool) -> Result<
     loop {
         if pattern.is_empty() {
             // Empty pattern matches at the start once (prepend the replacement).
-            let replacement = compute_replacement(vm, &repl, is_fn, "", &s, 0)?;
+            let replacement = compute_replacement(vm, &repl, repl_str.as_deref(), "", &s, 0)?;
             result.push_str(&replacement);
             result.push_str(rest);
             break;
@@ -697,7 +705,7 @@ fn replace_impl(vm: &mut Vm, this: &Value, args: &[Value], all: bool) -> Result<
                 result.push_str(&rest[..pos]);
                 let matched = &rest[pos..pos + pattern.len()];
                 let offset = s.len() - rest.len() + pos;
-                let replacement = compute_replacement(vm, &repl, is_fn, matched, &s, offset)?;
+                let replacement = compute_replacement(vm, &repl, repl_str.as_deref(), matched, &s, offset)?;
                 result.push_str(&replacement);
                 rest = &rest[pos + pattern.len()..];
                 replaced_any = true;
@@ -718,12 +726,12 @@ fn replace_impl(vm: &mut Vm, this: &Value, args: &[Value], all: bool) -> Result<
 fn compute_replacement(
     vm: &mut Vm,
     repl: &Value,
-    is_fn: bool,
+    repl_str: Option<&str>,
     matched: &str,
     whole: &str,
     offset: usize,
 ) -> Result<String, Value> {
-    if is_fn {
+    if repl_str.is_none() {
         let r = vm.call(
             repl.clone(),
             Value::Undefined,
@@ -733,9 +741,9 @@ fn compute_replacement(
                 Value::str(whole),
             ],
         )?;
-        Ok(vm.to_string_lossy(&r))
+        Ok(vm.to_js_string(&r)?.as_str().to_string())
     } else {
-        let rs = vm.to_string_lossy(repl);
+        let rs = repl_str.unwrap_or_default().to_string();
         // Handle $& (matched), $$ (literal $), $` (prefix), $' (suffix).
         let mut out = String::new();
         let mut chars = rs.chars().peekable();

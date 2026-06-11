@@ -115,7 +115,11 @@ impl ModuleRecord {
 }
 
 /// A module graph keyed by resolved specifier (canonical path string).
-#[derive(Default)]
+/// `Clone` is shallow (the records are shared `Rc`s), so a host can snapshot
+/// the registry to evaluate a graph without holding a `RefCell` borrow open —
+/// a dynamic `import()` job firing mid-evaluation (top-level await) needs to
+/// re-borrow the live registry to load new modules.
+#[derive(Default, Clone)]
 pub struct ModuleRegistry {
     pub modules: HashMap<String, Rc<RefCell<ModuleRecord>>>,
 }
@@ -191,7 +195,11 @@ impl Vm {
                     .map(|_| Rc::new(RefCell::new(Value::Uninitialized)))
                     .collect();
             }
-            b.status = ModuleStatus::Linked;
+            // Don't downgrade a module already evaluated by an earlier graph run
+            // (repeated dynamic import); evaluate-once relies on the status.
+            if b.status == ModuleStatus::Unlinked {
+                b.status = ModuleStatus::Linked;
+            }
         }
         order.push(key.to_string());
         for req in &requested {
@@ -254,6 +262,12 @@ impl Vm {
             return Ok(());
         }
         let rec = self.get_module(registry, key)?;
+        // Already evaluated by an earlier graph run (e.g. a repeated dynamic
+        // `import()` of the same specifier): evaluate-once, like the spec's
+        // Evaluated-state short-circuit. Its dependencies are Evaluated too.
+        if rec.borrow().status == ModuleStatus::Evaluated {
+            return Ok(());
+        }
         let (requested, resolved) = {
             let b = rec.borrow();
             (b.compiled.requested.clone(), b.resolved.clone())
@@ -278,6 +292,7 @@ impl Vm {
             upvalues: Vec::new(),
             home_object: None,
             is_class_ctor: false,
+            captured_with: Vec::new(),
         };
         let mut frame = self.make_frame(bf, Value::Undefined, &[], Value::Undefined);
         frame.cells = cells;
@@ -316,6 +331,14 @@ impl Vm {
         name: &str,
         seen: &mut HashSet<String>,
     ) -> Result<Rc<RefCell<Value>>, Value> {
+        // Circularity guard (spec: ResolveExport's resolveSet): revisiting the
+        // same (module, export name) pair means a circular `export {x} from`
+        // chain that never reaches a concrete binding — a SyntaxError, matching
+        // the resolution-phase negative tests.
+        let guard = format!("{:p}\u{0}{name}", Rc::as_ptr(module));
+        if !seen.insert(guard) {
+            return Err(self.throw_syntax(&format!("circular import of '{name}'")));
+        }
         let exports = module.borrow().compiled.exports.clone();
         let resolved = module.borrow().resolved.clone();
         // Direct local / indirect exports.
@@ -372,6 +395,17 @@ impl Vm {
             }
         }
         Err(self.throw_syntax(&format!("Module does not provide export '{name}'")))
+    }
+
+    /// The namespace object for a registry module by key — the value a dynamic
+    /// `import(specifier)` resolves with (the module must already be evaluated).
+    pub fn module_namespace_by_key(
+        &mut self,
+        registry: &ModuleRegistry,
+        key: &str,
+    ) -> Result<Value, Value> {
+        let rec = self.get_module(registry, key)?;
+        self.module_namespace(registry, &rec)
     }
 
     /// Build (and cache) the Module Namespace object for `import * as ns`: an

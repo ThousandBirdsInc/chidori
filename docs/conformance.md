@@ -77,6 +77,13 @@ For each test file the runner:
 `module`-flag tests **run by default** (the runner resolves their fixture
 imports); pass `--no-modules` to skip them.
 
+Dynamic `import()` also runs: the runner installs the engine's
+`Vm::dynamic_import` host hook, resolving specifiers against the test file's
+directory and sharing one module registry per test (so a specifier reached
+both statically and dynamically yields the same namespace object). Without a
+hook installed — e.g. in the production chidori runtime, which forbids dynamic
+import by policy — `import()` rejects with a TypeError, as before.
+
 ## Why the run is chunked
 
 `chidori-js` uses reference-counting (`Rc<RefCell<…>>`) and cannot reclaim every

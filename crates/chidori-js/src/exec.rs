@@ -160,6 +160,10 @@ impl Vm {
         let cells = (0..proto.num_cells)
             .map(|_| Rc::new(RefCell::new(Value::Undefined)))
             .collect();
+        // A closure created inside `with (o) { … }` carries the with-object
+        // chain; seed the frame's with-scope stack with it so the body's
+        // dynamic name ops resolve against it (under any with the body enters).
+        let with_scope = bf.captured_with.clone();
         Frame {
             func: bf,
             ip: 0,
@@ -175,7 +179,7 @@ impl Vm {
             args: args.to_vec(),
             completion: Value::Undefined,
             enumerators: Vec::new(),
-            with_scope: Vec::new(),
+            with_scope,
             trace_token: None,
         }
     }
@@ -704,6 +708,57 @@ impl Vm {
                     push!(Value::Bool(true));
                 }
             }
+            Op::ResolveNameBase(name) => {
+                let nm = self.const_name(frame, name);
+                let key = PropertyKey::Str(nm);
+                match self.with_lookup(frame, &key)? {
+                    Some(obj) => push!(Value::Object(obj)),
+                    None => push!(Value::Undefined),
+                }
+            }
+            Op::LoadFromBase { name, fallback } => {
+                let base = pop!();
+                if let Value::Object(_) = &base {
+                    let nm = self.const_name(frame, name);
+                    let key = PropertyKey::Str(nm);
+                    // Object Environment Record GetBindingValue: re-check
+                    // HasProperty (the binding may have been deleted since the
+                    // base was captured), then read.
+                    if self.has_prop(&base, &key)? {
+                        let v = self.get_prop(&base, &key)?;
+                        push!(v);
+                    } else {
+                        push!(Value::Undefined);
+                    }
+                } else {
+                    return self.step(frame, (*fallback).clone());
+                }
+            }
+            Op::StoreToBase { name, fallback } => {
+                let v = pop!();
+                let base = pop!();
+                if let Value::Object(_) = &base {
+                    let nm = self.const_name(frame, name);
+                    let key = PropertyKey::Str(nm.clone());
+                    let strict = frame.func.proto.is_strict;
+                    // Object Environment Record SetMutableBinding: if the
+                    // binding was deleted since the base was captured, a strict
+                    // write throws ReferenceError (not a silent re-create).
+                    if strict && !self.has_prop(&base, &key)? {
+                        return Err(
+                            self.throw_reference(&format!("{} is not defined", nm.as_str()))
+                        );
+                    }
+                    self.put_value(&base, &key, v, strict)?;
+                } else {
+                    frame.stack.push(v);
+                    return self.step(frame, (*fallback).clone());
+                }
+            }
+            Op::RequireCoercible => {
+                let base = pop!();
+                self.require_object_coercible(&base, "read properties of")?;
+            }
 
             Op::Pop => {
                 frame.stack.pop();
@@ -935,6 +990,9 @@ impl Vm {
             Op::GetPropDynamic => {
                 let key_v = pop!();
                 let obj = pop!();
+                // GetValue: RequireObjectCoercible(base) (via ToObject) throws
+                // BEFORE ToPropertyKey coerces the key expression's value.
+                self.require_object_coercible(&obj, "read properties of")?;
                 let key = self.to_property_key(&key_v)?;
                 let v = self.get_prop(&obj, &key)?;
                 push!(v);
@@ -943,6 +1001,7 @@ impl Vm {
                 let value = pop!();
                 let key_v = pop!();
                 let obj = pop!();
+                self.require_object_coercible(&obj, "set properties of")?;
                 let key = self.to_property_key(&key_v)?;
                 let strict = frame.func.proto.is_strict;
                 self.put_value(&obj, &key, value.clone(), strict)?;
@@ -957,6 +1016,7 @@ impl Vm {
             Op::DeletePropDynamic => {
                 let key_v = pop!();
                 let obj = pop!();
+                self.require_object_coercible(&obj, "delete properties of")?;
                 let key = self.to_property_key(&key_v)?;
                 let r = self.delete_prop(&obj, &key)?;
                 push!(Value::Bool(r));
@@ -1041,6 +1101,15 @@ impl Vm {
                     })
                     .collect();
                 let f = self.make_closure(proto, upvalues);
+                // Capture the active with-scope chain (closures defined inside
+                // `with` resolve free identifiers against it after the block).
+                if !frame.with_scope.is_empty() {
+                    if let Internal::Function(FunctionInner::Bytecode(bf)) =
+                        &mut f.borrow_mut().internal
+                    {
+                        bf.captured_with = frame.with_scope.clone();
+                    }
+                }
                 push!(Value::Object(f));
             }
 
@@ -1077,17 +1146,37 @@ impl Vm {
             }
             Op::DynamicImport => {
                 // Specifier already evaluated (and on the stack); coerce it to a
-                // string per spec (a Symbol specifier must reject), then reject —
-                // module loading is unsupported in this engine.
+                // string per spec (a Symbol specifier must reject, never throw).
+                // With a host hook installed, the load/link/evaluate runs as a
+                // queued job (spec: HostImportModuleDynamically completes in a
+                // separate job) and settles the returned promise; without one,
+                // module loading is unsupported and the promise rejects.
                 let spec = pop!();
-                let reason = match self.to_js_string(&spec) {
-                    Ok(_) => self.make_error(
-                        crate::vm::ErrorKind::Type,
-                        "dynamic import is not supported",
-                    ),
-                    Err(e) => e,
-                };
-                let p = self.new_rejected(reason);
+                let p = self.new_promise();
+                match self.to_js_string(&spec) {
+                    Ok(s) => {
+                        if let Some(hook) = self.dynamic_import.clone() {
+                            let spec_str = s.as_str().to_string();
+                            let pj = p.clone();
+                            self.microtasks.push_back(crate::vm::Microtask::Job(Box::new(
+                                move |vm: &mut Vm| {
+                                    match hook(vm, &spec_str) {
+                                        Ok(ns) => vm.resolve_promise(&pj, ns),
+                                        Err(e) => vm.reject_promise(&pj, e),
+                                    }
+                                    Ok(())
+                                },
+                            )));
+                        } else {
+                            let reason = self.make_error(
+                                crate::vm::ErrorKind::Type,
+                                "dynamic import is not supported",
+                            );
+                            self.reject_promise(&p, reason);
+                        }
+                    }
+                    Err(e) => self.reject_promise(&p, e),
+                }
                 push!(Value::Object(p));
             }
             Op::Inc => {
@@ -1511,6 +1600,7 @@ impl Vm {
             upvalues,
             home_object: None,
             is_class_ctor: kind == FuncKind::ClassCtor,
+            captured_with: Vec::new(),
         };
         // [[Prototype]] is the function-kind intrinsic: %GeneratorFunction.prototype%,
         // %AsyncFunction.prototype%, %AsyncGeneratorFunction.prototype%, or
