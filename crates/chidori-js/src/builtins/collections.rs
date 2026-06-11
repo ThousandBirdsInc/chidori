@@ -9,7 +9,7 @@
 //! callable `keys` returning an iterator) rather than requiring a real Set;
 //! `get_set_record` performs the spec's GetSetRecord coercion.
 
-use super::{arg, super_target};
+use super::arg;
 use crate::value::*;
 use crate::vm::Vm;
 use indexmap::IndexMap;
@@ -21,12 +21,6 @@ pub fn install(vm: &mut Vm) {
     install_weakset(vm);
 }
 
-/// When a native collection constructor is invoked *without* `new`, the only
-/// valid case is a `super(...)` from a subclass (`class S extends Set {}`): then
-/// `this` is the already-allocated derived instance whose prototype chain
-/// includes the builtin's `proto`. Return it so the constructor can initialize
-/// its internal slot in place. A bare `Set()`/`Map()` call (this = undefined or
-/// the global) returns `None`, so the caller throws "requires 'new'".
 /// Populate `target`'s `Internal::Map` from a Map-constructor iterable argument.
 fn init_map_entries(vm: &mut Vm, target: &JsObject, init: &Value) -> Result<(), Value> {
     if init.is_nullish() {
@@ -222,15 +216,7 @@ fn install_map(vm: &mut Vm) {
     let ctor = vm.new_native_ctor(
         "Map",
         0,
-        |vm, t, args| {
-            // Only reachable via `super(...)` from a subclass; initialize in place.
-            let proto = vm.realm.map_proto.clone();
-            let target = super_target(&t, &proto)
-                .ok_or_else(|| vm.throw_type("Constructor Map requires 'new'"))?;
-            target.borrow_mut().internal = Internal::Map(IndexMap::new());
-            init_map_entries(vm, &target, &arg(args, 0))?;
-            Ok(Value::Undefined)
-        },
+        |vm, _t, _args| Err(vm.throw_type("Constructor Map requires 'new'")),
         |vm, _t, args| {
             let m = vm.alloc(ObjectData::new(
                 Some(vm.realm.map_proto.clone()),
@@ -383,15 +369,7 @@ fn install_set(vm: &mut Vm) {
     let ctor = vm.new_native_ctor(
         "Set",
         0,
-        |vm, t, args| {
-            // Only reachable via `super(...)` from a subclass; initialize in place.
-            let proto = vm.realm.set_proto.clone();
-            let target = super_target(&t, &proto)
-                .ok_or_else(|| vm.throw_type("Constructor Set requires 'new'"))?;
-            target.borrow_mut().internal = Internal::Set(IndexMap::new());
-            init_set_entries(vm, &target, &arg(args, 0))?;
-            Ok(Value::Undefined)
-        },
+        |vm, _t, _args| Err(vm.throw_type("Constructor Set requires 'new'")),
         |vm, _t, args| {
             let s = vm.alloc(ObjectData::new(
                 Some(vm.realm.set_proto.clone()),

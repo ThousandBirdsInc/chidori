@@ -122,6 +122,14 @@ impl Vm {
         new_target: Value,
     ) -> Result<Value, Value> {
         let kind = bf.proto.kind;
+        // A class constructor is only reachable through [[Construct]] (spec
+        // 10.2.1 step 2) — `C()`, `C.call(..)`, etc. all throw.
+        if bf.is_class_ctor {
+            return Err(self.throw_type(&format!(
+                "Class constructor {} cannot be invoked without 'new'",
+                bf.proto.name
+            )));
+        }
         if kind.is_generator() {
             return self.make_generator(func_obj, bf, this, args, new_target);
         }
@@ -259,7 +267,28 @@ impl Vm {
                 let n = self.to_string_lossy(&name);
                 Err(self.throw_type(&format!("{n} is not a constructor")))
             }
-            Disp::Native(c) => c(self, Value::Undefined, args),
+            Disp::Native(c) => {
+                let r = c(self, Value::Undefined, args)?;
+                // GetPrototypeFromConstructor: when constructed via a different
+                // new.target (a subclass `super()` or Reflect.construct), the
+                // fresh instance's [[Prototype]] comes from new_target.prototype
+                // (falling back to the intrinsic default the builtin installed).
+                // Results that merely echo an argument (`new Object(existing)`)
+                // and proxies (no own [[Prototype]]) are left untouched.
+                if !new_target.same_obj(cobj) {
+                    if let Value::Object(res) = &r {
+                        let echoes_arg = args.iter().any(|a| a.same_obj(res));
+                        let is_proxy = matches!(res.borrow().internal, Internal::Proxy(_));
+                        if !echoes_arg && !is_proxy && matches!(new_target, Value::Object(_)) {
+                            let p = self.get_prop(new_target, &PropertyKey::str("prototype"))?;
+                            if let Value::Object(po) = p {
+                                res.borrow_mut().proto = Some(po);
+                            }
+                        }
+                    }
+                }
+                Ok(r)
+            }
             Disp::Bound(target, bargs) => {
                 let mut all = bargs;
                 all.extend_from_slice(args);
@@ -271,6 +300,45 @@ impl Vm {
                 self.construct(&Value::Object(target), &all, &nt)
             }
             Disp::Bytecode(bf) => {
+                // A derived-class constructor gets NO pre-created `this`: its
+                // `%this` cell stays in TDZ until `super()` constructs the
+                // instance (which is what gives `class A extends Array` a real
+                // exotic array). The derived-constructor completion rules apply
+                // HERE, at frame exit, so `finally` blocks (which may call
+                // super()) have already run: an object return passes through;
+                // undefined yields the bound `this` (ReferenceError when
+                // super() never ran); any other primitive is a TypeError. The
+                // `%this` cell is STABLE (same `Rc` for the whole call), so
+                // watching it across run_frame is sound.
+                if bf.proto.kind == FuncKind::DerivedCtor {
+                    let this_cell = bf.proto.this_cell;
+                    let frame = self.make_frame(bf, Value::Uninitialized, args, new_target.clone());
+                    let watched = this_cell.map(|i| frame.cells[i as usize].clone());
+                    return match self.run_frame(frame) {
+                        Flow::Return(v) => match v {
+                            Value::Object(_) => Ok(v),
+                            Value::Undefined => {
+                                let t = watched
+                                    .map(|c| c.borrow().clone())
+                                    .unwrap_or(Value::Uninitialized);
+                                if matches!(t, Value::Uninitialized) {
+                                    Err(self.throw_reference(
+                                        "Must call super constructor in derived class before returning from derived constructor",
+                                    ))
+                                } else {
+                                    Ok(t)
+                                }
+                            }
+                            _ => Err(self.throw_type(
+                                "Derived constructors may only return object or undefined",
+                            )),
+                        },
+                        Flow::Throw(e) => Err(e),
+                        Flow::Suspend(_) => {
+                            Err(self.throw_type("internal: constructor suspended"))
+                        }
+                    };
+                }
                 // Create `this` with prototype from new_target.prototype.
                 let nt_obj = match new_target {
                     Value::Object(o) => o.clone(),
@@ -1190,18 +1258,86 @@ impl Vm {
                 self.set_prop(&obj, &pkey, value.clone())?;
                 push!(value);
             }
-            Op::AdoptSuperThis(i) => {
+            Op::ConstructSuper(argc) => {
+                let nt = pop!();
+                let at = frame.stack.len() - argc as usize;
+                let args = frame.stack.split_off(at);
                 let sup = pop!();
-                let v = pop!();
-                let parent_is_bytecode = matches!(
-                    &sup,
-                    Value::Object(o) if matches!(
-                        o.borrow().as_function(),
-                        Some(FunctionInner::Bytecode(_))
-                    )
-                );
-                if parent_is_bytecode && matches!(v, Value::Object(_)) {
-                    *frame.cells[i as usize].borrow_mut() = v;
+                let r = self.construct(&sup, &args, &nt)?;
+                push!(r);
+            }
+            Op::ConstructSuperSpread => {
+                let nt = pop!();
+                let args_arr = pop!();
+                let sup = pop!();
+                let args = self.iterate_to_vec(&args_arr)?;
+                let r = self.construct(&sup, &args, &nt)?;
+                push!(r);
+            }
+            Op::BindThisCell(i) => {
+                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                let mut slot = frame.cells[i as usize].borrow_mut();
+                if !matches!(*slot, Value::Uninitialized) {
+                    drop(slot);
+                    return Err(
+                        self.throw_reference("Super constructor may only be called once")
+                    );
+                }
+                *slot = v;
+            }
+            Op::BindThisUpvalue(i) => {
+                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                let mut slot = frame.func.upvalues[i as usize].borrow_mut();
+                if !matches!(*slot, Value::Uninitialized) {
+                    drop(slot);
+                    return Err(
+                        self.throw_reference("Super constructor may only be called once")
+                    );
+                }
+                *slot = v;
+            }
+            Op::ClassLinkSuper => {
+                let sup = pop!();
+                let ctor = pop!();
+                let ctor_obj = match &ctor {
+                    Value::Object(o) => o.clone(),
+                    _ => return Err(self.throw_type("internal: class ctor not an object")),
+                };
+                match &sup {
+                    Value::Null => {
+                        // `extends null`: instances have no prototype chain; the
+                        // constructor itself still inherits %Function.prototype%.
+                        let p = self.get_prop(&ctor, &PropertyKey::str("prototype"))?;
+                        if let Value::Object(po) = p {
+                            po.borrow_mut().proto = None;
+                        }
+                    }
+                    _ => {
+                        if !self.is_constructor(&sup) {
+                            return Err(self.throw_type(
+                                "Class extends value is not a constructor or null",
+                            ));
+                        }
+                        let so = match &sup {
+                            Value::Object(o) => o.clone(),
+                            _ => unreachable!("constructors are objects"),
+                        };
+                        let sp = self.get_prop(&sup, &PropertyKey::str("prototype"))?;
+                        let proto_parent = match sp {
+                            Value::Object(o) => Some(o),
+                            Value::Null => None,
+                            _ => {
+                                return Err(self.throw_type(
+                                    "Class extends value does not have valid prototype property",
+                                ))
+                            }
+                        };
+                        let p = self.get_prop(&ctor, &PropertyKey::str("prototype"))?;
+                        if let Value::Object(po) = p {
+                            po.borrow_mut().proto = proto_parent;
+                        }
+                        ctor_obj.borrow_mut().proto = Some(so);
+                    }
                 }
             }
             Op::PrivateHasOwn(i) => {
@@ -1742,15 +1878,6 @@ impl Vm {
                 let it = self.get_async_iterator(&v)?;
                 push!(it);
             }
-            Op::SuperCall(_)
-            | Op::SuperCallSpread
-            | Op::LoadSuperBase
-            | Op::SuperGet(_)
-            | Op::SuperGetDynamic
-            | Op::SuperSet(_)
-            | Op::SpreadIntoArray => {
-                return Err(self.throw_type("unsupported opcode (super/spread-internal)"));
-            }
         }
         Ok(Ctl::Next)
     }
@@ -1881,7 +2008,7 @@ impl Vm {
             proto,
             upvalues,
             home_object: None,
-            is_class_ctor: kind == FuncKind::ClassCtor,
+            is_class_ctor: kind.is_class_ctor(),
             captured_with: Vec::new(),
         };
         // [[Prototype]] is the function-kind intrinsic: %GeneratorFunction.prototype%,
@@ -1929,7 +2056,10 @@ impl Vm {
             );
         }
         // Ordinary (non-arrow, non-method) functions get a fresh `.prototype`.
-        if matches!(kind, FuncKind::Normal | FuncKind::ClassCtor) {
+        if matches!(
+            kind,
+            FuncKind::Normal | FuncKind::ClassCtor | FuncKind::DerivedCtor
+        ) {
             let proto_obj = self.new_object();
             proto_obj.borrow_mut().props.insert(
                 PropertyKey::str("constructor"),

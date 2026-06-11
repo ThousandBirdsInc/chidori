@@ -925,7 +925,7 @@ impl Compiler {
                     // caller bindings (a sloppy caller's boxed `this` lives in
                     // its %this cell, not in the raw frame value).
                     if b.name.starts_with('%')
-                        && !matches!(b.name.as_str(), "%this" | "%newtarget" | "%superclass")
+                        && !matches!(b.name.as_str(), "%this" | "%newtarget" | "%superclass" | "%fieldinit")
                     {
                         continue;
                     }
@@ -946,7 +946,7 @@ impl Compiler {
             }
             for k in fc.upvalue_keys.clone() {
                 if k.starts_with('%')
-                    && !matches!(k.as_str(), "%this" | "%newtarget" | "%superclass")
+                    && !matches!(k.as_str(), "%this" | "%newtarget" | "%superclass" | "%fieldinit")
                 {
                     continue;
                 }
@@ -1423,6 +1423,7 @@ impl Compiler {
             param_names: fc.param_names,
             is_strict: fc.strict,
             stable_cells: fc.stable_cells.clone(),
+            this_cell: fc.this_cell,
         }
     }
 
@@ -1767,6 +1768,9 @@ impl Compiler {
                 // Leave every active `with` environment before returning.
                 self.emit_pop_with_to(0);
                 self.emit(Op::Return);
+                // (A derived constructor's return-value rules apply at frame
+                // exit, in [[Construct]], so `finally` blocks — which may call
+                // super() — run first.)
             }
             Statement::ThrowStatement(t) => {
                 self.compile_expr(&t.argument)?;
@@ -3530,19 +3534,24 @@ impl Compiler {
                 return Ok(());
             }
         }
-        // super(...) — call the parent constructor with the current `this`.
+        // super(...) — SuperCall (13.3.7.1): evaluate the args, then
+        // Construct(parent, args, new.target) so the PARENT allocates `this`
+        // (giving builtin subclasses real exotic instances), bind the result
+        // as `this` (once), and install instance fields/brands on it. The
+        // expression's value is the bound `this`.
         if matches!(c.callee, Expression::Super(_)) {
             self.load_binding("%superclass"); // [super]
-            self.load_binding("%this"); // [super, this]
-            self.finish_call(c)?;
-            // Constructor return-override: a bytecode parent that returned an
-            // object substitutes it as `this` (in place, so prior captures see
-            // it). Natives keep their discard-and-init-in-place behavior.
-            if let Resolved::Cell(i) = self.resolve("%this") {
-                self.emit(Op::Dup);
-                self.load_binding("%superclass");
-                self.emit(Op::AdoptSuperThis(i));
+            match self.compile_args(&c.arguments)? {
+                ArgForm::Count(n) => {
+                    self.load_binding("%newtarget"); // [super, args.., nt]
+                    self.emit(Op::ConstructSuper(n));
+                }
+                ArgForm::Spread => {
+                    self.load_binding("%newtarget"); // [super, argsArr, nt]
+                    self.emit(Op::ConstructSuperSpread);
+                }
             }
+            self.emit_super_bind_and_init();
             return Ok(());
         }
         // super.method(...) — look up on Super.prototype, call with `this`.
@@ -4544,7 +4553,7 @@ impl Compiler {
                     .any(|d| d.directive.as_str() == "use strict")
             })
             .unwrap_or(false);
-        let class_strict = matches!(kind, FuncKind::ClassCtor);
+        let class_strict = kind.is_class_ctor();
         fc.strict = parent_strict || own_strict || class_strict;
         // One-shot: an object-literal concise method/accessor resolves `super`
         // against its [[HomeObject]]. Arrows never consume it (they take the flag
@@ -4559,16 +4568,36 @@ impl Compiler {
 
         if !arrow {
             let tc = self.declare("%this", false);
-            self.emit(Op::LoadThis);
-            // Sloppy functions substitute the global object / box a primitive
-            // `this` (OrdinaryCallBindThis); strict functions keep it as-is.
-            if !self.cur().strict {
-                self.emit(Op::BindThisSloppy);
+            if kind == FuncKind::DerivedCtor {
+                // A derived constructor has no `this` until `super()` constructs
+                // it: the cell stays in TDZ (reads throw a ReferenceError) and
+                // `super()` initializes it in place via BindThis*. The cell is
+                // STABLE and recorded on the proto so [[Construct]] can read the
+                // final `this` at frame exit (after `finally` blocks have run).
+                self.cur().this_cell = Some(tc);
+                self.cur().stable_cells.push(tc);
+                self.emit(Op::InitCellTdz(tc));
+            } else {
+                self.emit(Op::LoadThis);
+                // Sloppy functions substitute the global object / box a primitive
+                // `this` (OrdinaryCallBindThis); strict functions keep it as-is.
+                if !self.cur().strict {
+                    self.emit(Op::BindThisSloppy);
+                }
+                self.emit(Op::InitCell(tc));
             }
-            self.emit(Op::InitCell(tc));
             let nt = self.declare("%newtarget", false);
             self.emit(Op::LoadNewTarget);
             self.emit(Op::InitCell(nt));
+            if kind == FuncKind::DerivedCtor {
+                // Instance fields/private brands install when `super()` returns,
+                // not at constructor entry. The work lives in a closure so a
+                // `super()` reached from a nested arrow (or direct eval) can run
+                // it against the freshly bound `this`.
+                let fi = self.declare("%fieldinit", false);
+                self.emit_field_init_closure(ctor_fields.unwrap_or(&[]))?;
+                self.emit(Op::InitCell(fi));
+            }
             // The `arguments` object is materialized (an allocation per call) only
             // when the body actually mentions `arguments` — the common case skips
             // it entirely. Scanning the source region for the word never produces
@@ -4664,32 +4693,12 @@ impl Compiler {
         }
         self.cur().in_params = false;
 
-        // Class instance-field initializers run at the top of the constructor.
-        if let Some(fields) = ctor_fields {
-            self.emit_private_brand_stamp();
-            for field in fields {
-                self.load_binding("%this");
-                if field.computed {
-                    self.compile_property_key_expr(&field.key)?;
-                    if let Some(init) = &field.value {
-                        self.compile_expr(init)?;
-                    } else {
-                        self.emit(Op::LoadUndefined);
-                    }
-                    self.emit(Op::SetPropDynamic);
-                } else {
-                    let key = self.class_element_key(&field.key);
-                    if let Some(init) = &field.value {
-                        // NamedEvaluation uses the source-visible name ("#x"),
-                        // not the internal suffixed storage key.
-                        self.compile_named_expr(init, &property_key_name(&field.key))?;
-                    } else {
-                        self.emit(Op::LoadUndefined);
-                    }
-                    let k = self.str_const(&key);
-                    self.emit(Op::SetProp(k));
-                }
-                self.emit(Op::Pop);
+        // A base-class constructor installs instance fields/brands at entry; a
+        // derived one defers them to `super()` (see %fieldinit above).
+        if kind != FuncKind::DerivedCtor {
+            if let Some(fields) = ctor_fields {
+                self.emit_private_brand_stamp();
+                self.emit_field_definitions(fields)?;
             }
         }
 
@@ -4896,7 +4905,11 @@ impl Compiler {
                 m.value.body.as_deref(),
                 false,
                 None,
-                FuncKind::ClassCtor,
+                if has_super {
+                    FuncKind::DerivedCtor
+                } else {
+                    FuncKind::ClassCtor
+                },
                 name,
                 Some(&instance_fields),
             )?;
@@ -4951,7 +4964,12 @@ impl Compiler {
         has_super: bool,
         fields: &[&PropertyDefinition],
     ) -> R {
-        let mut fc = FnCtx::new(name.unwrap_or(""), FuncKind::ClassCtor);
+        let kind = if has_super {
+            FuncKind::DerivedCtor
+        } else {
+            FuncKind::ClassCtor
+        };
+        let mut fc = FnCtx::new(name.unwrap_or(""), kind);
         fc.enclosed_in_with = self
             .fns
             .last()
@@ -4959,29 +4977,52 @@ impl Compiler {
             .unwrap_or(false);
         fc.has_rest = has_super;
         fc.num_params = 0;
+        fc.strict = true; // class bodies are always strict
         self.fns.push(fc);
         self.enter_scope(true);
         let tc = self.declare("%this", false);
-        self.emit(Op::LoadThis);
-        self.emit(Op::InitCell(tc));
+        if has_super {
+            self.cur().this_cell = Some(tc);
+            self.cur().stable_cells.push(tc);
+            self.emit(Op::InitCellTdz(tc));
+        } else {
+            self.emit(Op::LoadThis);
+            self.emit(Op::InitCell(tc));
+        }
         let nt = self.declare("%newtarget", false);
         self.emit(Op::LoadNewTarget);
         self.emit(Op::InitCell(nt));
-        let ac = self.declare("arguments", false);
-        self.emit(Op::LoadArguments);
-        self.emit(Op::InitCell(ac));
         if has_super {
-            // super(...arguments); a parent constructor that returns an object
-            // substitutes it as `this` (return-override), so brand/field
-            // installation below lands on the adopted object.
+            // The default derived constructor: `constructor(...args) {
+            // super(...args) }` — the parent constructs `this`, then instance
+            // fields/brands install on it.
+            let fi = self.declare("%fieldinit", false);
+            self.emit_field_init_closure(fields)?;
+            self.emit(Op::InitCell(fi));
             self.load_binding("%superclass");
-            self.load_binding("%this");
-            self.load_binding("arguments");
-            self.emit(Op::CallSpread);
-            self.load_binding("%superclass");
-            self.emit(Op::AdoptSuperThis(tc));
+            self.emit(Op::LoadRestArgs(0));
+            self.load_binding("%newtarget");
+            self.emit(Op::ConstructSuperSpread);
+            self.emit_super_bind_and_init();
+            self.emit(Op::Return); // super() evaluates to the bound `this`
+        } else {
+            self.emit_private_brand_stamp();
+            self.emit_field_definitions(fields)?;
+            self.emit(Op::LoadUndefined);
+            self.emit(Op::Return);
         }
-        self.emit_private_brand_stamp();
+        self.exit_scope();
+        let fc = self.fns.pop().unwrap();
+        let proto = self.finish(fc);
+        let idx = self.konst(Const::Func(Rc::new(proto)));
+        self.emit(Op::Closure(idx));
+        Ok(())
+    }
+
+    /// Define each instance field on `this` (assumes the surrounding scope can
+    /// resolve `%this`): evaluates the (possibly computed) key and initializer
+    /// and assigns the result.
+    fn emit_field_definitions(&mut self, fields: &[&PropertyDefinition]) -> R {
         for field in fields {
             self.load_binding("%this");
             if field.computed {
@@ -5007,13 +5048,36 @@ impl Compiler {
             }
             self.emit(Op::Pop);
         }
-        // A derived implicit constructor returns its (possibly adopted) `this`
-        // so construct() surfaces a return-override object.
-        if has_super {
-            self.load_binding("%this");
-        } else {
-            self.emit(Op::LoadUndefined);
+        Ok(())
+    }
+
+    /// Build the `%fieldinit` closure of a derived constructor: a function
+    /// that, called with the freshly constructed `this`, stamps the private
+    /// brand and installs the instance fields (InitializeInstanceElements).
+    /// It is invoked by every `super()` site — including ones inside nested
+    /// arrows or direct eval, which reach it lexically.
+    fn emit_field_init_closure(&mut self, fields: &[&PropertyDefinition]) -> R {
+        let mut fc = FnCtx::new("", FuncKind::Method);
+        fc.enclosed_in_with = self
+            .fns
+            .last()
+            .map(|f| f.with_depth > 0 || f.enclosed_in_with || f.contains_eval)
+            .unwrap_or(false);
+        fc.contains_eval = fields
+            .iter()
+            .any(|f| self.region_has_eval(f.span.start, f.span.end));
+        fc.strict = true; // class bodies are always strict
+        self.fns.push(fc);
+        self.enter_scope(true);
+        let tc = self.declare("%this", false);
+        self.emit(Op::LoadThis);
+        self.emit(Op::InitCell(tc));
+        if self.cur_ref().contains_eval {
+            self.emit(Op::InitEvalVars);
         }
+        self.emit_private_brand_stamp();
+        self.emit_field_definitions(fields)?;
+        self.emit(Op::LoadUndefined);
         self.emit(Op::Return);
         self.exit_scope();
         let fc = self.fns.pop().unwrap();
@@ -5023,32 +5087,32 @@ impl Compiler {
         Ok(())
     }
 
-    /// Link `ctor.prototype.__proto__ = Super.prototype` and
-    /// `ctor.__proto__ = Super` via `Object.setPrototypeOf`.
+    /// After `super()` leaves the constructed instance on the stack: bind it
+    /// as `this` (BindThisValue — throws if `super()` already ran) and run the
+    /// `%fieldinit` closure against it. `[instance] -> [instance]`.
+    fn emit_super_bind_and_init(&mut self) {
+        match self.resolve("%this") {
+            Resolved::Cell(i) => self.emit(Op::BindThisCell(i)),
+            Resolved::Upvalue(i) => self.emit(Op::BindThisUpvalue(i)),
+            // No reachable `%this` (malformed context): leave the value as-is.
+            Resolved::Global => return,
+        };
+        if !matches!(self.resolve("%fieldinit"), Resolved::Global) {
+            self.emit(Op::Dup); // [this, this]
+            self.load_binding("%fieldinit"); // [this, this, fi]
+            self.emit(Op::Swap); // [this, fi, this]
+            self.emit(Op::Call(0)); // [this, undefined]
+            self.emit(Op::Pop); // [this]
+        }
+    }
+
+    /// Wire `ctor.prototype.__proto__ = Super.prototype` and
+    /// `ctor.__proto__ = Super`, handling `extends null` and non-constructor
+    /// heritage (TypeError) natively.
     fn class_link_super(&mut self, ctor_cell: u32) -> R {
-        let object = self.str_const("Object");
-        let set_proto = self.str_const("setPrototypeOf");
-        let prototype = self.str_const("prototype");
-
-        // Object.setPrototypeOf(ctor.prototype, Super.prototype)
-        self.emit(Op::LoadGlobal(object));
-        self.emit(Op::GetProp(set_proto)); // [setFn]
-        self.emit(Op::LoadUndefined); // this
-        self.emit(Op::LoadCell(ctor_cell));
-        self.emit(Op::GetProp(prototype)); // ctor.prototype
-        self.load_binding("%superclass");
-        self.emit(Op::GetProp(prototype)); // super.prototype
-        self.emit(Op::Call(2));
-        self.emit(Op::Pop);
-
-        // Object.setPrototypeOf(ctor, Super)
-        self.emit(Op::LoadGlobal(object));
-        self.emit(Op::GetProp(set_proto));
-        self.emit(Op::LoadUndefined);
         self.emit(Op::LoadCell(ctor_cell));
         self.load_binding("%superclass");
-        self.emit(Op::Call(2));
-        self.emit(Op::Pop);
+        self.emit(Op::ClassLinkSuper);
         Ok(())
     }
 

@@ -1,162 +1,137 @@
 # Chidori v3 — Project Review
 
 *An in-depth review of the repository: what works, what is limited, and what
-is incomplete. Snapshot taken 2026-06-10 at commit `f93c2cd` ("runtime").*
+is incomplete. Originally taken 2026-06-10 at commit `f93c2cd` ("runtime");
+updated 2026-06-11 after the QuickJS removal (#39), the CI fixes (#40), the
+Test262 CI gate (#41), and the conformance work in #42 and the
+derived-constructor rework on this branch.*
 
 ## Scope and method
 
 This review covers the whole repository: the Rust core runtime (`src/`), the
-two embedded JavaScript engines (`crates/chidori-quickjs[-sys]` and
-`crates/chidori-js`), the WASM sandbox crates (`sandbox-runtime/`,
-`sandbox-python/`, `sandbox-js/`), the SDKs (`sdk/typescript`, `sdk/python`),
+pure-Rust JavaScript engine (`crates/chidori-js`), the Test262 harness
+(`crates/test262-runner`), the SDKs (`sdk/typescript`, `sdk/python`),
 examples, tests, CI, and the existing design docs. Findings were verified
-against the code (a fresh `cargo build` was attempted, CI history was checked
-on GitHub) rather than taken from the docs alone.
+against the code and the CI history on GitHub rather than taken from the
+docs alone.
 
-**Code size at a glance** (lines, excluding vendored QuickJS C sources):
+**Code size at a glance** (lines of Rust unless noted):
 
 | Area | Approx. LOC | Notes |
 |---|--:|---|
-| `src/` (runtime, server, CLI, providers, tools) | ~42,000 | `server.rs` alone is ~8,800 |
-| `crates/chidori-js` (pure-Rust JS engine) | ~32,000 | zero `unsafe`, oxc parser only |
-| `crates/chidori-quickjs-sys` (vendored QuickJS fork) | ~80,000 | C sources + FFI |
-| `crates/chidori-quickjs` (safe wrapper) | ~4,200 | single file |
-| `crates/test262-runner` | ~1,300 | conformance harness |
+| `src/` (runtime, server, CLI, providers, tools) | ~22,600 | `server.rs` is ~3,100 (was ~8,800 pre-#39) |
+| `crates/chidori-js` (pure-Rust JS engine) | ~57,000 | zero `unsafe`, oxc parser; ~26k of this is generated Unicode tables |
+| `crates/test262-runner` | ~1,200 | conformance harness + baseline gate |
 | `sdk/` (TypeScript + Python) | ~1,500 | zero-dependency clients |
+
+The previous snapshot carried ~84,000 additional lines of vendored QuickJS C
+and WASM-sandbox code; #39 deleted all of it (−112,897 lines in one commit).
 
 ---
 
 ## Executive summary
 
-Chidori v3 is an ambitious and unusually deep system: a single Rust binary
-that runs TypeScript agents on an embedded JS engine, records every side
-effect through a host boundary, and uses that journal for deterministic
-replay, durable pause/resume, and human-in-the-loop workflows. The TypeScript
-migration described in `TODO.md` is genuinely complete — every roadmap item is
-checked off — and the docs are unusually honest about remaining gaps.
+Chidori v3 is a single Rust binary that runs TypeScript agents on an embedded
+pure-Rust JS engine, records every side effect through a host boundary, and
+uses that journal for deterministic replay, durable pause/resume, and
+human-in-the-loop workflows.
 
-The headline findings of this review:
+Since the 2026-06-10 snapshot, the two headline problems identified by this
+review have been **fixed**:
 
-1. **The build is broken for fresh clones, and CI on `main` has been red
-   since 2026-05-28.** `src/runtime/sandbox.rs` embeds three WASM binaries via
-   `include_bytes!`, but those artifacts are not committed and neither the
-   README's `cargo build` quick start nor `.github/workflows/ci.yml` runs the
-   required `scripts/build-wasm.sh` first. The last six CI runs on `main` all
-   concluded `failure`. This is the single most important thing to fix.
-2. **The project carries three JavaScript engines at once** — the vendored
-   QuickJS fork (production default), the pure-Rust `chidori-js` engine
-   (opt-in, 91.69% Test262), and Boa compiled to WASM (for the `execJs`
-   sandbox). This is a deliberate migration state, but it is the project's
-   largest ongoing maintenance burden, and the QuickJS removal is blocked on
-   one remaining gate (G5, conformance).
-3. **Everything else is in good shape but intentionally narrow**: two LLM
-   providers, a blob-style persistence layer, capability-confinement (not
-   OS-level) sandboxing, no npm package support, and an 8-module `node:`
-   builtin allowlist. These are documented design choices rather than bugs,
-   but they bound what the runtime can be used for today.
+1. **The build/CI break is gone.** The broken `include_bytes!` of
+   never-committed WASM sandbox blobs disappeared along with the sandboxes
+   themselves. `cargo build` works on a fresh clone again, and both the `CI`
+   and `Test262 conformance` workflows are green on `main` (first green run:
+   `c964aea`, 2026-06-10).
+2. **The three-engine situation is resolved.** The vendored QuickJS fork,
+   the `rquickjs` parity path, and the Boa/RustPython/WASM exec sandboxes are
+   deleted. `chidori-js` is now the **only** JavaScript engine in the tree,
+   for agent, tool, and sub-agent execution alike.
 
----
+The flip side of the consolidation: conformance stopped being a migration
+gate ("G5") and became **load-bearing** — a language bug in `chidori-js` now
+breaks real agents with no fallback engine. The project responded correctly:
+Test262 runs in CI against a committed per-test baseline (PRs touching the
+engine, pushes to `main`, and a nightly schedule), so the number can no
+longer rot silently. Conformance is **95.2 %** of executed tests at the
+pinned suite commit, and the largest remaining failure cluster (the derived
+`class` constructor model) is addressed by the rework on this branch (see
+below).
 
-## Critical issue: fresh builds fail and CI is red
-
-A plain `cargo build` on a fresh checkout fails:
-
-```
-error: couldn't read `src/runtime/../../sandbox-runtime/target/wasm32-unknown-unknown/release/sandbox_runtime.wasm`: No such file or directory
-error: couldn't read `src/runtime/../../sandbox-python/target/wasm32-wasip1/release/sandbox-python.wasm`: No such file or directory
-error: couldn't read `src/runtime/../../sandbox-js/target/wasm32-wasip1/release/sandbox-js.wasm`: No such file or directory
-```
-
-The cause is the unconditional `include_bytes!` of prebuilt sandbox binaries
-in `src/runtime/sandbox.rs` (lines ~466, ~592, ~1005). `scripts/build-wasm.sh`
-exists and documents the prerequisite (it builds `sandbox-runtime` for
-`wasm32-unknown-unknown` and `sandbox-python`/`sandbox-js` for
-`wasm32-wasip1`), but:
-
-- The README quick start (`README.md:74`, `:109`) says only `cargo build`.
-- `.github/workflows/ci.yml` runs `cargo test --workspace` and `cargo build`
-  without ever invoking `build-wasm.sh` or installing the wasm targets.
-- The `.wasm` artifacts have never been committed (verified via
-  `git log --all -- '*.wasm'`).
-
-Consequently the `ci.yml` workflow has failed on every run of `main` since at
-least `770bc53` (2026-05-28), including the most recent commit `f93c2cd`.
-`scripts/publish.sh` would hit the same wall at its `cargo build --release`
-step.
-
-**Suggested fixes (any one of these unblocks):** make the sandbox embedding a
-cargo feature with a stub fallback; commit the (small, deterministic) wasm
-artifacts; generate them from `build.rs`; or simply add the
-`rustup target add` + `scripts/build-wasm.sh` steps to CI and the README.
-Until then, every "Quality Gates" claim in `TODO.md` ("Root Rust test suite
-passes", "Add CI for cargo test --workspace") is true on a machine that has
-run the script and silently false everywhere else.
+What remains is intentional narrowness, not breakage: two LLM providers, a
+blob-style persistence layer, capability-confinement (not OS-level)
+sandboxing, no npm packages, an 8-module `node:` allowlist — documented
+design choices that bound what the runtime can be used for today. The main
+*new* debt is documentation drift: a body of docs still describes the
+QuickJS-era architecture.
 
 ---
 
-## The three-engine situation
-
-This is the project's defining in-flight migration.
+## The engine: one runtime, conformance now load-bearing
 
 | Engine | Where | Role | Status |
 |---|---|---|---|
-| QuickJS fork (C) | `crates/chidori-quickjs[-sys]` | **Production default** for agent execution and live-VM snapshots | Stable; ~99.5% of executed Test262 |
-| `chidori-js` (pure Rust) | `crates/chidori-js` | Opt-in via `CHIDORI_JS_ENGINE=rust`; intended replacement | 91.69% of executed Test262 (36,490 pass / 3,307 fail / 7,468 skip, 2026-06-04) |
-| Boa (WASM) | `sandbox-js/` → embedded blob | Powers the `chidori.execJs()` sandbox only | Frozen at boa_engine 0.21, default features off |
+| `chidori-js` (pure Rust) | `crates/chidori-js` | **The** engine — agents, tools, sub-agents, Test262 | 95.2 % of executed Test262 (37,886 / 1,911 / 7,494 pass/fail/skip at the pinned commit; improving on this branch) |
 
-`docs/rust-engine-quickjs-removal-gaps.md` tracks the removal gates. G1
-(pause/resume), G2 (durable snapshot/restore), G3 (`node:` builtins), G4
-(native nested tool/sub-agent execution), and G6 (replay parity) are all
-closed. **G5 — the conformance bar — is the only open gate**: the default
-flip and QuickJS deletion wait on an agreed target (≥95% language +
-builtins).
+`docs/conformance.md` describes the measurement methodology (bare-context,
+fresh VM per variant, honest skip accounting) and the CI gate
+(`.github/workflows/test262.yml` + `scripts/test262.sh --gate` against
+`crates/test262-runner/test262-expectations.json`). Regressions fail the
+build; new passes print a baseline-refresh hint.
 
-The practical cost of this state:
+### Recent engine work
 
-- Two implementations of the `SnapshotCapableJsEngine` surface must be kept
-  in behavioral lockstep; the legacy `rquickjs` binding module is *also*
-  retained for parity tests.
-- ~80k lines of vendored C remain in the repo, with a dedicated
-  `quickjs-fork.yml` workflow to keep the fork updated.
-- Stale comments have already crept in: `crates/chidori-js/src/lib.rs:277`
-  still says module imports are unsupported on the rust path, but G3/G4
-  closure notes say relative imports and `node:` shims now work.
+- **#42**: dynamic `import()` via a `Vm::dynamic_import` host hook (the
+  production runtime still forbids it by policy — the *engine* supports it,
+  the *durability contract* rejects it), `with`-scope reference/closure
+  semantics, spec-order member writes, `export default` self-reference
+  fixes.
+- **This branch**: the spec construction model for derived classes —
+  `super()` now performs a real `Construct(parent, args, new.target)` so
+  `class A extends Array` (or `Map`, `Error`, …) produces a genuine exotic
+  instance; `this` is in TDZ until `super()` returns (ReferenceError before,
+  "may only be called once" after); instance fields/private brands install
+  when `super()` returns; derived `return` follows the object /
+  undefined-becomes-this / else-TypeError rules **at frame exit** (so a
+  `super()` inside `finally` is honored); native constructors honor
+  `new.target` for the instance prototype (`Reflect.construct(Array, [],
+  Other)` included); class constructors throw when invoked without `new`;
+  `extends null` and `extends Symbol` behave per spec. This clears the
+  largest single failure cluster in the baseline (~300 of the 1,911
+  remaining failures were `class`-related).
 
-### Remaining `chidori-js` language gaps (from Test262 + docs)
+### Remaining language gaps (top clusters of the baseline's 1,911 failures)
 
-Highest-value first, per `docs/rust-engine-quickjs-removal-gaps.md` and
-`docs/pure-rust-js-engine-plan.md`:
+| count | area | nature |
+|--:|---|---|
+| 414 | `language/statements` | mostly `class` (largely fixed on this branch), `await using`, `for-of` corners |
+| 370 | `language/expressions` | class elements, `super` edge cases, `delete`, `yield*` delegation |
+| 150 | `built-ins/Array` | species/proxy interplay, length-boundary semantics |
+| 100 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings), `v`-flag |
+| 96 | `built-ins/TypedArray` | resizable-`ArrayBuffer` out-of-bounds tracking |
+| 53 | `built-ins/Promise` | spec-detailed async ordering combinations |
 
-| Gap | ~Tests | Notes |
-|---|--:|---|
-| RegExp `\p{…}` Unicode property escapes | ~440 | Unicode tables are generated (`unicode_tables.rs`); the property-name→range mapping is unfinished. Biggest single cluster; RegExp sits at ~54%. |
-| Resizable `ArrayBuffer` mid-op edge cases | ~150 | detach/shrink-mid-operation checks; DataView-on-resizable. |
-| Promise/async ordering depths | ~100 | Promise at ~55%; spec-detailed timing combinations. |
-| Array iteration-method hole semantics | ~96 | `forEach`/`map`/etc. must `HasProperty`-gate holes; `copyWithin` still dense-only. |
-| Per-instance private brand model | ~50 | Class private methods/accessors; brand checks on calls landed, instance tracking didn't. |
-| Derived-constructor `this`-TDZ | ~40 | Engine pre-creates `this` instead of letting `super()` create it; needs the spec construction model. |
-| Async-generator `.return()` + `finally` | ~40 | Sync generators fixed (GeneratorPrototype 48%→100%); async path pending. |
+**Intentionally unsupported** (consistent with the deterministic replay
+contract, skipped honestly in the runner): `Intl`, `Temporal`,
+`Atomics`/`SharedArrayBuffer`, `WeakRef`/`FinalizationRegistry`,
+`ShadowRealm`, decorators, iterator helpers.
 
-**Intentionally unsupported everywhere** (consistent with the deterministic
-replay contract): `Intl`, `Temporal`, `Atomics`/`SharedArrayBuffer`,
-`WeakRef`/`FinalizationRegistry`, `ShadowRealm`, decorators, iterator
-helpers, dynamic module loading (dynamic `import()` returns a rejected
-promise).
+### Engine-internal notes
 
-### Engine-internal limitations worth knowing
-
-- **Reference-counting GC leaks cycles.** `Rc<RefCell<…>>` cannot reclaim
-  ctor↔prototype and closure cycles; `Vm::dispose()` breaks known cycles
-  manually (the conformance runner calls it per test — an earlier full run
-  OOM'd a 64 GB machine before this landed). Long-lived VM reuse without
-  `dispose()` will leak.
-- **No value checkpointing yet** (deferred P6): resume cost equals full
-  re-execution of the journal from the top, so very long histories get
-  slower to resume. `durableStep(fn)` memoization exists as a partial
-  mitigation.
-- **Regex engine is a custom backtracker** with a 100k step budget — safe
-  against ReDoS, but future TC39 regex features (v-flag, modifiers) all land
-  on this team.
+- **GC**: reference counting plus a real cycle collector (`gc.rs`) — every
+  allocation registers per-VM, `Vm::dispose()` breaks the outgoing edges of
+  everything the VM allocated, `Vm::collect_cycles()` offers mark-sweep for
+  long-lived VMs. The earlier "full Test262 run OOMs a 64 GB machine"
+  problem is gone (~20 MB flat RSS over the 21k `language/` tests); the
+  suite is still chunked per directory in CI, but for crash isolation, not
+  memory.
+- **Regex** is a custom backtracker with a 100k-step budget — ReDoS-safe,
+  but future TC39 regex features all land on this team.
+- `lib.rs`'s single-file `run_entrypoint` helper still carries a "module
+  imports are not supported on the rust engine path yet" error string —
+  stale phrasing (there is no other path; the real runtime resolves imports
+  through `typescript/module_graph.rs`).
 
 ---
 
@@ -166,192 +141,170 @@ promise).
 
 - Import policies are static: `None` / `Relative` / `Project` / `Node`
   (`Node` is the durable default so the VFS is reachable). **No dynamic
-  imports, no npm packages, no JSX/TSX.** Node package compatibility is an
-  explicit v1 non-goal (`DESIGN.md`).
-- The `node:` builtin allowlist covers only 8 modules
-  (`src/runtime/typescript/transpile.rs:57–66`): `process`, `buffer`, `util`,
+  imports (by policy), no npm packages, no JSX/TSX.** Node package
+  compatibility is an explicit v1 non-goal (`DESIGN.md`).
+- The `node:` builtin allowlist covers 8 modules
+  (`src/runtime/typescript/transpile.rs`): `process`, `buffer`, `util`,
   `fs`, `fs/promises`, `crypto`, `http`, `https`. Missing staples include
   `path`, `os`, `events`, `stream`, `url`, `assert`, `zlib`,
-  `child_process`. Agents that look "node-like" will hit this wall quickly.
+  `child_process`. Agents that look "node-like" hit this wall quickly.
 - `node:fs` is backed by an in-memory, snapshot-resident VFS — agents cannot
-  read the host filesystem (a deliberate confinement property, but worth
-  stating as a limitation: there is no opt-in host FS access either;
-  `FsPolicy::Host` is rejected in durable runs).
-- `node:crypto` is shimmed over synchronous host-backed hashing; timers are
-  virtual (logical clock) or disabled — no real wall-clock timers in durable
-  mode.
+  read the host filesystem (deliberate confinement; there is no opt-in host
+  FS access either — `FsPolicy::Host` is rejected in durable runs).
+- Timers are virtual (logical clock) or disabled — no real wall-clock timers
+  in durable mode.
 - Transpilation (oxc-based) strips types only; modern syntax is not
-  downleveled. No JSDoc-to-schema extraction for tool metadata.
+  downleveled.
+
+### Execution surface (narrowed by #39)
+
+The `execJs` / `execPython` / `execWasm` / `exec_expr` sandboxes are
+**removed**, along with their WASM interpreter blobs and the hand-rolled
+WASI shim. This deleted both a feature (polyglot snippet execution) and an
+attack/maintenance surface; agents now execute TypeScript only. Anyone
+relying on `chidori.execPython(...)` has no replacement.
 
 ### LLM providers
 
 - **Two real providers**: Anthropic and OpenAI (`src/providers/`), plus a
   catch-all LiteLLM-compatible provider (any model routes there when
   `LITELLM_API_URL` is set) and a `StaticProvider` for tests. No native
-  Gemini, Bedrock, Vertex, Azure OpenAI, Mistral, or Ollama integrations —
-  LiteLLM is the implicit escape hatch for all of them.
-- The base `LlmProvider::stream()` (`src/providers/mod.rs:117–125`) falls
-  back to a blocking `send()` and emits one synthetic delta; only Anthropic
-  and OpenAI implement true streaming.
+  Gemini, Bedrock, Vertex, Azure OpenAI, Mistral, or Ollama — LiteLLM is the
+  implicit escape hatch.
+- The base `LlmProvider::stream()` falls back to a blocking `send()` with
+  one synthetic delta; only Anthropic and OpenAI stream for real.
 - No embeddings, no image/audio modalities, no structured-output/JSON-mode
   plumbing beyond tool calls.
 
-### Sandboxed execution (`execJs` / `execPython` / `execWasm`)
-
-- `execPython` is RustPython-on-WASI and `execJs` is Boa-on-WASI — both are
-  *separate interpreters from the agent engine*, embedded as WASM blobs with
-  a hand-rolled 18-function WASI preview-1 shim. They are metered (fuel) but
-  feature-frozen at whatever those interpreter versions support.
-- Raw `execWasm` arguments and returns are limited to numeric types
-  (i32/i64/f32/f64); strings/objects must be marshaled via linear memory.
-  There are no host→guest callbacks beyond a `host.log` string channel.
-- `exec_expr`'s miniscript runtime caps source+vars at 16 KiB.
-
 ### Policy and sandbox model
 
-`docs/sandbox-model.md` is admirably explicit that this is
-**capability-confinement, not OS isolation**. The documented gaps are real
-and worth restating:
+Still **capability-confinement, not OS isolation** (`docs/sandbox-model.md`
+— note that doc still describes the rust engine as opt-in; see doc drift).
+The real gaps, restated post-#39:
 
-1. **Powerful injected effects are mostly ungated** — only `http` passes
-   through `enforce_policy`; `execPython`, `execWasm`, and `workspace.*`
-   appear unconditional. Deny-by-default routing through the policy gate is
-   the stated fix and has not landed.
-2. **Memory accounting is process-wide, not per-VM**
-   (`src/mem_guard.rs`): under concurrent agents, one run's allocations can
-   be attributed to another. The cap is a backstop, not a per-tenant quota.
-   Enforcement is also polled (~20 ms watchdog / every 256 ops), so brief
-   overshoot is possible.
+1. **`http` is the only effect routed through `enforce_policy`**;
+   `workspace.*` effects appear unconditional. The list of ungated powerful
+   effects shrank (the `exec*` family is gone), but deny-by-default routing
+   through the policy gate has still not landed.
+2. **Memory accounting is process-wide, not per-VM** (`src/mem_guard.rs`):
+   under concurrent agents one run's allocations can be attributed to
+   another; enforcement is polled, so brief overshoot is possible.
 3. **No per-agent CPU quota** — the opcode budget bounds a run, not a
    tenant.
-4. **No seccomp/namespace/process isolation** — the engine runs in-process;
-   Rust memory safety plus capability injection are the only boundaries.
-   Not suitable for genuinely hostile code without an outer container.
-5. Policy `match_args` matching is shallow (contains-check for objects,
-   equality for arrays — `src/policy.rs:98–105`); no regex or nested
-   queries. Approvals are cached per-session only, and policy cannot change
-   mid-run.
+4. **No seccomp/namespace/process isolation** — though "zero `unsafe`, no C"
+   is now true of the entire engine, which is a categorically better story
+   than the vendored-C era. Still not suitable for genuinely hostile code
+   without an outer container.
+5. Policy `match_args` matching is shallow; approvals are cached per-session
+   only; policy cannot change mid-run.
 
-### Persistence and scale
+### Persistence, resume, and scale
 
-- Storage (`src/storage.rs`) is **JSON files** (default,
-  `.chidori/runs/…`) or **SQLite** (opt-in via `CHIDORI_DB_PATH`), both
-  storing sessions as opaque JSON blobs. No field-level queries, no
-  migrations between backends, no multi-node story. Fine for a single-node
-  dev/prod box; not a fleet substrate.
-- Concurrency is bounded by a per-run tokio semaphore in the server; there
-  is no distributed scheduling or remote execution.
-- Full QuickJS `JSModule` graph serialization is deferred — snapshots use a
-  "selected roots + bundled module scaffold" model. If snapshot bundle
-  creation fails, the engine **silently falls back to replay**
-  (`src/runtime/engine.rs:109–116`) rather than surfacing an error.
+- Storage is **JSON files** (default) or **SQLite** (opt-in), both storing
+  sessions as opaque blobs. No field-level queries, no migrations, no
+  multi-node story.
+- **Resume is always call-log replay now.** The QuickJS live-VM
+  snapshot/resume machinery was deleted in #39, which *simplified* the
+  architecture (the silent snapshot→replay fallback this review previously
+  flagged is gone — replay is the only, explicit mechanism) at the cost of
+  the original performance idea. With **no value checkpointing** (the
+  deferred P6), resume cost equals re-execution of the journal from the
+  top, so very long histories get slower to resume; `durableStep(fn)`
+  memoization is the partial mitigation.
+- Concurrency is bounded by a per-run tokio semaphore in the server; no
+  distributed scheduling.
 
 ### Server and protocol surface
 
-- `src/server.rs` is ~8,800 lines — session API, SSE streaming, live-VM
-  resume, and replay-fallback logic in one module. It works, but it's the
-  file most in need of decomposition; the same goes for
-  `src/runtime/typescript/snapshot.rs` (~7,200 lines).
-- ACP (Agent Client Protocol, `src/acp.rs`) is self-described as a minimal
-  subset: create thread, send prompt, list/get threads. Streaming,
-  tool-approval flows, and richer session management are not covered.
-- MCP support exists (`src/mcp/`) but shares the same "minimal viable
-  surface" character.
+- `src/server.rs` is ~3,100 lines post-#39 — the earlier "8,800-line
+  unreviewable module" complaint is resolved by deletion rather than
+  decomposition, and the file is now reasonable.
+- ACP (`src/acp.rs`) remains a minimal subset: create thread, send prompt,
+  list/get threads. MCP support (`src/mcp/`) is similarly minimal-viable.
 
 ---
 
 ## SDKs, examples, tests, CI
 
-### SDKs — complete but unpublished
+### CI — green, with a conformance gate
 
-Both SDKs are zero-dependency, mirror each other method-for-method, and
-cover the full host/session API (run, replay, resume, checkpoint, stream,
-snapshot manifests). Two gaps:
+`.github/workflows/ci.yml` (build, tests, formatting, TS SDK typecheck) and
+`.github/workflows/test262.yml` (baseline-gated conformance, also nightly)
+both pass on `main`. The "Quality Gates" in `TODO.md` are finally true on a
+fresh clone.
 
-- `scripts/publish.sh` publishes only the Rust crates
-  (`chidori-quickjs-sys`, `chidori-quickjs`, `chidori`). **There is no npm or
-  PyPI publish automation** despite both SDKs being at version 3.0.0 and the
-  README badging npm/PyPI.
-- Both SDK READMEs state that checkpoint resume goes through call-log
-  replay because "direct live VM continuation … is still gated on the
-  QuickJS serializer," while `docs/typescript-migration-audit.md` says
-  direct live-VM continuation **is** implemented for production paths. One
-  of these is stale; reconcile them.
+### SDKs — complete but unpublished, with stale READMEs
+
+Both SDKs are zero-dependency and mirror each other. Gaps:
+
+- **No npm or PyPI publish automation** despite both SDKs being at 3.0.0 and
+  the README badging npm/PyPI.
+- Both SDK READMEs say checkpoint resume goes through call-log replay
+  because "direct live VM continuation … is still gated on the QuickJS
+  serializer". That was stale before; it is wrong in a new way now — live-VM
+  continuation isn't gated, it's *removed*. Replay is the design, not a
+  stopgap; the READMEs should say so.
 
 ### Tests
 
-- Good: engine unit/integration tests (`crates/chidori-js/tests/`), QuickJS
-  wrapper snapshot-ABI tests, CLI integration tests
-  (`tests/cli_typescript.rs`, 10 cases), and 8 Python-SDK integration tests
-  that exercise a real server (sessions, auth, CORS, concurrency,
-  pause/resume).
+- Good: engine unit/integration tests (`crates/chidori-js/tests/`), CLI
+  integration tests, 8 Python-SDK integration tests against a real server,
+  and Test262 in CI.
 - Missing: **any TypeScript SDK tests** (CI only typechecks and builds it);
-  meaningful integration coverage for the three `exec*` sandboxes; Test262
-  in CI (conformance is measured locally only, so the 91.69% number can rot
-  silently); MCP/ACP protocol tests.
-- And, per the critical issue above, the Rust jobs in CI cannot currently
-  pass at all.
+  MCP/ACP protocol tests.
 
-### Examples and docs
+### Examples and docs — the doc-drift list
 
-- Examples are in good shape: ~20 agents plus a dedicated
-  `examples/record-replay/` set demonstrating determinism, retries, human
-  approval, and exactly-once semantics. None reference unimplemented APIs.
-- The docs set is a genuine strength — `sandbox-model.md`,
-  `pure-rust-js-engine-plan.md`, and `rust-engine-quickjs-removal-gaps.md`
-  document their own gaps candidly. The main doc debt is *staleness drift*
-  between fast-moving reality and narrative docs (SDK READMEs vs migration
-  audit; `lib.rs:277`; README quick start vs the wasm prebuild requirement).
-- The three `sandbox-*` directories are intentionally outside the cargo
-  workspace (each is its own workspace so it can target wasm/no_std), but
-  nothing in the README explains this — they look vestigial until you find
-  `scripts/build-wasm.sh`.
+Examples (~20 agents plus `examples/record-replay/`) remain in good shape.
+The docs are the main debt: a body of them still describes the QuickJS era.
+Concretely:
+
+- `README.md` (~lines 358–410): says agents run on "an embedded QuickJS
+  runtime", cites the dead 99.5 % QuickJS number, and describes
+  `chidori-js` as the "younger" alternative path.
+- `docs/sandbox-model.md`: frames the rust engine as opt-in via a
+  `rust-engine` cargo feature (removed in #39).
+- `docs/rust-engine-quickjs-removal-gaps.md` and
+  `docs/pure-rust-js-engine-plan.md`: the migration they track is done;
+  they should be marked historical (their "decision: default stays QuickJS"
+  sections actively contradict the tree).
+- `scripts/conformance.sh`: still advertises `ENGINE=rust|quickjs`.
+- SDK READMEs (above), and `crates/chidori-js/src/lib.rs` ~420 ("rust
+  engine path yet").
 
 ---
 
 ## What is genuinely done
 
-To keep the limitations in perspective, the following are implemented and
-verified by the migration audit and test suite (modulo the CI build issue):
-
-- TypeScript-only agent authoring with runtime transpilation; the full
+- TypeScript-only agent authoring with runtime transpilation; the
   `chidori.*` host API (prompt, input, tool, callAgent, parallel, retry,
-  tryCall, http, template, log, memory, checkpoint, execJs/Python/Wasm,
-  workspace).
-- Deterministic call-log record/replay with zero-LLM-call replays.
-- Durable pause/resume across `input()`, policy approval, and host calls —
-  including direct live-VM resume on the QuickJS path with replay as an
-  explicit fallback, and nested tool/sub-agent suspension.
-- CLI (`check`, `run`, `serve`, `trace`, `stats`, `demo`, snapshot
-  inspection), HTTP session API with SSE streaming, OTEL trace emission.
-- Test262 conformance harness runnable against both engines.
+  tryCall, http, template, log, memory, checkpoint, workspace).
+- Deterministic call-log record/replay with zero-LLM-call replays; durable
+  pause/resume across `input()`, policy approval, and host calls, including
+  nested tool/sub-agent suspension — all on the single pure-Rust engine.
+- CLI (`check`, `run`, `serve`, `trace`, `stats`, `demo`), HTTP session API
+  with SSE streaming, OTEL trace emission.
+- A conformance story with teeth: pinned-suite Test262, committed per-test
+  baseline, CI gate, nightly run.
 
 ---
 
 ## Prioritized recommendations
 
-1. **Fix the build/CI break** (critical): add the wasm prebuild to CI and
-   the README, or make the sandbox blobs a feature/build-script concern.
-   Nothing else on this list is verifiable until CI is green again.
-2. **Finish G5 and delete an engine.** The four highest-value conformance
-   clusters (array holes ~96, async-gen finally ~40, resizable ArrayBuffer
-   ~150, RegExp `\p{}` ~440) plausibly reach the ~95% bar; flipping the
-   default and removing the QuickJS fork + `rquickjs` parity path would
-   eliminate ~84k lines and the dual-maintenance tax.
-3. **Gate the powerful effects** (`execPython`, `execWasm`, `workspace.*`)
-   through the policy layer, deny-by-default for untrusted profiles —
-   sandbox-model gap #1 and the most security-relevant single change.
-4. **Run Test262 in CI** (even a curated subset) so the conformance number
-   is continuously true, and add TypeScript SDK tests.
-5. **Automate SDK publishing** to npm/PyPI in `publish.sh`/CI, or remove the
-   registry badges until then.
-6. **Reconcile stale docs**: SDK READMEs vs `typescript-migration-audit.md`
-   on live-VM resume; `chidori-js/src/lib.rs:277`; README build
-   instructions; a short note on why `sandbox-*` are separate workspaces.
-7. **Decompose `server.rs` and `typescript/snapshot.rs`** before they grow
-   further; both are load-bearing and effectively unreviewable as single
-   files.
-8. Longer-term, as adoption demands: per-VM memory accounting, value
+1. ~~Fix the build/CI break~~ — **done** (#39/#40).
+2. ~~Finish G5 and delete an engine~~ — **done** (#39); conformance is now a
+   permanent quality bar, not a gate. Keep picking off the cluster table
+   above (Array species, RegExp `v`-flag/UTF-16, resizable ArrayBuffer,
+   Promise ordering are the next four).
+3. **Gate the remaining powerful effects** (`workspace.*`) through the
+   policy layer, deny-by-default for untrusted profiles — still the most
+   security-relevant single change, and smaller now that `exec*` is gone.
+4. ~~Run Test262 in CI~~ — **done** (#41). Add TypeScript SDK tests next.
+5. **Automate SDK publishing** to npm/PyPI, or remove the registry badges.
+6. **Pay down the doc drift** (the list above): README engine section, SDK
+   READMEs, sandbox-model preamble, archive the two migration docs, the
+   conformance.sh `ENGINE` knob.
+7. Longer-term, as adoption demands: per-VM memory accounting, value
    checkpointing for long journals (P6), a broader `node:` allowlist
    (`path`, `events`, `url` are cheap wins), more native providers or
    first-class embeddings, and a queryable storage schema.
@@ -360,10 +313,11 @@ verified by the migration audit and test suite (modulo the CI build issue):
 
 ## Bottom line
 
-Chidori v3 is a coherent, well-documented system with one foot still in a
-major engine migration. Its limitations split cleanly into three kinds:
-**deliberate scope cuts** (no npm, no OS sandbox, no Intl/Temporal, blob
-storage) that are defensible and documented; **migration residue** (three JS
-engines, G5 conformance gate, stale doc drift) that has a clear finish line;
-and **one operational regression** (the wasm prebuild / red CI) that
-contradicts the project's own quality gates and should be fixed first.
+The 2026-06-10 review closed on "one foot still in a major engine
+migration." That foot has landed: the migration finished by deletion, CI is
+green, and conformance is continuously measured against a committed
+baseline. The remaining limitations now split into two kinds: **deliberate
+scope cuts** (no npm, no OS sandbox, no Intl/Temporal, blob storage,
+replay-only resume) that are defensible and documented, and **follow-through
+work** (workspace policy gating, SDK publishing, TS SDK tests, doc drift,
+the conformance cluster table) that has a clear finish line.

@@ -12,15 +12,13 @@
 #   scripts/conformance.sh total                        # print the stored total, run nothing
 #
 # Env:
-#   ENGINE=rust|quickjs   (default: rust)
-#   STATE=<path>          (default: conformance-state.<engine>.json at repo root)
+#   STATE=<path>          (default: conformance-state.json at repo root)
 #   TEST262_TIMEOUT_MS    per-test timeout (default 4000)
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ENGINE="${ENGINE:-rust}"
-STATE="${STATE:-conformance-state.${ENGINE}.json}"
+STATE="${STATE:-conformance-state.json}"
 export TEST262_TIMEOUT_MS="${TEST262_TIMEOUT_MS:-4000}"
 
 cargo build --release -p test262-runner >/dev/null
@@ -29,7 +27,7 @@ RUNNER=./target/release/test262-runner
 # `total`: recompute/print the stored total without running anything (re-runs an
 # empty filter so nothing executes but the merged total is reprinted).
 if [[ "${1:-}" == "total" ]]; then
-  exec "$RUNNER" --engine "$ENGINE" --state "$STATE" --filter '\0__none__' test/built-ins/Array
+  exec "$RUNNER" --state "$STATE" --filter '\0__none__' test/built-ins/Array
 fi
 
 # `full`: drop the path args so the runner walks the default language+built-ins.
@@ -37,4 +35,4 @@ if [[ "${1:-}" == "full" ]]; then
   shift
 fi
 
-exec "$RUNNER" --engine "$ENGINE" --state "$STATE" "$@"
+exec "$RUNNER" --state "$STATE" "$@"
