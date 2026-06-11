@@ -253,6 +253,11 @@ fn trace_object(
                 f(t);
             }
         }
+        Internal::ModuleNamespace(ns) => {
+            for cell in ns.exports.values() {
+                trace_cell(cell, seen_cells, f);
+            }
+        }
         Internal::Function(func) => match func {
             FunctionInner::Bytecode(bf) => {
                 for cell in &bf.upvalues {

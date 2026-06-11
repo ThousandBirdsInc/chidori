@@ -260,6 +260,35 @@ pub enum Op {
     /// (RequireObjectCoercible, run before a computed key's ToPropertyKey).
     RequireCoercible,
 
+    // ---- private class elements ----
+    /// Brand-checked private METHOD/ACCESSOR read: `[obj] -> [value]`. The
+    /// receiver must OWN the `brand` key (instances are branded at
+    /// construction); the element itself is then read through the prototype
+    /// chain (methods/accessors live on the class prototype under `key`).
+    PrivateGetB {
+        brand: u32,
+        key: u32,
+    },
+    /// Brand-checked private METHOD/ACCESSOR write: `[obj, value] -> [value]`.
+    /// A method is never writable (TypeError); an accessor routes through its
+    /// setter (TypeError when it has none).
+    PrivateSetB {
+        brand: u32,
+        key: u32,
+        is_method: bool,
+    },
+    /// `#x in obj`: `[obj] -> [bool]` — whether obj OWNS the key (a field's
+    /// storage key, or a method/accessor's brand key).
+    PrivateHasOwn(u32),
+    /// `[superResult, superCtor] -> []`: constructor return-override — when
+    /// the parent is a BYTECODE constructor (a JS class/function) that
+    /// returned an object, substitute it as `this`; the `%this` cell (index
+    /// payload) is updated IN PLACE so closures that captured it before
+    /// `super()` observe the adopted object. Native parents (Error, Object,
+    /// Set, …) initialize the pre-created `this` via the super_target pattern
+    /// instead, so their call-handler results stay discarded.
+    AdoptSuperThis(u32),
+
     // ---- stack manipulation ----
     Pop,
     Dup,

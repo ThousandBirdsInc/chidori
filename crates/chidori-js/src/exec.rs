@@ -935,12 +935,14 @@ impl Vm {
                 let name = self.const_name(frame, i);
                 let obj = pop!();
                 let key = PropertyKey::Str(name.clone());
-                // PrivateBrandCheck: the receiver must possess the private name
-                // (own field, or method on the class prototype); else TypeError.
-                if !self.has_prop(&obj, &key)? {
+                // PrivateBrandCheck: the receiver must OWN the private storage
+                // key (fields/static elements are own properties; a prototype-
+                // chain hit must NOT pass — `Object.create(instance)` is not an
+                // instance). Foreign receivers throw TypeError.
+                if !private_owns(&obj, &key) {
                     return Err(self.throw_type(&format!(
                         "Cannot read private member {} from an object whose class did not declare it",
-                        name.as_str()
+                        private_display(name.as_str())
                     )));
                 }
                 // A private accessor with only a setter has no [[Get]] (spec
@@ -949,11 +951,36 @@ impl Vm {
                     if !has_get {
                         return Err(self.throw_type(&format!(
                             "'{}' was defined without a getter",
-                            name.as_str()
+                            private_display(name.as_str())
                         )));
                     }
                 }
                 let v = self.get_prop(&obj, &key)?;
+                push!(v);
+            }
+            Op::PrivateGetB { brand, key } => {
+                let brand_name = self.const_name(frame, brand);
+                let key_name = self.const_name(frame, key);
+                let obj = pop!();
+                // PrivateBrandCheck for methods/accessors: the instance carries
+                // an own brand key stamped at construction; the element itself
+                // lives on the class prototype.
+                if !private_owns(&obj, &PropertyKey::Str(brand_name)) {
+                    return Err(self.throw_type(&format!(
+                        "Cannot read private member {} from an object whose class did not declare it",
+                        private_display(key_name.as_str())
+                    )));
+                }
+                let pkey = PropertyKey::Str(key_name.clone());
+                if let Some((has_get, _)) = private_accessor_kind(&obj, &pkey) {
+                    if !has_get {
+                        return Err(self.throw_type(&format!(
+                            "'{}' was defined without a getter",
+                            private_display(key_name.as_str())
+                        )));
+                    }
+                }
+                let v = self.get_prop(&obj, &pkey)?;
                 push!(v);
             }
             Op::PrivateSet(i) => {
@@ -961,10 +988,10 @@ impl Vm {
                 let value = pop!();
                 let obj = pop!();
                 let key = PropertyKey::Str(name.clone());
-                if !self.has_prop(&obj, &key)? {
+                if !private_owns(&obj, &key) {
                     return Err(self.throw_type(&format!(
                         "Cannot write private member {} to an object whose class did not declare it",
-                        name.as_str()
+                        private_display(name.as_str())
                     )));
                 }
                 // A private accessor with no [[Set]] is a TypeError to assign.
@@ -972,12 +999,71 @@ impl Vm {
                     if !has_set {
                         return Err(self.throw_type(&format!(
                             "'{}' was defined without a setter",
-                            name.as_str()
+                            private_display(name.as_str())
                         )));
                     }
                 }
                 self.set_prop(&obj, &key, value.clone())?;
                 push!(value);
+            }
+            Op::PrivateSetB {
+                brand,
+                key,
+                is_method,
+            } => {
+                let brand_name = self.const_name(frame, brand);
+                let key_name = self.const_name(frame, key);
+                let value = pop!();
+                let obj = pop!();
+                if !private_owns(&obj, &PropertyKey::Str(brand_name)) {
+                    return Err(self.throw_type(&format!(
+                        "Cannot write private member {} to an object whose class did not declare it",
+                        private_display(key_name.as_str())
+                    )));
+                }
+                // A private METHOD is never writable (spec PrivateSet step 6).
+                if is_method {
+                    return Err(self.throw_type(&format!(
+                        "Cannot assign to private method {}",
+                        private_display(key_name.as_str())
+                    )));
+                }
+                let pkey = PropertyKey::Str(key_name.clone());
+                if let Some((_, has_set)) = private_accessor_kind(&obj, &pkey) {
+                    if !has_set {
+                        return Err(self.throw_type(&format!(
+                            "'{}' was defined without a setter",
+                            private_display(key_name.as_str())
+                        )));
+                    }
+                }
+                self.set_prop(&obj, &pkey, value.clone())?;
+                push!(value);
+            }
+            Op::AdoptSuperThis(i) => {
+                let sup = pop!();
+                let v = pop!();
+                let parent_is_bytecode = matches!(
+                    &sup,
+                    Value::Object(o) if matches!(
+                        o.borrow().as_function(),
+                        Some(FunctionInner::Bytecode(_))
+                    )
+                );
+                if parent_is_bytecode && matches!(v, Value::Object(_)) {
+                    *frame.cells[i as usize].borrow_mut() = v;
+                }
+            }
+            Op::PrivateHasOwn(i) => {
+                let name = self.const_name(frame, i);
+                let obj = pop!();
+                // `#x in v`: the RHS must be an object (spec 13.10.1 step 5).
+                if !matches!(obj, Value::Object(_)) {
+                    return Err(
+                        self.throw_type("Cannot use 'in' operator to search in a non-object")
+                    );
+                }
+                push!(Value::Bool(private_owns(&obj, &PropertyKey::Str(name))));
             }
             Op::SetProp(i) => {
                 let name = self.const_name(frame, i);
@@ -1010,7 +1096,14 @@ impl Vm {
             Op::DeleteProp(i) => {
                 let name = self.const_name(frame, i);
                 let obj = pop!();
-                let r = self.delete_prop(&obj, &PropertyKey::Str(name))?;
+                let r = self.delete_prop(&obj, &PropertyKey::Str(name.clone()))?;
+                // Strict-mode `delete` that fails throws (spec 13.5.1.2 step 5.c).
+                if !r && frame.func.proto.is_strict {
+                    return Err(self.throw_type(&format!(
+                        "Cannot delete property '{}' in strict mode",
+                        name.as_str()
+                    )));
+                }
                 push!(Value::Bool(r));
             }
             Op::DeletePropDynamic => {
@@ -1019,6 +1112,9 @@ impl Vm {
                 self.require_object_coercible(&obj, "delete properties of")?;
                 let key = self.to_property_key(&key_v)?;
                 let r = self.delete_prop(&obj, &key)?;
+                if !r && frame.func.proto.is_strict {
+                    return Err(self.throw_type("Cannot delete property in strict mode"));
+                }
                 push!(Value::Bool(r));
             }
             Op::HasProp => {
@@ -2135,6 +2231,22 @@ impl Value {
 /// accessor property, return `(has_getter, has_setter)`; otherwise `None` (a data
 /// field/method). Used by `PrivateGet`/`PrivateSet` to enforce the spec's
 /// accessor-without-getter / accessor-without-setter TypeErrors.
+/// Whether `obj` OWNS the private storage/brand key — the spec's
+/// PrivateElementFind over the receiver's own [[PrivateElements]] (never the
+/// prototype chain, never Proxy traps).
+fn private_owns(obj: &Value, key: &PropertyKey) -> bool {
+    match obj {
+        Value::Object(o) => o.borrow().props.contains_key(key),
+        _ => false,
+    }
+}
+
+/// The source-visible form of an internal private key: `#name@<classid>`
+/// renders as `#name` in error messages.
+fn private_display(key: &str) -> &str {
+    key.split('@').next().unwrap_or(key)
+}
+
 fn private_accessor_kind(obj: &Value, key: &PropertyKey) -> Option<(bool, bool)> {
     let mut cur = match obj {
         Value::Object(o) => o.clone(),

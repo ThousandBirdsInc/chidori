@@ -267,8 +267,41 @@ enum Resolved {
     Global,
 }
 
+/// The kind of a private class element, resolved lexically at compile time.
+#[derive(Clone, Copy, PartialEq)]
+enum PrivKind {
+    Field,
+    Method,
+    Accessor,
+    StaticField,
+    StaticMethod,
+    StaticAccessor,
+}
+
+/// Private-name scope of one `class` body being compiled. Each class gets a
+/// compile-time-unique id; a private element's runtime storage key is
+/// `#name@<id>` (so same-named privates of nested/sibling classes can never
+/// collide), and instances are stamped with the own brand key `#brand@<id>`
+/// at construction when the class has private instance methods/accessors.
+struct ClassPrivCtx {
+    id: u32,
+    names: std::collections::HashMap<String, PrivKind>,
+}
+
+impl ClassPrivCtx {
+    fn has_instance_branded(&self) -> bool {
+        self.names
+            .values()
+            .any(|k| matches!(k, PrivKind::Method | PrivKind::Accessor))
+    }
+}
+
 struct Compiler {
     fns: Vec<FnCtx>,
+    /// Enclosing `class` bodies (innermost last) for private-name resolution.
+    class_privs: Vec<ClassPrivCtx>,
+    /// Allocator for `ClassPrivCtx::id`.
+    next_class_id: u32,
     /// A label captured by the immediately-following loop's `push_loop`.
     pending_label: Option<String>,
     /// Set just before compiling an object-literal concise method/accessor so the
@@ -293,6 +326,8 @@ impl Compiler {
     fn new() -> Compiler {
         Compiler {
             fns: Vec::new(),
+            class_privs: Vec::new(),
+            next_class_id: 0,
             pending_label: None,
             pending_home_super: false,
             chain_jumps: Vec::new(),
@@ -2388,10 +2423,19 @@ impl Compiler {
             Expression::NewExpression(n) => self.compile_new(n)?,
             Expression::ChainExpression(c) => self.compile_chain(&c.expression)?,
             Expression::PrivateInExpression(p) => {
-                // `#x in obj` — private field check; approximate via key presence.
-                self.load_str(&format!("#{}", p.left.name.as_str()));
+                // `#x in obj` — own-key presence: a field's storage key, or a
+                // method/accessor's per-instance brand key.
                 self.compile_expr(&p.right)?;
-                self.emit(Op::HasProp);
+                let name = p.left.name.as_str();
+                let probe = match self.resolve_private(name) {
+                    Some((key, id, kind)) => match kind {
+                        PrivKind::Method | PrivKind::Accessor => Self::private_brand_key(id),
+                        _ => key,
+                    },
+                    None => format!("#{name}"),
+                };
+                let k = self.str_const(&probe);
+                self.emit(Op::PrivateHasOwn(k));
             }
             Expression::StaticMemberExpression(m) => {
                 if matches!(m.object, Expression::Super(_)) {
@@ -2441,11 +2485,11 @@ impl Compiler {
                 }
             }
             Expression::PrivateFieldExpression(m) => {
-                // Private names modeled as non-enumerable string keys "#name", with
-                // a brand check (`PrivateGet`) so foreign access throws a TypeError.
+                // Private names resolve lexically to their declaring class
+                // (suffixed storage keys + per-instance brand checks); see
+                // `resolve_private`/`emit_private_get_op`.
                 self.compile_expr(&m.object)?;
-                let k = self.str_const(&format!("#{}", m.field.name.as_str()));
-                self.emit(Op::PrivateGet(k));
+                self.emit_private_get_op(m.field.name.as_str());
             }
             Expression::FunctionExpression(f) => {
                 let name = f.id.as_ref().map(|i| i.name.as_str().to_string());
@@ -2932,6 +2976,28 @@ impl Compiler {
                     self.emit(Op::LoadCell(t_old));
                 }
             }
+            SimpleAssignmentTarget::PrivateFieldExpression(m) => {
+                let name = m.field.name.as_str().to_string();
+                let t_obj = self.temp();
+                self.compile_expr(&m.object)?;
+                self.emit(Op::InitCell(t_obj));
+                self.emit(Op::LoadCell(t_obj));
+                self.emit_private_get_op(&name);
+                self.emit(Op::ToNumeric);
+                let t_old = self.temp();
+                self.emit(Op::InitCell(t_old));
+                self.emit(Op::LoadCell(t_obj));
+                self.emit(Op::LoadCell(t_old));
+                self.emit(if inc { Op::Inc } else { Op::Dec });
+                self.emit_private_set_op(&name);
+                self.emit(Op::Pop);
+                if u.prefix {
+                    self.emit(Op::LoadCell(t_old));
+                    self.emit(if inc { Op::Inc } else { Op::Dec });
+                } else {
+                    self.emit(Op::LoadCell(t_old));
+                }
+            }
             _ => return Err("invalid update target".into()),
         }
         Ok(())
@@ -2977,8 +3043,16 @@ impl Compiler {
                 self.emit(Op::GetPropDynamic);
                 Ok(())
             }
-            ChainElement::PrivateFieldExpression(_) => {
-                Err("private field access is not supported".into())
+            ChainElement::PrivateFieldExpression(m) => {
+                // `obj?.#x`: short-circuit on a nullish base, then the usual
+                // brand-checked private read.
+                self.compile_expr(&m.object)?;
+                if m.optional {
+                    let j = self.emit(Op::JumpIfNullish(0));
+                    self.chain_jumps.push(j);
+                }
+                self.emit_private_get_op(m.field.name.as_str());
+                Ok(())
             }
         }
     }
@@ -2989,6 +3063,14 @@ impl Compiler {
             self.load_binding("%superclass"); // [super]
             self.load_binding("%this"); // [super, this]
             self.finish_call(c)?;
+            // Constructor return-override: a bytecode parent that returned an
+            // object substitutes it as `this` (in place, so prior captures see
+            // it). Natives keep their discard-and-init-in-place behavior.
+            if let Resolved::Cell(i) = self.resolve("%this") {
+                self.emit(Op::Dup);
+                self.load_binding("%superclass");
+                self.emit(Op::AdoptSuperThis(i));
+            }
             return Ok(());
         }
         // super.method(...) — look up on Super.prototype, call with `this`.
@@ -3060,10 +3142,9 @@ impl Compiler {
             Expression::PrivateFieldExpression(m) => {
                 self.compile_expr(&m.object)?; // [obj]
                 self.emit(Op::Dup); // [obj, obj]
-                let k = self.str_const(&format!("#{}", m.field.name.as_str()));
-                // Brand-checking read: calling a private method on an object that
-                // doesn't have it must throw a TypeError (not silently read undefined).
-                self.emit(Op::PrivateGet(k)); // [obj, method]
+                                    // Brand-checking read: calling a private method on an object that
+                                    // doesn't have it must throw a TypeError (not silently read undefined).
+                self.emit_private_get_op(m.field.name.as_str()); // [obj, method]
                 self.emit(Op::Swap); // [method, obj]
                 self.finish_call(c)?;
             }
@@ -3271,8 +3352,7 @@ impl Compiler {
                 self.member_assign(&m.object, k, a)?;
             }
             AssignmentTarget::PrivateFieldExpression(m) => {
-                let k = self.str_const(&format!("#{}", m.field.name.as_str()));
-                self.member_assign_kind(&m.object, k, a, true)?;
+                self.member_assign_private(&m.object, m.field.name.as_str(), a)?;
             }
             AssignmentTarget::ComputedMemberExpression(m) => match a.operator {
                 A::Assign => {
@@ -3335,6 +3415,60 @@ impl Compiler {
     /// Assign to `obj.<k>` (static-name key const `k`) with the given operator.
     fn member_assign(&mut self, obj: &Expression, k: u32, a: &AssignmentExpression) -> R {
         self.member_assign_kind(obj, k, a, false)
+    }
+
+    /// Private member assignment `obj.#x <op>= v`: same stack discipline as
+    /// `member_assign_kind`, with reads/writes routed through the lexically
+    /// resolved brand-checking private ops.
+    fn member_assign_private(
+        &mut self,
+        obj: &Expression,
+        name: &str,
+        a: &AssignmentExpression,
+    ) -> R {
+        use oxc::syntax::operator::AssignmentOperator as A;
+        match a.operator {
+            A::Assign => {
+                self.compile_expr(obj)?;
+                self.compile_expr(&a.right)?;
+                self.emit_private_set_op(name);
+            }
+            A::LogicalAnd | A::LogicalOr | A::LogicalNullish => {
+                let t_obj = self.temp();
+                self.compile_expr(obj)?;
+                self.emit(Op::InitCell(t_obj));
+                self.emit(Op::LoadCell(t_obj));
+                self.emit_private_get_op(name);
+                let j = match a.operator {
+                    A::LogicalAnd => self.emit(Op::JumpIfFalsyPeek(0)),
+                    A::LogicalOr => self.emit(Op::JumpIfTruthyPeek(0)),
+                    _ => self.emit(Op::JumpIfNullishPeek(0)),
+                };
+                self.compile_expr(&a.right)?;
+                let t_val = self.temp();
+                self.emit(Op::InitCell(t_val));
+                self.emit(Op::LoadCell(t_obj));
+                self.emit(Op::LoadCell(t_val));
+                self.emit_private_set_op(name);
+                let end = self.here();
+                self.patch_jump(j, end);
+            }
+            other => {
+                let t_obj = self.temp();
+                self.compile_expr(obj)?;
+                self.emit(Op::InitCell(t_obj));
+                self.emit(Op::LoadCell(t_obj));
+                self.emit_private_get_op(name);
+                self.compile_expr(&a.right)?;
+                self.emit(compound_op(other));
+                let t_val = self.temp();
+                self.emit(Op::InitCell(t_val));
+                self.emit(Op::LoadCell(t_obj));
+                self.emit(Op::LoadCell(t_val));
+                self.emit_private_set_op(name);
+            }
+        }
+        Ok(())
     }
 
     /// Member assignment `obj.x <op>= v`. `is_private` routes the field read/write
@@ -3422,14 +3556,13 @@ impl Compiler {
                 self.emit(Op::SetProp(k));
                 self.emit(Op::Pop);
             }
-            // Private field as a destructuring target: `[obj.#x] = […]`.
+            // Private field as a destructuring target: `[obj.#x] = [...]`.
             AssignmentTarget::PrivateFieldExpression(m) => {
-                let k = self.str_const(&format!("#{}", m.field.name.as_str()));
                 let t = self.temp();
                 self.emit(Op::InitCell(t));
                 self.compile_expr(&m.object)?;
                 self.emit(Op::LoadCell(t));
-                self.emit(Op::SetProp(k));
+                self.emit_private_set_op(m.field.name.as_str());
                 self.emit(Op::Pop);
             }
             AssignmentTarget::ComputedMemberExpression(m) => {
@@ -3820,6 +3953,7 @@ impl Compiler {
 
         // Class instance-field initializers run at the top of the constructor.
         if let Some(fields) = ctor_fields {
+            self.emit_private_brand_stamp();
             for field in fields {
                 self.load_binding("%this");
                 if field.computed {
@@ -3831,9 +3965,11 @@ impl Compiler {
                     }
                     self.emit(Op::SetPropDynamic);
                 } else {
-                    let key = property_key_name(&field.key);
+                    let key = self.class_element_key(&field.key);
                     if let Some(init) = &field.value {
-                        self.compile_named_expr(init, &key)?;
+                        // NamedEvaluation uses the source-visible name ("#x"),
+                        // not the internal suffixed storage key.
+                        self.compile_named_expr(init, &property_key_name(&field.key))?;
                     } else {
                         self.emit(Op::LoadUndefined);
                     }
@@ -3876,7 +4012,146 @@ impl Compiler {
         Ok(())
     }
 
+    /// Resolve `#name` against the enclosing class bodies (innermost first):
+    /// the runtime storage key, the class id, and the element kind. `None`
+    /// when no enclosing class declares it (e.g. eval'd fragments) — callers
+    /// fall back to the un-suffixed legacy key.
+    fn resolve_private(&self, name: &str) -> Option<(String, u32, PrivKind)> {
+        for ctx in self.class_privs.iter().rev() {
+            if let Some(k) = ctx.names.get(name) {
+                return Some((format!("#{}@{}", name, ctx.id), ctx.id, *k));
+            }
+        }
+        None
+    }
+
+    fn private_brand_key(id: u32) -> String {
+        format!("#brand@{id}")
+    }
+
+    /// `[obj] -> [value]`: brand-checked private read for `#name`.
+    fn emit_private_get_op(&mut self, name: &str) {
+        match self.resolve_private(name) {
+            Some((key, id, kind)) => {
+                let k = self.str_const(&key);
+                match kind {
+                    // Fields and static elements are own properties of their
+                    // carrier (instance / constructor): own-key check suffices.
+                    PrivKind::Field
+                    | PrivKind::StaticField
+                    | PrivKind::StaticMethod
+                    | PrivKind::StaticAccessor => {
+                        self.emit(Op::PrivateGet(k));
+                    }
+                    // Instance methods/accessors live on the prototype; the
+                    // brand is an own key stamped at construction.
+                    PrivKind::Method | PrivKind::Accessor => {
+                        let b = self.str_const(&Self::private_brand_key(id));
+                        self.emit(Op::PrivateGetB { brand: b, key: k });
+                    }
+                }
+            }
+            None => {
+                let k = self.str_const(&format!("#{name}"));
+                self.emit(Op::PrivateGet(k));
+            }
+        }
+    }
+
+    /// `[obj, value] -> [value]`: brand-checked private write for `#name`.
+    fn emit_private_set_op(&mut self, name: &str) {
+        match self.resolve_private(name) {
+            Some((key, id, kind)) => {
+                let k = self.str_const(&key);
+                match kind {
+                    PrivKind::Field | PrivKind::StaticField => {
+                        self.emit(Op::PrivateSet(k));
+                    }
+                    PrivKind::Method | PrivKind::Accessor => {
+                        let b = self.str_const(&Self::private_brand_key(id));
+                        self.emit(Op::PrivateSetB {
+                            brand: b,
+                            key: k,
+                            is_method: kind == PrivKind::Method,
+                        });
+                    }
+                    // Static method/accessor: the element IS the own key.
+                    PrivKind::StaticMethod | PrivKind::StaticAccessor => {
+                        self.emit(Op::PrivateSetB {
+                            brand: k,
+                            key: k,
+                            is_method: kind == PrivKind::StaticMethod,
+                        });
+                    }
+                }
+            }
+            None => {
+                let k = self.str_const(&format!("#{name}"));
+                self.emit(Op::PrivateSet(k));
+            }
+        }
+    }
+
+    /// The runtime storage key for a class element's property key (suffixed
+    /// for private identifiers, `property_key_name` otherwise).
+    fn class_element_key(&self, key: &PropertyKey) -> String {
+        if let PropertyKey::PrivateIdentifier(id) = key {
+            if let Some((k, _, _)) = self.resolve_private(id.name.as_str()) {
+                return k;
+            }
+        }
+        property_key_name(key)
+    }
+
     fn compile_class(&mut self, class: &Class, name: Option<&str>) -> R {
+        // Collect this class's private names (with kinds) and enter its
+        // private scope: every `#x` below — in the constructor, methods,
+        // initializers, and nested classes — resolves innermost-first.
+        {
+            let id = self.next_class_id;
+            self.next_class_id += 1;
+            let mut names: std::collections::HashMap<String, PrivKind> =
+                std::collections::HashMap::new();
+            for el in &class.body.body {
+                match el {
+                    ClassElement::PropertyDefinition(p) => {
+                        if let PropertyKey::PrivateIdentifier(pid) = &p.key {
+                            names.insert(
+                                pid.name.as_str().to_string(),
+                                if p.r#static {
+                                    PrivKind::StaticField
+                                } else {
+                                    PrivKind::Field
+                                },
+                            );
+                        }
+                    }
+                    ClassElement::MethodDefinition(m) => {
+                        if let PropertyKey::PrivateIdentifier(pid) = &m.key {
+                            let accessor = matches!(
+                                m.kind,
+                                MethodDefinitionKind::Get | MethodDefinitionKind::Set
+                            );
+                            let kind = match (m.r#static, accessor) {
+                                (false, false) => PrivKind::Method,
+                                (false, true) => PrivKind::Accessor,
+                                (true, false) => PrivKind::StaticMethod,
+                                (true, true) => PrivKind::StaticAccessor,
+                            };
+                            names.insert(pid.name.as_str().to_string(), kind);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            self.class_privs.push(ClassPrivCtx { id, names });
+        }
+        let result = self.compile_class_inner(class, name);
+        self.class_privs.pop();
+        result
+    }
+
+    fn compile_class_inner(&mut self, class: &Class, name: Option<&str>) -> R {
         // Superclass (if any) stored in a captured binding so methods can `super`.
         let has_super = class.super_class.is_some();
         if let Some(sc) = &class.super_class {
@@ -3941,6 +4216,22 @@ impl Compiler {
         Ok(())
     }
 
+    /// Stamp `this` with the current class's private brand (an own marker
+    /// key) when the class has private instance methods/accessors — the spec's
+    /// PrivateMethodOrAccessorAdd, which makes constructed instances (and only
+    /// them) pass the brand check.
+    fn emit_private_brand_stamp(&mut self) {
+        let brand = match self.class_privs.last() {
+            Some(ctx) if ctx.has_instance_branded() => Self::private_brand_key(ctx.id),
+            _ => return,
+        };
+        self.load_binding("%this");
+        self.load_str(&brand);
+        self.emit(Op::LoadTrue);
+        self.emit(Op::DefineField);
+        self.emit(Op::Pop);
+    }
+
     fn synthesize_constructor(
         &mut self,
         name: Option<&str>,
@@ -3967,13 +4258,17 @@ impl Compiler {
         self.emit(Op::LoadArguments);
         self.emit(Op::InitCell(ac));
         if has_super {
-            // super(...arguments)
+            // super(...arguments); a parent constructor that returns an object
+            // substitutes it as `this` (return-override), so brand/field
+            // installation below lands on the adopted object.
             self.load_binding("%superclass");
             self.load_binding("%this");
             self.load_binding("arguments");
             self.emit(Op::CallSpread);
-            self.emit(Op::Pop);
+            self.load_binding("%superclass");
+            self.emit(Op::AdoptSuperThis(tc));
         }
+        self.emit_private_brand_stamp();
         for field in fields {
             self.load_binding("%this");
             if field.computed {
@@ -3987,9 +4282,10 @@ impl Compiler {
                 }
                 self.emit(Op::SetPropDynamic);
             } else {
-                let key = property_key_name(&field.key);
+                let key = self.class_element_key(&field.key);
                 if let Some(init) = &field.value {
-                    self.compile_named_expr(init, &key)?;
+                    // NamedEvaluation uses the source-visible name ("#x").
+                    self.compile_named_expr(init, &property_key_name(&field.key))?;
                 } else {
                     self.emit(Op::LoadUndefined);
                 }
@@ -3998,7 +4294,13 @@ impl Compiler {
             }
             self.emit(Op::Pop);
         }
-        self.emit(Op::LoadUndefined);
+        // A derived implicit constructor returns its (possibly adopted) `this`
+        // so construct() surfaces a return-override object.
+        if has_super {
+            self.load_binding("%this");
+        } else {
+            self.emit(Op::LoadUndefined);
+        }
         self.emit(Op::Return);
         self.exit_scope();
         let fc = self.fns.pop().unwrap();
@@ -4047,7 +4349,7 @@ impl Compiler {
         if m.computed {
             self.compile_property_key_expr(&m.key)?;
         } else {
-            let name = property_key_name(&m.key);
+            let name = self.class_element_key(&m.key);
             self.load_str(&name);
         }
         // Accessors take a prefixed function name (`get x` / `set x`).
@@ -4095,10 +4397,11 @@ impl Compiler {
                 self.emit(Op::LoadUndefined);
             }
         } else {
-            let key = property_key_name(&p.key);
+            let key = self.class_element_key(&p.key);
             self.load_str(&key); // [ctor, key]
             if let Some(init) = &p.value {
-                self.compile_named_expr(init, &key)?;
+                // NamedEvaluation uses the source-visible name ("#x").
+                self.compile_named_expr(init, &property_key_name(&p.key))?;
             } else {
                 self.emit(Op::LoadUndefined);
             }

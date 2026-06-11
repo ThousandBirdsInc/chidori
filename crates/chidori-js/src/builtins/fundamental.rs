@@ -181,6 +181,39 @@ pub(crate) fn define_own_property(
             return define_typed_array_index(vm, obj, n, d, throw_on_fail);
         }
     }
+    // Module Namespace exotic [[DefineOwnProperty]] (spec 10.4.6.6): only a
+    // no-op redefinition of an existing export succeeds (data, writable,
+    // enumerable, non-configurable, same value); everything else is refused.
+    {
+        let verdict = match &obj.borrow().internal {
+            Internal::ModuleNamespace(ns) => match key {
+                PropertyKey::Str(s) => Some(match ns.exports.get(s) {
+                    None => false,
+                    Some(cell) => {
+                        !d.is_accessor()
+                            && d.writable != Some(false)
+                            && d.enumerable != Some(false)
+                            && d.configurable != Some(true)
+                            && d.value
+                                .as_ref()
+                                .map(|v| same_value(v, &cell.borrow()))
+                                .unwrap_or(true)
+                    }
+                }),
+                PropertyKey::Sym(_) => None, // ordinary path (@@toStringTag)
+            },
+            _ => None,
+        };
+        if let Some(ok) = verdict {
+            if ok {
+                return Ok(true);
+            }
+            if throw_on_fail {
+                return Err(vm.throw_type("Cannot redefine a module namespace property"));
+            }
+            return Ok(false);
+        }
+    }
     // ArraySetLength coercion (steps 3–5) runs BEFORE any descriptor validation:
     // `ToUint32` then `ToNumber` can invoke a user `valueOf` that itself redefines
     // `length`, and a newLen≠numberLen mismatch is a RangeError that must precede
@@ -1511,6 +1544,31 @@ pub(crate) fn own_property_descriptor(o: &JsObject, key: &PropertyKey) -> Option
                         kind: PropertyKind::Data {
                             value: Value::str(c.to_string()),
                             writable: false,
+                        },
+                        enumerable: true,
+                        configurable: false,
+                    });
+                }
+            }
+            None
+        }
+        // Module Namespace exotic [[GetOwnProperty]] for an export name:
+        // a live {writable:true, enumerable:true, configurable:false} data
+        // property (an uninitialized binding reads as undefined here — the
+        // throwing TDZ check lives on the [[Get]] path).
+        Internal::ModuleNamespace(ns) => {
+            if let PropertyKey::Str(s) = key {
+                if let Some(cell) = ns.exports.get(s) {
+                    let v = cell.borrow().clone();
+                    let v = if matches!(v, Value::Uninitialized) {
+                        Value::Undefined
+                    } else {
+                        v
+                    };
+                    return Some(Property {
+                        kind: PropertyKind::Data {
+                            value: v,
+                            writable: true,
                         },
                         enumerable: true,
                         configurable: false,

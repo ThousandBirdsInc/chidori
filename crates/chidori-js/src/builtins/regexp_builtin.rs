@@ -159,11 +159,80 @@ fn install_symbol_protocol(vm: &mut Vm, proto: &JsObject) {
     let sym = vm.realm.symbol_search.clone();
     vm.define_value_sym(proto, sym, Value::Object(f));
 
-    // [Symbol.split](string, limit)
+    // [Symbol.split](string, limit) — generic over the receiver (spec
+    // 22.2.6.14): a fresh sticky splitter is built via the species
+    // constructor, and matching runs through the `exec` protocol so RegExp
+    // subclasses and RegExp-like plain objects both work.
     let f = vm.new_native("[Symbol.split]", 2, |vm, this, args| {
-        let re = regexp_this(vm, &this)?;
-        let s = vm.to_js_string(&arg(args, 0))?;
-        sym_split(vm, &re, s.as_str(), &arg(args, 1))
+        require_object(vm, &this, "Symbol.split")?;
+        let s = vm.to_js_string(&arg(args, 0))?.as_str().to_string();
+        let default_ctor = vm.get_prop(
+            &Value::Object(vm.realm.regexp_proto.clone()),
+            &PropertyKey::str("constructor"),
+        )?;
+        let c = species_constructor(vm, &this, &default_ctor)?;
+        let flags_v = vm.get_prop(&this, &PropertyKey::str("flags"))?;
+        let flags = vm.to_js_string(&flags_v)?.as_str().to_string();
+        let unicode = flags.contains('u') || flags.contains('v');
+        let new_flags = if flags.contains('y') {
+            flags
+        } else {
+            format!("{flags}y")
+        };
+        let splitter = vm.construct(&c, &[this.clone(), Value::str(&new_flags)], &c)?;
+        let limit_arg = arg(args, 1);
+        let lim = if limit_arg.is_undefined() {
+            u32::MAX as usize
+        } else {
+            vm.to_uint32(&limit_arg)? as usize
+        };
+        let mut out: Vec<Value> = Vec::new();
+        if lim == 0 {
+            return Ok(Value::Object(vm.new_array(out)));
+        }
+        let chars: Vec<char> = s.chars().collect();
+        let size = chars.len();
+        if size == 0 {
+            let z = regexp_exec_abstract(vm, &splitter, &s)?;
+            if z.is_null() {
+                out.push(Value::str(&s));
+            }
+            return Ok(Value::Object(vm.new_array(out)));
+        }
+        let li_key = PropertyKey::str("lastIndex");
+        let mut p = 0usize;
+        let mut q = 0usize;
+        while q < size {
+            vm.set_prop_strict(&splitter, &li_key, Value::Number(q as f64))?;
+            let z = regexp_exec_abstract(vm, &splitter, &s)?;
+            if z.is_null() {
+                q = advance_string_index(q, unicode);
+            } else {
+                let li = vm.get_prop(&splitter, &li_key)?;
+                let e = vm.to_length(&li)?.min(size);
+                if e == p {
+                    q = advance_string_index(q, unicode);
+                } else {
+                    out.push(Value::str(chars[p..q].iter().collect::<String>()));
+                    if out.len() == lim {
+                        return Ok(Value::Object(vm.new_array(out)));
+                    }
+                    p = e;
+                    let len_v = vm.get_prop(&z, &PropertyKey::str("length"))?;
+                    let ncap = vm.to_length(&len_v)?.saturating_sub(1);
+                    for i in 1..=ncap {
+                        let cap = vm.get_prop(&z, &PropertyKey::from_index(i as u32))?;
+                        out.push(cap);
+                        if out.len() == lim {
+                            return Ok(Value::Object(vm.new_array(out)));
+                        }
+                    }
+                    q = p;
+                }
+            }
+        }
+        out.push(Value::str(chars[p..size].iter().collect::<String>()));
+        Ok(Value::Object(vm.new_array(out)))
     });
     let sym = vm.realm.symbol_split.clone();
     vm.define_value_sym(proto, sym, Value::Object(f));

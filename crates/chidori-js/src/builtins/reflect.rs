@@ -305,6 +305,13 @@ fn reflect_set(
     if vm.is_proxy(target) {
         return vm.proxy_set(target, key, value, receiver);
     }
+    // Module Namespace exotic [[Set]]: always false, for any key.
+    if matches!(
+        target.borrow().internal,
+        crate::value::Internal::ModuleNamespace(_)
+    ) {
+        return Ok(false);
+    }
     // Fast path: receiver === target -> ordinary set (engine semantics).
     if let Value::Object(r) = &receiver {
         if r.same(target) {

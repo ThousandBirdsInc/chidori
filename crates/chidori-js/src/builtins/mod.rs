@@ -137,6 +137,26 @@ fn install_kind_function(
 
 // ---- shared helpers ----
 
+/// For a native constructor's CALL handler: detect a `super(...)` invocation
+/// from a subclass — `this` is an under-construction instance whose prototype
+/// chain includes the builtin's `proto` — and return that instance so the
+/// handler can initialize its exotic internal slot in place. A plain call
+/// (no such `this`) returns `None`.
+pub(crate) fn super_target(this: &Value, proto: &JsObject) -> Option<JsObject> {
+    let o = match this {
+        Value::Object(o) => o.clone(),
+        _ => return None,
+    };
+    let mut cur = o.borrow().proto.clone();
+    while let Some(p) = cur {
+        if p.same(proto) {
+            return Some(o.clone());
+        }
+        cur = p.borrow().proto.clone();
+    }
+    None
+}
+
 pub(crate) fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).cloned().unwrap_or(Value::Undefined)
 }

@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::arg;
+use super::{arg, super_target};
 use crate::generator::ResumeKind;
 use crate::value::*;
 use crate::vm::Vm;
@@ -18,7 +18,31 @@ fn install_promise(vm: &mut Vm) {
     let ctor = vm.new_native_ctor(
         "Promise",
         1,
-        |vm, _t, _a| Err(vm.throw_type("Promise constructor cannot be invoked without 'new'")),
+        |vm, t, args| {
+            // Only reachable via `super(...)` from a Promise subclass (the
+            // construct handler serves `new Promise`): initialize the subclass
+            // instance's promise internals in place, like Set/Map/TypedArray.
+            let proto = vm.realm.promise_proto.clone();
+            let target = super_target(&t, &proto).ok_or_else(|| {
+                vm.throw_type("Promise constructor cannot be invoked without 'new'")
+            })?;
+            let executor = arg(args, 0);
+            if !vm.is_callable(&executor) {
+                return Err(vm.throw_type("Promise resolver is not a function"));
+            }
+            target.borrow_mut().internal = Internal::Promise(crate::vm::PromiseData {
+                state: crate::vm::PromiseState::Pending,
+                fulfill_reactions: Vec::new(),
+                reject_reactions: Vec::new(),
+                handled: false,
+                host_id: None,
+            });
+            let (resolve, reject) = make_resolving_functions(vm, &target);
+            if let Err(e) = vm.call(executor, Value::Undefined, &[resolve, reject]) {
+                vm.reject_promise(&target, e);
+            }
+            Ok(Value::Undefined)
+        },
         |vm, _t, args| {
             // 1. If executor is not callable, throw a TypeError.
             let executor = arg(args, 0);
@@ -103,52 +127,46 @@ fn install_promise(vm: &mut Vm) {
         vm.call(then, this.clone(), &[Value::Undefined, arg(args, 0)])
     });
     vm.define_method(&proto, "finally", 1, |vm, this, args| {
-        let p = promise_this(vm, &this)?;
+        // Spec 27.2.5.3: generic over any object receiver — the result comes
+        // from Invoke(this, "then", [thenFinally, catchFinally]), so subclass
+        // `then` overrides are observed; the intermediate promise is built via
+        // PromiseResolve(SpeciesConstructor(this, %Promise%), …).
+        if !matches!(this, Value::Object(_)) {
+            return Err(vm.throw_type("Promise.prototype.finally called on a non-object"));
+        }
         let on_finally = arg(args, 0);
         // Non-callable onFinally: behaves like then(onFinally, onFinally), which
         // (since neither is callable) passes the value/reason straight through.
         if !vm.is_callable(&on_finally) {
-            return Ok(Value::Object(vm.promise_then(
-                &p,
-                on_finally.clone(),
-                on_finally,
-            )));
+            return invoke_then(vm, &this, on_finally.clone(), on_finally);
         }
-        // onFulfilled(value): call onFinally(), and once Promise.resolve of its
-        // result settles, fulfil with the original value (pass-through after the
-        // onFinally result has been awaited). If onFinally throws, the resulting
-        // rejection propagates and the original value is dropped (spec behavior).
+        let default_ctor = vm.get_prop(
+            &Value::Object(vm.realm.promise_proto.clone()),
+            &PropertyKey::str("constructor"),
+        )?;
+        let c = promise_species(vm, &this, &default_ctor)?;
+        // thenFinally(value): call onFinally(), wait for PromiseResolve(C, its
+        // result) to settle, then fulfil with the original value. If onFinally
+        // throws, that rejection propagates and the value is dropped.
         let f1 = on_finally.clone();
+        let c1 = c.clone();
         let on_f = vm.new_native("", 1, move |vm, _t, a| {
             let value = arg(a, 0);
             let result = vm.call(f1.clone(), Value::Undefined, &[])?;
-            let p = vm.promise_resolve(result);
+            let p = promise_resolve_with(vm, &c1, result)?;
             let thunk = vm.new_native("", 0, move |_vm, _t, _a| Ok(value.clone()));
-            Ok(Value::Object(vm.promise_then(
-                &p,
-                Value::Object(thunk),
-                Value::Undefined,
-            )))
+            invoke_then(vm, &p, Value::Object(thunk), Value::Undefined)
         });
-        // onRejected(reason): call onFinally(), and once Promise.resolve of its
-        // result settles, re-throw the original reason.
+        // catchFinally(reason): same, then re-throw the original reason.
         let f2 = on_finally;
         let on_r = vm.new_native("", 1, move |vm, _t, a| {
             let reason = arg(a, 0);
             let result = vm.call(f2.clone(), Value::Undefined, &[])?;
-            let p = vm.promise_resolve(result);
+            let p = promise_resolve_with(vm, &c, result)?;
             let thrower = vm.new_native("", 0, move |_vm, _t, _a| Err(reason.clone()));
-            Ok(Value::Object(vm.promise_then(
-                &p,
-                Value::Object(thrower),
-                Value::Undefined,
-            )))
+            invoke_then(vm, &p, Value::Object(thrower), Value::Undefined)
         });
-        Ok(Value::Object(vm.promise_then(
-            &p,
-            Value::Object(on_f),
-            Value::Object(on_r),
-        )))
+        invoke_then(vm, &this, Value::Object(on_f), Value::Object(on_r))
     });
 
     // Promise.resolve: returns the argument unchanged if it is already a native
@@ -159,17 +177,7 @@ fn install_promise(vm: &mut Vm) {
         if !matches!(this, Value::Object(_)) {
             return Err(vm.throw_type("Promise.resolve called on a non-object"));
         }
-        let x = arg(args, 0);
-        // If x is a promise whose `constructor` is C, return it unchanged.
-        if vm.is_native_promise(&x) {
-            let xc = vm.get_prop(&x, &PropertyKey::str("constructor"))?;
-            if same_value(&xc, &this) {
-                return Ok(x);
-            }
-        }
-        let (promise, resolve, _reject) = new_promise_capability(vm, &this)?;
-        vm.call(resolve, Value::Undefined, &[x])?;
-        Ok(promise)
+        promise_resolve_with(vm, &this, arg(args, 0))
     });
     // Promise.reject: C = this; build a capability and call its reject.
     vm.define_method(&ctor, "reject", 1, |vm, this, args| {
@@ -280,6 +288,20 @@ fn promise_species(vm: &mut Vm, obj: &Value, default: &Value) -> Result<Value, V
     } else {
         Err(vm.throw_type("Symbol.species is not a constructor"))
     }
+}
+
+/// `PromiseResolve(C, x)`: a promise whose `constructor` is `C` passes through
+/// unchanged; anything else is wrapped via NewPromiseCapability(C) + resolve.
+fn promise_resolve_with(vm: &mut Vm, c: &Value, x: Value) -> Result<Value, Value> {
+    if vm.is_native_promise(&x) {
+        let xc = vm.get_prop(&x, &PropertyKey::str("constructor"))?;
+        if same_value(&xc, c) {
+            return Ok(x);
+        }
+    }
+    let (promise, resolve, _reject) = new_promise_capability(vm, c)?;
+    vm.call(resolve, Value::Undefined, &[x])?;
+    Ok(promise)
 }
 
 /// `GetPromiseResolve(C)`: `Get(C, "resolve")`, which must be callable.

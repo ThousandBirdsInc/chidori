@@ -9,7 +9,7 @@
 //! callable `keys` returning an iterator) rather than requiring a real Set;
 //! `get_set_record` performs the spec's GetSetRecord coercion.
 
-use super::arg;
+use super::{arg, super_target};
 use crate::value::*;
 use crate::vm::Vm;
 use indexmap::IndexMap;
@@ -27,21 +27,6 @@ pub fn install(vm: &mut Vm) {
 /// includes the builtin's `proto`. Return it so the constructor can initialize
 /// its internal slot in place. A bare `Set()`/`Map()` call (this = undefined or
 /// the global) returns `None`, so the caller throws "requires 'new'".
-fn super_target(this: &Value, proto: &JsObject) -> Option<JsObject> {
-    let o = match this {
-        Value::Object(o) => o.clone(),
-        _ => return None,
-    };
-    let mut cur = o.borrow().proto.clone();
-    while let Some(p) = cur {
-        if p.same(proto) {
-            return Some(o.clone());
-        }
-        cur = p.borrow().proto.clone();
-    }
-    None
-}
-
 /// Populate `target`'s `Internal::Map` from a Map-constructor iterable argument.
 fn init_map_entries(vm: &mut Vm, target: &JsObject, init: &Value) -> Result<(), Value> {
     if init.is_nullish() {

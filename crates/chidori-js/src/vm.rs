@@ -841,6 +841,36 @@ impl Vm {
             if matches!(cur.borrow().internal, Internal::Proxy(_)) {
                 return self.proxy_get(&cur, key, receiver);
             }
+            // Module Namespace exotic [[Get]]: a string key reads the live
+            // export binding (an uninitialized binding throws ReferenceError);
+            // symbols (@@toStringTag) fall through to the ordinary props.
+            {
+                let cell = match &cur.borrow().internal {
+                    Internal::ModuleNamespace(ns) => match key {
+                        PropertyKey::Str(s) => ns.exports.get(s).cloned().map(Some).unwrap_or({
+                            // Unknown string export: namespace proto is null.
+                            None
+                        }),
+                        PropertyKey::Sym(_) => None,
+                    },
+                    _ => None,
+                };
+                if let Some(cell) = cell {
+                    let v = cell.borrow().clone();
+                    if matches!(v, Value::Uninitialized) {
+                        return Err(
+                            self.throw_reference("Cannot access binding before initialization")
+                        );
+                    }
+                    return Ok(v);
+                }
+                let is_ns = matches!(cur.borrow().internal, Internal::ModuleNamespace(_));
+                if is_ns {
+                    if let PropertyKey::Str(_) = key {
+                        return Ok(Value::Undefined);
+                    }
+                }
+            }
             // Inspect own property without holding the borrow across calls.
             let found = {
                 let b = cur.borrow();
@@ -975,6 +1005,17 @@ impl Vm {
             // Proxy exotic [[Set]]: dispatch the trap (base or inherited proxy).
             if matches!(cur.borrow().internal, Internal::Proxy(_)) {
                 self.proxy_set(&cur, key, value, base.clone())?;
+                return Ok(());
+            }
+            // Module Namespace exotic [[Set]]: always returns false (a strict
+            // write throws, sloppy is a silent no-op), for any key.
+            if matches!(cur.borrow().internal, Internal::ModuleNamespace(_)) {
+                if strict {
+                    return Err(self.throw_type(&format!(
+                        "Cannot assign to read only property '{}' of a module namespace object",
+                        key_display(key)
+                    )));
+                }
                 return Ok(());
             }
             // TypedArray exotic [[Set]] reached via the proto chain (receiver is
@@ -1165,6 +1206,14 @@ impl Vm {
         if matches!(obj.borrow().internal, Internal::Proxy(_)) {
             return self.proxy_delete(&obj, key);
         }
+        // Module Namespace exotic [[Delete]]: an export name refuses (false);
+        // any other STRING key deletes vacuously (true). Symbol keys fall
+        // through to the ordinary path (@@toStringTag is non-configurable).
+        if let Internal::ModuleNamespace(ns) = &obj.borrow().internal {
+            if let PropertyKey::Str(s) = key {
+                return Ok(!ns.exports.contains_key(s));
+            }
+        }
         let mut b = obj.borrow_mut();
         // A reified `props` entry for an index shadows the dense slot; honour its
         // configurable flag and fall through to the ordinary delete below.
@@ -1221,6 +1270,15 @@ impl Vm {
             let (has, proto) = {
                 let b = cur.borrow();
                 let mut has = b.props.contains_key(key);
+                // Module Namespace exotic [[HasProperty]]: export names are
+                // present (symbols consult the ordinary props above).
+                if let Internal::ModuleNamespace(ns) = &b.internal {
+                    if let PropertyKey::Str(s) = key {
+                        if ns.exports.contains_key(s) {
+                            has = true;
+                        }
+                    }
+                }
                 if let Internal::Array(arr) = &b.internal {
                     if let Some("length") = key.as_str() {
                         has = true;
@@ -1285,6 +1343,13 @@ impl Vm {
         if let Internal::TypedArray(t) = &b.internal {
             for i in 0..t.length.min(crate::value::MAX_DENSE_ARRAY) {
                 int_keys.push(i as u32);
+            }
+        }
+        // Module Namespace exotic [[OwnPropertyKeys]]: the (pre-sorted) export
+        // names come first, then the ordinary symbol keys (@@toStringTag).
+        if let Internal::ModuleNamespace(ns) = &b.internal {
+            for name in ns.exports.keys() {
+                str_keys.push(PropertyKey::Str(name.clone()));
             }
         }
         for k in b.props.keys() {
