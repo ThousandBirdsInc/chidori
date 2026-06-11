@@ -70,6 +70,233 @@ pub fn compile_script(src: &str) -> Result<FuncProto, String> {
     })
 }
 
+/// The compiled artifact of a direct-`eval` source text: the body proto (its
+/// upvalues are `ParentCell(i)` indices into the scope snapshot's `bindings`,
+/// which the runtime wires to the caller frame's live cells), the sloppy
+/// escaping `var`/function names for EvalDeclarationInstantiation, and the
+/// effective strictness.
+pub struct CompiledEval {
+    pub proto: FuncProto,
+    pub var_names: Vec<String>,
+    pub strict: bool,
+}
+
+/// Compile a DIRECT `eval` source against the scope snapshot taken at its call
+/// site (see [`EvalScopeDesc`]). The source is parsed inside a wrapper picked
+/// from the call-site context so the parser's placement rules match the spec:
+/// a method wrapper permits `super.x`, a function wrapper permits
+/// `new.target`, and global eval parses as a bare script (rejecting both).
+/// `return` is gated back out (it is never legal in eval code). Visible
+/// caller bindings are declared in a synthetic parent scope, so the body's
+/// free references compile to ordinary upvalues.
+pub fn compile_direct_eval(src: &str, desc: &EvalScopeDesc) -> Result<CompiledEval, String> {
+    let allocator = Allocator::default();
+    enum Wrap {
+        None,
+        Function,
+        Method,
+    }
+    let wrap = if desc.allow_super_prop {
+        Wrap::Method
+    } else if desc.in_function {
+        Wrap::Function
+    } else {
+        Wrap::None
+    };
+    // A hashbang comment is only valid at position 0 — strip it before the
+    // source goes inside a wrapper (it is still a comment per the spec).
+    let src = if let Some(rest) = src.strip_prefix("#!") {
+        match rest.find('\n') {
+            Some(i) => &rest[i..],
+            None => "",
+        }
+    } else {
+        src
+    };
+    // A strict caller's eval inherits strictness, including its EARLY errors —
+    // carry it into the parse via a synthetic directive (skipped below when
+    // computing completion values).
+    let strict_prefix = if desc.strict { "\"use strict\";\n" } else { "" };
+    let wrapped = match wrap {
+        Wrap::None => format!("{strict_prefix}{src}"),
+        Wrap::Function => format!("(function(){{\n{strict_prefix}{src}\n}})"),
+        Wrap::Method => format!("({{ m(){{\n{strict_prefix}{src}\n}} }})"),
+    };
+    let source_type = SourceType::script();
+    let ret = Parser::new(&allocator, &wrapped, source_type).parse();
+    if !ret.errors.is_empty() {
+        let msg = ret
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("SyntaxError: {msg}"));
+    }
+    let program = ret.program;
+    let sem = oxc::semantic::SemanticBuilder::new()
+        .with_check_syntax_error(true)
+        .build(&program);
+    if !sem.errors.is_empty() {
+        return Err(format!(
+            "SyntaxError: {}",
+            sem.errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    // Extract the real body statements + directives from the wrapper.
+    let (stmts, directives): (&[Statement], &[Directive]) = match wrap {
+        Wrap::None => (&program.body, &program.directives),
+        Wrap::Function | Wrap::Method => {
+            let func = (|| -> Option<&Function> {
+                let st = program.body.first()?;
+                let Statement::ExpressionStatement(es) = st else {
+                    return None;
+                };
+                let mut e: &Expression = &es.expression;
+                if let Expression::ParenthesizedExpression(pe) = e {
+                    e = &pe.expression;
+                }
+                match e {
+                    Expression::FunctionExpression(f) => Some(f),
+                    Expression::ObjectExpression(o) => {
+                        let prop = o.properties.first()?;
+                        let oxc::ast::ast::ObjectPropertyKind::ObjectProperty(p) = prop else {
+                            return None;
+                        };
+                        match &p.value {
+                            Expression::FunctionExpression(f) => Some(f),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            })()
+            .ok_or_else(|| "SyntaxError: eval wrapper shape".to_string())?;
+            let body = func
+                .body
+                .as_deref()
+                .ok_or_else(|| "SyntaxError: eval wrapper body".to_string())?;
+            (&body.statements, &body.directives)
+        }
+    };
+    let body_strict = desc.strict
+        || directives
+            .iter()
+            .any(|d| d.directive.as_str() == "use strict");
+
+    let mut c = Compiler::new();
+    c.source = wrapped.clone();
+
+    // Synthetic parent scope: one cell per visible caller binding, in order —
+    // the body's upvalue descriptors index straight into `desc.bindings`.
+    let mut env = FnCtx::new("<eval-env>", FuncKind::Normal);
+    env.is_toplevel = true;
+    c.fns.push(env);
+    c.enter_scope(true);
+    for b in &desc.bindings {
+        c.declare_kind(&b.name, true, b.is_const);
+    }
+
+    // The eval body itself.
+    let mut fc = FnCtx::new("<eval>", FuncKind::Normal);
+    fc.strict = body_strict;
+    fc.track_completion = true;
+    fc.is_eval_body = true;
+    // For nested direct evals inside this body, the context flags are
+    // inherited through `is_toplevel` (in_function detection).
+    fc.is_toplevel = !desc.in_function;
+    fc.script_global = desc.is_global_var_scope && !body_strict;
+    fc.eval_sloppy = !body_strict && !(desc.is_global_var_scope && !body_strict);
+    fc.enclosed_in_with = true;
+    fc.contains_eval = wrapped.contains("eval");
+    fc.home_super = desc.home_super;
+    let body_script_global = fc.script_global;
+    let body_contains_eval = fc.contains_eval;
+    c.fns.push(fc);
+    c.enter_scope(true);
+    if body_contains_eval && !body_script_global {
+        c.emit(Op::InitEvalVars);
+    }
+    // Completion register (eval's result is its completion value).
+    c.emit(Op::LoadUndefined);
+    let comp_cell = c.declare("%completion", true);
+    c.emit(Op::InitCell(comp_cell));
+    // `this`/`new.target`: prefer the caller's own %this/%newtarget bindings
+    // from the snapshot (a sloppy caller's boxed `this` lives there); only
+    // declare locals when the snapshot doesn't carry them (global eval).
+    if !desc.bindings.iter().any(|b| b.name == "%this") {
+        let this_cell = c.declare("%this", true);
+        if body_script_global {
+            let gt = c.str_const("globalThis");
+            c.emit(Op::LoadGlobal(gt));
+        } else {
+            c.emit(Op::LoadThis);
+        }
+        c.emit(Op::InitCell(this_cell));
+    }
+    if !desc.bindings.iter().any(|b| b.name == "%newtarget") {
+        let nt_cell = c.declare("%newtarget", true);
+        c.emit(Op::LoadNewTarget);
+        c.emit(Op::InitCell(nt_cell));
+    }
+
+    // Directive prologue strings are completion values too (`eval("'1'")`).
+    // The synthetic "use strict" prefix is not part of the user's source.
+    let mut user_directives = directives.iter();
+    if desc.strict {
+        let _ = user_directives.next();
+    }
+    for d in user_directives {
+        let v = c.str_const(&d.expression.value);
+        c.emit(Op::LoadConst(v));
+        c.store_binding("%completion");
+    }
+
+    for st in stmts {
+        if let Statement::VariableDeclaration(d) = st {
+            if matches!(
+                d.kind,
+                VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing
+            ) {
+                return Err(
+                    "SyntaxError: 'using' declarations are not allowed at the top level of eval"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    let compile_body = |c: &mut Compiler| -> Result<(), String> {
+        c.hoist_lexical(stmts);
+        c.hoist_vars_all(stmts);
+        c.hoist_funcs(stmts)?;
+        for stmt in stmts {
+            c.compile_stmt(stmt)?;
+        }
+        Ok(())
+    };
+    compile_body(&mut c).map_err(|e| {
+        if e.starts_with("SyntaxError") {
+            e
+        } else {
+            format!("SyntaxError: {e}")
+        }
+    })?;
+    c.load_binding("%completion");
+    c.emit(Op::Return);
+    c.exit_scope();
+    let fc = c.fns.pop().unwrap();
+    let proto = c.finish(fc);
+    Ok(CompiledEval {
+        proto,
+        var_names: std::mem::take(&mut c.eval_var_names),
+        strict: body_strict,
+    })
+}
+
 /// Compile a module's source text into a [`CompiledModule`] (its body proto plus
 /// import/export entries). Parse + semantic early-errors surface as `SyntaxError`
 /// exactly as for scripts, so `negative: { phase: parse }` module tests pass with
@@ -211,6 +438,29 @@ struct FnCtx {
     /// enclosing function: its free identifiers must also resolve dynamically
     /// (against the closure's captured with-scope chain).
     enclosed_in_with: bool,
+    /// The function's source region mentions `eval`: the classic direct-eval
+    /// deopt. Free identifiers compile to dynamic name ops (so reads observe
+    /// eval-introduced vars on the frame's eval-vars object), `arguments` is
+    /// force-materialized, and the prologue creates the eval-vars object.
+    contains_eval: bool,
+    /// This is a top-level program context (`<script>`, `<module>`, or a
+    /// direct-eval body) rather than a real function.
+    is_toplevel: bool,
+    /// A direct-eval BODY (gates `return` as a SyntaxError).
+    is_eval_body: bool,
+    /// A SLOPPY direct-eval body whose `var`/function declarations escape to
+    /// the caller's var scope: hoisting collects their names (for the
+    /// runtime's EvalDeclarationInstantiation) instead of declaring local
+    /// cells, and initializers compile as dynamic name stores.
+    eval_sloppy: bool,
+    /// Currently compiling this function's parameter initializers (a sloppy
+    /// direct eval here that var-declares `arguments` is a SyntaxError when
+    /// the function is a non-arrow — its param scope owns an `arguments`
+    /// binding; the BODY's var scope does not, so body evals are fine).
+    in_params: bool,
+    /// ALL simple parameter names, prescanned before initializers compile
+    /// (an eval in an earlier default must see later parameter names).
+    all_param_names: Vec<String>,
     /// Strict-mode code (a `"use strict"` directive here, an enclosing strict
     /// function, or a class body). Propagated to `FuncProto.is_strict` so the VM
     /// makes assignment failures throw.
@@ -222,6 +472,8 @@ struct FnCtx {
     /// literal) via `getPrototypeOf`, rather than the class `%superclass`
     /// binding. (Nested arrows are separate functions and keep the class path.)
     home_super: bool,
+    /// Scope snapshots for this function's direct-eval call sites.
+    eval_scopes: Vec<std::rc::Rc<EvalScopeDesc>>,
 }
 
 impl FnCtx {
@@ -247,11 +499,18 @@ impl FnCtx {
             track_completion: false,
             with_depth: 0,
             enclosed_in_with: false,
+            contains_eval: false,
+            is_toplevel: false,
+            is_eval_body: false,
+            eval_sloppy: false,
+            in_params: false,
+            all_param_names: Vec::new(),
             handler_depth: 0,
             finally_depth: 0,
             strict: false,
             stable_cells: Vec::new(),
             home_super: false,
+            eval_scopes: Vec::new(),
         }
     }
     fn alloc_cell(&mut self) -> u32 {
@@ -320,6 +579,9 @@ struct Compiler {
     /// for the word `arguments` — when absent, the per-call `arguments` object is
     /// not materialized (a hot-path win for the common case).
     source: String,
+    /// Escaping `var`/function names collected while compiling a SLOPPY
+    /// direct-eval body (see `FnCtx::eval_sloppy`).
+    eval_var_names: Vec<String>,
 }
 
 impl Compiler {
@@ -336,6 +598,7 @@ impl Compiler {
             module_requested: Vec::new(),
             is_module: false,
             source: String::new(),
+            eval_var_names: Vec::new(),
         }
     }
 
@@ -345,6 +608,15 @@ impl Compiler {
         self.source
             .get(start as usize..end as usize)
             .map_or(true, |s| s.contains("arguments"))
+    }
+
+    /// Whether the source region mentions `eval` — the conservative trigger
+    /// for the direct-eval deopt (dynamic name ops + eval-vars object). A
+    /// false positive only costs speed, never correctness.
+    fn region_has_eval(&self, start: u32, end: u32) -> bool {
+        self.source
+            .get(start as usize..end as usize)
+            .map_or(true, |s| s.contains("eval"))
     }
 }
 
@@ -474,6 +746,19 @@ impl Compiler {
     /// everything else (nested functions, or top-level destructuring) keeps the
     /// existing cell-based binding.
     fn hoist_var_pattern(&mut self, pat: &BindingPattern) {
+        // Sloppy direct-eval body: simple `var name`s escape to the caller's
+        // var scope — collect the name for the runtime's instantiation and
+        // leave references dynamic (no local cell). Destructuring patterns
+        // keep eval-local cells (a documented approximation).
+        if self.cur_ref().eval_sloppy {
+            if let BindingPattern::BindingIdentifier(id) = pat {
+                let name = id.name.as_str().to_string();
+                if !self.eval_var_names.contains(&name) {
+                    self.eval_var_names.push(name);
+                }
+                return;
+            }
+        }
         match pat {
             BindingPattern::BindingIdentifier(id) if self.in_global_scope() => {
                 let n = self.str_const(id.name.as_str());
@@ -557,7 +842,9 @@ impl Compiler {
     /// static op is both correct and faster.
     fn in_with(&self, name: &str) -> bool {
         let fc = self.fns.last().unwrap();
-        if name.starts_with('%') || (fc.with_depth == 0 && !fc.enclosed_in_with) {
+        if name.starts_with('%')
+            || (fc.with_depth == 0 && !fc.enclosed_in_with && !fc.contains_eval)
+        {
             return false;
         }
         for scope in fc.scopes.iter().rev() {
@@ -616,6 +903,102 @@ impl Compiler {
                 Op::LoadGlobal(n)
             }
         }
+    }
+
+    /// Snapshot the scope visible at a direct-`eval` call site: every binding
+    /// of every enclosing function (innermost spelling wins), resolved FROM the
+    /// current context — which forces upvalue capture, so the caller frame can
+    /// hand the eval body live cells. `%`-internal names are excluded except
+    /// `%superclass` (so `super.x` inside the eval can resolve).
+    fn collect_eval_scope(&mut self) -> std::rc::Rc<EvalScopeDesc> {
+        use std::collections::HashSet;
+        // Phase 1: gather candidate names + kind metadata (innermost first).
+        let mut seen: HashSet<String> = HashSet::new();
+        // (name, is_lexical, is_const, is_param)
+        let mut metas: Vec<(String, bool, bool, bool)> = Vec::new();
+        for fi in (0..self.fns.len()).rev() {
+            let fc = &self.fns[fi];
+            for scope in fc.scopes.iter().rev() {
+                for b in scope.bindings.iter().rev() {
+                    // `%this`/`%newtarget`/`%superclass` ride along so the eval
+                    // body's `this`/`new.target`/`super` resolve to the exact
+                    // caller bindings (a sloppy caller's boxed `this` lives in
+                    // its %this cell, not in the raw frame value).
+                    if b.name.starts_with('%')
+                        && !matches!(b.name.as_str(), "%this" | "%newtarget" | "%superclass")
+                    {
+                        continue;
+                    }
+                    if !seen.insert(b.name.clone()) {
+                        continue;
+                    }
+                    // Params are declared block-scoped but are var-like for the
+                    // eval var-shadow check.
+                    let is_param = fc.param_names.iter().any(|p| p == &b.name);
+                    // `arguments` and params are var-like even though they are
+                    // declared block-scoped internally.
+                    let is_lexical = !b.function_scoped
+                        && !is_param
+                        && b.name != "arguments"
+                        && !b.name.starts_with('%');
+                    metas.push((b.name.clone(), is_lexical, b.is_const, is_param));
+                }
+            }
+            for k in fc.upvalue_keys.clone() {
+                if k.starts_with('%')
+                    && !matches!(k.as_str(), "%this" | "%newtarget" | "%superclass")
+                {
+                    continue;
+                }
+                if seen.insert(k.clone()) {
+                    let is_const = self.binding_is_const(&k);
+                    metas.push((k, false, is_const, false));
+                }
+            }
+        }
+        // Phase 2: resolve each from the current context (capturing upvalues).
+        let mut bindings: Vec<EvalBinding> = Vec::new();
+        for (name, is_lexical, is_const, is_param) in metas {
+            let slot = match self.resolve(&name) {
+                Resolved::Cell(i) => EvalSlot::Cell(i),
+                Resolved::Upvalue(i) => EvalSlot::Upvalue(i),
+                Resolved::Global => continue,
+            };
+            bindings.push(EvalBinding {
+                name,
+                slot,
+                is_lexical,
+                is_const,
+                is_param,
+            });
+        }
+        let in_function = self
+            .fns
+            .iter()
+            .any(|f| !f.is_toplevel && !f.kind.is_arrow());
+        // The spec's `var arguments` SyntaxError fires only when the eval runs
+        // in a PARAMETER scope owning an `arguments` binding: a non-arrow
+        // function's params, or any params declaring one named `arguments`.
+        let arguments_param_scope = self
+            .fns
+            .iter()
+            .rev()
+            .find(|f| f.in_params)
+            .map(|f| !f.kind.is_arrow() || f.all_param_names.iter().any(|p| p == "arguments"))
+            .unwrap_or(false);
+        let is_global_var_scope = self.fns.len() == 1;
+        let home_super = self.fns.iter().any(|f| f.home_super);
+        let allow_super_prop = home_super || bindings.iter().any(|b| b.name == "%superclass");
+        let strict = self.cur_ref().strict;
+        std::rc::Rc::new(EvalScopeDesc {
+            bindings,
+            in_function,
+            arguments_param_scope,
+            is_global_var_scope,
+            home_super,
+            allow_super_prop,
+            strict,
+        })
     }
 
     fn store_binding(&mut self, name: &str) {
@@ -713,6 +1096,8 @@ impl Compiler {
         let mut fc = FnCtx::new("<script>", FuncKind::Normal);
         fc.track_completion = true;
         fc.script_global = true;
+        fc.is_toplevel = true;
+        fc.contains_eval = self.source.contains("eval");
         fc.strict = program
             .directives
             .iter()
@@ -759,8 +1144,14 @@ impl Compiler {
         let mut fc = FnCtx::new("<module>", FuncKind::Normal);
         fc.strict = true;
         fc.script_global = false;
+        fc.is_toplevel = true;
+        fc.contains_eval = self.source.contains("eval");
+        let module_has_eval = fc.contains_eval;
         self.fns.push(fc);
         self.enter_scope(true);
+        if module_has_eval {
+            self.emit(Op::InitEvalVars);
+        }
         // Module `this` is undefined; new.target likewise.
         let this_cell = self.declare("%this", true);
         self.emit(Op::LoadUndefined);
@@ -1017,6 +1408,7 @@ impl Compiler {
 
     fn finish(&self, fc: FnCtx) -> FuncProto {
         FuncProto {
+            eval_scopes: fc.eval_scopes.clone(),
             name: fc.name,
             code: fc.code,
             consts: fc.consts,
@@ -1126,6 +1518,25 @@ impl Compiler {
     /// Declare + emit closures for function declarations directly in `stmts`
     /// (hoisted to the top of the current scope).
     fn hoist_funcs(&mut self, stmts: &[Statement]) -> R {
+        // Sloppy direct-eval body: function declarations escape to the caller's
+        // var scope. Collect the names (runtime pre-creates the bindings) and
+        // install each closure with a dynamic name store; calls resolve
+        // dynamically, so mutual recursion still works once both are stored.
+        if self.cur_ref().eval_sloppy {
+            for s in stmts {
+                if let Statement::FunctionDeclaration(f) = s {
+                    if let Some(id) = &f.id {
+                        let name = id.name.as_str().to_string();
+                        if !self.eval_var_names.contains(&name) {
+                            self.eval_var_names.push(name.clone());
+                        }
+                        self.compile_function(f, Some(&name))?;
+                        self.store_binding(&name);
+                    }
+                }
+            }
+            return Ok(());
+        }
         // Top-level function declarations become global-object properties. Their
         // bodies reference each other via `LoadGlobal` (resolved at call time), so
         // a single definition pass suffices.
@@ -1344,6 +1755,9 @@ impl Compiler {
             Statement::ForStatement(f) => self.compile_for(f)?,
             Statement::ForInStatement(f) => self.compile_for_in(f)?,
             Statement::ForOfStatement(f) => self.compile_for_of(f)?,
+            Statement::ReturnStatement(_) if self.cur_ref().is_eval_body => {
+                return Err("Illegal return statement".into());
+            }
             Statement::ReturnStatement(r) => {
                 if let Some(arg) = &r.argument {
                     self.compile_expr(arg)?;
@@ -1403,6 +1817,28 @@ impl Compiler {
     fn compile_var_decl(&mut self, d: &VariableDeclaration) -> R {
         let function_scoped = matches!(d.kind, VariableDeclarationKind::Var);
         let is_const = matches!(d.kind, VariableDeclarationKind::Const);
+        // Sloppy direct-eval body: a simple `var name = init` is an assignment
+        // to the caller-scope binding (dynamic name store; the binding was
+        // pre-created by EvalDeclarationInstantiation or is a visible one).
+        if function_scoped && self.cur_ref().eval_sloppy {
+            for decl in &d.declarations {
+                if let BindingPattern::BindingIdentifier(id) = &decl.id {
+                    let name = id.name.as_str().to_string();
+                    if let Some(init) = &decl.init {
+                        self.compile_named_expr(init, &name)?;
+                        self.store_binding(&name);
+                    }
+                    continue;
+                }
+                // Destructuring var in eval: eval-local cells (approximation).
+                self.declare_pattern_names(&decl.id, true);
+                if let Some(init) = &decl.init {
+                    self.compile_expr(init)?;
+                    self.bind_pattern(&decl.id, true)?;
+                }
+            }
+            return Ok(());
+        }
         // A top-level `var name` is a global property (already created by hoisting);
         // its initializer is an ordinary assignment to that global.
         let global_var = function_scoped && self.in_global_scope();
@@ -3064,6 +3500,36 @@ impl Compiler {
     }
 
     fn compile_call(&mut self, c: &CallExpression) -> R {
+        // Direct `eval(...)`: snapshot the visible scope and emit DirectEval.
+        // The runtime falls back to an ordinary call when the callee value
+        // isn't the %eval% intrinsic (shadowed/reassigned `eval`). Spread and
+        // optional calls keep the ordinary (indirect-semantics) path.
+        if let Expression::Identifier(id) = &c.callee {
+            if id.name.as_str() == "eval"
+                && !c.optional
+                && !c
+                    .arguments
+                    .iter()
+                    .any(|a| matches!(a, Argument::SpreadElement(_)))
+            {
+                let desc = self.collect_eval_scope();
+                self.load_binding("eval"); // [callee]
+                for a in &c.arguments {
+                    let e = a.as_expression().unwrap();
+                    self.compile_expr(e)?;
+                }
+                let scope_idx = {
+                    let fc = self.cur();
+                    fc.eval_scopes.push(desc);
+                    (fc.eval_scopes.len() - 1) as u32
+                };
+                self.emit(Op::DirectEval {
+                    argc: c.arguments.len() as u32,
+                    scope: scope_idx,
+                });
+                return Ok(());
+            }
+        }
         // super(...) — call the parent constructor with the current `this`.
         if matches!(c.callee, Expression::Super(_)) {
             self.load_binding("%superclass"); // [super]
@@ -4052,8 +4518,12 @@ impl Compiler {
         fc.enclosed_in_with = self
             .fns
             .last()
-            .map(|f| f.with_depth > 0 || f.enclosed_in_with)
+            .map(|f| f.with_depth > 0 || f.enclosed_in_with || f.contains_eval)
             .unwrap_or(false);
+        {
+            let end = body.map(|b| b.span.end).unwrap_or(params.span.end);
+            fc.contains_eval = self.region_has_eval(params.span.start, end);
+        }
         // `num_params` carries the function's `length` (ExpectedArgumentCount):
         // the count of leading formal parameters before the first one with a
         // default initializer or the rest element. A destructuring param with no
@@ -4103,12 +4573,20 @@ impl Compiler {
             // when the body actually mentions `arguments` — the common case skips
             // it entirely. Scanning the source region for the word never produces
             // a false negative (if `arguments` is used, the word is present).
+            // A direct eval may reference `arguments` even when the body text
+            // doesn't, so a function containing eval always materializes it.
             let end = body.map(|b| b.span.end).unwrap_or(params.span.end);
-            if self.region_has_arguments(params.span.start, end) {
+            if self.region_has_arguments(params.span.start, end) || self.cur_ref().contains_eval {
                 let ac = self.declare("arguments", false);
                 self.emit(Op::LoadArguments);
                 self.emit(Op::InitCell(ac));
             }
+        }
+        // Functions containing direct eval get an eval-vars object (sloppy
+        // eval `var`s land there; it rides the with-scope chain so dynamic
+        // name ops and nested closures see them).
+        if self.cur_ref().contains_eval {
+            self.emit(Op::InitEvalVars);
         }
 
         // Parameters. Each has an optional default (`initializer`) applied when
@@ -4138,6 +4616,17 @@ impl Compiler {
                     param_cells.push(None);
                 }
             }
+        }
+        {
+            let mut all: Vec<String> = Vec::new();
+            for p in &params.items {
+                if let BindingPattern::BindingIdentifier(id) = &p.pattern {
+                    all.push(id.name.as_str().to_string());
+                }
+            }
+            let fc = self.cur();
+            fc.all_param_names = all;
+            fc.in_params = true;
         }
         for (i, p) in params.items.iter().enumerate() {
             self.emit(Op::LoadArg(i as u32));
@@ -4173,6 +4662,7 @@ impl Compiler {
             self.emit(Op::LoadRestArgs(params.items.len() as u32));
             self.bind_pattern(&rest.rest.argument, false)?;
         }
+        self.cur().in_params = false;
 
         // Class instance-field initializers run at the top of the constructor.
         if let Some(fields) = ctor_fields {
@@ -4465,7 +4955,7 @@ impl Compiler {
         fc.enclosed_in_with = self
             .fns
             .last()
-            .map(|f| f.with_depth > 0 || f.enclosed_in_with)
+            .map(|f| f.with_depth > 0 || f.enclosed_in_with || f.contains_eval)
             .unwrap_or(false);
         fc.has_rest = has_super;
         fc.num_params = 0;

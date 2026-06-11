@@ -182,6 +182,7 @@ impl Vm {
             with_scope,
             trace_token: None,
             skip_delegation_throw: false,
+            eval_vars: None,
         }
     }
 
@@ -433,6 +434,133 @@ impl Vm {
     ///   finalizer (whose `EndFinally` resumes this dispatch);
     /// - once no more crossing handlers remain, the action is performed
     ///   (`Ctl::Return` / re-`throw` as `Err` / `Ctl::Jump` to the loop target).
+    /// PerformEval (spec 19.2.1.1) for a direct call to %eval%: compile the
+    /// source against the call site's scope snapshot, run the spec's
+    /// EvalDeclarationInstantiation checks (the sloppy `var arguments`
+    /// SyntaxError in function scopes; var-shadows-lexical), instantiate
+    /// escaping sloppy vars on the global / the caller frame's eval-vars
+    /// object, and execute the body with the caller's `this`, `new.target`,
+    /// [[HomeObject]], and with-scope chain. Visible caller bindings become
+    /// the body's upvalues, wired to the caller frame's LIVE cells.
+    fn perform_direct_eval(
+        &mut self,
+        frame: &mut Frame,
+        scope: u32,
+        args: Vec<Value>,
+    ) -> Result<Value, Value> {
+        let arg0 = args.first().cloned().unwrap_or(Value::Undefined);
+        let src = match &arg0 {
+            Value::String(s) => s.as_str().to_string(),
+            _ => return Ok(arg0), // non-string eval returns its argument
+        };
+        let desc = frame
+            .func
+            .proto
+            .eval_scopes
+            .get(scope as usize)
+            .cloned()
+            .ok_or_else(|| self.throw_type("internal: missing eval scope"))?;
+        let compiled = match crate::compiler::compile_direct_eval(&src, &desc) {
+            Ok(c) => c,
+            Err(msg) => return Err(self.throw_syntax(msg.trim_start_matches("SyntaxError: "))),
+        };
+        // EvalDeclarationInstantiation for the sloppy escaping vars.
+        if !compiled.strict {
+            for name in &compiled.var_names {
+                if name == "arguments" && desc.arguments_param_scope {
+                    return Err(self.throw_syntax(
+                        "Unexpected eval or arguments in eval code within a function",
+                    ));
+                }
+                if let Some(b) = desc.bindings.iter().find(|b| &b.name == name) {
+                    if b.is_lexical {
+                        return Err(self.throw_syntax(&format!(
+                            "Identifier '{name}' has already been declared"
+                        )));
+                    }
+                    continue; // visible var/param: writes hit the live cell
+                }
+                if desc.is_global_var_scope {
+                    // CanDeclareGlobalVar: a fresh global binding requires an
+                    // extensible global object.
+                    let g = self.realm.global.clone();
+                    let key = PropertyKey::str(name);
+                    let (present, extensible) = {
+                        let b = g.borrow();
+                        (b.props.contains_key(&key), b.extensible)
+                    };
+                    if !present {
+                        if !extensible {
+                            return Err(self
+                                .throw_type(&format!("Cannot declare global variable '{name}'")));
+                        }
+                        g.borrow_mut()
+                            .props
+                            .insert(key, Property::data(Value::Undefined));
+                    }
+                } else {
+                    // Function-scope eval var: lives on the caller frame's
+                    // eval-vars object (created by InitEvalVars at entry).
+                    let ev = match &frame.eval_vars {
+                        Some(o) => o.clone(),
+                        None => {
+                            let o =
+                                self.alloc(crate::value::ObjectData::new(None, Internal::Ordinary));
+                            frame.with_scope.insert(0, o.clone());
+                            frame.eval_vars = Some(o.clone());
+                            o
+                        }
+                    };
+                    let key = PropertyKey::str(name);
+                    if !ev.borrow().props.contains_key(&key) {
+                        let mut p = Property::data(Value::Undefined);
+                        p.enumerable = true;
+                        ev.borrow_mut().props.insert(key, p);
+                    }
+                }
+            }
+        }
+        // Wire the body's upvalues to the caller frame's live cells.
+        let mut upvalues: Vec<Rc<RefCell<Value>>> = Vec::new();
+        for uv in &compiled.proto.upvalues {
+            let idx = match *uv {
+                UpvalueSource::ParentCell(i) => i as usize,
+                UpvalueSource::ParentUpvalue(_) => {
+                    return Err(self.throw_type("internal: eval upvalue shape"))
+                }
+            };
+            let b = desc
+                .bindings
+                .get(idx)
+                .ok_or_else(|| self.throw_type("internal: eval binding index"))?;
+            let cell = match b.slot {
+                crate::bytecode::EvalSlot::Cell(i) => frame.cells[i as usize].clone(),
+                crate::bytecode::EvalSlot::Upvalue(i) => frame.func.upvalues[i as usize].clone(),
+            };
+            upvalues.push(cell);
+        }
+        let bf = BytecodeFunction {
+            proto: Rc::new(compiled.proto),
+            upvalues,
+            home_object: frame.func.home_object.clone(),
+            is_class_ctor: false,
+            captured_with: frame.with_scope.clone(),
+        };
+        self.call_depth += 1;
+        if self.call_depth > self.max_call_depth {
+            self.call_depth -= 1;
+            return Err(self.throw_range("Maximum call stack size exceeded"));
+        }
+        let eframe = self.make_frame(bf, frame.this.clone(), &[], frame.new_target.clone());
+        let flow = self.run_frame(eframe);
+        self.call_depth -= 1;
+        match flow {
+            Flow::Return(v) => Ok(v),
+            Flow::Throw(e) => Err(e),
+            Flow::Suspend(_) => Err(self.throw_type("internal: eval body suspended")),
+        }
+    }
+
     fn do_completion(&mut self, frame: &mut Frame, comp: Completion) -> Result<Ctl, Value> {
         let boundary = match &comp {
             Completion::Jump { boundary, .. } => *boundary as usize,
@@ -658,8 +786,18 @@ impl Vm {
             Op::DeclareGlobal(i) => {
                 let name = self.const_name(frame, i);
                 let g = self.realm.global.clone();
-                let key = PropertyKey::Str(name);
-                if !g.borrow().props.contains_key(&key) {
+                let key = PropertyKey::Str(name.clone());
+                let (present, extensible) = {
+                    let b = g.borrow();
+                    (b.props.contains_key(&key), b.extensible)
+                };
+                if !present {
+                    // CanDeclareGlobalVar/Function: needs an extensible global.
+                    if !extensible {
+                        return Err(
+                            self.throw_type(&format!("Cannot declare global '{}'", name.as_str()))
+                        );
+                    }
                     g.borrow_mut()
                         .props
                         .insert(key, Property::data(Value::Undefined));
@@ -1426,6 +1564,35 @@ impl Vm {
             Op::MarkDelegationHandler => {
                 if let Some(h) = frame.handlers.last_mut() {
                     h.delegation = true;
+                }
+            }
+            Op::InitEvalVars => {
+                // Null prototype: with-scope lookups HasProperty through the
+                // chain, and Object.prototype names must not shadow globals.
+                let o = self.alloc(crate::value::ObjectData::new(None, Internal::Ordinary));
+                // Outermost with-scope: real `with` objects entered later (and
+                // the static fallback for names it doesn't hold) take priority.
+                frame.with_scope.insert(0, o.clone());
+                frame.eval_vars = Some(o);
+            }
+            Op::DirectEval { argc, scope } => {
+                let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
+                for _ in 0..argc {
+                    args.push(pop!());
+                }
+                args.reverse();
+                let callee = pop!();
+                // Direct-eval semantics apply only when the callee IS %eval%.
+                let is_intrinsic = match (&callee, &self.realm.eval_fn) {
+                    (Value::Object(o), Some(e)) => o.same(e),
+                    _ => false,
+                };
+                if !is_intrinsic {
+                    let r = self.call(callee, Value::Undefined, &args)?;
+                    push!(r);
+                } else {
+                    let v = self.perform_direct_eval(frame, scope, args)?;
+                    push!(v);
                 }
             }
             Op::PopTryHandler => {

@@ -379,6 +379,13 @@ fn install_globals(vm: &mut Vm) {
             Err(msg) => Err(vm.throw_syntax(msg.trim_start_matches("SyntaxError: "))),
         }
     });
+    // Remember the %eval% intrinsic's identity: `Op::DirectEval` performs
+    // direct-eval semantics only when the callee IS this object.
+    if let Ok(Value::Object(ef)) =
+        vm.get_prop(&Value::Object(global.clone()), &PropertyKey::str("eval"))
+    {
+        vm.realm.eval_fn = Some(ef);
+    }
 
     // Function constructor: `new Function(p1, ..., body)` compiles a function
     // from source. Defined here (not in fundamental.rs) because it needs the

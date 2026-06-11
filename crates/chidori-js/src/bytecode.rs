@@ -120,6 +120,9 @@ pub struct FuncProto {
     /// exporter's cell, and have the body fill them without breaking the link.
     /// Empty for ordinary scripts/functions (default replace-the-`Rc` semantics).
     pub stable_cells: Vec<u32>,
+    /// Scope snapshots for the direct-`eval` call sites in this function,
+    /// indexed by `Op::DirectEval`'s `scope` payload.
+    pub eval_scopes: Vec<std::rc::Rc<EvalScopeDesc>>,
 }
 
 impl FuncProto {
@@ -139,6 +142,7 @@ impl FuncProto {
             param_names: Vec::new(),
             is_strict: false,
             stable_cells: Vec::new(),
+            eval_scopes: Vec::new(),
         }
     }
 }
@@ -148,6 +152,53 @@ impl FuncProto {
 pub enum Slot {
     Local(u32),
     Cell(u32),
+}
+
+/// Where a caller binding visible at a direct-`eval` call site lives in the
+/// CALLER's frame (see [`EvalScopeDesc`]).
+#[derive(Clone, Copy, Debug)]
+pub enum EvalSlot {
+    Cell(u32),
+    Upvalue(u32),
+}
+
+/// One caller binding visible at a direct-`eval` call site.
+#[derive(Clone, Debug)]
+pub struct EvalBinding {
+    pub name: String,
+    pub slot: EvalSlot,
+    /// let/const/class (a sloppy eval `var` of the same name is a SyntaxError).
+    pub is_lexical: bool,
+    pub is_const: bool,
+    /// A formal parameter (an eval var-declared `arguments` colliding with a
+    /// parameter named `arguments` is a SyntaxError).
+    pub is_param: bool,
+}
+
+/// Compile-time snapshot of the scope at a direct-`eval` call site. The
+/// runtime compiles the eval source against these bindings (they become the
+/// eval body's upvalues, wired to the caller frame's live cells) and uses the
+/// context flags for the spec's eval early errors and var-target selection.
+#[derive(Clone, Debug)]
+pub struct EvalScopeDesc {
+    pub bindings: Vec<EvalBinding>,
+    /// An enclosing NON-ARROW function exists (`new.target` is legal; the
+    /// parse wrapper is a function).
+    pub in_function: bool,
+    /// The eval site is inside a PARAMETER list whose scope owns an
+    /// `arguments` binding (non-arrow params, or any params that declare a
+    /// parameter literally named `arguments`): a sloppy direct eval
+    /// var-declaring `arguments` here is a SyntaxError.
+    pub arguments_param_scope: bool,
+    /// The caller's var scope is the global script (sloppy eval vars become
+    /// global object properties).
+    pub is_global_var_scope: bool,
+    /// `super.x` resolves via the [[HomeObject]] path at the call site.
+    pub home_super: bool,
+    /// `super.x` is syntactically allowed at the call site at all.
+    pub allow_super_prop: bool,
+    /// Caller code is strict (the eval inherits strictness).
+    pub strict: bool,
 }
 
 /// The instruction set. Jump targets are absolute indices into `code`, patched
@@ -265,6 +316,21 @@ pub enum Op {
     /// Mark the most recently pushed try-handler as a `yield*` delegation
     /// handler (see `TryHandler::delegation`).
     MarkDelegationHandler,
+    /// Direct `eval(...)` call site: `[callee, arg0..argN-1] -> [result]`.
+    /// When the callee is the %eval% intrinsic, the source compiles against
+    /// the scope snapshot `FuncProto::eval_scopes[scope]` and runs with the
+    /// caller's `this`/`new.target`/with-chain (spec PerformEval); any other
+    /// callee gets an ordinary call.
+    DirectEval {
+        argc: u32,
+        scope: u32,
+    },
+    /// Function-entry op for functions containing direct `eval`: create the
+    /// frame's eval-vars object (where sloppy eval `var`s that don't match a
+    /// visible binding live) and push it as the OUTERMOST with-scope, so the
+    /// function's dynamic name ops — and closures created inside — see
+    /// eval-introduced vars.
+    InitEvalVars,
 
     // ---- private class elements ----
     /// Brand-checked private METHOD/ACCESSOR read: `[obj] -> [value]`. The

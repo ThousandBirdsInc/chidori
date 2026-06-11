@@ -116,6 +116,10 @@ pub struct Frame {
     /// completion propagates out of a `yield*` rather than being delegated to
     /// the inner iterator's `throw`.
     pub skip_delegation_throw: bool,
+    /// For functions containing direct `eval`: the object holding sloppy
+    /// eval-introduced `var`s (also pushed as the outermost with-scope, so
+    /// dynamic name ops and nested closures resolve them). `None` elsewhere.
+    pub eval_vars: Option<JsObject>,
 }
 
 /// Promise internal state.

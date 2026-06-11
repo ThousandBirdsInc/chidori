@@ -422,4 +422,7 @@ fn trace_frame(fr: &Frame, seen_cells: &mut HashSet<usize>, f: &mut dyn FnMut(&J
     for o in &fr.with_scope {
         f(o);
     }
+    if let Some(o) = &fr.eval_vars {
+        f(o);
+    }
 }
