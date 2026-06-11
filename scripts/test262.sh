@@ -73,7 +73,10 @@ if [[ "$update_baseline" == "1" ]]; then
   rm -f "$BASELINE"
   while IFS= read -r d; do
     echo "  $d"
-    "$RUNNER" --test262 "$VENDOR_DIR" --state "$BASELINE" "$d" >/dev/null
+    # The runner exits non-zero when any test in the chunk fails — expected
+    # while recording (the baseline records those failures); don't let
+    # `set -e` abort the sweep.
+    "$RUNNER" --test262 "$VENDOR_DIR" --state "$BASELINE" "$d" >/dev/null || true
   done < <(chunk_dirs)
   echo "Baseline recorded -> $BASELINE"
   exec "$RUNNER" --test262 "$VENDOR_DIR" --state "$BASELINE" --max 0

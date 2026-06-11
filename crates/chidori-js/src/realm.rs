@@ -10,6 +10,9 @@ use crate::vm::Vm;
 
 pub struct Realm {
     pub global: JsObject,
+    /// The %eval% intrinsic function object — `Op::DirectEval` compares the
+    /// callee against it to decide direct-vs-ordinary call semantics.
+    pub eval_fn: Option<JsObject>,
 
     pub object_proto: JsObject,
     pub function_proto: JsObject,
@@ -139,6 +142,7 @@ impl Realm {
     pub fn placeholder() -> Realm {
         Realm {
             global: bare(),
+            eval_fn: None,
             object_proto: bare(),
             function_proto: bare(),
             array_proto: bare(),

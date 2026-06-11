@@ -70,6 +70,233 @@ pub fn compile_script(src: &str) -> Result<FuncProto, String> {
     })
 }
 
+/// The compiled artifact of a direct-`eval` source text: the body proto (its
+/// upvalues are `ParentCell(i)` indices into the scope snapshot's `bindings`,
+/// which the runtime wires to the caller frame's live cells), the sloppy
+/// escaping `var`/function names for EvalDeclarationInstantiation, and the
+/// effective strictness.
+pub struct CompiledEval {
+    pub proto: FuncProto,
+    pub var_names: Vec<String>,
+    pub strict: bool,
+}
+
+/// Compile a DIRECT `eval` source against the scope snapshot taken at its call
+/// site (see [`EvalScopeDesc`]). The source is parsed inside a wrapper picked
+/// from the call-site context so the parser's placement rules match the spec:
+/// a method wrapper permits `super.x`, a function wrapper permits
+/// `new.target`, and global eval parses as a bare script (rejecting both).
+/// `return` is gated back out (it is never legal in eval code). Visible
+/// caller bindings are declared in a synthetic parent scope, so the body's
+/// free references compile to ordinary upvalues.
+pub fn compile_direct_eval(src: &str, desc: &EvalScopeDesc) -> Result<CompiledEval, String> {
+    let allocator = Allocator::default();
+    enum Wrap {
+        None,
+        Function,
+        Method,
+    }
+    let wrap = if desc.allow_super_prop {
+        Wrap::Method
+    } else if desc.in_function {
+        Wrap::Function
+    } else {
+        Wrap::None
+    };
+    // A hashbang comment is only valid at position 0 — strip it before the
+    // source goes inside a wrapper (it is still a comment per the spec).
+    let src = if let Some(rest) = src.strip_prefix("#!") {
+        match rest.find('\n') {
+            Some(i) => &rest[i..],
+            None => "",
+        }
+    } else {
+        src
+    };
+    // A strict caller's eval inherits strictness, including its EARLY errors —
+    // carry it into the parse via a synthetic directive (skipped below when
+    // computing completion values).
+    let strict_prefix = if desc.strict { "\"use strict\";\n" } else { "" };
+    let wrapped = match wrap {
+        Wrap::None => format!("{strict_prefix}{src}"),
+        Wrap::Function => format!("(function(){{\n{strict_prefix}{src}\n}})"),
+        Wrap::Method => format!("({{ m(){{\n{strict_prefix}{src}\n}} }})"),
+    };
+    let source_type = SourceType::script();
+    let ret = Parser::new(&allocator, &wrapped, source_type).parse();
+    if !ret.errors.is_empty() {
+        let msg = ret
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("SyntaxError: {msg}"));
+    }
+    let program = ret.program;
+    let sem = oxc::semantic::SemanticBuilder::new()
+        .with_check_syntax_error(true)
+        .build(&program);
+    if !sem.errors.is_empty() {
+        return Err(format!(
+            "SyntaxError: {}",
+            sem.errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    // Extract the real body statements + directives from the wrapper.
+    let (stmts, directives): (&[Statement], &[Directive]) = match wrap {
+        Wrap::None => (&program.body, &program.directives),
+        Wrap::Function | Wrap::Method => {
+            let func = (|| -> Option<&Function> {
+                let st = program.body.first()?;
+                let Statement::ExpressionStatement(es) = st else {
+                    return None;
+                };
+                let mut e: &Expression = &es.expression;
+                if let Expression::ParenthesizedExpression(pe) = e {
+                    e = &pe.expression;
+                }
+                match e {
+                    Expression::FunctionExpression(f) => Some(f),
+                    Expression::ObjectExpression(o) => {
+                        let prop = o.properties.first()?;
+                        let oxc::ast::ast::ObjectPropertyKind::ObjectProperty(p) = prop else {
+                            return None;
+                        };
+                        match &p.value {
+                            Expression::FunctionExpression(f) => Some(f),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            })()
+            .ok_or_else(|| "SyntaxError: eval wrapper shape".to_string())?;
+            let body = func
+                .body
+                .as_deref()
+                .ok_or_else(|| "SyntaxError: eval wrapper body".to_string())?;
+            (&body.statements, &body.directives)
+        }
+    };
+    let body_strict = desc.strict
+        || directives
+            .iter()
+            .any(|d| d.directive.as_str() == "use strict");
+
+    let mut c = Compiler::new();
+    c.source = wrapped.clone();
+
+    // Synthetic parent scope: one cell per visible caller binding, in order —
+    // the body's upvalue descriptors index straight into `desc.bindings`.
+    let mut env = FnCtx::new("<eval-env>", FuncKind::Normal);
+    env.is_toplevel = true;
+    c.fns.push(env);
+    c.enter_scope(true);
+    for b in &desc.bindings {
+        c.declare_kind(&b.name, true, b.is_const);
+    }
+
+    // The eval body itself.
+    let mut fc = FnCtx::new("<eval>", FuncKind::Normal);
+    fc.strict = body_strict;
+    fc.track_completion = true;
+    fc.is_eval_body = true;
+    // For nested direct evals inside this body, the context flags are
+    // inherited through `is_toplevel` (in_function detection).
+    fc.is_toplevel = !desc.in_function;
+    fc.script_global = desc.is_global_var_scope && !body_strict;
+    fc.eval_sloppy = !body_strict && !(desc.is_global_var_scope && !body_strict);
+    fc.enclosed_in_with = true;
+    fc.contains_eval = wrapped.contains("eval");
+    fc.home_super = desc.home_super;
+    let body_script_global = fc.script_global;
+    let body_contains_eval = fc.contains_eval;
+    c.fns.push(fc);
+    c.enter_scope(true);
+    if body_contains_eval && !body_script_global {
+        c.emit(Op::InitEvalVars);
+    }
+    // Completion register (eval's result is its completion value).
+    c.emit(Op::LoadUndefined);
+    let comp_cell = c.declare("%completion", true);
+    c.emit(Op::InitCell(comp_cell));
+    // `this`/`new.target`: prefer the caller's own %this/%newtarget bindings
+    // from the snapshot (a sloppy caller's boxed `this` lives there); only
+    // declare locals when the snapshot doesn't carry them (global eval).
+    if !desc.bindings.iter().any(|b| b.name == "%this") {
+        let this_cell = c.declare("%this", true);
+        if body_script_global {
+            let gt = c.str_const("globalThis");
+            c.emit(Op::LoadGlobal(gt));
+        } else {
+            c.emit(Op::LoadThis);
+        }
+        c.emit(Op::InitCell(this_cell));
+    }
+    if !desc.bindings.iter().any(|b| b.name == "%newtarget") {
+        let nt_cell = c.declare("%newtarget", true);
+        c.emit(Op::LoadNewTarget);
+        c.emit(Op::InitCell(nt_cell));
+    }
+
+    // Directive prologue strings are completion values too (`eval("'1'")`).
+    // The synthetic "use strict" prefix is not part of the user's source.
+    let mut user_directives = directives.iter();
+    if desc.strict {
+        let _ = user_directives.next();
+    }
+    for d in user_directives {
+        let v = c.str_const(&d.expression.value);
+        c.emit(Op::LoadConst(v));
+        c.store_binding("%completion");
+    }
+
+    for st in stmts {
+        if let Statement::VariableDeclaration(d) = st {
+            if matches!(
+                d.kind,
+                VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing
+            ) {
+                return Err(
+                    "SyntaxError: 'using' declarations are not allowed at the top level of eval"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    let compile_body = |c: &mut Compiler| -> Result<(), String> {
+        c.hoist_lexical(stmts);
+        c.hoist_vars_all(stmts);
+        c.hoist_funcs(stmts)?;
+        for stmt in stmts {
+            c.compile_stmt(stmt)?;
+        }
+        Ok(())
+    };
+    compile_body(&mut c).map_err(|e| {
+        if e.starts_with("SyntaxError") {
+            e
+        } else {
+            format!("SyntaxError: {e}")
+        }
+    })?;
+    c.load_binding("%completion");
+    c.emit(Op::Return);
+    c.exit_scope();
+    let fc = c.fns.pop().unwrap();
+    let proto = c.finish(fc);
+    Ok(CompiledEval {
+        proto,
+        var_names: std::mem::take(&mut c.eval_var_names),
+        strict: body_strict,
+    })
+}
+
 /// Compile a module's source text into a [`CompiledModule`] (its body proto plus
 /// import/export entries). Parse + semantic early-errors surface as `SyntaxError`
 /// exactly as for scripts, so `negative: { phase: parse }` module tests pass with
@@ -141,6 +368,11 @@ struct Binding {
 struct Scope {
     bindings: Vec<Binding>,
     is_function_scope: bool,
+    /// `with` nesting depth in effect when this scope was entered. A binding in
+    /// a scope at the CURRENT depth has no `with` between it and a reference,
+    /// so the inner declarative binding shadows any with-object and compiles to
+    /// the static op.
+    with_depth: u32,
 }
 
 struct LoopCtx {
@@ -202,6 +434,33 @@ struct FnCtx {
     /// > 0, unqualified identifier reads/writes compile to dynamic name ops that
     /// consult the runtime with-scope stack before the static binding.
     with_depth: u32,
+    /// True when this function is textually nested inside a `with` block of an
+    /// enclosing function: its free identifiers must also resolve dynamically
+    /// (against the closure's captured with-scope chain).
+    enclosed_in_with: bool,
+    /// The function's source region mentions `eval`: the classic direct-eval
+    /// deopt. Free identifiers compile to dynamic name ops (so reads observe
+    /// eval-introduced vars on the frame's eval-vars object), `arguments` is
+    /// force-materialized, and the prologue creates the eval-vars object.
+    contains_eval: bool,
+    /// This is a top-level program context (`<script>`, `<module>`, or a
+    /// direct-eval body) rather than a real function.
+    is_toplevel: bool,
+    /// A direct-eval BODY (gates `return` as a SyntaxError).
+    is_eval_body: bool,
+    /// A SLOPPY direct-eval body whose `var`/function declarations escape to
+    /// the caller's var scope: hoisting collects their names (for the
+    /// runtime's EvalDeclarationInstantiation) instead of declaring local
+    /// cells, and initializers compile as dynamic name stores.
+    eval_sloppy: bool,
+    /// Currently compiling this function's parameter initializers (a sloppy
+    /// direct eval here that var-declares `arguments` is a SyntaxError when
+    /// the function is a non-arrow — its param scope owns an `arguments`
+    /// binding; the BODY's var scope does not, so body evals are fine).
+    in_params: bool,
+    /// ALL simple parameter names, prescanned before initializers compile
+    /// (an eval in an earlier default must see later parameter names).
+    all_param_names: Vec<String>,
     /// Strict-mode code (a `"use strict"` directive here, an enclosing strict
     /// function, or a class body). Propagated to `FuncProto.is_strict` so the VM
     /// makes assignment failures throw.
@@ -213,6 +472,8 @@ struct FnCtx {
     /// literal) via `getPrototypeOf`, rather than the class `%superclass`
     /// binding. (Nested arrows are separate functions and keep the class path.)
     home_super: bool,
+    /// Scope snapshots for this function's direct-eval call sites.
+    eval_scopes: Vec<std::rc::Rc<EvalScopeDesc>>,
 }
 
 impl FnCtx {
@@ -237,11 +498,19 @@ impl FnCtx {
             loops: Vec::new(),
             track_completion: false,
             with_depth: 0,
+            enclosed_in_with: false,
+            contains_eval: false,
+            is_toplevel: false,
+            is_eval_body: false,
+            eval_sloppy: false,
+            in_params: false,
+            all_param_names: Vec::new(),
             handler_depth: 0,
             finally_depth: 0,
             strict: false,
             stable_cells: Vec::new(),
             home_super: false,
+            eval_scopes: Vec::new(),
         }
     }
     fn alloc_cell(&mut self) -> u32 {
@@ -257,8 +526,41 @@ enum Resolved {
     Global,
 }
 
+/// The kind of a private class element, resolved lexically at compile time.
+#[derive(Clone, Copy, PartialEq)]
+enum PrivKind {
+    Field,
+    Method,
+    Accessor,
+    StaticField,
+    StaticMethod,
+    StaticAccessor,
+}
+
+/// Private-name scope of one `class` body being compiled. Each class gets a
+/// compile-time-unique id; a private element's runtime storage key is
+/// `#name@<id>` (so same-named privates of nested/sibling classes can never
+/// collide), and instances are stamped with the own brand key `#brand@<id>`
+/// at construction when the class has private instance methods/accessors.
+struct ClassPrivCtx {
+    id: u32,
+    names: std::collections::HashMap<String, PrivKind>,
+}
+
+impl ClassPrivCtx {
+    fn has_instance_branded(&self) -> bool {
+        self.names
+            .values()
+            .any(|k| matches!(k, PrivKind::Method | PrivKind::Accessor))
+    }
+}
+
 struct Compiler {
     fns: Vec<FnCtx>,
+    /// Enclosing `class` bodies (innermost last) for private-name resolution.
+    class_privs: Vec<ClassPrivCtx>,
+    /// Allocator for `ClassPrivCtx::id`.
+    next_class_id: u32,
     /// A label captured by the immediately-following loop's `push_loop`.
     pending_label: Option<String>,
     /// Set just before compiling an object-literal concise method/accessor so the
@@ -277,12 +579,17 @@ struct Compiler {
     /// for the word `arguments` — when absent, the per-call `arguments` object is
     /// not materialized (a hot-path win for the common case).
     source: String,
+    /// Escaping `var`/function names collected while compiling a SLOPPY
+    /// direct-eval body (see `FnCtx::eval_sloppy`).
+    eval_var_names: Vec<String>,
 }
 
 impl Compiler {
     fn new() -> Compiler {
         Compiler {
             fns: Vec::new(),
+            class_privs: Vec::new(),
+            next_class_id: 0,
             pending_label: None,
             pending_home_super: false,
             chain_jumps: Vec::new(),
@@ -291,6 +598,7 @@ impl Compiler {
             module_requested: Vec::new(),
             is_module: false,
             source: String::new(),
+            eval_var_names: Vec::new(),
         }
     }
 
@@ -300,6 +608,15 @@ impl Compiler {
         self.source
             .get(start as usize..end as usize)
             .map_or(true, |s| s.contains("arguments"))
+    }
+
+    /// Whether the source region mentions `eval` — the conservative trigger
+    /// for the direct-eval deopt (dynamic name ops + eval-vars object). A
+    /// false positive only costs speed, never correctness.
+    fn region_has_eval(&self, start: u32, end: u32) -> bool {
+        self.source
+            .get(start as usize..end as usize)
+            .map_or(true, |s| s.contains("eval"))
     }
 }
 
@@ -368,9 +685,11 @@ impl Compiler {
     // ---- scopes & bindings ----
 
     fn enter_scope(&mut self, is_function: bool) {
+        let with_depth = self.cur_ref().with_depth;
         self.cur().scopes.push(Scope {
             bindings: Vec::new(),
             is_function_scope: is_function,
+            with_depth,
         });
     }
     fn exit_scope(&mut self) {
@@ -427,6 +746,19 @@ impl Compiler {
     /// everything else (nested functions, or top-level destructuring) keeps the
     /// existing cell-based binding.
     fn hoist_var_pattern(&mut self, pat: &BindingPattern) {
+        // Sloppy direct-eval body: simple `var name`s escape to the caller's
+        // var scope — collect the name for the runtime's instantiation and
+        // leave references dynamic (no local cell). Destructuring patterns
+        // keep eval-local cells (a documented approximation).
+        if self.cur_ref().eval_sloppy {
+            if let BindingPattern::BindingIdentifier(id) = pat {
+                let name = id.name.as_str().to_string();
+                if !self.eval_var_names.contains(&name) {
+                    self.eval_var_names.push(name);
+                }
+                return;
+            }
+        }
         match pat {
             BindingPattern::BindingIdentifier(id) if self.in_global_scope() => {
                 let n = self.str_const(id.name.as_str());
@@ -500,19 +832,36 @@ impl Compiler {
         (fc.upvalues.len() - 1) as u32
     }
 
-    /// True when the current identifier reference is textually inside a `with`
-    /// block (in this function) and could shadow against the with-object. We
-    /// skip synthetic compiler-internal names (`%this`, `%completion`, ...)
-    /// which can never be shadowed by a real object property.
+    /// True when the current identifier reference could resolve against a
+    /// `with`-object at runtime — textually inside a `with` block in this
+    /// function, or in a function nested inside one (whose closure captures the
+    /// with-scope chain). We skip synthetic compiler-internal names (`%this`,
+    /// `%completion`, ...) which can never be shadowed by a real object
+    /// property, and bindings of THIS function declared with no intervening
+    /// `with`: the inner declarative binding shadows any with-object, so the
+    /// static op is both correct and faster.
     fn in_with(&self, name: &str) -> bool {
-        self.fns.last().unwrap().with_depth > 0 && !name.starts_with('%')
+        let fc = self.fns.last().unwrap();
+        if name.starts_with('%')
+            || (fc.with_depth == 0 && !fc.enclosed_in_with && !fc.contains_eval)
+        {
+            return false;
+        }
+        for scope in fc.scopes.iter().rev() {
+            if scope.bindings.iter().any(|b| b.name == name) {
+                return scope.with_depth != fc.with_depth;
+            }
+        }
+        true
     }
 
-    fn store_binding(&mut self, name: &str) {
+    /// The static (non-`with`) store op for `name`: plain store, used by
+    /// declaration/initialization paths.
+    fn store_fallback(&mut self, name: &str) -> Op {
         // Assignment to a `const` binding is a runtime TypeError. Inside a
         // `with` the const cell is still the fallback target, so the dynamic op
         // carries the const-assign throw as its fallback.
-        let fallback = if self.binding_is_const(name) {
+        if self.binding_is_const(name) {
             Op::ThrowConstAssign
         } else {
             match self.resolve(name) {
@@ -523,7 +872,137 @@ impl Compiler {
                     Op::StoreGlobal(n)
                 }
             }
-        };
+        }
+    }
+
+    /// The static store op for assignment *expressions*: TDZ-checked, so
+    /// `x = 1; let x;` throws (PutValue → SetMutableBinding on an
+    /// uninitialized binding).
+    fn store_assign_fallback(&mut self, name: &str) -> Op {
+        if self.binding_is_const(name) {
+            Op::ThrowConstAssign
+        } else {
+            match self.resolve(name) {
+                Resolved::Cell(i) => Op::StoreCellChecked(i),
+                Resolved::Upvalue(i) => Op::StoreUpvalueChecked(i),
+                Resolved::Global => {
+                    let n = self.str_const(name);
+                    Op::StoreGlobal(n)
+                }
+            }
+        }
+    }
+
+    /// The static load op for `name`.
+    fn load_fallback(&mut self, name: &str) -> Op {
+        match self.resolve(name) {
+            Resolved::Cell(i) => Op::LoadCell(i),
+            Resolved::Upvalue(i) => Op::LoadUpvalue(i),
+            Resolved::Global => {
+                let n = self.str_const(name);
+                Op::LoadGlobal(n)
+            }
+        }
+    }
+
+    /// Snapshot the scope visible at a direct-`eval` call site: every binding
+    /// of every enclosing function (innermost spelling wins), resolved FROM the
+    /// current context — which forces upvalue capture, so the caller frame can
+    /// hand the eval body live cells. `%`-internal names are excluded except
+    /// `%superclass` (so `super.x` inside the eval can resolve).
+    fn collect_eval_scope(&mut self) -> std::rc::Rc<EvalScopeDesc> {
+        use std::collections::HashSet;
+        // Phase 1: gather candidate names + kind metadata (innermost first).
+        let mut seen: HashSet<String> = HashSet::new();
+        // (name, is_lexical, is_const, is_param)
+        let mut metas: Vec<(String, bool, bool, bool)> = Vec::new();
+        for fi in (0..self.fns.len()).rev() {
+            let fc = &self.fns[fi];
+            for scope in fc.scopes.iter().rev() {
+                for b in scope.bindings.iter().rev() {
+                    // `%this`/`%newtarget`/`%superclass` ride along so the eval
+                    // body's `this`/`new.target`/`super` resolve to the exact
+                    // caller bindings (a sloppy caller's boxed `this` lives in
+                    // its %this cell, not in the raw frame value).
+                    if b.name.starts_with('%')
+                        && !matches!(b.name.as_str(), "%this" | "%newtarget" | "%superclass")
+                    {
+                        continue;
+                    }
+                    if !seen.insert(b.name.clone()) {
+                        continue;
+                    }
+                    // Params are declared block-scoped but are var-like for the
+                    // eval var-shadow check.
+                    let is_param = fc.param_names.iter().any(|p| p == &b.name);
+                    // `arguments` and params are var-like even though they are
+                    // declared block-scoped internally.
+                    let is_lexical = !b.function_scoped
+                        && !is_param
+                        && b.name != "arguments"
+                        && !b.name.starts_with('%');
+                    metas.push((b.name.clone(), is_lexical, b.is_const, is_param));
+                }
+            }
+            for k in fc.upvalue_keys.clone() {
+                if k.starts_with('%')
+                    && !matches!(k.as_str(), "%this" | "%newtarget" | "%superclass")
+                {
+                    continue;
+                }
+                if seen.insert(k.clone()) {
+                    let is_const = self.binding_is_const(&k);
+                    metas.push((k, false, is_const, false));
+                }
+            }
+        }
+        // Phase 2: resolve each from the current context (capturing upvalues).
+        let mut bindings: Vec<EvalBinding> = Vec::new();
+        for (name, is_lexical, is_const, is_param) in metas {
+            let slot = match self.resolve(&name) {
+                Resolved::Cell(i) => EvalSlot::Cell(i),
+                Resolved::Upvalue(i) => EvalSlot::Upvalue(i),
+                Resolved::Global => continue,
+            };
+            bindings.push(EvalBinding {
+                name,
+                slot,
+                is_lexical,
+                is_const,
+                is_param,
+            });
+        }
+        let in_function = self
+            .fns
+            .iter()
+            .any(|f| !f.is_toplevel && !f.kind.is_arrow());
+        // The spec's `var arguments` SyntaxError fires only when the eval runs
+        // in a PARAMETER scope owning an `arguments` binding: a non-arrow
+        // function's params, or any params declaring one named `arguments`.
+        let arguments_param_scope = self
+            .fns
+            .iter()
+            .rev()
+            .find(|f| f.in_params)
+            .map(|f| !f.kind.is_arrow() || f.all_param_names.iter().any(|p| p == "arguments"))
+            .unwrap_or(false);
+        let is_global_var_scope = self.fns.len() == 1;
+        let home_super = self.fns.iter().any(|f| f.home_super);
+        let allow_super_prop = home_super || bindings.iter().any(|b| b.name == "%superclass");
+        let strict = self.cur_ref().strict;
+        std::rc::Rc::new(EvalScopeDesc {
+            bindings,
+            in_function,
+            arguments_param_scope,
+            is_global_var_scope,
+            home_super,
+            allow_super_prop,
+            strict,
+        })
+    }
+
+    fn store_binding(&mut self, name: &str) {
+        let fallback = self.store_fallback(name);
         if self.in_with(name) {
             let n = self.str_const(name);
             self.emit(Op::StoreName {
@@ -541,18 +1020,7 @@ impl Compiler {
     /// Declaration/initialization paths keep calling `store_binding` (plain
     /// store) so they can fill a binding that is intentionally still in TDZ.
     fn store_binding_assign(&mut self, name: &str) {
-        let fallback = if self.binding_is_const(name) {
-            Op::ThrowConstAssign
-        } else {
-            match self.resolve(name) {
-                Resolved::Cell(i) => Op::StoreCellChecked(i),
-                Resolved::Upvalue(i) => Op::StoreUpvalueChecked(i),
-                Resolved::Global => {
-                    let n = self.str_const(name);
-                    Op::StoreGlobal(n)
-                }
-            }
-        };
+        let fallback = self.store_assign_fallback(name);
         if self.in_with(name) {
             let n = self.str_const(name);
             self.emit(Op::StoreName {
@@ -565,14 +1033,7 @@ impl Compiler {
     }
 
     fn load_binding(&mut self, name: &str) {
-        let fallback = match self.resolve(name) {
-            Resolved::Cell(i) => Op::LoadCell(i),
-            Resolved::Upvalue(i) => Op::LoadUpvalue(i),
-            Resolved::Global => {
-                let n = self.str_const(name);
-                Op::LoadGlobal(n)
-            }
-        };
+        let fallback = self.load_fallback(name);
         if self.in_with(name) {
             let n = self.str_const(name);
             self.emit(Op::LoadName {
@@ -584,12 +1045,59 @@ impl Compiler {
         }
     }
 
+    // ---- once-resolved references (with-scope) ----
+    //
+    // Assignment/update expressions evaluate their LHS Reference ONCE; a side
+    // effect during the RHS (or a with-object getter) that deletes/shadows the
+    // binding must not redirect the final write. Inside a `with` we therefore
+    // capture the resolved base object up front and read/write through it.
+
+    /// Capture the with-aware Reference base for `name` into a fresh temp cell
+    /// (the with-object holding `name`, or `undefined` for a static binding).
+    fn capture_name_base(&mut self, name: &str) -> u32 {
+        let n = self.str_const(name);
+        let t = self.temp();
+        self.emit(Op::ResolveNameBase(n));
+        self.emit(Op::InitCell(t));
+        t
+    }
+
+    /// Read `name` through the captured base in `t_base`.
+    fn load_via_base(&mut self, name: &str, t_base: u32) {
+        let fallback = self.load_fallback(name);
+        let n = self.str_const(name);
+        self.emit(Op::LoadCell(t_base));
+        self.emit(Op::LoadFromBase {
+            name: n,
+            fallback: Box::new(fallback),
+        });
+    }
+
+    /// Store the value on top of the stack to `name` through the captured base
+    /// in `t_base`, leaving the stored value on the stack (the assignment
+    /// expression's result).
+    fn store_via_base_keep(&mut self, name: &str, t_base: u32) {
+        let fallback = self.store_assign_fallback(name);
+        let n = self.str_const(name);
+        let t_val = self.temp();
+        self.emit(Op::InitCell(t_val));
+        self.emit(Op::LoadCell(t_base));
+        self.emit(Op::LoadCell(t_val));
+        self.emit(Op::StoreToBase {
+            name: n,
+            fallback: Box::new(fallback),
+        });
+        self.emit(Op::LoadCell(t_val));
+    }
+
     // ---- top level ----
 
     fn compile_toplevel(&mut self, program: &Program) -> Result<FuncProto, String> {
         let mut fc = FnCtx::new("<script>", FuncKind::Normal);
         fc.track_completion = true;
         fc.script_global = true;
+        fc.is_toplevel = true;
+        fc.contains_eval = self.source.contains("eval");
         fc.strict = program
             .directives
             .iter()
@@ -636,8 +1144,14 @@ impl Compiler {
         let mut fc = FnCtx::new("<module>", FuncKind::Normal);
         fc.strict = true;
         fc.script_global = false;
+        fc.is_toplevel = true;
+        fc.contains_eval = self.source.contains("eval");
+        let module_has_eval = fc.contains_eval;
         self.fns.push(fc);
         self.enter_scope(true);
+        if module_has_eval {
+            self.emit(Op::InitEvalVars);
+        }
         // Module `this` is undefined; new.target likewise.
         let this_cell = self.declare("%this", true);
         self.emit(Op::LoadUndefined);
@@ -787,14 +1301,19 @@ impl Compiler {
         let star = self.declare_kind("*default*", false, true);
         match &d.declaration {
             ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                // A named `export default function f(){}` also binds `f` locally.
+                // Declare that binding BEFORE compiling the body so a
+                // self-reference inside (e.g. `f = 2`) captures the module-level
+                // cell instead of falling through to the global scope.
+                let local =
+                    f.id.as_ref()
+                        .map(|id| self.declare(id.name.as_str(), false));
                 // An anonymous `export default function(){}` gets the name "default".
                 self.compile_function(
                     f,
                     Some(f.id.as_ref().map_or("default", |i| i.name.as_str())),
                 )?;
-                // A named `export default function f(){}` also binds `f` locally.
-                if let Some(id) = &f.id {
-                    let c = self.declare(id.name.as_str(), false);
+                if let Some(c) = local {
                     self.emit(Op::Dup);
                     self.emit(Op::InitCell(c));
                 }
@@ -819,11 +1338,26 @@ impl Compiler {
                 self.emit(Op::InitCell(star));
             }
         }
+        // A NAMED default function/class declaration has ONE live binding (the
+        // name); the `default` export resolves to it, so later reassignment of
+        // the name is visible through the export (live bindings). Anonymous
+        // defaults export the synthetic `*default*` cell.
+        let local_name = match &d.declaration {
+            ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                f.id.as_ref()
+                    .map(|i| i.name.as_str().to_string())
+                    .unwrap_or_else(|| "*default*".to_string())
+            }
+            ExportDefaultDeclarationKind::ClassDeclaration(c) => {
+                c.id.as_ref()
+                    .map(|i| i.name.as_str().to_string())
+                    .unwrap_or_else(|| "*default*".to_string())
+            }
+            _ => "*default*".to_string(),
+        };
         self.module_exports.push(ExportEntry {
             export_name: Some("default".to_string()),
-            kind: ExportKind::Local {
-                local_name: "*default*".to_string(),
-            },
+            kind: ExportKind::Local { local_name },
         });
         Ok(())
     }
@@ -874,6 +1408,7 @@ impl Compiler {
 
     fn finish(&self, fc: FnCtx) -> FuncProto {
         FuncProto {
+            eval_scopes: fc.eval_scopes.clone(),
             name: fc.name,
             code: fc.code,
             consts: fc.consts,
@@ -983,6 +1518,25 @@ impl Compiler {
     /// Declare + emit closures for function declarations directly in `stmts`
     /// (hoisted to the top of the current scope).
     fn hoist_funcs(&mut self, stmts: &[Statement]) -> R {
+        // Sloppy direct-eval body: function declarations escape to the caller's
+        // var scope. Collect the names (runtime pre-creates the bindings) and
+        // install each closure with a dynamic name store; calls resolve
+        // dynamically, so mutual recursion still works once both are stored.
+        if self.cur_ref().eval_sloppy {
+            for s in stmts {
+                if let Statement::FunctionDeclaration(f) = s {
+                    if let Some(id) = &f.id {
+                        let name = id.name.as_str().to_string();
+                        if !self.eval_var_names.contains(&name) {
+                            self.eval_var_names.push(name.clone());
+                        }
+                        self.compile_function(f, Some(&name))?;
+                        self.store_binding(&name);
+                    }
+                }
+            }
+            return Ok(());
+        }
         // Top-level function declarations become global-object properties. Their
         // bodies reference each other via `LoadGlobal` (resolved at call time), so
         // a single definition pass suffices.
@@ -1201,6 +1755,9 @@ impl Compiler {
             Statement::ForStatement(f) => self.compile_for(f)?,
             Statement::ForInStatement(f) => self.compile_for_in(f)?,
             Statement::ForOfStatement(f) => self.compile_for_of(f)?,
+            Statement::ReturnStatement(_) if self.cur_ref().is_eval_body => {
+                return Err("Illegal return statement".into());
+            }
             Statement::ReturnStatement(r) => {
                 if let Some(arg) = &r.argument {
                     self.compile_expr(arg)?;
@@ -1260,6 +1817,28 @@ impl Compiler {
     fn compile_var_decl(&mut self, d: &VariableDeclaration) -> R {
         let function_scoped = matches!(d.kind, VariableDeclarationKind::Var);
         let is_const = matches!(d.kind, VariableDeclarationKind::Const);
+        // Sloppy direct-eval body: a simple `var name = init` is an assignment
+        // to the caller-scope binding (dynamic name store; the binding was
+        // pre-created by EvalDeclarationInstantiation or is a visible one).
+        if function_scoped && self.cur_ref().eval_sloppy {
+            for decl in &d.declarations {
+                if let BindingPattern::BindingIdentifier(id) = &decl.id {
+                    let name = id.name.as_str().to_string();
+                    if let Some(init) = &decl.init {
+                        self.compile_named_expr(init, &name)?;
+                        self.store_binding(&name);
+                    }
+                    continue;
+                }
+                // Destructuring var in eval: eval-local cells (approximation).
+                self.declare_pattern_names(&decl.id, true);
+                if let Some(init) = &decl.init {
+                    self.compile_expr(init)?;
+                    self.bind_pattern(&decl.id, true)?;
+                }
+            }
+            return Ok(());
+        }
         // A top-level `var name` is a global property (already created by hoisting);
         // its initializer is an ordinary assignment to that global.
         let global_var = function_scoped && self.in_global_scope();
@@ -1338,6 +1917,12 @@ impl Compiler {
     fn emit_iter_step_tracked(&mut self, itc: u32, done_cell: u32) {
         self.emit(Op::LoadCell(done_cell));
         let jskip = self.emit(Op::JumpIfTrue(0)); // already done -> undefined
+                                                  // Latch done=true BEFORE stepping: an abrupt completion from next(),
+                                                  // the `done` getter, or the `value` getter sets [[Done]] (spec
+                                                  // IteratorStepValue), so the enclosing close handler must NOT call
+                                                  // `return()`. The latch is cleared only once a value is extracted.
+        self.emit(Op::LoadTrue);
+        self.emit(Op::StoreCell(done_cell));
         self.emit(Op::LoadCell(itc));
         self.emit(Op::IteratorNext); // [iter, result]
         self.emit(Op::Swap);
@@ -1348,13 +1933,13 @@ impl Compiler {
         let jdone = self.emit(Op::JumpIfTrue(0));
         let vk = self.str_const("value");
         self.emit(Op::GetProp(vk)); // [value]
+        self.emit(Op::LoadFalse);
+        self.emit(Op::StoreCell(done_cell)); // normal step: un-latch
         let jhave = self.emit(Op::Jump(0));
-        // result.done: latch done_cell, drop result, push undefined.
+        // result.done: done_cell stays latched, drop result, push undefined.
         let donelbl = self.here();
         self.patch_jump(jdone, donelbl);
         self.emit(Op::Pop);
-        self.emit(Op::LoadTrue);
-        self.emit(Op::StoreCell(done_cell));
         self.emit(Op::LoadUndefined);
         let jhave2 = self.emit(Op::Jump(0));
         // done_cell already true: push undefined.
@@ -2280,10 +2865,19 @@ impl Compiler {
             Expression::NewExpression(n) => self.compile_new(n)?,
             Expression::ChainExpression(c) => self.compile_chain(&c.expression)?,
             Expression::PrivateInExpression(p) => {
-                // `#x in obj` — private field check; approximate via key presence.
-                self.load_str(&format!("#{}", p.left.name.as_str()));
+                // `#x in obj` — own-key presence: a field's storage key, or a
+                // method/accessor's per-instance brand key.
                 self.compile_expr(&p.right)?;
-                self.emit(Op::HasProp);
+                let name = p.left.name.as_str();
+                let probe = match self.resolve_private(name) {
+                    Some((key, id, kind)) => match kind {
+                        PrivKind::Method | PrivKind::Accessor => Self::private_brand_key(id),
+                        _ => key,
+                    },
+                    None => format!("#{name}"),
+                };
+                let k = self.str_const(&probe);
+                self.emit(Op::PrivateHasOwn(k));
             }
             Expression::StaticMemberExpression(m) => {
                 if matches!(m.object, Expression::Super(_)) {
@@ -2333,11 +2927,11 @@ impl Compiler {
                 }
             }
             Expression::PrivateFieldExpression(m) => {
-                // Private names modeled as non-enumerable string keys "#name", with
-                // a brand check (`PrivateGet`) so foreign access throws a TypeError.
+                // Private names resolve lexically to their declaring class
+                // (suffixed storage keys + per-instance brand checks); see
+                // `resolve_private`/`emit_private_get_op`.
                 self.compile_expr(&m.object)?;
-                let k = self.str_const(&format!("#{}", m.field.name.as_str()));
-                self.emit(Op::PrivateGet(k));
+                self.emit_private_get_op(m.field.name.as_str());
             }
             Expression::FunctionExpression(f) => {
                 let name = f.id.as_ref().map(|i| i.name.as_str().to_string());
@@ -2737,6 +3331,26 @@ impl Compiler {
         match &u.argument {
             SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
                 let name = id.name.as_str();
+                if self.in_with(name) {
+                    // Once-resolved Reference: capture the with-aware base before
+                    // the read so the write can't be redirected in between.
+                    let t_base = self.capture_name_base(name);
+                    self.load_via_base(name, t_base);
+                    self.emit(Op::ToNumeric);
+                    if u.prefix {
+                        self.emit(if inc { Op::Inc } else { Op::Dec });
+                        self.store_via_base_keep(name, t_base);
+                    } else {
+                        let t_old = self.temp();
+                        self.emit(Op::Dup);
+                        self.emit(Op::InitCell(t_old));
+                        self.emit(if inc { Op::Inc } else { Op::Dec });
+                        self.store_via_base_keep(name, t_base);
+                        self.emit(Op::Pop);
+                        self.emit(Op::LoadCell(t_old));
+                    }
+                    return Ok(());
+                }
                 self.load_binding(name);
                 self.emit(Op::ToNumeric); // old value (BigInt-preserving)
                 if u.prefix {
@@ -2778,6 +3392,13 @@ impl Compiler {
                 self.emit(Op::InitCell(t_obj));
                 self.compile_expr(&m.expression)?;
                 self.emit(Op::InitCell(t_key));
+                // Coerce the key once (after the base coercibility check); the
+                // write below reuses the coerced key with no re-`toString`.
+                self.emit(Op::LoadCell(t_obj));
+                self.emit(Op::RequireCoercible);
+                self.emit(Op::LoadCell(t_key));
+                self.emit(Op::ToPropertyKey);
+                self.emit(Op::InitCell(t_key));
                 self.emit(Op::LoadCell(t_obj));
                 self.emit(Op::LoadCell(t_key));
                 self.emit(Op::GetPropDynamic);
@@ -2789,6 +3410,28 @@ impl Compiler {
                 self.emit(Op::LoadCell(t_old));
                 self.emit(if inc { Op::Inc } else { Op::Dec });
                 self.emit(Op::SetPropDynamic);
+                self.emit(Op::Pop);
+                if u.prefix {
+                    self.emit(Op::LoadCell(t_old));
+                    self.emit(if inc { Op::Inc } else { Op::Dec });
+                } else {
+                    self.emit(Op::LoadCell(t_old));
+                }
+            }
+            SimpleAssignmentTarget::PrivateFieldExpression(m) => {
+                let name = m.field.name.as_str().to_string();
+                let t_obj = self.temp();
+                self.compile_expr(&m.object)?;
+                self.emit(Op::InitCell(t_obj));
+                self.emit(Op::LoadCell(t_obj));
+                self.emit_private_get_op(&name);
+                self.emit(Op::ToNumeric);
+                let t_old = self.temp();
+                self.emit(Op::InitCell(t_old));
+                self.emit(Op::LoadCell(t_obj));
+                self.emit(Op::LoadCell(t_old));
+                self.emit(if inc { Op::Inc } else { Op::Dec });
+                self.emit_private_set_op(&name);
                 self.emit(Op::Pop);
                 if u.prefix {
                     self.emit(Op::LoadCell(t_old));
@@ -2842,18 +3485,64 @@ impl Compiler {
                 self.emit(Op::GetPropDynamic);
                 Ok(())
             }
-            ChainElement::PrivateFieldExpression(_) => {
-                Err("private field access is not supported".into())
+            ChainElement::PrivateFieldExpression(m) => {
+                // `obj?.#x`: short-circuit on a nullish base, then the usual
+                // brand-checked private read.
+                self.compile_expr(&m.object)?;
+                if m.optional {
+                    let j = self.emit(Op::JumpIfNullish(0));
+                    self.chain_jumps.push(j);
+                }
+                self.emit_private_get_op(m.field.name.as_str());
+                Ok(())
             }
         }
     }
 
     fn compile_call(&mut self, c: &CallExpression) -> R {
+        // Direct `eval(...)`: snapshot the visible scope and emit DirectEval.
+        // The runtime falls back to an ordinary call when the callee value
+        // isn't the %eval% intrinsic (shadowed/reassigned `eval`). Spread and
+        // optional calls keep the ordinary (indirect-semantics) path.
+        if let Expression::Identifier(id) = &c.callee {
+            if id.name.as_str() == "eval"
+                && !c.optional
+                && !c
+                    .arguments
+                    .iter()
+                    .any(|a| matches!(a, Argument::SpreadElement(_)))
+            {
+                let desc = self.collect_eval_scope();
+                self.load_binding("eval"); // [callee]
+                for a in &c.arguments {
+                    let e = a.as_expression().unwrap();
+                    self.compile_expr(e)?;
+                }
+                let scope_idx = {
+                    let fc = self.cur();
+                    fc.eval_scopes.push(desc);
+                    (fc.eval_scopes.len() - 1) as u32
+                };
+                self.emit(Op::DirectEval {
+                    argc: c.arguments.len() as u32,
+                    scope: scope_idx,
+                });
+                return Ok(());
+            }
+        }
         // super(...) — call the parent constructor with the current `this`.
         if matches!(c.callee, Expression::Super(_)) {
             self.load_binding("%superclass"); // [super]
             self.load_binding("%this"); // [super, this]
             self.finish_call(c)?;
+            // Constructor return-override: a bytecode parent that returned an
+            // object substitutes it as `this` (in place, so prior captures see
+            // it). Natives keep their discard-and-init-in-place behavior.
+            if let Resolved::Cell(i) = self.resolve("%this") {
+                self.emit(Op::Dup);
+                self.load_binding("%superclass");
+                self.emit(Op::AdoptSuperThis(i));
+            }
             return Ok(());
         }
         // super.method(...) — look up on Super.prototype, call with `this`.
@@ -2925,10 +3614,9 @@ impl Compiler {
             Expression::PrivateFieldExpression(m) => {
                 self.compile_expr(&m.object)?; // [obj]
                 self.emit(Op::Dup); // [obj, obj]
-                let k = self.str_const(&format!("#{}", m.field.name.as_str()));
-                // Brand-checking read: calling a private method on an object that
-                // doesn't have it must throw a TypeError (not silently read undefined).
-                self.emit(Op::PrivateGet(k)); // [obj, method]
+                                    // Brand-checking read: calling a private method on an object that
+                                    // doesn't have it must throw a TypeError (not silently read undefined).
+                self.emit_private_get_op(m.field.name.as_str()); // [obj, method]
                 self.emit(Op::Swap); // [method, obj]
                 self.finish_call(c)?;
             }
@@ -3019,10 +3707,17 @@ impl Compiler {
 
     fn compile_yield(&mut self, y: &YieldExpression) -> R {
         if y.delegate {
-            // yield* expr  — desugar to a loop yielding each value. In an async
+            // yield* expr — desugar to the spec's delegation loop. In an async
             // generator the delegate uses the *async* iterator protocol: the
             // iterator comes from @@asyncIterator (GetAsyncIterator) and each
-            // `next()` result is Awaited before its `done`/`value` are read.
+            // step result is Awaited before its `done`/`value` are read.
+            //
+            // The loop forwards the value SENT into the outer generator to the
+            // inner iterator's `next(sent)` (exactly one argument), checks each
+            // step result is an Object, and delegates a `.throw()` resumption
+            // to the inner iterator's `throw` method (closing the inner
+            // iterator with a TypeError when it has none). `.return()`
+            // delegation (running the inner `return`) is not yet modeled.
             let is_async = self.cur().kind.is_async();
             self.compile_expr(y.argument.as_ref().unwrap())?;
             if is_async {
@@ -3032,27 +3727,81 @@ impl Compiler {
             }
             let iter_cell = self.temp();
             self.emit(Op::InitCell(iter_cell));
-            let top = self.here();
+            let sent_cell = self.temp();
+            self.emit(Op::LoadUndefined);
+            self.emit(Op::InitCell(sent_cell));
+            let next_k = self.str_const("next");
+            let done_k = self.str_const("done");
+            let value_k = self.str_const("value");
+
+            // -- next_call: result = inner.next(sent) --
+            let next_call = self.here();
             self.emit(Op::LoadCell(iter_cell));
-            self.emit(Op::IteratorNext);
-            self.emit(Op::Swap);
-            self.emit(Op::Pop); // [result]
+            self.emit(Op::Dup);
+            self.emit(Op::GetProp(next_k)); // [iter, next]
+            self.emit(Op::Swap); // [next, iter]
+            self.emit(Op::LoadCell(sent_cell)); // [next, iter, sent]
+            self.emit(Op::Call(1)); // [result]
+
+            // -- have_result: (async: Await) -> object check -> done? --
+            let have_result = self.here();
             if is_async {
                 self.emit(Op::Await); // result is a promise of { value, done }
             }
+            self.emit(Op::RequireIterResult);
             self.emit(Op::Dup);
-            let done_k = self.str_const("done");
             self.emit(Op::GetProp(done_k));
             let jt = self.emit(Op::JumpIfTrue(0)); // [result]
-            let value_k = self.str_const("value");
-            self.emit(Op::GetProp(value_k));
-            self.emit(Op::Yield);
-            self.emit(Op::Pop); // discard sent value
-            self.emit(Op::Jump(top));
+            self.emit(Op::GetProp(value_k)); // [value]
+                                             // Yield inside a catch-only region: a `.throw(e)` resumption lands
+                                             // in the delegation handler below instead of unwinding.
+            let push_h = self.emit(Op::PushTryHandler {
+                catch: u32::MAX,
+                finally: u32::MAX,
+            });
+            self.emit(Op::MarkDelegationHandler);
+            self.cur().handler_depth += 1;
+            self.emit(Op::Yield); // [sent']
+            self.emit(Op::StoreCell(sent_cell));
+            self.emit(Op::PopTryHandler);
+            self.cur().handler_depth -= 1;
+            self.emit(Op::Jump(next_call));
+
+            // -- catch: delegate the thrown value to inner.throw(e) --
+            let catch_lbl = self.here();
+            self.patch_jump(push_h, catch_lbl); // [e]
+            let e_cell = self.temp();
+            self.emit(Op::InitCell(e_cell));
+            let thr_cell = self.temp();
+            self.emit(Op::LoadCell(iter_cell));
+            let throw_k = self.str_const("throw");
+            self.emit(Op::GetProp(throw_k));
+            self.emit(Op::InitCell(thr_cell));
+            self.emit(Op::LoadCell(thr_cell));
+            let jno_throw = self.emit(Op::JumpIfNullish(0)); // [thr] (peek)
+            self.emit(Op::Pop);
+            self.emit(Op::LoadCell(thr_cell));
+            self.emit(Op::LoadCell(iter_cell));
+            self.emit(Op::LoadCell(e_cell)); // [thr, iter, e]
+            self.emit(Op::Call(1)); // [result]
+            self.emit(Op::Jump(have_result));
+            // No `throw` method: close the inner iterator, then TypeError.
+            let no_throw = self.here();
+            self.patch_jump(jno_throw, no_throw);
+            self.emit(Op::Pop); // drop the nullish `throw`
+            self.emit(Op::LoadCell(iter_cell));
+            self.emit(Op::IteratorClose);
+            let tk = self.str_const("TypeError");
+            self.emit(Op::LoadGlobal(tk));
+            let mk = self.str_const("The iterator does not provide a 'throw' method");
+            self.emit(Op::LoadConst(mk));
+            self.emit(Op::New(1));
+            self.emit(Op::Throw);
+
+            // -- end: result of yield* = final result.value --
             let end = self.here();
             self.patch_jump(jt, end);
-            let value_k2 = self.str_const("value");
-            self.emit(Op::GetProp(value_k2)); // result of yield* = final value
+            self.emit(Op::GetProp(value_k)); // [result.value]
         } else {
             if let Some(arg) = &y.argument {
                 self.compile_expr(arg)?;
@@ -3071,6 +3820,38 @@ impl Compiler {
         match &a.left {
             AssignmentTarget::AssignmentTargetIdentifier(id) => {
                 let name = id.name.as_str().to_string();
+                if self.in_with(&name) {
+                    // Inside a `with`, resolve the Reference base once — before
+                    // the RHS runs — and write through the captured base.
+                    match a.operator {
+                        A::Assign => {
+                            let t_base = self.capture_name_base(&name);
+                            self.compile_named_expr(&a.right, &name)?;
+                            self.store_via_base_keep(&name, t_base);
+                        }
+                        A::LogicalAnd | A::LogicalOr | A::LogicalNullish => {
+                            let t_base = self.capture_name_base(&name);
+                            self.load_via_base(&name, t_base);
+                            let j = match a.operator {
+                                A::LogicalAnd => self.emit(Op::JumpIfFalsyPeek(0)),
+                                A::LogicalOr => self.emit(Op::JumpIfTruthyPeek(0)),
+                                _ => self.emit(Op::JumpIfNullishPeek(0)),
+                            };
+                            self.compile_expr(&a.right)?;
+                            self.store_via_base_keep(&name, t_base);
+                            let end = self.here();
+                            self.patch_jump(j, end);
+                        }
+                        other => {
+                            let t_base = self.capture_name_base(&name);
+                            self.load_via_base(&name, t_base);
+                            self.compile_expr(&a.right)?;
+                            self.emit(compound_op(other));
+                            self.store_via_base_keep(&name, t_base);
+                        }
+                    }
+                    return Ok(());
+                }
                 match a.operator {
                     A::Assign => {
                         self.compile_named_expr(&a.right, &name)?;
@@ -3104,8 +3885,7 @@ impl Compiler {
                 self.member_assign(&m.object, k, a)?;
             }
             AssignmentTarget::PrivateFieldExpression(m) => {
-                let k = self.str_const(&format!("#{}", m.field.name.as_str()));
-                self.member_assign_kind(&m.object, k, a, true)?;
+                self.member_assign_private(&m.object, m.field.name.as_str(), a)?;
             }
             AssignmentTarget::ComputedMemberExpression(m) => match a.operator {
                 A::Assign => {
@@ -3120,6 +3900,14 @@ impl Compiler {
                     self.compile_expr(&m.object)?;
                     self.emit(Op::InitCell(t_obj));
                     self.compile_expr(&m.expression)?;
+                    self.emit(Op::InitCell(t_key));
+                    // GetValue order: RequireObjectCoercible(base) first, then
+                    // ToPropertyKey exactly once (its `toString` must not run
+                    // again at the write).
+                    self.emit(Op::LoadCell(t_obj));
+                    self.emit(Op::RequireCoercible);
+                    self.emit(Op::LoadCell(t_key));
+                    self.emit(Op::ToPropertyKey);
                     self.emit(Op::InitCell(t_key));
                     self.emit(Op::LoadCell(t_obj));
                     self.emit(Op::LoadCell(t_key));
@@ -3160,6 +3948,60 @@ impl Compiler {
     /// Assign to `obj.<k>` (static-name key const `k`) with the given operator.
     fn member_assign(&mut self, obj: &Expression, k: u32, a: &AssignmentExpression) -> R {
         self.member_assign_kind(obj, k, a, false)
+    }
+
+    /// Private member assignment `obj.#x <op>= v`: same stack discipline as
+    /// `member_assign_kind`, with reads/writes routed through the lexically
+    /// resolved brand-checking private ops.
+    fn member_assign_private(
+        &mut self,
+        obj: &Expression,
+        name: &str,
+        a: &AssignmentExpression,
+    ) -> R {
+        use oxc::syntax::operator::AssignmentOperator as A;
+        match a.operator {
+            A::Assign => {
+                self.compile_expr(obj)?;
+                self.compile_expr(&a.right)?;
+                self.emit_private_set_op(name);
+            }
+            A::LogicalAnd | A::LogicalOr | A::LogicalNullish => {
+                let t_obj = self.temp();
+                self.compile_expr(obj)?;
+                self.emit(Op::InitCell(t_obj));
+                self.emit(Op::LoadCell(t_obj));
+                self.emit_private_get_op(name);
+                let j = match a.operator {
+                    A::LogicalAnd => self.emit(Op::JumpIfFalsyPeek(0)),
+                    A::LogicalOr => self.emit(Op::JumpIfTruthyPeek(0)),
+                    _ => self.emit(Op::JumpIfNullishPeek(0)),
+                };
+                self.compile_expr(&a.right)?;
+                let t_val = self.temp();
+                self.emit(Op::InitCell(t_val));
+                self.emit(Op::LoadCell(t_obj));
+                self.emit(Op::LoadCell(t_val));
+                self.emit_private_set_op(name);
+                let end = self.here();
+                self.patch_jump(j, end);
+            }
+            other => {
+                let t_obj = self.temp();
+                self.compile_expr(obj)?;
+                self.emit(Op::InitCell(t_obj));
+                self.emit(Op::LoadCell(t_obj));
+                self.emit_private_get_op(name);
+                self.compile_expr(&a.right)?;
+                self.emit(compound_op(other));
+                let t_val = self.temp();
+                self.emit(Op::InitCell(t_val));
+                self.emit(Op::LoadCell(t_obj));
+                self.emit(Op::LoadCell(t_val));
+                self.emit_private_set_op(name);
+            }
+        }
+        Ok(())
     }
 
     /// Member assignment `obj.x <op>= v`. `is_private` routes the field read/write
@@ -3247,14 +4089,13 @@ impl Compiler {
                 self.emit(Op::SetProp(k));
                 self.emit(Op::Pop);
             }
-            // Private field as a destructuring target: `[obj.#x] = […]`.
+            // Private field as a destructuring target: `[obj.#x] = [...]`.
             AssignmentTarget::PrivateFieldExpression(m) => {
-                let k = self.str_const(&format!("#{}", m.field.name.as_str()));
                 let t = self.temp();
                 self.emit(Op::InitCell(t));
                 self.compile_expr(&m.object)?;
                 self.emit(Op::LoadCell(t));
-                self.emit(Op::SetProp(k));
+                self.emit_private_set_op(m.field.name.as_str());
                 self.emit(Op::Pop);
             }
             AssignmentTarget::ComputedMemberExpression(m) => {
@@ -3284,19 +4125,58 @@ impl Compiler {
                 self.cur().handler_depth += 1;
                 self.cur().finally_depth += 1;
                 for el in &arr.elements {
-                    self.emit_iter_step_tracked(itc, done_cell); // [value]
                     match el {
-                        Some(maybe) => self.assign_maybe_default(maybe)?, // consumes value
+                        Some(maybe) => self.assign_element_ordered(maybe, itc, done_cell)?,
                         None => {
+                            self.emit_iter_step_tracked(itc, done_cell); // [value]
                             self.emit(Op::Pop); // elision
                         }
                     }
                 }
                 if let Some(rest) = &arr.rest {
+                    // A member-expression rest target's REFERENCE is evaluated
+                    // BEFORE the collection loop (spec AssignmentRestElement
+                    // step 1), so a throw there closes the iterator with no
+                    // further next() calls.
+                    enum RestPre {
+                        Static(u32, u32),     // (t_obj, key const)
+                        Computed(u32, u32),   // (t_obj, t_key)
+                        Private(u32, String), // (t_obj, name)
+                        Plain,
+                    }
+                    let pre = match &rest.target {
+                        AssignmentTarget::StaticMemberExpression(sm) => {
+                            let t_obj = self.temp();
+                            self.compile_expr(&sm.object)?;
+                            self.emit(Op::InitCell(t_obj));
+                            let k = self.str_const(sm.property.name.as_str());
+                            RestPre::Static(t_obj, k)
+                        }
+                        AssignmentTarget::ComputedMemberExpression(cm) => {
+                            let t_obj = self.temp();
+                            let t_key = self.temp();
+                            self.compile_expr(&cm.object)?;
+                            self.emit(Op::InitCell(t_obj));
+                            self.compile_expr(&cm.expression)?;
+                            self.emit(Op::InitCell(t_key));
+                            RestPre::Computed(t_obj, t_key)
+                        }
+                        AssignmentTarget::PrivateFieldExpression(pm) => {
+                            let t_obj = self.temp();
+                            self.compile_expr(&pm.object)?;
+                            self.emit(Op::InitCell(t_obj));
+                            RestPre::Private(t_obj, pm.field.name.as_str().to_string())
+                        }
+                        _ => RestPre::Plain,
+                    };
                     self.emit(Op::NewArray(0)); // [arr]
                     let top = self.here();
                     self.emit(Op::LoadCell(done_cell));
                     let jdone_rest = self.emit(Op::JumpIfTrue(0));
+                    // Latch done before stepping (abrupt next/done/value sets
+                    // [[Done]] — see emit_iter_step_tracked).
+                    self.emit(Op::LoadTrue);
+                    self.emit(Op::StoreCell(done_cell));
                     self.emit(Op::LoadCell(itc));
                     self.emit(Op::IteratorNext); // [arr, iter, result]
                     self.emit(Op::Swap);
@@ -3307,6 +4187,8 @@ impl Compiler {
                     let jend = self.emit(Op::JumpIfTrue(0));
                     let vk = self.str_const("value");
                     self.emit(Op::GetProp(vk)); // [arr, value]
+                    self.emit(Op::LoadFalse);
+                    self.emit(Op::StoreCell(done_cell)); // normal step: un-latch
                     let tv = self.temp();
                     self.emit(Op::InitCell(tv)); // [arr]
                     self.array_push_value(|c| {
@@ -3316,15 +4198,42 @@ impl Compiler {
                     self.emit(Op::Jump(top));
                     let end = self.here();
                     self.patch_jump(jend, end);
-                    self.emit(Op::Pop); // drop result -> [arr]
-                    self.emit(Op::LoadTrue);
-                    self.emit(Op::StoreCell(done_cell));
+                    self.emit(Op::Pop); // drop result -> [arr] (done stays latched)
                     let jafter = self.emit(Op::Jump(0));
                     let drest = self.here();
                     self.patch_jump(jdone_rest, drest);
                     let after_rest = self.here();
                     self.patch_jump(jafter, after_rest);
-                    self.assign_target(&rest.target)?; // consumes arr
+                    match pre {
+                        RestPre::Static(t_obj, k) => {
+                            let t_val = self.temp();
+                            self.emit(Op::InitCell(t_val)); // pops arr
+                            self.emit(Op::LoadCell(t_obj));
+                            self.emit(Op::LoadCell(t_val));
+                            self.emit(Op::SetProp(k));
+                            self.emit(Op::Pop);
+                        }
+                        RestPre::Computed(t_obj, t_key) => {
+                            let t_val = self.temp();
+                            self.emit(Op::InitCell(t_val));
+                            self.emit(Op::LoadCell(t_obj));
+                            self.emit(Op::LoadCell(t_key));
+                            self.emit(Op::LoadCell(t_val));
+                            self.emit(Op::SetPropDynamic);
+                            self.emit(Op::Pop);
+                        }
+                        RestPre::Private(t_obj, name) => {
+                            let t_val = self.temp();
+                            self.emit(Op::InitCell(t_val));
+                            self.emit(Op::LoadCell(t_obj));
+                            self.emit(Op::LoadCell(t_val));
+                            self.emit_private_set_op(&name);
+                            self.emit(Op::Pop);
+                        }
+                        RestPre::Plain => {
+                            self.assign_target(&rest.target)?; // consumes arr
+                        }
+                    }
                 }
                 self.emit(Op::PopTryHandler);
                 self.cur().handler_depth -= 1;
@@ -3392,6 +4301,94 @@ impl Compiler {
                 self.emit(Op::Pop);
             }
             _ => return Err("unsupported destructuring target".into()),
+        }
+        Ok(())
+    }
+
+    /// One array-destructuring-assignment element, in spec order
+    /// (IteratorDestructuringAssignmentEvaluation, AssignmentElement): a
+    /// member-expression target's REFERENCE (its object/key expressions) is
+    /// evaluated BEFORE the iterator is stepped — so a throw there closes the
+    /// iterator without `next()` ever running — and the write happens after
+    /// the (possibly defaulted) value is computed.
+    fn assign_element_ordered(
+        &mut self,
+        m: &AssignmentTargetMaybeDefault,
+        itc: u32,
+        done_cell: u32,
+    ) -> R {
+        let (target, init): (&AssignmentTarget, Option<&Expression>) = match m {
+            AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
+                (&d.binding, Some(&d.init))
+            }
+            _ => match m.as_assignment_target() {
+                Some(t) => (t, None),
+                None => return Err("unsupported destructuring element".into()),
+            },
+        };
+        // `[value]` -> `[value-or-default]`.
+        let apply_default = |c: &mut Self, init: Option<&Expression>| -> R {
+            if let Some(init) = init {
+                c.emit(Op::Dup);
+                c.emit(Op::LoadUndefined);
+                c.emit(Op::StrictEq);
+                let jf = c.emit(Op::JumpIfFalse(0));
+                c.emit(Op::Pop);
+                c.compile_expr(init)?;
+                let t = c.here();
+                c.patch_jump(jf, t);
+            }
+            Ok(())
+        };
+        match target {
+            AssignmentTarget::StaticMemberExpression(sm) => {
+                let t_obj = self.temp();
+                self.compile_expr(&sm.object)?;
+                self.emit(Op::InitCell(t_obj));
+                self.emit_iter_step_tracked(itc, done_cell); // [value]
+                apply_default(self, init)?;
+                let t_val = self.temp();
+                self.emit(Op::InitCell(t_val));
+                self.emit(Op::LoadCell(t_obj));
+                self.emit(Op::LoadCell(t_val));
+                let k = self.str_const(sm.property.name.as_str());
+                self.emit(Op::SetProp(k));
+                self.emit(Op::Pop);
+            }
+            AssignmentTarget::ComputedMemberExpression(cm) => {
+                let t_obj = self.temp();
+                let t_key = self.temp();
+                self.compile_expr(&cm.object)?;
+                self.emit(Op::InitCell(t_obj));
+                self.compile_expr(&cm.expression)?;
+                self.emit(Op::InitCell(t_key));
+                self.emit_iter_step_tracked(itc, done_cell); // [value]
+                apply_default(self, init)?;
+                let t_val = self.temp();
+                self.emit(Op::InitCell(t_val));
+                self.emit(Op::LoadCell(t_obj));
+                self.emit(Op::LoadCell(t_key));
+                self.emit(Op::LoadCell(t_val));
+                self.emit(Op::SetPropDynamic);
+                self.emit(Op::Pop);
+            }
+            AssignmentTarget::PrivateFieldExpression(pm) => {
+                let t_obj = self.temp();
+                self.compile_expr(&pm.object)?;
+                self.emit(Op::InitCell(t_obj));
+                self.emit_iter_step_tracked(itc, done_cell); // [value]
+                apply_default(self, init)?;
+                let t_val = self.temp();
+                self.emit(Op::InitCell(t_val));
+                self.emit(Op::LoadCell(t_obj));
+                self.emit(Op::LoadCell(t_val));
+                self.emit_private_set_op(pm.field.name.as_str());
+                self.emit(Op::Pop);
+            }
+            _ => {
+                self.emit_iter_step_tracked(itc, done_cell); // [value]
+                self.assign_maybe_default(m)?;
+            }
         }
         Ok(())
     }
@@ -3516,6 +4513,17 @@ impl Compiler {
         ctor_fields: Option<&[&PropertyDefinition]>,
     ) -> R {
         let mut fc = FnCtx::new(name.unwrap_or(""), kind);
+        // A function defined inside a `with` block (directly or transitively)
+        // resolves free identifiers against the captured with-scope chain.
+        fc.enclosed_in_with = self
+            .fns
+            .last()
+            .map(|f| f.with_depth > 0 || f.enclosed_in_with || f.contains_eval)
+            .unwrap_or(false);
+        {
+            let end = body.map(|b| b.span.end).unwrap_or(params.span.end);
+            fc.contains_eval = self.region_has_eval(params.span.start, end);
+        }
         // `num_params` carries the function's `length` (ExpectedArgumentCount):
         // the count of leading formal parameters before the first one with a
         // default initializer or the rest element. A destructuring param with no
@@ -3565,12 +4573,20 @@ impl Compiler {
             // when the body actually mentions `arguments` — the common case skips
             // it entirely. Scanning the source region for the word never produces
             // a false negative (if `arguments` is used, the word is present).
+            // A direct eval may reference `arguments` even when the body text
+            // doesn't, so a function containing eval always materializes it.
             let end = body.map(|b| b.span.end).unwrap_or(params.span.end);
-            if self.region_has_arguments(params.span.start, end) {
+            if self.region_has_arguments(params.span.start, end) || self.cur_ref().contains_eval {
                 let ac = self.declare("arguments", false);
                 self.emit(Op::LoadArguments);
                 self.emit(Op::InitCell(ac));
             }
+        }
+        // Functions containing direct eval get an eval-vars object (sloppy
+        // eval `var`s land there; it rides the with-scope chain so dynamic
+        // name ops and nested closures see them).
+        if self.cur_ref().contains_eval {
+            self.emit(Op::InitEvalVars);
         }
 
         // Parameters. Each has an optional default (`initializer`) applied when
@@ -3600,6 +4616,17 @@ impl Compiler {
                     param_cells.push(None);
                 }
             }
+        }
+        {
+            let mut all: Vec<String> = Vec::new();
+            for p in &params.items {
+                if let BindingPattern::BindingIdentifier(id) = &p.pattern {
+                    all.push(id.name.as_str().to_string());
+                }
+            }
+            let fc = self.cur();
+            fc.all_param_names = all;
+            fc.in_params = true;
         }
         for (i, p) in params.items.iter().enumerate() {
             self.emit(Op::LoadArg(i as u32));
@@ -3635,9 +4662,11 @@ impl Compiler {
             self.emit(Op::LoadRestArgs(params.items.len() as u32));
             self.bind_pattern(&rest.rest.argument, false)?;
         }
+        self.cur().in_params = false;
 
         // Class instance-field initializers run at the top of the constructor.
         if let Some(fields) = ctor_fields {
+            self.emit_private_brand_stamp();
             for field in fields {
                 self.load_binding("%this");
                 if field.computed {
@@ -3649,9 +4678,11 @@ impl Compiler {
                     }
                     self.emit(Op::SetPropDynamic);
                 } else {
-                    let key = property_key_name(&field.key);
+                    let key = self.class_element_key(&field.key);
                     if let Some(init) = &field.value {
-                        self.compile_named_expr(init, &key)?;
+                        // NamedEvaluation uses the source-visible name ("#x"),
+                        // not the internal suffixed storage key.
+                        self.compile_named_expr(init, &property_key_name(&field.key))?;
                     } else {
                         self.emit(Op::LoadUndefined);
                     }
@@ -3694,7 +4725,146 @@ impl Compiler {
         Ok(())
     }
 
+    /// Resolve `#name` against the enclosing class bodies (innermost first):
+    /// the runtime storage key, the class id, and the element kind. `None`
+    /// when no enclosing class declares it (e.g. eval'd fragments) — callers
+    /// fall back to the un-suffixed legacy key.
+    fn resolve_private(&self, name: &str) -> Option<(String, u32, PrivKind)> {
+        for ctx in self.class_privs.iter().rev() {
+            if let Some(k) = ctx.names.get(name) {
+                return Some((format!("#{}@{}", name, ctx.id), ctx.id, *k));
+            }
+        }
+        None
+    }
+
+    fn private_brand_key(id: u32) -> String {
+        format!("#brand@{id}")
+    }
+
+    /// `[obj] -> [value]`: brand-checked private read for `#name`.
+    fn emit_private_get_op(&mut self, name: &str) {
+        match self.resolve_private(name) {
+            Some((key, id, kind)) => {
+                let k = self.str_const(&key);
+                match kind {
+                    // Fields and static elements are own properties of their
+                    // carrier (instance / constructor): own-key check suffices.
+                    PrivKind::Field
+                    | PrivKind::StaticField
+                    | PrivKind::StaticMethod
+                    | PrivKind::StaticAccessor => {
+                        self.emit(Op::PrivateGet(k));
+                    }
+                    // Instance methods/accessors live on the prototype; the
+                    // brand is an own key stamped at construction.
+                    PrivKind::Method | PrivKind::Accessor => {
+                        let b = self.str_const(&Self::private_brand_key(id));
+                        self.emit(Op::PrivateGetB { brand: b, key: k });
+                    }
+                }
+            }
+            None => {
+                let k = self.str_const(&format!("#{name}"));
+                self.emit(Op::PrivateGet(k));
+            }
+        }
+    }
+
+    /// `[obj, value] -> [value]`: brand-checked private write for `#name`.
+    fn emit_private_set_op(&mut self, name: &str) {
+        match self.resolve_private(name) {
+            Some((key, id, kind)) => {
+                let k = self.str_const(&key);
+                match kind {
+                    PrivKind::Field | PrivKind::StaticField => {
+                        self.emit(Op::PrivateSet(k));
+                    }
+                    PrivKind::Method | PrivKind::Accessor => {
+                        let b = self.str_const(&Self::private_brand_key(id));
+                        self.emit(Op::PrivateSetB {
+                            brand: b,
+                            key: k,
+                            is_method: kind == PrivKind::Method,
+                        });
+                    }
+                    // Static method/accessor: the element IS the own key.
+                    PrivKind::StaticMethod | PrivKind::StaticAccessor => {
+                        self.emit(Op::PrivateSetB {
+                            brand: k,
+                            key: k,
+                            is_method: kind == PrivKind::StaticMethod,
+                        });
+                    }
+                }
+            }
+            None => {
+                let k = self.str_const(&format!("#{name}"));
+                self.emit(Op::PrivateSet(k));
+            }
+        }
+    }
+
+    /// The runtime storage key for a class element's property key (suffixed
+    /// for private identifiers, `property_key_name` otherwise).
+    fn class_element_key(&self, key: &PropertyKey) -> String {
+        if let PropertyKey::PrivateIdentifier(id) = key {
+            if let Some((k, _, _)) = self.resolve_private(id.name.as_str()) {
+                return k;
+            }
+        }
+        property_key_name(key)
+    }
+
     fn compile_class(&mut self, class: &Class, name: Option<&str>) -> R {
+        // Collect this class's private names (with kinds) and enter its
+        // private scope: every `#x` below — in the constructor, methods,
+        // initializers, and nested classes — resolves innermost-first.
+        {
+            let id = self.next_class_id;
+            self.next_class_id += 1;
+            let mut names: std::collections::HashMap<String, PrivKind> =
+                std::collections::HashMap::new();
+            for el in &class.body.body {
+                match el {
+                    ClassElement::PropertyDefinition(p) => {
+                        if let PropertyKey::PrivateIdentifier(pid) = &p.key {
+                            names.insert(
+                                pid.name.as_str().to_string(),
+                                if p.r#static {
+                                    PrivKind::StaticField
+                                } else {
+                                    PrivKind::Field
+                                },
+                            );
+                        }
+                    }
+                    ClassElement::MethodDefinition(m) => {
+                        if let PropertyKey::PrivateIdentifier(pid) = &m.key {
+                            let accessor = matches!(
+                                m.kind,
+                                MethodDefinitionKind::Get | MethodDefinitionKind::Set
+                            );
+                            let kind = match (m.r#static, accessor) {
+                                (false, false) => PrivKind::Method,
+                                (false, true) => PrivKind::Accessor,
+                                (true, false) => PrivKind::StaticMethod,
+                                (true, true) => PrivKind::StaticAccessor,
+                            };
+                            names.insert(pid.name.as_str().to_string(), kind);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            self.class_privs.push(ClassPrivCtx { id, names });
+        }
+        let result = self.compile_class_inner(class, name);
+        self.class_privs.pop();
+        result
+    }
+
+    fn compile_class_inner(&mut self, class: &Class, name: Option<&str>) -> R {
         // Superclass (if any) stored in a captured binding so methods can `super`.
         let has_super = class.super_class.is_some();
         if let Some(sc) = &class.super_class {
@@ -3759,6 +4929,22 @@ impl Compiler {
         Ok(())
     }
 
+    /// Stamp `this` with the current class's private brand (an own marker
+    /// key) when the class has private instance methods/accessors — the spec's
+    /// PrivateMethodOrAccessorAdd, which makes constructed instances (and only
+    /// them) pass the brand check.
+    fn emit_private_brand_stamp(&mut self) {
+        let brand = match self.class_privs.last() {
+            Some(ctx) if ctx.has_instance_branded() => Self::private_brand_key(ctx.id),
+            _ => return,
+        };
+        self.load_binding("%this");
+        self.load_str(&brand);
+        self.emit(Op::LoadTrue);
+        self.emit(Op::DefineField);
+        self.emit(Op::Pop);
+    }
+
     fn synthesize_constructor(
         &mut self,
         name: Option<&str>,
@@ -3766,6 +4952,11 @@ impl Compiler {
         fields: &[&PropertyDefinition],
     ) -> R {
         let mut fc = FnCtx::new(name.unwrap_or(""), FuncKind::ClassCtor);
+        fc.enclosed_in_with = self
+            .fns
+            .last()
+            .map(|f| f.with_depth > 0 || f.enclosed_in_with || f.contains_eval)
+            .unwrap_or(false);
         fc.has_rest = has_super;
         fc.num_params = 0;
         self.fns.push(fc);
@@ -3780,13 +4971,17 @@ impl Compiler {
         self.emit(Op::LoadArguments);
         self.emit(Op::InitCell(ac));
         if has_super {
-            // super(...arguments)
+            // super(...arguments); a parent constructor that returns an object
+            // substitutes it as `this` (return-override), so brand/field
+            // installation below lands on the adopted object.
             self.load_binding("%superclass");
             self.load_binding("%this");
             self.load_binding("arguments");
             self.emit(Op::CallSpread);
-            self.emit(Op::Pop);
+            self.load_binding("%superclass");
+            self.emit(Op::AdoptSuperThis(tc));
         }
+        self.emit_private_brand_stamp();
         for field in fields {
             self.load_binding("%this");
             if field.computed {
@@ -3800,9 +4995,10 @@ impl Compiler {
                 }
                 self.emit(Op::SetPropDynamic);
             } else {
-                let key = property_key_name(&field.key);
+                let key = self.class_element_key(&field.key);
                 if let Some(init) = &field.value {
-                    self.compile_named_expr(init, &key)?;
+                    // NamedEvaluation uses the source-visible name ("#x").
+                    self.compile_named_expr(init, &property_key_name(&field.key))?;
                 } else {
                     self.emit(Op::LoadUndefined);
                 }
@@ -3811,7 +5007,13 @@ impl Compiler {
             }
             self.emit(Op::Pop);
         }
-        self.emit(Op::LoadUndefined);
+        // A derived implicit constructor returns its (possibly adopted) `this`
+        // so construct() surfaces a return-override object.
+        if has_super {
+            self.load_binding("%this");
+        } else {
+            self.emit(Op::LoadUndefined);
+        }
         self.emit(Op::Return);
         self.exit_scope();
         let fc = self.fns.pop().unwrap();
@@ -3860,7 +5062,7 @@ impl Compiler {
         if m.computed {
             self.compile_property_key_expr(&m.key)?;
         } else {
-            let name = property_key_name(&m.key);
+            let name = self.class_element_key(&m.key);
             self.load_str(&name);
         }
         // Accessors take a prefixed function name (`get x` / `set x`).
@@ -3908,10 +5110,11 @@ impl Compiler {
                 self.emit(Op::LoadUndefined);
             }
         } else {
-            let key = property_key_name(&p.key);
+            let key = self.class_element_key(&p.key);
             self.load_str(&key); // [ctor, key]
             if let Some(init) = &p.value {
-                self.compile_named_expr(init, &key)?;
+                // NamedEvaluation uses the source-visible name ("#x").
+                self.compile_named_expr(init, &property_key_name(&p.key))?;
             } else {
                 self.emit(Op::LoadUndefined);
             }

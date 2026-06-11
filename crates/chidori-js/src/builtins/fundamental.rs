@@ -181,6 +181,39 @@ pub(crate) fn define_own_property(
             return define_typed_array_index(vm, obj, n, d, throw_on_fail);
         }
     }
+    // Module Namespace exotic [[DefineOwnProperty]] (spec 10.4.6.6): only a
+    // no-op redefinition of an existing export succeeds (data, writable,
+    // enumerable, non-configurable, same value); everything else is refused.
+    {
+        let verdict = match &obj.borrow().internal {
+            Internal::ModuleNamespace(ns) => match key {
+                PropertyKey::Str(s) => Some(match ns.exports.get(s) {
+                    None => false,
+                    Some(cell) => {
+                        !d.is_accessor()
+                            && d.writable != Some(false)
+                            && d.enumerable != Some(false)
+                            && d.configurable != Some(true)
+                            && d.value
+                                .as_ref()
+                                .map(|v| same_value(v, &cell.borrow()))
+                                .unwrap_or(true)
+                    }
+                }),
+                PropertyKey::Sym(_) => None, // ordinary path (@@toStringTag)
+            },
+            _ => None,
+        };
+        if let Some(ok) = verdict {
+            if ok {
+                return Ok(true);
+            }
+            if throw_on_fail {
+                return Err(vm.throw_type("Cannot redefine a module namespace property"));
+            }
+            return Ok(false);
+        }
+    }
     // ArraySetLength coercion (steps 3–5) runs BEFORE any descriptor validation:
     // `ToUint32` then `ToNumber` can invoke a user `valueOf` that itself redefines
     // `length`, and a newLen≠numberLen mismatch is a RangeError that must precede
@@ -575,7 +608,9 @@ fn store_property(
                                     drop(b);
                                     return Err(vm.throw_range("Array index exceeds engine limit"));
                                 }
-                                arr.resize(idx + 1, Value::Undefined);
+                                // Growing past length introduces HOLES at the
+                                // intermediate indices (absent, not undefined).
+                                arr.resize(idx + 1, Value::Hole);
                             }
                             arr[idx] = value.clone();
                         }
@@ -873,7 +908,7 @@ fn install_object(vm: &mut Vm) {
             groups.entry(key).or_default().push(v);
         }
         // Result is a null-prototype object; each group's elements become an Array.
-        let obj = JsObject::ordinary(None);
+        let obj = vm.alloc_ordinary(None);
         for (key, elements) in groups {
             let arr = vm.new_array(elements);
             obj.borrow_mut()
@@ -992,7 +1027,7 @@ fn install_object(vm: &mut Vm) {
             Value::Null => None,
             _ => return Err(vm.throw_type("Object prototype may only be an Object or null")),
         };
-        let obj = JsObject::ordinary(proto);
+        let obj = vm.alloc_ordinary(proto);
         let props = arg(args, 1);
         if !props.is_undefined() {
             define_properties(vm, &obj, &props)?;
@@ -1517,6 +1552,31 @@ pub(crate) fn own_property_descriptor(o: &JsObject, key: &PropertyKey) -> Option
             }
             None
         }
+        // Module Namespace exotic [[GetOwnProperty]] for an export name:
+        // a live {writable:true, enumerable:true, configurable:false} data
+        // property (an uninitialized binding reads as undefined here — the
+        // throwing TDZ check lives on the [[Get]] path).
+        Internal::ModuleNamespace(ns) => {
+            if let PropertyKey::Str(s) = key {
+                if let Some(cell) = ns.exports.get(s) {
+                    let v = cell.borrow().clone();
+                    let v = if matches!(v, Value::Uninitialized) {
+                        Value::Undefined
+                    } else {
+                        v
+                    };
+                    return Some(Property {
+                        kind: PropertyKind::Data {
+                            value: v,
+                            writable: true,
+                        },
+                        enumerable: true,
+                        configurable: false,
+                    });
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -1651,7 +1711,7 @@ fn install_function(vm: &mut Vm) {
             })
             .unwrap_or_default();
 
-        let bound = JsObject::new(ObjectData::new(
+        let bound = vm.alloc(ObjectData::new(
             Some(vm.realm.function_proto.clone()),
             Internal::Function(FunctionInner::Bound(BoundFunction {
                 target,
@@ -1899,7 +1959,7 @@ fn install_boolean(vm: &mut Vm) {
         |vm, _t, args| Ok(Value::Bool(vm.to_boolean(&arg(args, 0)))),
         |vm, _t, args| {
             let b = vm.to_boolean(&arg(args, 0));
-            Ok(Value::Object(JsObject::new(ObjectData::new(
+            Ok(Value::Object(vm.alloc(ObjectData::new(
                 Some(vm.realm.boolean_proto.clone()),
                 Internal::Boolean(b),
             ))))
@@ -1956,7 +2016,7 @@ fn install_errors(vm: &mut Vm) {
     // create an ordinary prototype chaining to Error.prototype.
     let error_proto = vm.realm.error_proto.clone();
     for name in ["EvalError"] {
-        let proto = JsObject::ordinary(Some(error_proto.clone()));
+        let proto = vm.alloc_ordinary(Some(error_proto.clone()));
         let ctor = install_error_kind(vm, &proto, name);
         // Subtype ctor inherits from the Error constructor.
         if let Some(ec) = &error_ctor {
@@ -1986,7 +2046,7 @@ fn install_errors(vm: &mut Vm) {
 /// `SuppressedError(error, suppressed, message)` — installs `error` and
 /// `suppressed` own data properties plus the usual error message/stack.
 fn install_suppressed_error(vm: &mut Vm, error_ctor: Option<&JsObject>) {
-    let proto = JsObject::ordinary(Some(vm.realm.error_proto.clone()));
+    let proto = vm.alloc_ordinary(Some(vm.realm.error_proto.clone()));
     proto.borrow_mut().internal = Internal::Error;
     proto.borrow_mut().props.insert(
         PropertyKey::str("name"),
@@ -2000,7 +2060,7 @@ fn install_suppressed_error(vm: &mut Vm, error_ctor: Option<&JsObject>) {
 
     let proto_for_ctor = proto.clone();
     let build = move |vm: &mut Vm, _t: Value, args: &[Value]| -> Result<Value, Value> {
-        let o = JsObject::new(ObjectData::new(
+        let o = vm.alloc(ObjectData::new(
             Some(proto_for_ctor.clone()),
             Internal::Error,
         ));
@@ -2097,7 +2157,7 @@ fn error_to_string(vm: &mut Vm, this: Value, _args: &[Value]) -> Result<Value, V
 }
 
 fn make_error_obj(vm: &mut Vm, proto: &JsObject, args: &[Value]) -> Result<Value, Value> {
-    let o = JsObject::new(ObjectData::new(Some(proto.clone()), Internal::Error));
+    let o = vm.alloc(ObjectData::new(Some(proto.clone()), Internal::Error));
     let msg = arg(args, 0);
     if !msg.is_undefined() {
         // ToString(message) is observable and throws for e.g. a Symbol.
@@ -2152,7 +2212,7 @@ fn install_error_stack(vm: &mut Vm, o: &JsObject) {
 
 /// AggregateError(errors, message [, options]).
 fn install_aggregate_error(vm: &mut Vm, error_ctor: Option<&JsObject>) {
-    let proto = JsObject::ordinary(Some(vm.realm.error_proto.clone()));
+    let proto = vm.alloc_ordinary(Some(vm.realm.error_proto.clone()));
     proto.borrow_mut().internal = Internal::Error;
     proto.borrow_mut().props.insert(
         PropertyKey::str("name"),
@@ -2166,7 +2226,7 @@ fn install_aggregate_error(vm: &mut Vm, error_ctor: Option<&JsObject>) {
 
     let proto_for_ctor = proto.clone();
     let build = move |vm: &mut Vm, _t: Value, args: &[Value]| -> Result<Value, Value> {
-        let o = JsObject::new(ObjectData::new(
+        let o = vm.alloc(ObjectData::new(
             Some(proto_for_ctor.clone()),
             Internal::Error,
         ));

@@ -115,7 +115,11 @@ impl ModuleRecord {
 }
 
 /// A module graph keyed by resolved specifier (canonical path string).
-#[derive(Default)]
+/// `Clone` is shallow (the records are shared `Rc`s), so a host can snapshot
+/// the registry to evaluate a graph without holding a `RefCell` borrow open —
+/// a dynamic `import()` job firing mid-evaluation (top-level await) needs to
+/// re-borrow the live registry to load new modules.
+#[derive(Default, Clone)]
 pub struct ModuleRegistry {
     pub modules: HashMap<String, Rc<RefCell<ModuleRecord>>>,
 }
@@ -191,7 +195,11 @@ impl Vm {
                     .map(|_| Rc::new(RefCell::new(Value::Uninitialized)))
                     .collect();
             }
-            b.status = ModuleStatus::Linked;
+            // Don't downgrade a module already evaluated by an earlier graph run
+            // (repeated dynamic import); evaluate-once relies on the status.
+            if b.status == ModuleStatus::Unlinked {
+                b.status = ModuleStatus::Linked;
+            }
         }
         order.push(key.to_string());
         for req in &requested {
@@ -254,6 +262,12 @@ impl Vm {
             return Ok(());
         }
         let rec = self.get_module(registry, key)?;
+        // Already evaluated by an earlier graph run (e.g. a repeated dynamic
+        // `import()` of the same specifier): evaluate-once, like the spec's
+        // Evaluated-state short-circuit. Its dependencies are Evaluated too.
+        if rec.borrow().status == ModuleStatus::Evaluated {
+            return Ok(());
+        }
         let (requested, resolved) = {
             let b = rec.borrow();
             (b.compiled.requested.clone(), b.resolved.clone())
@@ -278,6 +292,7 @@ impl Vm {
             upvalues: Vec::new(),
             home_object: None,
             is_class_ctor: false,
+            captured_with: Vec::new(),
         };
         let mut frame = self.make_frame(bf, Value::Undefined, &[], Value::Undefined);
         frame.cells = cells;
@@ -316,6 +331,14 @@ impl Vm {
         name: &str,
         seen: &mut HashSet<String>,
     ) -> Result<Rc<RefCell<Value>>, Value> {
+        // Circularity guard (spec: ResolveExport's resolveSet): revisiting the
+        // same (module, export name) pair means a circular `export {x} from`
+        // chain that never reaches a concrete binding — a SyntaxError, matching
+        // the resolution-phase negative tests.
+        let guard = format!("{:p}\u{0}{name}", Rc::as_ptr(module));
+        if !seen.insert(guard) {
+            return Err(self.throw_syntax(&format!("circular import of '{name}'")));
+        }
         let exports = module.borrow().compiled.exports.clone();
         let resolved = module.borrow().resolved.clone();
         // Direct local / indirect exports.
@@ -374,6 +397,17 @@ impl Vm {
         Err(self.throw_syntax(&format!("Module does not provide export '{name}'")))
     }
 
+    /// The namespace object for a registry module by key — the value a dynamic
+    /// `import(specifier)` resolves with (the module must already be evaluated).
+    pub fn module_namespace_by_key(
+        &mut self,
+        registry: &ModuleRegistry,
+        key: &str,
+    ) -> Result<Value, Value> {
+        let rec = self.get_module(registry, key)?;
+        self.module_namespace(registry, &rec)
+    }
+
     /// Build (and cache) the Module Namespace object for `import * as ns`: an
     /// object with a live accessor per export name and `@@toStringTag = "Module"`.
     fn module_namespace(
@@ -384,7 +418,6 @@ impl Vm {
         if let Some(ns) = &module.borrow().namespace {
             return Ok(ns.clone());
         }
-        let obj = self.new_object();
         let mut names: Vec<String> = Vec::new();
         let exports = module.borrow().compiled.exports.clone();
         for e in &exports {
@@ -395,33 +428,40 @@ impl Vm {
             }
         }
         names.sort();
-        let obj_val = Value::Object(obj.clone());
+        // Module Namespace exotic object: null prototype, non-extensible,
+        // exports backed by the live binding cells (see `Internal::ModuleNamespace`
+        // dispatch in the VM's property paths).
+        let mut export_cells: indexmap::IndexMap<crate::value::JsString, Rc<RefCell<Value>>> =
+            indexmap::IndexMap::new();
         for n in &names {
             if let Ok(cell) = self.resolve_export_cell(registry, module, n, &mut HashSet::new()) {
-                // A getter closing over the live export cell keeps the binding live.
-                let c = cell.clone();
-                let getter = self.new_native("get", 0, move |vm, _t, _a| {
-                    let v = c.borrow().clone();
-                    if matches!(v, Value::Uninitialized) {
-                        return Err(
-                            vm.throw_reference("Cannot access binding before initialization")
-                        );
-                    }
-                    Ok(v)
-                });
-                self.define_accessor(
-                    &obj_val,
-                    PropertyKey::str(n),
-                    Some(Value::Object(getter)),
-                    None,
-                );
+                export_cells.insert(crate::value::JsString::new(n), cell);
             }
         }
-        let tag = self.realm.symbol_to_string_tag.clone();
-        obj.borrow_mut().props.insert(
-            PropertyKey::Sym(tag),
-            Property::builtin(Value::str("Module")),
-        );
+        let obj = self.alloc(crate::value::ObjectData::new(
+            None,
+            crate::value::Internal::ModuleNamespace(crate::value::NamespaceData {
+                exports: export_cells,
+            }),
+        ));
+        {
+            let mut b = obj.borrow_mut();
+            b.extensible = false;
+            // @@toStringTag = "Module" — non-writable, non-enumerable,
+            // non-configurable (spec 28.3.1).
+            let tag = self.realm.symbol_to_string_tag.clone();
+            b.props.insert(
+                PropertyKey::Sym(tag),
+                Property {
+                    kind: crate::value::PropertyKind::Data {
+                        value: Value::str("Module"),
+                        writable: false,
+                    },
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+        }
         let ns = Value::Object(obj);
         module.borrow_mut().namespace = Some(ns.clone());
         Ok(ns)

@@ -578,6 +578,7 @@ fn run_variant_rust(
     // rather than being abandoned to run to its op-budget in the background.
     let interrupt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let interrupt_w = interrupt.clone();
+    let test_dir_w = test_dir.to_path_buf();
     let (tx, rx) = std::sync::mpsc::channel::<Outcome>();
     // 256 MB is a ~10× margin over the realistic worst case (the VM caps JS
     // recursion at 2000 frames and regex at 100k steps); 1 GB per worker, spawned
@@ -585,7 +586,7 @@ fn run_variant_rust(
     let spawned = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
-            let outcome = evaluate_rust(program, is_async_w, negative_w, interrupt_w);
+            let outcome = evaluate_rust(program, is_async_w, negative_w, interrupt_w, test_dir_w);
             let _ = tx.send(outcome);
         });
     if spawned.is_err() {
@@ -708,9 +709,20 @@ fn evaluate_rust_module(
                 .vm
                 .define_value(&g, "__t262_detachArrayBuffer", JsValue::Object(detach));
         }
+        // Dynamic `import()` resolves against the entry's directory and shares
+        // the registry with the static graph (same module record → same
+        // namespace identity for a specifier reached both ways).
+        let registry = std::rc::Rc::new(std::cell::RefCell::new(
+            chidori_js::module::ModuleRegistry::default(),
+        ));
+        let entry_dir = entry_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        install_dynamic_import(&mut engine, entry_dir, registry.clone());
         // Harness globals first (sloppy script), then the module graph.
         let result = match engine.eval(&prelude) {
-            Ok(_) => run_module_graph_test(&mut engine, &entry_source, &entry_path),
+            Ok(_) => run_module_graph_test(&mut engine, &entry_source, &entry_path, &registry),
             Err(e) => Err(format!("harness eval: {e}")),
         };
         (engine, result)
@@ -772,18 +784,54 @@ fn run_module_graph_test(
     engine: &mut chidori_js::Engine,
     entry_source: &str,
     entry_path: &Path,
+    registry: &std::rc::Rc<std::cell::RefCell<chidori_js::module::ModuleRegistry>>,
 ) -> Result<(), String> {
-    use chidori_js::module::ModuleRegistry;
-    let mut registry = ModuleRegistry::default();
     let entry_key = module_key(entry_path);
-    load_module_into(&mut registry, &entry_key, entry_path, Some(entry_source))?;
-    match engine.vm.run_module_graph(&registry, &entry_key) {
+    load_module_into(
+        &mut registry.borrow_mut(),
+        &entry_key,
+        entry_path,
+        Some(entry_source),
+    )?;
+    // Evaluate against a shallow snapshot (shared `Rc` records) so no borrow
+    // is held while the graph runs: a top-level-await body can trigger a
+    // dynamic `import()` job mid-evaluation, whose hook must re-borrow the
+    // live registry to load new modules.
+    let reg = registry.borrow().clone();
+    match engine.vm.run_module_graph(&reg, &entry_key) {
         Ok(_) => {
             let _ = engine.vm.run_jobs_until_blocked();
             Ok(())
         }
         Err(e) => Err(engine.vm.error_to_string(&e)),
     }
+}
+
+/// Install the dynamic-`import()` host hook: resolve the specifier against
+/// `base_dir`, load the module graph into the shared `registry`, evaluate it,
+/// and return its namespace object. Load/parse problems become thrown error
+/// values (TypeError / SyntaxError), which reject the `import()` promise.
+fn install_dynamic_import(
+    engine: &mut chidori_js::Engine,
+    base_dir: std::path::PathBuf,
+    registry: std::rc::Rc<std::cell::RefCell<chidori_js::module::ModuleRegistry>>,
+) {
+    engine.vm.dynamic_import = Some(std::rc::Rc::new(move |vm, spec| {
+        let path = base_dir.join(spec);
+        let key = module_key(&path);
+        if let Err(msg) = load_module_into(&mut registry.borrow_mut(), &key, &path, None) {
+            return Err(if let Some(m) = msg.strip_prefix("SyntaxError: ") {
+                vm.throw_syntax(m)
+            } else {
+                vm.throw_type(&msg)
+            });
+        }
+        // Shallow snapshot — see run_module_graph_test: evaluation must not
+        // hold a borrow open (a nested dynamic import re-borrows to load).
+        let reg = registry.borrow().clone();
+        vm.run_module_graph(&reg, &key)?;
+        vm.module_namespace_by_key(&reg, &key)
+    }));
 }
 
 /// Canonical registry key for a module path (falls back to the lexical path).
@@ -849,11 +897,16 @@ fn evaluate_rust(
     is_async: bool,
     negative: Option<(String, String)>,
     interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    test_dir: std::path::PathBuf,
 ) -> Outcome {
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut engine = chidori_js::Engine::new();
         engine.vm.op_budget = Some(50_000_000);
         engine.vm.interrupt = Some(interrupt);
+        let registry = std::rc::Rc::new(std::cell::RefCell::new(
+            chidori_js::module::ModuleRegistry::default(),
+        ));
+        install_dynamic_import(&mut engine, test_dir, registry);
         // Install a real `$262.detachArrayBuffer`: detaching sets the buffer's
         // backing store to `None`, which the TypedArray/DataView code already
         // treats as detached. Lets the ~330 `$DETACHBUFFER` tests exercise real

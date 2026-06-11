@@ -127,8 +127,11 @@ fn evaluate_tool_definition(path: &Path, javascript: &str) -> Result<TypeScriptT
         };
 
     let entry_key = path.display().to_string();
-    let tool = engine
-        .eval_module_export(&entry_key, javascript, "tool", &mut load)
+    let result = engine.eval_module_export(&entry_key, javascript, "tool", &mut load);
+    // The export is already a host `serde_json::Value`; break the heap's Rc
+    // cycles so per-tool discovery doesn't leak a realm each call.
+    engine.vm.dispose();
+    let tool = result
         .map_err(|err| {
             let bundle = write_tool_eval_failure_bundle(path, javascript)
                 .map(|path| format!("; transpiled tool bundle written to {}", path.display()))

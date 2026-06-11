@@ -48,9 +48,13 @@ exception is framed as `JavaScript exception: <message>` like the QuickJS host;
 the same providers as the live-VM path); the entrypoint receives `chidori` as
 its second argument (QuickJS `agent(input, chidori)` convention); and the rust
 arm clears the streaming `event_sender` after a run (`ctx.clear_event_sender()`)
-so a `--stream` drain loop terminates — the chidori-js VM can leak its heap on
-drop (Rc cycles, no cycle collector), which would otherwise keep the dispatch
-closure → ctx → sender alive and hang the channel.
+so a `--stream` drain loop terminates — at the time the chidori-js VM could
+leak its heap on drop (Rc cycles), which would otherwise keep the dispatch
+closure → ctx → sender alive and hang the channel. (Since then the engine grew
+a per-VM allocation registry and cycle collector — `crates/chidori-js/src/gc.rs`
+— `run_module` and tool-metadata evaluation now call `vm.dispose()`, which
+breaks every allocation's edges, so a long-lived server no longer accretes a
+leaked realm per agent run.)
 
 QuickJS-mechanism-specific test assertions (live-VM blob kind, `PROMPT_TOOL_PAUSE_FILE`,
 per-turn `max_turns` metadata, nested-suspension trace *shape*) were made
@@ -186,8 +190,20 @@ The dispatch logic also needs decoupling from `TypeScriptVmRuntime` (today
 reference it). ~Medium.
 
 ### G5 — Conformance bar
-91.69% of executed Test262 today (36,490 pass / 3,307 fail / 7,468 skip; full
-language + built-ins, rust engine, 2026-06-04). Agree on a
+94.52% of executed Test262 today (37,618 pass / 2,179 fail / 7,494 skip; full
+language + built-ins, rust engine, 2026-06-11 — was 91.69% on 2026-06-04; the
+2026-06-11 iterations added dynamic `import()` (host-hook loader, +~250),
+once-resolved `with`-scope references incl. closures capturing the with chain
+(+~120), spec-order member compound assignment, define-semantics Array result
+writes, Object-only String symbol-protocol dispatch, the per-instance private
+brand model with lexically resolved class-unique private names (+~90),
+constructor return-override via `super()`, a real Module Namespace exotic
+object, generic `RegExp[@@split]`, spec `Promise.prototype.finally`, and
+strict-mode `delete` TypeErrors — see `docs/conformance.md` for the current
+cluster table; a third 2026-06-11 iteration added spec-ordered destructuring
+assignment with abrupt-step [[Done]] latching, `yield*` sent-value forwarding +
+`throw` delegation, and strict ECMA-262 `\p{…}` property matching with exact
+UCD spellings). Agree on a
 target (e.g. ≥95% language + built-ins) before removal so we don't silently regress
 real agents. Progress + highest-impact remaining gaps:
 - **Non-local completion + iterator close — largely DONE.** Via a Frame

@@ -407,6 +407,7 @@ impl ObjectData {
             Internal::DataView(_) => "DataView",
             Internal::BigIntObj(_) => "BigInt",
             Internal::Proxy(_) => "Proxy",
+            Internal::ModuleNamespace(_) => "Module",
         }
     }
 }
@@ -447,6 +448,19 @@ pub enum Internal {
     /// A Proxy exotic object: forwards internal methods to `handler` traps,
     /// defaulting to `target`. `revoked` clears both once `revoke()` is called.
     Proxy(ProxyData),
+    /// A Module Namespace exotic object (`import * as ns` / dynamic
+    /// `import()` result): null prototype, non-extensible, exports exposed as
+    /// live {writable:true, enumerable:true, configurable:false} data
+    /// properties whose [[Set]] always fails and whose [[Delete]] refuses.
+    ModuleNamespace(NamespaceData),
+}
+
+/// Backing slots for a Module Namespace exotic object: export name → the
+/// module's live binding cell, pre-sorted by name (spec: ascending code-unit
+/// order). Reads go through the cell so post-snapshot reassignment in the
+/// module is observable; an uninitialized (TDZ) cell read throws.
+pub struct NamespaceData {
+    pub exports: IndexMap<JsString, Rc<RefCell<Value>>>,
 }
 
 /// Backing slots for a Proxy exotic object.
@@ -672,6 +686,11 @@ pub struct BytecodeFunction {
     pub home_object: Option<JsObject>,
     /// For class constructors only.
     pub is_class_ctor: bool,
+    /// The `with`-scope chain active when this closure was created (innermost
+    /// last). A function defined inside `with (o) { … }` resolves its free
+    /// identifiers against `o` even when called after the block; the chain
+    /// seeds the callee frame's with-scope stack.
+    pub captured_with: Vec<JsObject>,
 }
 
 pub struct BoundFunction {

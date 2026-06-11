@@ -145,7 +145,7 @@ impl Vm {
         string: Option<JsString>,
         kind: IterKind,
     ) -> Value {
-        Value::Object(JsObject::new(ObjectData::new(
+        Value::Object(self.alloc(ObjectData::new(
             Some(proto.clone()),
             Internal::Iterator(IterState {
                 target,

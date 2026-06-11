@@ -69,6 +69,11 @@ pub struct TryHandler {
     /// unwind into the catch/finally, the with-scope stack is restored to this
     /// depth so a `with` body that throws does not leak its environment.
     pub with_depth: usize,
+    /// A `yield*` delegation handler: it catches only EXTERNAL `.throw()`
+    /// resumptions (to forward them to the inner iterator). The async-generator
+    /// machinery's internal await-of-yielded-value rejection sets the frame's
+    /// one-shot skip flag, which makes the unwind pass this handler by.
+    pub delegation: bool,
 }
 
 /// A single call frame. Self-contained (own operand stack + locals) so that a
@@ -105,6 +110,16 @@ pub struct Frame {
     /// attributed correctly even when async resumption is non-LIFO. `None` when
     /// no trace sink is installed.
     pub trace_token: Option<u64>,
+    /// One-shot: the next throw dispatched in this frame skips `delegation`
+    /// try-handlers (see [`TryHandler::delegation`]). Set when an async
+    /// generator's internal await of a yielded value rejects — that abrupt
+    /// completion propagates out of a `yield*` rather than being delegated to
+    /// the inner iterator's `throw`.
+    pub skip_delegation_throw: bool,
+    /// For functions containing direct `eval`: the object holding sloppy
+    /// eval-introduced `var`s (also pushed as the outermost with-scope, so
+    /// dynamic name ops and nested closures resolve them). `None` elsewhere.
+    pub eval_vars: Option<JsObject>,
 }
 
 /// Promise internal state.
@@ -231,6 +246,30 @@ pub struct Vm {
     /// replay. `None` (default) makes tracing a single predictable-not-taken
     /// branch per call.
     pub trace_sink: Option<Box<dyn crate::trace::TraceObserver>>,
+    /// Host hook for dynamic `import(specifier)`. Receives the coerced specifier
+    /// string and must load/link/evaluate the module, returning its namespace
+    /// object (`Err` is the thrown error value, which rejects the `import()`
+    /// promise). Installed by hosts that can load modules (the test262 runner,
+    /// the chidori module loader); when absent, `import()` rejects with a
+    /// TypeError.
+    pub dynamic_import: Option<std::rc::Rc<dyn Fn(&mut Vm, &str) -> Result<Value, Value>>>,
+    /// Weak handle to every object this VM has allocated (see [`crate::gc`]).
+    /// Reference counting cannot reclaim cycles (closure↔cell, promise↔
+    /// reaction↔frame, ctor↔prototype); this registry lets `collect_cycles`
+    /// find garbage cycles among live objects and lets `dispose` break EVERY
+    /// allocation's outgoing edges, not just those still reachable from the
+    /// realm roots. Entries are weak, so the registry never extends lifetimes.
+    pub(crate) all_objects:
+        std::cell::RefCell<Vec<std::rc::Weak<RefCell<crate::value::ObjectData>>>>,
+    /// Registry compaction threshold (dead weak entries are pruned when the
+    /// registry length crosses it; doubled after each compaction).
+    pub(crate) gc_compact_at: std::cell::Cell<usize>,
+    /// Value cells (`Rc<RefCell<Value>>`) held OUTSIDE the VM — e.g. a host's
+    /// `ModuleRecord` cells — that also appear as closure upvalues inside it.
+    /// `collect_cycles` treats their contents as roots; without registration,
+    /// an object reachable only through such a shared cell could be collected
+    /// while the host can still reach it.
+    pub gc_cell_roots: Vec<std::rc::Rc<RefCell<Value>>>,
 }
 
 impl Vm {
@@ -252,8 +291,17 @@ impl Vm {
             module_capture_proto: None,
             module_capture: None,
             trace_sink: None,
+            dynamic_import: None,
+            all_objects: std::cell::RefCell::new(Vec::new()),
+            gc_compact_at: std::cell::Cell::new(1 << 12),
+            gc_cell_roots: Vec::new(),
         };
         crate::realm::init_realm(&mut vm);
+        // The placeholder realm's intrinsic objects were created before the VM
+        // existed; register them so the cycle collector sees the full heap.
+        for o in vm.realm.object_roots() {
+            vm.track_object(&o);
+        }
         vm
     }
 
@@ -271,15 +319,15 @@ impl Vm {
     // ---------------------------------------------------------------------
 
     pub fn new_object(&self) -> JsObject {
-        JsObject::ordinary(Some(self.realm.object_proto.clone()))
+        self.alloc_ordinary(Some(self.realm.object_proto.clone()))
     }
 
     pub fn new_object_proto(&self, proto: Option<JsObject>) -> JsObject {
-        JsObject::ordinary(proto)
+        self.alloc_ordinary(proto)
     }
 
     pub fn new_array(&self, elements: Vec<Value>) -> JsObject {
-        JsObject::new(ObjectData::new(
+        self.alloc(ObjectData::new(
             Some(self.realm.array_proto.clone()),
             Internal::Array(elements),
         ))
@@ -287,7 +335,7 @@ impl Vm {
 
     pub fn new_string_object(&self, s: JsString) -> JsObject {
         let len = s.as_str().chars().count();
-        let o = JsObject::new(ObjectData::new(
+        let o = self.alloc(ObjectData::new(
             Some(self.realm.string_proto.clone()),
             Internal::StringObj(s),
         ));
@@ -318,7 +366,7 @@ impl Vm {
             func: Rc::new(func),
             construct: None,
         };
-        let obj = JsObject::new(ObjectData::new(
+        let obj = self.alloc(ObjectData::new(
             Some(self.realm.function_proto.clone()),
             Internal::Function(FunctionInner::Native(nf)),
         ));
@@ -364,7 +412,7 @@ impl Vm {
             func: Rc::new(call),
             construct: Some(Rc::new(construct)),
         };
-        let obj = JsObject::new(ObjectData::new(
+        let obj = self.alloc(ObjectData::new(
             Some(self.realm.function_proto.clone()),
             Internal::Function(FunctionInner::Native(nf)),
         ));
@@ -467,7 +515,7 @@ impl Vm {
             ErrorKind::Syntax => &self.realm.syntax_error_proto,
             ErrorKind::Uri => &self.realm.uri_error_proto,
         };
-        let obj = JsObject::new(ObjectData::new(Some(proto.clone()), Internal::Error));
+        let obj = self.alloc(ObjectData::new(Some(proto.clone()), Internal::Error));
         obj.borrow_mut().props.insert(
             PropertyKey::str("message"),
             Property::builtin(Value::str(message)),
@@ -602,6 +650,18 @@ impl Vm {
             .unwrap_or_else(|_| "<error>".to_string())
     }
 
+    /// `RequireObjectCoercible(v)`: a nullish base throws TypeError before any
+    /// further coercion (notably before ToPropertyKey of a computed key, whose
+    /// `toString` side effects must not run). `action` reads like
+    /// "read properties of" in the message.
+    pub fn require_object_coercible(&mut self, v: &Value, action: &str) -> Result<(), Value> {
+        match v {
+            Value::Undefined => Err(self.throw_type(&format!("Cannot {action} undefined"))),
+            Value::Null => Err(self.throw_type(&format!("Cannot {action} null"))),
+            _ => Ok(()),
+        }
+    }
+
     pub fn to_property_key(&mut self, v: &Value) -> Result<PropertyKey, Value> {
         match v {
             Value::Symbol(s) => Ok(PropertyKey::Sym(s.clone())),
@@ -622,19 +682,19 @@ impl Vm {
         match v {
             Value::Object(o) => Ok(o.clone()),
             Value::String(s) => Ok(self.new_string_object(s.clone())),
-            Value::Number(n) => Ok(JsObject::new(ObjectData::new(
+            Value::Number(n) => Ok(self.alloc(ObjectData::new(
                 Some(self.realm.number_proto.clone()),
                 Internal::Number(*n),
             ))),
-            Value::Bool(b) => Ok(JsObject::new(ObjectData::new(
+            Value::Bool(b) => Ok(self.alloc(ObjectData::new(
                 Some(self.realm.boolean_proto.clone()),
                 Internal::Boolean(*b),
             ))),
-            Value::Symbol(s) => Ok(JsObject::new(ObjectData::new(
+            Value::Symbol(s) => Ok(self.alloc(ObjectData::new(
                 Some(self.realm.symbol_proto.clone()),
                 Internal::Symbol(s.clone()),
             ))),
-            Value::BigInt(n) => Ok(JsObject::new(ObjectData::new(
+            Value::BigInt(n) => Ok(self.alloc(ObjectData::new(
                 Some(self.realm.bigint_proto.clone()),
                 Internal::BigIntObj(n.clone()),
             ))),
@@ -796,6 +856,36 @@ impl Vm {
             if matches!(cur.borrow().internal, Internal::Proxy(_)) {
                 return self.proxy_get(&cur, key, receiver);
             }
+            // Module Namespace exotic [[Get]]: a string key reads the live
+            // export binding (an uninitialized binding throws ReferenceError);
+            // symbols (@@toStringTag) fall through to the ordinary props.
+            {
+                let cell = match &cur.borrow().internal {
+                    Internal::ModuleNamespace(ns) => match key {
+                        PropertyKey::Str(s) => ns.exports.get(s).cloned().map(Some).unwrap_or({
+                            // Unknown string export: namespace proto is null.
+                            None
+                        }),
+                        PropertyKey::Sym(_) => None,
+                    },
+                    _ => None,
+                };
+                if let Some(cell) = cell {
+                    let v = cell.borrow().clone();
+                    if matches!(v, Value::Uninitialized) {
+                        return Err(
+                            self.throw_reference("Cannot access binding before initialization")
+                        );
+                    }
+                    return Ok(v);
+                }
+                let is_ns = matches!(cur.borrow().internal, Internal::ModuleNamespace(_));
+                if is_ns {
+                    if let PropertyKey::Str(_) = key {
+                        return Ok(Value::Undefined);
+                    }
+                }
+            }
             // Inspect own property without holding the borrow across calls.
             let found = {
                 let b = cur.borrow();
@@ -931,6 +1021,41 @@ impl Vm {
             if matches!(cur.borrow().internal, Internal::Proxy(_)) {
                 self.proxy_set(&cur, key, value, base.clone())?;
                 return Ok(());
+            }
+            // Module Namespace exotic [[Set]]: always returns false (a strict
+            // write throws, sloppy is a silent no-op), for any key.
+            if matches!(cur.borrow().internal, Internal::ModuleNamespace(_)) {
+                if strict {
+                    return Err(self.throw_type(&format!(
+                        "Cannot assign to read only property '{}' of a module namespace object",
+                        key_display(key)
+                    )));
+                }
+                return Ok(());
+            }
+            // TypedArray exotic [[Set]] reached via the proto chain (receiver is
+            // an ordinary object): a canonical numeric key that is NOT a valid
+            // index is absorbed (returns true, no receiver property created); a
+            // valid index behaves like an inherited writable data property
+            // (shadows on the receiver).
+            if !cur.same(&obj) && matches!(cur.borrow().internal, Internal::TypedArray(_)) {
+                let n: Option<f64> = if let Some(i) = key.array_index() {
+                    Some(i as f64)
+                } else {
+                    key.as_str().and_then(|s| {
+                        if is_canonical_numeric(s) {
+                            Some(s.parse::<f64>().unwrap_or(f64::NAN))
+                        } else {
+                            None
+                        }
+                    })
+                };
+                if let Some(n) = n {
+                    if self.ta_valid_index(&cur, n) {
+                        break;
+                    }
+                    return Ok(());
+                }
             }
             let accessor = {
                 let b = cur.borrow();
@@ -1096,6 +1221,14 @@ impl Vm {
         if matches!(obj.borrow().internal, Internal::Proxy(_)) {
             return self.proxy_delete(&obj, key);
         }
+        // Module Namespace exotic [[Delete]]: an export name refuses (false);
+        // any other STRING key deletes vacuously (true). Symbol keys fall
+        // through to the ordinary path (@@toStringTag is non-configurable).
+        if let Internal::ModuleNamespace(ns) = &obj.borrow().internal {
+            if let PropertyKey::Str(s) = key {
+                return Ok(!ns.exports.contains_key(s));
+            }
+        }
         let mut b = obj.borrow_mut();
         // A reified `props` entry for an index shadows the dense slot; honour its
         // configurable flag and fall through to the ordinary delete below.
@@ -1152,6 +1285,15 @@ impl Vm {
             let (has, proto) = {
                 let b = cur.borrow();
                 let mut has = b.props.contains_key(key);
+                // Module Namespace exotic [[HasProperty]]: export names are
+                // present (symbols consult the ordinary props above).
+                if let Internal::ModuleNamespace(ns) = &b.internal {
+                    if let PropertyKey::Str(s) = key {
+                        if ns.exports.contains_key(s) {
+                            has = true;
+                        }
+                    }
+                }
                 if let Internal::Array(arr) = &b.internal {
                     if let Some("length") = key.as_str() {
                         has = true;
@@ -1216,6 +1358,13 @@ impl Vm {
         if let Internal::TypedArray(t) = &b.internal {
             for i in 0..t.length.min(crate::value::MAX_DENSE_ARRAY) {
                 int_keys.push(i as u32);
+            }
+        }
+        // Module Namespace exotic [[OwnPropertyKeys]]: the (pre-sorted) export
+        // names come first, then the ordinary symbol keys (@@toStringTag).
+        if let Internal::ModuleNamespace(ns) = &b.internal {
+            for name in ns.exports.keys() {
+                str_keys.push(PropertyKey::Str(name.clone()));
             }
         }
         for k in b.props.keys() {
@@ -1379,7 +1528,34 @@ impl Vm {
         self.pending_host.clear();
         self.unhandled_rejections.clear();
         self.console_log.clear();
+        // The dynamic-import hook closes over host module state (registries whose
+        // records hold realm values); drop it so those cells don't keep cycles.
+        self.dynamic_import = None;
+        self.gc_cell_roots.clear();
+        self.module_capture = None;
 
+        // Primary teardown: break the outgoing edges of EVERY object this VM
+        // ever allocated (see `Vm::alloc` / `crate::gc`). Unlike the
+        // realm-root walk below, this also reaches cycles that are no longer
+        // connected to the realm (orphaned closure/promise/generator loops),
+        // which used to leak per-VM and forced long conformance runs to be
+        // chunked across processes.
+        let tracked: Vec<JsObject> = {
+            let mut reg = self.all_objects.borrow_mut();
+            let live = reg
+                .iter()
+                .filter_map(|w| w.upgrade().map(JsObject))
+                .collect();
+            reg.clear();
+            live
+        };
+        for o in &tracked {
+            crate::gc::clear_object_edges(o);
+        }
+        drop(tracked);
+
+        // Belt and braces: also walk from the realm roots so any object that
+        // was created without registration still gets its edges broken.
         let mut seen: HashSet<usize> = HashSet::new();
         let mut stack: Vec<JsObject> = self.realm.object_roots();
         while let Some(o) = stack.pop() {
@@ -1453,6 +1629,9 @@ fn break_internal_cycles(internal: &mut Internal, stack: &mut Vec<JsObject>) {
                 for cell in std::mem::take(&mut bf.upvalues) {
                     let v = cell.borrow().clone();
                     push_dispose_obj(v, stack);
+                }
+                for o in std::mem::take(&mut bf.captured_with) {
+                    stack.push(o);
                 }
             }
             FunctionInner::Bound(b) => {

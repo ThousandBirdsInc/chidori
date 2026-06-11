@@ -370,6 +370,10 @@ fn run_module(
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         engine.run_entrypoint_graph(&entry_key, &js, input, &slot, fallback_export, &mut load)
     }));
+    // Break the heap's Rc cycles before the engine drops: the result is already
+    // a host `serde_json::Value`, and without this every agent run leaks its
+    // realm + agent object graph in a long-lived server process.
+    engine.vm.dispose();
     match outcome {
         Ok(result) => result.map_err(|e| anyhow::anyhow!(js_exception_message(&e))),
         Err(panic) => Err(anyhow::anyhow!(

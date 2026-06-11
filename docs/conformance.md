@@ -34,7 +34,7 @@ The runner prints, e.g.:
 
 ```
 Test262 (chidori pure-Rust engine, bare context)
-  pass 36787  fail 3010  skip 7494  =>  92.44% of executed
+  pass 37618  fail 2179  skip 7494  =>  94.52% of executed
 ```
 
 ## Current result
@@ -44,7 +44,7 @@ pinned suite commit:
 
 | | pass | fail | skip | % of executed |
 |---|---|---|---|---|
-| chidori pure-Rust engine, bare context | 36,787 | 3,010 | 7,494 | **92.44%** |
+| chidori pure-Rust engine, bare context | 37,618 | 2,179 | 7,494 | **94.52%** |
 
 The headline percentage is `pass / (pass + fail)` over *executed* tests; the
 skip count is reported alongside so the denominator is never hidden.
@@ -77,16 +77,31 @@ For each test file the runner:
 `module`-flag tests **run by default** (the runner resolves their fixture
 imports); pass `--no-modules` to skip them.
 
+Dynamic `import()` also runs: the runner installs the engine's
+`Vm::dynamic_import` host hook, resolving specifiers against the test file's
+directory and sharing one module registry per test (so a specifier reached
+both statically and dynamically yields the same namespace object). Without a
+hook installed — e.g. in the production chidori runtime, which forbids dynamic
+import by policy — `import()` rejects with a TypeError, as before.
+
 ## Why the run is chunked
 
-`chidori-js` uses reference-counting (`Rc<RefCell<…>>`) and cannot reclaim every
-object cycle, so a single process that walks all ~47k tests grows until it is
-OOM-killed (`Vm::dispose()` breaks known cycles per test, but not all). Both
-`scripts/test262.sh --gate` and `--update-baseline` therefore run the suite **one
-second-level directory at a time, in a fresh process each**, so memory is
-reclaimed between chunks. The runner's `--state <file>` flag merges per-test
-results across chunks; `--baseline <file>` gates each chunk against the full
-baseline. A full chunked pass is ~24 minutes on a dev box.
+`chidori-js` uses reference-counting (`Rc<RefCell<…>>`); cycles are reclaimed
+by the engine's cycle collector (`crates/chidori-js/src/gc.rs`): every
+allocation is registered per-VM, `Vm::dispose()` breaks the outgoing edges of
+**every** object the VM ever allocated (including orphaned cycles the old
+realm-root walk missed), and `Vm::collect_cycles()` offers mark-sweep for
+long-lived VMs. Since the runner disposes a fresh VM per test, memory across a
+single-process run is now flat (~20 MB RSS over the 21k `language/` tests;
+it previously grew without bound, ~300 MB over `built-ins/Array` alone).
+
+Both `scripts/test262.sh --gate` and `--update-baseline` still run the suite
+**one second-level directory at a time, in a fresh process each** — no longer
+for memory, but for crash isolation: a single engine abort (e.g. a stack
+overflow on a pathological test) kills only its chunk, not the whole sweep.
+The runner's `--state <file>` flag merges per-test results across chunks;
+`--baseline <file>` gates each chunk against the full baseline. A full chunked
+pass is ~24 minutes on a dev box.
 
 ## Honest skips
 
@@ -119,19 +134,19 @@ a single readable line in review).
 
 ## Remaining gaps
 
-The residual failures, by area (top clusters of the 3,010 total):
+The residual failures, by area (top clusters of the 2,179 total):
 
 | count | area | nature |
 |--:|---|---|
-| 891 | `language/expressions` | class private brands, derived-ctor `this`-TDZ, optional-chaining/assignment corners |
-| 580 | `language/statements` | class fields/accessors, `for`-loop scope, labelled/`with` edge cases |
-| 194 | `language/eval-code` | direct/indirect `eval` scoping details |
-| 181 | `built-ins/RegExp` | incomplete Unicode `\p{…}` property tables; `v`-flag |
-| 179 | `built-ins/Array` | iteration-method hole semantics (`HasProperty`-gating); `copyWithin` |
-| 102 | `built-ins/String` | `Symbol.replace`/`match`/`search` & Unicode edge cases |
+| 447 | `language/statements` | class field/accessor corners, derived-ctor `this`-TDZ, `for`-loop scope |
+| 405 | `language/expressions` | class element corners, `yield*` return-delegation, `super` edge cases |
+| 194 | `language/eval-code` | direct `eval` does not see the caller's scope (declares into the global) |
+| 150 | `built-ins/Array` | species/proxy interplay, length-boundary semantics |
+| 102 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings); `v`-flag; `prototype` long tail |
 | 96 | `built-ins/TypedArray` | resizable-`ArrayBuffer` / out-of-bounds tracking |
-| 77 | `built-ins/Promise` | spec-detailed async ordering combinations |
-| 68 | `language/module-code` | namespace/re-export corner cases |
+| 69 | `built-ins/String` | `normalize`, Unicode/surrogate edge cases |
+| 53 | `built-ins/Promise` | spec-detailed async ordering combinations |
+| 51 | `language/module-code` | TLA ordering, cyclic-graph corner cases |
 
 Each failure is individually identifiable from a `--json` report, so the
 clusters can be picked off as engine work warrants. See

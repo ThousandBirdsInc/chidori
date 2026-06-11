@@ -193,6 +193,18 @@ fn dense(vm: &mut Vm, this: &Value) -> Result<JsObject, Value> {
     }
 }
 
+/// `CreateDataPropertyOrThrow(A, key, v)` on a result value known to be an
+/// object (species-created result arrays). Define-semantics, NOT Set: a
+/// poisoned `Array.prototype` setter or inherited read-only index must not be
+/// consulted when a builtin fills its freshly created result.
+fn create_data_on(vm: &mut Vm, target: &Value, key: &PropertyKey, v: Value) -> Result<(), Value> {
+    let o = match target {
+        Value::Object(o) => o.clone(),
+        _ => return Err(vm.throw_type("result is not an object")),
+    };
+    create_data_property_or_throw(vm, &o, key, v)
+}
+
 /// `DeletePropertyOrThrow(O, key)`: a failed delete (non-configurable property)
 /// raises a TypeError instead of silently succeeding.
 fn delete_or_throw(vm: &mut Vm, o: &Value, key: &PropertyKey) -> Result<(), Value> {
@@ -341,7 +353,7 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             let key = PropertyKey::from_index(k as u32);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
-                vm.set_prop_strict(&a, &PropertyKey::from_index(n), v)?;
+                create_data_on(vm, &a, &PropertyKey::from_index(n), v)?;
             }
             n += 1;
             k += 1;
@@ -388,7 +400,7 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             let from = PropertyKey::from_index((s + k) as u32);
             if vm.has_prop(&ov, &from)? {
                 let v = vm.get_prop(&ov, &from)?;
-                vm.set_prop_strict(&a, &PropertyKey::from_index(k as u32), v)?;
+                create_data_on(vm, &a, &PropertyKey::from_index(k as u32), v)?;
             }
         }
         vm.set_prop_strict(&a, &PropertyKey::str("length"), Value::Number(dc as f64))?;
@@ -450,12 +462,12 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
                     let key = PropertyKey::from_index(k as u32);
                     if vm.has_prop(&e, &key)? {
                         let v = vm.get_prop(&e, &key)?;
-                        vm.set_prop_strict(&a, &PropertyKey::from_index(n), v)?;
+                        create_data_on(vm, &a, &PropertyKey::from_index(n), v)?;
                     }
                     n += 1;
                 }
             } else {
-                vm.set_prop_strict(&a, &PropertyKey::from_index(n), e)?;
+                create_data_on(vm, &a, &PropertyKey::from_index(n), e)?;
                 n += 1;
             }
         }
@@ -636,7 +648,7 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
                     this_arg.clone(),
                     &[v, Value::Number(k as f64), ov.clone()],
                 )?;
-                vm.set_prop_strict(&a, &key, mapped)?;
+                create_data_on(vm, &a, &key, mapped)?;
             }
         }
         Ok(a)
@@ -655,7 +667,7 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
                     &[v.clone(), Value::Number(k as f64), ov.clone()],
                 )?;
                 if vm.to_boolean(&keep) {
-                    vm.set_prop_strict(&a, &PropertyKey::from_index(to), v)?;
+                    create_data_on(vm, &a, &PropertyKey::from_index(to), v)?;
                     to += 1;
                 }
             }

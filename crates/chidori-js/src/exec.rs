@@ -160,6 +160,10 @@ impl Vm {
         let cells = (0..proto.num_cells)
             .map(|_| Rc::new(RefCell::new(Value::Undefined)))
             .collect();
+        // A closure created inside `with (o) { … }` carries the with-object
+        // chain; seed the frame's with-scope stack with it so the body's
+        // dynamic name ops resolve against it (under any with the body enters).
+        let with_scope = bf.captured_with.clone();
         Frame {
             func: bf,
             ip: 0,
@@ -175,8 +179,10 @@ impl Vm {
             args: args.to_vec(),
             completion: Value::Undefined,
             enumerators: Vec::new(),
-            with_scope: Vec::new(),
+            with_scope,
             trace_token: None,
+            skip_delegation_throw: false,
+            eval_vars: None,
         }
     }
 
@@ -278,7 +284,7 @@ impl Vm {
                     Value::Object(o) => Some(o),
                     _ => Some(self.realm.object_proto.clone()),
                 };
-                let this_obj = JsObject::ordinary(proto);
+                let this_obj = self.alloc_ordinary(proto);
                 let this = Value::Object(this_obj.clone());
                 let frame = self.make_frame(bf, this.clone(), args, new_target.clone());
                 match self.run_frame(frame) {
@@ -428,11 +434,141 @@ impl Vm {
     ///   finalizer (whose `EndFinally` resumes this dispatch);
     /// - once no more crossing handlers remain, the action is performed
     ///   (`Ctl::Return` / re-`throw` as `Err` / `Ctl::Jump` to the loop target).
+    /// PerformEval (spec 19.2.1.1) for a direct call to %eval%: compile the
+    /// source against the call site's scope snapshot, run the spec's
+    /// EvalDeclarationInstantiation checks (the sloppy `var arguments`
+    /// SyntaxError in function scopes; var-shadows-lexical), instantiate
+    /// escaping sloppy vars on the global / the caller frame's eval-vars
+    /// object, and execute the body with the caller's `this`, `new.target`,
+    /// [[HomeObject]], and with-scope chain. Visible caller bindings become
+    /// the body's upvalues, wired to the caller frame's LIVE cells.
+    fn perform_direct_eval(
+        &mut self,
+        frame: &mut Frame,
+        scope: u32,
+        args: Vec<Value>,
+    ) -> Result<Value, Value> {
+        let arg0 = args.first().cloned().unwrap_or(Value::Undefined);
+        let src = match &arg0 {
+            Value::String(s) => s.as_str().to_string(),
+            _ => return Ok(arg0), // non-string eval returns its argument
+        };
+        let desc = frame
+            .func
+            .proto
+            .eval_scopes
+            .get(scope as usize)
+            .cloned()
+            .ok_or_else(|| self.throw_type("internal: missing eval scope"))?;
+        let compiled = match crate::compiler::compile_direct_eval(&src, &desc) {
+            Ok(c) => c,
+            Err(msg) => return Err(self.throw_syntax(msg.trim_start_matches("SyntaxError: "))),
+        };
+        // EvalDeclarationInstantiation for the sloppy escaping vars.
+        if !compiled.strict {
+            for name in &compiled.var_names {
+                if name == "arguments" && desc.arguments_param_scope {
+                    return Err(self.throw_syntax(
+                        "Unexpected eval or arguments in eval code within a function",
+                    ));
+                }
+                if let Some(b) = desc.bindings.iter().find(|b| &b.name == name) {
+                    if b.is_lexical {
+                        return Err(self.throw_syntax(&format!(
+                            "Identifier '{name}' has already been declared"
+                        )));
+                    }
+                    continue; // visible var/param: writes hit the live cell
+                }
+                if desc.is_global_var_scope {
+                    // CanDeclareGlobalVar: a fresh global binding requires an
+                    // extensible global object.
+                    let g = self.realm.global.clone();
+                    let key = PropertyKey::str(name);
+                    let (present, extensible) = {
+                        let b = g.borrow();
+                        (b.props.contains_key(&key), b.extensible)
+                    };
+                    if !present {
+                        if !extensible {
+                            return Err(self
+                                .throw_type(&format!("Cannot declare global variable '{name}'")));
+                        }
+                        g.borrow_mut()
+                            .props
+                            .insert(key, Property::data(Value::Undefined));
+                    }
+                } else {
+                    // Function-scope eval var: lives on the caller frame's
+                    // eval-vars object (created by InitEvalVars at entry).
+                    let ev = match &frame.eval_vars {
+                        Some(o) => o.clone(),
+                        None => {
+                            let o =
+                                self.alloc(crate::value::ObjectData::new(None, Internal::Ordinary));
+                            frame.with_scope.insert(0, o.clone());
+                            frame.eval_vars = Some(o.clone());
+                            o
+                        }
+                    };
+                    let key = PropertyKey::str(name);
+                    if !ev.borrow().props.contains_key(&key) {
+                        let mut p = Property::data(Value::Undefined);
+                        p.enumerable = true;
+                        ev.borrow_mut().props.insert(key, p);
+                    }
+                }
+            }
+        }
+        // Wire the body's upvalues to the caller frame's live cells.
+        let mut upvalues: Vec<Rc<RefCell<Value>>> = Vec::new();
+        for uv in &compiled.proto.upvalues {
+            let idx = match *uv {
+                UpvalueSource::ParentCell(i) => i as usize,
+                UpvalueSource::ParentUpvalue(_) => {
+                    return Err(self.throw_type("internal: eval upvalue shape"))
+                }
+            };
+            let b = desc
+                .bindings
+                .get(idx)
+                .ok_or_else(|| self.throw_type("internal: eval binding index"))?;
+            let cell = match b.slot {
+                crate::bytecode::EvalSlot::Cell(i) => frame.cells[i as usize].clone(),
+                crate::bytecode::EvalSlot::Upvalue(i) => frame.func.upvalues[i as usize].clone(),
+            };
+            upvalues.push(cell);
+        }
+        let bf = BytecodeFunction {
+            proto: Rc::new(compiled.proto),
+            upvalues,
+            home_object: frame.func.home_object.clone(),
+            is_class_ctor: false,
+            captured_with: frame.with_scope.clone(),
+        };
+        self.call_depth += 1;
+        if self.call_depth > self.max_call_depth {
+            self.call_depth -= 1;
+            return Err(self.throw_range("Maximum call stack size exceeded"));
+        }
+        let eframe = self.make_frame(bf, frame.this.clone(), &[], frame.new_target.clone());
+        let flow = self.run_frame(eframe);
+        self.call_depth -= 1;
+        match flow {
+            Flow::Return(v) => Ok(v),
+            Flow::Throw(e) => Err(e),
+            Flow::Suspend(_) => Err(self.throw_type("internal: eval body suspended")),
+        }
+    }
+
     fn do_completion(&mut self, frame: &mut Frame, comp: Completion) -> Result<Ctl, Value> {
         let boundary = match &comp {
             Completion::Jump { boundary, .. } => *boundary as usize,
             _ => 0,
         };
+        // One-shot: an internal (await-rejection) throw resumption passes
+        // `yield*` delegation handlers by — only external `.throw()` delegates.
+        let skip_delegation = std::mem::take(&mut frame.skip_delegation_throw);
         while frame.handlers.len() > boundary {
             let h = frame.handlers.pop().unwrap();
             frame.stack.truncate(h.stack_depth);
@@ -440,8 +576,10 @@ impl Vm {
             frame.with_scope.truncate(h.with_depth);
             if let Completion::Throw(err) = &comp {
                 if let Some(catch_ip) = h.catch_ip {
-                    frame.stack.push(err.clone());
-                    return Ok(Ctl::Jump(catch_ip as usize));
+                    if !(skip_delegation && h.delegation) {
+                        frame.stack.push(err.clone());
+                        return Ok(Ctl::Jump(catch_ip as usize));
+                    }
                 }
             }
             if let Some(finally_ip) = h.finally_ip {
@@ -648,8 +786,18 @@ impl Vm {
             Op::DeclareGlobal(i) => {
                 let name = self.const_name(frame, i);
                 let g = self.realm.global.clone();
-                let key = PropertyKey::Str(name);
-                if !g.borrow().props.contains_key(&key) {
+                let key = PropertyKey::Str(name.clone());
+                let (present, extensible) = {
+                    let b = g.borrow();
+                    (b.props.contains_key(&key), b.extensible)
+                };
+                if !present {
+                    // CanDeclareGlobalVar/Function: needs an extensible global.
+                    if !extensible {
+                        return Err(
+                            self.throw_type(&format!("Cannot declare global '{}'", name.as_str()))
+                        );
+                    }
                     g.borrow_mut()
                         .props
                         .insert(key, Property::data(Value::Undefined));
@@ -702,6 +850,63 @@ impl Vm {
                 } else {
                     // Deleting an unresolvable/lexical bare name reports success.
                     push!(Value::Bool(true));
+                }
+            }
+            Op::ResolveNameBase(name) => {
+                let nm = self.const_name(frame, name);
+                let key = PropertyKey::Str(nm);
+                match self.with_lookup(frame, &key)? {
+                    Some(obj) => push!(Value::Object(obj)),
+                    None => push!(Value::Undefined),
+                }
+            }
+            Op::LoadFromBase { name, fallback } => {
+                let base = pop!();
+                if let Value::Object(_) = &base {
+                    let nm = self.const_name(frame, name);
+                    let key = PropertyKey::Str(nm);
+                    // Object Environment Record GetBindingValue: re-check
+                    // HasProperty (the binding may have been deleted since the
+                    // base was captured), then read.
+                    if self.has_prop(&base, &key)? {
+                        let v = self.get_prop(&base, &key)?;
+                        push!(v);
+                    } else {
+                        push!(Value::Undefined);
+                    }
+                } else {
+                    return self.step(frame, (*fallback).clone());
+                }
+            }
+            Op::StoreToBase { name, fallback } => {
+                let v = pop!();
+                let base = pop!();
+                if let Value::Object(_) = &base {
+                    let nm = self.const_name(frame, name);
+                    let key = PropertyKey::Str(nm.clone());
+                    let strict = frame.func.proto.is_strict;
+                    // Object Environment Record SetMutableBinding: if the
+                    // binding was deleted since the base was captured, a strict
+                    // write throws ReferenceError (not a silent re-create).
+                    if strict && !self.has_prop(&base, &key)? {
+                        return Err(
+                            self.throw_reference(&format!("{} is not defined", nm.as_str()))
+                        );
+                    }
+                    self.put_value(&base, &key, v, strict)?;
+                } else {
+                    frame.stack.push(v);
+                    return self.step(frame, (*fallback).clone());
+                }
+            }
+            Op::RequireCoercible => {
+                let base = pop!();
+                self.require_object_coercible(&base, "read properties of")?;
+            }
+            Op::RequireIterResult => {
+                let ok = matches!(frame.stack.last(), Some(Value::Object(_)));
+                if !ok {
+                    return Err(self.throw_type("Iterator result is not an object"));
                 }
             }
 
@@ -880,12 +1085,14 @@ impl Vm {
                 let name = self.const_name(frame, i);
                 let obj = pop!();
                 let key = PropertyKey::Str(name.clone());
-                // PrivateBrandCheck: the receiver must possess the private name
-                // (own field, or method on the class prototype); else TypeError.
-                if !self.has_prop(&obj, &key)? {
+                // PrivateBrandCheck: the receiver must OWN the private storage
+                // key (fields/static elements are own properties; a prototype-
+                // chain hit must NOT pass — `Object.create(instance)` is not an
+                // instance). Foreign receivers throw TypeError.
+                if !private_owns(&obj, &key) {
                     return Err(self.throw_type(&format!(
                         "Cannot read private member {} from an object whose class did not declare it",
-                        name.as_str()
+                        private_display(name.as_str())
                     )));
                 }
                 // A private accessor with only a setter has no [[Get]] (spec
@@ -894,11 +1101,36 @@ impl Vm {
                     if !has_get {
                         return Err(self.throw_type(&format!(
                             "'{}' was defined without a getter",
-                            name.as_str()
+                            private_display(name.as_str())
                         )));
                     }
                 }
                 let v = self.get_prop(&obj, &key)?;
+                push!(v);
+            }
+            Op::PrivateGetB { brand, key } => {
+                let brand_name = self.const_name(frame, brand);
+                let key_name = self.const_name(frame, key);
+                let obj = pop!();
+                // PrivateBrandCheck for methods/accessors: the instance carries
+                // an own brand key stamped at construction; the element itself
+                // lives on the class prototype.
+                if !private_owns(&obj, &PropertyKey::Str(brand_name)) {
+                    return Err(self.throw_type(&format!(
+                        "Cannot read private member {} from an object whose class did not declare it",
+                        private_display(key_name.as_str())
+                    )));
+                }
+                let pkey = PropertyKey::Str(key_name.clone());
+                if let Some((has_get, _)) = private_accessor_kind(&obj, &pkey) {
+                    if !has_get {
+                        return Err(self.throw_type(&format!(
+                            "'{}' was defined without a getter",
+                            private_display(key_name.as_str())
+                        )));
+                    }
+                }
+                let v = self.get_prop(&obj, &pkey)?;
                 push!(v);
             }
             Op::PrivateSet(i) => {
@@ -906,10 +1138,10 @@ impl Vm {
                 let value = pop!();
                 let obj = pop!();
                 let key = PropertyKey::Str(name.clone());
-                if !self.has_prop(&obj, &key)? {
+                if !private_owns(&obj, &key) {
                     return Err(self.throw_type(&format!(
                         "Cannot write private member {} to an object whose class did not declare it",
-                        name.as_str()
+                        private_display(name.as_str())
                     )));
                 }
                 // A private accessor with no [[Set]] is a TypeError to assign.
@@ -917,12 +1149,71 @@ impl Vm {
                     if !has_set {
                         return Err(self.throw_type(&format!(
                             "'{}' was defined without a setter",
-                            name.as_str()
+                            private_display(name.as_str())
                         )));
                     }
                 }
                 self.set_prop(&obj, &key, value.clone())?;
                 push!(value);
+            }
+            Op::PrivateSetB {
+                brand,
+                key,
+                is_method,
+            } => {
+                let brand_name = self.const_name(frame, brand);
+                let key_name = self.const_name(frame, key);
+                let value = pop!();
+                let obj = pop!();
+                if !private_owns(&obj, &PropertyKey::Str(brand_name)) {
+                    return Err(self.throw_type(&format!(
+                        "Cannot write private member {} to an object whose class did not declare it",
+                        private_display(key_name.as_str())
+                    )));
+                }
+                // A private METHOD is never writable (spec PrivateSet step 6).
+                if is_method {
+                    return Err(self.throw_type(&format!(
+                        "Cannot assign to private method {}",
+                        private_display(key_name.as_str())
+                    )));
+                }
+                let pkey = PropertyKey::Str(key_name.clone());
+                if let Some((_, has_set)) = private_accessor_kind(&obj, &pkey) {
+                    if !has_set {
+                        return Err(self.throw_type(&format!(
+                            "'{}' was defined without a setter",
+                            private_display(key_name.as_str())
+                        )));
+                    }
+                }
+                self.set_prop(&obj, &pkey, value.clone())?;
+                push!(value);
+            }
+            Op::AdoptSuperThis(i) => {
+                let sup = pop!();
+                let v = pop!();
+                let parent_is_bytecode = matches!(
+                    &sup,
+                    Value::Object(o) if matches!(
+                        o.borrow().as_function(),
+                        Some(FunctionInner::Bytecode(_))
+                    )
+                );
+                if parent_is_bytecode && matches!(v, Value::Object(_)) {
+                    *frame.cells[i as usize].borrow_mut() = v;
+                }
+            }
+            Op::PrivateHasOwn(i) => {
+                let name = self.const_name(frame, i);
+                let obj = pop!();
+                // `#x in v`: the RHS must be an object (spec 13.10.1 step 5).
+                if !matches!(obj, Value::Object(_)) {
+                    return Err(
+                        self.throw_type("Cannot use 'in' operator to search in a non-object")
+                    );
+                }
+                push!(Value::Bool(private_owns(&obj, &PropertyKey::Str(name))));
             }
             Op::SetProp(i) => {
                 let name = self.const_name(frame, i);
@@ -935,6 +1226,9 @@ impl Vm {
             Op::GetPropDynamic => {
                 let key_v = pop!();
                 let obj = pop!();
+                // GetValue: RequireObjectCoercible(base) (via ToObject) throws
+                // BEFORE ToPropertyKey coerces the key expression's value.
+                self.require_object_coercible(&obj, "read properties of")?;
                 let key = self.to_property_key(&key_v)?;
                 let v = self.get_prop(&obj, &key)?;
                 push!(v);
@@ -943,6 +1237,7 @@ impl Vm {
                 let value = pop!();
                 let key_v = pop!();
                 let obj = pop!();
+                self.require_object_coercible(&obj, "set properties of")?;
                 let key = self.to_property_key(&key_v)?;
                 let strict = frame.func.proto.is_strict;
                 self.put_value(&obj, &key, value.clone(), strict)?;
@@ -951,14 +1246,25 @@ impl Vm {
             Op::DeleteProp(i) => {
                 let name = self.const_name(frame, i);
                 let obj = pop!();
-                let r = self.delete_prop(&obj, &PropertyKey::Str(name))?;
+                let r = self.delete_prop(&obj, &PropertyKey::Str(name.clone()))?;
+                // Strict-mode `delete` that fails throws (spec 13.5.1.2 step 5.c).
+                if !r && frame.func.proto.is_strict {
+                    return Err(self.throw_type(&format!(
+                        "Cannot delete property '{}' in strict mode",
+                        name.as_str()
+                    )));
+                }
                 push!(Value::Bool(r));
             }
             Op::DeletePropDynamic => {
                 let key_v = pop!();
                 let obj = pop!();
+                self.require_object_coercible(&obj, "delete properties of")?;
                 let key = self.to_property_key(&key_v)?;
                 let r = self.delete_prop(&obj, &key)?;
+                if !r && frame.func.proto.is_strict {
+                    return Err(self.throw_type("Cannot delete property in strict mode"));
+                }
                 push!(Value::Bool(r));
             }
             Op::HasProp => {
@@ -1041,6 +1347,15 @@ impl Vm {
                     })
                     .collect();
                 let f = self.make_closure(proto, upvalues);
+                // Capture the active with-scope chain (closures defined inside
+                // `with` resolve free identifiers against it after the block).
+                if !frame.with_scope.is_empty() {
+                    if let Internal::Function(FunctionInner::Bytecode(bf)) =
+                        &mut f.borrow_mut().internal
+                    {
+                        bf.captured_with = frame.with_scope.clone();
+                    }
+                }
                 push!(Value::Object(f));
             }
 
@@ -1077,17 +1392,38 @@ impl Vm {
             }
             Op::DynamicImport => {
                 // Specifier already evaluated (and on the stack); coerce it to a
-                // string per spec (a Symbol specifier must reject), then reject —
-                // module loading is unsupported in this engine.
+                // string per spec (a Symbol specifier must reject, never throw).
+                // With a host hook installed, the load/link/evaluate runs as a
+                // queued job (spec: HostImportModuleDynamically completes in a
+                // separate job) and settles the returned promise; without one,
+                // module loading is unsupported and the promise rejects.
                 let spec = pop!();
-                let reason = match self.to_js_string(&spec) {
-                    Ok(_) => self.make_error(
-                        crate::vm::ErrorKind::Type,
-                        "dynamic import is not supported",
-                    ),
-                    Err(e) => e,
-                };
-                let p = self.new_rejected(reason);
+                let p = self.new_promise();
+                match self.to_js_string(&spec) {
+                    Ok(s) => {
+                        if let Some(hook) = self.dynamic_import.clone() {
+                            let spec_str = s.as_str().to_string();
+                            let pj = p.clone();
+                            self.microtasks
+                                .push_back(crate::vm::Microtask::Job(Box::new(
+                                    move |vm: &mut Vm| {
+                                        match hook(vm, &spec_str) {
+                                            Ok(ns) => vm.resolve_promise(&pj, ns),
+                                            Err(e) => vm.reject_promise(&pj, e),
+                                        }
+                                        Ok(())
+                                    },
+                                )));
+                        } else {
+                            let reason = self.make_error(
+                                crate::vm::ErrorKind::Type,
+                                "dynamic import is not supported",
+                            );
+                            self.reject_promise(&p, reason);
+                        }
+                    }
+                    Err(e) => self.reject_promise(&p, e),
+                }
                 push!(Value::Object(p));
             }
             Op::Inc => {
@@ -1222,7 +1558,42 @@ impl Vm {
                     },
                     stack_depth: frame.stack.len(),
                     with_depth: frame.with_scope.len(),
+                    delegation: false,
                 });
+            }
+            Op::MarkDelegationHandler => {
+                if let Some(h) = frame.handlers.last_mut() {
+                    h.delegation = true;
+                }
+            }
+            Op::InitEvalVars => {
+                // Null prototype: with-scope lookups HasProperty through the
+                // chain, and Object.prototype names must not shadow globals.
+                let o = self.alloc(crate::value::ObjectData::new(None, Internal::Ordinary));
+                // Outermost with-scope: real `with` objects entered later (and
+                // the static fallback for names it doesn't hold) take priority.
+                frame.with_scope.insert(0, o.clone());
+                frame.eval_vars = Some(o);
+            }
+            Op::DirectEval { argc, scope } => {
+                let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
+                for _ in 0..argc {
+                    args.push(pop!());
+                }
+                args.reverse();
+                let callee = pop!();
+                // Direct-eval semantics apply only when the callee IS %eval%.
+                let is_intrinsic = match (&callee, &self.realm.eval_fn) {
+                    (Value::Object(o), Some(e)) => o.same(e),
+                    _ => false,
+                };
+                if !is_intrinsic {
+                    let r = self.call(callee, Value::Undefined, &args)?;
+                    push!(r);
+                } else {
+                    let v = self.perform_direct_eval(frame, scope, args)?;
+                    push!(v);
+                }
             }
             Op::PopTryHandler => {
                 frame.handlers.pop();
@@ -1511,6 +1882,7 @@ impl Vm {
             upvalues,
             home_object: None,
             is_class_ctor: kind == FuncKind::ClassCtor,
+            captured_with: Vec::new(),
         };
         // [[Prototype]] is the function-kind intrinsic: %GeneratorFunction.prototype%,
         // %AsyncFunction.prototype%, %AsyncGeneratorFunction.prototype%, or
@@ -1527,7 +1899,7 @@ impl Vm {
         } else {
             self.realm.function_proto.clone()
         };
-        let obj = JsObject::new(ObjectData::new(
+        let obj = self.alloc(ObjectData::new(
             Some(func_proto),
             Internal::Function(FunctionInner::Bytecode(bf)),
         ));
@@ -1589,7 +1961,7 @@ impl Vm {
             } else {
                 self.realm.generator_proto.clone()
             };
-            let proto_obj = JsObject::ordinary(Some(instance_proto));
+            let proto_obj = self.alloc_ordinary(Some(instance_proto));
             obj.borrow_mut().props.insert(
                 PropertyKey::str("prototype"),
                 Property {
@@ -2044,6 +2416,22 @@ impl Value {
 /// accessor property, return `(has_getter, has_setter)`; otherwise `None` (a data
 /// field/method). Used by `PrivateGet`/`PrivateSet` to enforce the spec's
 /// accessor-without-getter / accessor-without-setter TypeErrors.
+/// Whether `obj` OWNS the private storage/brand key — the spec's
+/// PrivateElementFind over the receiver's own [[PrivateElements]] (never the
+/// prototype chain, never Proxy traps).
+fn private_owns(obj: &Value, key: &PropertyKey) -> bool {
+    match obj {
+        Value::Object(o) => o.borrow().props.contains_key(key),
+        _ => false,
+    }
+}
+
+/// The source-visible form of an internal private key: `#name@<classid>`
+/// renders as `#name` in error messages.
+fn private_display(key: &str) -> &str {
+    key.split('@').next().unwrap_or(key)
+}
+
 fn private_accessor_kind(obj: &Value, key: &PropertyKey) -> Option<(bool, bool)> {
     let mut cur = match obj {
         Value::Object(o) => o.clone(),

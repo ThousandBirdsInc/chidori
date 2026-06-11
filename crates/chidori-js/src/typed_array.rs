@@ -155,7 +155,7 @@ pub fn ta_eff_length(t: &TypedArrayData) -> usize {
 impl Vm {
     /// A fresh `ArrayBuffer` of `len` zero bytes.
     pub fn new_array_buffer(&self, len: usize) -> JsObject {
-        JsObject::new(ObjectData::new(
+        self.alloc(ObjectData::new(
             Some(self.realm.array_buffer_proto.clone()),
             Internal::ArrayBuffer(Some(vec![0u8; len])),
         ))
@@ -170,7 +170,7 @@ impl Vm {
         length: usize,
         proto: JsObject,
     ) -> JsObject {
-        JsObject::new(ObjectData::new(
+        self.alloc(ObjectData::new(
             Some(proto),
             Internal::TypedArray(TypedArrayData {
                 buffer,

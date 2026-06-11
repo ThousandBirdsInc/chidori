@@ -1504,7 +1504,7 @@ fn per_kind_proto(vm: &mut Vm, kind: TAKind) -> JsObject {
         }
     }
     // Should have been installed by install_kind_ctors; create a bare fallback.
-    let proto = JsObject::ordinary(Some(base.clone()));
+    let proto = vm.alloc_ordinary(Some(base.clone()));
     base.borrow_mut()
         .props
         .insert(key, Property::builtin(Value::Object(proto.clone())));
@@ -1515,7 +1515,7 @@ fn install_kind_ctors(vm: &mut Vm, ta_ctor: &JsObject) {
     let ta_proto = vm.realm.typed_array_proto.clone();
     for kind in TAKind::all() {
         // Per-kind prototype chained to %TypedArray%.prototype.
-        let proto = JsObject::ordinary(Some(ta_proto.clone()));
+        let proto = vm.alloc_ordinary(Some(ta_proto.clone()));
         // Record it on the base so per_kind_proto can recover it from the Vm.
         let key = PropertyKey::str(format!("__proto_{}", kind.name()));
         ta_proto
@@ -1762,7 +1762,7 @@ fn install_data_view(vm: &mut Vm) {
             }
             l
         };
-        let dv = JsObject::new(ObjectData::new(
+        let dv = vm.alloc(ObjectData::new(
             Some(vm.realm.data_view_proto.clone()),
             Internal::DataView(DataViewData {
                 buffer,
