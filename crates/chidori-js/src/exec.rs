@@ -282,7 +282,7 @@ impl Vm {
                     Value::Object(o) => Some(o),
                     _ => Some(self.realm.object_proto.clone()),
                 };
-                let this_obj = JsObject::ordinary(proto);
+                let this_obj = self.alloc_ordinary(proto);
                 let this = Value::Object(this_obj.clone());
                 let frame = self.make_frame(bf, this.clone(), args, new_target.clone());
                 match self.run_frame(frame) {
@@ -1158,15 +1158,16 @@ impl Vm {
                         if let Some(hook) = self.dynamic_import.clone() {
                             let spec_str = s.as_str().to_string();
                             let pj = p.clone();
-                            self.microtasks.push_back(crate::vm::Microtask::Job(Box::new(
-                                move |vm: &mut Vm| {
-                                    match hook(vm, &spec_str) {
-                                        Ok(ns) => vm.resolve_promise(&pj, ns),
-                                        Err(e) => vm.reject_promise(&pj, e),
-                                    }
-                                    Ok(())
-                                },
-                            )));
+                            self.microtasks
+                                .push_back(crate::vm::Microtask::Job(Box::new(
+                                    move |vm: &mut Vm| {
+                                        match hook(vm, &spec_str) {
+                                            Ok(ns) => vm.resolve_promise(&pj, ns),
+                                            Err(e) => vm.reject_promise(&pj, e),
+                                        }
+                                        Ok(())
+                                    },
+                                )));
                         } else {
                             let reason = self.make_error(
                                 crate::vm::ErrorKind::Type,
@@ -1617,7 +1618,7 @@ impl Vm {
         } else {
             self.realm.function_proto.clone()
         };
-        let obj = JsObject::new(ObjectData::new(
+        let obj = self.alloc(ObjectData::new(
             Some(func_proto),
             Internal::Function(FunctionInner::Bytecode(bf)),
         ));
@@ -1679,7 +1680,7 @@ impl Vm {
             } else {
                 self.realm.generator_proto.clone()
             };
-            let proto_obj = JsObject::ordinary(Some(instance_proto));
+            let proto_obj = self.alloc_ordinary(Some(instance_proto));
             obj.borrow_mut().props.insert(
                 PropertyKey::str("prototype"),
                 Property {

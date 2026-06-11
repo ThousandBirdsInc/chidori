@@ -188,7 +188,7 @@ fn set_date_value(o: &JsObject, ms: f64) {
 }
 
 fn new_date_object(vm: &Vm, ms: f64) -> JsObject {
-    JsObject::new(ObjectData::new(
+    vm.alloc(ObjectData::new(
         Some(vm.realm.date_proto.clone()),
         Internal::Date(ms),
     ))

@@ -52,7 +52,7 @@ fn push_disposer(arr: &JsObject, f: Value) {
 /// Build a fresh stack object carrying an empty (not-disposed) state array.
 fn new_stack(vm: &mut Vm, proto: &JsObject) -> JsObject {
     let arr = vm.new_array(vec![Value::Bool(false)]);
-    let o = JsObject::ordinary(Some(proto.clone()));
+    let o = vm.alloc_ordinary(Some(proto.clone()));
     let key = state_key(vm);
     o.borrow_mut()
         .props
@@ -66,7 +66,7 @@ fn install_one(vm: &mut Vm, is_async: bool) {
     } else {
         "DisposableStack"
     };
-    let proto = JsObject::ordinary(Some(vm.realm.object_proto.clone()));
+    let proto = vm.alloc_ordinary(Some(vm.realm.object_proto.clone()));
     let proto_for_ctor = proto.clone();
     let ctor = vm.new_native_ctor(
         name,

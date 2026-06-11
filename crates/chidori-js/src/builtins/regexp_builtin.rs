@@ -803,7 +803,7 @@ pub fn build_match_array(
     let groups = if names.is_empty() {
         Value::Undefined
     } else {
-        let obj = JsObject::ordinary(None);
+        let obj = vm.alloc_ordinary(None);
         {
             let mut gb = obj.borrow_mut();
             for (name, idx) in names {
@@ -835,7 +835,7 @@ pub fn build_match_array(
         let idx_groups = if names.is_empty() {
             Value::Undefined
         } else {
-            let obj = JsObject::ordinary(None);
+            let obj = vm.alloc_ordinary(None);
             for (name, gidx) in names {
                 let val = match mat.groups.get(*gidx).and_then(|g| *g) {
                     Some((s, e)) => pair(s, e, vm),

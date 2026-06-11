@@ -25,7 +25,7 @@ impl Vm {
     /// Allocate a Proxy exotic object wrapping `target` with `handler`.
     pub fn new_proxy(&self, target: JsObject, handler: JsObject) -> JsObject {
         // Proxies have no [[Prototype]] of their own; lookups are trapped.
-        JsObject::new(ObjectData::new(
+        self.alloc(ObjectData::new(
             None,
             Internal::Proxy(ProxyData {
                 target,

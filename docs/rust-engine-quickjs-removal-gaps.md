@@ -48,9 +48,13 @@ exception is framed as `JavaScript exception: <message>` like the QuickJS host;
 the same providers as the live-VM path); the entrypoint receives `chidori` as
 its second argument (QuickJS `agent(input, chidori)` convention); and the rust
 arm clears the streaming `event_sender` after a run (`ctx.clear_event_sender()`)
-so a `--stream` drain loop terminates — the chidori-js VM can leak its heap on
-drop (Rc cycles, no cycle collector), which would otherwise keep the dispatch
-closure → ctx → sender alive and hang the channel.
+so a `--stream` drain loop terminates — at the time the chidori-js VM could
+leak its heap on drop (Rc cycles), which would otherwise keep the dispatch
+closure → ctx → sender alive and hang the channel. (Since then the engine grew
+a per-VM allocation registry and cycle collector — `crates/chidori-js/src/gc.rs`
+— `run_module` and tool-metadata evaluation now call `vm.dispose()`, which
+breaks every allocation's edges, so a long-lived server no longer accretes a
+leaked realm per agent run.)
 
 QuickJS-mechanism-specific test assertions (live-VM blob kind, `PROMPT_TOOL_PAUSE_FILE`,
 per-turn `max_turns` metadata, nested-suspension trace *shape*) were made

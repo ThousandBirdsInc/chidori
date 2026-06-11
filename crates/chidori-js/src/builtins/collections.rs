@@ -103,7 +103,7 @@ fn install_weakmap(vm: &mut Vm) {
         0,
         |vm, _t, _a| Err(vm.throw_type("Constructor WeakMap requires 'new'")),
         |vm, _t, args| {
-            let m = JsObject::new(ObjectData::new(
+            let m = vm.alloc(ObjectData::new(
                 Some(vm.realm.weak_map_proto.clone()),
                 Internal::WeakMap(IndexMap::new()),
             ));
@@ -179,7 +179,7 @@ fn install_weakset(vm: &mut Vm) {
         0,
         |vm, _t, _a| Err(vm.throw_type("Constructor WeakSet requires 'new'")),
         |vm, _t, args| {
-            let s = JsObject::new(ObjectData::new(
+            let s = vm.alloc(ObjectData::new(
                 Some(vm.realm.weak_set_proto.clone()),
                 Internal::WeakSet(IndexMap::new()),
             ));
@@ -247,7 +247,7 @@ fn install_map(vm: &mut Vm) {
             Ok(Value::Undefined)
         },
         |vm, _t, args| {
-            let m = JsObject::new(ObjectData::new(
+            let m = vm.alloc(ObjectData::new(
                 Some(vm.realm.map_proto.clone()),
                 Internal::Map(IndexMap::new()),
             ));
@@ -287,7 +287,7 @@ fn install_map(vm: &mut Vm) {
             let arr = vm.new_array(elements);
             map.insert(k, Value::Object(arr));
         }
-        let m = JsObject::new(ObjectData::new(
+        let m = vm.alloc(ObjectData::new(
             Some(vm.realm.map_proto.clone()),
             Internal::Map(map),
         ));
@@ -408,7 +408,7 @@ fn install_set(vm: &mut Vm) {
             Ok(Value::Undefined)
         },
         |vm, _t, args| {
-            let s = JsObject::new(ObjectData::new(
+            let s = vm.alloc(ObjectData::new(
                 Some(vm.realm.set_proto.clone()),
                 Internal::Set(IndexMap::new()),
             ));
@@ -728,7 +728,7 @@ fn new_set(vm: &mut Vm, values: Vec<Value>) -> Value {
     for v in values {
         map.insert(MapKey(v), ());
     }
-    Value::Object(JsObject::new(ObjectData::new(
+    Value::Object(vm.alloc(ObjectData::new(
         Some(vm.realm.set_proto.clone()),
         Internal::Set(map),
     )))

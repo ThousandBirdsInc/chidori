@@ -1688,7 +1688,7 @@ impl Vm {
             return Err(self.throw_syntax(&msg));
         }
         let source = if pattern.is_empty() { "(?:)" } else { pattern };
-        let o = JsObject::new(ObjectData::new(
+        let o = self.alloc(ObjectData::new(
             Some(self.realm.regexp_proto.clone()),
             Internal::Ordinary,
         ));

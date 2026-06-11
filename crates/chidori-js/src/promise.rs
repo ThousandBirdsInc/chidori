@@ -15,7 +15,7 @@ use crate::vm::*;
 
 impl Vm {
     pub fn new_promise(&self) -> JsObject {
-        JsObject::new(ObjectData::new(
+        self.alloc(ObjectData::new(
             Some(self.realm.promise_proto.clone()),
             Internal::Promise(PromiseData {
                 state: PromiseState::Pending,

@@ -238,6 +238,23 @@ pub struct Vm {
     /// the chidori module loader); when absent, `import()` rejects with a
     /// TypeError.
     pub dynamic_import: Option<std::rc::Rc<dyn Fn(&mut Vm, &str) -> Result<Value, Value>>>,
+    /// Weak handle to every object this VM has allocated (see [`crate::gc`]).
+    /// Reference counting cannot reclaim cycles (closure↔cell, promise↔
+    /// reaction↔frame, ctor↔prototype); this registry lets `collect_cycles`
+    /// find garbage cycles among live objects and lets `dispose` break EVERY
+    /// allocation's outgoing edges, not just those still reachable from the
+    /// realm roots. Entries are weak, so the registry never extends lifetimes.
+    pub(crate) all_objects:
+        std::cell::RefCell<Vec<std::rc::Weak<RefCell<crate::value::ObjectData>>>>,
+    /// Registry compaction threshold (dead weak entries are pruned when the
+    /// registry length crosses it; doubled after each compaction).
+    pub(crate) gc_compact_at: std::cell::Cell<usize>,
+    /// Value cells (`Rc<RefCell<Value>>`) held OUTSIDE the VM — e.g. a host's
+    /// `ModuleRecord` cells — that also appear as closure upvalues inside it.
+    /// `collect_cycles` treats their contents as roots; without registration,
+    /// an object reachable only through such a shared cell could be collected
+    /// while the host can still reach it.
+    pub gc_cell_roots: Vec<std::rc::Rc<RefCell<Value>>>,
 }
 
 impl Vm {
@@ -260,8 +277,16 @@ impl Vm {
             module_capture: None,
             trace_sink: None,
             dynamic_import: None,
+            all_objects: std::cell::RefCell::new(Vec::new()),
+            gc_compact_at: std::cell::Cell::new(1 << 12),
+            gc_cell_roots: Vec::new(),
         };
         crate::realm::init_realm(&mut vm);
+        // The placeholder realm's intrinsic objects were created before the VM
+        // existed; register them so the cycle collector sees the full heap.
+        for o in vm.realm.object_roots() {
+            vm.track_object(&o);
+        }
         vm
     }
 
@@ -279,15 +304,15 @@ impl Vm {
     // ---------------------------------------------------------------------
 
     pub fn new_object(&self) -> JsObject {
-        JsObject::ordinary(Some(self.realm.object_proto.clone()))
+        self.alloc_ordinary(Some(self.realm.object_proto.clone()))
     }
 
     pub fn new_object_proto(&self, proto: Option<JsObject>) -> JsObject {
-        JsObject::ordinary(proto)
+        self.alloc_ordinary(proto)
     }
 
     pub fn new_array(&self, elements: Vec<Value>) -> JsObject {
-        JsObject::new(ObjectData::new(
+        self.alloc(ObjectData::new(
             Some(self.realm.array_proto.clone()),
             Internal::Array(elements),
         ))
@@ -295,7 +320,7 @@ impl Vm {
 
     pub fn new_string_object(&self, s: JsString) -> JsObject {
         let len = s.as_str().chars().count();
-        let o = JsObject::new(ObjectData::new(
+        let o = self.alloc(ObjectData::new(
             Some(self.realm.string_proto.clone()),
             Internal::StringObj(s),
         ));
@@ -326,7 +351,7 @@ impl Vm {
             func: Rc::new(func),
             construct: None,
         };
-        let obj = JsObject::new(ObjectData::new(
+        let obj = self.alloc(ObjectData::new(
             Some(self.realm.function_proto.clone()),
             Internal::Function(FunctionInner::Native(nf)),
         ));
@@ -372,7 +397,7 @@ impl Vm {
             func: Rc::new(call),
             construct: Some(Rc::new(construct)),
         };
-        let obj = JsObject::new(ObjectData::new(
+        let obj = self.alloc(ObjectData::new(
             Some(self.realm.function_proto.clone()),
             Internal::Function(FunctionInner::Native(nf)),
         ));
@@ -475,7 +500,7 @@ impl Vm {
             ErrorKind::Syntax => &self.realm.syntax_error_proto,
             ErrorKind::Uri => &self.realm.uri_error_proto,
         };
-        let obj = JsObject::new(ObjectData::new(Some(proto.clone()), Internal::Error));
+        let obj = self.alloc(ObjectData::new(Some(proto.clone()), Internal::Error));
         obj.borrow_mut().props.insert(
             PropertyKey::str("message"),
             Property::builtin(Value::str(message)),
@@ -642,19 +667,19 @@ impl Vm {
         match v {
             Value::Object(o) => Ok(o.clone()),
             Value::String(s) => Ok(self.new_string_object(s.clone())),
-            Value::Number(n) => Ok(JsObject::new(ObjectData::new(
+            Value::Number(n) => Ok(self.alloc(ObjectData::new(
                 Some(self.realm.number_proto.clone()),
                 Internal::Number(*n),
             ))),
-            Value::Bool(b) => Ok(JsObject::new(ObjectData::new(
+            Value::Bool(b) => Ok(self.alloc(ObjectData::new(
                 Some(self.realm.boolean_proto.clone()),
                 Internal::Boolean(*b),
             ))),
-            Value::Symbol(s) => Ok(JsObject::new(ObjectData::new(
+            Value::Symbol(s) => Ok(self.alloc(ObjectData::new(
                 Some(self.realm.symbol_proto.clone()),
                 Internal::Symbol(s.clone()),
             ))),
-            Value::BigInt(n) => Ok(JsObject::new(ObjectData::new(
+            Value::BigInt(n) => Ok(self.alloc(ObjectData::new(
                 Some(self.realm.bigint_proto.clone()),
                 Internal::BigIntObj(n.clone()),
             ))),
@@ -1426,7 +1451,31 @@ impl Vm {
         // The dynamic-import hook closes over host module state (registries whose
         // records hold realm values); drop it so those cells don't keep cycles.
         self.dynamic_import = None;
+        self.gc_cell_roots.clear();
+        self.module_capture = None;
 
+        // Primary teardown: break the outgoing edges of EVERY object this VM
+        // ever allocated (see `Vm::alloc` / `crate::gc`). Unlike the
+        // realm-root walk below, this also reaches cycles that are no longer
+        // connected to the realm (orphaned closure/promise/generator loops),
+        // which used to leak per-VM and forced long conformance runs to be
+        // chunked across processes.
+        let tracked: Vec<JsObject> = {
+            let mut reg = self.all_objects.borrow_mut();
+            let live = reg
+                .iter()
+                .filter_map(|w| w.upgrade().map(JsObject))
+                .collect();
+            reg.clear();
+            live
+        };
+        for o in &tracked {
+            crate::gc::clear_object_edges(o);
+        }
+        drop(tracked);
+
+        // Belt and braces: also walk from the realm roots so any object that
+        // was created without registration still gets its edges broken.
         let mut seen: HashSet<usize> = HashSet::new();
         let mut stack: Vec<JsObject> = self.realm.object_roots();
         while let Some(o) = stack.pop() {

@@ -86,14 +86,22 @@ import by policy — `import()` rejects with a TypeError, as before.
 
 ## Why the run is chunked
 
-`chidori-js` uses reference-counting (`Rc<RefCell<…>>`) and cannot reclaim every
-object cycle, so a single process that walks all ~47k tests grows until it is
-OOM-killed (`Vm::dispose()` breaks known cycles per test, but not all). Both
-`scripts/test262.sh --gate` and `--update-baseline` therefore run the suite **one
-second-level directory at a time, in a fresh process each**, so memory is
-reclaimed between chunks. The runner's `--state <file>` flag merges per-test
-results across chunks; `--baseline <file>` gates each chunk against the full
-baseline. A full chunked pass is ~24 minutes on a dev box.
+`chidori-js` uses reference-counting (`Rc<RefCell<…>>`); cycles are reclaimed
+by the engine's cycle collector (`crates/chidori-js/src/gc.rs`): every
+allocation is registered per-VM, `Vm::dispose()` breaks the outgoing edges of
+**every** object the VM ever allocated (including orphaned cycles the old
+realm-root walk missed), and `Vm::collect_cycles()` offers mark-sweep for
+long-lived VMs. Since the runner disposes a fresh VM per test, memory across a
+single-process run is now flat (~20 MB RSS over the 21k `language/` tests;
+it previously grew without bound, ~300 MB over `built-ins/Array` alone).
+
+Both `scripts/test262.sh --gate` and `--update-baseline` still run the suite
+**one second-level directory at a time, in a fresh process each** — no longer
+for memory, but for crash isolation: a single engine abort (e.g. a stack
+overflow on a pathological test) kills only its chunk, not the whole sweep.
+The runner's `--state <file>` flag merges per-test results across chunks;
+`--baseline <file>` gates each chunk against the full baseline. A full chunked
+pass is ~24 minutes on a dev box.
 
 ## Honest skips
 

@@ -75,7 +75,7 @@ impl Vm {
                 GeneratorState::Completed
             }
         };
-        let gen = JsObject::new(ObjectData::new(
+        let gen = self.alloc(ObjectData::new(
             Some(proto),
             Internal::Generator(GeneratorData {
                 state,

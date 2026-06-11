@@ -705,7 +705,8 @@ fn replace_impl(vm: &mut Vm, this: &Value, args: &[Value], all: bool) -> Result<
                 result.push_str(&rest[..pos]);
                 let matched = &rest[pos..pos + pattern.len()];
                 let offset = s.len() - rest.len() + pos;
-                let replacement = compute_replacement(vm, &repl, repl_str.as_deref(), matched, &s, offset)?;
+                let replacement =
+                    compute_replacement(vm, &repl, repl_str.as_deref(), matched, &s, offset)?;
                 result.push_str(&replacement);
                 rest = &rest[pos + pattern.len()..];
                 replaced_any = true;

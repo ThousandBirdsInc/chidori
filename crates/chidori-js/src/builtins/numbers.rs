@@ -69,7 +69,7 @@ fn install_number(vm: &mut Vm) {
             } else {
                 number_from_value(vm, &arg(args, 0))?
             };
-            Ok(Value::Object(JsObject::new(ObjectData::new(
+            Ok(Value::Object(vm.alloc(ObjectData::new(
                 Some(vm.realm.number_proto.clone()),
                 Internal::Number(n),
             ))))

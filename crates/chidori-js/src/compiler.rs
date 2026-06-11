@@ -879,7 +879,9 @@ impl Compiler {
                 // Declare that binding BEFORE compiling the body so a
                 // self-reference inside (e.g. `f = 2`) captures the module-level
                 // cell instead of falling through to the global scope.
-                let local = f.id.as_ref().map(|id| self.declare(id.name.as_str(), false));
+                let local =
+                    f.id.as_ref()
+                        .map(|id| self.declare(id.name.as_str(), false));
                 // An anonymous `export default function(){}` gets the name "default".
                 self.compile_function(
                     f,
@@ -915,16 +917,16 @@ impl Compiler {
         // the name is visible through the export (live bindings). Anonymous
         // defaults export the synthetic `*default*` cell.
         let local_name = match &d.declaration {
-            ExportDefaultDeclarationKind::FunctionDeclaration(f) => f
-                .id
-                .as_ref()
-                .map(|i| i.name.as_str().to_string())
-                .unwrap_or_else(|| "*default*".to_string()),
-            ExportDefaultDeclarationKind::ClassDeclaration(c) => c
-                .id
-                .as_ref()
-                .map(|i| i.name.as_str().to_string())
-                .unwrap_or_else(|| "*default*".to_string()),
+            ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                f.id.as_ref()
+                    .map(|i| i.name.as_str().to_string())
+                    .unwrap_or_else(|| "*default*".to_string())
+            }
+            ExportDefaultDeclarationKind::ClassDeclaration(c) => {
+                c.id.as_ref()
+                    .map(|i| i.name.as_str().to_string())
+                    .unwrap_or_else(|| "*default*".to_string())
+            }
             _ => "*default*".to_string(),
         };
         self.module_exports.push(ExportEntry {

@@ -10,6 +10,7 @@ pub mod bytecode;
 pub mod compiler;
 pub mod convert;
 pub mod exec;
+pub mod gc;
 pub mod generator;
 pub mod host;
 pub mod iter;
