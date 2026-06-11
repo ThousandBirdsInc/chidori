@@ -181,6 +181,7 @@ impl Vm {
             enumerators: Vec::new(),
             with_scope,
             trace_token: None,
+            skip_delegation_throw: false,
         }
     }
 
@@ -437,6 +438,9 @@ impl Vm {
             Completion::Jump { boundary, .. } => *boundary as usize,
             _ => 0,
         };
+        // One-shot: an internal (await-rejection) throw resumption passes
+        // `yield*` delegation handlers by — only external `.throw()` delegates.
+        let skip_delegation = std::mem::take(&mut frame.skip_delegation_throw);
         while frame.handlers.len() > boundary {
             let h = frame.handlers.pop().unwrap();
             frame.stack.truncate(h.stack_depth);
@@ -444,8 +448,10 @@ impl Vm {
             frame.with_scope.truncate(h.with_depth);
             if let Completion::Throw(err) = &comp {
                 if let Some(catch_ip) = h.catch_ip {
-                    frame.stack.push(err.clone());
-                    return Ok(Ctl::Jump(catch_ip as usize));
+                    if !(skip_delegation && h.delegation) {
+                        frame.stack.push(err.clone());
+                        return Ok(Ctl::Jump(catch_ip as usize));
+                    }
                 }
             }
             if let Some(finally_ip) = h.finally_ip {
@@ -758,6 +764,12 @@ impl Vm {
             Op::RequireCoercible => {
                 let base = pop!();
                 self.require_object_coercible(&base, "read properties of")?;
+            }
+            Op::RequireIterResult => {
+                let ok = matches!(frame.stack.last(), Some(Value::Object(_)));
+                if !ok {
+                    return Err(self.throw_type("Iterator result is not an object"));
+                }
             }
 
             Op::Pop => {
@@ -1408,7 +1420,13 @@ impl Vm {
                     },
                     stack_depth: frame.stack.len(),
                     with_depth: frame.with_scope.len(),
+                    delegation: false,
                 });
+            }
+            Op::MarkDelegationHandler => {
+                if let Some(h) = frame.handlers.last_mut() {
+                    h.delegation = true;
+                }
             }
             Op::PopTryHandler => {
                 frame.handlers.pop();

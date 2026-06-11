@@ -283,10 +283,14 @@ impl Vm {
                     let gen_r = gobj.clone();
                     let res_r = result.clone();
                     let on_r = self.new_native("", 1, move |vm, _t, args| {
-                        if let Some(fr) = cell.borrow_mut().take() {
+                        if let Some(mut fr) = cell.borrow_mut().take() {
                             let token = fr.trace_token;
                             vm.trace_resume(token);
                             let e = args.get(0).cloned().unwrap_or(Value::Undefined);
+                            // Internal await-of-yielded-value rejection: it
+                            // propagates out of a `yield*` rather than being
+                            // delegated to the inner iterator's `throw`.
+                            fr.skip_delegation_throw = true;
                             let flow = vm.resume_frame_throw(fr, e);
                             vm.agen_drive(&gen_r, flow, &res_r, token);
                         }

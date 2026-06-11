@@ -69,6 +69,11 @@ pub struct TryHandler {
     /// unwind into the catch/finally, the with-scope stack is restored to this
     /// depth so a `with` body that throws does not leak its environment.
     pub with_depth: usize,
+    /// A `yield*` delegation handler: it catches only EXTERNAL `.throw()`
+    /// resumptions (to forward them to the inner iterator). The async-generator
+    /// machinery's internal await-of-yielded-value rejection sets the frame's
+    /// one-shot skip flag, which makes the unwind pass this handler by.
+    pub delegation: bool,
 }
 
 /// A single call frame. Self-contained (own operand stack + locals) so that a
@@ -105,6 +110,12 @@ pub struct Frame {
     /// attributed correctly even when async resumption is non-LIFO. `None` when
     /// no trace sink is installed.
     pub trace_token: Option<u64>,
+    /// One-shot: the next throw dispatched in this frame skips `delegation`
+    /// try-handlers (see [`TryHandler::delegation`]). Set when an async
+    /// generator's internal await of a yielded value rejects — that abrupt
+    /// completion propagates out of a `yield*` rather than being delegated to
+    /// the inner iterator's `throw`.
+    pub skip_delegation_throw: bool,
 }
 
 /// Promise internal state.

@@ -259,6 +259,12 @@ pub enum Op {
     /// Pop a base value and throw TypeError if it is null/undefined
     /// (RequireObjectCoercible, run before a computed key's ToPropertyKey).
     RequireCoercible,
+    /// Peek the top of stack and throw TypeError unless it is an Object —
+    /// the iterator protocol's "result must be an Object" check.
+    RequireIterResult,
+    /// Mark the most recently pushed try-handler as a `yield*` delegation
+    /// handler (see `TryHandler::delegation`).
+    MarkDelegationHandler,
 
     // ---- private class elements ----
     /// Brand-checked private METHOD/ACCESSOR read: `[obj] -> [value]`. The

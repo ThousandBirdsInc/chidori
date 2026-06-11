@@ -603,13 +603,35 @@ impl<'a> Parser<'a> {
                             continue;
                         }
                         ClassAtom::Class(item) => {
-                            // e.g. `[a-\d]` — treat '-' literally.
+                            // `[a-\d]`: a class escape cannot bound a range.
+                            // Under the u/v flags that is a SyntaxError; the
+                            // legacy (Annex B) behavior treats '-' literally.
+                            if self.unicode {
+                                return Err(
+                                    "Invalid character class range (a class escape cannot \
+                                     be a range bound)"
+                                        .to_string(),
+                                );
+                            }
                             items.push(ClassItem::Char(lo_c));
                             items.push(ClassItem::Char('-'));
                             items.push(item);
                             continue;
                         }
                     }
+                }
+            }
+            // `[\d-z]`: a class escape on the LEFT of a range is likewise a
+            // SyntaxError under u/v (legacy treats the '-' literally).
+            if let ClassAtom::Class(_) = &lo {
+                if self.unicode
+                    && self.peek() == Some('-')
+                    && self.src.get(self.pos + 1).copied() != Some(']')
+                {
+                    return Err(
+                        "Invalid character class range (a class escape cannot be a range bound)"
+                            .to_string(),
+                    );
                 }
             }
             match lo {

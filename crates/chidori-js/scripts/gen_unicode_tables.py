@@ -105,6 +105,28 @@ def aliases_for(groups, *canonical_names):
     return out
 
 
+def load_property_alias_names():
+    """PropertyAliases.txt as EXACT spellings: list of lists (one per line)."""
+    groups = []
+    with open(os.path.join(UCD, "PropertyAliases.txt"), encoding="utf-8") as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            groups.append([p.strip() for p in line.split(";")])
+    return groups
+
+
+def exact_aliases_for(name_groups, *canonical_names):
+    """All EXACT alias spellings for whichever group contains any name."""
+    targets = {loose(n) for n in canonical_names}
+    out = set(canonical_names)
+    for names in name_groups:
+        if {loose(n) for n in names} & targets:
+            out |= set(names)
+    return out
+
+
 def load_value_aliases(prop):
     """For property `prop` (e.g. 'gc', 'sc'), map loose(alias) -> short value
     name, and short -> list of all aliases."""
@@ -280,54 +302,81 @@ def build():
         add_slice("SP_" + val.upper(), ranges)
 
     # ---------------------------------------------------------------------
-    # Build KEYS: loose-key -> slice index.
+    # Build KEYS: EXACT key -> slice index. ECMA-262 uses STRICT matching
+    # (no UAX44-LM3 loose matching): only the exact spellings listed in
+    # PropertyAliases.txt / PropertyValueAliases.txt are valid, the property
+    # set is the spec's fixed tables (table-nonbinary-unicode-properties and
+    # table-binary-unicode-properties), lone names must be a General_Category
+    # value or a listed binary property (NOT a script), and anything else is
+    # a SyntaxError.
     # ---------------------------------------------------------------------
-    keys = {}  # loose key -> slice ident
+    name_groups = load_property_alias_names()
+    keys = {}  # exact key -> slice ident
 
-    # gc: bare value names + gc=Value + General_Category=Value, all aliases.
-    gc_prop_aliases = aliases_for(prop_groups, "gc", "General_Category")
+    # ECMA-262 table-binary-unicode-properties (canonical names; their exact
+    # aliases come from PropertyAliases.txt). UCD binary properties NOT in
+    # this list (Hyphen, Other_*, Grapheme_Link, ...) are SyntaxErrors.
+    ES_BINARY = {
+        "ASCII_Hex_Digit", "Alphabetic", "Bidi_Control", "Bidi_Mirrored",
+        "Case_Ignorable", "Cased", "Changes_When_Casefolded",
+        "Changes_When_Casemapped", "Changes_When_Lowercased",
+        "Changes_When_NFKC_Casefolded", "Changes_When_Titlecased",
+        "Changes_When_Uppercased", "Dash", "Default_Ignorable_Code_Point",
+        "Deprecated", "Diacritic", "Emoji", "Emoji_Component",
+        "Emoji_Modifier", "Emoji_Modifier_Base", "Emoji_Presentation",
+        "Extended_Pictographic", "Extender", "Grapheme_Base",
+        "Grapheme_Extend", "Hex_Digit", "ID_Continue", "ID_Start",
+        "IDS_Binary_Operator", "IDS_Trinary_Operator", "Ideographic",
+        "Join_Control", "Logical_Order_Exception", "Lowercase", "Math",
+        "Noncharacter_Code_Point", "Pattern_Syntax", "Pattern_White_Space",
+        "Quotation_Mark", "Radical", "Regional_Indicator",
+        "Sentence_Terminal", "Soft_Dotted", "Terminal_Punctuation",
+        "Unified_Ideograph", "Uppercase", "Variation_Selector",
+        "White_Space", "XID_Continue", "XID_Start",
+    }
+
+    def exact_value_aliases(short2aliases, val):
+        aliases = set(short2aliases.get(val, [val]))
+        aliases.add(val)
+        return aliases
+
+    # gc: bare value aliases + gc=Value / General_Category=Value (exact).
+    gc_prop_names = exact_aliases_for(name_groups, "gc", "General_Category")
     for val in gc:
         ident = "GC_" + val.upper()
-        aliases = set(gc_short2aliases.get(val, [val]))
-        aliases.add(val)
-        for al in aliases:
-            lk = loose(al)
-            keys[lk] = ident                         # bare \p{Lu}, \p{Letter}
-            for pa in gc_prop_aliases:               # \p{gc=Lu}, \p{General_Category=Lu}
-                keys[pa + "=" + lk] = ident
+        for al in exact_value_aliases(gc_short2aliases, val):
+            keys[al] = ident                         # bare \p{Lu}, \p{Letter}
+            for pa in gc_prop_names:                 # \p{gc=Lu}, \p{General_Category=Lu}
+                keys[pa + "=" + al] = ident
 
-    # sc: bare + sc=Value + Script=Value.
-    sc_prop_aliases = aliases_for(prop_groups, "sc", "Script")
+    # sc: Script=Value only — a LONE script name is a SyntaxError in ECMA-262
+    # (LoneUnicodePropertyNameOrValue covers gc values + binary props only).
+    sc_prop_names = exact_aliases_for(name_groups, "sc", "Script")
     for val in sc:
         ident = "SC_" + re.sub(r"[^A-Za-z0-9]", "_", val).upper()
-        aliases = set(sc_short2aliases.get(val, [val]))
-        aliases.add(val)
-        for al in aliases:
-            lk = loose(al)
-            keys[lk] = ident                         # bare \p{Greek} (UTS#18)
-            for pa in sc_prop_aliases:
-                keys[pa + "=" + lk] = ident
+        for al in exact_value_aliases(sc_short2aliases, val):
+            for pa in sc_prop_names:
+                keys[pa + "=" + al] = ident
 
-    # scx: only Script_Extensions=Value (NOT bare). Uses sc value aliases.
-    scx_prop_aliases = aliases_for(prop_groups, "scx", "Script_Extensions")
+    # scx: Script_Extensions=Value only. Uses sc value aliases.
+    scx_prop_names = exact_aliases_for(name_groups, "scx", "Script_Extensions")
     for val in scx:
         ident = "SCX_" + re.sub(r"[^A-Za-z0-9]", "_", val).upper()
-        aliases = set(sc_short2aliases.get(val, [val]))
-        aliases.add(val)
-        for al in aliases:
-            lk = loose(al)
-            for pa in scx_prop_aliases:
-                keys[pa + "=" + lk] = ident
+        for al in exact_value_aliases(sc_short2aliases, val):
+            for pa in scx_prop_names:
+                keys[pa + "=" + al] = ident
 
-    # binary: bare name, every property-name alias.
+    # binary: bare exact aliases, restricted to the ES table.
     for prop in binary:
+        if prop not in ES_BINARY:
+            continue
         ident = "BIN_" + re.sub(r"[^A-Za-z0-9]", "_", prop).upper()
-        for lk in aliases_for(prop_groups, prop):
-            keys[lk] = ident
+        for al in exact_aliases_for(name_groups, prop):
+            keys[al] = ident
 
-    # specials: bare names.
+    # specials: bare exact names (ECMA-262 lists Any/ASCII/Assigned).
     for val in specials:
-        keys[loose(val)] = "SP_" + val.upper()
+        keys[val] = "SP_" + val.upper()
 
     return slices, keys
 
@@ -347,8 +396,8 @@ def emit(slices, keys):
         lines.append(f"static {name}: &[(u32, u32)] = &[{body}];")
     lines.append("")
 
-    # KEYS sorted by loose key.
-    lines.append("/// (normalized-key, ranges), sorted by key for binary search.")
+    # KEYS sorted by exact key.
+    lines.append("/// (exact key, ranges), sorted by key for binary search (strict matching).")
     lines.append("static KEYS: &[(&str, &[(u32, u32)])] = &[")
     for key in sorted(keys):
         ident = keys[key]
@@ -357,26 +406,15 @@ def emit(slices, keys):
     lines.append("];")
     lines.append("")
 
-    lines.append(r'''/// Loose-match (UAX44-LM3) a key: lowercase, drop `_`, `-`, and whitespace.
-fn normalize(s: &str) -> String {
-    s.chars()
-        .filter(|c| !matches!(c, '_' | '-' | ' ' | '\t' | '\n' | '\r'))
-        .flat_map(|c| c.to_lowercase())
-        .collect()
-}
-
-/// Resolve a RegExp `\p{...}` property name (the brace contents) to its
-/// code-point ranges. Accepts bare values (gc value, script, binary property)
-/// and `Property=Value` forms. Returns `None` for unknown names.
+    lines.append(r'''/// Resolve a RegExp `\p{...}` property name (the brace contents) to its
+/// code-point ranges. ECMA-262 uses STRICT matching: only the exact alias
+/// spellings from the UCD alias tables are valid (no case folding, no
+/// inserted/removed separators — UAX44-LM3 loose matching is a SyntaxError),
+/// lone names must be a General_Category value or a spec-listed binary
+/// property, and scripts require the `Script=` / `Script_Extensions=` form.
+/// Returns `None` for anything else.
 pub fn lookup(name: &str) -> Option<&'static [(u32, u32)]> {
-    let key = if let Some(eq) = name.find('=') {
-        let (prop, val) = name.split_at(eq);
-        let val = &val[1..];
-        format!("{}={}", normalize(prop), normalize(val))
-    } else {
-        normalize(name)
-    };
-    KEYS.binary_search_by(|(k, _)| k.cmp(&key.as_str()))
+    KEYS.binary_search_by(|(k, _)| (*k).cmp(name))
         .ok()
         .map(|i| KEYS[i].1)
 }

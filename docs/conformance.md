@@ -34,7 +34,7 @@ The runner prints, e.g.:
 
 ```
 Test262 (chidori pure-Rust engine, bare context)
-  pass 37445  fail 2352  skip 7494  =>  94.09% of executed
+  pass 37618  fail 2179  skip 7494  =>  94.52% of executed
 ```
 
 ## Current result
@@ -44,7 +44,7 @@ pinned suite commit:
 
 | | pass | fail | skip | % of executed |
 |---|---|---|---|---|
-| chidori pure-Rust engine, bare context | 37,445 | 2,352 | 7,494 | **94.09%** |
+| chidori pure-Rust engine, bare context | 37,618 | 2,179 | 7,494 | **94.52%** |
 
 The headline percentage is `pass / (pass + fail)` over *executed* tests; the
 skip count is reported alongside so the denominator is never hidden.
@@ -134,18 +134,18 @@ a single readable line in review).
 
 ## Remaining gaps
 
-The residual failures, by area (top clusters of the 2,352 total):
+The residual failures, by area (top clusters of the 2,179 total):
 
 | count | area | nature |
 |--:|---|---|
-| 488 | `language/statements` | class field/accessor corners, derived-ctor `this`-TDZ, `for`-loop scope |
-| 467 | `language/expressions` | class element corners, async-generator ordering, `super` edge cases |
+| 447 | `language/statements` | class field/accessor corners, derived-ctor `this`-TDZ, `for`-loop scope |
+| 405 | `language/expressions` | class element corners, `yield*` return-delegation, `super` edge cases |
 | 194 | `language/eval-code` | direct `eval` does not see the caller's scope (declares into the global) |
-| 157 | `built-ins/RegExp` | incomplete Unicode `\p{…}` property tables; `v`-flag |
 | 150 | `built-ins/Array` | species/proxy interplay, length-boundary semantics |
+| 102 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings); `v`-flag; `prototype` long tail |
 | 96 | `built-ins/TypedArray` | resizable-`ArrayBuffer` / out-of-bounds tracking |
 | 69 | `built-ins/String` | `normalize`, Unicode/surrogate edge cases |
-| 55 | `built-ins/Promise` | spec-detailed async ordering combinations |
+| 53 | `built-ins/Promise` | spec-detailed async ordering combinations |
 | 51 | `language/module-code` | TLA ordering, cyclic-graph corner cases |
 
 Each failure is individually identifiable from a `--json` report, so the

@@ -190,7 +190,7 @@ The dispatch logic also needs decoupling from `TypeScriptVmRuntime` (today
 reference it). ~Medium.
 
 ### G5 — Conformance bar
-94.09% of executed Test262 today (37,445 pass / 2,352 fail / 7,494 skip; full
+94.52% of executed Test262 today (37,618 pass / 2,179 fail / 7,494 skip; full
 language + built-ins, rust engine, 2026-06-11 — was 91.69% on 2026-06-04; the
 2026-06-11 iterations added dynamic `import()` (host-hook loader, +~250),
 once-resolved `with`-scope references incl. closures capturing the with chain
@@ -200,7 +200,10 @@ brand model with lexically resolved class-unique private names (+~90),
 constructor return-override via `super()`, a real Module Namespace exotic
 object, generic `RegExp[@@split]`, spec `Promise.prototype.finally`, and
 strict-mode `delete` TypeErrors — see `docs/conformance.md` for the current
-cluster table). Agree on a
+cluster table; a third 2026-06-11 iteration added spec-ordered destructuring
+assignment with abrupt-step [[Done]] latching, `yield*` sent-value forwarding +
+`throw` delegation, and strict ECMA-262 `\p{…}` property matching with exact
+UCD spellings). Agree on a
 target (e.g. ≥95% language + built-ins) before removal so we don't silently regress
 real agents. Progress + highest-impact remaining gaps:
 - **Non-local completion + iterator close — largely DONE.** Via a Frame

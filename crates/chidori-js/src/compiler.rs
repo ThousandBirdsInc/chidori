@@ -1481,6 +1481,12 @@ impl Compiler {
     fn emit_iter_step_tracked(&mut self, itc: u32, done_cell: u32) {
         self.emit(Op::LoadCell(done_cell));
         let jskip = self.emit(Op::JumpIfTrue(0)); // already done -> undefined
+                                                  // Latch done=true BEFORE stepping: an abrupt completion from next(),
+                                                  // the `done` getter, or the `value` getter sets [[Done]] (spec
+                                                  // IteratorStepValue), so the enclosing close handler must NOT call
+                                                  // `return()`. The latch is cleared only once a value is extracted.
+        self.emit(Op::LoadTrue);
+        self.emit(Op::StoreCell(done_cell));
         self.emit(Op::LoadCell(itc));
         self.emit(Op::IteratorNext); // [iter, result]
         self.emit(Op::Swap);
@@ -1491,13 +1497,13 @@ impl Compiler {
         let jdone = self.emit(Op::JumpIfTrue(0));
         let vk = self.str_const("value");
         self.emit(Op::GetProp(vk)); // [value]
+        self.emit(Op::LoadFalse);
+        self.emit(Op::StoreCell(done_cell)); // normal step: un-latch
         let jhave = self.emit(Op::Jump(0));
-        // result.done: latch done_cell, drop result, push undefined.
+        // result.done: done_cell stays latched, drop result, push undefined.
         let donelbl = self.here();
         self.patch_jump(jdone, donelbl);
         self.emit(Op::Pop);
-        self.emit(Op::LoadTrue);
-        self.emit(Op::StoreCell(done_cell));
         self.emit(Op::LoadUndefined);
         let jhave2 = self.emit(Op::Jump(0));
         // done_cell already true: push undefined.
@@ -3235,10 +3241,17 @@ impl Compiler {
 
     fn compile_yield(&mut self, y: &YieldExpression) -> R {
         if y.delegate {
-            // yield* expr  — desugar to a loop yielding each value. In an async
+            // yield* expr — desugar to the spec's delegation loop. In an async
             // generator the delegate uses the *async* iterator protocol: the
             // iterator comes from @@asyncIterator (GetAsyncIterator) and each
-            // `next()` result is Awaited before its `done`/`value` are read.
+            // step result is Awaited before its `done`/`value` are read.
+            //
+            // The loop forwards the value SENT into the outer generator to the
+            // inner iterator's `next(sent)` (exactly one argument), checks each
+            // step result is an Object, and delegates a `.throw()` resumption
+            // to the inner iterator's `throw` method (closing the inner
+            // iterator with a TypeError when it has none). `.return()`
+            // delegation (running the inner `return`) is not yet modeled.
             let is_async = self.cur().kind.is_async();
             self.compile_expr(y.argument.as_ref().unwrap())?;
             if is_async {
@@ -3248,27 +3261,81 @@ impl Compiler {
             }
             let iter_cell = self.temp();
             self.emit(Op::InitCell(iter_cell));
-            let top = self.here();
+            let sent_cell = self.temp();
+            self.emit(Op::LoadUndefined);
+            self.emit(Op::InitCell(sent_cell));
+            let next_k = self.str_const("next");
+            let done_k = self.str_const("done");
+            let value_k = self.str_const("value");
+
+            // -- next_call: result = inner.next(sent) --
+            let next_call = self.here();
             self.emit(Op::LoadCell(iter_cell));
-            self.emit(Op::IteratorNext);
-            self.emit(Op::Swap);
-            self.emit(Op::Pop); // [result]
+            self.emit(Op::Dup);
+            self.emit(Op::GetProp(next_k)); // [iter, next]
+            self.emit(Op::Swap); // [next, iter]
+            self.emit(Op::LoadCell(sent_cell)); // [next, iter, sent]
+            self.emit(Op::Call(1)); // [result]
+
+            // -- have_result: (async: Await) -> object check -> done? --
+            let have_result = self.here();
             if is_async {
                 self.emit(Op::Await); // result is a promise of { value, done }
             }
+            self.emit(Op::RequireIterResult);
             self.emit(Op::Dup);
-            let done_k = self.str_const("done");
             self.emit(Op::GetProp(done_k));
             let jt = self.emit(Op::JumpIfTrue(0)); // [result]
-            let value_k = self.str_const("value");
-            self.emit(Op::GetProp(value_k));
-            self.emit(Op::Yield);
-            self.emit(Op::Pop); // discard sent value
-            self.emit(Op::Jump(top));
+            self.emit(Op::GetProp(value_k)); // [value]
+                                             // Yield inside a catch-only region: a `.throw(e)` resumption lands
+                                             // in the delegation handler below instead of unwinding.
+            let push_h = self.emit(Op::PushTryHandler {
+                catch: u32::MAX,
+                finally: u32::MAX,
+            });
+            self.emit(Op::MarkDelegationHandler);
+            self.cur().handler_depth += 1;
+            self.emit(Op::Yield); // [sent']
+            self.emit(Op::StoreCell(sent_cell));
+            self.emit(Op::PopTryHandler);
+            self.cur().handler_depth -= 1;
+            self.emit(Op::Jump(next_call));
+
+            // -- catch: delegate the thrown value to inner.throw(e) --
+            let catch_lbl = self.here();
+            self.patch_jump(push_h, catch_lbl); // [e]
+            let e_cell = self.temp();
+            self.emit(Op::InitCell(e_cell));
+            let thr_cell = self.temp();
+            self.emit(Op::LoadCell(iter_cell));
+            let throw_k = self.str_const("throw");
+            self.emit(Op::GetProp(throw_k));
+            self.emit(Op::InitCell(thr_cell));
+            self.emit(Op::LoadCell(thr_cell));
+            let jno_throw = self.emit(Op::JumpIfNullish(0)); // [thr] (peek)
+            self.emit(Op::Pop);
+            self.emit(Op::LoadCell(thr_cell));
+            self.emit(Op::LoadCell(iter_cell));
+            self.emit(Op::LoadCell(e_cell)); // [thr, iter, e]
+            self.emit(Op::Call(1)); // [result]
+            self.emit(Op::Jump(have_result));
+            // No `throw` method: close the inner iterator, then TypeError.
+            let no_throw = self.here();
+            self.patch_jump(jno_throw, no_throw);
+            self.emit(Op::Pop); // drop the nullish `throw`
+            self.emit(Op::LoadCell(iter_cell));
+            self.emit(Op::IteratorClose);
+            let tk = self.str_const("TypeError");
+            self.emit(Op::LoadGlobal(tk));
+            let mk = self.str_const("The iterator does not provide a 'throw' method");
+            self.emit(Op::LoadConst(mk));
+            self.emit(Op::New(1));
+            self.emit(Op::Throw);
+
+            // -- end: result of yield* = final result.value --
             let end = self.here();
             self.patch_jump(jt, end);
-            let value_k2 = self.str_const("value");
-            self.emit(Op::GetProp(value_k2)); // result of yield* = final value
+            self.emit(Op::GetProp(value_k)); // [result.value]
         } else {
             if let Some(arg) = &y.argument {
                 self.compile_expr(arg)?;
@@ -3592,19 +3659,58 @@ impl Compiler {
                 self.cur().handler_depth += 1;
                 self.cur().finally_depth += 1;
                 for el in &arr.elements {
-                    self.emit_iter_step_tracked(itc, done_cell); // [value]
                     match el {
-                        Some(maybe) => self.assign_maybe_default(maybe)?, // consumes value
+                        Some(maybe) => self.assign_element_ordered(maybe, itc, done_cell)?,
                         None => {
+                            self.emit_iter_step_tracked(itc, done_cell); // [value]
                             self.emit(Op::Pop); // elision
                         }
                     }
                 }
                 if let Some(rest) = &arr.rest {
+                    // A member-expression rest target's REFERENCE is evaluated
+                    // BEFORE the collection loop (spec AssignmentRestElement
+                    // step 1), so a throw there closes the iterator with no
+                    // further next() calls.
+                    enum RestPre {
+                        Static(u32, u32),     // (t_obj, key const)
+                        Computed(u32, u32),   // (t_obj, t_key)
+                        Private(u32, String), // (t_obj, name)
+                        Plain,
+                    }
+                    let pre = match &rest.target {
+                        AssignmentTarget::StaticMemberExpression(sm) => {
+                            let t_obj = self.temp();
+                            self.compile_expr(&sm.object)?;
+                            self.emit(Op::InitCell(t_obj));
+                            let k = self.str_const(sm.property.name.as_str());
+                            RestPre::Static(t_obj, k)
+                        }
+                        AssignmentTarget::ComputedMemberExpression(cm) => {
+                            let t_obj = self.temp();
+                            let t_key = self.temp();
+                            self.compile_expr(&cm.object)?;
+                            self.emit(Op::InitCell(t_obj));
+                            self.compile_expr(&cm.expression)?;
+                            self.emit(Op::InitCell(t_key));
+                            RestPre::Computed(t_obj, t_key)
+                        }
+                        AssignmentTarget::PrivateFieldExpression(pm) => {
+                            let t_obj = self.temp();
+                            self.compile_expr(&pm.object)?;
+                            self.emit(Op::InitCell(t_obj));
+                            RestPre::Private(t_obj, pm.field.name.as_str().to_string())
+                        }
+                        _ => RestPre::Plain,
+                    };
                     self.emit(Op::NewArray(0)); // [arr]
                     let top = self.here();
                     self.emit(Op::LoadCell(done_cell));
                     let jdone_rest = self.emit(Op::JumpIfTrue(0));
+                    // Latch done before stepping (abrupt next/done/value sets
+                    // [[Done]] — see emit_iter_step_tracked).
+                    self.emit(Op::LoadTrue);
+                    self.emit(Op::StoreCell(done_cell));
                     self.emit(Op::LoadCell(itc));
                     self.emit(Op::IteratorNext); // [arr, iter, result]
                     self.emit(Op::Swap);
@@ -3615,6 +3721,8 @@ impl Compiler {
                     let jend = self.emit(Op::JumpIfTrue(0));
                     let vk = self.str_const("value");
                     self.emit(Op::GetProp(vk)); // [arr, value]
+                    self.emit(Op::LoadFalse);
+                    self.emit(Op::StoreCell(done_cell)); // normal step: un-latch
                     let tv = self.temp();
                     self.emit(Op::InitCell(tv)); // [arr]
                     self.array_push_value(|c| {
@@ -3624,15 +3732,42 @@ impl Compiler {
                     self.emit(Op::Jump(top));
                     let end = self.here();
                     self.patch_jump(jend, end);
-                    self.emit(Op::Pop); // drop result -> [arr]
-                    self.emit(Op::LoadTrue);
-                    self.emit(Op::StoreCell(done_cell));
+                    self.emit(Op::Pop); // drop result -> [arr] (done stays latched)
                     let jafter = self.emit(Op::Jump(0));
                     let drest = self.here();
                     self.patch_jump(jdone_rest, drest);
                     let after_rest = self.here();
                     self.patch_jump(jafter, after_rest);
-                    self.assign_target(&rest.target)?; // consumes arr
+                    match pre {
+                        RestPre::Static(t_obj, k) => {
+                            let t_val = self.temp();
+                            self.emit(Op::InitCell(t_val)); // pops arr
+                            self.emit(Op::LoadCell(t_obj));
+                            self.emit(Op::LoadCell(t_val));
+                            self.emit(Op::SetProp(k));
+                            self.emit(Op::Pop);
+                        }
+                        RestPre::Computed(t_obj, t_key) => {
+                            let t_val = self.temp();
+                            self.emit(Op::InitCell(t_val));
+                            self.emit(Op::LoadCell(t_obj));
+                            self.emit(Op::LoadCell(t_key));
+                            self.emit(Op::LoadCell(t_val));
+                            self.emit(Op::SetPropDynamic);
+                            self.emit(Op::Pop);
+                        }
+                        RestPre::Private(t_obj, name) => {
+                            let t_val = self.temp();
+                            self.emit(Op::InitCell(t_val));
+                            self.emit(Op::LoadCell(t_obj));
+                            self.emit(Op::LoadCell(t_val));
+                            self.emit_private_set_op(&name);
+                            self.emit(Op::Pop);
+                        }
+                        RestPre::Plain => {
+                            self.assign_target(&rest.target)?; // consumes arr
+                        }
+                    }
                 }
                 self.emit(Op::PopTryHandler);
                 self.cur().handler_depth -= 1;
@@ -3700,6 +3835,94 @@ impl Compiler {
                 self.emit(Op::Pop);
             }
             _ => return Err("unsupported destructuring target".into()),
+        }
+        Ok(())
+    }
+
+    /// One array-destructuring-assignment element, in spec order
+    /// (IteratorDestructuringAssignmentEvaluation, AssignmentElement): a
+    /// member-expression target's REFERENCE (its object/key expressions) is
+    /// evaluated BEFORE the iterator is stepped — so a throw there closes the
+    /// iterator without `next()` ever running — and the write happens after
+    /// the (possibly defaulted) value is computed.
+    fn assign_element_ordered(
+        &mut self,
+        m: &AssignmentTargetMaybeDefault,
+        itc: u32,
+        done_cell: u32,
+    ) -> R {
+        let (target, init): (&AssignmentTarget, Option<&Expression>) = match m {
+            AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
+                (&d.binding, Some(&d.init))
+            }
+            _ => match m.as_assignment_target() {
+                Some(t) => (t, None),
+                None => return Err("unsupported destructuring element".into()),
+            },
+        };
+        // `[value]` -> `[value-or-default]`.
+        let apply_default = |c: &mut Self, init: Option<&Expression>| -> R {
+            if let Some(init) = init {
+                c.emit(Op::Dup);
+                c.emit(Op::LoadUndefined);
+                c.emit(Op::StrictEq);
+                let jf = c.emit(Op::JumpIfFalse(0));
+                c.emit(Op::Pop);
+                c.compile_expr(init)?;
+                let t = c.here();
+                c.patch_jump(jf, t);
+            }
+            Ok(())
+        };
+        match target {
+            AssignmentTarget::StaticMemberExpression(sm) => {
+                let t_obj = self.temp();
+                self.compile_expr(&sm.object)?;
+                self.emit(Op::InitCell(t_obj));
+                self.emit_iter_step_tracked(itc, done_cell); // [value]
+                apply_default(self, init)?;
+                let t_val = self.temp();
+                self.emit(Op::InitCell(t_val));
+                self.emit(Op::LoadCell(t_obj));
+                self.emit(Op::LoadCell(t_val));
+                let k = self.str_const(sm.property.name.as_str());
+                self.emit(Op::SetProp(k));
+                self.emit(Op::Pop);
+            }
+            AssignmentTarget::ComputedMemberExpression(cm) => {
+                let t_obj = self.temp();
+                let t_key = self.temp();
+                self.compile_expr(&cm.object)?;
+                self.emit(Op::InitCell(t_obj));
+                self.compile_expr(&cm.expression)?;
+                self.emit(Op::InitCell(t_key));
+                self.emit_iter_step_tracked(itc, done_cell); // [value]
+                apply_default(self, init)?;
+                let t_val = self.temp();
+                self.emit(Op::InitCell(t_val));
+                self.emit(Op::LoadCell(t_obj));
+                self.emit(Op::LoadCell(t_key));
+                self.emit(Op::LoadCell(t_val));
+                self.emit(Op::SetPropDynamic);
+                self.emit(Op::Pop);
+            }
+            AssignmentTarget::PrivateFieldExpression(pm) => {
+                let t_obj = self.temp();
+                self.compile_expr(&pm.object)?;
+                self.emit(Op::InitCell(t_obj));
+                self.emit_iter_step_tracked(itc, done_cell); // [value]
+                apply_default(self, init)?;
+                let t_val = self.temp();
+                self.emit(Op::InitCell(t_val));
+                self.emit(Op::LoadCell(t_obj));
+                self.emit(Op::LoadCell(t_val));
+                self.emit_private_set_op(pm.field.name.as_str());
+                self.emit(Op::Pop);
+            }
+            _ => {
+                self.emit_iter_step_tracked(itc, done_cell); // [value]
+                self.assign_maybe_default(m)?;
+            }
         }
         Ok(())
     }
