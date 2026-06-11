@@ -1,4 +1,4 @@
-//! Test262 conformance runner for chidori's embedded QuickJS runtime.
+//! Test262 conformance runner for chidori's pure-Rust JavaScript engine.
 //!
 //! Test262 is the official TC39 ECMAScript conformance suite. It is the one
 //! test corpus that both Bun (JavaScriptCore) and Node (V8) publish numbers
@@ -24,11 +24,12 @@ use std::process::ExitCode;
 use serde::Deserialize;
 
 const USAGE: &str = "\
-test262-runner — run Test262 against chidori's embedded QuickJS runtime
+test262-runner — run Test262 against chidori's pure-Rust JS engine
 
 usage:
   test262-runner [--test262 <dir>] [--filter <substr>] [--max <n>]
-                 [--json <out>] [--verbose] [--no-modules] [--intl] [paths...]
+                 [--json <out>] [--state <file>] [--baseline <file>]
+                 [--verbose] [--no-modules] [--intl] [paths...]
 
 options:
   --test262 <dir>   Test262 root (else $TEST262_DIR, else vendor/test262)
@@ -39,6 +40,9 @@ options:
   --state <file>    persist per-test results; a run updates only the tests it
                     executes, then prints the whole-suite total from the store
                     (so targeted re-runs refresh global stats without a full run)
+  --baseline <file> gate against committed expectations: exit non-zero only on
+                    a regression (a baseline `pass` that now fails), not merely
+                    because some tests fail. Used by CI as a conformance gate.
   --verbose, -v     print each failure with the thrown message
   --no-modules      skip module-flag tests (they run by default)
   --intl            also run intl402 tests
@@ -163,6 +167,11 @@ struct Args {
     /// whole-suite total from the merged store — so a targeted re-run (e.g. one
     /// directory) refreshes the global stats without re-running everything.
     state: Option<PathBuf>,
+    /// Committed expectations to gate against. When set, the process exits
+    /// non-zero only on a REGRESSION (a test the baseline records as `pass`
+    /// that now fails or is gone), not merely because some tests fail. This is
+    /// what makes the runner usable as a CI conformance gate.
+    baseline: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -227,6 +236,10 @@ fn run() -> ExitCode {
     // This run overwrites only the entries for the tests it executes.
     let mut state: Option<std::collections::BTreeMap<String, String>> =
         args.state.as_ref().map(|p| load_state(p));
+
+    // This run's per-test results, always recorded so `--baseline` can diff
+    // against committed expectations regardless of `--state`.
+    let mut current: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 
     for file in &files {
         let rel = file
@@ -298,6 +311,7 @@ fn run() -> ExitCode {
         if let Some(state) = state.as_mut() {
             state.insert(rel.clone(), status.to_string());
         }
+        current.insert(rel.clone(), status.to_string());
 
         if args.json.is_some() {
             report.push(serde_json::json!({
@@ -324,7 +338,7 @@ fn run() -> ExitCode {
         0.0
     };
     println!(
-        "\nTest262 (chidori/QuickJS bare context)\n  pass {}  fail {}  skip {}  =>  {:.2}% of executed",
+        "\nTest262 (chidori pure-Rust engine, bare context)\n  pass {}  fail {}  skip {}  =>  {:.2}% of executed",
         tally.pass, tally.fail, tally.skip, pct
     );
 
@@ -369,6 +383,59 @@ fn run() -> ExitCode {
         } else {
             println!("  report: {}", path.display());
         }
+    }
+
+    // Baseline gate: when committed expectations are supplied, the exit code
+    // reflects REGRESSIONS against them rather than the raw fail count, so the
+    // job is green as long as no previously-passing test broke.
+    if let Some(path) = &args.baseline {
+        let expected = load_state(path);
+        if expected.is_empty() {
+            eprintln!(
+                "error: baseline {} is missing or has no results; cannot gate.\n\
+                 Regenerate it with `scripts/test262.sh --update-baseline`.",
+                path.display()
+            );
+            return ExitCode::from(2);
+        }
+
+        let mut regressions: Vec<(String, String)> = Vec::new(); // pass -> not-pass
+        let mut new_failures: Vec<String> = Vec::new(); // failing, absent from baseline
+        let mut progressions = 0u64; // fail -> pass (baseline can be refreshed)
+        for (rel, got) in &current {
+            match expected.get(rel).map(String::as_str) {
+                Some("pass") if got != "pass" => regressions.push((rel.clone(), got.clone())),
+                Some("fail") if got == "pass" => progressions += 1,
+                None if got == "fail" => new_failures.push(rel.clone()),
+                _ => {}
+            }
+        }
+
+        println!(
+            "\nBaseline gate ({}):\n  regressions {}  new failures {}  progressions {}",
+            path.display(),
+            regressions.len(),
+            new_failures.len(),
+            progressions
+        );
+        for (rel, got) in regressions.iter().take(50) {
+            println!("  REGRESSED {rel}  (baseline pass -> {got})");
+        }
+        for rel in new_failures.iter().take(50) {
+            println!("  NEW FAIL  {rel}  (not in baseline)");
+        }
+        if progressions > 0 {
+            println!(
+                "  note: {progressions} test(s) now pass that the baseline marks as failing.\n\
+                 Refresh with `scripts/test262.sh --update-baseline` to lock the gains in."
+            );
+        }
+
+        return if regressions.is_empty() && new_failures.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        };
     }
 
     if tally.fail > 0 {
@@ -1016,6 +1083,7 @@ fn parse_args() -> Result<Args, String> {
     let mut max = None;
     let mut json = None;
     let mut state = None;
+    let mut baseline = None;
     let mut verbose = false;
     let mut modules = true;
     let mut intl = false;
@@ -1042,6 +1110,9 @@ fn parse_args() -> Result<Args, String> {
                 let _ = it.next().ok_or("--engine needs a value")?;
             }
             "--state" => state = Some(PathBuf::from(it.next().ok_or("--state needs a value")?)),
+            "--baseline" => {
+                baseline = Some(PathBuf::from(it.next().ok_or("--baseline needs a value")?))
+            }
             "--verbose" | "-v" => verbose = true,
             "--modules" => modules = true,
             "--no-modules" => modules = false,
@@ -1071,5 +1142,6 @@ fn parse_args() -> Result<Args, String> {
         modules,
         intl,
         state,
+        baseline,
     })
 }

@@ -1,0 +1,40 @@
+name: Test262 conformance
+
+# Guards the pure-Rust JS engine (now the sole engine) against conformance
+# regressions. The gate fails only when a test the committed baseline records
+# as passing starts failing — newly fixed tests never break the build, they
+# just print a hint to refresh the baseline.
+on:
+  pull_request:
+    paths:
+      - "crates/chidori-js/**"
+      - "crates/test262-runner/**"
+      - "scripts/test262.sh"
+      - ".github/workflows/test262.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/chidori-js/**"
+      - "crates/test262-runner/**"
+      - "scripts/test262.sh"
+      - ".github/workflows/test262.yml"
+  # Keep the headline number honest even when the engine is untouched.
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: test262-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conformance:
+    name: Test262 baseline gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Test262 against the committed baseline
+        run: scripts/test262.sh --gate
