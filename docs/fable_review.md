@@ -54,10 +54,10 @@ gate ("G5") and became **load-bearing** — a language bug in `chidori-js` now
 breaks real agents with no fallback engine. The project responded correctly:
 Test262 runs in CI against a committed per-test baseline (PRs touching the
 engine, pushes to `main`, and a nightly schedule), so the number can no
-longer rot silently. Conformance is **95.2 %** of executed tests at the
-pinned suite commit, and the largest remaining failure cluster (the derived
-`class` constructor model) is addressed by the rework on this branch (see
-below).
+longer rot silently. Conformance is **95.56 %** of executed tests at the
+pinned suite commit (38,030 pass / 1,767 fail / 7,494 skip), after the
+derived-constructor rework on this branch cleared what had been the largest
+remaining failure cluster (see below).
 
 What remains is intentional narrowness, not breakage: two LLM providers, a
 blob-style persistence layer, capability-confinement (not OS-level)
@@ -72,7 +72,7 @@ QuickJS-era architecture.
 
 | Engine | Where | Role | Status |
 |---|---|---|---|
-| `chidori-js` (pure Rust) | `crates/chidori-js` | **The** engine — agents, tools, sub-agents, Test262 | 95.2 % of executed Test262 (37,886 / 1,911 / 7,494 pass/fail/skip at the pinned commit; improving on this branch) |
+| `chidori-js` (pure Rust) | `crates/chidori-js` | **The** engine — agents, tools, sub-agents, Test262 | 95.56 % of executed Test262 (38,030 / 1,767 / 7,494 pass/fail/skip at the pinned commit) |
 
 `docs/conformance.md` describes the measurement methodology (bare-context,
 fresh VM per variant, honest skip accounting) and the CI gate
@@ -97,20 +97,20 @@ build; new passes print a baseline-refresh hint.
   `super()` inside `finally` is honored); native constructors honor
   `new.target` for the instance prototype (`Reflect.construct(Array, [],
   Other)` included); class constructors throw when invoked without `new`;
-  `extends null` and `extends Symbol` behave per spec. This clears the
-  largest single failure cluster in the baseline (~300 of the 1,911
-  remaining failures were `class`-related).
+  `extends null` and `extends Symbol` behave per spec. This cleared 144
+  baseline failures (1,911 → 1,767) with zero regressions across the full
+  suite — the bulk of what had been a ~300-test `class` cluster.
 
-### Remaining language gaps (top clusters of the baseline's 1,911 failures)
+### Remaining language gaps (top clusters of the baseline's 1,767 failures)
 
 | count | area | nature |
 |--:|---|---|
-| 414 | `language/statements` | mostly `class` (largely fixed on this branch), `await using`, `for-of` corners |
-| 370 | `language/expressions` | class elements, `super` edge cases, `delete`, `yield*` delegation |
+| 356 | `language/expressions` | class element corners, dynamic-`import()` semantics, object-literal and `super` edges |
+| 329 | `language/statements` | remaining class element corners, `using`/`await using`, `for-of` iterator-close |
 | 150 | `built-ins/Array` | species/proxy interplay, length-boundary semantics |
-| 100 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings), `v`-flag |
+| 98 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings), `v`-flag |
 | 96 | `built-ins/TypedArray` | resizable-`ArrayBuffer` out-of-bounds tracking |
-| 53 | `built-ins/Promise` | spec-detailed async ordering combinations |
+| 52 | `built-ins/Promise` | spec-detailed async ordering combinations |
 
 **Intentionally unsupported** (consistent with the deterministic replay
 contract, skipped honestly in the runner): `Intl`, `Temporal`,

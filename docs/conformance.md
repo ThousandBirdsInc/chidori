@@ -34,7 +34,7 @@ The runner prints, e.g.:
 
 ```
 Test262 (chidori pure-Rust engine, bare context)
-  pass 37618  fail 2179  skip 7494  =>  94.52% of executed
+  pass 38030  fail 1767  skip 7494  =>  95.56% of executed
 ```
 
 ## Current result
@@ -44,7 +44,7 @@ pinned suite commit:
 
 | | pass | fail | skip | % of executed |
 |---|---|---|---|---|
-| chidori pure-Rust engine, bare context | 37,618 | 2,179 | 7,494 | **94.52%** |
+| chidori pure-Rust engine, bare context | 38,030 | 1,767 | 7,494 | **95.56%** |
 
 The headline percentage is `pass / (pass + fail)` over *executed* tests; the
 skip count is reported alongside so the denominator is never hidden.
@@ -134,19 +134,25 @@ a single readable line in review).
 
 ## Remaining gaps
 
-The residual failures, by area (top clusters of the 2,179 total):
+The residual failures, by area (top clusters of the 1,767 total):
 
 | count | area | nature |
 |--:|---|---|
-| 447 | `language/statements` | class field/accessor corners, derived-ctor `this`-TDZ, `for`-loop scope |
-| 405 | `language/expressions` | class element corners, `yield*` return-delegation, `super` edge cases |
-| 194 | `language/eval-code` | direct `eval` does not see the caller's scope (declares into the global) |
+| 356 | `language/expressions` | class element corners, dynamic-`import()` semantics, object-literal and `super` edge cases |
+| 329 | `language/statements` | remaining class element corners, `using`/`await using` (explicit resource management), `for-of` iterator-close |
 | 150 | `built-ins/Array` | species/proxy interplay, length-boundary semantics |
-| 102 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings); `v`-flag; `prototype` long tail |
+| 98 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings); `v`-flag; `prototype` long tail |
 | 96 | `built-ins/TypedArray` | resizable-`ArrayBuffer` / out-of-bounds tracking |
-| 69 | `built-ins/String` | `normalize`, Unicode/surrogate edge cases |
-| 53 | `built-ins/Promise` | spec-detailed async ordering combinations |
+| 60 | `built-ins/String` | `normalize`, Unicode/surrogate edge cases |
+| 52 | `built-ins/Promise` | spec-detailed async ordering combinations |
 | 51 | `language/module-code` | TLA ordering, cyclic-graph corner cases |
+| 44 | `language/arguments-object` | mapped-arguments aliasing corners |
+
+(The derived-class construction model — `super()` as a real `Construct`,
+`this`-TDZ, builtin subclassing, `new.target`-derived prototypes, class
+constructors uncallable without `new` — landed 2026-06-11 and cleared 144
+failures, on top of the 268 cleared by the dynamic-`import()`/`with`-scope
+work the week prior.)
 
 Each failure is individually identifiable from a `--json` report, so the
 clusters can be picked off as engine work warrants. See
