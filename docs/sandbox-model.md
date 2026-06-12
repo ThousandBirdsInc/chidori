@@ -202,10 +202,10 @@ resource-precision gaps.
    `workspace:delete` / `workspace:manifest`. A restrictive profile can therefore
    deny or require approval for disk writes while still allowing reads. The
    remaining gap is the *default*: the fallback decision is still `AlwaysAllow`, so
-   an untrusted profile must opt in to deny-by-default (`"default": "never_allow"`
-   plus explicit allow rules) rather than getting it automatically. *Fix:* ship a
-   ready-made deny-by-default untrusted profile and make it the default for
-   untrusted runs.
+   out of the box nothing is denied. Deny-by-default is now one switch away — the
+   built-in [`untrusted` profile](#the-untrusted-policy-profile-deny-by-default)
+   (`CHIDORI_POLICY_PROFILE=untrusted`) — but it is opt-in, not automatic.
+   *Remaining fix:* make it the default for untrusted runs.
 
 2. **The memory ceiling is process-wide, not per-VM.** The `CountingAllocator`
    counter is global; the watchdog caps *baseline-relative* growth
@@ -246,12 +246,49 @@ resource-precision gaps.
    determinism/replay. This is a correctness-maturity caveat, not a containment
    risk.
 
+## The `untrusted` policy profile (deny-by-default)
+
+The permission policy (`src/policy.rs`) gates the powerful host effects — `http`
+and every `workspace:*` action (`workspace:list` / `read` / `write` / `delete` /
+`manifest`) — through `enforce_policy`. By default the fallback for an unmatched
+effect is `AlwaysAllow`, so out of the box nothing is denied; deny-by-default is
+something you turn on.
+
+The **`untrusted`** profile is a ready-made, deny-by-default policy you can select
+by name — no hand-written JSON. Enable it with a single environment variable:
+
+```sh
+CHIDORI_POLICY_PROFILE=untrusted chidori run agent.ts
+```
+
+Semantics:
+
+- **Fallback: `NeverAllow`.** Any gated effect with no matching allow-rule is
+  refused with `policy: \`<target>\` denied`.
+- **Allowed:** `workspace:list`, `workspace:read`, `workspace:manifest` —
+  read-only introspection of the sanitized workspace root, which mutates nothing
+  and cannot reach outside the root.
+- **Denied:** `http` (network egress) and `workspace:write` / `workspace:delete`
+  (disk mutation within the root), plus anything else that reaches the gate.
+
+The fallback governs exactly the powerful surface, because the *pure* effects
+(`log`, `template`, `memory`, `prompt`, …) never call `enforce_policy` and so run
+regardless of the profile — they have no ambient authority to abuse.
+
+Selection order in `PolicyConfig::from_env` is `CHIDORI_POLICY_FILE` →
+`CHIDORI_POLICY` (inline JSON) → `CHIDORI_POLICY_PROFILE` (a built-in name) →
+default. The **default profile is unchanged** (`AlwaysAllow` fallback, no rules):
+the `untrusted` profile is purely opt-in. To customize further, copy the profile's
+shape into your own `CHIDORI_POLICY` JSON (rules + `"default": "never_allow"`), or
+add `AskBefore` rules to surface an approval prompt instead of a hard refusal.
+
 ## How to harden for untrusted code
 
 If you intend to run code you do not trust on this engine today:
 
-1. Gate or disable `workspace.*` (gap 1) with a deny-by-default policy check (the
-   `exec*` snippet sandboxes were already removed in #39).
+1. Select the deny-by-default policy: `CHIDORI_POLICY_PROFILE=untrusted` (above).
+   This denies `http` and `workspace` mutations while leaving read-only workspace
+   introspection available.
 2. Lower `CHIDORI_JS_OP_BUDGET` and `CHIDORI_JS_MEM_CAP_MB` to fit the workload, and
    enable `CHIDORI_JS_DEADLINE_MS` (acceptable because untrusted code should not be
    making slow trusted host calls).

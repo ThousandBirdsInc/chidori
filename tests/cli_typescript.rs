@@ -420,6 +420,77 @@ fn cli_workspace_read_allowed_while_write_denied() {
 }
 
 #[test]
+fn cli_untrusted_profile_denies_workspace_write() {
+    let dir = temp_project("untrusted-workspace-write");
+    let workspace = dir.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.workspace.write("agent.ts", "export default {};", {
+                    language: "typescript",
+                });
+                return { ok: true };
+            }
+        "#,
+    )
+    .unwrap();
+
+    let output = run_chidori_with_str_env(
+        &["run", agent.to_str().unwrap(), "--input", r#"{}"#],
+        &dir,
+        &[
+            ("CHIDORI_POLICY_PROFILE", "untrusted"),
+            ("CHIDORI_WORKSPACE_ROOT", workspace.to_str().unwrap()),
+        ],
+    );
+    assert_failure(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("workspace:write") && stderr.contains("denied"),
+        "expected workspace:write denial, got stderr:\n{stderr}"
+    );
+    // The denied write must not have touched disk.
+    assert!(!workspace.join("agent.ts").exists());
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cli_untrusted_profile_allows_read_only_workspace() {
+    let dir = temp_project("untrusted-workspace-read");
+    let workspace = dir.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let agent = dir.join("agent.ts");
+    // Read-only introspection is on the untrusted allowlist, so listing must
+    // succeed even under the deny-by-default profile.
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                const files = await chidori.workspace.list({ completeOnly: true });
+                return { count: files.length };
+            }
+        "#,
+    )
+    .unwrap();
+
+    let output = run_chidori_with_str_env(
+        &["run", agent.to_str().unwrap(), "--input", r#"{}"#],
+        &dir,
+        &[
+            ("CHIDORI_POLICY_PROFILE", "untrusted"),
+            ("CHIDORI_WORKSPACE_ROOT", workspace.to_str().unwrap()),
+        ],
+    );
+    assert_success(&output);
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn cli_stream_accepts_multiline_typed_agent_signature() {
     let dir = temp_project("stream-multiline-types");
     let agent = dir.join("agent.ts");
