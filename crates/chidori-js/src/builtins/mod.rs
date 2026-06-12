@@ -408,7 +408,7 @@ fn install_globals(vm: &mut Vm) {
             Value::String(s) => s.as_str().to_string(),
             _ => return Ok(v), // non-string eval returns its argument unchanged
         };
-        match crate::compiler::compile_script(&src) {
+        match crate::compiler::compile_indirect_eval(&src) {
             Ok(proto) => {
                 let f = vm.make_closure(std::rc::Rc::new(proto), Vec::new());
                 vm.call(Value::Object(f), Value::Undefined, &[])

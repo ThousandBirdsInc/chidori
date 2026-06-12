@@ -22,6 +22,17 @@ use oxc::span::SourceType;
 use crate::bytecode::*;
 
 pub fn compile_script(src: &str) -> Result<FuncProto, String> {
+    compile_script_impl(src, false)
+}
+
+/// Compile global eval code — `(0,eval)(src)`: identical to a script except
+/// `return` is illegal and the global `var`/function bindings it creates are
+/// DELETABLE (CreateGlobalVarBinding with D=true).
+pub fn compile_indirect_eval(src: &str) -> Result<FuncProto, String> {
+    compile_script_impl(src, true)
+}
+
+fn compile_script_impl(src: &str, as_eval: bool) -> Result<FuncProto, String> {
     let allocator = Allocator::default();
     // Parse as a *script* (the JS default): sloppy unless a `"use strict"`
     // directive (or a class/`module` context) makes it strict. The conformance
@@ -59,6 +70,7 @@ pub fn compile_script(src: &str) -> Result<FuncProto, String> {
     }
     let mut c = Compiler::new();
     c.source = src.to_string();
+    c.toplevel_is_eval = as_eval;
     // A construct the lowering step rejects is, for our purposes, a syntax/early
     // error — surface it as SyntaxError so it is reported consistently.
     c.compile_toplevel(&program).map_err(|e| {
@@ -560,6 +572,9 @@ impl ClassPrivCtx {
 
 struct Compiler {
     fns: Vec<FnCtx>,
+    /// The toplevel being compiled is global EVAL code (indirect eval), not a
+    /// script: `return` is illegal and global var bindings are deletable.
+    toplevel_is_eval: bool,
     /// Enclosing `class` bodies (innermost last) for private-name resolution.
     class_privs: Vec<ClassPrivCtx>,
     /// Allocator for `ClassPrivCtx::id`.
@@ -591,6 +606,7 @@ impl Compiler {
     fn new() -> Compiler {
         Compiler {
             fns: Vec::new(),
+            toplevel_is_eval: false,
             class_privs: Vec::new(),
             next_class_id: 0,
             pending_label: None,
@@ -784,7 +800,8 @@ impl Compiler {
         match pat {
             BindingPattern::BindingIdentifier(id) if self.in_global_scope() => {
                 let n = self.str_const(id.name.as_str());
-                self.emit(Op::DeclareGlobal(n));
+                let deletable = self.cur_ref().is_eval_body;
+                self.emit(Op::DeclareGlobal { name: n, deletable });
             }
             _ => self.declare_pattern_names(pat, true),
         }
@@ -1154,6 +1171,7 @@ impl Compiler {
         fc.track_completion = true;
         fc.script_global = true;
         fc.is_toplevel = true;
+        fc.is_eval_body = self.toplevel_is_eval;
         fc.contains_eval = self.source.contains("eval");
         fc.strict = program
             .directives
@@ -1609,7 +1627,8 @@ impl Compiler {
                         // to an existing one, so establish the property first.
                         // Otherwise the strict-mode unresolvable-reference check on
                         // `StoreGlobal` would reject the install itself.
-                        self.emit(Op::DeclareGlobal(n));
+                        let deletable = self.cur_ref().is_eval_body;
+                        self.emit(Op::DeclareGlobal { name: n, deletable });
                         self.emit(Op::StoreGlobal(n));
                     }
                 }
@@ -3171,6 +3190,12 @@ impl Compiler {
                     let is_accessor = matches!(p.kind, PropertyKind::Get | PropertyKind::Set);
                     if p.computed {
                         self.compile_property_key_expr(&p.key)?; // [obj, key]
+                                                                 // ToPropertyKey NOW (spec: ComputedPropertyName
+                                                                 // evaluation), so a later SetFunctionNameFromKey /
+                                                                 // DefineField can't re-run key-coercion side effects.
+                        if Self::is_anonymous_fn_expr(&p.value) {
+                            self.emit(Op::ToPropertyKey);
+                        }
                     } else {
                         let name = property_key_name(&p.key);
                         self.load_str(&name); // [obj, key]
@@ -5296,6 +5321,9 @@ impl Compiler {
         }
         if m.computed {
             self.compile_property_key_expr(&m.key)?;
+            // ToPropertyKey NOW — see compile_object: the later
+            // SetFunctionNameFromKey must not re-run coercion side effects.
+            self.emit(Op::ToPropertyKey);
         } else {
             let name = self.class_element_key(&m.key);
             self.load_str(&name);

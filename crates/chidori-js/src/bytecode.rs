@@ -270,7 +270,12 @@ pub enum Op {
     LoadGlobal(u32),  // const index of name
     StoreGlobal(u32), // const index of name
     /// Declare a global var/function binding (const index of name).
-    DeclareGlobal(u32),
+    DeclareGlobal {
+        name: u32,
+        /// CreateGlobalVarBinding's D argument: eval-created globals are
+        /// deletable (configurable); script-level ones are not.
+        deletable: bool,
+    },
     /// Throw ReferenceError if the named global is not defined (TDZ-ish for
     /// `typeof`-safe reads we use LoadGlobalOrUndefined instead).
     LoadGlobalTypeof(u32),

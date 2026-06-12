@@ -54,10 +54,12 @@ gate ("G5") and became **load-bearing** — a language bug in `chidori-js` now
 breaks real agents with no fallback engine. The project responded correctly:
 Test262 runs in CI against a committed per-test baseline (PRs touching the
 engine, pushes to `main`, and a nightly schedule), so the number can no
-longer rot silently. Conformance is **95.56 %** of executed tests at the
-pinned suite commit (38,030 pass / 1,767 fail / 7,494 skip), after the
-derived-constructor rework on this branch cleared what had been the largest
-remaining failure cluster (see below).
+longer rot silently. Conformance is **96.05 %** of executed tests at the
+pinned suite commit (38,203 pass / 1,571 fail / 7,517 skip), after the
+engine work on this branch — the derived-constructor construction model and
+a follow-up batch (arguments object, function-name bindings, restricted
+properties, `__proto__` literals, `delete` semantics) — cleared ~340
+baseline failures with zero regressions.
 
 What remains is intentional narrowness, not breakage: two LLM providers, a
 blob-style persistence layer, capability-confinement (not OS-level)
@@ -72,7 +74,7 @@ QuickJS-era architecture.
 
 | Engine | Where | Role | Status |
 |---|---|---|---|
-| `chidori-js` (pure Rust) | `crates/chidori-js` | **The** engine — agents, tools, sub-agents, Test262 | 95.56 % of executed Test262 (38,030 / 1,767 / 7,494 pass/fail/skip at the pinned commit) |
+| `chidori-js` (pure Rust) | `crates/chidori-js` | **The** engine — agents, tools, sub-agents, Test262 | 96.05 % of executed Test262 (38,203 / 1,571 / 7,517 pass/fail/skip at the pinned commit) |
 
 `docs/conformance.md` describes the measurement methodology (bare-context,
 fresh VM per variant, honest skip accounting) and the CI gate
@@ -100,14 +102,24 @@ build; new passes print a baseline-refresh hint.
   `extends null` and `extends Symbol` behave per spec. This cleared 144
   baseline failures (1,911 → 1,767) with zero regressions across the full
   suite — the bulk of what had been a ~300-test `class` cluster.
+- **Also on this branch** (a second batch, −194 failures → 1,571): named
+  function expressions and classes bind their own names per spec (immutable,
+  TDZ for class heritage); the `arguments` object is a real exotic
+  Arguments object (length/callee/@@iterator/tag) instead of a plain array;
+  the %ThrowTypeError% intrinsic poisons `Function.prototype.caller` /
+  `arguments`; object-literal `__proto__` sets the prototype;
+  computed-key anonymous functions get spec SetFunctionName; `delete` on
+  identifiers follows the spec (strict SyntaxError, binding/global
+  configurability); %Object.prototype% is an immutable-prototype exotic
+  object; eval-created globals are deletable, script-level ones are not.
 
-### Remaining language gaps (top clusters of the baseline's 1,767 failures)
+### Remaining language gaps (top clusters of the baseline's 1,571 failures)
 
 | count | area | nature |
 |--:|---|---|
-| 356 | `language/expressions` | class element corners, dynamic-`import()` semantics, object-literal and `super` edges |
-| 329 | `language/statements` | remaining class element corners, `using`/`await using`, `for-of` iterator-close |
-| 150 | `built-ins/Array` | species/proxy interplay, length-boundary semantics |
+| 303 | `language/expressions` | class element corners, dynamic-`import()` semantics, `yield*` delegation ordering |
+| 290 | `language/statements` | remaining class element corners, `using`/`await using`, `for-of` iterator-close |
+| 136 | `built-ins/Array` | species/proxy interplay, length-boundary semantics |
 | 98 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings), `v`-flag |
 | 96 | `built-ins/TypedArray` | resizable-`ArrayBuffer` out-of-bounds tracking |
 | 52 | `built-ins/Promise` | spec-detailed async ordering combinations |

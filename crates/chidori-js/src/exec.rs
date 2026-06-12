@@ -656,19 +656,12 @@ impl Vm {
                             return Err(self
                                 .throw_type(&format!("Cannot declare global variable '{name}'")));
                         }
-                        // CreateGlobalVarBinding: writable, enumerable,
-                        // NON-configurable (`delete v` on a var is false).
-                        g.borrow_mut().props.insert(
-                            key,
-                            Property {
-                                kind: PropertyKind::Data {
-                                    value: Value::Undefined,
-                                    writable: true,
-                                },
-                                enumerable: true,
-                                configurable: false,
-                            },
-                        );
+                        // CreateGlobalVarBinding(name, D=true): an EVAL-created
+                        // global var is deletable (configurable), unlike a
+                        // script-level one.
+                        g.borrow_mut()
+                            .props
+                            .insert(key, Property::data(Value::Undefined));
                     }
                 } else {
                     // Function-scope eval var: lives on the caller frame's
@@ -955,7 +948,7 @@ impl Vm {
                 }
                 self.put_value(&Value::Object(g), &key, v, strict)?;
             }
-            Op::DeclareGlobal(i) => {
+            Op::DeclareGlobal { name: i, deletable } => {
                 let name = self.const_name(frame, i);
                 let g = self.realm.global.clone();
                 let key = PropertyKey::Str(name.clone());
@@ -970,8 +963,8 @@ impl Vm {
                             self.throw_type(&format!("Cannot declare global '{}'", name.as_str()))
                         );
                     }
-                    // CreateGlobalVarBinding: writable, enumerable,
-                    // NON-configurable (`delete v` on a var is false).
+                    // CreateGlobalVarBinding(N, D): writable, enumerable;
+                    // configurable only for eval-created bindings.
                     g.borrow_mut().props.insert(
                         key,
                         Property {
@@ -980,7 +973,7 @@ impl Vm {
                                 writable: true,
                             },
                             enumerable: true,
-                            configurable: false,
+                            configurable: deletable,
                         },
                     );
                 }
