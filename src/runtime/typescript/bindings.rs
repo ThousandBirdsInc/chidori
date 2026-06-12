@@ -793,6 +793,20 @@ impl HostBindingBackend {
         effect: &str,
         a: &serde_json::Value,
     ) -> std::result::Result<serde_json::Value, String> {
+        // A live `chidori.step` callback must be pure compute: skipping it on
+        // replay skips everything it did, so any effect it performed would be
+        // lost (state) or desynchronize the journal (records). Refuse loudly.
+        // `step_begin`/`step_end` are the step protocol itself and
+        // `contextDigest` is a pure inline hash that records nothing.
+        if !matches!(effect, "step_begin" | "step_end" | "contextDigest") {
+            if let Some(step) = self.runtime_ctx().and_then(|ctx| ctx.active_step_name()) {
+                return Err(format!(
+                    "chidori.{effect} is not allowed inside chidori.step(\"{step}\"): \
+                     step callbacks must be pure, synchronous computation \
+                     (run host effects outside the step and pass their results in)"
+                ));
+            }
+        }
         let opt_null = |v: Option<serde_json::Value>| v.unwrap_or(serde_json::Value::Null);
         match effect {
             "log" => {
@@ -813,6 +827,27 @@ impl HostBindingBackend {
             }
             "signal" => self.signal(a),
             "poll_signal" => self.poll_signal(a),
+            // The two halves of `chidori.step(name, fn)` — the durable value
+            // checkpoint (docs/value-checkpoints.md). The engine binding probes
+            // for a recorded result, runs the callback only on a miss, then
+            // reports the outcome; one `step` CallRecord results either way.
+            "step_begin" => match self {
+                HostBindingBackend::Runtime { runtime_ctx, .. } => {
+                    host_core::execute_step_begin(runtime_ctx, a).map_err(|err| err.to_string())
+                }
+                // The recorder has no replay log, so the callback always runs.
+                HostBindingBackend::Recorder(_) => Ok(serde_json::json!({ "cached": false })),
+            },
+            "step_end" => match self {
+                HostBindingBackend::Runtime { runtime_ctx, .. } => {
+                    host_core::execute_step_end(runtime_ctx, a).map_err(|err| err.to_string())
+                }
+                HostBindingBackend::Recorder(recorder) => {
+                    let name = a.get("name").cloned().unwrap_or(serde_json::Value::Null);
+                    recorder.push("step", serde_json::json!({ "name": name }));
+                    Ok(a.get("value").cloned().unwrap_or(serde_json::Value::Null))
+                }
+            },
             "checkpoint" => {
                 let args = serde_json::json!({
                     "label": a.get("label").cloned().unwrap_or(serde_json::Value::Null),

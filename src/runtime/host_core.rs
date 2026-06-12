@@ -404,6 +404,105 @@ pub fn execute_poll_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> 
     Ok(result)
 }
 
+/// First half of `chidori.step(name, fn)` — the durable value checkpoint
+/// (`docs/value-checkpoints.md`). The VM-side binding calls this *before*
+/// running the callback:
+///   1. replay short-circuit (`try_replay_checked(seq, "step")`) — a recorded
+///      result (or recorded error) is returned as `{cached: true, ...}` and the
+///      callback is never run. The recorded `name` must match, else the agent
+///      code moved/renamed steps before the resume point (fail-loud divergence,
+///      same contract as `try_replay_checked`'s function-name check).
+///   2. otherwise mark the step live (`begin_step`) and return
+///      `{cached: false}` — the binding runs the callback and reports its
+///      result through [`execute_step_end`], which writes the record at this
+///      same `seq`.
+/// While the step is live, every other host effect is refused (the dispatchers
+/// check `active_step_name`), so the callback is guaranteed pure compute and
+/// skipping it on replay cannot desynchronize the journal. Steps never pause
+/// and need no pending host operation: a crash between begin and end simply
+/// re-runs the (deterministic) callback on resume.
+pub fn execute_step_begin(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("chidori.step requires a string name"))?
+        .to_string();
+    if let Some(active) = ctx.active_step_name() {
+        anyhow::bail!(
+            "chidori.step(\"{name}\") cannot start inside chidori.step(\"{active}\"): \
+             step callbacks must be pure, synchronous computation"
+        );
+    }
+    let seq = ctx.next_seq();
+
+    if let Some(record) = ctx
+        .try_replay_checked(seq, "step")
+        .map_err(|err| anyhow::anyhow!(err))?
+    {
+        let recorded_name = record
+            .args
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if recorded_name != name {
+            anyhow::bail!(
+                "Replay divergence at seq {seq}: checkpoint has step \"{recorded_name}\" \
+                 but agent called step \"{name}\". The agent code changed since the \
+                 checkpoint was saved — re-run without replay to regenerate."
+            );
+        }
+        return Ok(match record.error {
+            Some(error) => json!({ "cached": true, "error": error }),
+            None => json!({ "cached": true, "value": record.result }),
+        });
+    }
+
+    ctx.begin_step(seq, &name);
+    Ok(json!({ "cached": false }))
+}
+
+/// Second half of `chidori.step(name, fn)` — record the callback's outcome at
+/// the seq [`execute_step_begin`] reserved. `args` carries either `value` (the
+/// callback's JSON-serialized return value) or `error` (its thrown message).
+/// Returns the canonical (JSON round-tripped) value so live and replayed runs
+/// observe byte-identical results.
+pub fn execute_step_end(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("chidori.step requires a string name"))?;
+    let Some(step) = ctx.take_active_step() else {
+        anyhow::bail!("chidori.step internal error: step_end(\"{name}\") without an active step");
+    };
+    if step.name != name {
+        anyhow::bail!(
+            "chidori.step internal error: step_end(\"{name}\") while step \"{}\" is active",
+            step.name
+        );
+    }
+    let duration_ms = Utc::now()
+        .signed_duration_since(step.started)
+        .num_milliseconds()
+        .max(0) as u64;
+    let error = args.get("error").and_then(Value::as_str);
+    let result = match error {
+        Some(_) => Value::Null,
+        None => args.get("value").cloned().unwrap_or(Value::Null),
+    };
+    ctx.record_call(CallRecord {
+        seq: step.seq,
+        parent_seq: None,
+        function: "step".to_string(),
+        args: json!({ "name": name }),
+        result: result.clone(),
+        duration_ms,
+        token_usage: None,
+        timestamp: step.started,
+        error: error.map(str::to_string),
+    });
+    Ok(result)
+}
+
 /// Whether (and how long) a prompt request should mark cacheable prefix
 /// boundaries. The default is on with the 5-minute TTL — caching is a billing
 /// optimization that never changes a response, so it is safe by default; a
@@ -2177,5 +2276,120 @@ mod tests {
         let ctx = RuntimeContext::new();
         let err = execute_signal(&ctx, &json!({ "name": 42, "opts": null })).unwrap_err();
         assert!(err.to_string().contains("requires a string name"));
+    }
+
+    #[test]
+    fn step_begin_and_end_record_one_step_call() {
+        let ctx = RuntimeContext::new();
+        let begin = execute_step_begin(&ctx, &json!({ "name": "plan" })).unwrap();
+        assert_eq!(begin, json!({ "cached": false }));
+        assert_eq!(ctx.active_step_name().as_deref(), Some("plan"));
+
+        let result =
+            execute_step_end(&ctx, &json!({ "name": "plan", "value": { "total": 42 } })).unwrap();
+        assert_eq!(result, json!({ "total": 42 }));
+        assert!(ctx.active_step_name().is_none());
+
+        let records = ctx.call_log().into_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].function, "step");
+        assert_eq!(records[0].seq, 1);
+        assert_eq!(records[0].args, json!({ "name": "plan" }));
+        assert_eq!(records[0].result, json!({ "total": 42 }));
+        assert!(records[0].error.is_none());
+    }
+
+    #[test]
+    fn step_begin_replays_recorded_value_and_error_without_running() {
+        let records = vec![
+            CallRecord {
+                seq: 1,
+                parent_seq: None,
+                function: "step".to_string(),
+                args: json!({ "name": "plan" }),
+                result: json!({ "total": 42 }),
+                duration_ms: 0,
+                token_usage: None,
+                timestamp: Utc::now(),
+                error: None,
+            },
+            CallRecord {
+                seq: 2,
+                parent_seq: None,
+                function: "step".to_string(),
+                args: json!({ "name": "boom" }),
+                result: Value::Null,
+                duration_ms: 0,
+                token_usage: None,
+                timestamp: Utc::now(),
+                error: Some("Error: bad parse".to_string()),
+            },
+        ];
+        let ctx = RuntimeContext::with_replay(records);
+
+        let hit = execute_step_begin(&ctx, &json!({ "name": "plan" })).unwrap();
+        assert_eq!(hit, json!({ "cached": true, "value": { "total": 42 } }));
+        // A cache hit leaves no active step — the callback never runs, so no
+        // step_end follows.
+        assert!(ctx.active_step_name().is_none());
+
+        let err_hit = execute_step_begin(&ctx, &json!({ "name": "boom" })).unwrap();
+        assert_eq!(
+            err_hit,
+            json!({ "cached": true, "error": "Error: bad parse" })
+        );
+    }
+
+    #[test]
+    fn step_begin_diverges_on_renamed_step() {
+        let records = vec![CallRecord {
+            seq: 1,
+            parent_seq: None,
+            function: "step".to_string(),
+            args: json!({ "name": "plan" }),
+            result: json!(1),
+            duration_ms: 0,
+            token_usage: None,
+            timestamp: Utc::now(),
+            error: None,
+        }];
+        let ctx = RuntimeContext::with_replay(records);
+        let err = execute_step_begin(&ctx, &json!({ "name": "renamed" })).unwrap_err();
+        assert!(err.to_string().contains("Replay divergence"));
+        assert!(err.to_string().contains("\"plan\""));
+        assert!(err.to_string().contains("\"renamed\""));
+    }
+
+    #[test]
+    fn step_rejects_nesting_and_unmatched_end() {
+        let ctx = RuntimeContext::new();
+        execute_step_begin(&ctx, &json!({ "name": "outer" })).unwrap();
+        let nested = execute_step_begin(&ctx, &json!({ "name": "inner" })).unwrap_err();
+        assert!(nested
+            .to_string()
+            .contains("cannot start inside chidori.step(\"outer\")"));
+
+        // Close the outer step, then a stray step_end has nothing to match.
+        execute_step_end(&ctx, &json!({ "name": "outer", "value": 1 })).unwrap();
+        let stray = execute_step_end(&ctx, &json!({ "name": "outer", "value": 1 })).unwrap_err();
+        assert!(stray.to_string().contains("without an active step"));
+    }
+
+    #[test]
+    fn step_end_records_error_outcome() {
+        let ctx = RuntimeContext::new();
+        execute_step_begin(&ctx, &json!({ "name": "boom" })).unwrap();
+        let result = execute_step_end(
+            &ctx,
+            &json!({ "name": "boom", "error": "Error: bad parse" }),
+        )
+        .unwrap();
+        assert_eq!(result, Value::Null);
+
+        let records = ctx.call_log().into_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].function, "step");
+        assert_eq!(records[0].error.as_deref(), Some("Error: bad parse"));
+        assert_eq!(records[0].result, Value::Null);
     }
 }

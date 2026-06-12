@@ -130,6 +130,10 @@ struct RuntimeContextInner {
     /// Set by `signal()` when pausing at a listen point with an empty mailbox.
     /// The engine reads this after eval unwinds to surface a signal pause.
     pub pending_signal: Option<PendingSignal>,
+    /// The `chidori.step(name, fn)` callback currently live-executing, if any.
+    /// While set, all other host effects are refused (step callbacks must be
+    /// pure compute — `docs/value-checkpoints.md`).
+    pub active_step: Option<ActiveStep>,
     /// Durable per-run signal mailbox, loaded at run/resume start (threaded the
     /// same way `vfs` is). `take_queued_signal(name)` drains the lowest-
     /// `delivery_seq` matching entry and immediately re-persists the shrunken
@@ -234,6 +238,19 @@ pub struct PendingSignal {
     pub id: HostOperationId,
 }
 
+/// Set by `execute_step_begin` while a `chidori.step(name, fn)` callback is
+/// live-executing in the VM. The step's call-log record is written at `seq`
+/// when `execute_step_end` takes this back; while it is set, every other host
+/// effect refuses to run — a step callback must be pure, synchronous
+/// computation, or skipping it on replay would desynchronize the journal
+/// (see `docs/value-checkpoints.md`).
+#[derive(Debug, Clone)]
+pub struct ActiveStep {
+    pub seq: u64,
+    pub name: String,
+    pub started: chrono::DateTime<chrono::Utc>,
+}
+
 /// Set by the policy enforcer when a call needs user approval but the
 /// engine is running in Pause mode (server context). The engine catches the
 /// pause sentinel, takes this value, and returns it in `RunResult` so the
@@ -285,6 +302,7 @@ impl RuntimeContext {
                 pending_input: None,
                 pending_approval: None,
                 pending_signal: None,
+                active_step: None,
                 signal_inbox: Vec::new(),
                 host_promises: HostPromiseTable::new(),
                 event_sender: None,
@@ -350,6 +368,7 @@ impl RuntimeContext {
                 pending_input: None,
                 pending_approval: None,
                 pending_signal: None,
+                active_step: None,
                 signal_inbox,
                 host_promises: HostPromiseTable::from_records(host_promises),
                 event_sender: None,
@@ -385,6 +404,7 @@ impl RuntimeContext {
                 pending_input: None,
                 pending_approval: None,
                 pending_signal: None,
+                active_step: None,
                 signal_inbox: Vec::new(),
                 host_promises: HostPromiseTable::new(),
                 event_sender: None,
@@ -854,6 +874,34 @@ impl RuntimeContext {
 
     pub fn take_pending_signal(&self) -> Option<PendingSignal> {
         self.inner.lock().unwrap().pending_signal.take()
+    }
+
+    /// Mark a `chidori.step(name, fn)` callback as live-executing at `seq`.
+    /// While set, every other host effect refuses to run (the callback must be
+    /// pure compute), so the step's record at `seq` is always the next record —
+    /// skipping the callback on replay can never desynchronize the journal.
+    pub fn begin_step(&self, seq: u64, name: &str) {
+        self.inner.lock().unwrap().active_step = Some(ActiveStep {
+            seq,
+            name: name.to_string(),
+            started: chrono::Utc::now(),
+        });
+    }
+
+    /// Take back the live-executing step marker (set by [`begin_step`](Self::begin_step)).
+    pub fn take_active_step(&self) -> Option<ActiveStep> {
+        self.inner.lock().unwrap().active_step.take()
+    }
+
+    /// The name of the step callback currently live-executing, if any. Host
+    /// effect dispatchers consult this to refuse effects inside step bodies.
+    pub fn active_step_name(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .active_step
+            .as_ref()
+            .map(|s| s.name.clone())
     }
 
     /// Replace the in-memory signal mailbox. Used by the

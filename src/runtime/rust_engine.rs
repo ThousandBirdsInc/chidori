@@ -518,6 +518,32 @@ fn build_sync_native_dispatch(
     use crate::runtime::capability::Capability;
     Rc::new(
         move |name: &str, args: &Value| -> std::result::Result<Value, String> {
+            // Inside a live `chidori.step` callback (pure-compute contract,
+            // docs/value-checkpoints.md), refuse the captured-effect natives
+            // whose work would be skipped on replay: recorded randomness, VFS
+            // mutation, and timer/microtask scheduling (the polyfills note a
+            // capability at schedule time, so blocking that blocks them).
+            // Hashing and VFS reads stay allowed — they record nothing and
+            // mutate nothing, and the step's memoized result keeps replay
+            // deterministic regardless.
+            if matches!(
+                name,
+                "__chidori_crypto_random"
+                    | "__chidori_fs_write"
+                    | "__chidori_fs_append"
+                    | "__chidori_fs_mkdir"
+                    | "__chidori_fs_rm"
+                    | "__chidori_fs_rename"
+                    | "__chidori_note_capability"
+            ) {
+                if let Some(step) = ctx.active_step_name() {
+                    return Err(format!(
+                        "captured effects (randomness, fs writes, timers) are not allowed \
+                         inside chidori.step(\"{step}\"): step callbacks must be pure, \
+                         synchronous computation"
+                    ));
+                }
+            }
             let str_arg = |i: usize| -> std::result::Result<String, String> {
                 args.get(i)
                     .and_then(|v| v.as_str())

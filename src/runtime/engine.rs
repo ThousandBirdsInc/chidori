@@ -2036,4 +2036,291 @@ def agent(value):
 
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    /// `chidori.step(name, fn)` — the durable value checkpoint
+    /// (`docs/value-checkpoints.md`): the callback runs once and its result is
+    /// journaled as a `step` CallRecord; replay returns the recorded value
+    /// WITHOUT re-running the callback. Proven by replaying against an edited
+    /// agent whose step body now throws — the recorded value wins.
+    #[test]
+    fn engine_step_memoizes_value_checkpoint_on_replay() {
+        let dir =
+            std::env::temp_dir().join(format!("chidori-engine-ts-step-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(
+            &path,
+            r#"
+                export async function agent(input, chidori) {
+                    const plan = await chidori.step("plan", () => {
+                        let total = 0;
+                        for (let i = 0; i <= 1000; i++) total += i;
+                        return { total, source: "computed" };
+                    });
+                    return { total: plan.total, source: plan.source };
+                }
+            "#,
+        )
+        .unwrap();
+
+        let engine = || {
+            Engine::new(
+                Arc::new(ProviderRegistry::new()),
+                Arc::new(TemplateEngine::new(&dir)),
+                Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            )
+        };
+
+        let recorded = engine().run(&path, &serde_json::json!({})).unwrap();
+        assert_eq!(
+            recorded.output,
+            serde_json::json!({ "total": 500500, "source": "computed" })
+        );
+        let records = recorded.call_log.into_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].function, "step");
+        assert_eq!(records[0].args, serde_json::json!({ "name": "plan" }));
+        assert_eq!(
+            records[0].result,
+            serde_json::json!({ "total": 500500, "source": "computed" })
+        );
+
+        // Replay against an edited body that would throw if re-executed: the
+        // journaled value must win (the whole point of the value checkpoint).
+        std::fs::write(
+            &path,
+            r#"
+                export async function agent(input, chidori) {
+                    const plan = await chidori.step("plan", () => {
+                        throw new Error("step callback must not re-run on replay");
+                    });
+                    return { total: plan.total, source: plan.source };
+                }
+            "#,
+        )
+        .unwrap();
+        let replayed = engine()
+            .run_with_replay(&path, &serde_json::json!({}), records)
+            .unwrap();
+        assert_eq!(replayed.output, recorded.output);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A step callback that throws journals the error, and replay re-throws the
+    /// recorded error without re-running the callback — even when the edited
+    /// callback would now succeed.
+    #[test]
+    fn engine_step_replays_recorded_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-engine-ts-step-err-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(
+            &path,
+            r#"
+                export async function agent(input, chidori) {
+                    try {
+                        await chidori.step("parse", () => { throw new Error("bad parse"); });
+                        return { ok: true };
+                    } catch (e) {
+                        return { caught: String(e) };
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+
+        let engine = || {
+            Engine::new(
+                Arc::new(ProviderRegistry::new()),
+                Arc::new(TemplateEngine::new(&dir)),
+                Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            )
+        };
+
+        let recorded = engine().run(&path, &serde_json::json!({})).unwrap();
+        let caught = recorded
+            .output
+            .get("caught")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        assert!(caught.contains("bad parse"), "got: {caught}");
+        let records = recorded.call_log.into_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].function, "step");
+        assert!(records[0].error.as_deref().unwrap().contains("bad parse"));
+
+        // Edited callback now succeeds — but the journaled error replays.
+        std::fs::write(
+            &path,
+            r#"
+                export async function agent(input, chidori) {
+                    try {
+                        await chidori.step("parse", () => ({ fine: true }));
+                        return { ok: true };
+                    } catch (e) {
+                        return { caught: String(e) };
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        let replayed = engine()
+            .run_with_replay(&path, &serde_json::json!({}), records)
+            .unwrap();
+        assert_eq!(replayed.output, recorded.output);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The pure-compute contract is enforced loudly: host effects, captured
+    /// randomness, and async callbacks are all refused inside a step body.
+    #[test]
+    fn engine_step_enforces_pure_compute_contract() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-engine-ts-step-pure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(
+            &path,
+            r#"
+                import { randomBytes } from "node:crypto";
+                export async function agent(input, chidori) {
+                    const tryStep = async (name, fn) => {
+                        try { await chidori.step(name, fn); return "ok"; }
+                        catch (e) { return String(e); }
+                    };
+                    return {
+                        effect: await tryStep("effect", () => { chidori.log("nope"); return 1; }),
+                        random: await tryStep("random", () => randomBytes(4).toString("hex")),
+                        timer: await tryStep("timer", () => { setTimeout(() => {}, 1); return 1; }),
+                        asyncFn: await tryStep("asyncFn", async () => 1),
+                    };
+                }
+            "#,
+        )
+        .unwrap();
+
+        let engine = Engine::new(
+            Arc::new(ProviderRegistry::new()),
+            Arc::new(TemplateEngine::new(&dir)),
+            Arc::new(tokio::runtime::Runtime::new().unwrap()),
+        );
+        let result = engine.run(&path, &serde_json::json!({})).unwrap();
+        let field = |k: &str| {
+            result
+                .output
+                .get(k)
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .to_string()
+        };
+        assert!(
+            field("effect").contains("not allowed inside chidori.step(\"effect\")"),
+            "got: {}",
+            field("effect")
+        );
+        assert!(
+            field("random").contains("not allowed inside chidori.step(\"random\")"),
+            "got: {}",
+            field("random")
+        );
+        assert!(
+            field("timer").contains("not allowed inside chidori.step(\"timer\")"),
+            "got: {}",
+            field("timer")
+        );
+        assert!(
+            field("asyncFn").contains("must return synchronously"),
+            "got: {}",
+            field("asyncFn")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The P6 acceptance: a resume after a pause does not re-pay the step. The
+    /// agent computes a step, then pauses on `input()`; the resume replays from
+    /// the journal against an edited step body that would throw — and completes
+    /// with the recorded step value.
+    #[test]
+    fn engine_step_skips_recompute_on_input_resume() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-engine-ts-step-resume-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(
+            &path,
+            r#"
+                export async function agent(input, chidori) {
+                    const plan = await chidori.step("plan", () => ({ total: 42 }));
+                    const answer = await chidori.input("Approve the plan?");
+                    return { total: plan.total, approved: answer === "yes" };
+                }
+            "#,
+        )
+        .unwrap();
+
+        let engine = || {
+            Engine::new(
+                Arc::new(ProviderRegistry::new()),
+                Arc::new(TemplateEngine::new(&dir)),
+                Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            )
+        };
+
+        let paused = engine()
+            .run_pausable(&path, &serde_json::json!({}))
+            .unwrap();
+        let pending = paused.paused.expect("expected an input pause");
+        assert_eq!(pending.seq, 2, "step takes seq 1, input pauses at seq 2");
+        let mut replay = paused.call_log.into_records();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].function, "step");
+
+        // Resume = journal replay + the synthetic input record, against an
+        // edited step body that must not run.
+        replay.push(CallRecord {
+            seq: pending.seq,
+            parent_seq: None,
+            function: "input".to_string(),
+            args: serde_json::json!({ "prompt": pending.prompt }),
+            result: serde_json::json!("yes"),
+            duration_ms: 0,
+            token_usage: None,
+            timestamp: chrono::Utc::now(),
+            error: None,
+        });
+        std::fs::write(
+            &path,
+            r#"
+                export async function agent(input, chidori) {
+                    const plan = await chidori.step("plan", () => {
+                        throw new Error("resume must not re-pay the step");
+                    });
+                    const answer = await chidori.input("Approve the plan?");
+                    return { total: plan.total, approved: answer === "yes" };
+                }
+            "#,
+        )
+        .unwrap();
+        let resumed = engine()
+            .run_replay_pausable(&path, &serde_json::json!({}), replay)
+            .unwrap();
+        assert!(resumed.paused.is_none());
+        assert_eq!(
+            resumed.output,
+            serde_json::json!({ "total": 42, "approved": true })
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

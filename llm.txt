@@ -210,6 +210,20 @@ await chidori.checkpoint("after-draft", { tokens: 120 });
 `checkpoint()` records an explicit call-log marker. Persisted runs also refresh
 snapshot manifest metadata at durable host safepoints.
 
+### step
+
+```ts
+const plan = await chidori.step("plan", () => buildPlanDeterministically(input));
+```
+
+`step(name, fn)` is a durable value checkpoint: `fn` runs once and its
+JSON-serializable result is journaled; replay and resume return the recorded
+value (or re-throw the recorded error) without re-running `fn`. Wrap expensive
+deterministic computation in a step so resuming a long run does not re-pay it.
+The callback must be pure, synchronous compute: host effects, captured
+randomness, filesystem writes, timers, and async callbacks throw inside a step.
+See `docs/value-checkpoints.md`.
+
 ### log
 
 ```ts

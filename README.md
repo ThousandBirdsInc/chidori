@@ -233,6 +233,7 @@ An agent is a `.ts` file that exports an async `agent(input, chidori)` function.
 | `chidori.memory(action, ...)` | Persistent storage (key-value + vector) |
 | `chidori.log(msg, data)` | Structured logging |
 | `chidori.checkpoint(label, meta)` | Record an explicit call-log marker for trace/replay |
+| `chidori.step(name, fn)` | Durable value checkpoint — run pure compute once, journal the result, never re-pay it on replay/resume |
 | `chidori.retry(fn, options)` | Retry with backoff |
 | `chidori.tryCall(fn)` | Capture errors without raising |
 
