@@ -125,6 +125,34 @@ export interface InputOptions {
   choices?: string[];
 }
 
+/**
+ * Who delivered a signal. `kind` distinguishes a human participant from a peer
+ * agent; `id` is the participant identity; `runId` is set when an agent sends
+ * (its own run id), so agent-to-agent coordination is attributable in the trace.
+ */
+export interface SignalSender {
+  kind: "human" | "agent";
+  id: string;
+  runId?: string;
+}
+
+/**
+ * A named message delivered into a run mid-flight (`docs/signals.md` §6.1). The
+ * inverse of `input()`: an outside party (human or agent) pushes
+ * `{ name, payload, from }` at an agent-declared listen point. Every signal is
+ * recorded in the call log, so the multiplayer session replays deterministically.
+ */
+export interface Signal<T = AgentJson> {
+  name: string;
+  payload: T;
+  from: SignalSender;
+}
+
+export interface SignalOptions {
+  /** Phase 2 (future): resolve to a timeout sentinel instead of waiting forever. */
+  timeoutMs?: number;
+}
+
 export interface ParallelOptions {
   concurrency?: number;
 }
@@ -214,6 +242,19 @@ export interface Chidori {
   context(seed?: { system?: string; tools?: string[] }): Context;
   prompt(text: string, options?: PromptOptions): Promise<string>;
   input(message: string, options?: InputOptions): Promise<string>;
+  /**
+   * Pause at a named listen point until a matching signal is delivered (or one
+   * is already queued in the durable mailbox), then resolve to
+   * `{ name, payload, from }`. The inverse of `input()`: the run idles cheaply
+   * on disk and an outside party delivers via `POST /sessions/{id}/signal`.
+   */
+  signal<T = AgentJson>(name: string, options?: SignalOptions): Promise<Signal<T>>;
+  /**
+   * Non-blocking: consume a queued signal of this name if present, else resolve
+   * to `null`. Records the result (value or null) at this seq so replay is
+   * deterministic.
+   */
+  pollSignal<T = AgentJson>(name: string): Promise<Signal<T> | null>;
   callAgent<TInput extends AgentJson = JsonObject, TOutput extends AgentJson = AgentJson>(
     path: string,
     input?: TInput,

@@ -17,6 +17,6 @@ Usage:
     replayed = client.replay(checkpoint)
 """
 
-from chidori.client import AgentClient, Session, Checkpoint
+from chidori.client import AgentClient, Session, Checkpoint, SignalQueued
 
-__all__ = ["AgentClient", "Session", "Checkpoint"]
+__all__ = ["AgentClient", "Session", "Checkpoint", "SignalQueued"]

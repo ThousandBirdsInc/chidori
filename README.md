@@ -204,6 +204,8 @@ An agent is a `.ts` file that exports an async `agent(input, chidori)` function.
 | `chidori.callAgent(path, input)` | Call a sub-agent |
 | `chidori.parallel(fns)` | Run functions concurrently |
 | `chidori.input(msg, options)` | Human-in-the-loop — pauses execution |
+| `chidori.signal(name, options)` | Multiplayer — pause at a named listen point until an outside party (human or agent) delivers `{ name, payload, from }`; drains a durable mailbox if one is queued |
+| `chidori.pollSignal(name)` | Non-blocking signal check — consume a queued signal of this name or resolve to `null` |
 | `chidori.http(url, options)` | Make an HTTP request |
 | `chidori.memory(action, ...)` | Persistent storage (key-value + vector) |
 | `chidori.log(msg, data)` | Structured logging |
@@ -278,6 +280,7 @@ Exposes:
 - `GET  /sessions/{id}/checkpoint` — get the call log and snapshot manifest metadata
 - `GET  /sessions/{id}/snapshot` — inspect the durable journal-scaffold manifest metadata (no VM image — resume is call-log replay)
 - `POST /sessions/{id}/resume` — resume a paused `input()` or approval session
+- `POST /sessions/{id}/signal` — deliver a signal `{ name, payload?, from? }`: resolves+resumes a run paused-waiting on that name (200), else enqueues into the durable mailbox (202), or 409 for a terminal run
 - `POST /sessions/{id}/replay` — replay from a session's checkpoint
 - `POST /sessions/{id}/cancel` — cancel a running or stored session
 - `POST /sessions/stream` — run a session with SSE call and prompt progress events

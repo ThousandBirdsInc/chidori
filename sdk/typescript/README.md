@@ -26,7 +26,7 @@ import type { Chidori, ToolDefinition } from "chidori";
 ## Usage
 
 ```ts
-import { AgentClient, Checkpoint } from "chidori";
+import { AgentClient, Checkpoint, isSignalQueued } from "chidori";
 
 const client = new AgentClient("http://localhost:8080");
 
@@ -61,6 +61,21 @@ for await (const evt of client.stream({ document: "hi" })) {
 if (session.status === "paused") {
   const resumed = await client.resume(session.id, "yes");
   console.log(resumed.output);
+}
+
+// Multiplayer signals (from chidori.signal / pollSignal): deliver
+// { name, payload?, from? } to a run.
+const result = await client.signal(session.id, {
+  name: "review",
+  payload: { decision: "approve", notes: "LGTM" },
+  from: { kind: "human", id: "mara" },
+});
+if (isSignalQueued(result)) {
+  // run wasn't paused-waiting on this name → enqueued in the durable mailbox (202)
+  console.log("queued at delivery_seq", result.delivery_seq);
+} else {
+  // run was paused-waiting on this name → resolved + resumed (200)
+  console.log(result.status, result.output);
 }
 ```
 

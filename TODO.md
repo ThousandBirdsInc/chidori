@@ -13,6 +13,7 @@ runtime, CLI, server, and tool work should target `.ts` agents and tools.
 | Language-neutral host core | Done |
 | Call-log replay | Done |
 | Human input and policy approval pause/resume | Done through live VM resume with replay fallback |
+| Multiplayer signals (`chidori.signal` / `pollSignal`, `POST /sessions/{id}/signal`) | Done — Phase 1 + `pollSignal` (`docs/signals.md`); `signalAny` / `timeoutMs` / live in-memory delivery are future work |
 | TypeScript tool discovery | Done |
 | TypeScript and Python SDK parity | Done |
 | Snapshot manifests, policy/source validation, host promise records | Done |
@@ -46,6 +47,11 @@ completion audit lives in
 
 - [x] `chidori.prompt()`
 - [x] `chidori.input()`
+- [x] `chidori.signal()` / `chidori.pollSignal()` — multiplayer named signals:
+      blocking listen point, durable per-run mailbox, `POST /sessions/{id}/signal`
+      delivery (resolve+resume / enqueue / 409), deterministic replay (Phase 1 +
+      `pollSignal` of `docs/signals.md`; `signalAny` / `timeoutMs` / live in-memory
+      delivery are future work).
 - [x] `chidori.callAgent()`
 - [x] `chidori.tool()`
 - [x] `chidori.parallel()`
