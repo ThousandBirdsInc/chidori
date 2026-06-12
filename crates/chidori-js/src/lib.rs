@@ -417,7 +417,7 @@ impl Engine {
     ) -> Result<serde_json::Value, String> {
         let compiled = compiler::compile_module(src)?;
         if !compiled.requested.is_empty() {
-            return Err("module imports are not supported on the rust engine path yet".to_string());
+            return Err("module imports are not supported in single-file entrypoints".to_string());
         }
         let cell_of_name = compiled.cell_of_name.clone();
         let rec = std::rc::Rc::new(std::cell::RefCell::new(module::ModuleRecord::new(compiled)));

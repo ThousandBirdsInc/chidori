@@ -1389,6 +1389,11 @@ fn ordinary_set_prototype_of(vm: &Vm, o: &JsObject, proto: Option<JsObject>) -> 
     if same {
         return true;
     }
+    // %Object.prototype% is an immutable-prototype exotic object (spec
+    // 10.4.7): its [[Prototype]] can only be "set" to its current value.
+    if o.same(&vm.realm.object_proto) {
+        return false;
+    }
     if !o.borrow().extensible {
         return false;
     }
@@ -1790,17 +1795,24 @@ fn array_like_to_vec(vm: &mut Vm, v: &Value) -> Result<Vec<Value>, Value> {
 fn install_symbol(vm: &mut Vm) {
     let proto = vm.realm.symbol_proto.clone();
 
-    let ctor = vm.new_native("Symbol", 0, |vm, _this, args| {
-        let desc = arg(args, 0);
-        let d = if desc.is_undefined() {
-            None
-        } else {
-            Some(vm.to_string_lossy(&desc))
-        };
-        let s = vm.alloc_symbol(d.as_deref());
-        Ok(Value::Symbol(s))
-    });
-    // Symbol is not a constructor.
+    let ctor = vm.new_native_ctor(
+        "Symbol",
+        0,
+        |vm, _this, args| {
+            let desc = arg(args, 0);
+            let d = if desc.is_undefined() {
+                None
+            } else {
+                Some(vm.to_string_lossy(&desc))
+            };
+            let s = vm.alloc_symbol(d.as_deref());
+            Ok(Value::Symbol(s))
+        },
+        // `new Symbol()` throws, but Symbol still HAS a [[Construct]] — the
+        // spec allows it as the value of a class `extends` clause (the
+        // `super()` call is what fails).
+        |vm, _this, _args| Err(vm.throw_type("Symbol is not a constructor")),
+    );
     vm.install_ctor("Symbol", &ctor, &proto);
 
     // Well-known symbols as static properties.

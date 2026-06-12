@@ -127,6 +127,10 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "source-phase-imports",
     "FinalizationRegistry",
     "WeakRef",
+    // Legacy (normative-optional) Function.prototype.caller reflection on
+    // non-strict functions: the engine implements the standard poisoned
+    // accessor instead, so the legacy-behavior tests don't apply.
+    "caller",
     // Host capabilities this runner does not provide. `cross-realm` needs
     // `$262.createRealm` (a second realm with cross-realm marshaling), which the
     // bare context cannot host; `ShadowRealm` is unimplemented in QuickJS. Bun

@@ -22,6 +22,17 @@ use oxc::span::SourceType;
 use crate::bytecode::*;
 
 pub fn compile_script(src: &str) -> Result<FuncProto, String> {
+    compile_script_impl(src, false)
+}
+
+/// Compile global eval code — `(0,eval)(src)`: identical to a script except
+/// `return` is illegal and the global `var`/function bindings it creates are
+/// DELETABLE (CreateGlobalVarBinding with D=true).
+pub fn compile_indirect_eval(src: &str) -> Result<FuncProto, String> {
+    compile_script_impl(src, true)
+}
+
+fn compile_script_impl(src: &str, as_eval: bool) -> Result<FuncProto, String> {
     let allocator = Allocator::default();
     // Parse as a *script* (the JS default): sloppy unless a `"use strict"`
     // directive (or a class/`module` context) makes it strict. The conformance
@@ -59,6 +70,7 @@ pub fn compile_script(src: &str) -> Result<FuncProto, String> {
     }
     let mut c = Compiler::new();
     c.source = src.to_string();
+    c.toplevel_is_eval = as_eval;
     // A construct the lowering step rejects is, for our purposes, a syntax/early
     // error — surface it as SyntaxError so it is reported consistently.
     c.compile_toplevel(&program).map_err(|e| {
@@ -363,6 +375,9 @@ struct Binding {
     function_scoped: bool,
     /// `const` bindings: reassignment is a runtime TypeError.
     is_const: bool,
+    /// A named function expression's self-binding: immutable, but assignment
+    /// is silently IGNORED in sloppy mode (TypeError only in strict).
+    is_fn_name: bool,
 }
 
 struct Scope {
@@ -557,6 +572,9 @@ impl ClassPrivCtx {
 
 struct Compiler {
     fns: Vec<FnCtx>,
+    /// The toplevel being compiled is global EVAL code (indirect eval), not a
+    /// script: `return` is illegal and global var bindings are deletable.
+    toplevel_is_eval: bool,
     /// Enclosing `class` bodies (innermost last) for private-name resolution.
     class_privs: Vec<ClassPrivCtx>,
     /// Allocator for `ClassPrivCtx::id`.
@@ -588,6 +606,7 @@ impl Compiler {
     fn new() -> Compiler {
         Compiler {
             fns: Vec::new(),
+            toplevel_is_eval: false,
             class_privs: Vec::new(),
             next_class_id: 0,
             pending_label: None,
@@ -731,6 +750,25 @@ impl Compiler {
             cell,
             function_scoped,
             is_const,
+            is_fn_name: false,
+        });
+        cell
+    }
+
+    /// Declare a named function expression's self-binding: visible only inside
+    /// the function (the caller wraps it in its own scope), immutable —
+    /// assignment throws a TypeError in strict code and is silently ignored in
+    /// sloppy code.
+    fn declare_fn_name(&mut self, name: &str) -> u32 {
+        let cell = self.cur().alloc_cell();
+        let fc = self.cur();
+        let scope_idx = fc.scopes.len() - 1;
+        fc.scopes[scope_idx].bindings.push(Binding {
+            name: name.to_string(),
+            cell,
+            function_scoped: false,
+            is_const: false,
+            is_fn_name: true,
         });
         cell
     }
@@ -762,7 +800,8 @@ impl Compiler {
         match pat {
             BindingPattern::BindingIdentifier(id) if self.in_global_scope() => {
                 let n = self.str_const(id.name.as_str());
-                self.emit(Op::DeclareGlobal(n));
+                let deletable = self.cur_ref().is_eval_body;
+                self.emit(Op::DeclareGlobal { name: n, deletable });
             }
             _ => self.declare_pattern_names(pat, true),
         }
@@ -776,6 +815,21 @@ impl Compiler {
                 for b in scope.bindings.iter().rev() {
                     if b.name == name {
                         return b.is_const;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether `name` resolves (innermost-first, respecting shadowing) to a
+    /// named function expression's immutable self-binding.
+    fn binding_is_fn_name(&self, name: &str) -> bool {
+        for fi in (0..self.fns.len()).rev() {
+            for scope in self.fns[fi].scopes.iter().rev() {
+                for b in scope.bindings.iter().rev() {
+                    if b.name == name {
+                        return b.is_fn_name;
                     }
                 }
             }
@@ -863,6 +917,14 @@ impl Compiler {
         // carries the const-assign throw as its fallback.
         if self.binding_is_const(name) {
             Op::ThrowConstAssign
+        } else if self.binding_is_fn_name(name) {
+            // A named function expression's self-binding is immutable:
+            // TypeError in strict code, silently dropped in sloppy code.
+            if self.cur_ref().strict {
+                Op::ThrowConstAssign
+            } else {
+                Op::Pop
+            }
         } else {
             match self.resolve(name) {
                 Resolved::Cell(i) => Op::StoreCell(i),
@@ -881,6 +943,12 @@ impl Compiler {
     fn store_assign_fallback(&mut self, name: &str) -> Op {
         if self.binding_is_const(name) {
             Op::ThrowConstAssign
+        } else if self.binding_is_fn_name(name) {
+            if self.cur_ref().strict {
+                Op::ThrowConstAssign
+            } else {
+                Op::Pop
+            }
         } else {
             match self.resolve(name) {
                 Resolved::Cell(i) => Op::StoreCellChecked(i),
@@ -925,7 +993,10 @@ impl Compiler {
                     // caller bindings (a sloppy caller's boxed `this` lives in
                     // its %this cell, not in the raw frame value).
                     if b.name.starts_with('%')
-                        && !matches!(b.name.as_str(), "%this" | "%newtarget" | "%superclass")
+                        && !matches!(
+                            b.name.as_str(),
+                            "%this" | "%newtarget" | "%superclass" | "%fieldinit"
+                        )
                     {
                         continue;
                     }
@@ -946,7 +1017,10 @@ impl Compiler {
             }
             for k in fc.upvalue_keys.clone() {
                 if k.starts_with('%')
-                    && !matches!(k.as_str(), "%this" | "%newtarget" | "%superclass")
+                    && !matches!(
+                        k.as_str(),
+                        "%this" | "%newtarget" | "%superclass" | "%fieldinit"
+                    )
                 {
                     continue;
                 }
@@ -1097,6 +1171,7 @@ impl Compiler {
         fc.track_completion = true;
         fc.script_global = true;
         fc.is_toplevel = true;
+        fc.is_eval_body = self.toplevel_is_eval;
         fc.contains_eval = self.source.contains("eval");
         fc.strict = program
             .directives
@@ -1423,6 +1498,7 @@ impl Compiler {
             param_names: fc.param_names,
             is_strict: fc.strict,
             stable_cells: fc.stable_cells.clone(),
+            this_cell: fc.this_cell,
         }
     }
 
@@ -1461,10 +1537,14 @@ impl Compiler {
                 Statement::VariableDeclaration(d)
                     if matches!(
                         d.kind,
-                        VariableDeclarationKind::Let | VariableDeclarationKind::Const
+                        VariableDeclarationKind::Let
+                            | VariableDeclarationKind::Const
+                            | VariableDeclarationKind::Using
+                            | VariableDeclarationKind::AwaitUsing
                     ) =>
                 {
-                    let is_const = matches!(d.kind, VariableDeclarationKind::Const);
+                    // `using` bindings are const-like: reassignment TypeErrors.
+                    let is_const = !matches!(d.kind, VariableDeclarationKind::Let);
                     for decl in &d.declarations {
                         if let BindingPattern::BindingIdentifier(id) = &decl.id {
                             if self.current_scope_cell(id.name.as_str()).is_none() {
@@ -1551,7 +1631,8 @@ impl Compiler {
                         // to an existing one, so establish the property first.
                         // Otherwise the strict-mode unresolvable-reference check on
                         // `StoreGlobal` would reject the install itself.
-                        self.emit(Op::DeclareGlobal(n));
+                        let deletable = self.cur_ref().is_eval_body;
+                        self.emit(Op::DeclareGlobal { name: n, deletable });
                         self.emit(Op::StoreGlobal(n));
                     }
                 }
@@ -1752,7 +1833,27 @@ impl Compiler {
             Statement::IfStatement(i) => self.compile_if(i)?,
             Statement::WhileStatement(w) => self.compile_while(w)?,
             Statement::DoWhileStatement(w) => self.compile_do_while(w)?,
-            Statement::ForStatement(f) => self.compile_for(f)?,
+            Statement::ForStatement(f) => {
+                // `for (using x = ...; ;)`: the dispose capability spans the
+                // whole statement (disposed when the loop completes/aborts).
+                let head_using = matches!(
+                    &f.init,
+                    Some(ForStatementInit::VariableDeclaration(d)) if matches!(
+                        d.kind,
+                        VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing
+                    )
+                );
+                if head_using {
+                    let pad_async = matches!(
+                        &f.init,
+                        Some(ForStatementInit::VariableDeclaration(d))
+                            if matches!(d.kind, VariableDeclarationKind::AwaitUsing)
+                    );
+                    self.compile_with_dispose_scope(pad_async, |c| c.compile_for(f))?;
+                } else {
+                    self.compile_for(f)?;
+                }
+            }
             Statement::ForInStatement(f) => self.compile_for_in(f)?,
             Statement::ForOfStatement(f) => self.compile_for_of(f)?,
             Statement::ReturnStatement(_) if self.cur_ref().is_eval_body => {
@@ -1767,6 +1868,9 @@ impl Compiler {
                 // Leave every active `with` environment before returning.
                 self.emit_pop_with_to(0);
                 self.emit(Op::Return);
+                // (A derived constructor's return-value rules apply at frame
+                // exit, in [[Construct]], so `finally` blocks — which may call
+                // super() — run first.)
             }
             Statement::ThrowStatement(t) => {
                 self.compile_expr(&t.argument)?;
@@ -1805,18 +1909,132 @@ impl Compiler {
 
     fn compile_block(&mut self, body: &[Statement]) -> R {
         self.enter_scope(false);
-        self.hoist_lexical(body);
-        self.hoist_funcs(body)?;
-        for s in body {
-            self.compile_stmt(s)?;
+        if Self::stmts_have_using(body) {
+            self.compile_with_dispose_scope(Self::stmts_have_await_using(body), |c| {
+                c.hoist_lexical(body);
+                c.hoist_funcs(body)?;
+                for s in body {
+                    c.compile_stmt(s)?;
+                }
+                Ok(())
+            })?;
+        } else {
+            self.hoist_lexical(body);
+            self.hoist_funcs(body)?;
+            for s in body {
+                self.compile_stmt(s)?;
+            }
         }
         self.exit_scope();
         Ok(())
     }
 
+    /// Whether any DIRECT statement is a `using` / `await using` declaration
+    /// (nested blocks manage their own dispose scopes).
+    fn stmts_have_using(stmts: &[Statement]) -> bool {
+        stmts.iter().any(|s| {
+            matches!(
+                s,
+                Statement::VariableDeclaration(d) if matches!(
+                    d.kind,
+                    VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing
+                )
+            )
+        })
+    }
+
+    /// Whether any DIRECT statement is an `await using` declaration — its
+    /// dispose landing pad must Await each disposal.
+    fn stmts_have_await_using(stmts: &[Statement]) -> bool {
+        stmts.iter().any(|s| {
+            matches!(
+                s,
+                Statement::VariableDeclaration(d)
+                    if matches!(d.kind, VariableDeclarationKind::AwaitUsing)
+            )
+        })
+    }
+
+    /// Compile `f`'s statements inside a `using` dispose capability: a
+    /// finally-style region whose landing pad runs DisposeResources, so EVERY
+    /// exit — normal fall-through, throw, return, break/continue — disposes
+    /// the scope's resources (in reverse), merging dispose errors into the
+    /// in-flight completion (SuppressedError chaining). An `is_async` pad
+    /// (any `await using` present) Awaits each disposal result, merging
+    /// rejections the same way.
+    fn compile_with_dispose_scope(&mut self, is_async: bool, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.emit(Op::PushDisposeScope);
+        let push = self.emit(Op::PushTryHandler {
+            catch: u32::MAX,
+            finally: u32::MAX,
+        });
+        self.cur().handler_depth += 1;
+        self.cur().finally_depth += 1;
+        f(self)?;
+        self.emit(Op::PopTryHandler);
+        self.cur().handler_depth -= 1;
+        self.cur().finally_depth -= 1;
+        let normal = self.emit(Op::Jump(0));
+        let fin = self.here();
+        self.patch_finally(push, fin);
+        self.patch_jump(normal, fin);
+        if is_async {
+            // The try handler is (re)installed at EMPTY stack depth each
+            // iteration, so an Await rejection truncates to a clean base
+            // before pushing the error:
+            //   top:  PushTryHandler{catch}
+            //         DisposeAsyncNext           [result, more]
+            //         JumpIfFalse done           [result]
+            //         Await; Pop                 []
+            //         PopTryHandler; Jump top
+            //   done: Pop; PopTryHandler; EndFinally   ([result] dropped)
+            //   catch:                           [error]
+            //         MergeDisposeError; Jump top
+            let top = self.here();
+            let inner = self.emit(Op::PushTryHandler {
+                catch: 0,
+                finally: u32::MAX,
+            });
+            self.emit(Op::DisposeAsyncNext);
+            let jdone = self.emit(Op::JumpIfFalse(0));
+            self.emit(Op::Await);
+            self.emit(Op::Pop);
+            self.emit(Op::PopTryHandler);
+            let back = self.emit(Op::Jump(0));
+            let catch_ip = self.here();
+            self.patch_jump(inner, catch_ip);
+            self.emit(Op::MergeDisposeError);
+            let back2 = self.emit(Op::Jump(0));
+            let done = self.here();
+            self.patch_jump(jdone, done);
+            self.patch_jump(back, top);
+            self.patch_jump(back2, top);
+            self.emit(Op::Pop); // drop the exhausted step's undefined result
+            self.emit(Op::PopTryHandler);
+        } else {
+            self.emit(Op::DisposeScope);
+        }
+        self.emit(Op::EndFinally);
+        Ok(())
+    }
+
     fn compile_var_decl(&mut self, d: &VariableDeclaration) -> R {
         let function_scoped = matches!(d.kind, VariableDeclarationKind::Var);
-        let is_const = matches!(d.kind, VariableDeclarationKind::Const);
+        let is_const = matches!(
+            d.kind,
+            VariableDeclarationKind::Const
+                | VariableDeclarationKind::Using
+                | VariableDeclarationKind::AwaitUsing
+        );
+        // `using x = v` / `await using x = v`: after the initializer
+        // evaluates, AddDisposableResource records it (and resolves its
+        // dispose method — a TypeError here leaves the binding in TDZ)
+        // BEFORE the binding initializes.
+        let track_using = match d.kind {
+            VariableDeclarationKind::Using => Some(false),
+            VariableDeclarationKind::AwaitUsing => Some(true),
+            _ => None,
+        };
         // Sloppy direct-eval body: a simple `var name = init` is an assignment
         // to the caller-scope binding (dynamic name store; the binding was
         // pre-created by EvalDeclarationInstantiation or is a visible one).
@@ -1875,6 +2093,9 @@ impl Compiler {
                 };
                 if let Some(init) = &decl.init {
                     self.compile_named_expr(init, name)?;
+                    if let Some(is_await) = track_using {
+                        self.emit(Op::TrackDisposable { is_await });
+                    }
                     // The declaration's own initialization is allowed even for
                     // `const`; store directly into the cell (clearing any TDZ).
                     // Inside a `with`, a *var* initializer is an ordinary
@@ -2375,8 +2596,27 @@ impl Compiler {
         let value_k = self.str_const("value");
         self.emit(Op::GetProp(value_k)); // [value]
         self.enter_scope(false);
-        self.bind_for_target(&f.left)?; // consumes value
-        self.compile_stmt(&f.body)?;
+        // `for (using x of …)`: a fresh dispose capability per ITERATION —
+        // the resource is recorded before the binding initializes and
+        // disposed when the iteration ends (normally or abruptly).
+        let head_using_kind = match &f.left {
+            ForStatementLeft::VariableDeclaration(d) => match d.kind {
+                VariableDeclarationKind::Using => Some(false),
+                VariableDeclarationKind::AwaitUsing => Some(true),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(is_await) = head_using_kind {
+            self.compile_with_dispose_scope(is_await, |c| {
+                c.emit(Op::TrackDisposable { is_await });
+                c.bind_for_target(&f.left)?; // consumes value
+                c.compile_stmt(&f.body)
+            })?;
+        } else {
+            self.bind_for_target(&f.left)?; // consumes value
+            self.compile_stmt(&f.body)?;
+        }
         self.exit_scope();
         self.emit(Op::Jump(top));
 
@@ -2409,8 +2649,16 @@ impl Compiler {
         match left {
             ForStatementLeft::VariableDeclaration(d) => {
                 let function_scoped = matches!(d.kind, VariableDeclarationKind::Var);
+                // `const`/`using` loop bindings are immutable: assignment in
+                // the body is a TypeError.
+                let is_const = matches!(
+                    d.kind,
+                    VariableDeclarationKind::Const
+                        | VariableDeclarationKind::Using
+                        | VariableDeclarationKind::AwaitUsing
+                );
                 let decl = &d.declarations[0];
-                self.bind_pattern(&decl.id, function_scoped)?;
+                self.bind_pattern_kind(&decl.id, function_scoped, is_const)?;
             }
             _ => {
                 // assignment target (existing binding / member)
@@ -2935,7 +3183,21 @@ impl Compiler {
             }
             Expression::FunctionExpression(f) => {
                 let name = f.id.as_ref().map(|i| i.name.as_str().to_string());
-                self.compile_function(f, name.as_deref())?;
+                if let Some(n) = &name {
+                    // A named function expression binds its own name in a
+                    // dedicated scope around the closure: visible inside the
+                    // body, immutable (strict write TypeError, sloppy ignored).
+                    self.enter_scope(false);
+                    let cell = self.declare_fn_name(n);
+                    self.compile_function(f, Some(n))?;
+                    // StoreCell (not InitCell): mutate the cell in place so the
+                    // body's captured self-reference observes the closure.
+                    self.emit(Op::Dup);
+                    self.emit(Op::StoreCell(cell));
+                    self.exit_scope();
+                } else {
+                    self.compile_function(f, None)?;
+                }
             }
             Expression::ArrowFunctionExpression(a) => self.compile_arrow(a, None)?,
             Expression::ClassExpression(c) => {
@@ -3060,13 +3322,48 @@ impl Compiler {
 
     fn compile_object(&mut self, o: &ObjectExpression) -> R {
         self.emit(Op::NewObject);
+        // Duplicate plain `__proto__: v` definitions are an early SyntaxError
+        // (computed/shorthand/method forms don't count).
+        fn is_proto_def(p: &ObjectProperty) -> bool {
+            !p.computed
+                && !p.shorthand
+                && !p.method
+                && matches!(p.kind, PropertyKind::Init)
+                && property_key_name(&p.key) == "__proto__"
+        }
+        let proto_defs = o
+            .properties
+            .iter()
+            .filter(|pr| match pr {
+                ObjectPropertyKind::ObjectProperty(p) => is_proto_def(p),
+                _ => false,
+            })
+            .count();
+        if proto_defs > 1 {
+            return Err(
+                "SyntaxError: Duplicate __proto__ fields are not allowed in object literals".into(),
+            );
+        }
         for prop in &o.properties {
             match prop {
                 ObjectPropertyKind::ObjectProperty(p) => {
                     // [obj]
+                    // `__proto__: v` (plain, non-computed, non-shorthand) is
+                    // NOT a property definition: it sets the [[Prototype]].
+                    if is_proto_def(p) {
+                        self.compile_expr(&p.value)?; // [obj, v]
+                        self.emit(Op::SetProtoFromLiteral); // [obj]
+                        continue;
+                    }
                     let is_accessor = matches!(p.kind, PropertyKind::Get | PropertyKind::Set);
                     if p.computed {
                         self.compile_property_key_expr(&p.key)?; // [obj, key]
+                                                                 // ToPropertyKey NOW (spec: ComputedPropertyName
+                                                                 // evaluation), so a later SetFunctionNameFromKey /
+                                                                 // DefineField can't re-run key-coercion side effects.
+                        if Self::is_anonymous_fn_expr(&p.value) {
+                            self.emit(Op::ToPropertyKey);
+                        }
                     } else {
                         let name = property_key_name(&p.key);
                         self.load_str(&name); // [obj, key]
@@ -3091,6 +3388,16 @@ impl Compiler {
                         self.compile_named_expr(&p.value, &nm)?;
                     } else {
                         self.compile_expr(&p.value)?;
+                        // Computed key + anonymous value: NamedEvaluation takes
+                        // the runtime key (with get/set prefix for accessors).
+                        if Self::is_anonymous_fn_expr(&p.value) {
+                            let prefix = self.str_const(match p.kind {
+                                PropertyKind::Get => "get",
+                                PropertyKind::Set => "set",
+                                PropertyKind::Init => "",
+                            });
+                            self.emit(Op::SetFunctionNameFromKey(prefix));
+                        }
                     }
                     self.pending_home_super = false;
                     if is_method {
@@ -3116,6 +3423,17 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// Whether `e` is an ANONYMOUS function/arrow/class expression — the forms
+    /// NamedEvaluation gives a name from the assignment target or property key.
+    fn is_anonymous_fn_expr(e: &Expression) -> bool {
+        match e {
+            Expression::FunctionExpression(f) => f.id.is_none(),
+            Expression::ArrowFunctionExpression(_) => true,
+            Expression::ClassExpression(c) => c.id.is_none(),
+            _ => false,
+        }
     }
 
     fn compile_property_key_expr(&mut self, key: &PropertyKey) -> R {
@@ -3288,12 +3606,34 @@ impl Compiler {
                         self.compile_expr(&m.expression)?;
                         self.emit(Op::DeletePropDynamic);
                     }
-                    Expression::Identifier(id) if self.in_with(id.name.as_str()) => {
-                        // `delete name` inside a `with` deletes from the
-                        // with-object when the name resolves there; otherwise a
-                        // bare-name delete is a no-op reporting success.
-                        let n = self.str_const(id.name.as_str());
-                        self.emit(Op::DeleteName(n));
+                    Expression::Identifier(id) => {
+                        // Strict-mode `delete identifier` is an early error.
+                        if self.cur_ref().strict {
+                            return Err(
+                                "SyntaxError: Delete of an unqualified identifier in strict mode."
+                                    .into(),
+                            );
+                        }
+                        let name = id.name.as_str();
+                        if self.in_with(name) {
+                            // Inside `with`, delete from the with-object when
+                            // the name resolves there (else fall through to the
+                            // global / report-success path in the op).
+                            let n = self.str_const(name);
+                            self.emit(Op::DeleteName(n));
+                        } else {
+                            match self.resolve(name) {
+                                // Declared bindings are not deletable.
+                                Resolved::Cell(_) | Resolved::Upvalue(_) => {
+                                    self.emit(Op::LoadFalse)
+                                }
+                                // Globals: delete per configurability.
+                                Resolved::Global => {
+                                    let n = self.str_const(name);
+                                    self.emit(Op::DeleteName(n))
+                                }
+                            };
+                        }
                     }
                     _ => {
                         self.emit(Op::LoadTrue);
@@ -3530,19 +3870,24 @@ impl Compiler {
                 return Ok(());
             }
         }
-        // super(...) — call the parent constructor with the current `this`.
+        // super(...) — SuperCall (13.3.7.1): evaluate the args, then
+        // Construct(parent, args, new.target) so the PARENT allocates `this`
+        // (giving builtin subclasses real exotic instances), bind the result
+        // as `this` (once), and install instance fields/brands on it. The
+        // expression's value is the bound `this`.
         if matches!(c.callee, Expression::Super(_)) {
             self.load_binding("%superclass"); // [super]
-            self.load_binding("%this"); // [super, this]
-            self.finish_call(c)?;
-            // Constructor return-override: a bytecode parent that returned an
-            // object substitutes it as `this` (in place, so prior captures see
-            // it). Natives keep their discard-and-init-in-place behavior.
-            if let Resolved::Cell(i) = self.resolve("%this") {
-                self.emit(Op::Dup);
-                self.load_binding("%superclass");
-                self.emit(Op::AdoptSuperThis(i));
+            match self.compile_args(&c.arguments)? {
+                ArgForm::Count(n) => {
+                    self.load_binding("%newtarget"); // [super, args.., nt]
+                    self.emit(Op::ConstructSuper(n));
+                }
+                ArgForm::Spread => {
+                    self.load_binding("%newtarget"); // [super, argsArr, nt]
+                    self.emit(Op::ConstructSuperSpread);
+                }
             }
+            self.emit_super_bind_and_init();
             return Ok(());
         }
         // super.method(...) — look up on Super.prototype, call with `this`.
@@ -4544,7 +4889,7 @@ impl Compiler {
                     .any(|d| d.directive.as_str() == "use strict")
             })
             .unwrap_or(false);
-        let class_strict = matches!(kind, FuncKind::ClassCtor);
+        let class_strict = kind.is_class_ctor();
         fc.strict = parent_strict || own_strict || class_strict;
         // One-shot: an object-literal concise method/accessor resolves `super`
         // against its [[HomeObject]]. Arrows never consume it (they take the flag
@@ -4559,16 +4904,36 @@ impl Compiler {
 
         if !arrow {
             let tc = self.declare("%this", false);
-            self.emit(Op::LoadThis);
-            // Sloppy functions substitute the global object / box a primitive
-            // `this` (OrdinaryCallBindThis); strict functions keep it as-is.
-            if !self.cur().strict {
-                self.emit(Op::BindThisSloppy);
+            if kind == FuncKind::DerivedCtor {
+                // A derived constructor has no `this` until `super()` constructs
+                // it: the cell stays in TDZ (reads throw a ReferenceError) and
+                // `super()` initializes it in place via BindThis*. The cell is
+                // STABLE and recorded on the proto so [[Construct]] can read the
+                // final `this` at frame exit (after `finally` blocks have run).
+                self.cur().this_cell = Some(tc);
+                self.cur().stable_cells.push(tc);
+                self.emit(Op::InitCellTdz(tc));
+            } else {
+                self.emit(Op::LoadThis);
+                // Sloppy functions substitute the global object / box a primitive
+                // `this` (OrdinaryCallBindThis); strict functions keep it as-is.
+                if !self.cur().strict {
+                    self.emit(Op::BindThisSloppy);
+                }
+                self.emit(Op::InitCell(tc));
             }
-            self.emit(Op::InitCell(tc));
             let nt = self.declare("%newtarget", false);
             self.emit(Op::LoadNewTarget);
             self.emit(Op::InitCell(nt));
+            if kind == FuncKind::DerivedCtor {
+                // Instance fields/private brands install when `super()` returns,
+                // not at constructor entry. The work lives in a closure so a
+                // `super()` reached from a nested arrow (or direct eval) can run
+                // it against the freshly bound `this`.
+                let fi = self.declare("%fieldinit", false);
+                self.emit_field_init_closure(ctor_fields.unwrap_or(&[]))?;
+                self.emit(Op::InitCell(fi));
+            }
             // The `arguments` object is materialized (an allocation per call) only
             // when the body actually mentions `arguments` — the common case skips
             // it entirely. Scanning the source region for the word never produces
@@ -4664,32 +5029,12 @@ impl Compiler {
         }
         self.cur().in_params = false;
 
-        // Class instance-field initializers run at the top of the constructor.
-        if let Some(fields) = ctor_fields {
-            self.emit_private_brand_stamp();
-            for field in fields {
-                self.load_binding("%this");
-                if field.computed {
-                    self.compile_property_key_expr(&field.key)?;
-                    if let Some(init) = &field.value {
-                        self.compile_expr(init)?;
-                    } else {
-                        self.emit(Op::LoadUndefined);
-                    }
-                    self.emit(Op::SetPropDynamic);
-                } else {
-                    let key = self.class_element_key(&field.key);
-                    if let Some(init) = &field.value {
-                        // NamedEvaluation uses the source-visible name ("#x"),
-                        // not the internal suffixed storage key.
-                        self.compile_named_expr(init, &property_key_name(&field.key))?;
-                    } else {
-                        self.emit(Op::LoadUndefined);
-                    }
-                    let k = self.str_const(&key);
-                    self.emit(Op::SetProp(k));
-                }
-                self.emit(Op::Pop);
+        // A base-class constructor installs instance fields/brands at entry; a
+        // derived one defers them to `super()` (see %fieldinit above).
+        if kind != FuncKind::DerivedCtor {
+            if let Some(fields) = ctor_fields {
+                self.emit_private_brand_stamp();
+                self.emit_field_definitions(fields)?;
             }
         }
 
@@ -4704,14 +5049,32 @@ impl Compiler {
             self.compile_expr(ret)?;
             self.emit(Op::Return);
         } else if let Some(b) = body {
-            self.hoist_lexical(&b.statements);
-            self.hoist_vars_all(&b.statements);
-            self.hoist_funcs(&b.statements)?;
-            for s in &b.statements {
-                self.compile_stmt(s)?;
+            if Self::stmts_have_using(&b.statements) {
+                // A `using` at function-body top level disposes when the BODY
+                // exits (return/throw/fall-through all route through the
+                // dispose landing pad).
+                let pad_async = Self::stmts_have_await_using(&b.statements);
+                self.compile_with_dispose_scope(pad_async, |c| {
+                    c.hoist_lexical(&b.statements);
+                    c.hoist_vars_all(&b.statements);
+                    c.hoist_funcs(&b.statements)?;
+                    for s in &b.statements {
+                        c.compile_stmt(s)?;
+                    }
+                    c.emit(Op::LoadUndefined);
+                    c.emit(Op::Return);
+                    Ok(())
+                })?;
+            } else {
+                self.hoist_lexical(&b.statements);
+                self.hoist_vars_all(&b.statements);
+                self.hoist_funcs(&b.statements)?;
+                for s in &b.statements {
+                    self.compile_stmt(s)?;
+                }
+                self.emit(Op::LoadUndefined);
+                self.emit(Op::Return);
             }
-            self.emit(Op::LoadUndefined);
-            self.emit(Op::Return);
         } else {
             self.emit(Op::LoadUndefined);
             self.emit(Op::Return);
@@ -4865,6 +5228,27 @@ impl Compiler {
     }
 
     fn compile_class_inner(&mut self, class: &Class, name: Option<&str>) -> R {
+        // The class's own lexical scope: holds `%superclass` and (for a NAMED
+        // class) the inner self-binding — a `const` visible to every method
+        // and initializer, independent of the outer (mutable) declaration.
+        self.enter_scope(false);
+        let result = self.compile_class_scoped(class, name);
+        self.exit_scope();
+        result
+    }
+
+    fn compile_class_scoped(&mut self, class: &Class, name: Option<&str>) -> R {
+        // A class with a binding identifier binds it INSIDE the class scope as
+        // an immutable (const) self-reference: in TDZ while the heritage and
+        // computed keys evaluate, then initialized to the constructor; methods
+        // and static initializers see the class even if the outer binding is
+        // reassigned, and writes to it throw a TypeError (class bodies are
+        // strict).
+        let self_cell = class.id.as_ref().map(|id| {
+            let c = self.declare_kind(id.name.as_str(), false, true);
+            self.emit(Op::InitCellTdz(c));
+            c
+        });
         // Superclass (if any) stored in a captured binding so methods can `super`.
         let has_super = class.super_class.is_some();
         if let Some(sc) = &class.super_class {
@@ -4896,7 +5280,11 @@ impl Compiler {
                 m.value.body.as_deref(),
                 false,
                 None,
-                FuncKind::ClassCtor,
+                if has_super {
+                    FuncKind::DerivedCtor
+                } else {
+                    FuncKind::ClassCtor
+                },
                 name,
                 Some(&instance_fields),
             )?;
@@ -4905,6 +5293,13 @@ impl Compiler {
         }
         let ctor_cell = self.temp();
         self.emit(Op::InitCell(ctor_cell));
+
+        // Initialize the self-binding (StoreCell mutates the TDZ cell in
+        // place, so closures created either side observe the same cell).
+        if let Some(c) = self_cell {
+            self.emit(Op::LoadCell(ctor_cell));
+            self.emit(Op::StoreCell(c));
+        }
 
         if has_super {
             self.class_link_super(ctor_cell)?;
@@ -4951,7 +5346,12 @@ impl Compiler {
         has_super: bool,
         fields: &[&PropertyDefinition],
     ) -> R {
-        let mut fc = FnCtx::new(name.unwrap_or(""), FuncKind::ClassCtor);
+        let kind = if has_super {
+            FuncKind::DerivedCtor
+        } else {
+            FuncKind::ClassCtor
+        };
+        let mut fc = FnCtx::new(name.unwrap_or(""), kind);
         fc.enclosed_in_with = self
             .fns
             .last()
@@ -4959,29 +5359,52 @@ impl Compiler {
             .unwrap_or(false);
         fc.has_rest = has_super;
         fc.num_params = 0;
+        fc.strict = true; // class bodies are always strict
         self.fns.push(fc);
         self.enter_scope(true);
         let tc = self.declare("%this", false);
-        self.emit(Op::LoadThis);
-        self.emit(Op::InitCell(tc));
+        if has_super {
+            self.cur().this_cell = Some(tc);
+            self.cur().stable_cells.push(tc);
+            self.emit(Op::InitCellTdz(tc));
+        } else {
+            self.emit(Op::LoadThis);
+            self.emit(Op::InitCell(tc));
+        }
         let nt = self.declare("%newtarget", false);
         self.emit(Op::LoadNewTarget);
         self.emit(Op::InitCell(nt));
-        let ac = self.declare("arguments", false);
-        self.emit(Op::LoadArguments);
-        self.emit(Op::InitCell(ac));
         if has_super {
-            // super(...arguments); a parent constructor that returns an object
-            // substitutes it as `this` (return-override), so brand/field
-            // installation below lands on the adopted object.
+            // The default derived constructor: `constructor(...args) {
+            // super(...args) }` — the parent constructs `this`, then instance
+            // fields/brands install on it.
+            let fi = self.declare("%fieldinit", false);
+            self.emit_field_init_closure(fields)?;
+            self.emit(Op::InitCell(fi));
             self.load_binding("%superclass");
-            self.load_binding("%this");
-            self.load_binding("arguments");
-            self.emit(Op::CallSpread);
-            self.load_binding("%superclass");
-            self.emit(Op::AdoptSuperThis(tc));
+            self.emit(Op::LoadRestArgs(0));
+            self.load_binding("%newtarget");
+            self.emit(Op::ConstructSuperSpread);
+            self.emit_super_bind_and_init();
+            self.emit(Op::Return); // super() evaluates to the bound `this`
+        } else {
+            self.emit_private_brand_stamp();
+            self.emit_field_definitions(fields)?;
+            self.emit(Op::LoadUndefined);
+            self.emit(Op::Return);
         }
-        self.emit_private_brand_stamp();
+        self.exit_scope();
+        let fc = self.fns.pop().unwrap();
+        let proto = self.finish(fc);
+        let idx = self.konst(Const::Func(Rc::new(proto)));
+        self.emit(Op::Closure(idx));
+        Ok(())
+    }
+
+    /// Define each instance field on `this` (assumes the surrounding scope can
+    /// resolve `%this`): evaluates the (possibly computed) key and initializer
+    /// and assigns the result.
+    fn emit_field_definitions(&mut self, fields: &[&PropertyDefinition]) -> R {
         for field in fields {
             self.load_binding("%this");
             if field.computed {
@@ -5007,13 +5430,36 @@ impl Compiler {
             }
             self.emit(Op::Pop);
         }
-        // A derived implicit constructor returns its (possibly adopted) `this`
-        // so construct() surfaces a return-override object.
-        if has_super {
-            self.load_binding("%this");
-        } else {
-            self.emit(Op::LoadUndefined);
+        Ok(())
+    }
+
+    /// Build the `%fieldinit` closure of a derived constructor: a function
+    /// that, called with the freshly constructed `this`, stamps the private
+    /// brand and installs the instance fields (InitializeInstanceElements).
+    /// It is invoked by every `super()` site — including ones inside nested
+    /// arrows or direct eval, which reach it lexically.
+    fn emit_field_init_closure(&mut self, fields: &[&PropertyDefinition]) -> R {
+        let mut fc = FnCtx::new("", FuncKind::Method);
+        fc.enclosed_in_with = self
+            .fns
+            .last()
+            .map(|f| f.with_depth > 0 || f.enclosed_in_with || f.contains_eval)
+            .unwrap_or(false);
+        fc.contains_eval = fields
+            .iter()
+            .any(|f| self.region_has_eval(f.span.start, f.span.end));
+        fc.strict = true; // class bodies are always strict
+        self.fns.push(fc);
+        self.enter_scope(true);
+        let tc = self.declare("%this", false);
+        self.emit(Op::LoadThis);
+        self.emit(Op::InitCell(tc));
+        if self.cur_ref().contains_eval {
+            self.emit(Op::InitEvalVars);
         }
+        self.emit_private_brand_stamp();
+        self.emit_field_definitions(fields)?;
+        self.emit(Op::LoadUndefined);
         self.emit(Op::Return);
         self.exit_scope();
         let fc = self.fns.pop().unwrap();
@@ -5023,32 +5469,32 @@ impl Compiler {
         Ok(())
     }
 
-    /// Link `ctor.prototype.__proto__ = Super.prototype` and
-    /// `ctor.__proto__ = Super` via `Object.setPrototypeOf`.
+    /// After `super()` leaves the constructed instance on the stack: bind it
+    /// as `this` (BindThisValue — throws if `super()` already ran) and run the
+    /// `%fieldinit` closure against it. `[instance] -> [instance]`.
+    fn emit_super_bind_and_init(&mut self) {
+        match self.resolve("%this") {
+            Resolved::Cell(i) => self.emit(Op::BindThisCell(i)),
+            Resolved::Upvalue(i) => self.emit(Op::BindThisUpvalue(i)),
+            // No reachable `%this` (malformed context): leave the value as-is.
+            Resolved::Global => return,
+        };
+        if !matches!(self.resolve("%fieldinit"), Resolved::Global) {
+            self.emit(Op::Dup); // [this, this]
+            self.load_binding("%fieldinit"); // [this, this, fi]
+            self.emit(Op::Swap); // [this, fi, this]
+            self.emit(Op::Call(0)); // [this, undefined]
+            self.emit(Op::Pop); // [this]
+        }
+    }
+
+    /// Wire `ctor.prototype.__proto__ = Super.prototype` and
+    /// `ctor.__proto__ = Super`, handling `extends null` and non-constructor
+    /// heritage (TypeError) natively.
     fn class_link_super(&mut self, ctor_cell: u32) -> R {
-        let object = self.str_const("Object");
-        let set_proto = self.str_const("setPrototypeOf");
-        let prototype = self.str_const("prototype");
-
-        // Object.setPrototypeOf(ctor.prototype, Super.prototype)
-        self.emit(Op::LoadGlobal(object));
-        self.emit(Op::GetProp(set_proto)); // [setFn]
-        self.emit(Op::LoadUndefined); // this
-        self.emit(Op::LoadCell(ctor_cell));
-        self.emit(Op::GetProp(prototype)); // ctor.prototype
-        self.load_binding("%superclass");
-        self.emit(Op::GetProp(prototype)); // super.prototype
-        self.emit(Op::Call(2));
-        self.emit(Op::Pop);
-
-        // Object.setPrototypeOf(ctor, Super)
-        self.emit(Op::LoadGlobal(object));
-        self.emit(Op::GetProp(set_proto));
-        self.emit(Op::LoadUndefined);
         self.emit(Op::LoadCell(ctor_cell));
         self.load_binding("%superclass");
-        self.emit(Op::Call(2));
-        self.emit(Op::Pop);
+        self.emit(Op::ClassLinkSuper);
         Ok(())
     }
 
@@ -5061,6 +5507,9 @@ impl Compiler {
         }
         if m.computed {
             self.compile_property_key_expr(&m.key)?;
+            // ToPropertyKey NOW — see compile_object: the later
+            // SetFunctionNameFromKey must not re-run coercion side effects.
+            self.emit(Op::ToPropertyKey);
         } else {
             let name = self.class_element_key(&m.key);
             self.load_str(&name);
@@ -5079,6 +5528,16 @@ impl Compiler {
             self.pending_home_super = true;
         }
         self.compile_function(&m.value, Some(&fname))?;
+        // Computed-key method/accessor: the compile-time name above is just
+        // "[computed]" — SetFunctionName with the runtime key.
+        if m.computed {
+            let prefix = self.str_const(match m.kind {
+                MethodDefinitionKind::Get => "get",
+                MethodDefinitionKind::Set => "set",
+                _ => "",
+            });
+            self.emit(Op::SetFunctionNameFromKey(prefix));
+        }
         self.pending_home_super = false;
         if m.r#static {
             // [ctor, key, value] — stamp value.[[HomeObject]] = ctor.

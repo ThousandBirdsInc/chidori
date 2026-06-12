@@ -122,10 +122,19 @@ impl Vm {
         new_target: Value,
     ) -> Result<Value, Value> {
         let kind = bf.proto.kind;
+        // A class constructor is only reachable through [[Construct]] (spec
+        // 10.2.1 step 2) — `C()`, `C.call(..)`, etc. all throw.
+        if bf.is_class_ctor {
+            return Err(self.throw_type(&format!(
+                "Class constructor {} cannot be invoked without 'new'",
+                bf.proto.name
+            )));
+        }
         if kind.is_generator() {
             return self.make_generator(func_obj, bf, this, args, new_target);
         }
         let mut frame = self.make_frame(bf, this, args, new_target);
+        frame.func_obj = Some(func_obj.clone());
         let token = self.trace_enter(&frame.func.proto);
         frame.trace_token = token;
         if kind.is_async() {
@@ -147,6 +156,119 @@ impl Vm {
                 }
             }
         }
+    }
+
+    /// Build the `arguments` exotic object for a frame (spec 10.4.4):
+    /// indexed own properties, `length`, `@@iterator` (%Array.prototype.values%),
+    /// `[object Arguments]` tag, and `callee` — the function itself for a
+    /// mapped (sloppy, simple-parameter-list) frame, the %ThrowTypeError%
+    /// accessor otherwise. Index/parameter aliasing is not modeled.
+    fn make_arguments_object(&mut self, frame: &Frame) -> Value {
+        let o = self.alloc(ObjectData::new(
+            Some(self.realm.object_proto.clone()),
+            Internal::Arguments,
+        ));
+        {
+            let mut b = o.borrow_mut();
+            for (i, v) in frame.args.iter().enumerate() {
+                b.props.insert(
+                    PropertyKey::from_index(i as u32),
+                    Property {
+                        kind: PropertyKind::Data {
+                            value: v.clone(),
+                            writable: true,
+                        },
+                        enumerable: true,
+                        configurable: true,
+                    },
+                );
+            }
+            b.props.insert(
+                PropertyKey::str("length"),
+                Property {
+                    kind: PropertyKind::Data {
+                        value: Value::Number(frame.args.len() as f64),
+                        writable: true,
+                    },
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
+        // @@iterator: %Array.prototype.values% (writable, non-enum, configurable).
+        let values = self
+            .realm
+            .array_proto
+            .borrow()
+            .props
+            .get(&PropertyKey::str("values"))
+            .and_then(|p| p.value().cloned())
+            .unwrap_or(Value::Undefined);
+        let iter_key = PropertyKey::Sym(self.realm.symbol_iterator.clone());
+        o.borrow_mut().props.insert(
+            iter_key,
+            Property {
+                kind: PropertyKind::Data {
+                    value: values,
+                    writable: true,
+                },
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        // callee: mapped (sloppy + simple parameter list) exposes the function;
+        // unmapped poisons it with the %ThrowTypeError% accessor.
+        let p = &frame.func.proto;
+        let simple_params = !p.has_rest
+            && (p.num_params as usize) == p.param_names.len()
+            && p.param_names.iter().all(|n| !n.is_empty());
+        let callee = if !p.is_strict && simple_params {
+            Property {
+                kind: PropertyKind::Data {
+                    value: frame
+                        .func_obj
+                        .as_ref()
+                        .map(|f| Value::Object(f.clone()))
+                        .unwrap_or(Value::Undefined),
+                    writable: true,
+                },
+                enumerable: false,
+                configurable: true,
+            }
+        } else {
+            let tte = Value::Object(self.realm.throw_type_error.clone());
+            Property {
+                kind: PropertyKind::Accessor {
+                    get: Some(tte.clone()),
+                    set: Some(tte),
+                },
+                enumerable: false,
+                configurable: false,
+            }
+        };
+        o.borrow_mut()
+            .props
+            .insert(PropertyKey::str("callee"), callee);
+        Value::Object(o)
+    }
+
+    /// Build a SuppressedError(error, suppressed) for DisposeResources'
+    /// error-chaining; falls back to `error` if the intrinsic is unusable.
+    fn make_suppressed_error(&mut self, error: Value, suppressed: Value) -> Value {
+        let g = Value::Object(self.realm.global.clone());
+        if let Ok(ctor) = self.get_prop(&g, &PropertyKey::str("SuppressedError")) {
+            if self.is_constructor(&ctor) {
+                let args = [
+                    error.clone(),
+                    suppressed,
+                    Value::str("An error was suppressed during disposal"),
+                ];
+                if let Ok(se) = self.construct(&ctor, &args, &ctor.clone()) {
+                    return se;
+                }
+            }
+        }
+        error
     }
 
     pub fn make_frame(
@@ -177,6 +299,8 @@ impl Vm {
             pending_throw: None,
             pending_return: None,
             args: args.to_vec(),
+            func_obj: None,
+            dispose_scopes: Vec::new(),
             completion: Value::Undefined,
             enumerators: Vec::new(),
             with_scope,
@@ -259,7 +383,28 @@ impl Vm {
                 let n = self.to_string_lossy(&name);
                 Err(self.throw_type(&format!("{n} is not a constructor")))
             }
-            Disp::Native(c) => c(self, Value::Undefined, args),
+            Disp::Native(c) => {
+                let r = c(self, Value::Undefined, args)?;
+                // GetPrototypeFromConstructor: when constructed via a different
+                // new.target (a subclass `super()` or Reflect.construct), the
+                // fresh instance's [[Prototype]] comes from new_target.prototype
+                // (falling back to the intrinsic default the builtin installed).
+                // Results that merely echo an argument (`new Object(existing)`)
+                // and proxies (no own [[Prototype]]) are left untouched.
+                if !new_target.same_obj(cobj) {
+                    if let Value::Object(res) = &r {
+                        let echoes_arg = args.iter().any(|a| a.same_obj(res));
+                        let is_proxy = matches!(res.borrow().internal, Internal::Proxy(_));
+                        if !echoes_arg && !is_proxy && matches!(new_target, Value::Object(_)) {
+                            let p = self.get_prop(new_target, &PropertyKey::str("prototype"))?;
+                            if let Value::Object(po) = p {
+                                res.borrow_mut().proto = Some(po);
+                            }
+                        }
+                    }
+                }
+                Ok(r)
+            }
             Disp::Bound(target, bargs) => {
                 let mut all = bargs;
                 all.extend_from_slice(args);
@@ -271,6 +416,43 @@ impl Vm {
                 self.construct(&Value::Object(target), &all, &nt)
             }
             Disp::Bytecode(bf) => {
+                // A derived-class constructor gets NO pre-created `this`: its
+                // `%this` cell stays in TDZ until `super()` constructs the
+                // instance (which is what gives `class A extends Array` a real
+                // exotic array). The derived-constructor completion rules apply
+                // HERE, at frame exit, so `finally` blocks (which may call
+                // super()) have already run: an object return passes through;
+                // undefined yields the bound `this` (ReferenceError when
+                // super() never ran); any other primitive is a TypeError. The
+                // `%this` cell is STABLE (same `Rc` for the whole call), so
+                // watching it across run_frame is sound.
+                if bf.proto.kind == FuncKind::DerivedCtor {
+                    let this_cell = bf.proto.this_cell;
+                    let frame = self.make_frame(bf, Value::Uninitialized, args, new_target.clone());
+                    let watched = this_cell.map(|i| frame.cells[i as usize].clone());
+                    return match self.run_frame(frame) {
+                        Flow::Return(v) => match v {
+                            Value::Object(_) => Ok(v),
+                            Value::Undefined => {
+                                let t = watched
+                                    .map(|c| c.borrow().clone())
+                                    .unwrap_or(Value::Uninitialized);
+                                if matches!(t, Value::Uninitialized) {
+                                    Err(self.throw_reference(
+                                        "Must call super constructor in derived class before returning from derived constructor",
+                                    ))
+                                } else {
+                                    Ok(t)
+                                }
+                            }
+                            _ => Err(self.throw_type(
+                                "Derived constructors may only return object or undefined",
+                            )),
+                        },
+                        Flow::Throw(e) => Err(e),
+                        Flow::Suspend(_) => Err(self.throw_type("internal: constructor suspended")),
+                    };
+                }
                 // Create `this` with prototype from new_target.prototype.
                 let nt_obj = match new_target {
                     Value::Object(o) => o.clone(),
@@ -494,6 +676,9 @@ impl Vm {
                             return Err(self
                                 .throw_type(&format!("Cannot declare global variable '{name}'")));
                         }
+                        // CreateGlobalVarBinding(name, D=true): an EVAL-created
+                        // global var is deletable (configurable), unlike a
+                        // script-level one.
                         g.borrow_mut()
                             .props
                             .insert(key, Property::data(Value::Undefined));
@@ -681,8 +866,8 @@ impl Vm {
                 push!(Value::Object(self.new_array(rest)));
             }
             Op::LoadArguments => {
-                let arr = self.new_array(frame.args.clone());
-                push!(Value::Object(arr));
+                let o = self.make_arguments_object(frame);
+                push!(o);
             }
 
             Op::LoadLocal(i) => push!(frame.locals[i as usize].clone()),
@@ -783,7 +968,7 @@ impl Vm {
                 }
                 self.put_value(&Value::Object(g), &key, v, strict)?;
             }
-            Op::DeclareGlobal(i) => {
+            Op::DeclareGlobal { name: i, deletable } => {
                 let name = self.const_name(frame, i);
                 let g = self.realm.global.clone();
                 let key = PropertyKey::Str(name.clone());
@@ -798,9 +983,19 @@ impl Vm {
                             self.throw_type(&format!("Cannot declare global '{}'", name.as_str()))
                         );
                     }
-                    g.borrow_mut()
-                        .props
-                        .insert(key, Property::data(Value::Undefined));
+                    // CreateGlobalVarBinding(N, D): writable, enumerable;
+                    // configurable only for eval-created bindings.
+                    g.borrow_mut().props.insert(
+                        key,
+                        Property {
+                            kind: PropertyKind::Data {
+                                value: Value::Undefined,
+                                writable: true,
+                            },
+                            enumerable: true,
+                            configurable: deletable,
+                        },
+                    );
                 }
             }
 
@@ -848,8 +1043,17 @@ impl Vm {
                     let r = self.delete_prop(&Value::Object(obj), &key)?;
                     push!(Value::Bool(r));
                 } else {
-                    // Deleting an unresolvable/lexical bare name reports success.
-                    push!(Value::Bool(true));
+                    // Global Environment Record DeleteBinding: a global-object
+                    // property deletes per its configurability (NaN/undefined/
+                    // var-created globals are non-configurable -> false); an
+                    // unresolvable bare name reports success.
+                    let g = self.realm.global.clone();
+                    if self.has_own_or_proto(&g, &key) {
+                        let r = self.delete_prop(&Value::Object(g), &key)?;
+                        push!(Value::Bool(r));
+                    } else {
+                        push!(Value::Bool(true));
+                    }
                 }
             }
             Op::ResolveNameBase(name) => {
@@ -1190,18 +1394,249 @@ impl Vm {
                 self.set_prop(&obj, &pkey, value.clone())?;
                 push!(value);
             }
-            Op::AdoptSuperThis(i) => {
+            Op::ConstructSuper(argc) => {
+                let nt = pop!();
+                let at = frame.stack.len() - argc as usize;
+                let args = frame.stack.split_off(at);
                 let sup = pop!();
+                let r = self.construct(&sup, &args, &nt)?;
+                push!(r);
+            }
+            Op::ConstructSuperSpread => {
+                let nt = pop!();
+                let args_arr = pop!();
+                let sup = pop!();
+                let args = self.iterate_to_vec(&args_arr)?;
+                let r = self.construct(&sup, &args, &nt)?;
+                push!(r);
+            }
+            Op::BindThisCell(i) => {
+                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                let mut slot = frame.cells[i as usize].borrow_mut();
+                if !matches!(*slot, Value::Uninitialized) {
+                    drop(slot);
+                    return Err(self.throw_reference("Super constructor may only be called once"));
+                }
+                *slot = v;
+            }
+            Op::BindThisUpvalue(i) => {
+                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                let mut slot = frame.func.upvalues[i as usize].borrow_mut();
+                if !matches!(*slot, Value::Uninitialized) {
+                    drop(slot);
+                    return Err(self.throw_reference("Super constructor may only be called once"));
+                }
+                *slot = v;
+            }
+            Op::SetFunctionNameFromKey(prefix) => {
+                // [.., key, fn] (peek both): SetFunctionName with the runtime
+                // property key — symbols name as "[description]" (or "").
+                let n = frame.stack.len();
+                if n >= 2 {
+                    let value = frame.stack[n - 1].clone();
+                    let key = frame.stack[n - 2].clone();
+                    if let Value::Object(f) = &value {
+                        if f.borrow().is_callable() {
+                            let base = match &key {
+                                Value::Symbol(sym) => match sym.description() {
+                                    Some(d) => format!("[{d}]"),
+                                    None => String::new(),
+                                },
+                                other => self.to_string_lossy(other),
+                            };
+                            let prefix = self.const_name(frame, prefix);
+                            let name = if prefix.as_str().is_empty() {
+                                base
+                            } else {
+                                format!("{} {}", prefix.as_str(), base)
+                            };
+                            f.borrow_mut().props.insert(
+                                PropertyKey::str("name"),
+                                Property {
+                                    kind: PropertyKind::Data {
+                                        value: Value::str(name),
+                                        writable: false,
+                                    },
+                                    enumerable: false,
+                                    configurable: true,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Op::SetProtoFromLiteral => {
                 let v = pop!();
-                let parent_is_bytecode = matches!(
-                    &sup,
-                    Value::Object(o) if matches!(
-                        o.borrow().as_function(),
-                        Some(FunctionInner::Bytecode(_))
-                    )
-                );
-                if parent_is_bytecode && matches!(v, Value::Object(_)) {
-                    *frame.cells[i as usize].borrow_mut() = v;
+                let obj = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                if let Value::Object(o) = &obj {
+                    match v {
+                        Value::Object(p) => o.borrow_mut().proto = Some(p),
+                        Value::Null => o.borrow_mut().proto = None,
+                        // Non-object, non-null values are silently ignored.
+                        _ => {}
+                    }
+                }
+            }
+            Op::PushDisposeScope => {
+                frame.dispose_scopes.push(Vec::new());
+            }
+            Op::TrackDisposable { is_await } => {
+                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                if matches!(v, Value::Null | Value::Undefined) {
+                    // `await using x = null` still records an entry (method
+                    // undefined) so disposal performs its Await tick; sync
+                    // `using` records nothing.
+                    if is_await {
+                        if let Some(scope) = frame.dispose_scopes.last_mut() {
+                            scope.push((Value::Undefined, Value::Undefined));
+                        }
+                    }
+                } else {
+                    if !matches!(v, Value::Object(_)) {
+                        return Err(self.throw_type(
+                            "'using' declarations may only be used with object, null, or undefined values",
+                        ));
+                    }
+                    // GetDisposeMethod: @@asyncDispose (await using, falling
+                    // back to @@dispose) or @@dispose. A nullish property is
+                    // "no method"; a non-callable one is a TypeError.
+                    let get_method =
+                        |vm: &mut Self, sym: &JsSymbol| -> Result<Option<Value>, Value> {
+                            let m = vm.get_prop(&v, &PropertyKey::Sym(sym.clone()))?;
+                            if m.is_nullish() {
+                                return Ok(None);
+                            }
+                            if !vm.is_callable(&m) {
+                                return Err(vm.throw_type("dispose method is not a function"));
+                            }
+                            Ok(Some(m))
+                        };
+                    let method = if is_await {
+                        let asym = self.realm.symbol_async_dispose.clone();
+                        match get_method(self, &asym)? {
+                            Some(m) => Some(m),
+                            None => {
+                                let dsym = self.realm.symbol_dispose.clone();
+                                get_method(self, &dsym)?
+                            }
+                        }
+                    } else {
+                        let dsym = self.realm.symbol_dispose.clone();
+                        get_method(self, &dsym)?
+                    };
+                    let method = method.ok_or_else(|| {
+                        self.throw_type(
+                            "The value being disposed does not have a [Symbol.dispose] method",
+                        )
+                    })?;
+                    match frame.dispose_scopes.last_mut() {
+                        Some(scope) => scope.push((v, method)),
+                        None => {
+                            return Err(self.throw_type("internal: 'using' outside a dispose scope"))
+                        }
+                    }
+                }
+            }
+            Op::DisposeScope => {
+                // DisposeResources: reverse order; each error converts the
+                // parked completion to a throw — chaining an already-thrown
+                // completion via SuppressedError(error, suppressed).
+                let resources = frame.dispose_scopes.pop().unwrap_or_default();
+                for (value, method) in resources.into_iter().rev() {
+                    if let Err(e) = self.call(method, value, &[]) {
+                        let merged = match frame.pending_completion.take() {
+                            Some(Completion::Throw(prev)) => self.make_suppressed_error(e, prev),
+                            _ => e,
+                        };
+                        frame.pending_completion = Some(Completion::Throw(merged));
+                    }
+                }
+            }
+            Op::DisposeAsyncNext => {
+                let entry = frame.dispose_scopes.last_mut().and_then(|s| s.pop());
+                match entry {
+                    Some((value, method)) => {
+                        let result = if matches!(method, Value::Undefined) {
+                            // Nullish `await using`: nothing to call, but the
+                            // landing pad still Awaits undefined.
+                            Ok(Value::Undefined)
+                        } else {
+                            self.call(method, value, &[])
+                        };
+                        match result {
+                            Ok(r) => {
+                                push!(r);
+                                push!(Value::Bool(true));
+                            }
+                            Err(e) => {
+                                let merged = match frame.pending_completion.take() {
+                                    Some(Completion::Throw(prev)) => {
+                                        self.make_suppressed_error(e, prev)
+                                    }
+                                    _ => e,
+                                };
+                                frame.pending_completion = Some(Completion::Throw(merged));
+                                push!(Value::Undefined);
+                                push!(Value::Bool(true));
+                            }
+                        }
+                    }
+                    None => {
+                        frame.dispose_scopes.pop();
+                        push!(Value::Undefined);
+                        push!(Value::Bool(false));
+                    }
+                }
+            }
+            Op::MergeDisposeError => {
+                let e = pop!();
+                let merged = match frame.pending_completion.take() {
+                    Some(Completion::Throw(prev)) => self.make_suppressed_error(e, prev),
+                    _ => e,
+                };
+                frame.pending_completion = Some(Completion::Throw(merged));
+            }
+            Op::ClassLinkSuper => {
+                let sup = pop!();
+                let ctor = pop!();
+                let ctor_obj = match &ctor {
+                    Value::Object(o) => o.clone(),
+                    _ => return Err(self.throw_type("internal: class ctor not an object")),
+                };
+                match &sup {
+                    Value::Null => {
+                        // `extends null`: instances have no prototype chain; the
+                        // constructor itself still inherits %Function.prototype%.
+                        let p = self.get_prop(&ctor, &PropertyKey::str("prototype"))?;
+                        if let Value::Object(po) = p {
+                            po.borrow_mut().proto = None;
+                        }
+                    }
+                    _ => {
+                        if !self.is_constructor(&sup) {
+                            return Err(
+                                self.throw_type("Class extends value is not a constructor or null")
+                            );
+                        }
+                        let so = match &sup {
+                            Value::Object(o) => o.clone(),
+                            _ => unreachable!("constructors are objects"),
+                        };
+                        let sp = self.get_prop(&sup, &PropertyKey::str("prototype"))?;
+                        let proto_parent =
+                            match sp {
+                                Value::Object(o) => Some(o),
+                                Value::Null => None,
+                                _ => return Err(self.throw_type(
+                                    "Class extends value does not have valid prototype property",
+                                )),
+                            };
+                        let p = self.get_prop(&ctor, &PropertyKey::str("prototype"))?;
+                        if let Value::Object(po) = p {
+                            po.borrow_mut().proto = proto_parent;
+                        }
+                        ctor_obj.borrow_mut().proto = Some(so);
+                    }
                 }
             }
             Op::PrivateHasOwn(i) => {
@@ -1742,15 +2177,6 @@ impl Vm {
                 let it = self.get_async_iterator(&v)?;
                 push!(it);
             }
-            Op::SuperCall(_)
-            | Op::SuperCallSpread
-            | Op::LoadSuperBase
-            | Op::SuperGet(_)
-            | Op::SuperGetDynamic
-            | Op::SuperSet(_)
-            | Op::SpreadIntoArray => {
-                return Err(self.throw_type("unsupported opcode (super/spread-internal)"));
-            }
         }
         Ok(Ctl::Next)
     }
@@ -1881,7 +2307,7 @@ impl Vm {
             proto,
             upvalues,
             home_object: None,
-            is_class_ctor: kind == FuncKind::ClassCtor,
+            is_class_ctor: kind.is_class_ctor(),
             captured_with: Vec::new(),
         };
         // [[Prototype]] is the function-kind intrinsic: %GeneratorFunction.prototype%,
@@ -1929,7 +2355,10 @@ impl Vm {
             );
         }
         // Ordinary (non-arrow, non-method) functions get a fresh `.prototype`.
-        if matches!(kind, FuncKind::Normal | FuncKind::ClassCtor) {
+        if matches!(
+            kind,
+            FuncKind::Normal | FuncKind::ClassCtor | FuncKind::DerivedCtor
+        ) {
             let proto_obj = self.new_object();
             proto_obj.borrow_mut().props.insert(
                 PropertyKey::str("constructor"),

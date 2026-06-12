@@ -24,6 +24,7 @@ use crate::vm::Vm;
 
 pub fn install(vm: &mut Vm) {
     fundamental::install(vm);
+    install_restricted_properties(vm);
     numbers::install(vm);
     bigint::install(vm);
     array::install(vm);
@@ -40,6 +41,62 @@ pub fn install(vm: &mut Vm) {
     crate::proxy::install(vm);
     disposable::install(vm);
     install_globals(vm);
+}
+
+/// Build the unique-per-realm %ThrowTypeError% intrinsic and poison
+/// `Function.prototype.caller` / `Function.prototype.arguments` with it
+/// (spec 10.2.4 / 20.2.3): both are accessor properties whose get and set
+/// throw a TypeError. %ThrowTypeError% itself is non-extensible with
+/// non-configurable, non-writable `length` (0) and `name` ("").
+fn install_restricted_properties(vm: &mut Vm) {
+    use std::rc::Rc;
+    fn frozen(value: Value) -> Property {
+        Property {
+            kind: PropertyKind::Data {
+                value,
+                writable: false,
+            },
+            enumerable: false,
+            configurable: false,
+        }
+    }
+    let nf = NativeFunction {
+        name: Rc::from(""),
+        length: 0,
+        func: Rc::new(|vm: &mut Vm, _t: Value, _a: &[Value]| {
+            Err(vm.throw_type(
+                "'caller', 'callee', and 'arguments' properties may not be accessed on \
+                 strict mode functions or the arguments objects for calls to them",
+            ))
+        }),
+        construct: None,
+    };
+    let tte = vm.alloc(ObjectData::new(
+        Some(vm.realm.function_proto.clone()),
+        Internal::Function(FunctionInner::Native(nf)),
+    ));
+    {
+        let mut b = tte.borrow_mut();
+        b.props
+            .insert(PropertyKey::str("length"), frozen(Value::Number(0.0)));
+        b.props
+            .insert(PropertyKey::str("name"), frozen(Value::str("")));
+        b.extensible = false;
+    }
+    vm.realm.throw_type_error = tte.clone();
+
+    let poison = Property {
+        kind: PropertyKind::Accessor {
+            get: Some(Value::Object(tte.clone())),
+            set: Some(Value::Object(tte)),
+        },
+        enumerable: false,
+        configurable: true,
+    };
+    let fp = vm.realm.function_proto.clone();
+    let mut b = fp.borrow_mut();
+    b.props.insert(PropertyKey::str("caller"), poison.clone());
+    b.props.insert(PropertyKey::str("arguments"), poison);
 }
 
 // ---- function-kind intrinsics (%GeneratorFunction% etc.) ----
@@ -136,26 +193,6 @@ fn install_kind_function(
 }
 
 // ---- shared helpers ----
-
-/// For a native constructor's CALL handler: detect a `super(...)` invocation
-/// from a subclass — `this` is an under-construction instance whose prototype
-/// chain includes the builtin's `proto` — and return that instance so the
-/// handler can initialize its exotic internal slot in place. A plain call
-/// (no such `this`) returns `None`.
-pub(crate) fn super_target(this: &Value, proto: &JsObject) -> Option<JsObject> {
-    let o = match this {
-        Value::Object(o) => o.clone(),
-        _ => return None,
-    };
-    let mut cur = o.borrow().proto.clone();
-    while let Some(p) = cur {
-        if p.same(proto) {
-            return Some(o.clone());
-        }
-        cur = p.borrow().proto.clone();
-    }
-    None
-}
 
 pub(crate) fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).cloned().unwrap_or(Value::Undefined)
@@ -371,7 +408,7 @@ fn install_globals(vm: &mut Vm) {
             Value::String(s) => s.as_str().to_string(),
             _ => return Ok(v), // non-string eval returns its argument unchanged
         };
-        match crate::compiler::compile_script(&src) {
+        match crate::compiler::compile_indirect_eval(&src) {
             Ok(proto) => {
                 let f = vm.make_closure(std::rc::Rc::new(proto), Vec::new());
                 vm.call(Value::Object(f), Value::Undefined, &[])
