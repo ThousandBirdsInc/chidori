@@ -203,8 +203,9 @@ resource-precision gaps.
    deny or require approval for disk writes while still allowing reads. The
    remaining gap is the *default*: the fallback decision is still `AlwaysAllow`, so
    out of the box nothing is denied. Deny-by-default is now one switch away — the
-   built-in [`untrusted` profile](#the-untrusted-policy-profile-deny-by-default)
-   (`CHIDORI_POLICY_PROFILE=untrusted`) — but it is opt-in, not automatic.
+   built-in [`untrusted` profile](#the-untrusted-policy-profile-deny-by-default),
+   selectable as `chidori run --untrusted` / `chidori serve --untrusted` or via
+   `CHIDORI_POLICY_PROFILE=untrusted` — but it is opt-in, not automatic.
    *Remaining fix:* make it the default for untrusted runs.
 
 2. **The memory ceiling is process-wide, not per-VM.** The `CountingAllocator`
@@ -255,11 +256,19 @@ effect is `AlwaysAllow`, so out of the box nothing is denied; deny-by-default is
 something you turn on.
 
 The **`untrusted`** profile is a ready-made, deny-by-default policy you can select
-by name — no hand-written JSON. Enable it with a single environment variable:
+by name — no hand-written JSON. Enable it with a CLI flag (on `run` and `serve`)
+or an environment variable:
 
 ```sh
-CHIDORI_POLICY_PROFILE=untrusted chidori run agent.ts
+chidori run --untrusted agent.ts                       # CLI flag
+chidori serve --untrusted agent.ts                     # also on serve
+CHIDORI_POLICY_PROFILE=untrusted chidori run agent.ts  # env-var equivalent
 ```
+
+The flag is the operator's last word: `--untrusted` takes precedence over **all**
+`CHIDORI_POLICY*` env vars (including a permissive `CHIDORI_POLICY_FILE` /
+`CHIDORI_POLICY`), so a wrapper script can guarantee confinement regardless of
+ambient configuration.
 
 Semantics:
 
@@ -275,20 +284,62 @@ The fallback governs exactly the powerful surface, because the *pure* effects
 (`log`, `template`, `memory`, `prompt`, …) never call `enforce_policy` and so run
 regardless of the profile — they have no ambient authority to abuse.
 
-Selection order in `PolicyConfig::from_env` is `CHIDORI_POLICY_FILE` →
-`CHIDORI_POLICY` (inline JSON) → `CHIDORI_POLICY_PROFILE` (a built-in name) →
-default. The **default profile is unchanged** (`AlwaysAllow` fallback, no rules):
+Selection order is the `--untrusted` flag first, then `PolicyConfig::from_env`:
+`CHIDORI_POLICY_FILE` → `CHIDORI_POLICY` (inline JSON) → `CHIDORI_POLICY_PROFILE`
+(a built-in name) → default. The **default profile is unchanged** (`AlwaysAllow` fallback, no rules):
 the `untrusted` profile is purely opt-in. To customize further, copy the profile's
-shape into your own `CHIDORI_POLICY` JSON (rules + `"default": "never_allow"`), or
-add `AskBefore` rules to surface an approval prompt instead of a hard refusal.
+shape into your own `CHIDORI_POLICY` JSON (rules + `"default": "never_allow"`).
+
+### The `supervised` profile (ask-by-default)
+
+The **`supervised`** profile is the approval-flow sibling of `untrusted`: the same
+read-only workspace allowlist, but the fallback is `AskBefore` instead of
+`NeverAllow`. Under the server, a gated call suspends the run — the session
+transitions to `awaitingapproval` with a `pending_approval` carrying the
+`(target, args)` being asked about — and `POST /sessions/:id/approve` with
+`{"decision": "allow"}` or `{"decision": "deny"}` settles it. Approvals are
+remembered per `(target, args)` for the rest of the session, so the agent does not
+re-ask for an identical call. On the bare CLI (where nothing can answer the
+prompt) the gated call errors instead, unless `CHIDORI_POLICY_AUTO_APPROVE=1`.
+
+Select it anywhere a profile name is accepted: `CHIDORI_POLICY_PROFILE=supervised`
+or a session's `policy_profile` field (below).
+
+### Per-session profiles over the HTTP API
+
+A multi-tenant server can mix trusted and untrusted callers without restarting or
+re-configuring: `POST /sessions` and `POST /sessions/stream` accept an optional
+`policy_profile` field (alias `policyProfile`) naming a built-in profile.
+
+```sh
+curl -X POST localhost:8080/sessions \
+  -d '{"input": {}, "policy_profile": "untrusted"}'
+```
+
+Semantics:
+
+- **Stricter-wins layering.** The session profile is layered on the server
+  policy and, for every gated call, the *stricter* of the two decisions applies
+  (`never_allow` > `ask_before` > `always_allow`). A caller-selected profile can
+  therefore tighten what the operator's policy allows but can never relax it —
+  selecting a profile is not an escalation path even on a hardened server.
+- **Sticky for the session's lifetime.** The profile name is persisted on the
+  session and re-applied on every re-run: `input()` resume, approval replay, and
+  `/replay`. It is reported back in the session JSON as `policy_profile`.
+- **Validated up front.** An unknown profile name is a `400` at creation; a
+  stored name that no longer resolves (e.g. after a version change) fails closed
+  to `untrusted` rather than silently running under the looser server policy.
+
+Both SDKs expose this: `client.run(input, { policyProfile: "untrusted" })` in
+TypeScript, `client.run(input, policy_profile="untrusted")` in Python.
 
 ## How to harden for untrusted code
 
 If you intend to run code you do not trust on this engine today:
 
-1. Select the deny-by-default policy: `CHIDORI_POLICY_PROFILE=untrusted` (above).
-   This denies `http` and `workspace` mutations while leaving read-only workspace
-   introspection available.
+1. Select the deny-by-default policy: `chidori run --untrusted` (or
+   `CHIDORI_POLICY_PROFILE=untrusted`, above). This denies `http` and `workspace`
+   mutations while leaving read-only workspace introspection available.
 2. Lower `CHIDORI_JS_OP_BUDGET` and `CHIDORI_JS_MEM_CAP_MB` to fit the workload, and
    enable `CHIDORI_JS_DEADLINE_MS` (acceptable because untrusted code should not be
    making slow trusted host calls).

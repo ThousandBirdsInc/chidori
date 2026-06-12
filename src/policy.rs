@@ -33,6 +33,17 @@ impl Default for Decision {
     }
 }
 
+impl Decision {
+    /// Total order by restrictiveness: AlwaysAllow < AskBefore < NeverAllow.
+    fn strictness(self) -> u8 {
+        match self {
+            Decision::AlwaysAllow => 0,
+            Decision::AskBefore => 1,
+            Decision::NeverAllow => 2,
+        }
+    }
+}
+
 /// A single rule. `target` is "tool:<name>" / "http" / "workspace:<action>"
 /// (where `<action>` is `list` / `read` / `write` / `delete` / `manifest`) /
 /// "*". `match_args` is an optional JSON subset that must be contained in the
@@ -55,6 +66,13 @@ pub struct PolicyConfig {
     /// Fallback when no rule matches.
     #[serde(default)]
     pub default: Decision,
+    /// An additional policy layered on top of this one: the effective decision
+    /// for a call is the *stricter* of the two. Set via [`restricted_by`]
+    /// (e.g. a per-session profile on the server) so a caller-selected policy
+    /// can only tighten, never relax, the operator's policy. Never serialized:
+    /// the overlay is reconstructed from its profile name on every run.
+    #[serde(skip)]
+    pub overlay: Option<Arc<PolicyConfig>>,
 }
 
 impl PolicyConfig {
@@ -91,8 +109,24 @@ impl PolicyConfig {
 
     /// Resolve a call against the policy. `target` is the normalized target
     /// string (see PolicyRule.target). Rules are tried in order; the first
-    /// matching rule wins. Wildcard "*" always matches target.
+    /// matching rule wins. Wildcard "*" always matches target. When an
+    /// overlay is present, the stricter of the two resolutions wins.
     pub fn decide(&self, target: &str, args: &Value) -> (Decision, Option<String>) {
+        let base = self.decide_local(target, args);
+        match &self.overlay {
+            None => base,
+            Some(overlay) => {
+                let layered = overlay.decide(target, args);
+                if layered.0.strictness() > base.0.strictness() {
+                    layered
+                } else {
+                    base
+                }
+            }
+        }
+    }
+
+    fn decide_local(&self, target: &str, args: &Value) -> (Decision, Option<String>) {
         for rule in &self.rules {
             if rule.target != target && rule.target != "*" {
                 continue;
@@ -106,20 +140,39 @@ impl PolicyConfig {
         }
         (self.default, None)
     }
+
+    /// Layer `profile` on top of this policy: every decision becomes the
+    /// stricter of the two. This is the per-session selection mechanism — a
+    /// caller-picked profile can deny or gate what the operator's policy
+    /// allows, but can never allow what the operator denies.
+    pub fn restricted_by(&self, profile: Arc<PolicyConfig>) -> PolicyConfig {
+        let mut base = self.clone();
+        base.overlay = Some(match base.overlay.take() {
+            None => profile,
+            Some(existing) => Arc::new(existing.restricted_by(profile)),
+        });
+        base
+    }
 }
 
-/// Names of the built-in profiles selectable via `CHIDORI_POLICY_PROFILE`.
-pub const BUILTIN_PROFILES: &[&str] = &["untrusted"];
+/// Names of the built-in profiles selectable via `CHIDORI_POLICY_PROFILE`,
+/// the `--untrusted` CLI flag, or a session's `policy_profile` field.
+pub const BUILTIN_PROFILES: &[&str] = &["untrusted", "supervised"];
 
 /// Build a ready-made [`PolicyConfig`] by name, or `None` for an unknown name.
 ///
-/// The only profile today is `"untrusted"`: deny-by-default with a minimal
-/// allowlist of pure, side-effect-free host effects. It is opt-in (via
-/// `CHIDORI_POLICY_PROFILE=untrusted`) and never affects the default profile,
-/// which keeps the historical `AlwaysAllow` fallback.
+/// * `"untrusted"` — deny-by-default: gated effects are hard-refused unless
+///   on the read-only workspace allowlist.
+/// * `"supervised"` — ask-by-default: the same allowlist, but unmatched gated
+///   effects pause the run for operator approval (the server's
+///   `awaiting_approval` / `/approve` flow) instead of failing outright.
+///
+/// Both are opt-in and never affect the default profile, which keeps the
+/// historical `AlwaysAllow` fallback.
 pub fn builtin_profile(name: &str) -> Option<PolicyConfig> {
     match name {
         "untrusted" => Some(untrusted_profile()),
+        "supervised" => Some(supervised_profile()),
         _ => None,
     }
 }
@@ -140,20 +193,38 @@ pub fn builtin_profile(name: &str) -> Option<PolicyConfig> {
 /// Denied (by the fallback): `http` (network egress) and `workspace:write` /
 /// `workspace:delete` (disk mutation within the root).
 fn untrusted_profile() -> PolicyConfig {
+    PolicyConfig {
+        rules: read_only_workspace_allowlist(),
+        default: Decision::NeverAllow,
+        overlay: None,
+    }
+}
+
+/// Ask-by-default profile: identical allowlist to `untrusted`, but unmatched
+/// gated effects resolve to `AskBefore` — under the server's pause flow the
+/// run suspends as `awaiting_approval` and the operator decides per call
+/// (approvals are remembered per (target, args) for the session). On the bare
+/// CLI, where nothing can answer the prompt, the call errors instead.
+fn supervised_profile() -> PolicyConfig {
+    PolicyConfig {
+        rules: read_only_workspace_allowlist(),
+        default: Decision::AskBefore,
+        overlay: None,
+    }
+}
+
+fn read_only_workspace_allowlist() -> Vec<PolicyRule> {
     let allow_read_only = |target: &str| PolicyRule {
         target: target.to_string(),
         decision: Decision::AlwaysAllow,
         match_args: None,
         reason: Some("read-only workspace introspection".to_string()),
     };
-    PolicyConfig {
-        rules: vec![
-            allow_read_only("workspace:list"),
-            allow_read_only("workspace:read"),
-            allow_read_only("workspace:manifest"),
-        ],
-        default: Decision::NeverAllow,
-    }
+    vec![
+        allow_read_only("workspace:list"),
+        allow_read_only("workspace:read"),
+        allow_read_only("workspace:manifest"),
+    ]
 }
 
 /// True when `args` contains all keys/values in `pattern` (shallow for scalars,
@@ -238,6 +309,76 @@ mod tests {
                 "{target} should be allowed"
             );
         }
+    }
+
+    #[test]
+    fn supervised_profile_asks_by_default_and_allows_read_only() {
+        let cfg = builtin_profile("supervised").expect("supervised profile exists");
+        assert_eq!(cfg.default, Decision::AskBefore);
+
+        let (decision, _) = cfg.decide("http", &json!({ "url": "https://example.com" }));
+        assert_eq!(decision, Decision::AskBefore);
+        let (decision, _) = cfg.decide("workspace:write", &json!({ "path": "a.txt" }));
+        assert_eq!(decision, Decision::AskBefore);
+        for target in ["workspace:list", "workspace:read", "workspace:manifest"] {
+            let (decision, _) = cfg.decide(target, &json!({}));
+            assert_eq!(
+                decision,
+                Decision::AlwaysAllow,
+                "{target} should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_tightens_a_permissive_base() {
+        let base = PolicyConfig::default(); // AlwaysAllow fallback
+        let layered = base.restricted_by(Arc::new(builtin_profile("untrusted").unwrap()));
+
+        let (decision, _) = layered.decide("http", &json!({}));
+        assert_eq!(decision, Decision::NeverAllow);
+        let (decision, _) = layered.decide("workspace:write", &json!({}));
+        assert_eq!(decision, Decision::NeverAllow);
+        // Allowed on both sides stays allowed.
+        let (decision, _) = layered.decide("workspace:read", &json!({}));
+        assert_eq!(decision, Decision::AlwaysAllow);
+    }
+
+    #[test]
+    fn overlay_cannot_relax_a_restrictive_base() {
+        // Operator policy denies http outright; a session-selected supervised
+        // profile (AskBefore) must not downgrade that to a mere prompt.
+        let base = PolicyConfig {
+            rules: vec![PolicyRule {
+                target: "http".to_string(),
+                decision: Decision::NeverAllow,
+                match_args: None,
+                reason: Some("operator denies egress".to_string()),
+            }],
+            default: Decision::AlwaysAllow,
+            overlay: None,
+        };
+        let layered = base.restricted_by(Arc::new(builtin_profile("supervised").unwrap()));
+
+        let (decision, reason) = layered.decide("http", &json!({}));
+        assert_eq!(decision, Decision::NeverAllow);
+        assert_eq!(reason.as_deref(), Some("operator denies egress"));
+        // Targets the base allows fall to the overlay's AskBefore.
+        let (decision, _) = layered.decide("workspace:write", &json!({}));
+        assert_eq!(decision, Decision::AskBefore);
+    }
+
+    #[test]
+    fn overlay_stacks_recursively() {
+        let base = PolicyConfig::default();
+        let layered = base
+            .restricted_by(Arc::new(builtin_profile("supervised").unwrap()))
+            .restricted_by(Arc::new(builtin_profile("untrusted").unwrap()));
+        // The strictest of all layers wins.
+        let (decision, _) = layered.decide("http", &json!({}));
+        assert_eq!(decision, Decision::NeverAllow);
+        let (decision, _) = layered.decide("workspace:read", &json!({}));
+        assert_eq!(decision, Decision::AlwaysAllow);
     }
 
     #[test]

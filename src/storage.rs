@@ -52,6 +52,12 @@ pub struct StoredSession {
     /// have to ask twice for the same (target, args) within a session.
     #[serde(default)]
     pub approvals: Vec<(String, Value)>,
+    /// Built-in policy profile selected at session creation (e.g. "untrusted",
+    /// "supervised"). Layered on the server policy with stricter-wins
+    /// semantics on every run of this session, including resume/approve
+    /// replays — it can tighten the server policy but never relax it.
+    #[serde(default)]
+    pub policy_profile: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 

@@ -128,6 +128,7 @@ pub async fn run_once(recipe: &Recipe, deps: &SchedulerDeps) -> Result<String> {
             pending_prompt: None,
             pending_approval: None,
             approvals: Vec::new(),
+            policy_profile: None,
             created_at: Utc::now(),
         };
         Ok((id, session))

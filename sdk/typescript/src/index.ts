@@ -47,7 +47,20 @@ export type Json =
   | { [key: string]: Json };
 
 /** Server-side session status. */
-export type SessionStatus = "running" | "completed" | "failed" | "paused";
+export type SessionStatus =
+  | "running"
+  | "completed"
+  | "failed"
+  | "paused"
+  | "cancelled"
+  | "awaitingapproval";
+
+/**
+ * Built-in policy profiles selectable per session. Layered on the server
+ * policy with stricter-wins semantics: a profile can tighten what the
+ * operator's policy allows, never relax it.
+ */
+export type PolicyProfile = "untrusted" | "supervised";
 
 /** A single host function call recorded during an agent run. */
 export interface CallRecord {
@@ -262,9 +275,22 @@ export class AgentClient {
     return (await this.getJSON("/health")) as Json;
   }
 
-  /** Create a new session and run the agent with the given input. */
-  async run(input: Json): Promise<Session> {
-    const data = await this.postJSON("/sessions", { input });
+  /**
+   * Create a new session and run the agent with the given input.
+   *
+   * `options.policyProfile` optionally names a built-in policy profile
+   * ("untrusted" or "supervised") applied to every run of this session.
+   * It is layered on the server policy with stricter-wins semantics — it
+   * can tighten what the operator allows, never relax it. Under
+   * "supervised", gated calls pause the session as "awaitingapproval";
+   * approve or deny them via the server's /approve endpoint.
+   */
+  async run(input: Json, options?: { policyProfile?: PolicyProfile }): Promise<Session> {
+    const body: Record<string, unknown> = { input };
+    if (options?.policyProfile) {
+      body.policy_profile = options.policyProfile;
+    }
+    const data = await this.postJSON("/sessions", body);
     return this.sessionFrom(data, input);
   }
 
