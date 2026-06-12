@@ -1,0 +1,159 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="470" viewBox="0 0 1200 470" role="img" aria-label="How replay works: an original run records every host call into a call log; replay re-executes the agent against the cached results — identical output, zero LLM calls.">
+  <title>record once · replay free</title>
+  <defs>
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <marker id="arrow" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L8 4 L0 8 z" fill="#4a4940"/>
+    </marker>
+    <clipPath id="frame"><rect width="1200" height="470" rx="4"/></clipPath>
+  </defs>
+  <style>
+    text { font-family: 'JetBrains Mono','Berkeley Mono','SF Mono','DejaVu Sans Mono',Menlo,Consolas,ui-monospace,monospace; }
+    .ap { opacity: 0; animation-duration: 16s; animation-timing-function: linear; animation-iteration-count: infinite; }
+    .t8  { animation-name: t8;  } @keyframes t8  { 0%,8%  { opacity:0; } 10% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .t15 { animation-name: t15; } @keyframes t15 { 0%,15% { opacity:0; } 17% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .t21 { animation-name: t21; } @keyframes t21 { 0%,21% { opacity:0; } 23% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .t34 { animation-name: t34; } @keyframes t34 { 0%,34% { opacity:0; } 36% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .t38 { animation-name: t38; } @keyframes t38 { 0%,38% { opacity:0; } 40% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .t42 { animation-name: t42; } @keyframes t42 { 0%,42% { opacity:0; } 44% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .t46 { animation-name: t46; } @keyframes t46 { 0%,46% { opacity:0; } 48% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .t51 { animation-name: t51; } @keyframes t51 { 0%,51% { opacity:0; } 53% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .t59 { animation-name: t59; } @keyframes t59 { 0%,59.0% { opacity:0; } 59.8% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .t60 { animation-name: t60; } @keyframes t60 { 0%,60.0% { opacity:0; } 60.8% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .t61 { animation-name: t61; } @keyframes t61 { 0%,61.0% { opacity:0; } 61.8% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .t62 { animation-name: t62; } @keyframes t62 { 0%,62.0% { opacity:0; } 62.8% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .t63 { animation-name: t63; } @keyframes t63 { 0%,63.0% { opacity:0; } 63.8% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .t64 { animation-name: t64; } @keyframes t64 { 0%,64.0% { opacity:0; } 64.8% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .t68 { animation-name: t68; } @keyframes t68 { 0%,68% { opacity:0; } 70% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .runner { opacity: 0; animation: runner 16s linear infinite; }
+    @keyframes runner {
+      0%, 3%  { transform: translateX(70px);   opacity: 0; }
+      4%      { opacity: 1; }
+      8%      { transform: translateX(150px);  }
+      15%     { transform: translateX(320px);  }
+      21%     { transform: translateX(490px);  }
+      34%     { transform: translateX(660px);  }
+      38%     { transform: translateX(830px);  }
+      42%     { transform: translateX(1000px); opacity: 1; }
+      45%     { transform: translateX(1110px); opacity: 1; }
+      47%,100%{ transform: translateX(1110px); opacity: 0; }
+    }
+    .sweep { opacity: 0; transform: scaleX(0); transform-origin: 70px 345px; animation: sweep 16s linear infinite; }
+    @keyframes sweep {
+      0%, 58%  { transform: scaleX(0); opacity: 0; }
+      58.5%    { opacity: 1; }
+      64%      { transform: scaleX(1); opacity: 1; }
+      68%      { transform: scaleX(1); opacity: 0.18; }
+      92%      { transform: scaleX(1); opacity: 0.18; }
+      96%,100% { transform: scaleX(1); opacity: 0; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .ap, .runner, .sweep { animation: none !important; }
+      .ap { opacity: 1; }
+      .runner { opacity: 0; }
+      .sweep { opacity: 0.18; transform: scaleX(1); }
+    }
+  </style>
+
+  <g clip-path="url(#frame)">
+    <rect width="1200" height="470" fill="#0A0A0A"/>
+
+    <!-- window chrome -->
+    <g>
+      <circle cx="26" cy="26" r="5" fill="#FF5F56"/>
+      <circle cx="44" cy="26" r="5" fill="#FFBD2E"/>
+      <circle cx="62" cy="26" r="5" fill="#27C93F"/>
+    </g>
+
+    <!-- ───────── lane 1 · original run ───────── -->
+    <text x="70" y="64" font-size="14" font-weight="700" letter-spacing="2" fill="#F4C752">ORIGINAL RUN</text>
+    <text x="240" y="64" font-size="13" fill="#74736d">— executes everything, records every host call</text>
+    <text class="ap t46" x="1130" y="64" text-anchor="end" font-size="14" font-weight="700" fill="#FACC15">3.6 s · $0.12 in LLM calls</text>
+
+    <line x1="70" y1="130" x2="1130" y2="130" stroke="#2e2d29" stroke-width="2"/>
+
+    <g font-size="13" fill="#9b9a93" text-anchor="middle">
+      <text x="150" y="104">prompt()</text>
+      <text x="320" y="104">tool("search")</text>
+      <text x="490" y="104">http(get)</text>
+      <text x="660" y="104">prompt()</text>
+      <text x="830" y="104">memory.put()</text>
+      <text x="1000" y="104">return</text>
+    </g>
+    <g font-size="12" fill="#5d5c56" text-anchor="middle">
+      <text x="150" y="160">1.2 s</text>
+      <text x="320" y="160">0.3 s</text>
+      <text x="490" y="160">0.4 s</text>
+      <text x="660" y="160">1.6 s</text>
+      <text x="830" y="160">0.1 s</text>
+    </g>
+
+    <!-- node sockets (static) -->
+    <g fill="#141414" stroke="#4a4940" stroke-width="1.6">
+      <circle cx="150" cy="130" r="7"/><circle cx="320" cy="130" r="7"/><circle cx="490" cy="130" r="7"/>
+      <circle cx="660" cy="130" r="7"/><circle cx="830" cy="130" r="7"/><circle cx="1000" cy="130" r="7"/>
+    </g>
+    <!-- node lights + call-log entries, lit as the run reaches them -->
+    <g fill="#FACC15">
+      <circle class="ap t8"  cx="150"  cy="130" r="4.4"/>
+      <circle class="ap t15" cx="320"  cy="130" r="4.4"/>
+      <circle class="ap t21" cx="490"  cy="130" r="4.4"/>
+      <circle class="ap t34" cx="660"  cy="130" r="4.4"/>
+      <circle class="ap t38" cx="830"  cy="130" r="4.4"/>
+      <circle class="ap t42" cx="1000" cy="130" r="4.4"/>
+    </g>
+    <g font-size="11.5" fill="#F4C752" opacity="0.75" text-anchor="middle">
+      <text class="ap t8"  x="150"  y="184">seq 0 logged</text>
+      <text class="ap t15" x="320"  y="184">seq 1 logged</text>
+      <text class="ap t21" x="490"  y="184">seq 2 logged</text>
+      <text class="ap t34" x="660"  y="184">seq 3 logged</text>
+      <text class="ap t38" x="830"  y="184">seq 4 logged</text>
+      <text class="ap t42" x="1000" y="184">output saved</text>
+    </g>
+    <!-- travelling execution dot -->
+    <g class="runner"><circle cx="0" cy="130" r="6" fill="#FDF6D8" filter="url(#glow)"/></g>
+
+    <!-- ───────── checkpoint ───────── -->
+    <g class="ap t51">
+      <line x1="600" y1="148" x2="600" y2="210" stroke="#4a4940" stroke-width="1.6" marker-end="url(#arrow)"/>
+      <rect x="378" y="216" width="444" height="42" rx="4" fill="#141414" stroke="#E8E8E5" stroke-opacity="0.12" stroke-width="1.4"/>
+      <text x="600" y="243" text-anchor="middle" font-size="14.5" fill="#E8E8E5"><tspan font-weight="700" fill="#FACC15">checkpoint</tspan> = the call log · plain JSON on disk</text>
+      <line x1="600" y1="258" x2="600" y2="322" stroke="#4a4940" stroke-width="1.6" marker-end="url(#arrow)"/>
+    </g>
+
+    <!-- ───────── lane 2 · replay ───────── -->
+    <text x="70" y="300" font-size="14" font-weight="700" letter-spacing="2" fill="#C9DA8A">REPLAY</text>
+    <text x="172" y="300" font-size="13" fill="#74736d">— same code path, answered from the log</text>
+    <text class="ap t68" x="1130" y="300" text-anchor="end" font-size="14" font-weight="700" fill="#C9DA8A">0.04 s · $0.00 · identical output</text>
+
+    <line x1="70" y1="345" x2="1130" y2="345" stroke="#2e2d29" stroke-width="2"/>
+    <rect class="sweep" x="70" y="343.5" width="1060" height="3" rx="1.5" fill="#C9DA8A" filter="url(#glow)"/>
+
+    <g fill="#141414" stroke="#4a4940" stroke-width="1.6">
+      <circle cx="150" cy="345" r="7"/><circle cx="320" cy="345" r="7"/><circle cx="490" cy="345" r="7"/>
+      <circle cx="660" cy="345" r="7"/><circle cx="830" cy="345" r="7"/><circle cx="1000" cy="345" r="7"/>
+    </g>
+    <g fill="#C9DA8A">
+      <circle class="ap t59" cx="150"  cy="345" r="4.4"/>
+      <circle class="ap t60" cx="320"  cy="345" r="4.4"/>
+      <circle class="ap t61" cx="490"  cy="345" r="4.4"/>
+      <circle class="ap t62" cx="660"  cy="345" r="4.4"/>
+      <circle class="ap t63" cx="830"  cy="345" r="4.4"/>
+      <circle class="ap t64" cx="1000" cy="345" r="4.4"/>
+    </g>
+    <g font-size="11.5" fill="#C9DA8A" opacity="0.7" text-anchor="middle">
+      <text class="ap t59" x="150"  y="376">cached ✓</text>
+      <text class="ap t60" x="320"  y="376">cached ✓</text>
+      <text class="ap t61" x="490"  y="376">cached ✓</text>
+      <text class="ap t62" x="660"  y="376">cached ✓</text>
+      <text class="ap t63" x="830"  y="376">cached ✓</text>
+      <text class="ap t64" x="1000" y="376">same output</text>
+    </g>
+
+    <text x="600" y="440" text-anchor="middle" font-size="13.5" fill="#5d5c56">save it to disk · commit it to git · replay it in a test — no side effect re-executes</text>
+  </g>
+  <rect x="0.5" y="0.5" width="1199" height="469" rx="4" fill="none" stroke="#E8E8E5" stroke-opacity="0.12"/>
+</svg>

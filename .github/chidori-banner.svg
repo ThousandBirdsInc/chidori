@@ -1,0 +1,172 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-label="chidori — checkpoint, replay, resume: durable TypeScript agents on a Rust core">
+  <title>chidori — checkpoint · replay · resume</title>
+  <defs>
+    <linearGradient id="sweepgrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FACC15" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#FACC15" stop-opacity="0.045"/>
+      <stop offset="1" stop-color="#FACC15" stop-opacity="0"/>
+    </linearGradient>
+    <pattern id="scanlines" width="4" height="4" patternUnits="userSpaceOnUse">
+      <rect y="3" width="4" height="1" fill="#E8E8E5" opacity="0.02"/>
+    </pattern>
+    <filter id="dotglow" x="-150%" y="-150%" width="400%" height="400%">
+      <feGaussianBlur stdDeviation="2.5" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="frame"><rect width="1200" height="360" rx="4"/></clipPath>
+    <clipPath id="slice1"><rect x="370" y="141" width="460" height="13"/></clipPath>
+    <clipPath id="slice2"><rect x="370" y="161" width="460" height="10"/></clipPath>
+  </defs>
+  <style>
+    text { font-family: 'JetBrains Mono','Berkeley Mono','SF Mono','DejaVu Sans Mono',Menlo,Consolas,ui-monospace,monospace; }
+    .bird { animation: fly linear infinite; }
+    .b1 { animation-duration: 34s; animation-delay: -6s; }
+    .b2 { animation-duration: 42s; animation-delay: -23s; }
+    .b3 { animation-duration: 29s; animation-delay: -14s; }
+    .b4 { animation-duration: 47s; animation-delay: -35s; }
+    .b5 { animation-duration: 38s; animation-delay: -9s; }
+    @keyframes fly { from { transform: translateX(-60px); } to { transform: translateX(1260px); } }
+    .trace { stroke-dasharray: 46 900; animation: trace 3.2s linear infinite; }
+    .trR { animation-delay: -1.6s; }
+    @keyframes trace { from { stroke-dashoffset: 946; } to { stroke-dashoffset: 0; } }
+    .scansweep { animation: scansweep 8s linear infinite; }
+    @keyframes scansweep { from { transform: translateY(-90px); } to { transform: translateY(380px); } }
+    .g1 { opacity: 0; animation: g1 9s step-end infinite; }
+    @keyframes g1 {
+      0%, 30.6% { opacity: 0; transform: translateX(0); }
+      30.8%     { opacity: 1; transform: translateX(4px); }
+      31.6%     { opacity: 0; transform: translateX(0); }
+      72.8%     { opacity: 1; transform: translateX(-3px); }
+      73.4%, 100% { opacity: 0; transform: translateX(0); }
+    }
+    .g2 { opacity: 0; animation: g2 9s step-end infinite; }
+    @keyframes g2 {
+      0%, 30.7% { opacity: 0; transform: translateX(0); }
+      30.9%     { opacity: 1; transform: translateX(-4px); }
+      31.7%     { opacity: 0; transform: translateX(0); }
+      72.9%     { opacity: 1; transform: translateX(3px); }
+      73.5%, 100% { opacity: 0; transform: translateX(0); }
+    }
+    .tg rect { stroke: #4a4940; }
+    .tg text { fill: #9b9a93; }
+    .tg1 rect { animation: tgr 6.6s linear infinite; }
+    .tg1 text { animation: tgt 6.6s linear infinite; }
+    .tg2 rect { animation: tgr 6.6s linear infinite; animation-delay: 2.2s; }
+    .tg2 text { animation: tgt 6.6s linear infinite; animation-delay: 2.2s; }
+    .tg3 rect { animation: tgr 6.6s linear infinite; animation-delay: 4.4s; }
+    .tg3 text { animation: tgt 6.6s linear infinite; animation-delay: 4.4s; }
+    @keyframes tgr { 0% { stroke: #FACC15; } 28% { stroke: #FACC15; } 33%, 100% { stroke: #4a4940; } }
+    @keyframes tgt { 0% { fill: #FACC15; }   28% { fill: #FACC15; }   33%, 100% { fill: #9b9a93; } }
+    .rec { animation: rec 1.4s step-end infinite; }
+    @keyframes rec { 50% { opacity: 0.15; } }
+    .cursor { animation: blink 1s step-end infinite; }
+    @keyframes blink { 50% { opacity: 0; } }
+    .logline { opacity: 0; animation: logcycle 12s linear infinite; }
+    .l1 { animation-delay: 0s; }
+    .l2 { animation-delay: 4s; }
+    .l3 { animation-delay: 8s; }
+    @keyframes logcycle {
+      0% { opacity: 0; } 3% { opacity: 0.9; } 29% { opacity: 0.9; } 33%, 100% { opacity: 0; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .bird, .trace, .scansweep, .g1, .g2, .tg1 rect, .tg1 text, .tg2 rect, .tg2 text, .tg3 rect, .tg3 text, .rec, .cursor, .logline { animation: none !important; }
+      .bird, .trace, .scansweep, .g1, .g2 { opacity: 0; }
+      .l1 { opacity: 0.9; }
+    }
+  </style>
+
+  <g clip-path="url(#frame)">
+    <rect width="1200" height="360" fill="#0A0A0A"/>
+
+    <!-- fine grid -->
+    <g stroke="#E8E8E5" stroke-opacity="0.035" stroke-width="1">
+      <path d="M120 0 V322 M240 0 V322 M360 0 V322 M480 0 V322 M600 0 V322 M720 0 V322 M840 0 V322 M960 0 V322 M1080 0 V322"/>
+      <path d="M0 60 H1200 M0 120 H1200 M0 180 H1200 M0 240 H1200"/>
+    </g>
+
+    <!-- corner brackets -->
+    <g stroke="#FACC15" stroke-opacity="0.55" stroke-width="1.5" fill="none">
+      <path d="M14 38 V14 H38"/>
+      <path d="M1162 14 H1186 V38"/>
+      <path d="M14 284 V308 H38" transform="translate(0,-4)"/>
+      <path d="M1186 280 V304 H1162" transform="translate(0,0)"/>
+    </g>
+
+    <!-- top labels -->
+    <text x="52" y="36" font-size="10" letter-spacing="3" fill="#74736d">THOUSANDBIRDS.AI // AGENT RUNTIME</text>
+    <g>
+      <circle class="rec" cx="1008" cy="31" r="3.5" fill="#FF5F56"/>
+      <text x="1148" y="35" text-anchor="end" font-size="10" letter-spacing="3" fill="#9b9a93">REC · CALL LOG</text>
+    </g>
+
+    <!-- thousand-bird flock, faint -->
+    <g stroke="#4a4940" fill="none" stroke-width="1.5" stroke-linecap="round">
+      <g class="bird b1" opacity="0.20"><g transform="translate(0,62)"><path d="M0 0 Q3 -3.4 6 -0.4 Q9 -3.4 12 0"/></g></g>
+      <g class="bird b2" opacity="0.12"><g transform="translate(0,78) scale(0.8)"><path d="M0 0 Q3 -3.4 6 -0.4 Q9 -3.4 12 0"/></g></g>
+      <g class="bird b3" opacity="0.18"><g transform="translate(0,54) scale(1.1)"><path d="M0 0 Q3 -3.4 6 -0.4 Q9 -3.4 12 0"/></g></g>
+      <g class="bird b4" opacity="0.10"><g transform="translate(0,88) scale(0.7)"><path d="M0 0 Q3 -3.4 6 -0.4 Q9 -3.4 12 0"/></g></g>
+      <g class="bird b5" opacity="0.15"><g transform="translate(0,70) scale(0.9)"><path d="M0 0 Q3 -3.4 6 -0.4 Q9 -3.4 12 0"/></g></g>
+    </g>
+
+    <!-- circuit traces flanking the wordmark, with travelling sparks -->
+    <g fill="none" stroke-linejoin="round" stroke-linecap="round">
+      <path d="M70 158 h84 l16 -16 h64 l14 14 h118" stroke="#FACC15" stroke-opacity="0.18" stroke-width="1.5"/>
+      <path class="trace" d="M70 158 h84 l16 -16 h64 l14 14 h118" stroke="#FFE588" stroke-width="2" filter="url(#dotglow)"/>
+      <path d="M1130 158 h-84 l-16 -16 h-64 l-14 14 h-118" stroke="#FACC15" stroke-opacity="0.18" stroke-width="1.5"/>
+      <path class="trace trR" d="M1130 158 h-84 l-16 -16 h-64 l-14 14 h-118" stroke="#FFE588" stroke-width="2" filter="url(#dotglow)"/>
+      <circle cx="366" cy="156" r="3" fill="#FACC15" fill-opacity="0.6"/>
+      <circle cx="834" cy="156" r="3" fill="#FACC15" fill-opacity="0.6"/>
+    </g>
+
+    <!-- vertical 千鳥 signage -->
+    <g font-size="22" fill="#FACC15" fill-opacity="0.4" text-anchor="middle">
+      <text x="46" y="166">千</text>
+      <text x="46" y="196">鳥</text>
+    </g>
+
+    <!-- wordmark: flat fill, glitch slices -->
+    <text x="600" y="186" text-anchor="middle" font-size="88" font-weight="700" letter-spacing="4" fill="#E8E8E5">chidori</text>
+    <g clip-path="url(#slice1)">
+      <text class="g1" x="600" y="186" text-anchor="middle" font-size="88" font-weight="700" letter-spacing="4" fill="#FACC15">chidori</text>
+    </g>
+    <g clip-path="url(#slice2)">
+      <text class="g2" x="600" y="186" text-anchor="middle" font-size="88" font-weight="700" letter-spacing="4" fill="#74736d">chidori</text>
+    </g>
+    <text x="828" y="128" font-size="14" fill="#FACC15" fill-opacity="0.7">v3</text>
+
+    <!-- subtitle -->
+    <text x="600" y="226" text-anchor="middle" font-size="16" fill="#9b9a93"><tspan fill="#FACC15" fill-opacity="0.8">//</tspan> durable TypeScript agents on a Rust core</text>
+
+    <!-- capability tags, lit in sequence -->
+    <g font-size="13" letter-spacing="1">
+      <g class="tg tg1">
+        <rect x="462" y="250" width="102" height="28" rx="2" fill="none" stroke-width="1.2"/>
+        <text x="513" y="269" text-anchor="middle">checkpoint</text>
+      </g>
+      <g class="tg tg2">
+        <rect x="580" y="250" width="71" height="28" rx="2" fill="none" stroke-width="1.2"/>
+        <text x="615.5" y="269" text-anchor="middle">replay</text>
+      </g>
+      <g class="tg tg3">
+        <rect x="667" y="250" width="71" height="28" rx="2" fill="none" stroke-width="1.2"/>
+        <text x="702.5" y="269" text-anchor="middle">resume</text>
+      </g>
+    </g>
+
+    <!-- status bar -->
+    <rect x="0" y="322" width="1200" height="38" fill="#111110"/>
+    <line x1="0" y1="322" x2="1200" y2="322" stroke="#E8E8E5" stroke-opacity="0.12"/>
+    <text x="24" y="345" font-size="12" fill="#74736d">chidori v3 · rust core</text>
+    <g font-size="12.5" text-anchor="middle">
+      <text class="logline l1" x="600" y="345" fill="#9b9a93">$ chidori run agents/summarizer.ts <tspan class="cursor" fill="#FACC15">▮</tspan></text>
+      <text class="logline l2" x="600" y="345" fill="#9b9a93">✓ checkpoint saved · .chidori/runs/9f3a12/ · 12 host calls</text>
+      <text class="logline l3" x="600" y="345" fill="#C9DA8A">↺ replay · identical output · 0 LLM calls · $0.00</text>
+    </g>
+    <text x="1176" y="345" text-anchor="end" font-size="12" fill="#74736d">deterministic · replayable</text>
+
+    <!-- CRT texture + scan sweep -->
+    <rect width="1200" height="360" fill="url(#scanlines)"/>
+    <rect class="scansweep" width="1200" height="80" fill="url(#sweepgrad)"/>
+  </g>
+  <rect x="0.5" y="0.5" width="1199" height="359" rx="4" fill="none" stroke="#E8E8E5" stroke-opacity="0.12"/>
+</svg>

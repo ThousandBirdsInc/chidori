@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="310" viewBox="0 0 1200 310" role="img" aria-label="Human in the loop: the agent runs until input() pauses it, the session is persisted to disk, and when a human responds the runtime replays the call log to the pause point and continues.">
+  <title>pause on input() · resume by replay</title>
+  <defs>
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="frame"><rect width="1200" height="310" rx="4"/></clipPath>
+  </defs>
+  <style>
+    text { font-family: 'JetBrains Mono','Berkeley Mono','SF Mono','DejaVu Sans Mono',Menlo,Consolas,ui-monospace,monospace; }
+    .runner { opacity: 0; animation: runner 14s linear infinite; }
+    @keyframes runner {
+      0%, 2%   { transform: translateX(80px);   opacity: 0; fill: #FDF6D8; }
+      3%       { opacity: 1; }
+      10%      { transform: translateX(200px); }
+      17%      { transform: translateX(400px); }
+      25%      { transform: translateX(600px);  opacity: 1; fill: #FDF6D8; }
+      27%      { opacity: 0; }
+      63%      { transform: translateX(600px);  opacity: 0; fill: #E4EFC4; }
+      64%      { opacity: 1; }
+      68%      { transform: translateX(820px); }
+      72%      { transform: translateX(1020px); }
+      75%      { transform: translateX(1120px); opacity: 1; }
+      77%,100% { transform: translateX(1120px); opacity: 0; }
+    }
+    .pring { opacity: 0; transform-box: fill-box; transform-origin: center; animation: pring 14s linear infinite; }
+    @keyframes pring {
+      0%, 25% { opacity: 0;    transform: scale(0.6); }
+      27%     { opacity: 0.85; transform: scale(0.8); }
+      33%     { opacity: 0.10; transform: scale(1.7); }
+      34%     { opacity: 0.85; transform: scale(0.8); }
+      40%     { opacity: 0.10; transform: scale(1.7); }
+      41%     { opacity: 0.85; transform: scale(0.8); }
+      47%     { opacity: 0.10; transform: scale(1.7); }
+      48%     { opacity: 0.85; transform: scale(0.8); }
+      54%     { opacity: 0.10; transform: scale(1.7); }
+      55%     { opacity: 0.85; transform: scale(0.8); }
+      60%,100%{ opacity: 0;    transform: scale(1.7); }
+    }
+    .ap { opacity: 0; animation-duration: 14s; animation-timing-function: linear; animation-iteration-count: infinite; }
+    .n10 { animation-name: n10; } @keyframes n10 { 0%,10% { opacity:0; } 12% { opacity:1; } 56% { opacity:1; } 58%,100% { opacity:0; } }
+    .n17 { animation-name: n17; } @keyframes n17 { 0%,17% { opacity:0; } 19% { opacity:1; } 56% { opacity:1; } 58%,100% { opacity:0; } }
+    .amb { animation-name: amb; } @keyframes amb { 0%,25% { opacity:0; } 27% { opacity:1; } 56% { opacity:1; } 58%,100% { opacity:0; } }
+    .g59 { animation-name: g59; } @keyframes g59 { 0%,59% { opacity:0; } 60% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .g60 { animation-name: g60; } @keyframes g60 { 0%,60% { opacity:0; } 61% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .g61 { animation-name: g61; } @keyframes g61 { 0%,61% { opacity:0; } 62% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .g68 { animation-name: g68; } @keyframes g68 { 0%,68% { opacity:0; } 70% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .g72 { animation-name: g72; } @keyframes g72 { 0%,72% { opacity:0; } 74% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .paused   { animation-name: paused; }   @keyframes paused   { 0%,26% { opacity:0; } 28% { opacity:1; } 52% { opacity:1; } 55%,100% { opacity:0; } }
+    .response { animation-name: response; } @keyframes response { 0%,52% { opacity:0; } 54% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .endlbl   { animation-name: endlbl; }   @keyframes endlbl   { 0%,75% { opacity:0; } 77% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .swcap    { animation-name: swcap; }    @keyframes swcap    { 0%,59% { opacity:0; } 61% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
+    .sweep { opacity: 0; transform: scaleX(0); transform-origin: 80px 170px; animation: sweep 14s linear infinite; }
+    @keyframes sweep {
+      0%, 58%  { transform: scaleX(0); opacity: 0; }
+      58.5%    { opacity: 1; }
+      62%      { transform: scaleX(1); opacity: 1; }
+      66%      { transform: scaleX(1); opacity: 0.15; }
+      92%      { transform: scaleX(1); opacity: 0.15; }
+      96%,100% { transform: scaleX(1); opacity: 0; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .runner, .pring, .ap, .sweep { animation: none !important; }
+      .runner, .pring { opacity: 0; }
+      .ap { opacity: 1; }
+      .paused { opacity: 0; }
+      .amb { opacity: 0; }
+      .sweep { opacity: 0.15; transform: scaleX(1); }
+    }
+  </style>
+
+  <g clip-path="url(#frame)">
+    <rect width="1200" height="310" fill="#0A0A0A"/>
+
+    <!-- window chrome -->
+    <g>
+      <circle cx="26" cy="26" r="5" fill="#FF5F56"/>
+      <circle cx="44" cy="26" r="5" fill="#FFBD2E"/>
+      <circle cx="62" cy="26" r="5" fill="#27C93F"/>
+    </g>
+
+    <!-- status chips -->
+    <g class="ap paused">
+      <rect x="425" y="52" width="350" height="32" rx="4" fill="#1C1C1C" stroke="#FACC15" stroke-opacity="0.55" stroke-width="1.2"/>
+      <text x="600" y="73" text-anchor="middle" font-size="13.5" fill="#FACC15">⏸ paused — waiting for a human</text>
+      <text x="600" y="104" text-anchor="middle" font-size="11.5" fill="#74736d">session persisted to disk · the server can restart, the agent keeps its place</text>
+    </g>
+    <g class="ap response">
+      <rect x="498" y="206" width="204" height="30" rx="4" fill="#1C1C1C" stroke="#C9DA8A" stroke-opacity="0.55" stroke-width="1.2"/>
+      <text x="600" y="226" text-anchor="middle" font-size="13" fill="#C9DA8A">response: "yes" → resume</text>
+    </g>
+    <text class="ap endlbl" x="1120" y="73" text-anchor="end" font-size="13.5" font-weight="700" fill="#C9DA8A">completed — resumed exactly where it paused</text>
+
+    <!-- timeline -->
+    <line x1="80" y1="170" x2="1120" y2="170" stroke="#2e2d29" stroke-width="2"/>
+    <rect class="sweep" x="80" y="168.5" width="520" height="3" rx="1.5" fill="#C9DA8A" filter="url(#glow)"/>
+
+    <g font-size="13" text-anchor="middle">
+      <text x="200" y="142" fill="#9b9a93">prompt()</text>
+      <text x="400" y="142" fill="#9b9a93">tool("plan")</text>
+      <text x="600" y="142" fill="#F4C752">input("approve?")</text>
+      <text x="820" y="142" fill="#9b9a93">prompt()</text>
+      <text x="1020" y="142" fill="#9b9a93">return</text>
+    </g>
+
+    <circle class="pring" cx="600" cy="170" r="14" fill="none" stroke="#FACC15" stroke-width="2"/>
+
+    <g fill="#141414" stroke="#4a4940" stroke-width="1.6">
+      <circle cx="200" cy="170" r="7"/><circle cx="400" cy="170" r="7"/><circle cx="600" cy="170" r="7"/>
+      <circle cx="820" cy="170" r="7"/><circle cx="1020" cy="170" r="7"/>
+    </g>
+    <!-- live lights (gold), pause light (amber), replay/resume lights (sage) -->
+    <circle class="ap n10" cx="200" cy="170" r="4.4" fill="#FACC15"/>
+    <circle class="ap n17" cx="400" cy="170" r="4.4" fill="#FACC15"/>
+    <circle class="ap amb" cx="600" cy="170" r="4.4" fill="#FFBD2E"/>
+    <circle class="ap g59" cx="200" cy="170" r="4.4" fill="#C9DA8A"/>
+    <circle class="ap g60" cx="400" cy="170" r="4.4" fill="#C9DA8A"/>
+    <circle class="ap g61" cx="600" cy="170" r="4.4" fill="#C9DA8A"/>
+    <circle class="ap g68" cx="820" cy="170" r="4.4" fill="#C9DA8A"/>
+    <circle class="ap g72" cx="1020" cy="170" r="4.4" fill="#C9DA8A"/>
+
+    <g class="runner"><circle cx="0" cy="170" r="6" filter="url(#glow)"/></g>
+
+    <text class="ap swcap" x="600" y="280" text-anchor="middle" font-size="13.5" fill="#5d5c56">resume = replay the call log to the pause point — nothing re-executes, then live execution continues</text>
+  </g>
+  <rect x="0.5" y="0.5" width="1199" height="309" rx="4" fill="none" stroke="#E8E8E5" stroke-opacity="0.12"/>
+</svg>
