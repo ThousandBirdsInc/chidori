@@ -55,6 +55,14 @@ echo "Building runner ..."
 cargo build --release -p test262-runner
 RUNNER="$REPO_ROOT/target/release/test262-runner"
 
+# The runner now fans the file loop out across cores (one worker per CPU by
+# default; override with TEST262_JOBS). Pin the per-test timeout the *committed
+# baseline was recorded with* so the gate stays reproducible no matter what the
+# runner's compiled-in default is — otherwise a slow-but-passing test could flip
+# to a timeout failure and read as a phantom regression. Refresh the baseline
+# (and this pin) deliberately if the budget ever changes.
+export TEST262_TIMEOUT_MS="${TEST262_TIMEOUT_MS:-10000}"
+
 # The runner's reference-counting GC cannot reclaim every object cycle, so a
 # single process that walks all ~47k tests grows until it is OOM-killed. We
 # therefore run the suite one second-level directory at a time, in a fresh
