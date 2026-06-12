@@ -55,6 +55,10 @@ completion audit lives in
 - [x] `chidori.callAgent()`
 - [x] `chidori.tool()`
 - [x] `chidori.parallel()`
+- [x] `chidori.branch()` — in-agent execution branching (Phase 1 of
+      `docs/branching-execution.md`): fork into per-strategy sub-runs from the
+      anchored state, outcomes returned for comparison; pausable/persisted
+      branches and the whole-agent replay-prefix model are future work.
 - [x] `chidori.retry()`
 - [x] `chidori.tryCall()`
 - [x] `chidori.http()`

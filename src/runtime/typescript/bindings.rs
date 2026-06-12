@@ -766,6 +766,37 @@ impl HostBindingBackend {
         }
     }
 
+    /// Clone this runtime backend with a different [`RuntimeContext`] — same
+    /// providers, policy (and approval cache), tools, and MCP. Used by
+    /// `chidori.branch` to run each branch sub-run on its own context while
+    /// enforcing the parent's policy. `None` for the recorder backend.
+    pub(crate) fn with_runtime_ctx(&self, runtime_ctx: RuntimeContext) -> Option<Self> {
+        match self {
+            HostBindingBackend::Runtime {
+                providers,
+                template_engine,
+                tokio_rt,
+                policy,
+                policy_cache,
+                runtime_policy,
+                tools,
+                mcp,
+                ..
+            } => Some(HostBindingBackend::Runtime {
+                runtime_ctx,
+                providers: providers.clone(),
+                template_engine: template_engine.clone(),
+                tokio_rt: tokio_rt.clone(),
+                policy: policy.clone(),
+                policy_cache: policy_cache.clone(),
+                runtime_policy: runtime_policy.clone(),
+                tools: tools.clone(),
+                mcp: mcp.clone(),
+            }),
+            HostBindingBackend::Recorder(_) => None,
+        }
+    }
+
     /// The runtime context, when this is the runtime backend.
     pub(crate) fn runtime_ctx(&self) -> Option<&RuntimeContext> {
         match self {
@@ -967,6 +998,7 @@ impl HostBindingBackend {
                     .unwrap_or_else(|| serde_json::json!({}));
                 self.call_agent(path, input)
             }
+            "branch" => crate::runtime::host_branch::run_branches(self, a),
             "workspace" => self.dispatch_workspace(a),
             "contextDigest" => {
                 let segments = a

@@ -1,8 +1,30 @@
 # In-Agent Execution Branching — Design Doc & Implementation Plan
 
-> **Status:** Draft for review.
-> **Target engine:** pure-Rust JS engine (`CHIDORI_JS_ENGINE=rust`, `rust-engine`
-> feature). The default QuickJS path is untouched.
+> **Status:** Phase 1 (MVP) **implemented** — `chidori.branch` ships as a host
+> effect (`src/runtime/host_branch.rs`, dispatched from `bindings.rs`), with
+> SDK types, tests, and `examples/branching/`. Phases 2 (pausable/persisted
+> branches) and 3 (whole-agent replay-prefix model) remain future work.
+> **Target engine:** the doc was drafted before the QuickJS removal (#39);
+> `chidori-js` is now the only engine, so the `CHIDORI_JS_ENGINE=rust` /
+> `rust-engine`-feature framing below is historical. Implementation notes where
+> the shipped MVP deviates from the draft:
+> - Branch `source` paths resolve like `callAgent` paths (relative to the
+>   working directory) — the host backend doesn't track the parent agent's
+>   path. `source` is **required** in Phase 1 ("omit to reuse parent" would
+>   re-reach `chidori.branch` and recurse, §8.2).
+> - Sequence ranges still come from `ParallelBranchManifest::with_sequence_width`,
+>   but the slot id is derived from the parent's `branch`-call seq
+>   (`slot = seq / (width × count) + 1`) instead of a host-promise op id, so
+>   successive branch ops' reserved blocks grow linearly and stay disjoint.
+>   After the fan-out the branch records are folded into the parent log and the
+>   parent's counter advances past them — exactly what
+>   `absorb_replayed_subtree` reproduces on replay, keeping live and replayed
+>   sequence numbering aligned.
+> - Nested `chidori.branch` inside a branch is rejected (`is_branch` on the
+>   branch `RuntimeContext`): a nested fork would allocate ranges outside the
+>   parent branch's reserved range.
+> - Phase 1 reports a suspended branch as `status: "paused"` (+`pendingPrompt`)
+>   without persisting it for out-of-band resume; that is the Phase 2 work.
 > **Related:** [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md),
 > [`docs/captured-effects-vfs-crypto-timers.md`](./captured-effects-vfs-crypto-timers.md).
 
@@ -358,26 +380,30 @@ satisfies the stated goal.
 
 ## 12. Implementation plan (phased)
 
-**Phase 1 — MVP: synchronous branching, outcomes returned**
-- `crates/chidori-js/src/lib.rs`: add `branch` to `install_chidori_effects` (§7). Test
-  it marshals/returns.
-- `src/runtime/rust_engine.rs`: `dispatch_effect` `"branch"` arm; new module
-  `host_branch.rs` (or inline) with `run_branches(ctx, tools, args) -> Result<Value>`:
-  reserved ranges via `ParallelBranchManifest::with_sequence_width`; per-branch fresh
-  `RuntimeContext` seeded from parent VFS/memory; `run_module` per variant; collect
-  `BranchOutcome[]`; wrap in `execute_durable_json_call(ctx, "branch", …)`.
-- `src/runtime/context.rs`: a constructor to build a branch `RuntimeContext` seeded
-  with parent VFS + memory + a base seq (reuse `with_replay*`/`new` patterns + the VFS
-  setter that already exists for resume).
-- `sdk/typescript/src/agent.ts`: `BranchVariant`/`BranchOutcome` + `branch` on
-  `Chidori`.
-- Tests (`--features rust-engine`): agent does shared work, then
-  `chidori.branch([{source:A},{source:B}])`; assert (a) two outcomes with the right
-  outputs, (b) branch records carry `parent_seq` = the `branch` seq, (c) records land
-  in disjoint reserved ranges, (d) a counting native tool proves the parent prefix
-  fired once (handed over, not re-run).
-- Example: `examples/branching/` — an agent that branches into two strategy modules
-  from a shared state and prints both outcomes (runs on `CHIDORI_JS_ENGINE=rust`).
+**Phase 1 — MVP: synchronous branching, outcomes returned** ✅ **shipped**
+- [x] `crates/chidori-js/src/lib.rs`: `branch` added to `install_chidori_effects` (§7),
+  marshalling `(variants, options)`.
+- [x] `src/runtime/host_branch.rs`: `run_branches(backend, args)` — reserved ranges via
+  `ParallelBranchManifest::with_sequence_width` (slot derived from the branch call's
+  seq), per-branch fresh `RuntimeContext` seeded from parent VFS, native
+  `run_agent_file` per variant, `BranchOutcome[]` collected, all inside
+  `execute_durable_json_call_at_seq(ctx, seq, "branch", …)`. Dispatched from the
+  `"branch"` arm in `bindings.rs` (the engine's effect dispatcher).
+- [x] `src/runtime/context.rs`: `RuntimeContext::for_branch` (parent VFS + config +
+  input mode + shared OTEL run span/event sink, reserved base seq, call stack seeded
+  with the parent `branch` seq so records nest), `is_branch`, and
+  `merge_branch_records` (folds branch records into the parent log without
+  re-emitting, advancing the counter the way replay's `absorb_replayed_subtree` does).
+- [x] `sdk/typescript/src/agent.ts`: `BranchVariant`/`BranchOutcome`/`BranchOptions` +
+  `branch` on `Chidori`.
+- [x] Tests (`src/runtime/host_branch.rs`): (a) two outcomes with the right outputs,
+  (b) branch records carry `parent_seq` = the `branch` seq, (c) records land in
+  disjoint reserved ranges, (d) a counting native tool proves the parent prefix fired
+  once (handed over, not re-run) — plus parent replay returning cached outcomes
+  without re-running branches, a paused-branch outcome, nested-branch rejection, and
+  fail-fast variant validation.
+- [x] Example: `examples/branching/` — shared research, two strategy modules, compare
+  and pick; replays via `chidori resume`.
 
 **Phase 2 — pausable + editable + persisted branches**
 - Persist each branch under `branch_store` (`source.ts`, `checkpoint.json`, snapshot

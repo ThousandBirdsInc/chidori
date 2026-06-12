@@ -226,6 +226,7 @@ An agent is a `.ts` file that exports an async `agent(input, chidori)` function.
 | `chidori.tool(name, args)` | Invoke a registered tool |
 | `chidori.callAgent(path, input)` | Call a sub-agent |
 | `chidori.parallel(fns)` | Run functions concurrently |
+| `chidori.branch(variants)` | Fork the run into per-strategy sub-runs from the current state; returns every outcome for comparison ([design](./docs/branching-execution.md)) |
 | `chidori.input(msg, options)` | Human-in-the-loop — pauses execution |
 | `chidori.signal(name, options)` | Multiplayer — pause at a named listen point until an outside party (human or agent) delivers `{ name, payload, from }`; drains a durable mailbox if one is queued |
 | `chidori.pollSignal(name)` | Non-blocking signal check — consume a queued signal of this name or resolve to `null` |
