@@ -1204,6 +1204,13 @@ fn context_request_parts(
                     "<document label=\"{label}\">\n{text}\n</document>"
                 )));
             }
+            // The recorded product of `Context.compact()`: prior turns folded
+            // into one durable summary, framed so the model knows it reads
+            // condensed history rather than a live user turn.
+            "summary" => messages.push(LlmMessage::user_text(format!(
+                "<conversation-summary>\n{}\n</conversation-summary>",
+                str_field(seg, "text")
+            ))),
             "user" => messages.push(LlmMessage::user_text(str_field(seg, "text"))),
             "assistant" => messages.push(LlmMessage::assistant_blocks(vec![ContentBlock::Text {
                 text: str_field(seg, "text"),

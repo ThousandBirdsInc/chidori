@@ -731,6 +731,54 @@ fn apply_model_override(ctx: &RuntimeContext, request: &mut LlmRequest) {
     }
 }
 
+/// Look up a prompt in the opt-in local content-addressed cache
+/// (`prompt_cache`, Phase 3 of `docs/context-management.md`). Consulted on
+/// the live path only, after the replay short-circuit and completed-operation
+/// replay have both declined, so it can never shadow the call log. The digest
+/// is recomputed here because `apply_model_override` may have changed the
+/// model after the caller stamped `request_digest` into its args — the cache
+/// must key on the request actually sent.
+fn local_prompt_cache_lookup(request: &LlmRequest) -> Option<LlmResponse> {
+    if !crate::runtime::prompt_cache::enabled() {
+        return None;
+    }
+    crate::runtime::prompt_cache::lookup(&prompt_request_digest(request))
+        .and_then(|value| llm_response_from_json(&value))
+}
+
+/// Complete a prompt host operation with a locally cached response: identical
+/// begin/safepoint/resolve/record/completion sequence to a live provider
+/// success, with the same `result` the provider would have produced.
+/// `token_usage` stays `None` because this run paid no tokens for it.
+fn complete_prompt_from_local_cache(
+    ctx: &RuntimeContext,
+    seq: u64,
+    args: Value,
+    result: Value,
+) -> Result<()> {
+    let host_operation = ctx.begin_host_operation_with_function(
+        seq,
+        PendingHostOperationKind::Prompt,
+        Some("prompt".to_string()),
+        args.clone(),
+    );
+    ctx.run_host_operation_safepoint(host_operation)?;
+    ctx.resolve_host_operation(host_operation, result.clone())?;
+    ctx.record_call(CallRecord {
+        seq,
+        parent_seq: None,
+        function: "prompt".to_string(),
+        args,
+        result,
+        duration_ms: 0,
+        token_usage: None,
+        timestamp: Utc::now(),
+        error: None,
+    });
+    ctx.run_host_operation_completion_safepoint(host_operation)?;
+    Ok(())
+}
+
 pub fn execute_prompt_text(
     ctx: &RuntimeContext,
     providers: &ProviderRegistry,
@@ -758,6 +806,12 @@ pub fn execute_prompt_text(
         return Ok(result);
     }
 
+    if let Some(cached) = local_prompt_cache_lookup(&request) {
+        let result = Value::String(cached.content);
+        complete_prompt_from_local_cache(ctx, seq, args, result.clone())?;
+        return Ok(result);
+    }
+
     let host_operation = ctx.begin_host_operation_with_function(
         seq,
         PendingHostOperationKind::Prompt,
@@ -774,6 +828,12 @@ pub fn execute_prompt_text(
 
     match response {
         Ok(response) => {
+            if crate::runtime::prompt_cache::enabled() {
+                crate::runtime::prompt_cache::store(
+                    &prompt_request_digest(&request),
+                    &llm_response_to_json(&response),
+                );
+            }
             let result = Value::String(response.content.clone());
             ctx.resolve_host_operation(host_operation, result.clone())?;
             ctx.record_call(CallRecord {
@@ -841,6 +901,11 @@ pub fn execute_prompt_response(
         });
     }
 
+    if let Some(cached) = local_prompt_cache_lookup(&request) {
+        complete_prompt_from_local_cache(ctx, seq, args, llm_response_to_json(&cached))?;
+        return Ok(cached);
+    }
+
     let host_operation = ctx.begin_host_operation_with_function(
         seq,
         PendingHostOperationKind::Prompt,
@@ -858,6 +923,9 @@ pub fn execute_prompt_response(
     match response {
         Ok(response) => {
             let result = llm_response_to_json(&response);
+            if crate::runtime::prompt_cache::enabled() {
+                crate::runtime::prompt_cache::store(&prompt_request_digest(&request), &result);
+            }
             ctx.resolve_host_operation(host_operation, result.clone())?;
             ctx.record_call(CallRecord {
                 seq,

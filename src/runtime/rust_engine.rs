@@ -1050,6 +1050,13 @@ mod tests {
         }
     }
 
+    /// Serializes the prompt-issuing context tests against the local
+    /// prompt-cache test: `CHIDORI_PROMPT_CACHE_DIR` is process-global, and
+    /// the two CONTEXT_AGENT_SRC tests send byte-identical requests — run
+    /// concurrently with the cache enabled, one could be served from entries
+    /// the other stored and break its provider call-count assertions.
+    static PROMPT_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
     fn context_test_backend(
         ctx: RuntimeContext,
         providers: crate::providers::ProviderRegistry,
@@ -1096,6 +1103,7 @@ mod tests {
 
     #[test]
     fn context_builder_composes_multi_turn_prompts_with_cache_layout() {
+        let _env = PROMPT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ctx = RuntimeContext::new();
         let dir =
             std::env::temp_dir().join(format!("chidori-rust-context-{}", uuid::Uuid::new_v4()));
@@ -1182,6 +1190,7 @@ mod tests {
 
     #[test]
     fn context_conversation_replays_without_provider_calls() {
+        let _env = PROMPT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "chidori-rust-context-replay-{}",
             uuid::Uuid::new_v4()
@@ -1210,6 +1219,211 @@ mod tests {
             context_test_backend(replay_ctx, crate::providers::ProviderRegistry::new());
         let replay_output = run_agent(&path, CONTEXT_AGENT_SRC, &input, &replay_backend).unwrap();
         assert_eq!(live_output, replay_output);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    const COMPACT_AGENT_SRC: &str = r#"
+        export async function agent(input: { questions: string[] }) {
+            let ctx = chidori.context()
+                .system("You are a terse assistant for the compaction test.");
+            for (const q of input.questions) {
+                ctx = ctx.user(q);
+                const r = await ctx.prompt({ model: "test-model" });
+                ctx = r.context;
+            }
+            const beforeTokens = ctx.estimateTokens();
+            const underBudget = await ctx.compact({ budgetTokens: 1000000 });
+            const compacted = await ctx.compact({ keepTurns: 2 });
+            const next = compacted.user("compact-final-question?");
+            const r = await next.prompt({ model: "test-model" });
+            return {
+                finalText: r.text,
+                noopUnderBudget: underBudget === ctx,
+                compactedIsNew: compacted !== ctx,
+                shrank: compacted.estimateTokens() < beforeTokens,
+            };
+        }
+    "#;
+
+    #[test]
+    fn context_compact_summarizes_old_turns_into_recorded_segment() {
+        let _env = PROMPT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ctx = RuntimeContext::new();
+        let dir =
+            std::env::temp_dir().join(format!("chidori-rust-compact-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(&path, COMPACT_AGENT_SRC).unwrap();
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut providers = crate::providers::ProviderRegistry::new();
+        providers.register(Box::new(SequenceProvider {
+            responses: vec![
+                "a long first answer about compaction alpha".to_string(),
+                "a long second answer about compaction beta".to_string(),
+                "a long third answer about compaction gamma".to_string(),
+                "brief summary".to_string(),
+                "final answer".to_string(),
+            ],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            requests: Arc::clone(&requests),
+        }));
+        let backend = context_test_backend(ctx.clone(), providers);
+        let input = serde_json::json!({
+            "questions": ["compact-q-alpha?", "compact-q-beta?", "compact-q-gamma?"]
+        });
+        let output = run_agent(&path, COMPACT_AGENT_SRC, &input, &backend).unwrap();
+
+        assert_eq!(output["finalText"], serde_json::json!("final answer"));
+        // Under budget and "nothing old enough" paths are pure no-ops that
+        // return the SAME context value without a host call.
+        assert_eq!(output["noopUnderBudget"], serde_json::json!(true));
+        assert_eq!(output["compactedIsNew"], serde_json::json!(true));
+        assert_eq!(output["shrank"], serde_json::json!(true));
+
+        let requests = requests.lock().unwrap();
+        // 3 conversation turns + 1 summarization call + 1 post-compact turn;
+        // the under-budget compact made NO provider call.
+        assert_eq!(requests.len(), 5);
+
+        // The summarization request: transcript of the old turns as one user
+        // message under the summarizer system instructions.
+        let summarize = &requests[3];
+        assert!(summarize
+            .system
+            .as_deref()
+            .unwrap()
+            .contains("compact conversation history"));
+        assert_eq!(summarize.messages.len(), 1);
+        let transcript = match &summarize.messages[0].content[0] {
+            crate::providers::ContentBlock::Text { text } => text.clone(),
+            other => panic!("expected text transcript, got {other:?}"),
+        };
+        assert!(transcript.contains("User: compact-q-alpha?"));
+        assert!(transcript.contains("Assistant: a long first answer about compaction alpha"));
+        assert!(transcript.contains("User: compact-q-beta?"));
+        // The kept turns are NOT summarized.
+        assert!(!transcript.contains("compact-q-gamma?"));
+
+        // The post-compact request: summary segment + the two kept turns +
+        // the new question, with a fresh cache breakpoint on the summary.
+        let after = &requests[4];
+        assert_eq!(after.messages.len(), 4);
+        let summary_text = match &after.messages[0].content[0] {
+            crate::providers::ContentBlock::Text { text } => text.clone(),
+            other => panic!("expected summary text, got {other:?}"),
+        };
+        assert!(summary_text.contains("<conversation-summary>"));
+        assert!(summary_text.contains("brief summary"));
+        assert!(
+            after.messages[0].cache_control.is_some(),
+            "summary segment must carry a fresh cache breakpoint"
+        );
+        let kept_q = match &after.messages[1].content[0] {
+            crate::providers::ContentBlock::Text { text } => text.clone(),
+            other => panic!("expected kept user turn, got {other:?}"),
+        };
+        assert_eq!(kept_q, "compact-q-gamma?");
+
+        // The summarization is a normal recorded prompt: 5 prompt records.
+        let records = ctx.call_log().into_records();
+        let prompts: Vec<_> = records.iter().filter(|r| r.function == "prompt").collect();
+        assert_eq!(prompts.len(), 5);
+
+        // Replay against an empty provider registry reproduces the whole run,
+        // compaction included, from the call log alone.
+        let replay_ctx = RuntimeContext::with_replay(records);
+        let replay_backend =
+            context_test_backend(replay_ctx, crate::providers::ProviderRegistry::new());
+        let replay_output = run_agent(&path, COMPACT_AGENT_SRC, &input, &replay_backend).unwrap();
+        assert_eq!(output, replay_output);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Removes the prompt-cache env flag even if the test panics, so a failure
+    /// can't leave the process-global cache enabled for unrelated tests.
+    struct PromptCacheEnvGuard;
+    impl Drop for PromptCacheEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("CHIDORI_PROMPT_CACHE_DIR");
+        }
+    }
+
+    #[test]
+    fn local_prompt_cache_serves_identical_request_without_provider() {
+        let _env = PROMPT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-rust-prompt-cache-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent(input: {}) {
+                const text = await chidori.prompt(
+                    "local-prompt-cache-unique-question?",
+                    { model: "test-model" },
+                );
+                return { text };
+            }
+        "#;
+        std::fs::write(&path, src).unwrap();
+        std::env::set_var(
+            "CHIDORI_PROMPT_CACHE_DIR",
+            dir.join("prompt-cache").to_str().unwrap(),
+        );
+        let _cache_env = PromptCacheEnvGuard;
+
+        // First run pays the provider and populates the cache.
+        let first_ctx = RuntimeContext::new();
+        let first_calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut providers = crate::providers::ProviderRegistry::new();
+        providers.register(Box::new(SequenceProvider {
+            responses: vec!["the locally cached answer".to_string()],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            requests: Arc::clone(&first_calls),
+        }));
+        let first_backend = context_test_backend(first_ctx.clone(), providers);
+        let first_output = run_agent(&path, src, &serde_json::json!({}), &first_backend).unwrap();
+        assert_eq!(
+            first_output,
+            serde_json::json!({ "text": "the locally cached answer" })
+        );
+        assert_eq!(first_calls.lock().unwrap().len(), 1);
+
+        // A FRESH run (empty call log, so no replay) issuing the identical
+        // request is served from the local cache: zero provider calls, yet it
+        // records an identical result as a normal CallRecord.
+        let second_ctx = RuntimeContext::new();
+        let second_calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut providers = crate::providers::ProviderRegistry::new();
+        providers.register(Box::new(SequenceProvider {
+            responses: vec!["WRONG: provider must not be consulted".to_string()],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            requests: Arc::clone(&second_calls),
+        }));
+        let second_backend = context_test_backend(second_ctx.clone(), providers);
+        let second_output = run_agent(&path, src, &serde_json::json!({}), &second_backend).unwrap();
+        assert_eq!(second_output, first_output);
+        assert_eq!(second_calls.lock().unwrap().len(), 0);
+
+        let first_records = first_ctx.call_log().into_records();
+        let second_records = second_ctx.call_log().into_records();
+        let first_prompt = first_records
+            .iter()
+            .find(|r| r.function == "prompt")
+            .unwrap();
+        let second_prompt = second_records
+            .iter()
+            .find(|r| r.function == "prompt")
+            .unwrap();
+        assert_eq!(second_prompt.result, first_prompt.result);
+        assert_eq!(second_prompt.args, first_prompt.args);
+        // The first run paid tokens; the cache-served run paid none.
+        assert!(first_prompt.token_usage.is_some());
+        assert!(second_prompt.token_usage.is_none());
 
         let _ = std::fs::remove_dir_all(dir);
     }

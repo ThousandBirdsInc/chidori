@@ -116,8 +116,26 @@ first reads the shared prefix at the discounted cached rate.
 - `digest()` → stable content hash of the assembled request, also recorded in
   each prompt's call-log args as `request_digest`.
 - `estimateTokens()` → rough local size estimate for window budgeting.
+- `compact(options?)` → `Promise<Context>`: explicit, opt-in window
+  compaction. Summarizes the older conversation turns into ONE durable
+  summary segment (a recorded `prompt` host call, so it replays
+  deterministically) and returns a new context: stable head + summary +
+  fresh cache breakpoint + the newest `keepTurns` turns (default 2) kept
+  verbatim. `budgetTokens` makes it a pure no-op (no host call) while
+  `estimateTokens()` is within budget, so loops can call it unconditionally;
+  `model` / `instructions` / `maxTokens` / `ttl` tune the summarizer.
+  Compaction is never automatic — it changes what the model sees, so it is
+  always an author decision.
 
 See `examples/agents/context_qa.ts` for a complete corpus-Q&A agent.
+
+Setting `CHIDORI_PROMPT_CACHE_DIR=<dir>` opts into a local content-addressed
+prompt cache keyed on the assembled `request_digest`: an exact repeat of a
+prompt (same model, system, tools, messages, cache layout) — even from a
+different run — is served locally without calling the provider, then recorded
+as a normal call-log entry with the identical result (and no token usage,
+since nothing was billed). The cache is live-path only: replay always
+short-circuits to the call log first and never consults it.
 
 ### input
 

@@ -9,6 +9,7 @@ pub mod host_core;
 pub mod memory;
 pub mod native;
 pub mod otel;
+pub mod prompt_cache;
 /// Pure-Rust JS engine integration — the only JavaScript engine.
 pub mod rust_engine;
 pub mod secret_env;
