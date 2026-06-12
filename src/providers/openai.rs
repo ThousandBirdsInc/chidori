@@ -85,6 +85,17 @@ struct OpenAiToolCallFunction {
 struct OpenAiUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
+    /// OpenAI's prompt caching is automatic on exact prefixes; the cached
+    /// share of `prompt_tokens` is reported here. Absent on older/compatible
+    /// backends, so default to none.
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+#[derive(Deserialize, Default)]
+struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -215,9 +226,21 @@ impl LlmProvider for OpenAiProvider {
             other => other.to_string(),
         };
 
-        let (input_tokens, output_tokens) = match parsed.usage {
-            Some(usage) => (usage.prompt_tokens, usage.completion_tokens),
-            None => (0, 0),
+        let (input_tokens, output_tokens, cache_read_tokens) = match parsed.usage {
+            Some(usage) => {
+                let cached = usage
+                    .prompt_tokens_details
+                    .map(|d| d.cached_tokens)
+                    .unwrap_or(0);
+                // OpenAI counts cached tokens inside prompt_tokens; split them
+                // out so input_tokens means "fresh input" like Anthropic's.
+                (
+                    usage.prompt_tokens.saturating_sub(cached),
+                    usage.completion_tokens,
+                    cached,
+                )
+            }
+            None => (0, 0, 0),
         };
 
         Ok(LlmResponse {
@@ -227,6 +250,8 @@ impl LlmProvider for OpenAiProvider {
             stop_reason,
             input_tokens,
             output_tokens,
+            cache_creation_tokens: 0,
+            cache_read_tokens,
         })
     }
 
@@ -303,6 +328,7 @@ impl LlmProvider for OpenAiProvider {
         let mut finish_reason: String = "stop".into();
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
+        let mut cache_read_tokens: u64 = 0;
 
         let mut stream = resp.bytes_stream();
         let mut buffer = String::new();
@@ -337,6 +363,13 @@ impl LlmProvider for OpenAiProvider {
                     }
                     if let Some(t) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
                         output_tokens = t;
+                    }
+                    if let Some(t) = usage
+                        .get("prompt_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(|v| v.as_u64())
+                    {
+                        cache_read_tokens = t;
                     }
                 }
 
@@ -409,8 +442,12 @@ impl LlmProvider for OpenAiProvider {
             blocks,
             tool_calls,
             stop_reason,
-            input_tokens,
+            // Same split as the non-streaming path: report fresh input apart
+            // from the cached share.
+            input_tokens: input_tokens.saturating_sub(cache_read_tokens),
             output_tokens,
+            cache_creation_tokens: 0,
+            cache_read_tokens,
         })
     }
 }

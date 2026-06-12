@@ -375,14 +375,24 @@ impl NativeAgentRunner {
                 }
             }
             let prompt_type = if turn == 0 { "analysis" } else { "final" };
-            let llm_request = LlmRequest {
+            let mut llm_request = LlmRequest {
                 model: current_model.clone(),
                 messages: messages.clone(),
                 system: current_system.clone(),
                 temperature: request.temperature,
                 max_tokens: request.max_tokens,
                 tools: current_tools.clone(),
+                cache: crate::providers::CacheLayout::default(),
             };
+            // Cache the stable head (system + tools + conversation prefix) so
+            // every turn after the first reads the prefix at the discounted
+            // rate instead of re-billing it. Marking is request metadata only:
+            // recorded results are identical with or without it.
+            crate::runtime::host_core::auto_mark_prompt_cache(
+                &mut llm_request,
+                crate::runtime::host_core::CachePosture::default(),
+            );
+            let request_digest = crate::runtime::host_core::prompt_request_digest(&llm_request);
             let response = execute_prompt_response(
                 &ctx,
                 &self.providers,
@@ -393,6 +403,7 @@ impl NativeAgentRunner {
                     "type": prompt_type,
                     "messages": messages.clone(),
                     "tools": current_tools.clone(),
+                    "request_digest": request_digest,
                 }),
                 Some(prompt_type.to_string()),
             )?;
@@ -570,6 +581,7 @@ impl NativeAgentRunner {
         messages.push(Message {
             role: "user".to_string(),
             content,
+            cache_control: None,
         });
         Ok(BatchOutcome::Completed)
     }
@@ -642,6 +654,7 @@ mod tests {
                     stop_reason: "tool_use".to_string(),
                     input_tokens: 1,
                     output_tokens: 2,
+                    ..Default::default()
                 });
             }
             Ok(LlmResponse {
@@ -653,6 +666,7 @@ mod tests {
                 stop_reason: "end_turn".to_string(),
                 input_tokens: 3,
                 output_tokens: 4,
+                ..Default::default()
             })
         }
 
@@ -697,6 +711,7 @@ mod tests {
                     stop_reason: "tool_use".to_string(),
                     input_tokens: 1,
                     output_tokens: 1,
+                    ..Default::default()
                 });
             }
             Ok(LlmResponse {
@@ -708,6 +723,7 @@ mod tests {
                 stop_reason: "end_turn".to_string(),
                 input_tokens: 2,
                 output_tokens: 3,
+                ..Default::default()
             })
         }
     }
@@ -751,6 +767,107 @@ mod tests {
         assert_eq!(records[2].function, "prompt");
     }
 
+    /// Captures every provider request so a test can assert the cache layout
+    /// the loop emits. First call returns a tool use; second returns done.
+    struct RequestCapturingProvider {
+        calls: AtomicUsize,
+        requests: Arc<StdMutex<Vec<LlmRequest>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RequestCapturingProvider {
+        fn supports_model(&self, _model: &str) -> bool {
+            true
+        }
+
+        async fn send(&self, request: &LlmRequest) -> Result<LlmResponse> {
+            self.requests.lock().unwrap().push(request.clone());
+            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call_index == 0 {
+                return Ok(LlmResponse {
+                    blocks: vec![ContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "echo".to_string(),
+                        input: serde_json::json!({ "value": 1 }),
+                    }],
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".to_string(),
+                        name: "echo".to_string(),
+                        input: serde_json::json!({ "value": 1 }),
+                    }],
+                    stop_reason: "tool_use".to_string(),
+                    ..LlmResponse::default()
+                });
+            }
+            Ok(LlmResponse {
+                content: "done".to_string(),
+                blocks: vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                }],
+                ..LlmResponse::default()
+            })
+        }
+    }
+
+    #[test]
+    fn native_loop_marks_cacheable_prefix_and_records_request_digest() {
+        use crate::providers::CacheTtl;
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut providers = ProviderRegistry::new();
+        providers.register(Box::new(RequestCapturingProvider {
+            calls: AtomicUsize::new(0),
+            requests: Arc::clone(&requests),
+        }));
+        let mut tools = ToolRegistry::new();
+        tools.register_native("echo", "Echo input", Vec::new(), Ok);
+        let runner = NativeAgentRunner::new(
+            Arc::new(providers),
+            Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            Arc::new(tools),
+        );
+
+        let result = runner
+            .run_pausable(NativeAgentRequest {
+                model: "test-model".to_string(),
+                messages: vec![Message::user_text("use a tool")],
+                system: Some("be helpful".to_string()),
+                temperature: 0.0,
+                max_tokens: 100,
+                tool_schemas: vec![ToolSchema {
+                    name: "echo".to_string(),
+                    description: "Echo input".to_string(),
+                    input_schema: serde_json::json!({ "type": "object" }),
+                }],
+                max_turns: 4,
+            })
+            .unwrap();
+        assert_eq!(result.answer, "done");
+
+        // Every turn marks the stable head: system, tools, and the latest
+        // message — so turn 2 reads turn 1's prefix from the provider cache.
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert_eq!(request.cache.system, Some(CacheTtl::FiveMinutes));
+            assert_eq!(request.cache.tools, Some(CacheTtl::FiveMinutes));
+            assert_eq!(
+                request.messages.last().unwrap().cache_control,
+                Some(CacheTtl::FiveMinutes)
+            );
+        }
+        // Only the request copies carry marks — the loop's accumulated history
+        // (what checkpoints persist) stays unmarked.
+        assert!(result.messages.iter().all(|m| m.cache_control.is_none()));
+
+        // Each prompt record is self-describing via the assembled digest.
+        for record in result.call_log.into_records() {
+            if record.function == "prompt" {
+                let digest = record.args["request_digest"].as_str().unwrap();
+                assert_eq!(digest.len(), 64);
+            }
+        }
+    }
+
     /// Records the model of every provider request so a test can assert which
     /// model each tool-loop turn used. First call returns a tool use; second
     /// returns done.
@@ -784,6 +901,7 @@ mod tests {
                     stop_reason: "tool_use".to_string(),
                     input_tokens: 1,
                     output_tokens: 1,
+                    ..Default::default()
                 });
             }
             Ok(LlmResponse {
@@ -795,6 +913,7 @@ mod tests {
                 stop_reason: "end_turn".to_string(),
                 input_tokens: 1,
                 output_tokens: 1,
+                ..Default::default()
             })
         }
 
@@ -1022,6 +1141,7 @@ mod tests {
                     stop_reason: "tool_use".to_string(),
                     input_tokens: 1,
                     output_tokens: 1,
+                    ..Default::default()
                 });
             }
             // Validate that on resume, every tool_use in the prior assistant
@@ -1061,6 +1181,7 @@ mod tests {
                 stop_reason: "end_turn".to_string(),
                 input_tokens: 1,
                 output_tokens: 1,
+                ..Default::default()
             })
         }
 

@@ -962,6 +962,208 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A provider that answers each call with the next canned response and
+    /// captures every request, so context tests can assert both the answers
+    /// and the cache layout on the wire.
+    struct SequenceProvider {
+        responses: Vec<String>,
+        calls: std::sync::atomic::AtomicUsize,
+        requests: Arc<StdMutex<Vec<crate::providers::LlmRequest>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::LlmProvider for SequenceProvider {
+        fn supports_model(&self, _model: &str) -> bool {
+            true
+        }
+
+        async fn send(
+            &self,
+            request: &crate::providers::LlmRequest,
+        ) -> anyhow::Result<crate::providers::LlmResponse> {
+            self.requests.lock().unwrap().push(request.clone());
+            let index = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let content = self
+                .responses
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| "out of responses".to_string());
+            Ok(crate::providers::LlmResponse {
+                content: content.clone(),
+                blocks: vec![crate::providers::ContentBlock::Text { text: content }],
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_creation_tokens: if index == 0 { 100 } else { 0 },
+                cache_read_tokens: if index == 0 { 0 } else { 100 },
+                ..crate::providers::LlmResponse::default()
+            })
+        }
+    }
+
+    fn context_test_backend(
+        ctx: RuntimeContext,
+        providers: crate::providers::ProviderRegistry,
+    ) -> HostBindingBackend {
+        HostBindingBackend::for_runtime(
+            ctx,
+            Arc::new(providers),
+            Arc::new(TemplateEngine::new(".")),
+            Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            PolicyConfig::from_env(),
+            Arc::new(StdMutex::new(PolicyCache::default())),
+            RuntimePolicy::durable_default("rust-engine-test"),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(McpManager::new()),
+        )
+    }
+
+    const CONTEXT_AGENT_SRC: &str = r#"
+        export async function agent(input: { questions: string[] }) {
+            const base = chidori.context()
+                .system("You are a policy analyst.")
+                .doc("corpus", "Section 1: chidori agents are durable.")
+                .cacheBreakpoint("5m");
+            const baseDigest = base.digest();
+            const forkA = base.user("a");
+            const forkB = base.user("b");
+            let ctx = base;
+            const answers: string[] = [];
+            for (const q of input.questions) {
+                ctx = ctx.user(q);
+                const r = await ctx.prompt({ model: "test-model" });
+                ctx = r.context;
+                answers.push(r.text);
+            }
+            return {
+                answers,
+                digestLen: baseDigest.length,
+                baseDigestStable: base.digest() === baseDigest,
+                forkDigestsDiffer: forkA.digest() !== forkB.digest(),
+                hasTokenEstimate: ctx.estimateTokens() > 0,
+            };
+        }
+    "#;
+
+    #[test]
+    fn context_builder_composes_multi_turn_prompts_with_cache_layout() {
+        let ctx = RuntimeContext::new();
+        let dir =
+            std::env::temp_dir().join(format!("chidori-rust-context-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(&path, CONTEXT_AGENT_SRC).unwrap();
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut providers = crate::providers::ProviderRegistry::new();
+        providers.register(Box::new(SequenceProvider {
+            responses: vec!["answer one".to_string(), "answer two".to_string()],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            requests: Arc::clone(&requests),
+        }));
+        let backend = context_test_backend(ctx.clone(), providers);
+        let output = run_agent(
+            &path,
+            CONTEXT_AGENT_SRC,
+            &serde_json::json!({ "questions": ["q1", "q2"] }),
+            &backend,
+        )
+        .unwrap();
+
+        assert_eq!(
+            output["answers"],
+            serde_json::json!(["answer one", "answer two"])
+        );
+        assert_eq!(output["digestLen"], serde_json::json!(64));
+        assert_eq!(output["baseDigestStable"], serde_json::json!(true));
+        assert_eq!(output["forkDigestsDiffer"], serde_json::json!(true));
+        assert_eq!(output["hasTokenEstimate"], serde_json::json!(true));
+
+        // The wire requests: turn 1 sends [doc, q1]; turn 2 extends the same
+        // prefix with the assistant turn and q2. The explicit breakpoint marks
+        // the doc; auto-marking covers system and the conversation head.
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].messages.len(), 2);
+        assert_eq!(requests[1].messages.len(), 4);
+        for request in requests.iter() {
+            assert!(request
+                .system
+                .as_deref()
+                .unwrap()
+                .contains("policy analyst"));
+            assert!(request.cache.system.is_some(), "system head must be marked");
+            assert!(
+                request.messages[0].cache_control.is_some(),
+                "explicit doc breakpoint must survive"
+            );
+            assert!(
+                request.messages.last().unwrap().cache_control.is_some(),
+                "conversation head must be auto-marked"
+            );
+        }
+        // Turn 2's prefix content is identical to turn 1's request — the
+        // property provider caches key on. (The rolling head *marker* moves
+        // turn to turn; markers are placement metadata, not content.)
+        let content =
+            |m: &crate::providers::Message| serde_json::to_string(&(&m.role, &m.content)).unwrap();
+        for i in 0..2 {
+            assert_eq!(
+                content(&requests[1].messages[i]),
+                content(&requests[0].messages[i])
+            );
+        }
+
+        // Durable records: two prompt calls, each carrying the assembled
+        // request digest and the observed cache token split.
+        let records = ctx.call_log().into_records();
+        let prompts: Vec<_> = records.iter().filter(|r| r.function == "prompt").collect();
+        assert_eq!(prompts.len(), 2);
+        for record in &prompts {
+            assert_eq!(record.args["request_digest"].as_str().unwrap().len(), 64);
+        }
+        let usage_turn1 = prompts[0].token_usage.as_ref().unwrap();
+        assert_eq!(usage_turn1.cache_creation_tokens, Some(100));
+        assert_eq!(usage_turn1.cache_read_tokens, None);
+        let usage_turn2 = prompts[1].token_usage.as_ref().unwrap();
+        assert_eq!(usage_turn2.cache_read_tokens, Some(100));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn context_conversation_replays_without_provider_calls() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-rust-context-replay-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(&path, CONTEXT_AGENT_SRC).unwrap();
+        let input = serde_json::json!({ "questions": ["q1", "q2"] });
+
+        // Record a live run.
+        let live_ctx = RuntimeContext::new();
+        let mut providers = crate::providers::ProviderRegistry::new();
+        providers.register(Box::new(SequenceProvider {
+            responses: vec!["answer one".to_string(), "answer two".to_string()],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            requests: Arc::new(StdMutex::new(Vec::new())),
+        }));
+        let live_backend = context_test_backend(live_ctx.clone(), providers);
+        let live_output = run_agent(&path, CONTEXT_AGENT_SRC, &input, &live_backend).unwrap();
+        let records = live_ctx.call_log().into_records();
+
+        // Replay against an EMPTY provider registry: any live LLM call would
+        // fail, so identical output proves the conversation came from the log.
+        let replay_ctx = RuntimeContext::with_replay(records);
+        let replay_backend =
+            context_test_backend(replay_ctx, crate::providers::ProviderRegistry::new());
+        let replay_output = run_agent(&path, CONTEXT_AGENT_SRC, &input, &replay_backend).unwrap();
+        assert_eq!(live_output, replay_output);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn run_agent_resolves_relative_module_imports() {
         // A multi-file agent: the entry imports a helper from a sibling `.ts`

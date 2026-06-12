@@ -286,6 +286,28 @@ impl Engine {
                     serde_json::json!({ "source": source, "opts": opts }),
                 )
             });
+        let d = dispatch.clone();
+        // Synchronous, pure digest of a context segment chain — backs the JS
+        // SDK's `Context.digest()`. Unlike the async-shaped effects above it
+        // returns its value inline; the dispatcher computes a deterministic
+        // hash and records nothing.
+        self.vm
+            .define_method(&chidori, "__contextDigest", 2, move |vm, _t, args| {
+                let segments = args
+                    .first()
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                let opts = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "contextDigest",
+                    serde_json::json!({ "segments": segments, "opts": opts }),
+                )
+            });
         // chidori.workspace.<action>(...) — a nested object whose methods all
         // forward the "workspace" effect tagged with their action.
         let workspace = self.vm.new_object();

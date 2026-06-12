@@ -430,7 +430,7 @@ impl HostPromiseTable {
         self.records.values().find_map(|record| {
             if record.operation.seq == seq
                 && record.operation.kind == kind
-                && record.operation.args == *args
+                && completed_args_match(&record.operation.args, args)
                 && !matches!(record.state, HostPromiseState::Pending)
             {
                 Some(record.clone())
@@ -443,6 +443,25 @@ impl HostPromiseTable {
     pub fn records(&self) -> Vec<HostPromiseRecord> {
         self.records.values().cloned().collect()
     }
+}
+
+/// Args comparison for completed-operation replay, ignoring derived request
+/// metadata: `request_digest` describes the assembled prompt (it is recomputed
+/// from the same inputs on resume) rather than identifying the operation, so a
+/// digest-scheme change between record and resume must not force a completed
+/// side effect to re-execute.
+fn completed_args_match(recorded: &Value, rebuilt: &Value) -> bool {
+    if recorded == rebuilt {
+        return true;
+    }
+    let strip = |value: &Value| {
+        let mut value = value.clone();
+        if let Some(map) = value.as_object_mut() {
+            map.remove("request_digest");
+        }
+        value
+    };
+    strip(recorded) == strip(rebuilt)
 }
 
 pub const DEFAULT_BRANCH_SEQUENCE_RANGE_WIDTH: u64 = 10_000;

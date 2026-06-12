@@ -75,10 +75,49 @@ Options:
 - `maxTokens` or `max_tokens`: output token cap.
 - `temperature`: sampling temperature.
 - `tools`: registered tool names available to provider tool-use loops.
+- `cache`: prompt-cache posture. Defaults to on (`"5m"`): the runtime marks
+  the stable request head (system, tools, conversation prefix) so providers
+  bill repeated prefixes at the cached rate. `false` disables for this call;
+  `"1h"` requests the extended TTL. Caching never changes a response.
 
 When streaming is enabled, prompt events include `prompt_type`, `stream_id`,
 and `seq` so UIs can filter progress streams separately from final-answer
 streams.
+
+### context
+
+```ts
+const base = chidori
+  .context()
+  .system("You are a policy analyst.")
+  .doc("policy-corpus", corpusText) // large stable reference block
+  .cacheBreakpoint("5m");           // freeze the head as a cacheable prefix
+
+let ctx = base;
+for (const q of questions) {
+  ctx = ctx.user(q);
+  const { text, context } = await ctx.prompt({ type: "final" });
+  ctx = context; // assistant turn appended; the prefix stays shared
+}
+```
+
+An immutable, turn-structured prompt context. Builder methods (`system`,
+`tools`, `doc`, `user`, `assistant`, `toolResult`, `cacheBreakpoint`) each
+return a NEW context sharing the parent's segments, so `base.user("a")` and
+`base.user("b")` are independent forks of the same prefix. Building is pure
+in-VM work; only `prompt()` / `respond()` perform a durable host call. The
+stable head is auto-marked for provider prompt caching, so each turn after the
+first reads the shared prefix at the discounted cached rate.
+
+- `prompt(options?)` → `{ text, context }`: send, return the answer plus the
+  context extended with the assistant turn (including any tool-use exchange).
+- `respond(options?)` → `{ response, context }`: one structured turn for
+  author-driven tool loops (`response.tool_calls`, `response.blocks`).
+- `digest()` → stable content hash of the assembled request, also recorded in
+  each prompt's call-log args as `request_digest`.
+- `estimateTokens()` → rough local size estimate for window budgeting.
+
+See `examples/agents/context_qa.ts` for a complete corpus-Q&A agent.
 
 ### input
 

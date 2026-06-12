@@ -2049,6 +2049,7 @@ mod tests {
                 stop_reason: "end_turn".to_string(),
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
+                ..Default::default()
             })
         }
     }
@@ -2085,6 +2086,7 @@ mod tests {
                     stop_reason: "tool_use".to_string(),
                     input_tokens: 2,
                     output_tokens: 3,
+                    ..Default::default()
                 })
             } else {
                 Ok(crate::providers::LlmResponse {
@@ -2096,6 +2098,7 @@ mod tests {
                     stop_reason: "end_turn".to_string(),
                     input_tokens: 5,
                     output_tokens: 7,
+                    ..Default::default()
                 })
             }
         }
@@ -2131,6 +2134,7 @@ mod tests {
                     stop_reason: "tool_use".to_string(),
                     input_tokens: 2,
                     output_tokens: 3,
+                    ..Default::default()
                 }),
                 1 => Ok(crate::providers::LlmResponse {
                     content: String::new(),
@@ -2147,6 +2151,7 @@ mod tests {
                     stop_reason: "tool_use".to_string(),
                     input_tokens: 4,
                     output_tokens: 5,
+                    ..Default::default()
                 }),
                 _ => Ok(crate::providers::LlmResponse {
                     content: "final repeated answer".to_string(),
@@ -2157,6 +2162,7 @@ mod tests {
                     stop_reason: "end_turn".to_string(),
                     input_tokens: 6,
                     output_tokens: 7,
+                    ..Default::default()
                 }),
             }
         }

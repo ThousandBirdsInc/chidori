@@ -7,10 +7,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::rate_limit::RateLimiter;
-use super::{ContentBlock, LlmProvider, LlmRequest, LlmResponse, TokenSink, ToolCall};
+use super::{CacheTtl, ContentBlock, LlmProvider, LlmRequest, LlmResponse, TokenSink, ToolCall};
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// Beta header required for the extended (1h) cache TTL; only sent when a
+/// breakpoint actually requests it.
+const ANTHROPIC_EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
+/// Anthropic allows at most 4 cache breakpoints per request.
+const ANTHROPIC_MAX_CACHE_BREAKPOINTS: usize = 4;
 
 pub struct AnthropicProvider {
     api_key: String,
@@ -60,6 +65,13 @@ enum AnthropicResponseBlock {
 struct AnthropicUsage {
     input_tokens: u64,
     output_tokens: u64,
+    /// Tokens written to the prompt cache this request. Absent on responses
+    /// that involve no caching (and from older API versions), so default to 0.
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    /// Tokens served from the prompt cache this request.
+    #[serde(default)]
+    cache_read_input_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -72,11 +84,112 @@ struct AnthropicErrorBody {
     message: String,
 }
 
-#[derive(Serialize)]
-struct AnthropicTool<'a> {
-    name: &'a str,
-    description: &'a str,
-    input_schema: &'a Value,
+fn cache_control_json(ttl: CacheTtl) -> Value {
+    match ttl {
+        CacheTtl::FiveMinutes => json!({ "type": "ephemeral" }),
+        CacheTtl::OneHour => json!({ "type": "ephemeral", "ttl": "1h" }),
+    }
+}
+
+/// Build the Anthropic request body, emitting `cache_control` markers for the
+/// request's cache layout, and report whether any marker needs the extended
+/// (1h) TTL beta header. A request with no markers produces a body identical
+/// to the pre-caching wire format (plain string `system`, unannotated blocks).
+///
+/// Anthropic caps breakpoints at 4. The system and tools marks always survive
+/// (they cover the most stable prefix); when message-level marks exceed the
+/// remaining budget the *latest* marks win — a later mark's prefix subsumes an
+/// earlier one's, so dropping the oldest loses no coverage.
+fn build_request_body(request: &LlmRequest, stream: bool) -> Result<(Value, bool)> {
+    let mut needs_one_hour = false;
+    let mut note_ttl = |ttl: CacheTtl| {
+        if ttl == CacheTtl::OneHour {
+            needs_one_hour = true;
+        }
+        cache_control_json(ttl)
+    };
+
+    let mut budget = ANTHROPIC_MAX_CACHE_BREAKPOINTS;
+    if request.cache.system.is_some() && request.system.is_some() {
+        budget -= 1;
+    }
+    if request.cache.tools.is_some() && !request.tools.is_empty() {
+        budget -= 1;
+    }
+    let marked_indices: Vec<usize> = request
+        .messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| m.cache_control.map(|_| i))
+        .collect();
+    let kept_message_marks: std::collections::HashSet<usize> =
+        marked_indices.iter().rev().take(budget).copied().collect();
+    if marked_indices.len() > kept_message_marks.len() {
+        tracing::debug!(
+            dropped = marked_indices.len() - kept_message_marks.len(),
+            "coalesced cache breakpoints beyond Anthropic's limit of {ANTHROPIC_MAX_CACHE_BREAKPOINTS}"
+        );
+    }
+
+    let messages: Vec<Value> = request
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let mut blocks: Vec<Value> = m
+                .content
+                .iter()
+                .map(content_block_to_anthropic_json)
+                .collect();
+            if let Some(ttl) = m.cache_control.filter(|_| kept_message_marks.contains(&i)) {
+                if let Some(last) = blocks.last_mut() {
+                    last["cache_control"] = note_ttl(ttl);
+                }
+            }
+            json!({ "role": m.role, "content": blocks })
+        })
+        .collect();
+
+    let mut tools_json: Vec<Value> = request
+        .tools
+        .iter()
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.input_schema,
+            })
+        })
+        .collect();
+    if let Some(ttl) = request.cache.tools {
+        if let Some(last) = tools_json.last_mut() {
+            last["cache_control"] = note_ttl(ttl);
+        }
+    }
+
+    let mut body = json!({
+        "model": resolve_alias(&request.model),
+        "messages": messages,
+        "max_tokens": request.max_tokens,
+    });
+    if stream {
+        body["stream"] = Value::Bool(true);
+    }
+    if let Some(ref system) = request.system {
+        body["system"] = match request.cache.system {
+            // Caching the system prompt requires the structured-content form.
+            Some(ttl) => json!([{
+                "type": "text",
+                "text": system,
+                "cache_control": note_ttl(ttl),
+            }]),
+            None => Value::String(system.clone()),
+        };
+    }
+    if !tools_json.is_empty() {
+        body["tools"] = Value::Array(tools_json);
+    }
+    Ok((body, needs_one_hour))
 }
 
 /// Map common short aliases to canonical Anthropic model ids. Agents
@@ -108,40 +221,7 @@ impl LlmProvider for AnthropicProvider {
     }
 
     async fn send(&self, request: &LlmRequest) -> Result<LlmResponse> {
-        let messages: Vec<Value> = request
-            .messages
-            .iter()
-            .map(|m| {
-                let blocks: Vec<Value> = m
-                    .content
-                    .iter()
-                    .map(content_block_to_anthropic_json)
-                    .collect();
-                json!({ "role": m.role, "content": blocks })
-            })
-            .collect();
-
-        let tools_json: Vec<AnthropicTool> = request
-            .tools
-            .iter()
-            .map(|t| AnthropicTool {
-                name: &t.name,
-                description: &t.description,
-                input_schema: &t.input_schema,
-            })
-            .collect();
-
-        let mut body = json!({
-            "model": resolve_alias(&request.model),
-            "messages": messages,
-            "max_tokens": request.max_tokens,
-        });
-        if let Some(ref system) = request.system {
-            body["system"] = Value::String(system.clone());
-        }
-        if !tools_json.is_empty() {
-            body["tools"] = serde_json::to_value(&tools_json)?;
-        }
+        let (body, needs_one_hour) = build_request_body(request, false)?;
 
         let mut attempt = 0u32;
         loop {
@@ -149,12 +229,16 @@ impl LlmProvider for AnthropicProvider {
                 rl.acquire().await;
             }
 
-            let resp = self
+            let mut req = self
                 .client
                 .post(ANTHROPIC_API_URL)
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", ANTHROPIC_VERSION)
-                .header("content-type", "application/json")
+                .header("content-type", "application/json");
+            if needs_one_hour {
+                req = req.header("anthropic-beta", ANTHROPIC_EXTENDED_CACHE_TTL_BETA);
+            }
+            let resp = req
                 .json(&body)
                 .send()
                 .await
@@ -215,6 +299,8 @@ impl LlmProvider for AnthropicProvider {
                 stop_reason: parsed.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
                 input_tokens: parsed.usage.input_tokens,
                 output_tokens: parsed.usage.output_tokens,
+                cache_creation_tokens: parsed.usage.cache_creation_input_tokens,
+                cache_read_tokens: parsed.usage.cache_read_input_tokens,
             });
         }
     }
@@ -232,39 +318,7 @@ impl LlmProvider for AnthropicProvider {
             rl.acquire().await;
         }
 
-        let messages: Vec<Value> = request
-            .messages
-            .iter()
-            .map(|m| {
-                let blocks: Vec<Value> = m
-                    .content
-                    .iter()
-                    .map(content_block_to_anthropic_json)
-                    .collect();
-                json!({ "role": m.role, "content": blocks })
-            })
-            .collect();
-        let tools_json: Vec<AnthropicTool> = request
-            .tools
-            .iter()
-            .map(|t| AnthropicTool {
-                name: &t.name,
-                description: &t.description,
-                input_schema: &t.input_schema,
-            })
-            .collect();
-        let mut body = json!({
-            "model": resolve_alias(&request.model),
-            "messages": messages,
-            "max_tokens": request.max_tokens,
-            "stream": true,
-        });
-        if let Some(ref system) = request.system {
-            body["system"] = Value::String(system.clone());
-        }
-        if !tools_json.is_empty() {
-            body["tools"] = serde_json::to_value(&tools_json)?;
-        }
+        let (body, needs_one_hour) = build_request_body(request, true)?;
 
         let resp = 'retry: {
             let mut attempt = 0u32;
@@ -272,13 +326,17 @@ impl LlmProvider for AnthropicProvider {
                 if let Some(ref rl) = self.rate_limiter {
                     rl.acquire().await;
                 }
-                let r = self
+                let mut req = self
                     .client
                     .post(ANTHROPIC_API_URL)
                     .header("x-api-key", &self.api_key)
                     .header("anthropic-version", ANTHROPIC_VERSION)
                     .header("content-type", "application/json")
-                    .header("accept", "text/event-stream")
+                    .header("accept", "text/event-stream");
+                if needs_one_hour {
+                    req = req.header("anthropic-beta", ANTHROPIC_EXTENDED_CACHE_TTL_BETA);
+                }
+                let r = req
                     .json(&body)
                     .send()
                     .await
@@ -313,6 +371,8 @@ impl LlmProvider for AnthropicProvider {
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
+        let mut cache_creation_tokens: u64 = 0;
+        let mut cache_read_tokens: u64 = 0;
         let mut stop_reason: String = "end_turn".into();
 
         // Per content-block scratch space keyed by the block index.
@@ -353,6 +413,14 @@ impl LlmProvider for AnthropicProvider {
                         if let Some(usage) = event.get("message").and_then(|m| m.get("usage")) {
                             input_tokens = usage
                                 .get("input_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            cache_creation_tokens = usage
+                                .get("cache_creation_input_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            cache_read_tokens = usage
+                                .get("cache_read_input_tokens")
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(0);
                         }
@@ -459,6 +527,8 @@ impl LlmProvider for AnthropicProvider {
             stop_reason,
             input_tokens,
             output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
         })
     }
 }
@@ -472,6 +542,116 @@ fn retry_after_duration(headers: &reqwest::header::HeaderMap, attempt: u32) -> D
         }
     }
     Duration::from_secs(1u64 << attempt.min(6))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::{CacheLayout, Message, ToolSchema};
+
+    fn base_request() -> LlmRequest {
+        LlmRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            messages: vec![Message::user_text("hello")],
+            system: Some("be brief".to_string()),
+            temperature: 0.0,
+            max_tokens: 16,
+            tools: vec![ToolSchema {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                input_schema: json!({ "type": "object", "properties": {} }),
+            }],
+            cache: CacheLayout::default(),
+        }
+    }
+
+    #[test]
+    fn unmarked_request_body_has_no_cache_control() {
+        let (body, one_hour) = build_request_body(&base_request(), false).unwrap();
+        assert!(!one_hour);
+        // System stays the plain string form; nothing carries cache_control.
+        assert_eq!(body["system"], json!("be brief"));
+        assert!(!body.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn marked_request_emits_cache_control_layout() {
+        let mut request = base_request();
+        request.cache.system = Some(CacheTtl::FiveMinutes);
+        request.cache.tools = Some(CacheTtl::FiveMinutes);
+        request.messages.last_mut().unwrap().cache_control = Some(CacheTtl::FiveMinutes);
+
+        let (body, one_hour) = build_request_body(&request, false).unwrap();
+        assert!(!one_hour);
+        // Cached system requires the structured-content form.
+        assert_eq!(
+            body["system"],
+            json!([{ "type": "text", "text": "be brief", "cache_control": { "type": "ephemeral" } }])
+        );
+        // The tools mark lands on the last tool entry.
+        assert_eq!(
+            body["tools"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        // The message mark lands on the message's last content block.
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+    }
+
+    #[test]
+    fn one_hour_ttl_sets_extended_ttl_and_beta_flag() {
+        let mut request = base_request();
+        request.cache.system = Some(CacheTtl::OneHour);
+        let (body, one_hour) = build_request_body(&request, false).unwrap();
+        assert!(one_hour);
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+    }
+
+    #[test]
+    fn message_marks_beyond_breakpoint_budget_keep_the_latest() {
+        let mut request = base_request();
+        request.cache.system = Some(CacheTtl::FiveMinutes);
+        request.cache.tools = Some(CacheTtl::FiveMinutes);
+        // 3 message marks + system + tools = 5 > 4; the oldest message mark drops.
+        request.messages = (0..3)
+            .map(|i| {
+                let mut m = Message::user_text(format!("turn {i}"));
+                m.cache_control = Some(CacheTtl::FiveMinutes);
+                m
+            })
+            .collect();
+
+        let (body, _) = build_request_body(&request, false).unwrap();
+        let marked: Vec<bool> = (0..3)
+            .map(|i| {
+                body["messages"][i]["content"][0]
+                    .get("cache_control")
+                    .is_some()
+            })
+            .collect();
+        assert_eq!(marked, vec![false, true, true]);
+    }
+
+    #[test]
+    fn usage_cache_token_fields_parse_and_default() {
+        let with_cache: AnthropicUsage = serde_json::from_str(
+            r#"{ "input_tokens": 10, "output_tokens": 5,
+                 "cache_creation_input_tokens": 1000, "cache_read_input_tokens": 2000 }"#,
+        )
+        .unwrap();
+        assert_eq!(with_cache.cache_creation_input_tokens, 1000);
+        assert_eq!(with_cache.cache_read_input_tokens, 2000);
+
+        let without: AnthropicUsage =
+            serde_json::from_str(r#"{ "input_tokens": 10, "output_tokens": 5 }"#).unwrap();
+        assert_eq!(without.cache_creation_input_tokens, 0);
+        assert_eq!(without.cache_read_input_tokens, 0);
+    }
 }
 
 fn content_block_to_anthropic_json(block: &ContentBlock) -> Value {

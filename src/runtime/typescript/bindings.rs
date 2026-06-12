@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 use crate::mcp::McpManager;
 use crate::policy::{Decision, PolicyCache, PolicyConfig};
 use crate::providers::{
-    ContentBlock, LlmRequest, Message as LlmMessage, ProviderRegistry, ToolSchema,
+    CacheLayout, CacheTtl, ContentBlock, LlmRequest, Message as LlmMessage, ProviderRegistry,
+    ToolSchema,
 };
 use crate::runtime::call_log::CallRecord;
 use crate::runtime::context::{InputMode, PendingApproval, RuntimeContext, PAUSE_MARKER};
@@ -212,6 +213,152 @@ impl HostBindingBackend {
                     .collect()
             })
             .unwrap_or_default();
+        let posture = host_core::cache_posture_from_options(&options);
+
+        // `chidori.context(...).prompt()/.respond()` forwards its flattened
+        // segment chain in `__context`; everything below the seed differs from
+        // the single-text path, so branch early.
+        if let Some(segments) = options
+            .get("__context")
+            .and_then(serde_json::Value::as_array)
+        {
+            let respond = options
+                .get("__mode")
+                .and_then(serde_json::Value::as_str)
+                .map(|mode| mode == "respond")
+                .unwrap_or(false);
+            let parts = context_request_parts(segments)?;
+            let mut all_tool_names = parts.tool_names.clone();
+            for name in &tool_names {
+                if !all_tool_names.contains(name) {
+                    all_tool_names.push(name.clone());
+                }
+            }
+            let mut tool_schemas = Vec::new();
+            for name in &all_tool_names {
+                let tool_def = tools
+                    .get(name)
+                    .ok_or_else(|| format!("Unknown tool in context tools: {name}"))?;
+                tool_schemas.push(tool_def_to_schema(tool_def));
+            }
+            let system = match (parts.system, system) {
+                (Some(ctx_system), Some(opt_system)) => {
+                    Some(format!("{ctx_system}\n\n{opt_system}"))
+                }
+                (Some(ctx_system), None) => Some(ctx_system),
+                (None, opt_system) => opt_system,
+            };
+            let mut messages = parts.messages;
+            if messages.is_empty() {
+                return Err(
+                    "chidori.context prompt requires at least one user turn (add .user(...))"
+                        .to_string(),
+                );
+            }
+            let seed_len = messages.len();
+            let build_request = |messages: &[LlmMessage]| {
+                let mut request = LlmRequest {
+                    model: model.clone(),
+                    messages: messages.to_vec(),
+                    system: system.clone(),
+                    temperature,
+                    max_tokens,
+                    tools: tool_schemas.clone(),
+                    cache: parts.cache.clone(),
+                };
+                host_core::auto_mark_prompt_cache(&mut request, posture);
+                request
+            };
+            let call_args = |request: &LlmRequest, turn: Option<u64>| {
+                serde_json::json!({
+                    "model": model,
+                    "type": prompt_type,
+                    "tools": all_tool_names,
+                    "turn": turn,
+                    "context_segments": segments.len(),
+                    "request_digest": host_core::prompt_request_digest(request),
+                })
+            };
+
+            if respond {
+                // Single structured turn: the author drives any tool loop
+                // explicitly by appending toolResult segments.
+                let request = build_request(&messages);
+                let args = call_args(&request, None);
+                let response = host_core::execute_prompt_response(
+                    runtime_ctx,
+                    providers,
+                    tokio_rt,
+                    request,
+                    args,
+                    prompt_type.clone(),
+                )
+                .map_err(|err| err.to_string())?;
+                let new_messages = vec![LlmMessage::assistant_blocks(response.blocks.clone())];
+                return Ok(serde_json::json!({
+                    "text": response.content,
+                    "response": host_core::llm_response_to_json(&response),
+                    "messages": new_messages,
+                }));
+            }
+
+            if tool_schemas.is_empty() {
+                let request = build_request(&messages);
+                let args = call_args(&request, None);
+                let result = host_core::execute_prompt_text(
+                    runtime_ctx,
+                    providers,
+                    tokio_rt,
+                    request,
+                    args,
+                    prompt_type.clone(),
+                )
+                .map_err(|err| err.to_string())?;
+                let text = result.as_str().unwrap_or("").to_string();
+                let new_messages = vec![LlmMessage::assistant_blocks(vec![ContentBlock::Text {
+                    text: text.clone(),
+                }])];
+                return Ok(serde_json::json!({
+                    "text": text,
+                    "messages": new_messages,
+                }));
+            }
+
+            // Tool loop seeded from the context: identical machinery to the
+            // single-text loop, but every appended turn is returned so the JS
+            // side can extend the context with the full exchange.
+            let mut final_text = String::new();
+            for turn in 0..max_turns {
+                let request = build_request(&messages);
+                let args = call_args(&request, Some(turn));
+                let response = host_core::execute_prompt_response(
+                    runtime_ctx,
+                    providers,
+                    tokio_rt,
+                    request,
+                    args,
+                    prompt_type.clone(),
+                )
+                .map_err(|err| err.to_string())?;
+                final_text = response.content.clone();
+                messages.push(LlmMessage::assistant_blocks(response.blocks.clone()));
+                if response.tool_calls.is_empty() {
+                    break;
+                }
+                let result_blocks = self.run_tool_calls(response.tool_calls)?;
+                messages.push(LlmMessage {
+                    role: "user".to_string(),
+                    content: result_blocks,
+                    cache_control: None,
+                });
+            }
+            let new_messages = messages.split_off(seed_len);
+            return Ok(serde_json::json!({
+                "text": final_text,
+                "messages": new_messages,
+            }));
+        }
+
         let mut tool_schemas = Vec::new();
         for name in &tool_names {
             let tool_def = tools
@@ -224,14 +371,17 @@ impl HostBindingBackend {
             let mut messages = vec![LlmMessage::user_text(text.clone())];
             let mut final_text = String::new();
             for turn in 0..max_turns {
-                let request = LlmRequest {
+                let mut request = LlmRequest {
                     model: model.clone(),
                     messages: messages.clone(),
                     system: system.clone(),
                     temperature,
                     max_tokens,
                     tools: tool_schemas.clone(),
+                    cache: CacheLayout::default(),
                 };
+                host_core::auto_mark_prompt_cache(&mut request, posture);
+                let request_digest = host_core::prompt_request_digest(&request);
                 let response = host_core::execute_prompt_response(
                     runtime_ctx,
                     providers,
@@ -244,6 +394,7 @@ impl HostBindingBackend {
                         "tools": tool_names,
                         "turn": turn,
                         "max_turns": max_turns,
+                        "request_digest": request_digest,
                     }),
                     prompt_type.clone(),
                 )
@@ -254,26 +405,11 @@ impl HostBindingBackend {
                     break;
                 }
                 messages.push(LlmMessage::assistant_blocks(response.blocks.clone()));
-                let mut result_blocks = Vec::new();
-                for call in response.tool_calls {
-                    match self.tool(call.name.clone(), call.input.clone()) {
-                        Ok(value) => result_blocks.push(ContentBlock::ToolResult {
-                            tool_use_id: call.id,
-                            content: serde_json::to_string(&value)
-                                .unwrap_or_else(|_| value.to_string()),
-                            is_error: false,
-                        }),
-                        Err(err) if err.contains(PAUSE_MARKER) => return Err(err),
-                        Err(err) => result_blocks.push(ContentBlock::ToolResult {
-                            tool_use_id: call.id,
-                            content: err,
-                            is_error: true,
-                        }),
-                    }
-                }
+                let result_blocks = self.run_tool_calls(response.tool_calls)?;
                 messages.push(LlmMessage {
                     role: "user".to_string(),
                     content: result_blocks,
+                    cache_control: None,
                 });
             }
             if format.as_deref() == Some("json") {
@@ -283,20 +419,28 @@ impl HostBindingBackend {
             return Ok(serde_json::Value::String(final_text));
         }
 
-        let request = LlmRequest {
+        let mut request = LlmRequest {
             model: model.clone(),
             messages: vec![LlmMessage::user_text(text.clone())],
             system: system.clone(),
             temperature,
             max_tokens,
             tools: Vec::new(),
+            cache: CacheLayout::default(),
         };
+        host_core::auto_mark_prompt_cache(&mut request, posture);
+        let request_digest = host_core::prompt_request_digest(&request);
         let result = host_core::execute_prompt_text(
             runtime_ctx,
             providers,
             tokio_rt,
             request,
-            serde_json::json!({ "text": text, "model": model, "type": prompt_type }),
+            serde_json::json!({
+                "text": text,
+                "model": model,
+                "type": prompt_type,
+                "request_digest": request_digest,
+            }),
             prompt_type.clone(),
         )
         .map_err(|err| err.to_string())?;
@@ -311,6 +455,83 @@ impl HostBindingBackend {
         } else {
             Ok(result)
         }
+    }
+
+    /// Execute the tool calls from one assistant turn and frame each result as
+    /// a `tool_result` block. A pause inside a tool propagates; other errors
+    /// land in the block as `is_error` so the model can react.
+    fn run_tool_calls(
+        &self,
+        calls: Vec<crate::providers::ToolCall>,
+    ) -> std::result::Result<Vec<ContentBlock>, String> {
+        let mut result_blocks = Vec::new();
+        for call in calls {
+            match self.tool(call.name.clone(), call.input.clone()) {
+                Ok(value) => result_blocks.push(ContentBlock::ToolResult {
+                    tool_use_id: call.id,
+                    content: serde_json::to_string(&value).unwrap_or_else(|_| value.to_string()),
+                    is_error: false,
+                }),
+                Err(err) if err.contains(PAUSE_MARKER) => return Err(err),
+                Err(err) => result_blocks.push(ContentBlock::ToolResult {
+                    tool_use_id: call.id,
+                    content: err,
+                    is_error: true,
+                }),
+            }
+        }
+        Ok(result_blocks)
+    }
+
+    /// Pure digest of the request a context would assemble — backs the JS-side
+    /// `Context.digest()`. Deterministic in its inputs, so it is dispatched
+    /// directly and never recorded in the call log.
+    fn context_digest(
+        &self,
+        segments: &[serde_json::Value],
+        opts: &serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let HostBindingBackend::Runtime {
+            runtime_ctx, tools, ..
+        } = self
+        else {
+            return Err("chidori.context requires the runtime host backend".to_string());
+        };
+        let config = runtime_ctx.config();
+        let parts = context_request_parts(segments)?;
+        let mut tool_schemas = Vec::new();
+        for name in &parts.tool_names {
+            let tool_def = tools
+                .get(name)
+                .ok_or_else(|| format!("Unknown tool in context tools: {name}"))?;
+            tool_schemas.push(tool_def_to_schema(tool_def));
+        }
+        let mut request = LlmRequest {
+            model: opts
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&config.model)
+                .to_string(),
+            messages: parts.messages,
+            system: parts.system,
+            temperature: opts
+                .get("temperature")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(config.temperature),
+            max_tokens: opts
+                .get("maxTokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(config.max_tokens),
+            tools: tool_schemas,
+            cache: parts.cache,
+        };
+        host_core::auto_mark_prompt_cache(
+            &mut request,
+            host_core::cache_posture_from_options(opts),
+        );
+        Ok(serde_json::Value::String(host_core::prompt_request_digest(
+            &request,
+        )))
     }
 
     fn input(&self, prompt: String) -> std::result::Result<String, String> {
@@ -731,6 +952,15 @@ impl HostBindingBackend {
                 self.call_agent(path, input)
             }
             "workspace" => self.dispatch_workspace(a),
+            "contextDigest" => {
+                let segments = a
+                    .get("segments")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let opts = a.get("opts").cloned().unwrap_or(serde_json::Value::Null);
+                self.context_digest(&segments, &opts)
+            }
             other => Err(format!(
                 "chidori.{other} is not supported on the rust engine"
             )),
@@ -823,6 +1053,117 @@ impl HostBindingBackend {
             )),
         }
     }
+}
+
+/// The request-shaped pieces flattened out of a `chidori.context` segment
+/// chain: folded system text, tool names, the message turns, and the cache
+/// layout the author's explicit `cacheBreakpoint()` calls produced.
+struct ContextRequestParts {
+    system: Option<String>,
+    tool_names: Vec<String>,
+    messages: Vec<LlmMessage>,
+    cache: CacheLayout,
+}
+
+fn cache_ttl_from_str(value: &str) -> CacheTtl {
+    match value {
+        "1h" => CacheTtl::OneHour,
+        _ => CacheTtl::FiveMinutes,
+    }
+}
+
+/// Flatten the JS-side context segment chain (oldest first) into request
+/// parts. A `cacheBreakpoint` freezes everything appended so far: it marks the
+/// latest message when one exists, otherwise the tools or system head.
+fn context_request_parts(
+    segments: &[serde_json::Value],
+) -> std::result::Result<ContextRequestParts, String> {
+    let str_field = |seg: &serde_json::Value, field: &str| -> String {
+        seg.get(field)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut tool_names: Vec<String> = Vec::new();
+    let mut messages: Vec<LlmMessage> = Vec::new();
+    let mut cache = CacheLayout::default();
+    for seg in segments {
+        let kind = seg
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        match kind {
+            "system" => system_parts.push(str_field(seg, "text")),
+            "tools" => {
+                for name in seg
+                    .get("names")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|names| names.iter().filter_map(serde_json::Value::as_str))
+                    .into_iter()
+                    .flatten()
+                {
+                    if !tool_names.iter().any(|existing| existing == name) {
+                        tool_names.push(name.to_string());
+                    }
+                }
+            }
+            "doc" => {
+                let label = str_field(seg, "label");
+                let text = str_field(seg, "text");
+                messages.push(LlmMessage::user_text(format!(
+                    "<document label=\"{label}\">\n{text}\n</document>"
+                )));
+            }
+            "user" => messages.push(LlmMessage::user_text(str_field(seg, "text"))),
+            "assistant" => messages.push(LlmMessage::assistant_blocks(vec![ContentBlock::Text {
+                text: str_field(seg, "text"),
+            }])),
+            "toolResult" => messages.push(LlmMessage {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: str_field(seg, "id"),
+                    content: str_field(seg, "content"),
+                    is_error: seg
+                        .get("isError")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                }],
+                cache_control: None,
+            }),
+            "message" => {
+                let message = seg
+                    .get("message")
+                    .cloned()
+                    .ok_or_else(|| "context message segment is missing `message`".to_string())?;
+                messages.push(
+                    serde_json::from_value::<LlmMessage>(message)
+                        .map_err(|err| format!("invalid context message segment: {err}"))?,
+                );
+            }
+            "cacheBreakpoint" => {
+                let ttl = cache_ttl_from_str(&str_field(seg, "ttl"));
+                if let Some(last) = messages.last_mut() {
+                    last.cache_control = Some(ttl);
+                } else if !tool_names.is_empty() {
+                    cache.tools = Some(ttl);
+                } else if !system_parts.is_empty() {
+                    cache.system = Some(ttl);
+                }
+            }
+            other => return Err(format!("unknown context segment kind `{other}`")),
+        }
+    }
+    Ok(ContextRequestParts {
+        system: if system_parts.is_empty() {
+            None
+        } else {
+            Some(system_parts.join("\n\n"))
+        },
+        tool_names,
+        messages,
+        cache,
+    })
 }
 
 #[derive(Debug, Clone, Default)]

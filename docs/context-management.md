@@ -1,13 +1,72 @@
 # Context Management — Cache-Aware, Composable Prompts
 
-> **Status:** Draft for review.
-> **Target engine:** primarily the LLM provider layer (`src/providers/`) and the
-> host prompt path (`src/runtime/host_core.rs`), which are shared by **both** JS
-> engines. The new author-facing `chidori.context` builder targets the pure-Rust
-> engine first (`CHIDORI_JS_ENGINE=rust`, `rust-engine` feature), matching the
-> rollout of `signal`/`branch`; the QuickJS binding follows.
+> **Status:** Phases 1 and 2 are **implemented** (see the implementation-status
+> section below). Phase 3 (window compaction + the local content-addressed
+> cache) remains future work. The doc was drafted before the QuickJS removal
+> (#39); references to a "QuickJS path" / `rust-engine` feature describe the
+> pre-#39 tree — `chidori-js` is now the only engine and everything here ships
+> on it unconditionally.
 > **Related:** `docs/signals.md`, `docs/branching-execution.md`,
 > `docs/captured-effects-vfs-crypto-timers.md`, `docs/pure-rust-js-engine-plan.md`.
+
+## Implementation status (Phases 1–2 landed)
+
+**Phase 1 — cache-aware request layout + accounting** (no author API change):
+
+- `src/providers/mod.rs`: `CacheTtl` (`"5m"`/`"1h"`), request-level
+  `CacheLayout { system, tools }` on `LlmRequest`, and a per-message
+  `Message.cache_control` marker for the conversation head. All additive and
+  skip-serialized, so existing checkpoints round-trip unchanged.
+- `src/providers/anthropic.rs`: `build_request_body` emits
+  `cache_control: {"type":"ephemeral"}` on the marked system block
+  (structured-system form), the last tool entry, and each marked message's
+  last content block; coalesces marks to Anthropic's 4-breakpoint cap
+  (latest wins); sends the `extended-cache-ttl-2025-04-11` beta header only
+  when a `1h` TTL is requested; parses `cache_creation_input_tokens` /
+  `cache_read_input_tokens` on both the blocking and SSE paths. An unmarked
+  request serializes byte-identically to the pre-caching wire format.
+- `src/providers/openai.rs`: parses `prompt_tokens_details.cached_tokens`
+  (send + stream) and reports `input_tokens` as the fresh share so the two
+  providers agree on semantics. No marker emission (OpenAI caching is
+  automatic on exact prefixes — which the immutable-prefix design feeds).
+- Auto-marking (`host_core::auto_mark_prompt_cache`): system and tools are
+  always marked; the conversation head is marked when a follow-up sharing the
+  prefix is plausible (tools present or the request is already multi-turn).
+  Default on; `cache: false` in prompt options disables per call
+  (`host_core::cache_posture_from_options`). The native tool loop
+  (`src/runtime/native.rs`) and every `chidori.prompt` route through it.
+- Accounting: `TokenUsage` gained optional `cache_creation_tokens` /
+  `cache_read_tokens` (skip-if-none); `cost.rs` prices writes at 1.25x and
+  reads at 0.1x base input for Anthropic (0.5x reads for OpenAI); `RunSpan`
+  stamps `gen_ai.usage.cache_creation_tokens` / `_read_tokens` on prompt
+  spans.
+
+**Phase 2 — `chidori.context` + full-prompt recording:**
+
+- The immutable builder lives in the shared JS helpers
+  (`src/runtime/typescript/helpers.rs`): each builder call allocates one
+  frozen segment node pointing at its parent (structural prefix sharing);
+  only `.prompt()`/`.respond()` cross the host boundary, forwarding the
+  flattened chain in the prompt effect's options (`__context`).
+- `src/runtime/typescript/bindings.rs` flattens segments into
+  system/tools/messages plus the explicit `cacheBreakpoint` layout
+  (`context_request_parts`), runs the same durable
+  `execute_prompt_text`/`execute_prompt_response` path (tool loops included),
+  and returns the appended turns so the JS side extends the context with the
+  full exchange. `Context.digest()` is a synchronous pure host call
+  (`contextDigest`), never recorded.
+- Every prompt record's args now carry `request_digest` — a versioned sha256
+  over the canonicalized assembled request (model, system, tools, messages,
+  cache layout) — closing the §4.4 partial-capture gap. Replay still matches
+  on `(seq, function)`; host-promise completed-operation matching explicitly
+  ignores the digest (`snapshot.rs::completed_args_match`) so a digest-scheme
+  change can never force a completed effect to re-execute.
+- SDK types (`sdk/typescript/src/agent.ts`): `Context`, `CacheTtl`,
+  `LlmResponseJson`, `PromptOptions.cache`, `chidori.context()`. Example:
+  `examples/agents/context_qa.ts`. API reference: `llm.txt`.
+
+**Not yet implemented (Phase 3):** `.compact(strategy)`, the local
+content-addressed prompt cache, and budget helpers beyond `estimateTokens()`.
 
 ---
 
