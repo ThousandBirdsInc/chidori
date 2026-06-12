@@ -149,7 +149,7 @@ RUN_ID=$(ls -t examples/agents/.chidori/runs | head -1)
 ### Human-In-The-Loop Demo
 
 This demo shows the session API pausing on `chidori.input(...)` and resuming
-from the persisted VM state.
+from the persisted call log.
 
 Start the server:
 
@@ -188,8 +188,8 @@ The completed response includes:
 ```
 
 That flow is the core Chidori loop: TypeScript code runs until a durable host
-operation pauses, Chidori persists the run, and resume continues from the saved
-state.
+operation pauses, Chidori persists the run, and resume re-executes the agent
+against the persisted call log to continue from where it paused.
 
 ## 🧩 Core Concepts
 
@@ -206,7 +206,7 @@ An agent is a `.ts` file that exports an async `agent(input, chidori)` function.
 | `chidori.http(url, options)` | Make an HTTP request |
 | `chidori.memory(action, ...)` | Persistent storage (key-value + vector) |
 | `chidori.log(msg, data)` | Structured logging |
-| `chidori.env(name)` | Read environment variables |
+| `chidori.checkpoint(label, meta)` | Record an explicit call-log marker for trace/replay |
 | `chidori.retry(fn, options)` | Retry with backoff |
 | `chidori.tryCall(fn)` | Capture errors without raising |
 
@@ -253,7 +253,7 @@ Exposes:
 - `GET  /sessions` — list all sessions
 - `GET  /sessions/{id}` — get session result
 - `GET  /sessions/{id}/checkpoint` — get the call log and snapshot manifest metadata
-- `GET  /sessions/{id}/snapshot` — inspect snapshot manifest metadata without raw VM bytes
+- `GET  /sessions/{id}/snapshot` — inspect the durable journal-scaffold manifest metadata (no VM image — resume is call-log replay)
 - `POST /sessions/{id}/resume` — resume a paused `input()` or approval session
 - `POST /sessions/{id}/replay` — replay from a session's checkpoint
 - `POST /sessions/{id}/cancel` — cancel a running or stored session
@@ -471,7 +471,11 @@ chidori/
 │   │   └── openai.rs       # OpenAI-compatible (incl. LiteLLM)
 │   └── tools/
 │       └── mod.rs          # Tool discovery + JSON schema generation
+├── crates/
+│   ├── chidori-js/         # Pure-Rust JS engine (oxc → bytecode → VM), the only engine
+│   └── test262-runner/     # Test262 conformance harness + baseline gate
 ├── sdk/
+│   ├── typescript/         # TypeScript SDK (zero-dependency HTTP client)
 │   └── python/chidori/     # Python SDK (pure stdlib, no deps)
 ├── examples/
 │   ├── agents/             # Example .ts agents
