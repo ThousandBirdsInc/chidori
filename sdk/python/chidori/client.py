@@ -50,10 +50,15 @@ class Checkpoint:
 
 @dataclass
 class SignalQueued:
-    """Returned by `AgentClient.signal` when the run was not paused-waiting on
-    this name (it was running, or paused on something else), so the signal was
-    enqueued into the durable mailbox to be drained at the next matching listen
-    point. Mirrors the server's 202 Accepted body.
+    """Returned by `AgentClient.signal` when the signal was accepted but did
+    not resolve a pause synchronously. Mirrors the server's 202 Accepted body:
+
+      * status == "queued" — the run was not waiting on this name; the signal
+        sits in the durable mailbox until a matching listen point drains it.
+      * status == "delivered_live" — a live streaming worker supervises the
+        run; the signal was enqueued into the running agent's in-memory
+        mailbox and the worker was woken to resume a matching pause
+        in-process.
     """
 
     id: str
@@ -81,6 +86,13 @@ class Session:
     # name it is waiting on (so the caller can deliver via `client.signal`).
     # None for plain `input()` pauses and non-signal states.
     pending_signal_name: str | None = None
+    # The full awaited name set: `[name]` for `chidori.signal(name)`, the
+    # listen set for `chidori.signalAny(names)`. Empty for non-signal states.
+    pending_signal_names: list[str] = field(default_factory=list)
+    # Absolute deadline (ISO timestamp) for a signal pause created with
+    # `timeoutMs`; the server resolves the pause with the `{timedOut: true}`
+    # sentinel when it passes. None when the pause has no timeout.
+    pending_signal_deadline: str | None = None
     snapshot_manifest: dict | None = None
     _client: AgentClient | None = field(default=None, repr=False)
 
@@ -173,6 +185,8 @@ class AgentClient:
             pending_seq=data.get("pending_seq"),
             pending_prompt=data.get("pending_prompt"),
             pending_signal_name=data.get("pending_signal_name"),
+            pending_signal_names=data.get("pending_signal_names") or [],
+            pending_signal_deadline=data.get("pending_signal_deadline"),
             snapshot_manifest=data.get("snapshot_manifest"),
             _client=self,
         )
@@ -200,6 +214,8 @@ class AgentClient:
             pending_seq=data.get("pending_seq"),
             pending_prompt=data.get("pending_prompt"),
             pending_signal_name=data.get("pending_signal_name"),
+            pending_signal_names=data.get("pending_signal_names") or [],
+            pending_signal_deadline=data.get("pending_signal_deadline"),
             snapshot_manifest=data.get("snapshot_manifest"),
             _client=self,
         )
@@ -220,6 +236,8 @@ class AgentClient:
             pending_seq=data.get("pending_seq"),
             pending_prompt=data.get("pending_prompt"),
             pending_signal_name=data.get("pending_signal_name"),
+            pending_signal_names=data.get("pending_signal_names") or [],
+            pending_signal_deadline=data.get("pending_signal_deadline"),
             snapshot_manifest=data.get("snapshot_manifest"),
             _client=self,
         )
@@ -238,9 +256,12 @@ class AgentClient:
           * the run was paused-waiting on this exact name → the pause resolves
             and the run resumes; returns the advanced `Session` (200), now
             `completed` or re-`paused`.
-          * the run was running or paused on something else → the signal is
-            enqueued into the durable mailbox; returns a `SignalQueued`
-            descriptor (202) carrying the assigned `delivery_seq`.
+          * otherwise → the signal is accepted asynchronously; returns a
+            `SignalQueued` descriptor (202) carrying the assigned
+            `delivery_seq`. Its `status` is "queued" (durable mailbox, drained
+            at the next matching listen point) or "delivered_live" (a live
+            streaming worker received it in-memory and resumes a matching
+            pause in-process).
 
         Raises on 400 (empty name), 404 (unknown session), or 409 (terminal run).
         """
@@ -248,11 +269,12 @@ class AgentClient:
             f"/sessions/{session_id}/signal",
             {"name": name, "payload": payload, "from": from_},
         )
-        if status == 202 or data.get("status") == "queued":
+        if status == 202 or data.get("status") in ("queued", "delivered_live"):
             return SignalQueued(
                 id=data["id"],
                 name=data.get("name", name),
                 delivery_seq=data["delivery_seq"],
+                status=data.get("status", "queued"),
             )
         return Session(
             id=data["id"],
@@ -263,6 +285,8 @@ class AgentClient:
             pending_seq=data.get("pending_seq"),
             pending_prompt=data.get("pending_prompt"),
             pending_signal_name=data.get("pending_signal_name"),
+            pending_signal_names=data.get("pending_signal_names") or [],
+            pending_signal_deadline=data.get("pending_signal_deadline"),
             snapshot_manifest=data.get("snapshot_manifest"),
             _client=self,
         )
@@ -279,6 +303,8 @@ class AgentClient:
             pending_seq=data.get("pending_seq"),
             pending_prompt=data.get("pending_prompt"),
             pending_signal_name=data.get("pending_signal_name"),
+            pending_signal_names=data.get("pending_signal_names") or [],
+            pending_signal_deadline=data.get("pending_signal_deadline"),
             snapshot_manifest=data.get("snapshot_manifest"),
             _client=self,
         )

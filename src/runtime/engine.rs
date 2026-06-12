@@ -397,6 +397,21 @@ impl Engine {
         self.run_with_context(path, inputs, ctx)
     }
 
+    /// Run an agent on a context the caller prepared (event sender, input
+    /// mode, replay state, run id). Used by the server's streaming supervisor,
+    /// which keeps a handle on the live context so externally delivered
+    /// signals can be enqueued into the running agent's mailbox in-memory
+    /// (`docs/signals.md` Phase 3) and swaps in a fresh replay context for
+    /// each in-process resume.
+    pub fn run_with_prepared_context(
+        &self,
+        path: &Path,
+        inputs: &Value,
+        ctx: RuntimeContext,
+    ) -> Result<RunResult> {
+        self.run_with_context(path, inputs, ctx)
+    }
+
     /// Resume/replay an interactive streaming run with persisted host-promise
     /// state. Used by embedders that mirror the server session interaction
     /// without routing through HTTP.

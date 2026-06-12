@@ -149,8 +149,26 @@ export interface Signal<T = AgentJson> {
 }
 
 export interface SignalOptions {
-  /** Phase 2 (future): resolve to a timeout sentinel instead of waiting forever. */
+  /**
+   * Resolve to a {@link SignalTimeout} sentinel after this many milliseconds
+   * instead of waiting forever. The deadline is enforced by the supervising
+   * server while the run idles; the recorded result (signal or sentinel)
+   * replays deterministically. Discriminate with `"timedOut" in result`.
+   */
   timeoutMs?: number;
+}
+
+/**
+ * The sentinel a `timeoutMs` listen point resolves to when the deadline passes
+ * with no matching delivery (`docs/signals.md` §16, pinned:
+ * resolve-to-sentinel rather than reject). `name` is the single awaited name,
+ * or `null` for a multi-name `signalAny`.
+ */
+export interface SignalTimeout {
+  name: string | null;
+  payload: null;
+  from: null;
+  timedOut: true;
 }
 
 export interface ParallelOptions {
@@ -248,13 +266,28 @@ export interface Chidori {
    * `{ name, payload, from }`. The inverse of `input()`: the run idles cheaply
    * on disk and an outside party delivers via `POST /sessions/{id}/signal`.
    */
-  signal<T = AgentJson>(name: string, options?: SignalOptions): Promise<Signal<T>>;
+  signal<T = AgentJson>(name: string): Promise<Signal<T>>;
+  signal<T = AgentJson>(
+    name: string,
+    options: SignalOptions,
+  ): Promise<Signal<T> | SignalTimeout>;
   /**
    * Non-blocking: consume a queued signal of this name if present, else resolve
    * to `null`. Records the result (value or null) at this seq so replay is
    * deterministic.
    */
   pollSignal<T = AgentJson>(name: string): Promise<Signal<T> | null>;
+  /**
+   * Fan-in: pause until ANY of the named signals is delivered (or one is
+   * already queued in the durable mailbox). Resolves to the bare consumed
+   * signal — its `name` says which fired. Pre-arrived candidates are consumed
+   * in delivery order (lowest `delivery_seq` across the whole name set).
+   */
+  signalAny<T = AgentJson>(names: string[]): Promise<Signal<T>>;
+  signalAny<T = AgentJson>(
+    names: string[],
+    options: SignalOptions,
+  ): Promise<Signal<T> | SignalTimeout>;
   callAgent<TInput extends AgentJson = JsonObject, TOutput extends AgentJson = AgentJson>(
     path: string,
     input?: TInput,
