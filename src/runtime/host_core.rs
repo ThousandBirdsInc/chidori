@@ -677,9 +677,8 @@ fn execute_http_with_secrets(
             None => {
                 // Unparseable URL: only an error if the request references a
                 // secret token; otherwise let reqwest produce its usual error.
-                let mentions_token = crate::runtime::secret_env::SecretStore::looks_like_token(
-                    &args.to_string(),
-                );
+                let mentions_token =
+                    crate::runtime::secret_env::SecretStore::looks_like_token(&args.to_string());
                 if mentions_token {
                     anyhow::bail!(
                         "http secret substitution: cannot determine request host from url"
@@ -770,8 +769,10 @@ fn execute_http_with_secrets(
         let mut response_headers = serde_json::Map::new();
         for (name, value) in resp.headers() {
             if let Ok(value) = value.to_str() {
-                response_headers
-                    .insert(name.as_str().to_string(), Value::String(secrets.redact(value)));
+                response_headers.insert(
+                    name.as_str().to_string(),
+                    Value::String(secrets.redact(value)),
+                );
             }
         }
         let bytes = match resp.bytes().await {
@@ -1356,14 +1357,20 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("REMOTE_ONLY_KEY"), "error names the key: {err}");
+        assert!(
+            err.contains("REMOTE_ONLY_KEY"),
+            "error names the key: {err}"
+        );
         assert!(err.contains("127.0.0.1"), "error names the host: {err}");
         assert!(
             !err.contains("remote-only-value"),
             "error must not leak the value: {err}"
         );
         // The request never went out: the capture server is still waiting.
-        assert!(!server.is_finished(), "no request should reach the listener");
+        assert!(
+            !server.is_finished(),
+            "no request should reach the listener"
+        );
         server.abort();
     }
 

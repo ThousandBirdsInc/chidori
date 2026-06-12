@@ -264,7 +264,9 @@ mod tests {
     #[test]
     fn denies_disallowed_host_without_leaking_value() {
         let text = format!("Bearer {}", token("a1"));
-        let err = store().substitute_str(&text, "evil.example.com").unwrap_err();
+        let err = store()
+            .substitute_str(&text, "evil.example.com")
+            .unwrap_err();
         assert!(err.contains("OPENAI_API_KEY"));
         assert!(err.contains("evil.example.com"));
         assert!(!err.contains("sk-real-value"));
@@ -309,7 +311,10 @@ mod tests {
     #[test]
     fn redacts_values_with_key_names() {
         let out = store().redact("ok sk-real-value and xoxb-slack done");
-        assert_eq!(out, "ok [REDACTED:OPENAI_API_KEY] and [REDACTED:SLACK_TOKEN] done");
+        assert_eq!(
+            out,
+            "ok [REDACTED:OPENAI_API_KEY] and [REDACTED:SLACK_TOKEN] done"
+        );
     }
 
     #[test]
