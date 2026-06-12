@@ -10,6 +10,7 @@ pub mod native;
 pub mod otel;
 /// Pure-Rust JS engine integration — the only JavaScript engine.
 pub mod rust_engine;
+pub mod secret_env;
 pub mod snapshot;
 pub mod template;
 pub mod typescript;
