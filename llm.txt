@@ -43,7 +43,7 @@ chidori run agents/my_agent.ts --input key=value
 chidori run agents/my_agent.ts --input '{"document": "text"}'
 chidori run agents/my_agent.ts --stream
 chidori run agents/my_agent.ts --trace
-chidori serve agents/webhook.ts --port 8080
+chidori serve agents/webhook.ts --port 8080 --trusted
 chidori trace <run_id>
 chidori snapshot <run_id>
 ```
@@ -369,8 +369,14 @@ events are emitted through the shared runtime context.
 Start a server:
 
 ```bash
-chidori serve examples/agents/webhook.ts --port 8080
+chidori serve examples/agents/webhook.ts --port 8080 --trusted
 ```
+
+`chidori serve` is deny-by-default: without `--trusted` or explicit
+`CHIDORI_POLICY*` configuration, gated effects (`chidori.http`, workspace
+mutations) are refused under the built-in `untrusted` profile (read-only
+workspace introspection stays allowed). `--untrusted` forces that profile over
+any env configuration; `chidori run` keeps the permissive default.
 
 Session endpoints:
 

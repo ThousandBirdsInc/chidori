@@ -204,8 +204,19 @@ enum Commands {
         /// gated effects (http, workspace mutations) are refused unless
         /// allowlisted. Equivalent to CHIDORI_POLICY_PROFILE=untrusted, but
         /// takes precedence over all CHIDORI_POLICY* env vars.
-        #[arg(long)]
+        ///
+        /// This is also the server's default posture when no CHIDORI_POLICY*
+        /// configuration is present; pass --trusted to opt back into the
+        /// permissive allow-all default.
+        #[arg(long, conflicts_with = "trusted")]
         untrusted: bool,
+
+        /// Opt out of the server's deny-by-default posture: with no
+        /// CHIDORI_POLICY* configuration, gated effects (http, workspace
+        /// mutations) run without restriction, as `chidori run` does.
+        /// Explicit CHIDORI_POLICY* configuration still applies.
+        #[arg(long)]
+        trusted: bool,
     },
 }
 
@@ -260,7 +271,8 @@ fn main() {
             port,
             verbose,
             untrusted,
-        } => (cmd_serve(&file, port, verbose, untrusted), false),
+            trusted,
+        } => (cmd_serve(&file, port, verbose, untrusted, trusted), false),
     };
 
     // Flush any buffered OTLP spans before the process exits. No-op when
@@ -436,7 +448,9 @@ fn cmd_demo() -> Result<()> {
             if !confirm_start_server(*port)? {
                 return Ok(());
             }
-            cmd_serve(&PathBuf::from(file), *port, false, false)
+            // The demo serves the developer's own example agent on their own
+            // machine — the trusted posture, like `chidori run`.
+            cmd_serve(&PathBuf::from(file), *port, false, false, true)
         }
     }
 }
@@ -502,6 +516,42 @@ fn cli_policy(untrusted: bool) -> Arc<policy::PolicyConfig> {
         Arc::new(policy::builtin_profile("untrusted").expect("built-in untrusted profile exists"))
     } else {
         policy::PolicyConfig::from_env()
+    }
+}
+
+/// Resolve the permission policy for `chidori serve`. Unlike `chidori run`
+/// (trusted, developer-authored code on the developer's own machine), the
+/// server is the surface untrusted callers reach, so when the operator has
+/// said nothing it is deny-by-default. Precedence:
+///   1. `--untrusted` — deny-by-default, wins over all CHIDORI_POLICY* env.
+///   2. `--trusted` — the permissive `chidori run` resolution (env-driven,
+///      allow-all when nothing is configured).
+///   3. Explicit, valid CHIDORI_POLICY* configuration — as configured.
+///   4. Nothing configured (or only malformed configuration, which fails
+///      closed) — the deny-by-default serve profile.
+/// Returns the policy plus a posture label for the startup banner.
+fn serve_policy(untrusted: bool, trusted: bool) -> (Arc<policy::PolicyConfig>, String) {
+    if untrusted {
+        return (
+            Arc::new(
+                policy::builtin_profile("untrusted").expect("built-in untrusted profile exists"),
+            ),
+            "deny-by-default (--untrusted)".to_string(),
+        );
+    }
+    if trusted {
+        return (
+            policy::PolicyConfig::from_env(),
+            "trusted (--trusted; CHIDORI_POLICY* env still applies)".to_string(),
+        );
+    }
+    match policy::PolicyConfig::from_env_configured() {
+        Some(cfg) => (cfg, "from CHIDORI_POLICY* configuration".to_string()),
+        None => (
+            Arc::new(policy::serve_default_profile()),
+            "deny-by-default (no policy configured; pass --trusted or set CHIDORI_POLICY* to relax)"
+                .to_string(),
+        ),
     }
 }
 
@@ -1065,7 +1115,13 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_serve(file: &PathBuf, port: u16, verbose: bool, untrusted: bool) -> Result<()> {
+fn cmd_serve(
+    file: &PathBuf,
+    port: u16,
+    verbose: bool,
+    untrusted: bool,
+    trusted: bool,
+) -> Result<()> {
     if verbose {
         tracing_subscriber::fmt()
             .with_env_filter("info")
@@ -1093,13 +1149,15 @@ fn cmd_serve(file: &PathBuf, port: u16, verbose: bool, untrusted: bool) -> Resul
 
     eprintln!("Agent: {}", file.display());
 
+    let (policy, policy_posture) = serve_policy(untrusted, trusted);
     let tokio_rt = tokio::runtime::Runtime::new().context("Failed to create server runtime")?;
     tokio_rt.block_on(server::serve(
         providers,
         template_engine,
         file.clone(),
         port,
-        cli_policy(untrusted),
+        policy,
+        policy_posture,
     ))?;
 
     Ok(())
@@ -1155,4 +1213,58 @@ fn parse_inputs(inputs: &[String]) -> Result<Value> {
     }
 
     Ok(Value::Object(map))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::Decision;
+    use serde_json::json;
+
+    // serve_policy reads CHIDORI_POLICY* env vars only on its non-flag paths;
+    // the flag-driven branches below are deterministic regardless of ambient
+    // configuration. Nothing in this test binary sets those vars in-process.
+
+    #[test]
+    fn serve_policy_untrusted_flag_is_deny_by_default() {
+        let (cfg, posture) = serve_policy(true, false);
+        let (decision, _) = cfg.decide("http", &json!({}));
+        assert_eq!(decision, Decision::NeverAllow);
+        assert!(posture.contains("--untrusted"));
+    }
+
+    #[test]
+    fn serve_policy_default_denies_and_names_the_opt_out() {
+        // No flags and (in the test environment) no CHIDORI_POLICY* vars:
+        // the server posture is deny-by-default with an actionable reason.
+        if std::env::var_os("CHIDORI_POLICY_FILE").is_some()
+            || std::env::var_os("CHIDORI_POLICY").is_some()
+            || std::env::var_os("CHIDORI_POLICY_PROFILE").is_some()
+        {
+            return; // ambient configuration would legitimately change the result
+        }
+        let (cfg, posture) = serve_policy(false, false);
+        let (decision, reason) = cfg.decide("http", &json!({}));
+        assert_eq!(decision, Decision::NeverAllow);
+        assert!(reason.unwrap_or_default().contains("--trusted"));
+        assert!(posture.contains("deny-by-default"));
+
+        // The read-only workspace allowlist still applies.
+        let (decision, _) = cfg.decide("workspace:read", &json!({}));
+        assert_eq!(decision, Decision::AlwaysAllow);
+    }
+
+    #[test]
+    fn serve_policy_trusted_flag_restores_the_permissive_default() {
+        if std::env::var_os("CHIDORI_POLICY_FILE").is_some()
+            || std::env::var_os("CHIDORI_POLICY").is_some()
+            || std::env::var_os("CHIDORI_POLICY_PROFILE").is_some()
+        {
+            return;
+        }
+        let (cfg, posture) = serve_policy(false, true);
+        let (decision, _) = cfg.decide("http", &json!({}));
+        assert_eq!(decision, Decision::AlwaysAllow);
+        assert!(posture.contains("--trusted"));
+    }
 }

@@ -1002,6 +1002,7 @@ mod tests {
                 reason: Some("test approval".to_string()),
             }],
             default: Decision::AlwaysAllow,
+            default_reason: None,
             overlay: None,
         }));
 
@@ -1224,6 +1225,7 @@ mod tests {
                 reason: Some("write tool requires approval".to_string()),
             }],
             default: Decision::AlwaysAllow,
+            default_reason: None,
             overlay: None,
         }));
 

@@ -1156,6 +1156,7 @@ mod tests {
                 reason: Some("test approval".to_string()),
             }],
             default: crate::policy::Decision::AlwaysAllow,
+            default_reason: None,
             overlay: None,
         });
 

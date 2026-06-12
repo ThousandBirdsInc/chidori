@@ -536,6 +536,39 @@ fn cli_untrusted_flag_overrides_permissive_policy_env() {
 }
 
 #[test]
+fn cli_serve_rejects_conflicting_trust_flags() {
+    let dir = temp_project("serve-trust-flag-conflict");
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                return { ok: true };
+            }
+        "#,
+    )
+    .unwrap();
+
+    // --trusted and --untrusted contradict each other; clap must refuse the
+    // combination before any server starts.
+    let output = run_chidori(
+        &["serve", agent.to_str().unwrap(), "--untrusted", "--trusted"],
+        &dir,
+    );
+    assert!(
+        !output.status.success(),
+        "conflicting trust flags must not start a server"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--untrusted") && stderr.contains("--trusted"),
+        "expected a flag-conflict error, got stderr:\n{stderr}"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn cli_stream_accepts_multiline_typed_agent_signature() {
     let dir = temp_project("stream-multiline-types");
     let agent = dir.join("agent.ts");

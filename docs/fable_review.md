@@ -240,10 +240,18 @@ The real gaps, restated post-#39:
    env vars) — but it is still opt-in, not automatic. A `supervised`
    sibling (ask-by-default, settled through the server's `/approve` flow)
    and per-session profile selection over the HTTP API (stricter-wins
-   layering on the server policy) landed on this branch.
+   layering on the server policy) landed on this branch. *(Update
+   2026-06-12: resolved for the network surface — `chidori serve` is now
+   deny-by-default when no `CHIDORI_POLICY*` configuration is present, with
+   a `--trusted` opt-out; `chidori run` deliberately keeps the permissive
+   default.)*
 2. **Memory accounting is process-wide, not per-VM** (`src/mem_guard.rs`):
    under concurrent agents one run's allocations can be attributed to
    another; enforcement is polled, so brief overshoot is possible.
+   *(Update 2026-06-12: each run now registers a per-run meter on its
+   execution thread, so concurrent runs no longer trip each other's caps;
+   the watchdog polls every 10 ms, tunable via `CHIDORI_JS_MEM_POLL_MS`.
+   Residual drift: attribution is by thread, not ownership.)*
 3. **No per-agent CPU quota** — the opcode budget bounds a run, not a
    tenant.
 4. **No seccomp/namespace/process isolation** — though "zero `unsafe`, no C"
@@ -382,9 +390,13 @@ The original items, for the record:
    on `POST /sessions` / `/sessions/stream`, persisted on the session and
    re-applied across resume/approve/replay, exposed in both SDKs). Session
    profiles layer on the server policy with stricter-wins semantics, so a
-   caller can tighten but never relax the operator's policy. The default
+   caller can tighten but never relax the operator's policy. ~~The default
    profile remains `AlwaysAllow` — making `untrusted` automatic for
-   untrusted callers is the remaining (design-level) follow-up.
+   untrusted callers is the remaining (design-level) follow-up.~~ — **done**
+   (2026-06-12): `chidori serve` is deny-by-default when the operator has
+   configured no `CHIDORI_POLICY*` source (malformed configuration fails
+   closed), with `--trusted` as the explicit opt-out; `chidori run` keeps
+   the permissive default for local developer-authored code.
 4. ~~Run Test262 in CI~~ — **done** (#41). Add TypeScript SDK tests next.
 5. **Automate SDK publishing** to npm/PyPI, or remove the registry badges.
 6. ~~**Pay down the doc drift** (the list above): README engine section, SDK
