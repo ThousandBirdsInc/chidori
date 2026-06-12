@@ -408,16 +408,16 @@ The residual failures, by area (top clusters of the 757 total):
 
 | count | area | nature |
 |--:|---|---|
-| 199 | `language/expressions` | remaining class element corners, dynamic-`import()` semantics, tagged-template caching |
+| 198 | `language/expressions` | class element corners (direct-eval contexts, per-evaluation private brands), dynamic-`import()` semantics, tagged-template caching |
 | 111 | `language/statements` | remaining class element corners, labelled/eval interplay |
 | 94 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings); `v`-flag; `prototype` long tail |
 | 59 | `built-ins/String` | `normalize`, Unicode/surrogate edge cases |
-| 43 | `built-ins/Object` | array `length` descriptor attributes; sparse indices beyond the dense cap |
-| 27 | `language/module-code` | namespace own-keys details, TLA ordering corner cases |
-| 19 | `built-ins/Function` | dynamic `Function` parse corners, bound-function details |
+| 36 | `built-ins/Object` | array `length` descriptor corners; sparse indices beyond the dense cap |
+| 22 | `language/module-code` | namespace internals, hoisted default-function exports, TLA ordering |
 | 18 | `language/eval-code` | eval-created binding attribute corners |
-| 17 | `built-ins/Proxy` | proxy-of-proxy forwarding details |
 | 15 | `built-ins/Array` | sparse indices beyond the dense cap; UTF-16 string spread |
+| 15 | `built-ins/Date` | parse/format edge cases |
+| 13 | `built-ins/Proxy` | proxy-of-proxy forwarding details |
 
 See [`docs/conformance.md`](./docs/conformance.md) for the measurement
 methodology, the honest skip policy, the CI gate, and the full breakdown.
