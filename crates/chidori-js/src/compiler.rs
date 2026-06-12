@@ -363,6 +363,9 @@ struct Binding {
     function_scoped: bool,
     /// `const` bindings: reassignment is a runtime TypeError.
     is_const: bool,
+    /// A named function expression's self-binding: immutable, but assignment
+    /// is silently IGNORED in sloppy mode (TypeError only in strict).
+    is_fn_name: bool,
 }
 
 struct Scope {
@@ -731,6 +734,25 @@ impl Compiler {
             cell,
             function_scoped,
             is_const,
+            is_fn_name: false,
+        });
+        cell
+    }
+
+    /// Declare a named function expression's self-binding: visible only inside
+    /// the function (the caller wraps it in its own scope), immutable —
+    /// assignment throws a TypeError in strict code and is silently ignored in
+    /// sloppy code.
+    fn declare_fn_name(&mut self, name: &str) -> u32 {
+        let cell = self.cur().alloc_cell();
+        let fc = self.cur();
+        let scope_idx = fc.scopes.len() - 1;
+        fc.scopes[scope_idx].bindings.push(Binding {
+            name: name.to_string(),
+            cell,
+            function_scoped: false,
+            is_const: false,
+            is_fn_name: true,
         });
         cell
     }
@@ -776,6 +798,21 @@ impl Compiler {
                 for b in scope.bindings.iter().rev() {
                     if b.name == name {
                         return b.is_const;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether `name` resolves (innermost-first, respecting shadowing) to a
+    /// named function expression's immutable self-binding.
+    fn binding_is_fn_name(&self, name: &str) -> bool {
+        for fi in (0..self.fns.len()).rev() {
+            for scope in self.fns[fi].scopes.iter().rev() {
+                for b in scope.bindings.iter().rev() {
+                    if b.name == name {
+                        return b.is_fn_name;
                     }
                 }
             }
@@ -863,6 +900,14 @@ impl Compiler {
         // carries the const-assign throw as its fallback.
         if self.binding_is_const(name) {
             Op::ThrowConstAssign
+        } else if self.binding_is_fn_name(name) {
+            // A named function expression's self-binding is immutable:
+            // TypeError in strict code, silently dropped in sloppy code.
+            if self.cur_ref().strict {
+                Op::ThrowConstAssign
+            } else {
+                Op::Pop
+            }
         } else {
             match self.resolve(name) {
                 Resolved::Cell(i) => Op::StoreCell(i),
@@ -881,6 +926,12 @@ impl Compiler {
     fn store_assign_fallback(&mut self, name: &str) -> Op {
         if self.binding_is_const(name) {
             Op::ThrowConstAssign
+        } else if self.binding_is_fn_name(name) {
+            if self.cur_ref().strict {
+                Op::ThrowConstAssign
+            } else {
+                Op::Pop
+            }
         } else {
             match self.resolve(name) {
                 Resolved::Cell(i) => Op::StoreCellChecked(i),
@@ -925,7 +976,10 @@ impl Compiler {
                     // caller bindings (a sloppy caller's boxed `this` lives in
                     // its %this cell, not in the raw frame value).
                     if b.name.starts_with('%')
-                        && !matches!(b.name.as_str(), "%this" | "%newtarget" | "%superclass" | "%fieldinit")
+                        && !matches!(
+                            b.name.as_str(),
+                            "%this" | "%newtarget" | "%superclass" | "%fieldinit"
+                        )
                     {
                         continue;
                     }
@@ -946,7 +1000,10 @@ impl Compiler {
             }
             for k in fc.upvalue_keys.clone() {
                 if k.starts_with('%')
-                    && !matches!(k.as_str(), "%this" | "%newtarget" | "%superclass" | "%fieldinit")
+                    && !matches!(
+                        k.as_str(),
+                        "%this" | "%newtarget" | "%superclass" | "%fieldinit"
+                    )
                 {
                     continue;
                 }
@@ -2939,7 +2996,21 @@ impl Compiler {
             }
             Expression::FunctionExpression(f) => {
                 let name = f.id.as_ref().map(|i| i.name.as_str().to_string());
-                self.compile_function(f, name.as_deref())?;
+                if let Some(n) = &name {
+                    // A named function expression binds its own name in a
+                    // dedicated scope around the closure: visible inside the
+                    // body, immutable (strict write TypeError, sloppy ignored).
+                    self.enter_scope(false);
+                    let cell = self.declare_fn_name(n);
+                    self.compile_function(f, Some(n))?;
+                    // StoreCell (not InitCell): mutate the cell in place so the
+                    // body's captured self-reference observes the closure.
+                    self.emit(Op::Dup);
+                    self.emit(Op::StoreCell(cell));
+                    self.exit_scope();
+                } else {
+                    self.compile_function(f, None)?;
+                }
             }
             Expression::ArrowFunctionExpression(a) => self.compile_arrow(a, None)?,
             Expression::ClassExpression(c) => {
@@ -3064,10 +3135,39 @@ impl Compiler {
 
     fn compile_object(&mut self, o: &ObjectExpression) -> R {
         self.emit(Op::NewObject);
+        // Duplicate plain `__proto__: v` definitions are an early SyntaxError
+        // (computed/shorthand/method forms don't count).
+        fn is_proto_def(p: &ObjectProperty) -> bool {
+            !p.computed
+                && !p.shorthand
+                && !p.method
+                && matches!(p.kind, PropertyKind::Init)
+                && property_key_name(&p.key) == "__proto__"
+        }
+        let proto_defs = o
+            .properties
+            .iter()
+            .filter(|pr| match pr {
+                ObjectPropertyKind::ObjectProperty(p) => is_proto_def(p),
+                _ => false,
+            })
+            .count();
+        if proto_defs > 1 {
+            return Err(
+                "SyntaxError: Duplicate __proto__ fields are not allowed in object literals".into(),
+            );
+        }
         for prop in &o.properties {
             match prop {
                 ObjectPropertyKind::ObjectProperty(p) => {
                     // [obj]
+                    // `__proto__: v` (plain, non-computed, non-shorthand) is
+                    // NOT a property definition: it sets the [[Prototype]].
+                    if is_proto_def(p) {
+                        self.compile_expr(&p.value)?; // [obj, v]
+                        self.emit(Op::SetProtoFromLiteral); // [obj]
+                        continue;
+                    }
                     let is_accessor = matches!(p.kind, PropertyKind::Get | PropertyKind::Set);
                     if p.computed {
                         self.compile_property_key_expr(&p.key)?; // [obj, key]
@@ -3095,6 +3195,16 @@ impl Compiler {
                         self.compile_named_expr(&p.value, &nm)?;
                     } else {
                         self.compile_expr(&p.value)?;
+                        // Computed key + anonymous value: NamedEvaluation takes
+                        // the runtime key (with get/set prefix for accessors).
+                        if Self::is_anonymous_fn_expr(&p.value) {
+                            let prefix = self.str_const(match p.kind {
+                                PropertyKind::Get => "get",
+                                PropertyKind::Set => "set",
+                                PropertyKind::Init => "",
+                            });
+                            self.emit(Op::SetFunctionNameFromKey(prefix));
+                        }
                     }
                     self.pending_home_super = false;
                     if is_method {
@@ -3120,6 +3230,17 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// Whether `e` is an ANONYMOUS function/arrow/class expression — the forms
+    /// NamedEvaluation gives a name from the assignment target or property key.
+    fn is_anonymous_fn_expr(e: &Expression) -> bool {
+        match e {
+            Expression::FunctionExpression(f) => f.id.is_none(),
+            Expression::ArrowFunctionExpression(_) => true,
+            Expression::ClassExpression(c) => c.id.is_none(),
+            _ => false,
+        }
     }
 
     fn compile_property_key_expr(&mut self, key: &PropertyKey) -> R {
@@ -3292,12 +3413,34 @@ impl Compiler {
                         self.compile_expr(&m.expression)?;
                         self.emit(Op::DeletePropDynamic);
                     }
-                    Expression::Identifier(id) if self.in_with(id.name.as_str()) => {
-                        // `delete name` inside a `with` deletes from the
-                        // with-object when the name resolves there; otherwise a
-                        // bare-name delete is a no-op reporting success.
-                        let n = self.str_const(id.name.as_str());
-                        self.emit(Op::DeleteName(n));
+                    Expression::Identifier(id) => {
+                        // Strict-mode `delete identifier` is an early error.
+                        if self.cur_ref().strict {
+                            return Err(
+                                "SyntaxError: Delete of an unqualified identifier in strict mode."
+                                    .into(),
+                            );
+                        }
+                        let name = id.name.as_str();
+                        if self.in_with(name) {
+                            // Inside `with`, delete from the with-object when
+                            // the name resolves there (else fall through to the
+                            // global / report-success path in the op).
+                            let n = self.str_const(name);
+                            self.emit(Op::DeleteName(n));
+                        } else {
+                            match self.resolve(name) {
+                                // Declared bindings are not deletable.
+                                Resolved::Cell(_) | Resolved::Upvalue(_) => {
+                                    self.emit(Op::LoadFalse)
+                                }
+                                // Globals: delete per configurability.
+                                Resolved::Global => {
+                                    let n = self.str_const(name);
+                                    self.emit(Op::DeleteName(n))
+                                }
+                            };
+                        }
                     }
                     _ => {
                         self.emit(Op::LoadTrue);
@@ -4874,6 +5017,27 @@ impl Compiler {
     }
 
     fn compile_class_inner(&mut self, class: &Class, name: Option<&str>) -> R {
+        // The class's own lexical scope: holds `%superclass` and (for a NAMED
+        // class) the inner self-binding — a `const` visible to every method
+        // and initializer, independent of the outer (mutable) declaration.
+        self.enter_scope(false);
+        let result = self.compile_class_scoped(class, name);
+        self.exit_scope();
+        result
+    }
+
+    fn compile_class_scoped(&mut self, class: &Class, name: Option<&str>) -> R {
+        // A class with a binding identifier binds it INSIDE the class scope as
+        // an immutable (const) self-reference: in TDZ while the heritage and
+        // computed keys evaluate, then initialized to the constructor; methods
+        // and static initializers see the class even if the outer binding is
+        // reassigned, and writes to it throw a TypeError (class bodies are
+        // strict).
+        let self_cell = class.id.as_ref().map(|id| {
+            let c = self.declare_kind(id.name.as_str(), false, true);
+            self.emit(Op::InitCellTdz(c));
+            c
+        });
         // Superclass (if any) stored in a captured binding so methods can `super`.
         let has_super = class.super_class.is_some();
         if let Some(sc) = &class.super_class {
@@ -4918,6 +5082,13 @@ impl Compiler {
         }
         let ctor_cell = self.temp();
         self.emit(Op::InitCell(ctor_cell));
+
+        // Initialize the self-binding (StoreCell mutates the TDZ cell in
+        // place, so closures created either side observe the same cell).
+        if let Some(c) = self_cell {
+            self.emit(Op::LoadCell(ctor_cell));
+            self.emit(Op::StoreCell(c));
+        }
 
         if has_super {
             self.class_link_super(ctor_cell)?;
@@ -5143,6 +5314,16 @@ impl Compiler {
             self.pending_home_super = true;
         }
         self.compile_function(&m.value, Some(&fname))?;
+        // Computed-key method/accessor: the compile-time name above is just
+        // "[computed]" — SetFunctionName with the runtime key.
+        if m.computed {
+            let prefix = self.str_const(match m.kind {
+                MethodDefinitionKind::Get => "get",
+                MethodDefinitionKind::Set => "set",
+                _ => "",
+            });
+            self.emit(Op::SetFunctionNameFromKey(prefix));
+        }
         self.pending_home_super = false;
         if m.r#static {
             // [ctor, key, value] — stamp value.[[HomeObject]] = ctor.

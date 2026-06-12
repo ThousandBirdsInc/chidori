@@ -24,6 +24,7 @@ use crate::vm::Vm;
 
 pub fn install(vm: &mut Vm) {
     fundamental::install(vm);
+    install_restricted_properties(vm);
     numbers::install(vm);
     bigint::install(vm);
     array::install(vm);
@@ -40,6 +41,62 @@ pub fn install(vm: &mut Vm) {
     crate::proxy::install(vm);
     disposable::install(vm);
     install_globals(vm);
+}
+
+/// Build the unique-per-realm %ThrowTypeError% intrinsic and poison
+/// `Function.prototype.caller` / `Function.prototype.arguments` with it
+/// (spec 10.2.4 / 20.2.3): both are accessor properties whose get and set
+/// throw a TypeError. %ThrowTypeError% itself is non-extensible with
+/// non-configurable, non-writable `length` (0) and `name` ("").
+fn install_restricted_properties(vm: &mut Vm) {
+    use std::rc::Rc;
+    fn frozen(value: Value) -> Property {
+        Property {
+            kind: PropertyKind::Data {
+                value,
+                writable: false,
+            },
+            enumerable: false,
+            configurable: false,
+        }
+    }
+    let nf = NativeFunction {
+        name: Rc::from(""),
+        length: 0,
+        func: Rc::new(|vm: &mut Vm, _t: Value, _a: &[Value]| {
+            Err(vm.throw_type(
+                "'caller', 'callee', and 'arguments' properties may not be accessed on \
+                 strict mode functions or the arguments objects for calls to them",
+            ))
+        }),
+        construct: None,
+    };
+    let tte = vm.alloc(ObjectData::new(
+        Some(vm.realm.function_proto.clone()),
+        Internal::Function(FunctionInner::Native(nf)),
+    ));
+    {
+        let mut b = tte.borrow_mut();
+        b.props
+            .insert(PropertyKey::str("length"), frozen(Value::Number(0.0)));
+        b.props
+            .insert(PropertyKey::str("name"), frozen(Value::str("")));
+        b.extensible = false;
+    }
+    vm.realm.throw_type_error = tte.clone();
+
+    let poison = Property {
+        kind: PropertyKind::Accessor {
+            get: Some(Value::Object(tte.clone())),
+            set: Some(Value::Object(tte)),
+        },
+        enumerable: false,
+        configurable: true,
+    };
+    let fp = vm.realm.function_proto.clone();
+    let mut b = fp.borrow_mut();
+    b.props.insert(PropertyKey::str("caller"), poison.clone());
+    b.props.insert(PropertyKey::str("arguments"), poison);
 }
 
 // ---- function-kind intrinsics (%GeneratorFunction% etc.) ----

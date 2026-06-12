@@ -1389,6 +1389,11 @@ fn ordinary_set_prototype_of(vm: &Vm, o: &JsObject, proto: Option<JsObject>) -> 
     if same {
         return true;
     }
+    // %Object.prototype% is an immutable-prototype exotic object (spec
+    // 10.4.7): its [[Prototype]] can only be "set" to its current value.
+    if o.same(&vm.realm.object_proto) {
+        return false;
+    }
     if !o.borrow().extensible {
         return false;
     }

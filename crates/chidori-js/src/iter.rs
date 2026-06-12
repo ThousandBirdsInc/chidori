@@ -159,6 +159,49 @@ impl Vm {
 
     /// Advance a built-in iterator, returning an iterator-result object.
     pub fn builtin_iterator_next(&mut self, it: &JsObject) -> Result<Value, Value> {
+        // An Array* iterator over an array-like that is neither a dense array
+        // nor a typed array (e.g. the `arguments` object): step it via generic
+        // length/index reads, OUTSIDE the iterator borrow (the reads can run
+        // user getters).
+        let generic = {
+            let b = it.borrow();
+            match &b.internal {
+                Internal::Iterator(st)
+                    if !st.done
+                        && matches!(
+                            st.kind,
+                            IterKind::ArrayKeys | IterKind::ArrayValues | IterKind::ArrayEntries
+                        ) =>
+                {
+                    st.target.as_ref().and_then(|t| {
+                        let ti = &t.borrow().internal;
+                        if matches!(ti, Internal::Array(_) | Internal::TypedArray(_)) {
+                            None
+                        } else {
+                            Some((t.clone(), st.index, st.kind))
+                        }
+                    })
+                }
+                _ => None,
+            }
+        };
+        if let Some((target, idx, kind)) = generic {
+            let base = Value::Object(target);
+            let len_v = self.get_prop(&base, &PropertyKey::str("length"))?;
+            let len = self.to_length(&len_v)?;
+            if idx >= len {
+                if let Internal::Iterator(st) = &mut it.borrow_mut().internal {
+                    st.done = true;
+                }
+                return Ok(self.make_iter_result(Value::Undefined, true));
+            }
+            let v = self.get_prop(&base, &PropertyKey::from_index(idx as u32))?;
+            if let Internal::Iterator(st) = &mut it.borrow_mut().internal {
+                st.index += 1;
+            }
+            let entry = self.iter_entry(kind, idx, v);
+            return Ok(self.make_iter_result(entry, false));
+        }
         // Read + advance under a short borrow; build result after.
         enum Out {
             Done,

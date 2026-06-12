@@ -48,6 +48,7 @@ impl Vm {
             }
         };
         let mut frame = self.make_frame(bf, this, args, new_target);
+        frame.func_obj = Some(func_obj.clone());
         let token = self.trace_enter(&frame.func.proto);
         frame.trace_token = token;
         // Run the parameter prologue now (call-time parameter evaluation): the

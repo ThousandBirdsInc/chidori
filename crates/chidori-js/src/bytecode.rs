@@ -573,6 +573,14 @@ pub enum Op {
         pattern: u32,
         flags: u32,
     },
+    /// `[.., key, fn] -> [.., key, fn]` (peek): SetFunctionName for a
+    /// computed-key anonymous function/class value — name becomes the runtime
+    /// key (a Symbol key yields "[description]" or ""), with the payload
+    /// const ("", "get", "set") as prefix.
+    SetFunctionNameFromKey(u32),
+    /// `[obj, v] -> [obj]`: object-literal `__proto__: v` — set obj's
+    /// [[Prototype]] to v when v is an Object or null; ignore otherwise.
+    SetProtoFromLiteral,
     /// no-op / line marker
     Nop,
     /// Create the `arguments` object from current frame.

@@ -18,9 +18,7 @@ fn install_promise(vm: &mut Vm) {
     let ctor = vm.new_native_ctor(
         "Promise",
         1,
-        |vm, _t, _args| {
-            Err(vm.throw_type("Promise constructor cannot be invoked without 'new'"))
-        },
+        |vm, _t, _args| Err(vm.throw_type("Promise constructor cannot be invoked without 'new'")),
         |vm, _t, args| {
             // 1. If executor is not callable, throw a TypeError.
             let executor = arg(args, 0);

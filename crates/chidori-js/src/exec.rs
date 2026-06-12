@@ -134,6 +134,7 @@ impl Vm {
             return self.make_generator(func_obj, bf, this, args, new_target);
         }
         let mut frame = self.make_frame(bf, this, args, new_target);
+        frame.func_obj = Some(func_obj.clone());
         let token = self.trace_enter(&frame.func.proto);
         frame.trace_token = token;
         if kind.is_async() {
@@ -155,6 +156,100 @@ impl Vm {
                 }
             }
         }
+    }
+
+    /// Build the `arguments` exotic object for a frame (spec 10.4.4):
+    /// indexed own properties, `length`, `@@iterator` (%Array.prototype.values%),
+    /// `[object Arguments]` tag, and `callee` — the function itself for a
+    /// mapped (sloppy, simple-parameter-list) frame, the %ThrowTypeError%
+    /// accessor otherwise. Index/parameter aliasing is not modeled.
+    fn make_arguments_object(&mut self, frame: &Frame) -> Value {
+        let o = self.alloc(ObjectData::new(
+            Some(self.realm.object_proto.clone()),
+            Internal::Arguments,
+        ));
+        {
+            let mut b = o.borrow_mut();
+            for (i, v) in frame.args.iter().enumerate() {
+                b.props.insert(
+                    PropertyKey::from_index(i as u32),
+                    Property {
+                        kind: PropertyKind::Data {
+                            value: v.clone(),
+                            writable: true,
+                        },
+                        enumerable: true,
+                        configurable: true,
+                    },
+                );
+            }
+            b.props.insert(
+                PropertyKey::str("length"),
+                Property {
+                    kind: PropertyKind::Data {
+                        value: Value::Number(frame.args.len() as f64),
+                        writable: true,
+                    },
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
+        // @@iterator: %Array.prototype.values% (writable, non-enum, configurable).
+        let values = self
+            .realm
+            .array_proto
+            .borrow()
+            .props
+            .get(&PropertyKey::str("values"))
+            .and_then(|p| p.value().cloned())
+            .unwrap_or(Value::Undefined);
+        let iter_key = PropertyKey::Sym(self.realm.symbol_iterator.clone());
+        o.borrow_mut().props.insert(
+            iter_key,
+            Property {
+                kind: PropertyKind::Data {
+                    value: values,
+                    writable: true,
+                },
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        // callee: mapped (sloppy + simple parameter list) exposes the function;
+        // unmapped poisons it with the %ThrowTypeError% accessor.
+        let p = &frame.func.proto;
+        let simple_params = !p.has_rest
+            && (p.num_params as usize) == p.param_names.len()
+            && p.param_names.iter().all(|n| !n.is_empty());
+        let callee = if !p.is_strict && simple_params {
+            Property {
+                kind: PropertyKind::Data {
+                    value: frame
+                        .func_obj
+                        .as_ref()
+                        .map(|f| Value::Object(f.clone()))
+                        .unwrap_or(Value::Undefined),
+                    writable: true,
+                },
+                enumerable: false,
+                configurable: true,
+            }
+        } else {
+            let tte = Value::Object(self.realm.throw_type_error.clone());
+            Property {
+                kind: PropertyKind::Accessor {
+                    get: Some(tte.clone()),
+                    set: Some(tte),
+                },
+                enumerable: false,
+                configurable: false,
+            }
+        };
+        o.borrow_mut()
+            .props
+            .insert(PropertyKey::str("callee"), callee);
+        Value::Object(o)
     }
 
     pub fn make_frame(
@@ -185,6 +280,7 @@ impl Vm {
             pending_throw: None,
             pending_return: None,
             args: args.to_vec(),
+            func_obj: None,
             completion: Value::Undefined,
             enumerators: Vec::new(),
             with_scope,
@@ -334,9 +430,7 @@ impl Vm {
                             )),
                         },
                         Flow::Throw(e) => Err(e),
-                        Flow::Suspend(_) => {
-                            Err(self.throw_type("internal: constructor suspended"))
-                        }
+                        Flow::Suspend(_) => Err(self.throw_type("internal: constructor suspended")),
                     };
                 }
                 // Create `this` with prototype from new_target.prototype.
@@ -562,9 +656,19 @@ impl Vm {
                             return Err(self
                                 .throw_type(&format!("Cannot declare global variable '{name}'")));
                         }
-                        g.borrow_mut()
-                            .props
-                            .insert(key, Property::data(Value::Undefined));
+                        // CreateGlobalVarBinding: writable, enumerable,
+                        // NON-configurable (`delete v` on a var is false).
+                        g.borrow_mut().props.insert(
+                            key,
+                            Property {
+                                kind: PropertyKind::Data {
+                                    value: Value::Undefined,
+                                    writable: true,
+                                },
+                                enumerable: true,
+                                configurable: false,
+                            },
+                        );
                     }
                 } else {
                     // Function-scope eval var: lives on the caller frame's
@@ -749,8 +853,8 @@ impl Vm {
                 push!(Value::Object(self.new_array(rest)));
             }
             Op::LoadArguments => {
-                let arr = self.new_array(frame.args.clone());
-                push!(Value::Object(arr));
+                let o = self.make_arguments_object(frame);
+                push!(o);
             }
 
             Op::LoadLocal(i) => push!(frame.locals[i as usize].clone()),
@@ -866,9 +970,19 @@ impl Vm {
                             self.throw_type(&format!("Cannot declare global '{}'", name.as_str()))
                         );
                     }
-                    g.borrow_mut()
-                        .props
-                        .insert(key, Property::data(Value::Undefined));
+                    // CreateGlobalVarBinding: writable, enumerable,
+                    // NON-configurable (`delete v` on a var is false).
+                    g.borrow_mut().props.insert(
+                        key,
+                        Property {
+                            kind: PropertyKind::Data {
+                                value: Value::Undefined,
+                                writable: true,
+                            },
+                            enumerable: true,
+                            configurable: false,
+                        },
+                    );
                 }
             }
 
@@ -916,8 +1030,17 @@ impl Vm {
                     let r = self.delete_prop(&Value::Object(obj), &key)?;
                     push!(Value::Bool(r));
                 } else {
-                    // Deleting an unresolvable/lexical bare name reports success.
-                    push!(Value::Bool(true));
+                    // Global Environment Record DeleteBinding: a global-object
+                    // property deletes per its configurability (NaN/undefined/
+                    // var-created globals are non-configurable -> false); an
+                    // unresolvable bare name reports success.
+                    let g = self.realm.global.clone();
+                    if self.has_own_or_proto(&g, &key) {
+                        let r = self.delete_prop(&Value::Object(g), &key)?;
+                        push!(Value::Bool(r));
+                    } else {
+                        push!(Value::Bool(true));
+                    }
                 }
             }
             Op::ResolveNameBase(name) => {
@@ -1279,9 +1402,7 @@ impl Vm {
                 let mut slot = frame.cells[i as usize].borrow_mut();
                 if !matches!(*slot, Value::Uninitialized) {
                     drop(slot);
-                    return Err(
-                        self.throw_reference("Super constructor may only be called once")
-                    );
+                    return Err(self.throw_reference("Super constructor may only be called once"));
                 }
                 *slot = v;
             }
@@ -1290,11 +1411,58 @@ impl Vm {
                 let mut slot = frame.func.upvalues[i as usize].borrow_mut();
                 if !matches!(*slot, Value::Uninitialized) {
                     drop(slot);
-                    return Err(
-                        self.throw_reference("Super constructor may only be called once")
-                    );
+                    return Err(self.throw_reference("Super constructor may only be called once"));
                 }
                 *slot = v;
+            }
+            Op::SetFunctionNameFromKey(prefix) => {
+                // [.., key, fn] (peek both): SetFunctionName with the runtime
+                // property key — symbols name as "[description]" (or "").
+                let n = frame.stack.len();
+                if n >= 2 {
+                    let value = frame.stack[n - 1].clone();
+                    let key = frame.stack[n - 2].clone();
+                    if let Value::Object(f) = &value {
+                        if f.borrow().is_callable() {
+                            let base = match &key {
+                                Value::Symbol(sym) => match sym.description() {
+                                    Some(d) => format!("[{d}]"),
+                                    None => String::new(),
+                                },
+                                other => self.to_string_lossy(other),
+                            };
+                            let prefix = self.const_name(frame, prefix);
+                            let name = if prefix.as_str().is_empty() {
+                                base
+                            } else {
+                                format!("{} {}", prefix.as_str(), base)
+                            };
+                            f.borrow_mut().props.insert(
+                                PropertyKey::str("name"),
+                                Property {
+                                    kind: PropertyKind::Data {
+                                        value: Value::str(name),
+                                        writable: false,
+                                    },
+                                    enumerable: false,
+                                    configurable: true,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Op::SetProtoFromLiteral => {
+                let v = pop!();
+                let obj = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                if let Value::Object(o) = &obj {
+                    match v {
+                        Value::Object(p) => o.borrow_mut().proto = Some(p),
+                        Value::Null => o.borrow_mut().proto = None,
+                        // Non-object, non-null values are silently ignored.
+                        _ => {}
+                    }
+                }
             }
             Op::ClassLinkSuper => {
                 let sup = pop!();
@@ -1314,24 +1482,23 @@ impl Vm {
                     }
                     _ => {
                         if !self.is_constructor(&sup) {
-                            return Err(self.throw_type(
-                                "Class extends value is not a constructor or null",
-                            ));
+                            return Err(
+                                self.throw_type("Class extends value is not a constructor or null")
+                            );
                         }
                         let so = match &sup {
                             Value::Object(o) => o.clone(),
                             _ => unreachable!("constructors are objects"),
                         };
                         let sp = self.get_prop(&sup, &PropertyKey::str("prototype"))?;
-                        let proto_parent = match sp {
-                            Value::Object(o) => Some(o),
-                            Value::Null => None,
-                            _ => {
-                                return Err(self.throw_type(
+                        let proto_parent =
+                            match sp {
+                                Value::Object(o) => Some(o),
+                                Value::Null => None,
+                                _ => return Err(self.throw_type(
                                     "Class extends value does not have valid prototype property",
-                                ))
-                            }
-                        };
+                                )),
+                            };
                         let p = self.get_prop(&ctor, &PropertyKey::str("prototype"))?;
                         if let Value::Object(po) = p {
                             po.borrow_mut().proto = proto_parent;

@@ -97,6 +97,9 @@ pub struct Frame {
     pub pending_return: Option<Value>,
     /// `arguments`-style raw args retained when the function uses `arguments`.
     pub args: Vec<Value>,
+    /// The function OBJECT being executed (when known) — `arguments.callee`
+    /// for mapped (sloppy, simple-params) arguments objects.
+    pub func_obj: Option<JsObject>,
     /// Completion value for script-level evaluation (eval result).
     pub completion: Value,
     /// for-in enumerator stacks (key lists with cursor).
