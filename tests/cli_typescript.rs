@@ -491,6 +491,51 @@ fn cli_untrusted_profile_allows_read_only_workspace() {
 }
 
 #[test]
+fn cli_untrusted_flag_overrides_permissive_policy_env() {
+    let dir = temp_project("untrusted-flag-precedence");
+    let workspace = dir.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.workspace.write("out.txt", "data");
+                return { ok: true };
+            }
+        "#,
+    )
+    .unwrap();
+
+    // --untrusted must win over an explicitly permissive CHIDORI_POLICY:
+    // the flag is the operator's last word, env vars are ambient config.
+    let permissive = r#"{ "default": "always_allow", "rules": [] }"#;
+    let output = run_chidori_with_str_env(
+        &[
+            "run",
+            agent.to_str().unwrap(),
+            "--untrusted",
+            "--input",
+            r#"{}"#,
+        ],
+        &dir,
+        &[
+            ("CHIDORI_POLICY", permissive),
+            ("CHIDORI_WORKSPACE_ROOT", workspace.to_str().unwrap()),
+        ],
+    );
+    assert_failure(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("workspace:write") && stderr.contains("denied"),
+        "expected --untrusted to deny workspace:write despite permissive env policy, got stderr:\n{stderr}"
+    );
+    assert!(!workspace.join("out.txt").exists());
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn cli_stream_accepts_multiline_typed_agent_signature() {
     let dir = temp_project("stream-multiline-types");
     let agent = dir.join("agent.ts");

@@ -6,7 +6,9 @@ updated 2026-06-11 after the QuickJS removal (#39), the CI fixes (#40), the
 Test262 CI gate (#41), the conformance work in #42, and the
 derived-constructor / arguments / restricted-property / explicit-resource
 rework in #43; the parallel Test262 runner (#44) and the workspace policy
-gate (#45). Doc-drift pass on 2026-06-12 (this branch). All of #39–#45 are
+gate (#45). Doc-drift pass on 2026-06-12 (#46), followed by the secret
+broker (#47) and the node-shim batch + built-in `untrusted` policy profile
+(#48); a `--untrusted` CLI flag landed on this branch. All of #39–#48 are
 merged into the branch history.*
 
 ## Scope and method
@@ -219,8 +221,11 @@ The real gaps, restated post-#39:
    `read` / `write` / `delete` / `manifest`) pass through the policy gate, so a
    restrictive profile can deny or gate disk writes while allowing reads. The
    `exec*` family is gone. What remains is the *default decision*: the fallback
-   is still `AlwaysAllow`, so deny-by-default for untrusted profiles is opt-in
-   (`"default": "never_allow"` + allow rules) rather than automatic.
+   is still `AlwaysAllow`. Deny-by-default is now a one-switch opt-in — the
+   built-in `untrusted` profile (#48), selectable via
+   `CHIDORI_POLICY_PROFILE=untrusted` or the `--untrusted` flag on
+   `chidori run` / `chidori serve` (the flag wins over all `CHIDORI_POLICY*`
+   env vars) — but it is still opt-in, not automatic.
 2. **Memory accounting is process-wide, not per-VM** (`src/mem_guard.rs`):
    under concurrent agents one run's allocations can be attributed to
    another; enforcement is polled, so brief overshoot is possible.
@@ -343,11 +348,15 @@ The original items, for the record:
 3. ~~Gate the remaining powerful effects (`workspace.*`) through the policy
    layer~~ — **done**: every `workspace.*` action now routes through
    `enforce_policy` (targets `workspace:list` / `read` / `write` / `delete` /
-   `manifest`), joining `http`. The remaining follow-up is making
-   **deny-by-default** the actual default for untrusted profiles — today the
-   fallback decision is still `AlwaysAllow`, so untrusted callers must opt in
-   with `"default": "never_allow"` plus explicit allow rules. Shipping a
-   ready-made untrusted profile is the next step.
+   `manifest`), joining `http`. ~~Shipping a ready-made untrusted profile is
+   the next step.~~ — **done** (#48 + this branch): the built-in `untrusted`
+   profile (deny-by-default fallback, read-only workspace allowlist) ships
+   behind `CHIDORI_POLICY_PROFILE=untrusted` and an `--untrusted` flag on
+   `chidori run` / `chidori serve`; the flag takes precedence over all
+   `CHIDORI_POLICY*` env vars, with CLI integration tests covering denial,
+   the read-only allowlist, and flag-over-env precedence. The default
+   profile remains `AlwaysAllow` — making `untrusted` automatic for
+   untrusted callers is the remaining (design-level) follow-up.
 4. ~~Run Test262 in CI~~ — **done** (#41). Add TypeScript SDK tests next.
 5. **Automate SDK publishing** to npm/PyPI, or remove the registry badges.
 6. ~~**Pay down the doc drift** (the list above): README engine section, SDK

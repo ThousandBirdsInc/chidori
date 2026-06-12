@@ -76,6 +76,13 @@ enum Commands {
         /// When set, --trace is ignored (the call log is implicit in the stream).
         #[arg(long)]
         stream: bool,
+
+        /// Run under the built-in deny-by-default `untrusted` policy profile:
+        /// gated effects (http, workspace mutations) are refused unless
+        /// allowlisted. Equivalent to CHIDORI_POLICY_PROFILE=untrusted, but
+        /// takes precedence over all CHIDORI_POLICY* env vars.
+        #[arg(long)]
+        untrusted: bool,
     },
 
     /// Validate a TypeScript agent file without running it
@@ -147,6 +154,13 @@ enum Commands {
         /// Print host function calls to stderr during execution
         #[arg(short, long)]
         verbose: bool,
+
+        /// Serve under the built-in deny-by-default `untrusted` policy profile:
+        /// gated effects (http, workspace mutations) are refused unless
+        /// allowlisted. Equivalent to CHIDORI_POLICY_PROFILE=untrusted, but
+        /// takes precedence over all CHIDORI_POLICY* env vars.
+        #[arg(long)]
+        untrusted: bool,
     },
 }
 
@@ -163,11 +177,12 @@ fn main() {
             verbose,
             tools,
             stream,
+            untrusted,
         } => {
             let result = if stream {
-                cmd_run_stream(&file, &input, verbose, &tools)
+                cmd_run_stream(&file, &input, verbose, &tools, untrusted)
             } else {
-                cmd_run(&file, &input, trace, verbose, &tools)
+                cmd_run(&file, &input, trace, verbose, &tools, untrusted)
             };
             (result, false)
         }
@@ -184,7 +199,8 @@ fn main() {
             file,
             port,
             verbose,
-        } => (cmd_serve(&file, port, verbose), false),
+            untrusted,
+        } => (cmd_serve(&file, port, verbose, untrusted), false),
     };
 
     // Flush any buffered OTLP spans before the process exits. No-op when
@@ -351,16 +367,16 @@ fn cmd_demo() -> Result<()> {
                 .collect::<Vec<_>>();
             let tool_dirs = tools.iter().map(PathBuf::from).collect::<Vec<_>>();
             if *stream {
-                cmd_run_stream(&file, &inputs, false, &tool_dirs)
+                cmd_run_stream(&file, &inputs, false, &tool_dirs, false)
             } else {
-                cmd_run(&file, &inputs, *trace, false, &tool_dirs)
+                cmd_run(&file, &inputs, *trace, false, &tool_dirs, false)
             }
         }
         DemoAction::Serve { file, port } => {
             if !confirm_start_server(*port)? {
                 return Ok(());
             }
-            cmd_serve(&PathBuf::from(file), *port, false)
+            cmd_serve(&PathBuf::from(file), *port, false, false)
         }
     }
 }
@@ -417,12 +433,25 @@ fn has_llm_provider() -> bool {
         || std::env::var_os("LITELLM_API_URL").is_some()
 }
 
+/// Resolve the permission policy for a CLI invocation. `--untrusted` selects
+/// the built-in deny-by-default profile and wins over every CHIDORI_POLICY*
+/// env var (an explicit flag beats ambient configuration); otherwise the
+/// usual env-driven resolution applies.
+fn cli_policy(untrusted: bool) -> Arc<policy::PolicyConfig> {
+    if untrusted {
+        Arc::new(policy::builtin_profile("untrusted").expect("built-in untrusted profile exists"))
+    } else {
+        policy::PolicyConfig::from_env()
+    }
+}
+
 fn cmd_run(
     file: &PathBuf,
     inputs: &[String],
     trace: bool,
     verbose: bool,
     extra_tool_dirs: &[PathBuf],
+    untrusted: bool,
 ) -> Result<()> {
     // Set up tracing.
     if verbose {
@@ -456,6 +485,7 @@ fn cmd_run(
 
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
+        .with_policy(cli_policy(untrusted))
         .with_persist_base(base_dir.join(".chidori").join("runs"));
 
     // Run the agent.
@@ -498,6 +528,7 @@ fn cmd_run_stream(
     inputs: &[String],
     verbose: bool,
     extra_tool_dirs: &[PathBuf],
+    untrusted: bool,
 ) -> Result<()> {
     use tokio::sync::mpsc;
 
@@ -525,7 +556,9 @@ fn cmd_run_stream(
     let tools =
         Arc::new(ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()));
 
-    let engine = Engine::new(providers, template_engine, tokio_rt).with_tools(tools);
+    let engine = Engine::new(providers, template_engine, tokio_rt)
+        .with_tools(tools)
+        .with_policy(cli_policy(untrusted));
 
     let (event_tx, event_rx) = mpsc::unbounded_channel::<crate::runtime::context::RuntimeEvent>();
 
@@ -889,7 +922,7 @@ fn cmd_stats(dir: Option<&std::path::Path>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_serve(file: &PathBuf, port: u16, verbose: bool) -> Result<()> {
+fn cmd_serve(file: &PathBuf, port: u16, verbose: bool, untrusted: bool) -> Result<()> {
     if verbose {
         tracing_subscriber::fmt()
             .with_env_filter("info")
@@ -923,6 +956,7 @@ fn cmd_serve(file: &PathBuf, port: u16, verbose: bool) -> Result<()> {
         template_engine,
         file.clone(),
         port,
+        cli_policy(untrusted),
     ))?;
 
     Ok(())

@@ -325,6 +325,7 @@ pub async fn serve(
     template_engine: Arc<TemplateEngine>,
     agent_path: PathBuf,
     port: u16,
+    policy: Arc<PolicyConfig>,
 ) -> anyhow::Result<()> {
     // Configurable concurrency cap. Default 8 is low enough to keep one
     // LLM provider from being flooded and high enough that a small agent
@@ -340,9 +341,9 @@ pub async fn serve(
         .and_then(|v| v.parse().ok())
         .unwrap_or(30_000);
 
-    // Load the permission policy, MCP servers, recipes, and session store
-    // up front so startup errors happen before we bind the listener.
-    let policy = PolicyConfig::from_env();
+    // Load the MCP servers, recipes, and session store up front so startup
+    // errors happen before we bind the listener. The permission policy is
+    // resolved by the caller (CLI flag or CHIDORI_POLICY* env vars).
     let mcp = Arc::new(McpManager::new());
     let mcp_cfg = McpServersConfig::load_from_env().unwrap_or_default();
     let mcp_tools = mcp.start_from_config(&mcp_cfg).await.unwrap_or_else(|e| {
