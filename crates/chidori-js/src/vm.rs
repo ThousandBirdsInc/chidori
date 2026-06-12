@@ -1420,7 +1420,10 @@ impl Vm {
             }
         }
         if let Internal::TypedArray(t) = &b.internal {
-            for i in 0..t.length.min(crate::value::MAX_DENSE_ARRAY) {
+            // The LIVE element count: a length-tracking view follows its
+            // resizable buffer, and an out-of-bounds view has no index keys.
+            let len = crate::typed_array::ta_eff_length(t);
+            for i in 0..len.min(crate::value::MAX_DENSE_ARRAY) {
                 int_keys.push(i as u32);
             }
         }

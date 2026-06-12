@@ -2266,7 +2266,10 @@ impl Vm {
         get: Option<Value>,
         set: Option<Value>,
     ) {
-        self.define_accessor_with(obj, key, get, set, true);
+        // Builtin prototype/constructor accessors are always non-enumerable
+        // (every spec table 'get X' entry); object-literal accessors go
+        // through the DefineGetter/DefineSetter ops instead.
+        self.define_accessor_with(obj, key, get, set, false);
     }
 
     /// Install a non-enumerable `get [Symbol.species]` accessor on `ctor` that

@@ -441,6 +441,16 @@ fn ta_out_of_bounds(o: &JsObject) -> bool {
     }
 }
 
+/// Post-coercion revalidation: argument coercion can detach or shrink the
+/// backing buffer mid-method. A detached/out-of-bounds view is a TypeError;
+/// otherwise the CURRENT element length is returned for re-clamping.
+fn ta_revalidate(vm: &Vm, o: &JsObject) -> Result<usize, Value> {
+    if ta_out_of_bounds(o) {
+        return Err(vm.throw_type("TypedArray is detached or out of bounds"));
+    }
+    Ok(vm.ta_length(o).unwrap_or(0))
+}
+
 /// `SpeciesConstructor(O, defaultConstructor)` (spec 7.3.23) for typed arrays.
 fn ta_species_constructor(vm: &mut Vm, o: &JsObject, default: &Value) -> Result<Value, Value> {
     let c = vm.get_prop(&Value::Object(o.clone()), &PropertyKey::str("constructor"))?;
@@ -491,8 +501,14 @@ fn ta_species_create(vm: &mut Vm, exemplar: &JsObject, args: &[Value]) -> Result
         Some(k) => k,
         None => return Err(vm.throw_type("not a TypedArray")),
     };
-    let proto = per_kind_proto(vm, kind);
-    let default_ctor = vm.get_prop(&Value::Object(proto), &PropertyKey::str("constructor"))?;
+    // The default is the INTRINSIC per-kind constructor (stashed at install
+    // time), not whatever `prototype.constructor` currently holds.
+    let base = vm.realm.typed_array_proto.clone();
+    let ckey = PropertyKey::str(format!("__ctor_{}", kind.name()));
+    let default_ctor = match base.borrow().props.get(&ckey).and_then(|p| p.value()) {
+        Some(v) => v.clone(),
+        None => Value::Undefined,
+    };
     let c = ta_species_constructor(vm, exemplar, &default_ctor)?;
     ta_create(vm, &c, args)
 }
@@ -708,7 +724,11 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         };
         let start = rel_index(vm, &arg(args, 1), len, 0)?;
         let end = rel_index(vm, &arg(args, 2), len, len)?;
-        let mut i = start;
+        // The value/start/end coercions can detach or shrink the buffer:
+        // revalidate (TypeError) and re-clamp to the CURRENT length.
+        let cur = ta_revalidate(vm, &o)? as isize;
+        let mut i = start.min(cur);
+        let end = end.min(cur);
         while i < end {
             vm.ta_write(&o, i as usize, &value)?;
             i += 1;
@@ -719,7 +739,6 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
     // set(source, offset?)
     vm.define_method(proto, "set", 1, |vm, this, args| {
         let o = ta_this(vm, &this)?;
-        let target_len = vm.ta_length(&o).unwrap_or(0);
         // ToIntegerOrInfinity(offset); a negative or non-finite offset is a
         // RangeError (a `+Infinity` offset must not be allowed to saturate into
         // a `usize` and silently wrap the bounds check below).
@@ -727,52 +746,53 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         if offset_f < 0.0 || !offset_f.is_finite() {
             return Err(vm.throw_range("Start offset is out of bounds"));
         }
+        // The offset coercion can detach/shrink the target's buffer: a
+        // detached or out-of-bounds target is a TypeError, and the length is
+        // read AFTER the coercion.
+        let target_len = ta_revalidate(vm, &o)?;
         if offset_f > target_len as f64 {
             return Err(vm.throw_range("Start offset is out of bounds"));
         }
         let offset = offset_f as usize;
         let src = arg(args, 0);
-        // Source values. A typed-array (or array-like) source is fully snapshotted
-        // into this Vec before any element of the target is written, which makes
-        // overlapping buffers behave correctly. Values are coerced per the target
-        // kind by `ta_write` below.
-        let src_vals: Vec<Value> = if let Value::Object(so) = &src {
-            if matches!(so.borrow().internal, Internal::TypedArray(_)) {
-                ta_values_v(vm, so)
-            } else {
-                // Array-like.
-                let len_v = vm.get_prop(&src, &PropertyKey::str("length"))?;
-                let len = vm.to_length(&len_v)?;
-                if len > crate::value::MAX_DENSE_ARRAY {
-                    return Err(vm.throw_range("Source is too large"));
-                }
-                let mut v = Vec::with_capacity(len.min(1 << 16));
-                for i in 0..len {
-                    v.push(vm.get_prop(&src, &PropertyKey::from_index(i as u32))?);
-                }
-                v
+        // A detached or out-of-bounds TYPED-ARRAY source is a TypeError too.
+        if let Value::Object(so) = &src {
+            if matches!(so.borrow().internal, Internal::TypedArray(_)) && ta_out_of_bounds(so) {
+                return Err(vm.throw_type("source TypedArray is detached or out of bounds"));
+            }
+        }
+        // A typed-array source is fully snapshotted before any target element
+        // is written (overlapping buffers behave correctly); an array-like
+        // source is read and written INTERLEAVED per spec
+        // (SetTypedArrayFromArrayLike): Get(src, k) then write, one at a time,
+        // so an abrupt Get stops mid-way with earlier writes visible.
+        let is_ta_src =
+            matches!(&src, Value::Object(so) if matches!(so.borrow().internal, Internal::TypedArray(_)));
+        if is_ta_src {
+            let so = match &src {
+                Value::Object(so) => so.clone(),
+                _ => unreachable!(),
+            };
+            let src_vals = ta_values_v(vm, &so);
+            if offset + src_vals.len() > target_len {
+                return Err(vm.throw_range("Source is too large"));
+            }
+            for (i, val) in src_vals.into_iter().enumerate() {
+                vm.ta_write(&o, offset + i, &val)?;
             }
         } else {
             let so = vm.to_object(&src)?;
-            let len_v = vm.get_prop(&Value::Object(so.clone()), &PropertyKey::str("length"))?;
+            let sov = Value::Object(so);
+            let len_v = vm.get_prop(&sov, &PropertyKey::str("length"))?;
             let len = vm.to_length(&len_v)?;
-            if len > crate::value::MAX_DENSE_ARRAY {
+            // The bounds check precedes any source read.
+            if offset + len > target_len {
                 return Err(vm.throw_range("Source is too large"));
             }
-            let mut v = Vec::with_capacity(len.min(1 << 16));
             for i in 0..len {
-                v.push(vm.get_prop(
-                    &Value::Object(so.clone()),
-                    &PropertyKey::from_index(i as u32),
-                )?);
+                let val = vm.get_prop(&sov, &PropertyKey::from_index(i as u32))?;
+                vm.ta_write(&o, offset + i, &val)?;
             }
-            v
-        };
-        if offset + src_vals.len() > target_len {
-            return Err(vm.throw_range("Source is too large"));
-        }
-        for (i, val) in src_vals.into_iter().enumerate() {
-            vm.ta_write(&o, offset + i, &val)?;
         }
         Ok(Value::Undefined)
     });
@@ -811,9 +831,15 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         let count = (end - start).max(0) as usize;
         let _ = kind;
         let result = ta_species_create(vm, &o, &[Value::Number(count as f64)])?;
-        for i in 0..count {
-            let v = vm.ta_get(&o, (start as usize) + i);
-            vm.ta_write(&result, i, &v)?;
+        if count > 0 {
+            // The start/end coercions (or the species constructor) can detach
+            // or shrink the source: revalidate (TypeError) and re-clamp.
+            let cur = ta_revalidate(vm, &o)?;
+            let upto = count.min(cur.saturating_sub(start.max(0) as usize));
+            for i in 0..upto {
+                let v = vm.ta_get(&o, (start as usize) + i);
+                vm.ta_write(&result, i, &v)?;
+            }
         }
         Ok(Value::Object(result))
     });
@@ -825,6 +851,12 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         let target = rel_index(vm, &arg(args, 0), len, 0)?;
         let start = rel_index(vm, &arg(args, 1), len, 0)?;
         let end = rel_index(vm, &arg(args, 2), len, len)?;
+        // The index coercions can detach or shrink the buffer: revalidate
+        // (TypeError) and re-clamp everything to the CURRENT length.
+        let len = (ta_revalidate(vm, &o)? as isize).min(len);
+        let target = target.min(len);
+        let start = start.min(len);
+        let end = end.min(len);
         let count = (end - start).min(len - target).max(0);
         if count > 0 {
             // Snapshot the source range, then write — handles overlap correctly.
@@ -1129,6 +1161,11 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
             ((len as f64 + from).max(0.0)) as usize
         };
         for i in start..len {
+            // HasProperty per spec: an index that went out of bounds (shrunk
+            // resizable buffer) is absent — skipped, never matched.
+            if !vm.ta_valid_index(&o, i as f64) {
+                continue;
+            }
             let el = vm.ta_get(&o, i);
             if vm.strict_equals(&el, &target) {
                 return Ok(Value::Number(i as f64));
@@ -1158,9 +1195,12 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
         }
         let mut i = start;
         while i >= 0 {
-            let el = vm.ta_get(&o, i as usize);
-            if vm.strict_equals(&el, &target) {
-                return Ok(Value::Number(i as f64));
+            // HasProperty per spec: out-of-bounds indices are absent (skipped).
+            if vm.ta_valid_index(&o, i as f64) {
+                let el = vm.ta_get(&o, i as usize);
+                if vm.strict_equals(&el, &target) {
+                    return Ok(Value::Number(i as f64));
+                }
             }
             i -= 1;
         }
@@ -1202,8 +1242,11 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
     // join(separator?)
     vm.define_method(proto, "join", 1, |vm, this, args| {
         let o = ta_this(vm, &this)?;
-        // ToString(separator) is performed first and may throw (e.g. a Symbol
-        // separator must raise a TypeError rather than be silently coerced).
+        // The length is read BEFORE the separator coerces (whose side effects
+        // may resize/detach the buffer; the part count must not change), then
+        // each element is read live — an index that went out of bounds reads
+        // as undefined and contributes the empty string.
+        let len = vm.ta_length(&o).unwrap_or(0);
         let sep = {
             let s = arg(args, 0);
             if s.is_undefined() {
@@ -1212,11 +1255,14 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
                 vm.to_js_string(&s)?.as_str().to_string()
             }
         };
-        let len = vm.ta_length(&o).unwrap_or(0);
         let mut parts = Vec::with_capacity(len);
         for i in 0..len {
             let v = vm.ta_get(&o, i);
-            parts.push(vm.to_string_lossy(&v));
+            if v.is_undefined() {
+                parts.push(String::new());
+            } else {
+                parts.push(vm.to_string_lossy(&v));
+            }
         }
         Ok(Value::str(parts.join(&sep)))
     });
@@ -1567,6 +1613,15 @@ fn install_kind_ctors(vm: &mut Vm, ta_ctor: &JsObject) {
         // Concrete ctor inherits from %TypedArray%.
         ctor.borrow_mut().proto = Some(ta_ctor.clone());
         vm.install_ctor(name, &ctor, &proto);
+        // Record the INTRINSIC ctor on the base proto so TypedArraySpeciesCreate
+        // can use it as the default even after `prototype.constructor` is
+        // replaced or shadowed (SpeciesConstructor's defaultConstructor is the
+        // intrinsic, not the current property value).
+        let ckey = PropertyKey::str(format!("__ctor_{}", kind.name()));
+        ta_proto
+            .borrow_mut()
+            .props
+            .insert(ckey, Property::builtin(Value::Object(ctor.clone())));
 
         // BYTES_PER_ELEMENT on both ctor and prototype (non-writable,
         // non-enumerable, non-configurable).
@@ -1614,7 +1669,6 @@ fn construct_typed_array(vm: &mut Vm, kind: TAKind, args: &[Value]) -> Result<Va
         // new T(buffer, byteOffset?, length?)
         Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => {
             let buffer = o.clone();
-            let buf_len = buffer_byte_length(&buffer);
             let byte_offset = {
                 let off = to_integer_or_infinity(vm, &arg(args, 1))?;
                 if off < 0.0 || off.is_infinite() {
@@ -1625,13 +1679,24 @@ fn construct_typed_array(vm: &mut Vm, kind: TAKind, args: &[Value]) -> Result<Va
             if byte_offset % elem != 0 {
                 return Err(vm.throw_range("Start offset is not aligned to element size"));
             }
+            // IsDetachedBuffer after ToIndex(byteOffset) (whose coercion can
+            // itself detach), per spec; the byte length is read after that.
+            if matches!(buffer.borrow().internal, Internal::ArrayBuffer(None)) {
+                return Err(
+                    vm.throw_type("Cannot construct a TypedArray on a detached ArrayBuffer")
+                );
+            }
+            let buf_len = buffer_byte_length(&buffer);
             if byte_offset > buf_len {
                 return Err(vm.throw_range("Start offset is out of bounds"));
             }
             let auto_length = arg(args, 2).is_undefined();
             let length = if auto_length {
                 let remaining = buf_len - byte_offset;
-                if remaining % elem != 0 {
+                // A RESIZABLE buffer's auto-length view is length-tracking:
+                // its element count floors freely, with no alignment demand
+                // (the requirement applies to fixed buffers only).
+                if remaining % elem != 0 && ab_max_byte_length(&buffer).is_none() {
                     return Err(vm.throw_range("Byte length is not aligned to element size"));
                 }
                 remaining / elem
@@ -1639,6 +1704,12 @@ fn construct_typed_array(vm: &mut Vm, kind: TAKind, args: &[Value]) -> Result<Va
                 let l = to_integer_or_infinity(vm, &arg(args, 2))?;
                 if l < 0.0 || l.is_infinite() {
                     return Err(vm.throw_range("Invalid typed array length"));
+                }
+                // The length coercion can detach the buffer too.
+                if matches!(buffer.borrow().internal, Internal::ArrayBuffer(None)) {
+                    return Err(
+                        vm.throw_type("Cannot construct a TypedArray on a detached ArrayBuffer")
+                    );
                 }
                 let l = l as usize;
                 if byte_offset + l * elem > buf_len {
@@ -1659,6 +1730,10 @@ fn construct_typed_array(vm: &mut Vm, kind: TAKind, args: &[Value]) -> Result<Va
         // new T(typedArray | arrayLike | iterable)
         Value::Object(o) if matches!(o.borrow().internal, Internal::TypedArray(_)) => {
             let src = o.clone();
+            // A detached or out-of-bounds source TypedArray is a TypeError.
+            if ta_out_of_bounds(&src) {
+                return Err(vm.throw_type("source TypedArray is detached or out of bounds"));
+            }
             let vals = ta_values_v(vm, &src);
             let len = vals.len();
             let buf = vm.new_array_buffer(len * elem);
@@ -1738,7 +1813,6 @@ fn install_data_view(vm: &mut Vm) {
                 )
             }
         };
-        let buf_len = buffer_byte_length(&buffer);
         let byte_offset = {
             let off = to_integer_or_infinity(vm, &arg(args, 1))?;
             if off < 0.0 || off.is_infinite() {
@@ -1746,11 +1820,18 @@ fn install_data_view(vm: &mut Vm) {
             }
             off as usize
         };
+        // IsDetachedBuffer after ToIndex(byteOffset), per spec.
+        if matches!(buffer.borrow().internal, Internal::ArrayBuffer(None)) {
+            return Err(vm.throw_type("Cannot construct a DataView on a detached ArrayBuffer"));
+        }
+        let buf_len = buffer_byte_length(&buffer);
         if byte_offset > buf_len {
             return Err(vm.throw_range("Start offset is outside the bounds of the buffer"));
         }
-        let byte_length = if arg(args, 2).is_undefined() {
-            buf_len - byte_offset
+        // No explicit length: an auto-length view, which TRACKS a resizable
+        // buffer's byte length.
+        let (byte_length, length_tracking) = if arg(args, 2).is_undefined() {
+            (buf_len - byte_offset, ab_max_byte_length(&buffer).is_some())
         } else {
             let l = to_integer_or_infinity(vm, &arg(args, 2))?;
             if l < 0.0 || l.is_infinite() {
@@ -1760,7 +1841,7 @@ fn install_data_view(vm: &mut Vm) {
             if byte_offset + l > buf_len {
                 return Err(vm.throw_range("Invalid DataView length"));
             }
-            l
+            (l, false)
         };
         let dv = vm.alloc(ObjectData::new(
             Some(vm.realm.data_view_proto.clone()),
@@ -1768,6 +1849,7 @@ fn install_data_view(vm: &mut Vm) {
                 buffer,
                 byte_offset,
                 byte_length,
+                length_tracking,
             }),
         ));
         Ok(Value::Object(dv))
@@ -1798,12 +1880,10 @@ fn install_data_view(vm: &mut Vm) {
     );
 
     let g = vm.new_native("get byteLength", 0, |vm, this, _a| match &this {
-        Value::Object(o) => match &o.borrow().internal {
-            Internal::DataView(d) => Ok(Value::Number(d.byte_length as f64)),
-            _ => Err(
-                vm.throw_type("get DataView.prototype.byteLength called on incompatible receiver")
-            ),
-        },
+        Value::Object(o) if matches!(o.borrow().internal, Internal::DataView(_)) => {
+            // Detached / out-of-bounds views throw; tracking views are live.
+            Ok(Value::Number(dv_live_len(vm, o)? as f64))
+        }
         _ => {
             Err(vm.throw_type("get DataView.prototype.byteLength called on incompatible receiver"))
         }
@@ -1816,12 +1896,15 @@ fn install_data_view(vm: &mut Vm) {
     );
 
     let g = vm.new_native("get byteOffset", 0, |vm, this, _a| match &this {
-        Value::Object(o) => match &o.borrow().internal {
-            Internal::DataView(d) => Ok(Value::Number(d.byte_offset as f64)),
-            _ => Err(
-                vm.throw_type("get DataView.prototype.byteOffset called on incompatible receiver")
-            ),
-        },
+        Value::Object(o) if matches!(o.borrow().internal, Internal::DataView(_)) => {
+            // Detached / out-of-bounds views throw.
+            dv_live_len(vm, o)?;
+            let off = match &o.borrow().internal {
+                Internal::DataView(d) => d.byte_offset,
+                _ => 0,
+            };
+            Ok(Value::Number(off as f64))
+        }
         _ => {
             Err(vm.throw_type("get DataView.prototype.byteOffset called on incompatible receiver"))
         }
@@ -1908,6 +1991,35 @@ fn dv_fields(o: &JsObject) -> Option<(JsObject, usize, usize)> {
     }
 }
 
+/// The view's LIVE byte length: TypeError when the buffer is detached or the
+/// view no longer fits a shrunk resizable buffer (IsViewOutOfBounds); a
+/// length-tracking view follows the buffer's current byte length.
+fn dv_live_len(vm: &Vm, o: &JsObject) -> Result<usize, Value> {
+    match &o.borrow().internal {
+        Internal::DataView(d) => {
+            let buf_len = match &d.buffer.borrow().internal {
+                Internal::ArrayBuffer(Some(b)) => b.len(),
+                _ => {
+                    return Err(
+                        vm.throw_type("Cannot perform DataView access on a detached ArrayBuffer")
+                    )
+                }
+            };
+            if d.byte_offset > buf_len
+                || (!d.length_tracking && d.byte_offset + d.byte_length > buf_len)
+            {
+                return Err(vm.throw_type("DataView is out of bounds"));
+            }
+            Ok(if d.length_tracking {
+                buf_len - d.byte_offset
+            } else {
+                d.byte_length
+            })
+        }
+        _ => Err(vm.throw_type("not a DataView")),
+    }
+}
+
 fn define_dv_get(vm: &mut Vm, proto: &JsObject, name: &str, kind: DvKind) {
     vm.define_method(proto, name, 1, move |vm, this, args| {
         let o = match &this {
@@ -1918,7 +2030,7 @@ fn define_dv_get(vm: &mut Vm, proto: &JsObject, name: &str, kind: DvKind) {
                 )
             }
         };
-        let (buffer, base_off, view_len) =
+        let (buffer, base_off, _) =
             dv_fields(&o).ok_or_else(|| vm.throw_type("not a DataView"))?;
         let get_index = {
             let idx = to_integer_or_infinity(vm, &arg(args, 0))?;
@@ -1928,10 +2040,12 @@ fn define_dv_get(vm: &mut Vm, proto: &JsObject, name: &str, kind: DvKind) {
             idx as usize
         };
         let little_endian = vm.to_boolean(&arg(args, 1));
+        // Detached / out-of-bounds view is a TypeError, checked after the
+        // index coercion and before the bounds (RangeError).
+        let view_len = dv_live_len(vm, &o)?;
         let size = kind.bytes();
         let off = base_off + get_index;
         let buf = buffer.borrow();
-        // IsDetachedBuffer (TypeError) is checked before the bounds (RangeError).
         let bytes = match &buf.internal {
             Internal::ArrayBuffer(Some(b)) => b,
             _ => {
@@ -1956,7 +2070,7 @@ fn define_dv_set(vm: &mut Vm, proto: &JsObject, name: &str, kind: DvKind) {
                 )
             }
         };
-        let (buffer, base_off, view_len) =
+        let (buffer, base_off, _) =
             dv_fields(&o).ok_or_else(|| vm.throw_type("not a DataView"))?;
         let set_index = {
             let idx = to_integer_or_infinity(vm, &arg(args, 0))?;
@@ -1968,10 +2082,12 @@ fn define_dv_set(vm: &mut Vm, proto: &JsObject, name: &str, kind: DvKind) {
         // ToNumber on the value happens before the endian/bounds checks per spec.
         let value = vm.to_number(&arg(args, 1))?;
         let little_endian = vm.to_boolean(&arg(args, 2));
+        // Detached / out-of-bounds view is a TypeError, checked after the
+        // coercions and before the bounds (RangeError).
+        let view_len = dv_live_len(vm, &o)?;
         let size = kind.bytes();
         let off = base_off + set_index;
         let mut buf = buffer.borrow_mut();
-        // IsDetachedBuffer (TypeError) is checked before the bounds (RangeError).
         let bytes = match &mut buf.internal {
             Internal::ArrayBuffer(Some(b)) => b,
             _ => {
@@ -1997,7 +2113,7 @@ fn define_dv_get_big(vm: &mut Vm, proto: &JsObject, name: &str, kind: TAKind) {
                 )
             }
         };
-        let (buffer, base_off, view_len) =
+        let (buffer, base_off, _) =
             dv_fields(&o).ok_or_else(|| vm.throw_type("not a DataView"))?;
         let get_index = {
             let idx = to_integer_or_infinity(vm, &arg(args, 0))?;
@@ -2007,6 +2123,8 @@ fn define_dv_get_big(vm: &mut Vm, proto: &JsObject, name: &str, kind: TAKind) {
             idx as usize
         };
         let little_endian = vm.to_boolean(&arg(args, 1));
+        // Detached / out-of-bounds view is a TypeError (after index coercion).
+        let view_len = dv_live_len(vm, &o)?;
         let off = base_off + get_index;
         let buf = buffer.borrow();
         // Detached (TypeError) before bounds (RangeError).
@@ -2048,7 +2166,7 @@ fn define_dv_set_big(vm: &mut Vm, proto: &JsObject, name: &str, kind: TAKind) {
                 )
             }
         };
-        let (buffer, base_off, view_len) =
+        let (buffer, base_off, _) =
             dv_fields(&o).ok_or_else(|| vm.throw_type("not a DataView"))?;
         let set_index = {
             let idx = to_integer_or_infinity(vm, &arg(args, 0))?;
@@ -2060,6 +2178,8 @@ fn define_dv_set_big(vm: &mut Vm, proto: &JsObject, name: &str, kind: TAKind) {
         // ToBigInt on the value happens before the endian/bounds checks per spec.
         let value = vm.to_bigint(&arg(args, 1))?;
         let little_endian = vm.to_boolean(&arg(args, 2));
+        // Detached / out-of-bounds view is a TypeError (after the coercions).
+        let view_len = dv_live_len(vm, &o)?;
         let off = base_off + set_index;
         let mut buf = buffer.borrow_mut();
         // Detached (TypeError) before bounds (RangeError).
@@ -2273,5 +2393,13 @@ fn is_iterable(vm: &mut Vm, v: &Value) -> Result<bool, Value> {
     }
     let sym = vm.realm.symbol_iterator.clone();
     let m = vm.get_prop(v, &PropertyKey::Sym(sym))?;
-    Ok(vm.is_callable(&m))
+    if m.is_nullish() {
+        return Ok(false);
+    }
+    // GetMethod: a present but non-callable @@iterator is a TypeError, not a
+    // silent fall-back to the array-like path.
+    if !vm.is_callable(&m) {
+        return Err(vm.throw_type("Symbol.iterator is not a function"));
+    }
+    Ok(true)
 }

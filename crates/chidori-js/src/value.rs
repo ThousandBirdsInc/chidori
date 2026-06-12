@@ -545,6 +545,9 @@ pub struct DataViewData {
     pub buffer: JsObject,
     pub byte_offset: usize,
     pub byte_length: usize,
+    /// True for an auto-length view on a resizable buffer (no explicit length):
+    /// its byteLength tracks the buffer's current byte length.
+    pub length_tracking: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

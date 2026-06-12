@@ -202,6 +202,28 @@ impl Vm {
             let entry = self.iter_entry(kind, idx, v);
             return Ok(self.make_iter_result(entry, false));
         }
+        // %ArrayIterator%.next over a typed array re-validates the view each
+        // step: a detached or out-of-bounds (shrunk resizable buffer) view is
+        // a TypeError, not a quiet `done`.
+        let ta_oob = {
+            let b = it.borrow();
+            match &b.internal {
+                Internal::Iterator(st) if !st.done => {
+                    st.target
+                        .as_ref()
+                        .map_or(false, |t| match &t.borrow().internal {
+                            Internal::TypedArray(td) => {
+                                crate::typed_array::ta_out_of_bounds(td)
+                            }
+                            _ => false,
+                        })
+                }
+                _ => false,
+            }
+        };
+        if ta_oob {
+            return Err(self.throw_type("TypedArray is detached or out of bounds"));
+        }
         // Read + advance under a short borrow; build result after.
         enum Out {
             Done,

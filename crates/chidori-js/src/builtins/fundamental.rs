@@ -1539,6 +1539,39 @@ pub(crate) fn own_property_descriptor(o: &JsObject, key: &PropertyKey) -> Option
             }
             None
         }
+        Internal::TypedArray(t) => {
+            // Integer-indexed exotic [[GetOwnProperty]] (10.4.5.1): a valid
+            // canonical numeric index is a {writable, enumerable, configurable}
+            // data property holding the element; an invalid one is absent.
+            if let Some(n) = canonical_numeric_index(key) {
+                let len = crate::typed_array::ta_eff_length(t);
+                let valid = n.fract() == 0.0
+                    && n >= 0.0
+                    && !(n == 0.0 && n.is_sign_negative())
+                    && (n as usize) < len;
+                if valid {
+                    let i = n as usize;
+                    let off = t.byte_offset + i * t.kind.bytes();
+                    if let Internal::ArrayBuffer(Some(bytes)) = &t.buffer.borrow().internal {
+                        let value = if t.kind.is_bigint() {
+                            Value::bigint(crate::typed_array::decode_big(bytes, off, t.kind))
+                        } else {
+                            Value::Number(crate::typed_array::decode(bytes, off, t.kind))
+                        };
+                        return Some(Property {
+                            kind: PropertyKind::Data {
+                                value,
+                                writable: true,
+                            },
+                            enumerable: true,
+                            configurable: true,
+                        });
+                    }
+                }
+                return None;
+            }
+            None
+        }
         Internal::StringObj(s) => {
             if let Some("length") = key.as_str() {
                 return Some(Property {
