@@ -157,6 +157,49 @@ export interface ParallelOptions {
   concurrency?: number;
 }
 
+/**
+ * One `chidori.branch` variant (`docs/branching-execution.md` §6.1). A branch
+ * runs its own continuation source module from the parent's anchored state —
+ * not a re-run of the parent agent — so `source` is required.
+ */
+export interface BranchVariant {
+  /** Branch label, shown in outcomes and the trace. Defaults to `branch-<k>`. */
+  label?: string;
+  /** Branch source module path, resolved like `callAgent` paths. */
+  source: string;
+  /** State handed to the branch as its run input. Defaults to `{}`. */
+  input?: AgentJson;
+}
+
+export type BranchStatus = "completed" | "paused" | "failed";
+
+/** The result of one branch sub-run, returned for comparison (not merged). */
+export interface BranchOutcome<T extends AgentJson = AgentJson> {
+  label: string;
+  /**
+   * `<parent run id>-op<branch seq>-branch-<k>` — identifies the branch
+   * sub-run, including for out-of-band `chidori branch-resume` /
+   * `branch-rerun` against its persisted store.
+   */
+  branchId: string;
+  status: BranchStatus;
+  /** The branch's output, when `status` is `"completed"`. */
+  output?: T;
+  /** What the branch is waiting on, when `status` is `"paused"`. */
+  pendingPrompt?: string;
+  /** The failure message, when `status` is `"failed"`. */
+  error?: string;
+}
+
+export interface BranchOptions {
+  /**
+   * Maximum branches running live at once (cost cap). Defaults to 1 —
+   * sequential. Higher values run variants in concurrent waves; outcome
+   * order always follows variant order.
+   */
+  concurrency?: number;
+}
+
 export interface RetryOptions {
   attempts?: number;
   delayMs?: number;
@@ -259,6 +302,17 @@ export interface Chidori {
     path: string,
     input?: TInput,
   ): Promise<TOutput>;
+  /**
+   * Fork the run into one sub-run per variant from the current anchored state
+   * (the VFS plus each variant's explicit `input`), run each variant's own
+   * source module, and return every outcome so the agent can compare and pick.
+   * The whole fan-out is one recorded durable call: a replay of this run
+   * returns the outcomes from cache without re-running the branches.
+   */
+  branch<T extends AgentJson = AgentJson>(
+    variants: BranchVariant[],
+    options?: BranchOptions,
+  ): Promise<BranchOutcome<T>[]>;
   tool<TArgs extends JsonObject = JsonObject, TResult extends AgentJson = AgentJson>(
     name: string,
     args?: TArgs,

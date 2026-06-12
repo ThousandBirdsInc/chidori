@@ -261,6 +261,24 @@ impl Engine {
             });
         let d = dispatch.clone();
         self.vm
+            .define_method(&chidori, "branch", 2, move |vm, _t, args| {
+                let variants = args
+                    .first()
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                let options = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "branch",
+                    serde_json::json!({ "variants": variants, "options": options }),
+                )
+            });
+        let d = dispatch.clone();
+        self.vm
             .define_method(&chidori, "execJs", 2, move |vm, _t, args| {
                 let source = args
                     .first()

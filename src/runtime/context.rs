@@ -175,6 +175,11 @@ struct RuntimeContextInner {
     /// Reads/writes never touch the host disk; the tree rides the snapshot
     /// manifest so it survives suspend → restore identically.
     pub vfs: Vfs,
+    /// Whether this context belongs to a `chidori.branch` sub-run. Branch
+    /// contexts may not fork again: a nested branch would allocate sequence
+    /// ranges outside the parent branch's reserved range and break the
+    /// disjointness invariant, so `run_branches` rejects it up front.
+    pub is_branch: bool,
     /// Optional host-supplied model override (Pi-style save point). When set,
     /// every prompt host call (`execute_prompt_text` / `execute_prompt_response`)
     /// consults it just before sending and, if it yields `Some(model)`, swaps
@@ -296,6 +301,7 @@ impl RuntimeContext {
                 call_stack: Vec::new(),
                 capabilities: CapabilityLedger::new(),
                 vfs: vfs_from_seed_env(),
+                is_branch: false,
                 model_override: None,
             })),
         }
@@ -361,6 +367,7 @@ impl RuntimeContext {
                 call_stack: Vec::new(),
                 capabilities: CapabilityLedger::new(),
                 vfs,
+                is_branch: false,
                 model_override: None,
             })),
         }
@@ -396,8 +403,132 @@ impl RuntimeContext {
                 call_stack: Vec::new(),
                 capabilities: CapabilityLedger::new(),
                 vfs: vfs_from_seed_env(),
+                is_branch: false,
                 model_override: None,
             })),
+        }
+    }
+
+    /// Build the context for one `chidori.branch` sub-run, anchored to the
+    /// parent's state (`docs/branching-execution.md` §8.3): the parent's config,
+    /// VFS snapshot, input mode, workspace root, model override, streaming event
+    /// sink, and OTEL run span are inherited; the call log is fresh and the
+    /// sequence counter starts at `base_seq` (the branch's reserved
+    /// `CallLogSequenceRange` start minus one, so its records stay disjoint from
+    /// the parent and sibling branches). The call stack is seeded with
+    /// `parent_branch_seq` — the parent's `branch` call — so every top-level
+    /// record the branch makes carries `parent_seq = branch seq` and the shared
+    /// OTEL span tree nests the branch's subtree under the `branch` span.
+    pub fn for_branch(
+        parent: &RuntimeContext,
+        run_id: String,
+        base_seq: u64,
+        parent_branch_seq: u64,
+    ) -> Self {
+        let parent_inner = parent.inner.lock().unwrap();
+        Self {
+            inner: Arc::new(Mutex::new(RuntimeContextInner {
+                config: parent_inner.config.clone(),
+                call_log: CallLog::new(),
+                seq: base_seq,
+                replay_log: None,
+                run_id,
+                persist_dir: None,
+                input_mode: parent_inner.input_mode,
+                pending_input: None,
+                pending_approval: None,
+                pending_signal: None,
+                signal_inbox: Vec::new(),
+                host_promises: HostPromiseTable::new(),
+                event_sender: parent_inner.event_sender.clone(),
+                emit_call_events: parent_inner.emit_call_events,
+                otel_run: parent_inner.otel_run.clone(),
+                host_operation_safepoint: None,
+                host_operation_completion_safepoint: None,
+                workspace_root: parent_inner.workspace_root.clone(),
+                call_stack: vec![parent_branch_seq],
+                capabilities: CapabilityLedger::new(),
+                vfs: parent_inner.vfs.clone(),
+                is_branch: true,
+                model_override: parent_inner.model_override.clone(),
+            })),
+        }
+    }
+
+    /// Rebuild the context for one persisted `chidori.branch` sub-run resumed
+    /// or re-run **out-of-band** — after the parent run has moved on (or its
+    /// process exited), so there is no live parent context to inherit from.
+    /// The anchor state comes from the branch store instead: the fork-time VFS
+    /// snapshot, the branch's reserved base sequence, and the parent `branch`
+    /// call's seq for call-stack seeding (so re-recorded records keep the same
+    /// parentage the original run stamped). `replay_log` carries the branch's
+    /// recorded records (plus a synthetic `input` record when resuming a
+    /// pause); pass an empty log for a fresh edit-and-rerun from the anchor.
+    /// Input mode is `Pause` so an unanswered later `input()` pauses again
+    /// rather than reading stdin.
+    pub fn for_branch_resume(
+        replay_log: Vec<CallRecord>,
+        vfs: Vfs,
+        base_seq: u64,
+        parent_branch_seq: u64,
+        run_id: String,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RuntimeContextInner {
+                config: AgentConfig::default(),
+                call_log: CallLog::new(),
+                seq: base_seq,
+                replay_log: Some(replay_log),
+                run_id,
+                persist_dir: None,
+                input_mode: InputMode::Pause,
+                pending_input: None,
+                pending_approval: None,
+                pending_signal: None,
+                signal_inbox: Vec::new(),
+                host_promises: HostPromiseTable::new(),
+                event_sender: None,
+                emit_call_events: true,
+                otel_run: None,
+                host_operation_safepoint: None,
+                host_operation_completion_safepoint: None,
+                workspace_root: default_workspace_root(),
+                call_stack: vec![parent_branch_seq],
+                capabilities: CapabilityLedger::new(),
+                vfs,
+                is_branch: true,
+                model_override: None,
+            })),
+        }
+    }
+
+    /// Whether this context belongs to a `chidori.branch` sub-run.
+    pub fn is_branch(&self) -> bool {
+        self.inner.lock().unwrap().is_branch
+    }
+
+    /// The run's persistence directory, when persistence is enabled. Branch
+    /// sub-runs persist their stores under `<persist_dir>/branches/`.
+    pub fn persist_dir(&self) -> Option<PathBuf> {
+        self.inner.lock().unwrap().persist_dir.clone()
+    }
+
+    /// Fold a completed branch sub-run's records into this (parent) log without
+    /// re-emitting stream events or OTEL spans — the branch context already
+    /// emitted them live. Advances the sequence counter past every merged seq,
+    /// mirroring what `absorb_replayed_subtree` does for the same subtree on
+    /// replay, so live and replayed runs agree on the next sequence number after
+    /// a `branch` op. Persists the checkpoint once at the end.
+    pub fn merge_branch_records(&self, records: Vec<CallRecord>) {
+        let mut inner = self.inner.lock().unwrap();
+        for record in records {
+            inner.seq = inner.seq.max(record.seq);
+            inner.call_log.push(record);
+        }
+        if let Some(ref dir) = inner.persist_dir {
+            if let Ok(json) = inner.call_log.to_json() {
+                let _ = std::fs::write(dir.join("checkpoint.json"), json);
+            }
         }
     }
 

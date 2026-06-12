@@ -4,6 +4,7 @@ pub mod context;
 pub mod cost;
 pub mod crypto;
 pub mod engine;
+pub mod host_branch;
 pub mod host_core;
 pub mod memory;
 pub mod native;

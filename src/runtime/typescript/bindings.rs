@@ -1,7 +1,5 @@
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
-use std::rc::Rc;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use serde::{Deserialize, Serialize};
@@ -766,6 +764,37 @@ impl HostBindingBackend {
         }
     }
 
+    /// Clone this runtime backend with a different [`RuntimeContext`] — same
+    /// providers, policy (and approval cache), tools, and MCP. Used by
+    /// `chidori.branch` to run each branch sub-run on its own context while
+    /// enforcing the parent's policy. `None` for the recorder backend.
+    pub(crate) fn with_runtime_ctx(&self, runtime_ctx: RuntimeContext) -> Option<Self> {
+        match self {
+            HostBindingBackend::Runtime {
+                providers,
+                template_engine,
+                tokio_rt,
+                policy,
+                policy_cache,
+                runtime_policy,
+                tools,
+                mcp,
+                ..
+            } => Some(HostBindingBackend::Runtime {
+                runtime_ctx,
+                providers: providers.clone(),
+                template_engine: template_engine.clone(),
+                tokio_rt: tokio_rt.clone(),
+                policy: policy.clone(),
+                policy_cache: policy_cache.clone(),
+                runtime_policy: runtime_policy.clone(),
+                tools: tools.clone(),
+                mcp: mcp.clone(),
+            }),
+            HostBindingBackend::Recorder(_) => None,
+        }
+    }
+
     /// The runtime context, when this is the runtime backend.
     pub(crate) fn runtime_ctx(&self) -> Option<&RuntimeContext> {
         match self {
@@ -967,6 +996,7 @@ impl HostBindingBackend {
                     .unwrap_or_else(|| serde_json::json!({}));
                 self.call_agent(path, input)
             }
+            "branch" => crate::runtime::host_branch::run_branches(self, a),
             "workspace" => self.dispatch_workspace(a),
             "contextDigest" => {
                 let segments = a
@@ -1184,17 +1214,20 @@ fn context_request_parts(
 
 #[derive(Debug, Clone, Default)]
 pub struct HostBindingRecorder {
-    calls: Rc<RefCell<Vec<HostBindingCall>>>,
+    // Arc<Mutex> (not Rc<RefCell>) so HostBindingBackend is Send — branch
+    // sub-runs execute on their own threads when `chidori.branch` runs with
+    // `concurrency > 1`.
+    calls: Arc<StdMutex<Vec<HostBindingCall>>>,
 }
 
 impl HostBindingRecorder {
     #[allow(dead_code)]
     pub fn calls(&self) -> Vec<HostBindingCall> {
-        self.calls.borrow().clone()
+        self.calls.lock().unwrap().clone()
     }
 
     fn push(&self, function: impl Into<String>, args: serde_json::Value) {
-        self.calls.borrow_mut().push(HostBindingCall {
+        self.calls.lock().unwrap().push(HostBindingCall {
             function: function.into(),
             args,
         });

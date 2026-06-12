@@ -113,6 +113,51 @@ enum Commands {
         dir: Option<PathBuf>,
     },
 
+    /// List a run's persisted `chidori.branch` sub-runs and their states.
+    Branches {
+        /// Run id (subdirectory name under `.chidori/runs/`)
+        run_id: String,
+
+        /// Project dir containing `.chidori/runs/` (defaults to current dir)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+    },
+
+    /// Resume a paused branch sub-run by answering its pending input prompt.
+    /// The branch replays its checkpoint with the response and continues to
+    /// its next outcome; the parent run's history is untouched.
+    BranchResume {
+        /// Run id (subdirectory name under `.chidori/runs/`)
+        run_id: String,
+
+        /// Branch id, as reported in the branch outcome / `chidori branches`
+        branch_id: String,
+
+        /// The response to the branch's pending input prompt
+        #[arg(short, long)]
+        value: String,
+
+        /// Project dir containing `.chidori/runs/` (defaults to current dir)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+    },
+
+    /// Re-run a branch sub-run fresh from its parent anchor, using its stored
+    /// (editable) `source.ts`. Edit the file under
+    /// `.chidori/runs/<run>/branches/.../source.ts`, then re-run: only that
+    /// strategy changes while the anchored state stays identical.
+    BranchRerun {
+        /// Run id (subdirectory name under `.chidori/runs/`)
+        run_id: String,
+
+        /// Branch id, as reported in the branch outcome / `chidori branches`
+        branch_id: String,
+
+        /// Project dir containing `.chidori/runs/` (defaults to current dir)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+    },
+
     /// Pretty-print a persisted run's call log.
     Trace {
         /// Run id (subdirectory name under `.chidori/runs/`)
@@ -193,6 +238,21 @@ fn main() {
         Commands::Resume { file, run_id, dir } => {
             (cmd_resume(&file, &run_id, dir.as_deref()), false)
         }
+        Commands::Branches { run_id, dir } => (cmd_branches(&run_id, dir.as_deref()), false),
+        Commands::BranchResume {
+            run_id,
+            branch_id,
+            value,
+            dir,
+        } => (
+            cmd_branch_resume(&run_id, &branch_id, &value, dir.as_deref()),
+            false,
+        ),
+        Commands::BranchRerun {
+            run_id,
+            branch_id,
+            dir,
+        } => (cmd_branch_rerun(&run_id, &branch_id, dir.as_deref()), false),
         Commands::Trace { run_id, dir } => (cmd_trace(&run_id, dir.as_deref()), false),
         Commands::Snapshot { run_id, dir } => (cmd_snapshot(&run_id, dir.as_deref()), false),
         Commands::Serve {
@@ -756,6 +816,67 @@ fn cmd_resume(file: &PathBuf, run_id: &str, dir: Option<&std::path::Path>) -> Re
         run_id,
         result.call_log.total_duration_ms()
     );
+    Ok(())
+}
+
+/// Resolve `<base>/.chidori/runs/<run_id>` for the branch commands.
+fn branch_run_dir(run_id: &str, dir: Option<&std::path::Path>) -> Result<PathBuf> {
+    let base_dir = dir
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let run_dir = base_dir.join(".chidori").join("runs").join(run_id);
+    if !run_dir.is_dir() {
+        anyhow::bail!("No persisted run at {}", run_dir.display());
+    }
+    Ok(run_dir)
+}
+
+/// The engine for out-of-band branch operations, wired like `cmd_resume`'s:
+/// providers/policy from env, tools from `<base>/tools`.
+fn branch_engine(dir: Option<&std::path::Path>) -> Result<Engine> {
+    let base_dir = dir
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let providers = Arc::new(ProviderRegistry::from_env());
+    let template_engine = Arc::new(TemplateEngine::new(&base_dir));
+    let tokio_rt =
+        Arc::new(tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?);
+    let tools_dir = base_dir.join("tools");
+    let tools = Arc::new(
+        ToolRegistry::load_from_dirs(&[tools_dir]).unwrap_or_else(|_| ToolRegistry::new()),
+    );
+    Ok(Engine::new(providers, template_engine, tokio_rt).with_tools(tools))
+}
+
+fn cmd_branches(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
+    let run_dir = branch_run_dir(run_id, dir)?;
+    let branches = Engine::list_branches(&run_dir)?;
+    if branches.is_empty() {
+        eprintln!("No persisted branches under {}", run_dir.display());
+        return Ok(());
+    }
+    println!("{}", serde_json::to_string_pretty(&branches)?);
+    Ok(())
+}
+
+fn cmd_branch_resume(
+    run_id: &str,
+    branch_id: &str,
+    value: &str,
+    dir: Option<&std::path::Path>,
+) -> Result<()> {
+    let run_dir = branch_run_dir(run_id, dir)?;
+    let engine = branch_engine(dir)?;
+    let outcome = engine.resume_branch(&run_dir, branch_id, value)?;
+    println!("{}", serde_json::to_string_pretty(&outcome)?);
+    Ok(())
+}
+
+fn cmd_branch_rerun(run_id: &str, branch_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
+    let run_dir = branch_run_dir(run_id, dir)?;
+    let engine = branch_engine(dir)?;
+    let outcome = engine.rerun_branch(&run_dir, branch_id)?;
+    println!("{}", serde_json::to_string_pretty(&outcome)?);
     Ok(())
 }
 
