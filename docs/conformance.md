@@ -34,7 +34,7 @@ The runner prints, e.g.:
 
 ```
 Test262 (chidori pure-Rust engine, bare context)
-  pass 38203  fail 1571  skip 7517  =>  96.05% of executed
+  pass 38271  fail 1503  skip 7517  =>  96.22% of executed
 ```
 
 ## Current result
@@ -44,7 +44,7 @@ pinned suite commit:
 
 | | pass | fail | skip | % of executed |
 |---|---|---|---|---|
-| chidori pure-Rust engine, bare context | 38,203 | 1,571 | 7,517 | **96.05%** |
+| chidori pure-Rust engine, bare context | 38,271 | 1,503 | 7,517 | **96.22%** |
 
 The headline percentage is `pass / (pass + fail)` over *executed* tests; the
 skip count is reported alongside so the denominator is never hidden.
@@ -134,12 +134,12 @@ a single readable line in review).
 
 ## Remaining gaps
 
-The residual failures, by area (top clusters of the 1,571 total):
+The residual failures, by area (top clusters of the 1,503 total):
 
 | count | area | nature |
 |--:|---|---|
 | 303 | `language/expressions` | class element corners, dynamic-`import()` semantics, `yield*` delegation ordering |
-| 290 | `language/statements` | remaining class element corners, `using`/`await using` (explicit resource management), `for-of` iterator-close |
+| 222 | `language/statements` | remaining class element corners, `for-of` iterator-close |
 | 136 | `built-ins/Array` | species/proxy interplay, length-boundary semantics |
 | 98 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings); `v`-flag; `prototype` long tail |
 | 96 | `built-ins/TypedArray` | resizable-`ArrayBuffer` / out-of-bounds tracking |
@@ -156,7 +156,11 @@ prototypes, class constructors uncallable without `new` — cleared another
 `arguments` exotic object, %ThrowTypeError% restricted properties,
 object-literal `__proto__`, computed-key SetFunctionName, and `delete`
 identifier semantics — cleared 194 more. The legacy normative-optional
-`caller` feature is now an honest skip.)
+`caller` feature is now an honest skip. Explicit resource management —
+`using`/`await using` with spec disposal on every exit path, awaited
+async disposal, SuppressedError chaining, and per-iteration `for-of`
+disposal — landed next and cleared its entire 66-test cluster, +68 with
+the `for (const …)` immutability fix it exposed.)
 
 Each failure is individually identifiable from a `--json` report, so the
 clusters can be picked off as engine work warrants. See

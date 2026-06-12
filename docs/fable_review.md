@@ -54,12 +54,13 @@ gate ("G5") and became **load-bearing** — a language bug in `chidori-js` now
 breaks real agents with no fallback engine. The project responded correctly:
 Test262 runs in CI against a committed per-test baseline (PRs touching the
 engine, pushes to `main`, and a nightly schedule), so the number can no
-longer rot silently. Conformance is **96.05 %** of executed tests at the
-pinned suite commit (38,203 pass / 1,571 fail / 7,517 skip), after the
-engine work on this branch — the derived-constructor construction model and
-a follow-up batch (arguments object, function-name bindings, restricted
-properties, `__proto__` literals, `delete` semantics) — cleared ~340
-baseline failures with zero regressions.
+longer rot silently. Conformance is **96.22 %** of executed tests at the
+pinned suite commit (38,271 pass / 1,503 fail / 7,517 skip), after the
+engine work on this branch — the derived-constructor construction model,
+a correctness batch (arguments object, function-name bindings, restricted
+properties, `__proto__` literals, `delete` semantics), and a full
+implementation of explicit resource management (`using`/`await using`) —
+cleared ~400 baseline failures with zero regressions.
 
 What remains is intentional narrowness, not breakage: two LLM providers, a
 blob-style persistence layer, capability-confinement (not OS-level)
@@ -74,7 +75,7 @@ QuickJS-era architecture.
 
 | Engine | Where | Role | Status |
 |---|---|---|---|
-| `chidori-js` (pure Rust) | `crates/chidori-js` | **The** engine — agents, tools, sub-agents, Test262 | 96.05 % of executed Test262 (38,203 / 1,571 / 7,517 pass/fail/skip at the pinned commit) |
+| `chidori-js` (pure Rust) | `crates/chidori-js` | **The** engine — agents, tools, sub-agents, Test262 | 96.22 % of executed Test262 (38,271 / 1,503 / 7,517 pass/fail/skip at the pinned commit) |
 
 `docs/conformance.md` describes the measurement methodology (bare-context,
 fresh VM per variant, honest skip accounting) and the CI gate
@@ -112,13 +113,20 @@ build; new passes print a baseline-refresh hint.
   identifiers follows the spec (strict SyntaxError, binding/global
   configurability); %Object.prototype% is an immutable-prototype exotic
   object; eval-created globals are deletable, script-level ones are not.
+- **Explicit resource management** (a third batch, −68 → 1,503): `using` /
+  `await using` declarations now dispose per spec — resources recorded
+  before the binding initializes, disposed in reverse on EVERY exit path
+  (throw/return/break/continue included) via a finally-style landing pad,
+  dispose errors chained through SuppressedError, async disposal genuinely
+  awaited, and `for (using x of …)` disposing per iteration. The entire
+  66-test cluster passes.
 
-### Remaining language gaps (top clusters of the baseline's 1,571 failures)
+### Remaining language gaps (top clusters of the baseline's 1,503 failures)
 
 | count | area | nature |
 |--:|---|---|
 | 303 | `language/expressions` | class element corners, dynamic-`import()` semantics, `yield*` delegation ordering |
-| 290 | `language/statements` | remaining class element corners, `using`/`await using`, `for-of` iterator-close |
+| 222 | `language/statements` | remaining class element corners, `for-of` iterator-close |
 | 136 | `built-ins/Array` | species/proxy interplay, length-boundary semantics |
 | 98 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings), `v`-flag |
 | 96 | `built-ins/TypedArray` | resizable-`ArrayBuffer` out-of-bounds tracking |
