@@ -1,13 +1,20 @@
 # Pure-Rust JS Engine + Replay-Based Durable Execution — Implementation Plan
 
-Status: **implemented (v1)** · Owner: TBD · Last updated: 2026-05-31
+> **⚠️ Historical — superseded.** This plan tracked building the pure-Rust engine
+> *alongside* QuickJS behind a `rust-engine` cargo feature. That migration is
+> **complete**: QuickJS was removed in #39, the feature flag is gone, and
+> `chidori-js` is now the **only** JS engine in the tree (the default and only
+> path). The "default OFF / QuickJS untouched" framing below is historical. For
+> the current engine and conformance story see
+> [`docs/conformance.md`](./conformance.md).
+
+Status: **implemented · migration complete** · Last updated: 2026-05-31
 
 ## Implementation status
 
-The engine and replay runtime are built in `crates/chidori-js` and integrated
-behind the `rust-engine` cargo feature (default OFF — the QuickJS/C path is
-untouched, verified by the existing suite passing 100% and the default build
-producing zero errors).
+The engine and replay runtime are built in `crates/chidori-js`. It began behind
+a `rust-engine` cargo feature (default OFF, alongside the QuickJS/C path); as of
+#39 that feature is removed and `chidori-js` is the sole engine.
 
 | Phase | Scope | Status |
 | --- | --- | --- |

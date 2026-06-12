@@ -54,20 +54,21 @@ pub struct RunResult {
 
 /// Persist a resume scaffold for a run on the pure-Rust engine (G2).
 ///
-/// Unlike the QuickJS path, the rust live path's durability is the
-/// `RuntimeContext` call log, not a VM image: resume re-executes the agent from
-/// the top and feeds each host effect its recorded result via the call-log
-/// replay (`try_replay`), blocking again at the pending frontier. So there is no
-/// VM blob to store — we persist a manifest (`InitialTypeScriptStateScaffold`
-/// kind) plus the call log, pending operation, host-promise table, capabilities,
-/// and VFS, which is exactly what the server's call-log replay resume path
-/// consumes.
+/// The engine's durability is the `RuntimeContext` call log, not a VM image:
+/// resume re-executes the agent from the top and feeds each host effect its
+/// recorded result via the call-log replay (`try_replay`), blocking again at the
+/// pending frontier. So there is no VM blob to store — we persist a manifest
+/// (`InitialTypeScriptStateScaffold` kind) plus the call log, pending operation,
+/// host-promise table, capabilities, and VFS, which is exactly what the server's
+/// call-log replay resume path consumes.
 ///
-/// The ABI token is `chidori-quickjs` on purpose: the server's resume gate
-/// validates the manifest ABI against `SnapshotAbi::current("chidori-quickjs")`,
-/// and the existing QuickJS *scaffold* fallback uses the same token and resumes
-/// the same engine-agnostic way (call-log replay, not a VM image). Reusing it
-/// keeps the rust manifest acceptable to the unchanged resume gate.
+/// The ABI token is `chidori-quickjs` for backward compatibility: the server's
+/// resume gate validates the manifest ABI against
+/// `SnapshotAbi::current("chidori-quickjs")` — the token the durable format has
+/// always used (it predates the QuickJS removal in #39, and the scaffold has
+/// always resumed engine-agnostically via call-log replay, never a VM image).
+/// Keeping the name leaves the manifest acceptable to the unchanged resume gate
+/// and lets artifacts written before the removal still load.
 fn persist_rust_journal_scaffold(
     base: &Path,
     run_id: &str,
@@ -100,7 +101,7 @@ fn persist_rust_journal_scaffold(
     // The rust engine has no VM image to serialize; resume is call-log replay.
     // We still write a non-empty blob — the durable code bundle the journal keys
     // reference — so `SnapshotStore::load()` round-trips and the on-disk shape
-    // matches the QuickJS scaffold (manifest + blob + checkpoint + pending).
+    // matches the established scaffold shape (manifest + blob + checkpoint + pending).
     let blob = chidori_js::replay::DurableBlob {
         bundle: source.to_string(),
         effects: Vec::new(),
@@ -410,14 +411,14 @@ impl Engine {
             let source = std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read {}", path.display()))?;
 
-            // Route to the pure-Rust engine when selected (CHIDORI_JS_ENGINE=rust).
-            // Host effects still flow through host_core/RuntimeContext, so the
-            // durable call log and the host-call span tree behave identically;
-            // this path additionally emits JS-level function spans when tracing
-            // is on. Only compiled with `--features rust-engine`.
-            // Build the same runtime host backend the QuickJS path uses, so
-            // every `chidori.*` effect routes through identical durable
-            // machinery (call log, replay, policy, MCP, OTEL).
+            // Run the agent on the pure-Rust `chidori-js` engine — the only JS
+            // engine in the tree (the QuickJS/C path was removed in #39).
+            // Host effects flow through host_core/RuntimeContext, so the durable
+            // call log and the host-call span tree behave identically; this path
+            // additionally emits JS-level function spans when tracing is on.
+            // Build the runtime host backend so every `chidori.*` effect routes
+            // through identical durable machinery (call log, replay, policy,
+            // MCP, OTEL).
             let mut seeded = PolicyCache::default();
             for (target, args) in &self.approvals {
                 seeded.approve(target, args);
@@ -435,8 +436,7 @@ impl Engine {
             );
             // Persist a durable journal scaffold before the run and at each
             // host-operation safepoint, so a pause/crash has a resumable
-            // artifact on disk (G2). Mirrors the QuickJS safepoint wiring
-            // below, but stores the rust engine's journal-shaped manifest.
+            // artifact on disk (G2). Stores the engine's journal-shaped manifest.
             if let Some(ref base) = self.persist_base {
                 let safepoint_base = base.clone();
                 let safepoint_run_id = run_id.clone();
@@ -481,7 +481,7 @@ impl Engine {
             // the `PAUSE_MARKER` sentinel from the host effect — which the
             // rust engine throws as a JS error and bubbles up here as `Err`.
             // We surface that as a paused `RunResult` so the resume flow has
-            // something to resume, mirroring the QuickJS arm. The check runs
+            // something to resume. The check runs
             // on `Ok` too in case the agent caught the sentinel and returned.
             let surface_pause = |ctx: &RuntimeContext| -> Option<RunResult> {
                 if let Some(pending) = ctx.take_pending_input() {
@@ -1804,8 +1804,8 @@ def agent(value):
     /// `node:` captured effects (crypto + fs) run on the active engine and a
     /// record→replay round-trip reproduces identical output — including the
     /// captured randomness, which is journaled as a `crypto.random` call so a
-    /// resumed run draws the exact same bytes. Runs under whichever engine
-    /// `CHIDORI_JS_ENGINE` selects, so it guards both the QuickJS and rust paths.
+    /// resumed run draws the exact same bytes. Runs on the pure-Rust
+    /// `chidori-js` engine (the only engine in the tree).
     #[test]
     fn engine_node_builtins_crypto_fs_record_replay_parity() {
         let dir = std::env::temp_dir().join(format!(
