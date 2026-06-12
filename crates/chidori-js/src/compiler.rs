@@ -3434,11 +3434,9 @@ impl Compiler {
                     if p.computed {
                         self.compile_property_key_expr(&p.key)?; // [obj, key]
                                                                  // ToPropertyKey NOW (spec: ComputedPropertyName
-                                                                 // evaluation), so a later SetFunctionNameFromKey /
-                                                                 // DefineField can't re-run key-coercion side effects.
-                        if Self::is_anonymous_fn_expr(&p.value) {
-                            self.emit(Op::ToPropertyKey);
-                        }
+                                                                 // evaluation runs before the value), so key-coercion
+                                                                 // side effects precede the value and never re-run.
+                        self.emit(Op::ToPropertyKey);
                     } else {
                         let name = property_key_name(&p.key);
                         self.load_str(&name); // [obj, key]
@@ -4311,7 +4309,8 @@ impl Compiler {
                                 A::LogicalOr => self.emit(Op::JumpIfTruthyPeek(0)),
                                 _ => self.emit(Op::JumpIfNullishPeek(0)),
                             };
-                            self.compile_expr(&a.right)?;
+                            // NamedEvaluation: `x ||= function(){}` names it "x".
+                            self.compile_named_expr(&a.right, &name)?;
                             self.store_via_base_keep(&name, t_base);
                             let end = self.here();
                             self.patch_jump(j, end);
@@ -4339,7 +4338,8 @@ impl Compiler {
                             A::LogicalOr => self.emit(Op::JumpIfTruthyPeek(0)),
                             _ => self.emit(Op::JumpIfNullishPeek(0)),
                         };
-                        self.compile_expr(&a.right)?;
+                        // NamedEvaluation: `x ||= function(){}` names it "x".
+                        self.compile_named_expr(&a.right, &name)?;
                         self.emit(Op::Dup);
                         self.store_binding_assign(&name);
                         let end = self.here();

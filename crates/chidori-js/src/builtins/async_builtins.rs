@@ -701,4 +701,70 @@ fn install_generator(vm: &mut Vm) {
     let async_iter = vm.realm.symbol_async_iterator.clone();
     let self_iter = vm.new_native("[Symbol.asyncIterator]", 0, |_vm, this, _a| Ok(this));
     vm.define_value_sym(&aproto, async_iter, Value::Object(self_iter));
+
+    // %AsyncIteratorPrototype%[@@asyncDispose] (explicit resource management):
+    // GetMethod(this, "return"); absent → resolve undefined; otherwise call it
+    // and resolve undefined (or reject) once its result settles. The shared
+    // iterator prototype doubles as %AsyncIteratorPrototype% in this realm.
+    let dispose = vm.new_native("[Symbol.asyncDispose]", 0, |vm, this, _a| {
+        let promise = vm.new_promise();
+        let (resolve, reject) = make_resolving_functions(vm, &promise);
+        let outcome = (|| -> Result<Option<Value>, Value> {
+            let ret = vm.get_prop(&this, &PropertyKey::str("return"))?;
+            if ret.is_nullish() {
+                return Ok(None);
+            }
+            if !vm.is_callable(&ret) {
+                return Err(vm.throw_type("iterator return is not a function"));
+            }
+            Ok(Some(vm.call(ret, this.clone(), &[])?))
+        })();
+        match outcome {
+            Err(e) => {
+                vm.call(reject, Value::Undefined, &[e])?;
+            }
+            Ok(None) => {
+                vm.call(resolve, Value::Undefined, &[Value::Undefined])?;
+            }
+            Ok(Some(result)) => {
+                let target = vm.promise_resolve(result);
+                let res2 = resolve.clone();
+                let on_f = vm.new_native("", 1, move |vm, _t, _a| {
+                    vm.call(res2.clone(), Value::Undefined, &[Value::Undefined])?;
+                    Ok(Value::Undefined)
+                });
+                let rej2 = reject.clone();
+                let on_r = vm.new_native("", 1, move |vm, _t, a| {
+                    let e = a.first().cloned().unwrap_or(Value::Undefined);
+                    vm.call(rej2.clone(), Value::Undefined, &[e])?;
+                    Ok(Value::Undefined)
+                });
+                vm.promise_then(&target, Value::Object(on_f), Value::Object(on_r));
+            }
+        }
+        Ok(Value::Object(promise))
+    });
+    let async_dispose = vm.realm.symbol_async_dispose.clone();
+    let base_iter_proto = vm.realm.iterator_proto.clone();
+    vm.define_value_sym(&base_iter_proto, async_dispose, Value::Object(dispose));
+
+    // %AsyncIteratorPrototype%[@@asyncIterator]() { return this }.
+    let async_iter2 = vm.realm.symbol_async_iterator.clone();
+    let self_iter2 = vm.new_native("[Symbol.asyncIterator]", 0, |_vm, this, _a| Ok(this));
+    vm.define_value_sym(&base_iter_proto, async_iter2, Value::Object(self_iter2));
+
+    // %IteratorPrototype%[@@dispose]: GetMethod(this, "return"); call it when
+    // present; the result is discarded (return undefined).
+    let sync_dispose = vm.new_native("[Symbol.dispose]", 0, |vm, this, _a| {
+        let ret = vm.get_prop(&this, &PropertyKey::str("return"))?;
+        if !ret.is_nullish() {
+            if !vm.is_callable(&ret) {
+                return Err(vm.throw_type("iterator return is not a function"));
+            }
+            vm.call(ret, this, &[])?;
+        }
+        Ok(Value::Undefined)
+    });
+    let dispose_sym = vm.realm.symbol_dispose.clone();
+    vm.define_value_sym(&base_iter_proto, dispose_sym, Value::Object(sync_dispose));
 }

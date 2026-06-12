@@ -534,6 +534,14 @@ fn install_math(vm: &mut Vm) {
             n as f32 as f64
         }
     });
+    // Math.f16round (ES2025): round to IEEE-754 binary16 and widen back.
+    unary!("f16round", |n: f64| {
+        if n.is_nan() {
+            f64::NAN
+        } else {
+            super::typedarray::f16_to_f64(super::typedarray::f16_from_f64(n))
+        }
+    });
     unary!("clz32", |n: f64| {
         let u = crate::vm::to_uint32(n);
         u.leading_zeros() as f64
@@ -621,6 +629,81 @@ fn install_math(vm: &mut Vm) {
             .wrapping_add(1442695040888963407);
         let bits = (vm.rng_state >> 11) as f64;
         Ok(Value::Number(bits / (1u64 << 53) as f64))
+    });
+
+    // Math.sumPrecise(iterable) (ES2026 proposal): the exactly-rounded sum of
+    // an iterable of Numbers (Shewchuk's non-overlapping partials). The empty
+    // sum is -0; any non-Number element is a TypeError that closes the
+    // iterator; mixed infinities (or any NaN) give NaN.
+    vm.define_method(&math, "sumPrecise", 1, |vm, _t, args| {
+        let iterable = arg(args, 0);
+        if iterable.is_nullish() {
+            return Err(vm.throw_type("Math.sumPrecise requires an iterable"));
+        }
+        let it = vm.get_iterator(&iterable)?;
+        let mut partials: Vec<f64> = Vec::new();
+        let mut all_minus_zero = true;
+        let mut nan = false;
+        let mut pos_inf = false;
+        let mut neg_inf = false;
+        loop {
+            let v = match vm.iterator_step(&it)? {
+                Some(v) => v,
+                None => break,
+            };
+            let n = match v {
+                Value::Number(n) => n,
+                _ => {
+                    let _ = vm.iterator_close(&it);
+                    return Err(vm.throw_type("Math.sumPrecise: every value must be a Number"));
+                }
+            };
+            vm.native_tick()?;
+            all_minus_zero = all_minus_zero && n == 0.0 && n.is_sign_negative();
+            if n.is_nan() {
+                nan = true;
+                continue;
+            }
+            if n == f64::INFINITY {
+                pos_inf = true;
+                continue;
+            }
+            if n == f64::NEG_INFINITY {
+                neg_inf = true;
+                continue;
+            }
+            // Two-sum accumulation into non-overlapping partials.
+            let mut x = n;
+            let mut keep = 0usize;
+            for j in 0..partials.len() {
+                let mut y = partials[j];
+                if x.abs() < y.abs() {
+                    std::mem::swap(&mut x, &mut y);
+                }
+                let hi = x + y;
+                let lo = y - (hi - x);
+                if lo != 0.0 {
+                    partials[keep] = lo;
+                    keep += 1;
+                }
+                x = hi;
+            }
+            partials.truncate(keep);
+            partials.push(x);
+        }
+        if nan || (pos_inf && neg_inf) {
+            return Ok(Value::Number(f64::NAN));
+        }
+        if pos_inf {
+            return Ok(Value::Number(f64::INFINITY));
+        }
+        if neg_inf {
+            return Ok(Value::Number(f64::NEG_INFINITY));
+        }
+        if partials.is_empty() {
+            return Ok(Value::Number(if all_minus_zero { -0.0 } else { 0.0 }));
+        }
+        Ok(Value::Number(partials.iter().sum()))
     });
 
     // Math[Symbol.toStringTag] = "Math" (non-writable, non-enumerable, configurable).
@@ -883,33 +966,55 @@ fn json_indent(vm: &mut Vm, v: &Value) -> Result<String, Value> {
     })
 }
 
+/// Spec `InternalizeJSONProperty`: walk via Get / [[Delete]] /
+/// CreateDataProperty — proxy traps fire and their abrupt completions
+/// propagate; a CreateDataProperty/Delete that merely FAILS is ignored.
 fn json_revive(vm: &mut Vm, holder: &JsObject, key: &str, reviver: &Value) -> Result<Value, Value> {
     let val = vm.get_prop(&Value::Object(holder.clone()), &PropertyKey::str(key))?;
     if let Value::Object(o) = &val {
-        let is_array = matches!(o.borrow().internal, Internal::Array(_));
+        // IsArray pierces proxies (a revoked proxy is a TypeError).
+        let is_array = super::fundamental::is_array_exotic(vm, o)?;
         if is_array {
-            let len = if let Internal::Array(a) = &o.borrow().internal {
-                a.len()
-            } else {
-                0
-            };
+            let len_v = vm.get_prop(&val, &PropertyKey::str("length"))?;
+            let len = vm.to_length(&len_v)?;
             for i in 0..len {
                 let k = i.to_string();
+                let pk = PropertyKey::str(&k);
                 let new = json_revive(vm, o, &k, reviver)?;
                 if new.is_undefined() {
-                    vm.set_prop(&val, &PropertyKey::from_index(i as u32), Value::Undefined)?;
+                    vm.delete_prop(&val, &pk)?;
                 } else {
-                    vm.set_prop(&val, &PropertyKey::from_index(i as u32), new)?;
+                    json_create_data(vm, o, &pk, new)?;
                 }
             }
         } else {
-            let keys = vm.enumerable_own_string_keys(o);
+            // EnumerableOwnPropertyNames: the proxy ownKeys /
+            // getOwnPropertyDescriptor traps are consulted (and may throw).
+            let keys: Vec<JsString> = if vm.is_proxy(o) {
+                let mut out = Vec::new();
+                for k in vm.own_property_keys(o)? {
+                    if let PropertyKey::Str(s) = k {
+                        let pk = PropertyKey::Str(s.clone());
+                        let desc = vm.proxy_get_own_descriptor(o, &pk)?;
+                        if matches!(&desc, Value::Object(_)) {
+                            let e = vm.get_prop(&desc, &PropertyKey::str("enumerable"))?;
+                            if vm.to_boolean(&e) {
+                                out.push(s);
+                            }
+                        }
+                    }
+                }
+                out
+            } else {
+                vm.enumerable_own_string_keys(o)
+            };
             for k in keys {
+                let pk = PropertyKey::Str(k.clone());
                 let new = json_revive(vm, o, k.as_str(), reviver)?;
                 if new.is_undefined() {
-                    o.borrow_mut().props.shift_remove(&PropertyKey::Str(k));
+                    vm.delete_prop(&val, &pk)?;
                 } else {
-                    vm.set_prop(&val, &PropertyKey::Str(k), new)?;
+                    json_create_data(vm, o, &pk, new)?;
                 }
             }
         }
@@ -919,6 +1024,24 @@ fn json_revive(vm: &mut Vm, holder: &JsObject, key: &str, reviver: &Value) -> Re
         Value::Object(holder.clone()),
         &[Value::str(key), val],
     )
+}
+
+/// `CreateDataProperty(o, key, v)` for the reviver walk: a definition that
+/// returns false is ignored; an abrupt completion propagates.
+fn json_create_data(vm: &mut Vm, o: &JsObject, key: &PropertyKey, v: Value) -> Result<(), Value> {
+    let desc = vm.new_object();
+    let dv = Value::Object(desc);
+    vm.set_prop(&dv, &PropertyKey::str("value"), v)?;
+    for f in ["writable", "enumerable", "configurable"] {
+        vm.set_prop(&dv, &PropertyKey::str(f), Value::Bool(true))?;
+    }
+    if vm.is_proxy(o) {
+        let _ = vm.proxy_define_property(o, key, dv)?;
+    } else {
+        let d = super::fundamental::to_property_descriptor(vm, &dv)?;
+        let _ = super::fundamental::define_own_property(vm, o, key, &d, false)?;
+    }
+    Ok(())
 }
 
 struct JsonParser<'a> {

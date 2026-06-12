@@ -1544,11 +1544,11 @@ fn install_iterator_protos(vm: &mut Vm) {
     let self_iter = vm.new_native("[Symbol.iterator]", 0, |_vm, this, _a| Ok(this));
     vm.define_value_sym(&base, sym, Value::Object(self_iter));
 
-    for proto in [
-        vm.realm.array_iterator_proto.clone(),
-        vm.realm.string_iterator_proto.clone(),
-        vm.realm.map_iterator_proto.clone(),
-        vm.realm.set_iterator_proto.clone(),
+    for (proto, tag) in [
+        (vm.realm.array_iterator_proto.clone(), "Array Iterator"),
+        (vm.realm.string_iterator_proto.clone(), "String Iterator"),
+        (vm.realm.map_iterator_proto.clone(), "Map Iterator"),
+        (vm.realm.set_iterator_proto.clone(), "Set Iterator"),
     ] {
         vm.define_method(&proto, "next", 0, |vm, this, _args| {
             let o = match &this {
@@ -1557,5 +1557,19 @@ fn install_iterator_protos(vm: &mut Vm) {
             };
             vm.builtin_iterator_next(&o)
         });
+        // %XIteratorPrototype%[@@toStringTag] — non-writable, non-enumerable,
+        // configurable.
+        let sym = vm.realm.symbol_to_string_tag.clone();
+        proto.borrow_mut().props.insert(
+            PropertyKey::Sym(sym),
+            Property {
+                kind: PropertyKind::Data {
+                    value: Value::str(tag),
+                    writable: false,
+                },
+                enumerable: false,
+                configurable: true,
+            },
+        );
     }
 }

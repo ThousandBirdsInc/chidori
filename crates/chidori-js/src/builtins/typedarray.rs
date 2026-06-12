@@ -2237,7 +2237,7 @@ fn read_dv(bytes: &[u8], off: usize, kind: DvKind, little_endian: bool) -> f64 {
 }
 
 /// Decode IEEE-754 binary16 (half precision) to an `f64`.
-fn f16_to_f64(h: u16) -> f64 {
+pub(crate) fn f16_to_f64(h: u16) -> f64 {
     let sign = if (h >> 15) & 1 == 1 { -1.0 } else { 1.0 };
     let exp = ((h >> 10) & 0x1f) as i32;
     let mant = (h & 0x3ff) as f64;
@@ -2255,7 +2255,7 @@ fn f16_to_f64(h: u16) -> f64 {
 }
 
 /// Encode an `f64` to IEEE-754 binary16 bits, rounding to nearest, ties to even.
-fn f16_from_f64(value: f64) -> u16 {
+pub(crate) fn f16_from_f64(value: f64) -> u16 {
     if value.is_nan() {
         return 0x7e00;
     }
