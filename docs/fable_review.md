@@ -169,11 +169,13 @@ contract, skipped honestly in the runner): `Intl`, `Temporal`,
   (`Node` is the durable default so the VFS is reachable). **No dynamic
   imports (by policy), no npm packages, no JSX/TSX.** Node package
   compatibility is an explicit v1 non-goal (`DESIGN.md`).
-- The `node:` builtin allowlist covers 8 modules
-  (`src/runtime/typescript/transpile.rs`): `process`, `buffer`, `util`,
-  `fs`, `fs/promises`, `crypto`, `http`, `https`. Missing staples include
-  `path`, `os`, `events`, `stream`, `url`, `assert`, `zlib`,
-  `child_process`. Agents that look "node-like" hit this wall quickly.
+- The `node:` builtin allowlist (`src/runtime/typescript/transpile.rs`)
+  covers `process`, `buffer`, `util`, `fs`, `fs/promises`, `crypto`,
+  `http`, `https`, plus (added 2026-06-12) `path` (and `path/posix`),
+  `events`, `url`, `assert` (and `assert/strict`), and `os` (fixed
+  virtualized constants, in the same spirit as `process.platform`).
+  Missing staples now: `stream`, `zlib`, `child_process`. The "node-like
+  agents hit this wall quickly" complaint is substantially blunted.
 - `node:fs` is backed by an in-memory, snapshot-resident VFS — agents cannot
   read the host filesystem (deliberate confinement; there is no opt-in host
   FS access either — `FsPolicy::Host` is rejected in durable runs).
@@ -359,8 +361,10 @@ The original items, for the record:
    QuickJS-path comments in `src/runtime/engine.rs` are corrected.
 7. Longer-term, as adoption demands: per-VM memory accounting, value
    checkpointing for long journals (P6), a broader `node:` allowlist
-   (`path`, `events`, `url` are cheap wins), more native providers or
-   first-class embeddings, and a queryable storage schema.
+   (~~`path`, `events`, `url` are cheap wins~~ — done 2026-06-12, along
+   with `assert` and a virtualized `os`; `stream`/`zlib` remain), more
+   native providers or first-class embeddings, and a queryable storage
+   schema.
 
 ---
 
