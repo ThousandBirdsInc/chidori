@@ -1537,10 +1537,14 @@ impl Compiler {
                 Statement::VariableDeclaration(d)
                     if matches!(
                         d.kind,
-                        VariableDeclarationKind::Let | VariableDeclarationKind::Const
+                        VariableDeclarationKind::Let
+                            | VariableDeclarationKind::Const
+                            | VariableDeclarationKind::Using
+                            | VariableDeclarationKind::AwaitUsing
                     ) =>
                 {
-                    let is_const = matches!(d.kind, VariableDeclarationKind::Const);
+                    // `using` bindings are const-like: reassignment TypeErrors.
+                    let is_const = !matches!(d.kind, VariableDeclarationKind::Let);
                     for decl in &d.declarations {
                         if let BindingPattern::BindingIdentifier(id) = &decl.id {
                             if self.current_scope_cell(id.name.as_str()).is_none() {
@@ -1829,7 +1833,27 @@ impl Compiler {
             Statement::IfStatement(i) => self.compile_if(i)?,
             Statement::WhileStatement(w) => self.compile_while(w)?,
             Statement::DoWhileStatement(w) => self.compile_do_while(w)?,
-            Statement::ForStatement(f) => self.compile_for(f)?,
+            Statement::ForStatement(f) => {
+                // `for (using x = ...; ;)`: the dispose capability spans the
+                // whole statement (disposed when the loop completes/aborts).
+                let head_using = matches!(
+                    &f.init,
+                    Some(ForStatementInit::VariableDeclaration(d)) if matches!(
+                        d.kind,
+                        VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing
+                    )
+                );
+                if head_using {
+                    let pad_async = matches!(
+                        &f.init,
+                        Some(ForStatementInit::VariableDeclaration(d))
+                            if matches!(d.kind, VariableDeclarationKind::AwaitUsing)
+                    );
+                    self.compile_with_dispose_scope(pad_async, |c| c.compile_for(f))?;
+                } else {
+                    self.compile_for(f)?;
+                }
+            }
             Statement::ForInStatement(f) => self.compile_for_in(f)?,
             Statement::ForOfStatement(f) => self.compile_for_of(f)?,
             Statement::ReturnStatement(_) if self.cur_ref().is_eval_body => {
@@ -1885,18 +1909,132 @@ impl Compiler {
 
     fn compile_block(&mut self, body: &[Statement]) -> R {
         self.enter_scope(false);
-        self.hoist_lexical(body);
-        self.hoist_funcs(body)?;
-        for s in body {
-            self.compile_stmt(s)?;
+        if Self::stmts_have_using(body) {
+            self.compile_with_dispose_scope(Self::stmts_have_await_using(body), |c| {
+                c.hoist_lexical(body);
+                c.hoist_funcs(body)?;
+                for s in body {
+                    c.compile_stmt(s)?;
+                }
+                Ok(())
+            })?;
+        } else {
+            self.hoist_lexical(body);
+            self.hoist_funcs(body)?;
+            for s in body {
+                self.compile_stmt(s)?;
+            }
         }
         self.exit_scope();
         Ok(())
     }
 
+    /// Whether any DIRECT statement is a `using` / `await using` declaration
+    /// (nested blocks manage their own dispose scopes).
+    fn stmts_have_using(stmts: &[Statement]) -> bool {
+        stmts.iter().any(|s| {
+            matches!(
+                s,
+                Statement::VariableDeclaration(d) if matches!(
+                    d.kind,
+                    VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing
+                )
+            )
+        })
+    }
+
+    /// Whether any DIRECT statement is an `await using` declaration — its
+    /// dispose landing pad must Await each disposal.
+    fn stmts_have_await_using(stmts: &[Statement]) -> bool {
+        stmts.iter().any(|s| {
+            matches!(
+                s,
+                Statement::VariableDeclaration(d)
+                    if matches!(d.kind, VariableDeclarationKind::AwaitUsing)
+            )
+        })
+    }
+
+    /// Compile `f`'s statements inside a `using` dispose capability: a
+    /// finally-style region whose landing pad runs DisposeResources, so EVERY
+    /// exit — normal fall-through, throw, return, break/continue — disposes
+    /// the scope's resources (in reverse), merging dispose errors into the
+    /// in-flight completion (SuppressedError chaining). An `is_async` pad
+    /// (any `await using` present) Awaits each disposal result, merging
+    /// rejections the same way.
+    fn compile_with_dispose_scope(&mut self, is_async: bool, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.emit(Op::PushDisposeScope);
+        let push = self.emit(Op::PushTryHandler {
+            catch: u32::MAX,
+            finally: u32::MAX,
+        });
+        self.cur().handler_depth += 1;
+        self.cur().finally_depth += 1;
+        f(self)?;
+        self.emit(Op::PopTryHandler);
+        self.cur().handler_depth -= 1;
+        self.cur().finally_depth -= 1;
+        let normal = self.emit(Op::Jump(0));
+        let fin = self.here();
+        self.patch_finally(push, fin);
+        self.patch_jump(normal, fin);
+        if is_async {
+            // The try handler is (re)installed at EMPTY stack depth each
+            // iteration, so an Await rejection truncates to a clean base
+            // before pushing the error:
+            //   top:  PushTryHandler{catch}
+            //         DisposeAsyncNext           [result, more]
+            //         JumpIfFalse done           [result]
+            //         Await; Pop                 []
+            //         PopTryHandler; Jump top
+            //   done: Pop; PopTryHandler; EndFinally   ([result] dropped)
+            //   catch:                           [error]
+            //         MergeDisposeError; Jump top
+            let top = self.here();
+            let inner = self.emit(Op::PushTryHandler {
+                catch: 0,
+                finally: u32::MAX,
+            });
+            self.emit(Op::DisposeAsyncNext);
+            let jdone = self.emit(Op::JumpIfFalse(0));
+            self.emit(Op::Await);
+            self.emit(Op::Pop);
+            self.emit(Op::PopTryHandler);
+            let back = self.emit(Op::Jump(0));
+            let catch_ip = self.here();
+            self.patch_jump(inner, catch_ip);
+            self.emit(Op::MergeDisposeError);
+            let back2 = self.emit(Op::Jump(0));
+            let done = self.here();
+            self.patch_jump(jdone, done);
+            self.patch_jump(back, top);
+            self.patch_jump(back2, top);
+            self.emit(Op::Pop); // drop the exhausted step's undefined result
+            self.emit(Op::PopTryHandler);
+        } else {
+            self.emit(Op::DisposeScope);
+        }
+        self.emit(Op::EndFinally);
+        Ok(())
+    }
+
     fn compile_var_decl(&mut self, d: &VariableDeclaration) -> R {
         let function_scoped = matches!(d.kind, VariableDeclarationKind::Var);
-        let is_const = matches!(d.kind, VariableDeclarationKind::Const);
+        let is_const = matches!(
+            d.kind,
+            VariableDeclarationKind::Const
+                | VariableDeclarationKind::Using
+                | VariableDeclarationKind::AwaitUsing
+        );
+        // `using x = v` / `await using x = v`: after the initializer
+        // evaluates, AddDisposableResource records it (and resolves its
+        // dispose method — a TypeError here leaves the binding in TDZ)
+        // BEFORE the binding initializes.
+        let track_using = match d.kind {
+            VariableDeclarationKind::Using => Some(false),
+            VariableDeclarationKind::AwaitUsing => Some(true),
+            _ => None,
+        };
         // Sloppy direct-eval body: a simple `var name = init` is an assignment
         // to the caller-scope binding (dynamic name store; the binding was
         // pre-created by EvalDeclarationInstantiation or is a visible one).
@@ -1955,6 +2093,9 @@ impl Compiler {
                 };
                 if let Some(init) = &decl.init {
                     self.compile_named_expr(init, name)?;
+                    if let Some(is_await) = track_using {
+                        self.emit(Op::TrackDisposable { is_await });
+                    }
                     // The declaration's own initialization is allowed even for
                     // `const`; store directly into the cell (clearing any TDZ).
                     // Inside a `with`, a *var* initializer is an ordinary
@@ -2455,8 +2596,27 @@ impl Compiler {
         let value_k = self.str_const("value");
         self.emit(Op::GetProp(value_k)); // [value]
         self.enter_scope(false);
-        self.bind_for_target(&f.left)?; // consumes value
-        self.compile_stmt(&f.body)?;
+        // `for (using x of …)`: a fresh dispose capability per ITERATION —
+        // the resource is recorded before the binding initializes and
+        // disposed when the iteration ends (normally or abruptly).
+        let head_using_kind = match &f.left {
+            ForStatementLeft::VariableDeclaration(d) => match d.kind {
+                VariableDeclarationKind::Using => Some(false),
+                VariableDeclarationKind::AwaitUsing => Some(true),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(is_await) = head_using_kind {
+            self.compile_with_dispose_scope(is_await, |c| {
+                c.emit(Op::TrackDisposable { is_await });
+                c.bind_for_target(&f.left)?; // consumes value
+                c.compile_stmt(&f.body)
+            })?;
+        } else {
+            self.bind_for_target(&f.left)?; // consumes value
+            self.compile_stmt(&f.body)?;
+        }
         self.exit_scope();
         self.emit(Op::Jump(top));
 
@@ -2489,8 +2649,16 @@ impl Compiler {
         match left {
             ForStatementLeft::VariableDeclaration(d) => {
                 let function_scoped = matches!(d.kind, VariableDeclarationKind::Var);
+                // `const`/`using` loop bindings are immutable: assignment in
+                // the body is a TypeError.
+                let is_const = matches!(
+                    d.kind,
+                    VariableDeclarationKind::Const
+                        | VariableDeclarationKind::Using
+                        | VariableDeclarationKind::AwaitUsing
+                );
                 let decl = &d.declarations[0];
-                self.bind_pattern(&decl.id, function_scoped)?;
+                self.bind_pattern_kind(&decl.id, function_scoped, is_const)?;
             }
             _ => {
                 // assignment target (existing binding / member)
@@ -4881,14 +5049,32 @@ impl Compiler {
             self.compile_expr(ret)?;
             self.emit(Op::Return);
         } else if let Some(b) = body {
-            self.hoist_lexical(&b.statements);
-            self.hoist_vars_all(&b.statements);
-            self.hoist_funcs(&b.statements)?;
-            for s in &b.statements {
-                self.compile_stmt(s)?;
+            if Self::stmts_have_using(&b.statements) {
+                // A `using` at function-body top level disposes when the BODY
+                // exits (return/throw/fall-through all route through the
+                // dispose landing pad).
+                let pad_async = Self::stmts_have_await_using(&b.statements);
+                self.compile_with_dispose_scope(pad_async, |c| {
+                    c.hoist_lexical(&b.statements);
+                    c.hoist_vars_all(&b.statements);
+                    c.hoist_funcs(&b.statements)?;
+                    for s in &b.statements {
+                        c.compile_stmt(s)?;
+                    }
+                    c.emit(Op::LoadUndefined);
+                    c.emit(Op::Return);
+                    Ok(())
+                })?;
+            } else {
+                self.hoist_lexical(&b.statements);
+                self.hoist_vars_all(&b.statements);
+                self.hoist_funcs(&b.statements)?;
+                for s in &b.statements {
+                    self.compile_stmt(s)?;
+                }
+                self.emit(Op::LoadUndefined);
+                self.emit(Op::Return);
             }
-            self.emit(Op::LoadUndefined);
-            self.emit(Op::Return);
         } else {
             self.emit(Op::LoadUndefined);
             self.emit(Op::Return);

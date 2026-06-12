@@ -586,6 +586,30 @@ pub enum Op {
     /// `[obj, v] -> [obj]`: object-literal `__proto__: v` — set obj's
     /// [[Prototype]] to v when v is an Object or null; ignore otherwise.
     SetProtoFromLiteral,
+    /// Open a `using` dispose capability for the entering block/body.
+    PushDisposeScope,
+    /// `[v] -> [v]` (peek): AddDisposableResource — record `v` and its
+    /// dispose method (`@@dispose`; for `await using`, `@@asyncDispose`
+    /// falling back to `@@dispose`) in the innermost dispose scope.
+    /// Nullish `v` records nothing; a non-object or a missing/uncallable
+    /// method is a TypeError (thrown BEFORE the binding initializes).
+    TrackDisposable {
+        is_await: bool,
+    },
+    /// DisposeResources: pop the innermost dispose scope and call each
+    /// method (reverse order). Runs on a finally landing pad with the
+    /// in-flight completion parked: a dispose error converts the parked
+    /// completion to a throw, chaining prior throws via SuppressedError.
+    DisposeScope,
+    /// Async DisposeResources step: take the TOP resource off the innermost
+    /// dispose scope and call its method (a call error merges like
+    /// [`Op::DisposeScope`]); pushes `[result, more]` — when the scope is
+    /// exhausted it is popped and `[undefined, false]` is pushed. The
+    /// compiled landing pad Awaits `result` between steps (`await using`).
+    DisposeAsyncNext,
+    /// `[error] -> []`: merge an awaited dispose rejection into the parked
+    /// completion (same chaining as [`Op::DisposeScope`]).
+    MergeDisposeError,
     /// no-op / line marker
     Nop,
     /// Create the `arguments` object from current frame.

@@ -252,6 +252,25 @@ impl Vm {
         Value::Object(o)
     }
 
+    /// Build a SuppressedError(error, suppressed) for DisposeResources'
+    /// error-chaining; falls back to `error` if the intrinsic is unusable.
+    fn make_suppressed_error(&mut self, error: Value, suppressed: Value) -> Value {
+        let g = Value::Object(self.realm.global.clone());
+        if let Ok(ctor) = self.get_prop(&g, &PropertyKey::str("SuppressedError")) {
+            if self.is_constructor(&ctor) {
+                let args = [
+                    error.clone(),
+                    suppressed,
+                    Value::str("An error was suppressed during disposal"),
+                ];
+                if let Ok(se) = self.construct(&ctor, &args, &ctor.clone()) {
+                    return se;
+                }
+            }
+        }
+        error
+    }
+
     pub fn make_frame(
         &self,
         bf: BytecodeFunction,
@@ -281,6 +300,7 @@ impl Vm {
             pending_return: None,
             args: args.to_vec(),
             func_obj: None,
+            dispose_scopes: Vec::new(),
             completion: Value::Undefined,
             enumerators: Vec::new(),
             with_scope,
@@ -1456,6 +1476,125 @@ impl Vm {
                         _ => {}
                     }
                 }
+            }
+            Op::PushDisposeScope => {
+                frame.dispose_scopes.push(Vec::new());
+            }
+            Op::TrackDisposable { is_await } => {
+                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                if matches!(v, Value::Null | Value::Undefined) {
+                    // `await using x = null` still records an entry (method
+                    // undefined) so disposal performs its Await tick; sync
+                    // `using` records nothing.
+                    if is_await {
+                        if let Some(scope) = frame.dispose_scopes.last_mut() {
+                            scope.push((Value::Undefined, Value::Undefined));
+                        }
+                    }
+                } else {
+                    if !matches!(v, Value::Object(_)) {
+                        return Err(self.throw_type(
+                            "'using' declarations may only be used with object, null, or undefined values",
+                        ));
+                    }
+                    // GetDisposeMethod: @@asyncDispose (await using, falling
+                    // back to @@dispose) or @@dispose. A nullish property is
+                    // "no method"; a non-callable one is a TypeError.
+                    let get_method =
+                        |vm: &mut Self, sym: &JsSymbol| -> Result<Option<Value>, Value> {
+                            let m = vm.get_prop(&v, &PropertyKey::Sym(sym.clone()))?;
+                            if m.is_nullish() {
+                                return Ok(None);
+                            }
+                            if !vm.is_callable(&m) {
+                                return Err(vm.throw_type("dispose method is not a function"));
+                            }
+                            Ok(Some(m))
+                        };
+                    let method = if is_await {
+                        let asym = self.realm.symbol_async_dispose.clone();
+                        match get_method(self, &asym)? {
+                            Some(m) => Some(m),
+                            None => {
+                                let dsym = self.realm.symbol_dispose.clone();
+                                get_method(self, &dsym)?
+                            }
+                        }
+                    } else {
+                        let dsym = self.realm.symbol_dispose.clone();
+                        get_method(self, &dsym)?
+                    };
+                    let method = method.ok_or_else(|| {
+                        self.throw_type(
+                            "The value being disposed does not have a [Symbol.dispose] method",
+                        )
+                    })?;
+                    match frame.dispose_scopes.last_mut() {
+                        Some(scope) => scope.push((v, method)),
+                        None => {
+                            return Err(self.throw_type("internal: 'using' outside a dispose scope"))
+                        }
+                    }
+                }
+            }
+            Op::DisposeScope => {
+                // DisposeResources: reverse order; each error converts the
+                // parked completion to a throw — chaining an already-thrown
+                // completion via SuppressedError(error, suppressed).
+                let resources = frame.dispose_scopes.pop().unwrap_or_default();
+                for (value, method) in resources.into_iter().rev() {
+                    if let Err(e) = self.call(method, value, &[]) {
+                        let merged = match frame.pending_completion.take() {
+                            Some(Completion::Throw(prev)) => self.make_suppressed_error(e, prev),
+                            _ => e,
+                        };
+                        frame.pending_completion = Some(Completion::Throw(merged));
+                    }
+                }
+            }
+            Op::DisposeAsyncNext => {
+                let entry = frame.dispose_scopes.last_mut().and_then(|s| s.pop());
+                match entry {
+                    Some((value, method)) => {
+                        let result = if matches!(method, Value::Undefined) {
+                            // Nullish `await using`: nothing to call, but the
+                            // landing pad still Awaits undefined.
+                            Ok(Value::Undefined)
+                        } else {
+                            self.call(method, value, &[])
+                        };
+                        match result {
+                            Ok(r) => {
+                                push!(r);
+                                push!(Value::Bool(true));
+                            }
+                            Err(e) => {
+                                let merged = match frame.pending_completion.take() {
+                                    Some(Completion::Throw(prev)) => {
+                                        self.make_suppressed_error(e, prev)
+                                    }
+                                    _ => e,
+                                };
+                                frame.pending_completion = Some(Completion::Throw(merged));
+                                push!(Value::Undefined);
+                                push!(Value::Bool(true));
+                            }
+                        }
+                    }
+                    None => {
+                        frame.dispose_scopes.pop();
+                        push!(Value::Undefined);
+                        push!(Value::Bool(false));
+                    }
+                }
+            }
+            Op::MergeDisposeError => {
+                let e = pop!();
+                let merged = match frame.pending_completion.take() {
+                    Some(Completion::Throw(prev)) => self.make_suppressed_error(e, prev),
+                    _ => e,
+                };
+                frame.pending_completion = Some(Completion::Throw(merged));
             }
             Op::ClassLinkSuper => {
                 let sup = pop!();
