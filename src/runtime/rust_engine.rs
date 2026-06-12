@@ -1094,4 +1094,238 @@ mod tests {
             JsRunState::Completed
         ));
     }
+
+    /// Run a pure-compute agent (no host effects) through the full engine path
+    /// (transpile + module graph + `node:` shims) and return its completed value.
+    fn run_compute_agent(name: &str, source: &str) -> serde_json::Value {
+        let ctx = RuntimeContext::new();
+        let dir =
+            std::env::temp_dir().join(format!("chidori-rust-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(&path, source).unwrap();
+        let tools = Arc::new(ToolRegistry::new());
+        let backend = test_backend(ctx, tools);
+        let output = run_agent(&path, source, &serde_json::json!({}), &backend)
+            .unwrap_or_else(|e| panic!("{name} agent errored: {e:?}"));
+        let _ = std::fs::remove_dir_all(dir);
+        output
+    }
+
+    #[test]
+    fn run_agent_node_path_posix_surface() {
+        // Covers the default + named import forms and the `path.posix`
+        // self-alias. (Only the `node:`-prefixed specifier is accepted; bare
+        // builtin specifiers are not — the resolver treats a bare `path` as a
+        // package lookup, matching the other shims.)
+        let out = run_compute_agent(
+            "node-path",
+            r#"
+            import path from "node:path";
+            import { join, basename } from "node:path";
+            export async function agent() {
+                return {
+                    join: path.join("/a", "b", "..", "c.txt"),
+                    resolve: path.resolve("/a/b", "../c"),
+                    dirname: path.dirname("/a/b/c.txt"),
+                    basename: basename("/a/b/c.txt", ".txt"),
+                    extname: path.extname("index.test.ts"),
+                    normalize: path.normalize("/a/./b/../c/"),
+                    isAbsolute: path.isAbsolute("/x"),
+                    notAbsolute: path.isAbsolute("x/y"),
+                    relative: path.relative("/a/b/c", "/a/b/d/e"),
+                    parsed: path.parse("/a/b/c.txt"),
+                    format: path.format({ dir: "/a/b", name: "c", ext: ".txt" }),
+                    sep: path.sep,
+                    delimiter: path.delimiter,
+                    posixIsSelf: path.posix === path.posix.posix,
+                    namedJoin: join("a", "b"),
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["join"], serde_json::json!("/a/c.txt"));
+        assert_eq!(out["resolve"], serde_json::json!("/a/c"));
+        assert_eq!(out["dirname"], serde_json::json!("/a/b"));
+        assert_eq!(out["basename"], serde_json::json!("c"));
+        assert_eq!(out["extname"], serde_json::json!(".ts"));
+        assert_eq!(out["normalize"], serde_json::json!("/a/c/"));
+        assert_eq!(out["isAbsolute"], serde_json::json!(true));
+        assert_eq!(out["notAbsolute"], serde_json::json!(false));
+        assert_eq!(out["relative"], serde_json::json!("../d/e"));
+        assert_eq!(out["parsed"]["base"], serde_json::json!("c.txt"));
+        assert_eq!(out["parsed"]["ext"], serde_json::json!(".txt"));
+        assert_eq!(out["parsed"]["name"], serde_json::json!("c"));
+        assert_eq!(out["parsed"]["dir"], serde_json::json!("/a/b"));
+        assert_eq!(out["format"], serde_json::json!("/a/b/c.txt"));
+        assert_eq!(out["sep"], serde_json::json!("/"));
+        assert_eq!(out["delimiter"], serde_json::json!(":"));
+        assert_eq!(out["posixIsSelf"], serde_json::json!(true));
+        assert_eq!(out["namedJoin"], serde_json::json!("a/b"));
+    }
+
+    #[test]
+    fn run_agent_node_path_posix_subpath_reexports() {
+        // The `node:path/posix` subpath shim must re-export node:path's surface.
+        let out = run_compute_agent(
+            "node-path-posix",
+            r#"
+            import posix, { join } from "node:path/posix";
+            export async function agent() {
+                return { default: posix.join("/a", "b"), named: join("x", "y") };
+            }
+            "#,
+        );
+        assert_eq!(out["default"], serde_json::json!("/a/b"));
+        assert_eq!(out["named"], serde_json::json!("x/y"));
+    }
+
+    #[test]
+    fn run_agent_node_events_emitter_surface() {
+        let out = run_compute_agent(
+            "node-events",
+            r#"
+            import EventEmitter, { once } from "node:events";
+            export async function agent() {
+                const ee = new EventEmitter();
+                const seen = [];
+                const onData = (x) => seen.push("on:" + x);
+                ee.on("data", onData);
+                ee.once("data", (x) => seen.push("once:" + x));
+                ee.emit("data", 1);
+                ee.emit("data", 2);
+                const countBefore = ee.listenerCount("data");
+                ee.off("data", onData);
+                const countAfter = ee.listenerCount("data");
+                ee.on("other", () => {});
+                const names = ee.eventNames();
+                const p = once(ee, "ready");
+                ee.emit("ready", "go");
+                const readyArgs = await p;
+                return { seen, countBefore, countAfter, names, readyArgs };
+            }
+            "#,
+        );
+        assert_eq!(out["seen"], serde_json::json!(["on:1", "once:1", "on:2"]));
+        assert_eq!(out["countBefore"], serde_json::json!(1));
+        assert_eq!(out["countAfter"], serde_json::json!(0));
+        assert_eq!(out["names"], serde_json::json!(["other"]));
+        assert_eq!(out["readyArgs"], serde_json::json!(["go"]));
+    }
+
+    #[test]
+    fn run_agent_node_url_whatwg_surface() {
+        let out = run_compute_agent(
+            "node-url",
+            r#"
+            import { URL, URLSearchParams } from "node:url";
+            export async function agent() {
+                const u = new URL("https://user:pw@example.com:8443/p/q?a=1&b=2#frag");
+                u.searchParams.append("c", "3");
+                const rel = new URL("../sibling?x=1", "https://example.com/a/b/c");
+                const sp = new URLSearchParams("k=1&k=2&j=hello world");
+                return {
+                    protocol: u.protocol,
+                    hostname: u.hostname,
+                    port: u.port,
+                    host: u.host,
+                    pathname: u.pathname,
+                    hash: u.hash,
+                    origin: u.origin,
+                    username: u.username,
+                    getA: u.searchParams.get("a"),
+                    search: u.search,
+                    href: u.toString(),
+                    relHref: rel.toString(),
+                    spGetAll: sp.getAll("k"),
+                    spHas: sp.has("j"),
+                    spToString: sp.toString(),
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["protocol"], serde_json::json!("https:"));
+        assert_eq!(out["hostname"], serde_json::json!("example.com"));
+        assert_eq!(out["port"], serde_json::json!("8443"));
+        assert_eq!(out["host"], serde_json::json!("example.com:8443"));
+        assert_eq!(out["pathname"], serde_json::json!("/p/q"));
+        assert_eq!(out["hash"], serde_json::json!("#frag"));
+        assert_eq!(out["origin"], serde_json::json!("https://example.com:8443"));
+        assert_eq!(out["username"], serde_json::json!("user"));
+        assert_eq!(out["getA"], serde_json::json!("1"));
+        assert_eq!(out["search"], serde_json::json!("?a=1&b=2&c=3"));
+        assert_eq!(
+            out["relHref"],
+            serde_json::json!("https://example.com/a/sibling?x=1")
+        );
+        assert_eq!(out["spGetAll"], serde_json::json!(["1", "2"]));
+        assert_eq!(out["spHas"], serde_json::json!(true));
+        assert_eq!(
+            out["spToString"],
+            serde_json::json!("k=1&k=2&j=hello+world")
+        );
+    }
+
+    #[test]
+    fn run_agent_node_assert_surface() {
+        let out = run_compute_agent(
+            "node-assert",
+            r#"
+            import assert from "node:assert";
+            import strict, { strictEqual as strictEqualNamed } from "node:assert/strict";
+            export async function agent() {
+                strictEqualNamed(2, 2);
+                assert.ok(true);
+                assert.equal(1, "1");
+                assert.strictEqual(2, 2);
+                assert.notStrictEqual(2, 3);
+                assert.deepStrictEqual({ a: [1, 2], b: { c: 3 } }, { a: [1, 2], b: { c: 3 } });
+                strict.strictEqual(strict, assert.strict);
+                assert.throws(() => { throw new TypeError("boom"); }, TypeError);
+                let threwOnEqual = false;
+                try { assert.strictEqual(1, 2); } catch (e) { threwOnEqual = e.code === "ERR_ASSERTION"; }
+                let rejected = false;
+                try {
+                    await assert.rejects(Promise.reject(new Error("nope")), /nope/);
+                    rejected = true;
+                } catch { rejected = false; }
+                return { threwOnEqual, rejected, name: assert.AssertionError.name };
+            }
+            "#,
+        );
+        assert_eq!(out["threwOnEqual"], serde_json::json!(true));
+        assert_eq!(out["rejected"], serde_json::json!(true));
+        assert_eq!(out["name"], serde_json::json!("AssertionError"));
+    }
+
+    #[test]
+    fn run_agent_node_os_returns_virtualized_constants() {
+        // os values are fixed/virtualized (like process.platform) so runs and
+        // record/replay agree byte-for-byte regardless of the host machine.
+        let out = run_compute_agent(
+            "node-os",
+            r#"
+            import os from "node:os";
+            import { platform, EOL } from "node:os";
+            export async function agent() {
+                return {
+                    platform: os.platform(),
+                    namedPlatform: platform(),
+                    arch: os.arch(),
+                    eol: EOL,
+                    tmpdir: os.tmpdir(),
+                    totalmem: os.totalmem(),
+                    cpus: os.cpus().length,
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["platform"], serde_json::json!("chidori"));
+        assert_eq!(out["namedPlatform"], serde_json::json!("chidori"));
+        assert_eq!(out["arch"], serde_json::json!("wasm32"));
+        assert_eq!(out["eol"], serde_json::json!("\n"));
+        assert_eq!(out["tmpdir"], serde_json::json!("/tmp"));
+        assert_eq!(out["totalmem"], serde_json::json!(0));
+        assert_eq!(out["cpus"], serde_json::json!(0));
+    }
 }

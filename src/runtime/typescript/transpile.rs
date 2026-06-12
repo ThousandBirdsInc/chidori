@@ -63,6 +63,13 @@ pub const NODE_BUILTIN_ALLOWLIST: &[&str] = &[
     "crypto",
     "http",
     "https",
+    "path",
+    "path/posix",
+    "events",
+    "url",
+    "assert",
+    "assert/strict",
+    "os",
 ];
 
 /// Walk up from `start` looking for a `package.json` and return the directory
