@@ -1117,17 +1117,23 @@ pub fn install(vm: &mut Vm) {
             Value::String(s) => s.as_str().to_string(),
             _ => return Err(vm.throw_type("invalid hint")),
         };
-        match hint.as_str() {
-            "string" | "default" => {
-                let s = vm.get_prop(&this, &PropertyKey::str("toString"))?;
-                vm.call(s, this, &[])
+        // OrdinaryToPrimitive: try both methods in hint order, skipping a
+        // non-callable one and an object-valued result.
+        let order: [&str; 2] = match hint.as_str() {
+            "string" | "default" => ["toString", "valueOf"],
+            "number" => ["valueOf", "toString"],
+            _ => return Err(vm.throw_type("invalid hint")),
+        };
+        for name in order {
+            let method = vm.get_prop(&this, &PropertyKey::str(name))?;
+            if vm.is_callable(&method) {
+                let res = vm.call(method, this.clone(), &[])?;
+                if !matches!(res, Value::Object(_)) {
+                    return Ok(res);
+                }
             }
-            "number" => {
-                let v = vm.get_prop(&this, &PropertyKey::str("valueOf"))?;
-                vm.call(v, this, &[])
-            }
-            _ => Err(vm.throw_type("invalid hint")),
         }
+        Err(vm.throw_type("Cannot convert object to primitive value"))
     });
     {
         // Symbol.toPrimitive is non-enumerable, non-writable, configurable.

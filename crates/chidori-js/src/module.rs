@@ -148,6 +148,21 @@ impl Vm {
         for key in &order {
             self.wire_module_imports(registry, key)?;
         }
+        // Spec InitializeEnvironment step 9: every reachable module's INDIRECT
+        // export entries must resolve — not missing, not circular, not
+        // ambiguous — even when nothing imports them. A failure is a
+        // link-time SyntaxError.
+        for key in &order {
+            let rec = self.get_module(registry, key)?;
+            let exports = rec.borrow().compiled.exports.clone();
+            for e in &exports {
+                if matches!(e.kind, ExportKind::Indirect { .. }) {
+                    if let Some(name) = e.export_name.as_deref() {
+                        self.resolve_export_cell(registry, &rec, name, &mut HashSet::new())?;
+                    }
+                }
+            }
+        }
         // Phase 3: evaluate in dependency post-order.
         self.eval_modules(registry, entry_key, &mut HashSet::new())?;
         Ok(Value::Undefined)
@@ -346,6 +361,39 @@ impl Vm {
             if e.export_name.as_deref() == Some(name) {
                 match &e.kind {
                     ExportKind::Local { local_name } => {
+                        // A re-export of an IMPORTED binding resolves through
+                        // to the source module's export (spec ResolveExport
+                        // follows import entries), which also makes the
+                        // star-ambiguity identity check order-independent.
+                        let imp = module
+                            .borrow()
+                            .compiled
+                            .imports
+                            .iter()
+                            .find(|i| &i.local_name == local_name)
+                            .cloned();
+                        if let Some(imp) = imp {
+                            let through = match &imp.import_name {
+                                ImportName::Named(n) => Some(n.clone()),
+                                ImportName::Default => Some("default".to_string()),
+                                // `import * as ns` then `export {ns}`: the
+                                // namespace itself is the binding (below).
+                                ImportName::Namespace => None,
+                            };
+                            if let Some(n) = through {
+                                let dep_key = resolved
+                                    .get(&imp.module_request)
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        self.throw_syntax(&format!(
+                                            "Cannot resolve '{}'",
+                                            imp.module_request
+                                        ))
+                                    })?;
+                                let dep = self.get_module(registry, &dep_key)?;
+                                return self.resolve_export_cell(registry, &dep, &n, seen);
+                            }
+                        }
                         let idx = *module
                             .borrow()
                             .compiled
@@ -371,11 +419,27 @@ impl Vm {
                         let dep = self.get_module(registry, &dep_key)?;
                         return self.resolve_export_cell(registry, &dep, import_name, seen);
                     }
-                    ExportKind::Star { .. } => {}
+                    ExportKind::Star { module_request } => {
+                        // `export * as name from "mod"`: the export IS the
+                        // dependency's namespace object.
+                        let dep_key = resolved.get(module_request).cloned().ok_or_else(|| {
+                            self.throw_syntax(&format!("Cannot resolve '{module_request}'"))
+                        })?;
+                        let dep = self.get_module(registry, &dep_key)?;
+                        let ns = self.module_namespace(registry, &dep)?;
+                        return Ok(Rc::new(RefCell::new(ns)));
+                    }
                 }
             }
         }
-        // `export *` star re-exports.
+        // `export *` star re-exports. Two stars resolving the name to
+        // DIFFERENT bindings make it ambiguous — a SyntaxError per spec
+        // ResolveExport (the "ambiguous" resolution). "default" is NEVER
+        // provided by a star export.
+        if name == "default" {
+            return Err(self.throw_syntax("Module does not provide export 'default'"));
+        }
+        let mut star_resolution: Option<Rc<RefCell<Value>>> = None;
         for e in &exports {
             if let ExportKind::Star { module_request } = &e.kind {
                 if e.export_name.is_none() {
@@ -389,12 +453,66 @@ impl Vm {
                     }
                     let dep = self.get_module(registry, &dep_key)?;
                     if let Ok(cell) = self.resolve_export_cell(registry, &dep, name, seen) {
-                        return Ok(cell);
+                        // Two cells are the SAME binding when they are the
+                        // same Rc, or both hold the same object (namespace
+                        // re-exports mint fresh cells around one namespace).
+                        let same_binding = |a: &Rc<RefCell<Value>>, b: &Rc<RefCell<Value>>| {
+                            Rc::ptr_eq(a, b)
+                                || matches!(
+                                    (&*a.borrow(), &*b.borrow()),
+                                    (Value::Object(x), Value::Object(y)) if x.same(y)
+                                )
+                        };
+                        match &star_resolution {
+                            Some(prev) if !same_binding(prev, &cell) => {
+                                return Err(self
+                                    .throw_syntax(&format!("ambiguous star export of '{name}'")));
+                            }
+                            _ => star_resolution = Some(cell),
+                        }
                     }
                 }
             }
         }
+        if let Some(cell) = star_resolution {
+            return Ok(cell);
+        }
         Err(self.throw_syntax(&format!("Module does not provide export '{name}'")))
+    }
+
+    /// Spec `GetExportedNames`: this module's own export names plus — minus
+    /// "default" — the exported names of its `export *` dependencies,
+    /// cycle-safe. Ambiguous names stay listed here; namespace construction
+    /// drops the ones whose resolution fails.
+    fn exported_names(
+        &mut self,
+        registry: &ModuleRegistry,
+        module: &Rc<RefCell<ModuleRecord>>,
+        seen: &mut HashSet<usize>,
+    ) -> Result<Vec<String>, Value> {
+        if !seen.insert(Rc::as_ptr(module) as usize) {
+            return Ok(Vec::new());
+        }
+        let exports = module.borrow().compiled.exports.clone();
+        let resolved = module.borrow().resolved.clone();
+        let mut names: Vec<String> = Vec::new();
+        for e in &exports {
+            if let Some(n) = &e.export_name {
+                if !names.contains(n) {
+                    names.push(n.clone());
+                }
+            } else if let ExportKind::Star { module_request } = &e.kind {
+                if let Some(dep_key) = resolved.get(module_request) {
+                    let dep = self.get_module(registry, dep_key)?;
+                    for n in self.exported_names(registry, &dep, seen)? {
+                        if n != "default" && !names.contains(&n) {
+                            names.push(n);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(names)
     }
 
     /// The namespace object for a registry module by key — the value a dynamic
@@ -418,15 +536,17 @@ impl Vm {
         if let Some(ns) = &module.borrow().namespace {
             return Ok(ns.clone());
         }
-        let mut names: Vec<String> = Vec::new();
-        let exports = module.borrow().compiled.exports.clone();
-        for e in &exports {
-            if let Some(n) = &e.export_name {
-                if !matches!(e.kind, ExportKind::Star { .. }) && !names.contains(n) {
-                    names.push(n.clone());
-                }
-            }
-        }
+        // Publish an EMPTY namespace object before resolving exports: a cyclic
+        // `export * as ns` graph re-enters here and must get this same object
+        // (filled below by the outermost call) instead of recursing forever.
+        let obj = self.alloc(crate::value::ObjectData::new(
+            None,
+            crate::value::Internal::ModuleNamespace(crate::value::NamespaceData {
+                exports: indexmap::IndexMap::new(),
+            }),
+        ));
+        module.borrow_mut().namespace = Some(Value::Object(obj.clone()));
+        let mut names = self.exported_names(registry, module, &mut HashSet::new())?;
         names.sort();
         // Module Namespace exotic object: null prototype, non-extensible,
         // exports backed by the live binding cells (see `Internal::ModuleNamespace`
@@ -438,12 +558,9 @@ impl Vm {
                 export_cells.insert(crate::value::JsString::new(n), cell);
             }
         }
-        let obj = self.alloc(crate::value::ObjectData::new(
-            None,
-            crate::value::Internal::ModuleNamespace(crate::value::NamespaceData {
-                exports: export_cells,
-            }),
-        ));
+        if let crate::value::Internal::ModuleNamespace(ns) = &mut obj.borrow_mut().internal {
+            ns.exports = export_cells;
+        }
         {
             let mut b = obj.borrow_mut();
             b.extensible = false;
@@ -462,8 +579,6 @@ impl Vm {
                 },
             );
         }
-        let ns = Value::Object(obj);
-        module.borrow_mut().namespace = Some(ns.clone());
-        Ok(ns)
+        Ok(Value::Object(obj))
     }
 }

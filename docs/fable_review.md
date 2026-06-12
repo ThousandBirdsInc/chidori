@@ -11,6 +11,18 @@ broker (#47) and the node-shim batch + built-in `untrusted` policy profile
 (#48); a `--untrusted` CLI flag landed on this branch. All of #39–#48 are
 merged into the branch history.*
 
+> **Addendum (2026-06-12, conformance campaign):** after this review was
+> taken, a focused sweep drove Test262 conformance from 96.22 % to
+> **98.10 %** (39,017 pass / 757 fail / 7,517 skip) — recommendation 2's
+> "keep picking off the cluster table" executed at scale. The Array,
+> TypedArray/DataView (resizable-ArrayBuffer), Promise, Set/Map, JSON,
+> generator (`yield*` return delegation), class-field, statement-
+> completion-value, mapped-`arguments`, and module-linking clusters were
+> substantially or fully cleared, with zero regressions across seven
+> gated batches. Conformance numbers quoted below are the 2026-06-12
+> snapshot this review measured; see `docs/conformance.md` for the
+> current table.
+
 ## Scope and method
 
 This review covers the whole repository: the Rust core runtime (`src/`), the

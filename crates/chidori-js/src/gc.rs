@@ -302,6 +302,11 @@ fn trace_object(
                 f(&req.result);
             }
         }
+        Internal::Arguments(map) => {
+            for cell in map.iter().flatten() {
+                trace_value(&cell.borrow(), f);
+            }
+        }
         Internal::Ordinary
         | Internal::Error
         | Internal::Boolean(_)
@@ -309,7 +314,6 @@ fn trace_object(
         | Internal::StringObj(_)
         | Internal::Symbol(_)
         | Internal::Date(_)
-        | Internal::Arguments
         | Internal::ArrayBuffer(_)
         | Internal::BigIntObj(_) => {}
     }

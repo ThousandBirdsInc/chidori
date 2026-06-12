@@ -1,10 +1,23 @@
 //! Array constructor, `Array.prototype`, and the array/shared iterator
 //! prototypes.
+//!
+//! The prototype methods are implemented as the spec's *generic* algorithms:
+//! `ToObject(this)`, one `LengthOfArrayLike` read, then per-index
+//! `HasProperty`/`Get`/`Set`/`Delete` in spec order. Index arithmetic is `f64`
+//! because an array-like `length` ranges up to 2^53-1 (well past `u32`);
+//! `elem_key` maps an index to a real array-index key or a string key as
+//! appropriate. Every potentially long loop calls `Vm::native_tick` so the
+//! opcode budget / interrupt flag bounds hostile `{length: 2**53}` receivers.
 
 use super::arg;
-use super::fundamental::create_data_property_or_throw;
+use super::fundamental::{create_data_property_or_throw, is_array_exotic};
 use crate::value::*;
 use crate::vm::Vm;
+
+/// 2^53 - 1, the spec's maximum array-like length.
+const MAX_SAFE_LEN: f64 = 9007199254740991.0;
+/// 2^32 - 1, `ArrayCreate`'s maximum array length.
+const MAX_ARRAY_LEN: f64 = 4294967295.0;
 
 pub fn install(vm: &mut Vm) {
     install_iterator_protos(vm);
@@ -15,10 +28,8 @@ pub fn install(vm: &mut Vm) {
     vm.install_ctor("Array", &ctor, &proto);
     vm.install_species(&ctor);
 
-    vm.define_method(&ctor, "isArray", 1, |_vm, _t, args| {
-        Ok(Value::Bool(
-            matches!(arg(args, 0), Value::Object(o) if o.borrow().is_array()),
-        ))
+    vm.define_method(&ctor, "isArray", 1, |vm, _t, args| {
+        Ok(Value::Bool(spec_is_array(vm, &arg(args, 0))?))
     });
     vm.define_method(&ctor, "of", 0, |vm, t, args| {
         // C = this; A = IsConstructor(C) ? Construct(C, «len») : ArrayCreate(len).
@@ -49,11 +60,15 @@ pub fn install(vm: &mut Vm) {
         // C = this; the result is built via the constructor when `this` is one
         // (so `Array.from.call(MySubclass, …)` returns a MySubclass instance).
         let is_ctor = vm.is_constructor(&t);
-        let new_result = |vm: &mut Vm, len: usize| -> Result<(Value, JsObject), Value> {
+        // Iterator path constructs with NO arguments; array-like path with «len».
+        let new_result = |vm: &mut Vm, len: Option<usize>| -> Result<(Value, JsObject), Value> {
             let a = if is_ctor {
-                vm.construct(&t, &[Value::Number(len as f64)], &t)?
+                match len {
+                    Some(n) => vm.construct(&t, &[Value::Number(n as f64)], &t)?,
+                    None => vm.construct(&t, &[], &t)?,
+                }
             } else {
-                Value::Object(vm.new_array(vec![Value::Hole; len]))
+                Value::Object(vm.new_array(vec![Value::Hole; len.unwrap_or(0)]))
             };
             match &a {
                 Value::Object(o) => Ok((a.clone(), o.clone())),
@@ -61,7 +76,7 @@ pub fn install(vm: &mut Vm) {
             }
         };
         if is_iterable(vm, &src)? {
-            let (a, ao) = new_result(vm, 0)?;
+            let (a, ao) = new_result(vm, None)?;
             let it = vm.get_iterator(&src)?;
             let mut k: usize = 0;
             loop {
@@ -110,7 +125,7 @@ pub fn install(vm: &mut Vm) {
             if len > crate::value::MAX_DENSE_ARRAY {
                 return Err(vm.throw_range("array-like length exceeds engine limit"));
             }
-            let (a, ao) = new_result(vm, len)?;
+            let (a, ao) = new_result(vm, Some(len))?;
             for k in 0..len {
                 let kv = vm.get_prop(&ov, &PropertyKey::from_index(k as u32))?;
                 let mapped = if has_map {
@@ -130,6 +145,7 @@ pub fn install(vm: &mut Vm) {
     });
 
     install_proto_methods(vm, &proto);
+    install_unscopables(vm, &proto);
 }
 
 fn array_call(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -151,20 +167,27 @@ fn array_call(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value>
     Ok(Value::Object(vm.new_array(args.to_vec())))
 }
 
+/// Spec `IsArray` (7.2.2): an Array exotic, or a Proxy whose (transitive)
+/// target is one. A revoked proxy throws a TypeError.
+fn spec_is_array(vm: &Vm, v: &Value) -> Result<bool, Value> {
+    match v {
+        Value::Object(o) => is_array_exotic(vm, o),
+        _ => Ok(false),
+    }
+}
+
 /// `IsConcatSpreadable(O)`: object whose `@@isConcatSpreadable` (if defined)
-/// is truthy, else any Array. Non-objects are never spreadable.
+/// is truthy, else any Array (proxy-aware). Non-objects are never spreadable.
 fn is_concat_spreadable(vm: &mut Vm, v: &Value) -> Result<bool, Value> {
-    let o = match v {
-        Value::Object(o) => o.clone(),
-        _ => return Ok(false),
-    };
+    if !matches!(v, Value::Object(_)) {
+        return Ok(false);
+    }
     let sym = vm.realm.symbol_is_concat_spreadable.clone();
     let spread = vm.get_prop(v, &PropertyKey::Sym(sym))?;
     if !spread.is_undefined() {
         return Ok(vm.to_boolean(&spread));
     }
-    let is_arr = o.borrow().is_array();
-    Ok(is_arr)
+    spec_is_array(vm, v)
 }
 
 fn is_iterable(vm: &mut Vm, v: &Value) -> Result<bool, Value> {
@@ -179,6 +202,12 @@ fn is_iterable(vm: &mut Vm, v: &Value) -> Result<bool, Value> {
 fn get_length(vm: &mut Vm, o: &Value) -> Result<usize, Value> {
     let l = vm.get_prop(o, &PropertyKey::str("length"))?;
     vm.to_length(&l)
+}
+
+/// `LengthOfArrayLike(O)` as `f64` (array-like lengths range up to 2^53-1).
+fn length_of(vm: &mut Vm, ov: &Value) -> Result<f64, Value> {
+    let l = vm.get_prop(ov, &PropertyKey::str("length"))?;
+    Ok(vm.to_length(&l)? as f64)
 }
 
 /// Get the dense element vector of an array `this`, or error.
@@ -224,6 +253,19 @@ fn elem_key(i: f64) -> PropertyKey {
     }
 }
 
+/// `ArrayCreate(len)`-equivalent for a plain dense result array: the spec
+/// RangeError beyond 2^32-1, the engine's dense-storage RangeError beyond its
+/// cap.
+fn array_create(vm: &mut Vm, len: f64) -> Result<JsObject, Value> {
+    if len > MAX_ARRAY_LEN {
+        return Err(vm.throw_range("Invalid array length"));
+    }
+    if len > crate::value::MAX_DENSE_ARRAY as f64 {
+        return Err(vm.throw_range("array length exceeds engine limit"));
+    }
+    Ok(vm.new_array(vec![Value::Hole; len as usize]))
+}
+
 fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     vm.define_method(proto, "push", 1, |vm, this, args| {
         // Spec-generic: Set(O, len+i, arg, throw); Set(O, "length", …, throw). The
@@ -231,9 +273,9 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         // TypeError, and the 2^53-1 guard runs before any element is written.
         let o = vm.to_object(&this)?;
         let ov = Value::Object(o);
-        let mut len = elements_len(vm, &ov)? as f64;
+        let mut len = length_of(vm, &ov)?;
         let argc = args.len() as f64;
-        if len + argc > 9007199254740991.0 {
+        if len + argc > MAX_SAFE_LEN {
             return Err(vm.throw_type("push would exceed the maximum safe integer length"));
         }
         for v in args {
@@ -248,7 +290,7 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         // the (throwing) length — so a frozen/non-writable receiver throws.
         let o = vm.to_object(&this)?;
         let ov = Value::Object(o);
-        let len = elements_len(vm, &ov)? as f64;
+        let len = length_of(vm, &ov)?;
         if len == 0.0 {
             vm.set_prop_strict(&ov, &PropertyKey::str("length"), Value::Number(0.0))?;
             return Ok(Value::Undefined);
@@ -263,181 +305,176 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     vm.define_method(proto, "shift", 0, |vm, this, _args| {
         let o = vm.to_object(&this)?;
         let ov = Value::Object(o);
-        let len = elements_len(vm, &ov)?;
-        if len > crate::value::MAX_DENSE_ARRAY {
-            return Err(vm.throw_range("array-like length exceeds engine limit"));
-        }
-        if len == 0 {
+        let len = length_of(vm, &ov)?;
+        if len == 0.0 {
             vm.set_prop_strict(&ov, &PropertyKey::str("length"), Value::Number(0.0))?;
             return Ok(Value::Undefined);
         }
         let first = vm.get_prop(&ov, &PropertyKey::from_index(0))?;
-        for k in 1..len {
-            let from = elem_key(k as f64);
-            let to = elem_key((k - 1) as f64);
+        let mut k = 1.0;
+        while k < len {
+            vm.native_tick()?;
+            let from = elem_key(k);
+            let to = elem_key(k - 1.0);
             if vm.has_prop(&ov, &from)? {
                 let v = vm.get_prop(&ov, &from)?;
                 vm.set_prop_strict(&ov, &to, v)?;
             } else {
                 delete_or_throw(vm, &ov, &to)?;
             }
+            k += 1.0;
         }
-        delete_or_throw(vm, &ov, &elem_key((len - 1) as f64))?;
-        vm.set_prop_strict(
-            &ov,
-            &PropertyKey::str("length"),
-            Value::Number((len - 1) as f64),
-        )?;
+        delete_or_throw(vm, &ov, &elem_key(len - 1.0))?;
+        vm.set_prop_strict(&ov, &PropertyKey::str("length"), Value::Number(len - 1.0))?;
         Ok(first)
     });
     vm.define_method(proto, "unshift", 1, |vm, this, args| {
         let o = vm.to_object(&this)?;
         let ov = Value::Object(o);
-        let len = elements_len(vm, &ov)?;
-        let argc = args.len();
-        if argc > 0 {
-            if (len + argc) as f64 > 9007199254740991.0 {
+        let len = length_of(vm, &ov)?;
+        let argc = args.len() as f64;
+        if argc > 0.0 {
+            if len + argc > MAX_SAFE_LEN {
                 return Err(vm.throw_type("unshift would exceed the maximum safe integer length"));
-            }
-            if len > crate::value::MAX_DENSE_ARRAY {
-                return Err(vm.throw_range("array-like length exceeds engine limit"));
             }
             // Shift existing elements up by argc (high-to-low to avoid clobbering).
             let mut k = len;
-            while k > 0 {
-                let from = elem_key((k - 1) as f64);
-                let to = elem_key((k - 1 + argc) as f64);
+            while k > 0.0 {
+                vm.native_tick()?;
+                let from = elem_key(k - 1.0);
+                let to = elem_key(k - 1.0 + argc);
                 if vm.has_prop(&ov, &from)? {
                     let v = vm.get_prop(&ov, &from)?;
                     vm.set_prop_strict(&ov, &to, v)?;
                 } else {
                     delete_or_throw(vm, &ov, &to)?;
                 }
-                k -= 1;
+                k -= 1.0;
             }
             for (i, v) in args.iter().enumerate() {
                 vm.set_prop_strict(&ov, &PropertyKey::from_index(i as u32), v.clone())?;
             }
         }
-        let new_len = (len + argc) as f64;
+        let new_len = len + argc;
         vm.set_prop_strict(&ov, &PropertyKey::str("length"), Value::Number(new_len))?;
         Ok(Value::Number(new_len))
     });
     vm.define_method(proto, "at", 1, |vm, this, args| {
         // Generic: length + indexed access (works on array-likes).
-        let len = elements_len(vm, &this)? as f64;
+        let o = vm.to_object(&this)?;
+        let ov = Value::Object(o);
+        let len = length_of(vm, &ov)?;
         let rel = to_integer_or_infinity(vm, &arg(args, 0))?;
         let k = if rel >= 0.0 { rel } else { len + rel };
         if k < 0.0 || k >= len {
             return Ok(Value::Undefined);
         }
-        let recv = vm.to_object(&this)?;
-        vm.get_prop(&Value::Object(recv), &PropertyKey::from_index(k as u32))
+        vm.get_prop(&ov, &elem_key(k))
     });
     vm.define_method(proto, "slice", 2, |vm, this, args| {
         // Generic: works on array-likes (reads length + indexed elements). For a
         // dense array `get_prop` still hits the backing vec, so this stays fast.
         let o = vm.to_object(&this)?;
         let ov = Value::Object(o);
-        let len = elements_len(vm, &ov)? as isize;
-        let start = rel_index(vm, &arg(args, 0), len, 0)?;
-        let end = rel_index(vm, &arg(args, 1), len, len)?;
-        if (end - start).max(0) as usize > crate::value::MAX_DENSE_ARRAY {
-            return Err(vm.throw_range("array-like length exceeds engine limit"));
-        }
-        let count = (end - start).max(0) as usize;
+        let len = length_of(vm, &ov)?;
+        let mut k = rel_index(vm, &arg(args, 0), len, 0.0)?;
+        let fin = rel_index(vm, &arg(args, 1), len, len)?;
+        let count = (fin - k).max(0.0);
         let a = array_species_create(vm, &ov, count)?;
-        let mut n = 0u32;
-        let mut k = start;
-        while k < end {
-            let key = PropertyKey::from_index(k as u32);
+        let mut n = 0.0;
+        while k < fin {
+            vm.native_tick()?;
+            let key = elem_key(k);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
-                create_data_on(vm, &a, &PropertyKey::from_index(n), v)?;
+                create_data_on(vm, &a, &elem_key(n), v)?;
             }
-            n += 1;
-            k += 1;
+            n += 1.0;
+            k += 1.0;
         }
-        vm.set_prop_strict(&a, &PropertyKey::str("length"), Value::Number(count as f64))?;
+        vm.set_prop_strict(&a, &PropertyKey::str("length"), Value::Number(n))?;
         Ok(a)
     });
     vm.define_method(proto, "splice", 2, |vm, this, args| {
         let o = vm.to_object(&this)?;
-        let len = elements_len(vm, &Value::Object(o.clone()))? as isize;
-        let start = rel_index(vm, &arg(args, 0), len, 0)?;
-        let delete_count = if args.len() < 2 {
-            if args.is_empty() {
-                0
-            } else {
-                len - start
-            }
+        let ov = Value::Object(o);
+        let len = length_of(vm, &ov)?;
+        let actual_start = rel_index(vm, &arg(args, 0), len, 0.0)?;
+        let actual_delete = if args.is_empty() {
+            0.0
+        } else if args.len() == 1 {
+            len - actual_start
         } else {
             let dc = to_integer_or_infinity(vm, &arg(args, 1))?;
-            dc.max(0.0).min((len - start) as f64) as isize
-        }
-        .min(len - start)
-        .max(0);
+            dc.clamp(0.0, len - actual_start)
+        };
         let inserts: Vec<Value> = if args.len() > 2 {
             args[2..].to_vec()
         } else {
             Vec::new()
         };
-        // Spec-generic: ArraySpeciesCreate for the removed-elements result, then
-        // Get/Set/Delete through O so getters/setters and holes are honored.
-        // Bound the work to the engine's dense-array cap so a hostile huge
-        // `length` (e.g. 2**53) can't OOM/hang instead of allocating.
-        if len as usize > crate::value::MAX_DENSE_ARRAY {
-            return Err(vm.throw_range("array-like length exceeds engine limit"));
+        let ins = inserts.len() as f64;
+        // Spec step 8: the post-splice length may not exceed 2^53-1.
+        if len + ins - actual_delete > MAX_SAFE_LEN {
+            return Err(vm.throw_type("splice would exceed the maximum safe integer length"));
         }
-        let ov = Value::Object(o);
-        let s = start as usize;
-        let dc = delete_count as usize;
-        let ulen = len as usize;
-        let ins = inserts.len();
-        // A = ArraySpeciesCreate(O, deleteCount), filled with the removed values.
-        let a = array_species_create(vm, &ov, dc)?;
-        for k in 0..dc {
-            let from = PropertyKey::from_index((s + k) as u32);
+        // A = ArraySpeciesCreate(O, actualDeleteCount), filled with the removed
+        // values via Get (so getters fire and holes stay holes).
+        let a = array_species_create(vm, &ov, actual_delete)?;
+        let mut k = 0.0;
+        while k < actual_delete {
+            vm.native_tick()?;
+            let from = elem_key(actual_start + k);
             if vm.has_prop(&ov, &from)? {
                 let v = vm.get_prop(&ov, &from)?;
-                create_data_on(vm, &a, &PropertyKey::from_index(k as u32), v)?;
+                create_data_on(vm, &a, &elem_key(k), v)?;
             }
+            k += 1.0;
         }
-        vm.set_prop_strict(&a, &PropertyKey::str("length"), Value::Number(dc as f64))?;
+        vm.set_prop_strict(&a, &PropertyKey::str("length"), Value::Number(actual_delete))?;
         // Shift the tail of O to make room for / close the gap left by inserts.
-        if ins < dc {
-            for k in s..(ulen - dc) {
-                let from = PropertyKey::from_index((k + dc) as u32);
-                let to = PropertyKey::from_index((k + ins) as u32);
+        if ins < actual_delete {
+            let mut k = actual_start;
+            while k < len - actual_delete {
+                vm.native_tick()?;
+                let from = elem_key(k + actual_delete);
+                let to = elem_key(k + ins);
                 if vm.has_prop(&ov, &from)? {
                     let v = vm.get_prop(&ov, &from)?;
                     vm.set_prop_strict(&ov, &to, v)?;
                 } else {
-                    vm.delete_prop(&ov, &to)?;
+                    delete_or_throw(vm, &ov, &to)?;
                 }
+                k += 1.0;
             }
-            for k in (ulen - dc + ins..ulen).rev() {
-                vm.delete_prop(&ov, &PropertyKey::from_index(k as u32))?;
+            let mut k = len;
+            while k > len - actual_delete + ins {
+                vm.native_tick()?;
+                delete_or_throw(vm, &ov, &elem_key(k - 1.0))?;
+                k -= 1.0;
             }
-        } else if ins > dc {
-            for k in (s..(ulen - dc)).rev() {
-                let from = PropertyKey::from_index((k + dc) as u32);
-                let to = PropertyKey::from_index((k + ins) as u32);
+        } else if ins > actual_delete {
+            let mut k = len - actual_delete;
+            while k > actual_start {
+                vm.native_tick()?;
+                let from = elem_key(k + actual_delete - 1.0);
+                let to = elem_key(k + ins - 1.0);
                 if vm.has_prop(&ov, &from)? {
                     let v = vm.get_prop(&ov, &from)?;
                     vm.set_prop_strict(&ov, &to, v)?;
                 } else {
-                    vm.delete_prop(&ov, &to)?;
+                    delete_or_throw(vm, &ov, &to)?;
                 }
+                k -= 1.0;
             }
         }
         for (i, v) in inserts.into_iter().enumerate() {
-            vm.set_prop_strict(&ov, &PropertyKey::from_index((s + i) as u32), v)?;
+            vm.set_prop_strict(&ov, &elem_key(actual_start + i as f64), v)?;
         }
         vm.set_prop_strict(
             &ov,
             &PropertyKey::str("length"),
-            Value::Number((ulen - dc + ins) as f64),
+            Value::Number(len - actual_delete + ins),
         )?;
         Ok(a)
     });
@@ -447,74 +484,100 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         // A = ArraySpeciesCreate(O, 0). items = [O, ...args]; each is spread if
         // IsConcatSpreadable, else appended as a single element. Absent indices of
         // a spreadable leave a hole in A (so its length is preserved).
-        let a = array_species_create(vm, &ov, 0)?;
-        let mut n: u32 = 0;
+        let a = array_species_create(vm, &ov, 0.0)?;
+        let mut n = 0.0;
         let mut items: Vec<Value> = Vec::with_capacity(args.len() + 1);
         items.push(ov);
         items.extend(args.iter().cloned());
         for e in items {
             if is_concat_spreadable(vm, &e)? {
-                let len = elements_len(vm, &e)?;
-                if n as usize + len > crate::value::MAX_DENSE_ARRAY {
-                    return Err(vm.throw_range("array length exceeds engine limit"));
+                let len = length_of(vm, &e)?;
+                if n + len > MAX_SAFE_LEN {
+                    return Err(
+                        vm.throw_type("concat would exceed the maximum safe integer length")
+                    );
                 }
-                for k in 0..len {
-                    let key = PropertyKey::from_index(k as u32);
+                let mut k = 0.0;
+                while k < len {
+                    vm.native_tick()?;
+                    let key = elem_key(k);
                     if vm.has_prop(&e, &key)? {
                         let v = vm.get_prop(&e, &key)?;
-                        create_data_on(vm, &a, &PropertyKey::from_index(n), v)?;
+                        create_data_on(vm, &a, &elem_key(n), v)?;
                     }
-                    n += 1;
+                    n += 1.0;
+                    k += 1.0;
                 }
             } else {
-                create_data_on(vm, &a, &PropertyKey::from_index(n), e)?;
-                n += 1;
+                if n >= MAX_SAFE_LEN {
+                    return Err(
+                        vm.throw_type("concat would exceed the maximum safe integer length")
+                    );
+                }
+                create_data_on(vm, &a, &elem_key(n), e)?;
+                n += 1.0;
             }
         }
-        vm.set_prop_strict(&a, &PropertyKey::str("length"), Value::Number(n as f64))?;
+        vm.set_prop_strict(&a, &PropertyKey::str("length"), Value::Number(n))?;
         Ok(a)
     });
     vm.define_method(proto, "join", 1, |vm, this, args| {
-        let items = elements(vm, &this)?;
-        let sep = {
-            let s = arg(args, 0);
-            if s.is_undefined() {
-                ",".to_string()
-            } else {
-                vm.to_string_lossy(&s)
-            }
+        // Spec order: ToObject, LengthOfArrayLike, THEN coerce the separator
+        // (whose side effects may mutate the array), then Get + ToString each
+        // element. ToString errors propagate (no lossy fallback).
+        let o = vm.to_object(&this)?;
+        let ov = Value::Object(o);
+        let len = length_of(vm, &ov)?;
+        let sep_v = arg(args, 0);
+        let sep = if sep_v.is_undefined() {
+            ",".to_string()
+        } else {
+            vm.to_js_string(&sep_v)?.as_str().to_string()
         };
-        let mut parts = Vec::with_capacity(items.len());
-        for v in &items {
-            // null/undefined and holes all stringify to the empty string.
-            if v.is_nullish() || matches!(v, Value::Hole) {
-                parts.push(String::new());
-            } else {
-                parts.push(vm.to_string_lossy(v));
+        let mut r = String::new();
+        let mut k = 0.0;
+        while k < len {
+            vm.native_tick()?;
+            if k > 0.0 {
+                r.push_str(&sep);
             }
+            let element = vm.get_prop(&ov, &elem_key(k))?;
+            // null/undefined (and holes, which Get reads as undefined unless the
+            // prototype supplies a value) stringify to the empty string.
+            if !element.is_nullish() {
+                r.push_str(vm.to_js_string(&element)?.as_str());
+            }
+            k += 1.0;
         }
-        Ok(Value::str(parts.join(&sep)))
+        Ok(Value::str(r))
     });
     vm.define_method(proto, "toString", 0, |vm, this, _a| {
-        let join = vm.get_prop(&this, &PropertyKey::str("join"))?;
+        let array = vm.to_object(&this)?;
+        let av = Value::Object(array);
+        let join = vm.get_prop(&av, &PropertyKey::str("join"))?;
         if vm.is_callable(&join) {
-            vm.call(join, this, &[])
+            vm.call(join, av, &[])
         } else {
-            Ok(Value::str("[object Array]"))
+            // Non-callable `join`: the spec falls back to the INTRINSIC
+            // %Object.prototype.toString% (even if that property was deleted).
+            super::fundamental::object_to_string(vm, &av)
         }
     });
     vm.define_method(proto, "toLocaleString", 0, |vm, this, _a| {
         // Join each element's `ToString(Invoke(element, "toLocaleString"))` with
         // ",". null/undefined elements (and holes) contribute the empty string.
         let o = vm.to_object(&this)?;
-        let ov = Value::Object(o.clone());
-        let len = elements_len(vm, &ov)?;
+        let ov = Value::Object(o);
+        let len = length_of(vm, &ov)?;
         let mut out = String::new();
-        for k in 0..len {
-            if k > 0 {
+        let mut k = 0.0;
+        while k < len {
+            vm.native_tick()?;
+            if k > 0.0 {
                 out.push(',');
             }
-            let v = vm.get_prop(&ov, &PropertyKey::from_index(k as u32))?;
+            let v = vm.get_prop(&ov, &elem_key(k))?;
+            k += 1.0;
             if v.is_nullish() {
                 continue;
             }
@@ -529,108 +592,114 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         // holes are skipped and a live getter is observed (the `-8-*` tests).
         let o = vm.to_object(&this)?;
         let ov = Value::Object(o);
-        let len = elements_len(vm, &ov)?;
+        let len = length_of(vm, &ov)?;
         let target = arg(args, 0);
-        if len == 0 {
+        if len == 0.0 {
             return Ok(Value::Number(-1.0));
         }
-        let from = to_integer_or_infinity(vm, &arg(args, 1))?;
-        if from == f64::INFINITY {
+        let n = to_integer_or_infinity(vm, &arg(args, 1))?;
+        if n == f64::INFINITY {
             return Ok(Value::Number(-1.0));
         }
-        let start = if from == f64::NEG_INFINITY {
-            0
-        } else if from >= 0.0 {
-            from as usize
+        // `n + 0.0` normalizes a fromIndex of -0 (the found index is returned).
+        let mut k = if n == f64::NEG_INFINITY {
+            0.0
+        } else if n >= 0.0 {
+            n + 0.0
         } else {
-            ((len as f64 + from).max(0.0)) as usize
+            (len + n).max(0.0)
         };
-        for k in start..len {
-            let key = PropertyKey::from_index(k as u32);
+        while k < len {
+            vm.native_tick()?;
+            let key = elem_key(k);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
                 if vm.strict_equals(&v, &target) {
-                    return Ok(Value::Number(k as f64));
+                    return Ok(Value::Number(k));
                 }
             }
+            k += 1.0;
         }
         Ok(Value::Number(-1.0))
     });
     vm.define_method(proto, "lastIndexOf", 1, |vm, this, args| {
         let o = vm.to_object(&this)?;
         let ov = Value::Object(o);
-        let len = elements_len(vm, &ov)?;
+        let len = length_of(vm, &ov)?;
         let target = arg(args, 0);
-        if len == 0 {
+        if len == 0.0 {
             return Ok(Value::Number(-1.0));
         }
         // Default fromIndex is len-1; otherwise ToIntegerOrInfinity.
-        let mut start: isize = (len - 1) as isize;
-        if args.len() >= 2 {
-            let from = to_integer_or_infinity(vm, &arg(args, 1))?;
-            if from == f64::NEG_INFINITY {
+        let mut k = if args.len() >= 2 {
+            let n = to_integer_or_infinity(vm, &arg(args, 1))?;
+            if n == f64::NEG_INFINITY {
                 return Ok(Value::Number(-1.0));
-            } else if from >= 0.0 {
-                start = (from as isize).min((len - 1) as isize);
-            } else {
-                start = len as isize + from as isize;
             }
-        }
-        let mut k = start;
-        while k >= 0 {
-            let key = PropertyKey::from_index(k as u32);
+            if n >= 0.0 {
+                // `+ 0.0` normalizes a fromIndex of -0.
+                n.min(len - 1.0) + 0.0
+            } else {
+                len + n
+            }
+        } else {
+            len - 1.0
+        };
+        while k >= 0.0 {
+            vm.native_tick()?;
+            let key = elem_key(k);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
                 if vm.strict_equals(&v, &target) {
-                    return Ok(Value::Number(k as f64));
+                    return Ok(Value::Number(k));
                 }
             }
-            k -= 1;
+            k -= 1.0;
         }
         Ok(Value::Number(-1.0))
     });
     vm.define_method(proto, "includes", 1, |vm, this, args| {
-        let len = elements_len(vm, &this)? as f64;
+        // One length read, then Get at EVERY index (holes read as undefined;
+        // values are never cached — a getter installed mid-scan is observed).
+        let o = vm.to_object(&this)?;
+        let ov = Value::Object(o);
+        let len = length_of(vm, &ov)?;
         let target = arg(args, 0);
         if len == 0.0 {
             return Ok(Value::Bool(false));
         }
-        let from = to_integer_or_infinity(vm, &arg(args, 1))?;
-        let start = if from == f64::INFINITY {
+        let n = to_integer_or_infinity(vm, &arg(args, 1))?;
+        if n == f64::INFINITY {
             return Ok(Value::Bool(false));
-        } else if from == f64::NEG_INFINITY {
-            0
-        } else if from >= 0.0 {
-            from as usize
+        }
+        let mut k = if n == f64::NEG_INFINITY {
+            0.0
+        } else if n >= 0.0 {
+            n
         } else {
-            ((len + from).max(0.0)) as usize
+            (len + n).max(0.0)
         };
-        let items = elements(vm, &this)?;
-        for v in items.iter().skip(start) {
-            // `includes` reads holes as undefined (it does not skip them).
-            let probe = if matches!(v, Value::Hole) {
-                &Value::Undefined
-            } else {
-                v
-            };
-            if same_value_zero(probe, &target) {
+        while k < len {
+            vm.native_tick()?;
+            let v = vm.get_prop(&ov, &elem_key(k))?;
+            if same_value_zero(&v, &target) {
                 return Ok(Value::Bool(true));
             }
+            k += 1.0;
         }
         Ok(Value::Bool(false))
     });
     vm.define_method(proto, "forEach", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
-        for k in 0..len {
-            let key = PropertyKey::from_index(k as u32);
+        let mut k = 0.0;
+        while k < len {
+            vm.native_tick()?;
+            let key = elem_key(k);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
-                vm.call(
-                    cb.clone(),
-                    this_arg.clone(),
-                    &[v, Value::Number(k as f64), ov.clone()],
-                )?;
+                vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(k), ov.clone()])?;
             }
+            k += 1.0;
         }
         Ok(Value::Undefined)
     });
@@ -639,141 +708,148 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         // Result via ArraySpeciesCreate; holes map to holes (the callback is not
         // invoked for an absent index and that output slot stays absent).
         let a = array_species_create(vm, &ov, len)?;
-        for k in 0..len {
-            let key = PropertyKey::from_index(k as u32);
+        let mut k = 0.0;
+        while k < len {
+            vm.native_tick()?;
+            let key = elem_key(k);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
-                let mapped = vm.call(
-                    cb.clone(),
-                    this_arg.clone(),
-                    &[v, Value::Number(k as f64), ov.clone()],
-                )?;
+                let mapped =
+                    vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(k), ov.clone()])?;
                 create_data_on(vm, &a, &key, mapped)?;
             }
+            k += 1.0;
         }
         Ok(a)
     });
     vm.define_method(proto, "filter", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
-        let a = array_species_create(vm, &ov, 0)?;
-        let mut to = 0u32;
-        for k in 0..len {
-            let key = PropertyKey::from_index(k as u32);
+        let a = array_species_create(vm, &ov, 0.0)?;
+        let mut to = 0.0;
+        let mut k = 0.0;
+        while k < len {
+            vm.native_tick()?;
+            let key = elem_key(k);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
                 let keep = vm.call(
                     cb.clone(),
                     this_arg.clone(),
-                    &[v.clone(), Value::Number(k as f64), ov.clone()],
+                    &[v.clone(), Value::Number(k), ov.clone()],
                 )?;
                 if vm.to_boolean(&keep) {
-                    create_data_on(vm, &a, &PropertyKey::from_index(to), v)?;
-                    to += 1;
+                    create_data_on(vm, &a, &elem_key(to), v)?;
+                    to += 1.0;
                 }
             }
+            k += 1.0;
         }
         Ok(a)
     });
     vm.define_method(proto, "find", 1, |vm, this, args| {
         // `find` visits every index via Get (holes read as undefined).
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
-        for k in 0..len {
-            let v = vm.get_prop(&ov, &PropertyKey::from_index(k as u32))?;
+        let mut k = 0.0;
+        while k < len {
+            vm.native_tick()?;
+            let v = vm.get_prop(&ov, &elem_key(k))?;
             let r = vm.call(
                 cb.clone(),
                 this_arg.clone(),
-                &[v.clone(), Value::Number(k as f64), ov.clone()],
+                &[v.clone(), Value::Number(k), ov.clone()],
             )?;
             if vm.to_boolean(&r) {
                 return Ok(v);
             }
+            k += 1.0;
         }
         Ok(Value::Undefined)
     });
     vm.define_method(proto, "findIndex", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
-        for k in 0..len {
-            let v = vm.get_prop(&ov, &PropertyKey::from_index(k as u32))?;
-            let r = vm.call(
-                cb.clone(),
-                this_arg.clone(),
-                &[v, Value::Number(k as f64), ov.clone()],
-            )?;
+        let mut k = 0.0;
+        while k < len {
+            vm.native_tick()?;
+            let v = vm.get_prop(&ov, &elem_key(k))?;
+            let r = vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(k), ov.clone()])?;
             if vm.to_boolean(&r) {
-                return Ok(Value::Number(k as f64));
+                return Ok(Value::Number(k));
             }
+            k += 1.0;
         }
         Ok(Value::Number(-1.0))
     });
     vm.define_method(proto, "findLast", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
-        for k in (0..len).rev() {
-            let v = vm.get_prop(&ov, &PropertyKey::from_index(k as u32))?;
+        let mut k = len - 1.0;
+        while k >= 0.0 {
+            vm.native_tick()?;
+            let v = vm.get_prop(&ov, &elem_key(k))?;
             let r = vm.call(
                 cb.clone(),
                 this_arg.clone(),
-                &[v.clone(), Value::Number(k as f64), ov.clone()],
+                &[v.clone(), Value::Number(k), ov.clone()],
             )?;
             if vm.to_boolean(&r) {
                 return Ok(v);
             }
+            k -= 1.0;
         }
         Ok(Value::Undefined)
     });
     vm.define_method(proto, "findLastIndex", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
-        for k in (0..len).rev() {
-            let v = vm.get_prop(&ov, &PropertyKey::from_index(k as u32))?;
-            let r = vm.call(
-                cb.clone(),
-                this_arg.clone(),
-                &[v, Value::Number(k as f64), ov.clone()],
-            )?;
+        let mut k = len - 1.0;
+        while k >= 0.0 {
+            vm.native_tick()?;
+            let v = vm.get_prop(&ov, &elem_key(k))?;
+            let r = vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(k), ov.clone()])?;
             if vm.to_boolean(&r) {
-                return Ok(Value::Number(k as f64));
+                return Ok(Value::Number(k));
             }
+            k -= 1.0;
         }
         Ok(Value::Number(-1.0))
     });
     vm.define_method(proto, "some", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
-        for k in 0..len {
-            let key = PropertyKey::from_index(k as u32);
+        let mut k = 0.0;
+        while k < len {
+            vm.native_tick()?;
+            let key = elem_key(k);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
-                let r = vm.call(
-                    cb.clone(),
-                    this_arg.clone(),
-                    &[v, Value::Number(k as f64), ov.clone()],
-                )?;
+                let r =
+                    vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(k), ov.clone()])?;
                 if vm.to_boolean(&r) {
                     return Ok(Value::Bool(true));
                 }
             }
+            k += 1.0;
         }
         Ok(Value::Bool(false))
     });
     vm.define_method(proto, "every", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
-        for k in 0..len {
-            let key = PropertyKey::from_index(k as u32);
+        let mut k = 0.0;
+        while k < len {
+            vm.native_tick()?;
+            let key = elem_key(k);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
-                let r = vm.call(
-                    cb.clone(),
-                    this_arg.clone(),
-                    &[v, Value::Number(k as f64), ov.clone()],
-                )?;
+                let r =
+                    vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(k), ov.clone()])?;
                 if !vm.to_boolean(&r) {
                     return Ok(Value::Bool(false));
                 }
             }
+            k += 1.0;
         }
         Ok(Value::Bool(true))
     });
     vm.define_method(proto, "reduce", 1, |vm, this, args| {
         let (ov, len, cb, _) = iter_setup(vm, &this, args)?;
-        let mut k = 0usize;
+        let mut k = 0.0;
         let acc;
         if args.len() >= 2 {
             acc = arg(args, 1);
@@ -783,8 +859,9 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
                 if k >= len {
                     return Err(vm.throw_type("Reduce of empty array with no initial value"));
                 }
-                let key = PropertyKey::from_index(k as u32);
-                k += 1;
+                vm.native_tick()?;
+                let key = elem_key(k);
+                k += 1.0;
                 if vm.has_prop(&ov, &key)? {
                     acc = vm.get_prop(&ov, &key)?;
                     break;
@@ -793,32 +870,34 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         }
         let mut acc = acc;
         while k < len {
-            let key = PropertyKey::from_index(k as u32);
+            vm.native_tick()?;
+            let key = elem_key(k);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
                 acc = vm.call(
                     cb.clone(),
                     Value::Undefined,
-                    &[acc, v, Value::Number(k as f64), ov.clone()],
+                    &[acc, v, Value::Number(k), ov.clone()],
                 )?;
             }
-            k += 1;
+            k += 1.0;
         }
         Ok(acc)
     });
     vm.define_method(proto, "reduceRight", 1, |vm, this, args| {
         let (ov, len, cb, _) = iter_setup(vm, &this, args)?;
-        let mut k: isize = len as isize - 1;
+        let mut k = len - 1.0;
         let acc;
         if args.len() >= 2 {
             acc = arg(args, 1);
         } else {
             loop {
-                if k < 0 {
+                if k < 0.0 {
                     return Err(vm.throw_type("Reduce of empty array with no initial value"));
                 }
-                let key = PropertyKey::from_index(k as u32);
-                k -= 1;
+                vm.native_tick()?;
+                let key = elem_key(k);
+                k -= 1.0;
                 if vm.has_prop(&ov, &key)? {
                     acc = vm.get_prop(&ov, &key)?;
                     break;
@@ -826,94 +905,70 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             }
         }
         let mut acc = acc;
-        while k >= 0 {
-            let key = PropertyKey::from_index(k as u32);
+        while k >= 0.0 {
+            vm.native_tick()?;
+            let key = elem_key(k);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
                 acc = vm.call(
                     cb.clone(),
                     Value::Undefined,
-                    &[acc, v, Value::Number(k as f64), ov.clone()],
+                    &[acc, v, Value::Number(k), ov.clone()],
                 )?;
             }
-            k -= 1;
+            k -= 1.0;
         }
         Ok(acc)
     });
     vm.define_method(proto, "fill", 1, |vm, this, args| {
-        // Generic: Set(O, k, value) for k in [start, end). Works on array-likes;
-        // `set_prop` still hits the backing vec for a dense array.
+        // Generic: Set(O, k, value, throw) for k in [start, end). Works on
+        // array-likes; `set_prop` still hits the backing vec for a dense array.
         let o = vm.to_object(&this)?;
         let ov = Value::Object(o);
-        let len = elements_len(vm, &ov)? as isize;
+        let len = length_of(vm, &ov)?;
         let value = arg(args, 0);
-        let start = rel_index(vm, &arg(args, 1), len, 0)?;
-        let end = rel_index(vm, &arg(args, 2), len, len)?;
-        if (end - start).max(0) as usize > crate::value::MAX_DENSE_ARRAY {
-            return Err(vm.throw_range("array-like length exceeds engine limit"));
+        let mut k = rel_index(vm, &arg(args, 1), len, 0.0)?;
+        let fin = rel_index(vm, &arg(args, 2), len, len)?;
+        while k < fin {
+            vm.native_tick()?;
+            vm.set_prop_strict(&ov, &elem_key(k), value.clone())?;
+            k += 1.0;
         }
-        let mut i = start.max(0);
-        while i < end {
-            vm.set_prop(&ov, &PropertyKey::from_index(i as u32), value.clone())?;
-            i += 1;
-        }
-        Ok(this)
+        Ok(ov)
     });
     vm.define_method(proto, "copyWithin", 2, |vm, this, args| {
+        // Generic spec walk: argument coercion can mutate the receiver, and
+        // absent source slots must DeletePropertyOrThrow the destination — so
+        // every step goes through Has/Get/Set/Delete (no dense fast path).
         let o = vm.to_object(&this)?;
-        let ov = Value::Object(o.clone());
-        let len = elements_len(vm, &ov)? as isize;
-        let target = rel_index(vm, &arg(args, 0), len, 0)?;
-        let start = rel_index(vm, &arg(args, 1), len, 0)?;
-        let end = rel_index(vm, &arg(args, 2), len, len)?;
-        let count = (end - start).min(len - target).max(0);
-        if count <= 0 {
-            return Ok(this);
-        }
-        if count as usize > crate::value::MAX_DENSE_ARRAY {
-            return Err(vm.throw_range("array-like length exceeds engine limit"));
-        }
-        // Dense fast path.
-        if o.borrow().is_array() {
-            let mut b = o.borrow_mut();
-            if let Internal::Array(a) = &mut b.internal {
-                // Re-clamp to the CURRENT length (argument coercion may have run
-                // side effects that mutated the array).
-                let alen = a.len() as isize;
-                let start = start.clamp(0, alen);
-                let target = target.clamp(0, alen);
-                let count = count.min(alen - start).min(alen - target).max(0);
-                let src: Vec<Value> = (0..count)
-                    .map(|i| a[(start + i) as usize].clone())
-                    .collect();
-                for (i, v) in src.into_iter().enumerate() {
-                    a[(target + i as isize) as usize] = v;
-                }
-                return Ok(this);
-            }
-        }
-        // Generic array-like: copy with overlap-aware direction, mirroring holes
-        // (HasProperty false → DeleteProperty on the destination).
-        let (mut from, mut to, dir) = if start < target && target < start + count {
-            (start + count - 1, target + count - 1, -1isize)
+        let ov = Value::Object(o);
+        let len = length_of(vm, &ov)?;
+        let to = rel_index(vm, &arg(args, 0), len, 0.0)?;
+        let from = rel_index(vm, &arg(args, 1), len, 0.0)?;
+        let fin = rel_index(vm, &arg(args, 2), len, len)?;
+        let count = (fin - from).min(len - to).max(0.0);
+        // Copy with overlap-aware direction.
+        let (mut from, mut to, dir) = if from < to && to < from + count {
+            (from + count - 1.0, to + count - 1.0, -1.0)
         } else {
-            (start, target, 1)
+            (from, to, 1.0)
         };
         let mut cnt = count;
-        while cnt > 0 {
-            let fk = PropertyKey::from_index(from as u32);
-            let tk = PropertyKey::from_index(to as u32);
+        while cnt > 0.0 {
+            vm.native_tick()?;
+            let fk = elem_key(from);
+            let tk = elem_key(to);
             if vm.has_prop(&ov, &fk)? {
                 let v = vm.get_prop(&ov, &fk)?;
-                vm.set_prop(&ov, &tk, v)?;
+                vm.set_prop_strict(&ov, &tk, v)?;
             } else {
-                vm.delete_prop(&ov, &tk)?;
+                delete_or_throw(vm, &ov, &tk)?;
             }
             from += dir;
             to += dir;
-            cnt -= 1;
+            cnt -= 1.0;
         }
-        Ok(this)
+        Ok(ov)
     });
     vm.define_method(proto, "reverse", 0, |vm, this, _args| {
         let o = vm.to_object(&this)?;
@@ -935,18 +990,26 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         // Generic array-like: swap O[lower]/O[upper] honoring presence (holes) so
         // an absent slot is created/deleted rather than read as undefined.
         let ov = Value::Object(o);
-        let len = elements_len(vm, &ov)?;
-        if len > crate::value::MAX_DENSE_ARRAY {
-            return Err(vm.throw_range("array-like length exceeds engine limit"));
-        }
-        for lower in 0..len / 2 {
-            let upper = len - 1 - lower;
-            let lk = PropertyKey::from_index(lower as u32);
-            let uk = PropertyKey::from_index(upper as u32);
+        let len = length_of(vm, &ov)?;
+        let middle = (len / 2.0).floor();
+        let mut lower = 0.0;
+        while lower < middle {
+            vm.native_tick()?;
+            let upper = len - lower - 1.0;
+            let lk = elem_key(lower);
+            let uk = elem_key(upper);
             let lower_exists = vm.has_prop(&ov, &lk)?;
-            let lower_val = if lower_exists { vm.get_prop(&ov, &lk)? } else { Value::Undefined };
+            let lower_val = if lower_exists {
+                vm.get_prop(&ov, &lk)?
+            } else {
+                Value::Undefined
+            };
             let upper_exists = vm.has_prop(&ov, &uk)?;
-            let upper_val = if upper_exists { vm.get_prop(&ov, &uk)? } else { Value::Undefined };
+            let upper_val = if upper_exists {
+                vm.get_prop(&ov, &uk)?
+            } else {
+                Value::Undefined
+            };
             match (lower_exists, upper_exists) {
                 (true, true) => {
                     vm.set_prop_strict(&ov, &lk, upper_val)?;
@@ -962,51 +1025,38 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
                 }
                 (false, false) => {}
             }
+            lower += 1.0;
         }
         Ok(ov)
     });
     vm.define_method(proto, "flat", 0, |vm, this, args| {
-        let items = elements_with_holes(vm, &this)?;
+        let o = vm.to_object(&this)?;
+        let ov = Value::Object(o);
+        let source_len = length_of(vm, &ov)?;
         let depth = {
             let d = arg(args, 0);
             if d.is_undefined() {
                 1.0
             } else {
-                to_integer_or_infinity(vm, &d)?.max(0.0)
+                to_integer_or_infinity(vm, &d)?
             }
         };
-        let mut out = Vec::new();
-        flatten(vm, items, depth, &mut out);
-        Ok(Value::Object(vm.new_array(out)))
+        let a = array_species_create(vm, &ov, 0.0)?;
+        flatten_into(vm, &a, &ov, source_len, 0.0, depth, None)?;
+        Ok(a)
     });
     vm.define_method(proto, "flatMap", 1, |vm, this, args| {
-        let items = elements_with_holes(vm, &this)?;
+        let o = vm.to_object(&this)?;
+        let ov = Value::Object(o);
+        let source_len = length_of(vm, &ov)?;
         let cb = arg(args, 0);
         if !vm.is_callable(&cb) {
             return Err(vm.throw_type("callback is not a function"));
         }
         let this_arg = arg(args, 1);
-        let mut out = Vec::new();
-        for (i, v) in items.into_iter().enumerate() {
-            // Holes are skipped (HasProperty is false).
-            if matches!(v, Value::Hole) {
-                continue;
-            }
-            let r = vm.call(
-                cb.clone(),
-                this_arg.clone(),
-                &[v, Value::Number(i as f64), this.clone()],
-            )?;
-            // Spread a one-level array result; everything else is pushed as-is.
-            if let Value::Object(ro) = &r {
-                if ro.borrow().is_array() {
-                    out.extend(arr_clone(ro));
-                    continue;
-                }
-            }
-            out.push(r);
-        }
-        Ok(Value::Object(vm.new_array(out)))
+        let a = array_species_create(vm, &ov, 0.0)?;
+        flatten_into(vm, &a, &ov, source_len, 0.0, 1.0, Some((&cb, &this_arg)))?;
+        Ok(a)
     });
     vm.define_method(proto, "sort", 1, |vm, this, args| {
         let cmp = arg(args, 0);
@@ -1020,16 +1070,16 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         // snapshot, then write back through Set and delete the trailing slots.
         let o = vm.to_object(&this)?;
         let ov = Value::Object(o);
-        let len = elements_len(vm, &ov)?;
-        if len > crate::value::MAX_DENSE_ARRAY {
-            return Err(vm.throw_range("array-like length exceeds engine limit"));
-        }
+        let len = length_of(vm, &ov)?;
         let mut items: Vec<Value> = Vec::new();
-        for k in 0..len {
-            let key = PropertyKey::from_index(k as u32);
+        let mut k = 0.0;
+        while k < len {
+            vm.native_tick()?;
+            let key = elem_key(k);
             if vm.has_prop(&ov, &key)? {
                 items.push(vm.get_prop(&ov, &key)?);
             }
+            k += 1.0;
         }
         let item_count = items.len();
         // Undefineds sort to the end without the comparator ever seeing them.
@@ -1040,19 +1090,20 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             .collect();
         let undef_count = item_count - defined.len();
         merge_sort(vm, &mut defined, &cmp, has_cmp)?;
-        let mut j = 0usize;
+        let mut j = 0.0;
         for v in defined {
-            vm.set_prop_strict(&ov, &PropertyKey::from_index(j as u32), v)?;
-            j += 1;
+            vm.set_prop_strict(&ov, &elem_key(j), v)?;
+            j += 1.0;
         }
         for _ in 0..undef_count {
-            vm.set_prop_strict(&ov, &PropertyKey::from_index(j as u32), Value::Undefined)?;
-            j += 1;
+            vm.set_prop_strict(&ov, &elem_key(j), Value::Undefined)?;
+            j += 1.0;
         }
         // Indices [itemCount, len) were holes (absent) — delete them.
         while j < len {
-            vm.delete_prop(&ov, &PropertyKey::from_index(j as u32))?;
-            j += 1;
+            vm.native_tick()?;
+            delete_or_throw(vm, &ov, &elem_key(j))?;
+            j += 1.0;
         }
         Ok(ov)
     });
@@ -1062,7 +1113,20 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             return Err(vm.throw_type("comparator is not a function"));
         }
         let has_cmp = vm.is_callable(&cmp);
-        let items = elements(vm, &this)?;
+        let o = vm.to_object(&this)?;
+        let ov = Value::Object(o);
+        let len = length_of(vm, &ov)?;
+        // ArrayCreate(len) bounds (the result is a plain dense array).
+        array_create(vm, len)?;
+        // SortIndexedProperties in read-through-holes mode: Get at EVERY index
+        // (no HasProperty skip), so holes read as undefined / via the prototype.
+        let mut items: Vec<Value> = Vec::with_capacity(len as usize);
+        let mut k = 0.0;
+        while k < len {
+            vm.native_tick()?;
+            items.push(vm.get_prop(&ov, &elem_key(k))?);
+            k += 1.0;
+        }
         let mut defined: Vec<Value> = items
             .iter()
             .filter(|v| !v.is_undefined())
@@ -1074,45 +1138,89 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         Ok(Value::Object(vm.new_array(defined)))
     });
     vm.define_method(proto, "toReversed", 0, |vm, this, _args| {
-        let mut items = elements(vm, &this)?;
-        items.reverse();
-        Ok(Value::Object(vm.new_array(items)))
+        let o = vm.to_object(&this)?;
+        let ov = Value::Object(o);
+        let len = length_of(vm, &ov)?;
+        array_create(vm, len)?;
+        // Get(O, len-1-k) in ascending k order: reads are observably descending,
+        // holes read as undefined / through the prototype, and a getter that
+        // mutates the array mid-iteration is honored.
+        let mut out: Vec<Value> = Vec::with_capacity(len as usize);
+        let mut k = 0.0;
+        while k < len {
+            vm.native_tick()?;
+            out.push(vm.get_prop(&ov, &elem_key(len - k - 1.0))?);
+            k += 1.0;
+        }
+        Ok(Value::Object(vm.new_array(out)))
     });
     vm.define_method(proto, "toSpliced", 2, |vm, this, args| {
-        let items = elements(vm, &this)?;
-        let len = items.len() as isize;
-        let start = rel_index(vm, &arg(args, 0), len, 0)?;
+        let o = vm.to_object(&this)?;
+        let ov = Value::Object(o);
+        let len = length_of(vm, &ov)?;
+        let actual_start = rel_index(vm, &arg(args, 0), len, 0.0)?;
+        let insert_count = args.len().saturating_sub(2) as f64;
         let skip = if args.is_empty() {
-            0
+            0.0
         } else if args.len() == 1 {
-            len - start
+            len - actual_start
         } else {
             let dc = to_integer_or_infinity(vm, &arg(args, 1))?;
-            dc.max(0.0).min((len - start) as f64) as isize
-        }
-        .min(len - start)
-        .max(0);
-        let inserts: Vec<Value> = if args.len() > 2 {
-            args[2..].to_vec()
-        } else {
-            Vec::new()
+            dc.clamp(0.0, len - actual_start)
         };
-        let mut out: Vec<Value> = Vec::with_capacity(items.len());
-        out.extend_from_slice(&items[..start as usize]);
-        out.extend(inserts);
-        out.extend_from_slice(&items[(start + skip) as usize..]);
+        let new_len = len + insert_count - skip;
+        if new_len > MAX_SAFE_LEN {
+            return Err(vm.throw_type("toSpliced result exceeds the maximum safe integer length"));
+        }
+        array_create(vm, new_len)?;
+        // Three phases, all through Get in ascending index order: the head
+        // [0, actualStart), the inserted items, then the tail starting at
+        // actualStart + skipCount (the skipped range is never read).
+        let mut out: Vec<Value> = Vec::with_capacity(new_len as usize);
+        let mut i = 0.0;
+        while i < actual_start {
+            vm.native_tick()?;
+            out.push(vm.get_prop(&ov, &elem_key(i))?);
+            i += 1.0;
+        }
+        if args.len() > 2 {
+            for v in &args[2..] {
+                out.push(v.clone());
+                i += 1.0;
+            }
+        }
+        let mut r = actual_start + skip;
+        while i < new_len {
+            vm.native_tick()?;
+            out.push(vm.get_prop(&ov, &elem_key(r))?);
+            i += 1.0;
+            r += 1.0;
+        }
         Ok(Value::Object(vm.new_array(out)))
     });
     vm.define_method(proto, "with", 2, |vm, this, args| {
-        let mut items = elements(vm, &this)?;
-        let len = items.len() as f64;
+        let o = vm.to_object(&this)?;
+        let ov = Value::Object(o);
+        let len = length_of(vm, &ov)?;
         let rel = to_integer_or_infinity(vm, &arg(args, 0))?;
         let actual = if rel >= 0.0 { rel } else { len + rel };
         if actual < 0.0 || actual >= len {
             return Err(vm.throw_range("Invalid index"));
         }
-        items[actual as usize] = arg(args, 1);
-        Ok(Value::Object(vm.new_array(items)))
+        array_create(vm, len)?;
+        let value = arg(args, 1);
+        let mut out: Vec<Value> = Vec::with_capacity(len as usize);
+        let mut k = 0.0;
+        while k < len {
+            vm.native_tick()?;
+            if k == actual {
+                out.push(value.clone());
+            } else {
+                out.push(vm.get_prop(&ov, &elem_key(k))?);
+            }
+            k += 1.0;
+        }
+        Ok(Value::Object(vm.new_array(out)))
     });
     vm.define_method(proto, "keys", 0, |vm, this, _a| {
         let o = dense(vm, &this)?;
@@ -1149,24 +1257,106 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     vm.define_value_sym(proto, sym, values);
 }
 
-/// Flatten `items` recursively to `depth` levels, spreading nested arrays.
-fn flatten(vm: &mut Vm, items: Vec<Value>, depth: f64, out: &mut Vec<Value>) {
-    for v in items {
-        // Holes are skipped (FlattenIntoArray uses HasProperty).
-        if matches!(v, Value::Hole) {
-            continue;
+/// `Array.prototype[@@unscopables]` (23.1.3.38): a null-prototype object whose
+/// listed method names are excluded from `with`-scope resolution. The property
+/// itself is {writable: false, enumerable: false, configurable: true}; its
+/// entries are ordinary `true` data properties.
+fn install_unscopables(vm: &mut Vm, proto: &JsObject) {
+    let unsc = vm.new_object_proto(None);
+    {
+        let mut b = unsc.borrow_mut();
+        for name in [
+            "at",
+            "copyWithin",
+            "entries",
+            "fill",
+            "find",
+            "findIndex",
+            "findLast",
+            "findLastIndex",
+            "flat",
+            "flatMap",
+            "includes",
+            "keys",
+            "toReversed",
+            "toSorted",
+            "toSpliced",
+            "values",
+        ] {
+            b.props
+                .insert(PropertyKey::str(name), Property::data(Value::Bool(true)));
         }
-        if depth > 0.0 {
-            if let Value::Object(vo) = &v {
-                if vo.borrow().is_array() {
-                    let nested = arr_clone(vo);
-                    flatten(vm, nested, depth - 1.0, out);
-                    continue;
+    }
+    let sym = vm.realm.symbol_unscopables.clone();
+    proto.borrow_mut().props.insert(
+        PropertyKey::Sym(sym),
+        Property {
+            kind: PropertyKind::Data {
+                value: Value::Object(unsc),
+                writable: false,
+            },
+            enumerable: false,
+            configurable: true,
+        },
+    );
+}
+
+/// `FlattenIntoArray(target, source, sourceLen, start, depth [, mapper])`
+/// (23.1.3.13.1): walk the source via HasProperty/Get; spread elements that
+/// are arrays (proxy-aware `IsArray`) up to `depth` levels; everything else is
+/// CreateDataPropertyOrThrow'd onto the target at the running index.
+fn flatten_into(
+    vm: &mut Vm,
+    target: &Value,
+    source: &Value,
+    source_len: f64,
+    start: f64,
+    depth: f64,
+    mapper: Option<(&Value, &Value)>,
+) -> Result<f64, Value> {
+    let mut target_index = start;
+    let mut source_index = 0.0;
+    while source_index < source_len {
+        vm.native_tick()?;
+        let p = elem_key(source_index);
+        if vm.has_prop(source, &p)? {
+            let mut element = vm.get_prop(source, &p)?;
+            if let Some((cb, this_arg)) = mapper {
+                element = vm.call(
+                    (*cb).clone(),
+                    (*this_arg).clone(),
+                    &[element, Value::Number(source_index), source.clone()],
+                )?;
+            }
+            let should_flatten = if depth > 0.0 {
+                spec_is_array(vm, &element)?
+            } else {
+                false
+            };
+            if should_flatten {
+                let element_len = length_of(vm, &element)?;
+                target_index = flatten_into(
+                    vm,
+                    target,
+                    &element,
+                    element_len,
+                    target_index,
+                    depth - 1.0,
+                    None,
+                )?;
+            } else {
+                if target_index >= MAX_SAFE_LEN {
+                    return Err(
+                        vm.throw_type("flattened array exceeds the maximum safe integer length")
+                    );
                 }
+                create_data_on(vm, target, &elem_key(target_index), element)?;
+                target_index += 1.0;
             }
         }
-        out.push(v);
+        source_index += 1.0;
     }
+    Ok(target_index)
 }
 
 fn merge_sort(
@@ -1274,172 +1464,45 @@ fn iter_setup(
     vm: &mut Vm,
     this: &Value,
     args: &[Value],
-) -> Result<(Value, usize, Value, Value), Value> {
+) -> Result<(Value, f64, Value, Value), Value> {
     let o = vm.to_object(this)?;
     let ov = Value::Object(o);
-    let len = elements_len(vm, &ov)?;
+    let len = length_of(vm, &ov)?;
     let cb = arg(args, 0);
     if !vm.is_callable(&cb) {
         return Err(vm.throw_type("callback is not a function"));
-    }
-    if len > crate::value::MAX_DENSE_ARRAY {
-        return Err(vm.throw_range("array-like length exceeds engine limit"));
     }
     Ok((ov, len, cb, arg(args, 1)))
 }
 
 /// `ArraySpeciesCreate(originalArray, length)` (spec 10.4.2.2): build the result
-/// array for map/filter/slice/splice/concat via the original's constructor
+/// array for map/filter/slice/splice/concat/flat via the original's constructor
 /// `@@species`, falling back to a plain Array when there is no custom species.
-fn array_species_create(vm: &mut Vm, original: &Value, len: usize) -> Result<Value, Value> {
-    let is_arr = matches!(original, Value::Object(o) if o.borrow().is_array());
+/// `IsArray` is proxy-aware, so a Proxy of an array consults its (trapped)
+/// `constructor` too.
+fn array_species_create(vm: &mut Vm, original: &Value, len: f64) -> Result<Value, Value> {
+    let is_arr = spec_is_array(vm, original)?;
     let mut c = Value::Undefined;
     if is_arr {
         c = vm.get_prop(original, &PropertyKey::str("constructor"))?;
         if matches!(c, Value::Object(_)) {
             let sym = vm.realm.symbol_species.clone();
             c = vm.get_prop(&c, &PropertyKey::Sym(sym))?;
+            // Only a null @@species falls back to undefined; a null/primitive
+            // `constructor` itself must reach the IsConstructor TypeError.
             if matches!(c, Value::Null) {
                 c = Value::Undefined;
             }
         }
     }
     if c.is_undefined() {
-        if len > crate::value::MAX_DENSE_ARRAY {
-            return Err(vm.throw_range("array length exceeds engine limit"));
-        }
-        return Ok(Value::Object(vm.new_array(vec![Value::Hole; len])));
+        return Ok(Value::Object(array_create(vm, len)?));
     }
     if !vm.is_constructor(&c) {
         return Err(vm.throw_type("constructor's Symbol.species is not a constructor"));
     }
-    vm.construct(&c, &[Value::Number(len as f64)], &c)
-}
-
-/// Materialize the elements of an array or array-like `this` (length property +
-/// indexed access), so the non-mutating prototype methods work generically —
-/// including `Array.prototype.method.call(arrayLikeObject, …)`. Holes read as
-/// `undefined` (the spec's Get-based view); use `elements_with_holes` for the
-/// few methods that must distinguish a hole from a present `undefined`.
-fn elements(vm: &mut Vm, this: &Value) -> Result<Vec<Value>, Value> {
-    let mut out = elements_with_holes(vm, this)?;
-    for v in &mut out {
-        if matches!(v, Value::Hole) {
-            *v = Value::Undefined;
-        }
-    }
-    Ok(out)
-}
-
-/// Like `elements`, but preserves `Value::Hole` in the dense fast path so a
-/// caller can tell a hole apart from a present `undefined` (used by
-/// `indexOf`/`lastIndexOf`, which skip holes, and `flat`/`flatMap`).
-fn elements_with_holes(vm: &mut Vm, this: &Value) -> Result<Vec<Value>, Value> {
-    if let Value::Object(o) = this {
-        let is_arr = matches!(o.borrow().internal, Internal::Array(_));
-        if is_arr {
-            if let Internal::Array(a) = &o.borrow().internal {
-                return Ok(a.clone());
-            }
-        }
-    }
-    let o = vm.to_object(this)?;
-    let len_v = vm.get_prop(&Value::Object(o.clone()), &PropertyKey::str("length"))?;
-    let len = vm.to_length(&len_v)?;
-    // Cap array-like materialization: a huge `length` property (test262 uses
-    // values like 2^32) would otherwise loop forever. Bounding it fails such
-    // boundary tests loudly instead of hanging the engine.
-    if len > crate::value::MAX_DENSE_ARRAY {
-        return Err(vm.throw_range("array-like length exceeds engine limit"));
-    }
-    let mut out = Vec::with_capacity(len.min(1 << 16));
-    for i in 0..len {
-        out.push(vm.get_prop(
-            &Value::Object(o.clone()),
-            &PropertyKey::from_index(i as u32),
-        )?);
-    }
-    Ok(out)
-}
-
-/// `(index, value)` pairs for the *present* indices of an array-like receiver.
-/// The spec iteration methods (`forEach`/`some`/`every`/`map`/`filter`/`reduce`)
-/// skip holes — indices where `HasProperty(O, k)` is false — so an array-like
-/// like `{length: 3, 0: …, 2: …}` visits 0 and 2 but not 1. Dense arrays have no
-/// holes (every slot is present), so they visit every index.
-fn present_elements(vm: &mut Vm, this: &Value) -> Result<Vec<(usize, Value)>, Value> {
-    if let Value::Object(o) = this {
-        // Dense fast-path only when there are no *reified* index properties (a
-        // getter/accessor or a non-default descriptor defined via
-        // defineProperty on an index): those shadow the dense slot and must be
-        // read through `get_prop` (invoking the getter), which the generic path
-        // below does.
-        let dense_ok = {
-            let b = o.borrow();
-            matches!(b.internal, Internal::Array(_))
-                && !b.props.keys().any(|k| k.array_index().is_some())
-        };
-        if dense_ok {
-            if let Internal::Array(a) = &o.borrow().internal {
-                // Holes are absent: methods that consult HasProperty skip them.
-                return Ok(a
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, v)| !matches!(v, Value::Hole))
-                    .map(|(i, v)| (i, v.clone()))
-                    .collect());
-            }
-        }
-    }
-    let o = vm.to_object(this)?;
-    let ov = Value::Object(o);
-    let len = elements_len(vm, &ov)?;
-    if len > crate::value::MAX_DENSE_ARRAY {
-        return Err(vm.throw_range("array-like length exceeds engine limit"));
-    }
-    let mut out = Vec::new();
-    for k in 0..len {
-        let key = PropertyKey::from_index(k as u32);
-        if vm.has_prop(&ov, &key)? {
-            out.push((k, vm.get_prop(&ov, &key)?));
-        }
-    }
-    Ok(out)
-}
-
-/// The `length` of an array or array-like `this` without materializing every
-/// element (used by index-only methods like `at`/`includes`).
-fn elements_len(vm: &mut Vm, this: &Value) -> Result<usize, Value> {
-    if let Value::Object(o) = this {
-        if let Internal::Array(a) = &o.borrow().internal {
-            return Ok(a.len());
-        }
-    }
-    let o = vm.to_object(this)?;
-    let len_v = vm.get_prop(&Value::Object(o.clone()), &PropertyKey::str("length"))?;
-    vm.to_length(&len_v)
-}
-
-fn arr_len(o: &JsObject) -> usize {
-    if let Internal::Array(a) = &o.borrow().internal {
-        a.len()
-    } else {
-        0
-    }
-}
-fn arr_get(o: &JsObject, i: usize) -> Value {
-    if let Internal::Array(a) = &o.borrow().internal {
-        a.get(i).cloned().unwrap_or(Value::Undefined)
-    } else {
-        Value::Undefined
-    }
-}
-fn arr_clone(o: &JsObject) -> Vec<Value> {
-    if let Internal::Array(a) = &o.borrow().internal {
-        a.clone()
-    } else {
-        Vec::new()
-    }
+    // `len + 0.0` normalizes a negative-zero count (observable by the ctor).
+    vm.construct(&c, &[Value::Number(len + 0.0)], &c)
 }
 
 /// ECMAScript `ToIntegerOrInfinity`: ToNumber, then NaN -> 0, truncate toward
@@ -1458,20 +1521,18 @@ fn to_integer_or_infinity(vm: &mut Vm, v: &Value) -> Result<f64, Value> {
 
 /// Resolve a relative start/end index argument against `len`, clamped to
 /// `[0, len]`. `default` is used when the argument is `undefined`.
-fn rel_index(vm: &mut Vm, v: &Value, len: isize, default: isize) -> Result<isize, Value> {
+fn rel_index(vm: &mut Vm, v: &Value, len: f64, default: f64) -> Result<f64, Value> {
     if v.is_undefined() {
         return Ok(default);
     }
     let rel = to_integer_or_infinity(vm, v)?;
-    let lenf = len as f64;
-    let idx = if rel == f64::NEG_INFINITY {
+    Ok(if rel == f64::NEG_INFINITY {
         0.0
     } else if rel < 0.0 {
-        (lenf + rel).max(0.0)
+        (len + rel).max(0.0)
     } else {
-        rel.min(lenf)
-    };
-    Ok(idx as isize)
+        rel.min(len)
+    })
 }
 
 /// Install `next`, `[Symbol.iterator]` on the array/string/map/set iterator
@@ -1483,11 +1544,11 @@ fn install_iterator_protos(vm: &mut Vm) {
     let self_iter = vm.new_native("[Symbol.iterator]", 0, |_vm, this, _a| Ok(this));
     vm.define_value_sym(&base, sym, Value::Object(self_iter));
 
-    for proto in [
-        vm.realm.array_iterator_proto.clone(),
-        vm.realm.string_iterator_proto.clone(),
-        vm.realm.map_iterator_proto.clone(),
-        vm.realm.set_iterator_proto.clone(),
+    for (proto, tag) in [
+        (vm.realm.array_iterator_proto.clone(), "Array Iterator"),
+        (vm.realm.string_iterator_proto.clone(), "String Iterator"),
+        (vm.realm.map_iterator_proto.clone(), "Map Iterator"),
+        (vm.realm.set_iterator_proto.clone(), "Set Iterator"),
     ] {
         vm.define_method(&proto, "next", 0, |vm, this, _args| {
             let o = match &this {
@@ -1496,5 +1557,19 @@ fn install_iterator_protos(vm: &mut Vm) {
             };
             vm.builtin_iterator_next(&o)
         });
+        // %XIteratorPrototype%[@@toStringTag] — non-writable, non-enumerable,
+        // configurable.
+        let sym = vm.realm.symbol_to_string_tag.clone();
+        proto.borrow_mut().props.insert(
+            PropertyKey::Sym(sym),
+            Property {
+                kind: PropertyKind::Data {
+                    value: Value::str(tag),
+                    writable: false,
+                },
+                enumerable: false,
+                configurable: true,
+            },
+        );
     }
 }

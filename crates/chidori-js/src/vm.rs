@@ -74,6 +74,10 @@ pub struct TryHandler {
     /// machinery's internal await-of-yielded-value rejection sets the frame's
     /// one-shot skip flag, which makes the unwind pass this handler by.
     pub delegation: bool,
+    /// `yield*` return delegation: a `.return(v)` resumption unwinding across
+    /// this handler jumps here (with `v` pushed) instead of completing the
+    /// generator, so the loop can call the inner iterator's `return` method.
+    pub delegation_return_ip: Option<u32>,
 }
 
 /// A single call frame. Self-contained (own operand stack + locals) so that a
@@ -241,6 +245,9 @@ pub struct Vm {
     /// uncatchable throw. Used by the conformance runner's per-test timeout so a
     /// slow test stops grinding instead of being abandoned to leak a CPU core.
     pub interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Wrapping counter so [`Vm::native_tick`] only polls the interrupt flag
+    /// every 256 iterations (same cadence as the interpreter loop).
+    pub(crate) native_poll: u32,
     /// Module evaluation: when set, `run_frame` snapshots the final cell vector of
     /// the frame whose proto pointer matches, into `module_capture`. This lets the
     /// module linker recover a module's top-level binding cells (its live exports)
@@ -295,6 +302,7 @@ impl Vm {
             rng_state: 0x2545F4914F6CDD1D,
             op_budget: None,
             interrupt: None,
+            native_poll: 0,
             module_capture_proto: None,
             module_capture: None,
             trace_sink: None,
@@ -711,6 +719,34 @@ impl Vm {
         }
     }
 
+    /// Consume one unit of the opcode budget from a native builtin loop. The
+    /// spec mandates O(len) walks for the generic Array methods, and `len` can
+    /// be up to 2^53-1 on an array-like — without metering, a hostile
+    /// `{length: 2**53}` receiver would hang the engine where a JS `while`
+    /// loop could not. Same semantics as the interpreter loop: budget
+    /// exhaustion and observed interrupts throw uncatchably (the budget is
+    /// zeroed so `try/catch` cannot resume).
+    pub fn native_tick(&mut self) -> Result<(), Value> {
+        if let Some(budget) = self.op_budget.as_mut() {
+            if *budget == 0 {
+                return Err(self.throw_range("execution budget exceeded"));
+            }
+            *budget -= 1;
+        }
+        if self.interrupt.is_some() {
+            self.native_poll = self.native_poll.wrapping_add(1);
+            if self.native_poll & 0xFF == 0 {
+                if let Some(flag) = &self.interrupt {
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.op_budget = Some(0);
+                        return Err(self.throw_range("execution interrupted"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn to_length(&mut self, v: &Value) -> Result<usize, Value> {
         let n = self.to_number(v)?;
         if n.is_nan() || n <= 0.0 {
@@ -900,6 +936,17 @@ impl Vm {
                 // non-dense descriptor defined via defineProperty) is
                 // authoritative and shadows the dense-Vec slot, so only consult
                 // the Vec when there is no own `props` entry for the key.
+                // Mapped arguments: an aliased index reads the parameter
+                // CELL (live aliasing), not the stale props value.
+                if let Internal::Arguments(map) = &b.internal {
+                    if let Some(idx) = key.array_index() {
+                        if b.props.contains_key(key) {
+                            if let Some(Some(cell)) = map.get(idx as usize) {
+                                return Ok(cell.borrow().clone());
+                            }
+                        }
+                    }
+                }
                 if let Internal::Array(arr) = &b.internal {
                     if let Some("length") = key.as_str() {
                         if !b.props.contains_key(key) {
@@ -1102,6 +1149,27 @@ impl Vm {
                         }
                     }
                     None => {
+                        // Array exotic own data slots live in `internal`, not
+                        // `props`: the virtual `length` and any live (non-hole)
+                        // dense element are own writable data properties, so
+                        // the write must not consult the prototype chain
+                        // (which could hold a proxy trap or a read-only index
+                        // that would wrongly veto the assignment). A hole IS
+                        // absent, so it still walks the chain like the spec's
+                        // ordinary [[Set]].
+                        let dense_own = match &b.internal {
+                            Internal::Array(arr) => match key.as_str() {
+                                Some("length") => true,
+                                _ => key.array_index().map_or(false, |i| {
+                                    (i as usize) < arr.len()
+                                        && !matches!(arr[i as usize], Value::Hole)
+                                }),
+                            },
+                            _ => false,
+                        };
+                        if dense_own {
+                            break;
+                        }
                         let proto = b.proto.clone();
                         drop(b);
                         match proto {
@@ -1144,10 +1212,32 @@ impl Vm {
         strict: bool,
     ) -> Result<(), Value> {
         let mut b = obj.borrow_mut();
+        // Mapped arguments: a [[Set]] on an aliased index writes the parameter
+        // CELL too (the ordinary props entry below stays in sync).
+        if let Internal::Arguments(map) = &b.internal {
+            if let Some(idx) = key.array_index() {
+                if b.props.contains_key(key) {
+                    if let Some(Some(cell)) = map.get(idx as usize) {
+                        *cell.borrow_mut() = value.clone();
+                    }
+                }
+            }
+        }
         // Array exotic write. A reified `props` entry for an index/length shadows
         // the dense store, so route the write through the ordinary props path
         // below (which honours its writable flag) when such an entry exists.
         let has_props_entry = b.props.contains_key(key);
+        // A non-writable `length` marker blocks index writes past the end.
+        let len_not_writable = matches!(
+            b.props.get(&PropertyKey::str("length")),
+            Some(Property {
+                kind: PropertyKind::Data {
+                    writable: false,
+                    ..
+                },
+                ..
+            })
+        );
         if !has_props_entry {
             if let Internal::Array(arr) = &mut b.internal {
                 if let Some("length") = key.as_str() {
@@ -1170,6 +1260,16 @@ impl Vm {
                 if let Some(idx) = key.array_index() {
                     let idx = idx as usize;
                     if idx >= arr.len() {
+                        if len_not_writable {
+                            // Growing past a non-writable `length` is rejected
+                            // (silently in sloppy mode, TypeError in strict).
+                            if strict {
+                                return Err(self.throw_type(
+                                    "Cannot add property, array length is not writable",
+                                ));
+                            }
+                            return Ok(());
+                        }
                         if idx >= crate::value::MAX_DENSE_ARRAY {
                             return Err(self.throw_range("Array index exceeds engine limit"));
                         }
@@ -1262,6 +1362,14 @@ impl Vm {
                         let idx = idx as usize;
                         if idx < arr.len() {
                             arr[idx] = Value::Hole;
+                        }
+                    }
+                }
+                // Deleting a mapped arguments index severs the parameter alias.
+                if let Internal::Arguments(map) = &mut b.internal {
+                    if let Some(idx) = key.array_index() {
+                        if let Some(slot) = map.get_mut(idx as usize) {
+                            *slot = None;
                         }
                     }
                 }
@@ -1363,7 +1471,10 @@ impl Vm {
             }
         }
         if let Internal::TypedArray(t) = &b.internal {
-            for i in 0..t.length.min(crate::value::MAX_DENSE_ARRAY) {
+            // The LIVE element count: a length-tracking view follows its
+            // resizable buffer, and an out-of-bounds view has no index keys.
+            let len = crate::typed_array::ta_eff_length(t);
+            for i in 0..len.min(crate::value::MAX_DENSE_ARRAY) {
                 int_keys.push(i as u32);
             }
         }

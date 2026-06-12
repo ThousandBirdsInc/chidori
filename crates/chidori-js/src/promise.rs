@@ -64,8 +64,30 @@ impl Vm {
                 self.reject_promise(promise, err);
                 return;
             }
-            // Native promise: chain reactions.
-            if matches!(o.borrow().internal, Internal::Promise(_)) {
+            // `Get(value, "then")` is observable, and an abrupt completion
+            // REJECTS the promise (spec PromiseResolveFunctions step 9).
+            let then = match self.get_prop(&value, &PropertyKey::str("then")) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.reject_promise(promise, e);
+                    return;
+                }
+            };
+            // Native promise whose `then` is still the intrinsic
+            // %Promise.prototype.then%: chain reactions directly (a custom or
+            // poisoned `then` must go through the thenable job instead).
+            let builtin_then = self
+                .realm
+                .promise_proto
+                .borrow()
+                .props
+                .get(&PropertyKey::str("then"))
+                .and_then(|p| p.value().cloned());
+            let is_intrinsic_then = matches!(
+                (&then, &builtin_then),
+                (Value::Object(a), Some(Value::Object(b))) if a.same(b)
+            );
+            if is_intrinsic_then && matches!(o.borrow().internal, Internal::Promise(_)) {
                 let target = promise.clone();
                 let t2 = promise.clone();
                 self.promise_then_internal(
@@ -84,9 +106,6 @@ impl Vm {
                 return;
             }
             // Thenable? schedule a job.
-            let then = self
-                .get_prop(&value, &PropertyKey::str("then"))
-                .unwrap_or(Value::Undefined);
             if self.is_callable(&then) {
                 let promise2 = promise.clone();
                 let value2 = value.clone();

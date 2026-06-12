@@ -117,6 +117,10 @@ pub struct FuncProto {
     pub uses_arguments: bool,
     /// Names of the positional params, for `arguments`/debug.
     pub param_names: Vec<String>,
+    /// For a MAPPED `arguments` object (sloppy, simple parameter list): the
+    /// cell index of each positional parameter (`None` for an index shadowed
+    /// by a later duplicate name). Empty when the function is unmapped.
+    pub mapped_param_cells: Vec<Option<u32>>,
     /// Strict-mode code: assignment to a non-writable / setter-less / non-existent
     /// property of a non-extensible object (and to a primitive) throws a TypeError
     /// rather than silently failing (PutValue with Throw=true).
@@ -154,6 +158,7 @@ impl FuncProto {
             source_start: 0,
             uses_arguments: false,
             param_names: Vec::new(),
+            mapped_param_cells: Vec::new(),
             is_strict: false,
             stable_cells: Vec::new(),
             eval_scopes: Vec::new(),
@@ -334,8 +339,11 @@ pub enum Op {
     /// the iterator protocol's "result must be an Object" check.
     RequireIterResult,
     /// Mark the most recently pushed try-handler as a `yield*` delegation
-    /// handler (see `TryHandler::delegation`).
-    MarkDelegationHandler,
+    /// handler (see `TryHandler::delegation`). The operand is the ip a
+    /// `.return(v)` resumption jumps to (with `v` pushed) so the delegation
+    /// loop can forward it to the inner iterator's `return` method;
+    /// `u32::MAX` = no return delegation.
+    MarkDelegationHandler(u32),
     /// Direct `eval(...)` call site: `[callee, arg0..argN-1] -> [result]`.
     /// When the callee is the %eval% intrinsic, the source compiles against
     /// the scope snapshot `FuncProto::eval_scopes[scope]` and runs with the

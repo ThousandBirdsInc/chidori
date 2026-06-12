@@ -29,8 +29,11 @@ fn install_promise(vm: &mut Vm) {
             //    run the executor with (resolve, reject). A throw rejects.
             let promise = vm.new_promise();
             let (resolve, reject) = make_resolving_functions(vm, &promise);
+            let reject_fn = reject.clone();
             if let Err(e) = vm.call(executor, Value::Undefined, &[resolve, reject]) {
-                vm.reject_promise(&promise, e);
+                // The throw goes through the REJECT FUNCTION: a no-op when the
+                // executor already resolved/rejected (the shared flag won).
+                let _ = vm.call(reject_fn, Value::Undefined, &[e]);
             }
             Ok(Value::Object(promise))
         },
@@ -38,15 +41,39 @@ fn install_promise(vm: &mut Vm) {
     vm.install_ctor("Promise", &ctor, &proto);
     vm.install_species(&ctor);
 
-    // Promise.withResolvers() — { promise, resolve, reject } (ES2024).
-    vm.define_method(&ctor, "withResolvers", 0, |vm, _t, _a| {
-        let promise = vm.new_promise();
-        let (resolve, reject) = make_resolving_functions(vm, &promise);
+    // Promise.withResolvers() — { promise, resolve, reject } (ES2024), built
+    // via NewPromiseCapability(this) so subclasses construct themselves.
+    vm.define_method(&ctor, "withResolvers", 0, |vm, this, _a| {
+        let (promise, resolve, reject) = new_promise_capability(vm, &this)?;
         let obj = Value::Object(vm.new_object());
-        vm.set_prop(&obj, &PropertyKey::str("promise"), Value::Object(promise))?;
+        vm.set_prop(&obj, &PropertyKey::str("promise"), promise)?;
         vm.set_prop(&obj, &PropertyKey::str("resolve"), resolve)?;
         vm.set_prop(&obj, &PropertyKey::str("reject"), reject)?;
         Ok(obj)
+    });
+
+    // Promise.try(fn, ...args) (ES2025): call fn synchronously; its return
+    // value resolves (a throw rejects) a fresh capability of `this`.
+    vm.define_method(&ctor, "try", 1, |vm, this, args| {
+        if !matches!(this, Value::Object(_)) {
+            return Err(vm.throw_type("Promise.try called on a non-object"));
+        }
+        let (promise, resolve, reject) = new_promise_capability(vm, &this)?;
+        let f = arg(args, 0);
+        let rest: Vec<Value> = if args.len() > 1 {
+            args[1..].to_vec()
+        } else {
+            Vec::new()
+        };
+        match vm.call(f, Value::Undefined, &rest) {
+            Ok(v) => {
+                vm.call(resolve, Value::Undefined, &[v])?;
+            }
+            Err(e) => {
+                vm.call(reject, Value::Undefined, &[e])?;
+            }
+        }
+        Ok(promise)
     });
 
     // Promise.prototype[Symbol.toStringTag] = "Promise" (non-writable,
@@ -206,6 +233,20 @@ fn install_promise(vm: &mut Vm) {
 /// has already settled (so the caller must bail out), `false` on the first call
 /// (and marks it settled). Mirrors the spec's per-element resolve/reject guard so
 /// a misbehaving thenable cannot double-count the combinator's pending counter.
+
+/// `IfAbruptCloseIterator`: on an abrupt completion mid-combinator, close the
+/// iterator (suppressing any close error — the original abrupt wins) and
+/// propagate.
+fn close_on_err<T>(vm: &mut Vm, iter: &Value, r: Result<T, Value>) -> Result<T, Value> {
+    match r {
+        Err(e) => {
+            let _ = vm.iterator_close(iter);
+            Err(e)
+        }
+        ok => ok,
+    }
+}
+
 fn take_guard(flag: &Rc<RefCell<bool>>) -> bool {
     let mut done = flag.borrow_mut();
     if *done {
@@ -334,7 +375,8 @@ fn perform_promise_all(
             }
             Some(value) => {
                 values.borrow_mut().push(Value::Undefined);
-                let next = vm.call(promise_resolve.clone(), c.clone(), &[value])?;
+                let r = vm.call(promise_resolve.clone(), c.clone(), &[value]);
+                let next = close_on_err(vm, &iter, r)?;
                 let already = Rc::new(RefCell::new(false));
                 let (vc, rc, res, idx) =
                     (values.clone(), remaining.clone(), resolve.clone(), index);
@@ -350,7 +392,8 @@ fn perform_promise_all(
                     Ok(Value::Undefined)
                 });
                 *remaining.borrow_mut() += 1;
-                invoke_then(vm, &next, Value::Object(on_f), reject.clone())?;
+                let r = invoke_then(vm, &next, Value::Object(on_f), reject.clone());
+                close_on_err(vm, &iter, r)?;
                 index += 1;
             }
         }
@@ -381,7 +424,8 @@ fn perform_promise_all_settled(
             }
             Some(value) => {
                 values.borrow_mut().push(Value::Undefined);
-                let next = vm.call(promise_resolve.clone(), c.clone(), &[value])?;
+                let r = vm.call(promise_resolve.clone(), c.clone(), &[value]);
+                let next = close_on_err(vm, &iter, r)?;
                 let already = Rc::new(RefCell::new(false));
                 let make_record = |vm: &mut Vm, status: &str, key: &str, v: Value| {
                     let o = vm.new_object();
@@ -432,7 +476,8 @@ fn perform_promise_all_settled(
                     Ok(Value::Undefined)
                 });
                 *remaining.borrow_mut() += 1;
-                invoke_then(vm, &next, Value::Object(on_f), Value::Object(on_r))?;
+                let r = invoke_then(vm, &next, Value::Object(on_f), Value::Object(on_r));
+                close_on_err(vm, &iter, r)?;
                 index += 1;
             }
         }
@@ -453,8 +498,10 @@ fn perform_promise_race(
         match vm.iterator_step(&iter)? {
             None => return Ok(()),
             Some(value) => {
-                let next = vm.call(promise_resolve.clone(), c.clone(), &[value])?;
-                invoke_then(vm, &next, resolve.clone(), reject.clone())?;
+                let r = vm.call(promise_resolve.clone(), c.clone(), &[value]);
+                let next = close_on_err(vm, &iter, r)?;
+                let r = invoke_then(vm, &next, resolve.clone(), reject.clone());
+                close_on_err(vm, &iter, r)?;
             }
         }
     }
@@ -485,7 +532,8 @@ fn perform_promise_any(
             }
             Some(value) => {
                 errors.borrow_mut().push(Value::Undefined);
-                let next = vm.call(promise_resolve.clone(), c.clone(), &[value])?;
+                let r = vm.call(promise_resolve.clone(), c.clone(), &[value]);
+                let next = close_on_err(vm, &iter, r)?;
                 let already = Rc::new(RefCell::new(false));
                 let res = resolve.clone();
                 let g_f = already.clone();
@@ -515,7 +563,8 @@ fn perform_promise_any(
                     Ok(Value::Undefined)
                 });
                 *remaining.borrow_mut() += 1;
-                invoke_then(vm, &next, Value::Object(on_f), Value::Object(on_r))?;
+                let r = invoke_then(vm, &next, Value::Object(on_f), Value::Object(on_r));
+                close_on_err(vm, &iter, r)?;
                 index += 1;
             }
         }
@@ -655,4 +704,70 @@ fn install_generator(vm: &mut Vm) {
     let async_iter = vm.realm.symbol_async_iterator.clone();
     let self_iter = vm.new_native("[Symbol.asyncIterator]", 0, |_vm, this, _a| Ok(this));
     vm.define_value_sym(&aproto, async_iter, Value::Object(self_iter));
+
+    // %AsyncIteratorPrototype%[@@asyncDispose] (explicit resource management):
+    // GetMethod(this, "return"); absent → resolve undefined; otherwise call it
+    // and resolve undefined (or reject) once its result settles. The shared
+    // iterator prototype doubles as %AsyncIteratorPrototype% in this realm.
+    let dispose = vm.new_native("[Symbol.asyncDispose]", 0, |vm, this, _a| {
+        let promise = vm.new_promise();
+        let (resolve, reject) = make_resolving_functions(vm, &promise);
+        let outcome = (|| -> Result<Option<Value>, Value> {
+            let ret = vm.get_prop(&this, &PropertyKey::str("return"))?;
+            if ret.is_nullish() {
+                return Ok(None);
+            }
+            if !vm.is_callable(&ret) {
+                return Err(vm.throw_type("iterator return is not a function"));
+            }
+            Ok(Some(vm.call(ret, this.clone(), &[])?))
+        })();
+        match outcome {
+            Err(e) => {
+                vm.call(reject, Value::Undefined, &[e])?;
+            }
+            Ok(None) => {
+                vm.call(resolve, Value::Undefined, &[Value::Undefined])?;
+            }
+            Ok(Some(result)) => {
+                let target = vm.promise_resolve(result);
+                let res2 = resolve.clone();
+                let on_f = vm.new_native("", 1, move |vm, _t, _a| {
+                    vm.call(res2.clone(), Value::Undefined, &[Value::Undefined])?;
+                    Ok(Value::Undefined)
+                });
+                let rej2 = reject.clone();
+                let on_r = vm.new_native("", 1, move |vm, _t, a| {
+                    let e = a.first().cloned().unwrap_or(Value::Undefined);
+                    vm.call(rej2.clone(), Value::Undefined, &[e])?;
+                    Ok(Value::Undefined)
+                });
+                vm.promise_then(&target, Value::Object(on_f), Value::Object(on_r));
+            }
+        }
+        Ok(Value::Object(promise))
+    });
+    let async_dispose = vm.realm.symbol_async_dispose.clone();
+    let base_iter_proto = vm.realm.iterator_proto.clone();
+    vm.define_value_sym(&base_iter_proto, async_dispose, Value::Object(dispose));
+
+    // %AsyncIteratorPrototype%[@@asyncIterator]() { return this }.
+    let async_iter2 = vm.realm.symbol_async_iterator.clone();
+    let self_iter2 = vm.new_native("[Symbol.asyncIterator]", 0, |_vm, this, _a| Ok(this));
+    vm.define_value_sym(&base_iter_proto, async_iter2, Value::Object(self_iter2));
+
+    // %IteratorPrototype%[@@dispose]: GetMethod(this, "return"); call it when
+    // present; the result is discarded (return undefined).
+    let sync_dispose = vm.new_native("[Symbol.dispose]", 0, |vm, this, _a| {
+        let ret = vm.get_prop(&this, &PropertyKey::str("return"))?;
+        if !ret.is_nullish() {
+            if !vm.is_callable(&ret) {
+                return Err(vm.throw_type("iterator return is not a function"));
+            }
+            vm.call(ret, this, &[])?;
+        }
+        Ok(Value::Undefined)
+    });
+    let dispose_sym = vm.realm.symbol_dispose.clone();
+    vm.define_value_sym(&base_iter_proto, dispose_sym, Value::Object(sync_dispose));
 }

@@ -321,6 +321,36 @@ fn reflect_set(
     // Walk the chain looking for an accessor or a data property.
     let mut cur = target.clone();
     loop {
+        // TypedArray integer-indexed exotic [[Set]] (10.4.5.5): a canonical
+        // numeric key is handled by the typed array wherever it sits on the
+        // chain — receiver===O writes the element (coercion side effects
+        // included, out-of-bounds absorbed); otherwise an out-of-bounds index
+        // is absorbed and a valid one behaves like a writable data property.
+        if vm.ta_kind(&cur).is_some() {
+            let n: Option<f64> = if let Some(i) = key.array_index() {
+                Some(i as f64)
+            } else {
+                key.as_str().and_then(|s| {
+                    if crate::vm::is_canonical_numeric(s) {
+                        Some(s.parse::<f64>().unwrap_or(f64::NAN))
+                    } else {
+                        None
+                    }
+                })
+            };
+            if let Some(n) = n {
+                if matches!(&receiver, Value::Object(r) if r.same(&cur)) {
+                    // Engine [[Set]] on the typed array itself covers element
+                    // writes and non-index numeric coercion.
+                    vm.set_prop(&Value::Object(cur), key, value)?;
+                    return Ok(true);
+                }
+                if !vm.ta_valid_index(&cur, n) {
+                    return Ok(true);
+                }
+                break;
+            }
+        }
         let kind = {
             let b = cur.borrow();
             b.props.get(key).map(|p| match &p.kind {
@@ -354,8 +384,66 @@ fn reflect_set(
             }
         }
     }
-    // CreateDataProperty / set on the receiver object.
-    set_ordinary(vm, &receiver, key, value)
+    // OrdinarySetWithOwnDescriptor step 3: finish on the RECEIVER with
+    // [[GetOwnProperty]] + [[DefineOwnProperty]] — never a recursive [[Set]],
+    // which would loop forever when a proxy receiver's `set` trap itself
+    // calls `Reflect.set(target, key, value, receiver)`.
+    let robj = match &receiver {
+        Value::Object(o) => o.clone(),
+        // Primitive receivers are not writable targets.
+        _ => return Ok(false),
+    };
+    let new_desc = |vm: &mut Vm, value: Value, full: bool| -> Result<Value, Value> {
+        let d = vm.new_object();
+        let dv = Value::Object(d);
+        vm.set_prop(&dv, &PropertyKey::str("value"), value)?;
+        if full {
+            for f in ["writable", "enumerable", "configurable"] {
+                vm.set_prop(&dv, &PropertyKey::str(f), Value::Bool(true))?;
+            }
+        }
+        Ok(dv)
+    };
+    if vm.is_proxy(&robj) {
+        let existing = vm.proxy_get_own_descriptor(&robj, key)?;
+        let dv = if let Value::Object(_) = &existing {
+            let g = vm.get_prop(&existing, &PropertyKey::str("get"))?;
+            let s = vm.get_prop(&existing, &PropertyKey::str("set"))?;
+            if !g.is_undefined() || !s.is_undefined() {
+                return Ok(false);
+            }
+            let w = vm.get_prop(&existing, &PropertyKey::str("writable"))?;
+            if !vm.to_boolean(&w) {
+                return Ok(false);
+            }
+            // Existing writable data property: define {value} only.
+            new_desc(vm, value, false)?
+        } else {
+            // Absent: CreateDataProperty(receiver, key, value).
+            new_desc(vm, value, true)?
+        };
+        return vm.proxy_define_property(&robj, key, dv);
+    }
+    match own_property_descriptor(&robj, key) {
+        Some(p) => match &p.kind {
+            PropertyKind::Accessor { .. } => Ok(false),
+            PropertyKind::Data { writable, .. } => {
+                if !*writable {
+                    return Ok(false);
+                }
+                let dv = new_desc(vm, value, false)?;
+                let d = to_property_descriptor(vm, &dv)?;
+                define_own_property(vm, &robj, key, &d, false)
+            }
+        },
+        None => {
+            // CreateDataProperty(receiver, key, value): a define, so the
+            // receiver's prototype chain is NOT consulted.
+            let dv = new_desc(vm, value, true)?;
+            let d = to_property_descriptor(vm, &dv)?;
+            define_own_property(vm, &robj, key, &d, false)
+        }
+    }
 }
 
 enum DescKind {

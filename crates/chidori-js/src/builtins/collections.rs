@@ -22,37 +22,140 @@ pub fn install(vm: &mut Vm) {
 }
 
 /// Populate `target`'s `Internal::Map` from a Map-constructor iterable argument.
+/// Close `it` and return `e` (the spec's IfAbruptCloseIterator).
+fn close_with(vm: &mut Vm, it: &Value, e: Value) -> Value {
+    let _ = vm.iterator_close(it);
+    e
+}
+
 fn init_map_entries(vm: &mut Vm, target: &JsObject, init: &Value) -> Result<(), Value> {
     if init.is_nullish() {
         return Ok(());
     }
-    let items = vm.iterate_to_vec(init)?;
-    for item in items {
+    // AddEntriesFromIterable: the OBSERVABLE `set` method is fetched once
+    // (and must be callable — before any iteration), then invoked per entry;
+    // an abrupt entry read or adder call closes the iterator.
+    let tv = Value::Object(target.clone());
+    let adder = vm.get_prop(&tv, &PropertyKey::str("set"))?;
+    if !vm.is_callable(&adder) {
+        return Err(vm.throw_type("Map constructor: 'set' is not callable"));
+    }
+    let it = vm.get_iterator(init)?;
+    let next = vm.get_prop(&it, &PropertyKey::str("next"))?;
+    loop {
+        vm.native_tick()?;
+        let res = vm.call(next.clone(), it.clone(), &[])?;
+        if !matches!(res, Value::Object(_)) {
+            return Err(vm.throw_type("iterator result is not an object"));
+        }
+        let done = vm.get_prop(&res, &PropertyKey::str("done"))?;
+        if vm.to_boolean(&done) {
+            return Ok(());
+        }
+        let item = vm.get_prop(&res, &PropertyKey::str("value"))?;
         // Each entry must be an Object; primitives (incl. strings) are rejected.
         if !matches!(item, Value::Object(_)) {
-            return Err(vm.throw_type("Iterator value is not an entry object"));
+            let e = vm.throw_type("Iterator value is not an entry object");
+            return Err(close_with(vm, &it, e));
         }
-        let k = vm.get_prop(&item, &PropertyKey::from_index(0))?;
-        let v = vm.get_prop(&item, &PropertyKey::from_index(1))?;
-        if let Internal::Map(map) = &mut target.borrow_mut().internal {
-            map.insert(MapKey(k), v);
+        let k = match vm.get_prop(&item, &PropertyKey::from_index(0)) {
+            Ok(v) => v,
+            Err(e) => return Err(close_with(vm, &it, e)),
+        };
+        let v = match vm.get_prop(&item, &PropertyKey::from_index(1)) {
+            Ok(v) => v,
+            Err(e) => return Err(close_with(vm, &it, e)),
+        };
+        if let Err(e) = vm.call(adder.clone(), tv.clone(), &[k, v]) {
+            return Err(close_with(vm, &it, e));
         }
     }
-    Ok(())
 }
 
-/// Populate `target`'s `Internal::Set` from a Set-constructor iterable argument.
+/// Populate `target`'s `Internal::Set` from a Set-constructor iterable argument
+/// (AddEntriesFromIterable shape: observable `add`, per-element calls,
+/// abrupt completions close the iterator).
 fn init_set_entries(vm: &mut Vm, target: &JsObject, init: &Value) -> Result<(), Value> {
     if init.is_nullish() {
         return Ok(());
     }
-    let items = vm.iterate_to_vec(init)?;
-    for item in items {
-        if let Internal::Set(set) = &mut target.borrow_mut().internal {
-            set.insert(MapKey(item), ());
+    let tv = Value::Object(target.clone());
+    let adder = vm.get_prop(&tv, &PropertyKey::str("add"))?;
+    if !vm.is_callable(&adder) {
+        return Err(vm.throw_type("Set constructor: 'add' is not callable"));
+    }
+    let it = vm.get_iterator(init)?;
+    let next = vm.get_prop(&it, &PropertyKey::str("next"))?;
+    loop {
+        vm.native_tick()?;
+        let res = vm.call(next.clone(), it.clone(), &[])?;
+        if !matches!(res, Value::Object(_)) {
+            return Err(vm.throw_type("iterator result is not an object"));
+        }
+        let done = vm.get_prop(&res, &PropertyKey::str("done"))?;
+        if vm.to_boolean(&done) {
+            return Ok(());
+        }
+        let item = vm.get_prop(&res, &PropertyKey::str("value"))?;
+        if let Err(e) = vm.call(adder.clone(), tv.clone(), &[item]) {
+            return Err(close_with(vm, &it, e));
         }
     }
-    Ok(())
+}
+
+/// AddEntriesFromIterable for the Weak collections: fetch the observable
+/// `adder` method (must be callable), then per item either unpack an `[k, v]`
+/// entry object (`paired`) or pass the item through; abrupt completions
+/// close the iterator.
+fn init_weak_entries(
+    vm: &mut Vm,
+    target: &JsObject,
+    init: &Value,
+    adder_name: &str,
+    paired: bool,
+) -> Result<(), Value> {
+    if init.is_nullish() {
+        return Ok(());
+    }
+    let tv = Value::Object(target.clone());
+    let adder = vm.get_prop(&tv, &PropertyKey::str(adder_name))?;
+    if !vm.is_callable(&adder) {
+        return Err(vm.throw_type(&format!("'{adder_name}' is not callable")));
+    }
+    let it = vm.get_iterator(init)?;
+    let next = vm.get_prop(&it, &PropertyKey::str("next"))?;
+    loop {
+        vm.native_tick()?;
+        let res = vm.call(next.clone(), it.clone(), &[])?;
+        if !matches!(res, Value::Object(_)) {
+            return Err(vm.throw_type("iterator result is not an object"));
+        }
+        let done = vm.get_prop(&res, &PropertyKey::str("done"))?;
+        if vm.to_boolean(&done) {
+            return Ok(());
+        }
+        let item = vm.get_prop(&res, &PropertyKey::str("value"))?;
+        let call_args: Vec<Value> = if paired {
+            if !matches!(item, Value::Object(_)) {
+                let e = vm.throw_type("Iterator value is not an entry object");
+                return Err(close_with(vm, &it, e));
+            }
+            let k = match vm.get_prop(&item, &PropertyKey::from_index(0)) {
+                Ok(v) => v,
+                Err(e) => return Err(close_with(vm, &it, e)),
+            };
+            let v = match vm.get_prop(&item, &PropertyKey::from_index(1)) {
+                Ok(v) => v,
+                Err(e) => return Err(close_with(vm, &it, e)),
+            };
+            vec![k, v]
+        } else {
+            vec![item]
+        };
+        if let Err(e) = vm.call(adder.clone(), tv.clone(), &call_args) {
+            return Err(close_with(vm, &it, e));
+        }
+    }
 }
 
 /// A value that "can be held weakly": an object or a (non-registered) symbol.
@@ -86,23 +189,9 @@ fn install_weakmap(vm: &mut Vm) {
                 Some(vm.realm.weak_map_proto.clone()),
                 Internal::WeakMap(IndexMap::new()),
             ));
-            let init = arg(args, 0);
-            if !init.is_nullish() {
-                let items = vm.iterate_to_vec(&init)?;
-                for item in items {
-                    if !matches!(item, Value::Object(_)) {
-                        return Err(vm.throw_type("Iterator value is not an entry object"));
-                    }
-                    let k = vm.get_prop(&item, &PropertyKey::from_index(0))?;
-                    let v = vm.get_prop(&item, &PropertyKey::from_index(1))?;
-                    if !can_be_held_weakly(&k) {
-                        return Err(vm.throw_type("Invalid value used as weak map key"));
-                    }
-                    if let Internal::WeakMap(map) = &mut m.borrow_mut().internal {
-                        map.insert(MapKey(k), v);
-                    }
-                }
-            }
+            // AddEntriesFromIterable through the observable `set` method —
+            // same shape as the Map constructor.
+            init_weak_entries(vm, &m, &arg(args, 0), "set", true)?;
             Ok(Value::Object(m))
         },
     );
@@ -162,18 +251,8 @@ fn install_weakset(vm: &mut Vm) {
                 Some(vm.realm.weak_set_proto.clone()),
                 Internal::WeakSet(IndexMap::new()),
             ));
-            let init = arg(args, 0);
-            if !init.is_nullish() {
-                let items = vm.iterate_to_vec(&init)?;
-                for item in items {
-                    if !can_be_held_weakly(&item) {
-                        return Err(vm.throw_type("Invalid value used in weak set"));
-                    }
-                    if let Internal::WeakSet(set) = &mut s.borrow_mut().internal {
-                        set.insert(MapKey(item), ());
-                    }
-                }
-            }
+            // Per-element calls through the observable `add` method.
+            init_weak_entries(vm, &s, &arg(args, 0), "add", false)?;
             Ok(Value::Object(s))
         },
     );
@@ -315,15 +394,25 @@ fn install_map(vm: &mut Vm) {
             return Err(vm.throw_type("Map.prototype.forEach callback is not a function"));
         }
         let this_arg = arg(args, 1);
-        let entries: Vec<(Value, Value)> = {
-            if let Internal::Map(m) = &o.borrow().internal {
-                m.iter().map(|(k, v)| (k.0.clone(), v.clone())).collect()
-            } else {
-                vec![]
+        // LIVE iteration (no snapshot): entries added during the walk are
+        // visited; a deleted-then-re-added entry moves to the end and is
+        // visited again — same index discipline as the builtin iterators.
+        let mut i = 0usize;
+        loop {
+            let entry = {
+                if let Internal::Map(m) = &o.borrow().internal {
+                    m.get_index(i).map(|(k, v)| (k.0.clone(), v.clone()))
+                } else {
+                    None
+                }
+            };
+            match entry {
+                Some((k, v)) => {
+                    vm.call(cb.clone(), this_arg.clone(), &[v, k, this.clone()])?;
+                    i += 1;
+                }
+                None => break,
             }
-        };
-        for (k, v) in entries {
-            vm.call(cb.clone(), this_arg.clone(), &[v, k, this.clone()])?;
         }
         Ok(Value::Undefined)
     });
@@ -421,15 +510,23 @@ fn install_set(vm: &mut Vm) {
             return Err(vm.throw_type("Set.prototype.forEach callback is not a function"));
         }
         let this_arg = arg(args, 1);
-        let items: Vec<Value> = {
-            if let Internal::Set(s) = &o.borrow().internal {
-                s.keys().map(|k| k.0.clone()).collect()
-            } else {
-                vec![]
+        // LIVE iteration (no snapshot) — see Map.prototype.forEach above.
+        let mut i = 0usize;
+        loop {
+            let entry = {
+                if let Internal::Set(s) = &o.borrow().internal {
+                    s.get_index(i).map(|(k, _)| k.0.clone())
+                } else {
+                    None
+                }
+            };
+            match entry {
+                Some(v) => {
+                    vm.call(cb.clone(), this_arg.clone(), &[v.clone(), v, this.clone()])?;
+                    i += 1;
+                }
+                None => break,
             }
-        };
-        for v in items {
-            vm.call(cb.clone(), this_arg.clone(), &[v.clone(), v, this.clone()])?;
         }
         Ok(Value::Undefined)
     });
@@ -461,6 +558,12 @@ fn install_set(vm: &mut Vm) {
         let mut result = set_keys_snapshot(vm, &this)?;
         let other_keys = record.keys_to_vec(vm)?;
         for k in other_keys {
+            // -0 from a set-like canonicalizes to +0 on insertion.
+            let k = if matches!(&k, Value::Number(n) if *n == 0.0) {
+                Value::Number(0.0)
+            } else {
+                k
+            };
             if !result.iter().any(|e| same_value_zero(e, &k)) {
                 result.push(k);
             }
@@ -476,13 +579,22 @@ fn install_set(vm: &mut Vm) {
         // smaller, probe `other.has`; otherwise iterate `other.keys()` and probe
         // `this` internally (so `other.has` is not invoked).
         if (this_keys.len() as f64) <= record.size {
-            for k in this_keys {
+            // LIVE walk of `this` (a `has` side effect that deletes a
+            // not-yet-visited element makes it skipped).
+            for_each_live_set_key(vm, &this, |vm, k| {
                 if record.has(vm, &k)? && !result.iter().any(|e| same_value_zero(e, &k)) {
                     result.push(k);
                 }
-            }
+                Ok(true)
+            })?;
         } else {
             for k in record.keys_to_vec(vm)? {
+                // -0 from a set-like canonicalizes to +0 on insertion.
+                let k = if matches!(&k, Value::Number(n) if *n == 0.0) {
+                    Value::Number(0.0)
+                } else {
+                    k
+                };
                 if set_has(vm, &this, &k)? && !result.iter().any(|e| same_value_zero(e, &k)) {
                     result.push(k);
                 }
@@ -496,13 +608,15 @@ fn install_set(vm: &mut Vm) {
         let this_keys = set_keys_snapshot(vm, &this)?;
         let mut result = this_keys.clone();
         if (this_keys.len() as f64) <= record.size {
-            // Smaller `this`: probe `other.has` for each of this's elements.
+            // Smaller `this`: probe `other.has` for each element, walking
+            // `this` LIVE (mid-walk deletions are skipped).
             let mut kept = Vec::new();
-            for k in this_keys {
+            for_each_live_set_key(vm, &this, |vm, k| {
                 if !record.has(vm, &k)? {
                     kept.push(k);
                 }
-            }
+                Ok(true)
+            })?;
             result = kept;
         } else {
             // Larger `this`: iterate `other.keys()` and remove matches from the
@@ -545,12 +659,15 @@ fn install_set(vm: &mut Vm) {
         if (this_keys.len() as f64) > record.size {
             return Ok(Value::Bool(false));
         }
-        for k in this_keys {
+        let mut subset = true;
+        for_each_live_set_key(vm, &this, |vm, k| {
             if !record.has(vm, &k)? {
-                return Ok(Value::Bool(false));
+                subset = false;
+                return Ok(false);
             }
-        }
-        Ok(Value::Bool(true))
+            Ok(true)
+        })?;
+        Ok(Value::Bool(subset))
     });
     vm.define_method(&proto, "isSupersetOf", 1, |vm, this, args| {
         set_this(vm, &this)?;
@@ -560,12 +677,15 @@ fn install_set(vm: &mut Vm) {
         if (this_keys.len() as f64) < record.size {
             return Ok(Value::Bool(false));
         }
-        for k in record.keys_to_vec(vm)? {
+        let mut superset = true;
+        record.for_each_key(vm, |vm, k| {
             if !set_has(vm, &this, &k)? {
-                return Ok(Value::Bool(false));
+                superset = false;
+                return Ok(false); // early exit closes the keys iterator
             }
-        }
-        Ok(Value::Bool(true))
+            Ok(true)
+        })?;
+        Ok(Value::Bool(superset))
     });
     vm.define_method(&proto, "isDisjointFrom", 1, |vm, this, args| {
         set_this(vm, &this)?;
@@ -573,16 +693,28 @@ fn install_set(vm: &mut Vm) {
         let this_keys = set_keys_snapshot(vm, &this)?;
         // Iterate the smaller collection (size-based branch), mirroring the spec.
         if (this_keys.len() as f64) <= record.size {
-            for k in this_keys {
+            let mut disjoint = true;
+            for_each_live_set_key(vm, &this, |vm, k| {
                 if record.has(vm, &k)? {
-                    return Ok(Value::Bool(false));
+                    disjoint = false;
+                    return Ok(false);
                 }
+                Ok(true)
+            })?;
+            if !disjoint {
+                return Ok(Value::Bool(false));
             }
         } else {
-            for k in record.keys_to_vec(vm)? {
+            let mut disjoint = true;
+            record.for_each_key(vm, |vm, k| {
                 if set_has(vm, &this, &k)? {
-                    return Ok(Value::Bool(false));
+                    disjoint = false;
+                    return Ok(false); // early exit closes the keys iterator
                 }
+                Ok(true)
+            })?;
+            if !disjoint {
+                return Ok(Value::Bool(false));
             }
         }
         Ok(Value::Bool(true))
@@ -663,6 +795,39 @@ fn set_this(vm: &mut Vm, this: &Value) -> Result<JsObject, Value> {
 }
 
 /// Snapshot the elements of a Set receiver to a `Vec` (no live borrow held).
+/// Iterate `this`'s [[SetData]] LIVE (index-based, like the builtin
+/// iterators): elements deleted mid-walk by a `has`/`keys` side effect are
+/// skipped, appended ones visited. `f` returns `false` to stop early.
+fn for_each_live_set_key(
+    vm: &mut Vm,
+    set: &Value,
+    mut f: impl FnMut(&mut Vm, Value) -> Result<bool, Value>,
+) -> Result<(), Value> {
+    let o = match set {
+        Value::Object(o) => o.clone(),
+        _ => return Ok(()),
+    };
+    let mut i = 0usize;
+    loop {
+        let k = {
+            if let Internal::Set(s) = &o.borrow().internal {
+                s.get_index(i).map(|(k, _)| k.0.clone())
+            } else {
+                None
+            }
+        };
+        match k {
+            Some(k) => {
+                if !f(vm, k)? {
+                    return Ok(());
+                }
+                i += 1;
+            }
+            None => return Ok(()),
+        }
+    }
+}
+
 fn set_keys_snapshot(vm: &mut Vm, this: &Value) -> Result<Vec<Value>, Value> {
     let o = set_this(vm, this)?;
     let keys = if let Internal::Set(s) = &o.borrow().internal {
@@ -713,18 +878,57 @@ impl SetRecord {
         Ok(vm.to_boolean(&r))
     }
 
+    /// Iterate `keys()` incrementally (cached next method); `f` returning
+    /// `false` stops the walk and CLOSES the iterator (the spec's early-exit
+    /// IteratorClose, observable via the iterator's `return`).
+    fn for_each_key(
+        &self,
+        vm: &mut Vm,
+        mut f: impl FnMut(&mut Vm, Value) -> Result<bool, Value>,
+    ) -> Result<(), Value> {
+        let it = vm.call(self.keys.clone(), self.obj.clone(), &[])?;
+        if !matches!(it, Value::Object(_)) {
+            return Err(vm.throw_type("set-like keys() did not return an object"));
+        }
+        let next = vm.get_prop(&it, &PropertyKey::str("next"))?;
+        loop {
+            vm.native_tick()?;
+            let res = vm.call(next.clone(), it.clone(), &[])?;
+            if !matches!(res, Value::Object(_)) {
+                return Err(vm.throw_type("iterator result is not an object"));
+            }
+            let done = vm.get_prop(&res, &PropertyKey::str("done"))?;
+            if vm.to_boolean(&done) {
+                return Ok(());
+            }
+            let v = vm.get_prop(&res, &PropertyKey::str("value"))?;
+            if !f(vm, v)? {
+                let _ = vm.iterator_close(&it);
+                return Ok(());
+            }
+        }
+    }
+
     /// Invoke `this.[[Keys]]()` and drain the returned iterator to a `Vec`.
     fn keys_to_vec(&self, vm: &mut Vm) -> Result<Vec<Value>, Value> {
         let it = vm.call(self.keys.clone(), self.obj.clone(), &[])?;
         if !matches!(it, Value::Object(_)) {
             return Err(vm.throw_type("set-like keys() did not return an object"));
         }
+        // Iterator record: Get "next" exactly once, call the cached method
+        // per step (the spec's GetIteratorFromMethod + IteratorStepValue).
+        let next = vm.get_prop(&it, &PropertyKey::str("next"))?;
         let mut out = Vec::new();
         loop {
-            match vm.iterator_step(&it)? {
-                Some(v) => out.push(v),
-                None => break,
+            let res = vm.call(next.clone(), it.clone(), &[])?;
+            if !matches!(res, Value::Object(_)) {
+                return Err(vm.throw_type("iterator result is not an object"));
             }
+            let done = vm.get_prop(&res, &PropertyKey::str("done"))?;
+            if vm.to_boolean(&done) {
+                break;
+            }
+            out.push(vm.get_prop(&res, &PropertyKey::str("value"))?);
         }
         Ok(out)
     }

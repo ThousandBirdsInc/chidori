@@ -8,6 +8,8 @@
 use super::arg;
 use crate::value::*;
 use crate::vm::Vm;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 pub fn install(vm: &mut Vm) {
     install_one(vm, false);
@@ -103,15 +105,30 @@ fn install_one(vm: &mut Vm, is_async: bool) {
             }
             let value = arg(args, 0);
             if value.is_nullish() {
+                if is_async {
+                    // A null/undefined ASYNC resource still records a step:
+                    // its disposal awaits undefined (one observable tick).
+                    let disposer = vm.new_native("", 0, |_vm, _t, _a| Ok(Value::Undefined));
+                    push_disposer(&arr, Value::Object(disposer));
+                }
                 return Ok(value);
             }
-            let method = vm.get_prop(&value, &PropertyKey::Sym(dsym.clone()))?;
+            let mut method = vm.get_prop(&value, &PropertyKey::Sym(dsym.clone()))?;
+            // GetDisposeMethod hint async-dispose: fall back to @@dispose,
+            // wrapped so the sync result is NOT awaited as a thenable.
+            let mut sync_fallback = false;
+            if is_async && method.is_nullish() {
+                let sd = vm.realm.symbol_dispose.clone();
+                method = vm.get_prop(&value, &PropertyKey::Sym(sd))?;
+                sync_fallback = true;
+            }
             if !vm.is_callable(&method) {
                 return Err(vm.throw_type("value is not disposable (no @@dispose method)"));
             }
             let v = value.clone();
             let disposer = vm.new_native("", 0, move |vm, _t, _a| {
-                vm.call(method.clone(), v.clone(), &[])
+                let r = vm.call(method.clone(), v.clone(), &[])?;
+                Ok(if sync_fallback { Value::Undefined } else { r })
             });
             push_disposer(&arr, Value::Object(disposer));
             Ok(value)
@@ -262,8 +279,10 @@ fn rejected(vm: &mut Vm, reason: Value) -> Value {
 }
 
 fn install_async_dispose(vm: &mut Vm, proto: &JsObject, dispose_sym: &JsSymbol) {
-    // disposeAsync(): for the MVP, run disposers synchronously (awaiting each is
-    // not modeled) and return a resolved/rejected promise.
+    // disposeAsync(): run the disposers in reverse registration order,
+    // AWAITING each call's result before the next (so a thenable-returning
+    // @@asyncDispose holds up later disposals); errors chain through
+    // SuppressedError, last error outermost.
     let dispose = vm.new_native("disposeAsync", 0, |vm, this, _a| {
         let arr = match stack_state(vm, &this) {
             Ok(a) => a,
@@ -280,10 +299,82 @@ fn install_async_dispose(vm: &mut Vm, proto: &JsObject, dispose_sym: &JsSymbol) 
         } else {
             Vec::new()
         };
-        match run_disposers(vm, disposers) {
-            Ok(()) => Ok(Value::Object(vm.promise_resolve(Value::Undefined))),
-            Err(e) => Ok(rejected(vm, e)),
+        let result = vm.new_promise();
+        // `queue` pops from the END = reverse registration order.
+        let queue: Rc<RefCell<Vec<Value>>> = Rc::new(RefCell::new(disposers));
+        let completion: Rc<RefCell<Option<Value>>> = Rc::new(RefCell::new(None));
+        // The driver calls one disposer, awaits its result, then re-invokes
+        // itself (via the shared cell) until the queue is drained.
+        let driver_cell: Rc<RefCell<Value>> = Rc::new(RefCell::new(Value::Undefined));
+        let dc = driver_cell.clone();
+        let q = queue.clone();
+        let comp = completion.clone();
+        let res_p = result.clone();
+        let driver = vm.new_native("", 0, move |vm, _t, _a| {
+            let next = q.borrow_mut().pop();
+            match next {
+                None => {
+                    let c = comp.borrow_mut().take();
+                    match c {
+                        Some(e) => vm.reject_promise(&res_p, e),
+                        None => vm.resolve_promise(&res_p, Value::Undefined),
+                    }
+                }
+                Some(d) => {
+                    let step = match vm.call(d, Value::Undefined, &[]) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // Record (suppress-chaining) and keep going.
+                            let mut slot = comp.borrow_mut();
+                            let chained = match slot.take() {
+                                None => e,
+                                Some(prev) => {
+                                    drop(slot);
+                                    let s = make_suppressed(vm, e, prev);
+                                    slot = comp.borrow_mut();
+                                    s
+                                }
+                            };
+                            *slot = Some(chained);
+                            drop(slot);
+                            Value::Undefined
+                        }
+                    };
+                    let target = vm.promise_resolve(step);
+                    let drive2 = dc.borrow().clone();
+                    let on_f = {
+                        let drive2 = drive2.clone();
+                        vm.new_native("", 1, move |vm, _t, _a| {
+                            vm.call(drive2.clone(), Value::Undefined, &[])
+                        })
+                    };
+                    let comp2 = comp.clone();
+                    let on_r = vm.new_native("", 1, move |vm, _t, a| {
+                        let e = a.first().cloned().unwrap_or(Value::Undefined);
+                        let mut slot = comp2.borrow_mut();
+                        let chained = match slot.take() {
+                            None => e,
+                            Some(prev) => {
+                                drop(slot);
+                                let s = make_suppressed(vm, e, prev);
+                                slot = comp2.borrow_mut();
+                                s
+                            }
+                        };
+                        *slot = Some(chained);
+                        drop(slot);
+                        vm.call(drive2.clone(), Value::Undefined, &[])
+                    });
+                    vm.promise_then(&target, Value::Object(on_f), Value::Object(on_r));
+                }
+            }
+            Ok(Value::Undefined)
+        });
+        *driver_cell.borrow_mut() = Value::Object(driver.clone());
+        if let Err(e) = vm.call(Value::Object(driver), Value::Undefined, &[]) {
+            return Ok(rejected(vm, e));
         }
+        Ok(Value::Object(result))
     });
     proto.borrow_mut().props.insert(
         PropertyKey::str("disposeAsync"),

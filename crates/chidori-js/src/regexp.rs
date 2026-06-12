@@ -304,6 +304,16 @@ impl<'a> Parser<'a> {
         loop {
             match self.peek() {
                 None | Some('|') | Some(')') => break,
+                Some('{') => {
+                    // A brace sequence that FORMS a valid quantifier at term
+                    // position has nothing to repeat — a SyntaxError in both
+                    // modes (Annex B's literal-`{` carve-out excludes it).
+                    let save = self.pos;
+                    if self.try_parse_brace_quantifier()?.is_some() {
+                        return Err("Nothing to repeat".to_string());
+                    }
+                    self.pos = save;
+                }
                 _ => {}
             }
             let atom = self.parse_quantified()?;
@@ -356,6 +366,11 @@ impl<'a> Parser<'a> {
         // In unicode mode, anchors/boundaries/lookaround cannot be quantified.
         if self.unicode && is_assertion(&atom) {
             return Err("Invalid quantifier on assertion".to_string());
+        }
+        // A LOOKBEHIND can never be quantified (Annex B's quantifiable
+        // assertions cover lookahead only).
+        if matches!(&atom, Node::Look { behind: true, .. }) {
+            return Err("Invalid quantifier on lookbehind assertion".to_string());
         }
         let greedy = !self.eat('?');
         Ok(Node::Repeat {

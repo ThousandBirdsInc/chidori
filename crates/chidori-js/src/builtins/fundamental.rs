@@ -173,6 +173,44 @@ pub(crate) fn define_own_property(
     d: &PropDesc,
     throw_on_fail: bool,
 ) -> Result<bool, Value> {
+    let args_index = if matches!(obj.borrow().internal, Internal::Arguments(_)) {
+        key.array_index()
+    } else {
+        None
+    };
+    let ok = define_own_property_inner(vm, obj, key, d, throw_on_fail)?;
+    // Arguments exotic [[DefineOwnProperty]] (10.4.4.2) post-steps on a MAPPED
+    // index: a value redefinition writes through to the parameter cell; an
+    // accessor redefinition or `writable: false` severs the alias.
+    if ok {
+        if let Some(idx) = args_index {
+            let mut b = obj.borrow_mut();
+            if let Internal::Arguments(map) = &mut b.internal {
+                if let Some(slot) = map.get_mut(idx as usize) {
+                    if d.is_accessor() {
+                        *slot = None;
+                    } else {
+                        if let (Some(v), Some(cell)) = (&d.value, slot.as_ref()) {
+                            *cell.borrow_mut() = v.clone();
+                        }
+                        if d.writable == Some(false) {
+                            *slot = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(ok)
+}
+
+fn define_own_property_inner(
+    vm: &mut Vm,
+    obj: &JsObject,
+    key: &PropertyKey,
+    d: &PropDesc,
+    throw_on_fail: bool,
+) -> Result<bool, Value> {
     // Integer-indexed exotic [[DefineOwnProperty]] (spec 10.4.5.3): a canonical
     // numeric index on a TypedArray is validated and written through the element
     // setter; it never becomes an ordinary `props` entry.
@@ -251,6 +289,35 @@ pub(crate) fn define_own_property(
             Ok(false)
         }
     };
+
+    // Array exotic [[DefineOwnProperty]] for an index: growing the array past
+    // a non-writable `length` is rejected (ArraySetLength step 2.c — the
+    // non-writable marker entry records that state).
+    if is_array {
+        if let Some(idx) = key.array_index() {
+            let blocked = {
+                let b = obj.borrow();
+                let len = match &b.internal {
+                    Internal::Array(a) => a.len(),
+                    _ => 0,
+                };
+                (idx as usize) >= len
+                    && matches!(
+                        b.props.get(&PropertyKey::str("length")),
+                        Some(Property {
+                            kind: PropertyKind::Data {
+                                writable: false,
+                                ..
+                            },
+                            ..
+                        })
+                    )
+            };
+            if blocked {
+                return fail(vm);
+            }
+        }
+    }
 
     let current = match current {
         None => {
@@ -385,6 +452,22 @@ pub(crate) fn define_own_property(
                     .collect();
                 for kk in drop_keys {
                     b.props.shift_remove(&kk);
+                }
+                // A deferred `writable: false` still applies — with the length
+                // where deletion stopped — even though the define FAILS
+                // (ArraySetLength steps 19.d.i-ii).
+                if d.writable == Some(false) {
+                    b.props.insert(
+                        PropertyKey::str("length"),
+                        Property {
+                            kind: PropertyKind::Data {
+                                value: Value::Number((k + 1) as f64),
+                                writable: false,
+                            },
+                            enumerable: false,
+                            configurable: false,
+                        },
+                    );
                 }
                 drop(b);
                 return fail(vm);
@@ -650,6 +733,12 @@ fn install_object(vm: &mut Vm) {
     vm.define_method(&proto, "hasOwnProperty", 1, |vm, this, args| {
         let key = vm.to_property_key(&arg(args, 0))?;
         let o = this_object(vm, &this)?;
+        // A Proxy receiver dispatches [[GetOwnProperty]] (the trap, or the
+        // target's own property when there is none).
+        if vm.is_proxy(&o) {
+            let desc = vm.proxy_get_own_descriptor(&o, &key)?;
+            return Ok(Value::Bool(matches!(desc, Value::Object(_))));
+        }
         let has = own_property_exists(&o, &key);
         Ok(Value::Bool(has))
     });
@@ -676,6 +765,15 @@ fn install_object(vm: &mut Vm) {
     vm.define_method(&proto, "propertyIsEnumerable", 1, |vm, this, args| {
         let key = vm.to_property_key(&arg(args, 0))?;
         let o = this_object(vm, &this)?;
+        // A Proxy receiver dispatches [[GetOwnProperty]].
+        if vm.is_proxy(&o) {
+            let desc = vm.proxy_get_own_descriptor(&o, &key)?;
+            if matches!(&desc, Value::Object(_)) {
+                let e = vm.get_prop(&desc, &PropertyKey::str("enumerable"))?;
+                return Ok(Value::Bool(vm.to_boolean(&e)));
+            }
+            return Ok(Value::Bool(false));
+        }
         let b = o.borrow();
         let e = match b.props.get(&key) {
             Some(p) => p.enumerable,
@@ -783,38 +881,7 @@ fn install_object(vm: &mut Vm) {
     // Object.prototype.toString honoring a string-valued Symbol.toStringTag
     // (spec 20.1.3.6). For null/undefined this returns the fixed tags.
     vm.define_method(&proto, "toString", 0, |vm, this, _args| {
-        match &this {
-            Value::Undefined => return Ok(Value::str("[object Undefined]")),
-            Value::Null => return Ok(Value::str("[object Null]")),
-            _ => {}
-        }
-        let o = vm.to_object(&this)?;
-        // Spec 20.1.3.6: IsArray (proxy-aware) → Callable → other internal slots.
-        let builtin_tag = if is_array_exotic(vm, &o)? {
-            "Array"
-        } else if vm.is_callable(&Value::Object(o.clone())) {
-            "Function"
-        } else if is_regexp(&Value::Object(o.clone())) {
-            "RegExp"
-        } else {
-            let b = o.borrow();
-            match &b.internal {
-                Internal::Error => "Error",
-                Internal::Boolean(_) => "Boolean",
-                Internal::Number(_) => "Number",
-                Internal::StringObj(_) => "String",
-                Internal::Date(_) => "Date",
-                Internal::Arguments => "Arguments",
-                _ => "Object",
-            }
-        };
-        let tag_sym = vm.realm.symbol_to_string_tag.clone();
-        let tag_val = vm.get_prop(&Value::Object(o.clone()), &PropertyKey::Sym(tag_sym))?;
-        let tag = match &tag_val {
-            Value::String(s) => s.as_str().to_string(),
-            _ => builtin_tag.to_string(),
-        };
-        Ok(Value::str(format!("[object {tag}]")))
+        object_to_string(vm, &this)
     });
     // toLocaleString defers to this.toString().
     vm.define_method(&proto, "toLocaleString", 0, |vm, this, _args| {
@@ -1354,7 +1421,45 @@ fn define_accessor_or_throw(
 
 /// IsArray (spec 7.2.2): true for an Array exotic object, or a non-revoked
 /// Proxy whose target is (transitively) an Array. Throws on a revoked Proxy.
-fn is_array_exotic(vm: &Vm, o: &JsObject) -> Result<bool, Value> {
+/// `%Object.prototype.toString%` (20.1.3.6) as a callable intrinsic: shared by
+/// the installed method and `Array.prototype.toString`'s non-callable-`join`
+/// fallback (which must use the intrinsic even if the property was deleted).
+pub(crate) fn object_to_string(vm: &mut Vm, this: &Value) -> Result<Value, Value> {
+    match this {
+        Value::Undefined => return Ok(Value::str("[object Undefined]")),
+        Value::Null => return Ok(Value::str("[object Null]")),
+        _ => {}
+    }
+    let o = vm.to_object(this)?;
+    // Spec 20.1.3.6: IsArray (proxy-aware) → Callable → other internal slots.
+    let builtin_tag = if is_array_exotic(vm, &o)? {
+        "Array"
+    } else if vm.is_callable(&Value::Object(o.clone())) {
+        "Function"
+    } else if is_regexp(&Value::Object(o.clone())) {
+        "RegExp"
+    } else {
+        let b = o.borrow();
+        match &b.internal {
+            Internal::Error => "Error",
+            Internal::Boolean(_) => "Boolean",
+            Internal::Number(_) => "Number",
+            Internal::StringObj(_) => "String",
+            Internal::Date(_) => "Date",
+            Internal::Arguments(_) => "Arguments",
+            _ => "Object",
+        }
+    };
+    let tag_sym = vm.realm.symbol_to_string_tag.clone();
+    let tag_val = vm.get_prop(&Value::Object(o.clone()), &PropertyKey::Sym(tag_sym))?;
+    let tag = match &tag_val {
+        Value::String(s) => s.as_str().to_string(),
+        _ => builtin_tag.to_string(),
+    };
+    Ok(Value::str(format!("[object {tag}]")))
+}
+
+pub(crate) fn is_array_exotic(vm: &Vm, o: &JsObject) -> Result<bool, Value> {
     let mut cur = o.clone();
     loop {
         let target = {
@@ -1501,7 +1606,18 @@ pub(crate) fn own_property_descriptor(o: &JsObject, key: &PropertyKey) -> Option
     }
     let b = o.borrow();
     if let Some(p) = b.props.get(key) {
-        return Some(p.clone());
+        let mut p = p.clone();
+        // Mapped arguments: the descriptor's value reads the parameter cell.
+        if let Internal::Arguments(map) = &b.internal {
+            if let Some(idx) = key.array_index() {
+                if let Some(Some(cell)) = map.get(idx as usize) {
+                    if let PropertyKind::Data { value, .. } = &mut p.kind {
+                        *value = cell.borrow().clone();
+                    }
+                }
+            }
+        }
+        return Some(p);
     }
     match &b.internal {
         Internal::Array(arr) => {
@@ -1528,6 +1644,56 @@ pub(crate) fn own_property_descriptor(o: &JsObject, key: &PropertyKey) -> Option
                             configurable: true,
                         });
                     }
+                }
+            }
+            None
+        }
+        Internal::TypedArray(t) => {
+            // Integer-indexed exotic [[GetOwnProperty]] (10.4.5.1): a valid
+            // canonical numeric index is a {writable, enumerable, configurable}
+            // data property holding the element; an invalid one is absent.
+            if let Some(n) = canonical_numeric_index(key) {
+                let len = crate::typed_array::ta_eff_length(t);
+                let valid = n.fract() == 0.0
+                    && n >= 0.0
+                    && !(n == 0.0 && n.is_sign_negative())
+                    && (n as usize) < len;
+                if valid {
+                    let i = n as usize;
+                    let off = t.byte_offset + i * t.kind.bytes();
+                    if let Internal::ArrayBuffer(Some(bytes)) = &t.buffer.borrow().internal {
+                        let value = if t.kind.is_bigint() {
+                            Value::bigint(crate::typed_array::decode_big(bytes, off, t.kind))
+                        } else {
+                            Value::Number(crate::typed_array::decode(bytes, off, t.kind))
+                        };
+                        return Some(Property {
+                            kind: PropertyKind::Data {
+                                value,
+                                writable: true,
+                            },
+                            enumerable: true,
+                            configurable: true,
+                        });
+                    }
+                }
+                return None;
+            }
+            None
+        }
+        Internal::ModuleNamespace(ns) => {
+            // [[GetOwnProperty]] for an export name: a {writable, enumerable,
+            // non-configurable} data property reflecting the live binding.
+            if let PropertyKey::Str(sk) = key {
+                if let Some(cell) = ns.exports.get(sk) {
+                    return Some(Property {
+                        kind: PropertyKind::Data {
+                            value: cell.borrow().clone(),
+                            writable: true,
+                        },
+                        enumerable: true,
+                        configurable: false,
+                    });
                 }
             }
             None
@@ -1589,11 +1755,20 @@ pub(crate) fn own_property_descriptor(o: &JsObject, key: &PropertyKey) -> Option
 fn define_properties(vm: &mut Vm, obj: &JsObject, props: &Value) -> Result<(), Value> {
     let po = vm.to_object(props)?;
     // Collect (key, parsed descriptor) for every enumerable own key (including
-    // symbols) first, then apply — per ObjectDefineProperties.
-    let keys = vm.own_keys(&po);
+    // symbols) first, then apply — per ObjectDefineProperties. The source's
+    // keys and enumerability flow through proxy traps when it is one.
+    let keys = vm.own_property_keys(&po)?;
     let mut descriptors: Vec<(PropertyKey, PropDesc)> = Vec::new();
     for k in keys {
-        let enumerable = {
+        let enumerable = if vm.is_proxy(&po) {
+            let desc = vm.proxy_get_own_descriptor(&po, &k)?;
+            if matches!(&desc, Value::Object(_)) {
+                let e = vm.get_prop(&desc, &PropertyKey::str("enumerable"))?;
+                vm.to_boolean(&e)
+            } else {
+                false
+            }
+        } else {
             let b = po.borrow();
             match b.props.get(&k) {
                 Some(p) => p.enumerable,
@@ -1680,6 +1855,10 @@ fn install_function(vm: &mut Vm) {
         let call_args = if list.is_nullish() {
             Vec::new()
         } else {
+            // CreateListFromArrayLike: a primitive argArray is a TypeError.
+            if !matches!(list, Value::Object(_)) {
+                return Err(vm.throw_type("CreateListFromArrayLike called on non-object"));
+            }
             array_like_to_vec(vm, &list)?
         };
         vm.call(this, this_arg, &call_args)
@@ -1695,26 +1874,26 @@ fn install_function(vm: &mut Vm) {
         } else {
             Vec::new()
         };
-        // length = max(0, target.length - bound_args.len()), if target.length
-        // is a number; otherwise 0.
-        let target_len = vm
-            .get_prop(&this, &PropertyKey::str("length"))
-            .ok()
-            .and_then(|v| match v {
-                Value::Number(n) if n.is_finite() => Some(n.max(0.0).floor()),
-                _ => None,
-            })
-            .unwrap_or(0.0);
-        let bound_len = (target_len - bound_args.len() as f64).max(0.0);
-        // name = "bound " + target.name (target.name coerced to string).
-        let target_name = vm
-            .get_prop(&this, &PropertyKey::str("name"))
-            .ok()
-            .map(|v| match v {
-                Value::String(s) => s.as_str().to_string(),
-                _ => String::new(),
-            })
-            .unwrap_or_default();
+        // L = 0 unless the target has an OWN "length" (a deleted length means
+        // 0 even when the prototype provides one); the Get is observable and
+        // may throw. Infinity is preserved; -Infinity clamps to 0.
+        let bound_len = if own_property_descriptor(&target, &PropertyKey::str("length")).is_some()
+        {
+            match vm.get_prop(&this, &PropertyKey::str("length"))? {
+                Value::Number(n) if n.is_nan() => 0.0,
+                Value::Number(n) if n == f64::INFINITY => f64::INFINITY,
+                Value::Number(n) if n == f64::NEG_INFINITY => 0.0,
+                Value::Number(n) => (n.trunc() - bound_args.len() as f64).max(0.0),
+                _ => 0.0,
+            }
+        } else {
+            0.0
+        };
+        // name = "bound " + target.name; the Get may throw, a non-string is "".
+        let target_name = match vm.get_prop(&this, &PropertyKey::str("name"))? {
+            Value::String(s) => s.as_str().to_string(),
+            _ => String::new(),
+        };
 
         let bound = vm.alloc(ObjectData::new(
             Some(vm.realm.function_proto.clone()),
@@ -1775,7 +1954,38 @@ fn install_function(vm: &mut Vm) {
         let r = vm.instance_of_ordinary(&arg(args, 0), &this)?;
         Ok(Value::Bool(r))
     });
-    vm.define_value_sym(&proto, has_instance, Value::Object(f));
+    // @@hasInstance is non-writable, non-enumerable, NON-configurable.
+    proto.borrow_mut().props.insert(
+        PropertyKey::Sym(has_instance),
+        Property {
+            kind: PropertyKind::Data {
+                value: Value::Object(f),
+                writable: false,
+            },
+            enumerable: false,
+            configurable: false,
+        },
+    );
+    // %Function.prototype% is itself a function: own `length` (0) then
+    // `name` ("") data properties, in that order.
+    for (k, v) in [("length", 0.0), ("name", f64::NAN)] {
+        let value = if k == "length" {
+            Value::Number(v)
+        } else {
+            Value::str("")
+        };
+        proto.borrow_mut().props.insert(
+            PropertyKey::str(k),
+            Property {
+                kind: PropertyKind::Data {
+                    value,
+                    writable: false,
+                },
+                enumerable: false,
+                configurable: true,
+            },
+        );
+    }
 }
 
 fn array_like_to_vec(vm: &mut Vm, v: &Value) -> Result<Vec<Value>, Value> {

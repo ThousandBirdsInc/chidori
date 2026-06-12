@@ -423,6 +423,7 @@ struct FnCtx {
     num_params: u32,
     has_rest: bool,
     param_names: Vec<String>,
+    mapped_param_cells: Vec<Option<u32>>,
     uses_arguments: bool,
     /// Cell index of the implicit `this` binding (for non-arrow functions).
     this_cell: Option<u32>,
@@ -505,6 +506,7 @@ impl FnCtx {
             num_params: 0,
             has_rest: false,
             param_names: Vec::new(),
+            mapped_param_cells: Vec::new(),
             uses_arguments: false,
             this_cell: None,
             new_target_cell: None,
@@ -671,6 +673,7 @@ impl Compiler {
             | Op::JumpIfNullishPeek(t)
             | Op::JumpIfNullish(t) => *t = target,
             Op::PushTryHandler { catch, .. } => *catch = target,
+            Op::MarkDelegationHandler(t) => *t = target,
             Op::CompletionJump { target: t, .. } => *t = target,
             _ => panic!("patch_jump on non-jump op"),
         }
@@ -1407,9 +1410,10 @@ impl Compiler {
                 self.emit(Op::InitCell(star));
             }
             other => {
-                // `export default <AssignmentExpression>`.
+                // `export default <AssignmentExpression>`: NamedEvaluation
+                // gives an anonymous function/class the name "default".
                 let expr: &Expression = other.as_expression().unwrap();
-                self.compile_expr(expr)?;
+                self.compile_named_expr(expr, "default")?;
                 self.emit(Op::InitCell(star));
             }
         }
@@ -1496,6 +1500,7 @@ impl Compiler {
             source_start: 0,
             uses_arguments: fc.uses_arguments,
             param_names: fc.param_names,
+            mapped_param_cells: fc.mapped_param_cells,
             is_strict: fc.strict,
             stable_cells: fc.stable_cells.clone(),
             this_cell: fc.this_cell,
@@ -1830,10 +1835,20 @@ impl Compiler {
                     self.emit(Op::Pop);
                 }
             }
-            Statement::IfStatement(i) => self.compile_if(i)?,
-            Statement::WhileStatement(w) => self.compile_while(w)?,
-            Statement::DoWhileStatement(w) => self.compile_do_while(w)?,
+            Statement::IfStatement(i) => {
+                self.zero_completion();
+                self.compile_if(i)?
+            }
+            Statement::WhileStatement(w) => {
+                self.zero_completion();
+                self.compile_while(w)?
+            }
+            Statement::DoWhileStatement(w) => {
+                self.zero_completion();
+                self.compile_do_while(w)?
+            }
             Statement::ForStatement(f) => {
+                self.zero_completion();
                 // `for (using x = ...; ;)`: the dispose capability spans the
                 // whole statement (disposed when the loop completes/aborts).
                 let head_using = matches!(
@@ -1854,8 +1869,14 @@ impl Compiler {
                     self.compile_for(f)?;
                 }
             }
-            Statement::ForInStatement(f) => self.compile_for_in(f)?,
-            Statement::ForOfStatement(f) => self.compile_for_of(f)?,
+            Statement::ForInStatement(f) => {
+                self.zero_completion();
+                self.compile_for_in(f)?
+            }
+            Statement::ForOfStatement(f) => {
+                self.zero_completion();
+                self.compile_for_of(f)?
+            }
             Statement::ReturnStatement(_) if self.cur_ref().is_eval_body => {
                 return Err("Illegal return statement".into());
             }
@@ -1892,10 +1913,22 @@ impl Compiler {
                 let at = self.emit_break_continue_jump(label.as_deref(), true);
                 self.register_continue(at, label)?;
             }
-            Statement::TryStatement(t) => self.compile_try(t)?,
-            Statement::SwitchStatement(s) => self.compile_switch(s)?,
-            Statement::WithStatement(w) => self.compile_with(w)?,
-            Statement::LabeledStatement(l) => self.compile_labeled(l)?,
+            Statement::TryStatement(t) => {
+                self.zero_completion();
+                self.compile_try(t)?
+            }
+            Statement::SwitchStatement(s) => {
+                self.zero_completion();
+                self.compile_switch(s)?
+            }
+            Statement::WithStatement(w) => {
+                self.zero_completion();
+                self.compile_with(w)?
+            }
+            Statement::LabeledStatement(l) => {
+                self.zero_completion();
+                self.compile_labeled(l)?
+            }
             Statement::DebuggerStatement(_) => {}
             Statement::ImportDeclaration(d) => self.compile_import_decl(d)?,
             Statement::ExportNamedDeclaration(d) => self.compile_export_named(d)?,
@@ -2555,14 +2588,45 @@ impl Compiler {
         }
         let iter_cell = self.declare("%iter", false);
         self.emit(Op::InitCell(iter_cell));
+        // Iterator record: the next method is read ONCE, at GetIterator time
+        // (a `next` getter must not fire per iteration), and a non-callable
+        // one already fails here via the call below.
+        let next_k = self.str_const("next");
+        let next_cell = self.temp();
+        self.emit(Op::LoadCell(iter_cell));
+        self.emit(Op::GetProp(next_k));
+        self.emit(Op::InitCell(next_cell));
 
-        // Install a finally-style handler over the loop so an *abrupt* completion
-        // (break / return / throw / continue to an outer loop) runs IteratorClose
-        // on the iterator. Normal exhaustion (`done: true`) and a `continue` to
-        // this loop must NOT close it, so the close handler is popped on the done
-        // path, and `continue`'s unwind boundary stays inside it (see below).
+        // A finally-style close handler covers the BINDING + BODY of each
+        // iteration, so an abrupt completion there (break / return / throw /
+        // continue to an outer loop) runs IteratorClose. The `next()` call and
+        // the done/value reads run OUTSIDE it: per spec an error from the
+        // iterator protocol itself does NOT close the iterator. Normal
+        // exhaustion doesn't close either. `continue` to THIS loop jumps to
+        // `top`, which pops the handler before the next protocol round.
         let outer_hd = self.cur().handler_depth;
         let outer_fd = self.cur().finally_depth;
+        let entry = self.emit(Op::Jump(0)); // first iteration: handler not yet pushed
+        let top = self.here();
+        self.emit(Op::PopTryHandler);
+        let call_next = self.here();
+        self.patch_jump(entry, call_next);
+        self.emit(Op::LoadCell(next_cell));
+        self.emit(Op::LoadCell(iter_cell)); // [next, iter]
+        self.emit(Op::Call(0)); // [result]
+        if f.r#await {
+            // for-await: the iterator's next() returns a promise of the result;
+            // await it before reading done/value (await of a non-promise is a
+            // no-op, so this also works for sync iterables of plain values).
+            self.emit(Op::Await);
+        }
+        self.emit(Op::RequireIterResult);
+        self.emit(Op::Dup);
+        let done_k = self.str_const("done");
+        self.emit(Op::GetProp(done_k)); // [result, done]
+        let jt = self.emit(Op::JumpIfTrue(0)); // consumes done; [result]
+        let value_k = self.str_const("value");
+        self.emit(Op::GetProp(value_k)); // [value]
         let close_push = self.emit(Op::PushTryHandler {
             catch: u32::MAX,
             finally: u32::MAX,
@@ -2571,30 +2635,11 @@ impl Compiler {
         self.cur().finally_depth += 1;
         self.push_loop(None, true);
         // `break` unwinds to *outside* the close handler (so it closes); `continue`
-        // stays inside (so it re-iterates without closing).
+        // stays inside (so it reaches `top`, which pops without closing).
         if let Some(lp) = self.cur().loops.last_mut() {
             lp.brk_handler_depth = outer_hd;
             lp.brk_finally_depth = outer_fd;
         }
-
-        let top = self.here();
-        self.emit(Op::LoadCell(iter_cell));
-        self.emit(Op::IteratorNext); // [iter, result] -> result is pushed; iter stays
-                                     // IteratorNext leaves [iter, result]; drop the iter copy underneath.
-        self.emit(Op::Swap);
-        self.emit(Op::Pop); // [result]
-        if f.r#await {
-            // for-await: the iterator's next() returns a promise of the result;
-            // await it before reading done/value (await of a non-promise is a
-            // no-op, so this also works for sync iterables of plain values).
-            self.emit(Op::Await);
-        }
-        self.emit(Op::Dup);
-        let done_k = self.str_const("done");
-        self.emit(Op::GetProp(done_k)); // [result, done]
-        let jt = self.emit(Op::JumpIfTrue(0)); // consumes done; [result]
-        let value_k = self.str_const("value");
-        self.emit(Op::GetProp(value_k)); // [value]
         self.enter_scope(false);
         // `for (using x of …)`: a fresh dispose capability per ITERATION —
         // the resource is recorded before the binding initializes and
@@ -2618,15 +2663,14 @@ impl Compiler {
             self.compile_stmt(&f.body)?;
         }
         self.exit_scope();
-        self.emit(Op::Jump(top));
-
-        // Normal-exhaustion (done) path: remove the close handler and skip the
-        // close landing entirely (the iterator closed itself by returning done).
-        let done_label = self.here();
-        self.patch_jump(jt, done_label);
-        self.emit(Op::PopTryHandler);
+        self.emit(Op::Jump(top)); // `top` pops the close handler before next()
         self.cur().handler_depth -= 1;
         self.cur().finally_depth -= 1;
+
+        // Normal-exhaustion (done) path: the close handler is not active here
+        // (the protocol round runs outside it), so just drop the result.
+        let done_label = self.here();
+        self.patch_jump(jt, done_label);
         self.emit(Op::Pop); // pop result on done path
         let skip_close = self.emit(Op::Jump(0));
 
@@ -2669,6 +2713,18 @@ impl Compiler {
         Ok(())
     }
 
+    /// Spec `UpdateEmpty(completion, undefined)`: the compound statements
+    /// (if/loops/switch/try/with/labelled) produce **undefined** — not the
+    /// preceding statement's value — when their own body produces nothing.
+    /// Zeroing the completion register on statement entry implements that
+    /// (only meaningful where the register exists: script/eval bodies).
+    fn zero_completion(&mut self) {
+        if self.cur_ref().track_completion {
+            self.emit(Op::LoadUndefined);
+            self.store_binding("%completion");
+        }
+    }
+
     fn compile_try(&mut self, t: &TryStatement) -> R {
         if let Some(finalizer) = &t.finalizer {
             // Wrap try/catch with a finally landing pad.
@@ -2700,6 +2756,10 @@ impl Compiler {
         let skip = self.emit(Op::Jump(0));
         let catch_start = self.here();
         self.patch_jump(push, catch_start);
+        // The try block's partial completion value is discarded when it threw:
+        // the catch clause's own completion is what UpdateEmpty sees.
+        // (Stack-neutral: the exception stays on top.)
+        self.zero_completion();
         // exception is on stack
         self.enter_scope(false);
         if let Some(h) = handler {
@@ -2758,6 +2818,9 @@ impl Compiler {
             });
             inner_push = Some(ip);
             self.cur().handler_depth += 1;
+            // Discard the try block's partial completion value (see
+            // compile_try_catch_only).
+            self.zero_completion();
             self.enter_scope(false);
             if let Some(param) = &h.param {
                 self.bind_pattern(&param.pattern, false)?;
@@ -2787,7 +2850,22 @@ impl Compiler {
         }
         // The finalizer body itself is no longer inside this try's finally region.
         self.cur().finally_depth -= 1;
+        // A normally-completing finalizer's value is DISCARDED (spec: "If F is
+        // a normal completion, set F to B"): save/restore the completion
+        // register around the finalizer body.
+        let saved = if self.cur_ref().track_completion {
+            let c = self.temp();
+            self.load_binding("%completion");
+            self.emit(Op::InitCell(c));
+            Some(c)
+        } else {
+            None
+        };
         self.compile_block(&finalizer.body)?;
+        if let Some(c) = saved {
+            self.emit(Op::LoadCell(c));
+            self.store_binding("%completion");
+        }
         self.emit(Op::EndFinally);
         Ok(())
     }
@@ -3359,11 +3437,9 @@ impl Compiler {
                     if p.computed {
                         self.compile_property_key_expr(&p.key)?; // [obj, key]
                                                                  // ToPropertyKey NOW (spec: ComputedPropertyName
-                                                                 // evaluation), so a later SetFunctionNameFromKey /
-                                                                 // DefineField can't re-run key-coercion side effects.
-                        if Self::is_anonymous_fn_expr(&p.value) {
-                            self.emit(Op::ToPropertyKey);
-                        }
+                                                                 // evaluation runs before the value), so key-coercion
+                                                                 // side effects precede the value and never re-run.
+                        self.emit(Op::ToPropertyKey);
                     } else {
                         let name = property_key_name(&p.key);
                         self.load_str(&name); // [obj, key]
@@ -4058,11 +4134,13 @@ impl Compiler {
             // step result is Awaited before its `done`/`value` are read.
             //
             // The loop forwards the value SENT into the outer generator to the
-            // inner iterator's `next(sent)` (exactly one argument), checks each
-            // step result is an Object, and delegates a `.throw()` resumption
-            // to the inner iterator's `throw` method (closing the inner
-            // iterator with a TypeError when it has none). `.return()`
-            // delegation (running the inner `return`) is not yet modeled.
+            // inner iterator's `next(sent)` (exactly one argument, through the
+            // next method CACHED at GetIterator time per the spec's iterator
+            // record), checks each step result is an Object, delegates a
+            // `.throw()` resumption to the inner iterator's `throw` method
+            // (closing the inner iterator with a TypeError when it has none),
+            // and delegates a `.return(v)` resumption to the inner iterator's
+            // `return` method (finishing the outer return when it has none).
             let is_async = self.cur().kind.is_async();
             self.compile_expr(y.argument.as_ref().unwrap())?;
             if is_async {
@@ -4072,19 +4150,23 @@ impl Compiler {
             }
             let iter_cell = self.temp();
             self.emit(Op::InitCell(iter_cell));
-            let sent_cell = self.temp();
-            self.emit(Op::LoadUndefined);
-            self.emit(Op::InitCell(sent_cell));
             let next_k = self.str_const("next");
             let done_k = self.str_const("done");
             let value_k = self.str_const("value");
-
-            // -- next_call: result = inner.next(sent) --
-            let next_call = self.here();
+            // Iterator record: cache the next method once (Get(iter, "next")
+            // must be observable exactly once, at GetIterator time).
+            let next_cell = self.temp();
             self.emit(Op::LoadCell(iter_cell));
-            self.emit(Op::Dup);
-            self.emit(Op::GetProp(next_k)); // [iter, next]
-            self.emit(Op::Swap); // [next, iter]
+            self.emit(Op::GetProp(next_k));
+            self.emit(Op::InitCell(next_cell));
+            let sent_cell = self.temp();
+            self.emit(Op::LoadUndefined);
+            self.emit(Op::InitCell(sent_cell));
+
+            // -- next_call: result = cachedNext.call(inner, sent) --
+            let next_call = self.here();
+            self.emit(Op::LoadCell(next_cell));
+            self.emit(Op::LoadCell(iter_cell)); // [next, iter]
             self.emit(Op::LoadCell(sent_cell)); // [next, iter, sent]
             self.emit(Op::Call(1)); // [result]
 
@@ -4099,12 +4181,14 @@ impl Compiler {
             let jt = self.emit(Op::JumpIfTrue(0)); // [result]
             self.emit(Op::GetProp(value_k)); // [value]
                                              // Yield inside a catch-only region: a `.throw(e)` resumption lands
-                                             // in the delegation handler below instead of unwinding.
+                                             // in the delegation handler below instead of unwinding, and a
+                                             // `.return(v)` resumption lands at the return-delegation block.
+            let yield_site = self.here();
             let push_h = self.emit(Op::PushTryHandler {
                 catch: u32::MAX,
                 finally: u32::MAX,
             });
-            self.emit(Op::MarkDelegationHandler);
+            let mark = self.emit(Op::MarkDelegationHandler(u32::MAX));
             self.cur().handler_depth += 1;
             self.emit(Op::Yield); // [sent']
             self.emit(Op::StoreCell(sent_cell));
@@ -4142,6 +4226,52 @@ impl Compiler {
             self.emit(Op::LoadConst(mk));
             self.emit(Op::New(1));
             self.emit(Op::Throw);
+
+            // -- return delegation (spec 15.5.5 step 7.c): a `.return(v)`
+            // resumption jumps here with [v]. Forward to inner.return(v);
+            // when the inner has no `return`, the outer return proceeds. --
+            let ret_lbl = self.here();
+            self.patch_jump(mark, ret_lbl); // [v]
+            let ret_cell = self.temp();
+            self.emit(Op::InitCell(ret_cell));
+            let retm_cell = self.temp();
+            self.emit(Op::LoadCell(iter_cell));
+            let return_k = self.str_const("return");
+            self.emit(Op::GetProp(return_k));
+            self.emit(Op::InitCell(retm_cell));
+            self.emit(Op::LoadCell(retm_cell));
+            let jno_ret = self.emit(Op::JumpIfNullish(0)); // [retm] (peek)
+            self.emit(Op::Pop);
+            self.emit(Op::LoadCell(retm_cell));
+            self.emit(Op::LoadCell(iter_cell));
+            self.emit(Op::LoadCell(ret_cell)); // [retm, iter, v]
+            self.emit(Op::Call(1)); // [innerReturnResult]
+            if is_async {
+                self.emit(Op::Await);
+            }
+            self.emit(Op::RequireIterResult);
+            self.emit(Op::Dup);
+            self.emit(Op::GetProp(done_k));
+            let jr_done = self.emit(Op::JumpIfTrue(0)); // [result]
+            // Not done: keep delegating — yield the inner value and loop.
+            self.emit(Op::GetProp(value_k)); // [value]
+            self.emit(Op::Jump(yield_site));
+            // Done: the outer generator returns IteratorValue(result),
+            // running any enclosing finally blocks.
+            let r_done = self.here();
+            self.patch_jump(jr_done, r_done);
+            self.emit(Op::GetProp(value_k)); // [value]
+            self.emit(Op::Return);
+            // No `return` method: complete the outer return with v
+            // ((async) after awaiting it).
+            let no_ret = self.here();
+            self.patch_jump(jno_ret, no_ret);
+            self.emit(Op::Pop); // drop the nullish `return`
+            self.emit(Op::LoadCell(ret_cell));
+            if is_async {
+                self.emit(Op::Await);
+            }
+            self.emit(Op::Return);
 
             // -- end: result of yield* = final result.value --
             let end = self.here();
@@ -4182,7 +4312,8 @@ impl Compiler {
                                 A::LogicalOr => self.emit(Op::JumpIfTruthyPeek(0)),
                                 _ => self.emit(Op::JumpIfNullishPeek(0)),
                             };
-                            self.compile_expr(&a.right)?;
+                            // NamedEvaluation: `x ||= function(){}` names it "x".
+                            self.compile_named_expr(&a.right, &name)?;
                             self.store_via_base_keep(&name, t_base);
                             let end = self.here();
                             self.patch_jump(j, end);
@@ -4210,7 +4341,8 @@ impl Compiler {
                             A::LogicalOr => self.emit(Op::JumpIfTruthyPeek(0)),
                             _ => self.emit(Op::JumpIfNullishPeek(0)),
                         };
-                        self.compile_expr(&a.right)?;
+                        // NamedEvaluation: `x ||= function(){}` names it "x".
+                        self.compile_named_expr(&a.right, &name)?;
                         self.emit(Op::Dup);
                         self.store_binding_assign(&name);
                         let end = self.here();
@@ -5029,6 +5161,44 @@ impl Compiler {
         }
         self.cur().in_params = false;
 
+        // A MAPPED `arguments` object (sloppy, simple parameter list) aliases
+        // the parameter cells: record each positional parameter's cell index.
+        // A name duplicated later in the list maps only its LAST index.
+        if !self.cur_ref().strict
+            && params.rest.is_none()
+            && !has_param_default
+            && params
+                .items
+                .iter()
+                .all(|p| matches!(&p.pattern, BindingPattern::BindingIdentifier(_)))
+        {
+            let names: Vec<&str> = params
+                .items
+                .iter()
+                .filter_map(|p| match &p.pattern {
+                    BindingPattern::BindingIdentifier(id) => Some(id.name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let mut cells: Vec<Option<u32>> = Vec::with_capacity(names.len());
+            for (i, n) in names.iter().enumerate() {
+                let shadowed = names[i + 1..].contains(n);
+                cells.push(if shadowed {
+                    None
+                } else {
+                    self.current_scope_cell(n)
+                });
+            }
+            if cells.iter().any(|c| c.is_some()) {
+                // The aliased cells must be STABLE: the arguments object may
+                // capture them before InitCell runs for the parameter, so the
+                // init must mutate the Rc in place, never replace it.
+                let stable: Vec<u32> = cells.iter().flatten().copied().collect();
+                self.cur().stable_cells.extend(stable);
+                self.cur().mapped_param_cells = cells;
+            }
+        }
+
         // A base-class constructor installs instance fields/brands at entry; a
         // derived one defers them to `super()` (see %fieldinit above).
         if kind != FuncKind::DerivedCtor {
@@ -5272,6 +5442,18 @@ impl Compiler {
             }
         }
 
+        // Computed instance-field KEYS evaluate once, at class-definition time
+        // (spec ClassFieldDefinitionEvaluation), in element order — not per
+        // construction. Declare a class-scope cell per computed field now (so
+        // the constructor closure captures it) and fill it in the element walk
+        // below; the per-instance initializer only evaluates the VALUE.
+        for (i, p) in instance_fields.iter().enumerate() {
+            if p.computed {
+                let c = self.declare(&format!("%fieldkey{i}"), false);
+                self.emit(Op::InitCellTdz(c));
+            }
+        }
+
         // Build the constructor closure, then stash it in a temp cell so the rest
         // of class building can address it cleanly.
         if let Some(m) = ctor_method {
@@ -5305,6 +5487,7 @@ impl Compiler {
             self.class_link_super(ctor_cell)?;
         }
 
+        let mut ifield_idx = 0usize;
         for el in &class.body.body {
             match el {
                 ClassElement::MethodDefinition(m)
@@ -5314,6 +5497,20 @@ impl Compiler {
                 }
                 ClassElement::PropertyDefinition(p) if p.r#static => {
                     self.class_define_static_field(ctor_cell, p)?;
+                }
+                ClassElement::PropertyDefinition(p) => {
+                    // Non-static field: evaluate a computed KEY now, in element
+                    // order, into its class-scope cell.
+                    let i = ifield_idx;
+                    ifield_idx += 1;
+                    if p.computed {
+                        self.compile_property_key_expr(&p.key)?;
+                        self.emit(Op::ToPropertyKey);
+                        match self.resolve(&format!("%fieldkey{i}")) {
+                            Resolved::Cell(c) => self.emit(Op::StoreCell(c)),
+                            _ => unreachable!("%fieldkey declared in this scope"),
+                        };
+                    }
                 }
                 _ => {}
             }
@@ -5405,29 +5602,36 @@ impl Compiler {
     /// resolve `%this`): evaluates the (possibly computed) key and initializer
     /// and assigns the result.
     fn emit_field_definitions(&mut self, fields: &[&PropertyDefinition]) -> R {
-        for field in fields {
+        for (i, field) in fields.iter().enumerate() {
             self.load_binding("%this");
             if field.computed {
-                // Computed field key (`[expr] = …`): evaluate + ToPropertyKey so a
-                // number becomes its string form and a symbol stays a symbol.
-                self.compile_property_key_expr(&field.key)?;
+                // Computed field key: already evaluated (with ToPropertyKey) at
+                // class-definition time into the class-scope `%fieldkey{i}` cell.
+                self.load_binding(&format!("%fieldkey{i}")); // [this, key]
                 if let Some(init) = &field.value {
                     self.compile_expr(init)?;
+                    // Computed key + anonymous value: NamedEvaluation takes the
+                    // runtime key.
+                    if Self::is_anonymous_fn_expr(init) {
+                        let prefix = self.str_const("");
+                        self.emit(Op::SetFunctionNameFromKey(prefix));
+                    }
                 } else {
                     self.emit(Op::LoadUndefined);
                 }
-                self.emit(Op::SetPropDynamic);
             } else {
                 let key = self.class_element_key(&field.key);
+                self.load_str(&key); // [this, key]
                 if let Some(init) = &field.value {
                     // NamedEvaluation uses the source-visible name ("#x").
                     self.compile_named_expr(init, &property_key_name(&field.key))?;
                 } else {
                     self.emit(Op::LoadUndefined);
                 }
-                let k = self.str_const(&key);
-                self.emit(Op::SetProp(k));
             }
+            // DefineField (CreateDataPropertyOrThrow): a field is an own data
+            // property — an inherited setter/read-only slot must not be hit.
+            self.emit(Op::DefineField); // [this]
             self.emit(Op::Pop);
         }
         Ok(())
@@ -5563,8 +5767,27 @@ impl Compiler {
         self.emit(Op::LoadCell(ctor_cell)); // [ctor]
         if p.computed {
             self.compile_property_key_expr(&p.key)?; // [ctor, key]
+            self.emit(Op::ToPropertyKey);
+            // A computed static field named "prototype" is a runtime TypeError
+            // (the literal spelling is the early SyntaxError).
+            self.emit(Op::Dup);
+            self.load_str("prototype");
+            self.emit(Op::StrictEq);
+            let jok = self.emit(Op::JumpIfFalse(0));
+            let tk = self.str_const("TypeError");
+            self.emit(Op::LoadGlobal(tk));
+            let mk = self.str_const("Classes may not have a static property named 'prototype'");
+            self.emit(Op::LoadConst(mk));
+            self.emit(Op::New(1));
+            self.emit(Op::Throw);
+            let ok = self.here();
+            self.patch_jump(jok, ok);
             if let Some(init) = &p.value {
                 self.compile_expr(init)?;
+                if Self::is_anonymous_fn_expr(init) {
+                    let prefix = self.str_const("");
+                    self.emit(Op::SetFunctionNameFromKey(prefix));
+                }
             } else {
                 self.emit(Op::LoadUndefined);
             }

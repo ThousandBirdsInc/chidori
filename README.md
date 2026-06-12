@@ -377,7 +377,7 @@ The runner prints a pass/fail/skip summary:
 
 ```
 Test262 (chidori pure-Rust engine, bare context)
-  pass 38271  fail 1503  skip 7517  =>  96.22% of executed
+  pass 39017  fail 757  skip 7517  =>  98.10% of executed
 ```
 
 It drives the **bare ECMAScript context** (no `chidori` host object), so the
@@ -404,19 +404,20 @@ target/release/test262-runner --test262 vendor/test262 --help
 
 ### Remaining gaps
 
-The residual failures, by area (top clusters of the 1,503 total):
+The residual failures, by area (top clusters of the 757 total):
 
 | count | area | nature |
 |--:|---|---|
-| 303 | `language/expressions` | class element corners, dynamic-`import()` semantics, `yield*` delegation ordering |
-| 222 | `language/statements` | remaining class element corners, `for-of` iterator-close |
-| 136 | `built-ins/Array` | species/proxy interplay, length-boundary semantics |
-| 98 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings); `v`-flag; `prototype` long tail |
-| 96 | `built-ins/TypedArray` | resizable-`ArrayBuffer` / out-of-bounds tracking |
+| 198 | `language/expressions` | class element corners (direct-eval contexts, per-evaluation private brands), dynamic-`import()` semantics, tagged-template caching |
+| 111 | `language/statements` | remaining class element corners, labelled/eval interplay |
+| 94 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings); `v`-flag; `prototype` long tail |
 | 59 | `built-ins/String` | `normalize`, Unicode/surrogate edge cases |
-| 52 | `built-ins/Promise` | spec-detailed async ordering combinations |
-| 51 | `language/module-code` | TLA ordering, cyclic-graph corner cases |
-| 23 | `language/arguments-object` | mapped-arguments index/parameter aliasing |
+| 36 | `built-ins/Object` | array `length` descriptor corners; sparse indices beyond the dense cap |
+| 22 | `language/module-code` | namespace internals, hoisted default-function exports, TLA ordering |
+| 18 | `language/eval-code` | eval-created binding attribute corners |
+| 15 | `built-ins/Array` | sparse indices beyond the dense cap; UTF-16 string spread |
+| 15 | `built-ins/Date` | parse/format edge cases |
+| 13 | `built-ins/Proxy` | proxy-of-proxy forwarding details |
 
 See [`docs/conformance.md`](./docs/conformance.md) for the measurement
 methodology, the honest skip policy, the CI gate, and the full breakdown.

@@ -142,14 +142,35 @@ fn to_uint8_clamp(v: f64) -> u8 {
 /// current byte length (`floor((bufferByteLength - byteOffset) / elementSize)`,
 /// clamped to 0 when the view no longer fits / the buffer is detached).
 pub fn ta_eff_length(t: &TypedArrayData) -> usize {
-    if !t.length_tracking {
-        return t.length;
-    }
     let buf_len = match &t.buffer.borrow().internal {
         Internal::ArrayBuffer(Some(bytes)) => bytes.len(),
-        _ => 0,
+        _ => 0, // detached
     };
+    if !t.length_tracking {
+        // IsTypedArrayOutOfBounds: a fixed-length view that no longer fits its
+        // (shrunk resizable) buffer behaves like a detached one — length 0.
+        if t.byte_offset + t.length * t.kind.bytes() > buf_len {
+            return 0;
+        }
+        return t.length;
+    }
     buf_len.saturating_sub(t.byte_offset) / t.kind.bytes()
+}
+
+/// `IsTypedArrayOutOfBounds` (spec 10.4.5.13): detached, or the view's
+/// `[byteOffset, byteOffset + byteLength)` range no longer fits the buffer.
+pub fn ta_out_of_bounds(t: &TypedArrayData) -> bool {
+    let buf_len = match &t.buffer.borrow().internal {
+        Internal::ArrayBuffer(Some(bytes)) => bytes.len(),
+        _ => return true, // detached
+    };
+    if t.byte_offset > buf_len {
+        return true;
+    }
+    if !t.length_tracking && t.byte_offset + t.length * t.kind.bytes() > buf_len {
+        return true;
+    }
+    false
 }
 
 impl Vm {
