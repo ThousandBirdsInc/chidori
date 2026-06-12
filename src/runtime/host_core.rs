@@ -7,7 +7,9 @@ use crate::providers::{
     CacheTtl, ContentBlock, LlmRequest, LlmResponse, ProviderRegistry, TokenSink, ToolCall,
 };
 use crate::runtime::call_log::{CallRecord, TokenUsage};
-use crate::runtime::context::{InputMode, PendingInput, RuntimeContext, PAUSE_MARKER};
+use crate::runtime::context::{
+    InputMode, PendingInput, PendingSignal, RuntimeContext, PAUSE_MARKER,
+};
 use crate::runtime::memory::execute_memory_action;
 use crate::runtime::snapshot::{HostPromiseState, PendingHostOperationKind};
 use crate::runtime::template::TemplateEngine;
@@ -194,6 +196,7 @@ fn host_operation_kind(function: &str) -> Option<PendingHostOperationKind> {
         "memory" => Some(PendingHostOperationKind::Memory),
         "checkpoint" => Some(PendingHostOperationKind::Checkpoint),
         "log" => Some(PendingHostOperationKind::Log),
+        "signal" | "poll_signal" => Some(PendingHostOperationKind::Signal),
         _ => None,
     }
 }
@@ -254,6 +257,151 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
             Err(anyhow::anyhow!("{PAUSE_MARKER}: {prompt}"))
         }
     }
+}
+
+/// Pull the required `name` string from a signal binding's args
+/// (`{ "name": <string>, "opts": <json|null> }`), with a clear host-side error
+/// when it is missing or not a string. Shared by `execute_signal` /
+/// `execute_poll_signal`.
+fn signal_name(function: &str, args: &Value) -> Result<String> {
+    args.get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("chidori.{function} requires a string name"))
+}
+
+/// `chidori.signal(name, opts)` — the blocking, named, externally-deliverable
+/// flavor of `input`, fronted by a durable per-run mailbox. See
+/// `docs/signals.md` §5/§8.3. Order:
+///   1. replay short-circuit (`try_replay_checked`) — a recorded result wins,
+///      so a replay never reads the inbox;
+///   2. completed-host-op check (`(seq, Signal, {name})`) — a delivered-via-
+///      resume signal that post-dates the journal;
+///   3. mailbox drain (`take_queued_signal`) — consume a pre-arrived signal
+///      WITHOUT pausing, recording the `{name,payload,from}` result;
+///   4. otherwise PAUSE: set `PendingSignal` and bail with `PAUSE_MARKER` (the
+///      pause *type* is distinguished from `input` by which pending slot is set).
+/// The durable match key is `{ "name": name }` only — the payload is unknown at
+/// pause time and rides in the result.
+pub fn execute_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
+    let name = signal_name("signal", args)?;
+    let match_args = json!({ "name": name });
+    let seq = ctx.next_seq();
+
+    if let Some(record) = ctx
+        .try_replay_checked(seq, "signal")
+        .map_err(|err| anyhow::anyhow!(err))?
+    {
+        return Ok(record.result);
+    }
+
+    if let Some(result) = replay_completed_host_operation(
+        ctx,
+        seq,
+        "signal",
+        PendingHostOperationKind::Signal,
+        &match_args,
+    )? {
+        return Ok(result);
+    }
+
+    let host_operation = ctx.begin_host_operation_with_function(
+        seq,
+        PendingHostOperationKind::Signal,
+        Some("signal".to_string()),
+        match_args.clone(),
+    );
+    ctx.run_host_operation_safepoint(host_operation)?;
+
+    if let Some(queued) = ctx.take_queued_signal(&name) {
+        let result = json!({
+            "name": queued.name,
+            "payload": queued.payload,
+            "from": queued.from,
+        });
+        ctx.resolve_host_operation(host_operation, result.clone())?;
+        ctx.record_call(CallRecord {
+            seq,
+            parent_seq: None,
+            function: "signal".to_string(),
+            args: match_args,
+            result: result.clone(),
+            duration_ms: 0,
+            token_usage: None,
+            timestamp: Utc::now(),
+            error: None,
+        });
+        ctx.run_host_operation_completion_safepoint(host_operation)?;
+        return Ok(result);
+    }
+
+    ctx.set_pending_signal(PendingSignal {
+        seq,
+        name: name.clone(),
+        id: host_operation,
+    });
+    Err(anyhow::anyhow!("{PAUSE_MARKER}: signal {name}"))
+}
+
+/// `chidori.pollSignal(name)` — non-blocking signal consumption (`docs/signals.md`
+/// §6.1). Same replay/completed-host-op checks as `execute_signal` (function
+/// name `"poll_signal"`, kind `Signal`, match key `{name}`), then a single
+/// mailbox drain: records the `{name,payload,from}` object if a matching signal
+/// is queued, or JSON `null` if not. The result is ALWAYS recorded at this seq —
+/// so a poll that found nothing replays as `null` deterministically — and it
+/// never pauses.
+pub fn execute_poll_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
+    let name = signal_name("pollSignal", args)?;
+    let match_args = json!({ "name": name });
+    let seq = ctx.next_seq();
+
+    if let Some(record) = ctx
+        .try_replay_checked(seq, "poll_signal")
+        .map_err(|err| anyhow::anyhow!(err))?
+    {
+        return Ok(record.result);
+    }
+
+    if let Some(result) = replay_completed_host_operation(
+        ctx,
+        seq,
+        "poll_signal",
+        PendingHostOperationKind::Signal,
+        &match_args,
+    )? {
+        return Ok(result);
+    }
+
+    let host_operation = ctx.begin_host_operation_with_function(
+        seq,
+        PendingHostOperationKind::Signal,
+        Some("poll_signal".to_string()),
+        match_args.clone(),
+    );
+    ctx.run_host_operation_safepoint(host_operation)?;
+
+    let result = match ctx.take_queued_signal(&name) {
+        Some(queued) => json!({
+            "name": queued.name,
+            "payload": queued.payload,
+            "from": queued.from,
+        }),
+        None => Value::Null,
+    };
+    ctx.resolve_host_operation(host_operation, result.clone())?;
+    ctx.record_call(CallRecord {
+        seq,
+        parent_seq: None,
+        function: "poll_signal".to_string(),
+        args: match_args,
+        result: result.clone(),
+        duration_ms: 0,
+        token_usage: None,
+        timestamp: Utc::now(),
+        error: None,
+    });
+    ctx.run_host_operation_completion_safepoint(host_operation)?;
+    Ok(result)
 }
 
 /// Whether (and how long) a prompt request should mark cacheable prefix
@@ -907,7 +1055,7 @@ mod tests {
         HostOperationCompletionSafepoint, HostOperationSafepoint, RuntimeContext,
     };
     use crate::runtime::snapshot::{
-        HostOperationId, HostPromiseRecord, HostPromiseState, PendingHostOperation,
+        HostOperationId, HostPromiseRecord, HostPromiseState, PendingHostOperation, QueuedSignal,
         PENDING_HOST_OPERATION_FILE,
     };
 
@@ -1814,5 +1962,220 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].kind, PendingHostOperationKind::Input);
         assert_eq!(pending[0].args, json!({ "prompt": "Approve?" }));
+    }
+
+    fn queued_signal(name: &str, payload: Value, from: Value, delivery_seq: u64) -> QueuedSignal {
+        QueuedSignal {
+            name: name.to_string(),
+            payload,
+            from,
+            delivery_seq,
+            enqueued_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn signal_pauses_when_inbox_empty() {
+        let ctx = RuntimeContext::new();
+
+        let err = execute_signal(&ctx, &json!({ "name": "review", "opts": null })).unwrap_err();
+
+        assert!(err.to_string().contains(PAUSE_MARKER));
+        // The pending host op carries kind Signal and the name-only match key.
+        let pending = ctx.pending_host_operations();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind, PendingHostOperationKind::Signal);
+        assert_eq!(pending[0].args, json!({ "name": "review" }));
+        // The pause slot is set so the engine surfaces a signal pause.
+        let pending_signal = ctx.take_pending_signal().expect("pending signal set");
+        assert_eq!(pending_signal.name, "review");
+        assert_eq!(pending_signal.seq, 1);
+        // No call was recorded — the run is suspended, not completed.
+        assert!(ctx.call_log().into_records().is_empty());
+    }
+
+    #[test]
+    fn signal_consumes_queued_without_pausing() {
+        let ctx = RuntimeContext::new();
+        ctx.set_signal_inbox(vec![queued_signal(
+            "review",
+            json!({ "decision": "approve" }),
+            json!({ "kind": "human", "id": "mara" }),
+            7,
+        )]);
+
+        let result = execute_signal(&ctx, &json!({ "name": "review", "opts": null })).unwrap();
+
+        assert_eq!(
+            result,
+            json!({
+                "name": "review",
+                "payload": { "decision": "approve" },
+                "from": { "kind": "human", "id": "mara" },
+            })
+        );
+        // The inbox is drained and a completed call is recorded with the value.
+        assert!(ctx.signal_inbox().is_empty());
+        let records = ctx.call_log().into_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].function, "signal");
+        assert_eq!(records[0].args, json!({ "name": "review" }));
+        assert_eq!(records[0].result, result);
+        assert!(ctx.take_pending_signal().is_none());
+    }
+
+    #[test]
+    fn signal_replay_returns_recorded_value_without_touching_inbox() {
+        // Record a signal consumption.
+        let recorded = vec![CallRecord {
+            seq: 1,
+            parent_seq: None,
+            function: "signal".to_string(),
+            args: json!({ "name": "review" }),
+            result: json!({
+                "name": "review",
+                "payload": { "decision": "approve" },
+                "from": { "kind": "human", "id": "mara" },
+            }),
+            duration_ms: 0,
+            token_usage: None,
+            timestamp: Utc::now(),
+            error: None,
+        }];
+        // Replay context with a DIFFERENT same-name signal sitting in the inbox.
+        // The recorded value must win and the inbox must stay undrained.
+        let ctx = RuntimeContext::with_replay(recorded);
+        ctx.set_signal_inbox(vec![queued_signal(
+            "review",
+            json!({ "decision": "changes" }),
+            json!({ "kind": "agent", "id": "bot" }),
+            99,
+        )]);
+
+        let result = execute_signal(&ctx, &json!({ "name": "review", "opts": null })).unwrap();
+
+        assert_eq!(
+            result,
+            json!({
+                "name": "review",
+                "payload": { "decision": "approve" },
+                "from": { "kind": "human", "id": "mara" },
+            })
+        );
+        // The inbox was never read on replay.
+        assert_eq!(ctx.signal_inbox().len(), 1);
+        assert_eq!(
+            ctx.signal_inbox()[0].payload,
+            json!({ "decision": "changes" })
+        );
+    }
+
+    #[test]
+    fn signal_consumes_same_name_in_delivery_seq_order() {
+        let ctx = RuntimeContext::new();
+        // Two same-name signals enqueued out of delivery_seq order.
+        ctx.set_signal_inbox(vec![
+            queued_signal("review", json!("second"), json!({ "id": "b" }), 20),
+            queued_signal("review", json!("first"), json!({ "id": "a" }), 10),
+        ]);
+
+        let first = execute_signal(&ctx, &json!({ "name": "review", "opts": null })).unwrap();
+        assert_eq!(first["payload"], json!("first"));
+        assert_eq!(ctx.signal_inbox().len(), 1);
+
+        let second = execute_signal(&ctx, &json!({ "name": "review", "opts": null })).unwrap();
+        assert_eq!(second["payload"], json!("second"));
+        assert!(ctx.signal_inbox().is_empty());
+
+        let records = ctx.call_log().into_records();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].result["payload"], json!("first"));
+        assert_eq!(records[1].result["payload"], json!("second"));
+    }
+
+    #[test]
+    fn poll_signal_records_null_when_empty_and_value_when_queued() {
+        // Empty inbox → records null, never pauses.
+        let ctx = RuntimeContext::new();
+        let empty = execute_poll_signal(&ctx, &json!({ "name": "steer" })).unwrap();
+        assert_eq!(empty, Value::Null);
+        let records = ctx.call_log().into_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].function, "poll_signal");
+        assert_eq!(records[0].result, Value::Null);
+
+        // Queued → records the value object.
+        let ctx2 = RuntimeContext::new();
+        ctx2.set_signal_inbox(vec![queued_signal(
+            "steer",
+            json!({ "priority": "high" }),
+            json!({ "kind": "human", "id": "sam" }),
+            3,
+        )]);
+        let value = execute_poll_signal(&ctx2, &json!({ "name": "steer" })).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "name": "steer",
+                "payload": { "priority": "high" },
+                "from": { "kind": "human", "id": "sam" },
+            })
+        );
+        assert!(ctx2.signal_inbox().is_empty());
+    }
+
+    #[test]
+    fn poll_signal_replays_null_and_value_deterministically() {
+        // A recorded null poll replays as null without consulting the inbox.
+        let null_record = vec![CallRecord {
+            seq: 1,
+            parent_seq: None,
+            function: "poll_signal".to_string(),
+            args: json!({ "name": "steer" }),
+            result: Value::Null,
+            duration_ms: 0,
+            token_usage: None,
+            timestamp: Utc::now(),
+            error: None,
+        }];
+        let ctx = RuntimeContext::with_replay(null_record);
+        // Even with a queued same-name signal, the recorded null wins.
+        ctx.set_signal_inbox(vec![queued_signal(
+            "steer",
+            json!({ "priority": "high" }),
+            json!({ "id": "sam" }),
+            5,
+        )]);
+        let replayed_null = execute_poll_signal(&ctx, &json!({ "name": "steer" })).unwrap();
+        assert_eq!(replayed_null, Value::Null);
+        assert_eq!(ctx.signal_inbox().len(), 1);
+
+        // A recorded value poll replays the value.
+        let value = json!({
+            "name": "steer",
+            "payload": { "priority": "high" },
+            "from": { "id": "sam" },
+        });
+        let value_record = vec![CallRecord {
+            seq: 1,
+            parent_seq: None,
+            function: "poll_signal".to_string(),
+            args: json!({ "name": "steer" }),
+            result: value.clone(),
+            duration_ms: 0,
+            token_usage: None,
+            timestamp: Utc::now(),
+            error: None,
+        }];
+        let ctx2 = RuntimeContext::with_replay(value_record);
+        let replayed_value = execute_poll_signal(&ctx2, &json!({ "name": "steer" })).unwrap();
+        assert_eq!(replayed_value, value);
+    }
+
+    #[test]
+    fn signal_requires_string_name() {
+        let ctx = RuntimeContext::new();
+        let err = execute_signal(&ctx, &json!({ "name": 42, "opts": null })).unwrap_err();
+        assert!(err.to_string().contains("requires a string name"));
     }
 }

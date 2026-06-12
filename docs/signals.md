@@ -1,8 +1,15 @@
 # Runtime Signals — Multiplayer Agents — Design Doc & Implementation Plan
 
-> **Status:** Draft for review.
-> **Target engine:** pure-Rust JS engine (`CHIDORI_JS_ENGINE=rust`, `rust-engine`
-> feature). The default QuickJS path is untouched.
+> **Status:** Implemented. Phase 1 plus `pollSignal` have shipped: the named
+> **blocking** `chidori.signal(name)`, the durable **per-run mailbox**, the
+> `POST /sessions/{id}/signal` **delivery endpoint** (resolve+resume, enqueue, or
+> 409), and **deterministic replay** of the whole multiplayer session.
+> `signalAny`, `timeoutMs`, and live zero-latency in-memory delivery to a running
+> task (the Phase 2/3 remainder) are **future work**. The same-name tie-break is
+> pinned to **pending-pause-wins-with-newest**.
+> **Engine:** chidori-js (the pure-Rust JS engine) is now the only runtime — there
+> is no `CHIDORI_JS_ENGINE=rust` selector, no `rust-engine` cargo feature gate to
+> opt in, and no separate QuickJS path to keep untouched.
 > **Related:** [`docs/branching-execution.md`](./branching-execution.md),
 > [`docs/captured-effects-vfs-crypto-timers.md`](./captured-effects-vfs-crypto-timers.md),
 > [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md).
@@ -530,7 +537,7 @@ pick among them.
 
 ## 14. Implementation plan (phased)
 
-**Phase 1 — Named blocking signal + durable mailbox + paused-run delivery (deterministic)**
+**Phase 1 — Named blocking signal + durable mailbox + paused-run delivery (deterministic)** *(shipped)*
 1. `src/runtime/engine.rs` (~425–451): **fix the rust-engine arm of `run_with_context`**
    to surface pauses via `take_pending_input()` / `take_pending_signal()` →
    `RunResult{paused}` (prerequisite; also fixes rust-engine `input()` pausing).
@@ -560,7 +567,7 @@ Tests (`--features rust-engine`):
   chidori.signal("review")`, a second terminal (or peer agent) POSTs the review; streams
   to tael (`CHIDORI_JS_ENGINE=rust`).
 
-**Phase 2 — Non-blocking poll + fan-in/select + sender identity in trace**
+**Phase 2 — Non-blocking poll + fan-in/select + sender identity in trace** *(partially shipped: `pollSignal` done; `signalAny` / `timeoutMs` / `from`-as-span-attribute are future)*
 - `chidori.pollSignal` (records value *or* null at the seq → deterministic),
   `chidori.signalAny([names])` (pauses on a name *set*; result says which fired; match key
   `{names:[...]}`). `from` stamped as an OTEL span attribute in `RunSpan::stream_record`.
@@ -568,7 +575,7 @@ Tests (`--features rust-engine`):
 - Tests: poll returns null then a value deterministically; select fires on first matching
   name; `from` appears in the streamed span.
 
-**Phase 3 — Live in-memory delivery to running tasks**
+**Phase 3 — Live in-memory delivery to running tasks** *(future)*
 - `ActiveSession.signal_tx` (analogous to `cancel_tx`); streaming worker `select!`s on
   `signal_rx`, write-through to `inbox.json`, in-process fast resume trigger (skip the
   HTTP `/resume` round-trip). Determinism unchanged (it is still a deterministic resume

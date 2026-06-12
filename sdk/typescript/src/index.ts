@@ -4,6 +4,8 @@
  * dependencies; uses the global `fetch` available in Node 18+ and browsers.
  */
 
+import type { SignalSender } from "./agent.js";
+
 export type {
   AgentFunction,
   AgentJson,
@@ -25,6 +27,9 @@ export type {
   RandomPolicy,
   RetryOptions,
   RuntimePolicyConfig,
+  Signal,
+  SignalOptions,
+  SignalSender,
   ToolDefinition,
   ToolFunction,
   TryCallResult,
@@ -188,6 +193,41 @@ export class Checkpoint {
   }
 }
 
+/**
+ * Returned by `client.signal` when the run was not paused-waiting on this name
+ * (it was running, or paused on something else), so the signal was enqueued
+ * into the durable mailbox to be drained at the next matching listen point.
+ * Mirrors the server's 202 Accepted body.
+ */
+export interface SignalQueued {
+  /** Session id the signal was delivered to. */
+  id: string;
+  status: "queued";
+  /** The signal name, echoed back. */
+  name: string;
+  /** Monotonic per-run sequence freezing global arrival order across senders. */
+  delivery_seq: number;
+}
+
+/** A signal delivery request body for `client.signal`. */
+export interface SignalDelivery {
+  /** Required, non-empty: the listen-point name the agent awaits. */
+  name: string;
+  /** Any JSON payload (default null). */
+  payload?: Json;
+  /** Sender provenance recorded in the trace (default null). */
+  from?: SignalSender | Json;
+}
+
+/**
+ * Type guard distinguishing the two `client.signal` outcomes: a resumed
+ * `Session` (the run was paused-waiting on this name) vs a `SignalQueued`
+ * descriptor (the signal was enqueued for a later listen point).
+ */
+export function isSignalQueued(result: Session | SignalQueued): result is SignalQueued {
+  return (result as SignalQueued).status === "queued";
+}
+
 /** One execution of an agent — result + call log + status. */
 export class Session {
   constructor(
@@ -200,6 +240,12 @@ export class Session {
     public pendingPrompt: string | null = null,
     private readonly client: AgentClient | null = null,
     public snapshotManifest: SnapshotManifest | null = null,
+    /**
+     * When the run is `paused` at a `chidori.signal(name)` listen point, the
+     * name it is waiting on (so a caller can deliver via `client.signal`).
+     * `null` for plain `input()` pauses and non-signal states.
+     */
+    public pendingSignalName: string | null = null,
   ) {}
 
   get ok(): boolean {
@@ -318,6 +364,38 @@ export class AgentClient {
     return this.sessionFrom(data, (data.input as Json | undefined) ?? null);
   }
 
+  /**
+   * Deliver a signal `{ name, payload?, from? }` to a run
+   * (`POST /sessions/{id}/signal`).
+   *
+   * Two outcomes, distinguished by `isSignalQueued`:
+   *   * the run was paused-waiting on this exact name → it resolves the pause
+   *     and resumes; this returns the advanced `Session` (200), now `completed`
+   *     or re-`paused`.
+   *   * the run was running or paused on something else → the signal is enqueued
+   *     into the durable mailbox; this returns a `SignalQueued` descriptor (202)
+   *     carrying the assigned `delivery_seq`.
+   *
+   * Throws on 400 (empty name), 404 (unknown session), or 409 (terminal run).
+   */
+  async signal(
+    sessionId: string,
+    delivery: SignalDelivery,
+  ): Promise<Session | SignalQueued> {
+    const { status, data } = await this.postJSONWithStatus(
+      `/sessions/${sessionId}/signal`,
+      {
+        name: delivery.name,
+        payload: delivery.payload ?? null,
+        from: delivery.from ?? null,
+      },
+    );
+    if (status === 202 || (data as { status?: string }).status === "queued") {
+      return data as unknown as SignalQueued;
+    }
+    return this.sessionFrom(data, (data.input as Json | undefined) ?? null);
+  }
+
   /** Fetch an existing session by id. */
   async getSession(id: string): Promise<Session> {
     const data = (await this.getJSON(`/sessions/${id}`)) as Record<string, unknown>;
@@ -398,6 +476,7 @@ export class AgentClient {
       (data.pending_prompt as string | undefined) ?? null,
       this,
       (data.snapshot_manifest as SnapshotManifest | undefined) ?? null,
+      (data.pending_signal_name as string | undefined) ?? null,
     );
   }
 
@@ -408,13 +487,20 @@ export class AgentClient {
   }
 
   private async postJSON(path: string, body: unknown): Promise<Record<string, unknown>> {
+    return (await this.postJSONWithStatus(path, body)).data;
+  }
+
+  private async postJSONWithStatus(
+    path: string,
+    body: unknown,
+  ): Promise<{ status: number; data: Record<string, unknown> }> {
     const resp = await fetch(this.baseUrl + path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
     if (!resp.ok) throw await httpError(resp);
-    return (await resp.json()) as Record<string, unknown>;
+    return { status: resp.status, data: (await resp.json()) as Record<string, unknown> };
   }
 }
 

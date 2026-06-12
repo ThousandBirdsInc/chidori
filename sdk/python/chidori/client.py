@@ -49,6 +49,20 @@ class Checkpoint:
 
 
 @dataclass
+class SignalQueued:
+    """Returned by `AgentClient.signal` when the run was not paused-waiting on
+    this name (it was running, or paused on something else), so the signal was
+    enqueued into the durable mailbox to be drained at the next matching listen
+    point. Mirrors the server's 202 Accepted body.
+    """
+
+    id: str
+    name: str
+    delivery_seq: int
+    status: str = "queued"
+
+
+@dataclass
 class Session:
     """A single agent execution session with its result and call log."""
 
@@ -63,6 +77,10 @@ class Session:
     # to the human and later call `client.resume(session.id, response)`.
     pending_seq: int | None = None
     pending_prompt: str | None = None
+    # When the run is `paused` at a `chidori.signal(name)` listen point, the
+    # name it is waiting on (so the caller can deliver via `client.signal`).
+    # None for plain `input()` pauses and non-signal states.
+    pending_signal_name: str | None = None
     snapshot_manifest: dict | None = None
     _client: AgentClient | None = field(default=None, repr=False)
 
@@ -154,6 +172,7 @@ class AgentClient:
             error=data.get("error"),
             pending_seq=data.get("pending_seq"),
             pending_prompt=data.get("pending_prompt"),
+            pending_signal_name=data.get("pending_signal_name"),
             snapshot_manifest=data.get("snapshot_manifest"),
             _client=self,
         )
@@ -180,6 +199,7 @@ class AgentClient:
             error=data.get("error"),
             pending_seq=data.get("pending_seq"),
             pending_prompt=data.get("pending_prompt"),
+            pending_signal_name=data.get("pending_signal_name"),
             snapshot_manifest=data.get("snapshot_manifest"),
             _client=self,
         )
@@ -199,6 +219,50 @@ class AgentClient:
             error=data.get("error"),
             pending_seq=data.get("pending_seq"),
             pending_prompt=data.get("pending_prompt"),
+            pending_signal_name=data.get("pending_signal_name"),
+            snapshot_manifest=data.get("snapshot_manifest"),
+            _client=self,
+        )
+
+    def signal(
+        self,
+        session_id: str,
+        name: str,
+        payload: Any = None,
+        from_: Any = None,
+    ) -> Session | SignalQueued:
+        """Deliver a signal `{name, payload?, from?}` to a run
+        (`POST /sessions/{id}/signal`).
+
+        Two outcomes:
+          * the run was paused-waiting on this exact name → the pause resolves
+            and the run resumes; returns the advanced `Session` (200), now
+            `completed` or re-`paused`.
+          * the run was running or paused on something else → the signal is
+            enqueued into the durable mailbox; returns a `SignalQueued`
+            descriptor (202) carrying the assigned `delivery_seq`.
+
+        Raises on 400 (empty name), 404 (unknown session), or 409 (terminal run).
+        """
+        status, data = self._post_with_status(
+            f"/sessions/{session_id}/signal",
+            {"name": name, "payload": payload, "from": from_},
+        )
+        if status == 202 or data.get("status") == "queued":
+            return SignalQueued(
+                id=data["id"],
+                name=data.get("name", name),
+                delivery_seq=data["delivery_seq"],
+            )
+        return Session(
+            id=data["id"],
+            status=data["status"],
+            input=data.get("input", {}),
+            output=data.get("output"),
+            error=data.get("error"),
+            pending_seq=data.get("pending_seq"),
+            pending_prompt=data.get("pending_prompt"),
+            pending_signal_name=data.get("pending_signal_name"),
             snapshot_manifest=data.get("snapshot_manifest"),
             _client=self,
         )
@@ -214,6 +278,7 @@ class AgentClient:
             error=data.get("error"),
             pending_seq=data.get("pending_seq"),
             pending_prompt=data.get("pending_prompt"),
+            pending_signal_name=data.get("pending_signal_name"),
             snapshot_manifest=data.get("snapshot_manifest"),
             _client=self,
         )
@@ -342,6 +407,9 @@ class AgentClient:
             raise RuntimeError(f"HTTP {e.code}: {body}") from e
 
     def _post(self, path: str, body: dict) -> dict:
+        return self._post_with_status(path, body)[1]
+
+    def _post_with_status(self, path: str, body: dict) -> tuple[int, dict]:
         url = self.base_url + path
         data = json.dumps(body).encode()
         req = urllib.request.Request(
@@ -349,7 +417,7 @@ class AgentClient:
         )
         try:
             with urllib.request.urlopen(req) as resp:
-                return json.loads(resp.read())
+                return resp.status, json.loads(resp.read())
         except urllib.error.HTTPError as e:
             body = e.read().decode()
             raise RuntimeError(f"HTTP {e.code}: {body}") from e

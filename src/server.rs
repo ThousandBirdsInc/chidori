@@ -54,6 +54,26 @@ struct AppState {
     run_semaphore: Arc<Semaphore>,
     acquire_timeout: std::time::Duration,
     active_sessions: Arc<StdMutex<HashMap<String, ActiveSession>>>,
+    /// Per-run advisory locks serializing `signals/inbox.json` read-modify-write
+    /// (enqueue and the delivery routing decision). A paused run is not a live
+    /// task in Phase 1, but the endpoint can still race itself across concurrent
+    /// deliveries; this in-process mutex (keyed by run id) makes each delivery's
+    /// inbox mutation atomic, matching how the server already serializes per-run
+    /// state. See `docs/signals.md` §11.
+    signal_inbox_locks: Arc<StdMutex<HashMap<String, Arc<StdMutex<()>>>>>,
+}
+
+impl AppState {
+    /// Resolve (creating on first use) the per-run inbox lock for `run_id`. The
+    /// caller `.lock()`s the returned `Arc` and holds the guard for the duration
+    /// of an enqueue / routing decision.
+    fn signal_inbox_lock(&self, run_id: &str) -> Arc<StdMutex<()>> {
+        let mut locks = self.signal_inbox_locks.lock().unwrap();
+        locks
+            .entry(run_id.to_string())
+            .or_insert_with(|| Arc::new(StdMutex::new(())))
+            .clone()
+    }
 }
 
 const PROMPT_TOOL_PAUSE_FILE: &str = "prompt_tool_pause.json";
@@ -77,6 +97,7 @@ fn session_view(s: &StoredSession) -> Value {
         "call_count": s.call_log.len(),
         "pending_seq": s.pending_seq,
         "pending_prompt": s.pending_prompt,
+        "pending_signal_name": s.pending_signal_name,
         "pending_approval": s.pending_approval,
         "policy_profile": s.policy_profile,
     })
@@ -300,6 +321,65 @@ fn load_persisted_vfs(run_base: &FsPath, run_id: Option<&str>) -> crate::runtime
     }
 }
 
+/// Load a run's durable signal mailbox (`signals/inbox.json`) so a resumed run
+/// can drain queued signals at later listen points (doc §9, sibling of
+/// `load_persisted_vfs`). Empty when the run has no inbox file yet.
+fn load_persisted_signal_inbox(
+    run_base: &FsPath,
+    run_id: Option<&str>,
+) -> Vec<crate::runtime::snapshot::QueuedSignal> {
+    let Some(run_id) = run_id else {
+        return Vec::new();
+    };
+    crate::runtime::context::load_signal_inbox(&run_base.join(run_id))
+}
+
+/// Append a signal to a run's durable mailbox under a per-run advisory lock,
+/// assigning it the next `delivery_seq` (`max(existing)+1`, starting at 1) so
+/// global arrival order across senders is frozen and same-name signals are
+/// consumed lowest-first (doc §8.4/§10/§11). The lock is the same per-run mutex
+/// the server uses to serialize inbox read-modify-write while a run is paused or
+/// running (doc §11: "guard `inbox.json` read-modify-write with a per-run
+/// advisory ... lock"). Creates the `signals/` directory if absent.
+fn enqueue_signal_to_inbox(
+    state: &AppState,
+    run_id: &str,
+    name: &str,
+    payload: Value,
+    from: Value,
+) -> anyhow::Result<crate::runtime::snapshot::QueuedSignal> {
+    use crate::runtime::snapshot::{QueuedSignal, SIGNAL_INBOX_FILE};
+
+    let lock = state.signal_inbox_lock(run_id);
+    let _guard = lock.lock().unwrap();
+    let run_dir = state.run_base.join(run_id);
+    let inbox_path = run_dir.join(SIGNAL_INBOX_FILE);
+    let mut inbox: Vec<QueuedSignal> = if inbox_path.exists() {
+        serde_json::from_slice(&std::fs::read(&inbox_path)?).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let next_delivery_seq = inbox
+        .iter()
+        .map(|s| s.delivery_seq)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    let queued = QueuedSignal {
+        name: name.to_string(),
+        payload,
+        from,
+        delivery_seq: next_delivery_seq,
+        enqueued_at: chrono::Utc::now(),
+    };
+    inbox.push(queued.clone());
+    if let Some(parent) = inbox_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&inbox_path, serde_json::to_vec_pretty(&inbox)?)?;
+    Ok(queued)
+}
+
 #[allow(dead_code)]
 fn resolve_persisted_pending_host_operation(
     run_base: &FsPath,
@@ -392,6 +472,7 @@ pub async fn serve(
         run_semaphore: Arc::new(Semaphore::new(max_concurrent)),
         acquire_timeout: std::time::Duration::from_millis(acquire_timeout_ms),
         active_sessions: Arc::new(StdMutex::new(HashMap::new())),
+        signal_inbox_locks: Arc::new(StdMutex::new(HashMap::new())),
     };
 
     let auth_required = std::env::var("CHIDORI_API_KEY").is_ok();
@@ -417,6 +498,7 @@ pub async fn serve(
         .route("/sessions/{id}/snapshot", get(get_snapshot_manifest))
         .route("/sessions/{id}/replay", post(replay_session))
         .route("/sessions/{id}/resume", post(resume_session))
+        .route("/sessions/{id}/signal", post(signal_session))
         .route("/sessions/{id}/approve", post(approve_session))
         .route("/sessions/{id}/cancel", post(cancel_session))
         .route("/sessions/stream", post(stream_session))
@@ -467,6 +549,7 @@ pub async fn serve(
     eprintln!("              GET  /sessions/{{id}}/snapshot   → snapshot manifest");
     eprintln!("              POST /sessions/{{id}}/replay     → replay from checkpoint");
     eprintln!("              POST /sessions/{{id}}/resume     → resume paused input() call");
+    eprintln!("              POST /sessions/{{id}}/signal     → deliver a signal to a run");
     eprintln!("              POST /sessions/{{id}}/cancel     → cancel running session");
     eprintln!("              POST /sessions/stream            → run with SSE events");
     eprintln!("  Health:     GET  /health");
@@ -864,32 +947,53 @@ async fn create_session(
 
     let session = match result {
         Ok(run_result) => {
-            let (status, pending_seq, pending_prompt, pending_approval, output) =
-                if let Some(pending) = run_result.paused {
-                    (
-                        SessionStatus::Paused,
-                        Some(pending.seq),
-                        Some(pending.prompt),
-                        None,
-                        None,
-                    )
-                } else if let Some(appr) = run_result.paused_approval {
-                    (
-                        SessionStatus::AwaitingApproval,
-                        None,
-                        None,
-                        Some(appr),
-                        None,
-                    )
-                } else {
-                    (
-                        SessionStatus::Completed,
-                        None,
-                        None,
-                        None,
-                        Some(run_result.output),
-                    )
-                };
+            let (
+                status,
+                pending_seq,
+                pending_prompt,
+                pending_signal_name,
+                pending_approval,
+                output,
+            ) = if let Some(pending) = run_result.paused {
+                (
+                    SessionStatus::Paused,
+                    Some(pending.seq),
+                    Some(pending.prompt),
+                    None,
+                    None,
+                    None,
+                )
+            } else if let Some(signal) = run_result.paused_signal {
+                // A `chidori.signal(name)` listen point with an empty mailbox.
+                // Reuse `Paused`; `pending_signal_name` (not the status) marks it
+                // as a signal pause so the delivery endpoint can match the name.
+                (
+                    SessionStatus::Paused,
+                    Some(signal.seq),
+                    None,
+                    Some(signal.name),
+                    None,
+                    None,
+                )
+            } else if let Some(appr) = run_result.paused_approval {
+                (
+                    SessionStatus::AwaitingApproval,
+                    None,
+                    None,
+                    None,
+                    Some(appr),
+                    None,
+                )
+            } else {
+                (
+                    SessionStatus::Completed,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(run_result.output),
+                )
+            };
             StoredSession {
                 id: id.clone(),
                 run_id: Some(run_result.run_id),
@@ -900,6 +1004,7 @@ async fn create_session(
                 error: None,
                 pending_seq,
                 pending_prompt,
+                pending_signal_name,
                 pending_approval,
                 approvals: Vec::new(),
                 policy_profile: policy_profile.clone(),
@@ -916,6 +1021,7 @@ async fn create_session(
             error: Some(e.to_string()),
             pending_seq: None,
             pending_prompt: None,
+            pending_signal_name: None,
             pending_approval: None,
             approvals: Vec::new(),
             policy_profile,
@@ -1090,6 +1196,7 @@ async fn replay_session(State(state): State<AppState>, Path(id): Path<String>) -
                 error: None,
                 pending_seq: None,
                 pending_prompt: None,
+                pending_signal_name: None,
                 pending_approval: None,
                 approvals: original.approvals.clone(),
                 policy_profile: original.policy_profile.clone(),
@@ -1251,6 +1358,7 @@ async fn stream_session(
         error: None,
         pending_seq: None,
         pending_prompt: None,
+        pending_signal_name: None,
         pending_approval: None,
         approvals: Vec::new(),
         policy_profile: policy_profile.clone(),
@@ -1297,6 +1405,7 @@ async fn stream_session(
                     error: error.clone(),
                     pending_seq: None,
                     pending_prompt: None,
+                    pending_signal_name: None,
                     pending_approval: None,
                     approvals: Vec::new(),
                     policy_profile: policy_profile.clone(),
@@ -1338,6 +1447,7 @@ async fn stream_session(
                     error: Some(error.clone()),
                     pending_seq: None,
                     pending_prompt: None,
+                    pending_signal_name: None,
                     pending_approval: None,
                     approvals: Vec::new(),
                     policy_profile: policy_profile.clone(),
@@ -1430,6 +1540,7 @@ async fn cancel_session(
             error: Some(reason.clone()),
             pending_seq: None,
             pending_prompt: None,
+            pending_signal_name: None,
             pending_approval: None,
             approvals: Vec::new(),
             policy_profile: None,
@@ -1474,6 +1585,126 @@ async fn cancel_session(
         "reason": reason,
     }))
     .into_response()
+}
+
+/// Shared tail of `resume_session` and `signal_session` (doc §9: "factor its
+/// shared tail into `complete_pending_and_resume(...)`"). The caller has already
+/// (1) resolved the persisted pending host operation and (2) appended the
+/// synthetic resume `CallRecord` (an `input` record for resume, a `signal`
+/// record for signal delivery) at the pending seq into `call_log`. This helper
+/// performs the common re-run: load the host-promise table, VFS, and signal
+/// mailbox; replay-run the agent (preserving the run id and per-session policy
+/// profile + approvals); and map the outcome back onto `original`, surfacing a
+/// fresh input/signal/approval pause or completion. Returns the HTTP `Response`.
+///
+/// Threading the signal inbox here is what lets a resumed run that reaches a
+/// *second* `signal(name)`/`pollSignal(name)` listen point drain a queued entry
+/// instead of pausing (doc §9, §3 of the stage spec).
+async fn complete_pending_and_resume(
+    state: &AppState,
+    original: StoredSession,
+    call_log: Vec<CallRecord>,
+) -> Response {
+    let input = original.input.clone();
+    let host_promises =
+        match load_persisted_host_promises(&state.run_base, original.run_id.as_deref()) {
+            Ok(host_promises) => host_promises,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        };
+    let approvals = original.approvals.clone();
+    let vfs = load_persisted_vfs(&state.run_base, original.run_id.as_deref());
+    let signal_inbox = load_persisted_signal_inbox(&state.run_base, original.run_id.as_deref());
+    let resume_run_id = original.run_id.clone();
+    let policy_profile = original.policy_profile.clone();
+    let app_state = state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let engine = build_engine(&app_state, policy_profile.as_deref()).with_approvals(approvals);
+        // Continue under the original run id (when known) so the resumed run
+        // keeps its persisted run directory and stays a single durable run,
+        // matching the live-VM resume path. Falls back to a fresh id only when
+        // the session never recorded one.
+        match resume_run_id {
+            Some(run_id) => engine
+                .run_replay_pausable_with_host_promises_vfs_signals_preserving_run_id(
+                    &app_state.agent_path,
+                    &input,
+                    call_log,
+                    host_promises,
+                    vfs,
+                    signal_inbox,
+                    run_id,
+                ),
+            None => engine.run_replay_pausable_with_host_promises_vfs_and_signals(
+                &app_state.agent_path,
+                &input,
+                call_log,
+                host_promises,
+                vfs,
+                signal_inbox,
+            ),
+        }
+    })
+    .await
+    .unwrap();
+
+    let mut session = original;
+    match result {
+        Ok(run_result) => {
+            session.run_id = Some(run_result.run_id);
+            session.call_log = run_result.call_log.into_records();
+            if let Some(pending) = run_result.paused {
+                session.status = SessionStatus::Paused;
+                session.pending_seq = Some(pending.seq);
+                session.pending_prompt = Some(pending.prompt.clone());
+                session.pending_signal_name = None;
+                session.pending_approval = None;
+            } else if let Some(signal) = run_result.paused_signal {
+                // Re-run reached a NEW signal listen point with an empty mailbox.
+                // Persist it exactly like an input pause (the pending op + host
+                // promise table + shrunken inbox were already written to disk by
+                // the runtime safepoints); surface the awaited name in the view.
+                session.status = SessionStatus::Paused;
+                session.pending_seq = Some(signal.seq);
+                session.pending_prompt = None;
+                session.pending_signal_name = Some(signal.name);
+                session.pending_approval = None;
+            } else if let Some(appr) = run_result.paused_approval {
+                session.status = SessionStatus::AwaitingApproval;
+                session.pending_seq = None;
+                session.pending_prompt = None;
+                session.pending_signal_name = None;
+                session.pending_approval = Some(appr);
+            } else {
+                session.status = SessionStatus::Completed;
+                session.output = Some(run_result.output.clone());
+                session.pending_seq = None;
+                session.pending_prompt = None;
+                session.pending_signal_name = None;
+                session.pending_approval = None;
+            }
+            if let Some(err) = store_or_500(state, &session) {
+                return err;
+            }
+            (StatusCode::OK, Json(session_view(&session))).into_response()
+        }
+        Err(e) => {
+            session.status = SessionStatus::Failed;
+            session.error = Some(e.to_string());
+            let _ = state.session_store.put(&session);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// POST /sessions/:id/resume — supply a response to the agent's pending
@@ -1564,92 +1795,197 @@ async fn resume_session(
         error: None,
     });
 
-    let input = original.input.clone();
-    let input_clone = input.clone();
-    let host_promises =
-        match load_persisted_host_promises(&state.run_base, original.run_id.as_deref()) {
-            Ok(host_promises) => host_promises,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": e.to_string()})),
-                )
-                    .into_response();
-            }
-        };
-    let approvals = original.approvals.clone();
-    let vfs = load_persisted_vfs(&state.run_base, original.run_id.as_deref());
-    let resume_run_id = original.run_id.clone();
-    let policy_profile = original.policy_profile.clone();
-    let app_state = state.clone();
+    complete_pending_and_resume(&state, original, call_log).await
+}
 
-    let result = tokio::task::spawn_blocking(move || {
-        let engine = build_engine(&app_state, policy_profile.as_deref()).with_approvals(approvals);
-        // Continue under the original run id (when known) so the resumed run
-        // keeps its persisted run directory and stays a single durable run,
-        // matching the live-VM resume path. Falls back to a fresh id only when
-        // the session never recorded one.
-        match resume_run_id {
-            Some(run_id) => engine
-                .run_replay_pausable_with_host_promises_and_vfs_preserving_run_id(
-                    &app_state.agent_path,
-                    &input_clone,
-                    call_log,
-                    host_promises,
-                    vfs,
-                    run_id,
-                ),
-            None => engine.run_replay_pausable_with_host_promises_and_vfs(
-                &app_state.agent_path,
-                &input_clone,
-                call_log,
-                host_promises,
-                vfs,
-            ),
-        }
-    })
-    .await
-    .unwrap();
+/// POST /sessions/:id/signal — deliver a signal `{ name, payload, from }` to a
+/// run (`docs/signals.md` §9). `name` is a required string; `payload` is any
+/// JSON (default null); `from` is an optional provenance object (default null).
+///
+/// Routing by run state (doc §9 table):
+///   * Paused waiting on THIS name → resolve the pending `Signal` op with
+///     `{name,payload,from}`, inject a synthetic `signal` CallRecord, and resume
+///     via `complete_pending_and_resume` (the same machinery `/resume` uses).
+///   * Paused on a different name / on input / on approval, or Running → enqueue
+///     into `signals/inbox.json` (drained at the next matching listen point),
+///     202 Accepted.
+///   * Completed / Failed / Cancelled → 409 Conflict, NO inbox write (an orphan
+///     inbox would mislead a later replay).
+#[derive(Deserialize)]
+struct SignalRequest {
+    name: String,
+    #[serde(default)]
+    payload: Value,
+    #[serde(default)]
+    from: Value,
+}
 
-    let mut session = original;
-    match result {
-        Ok(run_result) => {
-            session.run_id = Some(run_result.run_id);
-            if let Some(pending) = run_result.paused {
-                session.status = SessionStatus::Paused;
-                session.call_log = run_result.call_log.into_records();
-                session.pending_seq = Some(pending.seq);
-                session.pending_prompt = Some(pending.prompt.clone());
-                session.pending_approval = None;
-            } else if let Some(appr) = run_result.paused_approval {
-                session.status = SessionStatus::AwaitingApproval;
-                session.call_log = run_result.call_log.into_records();
-                session.pending_seq = None;
-                session.pending_prompt = None;
-                session.pending_approval = Some(appr);
-            } else {
-                session.status = SessionStatus::Completed;
-                session.output = Some(run_result.output.clone());
-                session.call_log = run_result.call_log.into_records();
-                session.pending_seq = None;
-                session.pending_prompt = None;
-                session.pending_approval = None;
-            }
-            if let Some(err) = store_or_500(&state, &session) {
-                return err;
-            }
-            (StatusCode::OK, Json(session_view(&session))).into_response()
+async fn signal_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<SignalRequest>,
+) -> Response {
+    if body.name.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "signal requires a non-empty `name`"})),
+        )
+            .into_response();
+    }
+
+    let original = match state.session_store.get(&id) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Session not found"})),
+            )
+                .into_response();
         }
         Err(e) => {
-            session.status = SessionStatus::Failed;
-            session.error = Some(e.to_string());
-            let _ = state.session_store.put(&session);
-            (
+            return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
             )
-                .into_response()
+                .into_response();
         }
+    };
+
+    // Terminal runs reject delivery with no inbox write.
+    if matches!(
+        original.status,
+        SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Cancelled
+    ) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("session is {:?}; cannot accept signals", original.status),
+            })),
+        )
+            .into_response();
+    }
+
+    // Paused waiting on THIS exact name: resolve the pending pause with the
+    // newly arrived signal and resume. Tie-break (doc §11, pinned decision):
+    // "pending-pause-wins-with-newest" — when the run is paused on name X and a
+    // same-name entry is ALSO already queued in the inbox, the pending pause
+    // resolves with THIS just-delivered signal; the older queued entry stays in
+    // the inbox (threaded into the resumed run by `complete_pending_and_resume`)
+    // for the next `signal(name)` listen point.
+    let waiting_on_this_name = original.status == SessionStatus::Paused
+        && original.pending_signal_name.as_deref() == Some(body.name.as_str());
+
+    if waiting_on_this_name {
+        let Some(seq) = original.pending_seq else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Signal-paused session has no pending seq"})),
+            )
+                .into_response();
+        };
+
+        if let Err(err) = validate_snapshot_manifest_for_resume(
+            &state.run_base,
+            original.run_id.as_deref(),
+            &state.agent_path,
+        ) {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+
+        // The recorded signal result freezes `{name,payload,from}` (doc §8.3) —
+        // the match key on disk is `{name}` only.
+        let value = json!({
+            "name": body.name,
+            "payload": body.payload,
+            "from": body.from,
+        });
+
+        // Serialize against concurrent deliveries to the same run while we
+        // resolve the pending op + mutate the inbox-adjacent durable state.
+        let lock = state.signal_inbox_lock(original.run_id.as_deref().unwrap_or(&id));
+        let _guard = lock.lock().unwrap();
+
+        let completed = complete_persisted_pending_host_operation(
+            &state.run_base,
+            original.run_id.as_deref(),
+            Some((seq, PendingHostOperationKind::Signal)),
+            HostPromiseCompletion::Resolved(value.clone()),
+        );
+        match completed {
+            // The pending op matched a `Signal` at this seq: inject the synthetic
+            // `signal` record and resume (reusing the resume tail).
+            Ok(Some(_)) => {
+                drop(_guard);
+                let mut call_log = original.call_log.clone();
+                call_log.push(CallRecord {
+                    seq,
+                    parent_seq: None,
+                    function: "signal".to_string(),
+                    args: json!({ "name": body.name }),
+                    result: value,
+                    duration_ms: 0,
+                    token_usage: None,
+                    timestamp: chrono::Utc::now(),
+                    error: None,
+                });
+                complete_pending_and_resume(&state, original, call_log).await
+            }
+            // No matching pending op on disk (e.g. nothing persisted). Fall back
+            // to enqueueing so the signal is not lost.
+            Ok(None) => {
+                drop(_guard);
+                enqueue_and_respond(&state, &original, &id, body)
+            }
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response(),
+        }
+    } else {
+        // Paused on a different name / input / approval, or Running: enqueue.
+        enqueue_and_respond(&state, &original, &id, body)
+    }
+}
+
+/// Enqueue a delivered signal into the run's durable mailbox and return a
+/// 202 Accepted body describing the assigned `delivery_seq`. Shared by the
+/// "paused-on-other / running" branch and the pending-op-missing fallback.
+fn enqueue_and_respond(
+    state: &AppState,
+    original: &StoredSession,
+    id: &str,
+    body: SignalRequest,
+) -> Response {
+    let run_id = match original.run_id.as_deref() {
+        Some(run_id) => run_id,
+        None => {
+            // No run directory yet (e.g. a Running session that hasn't recorded
+            // a run id). Key the mailbox by session id so it is still durable and
+            // is picked up once the run threads its inbox.
+            id
+        }
+    };
+    match enqueue_signal_to_inbox(state, run_id, &body.name, body.payload, body.from) {
+        Ok(queued) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "id": id,
+                "status": "queued",
+                "name": queued.name,
+                "delivery_seq": queued.delivery_seq,
+            })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1771,6 +2107,9 @@ async fn approve_session(
     let call_log = original.call_log.clone();
     let resume_run_id = original.run_id.clone();
     let vfs = load_persisted_vfs(&state.run_base, original.run_id.as_deref());
+    // Thread the signal mailbox so an approved run that reaches a `signal(name)`
+    // listen point drains a queued entry instead of pausing (doc §9, §3).
+    let signal_inbox = load_persisted_signal_inbox(&state.run_base, original.run_id.as_deref());
     let policy_profile = original.policy_profile.clone();
     let app_state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -1785,20 +2124,22 @@ async fn approve_session(
         // the resumed run keeps its persisted directory.
         match resume_run_id {
             Some(run_id) => engine
-                .run_replay_pausable_with_host_promises_and_vfs_preserving_run_id(
+                .run_replay_pausable_with_host_promises_vfs_signals_preserving_run_id(
                     &app_state.agent_path,
                     &input,
                     call_log,
                     Vec::new(),
                     vfs,
+                    signal_inbox,
                     run_id,
                 ),
-            None => engine.run_replay_pausable_with_host_promises_and_vfs(
+            None => engine.run_replay_pausable_with_host_promises_vfs_and_signals(
                 &app_state.agent_path,
                 &input,
                 call_log,
                 Vec::new(),
                 vfs,
+                signal_inbox,
             ),
         }
     })
@@ -1813,6 +2154,12 @@ async fn approve_session(
                 session.status = SessionStatus::Paused;
                 session.pending_seq = Some(pending.seq);
                 session.pending_prompt = Some(pending.prompt);
+                session.pending_signal_name = None;
+            } else if let Some(signal) = run_result.paused_signal {
+                session.status = SessionStatus::Paused;
+                session.pending_seq = Some(signal.seq);
+                session.pending_prompt = None;
+                session.pending_signal_name = Some(signal.name);
             } else if let Some(appr) = run_result.paused_approval {
                 session.status = SessionStatus::AwaitingApproval;
                 session.pending_approval = Some(appr);
@@ -1944,6 +2291,7 @@ mod tests {
             run_semaphore: Arc::new(Semaphore::new(1)),
             acquire_timeout: std::time::Duration::from_millis(1),
             active_sessions: Arc::new(StdMutex::new(HashMap::new())),
+            signal_inbox_locks: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -1994,6 +2342,7 @@ mod tests {
                 error: None,
                 pending_seq: None,
                 pending_prompt: None,
+                pending_signal_name: None,
                 pending_approval: None,
                 approvals: Vec::new(),
                 policy_profile: None,
@@ -2273,6 +2622,7 @@ mod tests {
             error: None,
             pending_seq: None,
             pending_prompt: None,
+            pending_signal_name: None,
             pending_approval: None,
             approvals: Vec::new(),
             policy_profile: None,
@@ -2337,6 +2687,7 @@ mod tests {
             error: None,
             pending_seq: None,
             pending_prompt: None,
+            pending_signal_name: None,
             pending_approval: None,
             approvals: Vec::new(),
             policy_profile: None,
@@ -2403,6 +2754,7 @@ mod tests {
             error: None,
             pending_seq: None,
             pending_prompt: None,
+            pending_signal_name: None,
             pending_approval: None,
             approvals: Vec::new(),
             policy_profile: None,
@@ -2473,6 +2825,7 @@ mod tests {
             error: None,
             pending_seq: None,
             pending_prompt: None,
+            pending_signal_name: None,
             pending_approval: None,
             approvals: Vec::new(),
             policy_profile: None,
@@ -2559,6 +2912,7 @@ mod tests {
             error: None,
             pending_seq: Some(2),
             pending_prompt: Some("continue?".to_string()),
+            pending_signal_name: None,
             pending_approval: None,
             approvals: Vec::new(),
             policy_profile: None,
@@ -2657,6 +3011,7 @@ mod tests {
             error: None,
             pending_seq: Some(2),
             pending_prompt: Some("continue?".to_string()),
+            pending_signal_name: None,
             pending_approval: None,
             approvals: Vec::new(),
             policy_profile: None,
@@ -2760,6 +3115,7 @@ mod tests {
             error: None,
             pending_seq: Some(2),
             pending_prompt: Some("continue?".to_string()),
+            pending_signal_name: None,
             pending_approval: None,
             approvals: Vec::new(),
             policy_profile: None,
@@ -3300,6 +3656,523 @@ mod tests {
             error.contains("denied by operator"),
             "expected an operator-denied error, got: {error}"
         );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Signal delivery (`docs/signals.md` §9–§11) — Stage 2.
+    // -----------------------------------------------------------------------
+
+    /// Build a state whose run_base is the agent's `.chidori/runs` dir (so a run
+    /// pausing on a signal persists into the same tree the delivery endpoint
+    /// reads), with a generous acquire timeout for the real engine runs.
+    fn signal_test_state(temp_dir: &FsPath, agent_path: PathBuf) -> AppState {
+        let run_base = temp_dir.join(".chidori").join("runs");
+        std::fs::create_dir_all(&run_base).unwrap();
+        let mut state = test_state(run_base, agent_path);
+        state.run_semaphore = Arc::new(Semaphore::new(4));
+        state.acquire_timeout = std::time::Duration::from_secs(30);
+        state
+    }
+
+    fn write_agent(temp_dir: &FsPath, source: &str) -> PathBuf {
+        std::fs::create_dir_all(temp_dir).unwrap();
+        let agent_path = temp_dir.join("agent.ts");
+        std::fs::write(&agent_path, source).unwrap();
+        agent_path
+    }
+
+    async fn create_paused_session(state: &AppState, id: &str, input: Value) -> Value {
+        let (_status, body) = response_json(
+            create_session(
+                State(state.clone()),
+                Json(
+                    serde_json::from_value(json!({
+                        "input": input,
+                        "session_id": id,
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        body
+    }
+
+    /// Signal delivered to a run paused waiting on THIS name resolves the pause
+    /// and resumes to completion; the final output and the session view reflect
+    /// the delivered payload.
+    #[tokio::test]
+    async fn signal_to_paused_waiting_this_name_resolves_and_resumes() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("chidori-signal-resolve-{}", uuid::Uuid::new_v4()));
+        let agent_path = write_agent(
+            &temp_dir,
+            r#"
+                export async function agent(input, chidori) {
+                    const review = await chidori.signal("review");
+                    return { decision: review.payload.decision, by: review.from.id };
+                }
+            "#,
+        );
+        let state = signal_test_state(&temp_dir, agent_path);
+
+        let created = create_paused_session(&state, "s-signal-1", json!({})).await;
+        assert_eq!(created["status"], json!("paused"));
+        assert_eq!(created["pending_signal_name"], json!("review"));
+
+        let (status, body) = response_json(
+            signal_session(
+                State(state.clone()),
+                Path("s-signal-1".to_string()),
+                Json(SignalRequest {
+                    name: "review".to_string(),
+                    payload: json!({ "decision": "approve" }),
+                    from: json!({ "kind": "human", "id": "mara" }),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], json!("completed"));
+        assert_eq!(
+            body["output"],
+            json!({ "decision": "approve", "by": "mara" })
+        );
+
+        let stored = state.session_store.get("s-signal-1").unwrap().unwrap();
+        assert_eq!(stored.status, SessionStatus::Completed);
+        assert_eq!(stored.pending_signal_name, None);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// Signal delivered to a run paused on `input()` (a different pause) is
+    /// enqueued; the run stays paused; after the input is resumed, the agent's
+    /// later `signal(name)` drains the queued entry without pausing again.
+    #[tokio::test]
+    async fn signal_to_input_paused_enqueues_then_drains_after_resume() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("chidori-signal-enqueue-{}", uuid::Uuid::new_v4()));
+        let agent_path = write_agent(
+            &temp_dir,
+            r#"
+                export async function agent(input, chidori) {
+                    const name = await chidori.input("who?");
+                    const review = await chidori.signal("review");
+                    return { name, decision: review.payload.decision };
+                }
+            "#,
+        );
+        let state = signal_test_state(&temp_dir, agent_path);
+
+        let created = create_paused_session(&state, "s-signal-2", json!({})).await;
+        assert_eq!(created["status"], json!("paused"));
+        // This is an input() pause, not a signal pause.
+        assert_eq!(created["pending_signal_name"], Value::Null);
+        let run_id = created["run_id"].as_str().unwrap().to_string();
+
+        // Deliver a "review" signal while paused on input → must enqueue.
+        let (status, body) = response_json(
+            signal_session(
+                State(state.clone()),
+                Path("s-signal-2".to_string()),
+                Json(SignalRequest {
+                    name: "review".to_string(),
+                    payload: json!({ "decision": "changes" }),
+                    from: json!({ "id": "bot" }),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["status"], json!("queued"));
+        assert_eq!(body["delivery_seq"], json!(1));
+
+        // inbox.json exists with the entry, and the run is still paused.
+        let inbox = load_persisted_signal_inbox(&state.run_base, Some(&run_id));
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].name, "review");
+        let still_paused = state.session_store.get("s-signal-2").unwrap().unwrap();
+        assert_eq!(still_paused.status, SessionStatus::Paused);
+
+        // Resume the input(); the later signal() drains the queued entry.
+        let (status, body) = response_json(
+            resume_session(
+                State(state.clone()),
+                Path("s-signal-2".to_string()),
+                Json(ResumeRequest {
+                    response: "ada".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], json!("completed"));
+        assert_eq!(
+            body["output"],
+            json!({ "name": "ada", "decision": "changes" })
+        );
+
+        // Inbox was drained to empty by consumption.
+        let drained = load_persisted_signal_inbox(&state.run_base, Some(&run_id));
+        assert!(
+            drained.is_empty(),
+            "inbox should be drained, got {drained:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// Signal delivered to a completed run → 409 Conflict and NO inbox file.
+    #[tokio::test]
+    async fn signal_to_completed_run_conflicts_with_no_inbox() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("chidori-signal-409-{}", uuid::Uuid::new_v4()));
+        let agent_path = write_agent(
+            &temp_dir,
+            r#"
+                export async function agent() { return { ok: true }; }
+            "#,
+        );
+        let state = signal_test_state(&temp_dir, agent_path);
+
+        let created = create_paused_session(&state, "s-signal-3", json!({})).await;
+        assert_eq!(created["status"], json!("completed"));
+        let run_id = created["run_id"].as_str().unwrap().to_string();
+
+        let (status, _body) = response_json(
+            signal_session(
+                State(state.clone()),
+                Path("s-signal-3".to_string()),
+                Json(SignalRequest {
+                    name: "review".to_string(),
+                    payload: Value::Null,
+                    from: Value::Null,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let inbox_path = state
+            .run_base
+            .join(&run_id)
+            .join(crate::runtime::snapshot::SIGNAL_INBOX_FILE);
+        assert!(
+            !inbox_path.exists(),
+            "completed run must not have an inbox written"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// Determinism: enqueue-before-listen and pause-then-deliver produce the
+    /// identical recorded `signal` CallRecord and final output. Both paths use
+    /// the same agent body and deliver the same `{name,payload,from}`; only the
+    /// arrival timing differs (queued-then-drained vs pending-pause-resolved).
+    #[tokio::test]
+    async fn signal_enqueue_before_listen_matches_pause_then_deliver() {
+        let payload = json!({ "decision": "approve" });
+        let from = json!({ "kind": "human", "id": "mara" });
+
+        // Path A: pause-then-deliver. The agent reaches `signal("review")` with
+        // an empty mailbox, pauses, and the delivery resolves the pending pause.
+        let source_a = r#"
+            export async function agent(input, chidori) {
+                const review = await chidori.signal("review");
+                return { decision: review.payload.decision, by: review.from.id };
+            }
+        "#;
+        let dir_a =
+            std::env::temp_dir().join(format!("chidori-signal-det-a-{}", uuid::Uuid::new_v4()));
+        let agent_a = write_agent(&dir_a, source_a);
+        let state_a = signal_test_state(&dir_a, agent_a);
+        create_paused_session(&state_a, "a", json!({})).await;
+        response_json(
+            signal_session(
+                State(state_a.clone()),
+                Path("a".to_string()),
+                Json(SignalRequest {
+                    name: "review".to_string(),
+                    payload: payload.clone(),
+                    from: from.clone(),
+                }),
+            )
+            .await,
+        )
+        .await;
+        let stored_a = state_a.session_store.get("a").unwrap().unwrap();
+
+        // Path B: enqueue-before-listen. The agent first pauses on `input()`; we
+        // deliver "review" while it is paused (so the signal is ENQUEUED, never a
+        // pending-pause), then resume the input(). When the agent reaches
+        // `signal("review")` it drains the queued entry WITHOUT pausing. The
+        // recorded signal value must be identical to Path A.
+        let source_b = r#"
+            export async function agent(input, chidori) {
+                await chidori.input("gate");
+                const review = await chidori.signal("review");
+                return { decision: review.payload.decision, by: review.from.id };
+            }
+        "#;
+        let dir_b =
+            std::env::temp_dir().join(format!("chidori-signal-det-b-{}", uuid::Uuid::new_v4()));
+        let agent_b = write_agent(&dir_b, source_b);
+        let state_b = signal_test_state(&dir_b, agent_b);
+        create_paused_session(&state_b, "b", json!({})).await;
+        // Deliver while paused on input → enqueued.
+        let (qstatus, _) = response_json(
+            signal_session(
+                State(state_b.clone()),
+                Path("b".to_string()),
+                Json(SignalRequest {
+                    name: "review".to_string(),
+                    payload: payload.clone(),
+                    from: from.clone(),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(qstatus, StatusCode::ACCEPTED);
+        // Resume the input(); the later signal() drains the queued entry.
+        response_json(
+            resume_session(
+                State(state_b.clone()),
+                Path("b".to_string()),
+                Json(ResumeRequest {
+                    response: "go".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+        let stored_b = state_b.session_store.get("b").unwrap().unwrap();
+
+        // Identical recorded signal CallRecord (result + match-key args) and
+        // identical final output, regardless of arrival timing.
+        let sig_a = stored_a
+            .call_log
+            .iter()
+            .find(|r| r.function == "signal")
+            .unwrap();
+        let sig_b = stored_b
+            .call_log
+            .iter()
+            .find(|r| r.function == "signal")
+            .unwrap();
+        assert_eq!(sig_a.result, sig_b.result);
+        assert_eq!(sig_a.args, sig_b.args);
+        assert_eq!(stored_a.output, stored_b.output);
+
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    /// Tie-break (`docs/signals.md` §11, pinned "pending-pause-wins-with-newest"):
+    /// a queued same-name entry already in the inbox PLUS a pending pause on that
+    /// name PLUS a new delivery → the pause resolves with the NEW payload, and
+    /// the older queued entry survives for a later listen point.
+    #[tokio::test]
+    async fn signal_tie_break_pending_pause_wins_with_newest() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("chidori-signal-tiebreak-{}", uuid::Uuid::new_v4()));
+        // Two sequential review listen points: the first consumes the new
+        // delivery (pause wins), the second drains the older queued entry.
+        let agent_path = write_agent(
+            &temp_dir,
+            r#"
+                export async function agent(input, chidori) {
+                    const first = await chidori.signal("review");
+                    const second = await chidori.signal("review");
+                    return { first: first.payload.tag, second: second.payload.tag };
+                }
+            "#,
+        );
+        let state = signal_test_state(&temp_dir, agent_path);
+
+        let created = create_paused_session(&state, "tie", json!({})).await;
+        let run_id = created["run_id"].as_str().unwrap().to_string();
+        assert_eq!(created["pending_signal_name"], json!("review"));
+
+        // Pre-seed an OLDER queued same-name entry directly into the inbox while
+        // the run is paused on the first `review`.
+        enqueue_signal_to_inbox(
+            &state,
+            &run_id,
+            "review",
+            json!({ "tag": "old-queued" }),
+            json!({ "id": "queued-sender" }),
+        )
+        .unwrap();
+
+        // Deliver a NEW review: the pending pause must resolve with THIS one.
+        let (status, body) = response_json(
+            signal_session(
+                State(state.clone()),
+                Path("tie".to_string()),
+                Json(SignalRequest {
+                    name: "review".to_string(),
+                    payload: json!({ "tag": "new-delivered" }),
+                    from: json!({ "id": "live-sender" }),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], json!("completed"));
+        // First listen point got the NEW payload; second drained the OLD queued.
+        assert_eq!(
+            body["output"],
+            json!({ "first": "new-delivered", "second": "old-queued" })
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// End-to-end: an agent with two sequential `signal("review")` calls; two
+    /// deliveries; both recorded in order with their delivered payloads.
+    #[tokio::test]
+    async fn signal_two_sequential_listen_points_record_in_order() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("chidori-signal-two-{}", uuid::Uuid::new_v4()));
+        let agent_path = write_agent(
+            &temp_dir,
+            r#"
+                export async function agent(input, chidori) {
+                    const a = await chidori.signal("review");
+                    const b = await chidori.signal("review");
+                    return { a: a.payload.round, b: b.payload.round };
+                }
+            "#,
+        );
+        let state = signal_test_state(&temp_dir, agent_path);
+
+        create_paused_session(&state, "two", json!({})).await;
+
+        // First delivery resolves the first listen point; the run re-pauses on
+        // the second `review`.
+        let (status, body) = response_json(
+            signal_session(
+                State(state.clone()),
+                Path("two".to_string()),
+                Json(SignalRequest {
+                    name: "review".to_string(),
+                    payload: json!({ "round": 1 }),
+                    from: json!({ "id": "r1" }),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], json!("paused"));
+        assert_eq!(body["pending_signal_name"], json!("review"));
+
+        // Second delivery resolves the second listen point → completion.
+        let (status, body) = response_json(
+            signal_session(
+                State(state.clone()),
+                Path("two".to_string()),
+                Json(SignalRequest {
+                    name: "review".to_string(),
+                    payload: json!({ "round": 2 }),
+                    from: json!({ "id": "r2" }),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], json!("completed"));
+        assert_eq!(body["output"], json!({ "a": 1, "b": 2 }));
+
+        // Both signal records present, in seq order, with their payloads.
+        let stored = state.session_store.get("two").unwrap().unwrap();
+        let signals: Vec<_> = stored
+            .call_log
+            .iter()
+            .filter(|r| r.function == "signal")
+            .collect();
+        assert_eq!(signals.len(), 2);
+        assert!(signals[0].seq < signals[1].seq);
+        assert_eq!(signals[0].result["payload"], json!({ "round": 1 }));
+        assert_eq!(signals[1].result["payload"], json!({ "round": 2 }));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// Pure replay (`/sessions/{id}/replay`) must NOT consume the inbox: a replay
+    /// with a non-empty inbox leaves the inbox file unchanged and reproduces the
+    /// identical output (the recorded `signal` call short-circuits before the
+    /// mailbox drain — the determinism contract, `docs/signals.md` §10).
+    #[tokio::test]
+    async fn replay_does_not_consume_inbox() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("chidori-signal-replay-{}", uuid::Uuid::new_v4()));
+        let agent_path = write_agent(
+            &temp_dir,
+            r#"
+                export async function agent(input, chidori) {
+                    const review = await chidori.signal("review");
+                    return { decision: review.payload.decision };
+                }
+            "#,
+        );
+        let state = signal_test_state(&temp_dir, agent_path);
+
+        // Drive a run to completion via a delivered signal.
+        let created = create_paused_session(&state, "replay-src", json!({})).await;
+        let run_id = created["run_id"].as_str().unwrap().to_string();
+        response_json(
+            signal_session(
+                State(state.clone()),
+                Path("replay-src".to_string()),
+                Json(SignalRequest {
+                    name: "review".to_string(),
+                    payload: json!({ "decision": "approve" }),
+                    from: json!({ "id": "x" }),
+                }),
+            )
+            .await,
+        )
+        .await;
+        let completed = state.session_store.get("replay-src").unwrap().unwrap();
+        assert_eq!(completed.status, SessionStatus::Completed);
+
+        // Seed a non-empty inbox under the run dir; replay must ignore it.
+        enqueue_signal_to_inbox(
+            &state,
+            &run_id,
+            "review",
+            json!({ "decision": "SHOULD-NOT-BE-USED" }),
+            json!({ "id": "ghost" }),
+        )
+        .unwrap();
+        let inbox_before = load_persisted_signal_inbox(&state.run_base, Some(&run_id));
+        assert_eq!(inbox_before.len(), 1);
+
+        let (status, body) = response_json(
+            replay_session(State(state.clone()), Path("replay-src".to_string())).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        // Replay reproduces the recorded decision, not the ghost inbox entry.
+        assert_eq!(body["output"], json!({ "decision": "approve" }));
+
+        // Inbox file is untouched by replay.
+        let inbox_after = load_persisted_signal_inbox(&state.run_base, Some(&run_id));
+        assert_eq!(inbox_after, inbox_before);
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

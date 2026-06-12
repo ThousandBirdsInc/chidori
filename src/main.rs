@@ -491,6 +491,25 @@ fn cmd_run(
     // Run the agent.
     let result = engine.run(file, &input_value)?;
 
+    // A `chidori.signal(name)` listen point with an empty mailbox pauses the run
+    // (there is no stdin fallback for signals, unlike `input()`). The engine has
+    // already persisted the durable pause scaffold under `.chidori/runs/<run_id>`;
+    // tell the user the run is awaiting a signal and how to deliver one rather
+    // than printing a bare `null` output. See `docs/signals.md`.
+    if let Some(signal) = &result.paused_signal {
+        eprintln!(
+            "Run {} paused, awaiting signal '{}'.",
+            result.run_id, signal.name
+        );
+        eprintln!(
+            "Deliver it with: POST /sessions/{{id}}/signal \
+             {{\"name\":\"{}\",\"payload\":...,\"from\":...}} \
+             (or resume the run server-side).",
+            signal.name
+        );
+        return Ok(());
+    }
+
     // Print the output.
     let output_str = serde_json::to_string_pretty(&result.output)?;
     println!("{output_str}");

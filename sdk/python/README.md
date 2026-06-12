@@ -41,6 +41,23 @@ if paused.status == "paused":
     print("prompt:", paused.pending_prompt)
     final = client.resume(paused.id, "yes")
 
+# Multiplayer signals (when the agent calls `chidori.signal` / `pollSignal`):
+# deliver {name, payload?, from?} to a run. A run paused-waiting on this name
+# resolves + resumes (returns a Session); otherwise the signal is enqueued into
+# the durable mailbox (returns a SignalQueued with the assigned delivery_seq).
+from chidori import Session, SignalQueued
+paused = client.run({"topic": "data-retention policy"})
+print("awaiting signal:", paused.pending_signal_name)  # -> "review"
+result = client.signal(
+    paused.id, "review",
+    payload={"decision": "approve", "notes": "LGTM"},
+    from_={"kind": "human", "id": "mara"},
+)
+if isinstance(result, SignalQueued):
+    print("queued at delivery_seq", result.delivery_seq)  # 202
+else:
+    print(result.status, result.output)  # 200 — resumed Session
+
 # Live streaming: yields host calls, prompt stream events, then `done`
 for evt in client.stream({"document": "hi"}):
     if evt["type"] == "call":

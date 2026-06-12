@@ -30,7 +30,7 @@ from pathlib import Path
 
 # The SDK lives alongside this test file.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from chidori import AgentClient, Checkpoint  # noqa: E402
+from chidori import AgentClient, Checkpoint, Session, SignalQueued  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Paths + defaults
@@ -378,6 +378,79 @@ class PauseResumeTests(_MockLlmTestCase):
         resumed = self.client.resume(paused.id, "no thanks")
         self.assertEqual(resumed.status, "completed")
         self.assertFalse(resumed.output["approved"])
+
+
+# ---------------------------------------------------------------------------
+# Signal delivery via POST /sessions/{id}/signal
+# ---------------------------------------------------------------------------
+
+
+class SignalTests(_MockLlmTestCase):
+    agent = FIXTURES / "signal_review.ts"
+
+    def test_run_pauses_on_signal_with_pending_name(self):
+        paused = self.client.run({"topic": "data-retention"})
+        self.assertEqual(paused.status, "paused")
+        # A signal pause surfaces the awaited name (not a plain input prompt).
+        self.assertEqual(paused.pending_signal_name, "review")
+
+    def test_signal_resolves_pause_and_resumes(self):
+        paused = self.client.run({"topic": "data-retention"})
+        self.assertEqual(paused.status, "paused")
+
+        result = self.client.signal(
+            paused.id,
+            "review",
+            payload={"decision": "approve", "notes": "lgtm"},
+            from_={"kind": "human", "id": "mara"},
+        )
+        # Paused-waiting-on-this-name → resolves + resumes → a Session.
+        self.assertIsInstance(result, Session)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.output["decision"], "approve")
+        self.assertEqual(result.output["reviewedBy"], {"kind": "human", "id": "mara"})
+
+    def test_signal_with_other_name_is_queued(self):
+        paused = self.client.run({"topic": "data-retention"})
+        self.assertEqual(paused.status, "paused")
+
+        # The run is paused on "review", not "steer" → enqueued into the mailbox.
+        queued = self.client.signal(
+            paused.id,
+            "steer",
+            payload={"priority": "high"},
+            from_={"kind": "human", "id": "sam"},
+        )
+        self.assertIsInstance(queued, SignalQueued)
+        self.assertEqual(queued.status, "queued")
+        self.assertEqual(queued.name, "steer")
+        self.assertIsInstance(queued.delivery_seq, int)
+
+        # The run stays paused-waiting-on-review; delivering it still resumes.
+        self.assertEqual(self.client.get_session(paused.id).status, "paused")
+        resumed = self.client.signal(
+            paused.id,
+            "review",
+            payload={"decision": "changes", "notes": "tighten"},
+            from_={"kind": "agent", "id": "compliance-bot"},
+        )
+        self.assertIsInstance(resumed, Session)
+        self.assertEqual(resumed.status, "completed")
+        self.assertEqual(resumed.output["decision"], "changes")
+
+    def test_signal_to_completed_run_is_409(self):
+        paused = self.client.run({"topic": "data-retention"})
+        done = self.client.signal(
+            paused.id,
+            "review",
+            payload={"decision": "approve", "notes": "ok"},
+            from_={"kind": "human", "id": "mara"},
+        )
+        self.assertEqual(done.status, "completed")
+        # A terminal run rejects further delivery with 409 (no inbox write).
+        with self.assertRaises(RuntimeError) as ctx:
+            self.client.signal(done.id, "review", payload={"decision": "approve"})
+        self.assertIn("409", str(ctx.exception))
 
 
 # ---------------------------------------------------------------------------

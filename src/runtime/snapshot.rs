@@ -16,6 +16,12 @@ pub const SNAPSHOT_MANIFEST_FILE: &str = "runtime.snapshot.json";
 pub const SNAPSHOT_BLOB_FILE: &str = "runtime.snapshot";
 pub const PENDING_HOST_OPERATION_FILE: &str = "pending.json";
 pub const HOST_PROMISE_TABLE_FILE: &str = "host_promises.json";
+/// Durable per-run signal mailbox. Lives in a `signals/` subdirectory of the
+/// run directory (unlike the flat `pending.json`/`host_promises.json`), so
+/// writers must create the parent dir before writing. Holds the ordered
+/// `Vec<QueuedSignal>` absorbing signals that arrive before the agent reaches a
+/// matching `chidori.signal(name)` listen point.
+pub const SIGNAL_INBOX_FILE: &str = "signals/inbox.json";
 pub const BRANCHES_DIR: &str = "branches";
 pub const PARALLEL_BRANCH_MANIFEST_FILE: &str = "manifest.json";
 pub const TYPESCRIPT_RUNTIME_ABI_VERSION: u32 = 1;
@@ -239,6 +245,11 @@ pub enum PendingHostOperationKind {
     /// timers that must survive suspend → restore (see
     /// `docs/captured-effects-vfs-crypto-timers.md`).
     Timer,
+    /// A `chidori.signal(name)` / `chidori.pollSignal(name)` listen point. The
+    /// match key (the pending op's `args`) is `{ "name": <string> }` only; the
+    /// delivered `{ name, payload, from }` rides in the resolved result. See
+    /// `docs/signals.md`.
+    Signal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -462,6 +473,21 @@ fn completed_args_match(recorded: &Value, rebuilt: &Value) -> bool {
         value
     };
     strip(recorded) == strip(rebuilt)
+}
+
+/// One signal sitting in the durable per-run mailbox (`signals/inbox.json`),
+/// absorbed before the agent reached a matching `chidori.signal(name)` listen
+/// point. `delivery_seq` is a monotonic counter assigned by the delivery
+/// endpoint, freezing global arrival order across all senders so same-name
+/// signals are consumed lowest-first and that choice replays deterministically.
+/// `from` stays an opaque JSON value carrying `{ kind, id, runId? }`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueuedSignal {
+    pub name: String,
+    pub payload: Value,
+    pub from: Value,
+    pub delivery_seq: u64,
+    pub enqueued_at: DateTime<Utc>,
 }
 
 pub const DEFAULT_BRANCH_SEQUENCE_RANGE_WIDTH: u64 = 10_000;
