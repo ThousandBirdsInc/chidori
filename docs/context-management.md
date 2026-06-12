@@ -1,15 +1,14 @@
 # Context Management — Cache-Aware, Composable Prompts
 
-> **Status:** Phases 1 and 2 are **implemented** (see the implementation-status
-> section below). Phase 3 (window compaction + the local content-addressed
-> cache) remains future work. The doc was drafted before the QuickJS removal
-> (#39); references to a "QuickJS path" / `rust-engine` feature describe the
-> pre-#39 tree — `chidori-js` is now the only engine and everything here ships
-> on it unconditionally.
+> **Status:** Phases 1, 2, and 3 are **implemented** (see the
+> implementation-status section below). The doc was drafted before the QuickJS
+> removal (#39); references to a "QuickJS path" / `rust-engine` feature
+> describe the pre-#39 tree — `chidori-js` is now the only engine and
+> everything here ships on it unconditionally.
 > **Related:** `docs/signals.md`, `docs/branching-execution.md`,
 > `docs/captured-effects-vfs-crypto-timers.md`, `docs/pure-rust-js-engine-plan.md`.
 
-## Implementation status (Phases 1–2 landed)
+## Implementation status (Phases 1–3 landed)
 
 **Phase 1 — cache-aware request layout + accounting** (no author API change):
 
@@ -65,8 +64,38 @@
   `LlmResponseJson`, `PromptOptions.cache`, `chidori.context()`. Example:
   `examples/agents/context_qa.ts`. API reference: `llm.txt`.
 
-**Not yet implemented (Phase 3):** `.compact(strategy)`, the local
-content-addressed prompt cache, and budget helpers beyond `estimateTokens()`.
+**Phase 3 — window compaction + local content-addressed prompt cache:**
+
+- `Context.compact(options?)` (`src/runtime/typescript/helpers.rs`): explicit,
+  opt-in window compaction. Splits the chain into the stable head
+  (system/tools/doc) and the conversation tail, summarizes everything older
+  than the newest `keepTurns` turns (default 2) through a **recorded `prompt`
+  host call** (so the summary is durable and replays deterministically), and
+  rebuilds the chain as head + one `summary` segment + a fresh
+  `cacheBreakpoint` + the kept turns verbatim. `budgetTokens` makes the call a
+  pure no-op (same context value, no host call) while `estimateTokens()` is
+  within budget, so loops can call it unconditionally; `model`,
+  `instructions`, `maxTokens`, and `ttl` tune the summarizer. The host maps
+  the `summary` segment to a `<conversation-summary>…</conversation-summary>`
+  user turn (`bindings.rs::context_request_parts`). Never automatic — silent
+  truncation would change results invisibly (§3 non-goal holds).
+- Local content-addressed prompt cache (`src/runtime/prompt_cache.rs`):
+  opt-in via `CHIDORI_PROMPT_CACHE_DIR=<dir>`; one JSON entry per
+  `request_digest` (the §8.3 digest over the fully assembled request,
+  recomputed after model overrides so it keys on the request actually sent).
+  Consulted in `execute_prompt_text` / `execute_prompt_response` on the live
+  path only — strictly **after** the replay short-circuit and
+  completed-host-operation replay decline (§10) — and a hit completes the
+  same begin/safepoint/resolve/record sequence as a provider success, with
+  the identical recorded result and `token_usage: None` (nothing was billed).
+  Successful live responses write through (atomic temp-file + rename).
+  Disabled (the default) the module is inert. Both the `chidori.prompt` /
+  context paths and the native tool loop get it for free since all route
+  through the two executors.
+- Budget helpers: `estimateTokens()` (Phase 2) + `compact({ budgetTokens })`
+  as the decide-when-to-compact primitive.
+- SDK: `CompactOptions` + `Context.compact()` in `sdk/typescript/src/agent.ts`;
+  API reference in `llm.txt`.
 
 ---
 

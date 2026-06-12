@@ -278,6 +278,15 @@ at the provider's cached rates. Caching never changes results — replay returns
 recorded results and pays zero tokens either way. See
 [`docs/context-management.md`](./docs/context-management.md).
 
+When a conversation outgrows the window, `await ctx.compact({ budgetTokens })`
+is the explicit (never automatic) escape valve: it folds the older turns into
+one durable summary segment via a recorded prompt call — so it replays
+deterministically — and keeps the stable head and newest turns verbatim under
+a fresh cache breakpoint. And setting `CHIDORI_PROMPT_CACHE_DIR=<dir>` opts
+into a local content-addressed response cache: an exact repeat of a prompt,
+even across runs, is served locally without calling the provider and still
+recorded as a normal call-log entry.
+
 ## 🚦 Running Modes
 
 ### 1. One-shot CLI

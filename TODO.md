@@ -14,6 +14,7 @@ runtime, CLI, server, and tool work should target `.ts` agents and tools.
 | Call-log replay | Done |
 | Human input and policy approval pause/resume | Done through live VM resume with replay fallback |
 | Multiplayer signals (`chidori.signal` / `pollSignal` / `signalAny` + `timeoutMs`, `POST /sessions/{id}/signal`, live in-memory delivery to streaming runs) | Done — Phases 1–3 of `docs/signals.md` |
+| Context management (provider prompt caching, `chidori.context` builder, `Context.compact()`, opt-in local prompt cache via `CHIDORI_PROMPT_CACHE_DIR`) | Done — Phases 1–3 of `docs/context-management.md` |
 | TypeScript tool discovery | Done |
 | TypeScript and Python SDK parity | Done |
 | Snapshot manifests, policy/source validation, host promise records | Done |

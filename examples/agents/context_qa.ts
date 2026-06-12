@@ -31,6 +31,11 @@ export async function agent(
   const answers: { question: string; answer: string }[] = [];
   let ctx = base;
   for (const question of input.questions) {
+    // Explicit window management: while the running Q&A tail stays under
+    // ~8K estimated tokens this is a pure no-op; past it, the older turns
+    // are folded into one recorded summary segment (the corpus head and the
+    // newest two turns survive verbatim).
+    ctx = await ctx.compact({ budgetTokens: 8000 });
     ctx = ctx.user(question);
     const { text, context } = await ctx.prompt({ type: "final" });
     ctx = context; // assistant turn appended; the corpus prefix stays shared

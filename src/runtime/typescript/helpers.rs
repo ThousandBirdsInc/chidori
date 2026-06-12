@@ -134,6 +134,50 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
             }
             return value;
         }
+        // A "turn" is a segment that lands in the conversation `messages`
+        // array (vs the stable system/tools head). `doc` is intentionally not
+        // a turn: docs anchor the cacheable head, but a doc appended after the
+        // conversation started is still summarizable content (see compact()).
+        function isTurn(segment) {
+            return segment.kind === "user" || segment.kind === "assistant" ||
+                segment.kind === "toolResult" || segment.kind === "message" ||
+                segment.kind === "summary";
+        }
+        function renderBlock(block) {
+            if (!block || typeof block !== "object") return String(block);
+            if (block.type === "text") return block.text;
+            if (block.type === "tool_use") {
+                return "[tool call " + block.name + ": " + JSON.stringify(block.input) + "]";
+            }
+            if (block.type === "tool_result") {
+                return "[tool result: " + block.content + "]";
+            }
+            return JSON.stringify(block);
+        }
+        function renderSegment(segment) {
+            if (segment.kind === "user") return "User: " + segment.text;
+            if (segment.kind === "assistant") return "Assistant: " + segment.text;
+            if (segment.kind === "summary") {
+                return "Summary of earlier conversation: " + segment.text;
+            }
+            if (segment.kind === "toolResult") {
+                return "Tool result (" + segment.id + "): " + segment.content;
+            }
+            if (segment.kind === "doc") {
+                return "Document \"" + segment.label + "\": " + segment.text;
+            }
+            if (segment.kind === "message") {
+                const role = segment.message.role === "assistant" ? "Assistant" : "User";
+                const content = segment.message.content || [];
+                return role + ": " + content.map(renderBlock).join("\n");
+            }
+            return "";
+        }
+        const DEFAULT_COMPACT_INSTRUCTIONS =
+            "You compact conversation history. Summarize the transcript into a " +
+            "concise brief that preserves every fact, decision, constraint, open " +
+            "question, and commitment needed to continue the conversation " +
+            "faithfully. Reply with only the summary.";
         async function send(ctx, options, mode) {
             const opts = Object.assign({}, options || {}, {
                 __context: flatten(ctx),
@@ -190,6 +234,71 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
             async respond(options) {
                 const { out, extended } = await send(this, options, "respond");
                 return { response: out.response, context: extended };
+            },
+            // Explicit, opt-in window compaction: summarize the old turns into
+            // ONE summary segment (via a recorded `prompt` host call, so the
+            // result is durable and replays deterministically) and rebuild the
+            // chain as head + summary + fresh cache breakpoint + the kept
+            // tail. Pure no-op (no host call) when there is nothing to
+            // compact or the context is still within `budgetTokens`.
+            async compact(options) {
+                const opts = options || {};
+                const keepTurns = Number.isFinite(Number(opts.keepTurns))
+                    ? Math.max(0, Math.floor(Number(opts.keepTurns)))
+                    : 2;
+                const budget = Number(opts.budgetTokens);
+                if (Number.isFinite(budget) && budget > 0 && this.estimateTokens() <= budget) {
+                    return this;
+                }
+                const flat = flatten(this);
+                let headEnd = 0;
+                while (headEnd < flat.length && !isTurn(flat[headEnd])) headEnd += 1;
+                const head = flat.slice(0, headEnd);
+                const tail = flat.slice(headEnd);
+                const turnCount = tail.filter(isTurn).length;
+                if (turnCount <= keepTurns) {
+                    return this;
+                }
+                // Cut so the last `keepTurns` turns (plus anything appended
+                // after them) survive verbatim; everything older is
+                // summarized. Breakpoint markers in the old region are
+                // placement metadata, not content — drop them.
+                let cut = tail.length;
+                let seen = 0;
+                for (let i = tail.length - 1; i >= 0; i -= 1) {
+                    if (isTurn(tail[i])) {
+                        seen += 1;
+                        if (seen === keepTurns) { cut = i; break; }
+                    }
+                }
+                const old = tail.slice(0, cut).filter((s) => s.kind !== "cacheBreakpoint");
+                const kept = tail.slice(cut);
+                if (old.length === 0) {
+                    return this;
+                }
+                const transcript = old.map(renderSegment).join("\n");
+                const promptOpts = {
+                    system: typeof opts.instructions === "string" && opts.instructions
+                        ? opts.instructions
+                        : DEFAULT_COMPACT_INSTRUCTIONS,
+                };
+                if (typeof opts.model === "string") promptOpts.model = opts.model;
+                if (opts.maxTokens !== undefined) promptOpts.maxTokens = opts.maxTokens;
+                if (opts.cache !== undefined) promptOpts.cache = opts.cache;
+                const summary = await nativePrompt.call(
+                    globalThis.chidori,
+                    transcript,
+                    promptOpts,
+                );
+                let ctx = append(null, null);
+                for (const segment of head) ctx = append(ctx, segment);
+                ctx = append(ctx, { kind: "summary", text: String(summary) });
+                ctx = append(ctx, {
+                    kind: "cacheBreakpoint",
+                    ttl: opts.ttl === "1h" ? "1h" : "5m",
+                });
+                for (const segment of kept) ctx = append(ctx, segment);
+                return ctx;
             },
             digest(options) {
                 return nativeDigest.call(globalThis.chidori, flatten(this), options || null);

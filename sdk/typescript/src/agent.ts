@@ -72,6 +72,27 @@ export interface LlmResponseJson {
   cache_read_tokens: number;
 }
 
+/** Options for `Context.compact()` — explicit, opt-in window compaction. */
+export interface CompactOptions {
+  /** How many of the newest conversation turns to keep verbatim (default 2). */
+  keepTurns?: number;
+  /**
+   * Skip compaction (pure no-op, no host call) while `estimateTokens()` is at
+   * or under this budget — lets a loop call `compact()` unconditionally.
+   */
+  budgetTokens?: number;
+  /** Model for the summarization prompt (defaults like `prompt()`). */
+  model?: string;
+  /** System instructions for the summarizer (a faithful-brief default). */
+  instructions?: string;
+  /** `maxTokens` for the summarization prompt. */
+  maxTokens?: number;
+  /** Cache posture for the summarization prompt (see `PromptOptions.cache`). */
+  cache?: boolean | CacheTtl | { ttl?: CacheTtl };
+  /** TTL of the fresh cache breakpoint placed on the summary (default "5m"). */
+  ttl?: CacheTtl;
+}
+
 /**
  * An immutable, content-addressed, turn-structured prompt context.
  *
@@ -113,6 +134,16 @@ export interface Context {
   prompt(options?: PromptOptions): Promise<{ text: string; context: Context }>;
   /** Single structured turn for author-driven tool loops. */
   respond(options?: PromptOptions): Promise<{ response: LlmResponseJson; context: Context }>;
+  /**
+   * Summarize the older conversation turns into one durable summary segment
+   * (via a recorded `prompt` host call, so it replays deterministically) and
+   * return a new context: stable head + summary + fresh cache breakpoint +
+   * the kept newest turns. Never automatic — compaction changes what the
+   * model sees, so it is always an explicit author decision. Returns this
+   * context unchanged (without a host call) when there is nothing to compact
+   * or the context is within `budgetTokens`.
+   */
+  compact(options?: CompactOptions): Promise<Context>;
   /** Stable content hash of the request this context would assemble. */
   digest(options?: PromptOptions): string;
   /** Rough local token estimate for window budgeting. */

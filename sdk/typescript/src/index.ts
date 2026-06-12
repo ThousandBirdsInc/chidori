@@ -11,6 +11,7 @@ export type {
   AgentJson,
   CacheTtl,
   Chidori,
+  CompactOptions,
   Context,
   DatePolicy,
   HttpRequestOptions,
