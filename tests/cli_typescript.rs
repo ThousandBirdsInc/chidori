@@ -43,6 +43,15 @@ fn run_chidori_with_env(args: &[&str], cwd: &Path, envs: &[(&str, &Path)]) -> Ou
     command.output().unwrap()
 }
 
+fn run_chidori_with_str_env(args: &[&str], cwd: &Path, envs: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(chidori_bin());
+    command.args(args).current_dir(cwd);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.output().unwrap()
+}
+
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
@@ -310,6 +319,102 @@ fn cli_stream_workspace_binding_writes_real_disk_manifest() {
             && event["output"]["content"] == "export default {};"
             && event["output"]["files"][0]["path"] == "agent.ts"
     }));
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cli_workspace_write_denied_by_policy_is_blocked() {
+    let dir = temp_project("workspace-policy-deny");
+    let workspace = dir.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.workspace.write("secret.ts", "export default {};");
+                return { ok: true };
+            }
+        "#,
+    )
+    .unwrap();
+
+    // A restrictive profile that denies workspace writes. Before workspace
+    // effects were routed through the policy gate, this rule had no effect and
+    // the write went through unconditionally.
+    let policy = r#"{
+        "default": "always_allow",
+        "rules": [
+            { "target": "workspace:write", "decision": "never_allow", "reason": "read-only profile" }
+        ]
+    }"#;
+
+    let output = run_chidori_with_str_env(
+        &["run", agent.to_str().unwrap(), "--input", r#"{}"#],
+        &dir,
+        &[
+            ("CHIDORI_WORKSPACE_ROOT", workspace.to_str().unwrap()),
+            ("CHIDORI_POLICY", policy),
+        ],
+    );
+
+    assert_failure(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("workspace:write") && stderr.contains("denied"),
+        "expected a workspace:write policy denial, got stderr:\n{stderr}"
+    );
+    // The deny must happen before the effect runs: no file on disk.
+    assert!(
+        !workspace.join("secret.ts").exists(),
+        "denied workspace.write must not have touched the disk"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cli_workspace_read_allowed_while_write_denied() {
+    let dir = temp_project("workspace-policy-read-ok");
+    let workspace = dir.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    // Seed a file the agent is allowed to read.
+    fs::write(workspace.join("seed.txt"), "hello").unwrap();
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                return { content: await chidori.workspace.read("seed.txt") };
+            }
+        "#,
+    )
+    .unwrap();
+
+    // Deny only writes; reads fall through to the AlwaysAllow default.
+    let policy = r#"{
+        "default": "always_allow",
+        "rules": [
+            { "target": "workspace:write", "decision": "never_allow" }
+        ]
+    }"#;
+
+    let output = run_chidori_with_str_env(
+        &["run", agent.to_str().unwrap(), "--input", r#"{}"#],
+        &dir,
+        &[
+            ("CHIDORI_WORKSPACE_ROOT", workspace.to_str().unwrap()),
+            ("CHIDORI_POLICY", policy),
+        ],
+    );
+
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello"),
+        "expected the allowed workspace.read to return its content, got:\n{stdout}"
+    );
 
     fs::remove_dir_all(dir).ok();
 }
