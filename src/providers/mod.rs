@@ -8,6 +8,26 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Cache lifetime for a provider prompt-cache breakpoint. Serialized as the
+/// author-facing short form (`"5m"` / `"1h"`) so it round-trips through prompt
+/// options, call-log args, and the request digest unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CacheTtl {
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
+/// Request-level cache markers for the stable head of a prompt: the system
+/// block and the tool schemas. Conversation-head markers ride on the message
+/// they freeze ([`Message::cache_control`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CacheLayout {
+    pub system: Option<CacheTtl>,
+    pub tools: Option<CacheTtl>,
+}
+
 /// A content block inside a message. Mirrors Anthropic's block-based content model;
 /// providers translate to their own wire format on send.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +54,13 @@ pub enum ContentBlock {
 pub struct Message {
     pub role: String,
     pub content: Vec<ContentBlock>,
+    /// When set, providers that support explicit prompt caching place a cache
+    /// breakpoint covering everything up to and including this message (emitted
+    /// on its last content block). Pure request metadata: it never changes the
+    /// response, only how the prefix is billed. Skipped in serialization when
+    /// unset so existing checkpoints round-trip unchanged.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cache_control: Option<CacheTtl>,
 }
 
 impl Message {
@@ -41,6 +68,7 @@ impl Message {
         Self {
             role: "user".to_string(),
             content: vec![ContentBlock::Text { text: text.into() }],
+            cache_control: None,
         }
     }
 
@@ -48,6 +76,7 @@ impl Message {
         Self {
             role: "assistant".to_string(),
             content: blocks,
+            cache_control: None,
         }
     }
 }
@@ -78,6 +107,11 @@ pub struct LlmRequest {
     pub temperature: f64,
     pub max_tokens: u64,
     pub tools: Vec<ToolSchema>,
+    /// Cache markers for the system block and tool schemas. Providers without
+    /// explicit cache markers (OpenAI caches exact prefixes automatically)
+    /// ignore this; an empty layout emits a request byte-identical to before
+    /// caching existed.
+    pub cache: CacheLayout,
 }
 
 /// A response from an LLM provider.
@@ -92,8 +126,32 @@ pub struct LlmResponse {
     pub tool_calls: Vec<ToolCall>,
     /// Stop reason reported by the provider, normalized to "end_turn" | "tool_use" | other.
     pub stop_reason: String,
+    /// Fresh (non-cached) input tokens. Cache reads/creations are reported
+    /// separately below so cost accounting can price each at its own rate.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Input tokens written to the provider's prompt cache this request
+    /// (Anthropic `cache_creation_input_tokens`; billed ~1.25x base input).
+    pub cache_creation_tokens: u64,
+    /// Input tokens served from the provider's prompt cache (Anthropic
+    /// `cache_read_input_tokens` / OpenAI `cached_tokens`; billed at a steep
+    /// discount).
+    pub cache_read_tokens: u64,
+}
+
+impl Default for LlmResponse {
+    fn default() -> Self {
+        Self {
+            content: String::new(),
+            blocks: Vec::new(),
+            tool_calls: Vec::new(),
+            stop_reason: "end_turn".to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+        }
+    }
 }
 
 /// Sink for streaming token deltas while an LLM response is in flight.
@@ -173,8 +231,7 @@ impl LlmProvider for StaticProvider {
                     }],
                     tool_calls: vec![ToolCall { id, name, input }],
                     stop_reason: "tool_use".to_string(),
-                    input_tokens: 0,
-                    output_tokens: 0,
+                    ..LlmResponse::default()
                 });
             }
         }
@@ -183,10 +240,7 @@ impl LlmProvider for StaticProvider {
             blocks: vec![ContentBlock::Text {
                 text: self.response.clone(),
             }],
-            tool_calls: Vec::new(),
-            stop_reason: "end_turn".to_string(),
-            input_tokens: 0,
-            output_tokens: 0,
+            ..LlmResponse::default()
         })
     }
 }
@@ -218,6 +272,7 @@ mod tests {
             temperature: 0.0,
             max_tokens: 10,
             tools: Vec::new(),
+            cache: CacheLayout::default(),
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let response = rt.block_on(provider.send(&request)).unwrap();
@@ -244,6 +299,7 @@ mod tests {
             temperature: 0.0,
             max_tokens: 10,
             tools: Vec::new(),
+            cache: CacheLayout::default(),
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
 

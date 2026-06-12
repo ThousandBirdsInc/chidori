@@ -1877,8 +1877,7 @@ fn install_function(vm: &mut Vm) {
         // L = 0 unless the target has an OWN "length" (a deleted length means
         // 0 even when the prototype provides one); the Get is observable and
         // may throw. Infinity is preserved; -Infinity clamps to 0.
-        let bound_len = if own_property_descriptor(&target, &PropertyKey::str("length")).is_some()
-        {
+        let bound_len = if own_property_descriptor(&target, &PropertyKey::str("length")).is_some() {
             match vm.get_prop(&this, &PropertyKey::str("length"))? {
                 Value::Number(n) if n.is_nan() => 0.0,
                 Value::Number(n) if n == f64::INFINITY => f64::INFINITY,

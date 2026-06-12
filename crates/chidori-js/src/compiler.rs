@@ -4253,7 +4253,7 @@ impl Compiler {
             self.emit(Op::Dup);
             self.emit(Op::GetProp(done_k));
             let jr_done = self.emit(Op::JumpIfTrue(0)); // [result]
-            // Not done: keep delegating — yield the inner value and loop.
+                                                        // Not done: keep delegating — yield the inner value and loop.
             self.emit(Op::GetProp(value_k)); // [value]
             self.emit(Op::Jump(yield_site));
             // Done: the outer generator returns IteratorValue(result),

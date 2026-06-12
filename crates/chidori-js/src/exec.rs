@@ -171,10 +171,7 @@ impl Vm {
                 Vec::new()
             } else {
                 (0..frame.args.len().min(p.mapped_param_cells.len()))
-                    .map(|i| {
-                        p.mapped_param_cells[i]
-                            .map(|c| frame.cells[c as usize].clone())
-                    })
+                    .map(|i| p.mapped_param_cells[i].map(|c| frame.cells[c as usize].clone()))
                     .collect()
             }
         };
@@ -1192,7 +1189,8 @@ impl Vm {
                     // they attach directly to the receiver — even a Proxy —
                     // without [[DefineOwnProperty]] (no trap, no extensibility
                     // check). Everything else is CreateDataPropertyOrThrow.
-                    let is_private = matches!(&key, PropertyKey::Str(s) if s.as_str().starts_with('#'));
+                    let is_private =
+                        matches!(&key, PropertyKey::Str(s) if s.as_str().starts_with('#'));
                     if is_private {
                         o.borrow_mut().props.insert(key, Property::data(value));
                     } else {

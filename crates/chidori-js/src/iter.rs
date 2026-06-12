@@ -212,9 +212,7 @@ impl Vm {
                     st.target
                         .as_ref()
                         .map_or(false, |t| match &t.borrow().internal {
-                            Internal::TypedArray(td) => {
-                                crate::typed_array::ta_out_of_bounds(td)
-                            }
+                            Internal::TypedArray(td) => crate::typed_array::ta_out_of_bounds(td),
                             _ => false,
                         })
                 }

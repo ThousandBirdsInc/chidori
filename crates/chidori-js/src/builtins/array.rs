@@ -431,7 +431,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             }
             k += 1.0;
         }
-        vm.set_prop_strict(&a, &PropertyKey::str("length"), Value::Number(actual_delete))?;
+        vm.set_prop_strict(
+            &a,
+            &PropertyKey::str("length"),
+            Value::Number(actual_delete),
+        )?;
         // Shift the tail of O to make room for / close the gap left by inserts.
         if ins < actual_delete {
             let mut k = actual_start;
@@ -697,7 +701,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             let key = elem_key(k);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
-                vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(k), ov.clone()])?;
+                vm.call(
+                    cb.clone(),
+                    this_arg.clone(),
+                    &[v, Value::Number(k), ov.clone()],
+                )?;
             }
             k += 1.0;
         }
@@ -714,8 +722,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             let key = elem_key(k);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
-                let mapped =
-                    vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(k), ov.clone()])?;
+                let mapped = vm.call(
+                    cb.clone(),
+                    this_arg.clone(),
+                    &[v, Value::Number(k), ov.clone()],
+                )?;
                 create_data_on(vm, &a, &key, mapped)?;
             }
             k += 1.0;
@@ -771,7 +782,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         while k < len {
             vm.native_tick()?;
             let v = vm.get_prop(&ov, &elem_key(k))?;
-            let r = vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(k), ov.clone()])?;
+            let r = vm.call(
+                cb.clone(),
+                this_arg.clone(),
+                &[v, Value::Number(k), ov.clone()],
+            )?;
             if vm.to_boolean(&r) {
                 return Ok(Value::Number(k));
             }
@@ -803,7 +818,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         while k >= 0.0 {
             vm.native_tick()?;
             let v = vm.get_prop(&ov, &elem_key(k))?;
-            let r = vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(k), ov.clone()])?;
+            let r = vm.call(
+                cb.clone(),
+                this_arg.clone(),
+                &[v, Value::Number(k), ov.clone()],
+            )?;
             if vm.to_boolean(&r) {
                 return Ok(Value::Number(k));
             }
@@ -819,8 +838,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             let key = elem_key(k);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
-                let r =
-                    vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(k), ov.clone()])?;
+                let r = vm.call(
+                    cb.clone(),
+                    this_arg.clone(),
+                    &[v, Value::Number(k), ov.clone()],
+                )?;
                 if vm.to_boolean(&r) {
                     return Ok(Value::Bool(true));
                 }
@@ -837,8 +859,11 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             let key = elem_key(k);
             if vm.has_prop(&ov, &key)? {
                 let v = vm.get_prop(&ov, &key)?;
-                let r =
-                    vm.call(cb.clone(), this_arg.clone(), &[v, Value::Number(k), ov.clone()])?;
+                let r = vm.call(
+                    cb.clone(),
+                    this_arg.clone(),
+                    &[v, Value::Number(k), ov.clone()],
+                )?;
                 if !vm.to_boolean(&r) {
                     return Ok(Value::Bool(false));
                 }

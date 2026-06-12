@@ -33,8 +33,32 @@ pub struct CallRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsage {
+    /// Fresh (non-cached) input tokens.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Input tokens written to the provider prompt cache (billed above base
+    /// input rate). Omitted when zero so existing logs round-trip unchanged.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cache_creation_tokens: Option<u64>,
+    /// Input tokens served from the provider prompt cache (billed at a steep
+    /// discount).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cache_read_tokens: Option<u64>,
+}
+
+impl TokenUsage {
+    /// Build usage from a provider response, recording cache counts only when
+    /// the provider reported any.
+    pub fn from_response(response: &crate::providers::LlmResponse) -> Self {
+        Self {
+            input_tokens: response.input_tokens,
+            output_tokens: response.output_tokens,
+            cache_creation_tokens: (response.cache_creation_tokens > 0)
+                .then_some(response.cache_creation_tokens),
+            cache_read_tokens: (response.cache_read_tokens > 0)
+                .then_some(response.cache_read_tokens),
+        }
+    }
 }
 
 /// Ordered list of call records forming a checkpoint.
@@ -68,7 +92,11 @@ impl CallLog {
         let mut output = 0;
         for r in &self.records {
             if let Some(ref usage) = r.token_usage {
-                input += usage.input_tokens;
+                // Cache writes/reads are input tokens the model processed —
+                // include them so the total reflects real context size.
+                input += usage.input_tokens
+                    + usage.cache_creation_tokens.unwrap_or(0)
+                    + usage.cache_read_tokens.unwrap_or(0);
                 output += usage.output_tokens;
             }
         }
@@ -82,7 +110,7 @@ impl CallLog {
     /// Walk LLM call records and sum an estimated USD cost based on the
     /// model name stored in each record's args.
     pub fn total_cost_usd(&self) -> f64 {
-        use crate::runtime::cost::estimate_cost_usd;
+        use crate::runtime::cost::estimate_cost_usd_with_cache;
         let mut total = 0.0;
         for r in &self.records {
             if r.function != "prompt" {
@@ -92,7 +120,13 @@ impl CallLog {
                 continue;
             };
             let model = r.args.get("model").and_then(|v| v.as_str()).unwrap_or("");
-            total += estimate_cost_usd(model, usage.input_tokens, usage.output_tokens);
+            total += estimate_cost_usd_with_cache(
+                model,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_creation_tokens.unwrap_or(0),
+                usage.cache_read_tokens.unwrap_or(0),
+            );
         }
         total
     }

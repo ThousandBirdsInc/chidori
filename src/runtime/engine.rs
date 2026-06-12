@@ -623,6 +623,7 @@ mod tests {
                 stop_reason: "end_turn".to_string(),
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
+                ..Default::default()
             })
         }
 
@@ -702,6 +703,7 @@ mod tests {
                 stop_reason: "end_turn".to_string(),
                 input_tokens: 1,
                 output_tokens: 2,
+                ..Default::default()
             })
         }
     }

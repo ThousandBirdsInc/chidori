@@ -304,6 +304,18 @@ impl RunSpan {
                 "gen_ai.usage.output_tokens",
                 usage.output_tokens as i64,
             ));
+            // Prompt-cache effectiveness, visible per prompt span: creation =
+            // the prefix was (re)written this call, read = it was served from
+            // cache at the discounted rate.
+            if let Some(creation) = usage.cache_creation_tokens {
+                attrs.push(KeyValue::new(
+                    "gen_ai.usage.cache_creation_tokens",
+                    creation as i64,
+                ));
+            }
+            if let Some(read) = usage.cache_read_tokens {
+                attrs.push(KeyValue::new("gen_ai.usage.cache_read_tokens", read as i64));
+            }
             self.total_input_tokens
                 .fetch_add(usage.input_tokens, Ordering::Relaxed);
             self.total_output_tokens
@@ -869,6 +881,8 @@ mod tests {
         r.token_usage = Some(crate::runtime::call_log::TokenUsage {
             input_tokens: 10,
             output_tokens: 7,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
         });
 
         let spans = emit_and_collect(std::slice::from_ref(&r));

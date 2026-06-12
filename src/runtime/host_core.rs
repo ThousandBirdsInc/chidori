@@ -1,9 +1,10 @@
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::providers::{
-    ContentBlock, LlmRequest, LlmResponse, ProviderRegistry, TokenSink, ToolCall,
+    CacheTtl, ContentBlock, LlmRequest, LlmResponse, ProviderRegistry, TokenSink, ToolCall,
 };
 use crate::runtime::call_log::{CallRecord, TokenUsage};
 use crate::runtime::context::{InputMode, PendingInput, RuntimeContext, PAUSE_MARKER};
@@ -255,6 +256,102 @@ pub fn execute_input(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
     }
 }
 
+/// Whether (and how long) a prompt request should mark cacheable prefix
+/// boundaries. The default is on with the 5-minute TTL — caching is a billing
+/// optimization that never changes a response, so it is safe by default; a
+/// single call opts out with `cache: false` in its prompt options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePosture {
+    Auto(CacheTtl),
+    Disabled,
+}
+
+impl Default for CachePosture {
+    fn default() -> Self {
+        CachePosture::Auto(CacheTtl::FiveMinutes)
+    }
+}
+
+/// Parse the cache posture from prompt options: `cache: false` disables,
+/// `cache: true` / absent uses the default 5m TTL, `cache: "1h"` or
+/// `cache: { ttl: "1h" }` selects the extended TTL.
+pub fn cache_posture_from_options(options: &Value) -> CachePosture {
+    let Some(cache) = options.get("cache") else {
+        return CachePosture::default();
+    };
+    let ttl_str = |s: &str| match s {
+        "1h" => Some(CacheTtl::OneHour),
+        "5m" => Some(CacheTtl::FiveMinutes),
+        _ => None,
+    };
+    match cache {
+        Value::Bool(false) => CachePosture::Disabled,
+        Value::Bool(true) | Value::Null => CachePosture::default(),
+        Value::String(s) => CachePosture::Auto(ttl_str(s).unwrap_or(CacheTtl::FiveMinutes)),
+        Value::Object(map) => CachePosture::Auto(
+            map.get("ttl")
+                .and_then(Value::as_str)
+                .and_then(ttl_str)
+                .unwrap_or(CacheTtl::FiveMinutes),
+        ),
+        _ => CachePosture::default(),
+    }
+}
+
+/// Default auto-marking of cacheable prefix boundaries (the zero-author win):
+/// the system block and the tool schemas are stable for a whole run/loop, so
+/// they are always marked; the conversation head (the latest message) is
+/// marked when a follow-up request sharing the prefix is plausible — a
+/// tool-use loop is coming (`tools` non-empty) or the request is already
+/// multi-turn (a context/conversation being extended). Explicit marks placed
+/// by the author are never overridden. A pure function of the request shape,
+/// so the same request always produces the same layout (replay-stable).
+pub fn auto_mark_prompt_cache(request: &mut LlmRequest, posture: CachePosture) {
+    let CachePosture::Auto(ttl) = posture else {
+        return;
+    };
+    if request.system.is_some() && request.cache.system.is_none() {
+        request.cache.system = Some(ttl);
+    }
+    if !request.tools.is_empty() && request.cache.tools.is_none() {
+        request.cache.tools = Some(ttl);
+    }
+    let multi_turn = request.messages.len() >= 2 || !request.tools.is_empty();
+    if multi_turn {
+        if let Some(last) = request
+            .messages
+            .last_mut()
+            .filter(|m| m.cache_control.is_none())
+        {
+            last.cache_control = Some(ttl);
+        }
+    }
+}
+
+/// Content digest of the fully assembled prompt request (model, system, tools,
+/// messages, cache layout). Recorded in the prompt `CallRecord.args` so the
+/// durable log is self-describing — replay still matches on `(seq, function)`
+/// and ignores it. Computed over canonical JSON (serde_json sorts object keys)
+/// and versioned so a future canonicalization change can't silently collide.
+pub fn prompt_request_digest(request: &LlmRequest) -> String {
+    let canonical = json!({
+        "v": 1,
+        "model": request.model,
+        "system": request.system,
+        "messages": request.messages,
+        "tools": request.tools,
+        "cache": {
+            "system": request.cache.system,
+            "tools": request.cache.tools,
+        },
+        "max_tokens": request.max_tokens,
+        "temperature": request.temperature,
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 /// Apply the runtime context's model override (Pi-style save point) to an
 /// outgoing prompt request. A no-op unless the host installed an override hook
 /// that currently yields a model. This is the single point where a mid-run
@@ -318,10 +415,7 @@ pub fn execute_prompt_text(
                 args,
                 result: result.clone(),
                 duration_ms,
-                token_usage: Some(TokenUsage {
-                    input_tokens: response.input_tokens,
-                    output_tokens: response.output_tokens,
-                }),
+                token_usage: Some(TokenUsage::from_response(&response)),
                 timestamp: started,
                 error: None,
             });
@@ -404,10 +498,7 @@ pub fn execute_prompt_response(
                 args,
                 result,
                 duration_ms,
-                token_usage: Some(TokenUsage {
-                    input_tokens: response.input_tokens,
-                    output_tokens: response.output_tokens,
-                }),
+                token_usage: Some(TokenUsage::from_response(&response)),
                 timestamp: started,
                 error: None,
             });
@@ -484,6 +575,8 @@ pub fn llm_response_to_json(response: &LlmResponse) -> Value {
         "stop_reason": response.stop_reason,
         "input_tokens": response.input_tokens,
         "output_tokens": response.output_tokens,
+        "cache_creation_tokens": response.cache_creation_tokens,
+        "cache_read_tokens": response.cache_read_tokens,
     })
 }
 
@@ -506,6 +599,15 @@ pub fn llm_response_from_json(value: &Value) -> Option<LlmResponse> {
         stop_reason: value.get("stop_reason")?.as_str()?.to_string(),
         input_tokens: value.get("input_tokens")?.as_u64()?,
         output_tokens: value.get("output_tokens")?.as_u64()?,
+        // Absent in records written before prompt caching existed.
+        cache_creation_tokens: value
+            .get("cache_creation_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cache_read_tokens: value
+            .get("cache_read_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     })
 }
 
@@ -1019,10 +1121,9 @@ mod tests {
                     blocks: vec![ContentBlock::Text {
                         text: "ok".to_string(),
                     }],
-                    tool_calls: Vec::new(),
-                    stop_reason: "end_turn".to_string(),
                     input_tokens: 1,
                     output_tokens: 1,
+                    ..LlmResponse::default()
                 })
             }
             async fn stream(
@@ -1053,6 +1154,7 @@ mod tests {
             temperature: 0.0,
             max_tokens: 16,
             tools: Vec::new(),
+            cache: crate::providers::CacheLayout::default(),
         };
         let _ =
             execute_prompt_response(&ctx, &providers, &tokio_rt, request, json!({}), None).unwrap();
@@ -1097,6 +1199,7 @@ mod tests {
                 temperature: 0.0,
                 max_tokens: 16,
                 tools: Vec::new(),
+                cache: crate::providers::CacheLayout::default(),
             },
             args,
             Some("progress".to_string()),
@@ -1601,6 +1704,102 @@ mod tests {
         assert_eq!(call_log.len(), 1);
         assert_eq!(call_log[0].function, "tool");
         assert_eq!(call_log[0].result, json!({ "value": 42 }));
+    }
+
+    #[test]
+    fn cache_posture_parses_prompt_options() {
+        assert_eq!(
+            cache_posture_from_options(&json!({})),
+            CachePosture::Auto(CacheTtl::FiveMinutes)
+        );
+        assert_eq!(
+            cache_posture_from_options(&json!({ "cache": false })),
+            CachePosture::Disabled
+        );
+        assert_eq!(
+            cache_posture_from_options(&json!({ "cache": true })),
+            CachePosture::Auto(CacheTtl::FiveMinutes)
+        );
+        assert_eq!(
+            cache_posture_from_options(&json!({ "cache": "1h" })),
+            CachePosture::Auto(CacheTtl::OneHour)
+        );
+        assert_eq!(
+            cache_posture_from_options(&json!({ "cache": { "ttl": "1h" } })),
+            CachePosture::Auto(CacheTtl::OneHour)
+        );
+    }
+
+    fn cacheable_request() -> LlmRequest {
+        LlmRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            messages: vec![LlmMessage::user_text("q1")],
+            system: Some("system".to_string()),
+            temperature: 0.0,
+            max_tokens: 16,
+            tools: Vec::new(),
+            cache: crate::providers::CacheLayout::default(),
+        }
+    }
+
+    #[test]
+    fn auto_marking_covers_stable_head_and_respects_disable() {
+        // Single-shot text prompt (no tools, one message): system is marked but
+        // the lone user turn is not — there is no follow-up to read it.
+        let mut single = cacheable_request();
+        auto_mark_prompt_cache(&mut single, CachePosture::default());
+        assert_eq!(single.cache.system, Some(CacheTtl::FiveMinutes));
+        assert!(single.messages[0].cache_control.is_none());
+
+        // Tool-loop shape: tools and the conversation head are marked too.
+        let mut looped = cacheable_request();
+        looped.tools.push(crate::providers::ToolSchema {
+            name: "read".to_string(),
+            description: "Read".to_string(),
+            input_schema: json!({ "type": "object" }),
+        });
+        auto_mark_prompt_cache(&mut looped, CachePosture::default());
+        assert_eq!(looped.cache.tools, Some(CacheTtl::FiveMinutes));
+        assert_eq!(
+            looped.messages.last().unwrap().cache_control,
+            Some(CacheTtl::FiveMinutes)
+        );
+
+        // Multi-turn conversation: head marked even without tools.
+        let mut convo = cacheable_request();
+        convo.messages.push(LlmMessage::assistant_blocks(vec![]));
+        convo.messages.push(LlmMessage::user_text("q2"));
+        auto_mark_prompt_cache(&mut convo, CachePosture::default());
+        assert_eq!(
+            convo.messages.last().unwrap().cache_control,
+            Some(CacheTtl::FiveMinutes)
+        );
+
+        // Explicit author marks are never overridden, and Disabled is inert.
+        let mut explicit = cacheable_request();
+        explicit.messages[0].cache_control = Some(CacheTtl::OneHour);
+        auto_mark_prompt_cache(&mut explicit, CachePosture::default());
+        assert_eq!(explicit.messages[0].cache_control, Some(CacheTtl::OneHour));
+        let mut disabled = cacheable_request();
+        auto_mark_prompt_cache(&mut disabled, CachePosture::Disabled);
+        assert!(disabled.cache.system.is_none());
+        assert!(disabled.messages[0].cache_control.is_none());
+    }
+
+    #[test]
+    fn request_digest_is_stable_and_covers_cache_layout() {
+        let request = cacheable_request();
+        let digest = prompt_request_digest(&request);
+        assert_eq!(digest, prompt_request_digest(&request.clone()));
+        assert_eq!(digest.len(), 64);
+
+        let mut different_text = cacheable_request();
+        different_text.messages = vec![LlmMessage::user_text("q2")];
+        assert_ne!(digest, prompt_request_digest(&different_text));
+
+        let mut different_cache = cacheable_request();
+        different_cache.cache.system = Some(CacheTtl::FiveMinutes);
+        assert_ne!(digest, prompt_request_digest(&different_cache));
     }
 
     #[test]

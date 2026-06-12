@@ -2030,8 +2030,7 @@ fn define_dv_get(vm: &mut Vm, proto: &JsObject, name: &str, kind: DvKind) {
                 )
             }
         };
-        let (buffer, base_off, _) =
-            dv_fields(&o).ok_or_else(|| vm.throw_type("not a DataView"))?;
+        let (buffer, base_off, _) = dv_fields(&o).ok_or_else(|| vm.throw_type("not a DataView"))?;
         let get_index = {
             let idx = to_integer_or_infinity(vm, &arg(args, 0))?;
             if idx < 0.0 || idx.is_infinite() {
@@ -2070,8 +2069,7 @@ fn define_dv_set(vm: &mut Vm, proto: &JsObject, name: &str, kind: DvKind) {
                 )
             }
         };
-        let (buffer, base_off, _) =
-            dv_fields(&o).ok_or_else(|| vm.throw_type("not a DataView"))?;
+        let (buffer, base_off, _) = dv_fields(&o).ok_or_else(|| vm.throw_type("not a DataView"))?;
         let set_index = {
             let idx = to_integer_or_infinity(vm, &arg(args, 0))?;
             if idx < 0.0 || idx.is_infinite() {
@@ -2113,8 +2111,7 @@ fn define_dv_get_big(vm: &mut Vm, proto: &JsObject, name: &str, kind: TAKind) {
                 )
             }
         };
-        let (buffer, base_off, _) =
-            dv_fields(&o).ok_or_else(|| vm.throw_type("not a DataView"))?;
+        let (buffer, base_off, _) = dv_fields(&o).ok_or_else(|| vm.throw_type("not a DataView"))?;
         let get_index = {
             let idx = to_integer_or_infinity(vm, &arg(args, 0))?;
             if idx < 0.0 || idx.is_infinite() {
@@ -2166,8 +2163,7 @@ fn define_dv_set_big(vm: &mut Vm, proto: &JsObject, name: &str, kind: TAKind) {
                 )
             }
         };
-        let (buffer, base_off, _) =
-            dv_fields(&o).ok_or_else(|| vm.throw_type("not a DataView"))?;
+        let (buffer, base_off, _) = dv_fields(&o).ok_or_else(|| vm.throw_type("not a DataView"))?;
         let set_index = {
             let idx = to_integer_or_infinity(vm, &arg(args, 0))?;
             if idx < 0.0 || idx.is_infinite() {

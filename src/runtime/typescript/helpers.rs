@@ -105,6 +105,118 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
     };
     globalThis.__chidori_install_memory_helpers();
 
+    // chidori.context(): an immutable, turn-structured prompt builder. Each
+    // builder call allocates ONE new node pointing at its parent, so contexts
+    // share their prefix structurally — `base.user("a")` and `base.user("b")`
+    // share every segment of `base`. Only `.prompt()` / `.respond()` cross the
+    // host boundary (as the durable prompt effect, carrying the flattened
+    // chain); building is pure in-VM work.
+    (() => {
+        const nativePrompt = globalThis.chidori.prompt;
+        const nativeDigest = globalThis.chidori.__contextDigest;
+        if (typeof nativePrompt !== "function") {
+            return;
+        }
+        function flatten(ctx) {
+            const out = [];
+            let node = ctx;
+            while (node) {
+                if (node.__segment) out.push(node.__segment);
+                node = node.__parent;
+            }
+            out.reverse();
+            return out;
+        }
+        function deepFreeze(value) {
+            if (value && typeof value === "object" && !Object.isFrozen(value)) {
+                Object.freeze(value);
+                for (const key of Object.keys(value)) deepFreeze(value[key]);
+            }
+            return value;
+        }
+        async function send(ctx, options, mode) {
+            const opts = Object.assign({}, options || {}, {
+                __context: flatten(ctx),
+                __mode: mode,
+            });
+            const out = await nativePrompt.call(globalThis.chidori, "", opts);
+            let extended = ctx;
+            for (const message of out.messages || []) {
+                extended = append(extended, { kind: "message", message });
+            }
+            return { out, extended };
+        }
+        const proto = {
+            system(text) {
+                return append(this, { kind: "system", text: String(text) });
+            },
+            tools(names) {
+                return append(this, {
+                    kind: "tools",
+                    names: (names || []).map(String),
+                });
+            },
+            doc(label, text) {
+                return append(this, {
+                    kind: "doc",
+                    label: String(label),
+                    text: String(text),
+                });
+            },
+            user(text) {
+                return append(this, { kind: "user", text: String(text) });
+            },
+            assistant(text) {
+                return append(this, { kind: "assistant", text: String(text) });
+            },
+            toolResult(id, content, isError) {
+                return append(this, {
+                    kind: "toolResult",
+                    id: String(id),
+                    content: String(content),
+                    isError: !!isError,
+                });
+            },
+            cacheBreakpoint(ttl) {
+                return append(this, {
+                    kind: "cacheBreakpoint",
+                    ttl: ttl === "1h" ? "1h" : "5m",
+                });
+            },
+            async prompt(options) {
+                const { out, extended } = await send(this, options, "prompt");
+                return { text: out.text, context: extended };
+            },
+            async respond(options) {
+                const { out, extended } = await send(this, options, "respond");
+                return { response: out.response, context: extended };
+            },
+            digest(options) {
+                return nativeDigest.call(globalThis.chidori, flatten(this), options || null);
+            },
+            estimateTokens() {
+                let chars = 0;
+                for (const segment of flatten(this)) {
+                    if (typeof segment.text === "string") chars += segment.text.length;
+                    if (segment.kind === "message") chars += JSON.stringify(segment.message).length;
+                }
+                return Math.ceil(chars / 4);
+            },
+        };
+        function append(parent, segment) {
+            const ctx = Object.create(proto);
+            Object.defineProperty(ctx, "__parent", { value: parent });
+            Object.defineProperty(ctx, "__segment", { value: deepFreeze(segment) });
+            return Object.freeze(ctx);
+        }
+        globalThis.chidori.context = function context(seed) {
+            let ctx = append(null, null);
+            if (seed && typeof seed.system === "string") ctx = ctx.system(seed.system);
+            if (seed && Array.isArray(seed.tools)) ctx = ctx.tools(seed.tools);
+            return ctx;
+        };
+    })();
+
     if (typeof globalThis.__chidori_workspace_write === "function") {
         globalThis.chidori.workspace = {
             list(options) {

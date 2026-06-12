@@ -198,6 +198,7 @@ An agent is a `.ts` file that exports an async `agent(input, chidori)` function.
 | Function | Purpose |
 |---|---|
 | `chidori.prompt(text, { type, ... })` | Send to an LLM, return string or parsed JSON; streamed prompt events carry the optional type |
+| `chidori.context()` | Immutable multi-turn prompt builder with prefix sharing and provider prompt caching |
 | `chidori.template(strOrPath, vars)` | Render a Jinja2 template with minijinja |
 | `chidori.tool(name, args)` | Invoke a registered tool |
 | `chidori.callAgent(path, input)` | Call a sub-agent |
@@ -227,6 +228,28 @@ When using `--stream` or `POST /sessions/stream`, prompt calls emit
 `seq`, and `prompt_type`. This also works for prompts inside
 `chidori.parallel(...)` branches and `chidori.callAgent(...)` sub-agents. See
 [`examples/agents/streaming_progress.ts`](./examples/agents/streaming_progress.ts).
+
+### Prompt Caching
+
+Every prompt automatically marks its stable head (system prompt, tool schemas,
+conversation prefix) for the provider's prompt cache, so a tool loop or
+multi-turn conversation re-bills its prefix at the cached rate (~10% of base
+input on Anthropic) instead of full price each turn. Disable per call with
+`cache: false`. For long-lived contexts, build them once with
+`chidori.context()` — an immutable, prefix-sharing conversation builder — and
+the cache hits become structural:
+
+```ts
+const base = chidori.context().system(INSTRUCTIONS).doc("corpus", corpus).cacheBreakpoint("1h");
+let ctx = base.user(firstQuestion);
+const { text, context } = await ctx.prompt();
+```
+
+Cache effectiveness is measurable: prompt records and OTEL spans carry
+`cache_creation`/`cache_read` token counts, and `total_cost_usd` prices them
+at the provider's cached rates. Caching never changes results — replay returns
+recorded results and pays zero tokens either way. See
+[`docs/context-management.md`](./docs/context-management.md).
 
 ## 🚦 Running Modes
 
@@ -345,6 +368,7 @@ See [`examples/`](./examples):
 
 - [`agents/hello.ts`](./examples/agents/hello.ts) — minimal agent, no LLM
 - [`agents/summarizer.ts`](./examples/agents/summarizer.ts) — LLM summary pipeline
+- [`agents/context_qa.ts`](./examples/agents/context_qa.ts) — cache-aware multi-turn Q&A via `chidori.context`
 - [`agents/streaming_progress.ts`](./examples/agents/streaming_progress.ts) — labelled prompt progress streams
 - [`agents/webhook.ts`](./examples/agents/webhook.ts) — event-driven HTTP handler
 - [`agents/tool_use.ts`](./examples/agents/tool_use.ts) — tool call example

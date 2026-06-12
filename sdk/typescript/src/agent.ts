@@ -35,6 +35,9 @@ export interface ToolDefinition {
 
 export type PromptStreamType = "progress" | "draft" | "subagent" | "final" | (string & {});
 
+/** Provider prompt-cache lifetime for a cached prefix. */
+export type CacheTtl = "5m" | "1h";
+
 export interface PromptOptions {
   type?: PromptStreamType;
   system?: string;
@@ -47,6 +50,73 @@ export interface PromptOptions {
   tools?: string[];
   format?: "json" | (string & {});
   stream?: boolean;
+  /**
+   * Prompt-cache posture. Defaults to on (`"5m"`): the runtime marks the
+   * stable request head (system, tools, conversation prefix) so providers
+   * bill repeated prefixes at the cached rate. `false` disables marking for
+   * this call; `"1h"` (or `{ ttl: "1h" }`) requests the extended TTL.
+   * Caching never changes a response — only how it is billed.
+   */
+  cache?: boolean | CacheTtl | { ttl?: CacheTtl };
+}
+
+/** Structured response from `Context.respond()` — mirrors the provider turn. */
+export interface LlmResponseJson {
+  content: string;
+  blocks: AgentJson[];
+  tool_calls: { id: string; name: string; input: AgentJson }[];
+  stop_reason: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+}
+
+/**
+ * An immutable, content-addressed, turn-structured prompt context.
+ *
+ * Builder methods return a NEW context that structurally shares this one's
+ * segments — `base.user("a")` and `base.user("b")` are independent and share
+ * `base`'s prefix — which keeps cache prefixes stable and makes forks cheap.
+ * Only `prompt()` / `respond()` perform a durable host call.
+ *
+ * ```ts
+ * const base = chidori.context()
+ *   .system("You are a policy analyst.")
+ *   .doc("corpus", corpusText)
+ *   .cacheBreakpoint("1h");
+ * let ctx = base;
+ * for (const q of questions) {
+ *   ctx = ctx.user(q);
+ *   const { text, context } = await ctx.prompt();
+ *   ctx = context; // assistant turn appended, prefix still shared
+ * }
+ * ```
+ */
+export interface Context {
+  system(text: string): Context;
+  /** Expose registered tools (by name, resolved like `prompt({ tools })`). */
+  tools(names: string[]): Context;
+  /** A large stable reference block, labelled for the trace. */
+  doc(label: string, text: string): Context;
+  user(text: string): Context;
+  assistant(text: string): Context;
+  toolResult(id: string, content: string, isError?: boolean): Context;
+  /**
+   * Freeze everything appended so far as a cacheable prefix (one provider
+   * cache breakpoint). Providers cap breakpoints, so marks are coalesced —
+   * latest wins. Most authors never need this: stable heads are auto-marked.
+   */
+  cacheBreakpoint(ttl?: CacheTtl): Context;
+  /** Send this context; returns the text and the context extended with the
+   * assistant turn (including any internal tool-use exchange). */
+  prompt(options?: PromptOptions): Promise<{ text: string; context: Context }>;
+  /** Single structured turn for author-driven tool loops. */
+  respond(options?: PromptOptions): Promise<{ response: LlmResponseJson; context: Context }>;
+  /** Stable content hash of the request this context would assemble. */
+  digest(options?: PromptOptions): string;
+  /** Rough local token estimate for window budgeting. */
+  estimateTokens(): number;
 }
 
 export interface InputOptions {
@@ -140,6 +210,8 @@ export interface RuntimePolicyConfig {
 
 export interface Chidori {
   workspace: WorkspaceHost;
+  /** Start an immutable multi-turn prompt context (optionally seeded). */
+  context(seed?: { system?: string; tools?: string[] }): Context;
   prompt(text: string, options?: PromptOptions): Promise<string>;
   input(message: string, options?: InputOptions): Promise<string>;
   callAgent<TInput extends AgentJson = JsonObject, TOutput extends AgentJson = AgentJson>(
