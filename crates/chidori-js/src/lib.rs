@@ -180,6 +180,88 @@ impl Engine {
                 forward_effect(vm, &d, "poll_signal", serde_json::json!({ "name": name }))
             });
         let d = dispatch.clone();
+        // chidori.step(name, fn) — durable value checkpoint. Unlike the other
+        // effects, the second argument is a JS callback, which cannot cross the
+        // JSON dispatch boundary; instead the binding drives a two-call
+        // protocol: probe the journal (`step_begin`), run the callback
+        // synchronously only on a miss, then record its outcome (`step_end`).
+        // On replay the probe returns the recorded value (or re-throws the
+        // recorded error) and the callback never runs — that is the point: it
+        // bounds resume cost for expensive deterministic compute. Results are
+        // JSON round-tripped on the live path too, so live and replayed runs
+        // observe byte-identical values.
+        self.vm
+            .define_method(&chidori, "step", 2, move |vm, _t, args| {
+                let name = match args.first() {
+                    Some(Value::String(s)) => s.as_str().to_string(),
+                    _ => {
+                        return Err(vm.make_error(
+                            crate::vm::ErrorKind::Type,
+                            "chidori.step requires a string name as its first argument",
+                        ))
+                    }
+                };
+                let f = args.get(1).cloned().unwrap_or(Value::Undefined);
+                if !vm.is_callable(&f) {
+                    return Err(vm.make_error(
+                        crate::vm::ErrorKind::Type,
+                        "chidori.step requires a callback as its second argument",
+                    ));
+                }
+                let begin = match d("step_begin", &serde_json::json!({ "name": name })) {
+                    Ok(j) => j,
+                    Err(e) => return Err(vm.make_error(crate::vm::ErrorKind::Error, &e)),
+                };
+                if begin
+                    .get("cached")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    if let Some(err) = begin.get("error").and_then(serde_json::Value::as_str) {
+                        return Err(vm.make_error(crate::vm::ErrorKind::Error, err));
+                    }
+                    let value = begin.get("value").unwrap_or(&serde_json::Value::Null);
+                    return Ok(vm.json_to_value(value));
+                }
+                match vm.call(f, Value::Undefined, &[]) {
+                    Ok(v) => {
+                        let is_promise = matches!(
+                            &v,
+                            Value::Object(o) if matches!(
+                                o.borrow().internal,
+                                crate::value::Internal::Promise(_)
+                            )
+                        );
+                        if is_promise {
+                            let msg = "chidori.step callback must return synchronously \
+                                       (got a Promise): step bodies are pure compute — run \
+                                       host effects outside the step and pass results in";
+                            let _ = d(
+                                "step_end",
+                                &serde_json::json!({ "name": name, "error": msg }),
+                            );
+                            return Err(vm.make_error(crate::vm::ErrorKind::Type, msg));
+                        }
+                        let j = vm.value_to_json(&v);
+                        match d("step_end", &serde_json::json!({ "name": name, "value": j })) {
+                            Ok(rj) => Ok(vm.json_to_value(&rj)),
+                            Err(e) => Err(vm.make_error(crate::vm::ErrorKind::Error, &e)),
+                        }
+                    }
+                    Err(e) => {
+                        let msg = vm.error_to_string(&e);
+                        let _ = d(
+                            "step_end",
+                            &serde_json::json!({ "name": name, "error": msg }),
+                        );
+                        // Rebuild from the recorded message (instead of
+                        // re-throwing `e`) so the live throw matches the
+                        // replayed one exactly.
+                        Err(vm.make_error(crate::vm::ErrorKind::Error, &msg))
+                    }
+                }
+            });
+        let d = dispatch.clone();
         self.vm
             .define_method(&chidori, "signalAny", 2, move |vm, _t, args| {
                 let names = args

@@ -70,6 +70,9 @@ completion audit lives in
 - [x] `chidori.log()`
 - [x] `chidori.memory()`
 - [x] `chidori.checkpoint()`
+- [x] `chidori.step()` — durable value checkpoints (plan P6): memoize pure
+      compute into the call log so replay/resume never re-pays it
+      (`docs/value-checkpoints.md`).
 - [x] `chidori.execJs()`
 - [x] `chidori.execPython()`
 - [x] `chidori.execWasm()`

@@ -331,6 +331,15 @@ export interface Chidori {
     names: string[],
     options: SignalOptions,
   ): Promise<Signal<T> | SignalTimeout>;
+  /**
+   * Durable value checkpoint: run `fn` once and journal its JSON-serializable
+   * result; on replay/resume the recorded value (or error) is returned without
+   * re-running `fn`. Wrap expensive deterministic computation in a step so a
+   * resumed run does not re-pay it. The callback must be pure, synchronous
+   * compute — host effects (`chidori.*`), captured randomness, filesystem
+   * writes, timers, and async callbacks are refused inside a step.
+   */
+  step<T extends AgentJson = AgentJson>(name: string, fn: () => T): Promise<T>;
   callAgent<TInput extends AgentJson = JsonObject, TOutput extends AgentJson = AgentJson>(
     path: string,
     input?: TInput,

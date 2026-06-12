@@ -262,10 +262,15 @@ The real gaps, restated post-#39:
   snapshot/resume machinery was deleted in #39, which *simplified* the
   architecture (the silent snapshot→replay fallback this review previously
   flagged is gone — replay is the only, explicit mechanism) at the cost of
-  the original performance idea. With **no value checkpointing** (the
+  the original performance idea. ~~With **no value checkpointing** (the
   deferred P6), resume cost equals re-execution of the journal from the
   top, so very long histories get slower to resume; `durableStep(fn)`
-  memoization is the partial mitigation.
+  memoization is the partial mitigation.~~ **Update (2026-06-12): P6 landed
+  as `chidori.step(name, fn)`** — pure deterministic compute is memoized
+  into the call log and skipped on replay/resume, with the pure-compute
+  contract enforced loudly (see `docs/value-checkpoints.md`). Host effects
+  were already journal-served; un-wrapped pure JS between effects remains
+  the only re-executed cost.
 - Concurrency is bounded by a per-run tokio semaphore in the server; no
   distributed scheduling.
 
@@ -391,12 +396,13 @@ The original items, for the record:
    migration docs carry a "historical — superseded" banner; both SDK READMEs no
    longer claim resume is "gated on the QuickJS serializer"; and the stale
    QuickJS-path comments in `src/runtime/engine.rs` are corrected.
-7. Longer-term, as adoption demands: per-VM memory accounting, value
-   checkpointing for long journals (P6), a broader `node:` allowlist
-   (~~`path`, `events`, `url` are cheap wins~~ — done 2026-06-12, along
-   with `assert` and a virtualized `os`; `stream`/`zlib` remain), more
-   native providers or first-class embeddings, and a queryable storage
-   schema.
+7. Longer-term, as adoption demands: per-VM memory accounting, ~~value
+   checkpointing for long journals (P6)~~ (done 2026-06-12:
+   `chidori.step(name, fn)`, `docs/value-checkpoints.md`), a broader
+   `node:` allowlist (~~`path`, `events`, `url` are cheap wins~~ — done
+   2026-06-12, along with `assert` and a virtualized `os`; `stream`/`zlib`
+   remain), more native providers or first-class embeddings, and a
+   queryable storage schema.
 
 ---
 
