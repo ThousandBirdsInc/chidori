@@ -162,11 +162,25 @@ impl Vm {
     /// indexed own properties, `length`, `@@iterator` (%Array.prototype.values%),
     /// `[object Arguments]` tag, and `callee` — the function itself for a
     /// mapped (sloppy, simple-parameter-list) frame, the %ThrowTypeError%
-    /// accessor otherwise. Index/parameter aliasing is not modeled.
+    /// accessor otherwise. A mapped frame's indices ALIAS the parameter
+    /// cells (reads/writes flow both ways) via the `Internal::Arguments` map.
     fn make_arguments_object(&mut self, frame: &Frame) -> Value {
+        let map: Vec<Option<Rc<RefCell<Value>>>> = {
+            let p = &frame.func.proto;
+            if p.mapped_param_cells.is_empty() {
+                Vec::new()
+            } else {
+                (0..frame.args.len().min(p.mapped_param_cells.len()))
+                    .map(|i| {
+                        p.mapped_param_cells[i]
+                            .map(|c| frame.cells[c as usize].clone())
+                    })
+                    .collect()
+            }
+        };
         let o = self.alloc(ObjectData::new(
             Some(self.realm.object_proto.clone()),
-            Internal::Arguments,
+            Internal::Arguments(map),
         ));
         {
             let mut b = o.borrow_mut();

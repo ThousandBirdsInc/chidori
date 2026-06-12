@@ -400,7 +400,7 @@ impl ObjectData {
             Internal::Promise(_) => "Promise",
             Internal::Generator(_) => "Generator",
             Internal::Date(_) => "Date",
-            Internal::Arguments => "Arguments",
+            Internal::Arguments(_) => "Arguments",
             Internal::Iterator(_) => "Iterator",
             Internal::ArrayBuffer(_) => "ArrayBuffer",
             Internal::TypedArray(_) => "TypedArray",
@@ -434,7 +434,10 @@ pub enum Internal {
     Promise(crate::vm::PromiseData),
     Generator(crate::vm::GeneratorData),
     Date(f64),
-    Arguments,
+    /// The `arguments` exotic object. For a MAPPED one (sloppy, simple
+    /// parameter list) the vec aliases each index to its parameter's live
+    /// cell (`None` = unmapped index); empty for unmapped arguments.
+    Arguments(Vec<Option<Rc<RefCell<Value>>>>),
     /// A built-in iterator over an array/string/Map/Set.
     Iterator(IterState),
     /// Raw byte buffer backing typed arrays / data views. `None` = detached.

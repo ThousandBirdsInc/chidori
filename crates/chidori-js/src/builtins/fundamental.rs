@@ -173,6 +173,44 @@ pub(crate) fn define_own_property(
     d: &PropDesc,
     throw_on_fail: bool,
 ) -> Result<bool, Value> {
+    let args_index = if matches!(obj.borrow().internal, Internal::Arguments(_)) {
+        key.array_index()
+    } else {
+        None
+    };
+    let ok = define_own_property_inner(vm, obj, key, d, throw_on_fail)?;
+    // Arguments exotic [[DefineOwnProperty]] (10.4.4.2) post-steps on a MAPPED
+    // index: a value redefinition writes through to the parameter cell; an
+    // accessor redefinition or `writable: false` severs the alias.
+    if ok {
+        if let Some(idx) = args_index {
+            let mut b = obj.borrow_mut();
+            if let Internal::Arguments(map) = &mut b.internal {
+                if let Some(slot) = map.get_mut(idx as usize) {
+                    if d.is_accessor() {
+                        *slot = None;
+                    } else {
+                        if let (Some(v), Some(cell)) = (&d.value, slot.as_ref()) {
+                            *cell.borrow_mut() = v.clone();
+                        }
+                        if d.writable == Some(false) {
+                            *slot = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(ok)
+}
+
+fn define_own_property_inner(
+    vm: &mut Vm,
+    obj: &JsObject,
+    key: &PropertyKey,
+    d: &PropDesc,
+    throw_on_fail: bool,
+) -> Result<bool, Value> {
     // Integer-indexed exotic [[DefineOwnProperty]] (spec 10.4.5.3): a canonical
     // numeric index on a TypedArray is validated and written through the element
     // setter; it never becomes an ordinary `props` entry.
@@ -1348,7 +1386,7 @@ pub(crate) fn object_to_string(vm: &mut Vm, this: &Value) -> Result<Value, Value
             Internal::Number(_) => "Number",
             Internal::StringObj(_) => "String",
             Internal::Date(_) => "Date",
-            Internal::Arguments => "Arguments",
+            Internal::Arguments(_) => "Arguments",
             _ => "Object",
         }
     };
@@ -1508,7 +1546,18 @@ pub(crate) fn own_property_descriptor(o: &JsObject, key: &PropertyKey) -> Option
     }
     let b = o.borrow();
     if let Some(p) = b.props.get(key) {
-        return Some(p.clone());
+        let mut p = p.clone();
+        // Mapped arguments: the descriptor's value reads the parameter cell.
+        if let Internal::Arguments(map) = &b.internal {
+            if let Some(idx) = key.array_index() {
+                if let Some(Some(cell)) = map.get(idx as usize) {
+                    if let PropertyKind::Data { value, .. } = &mut p.kind {
+                        *value = cell.borrow().clone();
+                    }
+                }
+            }
+        }
+        return Some(p);
     }
     match &b.internal {
         Internal::Array(arr) => {

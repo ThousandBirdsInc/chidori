@@ -423,6 +423,7 @@ struct FnCtx {
     num_params: u32,
     has_rest: bool,
     param_names: Vec<String>,
+    mapped_param_cells: Vec<Option<u32>>,
     uses_arguments: bool,
     /// Cell index of the implicit `this` binding (for non-arrow functions).
     this_cell: Option<u32>,
@@ -505,6 +506,7 @@ impl FnCtx {
             num_params: 0,
             has_rest: false,
             param_names: Vec::new(),
+            mapped_param_cells: Vec::new(),
             uses_arguments: false,
             this_cell: None,
             new_target_cell: None,
@@ -1498,6 +1500,7 @@ impl Compiler {
             source_start: 0,
             uses_arguments: fc.uses_arguments,
             param_names: fc.param_names,
+            mapped_param_cells: fc.mapped_param_cells,
             is_strict: fc.strict,
             stable_cells: fc.stable_cells.clone(),
             this_cell: fc.this_cell,
@@ -5157,6 +5160,44 @@ impl Compiler {
             self.bind_pattern(&rest.rest.argument, false)?;
         }
         self.cur().in_params = false;
+
+        // A MAPPED `arguments` object (sloppy, simple parameter list) aliases
+        // the parameter cells: record each positional parameter's cell index.
+        // A name duplicated later in the list maps only its LAST index.
+        if !self.cur_ref().strict
+            && params.rest.is_none()
+            && !has_param_default
+            && params
+                .items
+                .iter()
+                .all(|p| matches!(&p.pattern, BindingPattern::BindingIdentifier(_)))
+        {
+            let names: Vec<&str> = params
+                .items
+                .iter()
+                .filter_map(|p| match &p.pattern {
+                    BindingPattern::BindingIdentifier(id) => Some(id.name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let mut cells: Vec<Option<u32>> = Vec::with_capacity(names.len());
+            for (i, n) in names.iter().enumerate() {
+                let shadowed = names[i + 1..].contains(n);
+                cells.push(if shadowed {
+                    None
+                } else {
+                    self.current_scope_cell(n)
+                });
+            }
+            if cells.iter().any(|c| c.is_some()) {
+                // The aliased cells must be STABLE: the arguments object may
+                // capture them before InitCell runs for the parameter, so the
+                // init must mutate the Rc in place, never replace it.
+                let stable: Vec<u32> = cells.iter().flatten().copied().collect();
+                self.cur().stable_cells.extend(stable);
+                self.cur().mapped_param_cells = cells;
+            }
+        }
 
         // A base-class constructor installs instance fields/brands at entry; a
         // derived one defers them to `super()` (see %fieldinit above).

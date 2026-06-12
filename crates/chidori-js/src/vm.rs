@@ -936,6 +936,17 @@ impl Vm {
                 // non-dense descriptor defined via defineProperty) is
                 // authoritative and shadows the dense-Vec slot, so only consult
                 // the Vec when there is no own `props` entry for the key.
+                // Mapped arguments: an aliased index reads the parameter
+                // CELL (live aliasing), not the stale props value.
+                if let Internal::Arguments(map) = &b.internal {
+                    if let Some(idx) = key.array_index() {
+                        if b.props.contains_key(key) {
+                            if let Some(Some(cell)) = map.get(idx as usize) {
+                                return Ok(cell.borrow().clone());
+                            }
+                        }
+                    }
+                }
                 if let Internal::Array(arr) = &b.internal {
                     if let Some("length") = key.as_str() {
                         if !b.props.contains_key(key) {
@@ -1201,6 +1212,17 @@ impl Vm {
         strict: bool,
     ) -> Result<(), Value> {
         let mut b = obj.borrow_mut();
+        // Mapped arguments: a [[Set]] on an aliased index writes the parameter
+        // CELL too (the ordinary props entry below stays in sync).
+        if let Internal::Arguments(map) = &b.internal {
+            if let Some(idx) = key.array_index() {
+                if b.props.contains_key(key) {
+                    if let Some(Some(cell)) = map.get(idx as usize) {
+                        *cell.borrow_mut() = value.clone();
+                    }
+                }
+            }
+        }
         // Array exotic write. A reified `props` entry for an index/length shadows
         // the dense store, so route the write through the ordinary props path
         // below (which honours its writable flag) when such an entry exists.
@@ -1319,6 +1341,14 @@ impl Vm {
                         let idx = idx as usize;
                         if idx < arr.len() {
                             arr[idx] = Value::Hole;
+                        }
+                    }
+                }
+                // Deleting a mapped arguments index severs the parameter alias.
+                if let Internal::Arguments(map) = &mut b.internal {
+                    if let Some(idx) = key.array_index() {
+                        if let Some(slot) = map.get_mut(idx as usize) {
+                            *slot = None;
                         }
                     }
                 }

@@ -117,6 +117,10 @@ pub struct FuncProto {
     pub uses_arguments: bool,
     /// Names of the positional params, for `arguments`/debug.
     pub param_names: Vec<String>,
+    /// For a MAPPED `arguments` object (sloppy, simple parameter list): the
+    /// cell index of each positional parameter (`None` for an index shadowed
+    /// by a later duplicate name). Empty when the function is unmapped.
+    pub mapped_param_cells: Vec<Option<u32>>,
     /// Strict-mode code: assignment to a non-writable / setter-less / non-existent
     /// property of a non-extensible object (and to a primitive) throws a TypeError
     /// rather than silently failing (PutValue with Throw=true).
@@ -154,6 +158,7 @@ impl FuncProto {
             source_start: 0,
             uses_arguments: false,
             param_names: Vec::new(),
+            mapped_param_cells: Vec::new(),
             is_strict: false,
             stable_cells: Vec::new(),
             eval_scopes: Vec::new(),
