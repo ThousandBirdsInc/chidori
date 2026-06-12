@@ -72,6 +72,8 @@ async fn create_thread(
         pending_seq: None,
         pending_prompt: None,
         pending_signal_name: None,
+        pending_signal_names: Vec::new(),
+        pending_signal_deadline: None,
         pending_approval: None,
         approvals: Vec::new(),
         policy_profile: None,

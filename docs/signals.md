@@ -1,12 +1,21 @@
 # Runtime Signals — Multiplayer Agents — Design Doc & Implementation Plan
 
-> **Status:** Implemented. Phase 1 plus `pollSignal` have shipped: the named
+> **Status:** Implemented — Phases 1–3 have all shipped. Phase 1: the named
 > **blocking** `chidori.signal(name)`, the durable **per-run mailbox**, the
 > `POST /sessions/{id}/signal` **delivery endpoint** (resolve+resume, enqueue, or
 > 409), and **deterministic replay** of the whole multiplayer session.
-> `signalAny`, `timeoutMs`, and live zero-latency in-memory delivery to a running
-> task (the Phase 2/3 remainder) are **future work**. The same-name tie-break is
-> pinned to **pending-pause-wins-with-newest**.
+> Phase 2: **`pollSignal`**, the fan-in **`chidori.signalAny([names])`**,
+> **`timeoutMs`** (pinned: resolve to a `{timedOut: true}` **sentinel**, enforced
+> by a server timer against a persisted deadline, re-armed on restart), and
+> signal `name`/`from` stamped as **OTEL span attributes**. Phase 3: **live
+> in-memory delivery** — the delivery endpoint enqueues straight into a
+> streaming run's in-memory mailbox (write-through to `signals/inbox.json`) and
+> wakes the supervising worker, which resolves a matching pause **in-process**
+> (no HTTP `/resume` round-trip) and keeps the SSE stream open across the
+> resume. Pinned decisions: the same-name tie-break is
+> **pending-pause-wins-with-newest** (also applied by the live worker, which
+> takes the just-delivered entry back out of the mailbox); the `signalAny`
+> result shape is the **bare `Signal`** whose `name` says which fired.
 > **Engine:** chidori-js (the pure-Rust JS engine) is now the only runtime — there
 > is no `CHIDORI_JS_ENGINE=rust` selector, no `rust-engine` cargo feature gate to
 > opt in, and no separate QuickJS path to keep untouched.
@@ -211,19 +220,25 @@ import { chidori } from "chidori";
 type Signal<T = Json> = { name: string; payload: T; from: SignalSender };
 type SignalSender = { kind: "human" | "agent"; id: string; runId?: string };
 
-// Blocking: pause at a named listen point until a matching signal is delivered
-// (or already queued in the mailbox).
-chidori.signal<T = Json>(name: string, opts?: {
-  timeoutMs?: number;          // Phase 2: resolve to a Timeout sentinel instead of waiting forever
-}): Promise<Signal<T>>;
+type SignalTimeout = { name: string | null; payload: null; from: null; timedOut: true };
 
-// Non-blocking (Phase 2): consume a queued signal if present, else null. Records
+// Blocking: pause at a named listen point until a matching signal is delivered
+// (or already queued in the mailbox). With timeoutMs, resolves to the
+// SignalTimeout sentinel after the deadline (discriminate with "timedOut" in r).
+chidori.signal<T = Json>(name: string, opts?: {
+  timeoutMs?: number;
+}): Promise<Signal<T> | SignalTimeout>;
+
+// Non-blocking: consume a queued signal if present, else null. Records
 // the result (value OR null) so replay is deterministic at this seq.
 chidori.pollSignal<T = Json>(name: string): Promise<Signal<T> | null>;
 
-// Fan-in (Phase 2): pause until ANY of the named signals is delivered; the result
-// says which fired.
-chidori.signalAny<T = Json>(names: string[]): Promise<Signal<T>>;
+// Fan-in: pause until ANY of the named signals is delivered; the result is the
+// bare consumed signal — its `name` says which fired. Pre-arrived candidates
+// are consumed in arrival order (lowest delivery_seq across the name set).
+chidori.signalAny<T = Json>(names: string[], opts?: {
+  timeoutMs?: number;          // sentinel `name` is null (no name fired)
+}): Promise<Signal<T> | SignalTimeout>;
 ```
 
 ### 6.2 SDK types
@@ -567,21 +582,45 @@ Tests (`--features rust-engine`):
   chidori.signal("review")`, a second terminal (or peer agent) POSTs the review; streams
   to tael (`CHIDORI_JS_ENGINE=rust`).
 
-**Phase 2 — Non-blocking poll + fan-in/select + sender identity in trace** *(partially shipped: `pollSignal` done; `signalAny` / `timeoutMs` / `from`-as-span-attribute are future)*
-- `chidori.pollSignal` (records value *or* null at the seq → deterministic),
-  `chidori.signalAny([names])` (pauses on a name *set*; result says which fired; match key
-  `{names:[...]}`). `from` stamped as an OTEL span attribute in `RunSpan::stream_record`.
-  Optional `timeoutMs` → a `Timer`-backed Timeout sentinel.
-- Tests: poll returns null then a value deterministically; select fires on first matching
-  name; `from` appears in the streamed span.
+**Phase 2 — Non-blocking poll + fan-in/select + timeout + sender identity in trace** *(shipped)*
+- `chidori.pollSignal` (records value *or* null at the seq → deterministic).
+- `chidori.signalAny([names])`: pauses on a name *set* (match key `{names:[...]}`,
+  function `signal_any`); the result is the bare consumed signal whose `name` says which
+  fired; the mailbox drain takes the lowest-`delivery_seq` entry across the whole set.
+  A delivery matching ANY name in `pending_signal_names` resolves the pause.
+- `timeoutMs` (on both `signal` and `signalAny`): the pause records the timeout, the
+  server persists an absolute `pending_signal_deadline` on the session and arms an
+  in-process timer (re-armed for every paused session at server startup). On expiry the
+  pause resolves to the `{name, payload: null, from: null, timedOut: true}` sentinel
+  (`name` is null for a multi-name `signalAny`) — recorded like any signal result, so
+  the timed-out run replays deterministically. A delivery that lands first wins; the
+  late timer validates against the stored session and no-ops.
+- `name`/`from` stamped as OTEL span attributes (`signal.name`, `signal.listen_names`,
+  `signal.from.kind/id/run_id`, `signal.timed_out`) on `signal`/`poll_signal`/
+  `signal_any` spans.
+- Tests: poll returns null then a value deterministically; select fires on the earliest
+  matching delivery; timeout resolves the sentinel and replays; delivery-before-timeout
+  wins.
 
-**Phase 3 — Live in-memory delivery to running tasks** *(future)*
-- `ActiveSession.signal_tx` (analogous to `cancel_tx`); streaming worker `select!`s on
-  `signal_rx`, write-through to `inbox.json`, in-process fast resume trigger (skip the
-  HTTP `/resume` round-trip). Determinism unchanged (it is still a deterministic resume
-  re-run; the channel only removes the disk/HTTP latency).
-- Tests: a streaming run receives a mid-stream signal with low latency and produces a
-  call_log identical to the persist-resume path.
+**Phase 3 — Live in-memory delivery to running tasks** *(shipped)*
+- `ActiveSession.signals` carries the live run's context slot plus a `signal_tx` wake
+  channel (analogous to `cancel_tx`). The delivery endpoint enqueues straight into the
+  live run's in-memory mailbox — write-through persisted to `inbox.json` in the same
+  critical section — and wakes the streaming worker (`202 {"status":"delivered_live"}`).
+- The streaming worker (`stream_session`) is a supervision loop: a `signal()` pause
+  persists durably, emits a `paused` SSE event, and keeps the stream open; the worker
+  `select!`s on `signal_rx` / cancel / the `timeoutMs` deadline and resolves a matching
+  pause **in-process** (resolve persisted op + synthetic record + replay re-run, the
+  same shape as `/resume`) — skipping the HTTP round-trip. The pinned
+  pending-pause-wins-with-newest tie-break is preserved: the worker takes the
+  just-delivered entry back out of the mailbox by its `delivery_seq`, leaving older
+  queued entries for later listen points. Determinism unchanged (it is still a
+  deterministic resume re-run; the live path only removes the disk/HTTP latency).
+- Input/approval pauses end live supervision and hand off to the durable HTTP
+  endpoints; terminal states close the stream with the usual `done` event.
+- Tests: a streaming run's delivered signal records a call identical to the
+  persist-resume path; a non-matching live delivery survives the in-process resume and
+  is drained by a later `pollSignal`; a streaming `timeoutMs` pause resolves in-process.
 
 ---
 
@@ -598,11 +637,21 @@ Tests (`--features rust-engine`):
   unless the agent calls them).
 
 ## 16. Open questions
-- **Same-name tie-break** when a pause and a queued entry both match (§11) — confirm
-  "pending-pause-wins-with-newest" vs "drain-oldest-queued".
-- **`timeoutMs` semantics** — resolve to a `Timeout` sentinel vs reject the promise.
-- **`signalAny` result shape** — `{firedName, signal}` vs the bare `Signal` with its
-  `name`.
+
+**Pinned (decided with Phase 2/3):**
+- **Same-name tie-break**: **pending-pause-wins-with-newest** — the pending pause
+  resolves with the just-delivered signal; older queued same-name entries stay for later
+  listen points. The live worker preserves this by taking the delivered entry back out
+  of the mailbox by `delivery_seq`.
+- **`timeoutMs` semantics**: **resolve to a sentinel** (`{name, payload: null,
+  from: null, timedOut: true}`), never reject — a timeout is an expected outcome the
+  agent discriminates on, not an error. Enforcement is server-side (in-process timer
+  against a persisted `pending_signal_deadline`, re-armed on restart); a CLI run that
+  pauses on a timed listen point just reports the pause.
+- **`signalAny` result shape**: the **bare `Signal`** — its `name` already says which
+  fired; no wrapper object.
+
+**Still open:**
 - **Per-branch addressing** — is a single per-run mailbox enough for the branching
   composition, or is `branch_index`-addressed delivery wanted sooner?
 - **Auth/identity for `from`** — is sender identity asserted by the caller (trusted) or

@@ -132,6 +132,30 @@ const answer = await chidori.input("Approve this request?", {
 In server mode, `input()` pauses the session. Resume it with
 `POST /sessions/{id}/resume` or `AgentClient.resume(id, response)`.
 
+### signal / pollSignal / signalAny
+
+```ts
+// Pause at a named listen point until an outside party (human or agent)
+// delivers { name, payload, from } via POST /sessions/{id}/signal. A durable
+// per-run mailbox absorbs signals that arrive before the agent listens.
+const review = await chidori.signal("review");
+
+// With timeoutMs, resolves to { timedOut: true } after the deadline.
+const r = await chidori.signal("review", { timeoutMs: 60000 });
+if ("timedOut" in r && r.timedOut) { /* nobody answered */ }
+
+// Non-blocking: consume a queued signal or get null (recorded, replayable).
+const steer = await chidori.pollSignal("steer");
+
+// Fan-in: pause until ANY listed name fires; result.name says which.
+const fired = await chidori.signalAny(["review", "steer"]);
+```
+
+Every consumed signal is recorded in the call log, so multiplayer sessions
+replay deterministically. Signals delivered to a run streaming over
+`POST /sessions/stream` are pushed into the live agent's mailbox in-memory and
+resume a matching pause in-process. See `docs/signals.md`.
+
 ### tool
 
 ```ts
@@ -343,6 +367,9 @@ Session endpoints:
   `snapshot_manifest`.
 - `GET /sessions/{id}/snapshot`: get only snapshot manifest metadata.
 - `POST /sessions/{id}/resume`: resume a paused `input()` session.
+- `POST /sessions/{id}/signal`: deliver `{ name, payload?, from? }` — resolves
+  a matching signal pause (200), delivers live to a streaming run
+  (202 `delivered_live`), or enqueues into the durable mailbox (202 `queued`).
 - `POST /sessions/{id}/replay`: replay from a call-log checkpoint.
 - `POST /sessions/stream`: run with SSE events.
 

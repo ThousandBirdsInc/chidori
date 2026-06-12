@@ -227,16 +227,41 @@ pub struct PendingInput {
     pub prompt: String,
 }
 
-/// Set by `execute_signal` when a `chidori.signal(name)` listen point has no
+/// Set by `execute_signal` / `execute_signal_any` when a listen point has no
 /// matching mailbox entry and must pause. The engine reads this after eval
 /// unwinds to distinguish a signal pause (surfaced as `RunResult.paused_signal`)
 /// from a real error, mirroring [`PendingInput`]. The pending host operation's
-/// match key is `{ "name": name }`; `id` is its host-promise id.
+/// match key is `{ "name": name }` (or `{ "names": [...] }` for `signalAny`);
+/// `id` is its host-promise id.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingSignal {
     pub seq: u64,
+    /// The awaited name (`signal`) or the first of the awaited names
+    /// (`signalAny`). Kept as the primary name for views and messages.
     pub name: String,
+    /// The full awaited name set. `[name]` for `chidori.signal(name)`; the
+    /// listen set for `chidori.signalAny(names)`. A delivery matching ANY of
+    /// these resolves the pause.
+    #[serde(default)]
+    pub names: Vec<String>,
+    /// `timeoutMs` from the listen call's options, when given. The supervising
+    /// server arms a timer and, on expiry, resolves the pause with the
+    /// `{ timedOut: true }` sentinel instead of a delivered signal.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
     pub id: HostOperationId,
+}
+
+impl PendingSignal {
+    /// The awaited name set, falling back to `[name]` for values deserialized
+    /// from before `names` existed.
+    pub fn listen_names(&self) -> Vec<String> {
+        if self.names.is_empty() {
+            vec![self.name.clone()]
+        } else {
+            self.names.clone()
+        }
+    }
 }
 
 /// Set by the policy enforcer when a call needs user approval but the
@@ -1008,17 +1033,77 @@ impl RuntimeContext {
     /// delivery — on restart the recorded result wins and the inbox is never
     /// re-drained for that seq. Returns `None` when no matching entry exists.
     pub fn take_queued_signal(&self, name: &str) -> Option<QueuedSignal> {
+        self.take_queued_signal_any(std::slice::from_ref(&name.to_string()))
+    }
+
+    /// As [`take_queued_signal`](Self::take_queued_signal), but matching ANY of
+    /// `names` (the `chidori.signalAny` fan-in drain). The lowest-`delivery_seq`
+    /// entry across the whole set wins, so two queued candidates with different
+    /// names are consumed in arrival order — and that choice is frozen into the
+    /// recorded result.
+    pub fn take_queued_signal_any(&self, names: &[String]) -> Option<QueuedSignal> {
         let mut inner = self.inner.lock().unwrap();
         let idx = inner
             .signal_inbox
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.name == name)
+            .filter(|(_, s)| names.iter().any(|n| n == &s.name))
             .min_by_key(|(_, s)| s.delivery_seq)
             .map(|(i, _)| i)?;
         let signal = inner.signal_inbox.remove(idx);
         persist_signal_inbox(&inner);
         Some(signal)
+    }
+
+    /// Remove a specific queued signal by its `delivery_seq`, re-persisting the
+    /// shrunken inbox in the same critical section. Used by the live streaming
+    /// supervisor (Phase 3, `docs/signals.md`) to apply the pinned
+    /// "pending-pause-wins-with-newest" tie-break: a just-delivered signal is
+    /// write-through enqueued for durability, then *that exact entry* is taken
+    /// back out to resolve the pending pause, leaving older queued same-name
+    /// entries for later listen points.
+    pub fn take_queued_signal_by_delivery_seq(&self, delivery_seq: u64) -> Option<QueuedSignal> {
+        let mut inner = self.inner.lock().unwrap();
+        let idx = inner
+            .signal_inbox
+            .iter()
+            .position(|s| s.delivery_seq == delivery_seq)?;
+        let signal = inner.signal_inbox.remove(idx);
+        persist_signal_inbox(&inner);
+        Some(signal)
+    }
+
+    /// Append a signal delivered to a LIVE run into its in-memory mailbox,
+    /// write-through persisting the grown inbox (`docs/signals.md` Phase 3).
+    /// The in-memory and on-disk inboxes mutate in one critical section, so the
+    /// running agent sees the entry at its next listen point and a crash after
+    /// the enqueue cannot lose an acknowledged delivery. Returns the stored
+    /// entry with its assigned `delivery_seq` (monotonic above every entry
+    /// currently queued).
+    pub fn enqueue_live_signal(
+        &self,
+        name: &str,
+        payload: serde_json::Value,
+        from: serde_json::Value,
+    ) -> QueuedSignal {
+        let mut inner = self.inner.lock().unwrap();
+        let delivery_seq = inner
+            .signal_inbox
+            .iter()
+            .map(|s| s.delivery_seq)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let queued = QueuedSignal {
+            name: name.to_string(),
+            payload,
+            from,
+            delivery_seq,
+            enqueued_at: chrono::Utc::now(),
+        };
+        inner.signal_inbox.push(queued.clone());
+        persist_signal_inbox(&inner);
+        queued
     }
 
     #[allow(dead_code)]

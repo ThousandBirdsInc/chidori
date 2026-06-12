@@ -181,6 +181,24 @@ impl Engine {
             });
         let d = dispatch.clone();
         self.vm
+            .define_method(&chidori, "signalAny", 2, move |vm, _t, args| {
+                let names = args
+                    .first()
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                let opts = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "signal_any",
+                    serde_json::json!({ "names": names, "opts": opts }),
+                )
+            });
+        let d = dispatch.clone();
+        self.vm
             .define_method(&chidori, "checkpoint", 2, move |vm, _t, args| {
                 let label = args
                     .first()

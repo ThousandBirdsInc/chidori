@@ -557,9 +557,12 @@ fn cmd_run(
     // tell the user the run is awaiting a signal and how to deliver one rather
     // than printing a bare `null` output. See `docs/signals.md`.
     if let Some(signal) = &result.paused_signal {
+        let names = signal.listen_names();
         eprintln!(
-            "Run {} paused, awaiting signal '{}'.",
-            result.run_id, signal.name
+            "Run {} paused, awaiting signal{} '{}'.",
+            result.run_id,
+            if names.len() > 1 { " (any of)" } else { "" },
+            names.join("', '")
         );
         eprintln!(
             "Deliver it with: POST /sessions/{{id}}/signal \

@@ -557,6 +557,13 @@ impl HostBindingBackend {
         host_core::execute_poll_signal(runtime_ctx, a).map_err(|err| err.to_string())
     }
 
+    fn signal_any(&self, a: &serde_json::Value) -> std::result::Result<serde_json::Value, String> {
+        let HostBindingBackend::Runtime { runtime_ctx, .. } = self else {
+            return Err("chidori.signalAny requires the runtime host backend".to_string());
+        };
+        host_core::execute_signal_any(runtime_ctx, a).map_err(|err| err.to_string())
+    }
+
     fn enforce_policy(
         &self,
         target: &str,
@@ -842,6 +849,7 @@ impl HostBindingBackend {
             }
             "signal" => self.signal(a),
             "poll_signal" => self.poll_signal(a),
+            "signal_any" => self.signal_any(a),
             "checkpoint" => {
                 let args = serde_json::json!({
                     "label": a.get("label").cloned().unwrap_or(serde_json::Value::Null),
