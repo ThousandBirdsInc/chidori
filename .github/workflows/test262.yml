@@ -29,12 +29,30 @@ concurrency:
 
 jobs:
   conformance:
-    name: Test262 baseline gate
+    # Shard the gate across runners. Each shard runs ~1/N of the second-level
+    # dirs (assigned round-robin by scripts/test262.sh) and gates that slice
+    # against the full committed baseline; within a shard the runner still fans
+    # out across the runner's cores. So the suite runs N-shards × cores-per-runner
+    # wide, and a regression anywhere fails its owning shard. fail-fast is off so
+    # one shard's failure doesn't cancel the others — we want every regression.
+    name: Test262 baseline gate (shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      TEST262_SHARD_TOTAL: 4
+      TEST262_SHARD_INDEX: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Run Test262 against the committed baseline
+      # Cache the build so the parallel shards don't each pay a cold compile.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test262-runner
+
+      - name: Run Test262 against the committed baseline (shard ${{ matrix.shard }}/4)
         run: scripts/test262.sh --gate
