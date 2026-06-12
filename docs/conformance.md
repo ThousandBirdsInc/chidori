@@ -34,7 +34,7 @@ The runner prints, e.g.:
 
 ```
 Test262 (chidori pure-Rust engine, bare context)
-  pass 38375  fail 1399  skip 7517  =>  96.48% of executed
+  pass 38986  fail 788  skip 7517  =>  98.02% of executed
 ```
 
 ## Current result
@@ -44,7 +44,7 @@ pinned suite commit:
 
 | | pass | fail | skip | % of executed |
 |---|---|---|---|---|
-| chidori pure-Rust engine, bare context | 38,375 | 1,399 | 7,517 | **96.48%** |
+| chidori pure-Rust engine, bare context | 38,986 | 788 | 7,517 | **98.02%** |
 
 The headline percentage is `pass / (pass + fail)` over *executed* tests; the
 skip count is reported alongside so the denominator is never hidden.
@@ -159,19 +159,20 @@ a single readable line in review).
 
 ## Remaining gaps
 
-The residual failures, by area (top clusters of the 1,399 total):
+The residual failures, by area (top clusters of the 788 total):
 
 | count | area | nature |
 |--:|---|---|
-| 303 | `language/expressions` | class element corners, dynamic-`import()` semantics, `yield*` delegation ordering |
-| 222 | `language/statements` | remaining class element corners, `for-of` iterator-close |
-| 98 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings); `v`-flag; `prototype` long tail |
-| 96 | `built-ins/TypedArray` | resizable-`ArrayBuffer` / out-of-bounds tracking |
+| 199 | `language/expressions` | remaining class element corners, dynamic-`import()` semantics, tagged-template caching |
+| 111 | `language/statements` | remaining class element corners, labelled/eval interplay |
+| 94 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings); `v`-flag; `prototype` long tail |
 | 59 | `built-ins/String` | `normalize`, Unicode/surrogate edge cases |
-| 52 | `built-ins/Object` | descriptor/integrity-level corner cases |
-| 52 | `built-ins/Promise` | spec-detailed async ordering combinations |
-| 51 | `language/module-code` | TLA ordering, cyclic-graph corner cases |
-| 40 | `built-ins/Array` | resizable-`ArrayBuffer` interplay; sparse indices beyond the dense cap |
+| 43 | `built-ins/Object` | array `length` descriptor attributes; sparse indices beyond the dense cap |
+| 27 | `language/module-code` | namespace own-keys details, TLA ordering corner cases |
+| 19 | `built-ins/Function` | dynamic `Function` parse corners, bound-function details |
+| 18 | `language/eval-code` | eval-created binding attribute corners |
+| 17 | `built-ins/Proxy` | proxy-of-proxy forwarding details |
+| 15 | `built-ins/Array` | sparse indices beyond the dense cap; UTF-16 string spread |
 
 (Recent sweeps: the dynamic-`import()`/`with`-scope work cleared 268
 failures; the derived-class construction model — `super()` as a real

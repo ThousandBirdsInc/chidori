@@ -29,8 +29,11 @@ fn install_promise(vm: &mut Vm) {
             //    run the executor with (resolve, reject). A throw rejects.
             let promise = vm.new_promise();
             let (resolve, reject) = make_resolving_functions(vm, &promise);
+            let reject_fn = reject.clone();
             if let Err(e) = vm.call(executor, Value::Undefined, &[resolve, reject]) {
-                vm.reject_promise(&promise, e);
+                // The throw goes through the REJECT FUNCTION: a no-op when the
+                // executor already resolved/rejected (the shared flag won).
+                let _ = vm.call(reject_fn, Value::Undefined, &[e]);
             }
             Ok(Value::Object(promise))
         },
