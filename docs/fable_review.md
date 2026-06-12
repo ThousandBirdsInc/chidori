@@ -3,8 +3,11 @@
 *An in-depth review of the repository: what works, what is limited, and what
 is incomplete. Originally taken 2026-06-10 at commit `f93c2cd` ("runtime");
 updated 2026-06-11 after the QuickJS removal (#39), the CI fixes (#40), the
-Test262 CI gate (#41), and the conformance work in #42 and the
-derived-constructor rework on this branch.*
+Test262 CI gate (#41), the conformance work in #42, and the
+derived-constructor / arguments / restricted-property / explicit-resource
+rework in #43; the parallel Test262 runner (#44) and the workspace policy
+gate (#45). Doc-drift pass on 2026-06-12 (this branch). All of #39–#45 are
+merged into the branch history.*
 
 ## Scope and method
 
@@ -56,7 +59,7 @@ Test262 runs in CI against a committed per-test baseline (PRs touching the
 engine, pushes to `main`, and a nightly schedule), so the number can no
 longer rot silently. Conformance is **96.22 %** of executed tests at the
 pinned suite commit (38,271 pass / 1,503 fail / 7,517 skip), after the
-engine work on this branch — the derived-constructor construction model,
+engine work in #43 — the derived-constructor construction model,
 a correctness batch (arguments object, function-name bindings, restricted
 properties, `__proto__` literals, `delete` semantics), and a full
 implementation of explicit resource management (`using`/`await using`) —
@@ -90,7 +93,7 @@ build; new passes print a baseline-refresh hint.
   the *durability contract* rejects it), `with`-scope reference/closure
   semantics, spec-order member writes, `export default` self-reference
   fixes.
-- **This branch**: the spec construction model for derived classes —
+- **#43** (first batch): the spec construction model for derived classes —
   `super()` now performs a real `Construct(parent, args, new.target)` so
   `class A extends Array` (or `Map`, `Error`, …) produces a genuine exotic
   instance; `this` is in TDZ until `super()` returns (ReferenceError before,
@@ -103,7 +106,7 @@ build; new passes print a baseline-refresh hint.
   `extends null` and `extends Symbol` behave per spec. This cleared 144
   baseline failures (1,911 → 1,767) with zero regressions across the full
   suite — the bulk of what had been a ~300-test `class` cluster.
-- **Also on this branch** (a second batch, −194 failures → 1,571): named
+- **#43** (a second batch, −194 failures → 1,571): named
   function expressions and classes bind their own names per spec (immutable,
   TDZ for class heritage); the `arguments` object is a real exotic
   Arguments object (length/callee/@@iterator/tag) instead of a plain array;
@@ -113,7 +116,7 @@ build; new passes print a baseline-refresh hint.
   identifiers follows the spec (strict SyntaxError, binding/global
   configurability); %Object.prototype% is an immutable-prototype exotic
   object; eval-created globals are deletable, script-level ones are not.
-- **Explicit resource management** (a third batch, −68 → 1,503): `using` /
+- **#43 — explicit resource management** (a third batch, −68 → 1,503): `using` /
   `await using` declarations now dispose per spec — resources recorded
   before the binding initializes, disposed in reverse on EVERY exit path
   (throw/return/break/continue included) via a finally-style landing pad,
@@ -128,9 +131,12 @@ build; new passes print a baseline-refresh hint.
 | 303 | `language/expressions` | class element corners, dynamic-`import()` semantics, `yield*` delegation ordering |
 | 222 | `language/statements` | remaining class element corners, `for-of` iterator-close |
 | 136 | `built-ins/Array` | species/proxy interplay, length-boundary semantics |
-| 98 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings), `v`-flag |
-| 96 | `built-ins/TypedArray` | resizable-`ArrayBuffer` out-of-bounds tracking |
+| 98 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings); `v`-flag; `prototype` long tail |
+| 96 | `built-ins/TypedArray` | resizable-`ArrayBuffer` / out-of-bounds tracking |
+| 59 | `built-ins/String` | `normalize`, Unicode/surrogate edge cases |
 | 52 | `built-ins/Promise` | spec-detailed async ordering combinations |
+| 51 | `language/module-code` | TLA ordering, cyclic-graph corner cases |
+| 23 | `language/arguments-object` | mapped-arguments index/parameter aliasing |
 
 **Intentionally unsupported** (consistent with the deterministic replay
 contract, skipped honestly in the runner): `Intl`, `Temporal`,
@@ -182,7 +188,11 @@ The `execJs` / `execPython` / `execWasm` / `exec_expr` sandboxes are
 **removed**, along with their WASM interpreter blobs and the hand-rolled
 WASI shim. This deleted both a feature (polyglot snippet execution) and an
 attack/maintenance surface; agents now execute TypeScript only. Anyone
-relying on `chidori.execPython(...)` has no replacement.
+relying on `chidori.execPython(...)` has no replacement. (The
+`execJs`/`execPython`/`execWasm` JS *stubs* still exist in
+`crates/chidori-js/src/lib.rs`, but they are inert — the host backend
+rejects the effect with `chidori.<name> is not supported on the rust engine`,
+so there is no path back to snippet execution.)
 
 ### LLM providers
 
