@@ -612,25 +612,81 @@ const DEFAULT_USER_AGENT: &str = concat!(
 );
 
 pub fn execute_http(tokio_rt: &tokio::runtime::Runtime, args: &Value) -> Result<Value> {
+    execute_http_with_secrets(
+        tokio_rt,
+        args,
+        crate::runtime::secret_env::SecretStore::global(),
+    )
+}
+
+/// `execute_http` with an explicit secret store — split out so tests can
+/// inject a store without touching the process-wide one.
+fn execute_http_with_secrets(
+    tokio_rt: &tokio::runtime::Runtime,
+    args: &Value,
+    secrets: &crate::runtime::secret_env::SecretStore,
+) -> Result<Value> {
     let method = args
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or("GET")
         .to_string();
-    let url = args
+    let mut url = args
         .get("url")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("http requires string url"))?
         .to_string();
-    let headers = args.get("headers").and_then(|value| match value {
+    let mut headers = args.get("headers").and_then(|value| match value {
         Value::Object(map) => Some(map.clone()),
         _ => None,
     });
-    let body = args.get("body").filter(|value| !value.is_null()).cloned();
-    let params = args.get("params").and_then(|value| match value {
+    let mut body = args.get("body").filter(|value| !value.is_null()).cloned();
+    let mut params = args.get("params").and_then(|value| match value {
         Value::Object(map) => Some(map.clone()),
         _ => None,
     });
+
+    // Secret broker: guest code only ever holds opaque placeholder tokens
+    // (its `process.env` is built that way by the harness); the real values
+    // are substituted here — after the durable call log captured the args in
+    // token form — and only for hosts the secret's allowlist permits. The
+    // substitution happens on the local copies above, so recorded args,
+    // traces, and anything the guest can observe keep the token form.
+    if !secrets.is_empty() {
+        let host = url::Url::parse(&url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_owned));
+        match host {
+            Some(host) => {
+                let deny = |err: String| anyhow::anyhow!("http secret substitution: {err}");
+                url = secrets.substitute_str(&url, &host).map_err(deny)?;
+                if let Some(map) = headers.as_mut() {
+                    for (_, value) in map.iter_mut() {
+                        secrets.substitute_value(value, &host).map_err(deny)?;
+                    }
+                }
+                if let Some(map) = params.as_mut() {
+                    for (_, value) in map.iter_mut() {
+                        secrets.substitute_value(value, &host).map_err(deny)?;
+                    }
+                }
+                if let Some(value) = body.as_mut() {
+                    secrets.substitute_value(value, &host).map_err(deny)?;
+                }
+            }
+            None => {
+                // Unparseable URL: only an error if the request references a
+                // secret token; otherwise let reqwest produce its usual error.
+                let mentions_token =
+                    crate::runtime::secret_env::SecretStore::looks_like_token(&args.to_string());
+                if mentions_token {
+                    anyhow::bail!(
+                        "http secret substitution: cannot determine request host from url"
+                    );
+                }
+            }
+        }
+    }
 
     let caller_set_user_agent = headers
         .as_ref()
@@ -691,17 +747,21 @@ pub fn execute_http(tokio_rt: &tokio::runtime::Runtime, args: &Value) -> Result<
             }
         }
 
+        // Everything returned from here flows into the durable call log and
+        // OTEL export, so secret values must never appear: transport errors
+        // can embed the full (substituted) URL, and APIs may echo credentials
+        // back in bodies or headers. `redact` maps them to [REDACTED:<KEY>].
         let resp = match req.send().await {
             Ok(resp) => resp,
             Err(err) => {
                 if err.is_builder() {
-                    return Err(anyhow::anyhow!(err));
+                    return Err(anyhow::anyhow!(secrets.redact(&err.to_string())));
                 }
                 return Ok(json!({
                     "status": 0,
                     "headers": {},
                     "body": null,
-                    "error": err.to_string(),
+                    "error": secrets.redact(&err.to_string()),
                 }));
             }
         };
@@ -709,8 +769,10 @@ pub fn execute_http(tokio_rt: &tokio::runtime::Runtime, args: &Value) -> Result<
         let mut response_headers = serde_json::Map::new();
         for (name, value) in resp.headers() {
             if let Ok(value) = value.to_str() {
-                response_headers
-                    .insert(name.as_str().to_string(), Value::String(value.to_string()));
+                response_headers.insert(
+                    name.as_str().to_string(),
+                    Value::String(secrets.redact(value)),
+                );
             }
         }
         let bytes = match resp.bytes().await {
@@ -720,11 +782,11 @@ pub fn execute_http(tokio_rt: &tokio::runtime::Runtime, args: &Value) -> Result<
                     "status": status,
                     "headers": response_headers,
                     "body": null,
-                    "error": err.to_string(),
+                    "error": secrets.redact(&err.to_string()),
                 }));
             }
         };
-        let text = String::from_utf8_lossy(&bytes).to_string();
+        let text = secrets.redact(&String::from_utf8_lossy(&bytes));
         let body = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| Value::String(text));
 
         Ok(json!({
@@ -1220,6 +1282,136 @@ mod tests {
         assert!(
             request.ends_with("{\"a\":1}"),
             "string body should be sent verbatim, got request:\n{request}"
+        );
+    }
+
+    fn secret_test_store() -> crate::runtime::secret_env::SecretStore {
+        use crate::runtime::secret_env::{SecretEntry, SECRET_TOKEN_PREFIX};
+        crate::runtime::secret_env::SecretStore::for_tests(vec![
+            (
+                format!("{SECRET_TOKEN_PREFIX}aaaa1111__"),
+                SecretEntry {
+                    key: "LOCAL_API_KEY".into(),
+                    value: "sk-local-secret-value".into(),
+                    allowed_hosts: vec!["127.0.0.1".into()],
+                    allow_any_host: false,
+                },
+            ),
+            (
+                format!("{SECRET_TOKEN_PREFIX}bbbb2222__"),
+                SecretEntry {
+                    key: "REMOTE_ONLY_KEY".into(),
+                    value: "remote-only-value".into(),
+                    allowed_hosts: vec!["api.example.com".into()],
+                    allow_any_host: false,
+                },
+            ),
+        ])
+    }
+
+    #[test]
+    fn execute_http_substitutes_secret_for_allowed_host() {
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+        let (url, server) = tokio_rt.block_on(one_shot_http_capture());
+        let token = format!(
+            "{}aaaa1111__",
+            crate::runtime::secret_env::SECRET_TOKEN_PREFIX
+        );
+        execute_http_with_secrets(
+            &tokio_rt,
+            &json!({
+                "url": url,
+                "method": "GET",
+                "headers": { "Authorization": format!("Bearer {token}") },
+            }),
+            &secret_test_store(),
+        )
+        .unwrap();
+        let request = tokio_rt.block_on(server).unwrap();
+        assert!(
+            request.contains("Bearer sk-local-secret-value"),
+            "wire request should carry the substituted secret, got: {request}"
+        );
+        assert!(
+            !request.contains("__CHIDORI_SECRET__"),
+            "placeholder token must not reach the wire: {request}"
+        );
+    }
+
+    #[test]
+    fn execute_http_fails_closed_for_disallowed_host() {
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+        let (url, server) = tokio_rt.block_on(one_shot_http_capture());
+        let token = format!(
+            "{}bbbb2222__",
+            crate::runtime::secret_env::SECRET_TOKEN_PREFIX
+        );
+        let err = execute_http_with_secrets(
+            &tokio_rt,
+            &json!({
+                "url": url,
+                "method": "GET",
+                "headers": { "Authorization": format!("Bearer {token}") },
+            }),
+            &secret_test_store(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("REMOTE_ONLY_KEY"),
+            "error names the key: {err}"
+        );
+        assert!(err.contains("127.0.0.1"), "error names the host: {err}");
+        assert!(
+            !err.contains("remote-only-value"),
+            "error must not leak the value: {err}"
+        );
+        // The request never went out: the capture server is still waiting.
+        assert!(
+            !server.is_finished(),
+            "no request should reach the listener"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn execute_http_redacts_echoed_secret_from_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+        let (url, server) = tokio_rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let url = format!("http://{addr}/echo");
+            let handle = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await.unwrap();
+                let body = "leaked: sk-local-secret-value";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nX-Echo: sk-local-secret-value\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+            (url, handle)
+        });
+        let result = execute_http_with_secrets(
+            &tokio_rt,
+            &json!({ "url": url, "method": "GET" }),
+            &secret_test_store(),
+        )
+        .unwrap();
+        tokio_rt.block_on(server).unwrap();
+        assert_eq!(
+            result["body"],
+            json!("leaked: [REDACTED:LOCAL_API_KEY]"),
+            "response body must be redacted"
+        );
+        assert_eq!(
+            result["headers"]["x-echo"],
+            json!("[REDACTED:LOCAL_API_KEY]"),
+            "response headers must be redacted"
         );
     }
 

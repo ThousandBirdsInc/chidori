@@ -29,6 +29,7 @@ tokio = { version = "1", features = ["full"] }
 
 # HTTP client for LLM providers
 reqwest = { version = "0.12", features = ["json", "stream", "gzip"] }
+url = "2"
 
 # HTTP server for serve command
 axum = "0.8"
