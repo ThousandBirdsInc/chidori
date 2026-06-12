@@ -545,6 +545,20 @@ impl HostBindingBackend {
         Ok(result.as_str().unwrap_or("").to_string())
     }
 
+    fn signal(&self, a: &serde_json::Value) -> std::result::Result<serde_json::Value, String> {
+        let HostBindingBackend::Runtime { runtime_ctx, .. } = self else {
+            return Err("chidori.signal requires the runtime host backend".to_string());
+        };
+        host_core::execute_signal(runtime_ctx, a).map_err(|err| err.to_string())
+    }
+
+    fn poll_signal(&self, a: &serde_json::Value) -> std::result::Result<serde_json::Value, String> {
+        let HostBindingBackend::Runtime { runtime_ctx, .. } = self else {
+            return Err("chidori.pollSignal requires the runtime host backend".to_string());
+        };
+        host_core::execute_poll_signal(runtime_ctx, a).map_err(|err| err.to_string())
+    }
+
     fn enforce_policy(
         &self,
         target: &str,
@@ -797,6 +811,8 @@ impl HostBindingBackend {
                     .to_string();
                 self.input(prompt).map(serde_json::Value::String)
             }
+            "signal" => self.signal(a),
+            "poll_signal" => self.poll_signal(a),
             "checkpoint" => {
                 let args = serde_json::json!({
                     "label": a.get("label").cloned().unwrap_or(serde_json::Value::Null),

@@ -10,7 +10,7 @@ use crate::providers::ProviderRegistry;
 use crate::runtime::call_log::{CallLog, CallRecord};
 use crate::runtime::context::{
     HostOperationCompletionSafepoint, HostOperationSafepoint, InputMode, PendingApproval,
-    PendingInput, RuntimeContext, RuntimeEvent,
+    PendingInput, PendingSignal, RuntimeContext, RuntimeEvent,
 };
 use crate::runtime::snapshot::{
     HostPromiseRecord, RuntimePolicy, SnapshotAbi, SnapshotManifest, SnapshotStore,
@@ -50,6 +50,13 @@ pub struct RunResult {
     /// mode. The caller should render an approval UI and, on approve, re-run
     /// the agent with the approval added to `Engine::with_approvals`.
     pub paused_approval: Option<PendingApproval>,
+    /// Set when the agent called `chidori.signal(name)` at a listen point with
+    /// an empty mailbox in Pause mode. The caller should treat the run as
+    /// suspended on the named listen point and later resume by delivering a
+    /// matching signal (replaying the call log with a completed `Signal` host
+    /// op at `pending.seq`). Distinct from `paused` so the server knows *which*
+    /// named op is waiting. See `docs/signals.md`.
+    pub paused_signal: Option<PendingSignal>,
 }
 
 /// Persist a resume scaffold for a run on the pure-Rust engine (G2).
@@ -497,6 +504,7 @@ impl Engine {
                         run_id: ctx.run_id(),
                         paused: Some(pending),
                         paused_approval: None,
+                        paused_signal: None,
                     });
                 }
                 if let Some(approval) = ctx.take_pending_approval() {
@@ -512,6 +520,26 @@ impl Engine {
                         run_id: ctx.run_id(),
                         paused: None,
                         paused_approval: Some(approval),
+                        paused_signal: None,
+                    });
+                }
+                // A `chidori.signal(name)` listen point with an empty mailbox
+                // sets `pending_signal` and bails with `PAUSE_MARKER`, exactly
+                // like `input` — surface it as a paused run, not a failure.
+                if let Some(signal) = ctx.take_pending_signal() {
+                    if let Some(ref base) = self.persist_base {
+                        let _ = persist_rust_journal_scaffold(
+                            base, &run_id, path, &source, &policy, ctx,
+                        );
+                    }
+                    emit_otel(ctx, None);
+                    return Some(RunResult {
+                        output: Value::Null,
+                        call_log: ctx.call_log(),
+                        run_id: ctx.run_id(),
+                        paused: None,
+                        paused_approval: None,
+                        paused_signal: Some(signal),
                     });
                 }
                 None
@@ -550,6 +578,7 @@ impl Engine {
                         run_id: ctx.run_id(),
                         paused: None,
                         paused_approval: None,
+                        paused_signal: None,
                     })
                 }
                 Err(e) => {
@@ -1865,6 +1894,96 @@ def agent(value):
             .run_with_replay(&path, &serde_json::json!({ "msg": "hello" }), replay_log)
             .unwrap();
         assert_eq!(replayed.output, out);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An agent awaiting `chidori.signal("review")` with an empty mailbox pauses
+    /// (surfaced as `RunResult.paused_signal`, not a failure). Delivering the
+    /// signal — via a completed `Signal` host promise plus the synthetic
+    /// `signal` CallRecord, the durable resume shape from `docs/signals.md` §9 —
+    /// completes the run with the delivered payload, and a full re-run from the
+    /// recorded call_log reproduces identical output.
+    #[test]
+    fn engine_pauses_and_resumes_typescript_signal() {
+        let dir =
+            std::env::temp_dir().join(format!("chidori-engine-ts-signal-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(
+            &path,
+            r#"
+                export async function agent(input, chidori) {
+                    const review = await chidori.signal("review");
+                    return { decision: review.payload.decision, by: review.from.id };
+                }
+            "#,
+        )
+        .unwrap();
+
+        let engine = || {
+            Engine::new(
+                Arc::new(ProviderRegistry::new()),
+                Arc::new(TemplateEngine::new(&dir)),
+                Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            )
+        };
+
+        // Empty mailbox → pauses on the named listen point.
+        let paused = engine()
+            .run_pausable(&path, &serde_json::json!({}))
+            .unwrap();
+        assert!(paused.paused.is_none());
+        assert!(paused.paused_approval.is_none());
+        let pending = paused.paused_signal.expect("expected a signal pause");
+        assert_eq!(pending.name, "review");
+        assert_eq!(pending.seq, 1);
+        assert!(paused.call_log.into_records().is_empty());
+
+        // Deliver the signal: a completed Signal host promise (match key
+        // {name}) carrying the {name,payload,from} result. `replay_completed_
+        // host_operation` injects the synthetic `signal` CallRecord on resume.
+        let delivered = serde_json::json!({
+            "name": "review",
+            "payload": { "decision": "approve" },
+            "from": { "kind": "human", "id": "mara" },
+        });
+        let host_promises = vec![crate::runtime::snapshot::HostPromiseRecord {
+            operation: crate::runtime::snapshot::PendingHostOperation::new(
+                crate::runtime::snapshot::HostOperationId(1),
+                pending.seq,
+                crate::runtime::snapshot::PendingHostOperationKind::Signal,
+                serde_json::json!({ "name": "review" }),
+            ),
+            state: crate::runtime::snapshot::HostPromiseState::Resolved {
+                value: delivered.clone(),
+                completed_at: chrono::Utc::now(),
+            },
+        }];
+        let resumed = engine()
+            .run_replay_pausable_with_host_promises(
+                &path,
+                &serde_json::json!({}),
+                Vec::new(),
+                host_promises,
+            )
+            .unwrap();
+        assert!(resumed.paused_signal.is_none());
+        assert_eq!(
+            resumed.output,
+            serde_json::json!({ "decision": "approve", "by": "mara" })
+        );
+        let records = resumed.call_log.into_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].function, "signal");
+        assert_eq!(records[0].result, delivered);
+
+        // Full re-run from the recorded call_log reproduces identical output
+        // without any mailbox or delivery.
+        let rerun = engine()
+            .run_with_replay(&path, &serde_json::json!({}), records.clone())
+            .unwrap();
+        assert_eq!(rerun.output, resumed.output);
 
         let _ = std::fs::remove_dir_all(dir);
     }

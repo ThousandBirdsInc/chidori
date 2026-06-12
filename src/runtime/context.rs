@@ -10,7 +10,8 @@ use crate::runtime::capability::{Capability, CapabilityLedger};
 use crate::runtime::otel::RunSpan;
 use crate::runtime::snapshot::{
     HostOperationId, HostPromiseRecord, HostPromiseTable, PendingHostOperation,
-    PendingHostOperationKind, HOST_PROMISE_TABLE_FILE, PENDING_HOST_OPERATION_FILE,
+    PendingHostOperationKind, QueuedSignal, HOST_PROMISE_TABLE_FILE, PENDING_HOST_OPERATION_FILE,
+    SIGNAL_INBOX_FILE,
 };
 use crate::runtime::vfs::Vfs;
 
@@ -126,6 +127,14 @@ struct RuntimeContextInner {
     pub pending_input: Option<PendingInput>,
     /// Set by the permission policy when an AskBefore rule needs approval.
     pub pending_approval: Option<PendingApproval>,
+    /// Set by `signal()` when pausing at a listen point with an empty mailbox.
+    /// The engine reads this after eval unwinds to surface a signal pause.
+    pub pending_signal: Option<PendingSignal>,
+    /// Durable per-run signal mailbox, loaded at run/resume start (threaded the
+    /// same way `vfs` is). `take_queued_signal(name)` drains the lowest-
+    /// `delivery_seq` matching entry and immediately re-persists the shrunken
+    /// inbox so a crash can't double-deliver (see `docs/signals.md` §8.4/§10).
+    pub signal_inbox: Vec<QueuedSignal>,
     /// Durable host-promise bookkeeping. This is snapshot-serializable Rust
     /// state; the QuickJS fork will bind these ids to real JS promises.
     #[allow(dead_code)]
@@ -213,6 +222,18 @@ pub struct PendingInput {
     pub prompt: String,
 }
 
+/// Set by `execute_signal` when a `chidori.signal(name)` listen point has no
+/// matching mailbox entry and must pause. The engine reads this after eval
+/// unwinds to distinguish a signal pause (surfaced as `RunResult.paused_signal`)
+/// from a real error, mirroring [`PendingInput`]. The pending host operation's
+/// match key is `{ "name": name }`; `id` is its host-promise id.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PendingSignal {
+    pub seq: u64,
+    pub name: String,
+    pub id: HostOperationId,
+}
+
 /// Set by the policy enforcer when a call needs user approval but the
 /// engine is running in Pause mode (server context). The engine catches the
 /// pause sentinel, takes this value, and returns it in `RunResult` so the
@@ -263,6 +284,8 @@ impl RuntimeContext {
                 input_mode: InputMode::Stdin,
                 pending_input: None,
                 pending_approval: None,
+                pending_signal: None,
+                signal_inbox: Vec::new(),
                 host_promises: HostPromiseTable::new(),
                 event_sender: None,
                 emit_call_events: true,
@@ -299,6 +322,22 @@ impl RuntimeContext {
         host_promises: Vec<HostPromiseRecord>,
         vfs: Vfs,
     ) -> Self {
+        Self::with_replay_host_promises_vfs_and_signals(replay_log, host_promises, vfs, Vec::new())
+    }
+
+    /// As `with_replay_host_promises_and_vfs`, but also threads an initial signal
+    /// mailbox (`docs/signals.md` §8.4) loaded from the run's durable
+    /// `signals/inbox.json`, the same way `vfs` is restored. A signal that was
+    /// enqueued before the agent reached a matching `chidori.signal(name)` listen
+    /// point is drained from this inbox on (re)run. The existing constructor
+    /// variants delegate here with an empty inbox so their signatures stay
+    /// unchanged.
+    pub fn with_replay_host_promises_vfs_and_signals(
+        replay_log: Vec<CallRecord>,
+        host_promises: Vec<HostPromiseRecord>,
+        vfs: Vfs,
+        signal_inbox: Vec<QueuedSignal>,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(RuntimeContextInner {
                 config: AgentConfig::default(),
@@ -310,6 +349,8 @@ impl RuntimeContext {
                 input_mode: InputMode::Stdin,
                 pending_input: None,
                 pending_approval: None,
+                pending_signal: None,
+                signal_inbox,
                 host_promises: HostPromiseTable::from_records(host_promises),
                 event_sender: None,
                 emit_call_events: true,
@@ -343,6 +384,8 @@ impl RuntimeContext {
                 input_mode: InputMode::Stdin,
                 pending_input: None,
                 pending_approval: None,
+                pending_signal: None,
+                signal_inbox: Vec::new(),
                 host_promises: HostPromiseTable::new(),
                 event_sender: None,
                 emit_call_events: true,
@@ -805,6 +848,48 @@ impl RuntimeContext {
         self.inner.lock().unwrap().pending_approval.take()
     }
 
+    pub fn set_pending_signal(&self, pending: PendingSignal) {
+        self.inner.lock().unwrap().pending_signal = Some(pending);
+    }
+
+    pub fn take_pending_signal(&self) -> Option<PendingSignal> {
+        self.inner.lock().unwrap().pending_signal.take()
+    }
+
+    /// Replace the in-memory signal mailbox. Used by the
+    /// `with_replay_..._and_signals` constructors and resume paths that load the
+    /// durable inbox from disk before agent code runs.
+    pub fn set_signal_inbox(&self, inbox: Vec<QueuedSignal>) {
+        self.inner.lock().unwrap().signal_inbox = inbox;
+    }
+
+    /// A clone of the current signal mailbox, for inspection/tests.
+    pub fn signal_inbox(&self) -> Vec<QueuedSignal> {
+        self.inner.lock().unwrap().signal_inbox.clone()
+    }
+
+    /// Drain the lowest-`delivery_seq` queued signal whose name matches `name`,
+    /// removing it from the in-memory mailbox and — if persistence is enabled —
+    /// immediately re-persisting the shrunken inbox to `SIGNAL_INBOX_FILE` in the
+    /// SAME critical section as consumption. This is the determinism guarantee
+    /// from `docs/signals.md` §8.4/§10: a crash between consumption and the
+    /// recorded `CallRecord` must not leave the signal in the inbox for a second
+    /// delivery — on restart the recorded result wins and the inbox is never
+    /// re-drained for that seq. Returns `None` when no matching entry exists.
+    pub fn take_queued_signal(&self, name: &str) -> Option<QueuedSignal> {
+        let mut inner = self.inner.lock().unwrap();
+        let idx = inner
+            .signal_inbox
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.name == name)
+            .min_by_key(|(_, s)| s.delivery_seq)
+            .map(|(i, _)| i)?;
+        let signal = inner.signal_inbox.remove(idx);
+        persist_signal_inbox(&inner);
+        Some(signal)
+    }
+
     #[allow(dead_code)]
     pub fn create_host_promise(
         &self,
@@ -993,6 +1078,34 @@ fn persist_host_promises(inner: &RuntimeContextInner) {
             }
         }
     }
+}
+
+/// Persist the in-memory signal mailbox to `SIGNAL_INBOX_FILE` under the run's
+/// persist dir. The inbox lives in a `signals/` subdirectory, so the parent dir
+/// is created first. No-op when persistence is disabled.
+fn persist_signal_inbox(inner: &RuntimeContextInner) {
+    let Some(dir) = inner.persist_dir.as_ref() else {
+        return;
+    };
+    let inbox_path = dir.join(SIGNAL_INBOX_FILE);
+    if let Some(parent) = inbox_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(&inner.signal_inbox) {
+        let _ = std::fs::write(inbox_path, json);
+    }
+}
+
+/// Load the durable signal mailbox from a run directory. Returns an empty vec
+/// when the file is absent or unreadable (a fresh run with no queued signals).
+/// Used by resume/run paths to thread the inbox into a context the same way the
+/// VFS is restored.
+pub fn load_signal_inbox(run_dir: &std::path::Path) -> Vec<QueuedSignal> {
+    let path = run_dir.join(SIGNAL_INBOX_FILE);
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
 }
 
 fn default_workspace_root() -> Option<PathBuf> {
