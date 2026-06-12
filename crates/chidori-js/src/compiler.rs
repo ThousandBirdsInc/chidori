@@ -1408,9 +1408,10 @@ impl Compiler {
                 self.emit(Op::InitCell(star));
             }
             other => {
-                // `export default <AssignmentExpression>`.
+                // `export default <AssignmentExpression>`: NamedEvaluation
+                // gives an anonymous function/class the name "default".
                 let expr: &Expression = other.as_expression().unwrap();
-                self.compile_expr(expr)?;
+                self.compile_named_expr(expr, "default")?;
                 self.emit(Op::InitCell(star));
             }
         }

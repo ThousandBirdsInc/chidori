@@ -38,15 +38,39 @@ fn install_promise(vm: &mut Vm) {
     vm.install_ctor("Promise", &ctor, &proto);
     vm.install_species(&ctor);
 
-    // Promise.withResolvers() — { promise, resolve, reject } (ES2024).
-    vm.define_method(&ctor, "withResolvers", 0, |vm, _t, _a| {
-        let promise = vm.new_promise();
-        let (resolve, reject) = make_resolving_functions(vm, &promise);
+    // Promise.withResolvers() — { promise, resolve, reject } (ES2024), built
+    // via NewPromiseCapability(this) so subclasses construct themselves.
+    vm.define_method(&ctor, "withResolvers", 0, |vm, this, _a| {
+        let (promise, resolve, reject) = new_promise_capability(vm, &this)?;
         let obj = Value::Object(vm.new_object());
-        vm.set_prop(&obj, &PropertyKey::str("promise"), Value::Object(promise))?;
+        vm.set_prop(&obj, &PropertyKey::str("promise"), promise)?;
         vm.set_prop(&obj, &PropertyKey::str("resolve"), resolve)?;
         vm.set_prop(&obj, &PropertyKey::str("reject"), reject)?;
         Ok(obj)
+    });
+
+    // Promise.try(fn, ...args) (ES2025): call fn synchronously; its return
+    // value resolves (a throw rejects) a fresh capability of `this`.
+    vm.define_method(&ctor, "try", 1, |vm, this, args| {
+        if !matches!(this, Value::Object(_)) {
+            return Err(vm.throw_type("Promise.try called on a non-object"));
+        }
+        let (promise, resolve, reject) = new_promise_capability(vm, &this)?;
+        let f = arg(args, 0);
+        let rest: Vec<Value> = if args.len() > 1 {
+            args[1..].to_vec()
+        } else {
+            Vec::new()
+        };
+        match vm.call(f, Value::Undefined, &rest) {
+            Ok(v) => {
+                vm.call(resolve, Value::Undefined, &[v])?;
+            }
+            Err(e) => {
+                vm.call(reject, Value::Undefined, &[e])?;
+            }
+        }
+        Ok(promise)
     });
 
     // Promise.prototype[Symbol.toStringTag] = "Promise" (non-writable,
@@ -206,6 +230,20 @@ fn install_promise(vm: &mut Vm) {
 /// has already settled (so the caller must bail out), `false` on the first call
 /// (and marks it settled). Mirrors the spec's per-element resolve/reject guard so
 /// a misbehaving thenable cannot double-count the combinator's pending counter.
+
+/// `IfAbruptCloseIterator`: on an abrupt completion mid-combinator, close the
+/// iterator (suppressing any close error — the original abrupt wins) and
+/// propagate.
+fn close_on_err<T>(vm: &mut Vm, iter: &Value, r: Result<T, Value>) -> Result<T, Value> {
+    match r {
+        Err(e) => {
+            let _ = vm.iterator_close(iter);
+            Err(e)
+        }
+        ok => ok,
+    }
+}
+
 fn take_guard(flag: &Rc<RefCell<bool>>) -> bool {
     let mut done = flag.borrow_mut();
     if *done {
@@ -334,7 +372,8 @@ fn perform_promise_all(
             }
             Some(value) => {
                 values.borrow_mut().push(Value::Undefined);
-                let next = vm.call(promise_resolve.clone(), c.clone(), &[value])?;
+                let r = vm.call(promise_resolve.clone(), c.clone(), &[value]);
+                let next = close_on_err(vm, &iter, r)?;
                 let already = Rc::new(RefCell::new(false));
                 let (vc, rc, res, idx) =
                     (values.clone(), remaining.clone(), resolve.clone(), index);
@@ -350,7 +389,8 @@ fn perform_promise_all(
                     Ok(Value::Undefined)
                 });
                 *remaining.borrow_mut() += 1;
-                invoke_then(vm, &next, Value::Object(on_f), reject.clone())?;
+                let r = invoke_then(vm, &next, Value::Object(on_f), reject.clone());
+                close_on_err(vm, &iter, r)?;
                 index += 1;
             }
         }
@@ -381,7 +421,8 @@ fn perform_promise_all_settled(
             }
             Some(value) => {
                 values.borrow_mut().push(Value::Undefined);
-                let next = vm.call(promise_resolve.clone(), c.clone(), &[value])?;
+                let r = vm.call(promise_resolve.clone(), c.clone(), &[value]);
+                let next = close_on_err(vm, &iter, r)?;
                 let already = Rc::new(RefCell::new(false));
                 let make_record = |vm: &mut Vm, status: &str, key: &str, v: Value| {
                     let o = vm.new_object();
@@ -432,7 +473,8 @@ fn perform_promise_all_settled(
                     Ok(Value::Undefined)
                 });
                 *remaining.borrow_mut() += 1;
-                invoke_then(vm, &next, Value::Object(on_f), Value::Object(on_r))?;
+                let r = invoke_then(vm, &next, Value::Object(on_f), Value::Object(on_r));
+                close_on_err(vm, &iter, r)?;
                 index += 1;
             }
         }
@@ -453,8 +495,10 @@ fn perform_promise_race(
         match vm.iterator_step(&iter)? {
             None => return Ok(()),
             Some(value) => {
-                let next = vm.call(promise_resolve.clone(), c.clone(), &[value])?;
-                invoke_then(vm, &next, resolve.clone(), reject.clone())?;
+                let r = vm.call(promise_resolve.clone(), c.clone(), &[value]);
+                let next = close_on_err(vm, &iter, r)?;
+                let r = invoke_then(vm, &next, resolve.clone(), reject.clone());
+                close_on_err(vm, &iter, r)?;
             }
         }
     }
@@ -485,7 +529,8 @@ fn perform_promise_any(
             }
             Some(value) => {
                 errors.borrow_mut().push(Value::Undefined);
-                let next = vm.call(promise_resolve.clone(), c.clone(), &[value])?;
+                let r = vm.call(promise_resolve.clone(), c.clone(), &[value]);
+                let next = close_on_err(vm, &iter, r)?;
                 let already = Rc::new(RefCell::new(false));
                 let res = resolve.clone();
                 let g_f = already.clone();
@@ -515,7 +560,8 @@ fn perform_promise_any(
                     Ok(Value::Undefined)
                 });
                 *remaining.borrow_mut() += 1;
-                invoke_then(vm, &next, Value::Object(on_f), Value::Object(on_r))?;
+                let r = invoke_then(vm, &next, Value::Object(on_f), Value::Object(on_r));
+                close_on_err(vm, &iter, r)?;
                 index += 1;
             }
         }
