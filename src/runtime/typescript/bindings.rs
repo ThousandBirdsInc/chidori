@@ -91,6 +91,13 @@ impl HostBindingBackend {
         args: serde_json::Value,
         live: impl FnOnce() -> std::result::Result<serde_json::Value, String>,
     ) -> std::result::Result<serde_json::Value, String> {
+        // Route every workspace effect through the policy gate before it runs,
+        // the same way `http` and `tool:` calls are gated. With the default
+        // AlwaysAllow policy this is a no-op; a restrictive profile can now
+        // deny or gate `workspace:write` / `workspace:delete` (or any action)
+        // by target. Enforcing before recording means a denied or paused call
+        // never lands in the journal.
+        self.enforce_policy(&format!("workspace:{action}"), &args)?;
         let call_args = serde_json::json!({
             "action": action,
             "args": args,

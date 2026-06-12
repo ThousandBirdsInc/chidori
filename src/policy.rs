@@ -32,9 +32,10 @@ impl Default for Decision {
     }
 }
 
-/// A single rule. `target` is "tool:<name>" / "shell" / "http" / "exec" /
-/// "write_file" / "*". `match_args` is an optional JSON subset that must be
-/// contained in the call args for the rule to apply.
+/// A single rule. `target` is "tool:<name>" / "http" / "workspace:<action>"
+/// (where `<action>` is `list` / `read` / `write` / `delete` / `manifest`) /
+/// "*". `match_args` is an optional JSON subset that must be contained in the
+/// call args for the rule to apply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyRule {
     pub target: String,

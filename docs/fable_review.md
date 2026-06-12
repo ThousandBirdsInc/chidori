@@ -202,10 +202,13 @@ Still **capability-confinement, not OS isolation** (`docs/sandbox-model.md`
 — note that doc still describes the rust engine as opt-in; see doc drift).
 The real gaps, restated post-#39:
 
-1. **`http` is the only effect routed through `enforce_policy`**;
-   `workspace.*` effects appear unconditional. The list of ungated powerful
-   effects shrank (the `exec*` family is gone), but deny-by-default routing
-   through the policy gate has still not landed.
+1. **Powerful effects now route through `enforce_policy`, but the default is
+   still allow.** `http` and every `workspace.*` action (`workspace:list` /
+   `read` / `write` / `delete` / `manifest`) pass through the policy gate, so a
+   restrictive profile can deny or gate disk writes while allowing reads. The
+   `exec*` family is gone. What remains is the *default decision*: the fallback
+   is still `AlwaysAllow`, so deny-by-default for untrusted profiles is opt-in
+   (`"default": "never_allow"` + allow rules) rather than automatic.
 2. **Memory accounting is process-wide, not per-VM** (`src/mem_guard.rs`):
    under concurrent agents one run's allocations can be attributed to
    another; enforcement is polled, so brief overshoot is possible.
@@ -316,9 +319,14 @@ Concretely:
    permanent quality bar, not a gate. Keep picking off the cluster table
    above (Array species, RegExp `v`-flag/UTF-16, resizable ArrayBuffer,
    Promise ordering are the next four).
-3. **Gate the remaining powerful effects** (`workspace.*`) through the
-   policy layer, deny-by-default for untrusted profiles — still the most
-   security-relevant single change, and smaller now that `exec*` is gone.
+3. ~~Gate the remaining powerful effects (`workspace.*`) through the policy
+   layer~~ — **done**: every `workspace.*` action now routes through
+   `enforce_policy` (targets `workspace:list` / `read` / `write` / `delete` /
+   `manifest`), joining `http`. The remaining follow-up is making
+   **deny-by-default** the actual default for untrusted profiles — today the
+   fallback decision is still `AlwaysAllow`, so untrusted callers must opt in
+   with `"default": "never_allow"` plus explicit allow rules. Shipping a
+   ready-made untrusted profile is the next step.
 4. ~~Run Test262 in CI~~ — **done** (#41). Add TypeScript SDK tests next.
 5. **Automate SDK publishing** to npm/PyPI, or remove the registry badges.
 6. **Pay down the doc drift** (the list above): README engine section, SDK

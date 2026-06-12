@@ -191,15 +191,19 @@ These are the known limitations as of this writing. None of them are
 memory-safety holes (the engine is safe Rust); they are confinement and
 resource-precision gaps.
 
-1. **Injected powerful effects are mostly ungated.** `execPython` spawns a Python
-   interpreter, `execWasm` runs Wasmer (fuel + memory-page capped), `http` makes
-   real outbound network requests, and `workspace.*` does real disk I/O within a
-   sanitized root. Of these, only `http` passes through the policy enforcement gate
-   (`enforce_policy`); `execPython`/`execJs`/`execWasm`/`workspace.*` appear to run
-   unconditionally once installed. For **trusted** agent code this is by design;
-   for **untrusted** code these are escape hatches (subprocess, network egress,
-   disk-in-root). *Fix:* route every powerful effect through the same policy gate
-   `http` uses, defaulting to deny for an untrusted profile.
+1. **Not every powerful effect is gated yet.** The remaining powerful effects are
+   `http` (real outbound network requests) and `workspace.*` (real disk I/O within
+   a sanitized root); the `exec*` snippet sandboxes were removed in #39. Both `http`
+   and every `workspace.*` action now pass through the policy enforcement gate
+   (`enforce_policy`): `http` against the `http` target, and workspace actions
+   against `workspace:list` / `workspace:read` / `workspace:write` /
+   `workspace:delete` / `workspace:manifest`. A restrictive profile can therefore
+   deny or require approval for disk writes while still allowing reads. The
+   remaining gap is the *default*: the fallback decision is still `AlwaysAllow`, so
+   an untrusted profile must opt in to deny-by-default (`"default": "never_allow"`
+   plus explicit allow rules) rather than getting it automatically. *Fix:* ship a
+   ready-made deny-by-default untrusted profile and make it the default for
+   untrusted runs.
 
 2. **The memory ceiling is process-wide, not per-VM.** The `CountingAllocator`
    counter is global; the watchdog caps *baseline-relative* growth
