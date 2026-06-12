@@ -5,16 +5,33 @@ Uses the global `fetch` (Node 18+, browsers). Mirrors the Python SDK.
 
 ## Install
 
+The package is published to npm as
+[`@1kbirds/chidori`](https://www.npmjs.com/package/@1kbirds/chidori) (the
+unscoped `chidori` npm name belongs to an unrelated project). Installing it
+under the `chidori` alias keeps the historical import spelling working:
+
+```bash
+npm install chidori@npm:@1kbirds/chidori
+```
+
+```ts
+import { AgentClient, Checkpoint } from "chidori";
+```
+
+Or install under the scoped name directly — the Chidori runtime accepts both
+`"chidori"` and `"@1kbirds/chidori"` as the SDK module specifier in agent
+files:
+
+```bash
+npm install @1kbirds/chidori
+```
+
+To build from source instead:
+
 ```bash
 cd sdk/typescript
 npm install
 npm run build
-```
-
-Then import from the package or link it locally:
-
-```ts
-import { AgentClient, Checkpoint } from "chidori";
 ```
 
 Agent and tool authoring types are also exported:
