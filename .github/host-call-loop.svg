@@ -1,27 +1,23 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="400" viewBox="0 0 1200 400" role="img" aria-label="Agents never touch the world directly: a TypeScript agent calls host functions on the Chidori runtime, the runtime performs the side effect against the world and records it in the call log.">
   <title>every side effect is a host call</title>
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#04070d"/>
-      <stop offset="1" stop-color="#070f1c"/>
-    </linearGradient>
     <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
       <feGaussianBlur stdDeviation="4" result="b"/>
       <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
     </filter>
-    <clipPath id="frame"><rect width="1200" height="400" rx="16"/></clipPath>
+    <clipPath id="frame"><rect width="1200" height="400" rx="4"/></clipPath>
   </defs>
   <style>
-    text { font-family: 'JetBrains Mono','IBM Plex Mono','SF Mono','DejaVu Sans Mono',Menlo,Consolas,monospace; }
+    text { font-family: 'JetBrains Mono','Berkeley Mono','SF Mono','DejaVu Sans Mono',Menlo,Consolas,ui-monospace,monospace; }
     .pulse { opacity: 0; animation: trip 4s linear infinite; }
     @keyframes trip {
-      0%       { transform: translateX(350px);  opacity: 0; fill: #9ae9ff; }
+      0%       { transform: translateX(350px);  opacity: 0; fill: #FACC15; }
       4%       { opacity: 1; }
-      20%      { transform: translateX(610px);  fill: #9ae9ff; }
+      20%      { transform: translateX(610px);  fill: #FACC15; }
       28%      { transform: translateX(610px); }
-      45%      { transform: translateX(1005px); fill: #9ae9ff; }
-      55%      { transform: translateX(1005px); fill: #7fe0b0; }
-      72%      { transform: translateX(610px);  fill: #7fe0b0; }
+      45%      { transform: translateX(1005px); fill: #FACC15; }
+      55%      { transform: translateX(1005px); fill: #C9DA8A; }
+      72%      { transform: translateX(610px);  fill: #C9DA8A; }
       78%      { transform: translateX(610px); }
       94%      { transform: translateX(350px);  opacity: 1; }
       97%,100% { transform: translateX(350px);  opacity: 0; }
@@ -53,50 +49,57 @@
   </style>
 
   <g clip-path="url(#frame)">
-    <rect width="1200" height="400" fill="url(#bg)"/>
+    <rect width="1200" height="400" fill="#0A0A0A"/>
+
+    <!-- window chrome -->
+    <g>
+      <circle cx="26" cy="26" r="5" fill="#FF5F56"/>
+      <circle cx="44" cy="26" r="5" fill="#FFBD2E"/>
+      <circle cx="62" cy="26" r="5" fill="#27C93F"/>
+    </g>
 
     <!-- connectors -->
-    <line x1="350" y1="195" x2="460" y2="195" stroke="#1c3a55" stroke-width="2"/>
-    <line x1="760" y1="195" x2="880" y2="195" stroke="#1c3a55" stroke-width="2"/>
+    <line x1="350" y1="195" x2="460" y2="195" stroke="#2e2d29" stroke-width="2"/>
+    <line x1="760" y1="195" x2="880" y2="195" stroke="#2e2d29" stroke-width="2"/>
 
     <!-- ── agent box ── -->
-    <rect x="70" y="80" width="280" height="230" rx="12" fill="#0c1c30" stroke="#2c4f6e" stroke-width="1.4"/>
-    <text x="92" y="112" font-size="14" font-weight="700" letter-spacing="1.5" fill="#9ae9ff">AGENT.TS</text>
-    <text x="328" y="112" text-anchor="end" font-size="11.5" fill="#3c5a75">plain TypeScript</text>
-    <g class="curline"><rect x="84" y="139" width="252" height="22" rx="5" fill="#9ae9ff" opacity="0.10"/></g>
-    <g font-size="12.5" fill="#5d93b8">
-      <text x="94" y="154">const a = await c.prompt(…)</text>
-      <text x="94" y="190">const b = await c.http(…)</text>
-      <text x="94" y="226">const t = await c.tool(…)</text>
-      <text x="94" y="262" fill="#46688a">return { a, b, t }</text>
+    <rect x="70" y="80" width="280" height="230" rx="4" fill="#141414" stroke="#E8E8E5" stroke-opacity="0.12" stroke-width="1.4"/>
+    <text x="92" y="112" font-size="14" font-weight="700" letter-spacing="1.5" fill="#E8E8E5">AGENT.TS</text>
+    <text x="328" y="112" text-anchor="end" font-size="11.5" fill="#5d5c56">plain TypeScript</text>
+    <g class="curline"><rect x="84" y="139" width="252" height="22" rx="3" fill="#FACC15" opacity="0.08"/></g>
+    <g font-size="12.5" fill="#E8E8E5" opacity="0.85">
+      <text x="94" y="154"><tspan fill="#FACC15">const</tspan> a = <tspan fill="#FACC15">await</tspan> <tspan fill="#F4C752">c.prompt</tspan>(…)</text>
+      <text x="94" y="190"><tspan fill="#FACC15">const</tspan> b = <tspan fill="#FACC15">await</tspan> <tspan fill="#F4C752">c.http</tspan>(…)</text>
+      <text x="94" y="226"><tspan fill="#FACC15">const</tspan> t = <tspan fill="#FACC15">await</tspan> <tspan fill="#F4C752">c.tool</tspan>(…)</text>
+      <text x="94" y="262" fill="#74736d"><tspan fill="#FACC15" fill-opacity="0.7">return</tspan> { a, b, t }</text>
     </g>
 
     <!-- ── runtime box ── -->
-    <rect x="460" y="60" width="300" height="270" rx="12" fill="#0c1c30" stroke="#3fb9f5" stroke-width="1.6"/>
-    <text x="610" y="92" text-anchor="middle" font-size="14" font-weight="700" letter-spacing="1.5" fill="#9ae9ff">CHIDORI RUNTIME</text>
-    <text x="610" y="118" text-anchor="middle" font-size="12" fill="#5d93b8">prompt · tool · http · input · memory</text>
-    <line x1="478" y1="134" x2="742" y2="134" stroke="#1c3a55" stroke-width="1.2"/>
-    <text x="610" y="158" text-anchor="middle" font-size="12" letter-spacing="1.5" fill="#46688a">CALL LOG</text>
+    <rect x="460" y="60" width="300" height="270" rx="4" fill="#141414" stroke="#FACC15" stroke-opacity="0.55" stroke-width="1.4"/>
+    <text x="610" y="92" text-anchor="middle" font-size="14" font-weight="700" letter-spacing="1.5" fill="#FACC15">CHIDORI RUNTIME</text>
+    <text x="610" y="118" text-anchor="middle" font-size="12" fill="#9b9a93">prompt · tool · http · input · memory</text>
+    <line x1="478" y1="134" x2="742" y2="134" stroke="#E8E8E5" stroke-opacity="0.12" stroke-width="1.2"/>
+    <text x="610" y="158" text-anchor="middle" font-size="12" letter-spacing="1.5" fill="#74736d">CALL LOG</text>
     <g font-size="12.5">
       <g class="lg lg0">
-        <rect x="482" y="172" width="256" height="26" rx="6" fill="#10243c"/>
-        <text x="494" y="190" fill="#79b8d9">seq 0 · prompt <tspan fill="#7fe0b0">✓ recorded</tspan></text>
+        <rect x="482" y="172" width="256" height="26" rx="3" fill="#1C1C1C"/>
+        <text x="494" y="190" fill="#9b9a93">seq 0 · prompt <tspan fill="#C9DA8A">✓ recorded</tspan></text>
       </g>
       <g class="lg lg1">
-        <rect x="482" y="204" width="256" height="26" rx="6" fill="#10243c"/>
-        <text x="494" y="222" fill="#79b8d9">seq 1 · http <tspan fill="#7fe0b0">✓ recorded</tspan></text>
+        <rect x="482" y="204" width="256" height="26" rx="3" fill="#1C1C1C"/>
+        <text x="494" y="222" fill="#9b9a93">seq 1 · http <tspan fill="#C9DA8A">✓ recorded</tspan></text>
       </g>
       <g class="lg lg2">
-        <rect x="482" y="236" width="256" height="26" rx="6" fill="#10243c"/>
-        <text x="494" y="254" fill="#79b8d9">seq 2 · tool <tspan fill="#7fe0b0">✓ recorded</tspan></text>
+        <rect x="482" y="236" width="256" height="26" rx="3" fill="#1C1C1C"/>
+        <text x="494" y="254" fill="#9b9a93">seq 2 · tool <tspan fill="#C9DA8A">✓ recorded</tspan></text>
       </g>
     </g>
-    <text x="610" y="306" text-anchor="middle" font-size="11.5" fill="#46688a">on replay: answered from here</text>
+    <text x="610" y="306" text-anchor="middle" font-size="11.5" fill="#74736d">on replay: answered from here</text>
 
     <!-- ── world box ── -->
-    <rect x="880" y="80" width="250" height="230" rx="12" fill="#0c1c30" stroke="#2c4f6e" stroke-width="1.4"/>
-    <text x="1005" y="112" text-anchor="middle" font-size="14" font-weight="700" letter-spacing="1.5" fill="#9ae9ff">THE WORLD</text>
-    <g font-size="13" fill="#bde4f7" text-anchor="middle">
+    <rect x="880" y="80" width="250" height="230" rx="4" fill="#141414" stroke="#E8E8E5" stroke-opacity="0.12" stroke-width="1.4"/>
+    <text x="1005" y="112" text-anchor="middle" font-size="14" font-weight="700" letter-spacing="1.5" fill="#E8E8E5">THE WORLD</text>
+    <g font-size="13" fill="#E8E8E5" text-anchor="middle">
       <text class="wr wr0" x="1005" y="158" opacity="0.45">LLM providers</text>
       <text class="wr wr1" x="1005" y="196" opacity="0.45">HTTP services</text>
       <text class="wr wr2" x="1005" y="234" opacity="0.45">registered tools</text>
@@ -105,15 +108,15 @@
 
     <!-- cycling call label -->
     <g font-size="13" text-anchor="middle">
-      <text class="lbl lbl0" x="610" y="42" fill="#79b8d9">chidori.prompt("summarize this…")</text>
-      <text class="lbl lbl1" x="610" y="42" fill="#79b8d9">chidori.http("https://api…")</text>
-      <text class="lbl lbl2" x="610" y="42" fill="#79b8d9">chidori.tool("search", { q })</text>
+      <text class="lbl lbl0" x="610" y="42" fill="#F4C752">chidori.prompt("summarize this…")</text>
+      <text class="lbl lbl1" x="610" y="42" fill="#F4C752">chidori.http("https://api…")</text>
+      <text class="lbl lbl2" x="610" y="42" fill="#F4C752">chidori.tool("search", { q })</text>
     </g>
 
     <!-- travelling host call -->
     <g class="pulse"><circle cx="0" cy="195" r="6" filter="url(#glow)"/></g>
 
-    <text x="600" y="372" text-anchor="middle" font-size="13.5" fill="#46688a">agents never touch the world directly — every side effect is a host call: logged, cached, replayable</text>
+    <text x="600" y="372" text-anchor="middle" font-size="13.5" fill="#5d5c56">agents never touch the world directly — every side effect is a host call: logged, cached, replayable</text>
   </g>
-  <rect x="0.5" y="0.5" width="1199" height="399" rx="16" fill="none" stroke="#16314d"/>
+  <rect x="0.5" y="0.5" width="1199" height="399" rx="4" fill="none" stroke="#E8E8E5" stroke-opacity="0.12"/>
 </svg>

@@ -1,20 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-label="chidori — checkpoint, replay, resume: durable TypeScript agents on a Rust core">
   <title>chidori — checkpoint · replay · resume</title>
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#04070d"/>
-      <stop offset="0.55" stop-color="#07101e"/>
-      <stop offset="1" stop-color="#050b15"/>
-    </linearGradient>
     <linearGradient id="wordmark" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#eafcff"/>
-      <stop offset="0.55" stop-color="#9ae9ff"/>
-      <stop offset="1" stop-color="#3fb9f5"/>
+      <stop offset="0" stop-color="#FDF6D8"/>
+      <stop offset="0.55" stop-color="#FACC15"/>
+      <stop offset="1" stop-color="#E3A008"/>
     </linearGradient>
-    <radialGradient id="vignette" cx="600" cy="170" r="740" gradientUnits="userSpaceOnUse">
-      <stop offset="0.55" stop-color="#000000" stop-opacity="0"/>
-      <stop offset="1" stop-color="#000000" stop-opacity="0.5"/>
-    </radialGradient>
     <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
       <feGaussianBlur stdDeviation="5" result="b"/>
       <feMerge>
@@ -30,11 +21,11 @@
       </feMerge>
     </filter>
     <clipPath id="frame">
-      <rect width="1200" height="360" rx="16"/>
+      <rect width="1200" height="360" rx="4"/>
     </clipPath>
   </defs>
   <style>
-    text { font-family: 'JetBrains Mono','IBM Plex Mono','SF Mono','DejaVu Sans Mono',Menlo,Consolas,monospace; }
+    text { font-family: 'JetBrains Mono','Berkeley Mono','SF Mono','DejaVu Sans Mono',Menlo,Consolas,ui-monospace,monospace; }
     .bird { animation: fly linear infinite; }
     .b1 { animation-duration: 30s; animation-delay: -4s; }
     .b2 { animation-duration: 38s; animation-delay: -21s; }
@@ -59,12 +50,12 @@
     @keyframes flicker {
       0%, 100% { opacity: 0.10; }
       41%      { opacity: 0.10; }
-      42%      { opacity: 0.55; }
+      42%      { opacity: 0.50; }
       43%      { opacity: 0.14; }
-      44.5%    { opacity: 0.45; }
+      44.5%    { opacity: 0.42; }
       46%      { opacity: 0.10; }
       78%      { opacity: 0.10; }
-      79%      { opacity: 0.38; }
+      79%      { opacity: 0.35; }
       80.5%    { opacity: 0.10; }
     }
     .kw { animation: wpulse 6.6s linear infinite; }
@@ -72,10 +63,10 @@
     .w2 { animation-delay: 2.2s; }
     .w3 { animation-delay: 4.4s; }
     @keyframes wpulse {
-      0%        { fill: #6fc4ea; }
-      6%        { fill: #eafcff; }
-      11%       { fill: #b9ecff; }
-      26%, 100% { fill: #6fc4ea; }
+      0%        { fill: #F4C752; }
+      6%        { fill: #FDF6D8; }
+      11%       { fill: #FACC15; }
+      26%, 100% { fill: #F4C752; }
     }
     .logline { opacity: 0; animation: logcycle 12s linear infinite; }
     .l1 { animation-delay: 0s; }
@@ -83,25 +74,27 @@
     .l3 { animation-delay: 8s; }
     @keyframes logcycle {
       0%        { opacity: 0; }
-      3%        { opacity: 0.85; }
-      29%       { opacity: 0.85; }
+      3%        { opacity: 0.9; }
+      29%       { opacity: 0.9; }
       33%, 100% { opacity: 0; }
     }
+    .cursor { animation: blink 1s step-end infinite; }
+    @keyframes blink { 50% { opacity: 0; } }
     @media (prefers-reduced-motion: reduce) {
-      .bird, .spark, .bolt, .kw, .logline { animation: none !important; }
+      .bird, .spark, .bolt, .kw, .logline, .cursor { animation: none !important; }
       .bird { opacity: 0; }
       .bolt { opacity: 0.14; }
       .spark { opacity: 0; }
-      .l1 { opacity: 0.85; }
+      .l1 { opacity: 0.9; }
     }
   </style>
 
   <g clip-path="url(#frame)">
-    <rect width="1200" height="360" fill="url(#bg)"/>
+    <rect width="1200" height="360" fill="#0A0A0A"/>
 
     <!-- thousand-bird flock: stylised plovers drifting across the upper sky -->
-    <g stroke="#2c4f6e" fill="none" stroke-width="1.6" stroke-linecap="round">
-      <g class="bird b1" opacity="0.30"><g transform="translate(0,46)"><path d="M0 0 Q3 -3.4 6 -0.4 Q9 -3.4 12 0"/></g></g>
+    <g stroke="#4a4940" fill="none" stroke-width="1.6" stroke-linecap="round">
+      <g class="bird b1" opacity="0.32"><g transform="translate(0,46)"><path d="M0 0 Q3 -3.4 6 -0.4 Q9 -3.4 12 0"/></g></g>
       <g class="bird b2" opacity="0.18"><g transform="translate(0,64) scale(0.8)"><path d="M0 0 Q3 -3.4 6 -0.4 Q9 -3.4 12 0"/></g></g>
       <g class="bird b3" opacity="0.26"><g transform="translate(0,34) scale(1.15)"><path d="M0 0 Q3 -3.4 6 -0.4 Q9 -3.4 12 0"/></g></g>
       <g class="bird b4" opacity="0.14"><g transform="translate(0,84) scale(0.7)"><path d="M0 0 Q3 -3.4 6 -0.4 Q9 -3.4 12 0"/></g></g>
@@ -112,35 +105,33 @@
 
     <!-- lightning arc behind the wordmark, with a travelling spark -->
     <g fill="none" stroke-linejoin="round" stroke-linecap="round">
-      <path class="bolt" opacity="0.12" d="M70 150 L185 136 L260 161 L355 130 L450 158 L545 137 L600 152 L655 134 L750 160 L845 132 L940 157 L1030 138 L1130 150"
-            stroke="#3fb9f5" stroke-width="1.5"/>
+      <path class="bolt" opacity="0.10" d="M70 150 L185 136 L260 161 L355 130 L450 158 L545 137 L600 152 L655 134 L750 160 L845 132 L940 157 L1030 138 L1130 150"
+            stroke="#FACC15" stroke-width="1.5"/>
       <path class="spark" d="M70 150 L185 136 L260 161 L355 130 L450 158 L545 137 L600 152 L655 134 L750 160 L845 132 L940 157 L1030 138 L1130 150"
-            stroke="#bdf0ff" stroke-width="2.2" filter="url(#glow)"/>
+            stroke="#FFE588" stroke-width="2.2" filter="url(#glow)"/>
     </g>
 
     <!-- wordmark -->
-    <text x="600" y="86" text-anchor="middle" font-size="22" letter-spacing="10" fill="#39618a">千鳥</text>
+    <text x="600" y="86" text-anchor="middle" font-size="22" letter-spacing="10" fill="#F4C752" opacity="0.5">千鳥</text>
     <text x="600" y="178" text-anchor="middle" font-size="92" font-weight="700" letter-spacing="3"
           fill="url(#wordmark)" filter="url(#softglow)">chidori</text>
     <g transform="translate(854,104)">
-      <rect width="42" height="26" rx="6" fill="none" stroke="#2c4f6e" stroke-width="1.2"/>
-      <text x="21" y="18" text-anchor="middle" font-size="14" font-weight="600" fill="#6fa8cc">v3</text>
+      <rect width="42" height="26" rx="4" fill="none" stroke="#4a4940" stroke-width="1.2"/>
+      <text x="21" y="18" text-anchor="middle" font-size="14" font-weight="600" fill="#9b9a93">v3</text>
     </g>
 
     <!-- subtitle: the three verbs pulse in sequence -->
-    <text x="600" y="226" text-anchor="middle" font-size="17" fill="#587c99" letter-spacing="0.5"><tspan
-      class="kw w1" fill="#6fc4ea" font-weight="600">checkpoint</tspan><tspan fill="#3c5a75"> · </tspan><tspan
-      class="kw w2" fill="#6fc4ea" font-weight="600">replay</tspan><tspan fill="#3c5a75"> · </tspan><tspan
-      class="kw w3" fill="#6fc4ea" font-weight="600">resume</tspan><tspan>  —  durable TypeScript agents on a Rust core</tspan></text>
+    <text x="600" y="226" text-anchor="middle" font-size="17" fill="#74736d" letter-spacing="0.5"><tspan
+      class="kw w1" fill="#F4C752" font-weight="600">checkpoint</tspan><tspan fill="#4a4940"> · </tspan><tspan
+      class="kw w2" fill="#F4C752" font-weight="600">replay</tspan><tspan fill="#4a4940"> · </tspan><tspan
+      class="kw w3" fill="#F4C752" font-weight="600">resume</tspan><tspan>  —  durable TypeScript agents on a Rust core</tspan></text>
 
     <!-- cycling run log -->
     <g font-size="14" text-anchor="middle">
-      <text class="logline l1" x="600" y="306" fill="#79b8d9">$ chidori run agents/summarizer.ts</text>
-      <text class="logline l2" x="600" y="306" fill="#79b8d9">✓ checkpoint saved · .chidori/runs/9f3a12/ · 12 host calls</text>
-      <text class="logline l3" x="600" y="306" fill="#8fd8c7">↺ replay · identical output · 0 LLM calls · $0.00</text>
+      <text class="logline l1" x="600" y="306" fill="#9b9a93">$ chidori run agents/summarizer.ts <tspan class="cursor" fill="#FACC15">▮</tspan></text>
+      <text class="logline l2" x="600" y="306" fill="#9b9a93">✓ checkpoint saved · .chidori/runs/9f3a12/ · 12 host calls</text>
+      <text class="logline l3" x="600" y="306" fill="#C9DA8A">↺ replay · identical output · 0 LLM calls · $0.00</text>
     </g>
-
-    <rect width="1200" height="360" fill="url(#vignette)"/>
   </g>
-  <rect x="0.5" y="0.5" width="1199" height="359" rx="16" fill="none" stroke="#16314d"/>
+  <rect x="0.5" y="0.5" width="1199" height="359" rx="4" fill="none" stroke="#E8E8E5" stroke-opacity="0.12"/>
 </svg>

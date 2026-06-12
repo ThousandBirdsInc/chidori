@@ -1,27 +1,23 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="310" viewBox="0 0 1200 310" role="img" aria-label="Human in the loop: the agent runs until input() pauses it, the session is persisted to disk, and when a human responds the runtime replays the call log to the pause point and continues.">
   <title>pause on input() · resume by replay</title>
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#04070d"/>
-      <stop offset="1" stop-color="#070f1c"/>
-    </linearGradient>
     <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
       <feGaussianBlur stdDeviation="4" result="b"/>
       <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
     </filter>
-    <clipPath id="frame"><rect width="1200" height="310" rx="16"/></clipPath>
+    <clipPath id="frame"><rect width="1200" height="310" rx="4"/></clipPath>
   </defs>
   <style>
-    text { font-family: 'JetBrains Mono','IBM Plex Mono','SF Mono','DejaVu Sans Mono',Menlo,Consolas,monospace; }
+    text { font-family: 'JetBrains Mono','Berkeley Mono','SF Mono','DejaVu Sans Mono',Menlo,Consolas,ui-monospace,monospace; }
     .runner { opacity: 0; animation: runner 14s linear infinite; }
     @keyframes runner {
-      0%, 2%   { transform: translateX(80px);   opacity: 0; fill: #dffaff; }
+      0%, 2%   { transform: translateX(80px);   opacity: 0; fill: #FDF6D8; }
       3%       { opacity: 1; }
       10%      { transform: translateX(200px); }
       17%      { transform: translateX(400px); }
-      25%      { transform: translateX(600px);  opacity: 1; fill: #dffaff; }
+      25%      { transform: translateX(600px);  opacity: 1; fill: #FDF6D8; }
       27%      { opacity: 0; }
-      63%      { transform: translateX(600px);  opacity: 0; fill: #b9f4dd; }
+      63%      { transform: translateX(600px);  opacity: 0; fill: #E4EFC4; }
       64%      { opacity: 1; }
       68%      { transform: translateX(820px); }
       72%      { transform: translateX(1020px); }
@@ -75,51 +71,58 @@
   </style>
 
   <g clip-path="url(#frame)">
-    <rect width="1200" height="310" fill="url(#bg)"/>
+    <rect width="1200" height="310" fill="#0A0A0A"/>
+
+    <!-- window chrome -->
+    <g>
+      <circle cx="26" cy="26" r="5" fill="#FF5F56"/>
+      <circle cx="44" cy="26" r="5" fill="#FFBD2E"/>
+      <circle cx="62" cy="26" r="5" fill="#27C93F"/>
+    </g>
 
     <!-- status chips -->
     <g class="ap paused">
-      <rect x="425" y="52" width="350" height="32" rx="8" fill="#241c0c" stroke="#7a6230" stroke-width="1.2"/>
-      <text x="600" y="73" text-anchor="middle" font-size="13.5" fill="#f5c469">⏸ paused — waiting for a human</text>
-      <text x="600" y="104" text-anchor="middle" font-size="11.5" fill="#46688a">session persisted to disk · the server can restart, the agent keeps its place</text>
+      <rect x="425" y="52" width="350" height="32" rx="4" fill="#1C1C1C" stroke="#FACC15" stroke-opacity="0.55" stroke-width="1.2"/>
+      <text x="600" y="73" text-anchor="middle" font-size="13.5" fill="#FACC15">⏸ paused — waiting for a human</text>
+      <text x="600" y="104" text-anchor="middle" font-size="11.5" fill="#74736d">session persisted to disk · the server can restart, the agent keeps its place</text>
     </g>
     <g class="ap response">
-      <rect x="498" y="206" width="204" height="30" rx="8" fill="#0d2419" stroke="#2e6b4d" stroke-width="1.2"/>
-      <text x="600" y="226" text-anchor="middle" font-size="13" fill="#7fe0b0">response: "yes" → resume</text>
+      <rect x="498" y="206" width="204" height="30" rx="4" fill="#1C1C1C" stroke="#C9DA8A" stroke-opacity="0.55" stroke-width="1.2"/>
+      <text x="600" y="226" text-anchor="middle" font-size="13" fill="#C9DA8A">response: "yes" → resume</text>
     </g>
-    <text class="ap endlbl" x="1120" y="73" text-anchor="end" font-size="13.5" font-weight="700" fill="#7fe0b0">completed — resumed exactly where it paused</text>
+    <text class="ap endlbl" x="1120" y="73" text-anchor="end" font-size="13.5" font-weight="700" fill="#C9DA8A">completed — resumed exactly where it paused</text>
 
     <!-- timeline -->
-    <line x1="80" y1="170" x2="1120" y2="170" stroke="#1c3a55" stroke-width="2"/>
-    <rect class="sweep" x="80" y="168.5" width="520" height="3" rx="1.5" fill="#8fd8c7" filter="url(#glow)"/>
+    <line x1="80" y1="170" x2="1120" y2="170" stroke="#2e2d29" stroke-width="2"/>
+    <rect class="sweep" x="80" y="168.5" width="520" height="3" rx="1.5" fill="#C9DA8A" filter="url(#glow)"/>
 
     <g font-size="13" text-anchor="middle">
-      <text x="200" y="142" fill="#7fa3c0">prompt()</text>
-      <text x="400" y="142" fill="#7fa3c0">tool("plan")</text>
-      <text x="600" y="142" fill="#f5c469">input("approve?")</text>
-      <text x="820" y="142" fill="#7fa3c0">prompt()</text>
-      <text x="1020" y="142" fill="#7fa3c0">return</text>
+      <text x="200" y="142" fill="#9b9a93">prompt()</text>
+      <text x="400" y="142" fill="#9b9a93">tool("plan")</text>
+      <text x="600" y="142" fill="#F4C752">input("approve?")</text>
+      <text x="820" y="142" fill="#9b9a93">prompt()</text>
+      <text x="1020" y="142" fill="#9b9a93">return</text>
     </g>
 
-    <circle class="pring" cx="600" cy="170" r="14" fill="none" stroke="#f5c469" stroke-width="2"/>
+    <circle class="pring" cx="600" cy="170" r="14" fill="none" stroke="#FACC15" stroke-width="2"/>
 
-    <g fill="#0a1626" stroke="#2c4f6e" stroke-width="1.6">
+    <g fill="#141414" stroke="#4a4940" stroke-width="1.6">
       <circle cx="200" cy="170" r="7"/><circle cx="400" cy="170" r="7"/><circle cx="600" cy="170" r="7"/>
       <circle cx="820" cy="170" r="7"/><circle cx="1020" cy="170" r="7"/>
     </g>
-    <!-- live lights (cyan), pause light (amber), replay/resume lights (green) -->
-    <circle class="ap n10" cx="200" cy="170" r="4.4" fill="#9ae9ff"/>
-    <circle class="ap n17" cx="400" cy="170" r="4.4" fill="#9ae9ff"/>
-    <circle class="ap amb" cx="600" cy="170" r="4.4" fill="#f5c469"/>
-    <circle class="ap g59" cx="200" cy="170" r="4.4" fill="#7fe0b0"/>
-    <circle class="ap g60" cx="400" cy="170" r="4.4" fill="#7fe0b0"/>
-    <circle class="ap g61" cx="600" cy="170" r="4.4" fill="#7fe0b0"/>
-    <circle class="ap g68" cx="820" cy="170" r="4.4" fill="#7fe0b0"/>
-    <circle class="ap g72" cx="1020" cy="170" r="4.4" fill="#7fe0b0"/>
+    <!-- live lights (gold), pause light (amber), replay/resume lights (sage) -->
+    <circle class="ap n10" cx="200" cy="170" r="4.4" fill="#FACC15"/>
+    <circle class="ap n17" cx="400" cy="170" r="4.4" fill="#FACC15"/>
+    <circle class="ap amb" cx="600" cy="170" r="4.4" fill="#FFBD2E"/>
+    <circle class="ap g59" cx="200" cy="170" r="4.4" fill="#C9DA8A"/>
+    <circle class="ap g60" cx="400" cy="170" r="4.4" fill="#C9DA8A"/>
+    <circle class="ap g61" cx="600" cy="170" r="4.4" fill="#C9DA8A"/>
+    <circle class="ap g68" cx="820" cy="170" r="4.4" fill="#C9DA8A"/>
+    <circle class="ap g72" cx="1020" cy="170" r="4.4" fill="#C9DA8A"/>
 
     <g class="runner"><circle cx="0" cy="170" r="6" filter="url(#glow)"/></g>
 
-    <text class="ap swcap" x="600" y="280" text-anchor="middle" font-size="13.5" fill="#46688a">resume = replay the call log to the pause point — nothing re-executes, then live execution continues</text>
+    <text class="ap swcap" x="600" y="280" text-anchor="middle" font-size="13.5" fill="#5d5c56">resume = replay the call log to the pause point — nothing re-executes, then live execution continues</text>
   </g>
-  <rect x="0.5" y="0.5" width="1199" height="309" rx="16" fill="none" stroke="#16314d"/>
+  <rect x="0.5" y="0.5" width="1199" height="309" rx="4" fill="none" stroke="#E8E8E5" stroke-opacity="0.12"/>
 </svg>

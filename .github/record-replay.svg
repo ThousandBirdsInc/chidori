@@ -1,21 +1,17 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="470" viewBox="0 0 1200 470" role="img" aria-label="How replay works: an original run records every host call into a call log; replay re-executes the agent against the cached results — identical output, zero LLM calls.">
   <title>record once · replay free</title>
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#04070d"/>
-      <stop offset="1" stop-color="#070f1c"/>
-    </linearGradient>
     <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
       <feGaussianBlur stdDeviation="4" result="b"/>
       <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
     </filter>
     <marker id="arrow" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0 0 L8 4 L0 8 z" fill="#3c5a75"/>
+      <path d="M0 0 L8 4 L0 8 z" fill="#4a4940"/>
     </marker>
-    <clipPath id="frame"><rect width="1200" height="470" rx="16"/></clipPath>
+    <clipPath id="frame"><rect width="1200" height="470" rx="4"/></clipPath>
   </defs>
   <style>
-    text { font-family: 'JetBrains Mono','IBM Plex Mono','SF Mono','DejaVu Sans Mono',Menlo,Consolas,monospace; }
+    text { font-family: 'JetBrains Mono','Berkeley Mono','SF Mono','DejaVu Sans Mono',Menlo,Consolas,ui-monospace,monospace; }
     .ap { opacity: 0; animation-duration: 16s; animation-timing-function: linear; animation-iteration-count: infinite; }
     .t8  { animation-name: t8;  } @keyframes t8  { 0%,8%  { opacity:0; } 10% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
     .t15 { animation-name: t15; } @keyframes t15 { 0%,15% { opacity:0; } 17% { opacity:1; } 92% { opacity:1; } 96%,100% { opacity:0; } }
@@ -63,16 +59,23 @@
   </style>
 
   <g clip-path="url(#frame)">
-    <rect width="1200" height="470" fill="url(#bg)"/>
+    <rect width="1200" height="470" fill="#0A0A0A"/>
+
+    <!-- window chrome -->
+    <g>
+      <circle cx="26" cy="26" r="5" fill="#FF5F56"/>
+      <circle cx="44" cy="26" r="5" fill="#FFBD2E"/>
+      <circle cx="62" cy="26" r="5" fill="#27C93F"/>
+    </g>
 
     <!-- ───────── lane 1 · original run ───────── -->
-    <text x="70" y="64" font-size="14" font-weight="700" letter-spacing="2" fill="#79b8d9">ORIGINAL RUN</text>
-    <text x="240" y="64" font-size="13" fill="#3c5a75">— executes everything, records every host call</text>
-    <text class="ap t46" x="1130" y="64" text-anchor="end" font-size="14" font-weight="700" fill="#f5c469">3.6 s · $0.12 in LLM calls</text>
+    <text x="70" y="64" font-size="14" font-weight="700" letter-spacing="2" fill="#F4C752">ORIGINAL RUN</text>
+    <text x="240" y="64" font-size="13" fill="#74736d">— executes everything, records every host call</text>
+    <text class="ap t46" x="1130" y="64" text-anchor="end" font-size="14" font-weight="700" fill="#FACC15">3.6 s · $0.12 in LLM calls</text>
 
-    <line x1="70" y1="130" x2="1130" y2="130" stroke="#1c3a55" stroke-width="2"/>
+    <line x1="70" y1="130" x2="1130" y2="130" stroke="#2e2d29" stroke-width="2"/>
 
-    <g font-size="13" fill="#7fa3c0" text-anchor="middle">
+    <g font-size="13" fill="#9b9a93" text-anchor="middle">
       <text x="150" y="104">prompt()</text>
       <text x="320" y="104">tool("search")</text>
       <text x="490" y="104">http(get)</text>
@@ -80,7 +83,7 @@
       <text x="830" y="104">memory.put()</text>
       <text x="1000" y="104">return</text>
     </g>
-    <g font-size="12" fill="#3c5a75" text-anchor="middle">
+    <g font-size="12" fill="#5d5c56" text-anchor="middle">
       <text x="150" y="160">1.2 s</text>
       <text x="320" y="160">0.3 s</text>
       <text x="490" y="160">0.4 s</text>
@@ -89,12 +92,12 @@
     </g>
 
     <!-- node sockets (static) -->
-    <g fill="#0a1626" stroke="#2c4f6e" stroke-width="1.6">
+    <g fill="#141414" stroke="#4a4940" stroke-width="1.6">
       <circle cx="150" cy="130" r="7"/><circle cx="320" cy="130" r="7"/><circle cx="490" cy="130" r="7"/>
       <circle cx="660" cy="130" r="7"/><circle cx="830" cy="130" r="7"/><circle cx="1000" cy="130" r="7"/>
     </g>
     <!-- node lights + call-log entries, lit as the run reaches them -->
-    <g fill="#9ae9ff">
+    <g fill="#FACC15">
       <circle class="ap t8"  cx="150"  cy="130" r="4.4"/>
       <circle class="ap t15" cx="320"  cy="130" r="4.4"/>
       <circle class="ap t21" cx="490"  cy="130" r="4.4"/>
@@ -102,7 +105,7 @@
       <circle class="ap t38" cx="830"  cy="130" r="4.4"/>
       <circle class="ap t42" cx="1000" cy="130" r="4.4"/>
     </g>
-    <g font-size="11.5" fill="#5d93b8" text-anchor="middle">
+    <g font-size="11.5" fill="#F4C752" opacity="0.75" text-anchor="middle">
       <text class="ap t8"  x="150"  y="184">seq 0 logged</text>
       <text class="ap t15" x="320"  y="184">seq 1 logged</text>
       <text class="ap t21" x="490"  y="184">seq 2 logged</text>
@@ -111,29 +114,29 @@
       <text class="ap t42" x="1000" y="184">output saved</text>
     </g>
     <!-- travelling execution dot -->
-    <g class="runner"><circle cx="0" cy="130" r="6" fill="#dffaff" filter="url(#glow)"/></g>
+    <g class="runner"><circle cx="0" cy="130" r="6" fill="#FDF6D8" filter="url(#glow)"/></g>
 
     <!-- ───────── checkpoint ───────── -->
     <g class="ap t51">
-      <line x1="600" y1="148" x2="600" y2="210" stroke="#3c5a75" stroke-width="1.6" marker-end="url(#arrow)"/>
-      <rect x="378" y="216" width="444" height="42" rx="10" fill="#0c1c30" stroke="#2c4f6e" stroke-width="1.4"/>
-      <text x="600" y="243" text-anchor="middle" font-size="14.5" fill="#bde4f7"><tspan font-weight="700" fill="#9ae9ff">checkpoint</tspan> = the call log · plain JSON on disk</text>
-      <line x1="600" y1="258" x2="600" y2="322" stroke="#3c5a75" stroke-width="1.6" marker-end="url(#arrow)"/>
+      <line x1="600" y1="148" x2="600" y2="210" stroke="#4a4940" stroke-width="1.6" marker-end="url(#arrow)"/>
+      <rect x="378" y="216" width="444" height="42" rx="4" fill="#141414" stroke="#E8E8E5" stroke-opacity="0.12" stroke-width="1.4"/>
+      <text x="600" y="243" text-anchor="middle" font-size="14.5" fill="#E8E8E5"><tspan font-weight="700" fill="#FACC15">checkpoint</tspan> = the call log · plain JSON on disk</text>
+      <line x1="600" y1="258" x2="600" y2="322" stroke="#4a4940" stroke-width="1.6" marker-end="url(#arrow)"/>
     </g>
 
     <!-- ───────── lane 2 · replay ───────── -->
-    <text x="70" y="300" font-size="14" font-weight="700" letter-spacing="2" fill="#8fd8c7">REPLAY</text>
-    <text x="172" y="300" font-size="13" fill="#3c5a75">— same code path, answered from the log</text>
-    <text class="ap t68" x="1130" y="300" text-anchor="end" font-size="14" font-weight="700" fill="#7fe0b0">0.04 s · $0.00 · identical output</text>
+    <text x="70" y="300" font-size="14" font-weight="700" letter-spacing="2" fill="#C9DA8A">REPLAY</text>
+    <text x="172" y="300" font-size="13" fill="#74736d">— same code path, answered from the log</text>
+    <text class="ap t68" x="1130" y="300" text-anchor="end" font-size="14" font-weight="700" fill="#C9DA8A">0.04 s · $0.00 · identical output</text>
 
-    <line x1="70" y1="345" x2="1130" y2="345" stroke="#1c3a55" stroke-width="2"/>
-    <rect class="sweep" x="70" y="343.5" width="1060" height="3" rx="1.5" fill="#8fd8c7" filter="url(#glow)"/>
+    <line x1="70" y1="345" x2="1130" y2="345" stroke="#2e2d29" stroke-width="2"/>
+    <rect class="sweep" x="70" y="343.5" width="1060" height="3" rx="1.5" fill="#C9DA8A" filter="url(#glow)"/>
 
-    <g fill="#0a1626" stroke="#2c4f6e" stroke-width="1.6">
+    <g fill="#141414" stroke="#4a4940" stroke-width="1.6">
       <circle cx="150" cy="345" r="7"/><circle cx="320" cy="345" r="7"/><circle cx="490" cy="345" r="7"/>
       <circle cx="660" cy="345" r="7"/><circle cx="830" cy="345" r="7"/><circle cx="1000" cy="345" r="7"/>
     </g>
-    <g fill="#7fe0b0">
+    <g fill="#C9DA8A">
       <circle class="ap t59" cx="150"  cy="345" r="4.4"/>
       <circle class="ap t60" cx="320"  cy="345" r="4.4"/>
       <circle class="ap t61" cx="490"  cy="345" r="4.4"/>
@@ -141,7 +144,7 @@
       <circle class="ap t63" cx="830"  cy="345" r="4.4"/>
       <circle class="ap t64" cx="1000" cy="345" r="4.4"/>
     </g>
-    <g font-size="11.5" fill="#5fae93" text-anchor="middle">
+    <g font-size="11.5" fill="#C9DA8A" opacity="0.7" text-anchor="middle">
       <text class="ap t59" x="150"  y="376">cached ✓</text>
       <text class="ap t60" x="320"  y="376">cached ✓</text>
       <text class="ap t61" x="490"  y="376">cached ✓</text>
@@ -150,7 +153,7 @@
       <text class="ap t64" x="1000" y="376">same output</text>
     </g>
 
-    <text x="600" y="440" text-anchor="middle" font-size="13.5" fill="#46688a">save it to disk · commit it to git · replay it in a test — no side effect re-executes</text>
+    <text x="600" y="440" text-anchor="middle" font-size="13.5" fill="#5d5c56">save it to disk · commit it to git · replay it in a test — no side effect re-executes</text>
   </g>
-  <rect x="0.5" y="0.5" width="1199" height="469" rx="16" fill="none" stroke="#16314d"/>
+  <rect x="0.5" y="0.5" width="1199" height="469" rx="4" fill="none" stroke="#E8E8E5" stroke-opacity="0.12"/>
 </svg>
