@@ -767,6 +767,15 @@ impl Vm {
                     }
                 }
             }
+            // `yield*` return delegation: a `.return(v)` resumption crossing
+            // the delegation handler is forwarded to the inner iterator's
+            // `return` method instead of completing the outer generator.
+            if let Completion::Return(v) = &comp {
+                if let Some(return_ip) = h.delegation_return_ip {
+                    frame.stack.push(v.clone());
+                    return Ok(Ctl::Jump(return_ip as usize));
+                }
+            }
             if let Some(finally_ip) = h.finally_ip {
                 frame.pending_completion = Some(comp);
                 return Ok(Ctl::Jump(finally_ip as usize));
@@ -1165,7 +1174,18 @@ impl Vm {
                 let obj = pop!();
                 let key = self.to_property_key(&key_v)?;
                 if let Value::Object(o) = &obj {
-                    o.borrow_mut().props.insert(key, Property::data(value));
+                    // Private storage keys ("#x@id") are spec Private Names:
+                    // they attach directly to the receiver — even a Proxy —
+                    // without [[DefineOwnProperty]] (no trap, no extensibility
+                    // check). Everything else is CreateDataPropertyOrThrow.
+                    let is_private = matches!(&key, PropertyKey::Str(s) if s.as_str().starts_with('#'));
+                    if is_private {
+                        o.borrow_mut().props.insert(key, Property::data(value));
+                    } else {
+                        crate::builtins::fundamental::create_data_property_or_throw(
+                            self, o, &key, value,
+                        )?;
+                    }
                 }
                 push!(obj);
             }
@@ -1994,11 +2014,17 @@ impl Vm {
                     stack_depth: frame.stack.len(),
                     with_depth: frame.with_scope.len(),
                     delegation: false,
+                    delegation_return_ip: None,
                 });
             }
-            Op::MarkDelegationHandler => {
+            Op::MarkDelegationHandler(return_ip) => {
                 if let Some(h) = frame.handlers.last_mut() {
                     h.delegation = true;
+                    h.delegation_return_ip = if return_ip == u32::MAX {
+                        None
+                    } else {
+                        Some(return_ip)
+                    };
                 }
             }
             Op::InitEvalVars => {
@@ -2092,6 +2118,10 @@ impl Vm {
                             }
                         }
                     }
+                } else if !ret.is_nullish() && !completion_is_throw {
+                    // GetMethod: a present but non-callable `return` is a
+                    // TypeError (masked only by an in-flight throw).
+                    return Err(self.throw_type("iterator return is not a function"));
                 }
             }
             Op::ForInEnumerate => {

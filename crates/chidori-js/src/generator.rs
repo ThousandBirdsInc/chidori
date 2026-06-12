@@ -181,32 +181,68 @@ impl Vm {
                 }
                 Action::Resume(frame, is_start, (kind, value, result)) => {
                     if matches!(kind, ResumeKind::Return) {
-                        // AsyncGeneratorReturn: Await the return value (unwrapping
-                        // a thenable) before settling `{value, done:true}`; a
-                        // rejected value rejects the result. (Running an enclosing
-                        // `finally` on a suspended-yield return is the separate
-                        // try/finally gap.)
-                        self.set_gen_state(gobj, GeneratorState::Completed);
+                        if is_start {
+                            // AsyncGeneratorReturn before the body started: no
+                            // try is in scope, so Await the return value
+                            // (unwrapping a thenable) and settle
+                            // `{value, done:true}`; a rejected value rejects
+                            // the result.
+                            self.set_gen_state(gobj, GeneratorState::Completed);
+                            let target = self.promise_resolve(value);
+                            let gen_f = gobj.clone();
+                            let res_f = result.clone();
+                            let on_f = self.new_native("", 1, move |vm, _t, args| {
+                                let v = args.first().cloned().unwrap_or(Value::Undefined);
+                                let r = vm.make_iter_result(v, true);
+                                vm.resolve_promise(&res_f, r);
+                                vm.agen_complete_step(&gen_f);
+                                Ok(Value::Undefined)
+                            });
+                            let gen_r = gobj.clone();
+                            let res_r = result.clone();
+                            let on_r = self.new_native("", 1, move |vm, _t, args| {
+                                let e = args.first().cloned().unwrap_or(Value::Undefined);
+                                vm.reject_promise(&res_r, e);
+                                vm.agen_complete_step(&gen_r);
+                                Ok(Value::Undefined)
+                            });
+                            self.promise_then(&target, Value::Object(on_f), Value::Object(on_r));
+                            return; // completion is async; on_f/on_r re-drain
+                        }
+                        // Suspended at a yield: AsyncGeneratorUnwrapYieldResumption
+                        // — Await the return value, then resume the frame with a
+                        // Return completion so enclosing `finally` blocks run and
+                        // a `yield*` delegates to the inner iterator's `return`.
+                        // A rejected awaited value resumes with a Throw instead.
                         let target = self.promise_resolve(value);
+                        let cell = std::rc::Rc::new(std::cell::RefCell::new(Some(frame)));
                         let gen_f = gobj.clone();
                         let res_f = result.clone();
+                        let cell_f = cell.clone();
                         let on_f = self.new_native("", 1, move |vm, _t, args| {
-                            let v = args.first().cloned().unwrap_or(Value::Undefined);
-                            let r = vm.make_iter_result(v, true);
-                            vm.resolve_promise(&res_f, r);
-                            vm.agen_complete_step(&gen_f);
+                            if let Some(fr) = cell_f.borrow_mut().take() {
+                                let token = fr.trace_token;
+                                vm.trace_resume(token);
+                                let v = args.first().cloned().unwrap_or(Value::Undefined);
+                                let flow = vm.resume_frame_return(fr, v);
+                                vm.agen_drive(&gen_f, flow, &res_f, token);
+                            }
                             Ok(Value::Undefined)
                         });
                         let gen_r = gobj.clone();
                         let res_r = result.clone();
                         let on_r = self.new_native("", 1, move |vm, _t, args| {
-                            let e = args.first().cloned().unwrap_or(Value::Undefined);
-                            vm.reject_promise(&res_r, e);
-                            vm.agen_complete_step(&gen_r);
+                            if let Some(fr) = cell.borrow_mut().take() {
+                                let token = fr.trace_token;
+                                vm.trace_resume(token);
+                                let e = args.first().cloned().unwrap_or(Value::Undefined);
+                                let flow = vm.resume_frame_throw(fr, e);
+                                vm.agen_drive(&gen_r, flow, &res_r, token);
+                            }
                             Ok(Value::Undefined)
                         });
                         self.promise_then(&target, Value::Object(on_f), Value::Object(on_r));
-                        return; // completion is async; on_f/on_r re-drain
+                        return; // the resumption re-drives via agen_drive
                     }
                     let token = frame.trace_token;
                     self.trace_resume(token);

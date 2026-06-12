@@ -74,6 +74,10 @@ pub struct TryHandler {
     /// machinery's internal await-of-yielded-value rejection sets the frame's
     /// one-shot skip flag, which makes the unwind pass this handler by.
     pub delegation: bool,
+    /// `yield*` return delegation: a `.return(v)` resumption unwinding across
+    /// this handler jumps here (with `v` pushed) instead of completing the
+    /// generator, so the loop can call the inner iterator's `return` method.
+    pub delegation_return_ip: Option<u32>,
 }
 
 /// A single call frame. Self-contained (own operand stack + locals) so that a

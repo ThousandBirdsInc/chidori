@@ -334,8 +334,11 @@ pub enum Op {
     /// the iterator protocol's "result must be an Object" check.
     RequireIterResult,
     /// Mark the most recently pushed try-handler as a `yield*` delegation
-    /// handler (see `TryHandler::delegation`).
-    MarkDelegationHandler,
+    /// handler (see `TryHandler::delegation`). The operand is the ip a
+    /// `.return(v)` resumption jumps to (with `v` pushed) so the delegation
+    /// loop can forward it to the inner iterator's `return` method;
+    /// `u32::MAX` = no return delegation.
+    MarkDelegationHandler(u32),
     /// Direct `eval(...)` call site: `[callee, arg0..argN-1] -> [result]`.
     /// When the callee is the %eval% intrinsic, the source compiles against
     /// the scope snapshot `FuncProto::eval_scopes[scope]` and runs with the
