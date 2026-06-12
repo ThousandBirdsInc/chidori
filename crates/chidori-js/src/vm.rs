@@ -1227,6 +1227,17 @@ impl Vm {
         // the dense store, so route the write through the ordinary props path
         // below (which honours its writable flag) when such an entry exists.
         let has_props_entry = b.props.contains_key(key);
+        // A non-writable `length` marker blocks index writes past the end.
+        let len_not_writable = matches!(
+            b.props.get(&PropertyKey::str("length")),
+            Some(Property {
+                kind: PropertyKind::Data {
+                    writable: false,
+                    ..
+                },
+                ..
+            })
+        );
         if !has_props_entry {
             if let Internal::Array(arr) = &mut b.internal {
                 if let Some("length") = key.as_str() {
@@ -1249,6 +1260,16 @@ impl Vm {
                 if let Some(idx) = key.array_index() {
                     let idx = idx as usize;
                     if idx >= arr.len() {
+                        if len_not_writable {
+                            // Growing past a non-writable `length` is rejected
+                            // (silently in sloppy mode, TypeError in strict).
+                            if strict {
+                                return Err(self.throw_type(
+                                    "Cannot add property, array length is not writable",
+                                ));
+                            }
+                            return Ok(());
+                        }
                         if idx >= crate::value::MAX_DENSE_ARRAY {
                             return Err(self.throw_range("Array index exceeds engine limit"));
                         }

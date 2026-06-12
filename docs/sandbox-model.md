@@ -240,7 +240,7 @@ resource-precision gaps.
    accumulate leaked bytes across runs; the baseline-relative memory cap is robust
    to this within a run but not across many runs on a reused thread.
 
-7. **Engine maturity.** The pure-Rust engine is at 98.02% Test262 (see
+7. **Engine maturity.** The pure-Rust engine is at 98.10% Test262 (see
    [`docs/conformance.md`](./conformance.md)); spec deviations are not
    memory-unsafe but can produce surprising behavior or, in edge cases, perturb
    determinism/replay. This is a correctness-maturity caveat, not a containment

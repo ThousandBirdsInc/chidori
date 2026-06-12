@@ -9,6 +9,18 @@ rework in #43; the parallel Test262 runner (#44) and the workspace policy
 gate (#45). Doc-drift pass on 2026-06-12 (this branch). All of #39–#45 are
 merged into the branch history.*
 
+> **Addendum (2026-06-12, conformance campaign):** after this review was
+> taken, a focused sweep drove Test262 conformance from 96.22 % to
+> **98.10 %** (39,017 pass / 757 fail / 7,517 skip) — recommendation 2's
+> "keep picking off the cluster table" executed at scale. The Array,
+> TypedArray/DataView (resizable-ArrayBuffer), Promise, Set/Map, JSON,
+> generator (`yield*` return delegation), class-field, statement-
+> completion-value, mapped-`arguments`, and module-linking clusters were
+> substantially or fully cleared, with zero regressions across seven
+> gated batches. Conformance numbers quoted below are the 2026-06-12
+> snapshot this review measured; see `docs/conformance.md` for the
+> current table.
+
 ## Scope and method
 
 This review covers the whole repository: the Rust core runtime (`src/`), the

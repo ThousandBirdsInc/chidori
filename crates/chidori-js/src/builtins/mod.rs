@@ -431,10 +431,12 @@ fn install_globals(vm: &mut Vm) {
         let (params, body) = if args.is_empty() {
             (String::new(), String::new())
         } else {
-            let body = vm.to_string_lossy(&args[args.len() - 1]);
+            // ToString is observable and may throw (a body/param object with a
+            // poisoned toString propagates its error, not a SyntaxError).
+            let body = vm.to_js_string(&args[args.len() - 1])?.as_str().to_string();
             let mut parts = Vec::new();
             for a in &args[..args.len() - 1] {
-                parts.push(vm.to_string_lossy(a));
+                parts.push(vm.to_js_string(a)?.as_str().to_string());
             }
             (parts.join(","), body)
         };

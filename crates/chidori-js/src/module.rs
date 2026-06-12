@@ -434,7 +434,11 @@ impl Vm {
         }
         // `export *` star re-exports. Two stars resolving the name to
         // DIFFERENT bindings make it ambiguous — a SyntaxError per spec
-        // ResolveExport (the "ambiguous" resolution).
+        // ResolveExport (the "ambiguous" resolution). "default" is NEVER
+        // provided by a star export.
+        if name == "default" {
+            return Err(self.throw_syntax("Module does not provide export 'default'"));
+        }
         let mut star_resolution: Option<Rc<RefCell<Value>>> = None;
         for e in &exports {
             if let ExportKind::Star { module_request } = &e.kind {
@@ -449,8 +453,18 @@ impl Vm {
                     }
                     let dep = self.get_module(registry, &dep_key)?;
                     if let Ok(cell) = self.resolve_export_cell(registry, &dep, name, seen) {
+                        // Two cells are the SAME binding when they are the
+                        // same Rc, or both hold the same object (namespace
+                        // re-exports mint fresh cells around one namespace).
+                        let same_binding = |a: &Rc<RefCell<Value>>, b: &Rc<RefCell<Value>>| {
+                            Rc::ptr_eq(a, b)
+                                || matches!(
+                                    (&*a.borrow(), &*b.borrow()),
+                                    (Value::Object(x), Value::Object(y)) if x.same(y)
+                                )
+                        };
                         match &star_resolution {
-                            Some(prev) if !Rc::ptr_eq(prev, &cell) => {
+                            Some(prev) if !same_binding(prev, &cell) => {
                                 return Err(self
                                     .throw_syntax(&format!("ambiguous star export of '{name}'")));
                             }

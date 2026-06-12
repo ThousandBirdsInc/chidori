@@ -377,7 +377,7 @@ The runner prints a pass/fail/skip summary:
 
 ```
 Test262 (chidori pure-Rust engine, bare context)
-  pass 38986  fail 788  skip 7517  =>  98.02% of executed
+  pass 39017  fail 757  skip 7517  =>  98.10% of executed
 ```
 
 It drives the **bare ECMAScript context** (no `chidori` host object), so the
@@ -404,7 +404,7 @@ target/release/test262-runner --test262 vendor/test262 --help
 
 ### Remaining gaps
 
-The residual failures, by area (top clusters of the 788 total):
+The residual failures, by area (top clusters of the 757 total):
 
 | count | area | nature |
 |--:|---|---|

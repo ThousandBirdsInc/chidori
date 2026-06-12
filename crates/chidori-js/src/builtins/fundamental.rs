@@ -290,6 +290,35 @@ fn define_own_property_inner(
         }
     };
 
+    // Array exotic [[DefineOwnProperty]] for an index: growing the array past
+    // a non-writable `length` is rejected (ArraySetLength step 2.c — the
+    // non-writable marker entry records that state).
+    if is_array {
+        if let Some(idx) = key.array_index() {
+            let blocked = {
+                let b = obj.borrow();
+                let len = match &b.internal {
+                    Internal::Array(a) => a.len(),
+                    _ => 0,
+                };
+                (idx as usize) >= len
+                    && matches!(
+                        b.props.get(&PropertyKey::str("length")),
+                        Some(Property {
+                            kind: PropertyKind::Data {
+                                writable: false,
+                                ..
+                            },
+                            ..
+                        })
+                    )
+            };
+            if blocked {
+                return fail(vm);
+            }
+        }
+    }
+
     let current = match current {
         None => {
             // New property: require extensibility.
@@ -423,6 +452,22 @@ fn define_own_property_inner(
                     .collect();
                 for kk in drop_keys {
                     b.props.shift_remove(&kk);
+                }
+                // A deferred `writable: false` still applies — with the length
+                // where deletion stopped — even though the define FAILS
+                // (ArraySetLength steps 19.d.i-ii).
+                if d.writable == Some(false) {
+                    b.props.insert(
+                        PropertyKey::str("length"),
+                        Property {
+                            kind: PropertyKind::Data {
+                                value: Value::Number((k + 1) as f64),
+                                writable: false,
+                            },
+                            enumerable: false,
+                            configurable: false,
+                        },
+                    );
                 }
                 drop(b);
                 return fail(vm);
@@ -688,6 +733,12 @@ fn install_object(vm: &mut Vm) {
     vm.define_method(&proto, "hasOwnProperty", 1, |vm, this, args| {
         let key = vm.to_property_key(&arg(args, 0))?;
         let o = this_object(vm, &this)?;
+        // A Proxy receiver dispatches [[GetOwnProperty]] (the trap, or the
+        // target's own property when there is none).
+        if vm.is_proxy(&o) {
+            let desc = vm.proxy_get_own_descriptor(&o, &key)?;
+            return Ok(Value::Bool(matches!(desc, Value::Object(_))));
+        }
         let has = own_property_exists(&o, &key);
         Ok(Value::Bool(has))
     });
@@ -714,6 +765,15 @@ fn install_object(vm: &mut Vm) {
     vm.define_method(&proto, "propertyIsEnumerable", 1, |vm, this, args| {
         let key = vm.to_property_key(&arg(args, 0))?;
         let o = this_object(vm, &this)?;
+        // A Proxy receiver dispatches [[GetOwnProperty]].
+        if vm.is_proxy(&o) {
+            let desc = vm.proxy_get_own_descriptor(&o, &key)?;
+            if matches!(&desc, Value::Object(_)) {
+                let e = vm.get_prop(&desc, &PropertyKey::str("enumerable"))?;
+                return Ok(Value::Bool(vm.to_boolean(&e)));
+            }
+            return Ok(Value::Bool(false));
+        }
         let b = o.borrow();
         let e = match b.props.get(&key) {
             Some(p) => p.enumerable,
@@ -1621,6 +1681,23 @@ pub(crate) fn own_property_descriptor(o: &JsObject, key: &PropertyKey) -> Option
             }
             None
         }
+        Internal::ModuleNamespace(ns) => {
+            // [[GetOwnProperty]] for an export name: a {writable, enumerable,
+            // non-configurable} data property reflecting the live binding.
+            if let PropertyKey::Str(sk) = key {
+                if let Some(cell) = ns.exports.get(sk) {
+                    return Some(Property {
+                        kind: PropertyKind::Data {
+                            value: cell.borrow().clone(),
+                            writable: true,
+                        },
+                        enumerable: true,
+                        configurable: false,
+                    });
+                }
+            }
+            None
+        }
         Internal::StringObj(s) => {
             if let Some("length") = key.as_str() {
                 return Some(Property {
@@ -1678,11 +1755,20 @@ pub(crate) fn own_property_descriptor(o: &JsObject, key: &PropertyKey) -> Option
 fn define_properties(vm: &mut Vm, obj: &JsObject, props: &Value) -> Result<(), Value> {
     let po = vm.to_object(props)?;
     // Collect (key, parsed descriptor) for every enumerable own key (including
-    // symbols) first, then apply — per ObjectDefineProperties.
-    let keys = vm.own_keys(&po);
+    // symbols) first, then apply — per ObjectDefineProperties. The source's
+    // keys and enumerability flow through proxy traps when it is one.
+    let keys = vm.own_property_keys(&po)?;
     let mut descriptors: Vec<(PropertyKey, PropDesc)> = Vec::new();
     for k in keys {
-        let enumerable = {
+        let enumerable = if vm.is_proxy(&po) {
+            let desc = vm.proxy_get_own_descriptor(&po, &k)?;
+            if matches!(&desc, Value::Object(_)) {
+                let e = vm.get_prop(&desc, &PropertyKey::str("enumerable"))?;
+                vm.to_boolean(&e)
+            } else {
+                false
+            }
+        } else {
             let b = po.borrow();
             match b.props.get(&k) {
                 Some(p) => p.enumerable,
@@ -1769,6 +1855,10 @@ fn install_function(vm: &mut Vm) {
         let call_args = if list.is_nullish() {
             Vec::new()
         } else {
+            // CreateListFromArrayLike: a primitive argArray is a TypeError.
+            if !matches!(list, Value::Object(_)) {
+                return Err(vm.throw_type("CreateListFromArrayLike called on non-object"));
+            }
             array_like_to_vec(vm, &list)?
         };
         vm.call(this, this_arg, &call_args)
@@ -1784,26 +1874,26 @@ fn install_function(vm: &mut Vm) {
         } else {
             Vec::new()
         };
-        // length = max(0, target.length - bound_args.len()), if target.length
-        // is a number; otherwise 0.
-        let target_len = vm
-            .get_prop(&this, &PropertyKey::str("length"))
-            .ok()
-            .and_then(|v| match v {
-                Value::Number(n) if n.is_finite() => Some(n.max(0.0).floor()),
-                _ => None,
-            })
-            .unwrap_or(0.0);
-        let bound_len = (target_len - bound_args.len() as f64).max(0.0);
-        // name = "bound " + target.name (target.name coerced to string).
-        let target_name = vm
-            .get_prop(&this, &PropertyKey::str("name"))
-            .ok()
-            .map(|v| match v {
-                Value::String(s) => s.as_str().to_string(),
-                _ => String::new(),
-            })
-            .unwrap_or_default();
+        // L = 0 unless the target has an OWN "length" (a deleted length means
+        // 0 even when the prototype provides one); the Get is observable and
+        // may throw. Infinity is preserved; -Infinity clamps to 0.
+        let bound_len = if own_property_descriptor(&target, &PropertyKey::str("length")).is_some()
+        {
+            match vm.get_prop(&this, &PropertyKey::str("length"))? {
+                Value::Number(n) if n.is_nan() => 0.0,
+                Value::Number(n) if n == f64::INFINITY => f64::INFINITY,
+                Value::Number(n) if n == f64::NEG_INFINITY => 0.0,
+                Value::Number(n) => (n.trunc() - bound_args.len() as f64).max(0.0),
+                _ => 0.0,
+            }
+        } else {
+            0.0
+        };
+        // name = "bound " + target.name; the Get may throw, a non-string is "".
+        let target_name = match vm.get_prop(&this, &PropertyKey::str("name"))? {
+            Value::String(s) => s.as_str().to_string(),
+            _ => String::new(),
+        };
 
         let bound = vm.alloc(ObjectData::new(
             Some(vm.realm.function_proto.clone()),
@@ -1864,7 +1954,38 @@ fn install_function(vm: &mut Vm) {
         let r = vm.instance_of_ordinary(&arg(args, 0), &this)?;
         Ok(Value::Bool(r))
     });
-    vm.define_value_sym(&proto, has_instance, Value::Object(f));
+    // @@hasInstance is non-writable, non-enumerable, NON-configurable.
+    proto.borrow_mut().props.insert(
+        PropertyKey::Sym(has_instance),
+        Property {
+            kind: PropertyKind::Data {
+                value: Value::Object(f),
+                writable: false,
+            },
+            enumerable: false,
+            configurable: false,
+        },
+    );
+    // %Function.prototype% is itself a function: own `length` (0) then
+    // `name` ("") data properties, in that order.
+    for (k, v) in [("length", 0.0), ("name", f64::NAN)] {
+        let value = if k == "length" {
+            Value::Number(v)
+        } else {
+            Value::str("")
+        };
+        proto.borrow_mut().props.insert(
+            PropertyKey::str(k),
+            Property {
+                kind: PropertyKind::Data {
+                    value,
+                    writable: false,
+                },
+                enumerable: false,
+                configurable: true,
+            },
+        );
+    }
 }
 
 fn array_like_to_vec(vm: &mut Vm, v: &Value) -> Result<Vec<Value>, Value> {
