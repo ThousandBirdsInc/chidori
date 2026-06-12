@@ -212,8 +212,6 @@ fn run() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let mut harness = HarnessCache::new(harness_dir);
-
     // Resolve the set of test files to run.
     let mut files = Vec::new();
     let roots: Vec<PathBuf> = if args.paths.is_empty() {
@@ -232,6 +230,59 @@ fn run() -> ExitCode {
     }
     files.sort();
 
+    // Apply `--filter` and `--max` up front so the work list is exactly the set
+    // that runs. Doing it here (rather than inside the loop) lets the file loop
+    // fan out across cores against a fixed list with a deterministic merge.
+    if let Some(filter) = &args.filter {
+        files.retain(|f| {
+            f.strip_prefix(&args.root)
+                .unwrap_or(f)
+                .to_string_lossy()
+                .contains(filter.as_str())
+        });
+    }
+    if let Some(max) = args.max {
+        files.truncate(max as usize);
+    }
+
+    // Fan out across cores. A fixed pool of worker threads pulls file indices off
+    // a shared atomic cursor — dynamic load-balancing, since second-level dirs
+    // vary by orders of magnitude in cost — each worker with its own harness
+    // cache. Per-test timeout/panic isolation is unchanged: every execution still
+    // runs on its own worker thread inside `run_test`, confining the (non-`Send`,
+    // `Rc`-based) engine to that thread. Outcomes are merged back in path order so
+    // the printed report, `--state`, and `--baseline` gate stay deterministic
+    // regardless of how the work was scheduled.
+    let jobs = job_count();
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    let files_ref = &files;
+    let args_ref = &args;
+    let mut indexed: Vec<(usize, FileOutcome)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..jobs)
+            .map(|_| {
+                let cursor = &cursor;
+                let hdir = harness_dir.clone();
+                scope.spawn(move || {
+                    let mut cache = HarnessCache::new(hdir);
+                    let mut local: Vec<(usize, FileOutcome)> = Vec::new();
+                    loop {
+                        let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= files_ref.len() {
+                            break;
+                        }
+                        local.push((i, run_file(&files_ref[i], args_ref, &mut cache)));
+                    }
+                    local
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+    indexed.sort_by_key(|(i, _)| *i);
+
     let mut tally = Tally::default();
     let mut failures: Vec<(String, String)> = Vec::new();
     let mut report = Vec::new();
@@ -245,83 +296,29 @@ fn run() -> ExitCode {
     // against committed expectations regardless of `--state`.
     let mut current: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 
-    for file in &files {
-        let rel = file
-            .strip_prefix(&args.root)
-            .unwrap_or(file)
-            .to_string_lossy()
-            .to_string();
-
-        if let Some(filter) = &args.filter {
-            if !rel.contains(filter.as_str()) {
-                continue;
-            }
-        }
-        if let Some(max) = args.max {
-            if tally.pass + tally.fail + tally.skip >= max {
-                break;
-            }
-        }
-
-        let source = match fs::read_to_string(file) {
-            Ok(s) => s,
-            Err(e) => {
+    // Merge the fanned-out results sequentially, in path order, so tallies and
+    // the persisted store are byte-for-byte stable across runs.
+    for (_, fo) in &indexed {
+        match fo.status {
+            "fail" => {
                 tally.fail += 1;
-                failures.push((rel.clone(), format!("read error: {e}")));
-                continue;
+                failures.push((fo.rel.clone(), fo.failure.clone().unwrap_or_default()));
             }
-        };
-
-        let test_dir = file.parent().unwrap_or(Path::new("."));
-        if std::env::var("T262_TRACE").is_ok() {
-            eprintln!("RUNNING {}", rel);
+            "skip" => tally.skip += 1,
+            _ => tally.pass += 1,
         }
-        let outcomes = run_test(&rel, &source, test_dir, &mut harness, &args);
-        // A test passes only if every variant passes; skips collapse to skip.
-        let mut variant_results = Vec::new();
-        let mut any_fail = None;
-        let mut all_skip = true;
-        for (variant, outcome) in &outcomes {
-            match outcome {
-                Outcome::Pass => {
-                    all_skip = false;
-                    variant_results.push((variant.label(), "pass", String::new()));
-                }
-                Outcome::Skip(why) => {
-                    variant_results.push((variant.label(), "skip", why.clone()));
-                }
-                Outcome::Fail(why) => {
-                    all_skip = false;
-                    if any_fail.is_none() {
-                        any_fail = Some(format!("[{}] {}", variant.label(), why));
-                    }
-                    variant_results.push((variant.label(), "fail", why.clone()));
-                }
-            }
-        }
-
-        let status = if let Some(why) = any_fail {
-            tally.fail += 1;
-            failures.push((rel.clone(), why));
-            "fail"
-        } else if all_skip {
-            tally.skip += 1;
-            "skip"
-        } else {
-            tally.pass += 1;
-            "pass"
-        };
 
         if let Some(state) = state.as_mut() {
-            state.insert(rel.clone(), status.to_string());
+            state.insert(fo.rel.clone(), fo.status.to_string());
         }
-        current.insert(rel.clone(), status.to_string());
+        current.insert(fo.rel.clone(), fo.status.to_string());
 
         if args.json.is_some() {
             report.push(serde_json::json!({
-                "file": rel,
-                "status": status,
-                "variants": variant_results
+                "file": fo.rel,
+                "status": fo.status,
+                "variants": fo
+                    .variants
                     .iter()
                     .map(|(v, s, m)| serde_json::json!({"variant": v, "status": s, "message": m}))
                     .collect::<Vec<_>>(),
@@ -446,6 +443,98 @@ fn run() -> ExitCode {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// The merged result of one test file: its overall status, the first failure
+/// message (if any), and the per-variant detail for `--json`. Produced on a
+/// worker thread and merged back on the main thread in path order.
+struct FileOutcome {
+    rel: String,
+    status: &'static str,
+    failure: Option<String>,
+    variants: Vec<(&'static str, &'static str, String)>,
+}
+
+/// Number of parallel workers: `TEST262_JOBS` if set (and > 0), else the machine
+/// parallelism, else 1. One worker streams files off the shared cursor.
+fn job_count() -> usize {
+    std::env::var("TEST262_JOBS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        })
+}
+
+/// Read, run, and classify a single test file (the per-worker unit of work).
+fn run_file(file: &Path, args: &Args, cache: &mut HarnessCache) -> FileOutcome {
+    let rel = file
+        .strip_prefix(&args.root)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .to_string();
+
+    let source = match fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            return FileOutcome {
+                rel,
+                status: "fail",
+                failure: Some(format!("read error: {e}")),
+                variants: Vec::new(),
+            }
+        }
+    };
+
+    let test_dir = file.parent().unwrap_or(Path::new("."));
+    if std::env::var("T262_TRACE").is_ok() {
+        eprintln!("RUNNING {}", rel);
+    }
+    let outcomes = run_test(&rel, &source, test_dir, cache, args);
+    classify(rel, &outcomes)
+}
+
+/// Collapse a file's per-variant outcomes into one status: a file passes only if
+/// every executed variant passes; an all-skip file skips; any failing variant
+/// fails (recording the first failure message).
+fn classify(rel: String, outcomes: &[(Variant, Outcome)]) -> FileOutcome {
+    let mut variants = Vec::new();
+    let mut any_fail = None;
+    let mut all_skip = true;
+    for (variant, outcome) in outcomes {
+        match outcome {
+            Outcome::Pass => {
+                all_skip = false;
+                variants.push((variant.label(), "pass", String::new()));
+            }
+            Outcome::Skip(why) => {
+                variants.push((variant.label(), "skip", why.clone()));
+            }
+            Outcome::Fail(why) => {
+                all_skip = false;
+                if any_fail.is_none() {
+                    any_fail = Some(format!("[{}] {}", variant.label(), why));
+                }
+                variants.push((variant.label(), "fail", why.clone()));
+            }
+        }
+    }
+    let (status, failure) = if let Some(why) = any_fail {
+        ("fail", Some(why))
+    } else if all_skip {
+        ("skip", None)
+    } else {
+        ("pass", None)
+    };
+    FileOutcome {
+        rel,
+        status,
+        failure,
+        variants,
     }
 }
 
@@ -883,13 +972,17 @@ fn load_module_into(
 }
 
 /// Per-test wall-clock budget for the Rust engine (override with
-/// `TEST262_TIMEOUT_MS`; default 10s). A test exceeding this is recorded as a
-/// timeout failure rather than blocking the suite.
+/// `TEST262_TIMEOUT_MS`; default 5s). A test exceeding this is recorded as a
+/// timeout failure rather than blocking the suite. A conformant engine runs each
+/// Test262 file in well under a second, so the budget only catches pathological
+/// cases (catastrophic regex, near-op-budget loops); the gate scripts pin this
+/// explicitly so the committed baseline is reproducible regardless of the
+/// default here.
 fn rust_test_timeout() -> std::time::Duration {
     let ms = std::env::var("TEST262_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(10_000);
+        .unwrap_or(5_000);
     std::time::Duration::from_millis(ms)
 }
 
