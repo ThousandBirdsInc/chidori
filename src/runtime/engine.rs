@@ -161,6 +161,59 @@ impl Engine {
         self
     }
 
+    /// Resume a persisted, paused `chidori.branch` sub-run of the run at
+    /// `run_dir` by answering its pending `input()` prompt. The branch replays
+    /// its checkpoint with a synthetic input record and continues live to its
+    /// next outcome (out-of-band — the parent run is untouched history).
+    /// Returns the updated `BranchOutcome` JSON.
+    pub fn resume_branch(&self, run_dir: &Path, branch_id: &str, response: &str) -> Result<Value> {
+        let backend = self.branch_backend(branch_id)?;
+        crate::runtime::host_branch::resume_branch(&backend, run_dir, branch_id, response)
+            .map_err(|err| anyhow::anyhow!(err))
+    }
+
+    /// Re-run a persisted `chidori.branch` sub-run fresh from its parent
+    /// anchor with whatever its stored `source.ts` now contains — the
+    /// edit-and-rerun flow. Returns the updated `BranchOutcome` JSON.
+    pub fn rerun_branch(&self, run_dir: &Path, branch_id: &str) -> Result<Value> {
+        let backend = self.branch_backend(branch_id)?;
+        crate::runtime::host_branch::rerun_branch(&backend, run_dir, branch_id)
+            .map_err(|err| anyhow::anyhow!(err))
+    }
+
+    /// List the persisted branch stores of the run at `run_dir`.
+    pub fn list_branches(run_dir: &Path) -> Result<Vec<Value>> {
+        crate::runtime::host_branch::list_branches(run_dir).map_err(|err| anyhow::anyhow!(err))
+    }
+
+    /// The host backend for out-of-band branch operations: same wiring as a
+    /// run's backend (providers, policy + seeded approvals, tools, MCP); the
+    /// placeholder context is swapped for the rebuilt branch context inside
+    /// `host_branch`.
+    fn branch_backend(
+        &self,
+        branch_id: &str,
+    ) -> Result<crate::runtime::typescript::bindings::HostBindingBackend> {
+        let policy = RuntimePolicy::from_env_for_durable_run(branch_id)?;
+        let mut seeded = PolicyCache::default();
+        for (target, args) in &self.approvals {
+            seeded.approve(target, args);
+        }
+        Ok(
+            crate::runtime::typescript::bindings::HostBindingBackend::for_runtime(
+                RuntimeContext::new(),
+                self.providers.clone(),
+                self.template_engine.clone(),
+                self.tokio_rt.clone(),
+                self.policy.clone(),
+                Arc::new(StdMutex::new(seeded)),
+                policy,
+                self.tools.clone(),
+                self.mcp.clone(),
+            ),
+        )
+    }
+
     /// Parse and validate an agent or tool file without executing it.
     pub fn check(&self, path: &Path) -> Result<()> {
         if path.extension().and_then(|e| e.to_str()) == Some("ts") {
@@ -394,6 +447,21 @@ impl Engine {
         );
         ctx.set_run_id(run_id);
         ctx.set_input_mode(InputMode::Pause);
+        self.run_with_context(path, inputs, ctx)
+    }
+
+    /// Run an agent on a context the caller prepared (event sender, input
+    /// mode, replay state, run id). Used by the server's streaming supervisor,
+    /// which keeps a handle on the live context so externally delivered
+    /// signals can be enqueued into the running agent's mailbox in-memory
+    /// (`docs/signals.md` Phase 3) and swaps in a fresh replay context for
+    /// each in-process resume.
+    pub fn run_with_prepared_context(
+        &self,
+        path: &Path,
+        inputs: &Value,
+        ctx: RuntimeContext,
+    ) -> Result<RunResult> {
         self.run_with_context(path, inputs, ctx)
     }
 

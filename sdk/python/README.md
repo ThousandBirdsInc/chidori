@@ -5,6 +5,14 @@ bindings, no third-party dependencies.
 
 ## Install
 
+From [PyPI](https://pypi.org/project/chidori/):
+
+```bash
+pip install chidori
+```
+
+Or from a checkout of this repository:
+
 ```bash
 pip install -e ./sdk/python
 ```

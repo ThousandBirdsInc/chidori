@@ -50,6 +50,19 @@ pub struct StoredSession {
     /// status) distinguishes it from an `input()` pause. See `docs/signals.md`.
     #[serde(default)]
     pub pending_signal_name: Option<String>,
+    /// The full awaited name set for a signal pause: `[name]` for
+    /// `chidori.signal(name)`, the listen set for `chidori.signalAny(names)`.
+    /// The delivery endpoint matches `body.name` against ANY of these. Empty
+    /// when the session is not paused on a signal (sessions persisted before
+    /// `signalAny` deserialize as empty; fall back to `pending_signal_name`).
+    #[serde(default)]
+    pub pending_signal_names: Vec<String>,
+    /// Absolute deadline for a signal pause created with `timeoutMs`
+    /// (`docs/signals.md` Phase 2). When it passes, the supervising server
+    /// resolves the pause with the `{ timedOut: true }` sentinel. Persisted so
+    /// a restarted server can re-arm the timer.
+    #[serde(default)]
+    pub pending_signal_deadline: Option<chrono::DateTime<chrono::Utc>>,
     /// Set when status == AwaitingApproval. Carries the (target, args)
     /// the policy is asking about so the UI can render a prompt.
     #[serde(default)]

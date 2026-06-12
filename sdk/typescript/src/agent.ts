@@ -149,11 +149,72 @@ export interface Signal<T = AgentJson> {
 }
 
 export interface SignalOptions {
-  /** Phase 2 (future): resolve to a timeout sentinel instead of waiting forever. */
+  /**
+   * Resolve to a {@link SignalTimeout} sentinel after this many milliseconds
+   * instead of waiting forever. The deadline is enforced by the supervising
+   * server while the run idles; the recorded result (signal or sentinel)
+   * replays deterministically. Discriminate with `"timedOut" in result`.
+   */
   timeoutMs?: number;
 }
 
+/**
+ * The sentinel a `timeoutMs` listen point resolves to when the deadline passes
+ * with no matching delivery (`docs/signals.md` §16, pinned:
+ * resolve-to-sentinel rather than reject). `name` is the single awaited name,
+ * or `null` for a multi-name `signalAny`.
+ */
+export interface SignalTimeout {
+  name: string | null;
+  payload: null;
+  from: null;
+  timedOut: true;
+}
+
 export interface ParallelOptions {
+  concurrency?: number;
+}
+
+/**
+ * One `chidori.branch` variant (`docs/branching-execution.md` §6.1). A branch
+ * runs its own continuation source module from the parent's anchored state —
+ * not a re-run of the parent agent — so `source` is required.
+ */
+export interface BranchVariant {
+  /** Branch label, shown in outcomes and the trace. Defaults to `branch-<k>`. */
+  label?: string;
+  /** Branch source module path, resolved like `callAgent` paths. */
+  source: string;
+  /** State handed to the branch as its run input. Defaults to `{}`. */
+  input?: AgentJson;
+}
+
+export type BranchStatus = "completed" | "paused" | "failed";
+
+/** The result of one branch sub-run, returned for comparison (not merged). */
+export interface BranchOutcome<T extends AgentJson = AgentJson> {
+  label: string;
+  /**
+   * `<parent run id>-op<branch seq>-branch-<k>` — identifies the branch
+   * sub-run, including for out-of-band `chidori branch-resume` /
+   * `branch-rerun` against its persisted store.
+   */
+  branchId: string;
+  status: BranchStatus;
+  /** The branch's output, when `status` is `"completed"`. */
+  output?: T;
+  /** What the branch is waiting on, when `status` is `"paused"`. */
+  pendingPrompt?: string;
+  /** The failure message, when `status` is `"failed"`. */
+  error?: string;
+}
+
+export interface BranchOptions {
+  /**
+   * Maximum branches running live at once (cost cap). Defaults to 1 —
+   * sequential. Higher values run variants in concurrent waves; outcome
+   * order always follows variant order.
+   */
   concurrency?: number;
 }
 
@@ -248,13 +309,28 @@ export interface Chidori {
    * `{ name, payload, from }`. The inverse of `input()`: the run idles cheaply
    * on disk and an outside party delivers via `POST /sessions/{id}/signal`.
    */
-  signal<T = AgentJson>(name: string, options?: SignalOptions): Promise<Signal<T>>;
+  signal<T = AgentJson>(name: string): Promise<Signal<T>>;
+  signal<T = AgentJson>(
+    name: string,
+    options: SignalOptions,
+  ): Promise<Signal<T> | SignalTimeout>;
   /**
    * Non-blocking: consume a queued signal of this name if present, else resolve
    * to `null`. Records the result (value or null) at this seq so replay is
    * deterministic.
    */
   pollSignal<T = AgentJson>(name: string): Promise<Signal<T> | null>;
+  /**
+   * Fan-in: pause until ANY of the named signals is delivered (or one is
+   * already queued in the durable mailbox). Resolves to the bare consumed
+   * signal — its `name` says which fired. Pre-arrived candidates are consumed
+   * in delivery order (lowest `delivery_seq` across the whole name set).
+   */
+  signalAny<T = AgentJson>(names: string[]): Promise<Signal<T>>;
+  signalAny<T = AgentJson>(
+    names: string[],
+    options: SignalOptions,
+  ): Promise<Signal<T> | SignalTimeout>;
   /**
    * Durable value checkpoint: run `fn` once and journal its JSON-serializable
    * result; on replay/resume the recorded value (or error) is returned without
@@ -268,6 +344,17 @@ export interface Chidori {
     path: string,
     input?: TInput,
   ): Promise<TOutput>;
+  /**
+   * Fork the run into one sub-run per variant from the current anchored state
+   * (the VFS plus each variant's explicit `input`), run each variant's own
+   * source module, and return every outcome so the agent can compare and pick.
+   * The whole fan-out is one recorded durable call: a replay of this run
+   * returns the outcomes from cache without re-running the branches.
+   */
+  branch<T extends AgentJson = AgentJson>(
+    variants: BranchVariant[],
+    options?: BranchOptions,
+  ): Promise<BranchOutcome<T>[]>;
   tool<TArgs extends JsonObject = JsonObject, TResult extends AgentJson = AgentJson>(
     name: string,
     args?: TArgs,

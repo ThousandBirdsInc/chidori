@@ -22,8 +22,9 @@ use crate::policy::PolicyConfig;
 use crate::providers::ProviderRegistry;
 use crate::recipes::Recipe;
 use crate::runtime::call_log::CallRecord;
-use crate::runtime::context::RuntimeEvent;
-use crate::runtime::engine::Engine;
+use crate::runtime::context::{InputMode, RuntimeContext, RuntimeEvent};
+use crate::runtime::engine::{Engine, RunResult};
+use crate::runtime::host_core::signal_timeout_sentinel;
 use crate::runtime::snapshot::{
     HostOperationId, HostPromiseRecord, HostPromiseState, PendingHostOperation,
     PendingHostOperationKind, RuntimePolicy, SnapshotAbi, SnapshotStore, SourceFingerprint,
@@ -83,6 +84,30 @@ struct ActiveSession {
     cancelled: Arc<AtomicBool>,
     cancel_tx: tokio::sync::mpsc::UnboundedSender<String>,
     attempt_number: Option<u64>,
+    /// Live in-memory signal delivery (`docs/signals.md` Phase 3). Present
+    /// while a streaming worker supervises this session; the delivery endpoint
+    /// enqueues straight into the live run's mailbox and wakes the worker,
+    /// skipping the HTTP pause→deliver→resume round-trip.
+    signals: Option<LiveSignalSession>,
+}
+
+/// The live-delivery handle a streaming worker registers in `active_sessions`.
+#[derive(Clone)]
+struct LiveSignalSession {
+    /// The CURRENT run context of the supervised session. The endpoint
+    /// enqueues into this context's in-memory mailbox (which write-through
+    /// persists to `signals/inbox.json`), so a running agent sees the signal
+    /// at its next listen point with no disk re-read. The worker swaps in the
+    /// fresh context before each in-process resume while holding this lock,
+    /// so a concurrent delivery always lands in the context that will run.
+    ctx_slot: Arc<StdMutex<RuntimeContext>>,
+    /// Wake channel into the worker's `select!` loop. Carries the
+    /// `delivery_seq` and name of a just-enqueued signal so a worker idling on
+    /// a signal pause can resolve it immediately (pending-pause-wins-with-
+    /// newest: the woken worker takes *this exact entry* back out of the
+    /// mailbox, leaving older queued same-name entries for later listen
+    /// points).
+    signal_tx: tokio::sync::mpsc::UnboundedSender<(u64, String)>,
 }
 
 /// Render a StoredSession into the JSON shape historical clients expect.
@@ -98,6 +123,8 @@ fn session_view(s: &StoredSession) -> Value {
         "pending_seq": s.pending_seq,
         "pending_prompt": s.pending_prompt,
         "pending_signal_name": s.pending_signal_name,
+        "pending_signal_names": s.pending_signal_names,
+        "pending_signal_deadline": s.pending_signal_deadline,
         "pending_approval": s.pending_approval,
         "policy_profile": s.policy_profile,
     })
@@ -474,6 +501,16 @@ pub async fn serve(
         active_sessions: Arc::new(StdMutex::new(HashMap::new())),
         signal_inbox_locks: Arc::new(StdMutex::new(HashMap::new())),
     };
+
+    // Re-arm signal-pause timeout timers (`timeoutMs`, `docs/signals.md`
+    // Phase 2) for sessions persisted with a deadline by a previous server
+    // process. Deadlines already in the past fire (resolve to the timeout
+    // sentinel) immediately.
+    if let Ok(sessions) = state.session_store.list() {
+        for session in &sessions {
+            arm_signal_timeout(&state, session);
+        }
+    }
 
     let auth_required = std::env::var("CHIDORI_API_KEY").is_ok();
     let cors_layer = build_cors_layer();
@@ -945,93 +982,33 @@ async fn create_session(
     .await
     .unwrap();
 
-    let session = match result {
-        Ok(run_result) => {
-            let (
-                status,
-                pending_seq,
-                pending_prompt,
-                pending_signal_name,
-                pending_approval,
-                output,
-            ) = if let Some(pending) = run_result.paused {
-                (
-                    SessionStatus::Paused,
-                    Some(pending.seq),
-                    Some(pending.prompt),
-                    None,
-                    None,
-                    None,
-                )
-            } else if let Some(signal) = run_result.paused_signal {
-                // A `chidori.signal(name)` listen point with an empty mailbox.
-                // Reuse `Paused`; `pending_signal_name` (not the status) marks it
-                // as a signal pause so the delivery endpoint can match the name.
-                (
-                    SessionStatus::Paused,
-                    Some(signal.seq),
-                    None,
-                    Some(signal.name),
-                    None,
-                    None,
-                )
-            } else if let Some(appr) = run_result.paused_approval {
-                (
-                    SessionStatus::AwaitingApproval,
-                    None,
-                    None,
-                    None,
-                    Some(appr),
-                    None,
-                )
-            } else {
-                (
-                    SessionStatus::Completed,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(run_result.output),
-                )
-            };
-            StoredSession {
-                id: id.clone(),
-                run_id: Some(run_result.run_id),
-                status,
-                input,
-                output,
-                call_log: run_result.call_log.into_records(),
-                error: None,
-                pending_seq,
-                pending_prompt,
-                pending_signal_name,
-                pending_approval,
-                approvals: Vec::new(),
-                policy_profile: policy_profile.clone(),
-                created_at: chrono::Utc::now(),
-            }
-        }
-        Err(e) => StoredSession {
-            id: id.clone(),
-            run_id: None,
-            status: SessionStatus::Failed,
-            input,
-            output: None,
-            call_log: Vec::new(),
-            error: Some(e.to_string()),
-            pending_seq: None,
-            pending_prompt: None,
-            pending_signal_name: None,
-            pending_approval: None,
-            approvals: Vec::new(),
-            policy_profile,
-            created_at: chrono::Utc::now(),
-        },
+    let mut session = StoredSession {
+        id: id.clone(),
+        run_id: None,
+        status: SessionStatus::Failed,
+        input,
+        output: None,
+        call_log: Vec::new(),
+        error: None,
+        pending_seq: None,
+        pending_prompt: None,
+        pending_signal_name: None,
+        pending_signal_names: Vec::new(),
+        pending_signal_deadline: None,
+        pending_approval: None,
+        approvals: Vec::new(),
+        policy_profile,
+        created_at: chrono::Utc::now(),
     };
+    match result {
+        Ok(run_result) => apply_run_outcome(&mut session, run_result),
+        Err(e) => session.error = Some(e.to_string()),
+    }
 
     if let Some(err) = store_or_500(&state, &session) {
         return err;
     }
+    arm_signal_timeout(&state, &session);
     drop(permit);
     (StatusCode::CREATED, Json(session_view(&session))).into_response()
 }
@@ -1197,6 +1174,8 @@ async fn replay_session(State(state): State<AppState>, Path(id): Path<String>) -
                 pending_seq: None,
                 pending_prompt: None,
                 pending_signal_name: None,
+                pending_signal_names: Vec::new(),
+                pending_signal_deadline: None,
                 pending_approval: None,
                 approvals: original.approvals.clone(),
                 policy_profile: original.policy_profile.clone(),
@@ -1301,6 +1280,108 @@ fn runtime_event_to_sse_event(evt: RuntimeEvent, attempt_number: Option<u64>) ->
     Event::default().event(name).data(data)
 }
 
+/// Spawn one blocking agent run for the streaming supervisor, reporting the
+/// engine result back on `result_tx`. Holds a clone of the shared run permit
+/// for the duration of the run.
+fn spawn_streaming_run(
+    state: &AppState,
+    policy_profile: Option<String>,
+    ctx: RuntimeContext,
+    input: Value,
+    result_tx: tokio::sync::mpsc::UnboundedSender<anyhow::Result<RunResult>>,
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+) {
+    let app_state = state.clone();
+    let agent_path = state.agent_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let _run_permit = permit;
+        let engine = build_engine(&app_state, policy_profile.as_deref());
+        let result = engine.run_with_prepared_context(&agent_path, &input, ctx);
+        let _ = result_tx.send(result);
+    });
+}
+
+/// Resolve a supervised signal pause in-process and kick off the resumed run
+/// (`docs/signals.md` Phase 3 — the fast resume trigger that skips the HTTP
+/// `/resume` round-trip). Completes the persisted pending `Signal` op with
+/// `value` (a delivered `{name,payload,from}` or the timeout sentinel),
+/// appends the synthetic resolution record, swaps a fresh replay context into
+/// the live slot — carrying over the in-memory mailbox so a delivery racing
+/// this resume is not lost — persists the session as Running, and spawns the
+/// blocking re-run, which reports back on `result_tx`. Returns false (leaving
+/// the pause supervised) when no matching pending op exists on disk.
+#[allow(clippy::too_many_arguments)]
+fn resume_signal_pause_in_process(
+    state: &AppState,
+    session: &mut StoredSession,
+    ctx_slot: &Arc<StdMutex<RuntimeContext>>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+    result_tx: &tokio::sync::mpsc::UnboundedSender<anyhow::Result<RunResult>>,
+    permit: &Arc<tokio::sync::OwnedSemaphorePermit>,
+    policy_profile: Option<String>,
+    seq: u64,
+    value: Value,
+) -> bool {
+    let run_id = session.run_id.clone().unwrap_or_else(|| session.id.clone());
+    let completed = {
+        let lock = state.signal_inbox_lock(&run_id);
+        let _guard = lock.lock().unwrap();
+        complete_persisted_pending_host_operation(
+            &state.run_base,
+            session.run_id.as_deref(),
+            Some((seq, PendingHostOperationKind::Signal)),
+            HostPromiseCompletion::Resolved(value.clone()),
+        )
+    };
+    let Ok(Some(pending)) = completed else {
+        return false;
+    };
+    session
+        .call_log
+        .push(signal_resolution_record(&pending, seq, value));
+
+    let host_promises = load_persisted_host_promises(&state.run_base, session.run_id.as_deref())
+        .unwrap_or_default();
+    let vfs = load_persisted_vfs(&state.run_base, session.run_id.as_deref());
+
+    // Swap the resumed run's context into the live slot while holding it: the
+    // delivery endpoint enqueues into whatever context the slot currently
+    // names, so carrying the old context's in-memory mailbox into the new one
+    // under the lock means no delivery can fall between the two.
+    let ctx = {
+        let mut slot = ctx_slot.lock().unwrap();
+        let inbox = slot.signal_inbox();
+        let ctx = RuntimeContext::with_replay_host_promises_vfs_and_signals(
+            session.call_log.clone(),
+            host_promises,
+            vfs,
+            inbox,
+        );
+        ctx.set_run_id(run_id);
+        ctx.set_input_mode(InputMode::Pause);
+        ctx.set_event_sender(event_tx.clone());
+        *slot = ctx.clone();
+        ctx
+    };
+
+    session.status = SessionStatus::Running;
+    session.pending_seq = None;
+    session.pending_signal_name = None;
+    session.pending_signal_names = Vec::new();
+    session.pending_signal_deadline = None;
+    let _ = state.session_store.put(session);
+
+    spawn_streaming_run(
+        state,
+        policy_profile,
+        ctx,
+        session.input.clone(),
+        result_tx.clone(),
+        permit.clone(),
+    );
+    true
+}
+
 async fn stream_session(
     State(state): State<AppState>,
     Json(body): Json<CreateSessionRequest>,
@@ -1309,9 +1390,12 @@ async fn stream_session(
 
     // Gate on the concurrency semaphore. If we can't get a permit within
     // the acquire deadline, 503 before any streaming response headers are
-    // committed so clients see the overflow cleanly.
+    // committed so clients see the overflow cleanly. The permit is shared
+    // (Arc) between the supervisor stream and each blocking run, so the slot
+    // stays held across in-process signal resumes and is released when the
+    // last holder drops.
     let permit = match acquire_run_slot(&state).await {
-        Ok(p) => p,
+        Ok(p) => Arc::new(p),
         Err(resp) => return resp,
     };
 
@@ -1333,24 +1417,40 @@ async fn stream_session(
             .and_then(Value::as_u64)
     });
     let input = body.input.clone();
-    let app_state = state.clone();
 
     let (event_tx, mut event_rx) =
         mpsc::unbounded_channel::<crate::runtime::context::RuntimeEvent>();
-    let (result_tx, mut result_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    let (result_tx, mut result_rx) = mpsc::unbounded_channel::<anyhow::Result<RunResult>>();
     let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<String>();
+    let (signal_tx, mut signal_rx) = mpsc::unbounded_channel::<(u64, String)>();
     let cancelled = Arc::new(AtomicBool::new(false));
+
+    // Build the first run's context up front so the run id is known before the
+    // agent starts and the delivery endpoint can enqueue into the live
+    // in-memory mailbox from the first instant (`docs/signals.md` Phase 3).
+    // Pause mode: an `input()` or approval gate surfaces as a paused session
+    // (handed to the durable HTTP endpoints) instead of blocking on stdin.
+    let ctx = RuntimeContext::new();
+    ctx.set_event_sender(event_tx.clone());
+    ctx.set_input_mode(InputMode::Pause);
+    let run_id = ctx.run_id();
+    let ctx_slot = Arc::new(StdMutex::new(ctx.clone()));
+
     state.active_sessions.lock().unwrap().insert(
         session_id.clone(),
         ActiveSession {
             cancelled: cancelled.clone(),
             cancel_tx,
             attempt_number,
+            signals: Some(LiveSignalSession {
+                ctx_slot: ctx_slot.clone(),
+                signal_tx,
+            }),
         },
     );
-    let running_session = StoredSession {
+    let mut session = StoredSession {
         id: session_id.clone(),
-        run_id: None,
+        run_id: Some(run_id),
         status: SessionStatus::Running,
         input: input.clone(),
         output: None,
@@ -1359,113 +1459,33 @@ async fn stream_session(
         pending_seq: None,
         pending_prompt: None,
         pending_signal_name: None,
+        pending_signal_names: Vec::new(),
+        pending_signal_deadline: None,
         pending_approval: None,
         approvals: Vec::new(),
         policy_profile: policy_profile.clone(),
         created_at: chrono::Utc::now(),
     };
-    let _ = state.session_store.put(&running_session);
+    let _ = state.session_store.put(&session);
 
-    let agent_path = app_state.agent_path.clone();
-    let session_id_for_task = session_id.clone();
-    let cancelled_for_task = cancelled.clone();
-
-    // Move the permit into the blocking task so it's held for the entire
-    // agent run. Dropping it at the end of the closure releases the slot.
-    tokio::task::spawn_blocking(move || {
-        let _run_permit = permit;
-        let engine = build_engine(&app_state, policy_profile.as_deref());
-
-        let result = engine.run_streaming(&agent_path, &input, event_tx);
-        let final_event = match result {
-            Ok(run_result) => {
-                let cancelled = cancelled_for_task.load(Ordering::SeqCst);
-                let status = if cancelled {
-                    SessionStatus::Cancelled
-                } else {
-                    SessionStatus::Completed
-                };
-                let output = if cancelled {
-                    None
-                } else {
-                    Some(run_result.output.clone())
-                };
-                let error = if cancelled {
-                    Some("session cancelled".to_string())
-                } else {
-                    None
-                };
-                let completed_session = StoredSession {
-                    id: session_id_for_task.clone(),
-                    run_id: Some(run_result.run_id),
-                    status,
-                    input: input.clone(),
-                    output,
-                    call_log: run_result.call_log.into_records(),
-                    error: error.clone(),
-                    pending_seq: None,
-                    pending_prompt: None,
-                    pending_signal_name: None,
-                    pending_approval: None,
-                    approvals: Vec::new(),
-                    policy_profile: policy_profile.clone(),
-                    created_at: chrono::Utc::now(),
-                };
-                let _ = app_state.session_store.put(&completed_session);
-                if cancelled {
-                    json!({
-                        "id": session_id_for_task,
-                        "status": "cancelled",
-                        "error": error,
-                    })
-                } else {
-                    json!({
-                        "id": session_id_for_task,
-                        "status": "completed",
-                        "output": run_result.output,
-                    })
-                }
-            }
-            Err(e) => {
-                let status = if cancelled_for_task.load(Ordering::SeqCst) {
-                    SessionStatus::Cancelled
-                } else {
-                    SessionStatus::Failed
-                };
-                let error = if status == SessionStatus::Cancelled {
-                    "session cancelled".to_string()
-                } else {
-                    e.to_string()
-                };
-                let _ = app_state.session_store.put(&StoredSession {
-                    id: session_id_for_task.clone(),
-                    run_id: None,
-                    status,
-                    input: input.clone(),
-                    output: None,
-                    call_log: Vec::new(),
-                    error: Some(error.clone()),
-                    pending_seq: None,
-                    pending_prompt: None,
-                    pending_signal_name: None,
-                    pending_approval: None,
-                    approvals: Vec::new(),
-                    policy_profile: policy_profile.clone(),
-                    created_at: chrono::Utc::now(),
-                });
-                json!({
-                    "id": session_id_for_task,
-                    "status": if cancelled_for_task.load(Ordering::SeqCst) { "cancelled" } else { "failed" },
-                    "error": error,
-                })
-            }
-        };
-        let _ = result_tx.send(final_event);
-    });
+    spawn_streaming_run(
+        &state,
+        policy_profile.clone(),
+        ctx,
+        input.clone(),
+        result_tx.clone(),
+        permit.clone(),
+    );
 
     let state_for_stream = state.clone();
-    let session_id_for_stream = session_id.clone();
     let stream = async_stream::stream! {
+        // The supervisor's share of the run slot (see acquire above).
+        let permit = permit;
+        // The signal pause currently supervised: (pending seq, listen set).
+        // While set, the run idles and a matching delivery (or the timeout
+        // deadline) resumes it in-process without an HTTP round-trip.
+        let mut supervising: Option<(u64, Vec<String>)> = None;
+        let mut deadline: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
                 Some(evt) = event_rx.recv() => {
@@ -1473,9 +1493,17 @@ async fn stream_session(
                 }
                 Some(reason) = cancel_rx.recv() => {
                     cancelled.store(true, Ordering::SeqCst);
-                    state_for_stream.active_sessions.lock().unwrap().remove(&session_id_for_stream);
+                    state_for_stream.active_sessions.lock().unwrap().remove(&session.id);
+                    // A run idling on a supervised signal pause has no blocking
+                    // task left to notice the flag — persist the cancellation
+                    // here. A still-executing run persists it when it returns.
+                    if supervising.is_some() {
+                        session.status = SessionStatus::Cancelled;
+                        session.error = Some(reason.clone());
+                        let _ = state_for_stream.session_store.put(&session);
+                    }
                     let final_event = stamp_attempt(json!({
-                        "id": session_id_for_stream,
+                        "id": session.id,
                         "status": "cancelled",
                         "error": reason,
                     }), attempt_number);
@@ -1483,14 +1511,152 @@ async fn stream_session(
                     yield Ok::<_, std::convert::Infallible>(Event::default().event("done").data(data));
                     break;
                 }
-                Some(final_event) = result_rx.recv() => {
-                    state_for_stream.active_sessions.lock().unwrap().remove(&session_id_for_stream);
+                Some((delivery_seq, name)) = signal_rx.recv() => {
+                    // A delivery landed while we supervise. If it matches the
+                    // pause we're idling on, apply the pinned tie-break
+                    // (pending-pause-wins-with-newest): take THIS exact entry
+                    // back out of the mailbox and resolve the pause with it,
+                    // leaving older queued entries for later listen points.
+                    // Otherwise it stays durably queued for a future drain.
+                    if let Some((seq, names)) = supervising.clone() {
+                        if names.iter().any(|n| n == &name) {
+                            let entry = ctx_slot.lock().unwrap()
+                                .take_queued_signal_by_delivery_seq(delivery_seq);
+                            if let Some(entry) = entry {
+                                let value = json!({
+                                    "name": entry.name,
+                                    "payload": entry.payload,
+                                    "from": entry.from,
+                                });
+                                if resume_signal_pause_in_process(
+                                    &state_for_stream, &mut session, &ctx_slot,
+                                    &event_tx, &result_tx, &permit,
+                                    policy_profile.clone(), seq, value,
+                                ) {
+                                    supervising = None;
+                                    deadline = None;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ = async { tokio::time::sleep_until(deadline.unwrap()).await }, if deadline.is_some() => {
+                    // `timeoutMs` deadline passed with no matching delivery:
+                    // resolve the supervised pause with the timeout sentinel.
+                    if let Some((seq, names)) = supervising.clone() {
+                        let sentinel = signal_timeout_sentinel(&names);
+                        if resume_signal_pause_in_process(
+                            &state_for_stream, &mut session, &ctx_slot,
+                            &event_tx, &result_tx, &permit,
+                            policy_profile.clone(), seq, sentinel,
+                        ) {
+                            supervising = None;
+                        }
+                    }
+                    deadline = None;
+                }
+                Some(result) = result_rx.recv() => {
+                    let was_cancelled = cancelled.load(Ordering::SeqCst);
+                    match result {
+                        Ok(run_result) => apply_run_outcome(&mut session, run_result),
+                        Err(e) => {
+                            session.status = SessionStatus::Failed;
+                            session.output = None;
+                            session.error = Some(e.to_string());
+                        }
+                    }
+                    if was_cancelled {
+                        session.status = SessionStatus::Cancelled;
+                        session.output = None;
+                        session.error = Some("session cancelled".to_string());
+                    }
+                    let _ = state_for_stream.session_store.put(&session);
+
+                    if session.status == SessionStatus::Paused
+                        && !session.pending_signal_names.is_empty()
+                    {
+                        // A signal listen point: stay live. Announce the pause,
+                        // then either drain a signal that arrived while the run
+                        // was unwinding (mailbox order: lowest delivery_seq
+                        // first) or idle until a delivery/timeout resumes us.
+                        let names = session.pending_signal_names.clone();
+                        let seq = session.pending_seq.unwrap_or_default();
+                        let paused_event = stamp_attempt(json!({
+                            "id": session.id,
+                            "status": "paused",
+                            "pending_seq": seq,
+                            "pending_signal_name": session.pending_signal_name,
+                            "pending_signal_names": names,
+                            "pending_signal_deadline": session.pending_signal_deadline,
+                        }), attempt_number);
+                        let data = serde_json::to_string(&paused_event).unwrap_or_else(|_| "{}".into());
+                        yield Ok::<_, std::convert::Infallible>(Event::default().event("paused").data(data));
+
+                        let queued = ctx_slot.lock().unwrap().take_queued_signal_any(&names);
+                        let mut resumed = false;
+                        if let Some(entry) = queued {
+                            let value = json!({
+                                "name": entry.name,
+                                "payload": entry.payload,
+                                "from": entry.from,
+                            });
+                            resumed = resume_signal_pause_in_process(
+                                &state_for_stream, &mut session, &ctx_slot,
+                                &event_tx, &result_tx, &permit,
+                                policy_profile.clone(), seq, value,
+                            );
+                        }
+                        if resumed {
+                            supervising = None;
+                            deadline = None;
+                        } else {
+                            supervising = Some((seq, names));
+                            deadline = session.pending_signal_deadline.map(|d| {
+                                let wait = (d - chrono::Utc::now()).to_std().unwrap_or_default();
+                                tokio::time::Instant::now() + wait
+                            });
+                        }
+                        continue;
+                    }
+
+                    // Anything else ends live supervision: terminal states
+                    // close the stream, and input/approval pauses hand off to
+                    // the durable HTTP resume/approve endpoints.
+                    state_for_stream.active_sessions.lock().unwrap().remove(&session.id);
+                    let final_event = match session.status {
+                        SessionStatus::Completed => json!({
+                            "id": session.id,
+                            "status": "completed",
+                            "output": session.output,
+                        }),
+                        SessionStatus::Paused => json!({
+                            "id": session.id,
+                            "status": "paused",
+                            "pending_seq": session.pending_seq,
+                            "pending_prompt": session.pending_prompt,
+                        }),
+                        SessionStatus::AwaitingApproval => json!({
+                            "id": session.id,
+                            "status": "awaiting_approval",
+                            "pending_approval": session.pending_approval,
+                        }),
+                        SessionStatus::Cancelled => json!({
+                            "id": session.id,
+                            "status": "cancelled",
+                            "error": session.error,
+                        }),
+                        _ => json!({
+                            "id": session.id,
+                            "status": "failed",
+                            "error": session.error,
+                        }),
+                    };
                     let data = serde_json::to_string(&stamp_attempt(final_event, attempt_number)).unwrap_or_else(|_| "{}".into());
                     yield Ok::<_, std::convert::Infallible>(Event::default().event("done").data(data));
                     break;
                 }
                 else => {
-                    state_for_stream.active_sessions.lock().unwrap().remove(&session_id_for_stream);
+                    state_for_stream.active_sessions.lock().unwrap().remove(&session.id);
                     break;
                 },
             }
@@ -1541,6 +1707,8 @@ async fn cancel_session(
             pending_seq: None,
             pending_prompt: None,
             pending_signal_name: None,
+            pending_signal_names: Vec::new(),
+            pending_signal_deadline: None,
             pending_approval: None,
             approvals: Vec::new(),
             policy_profile: None,
@@ -1585,6 +1753,145 @@ async fn cancel_session(
         "reason": reason,
     }))
     .into_response()
+}
+
+/// Map a finished engine run onto a stored session: status, output, call log,
+/// and the pending-pause fields (input prompt / signal listen set + timeout
+/// deadline / approval). Shared by session creation, the durable resume tail,
+/// and the streaming supervisor so every path surfaces pauses identically.
+fn apply_run_outcome(session: &mut StoredSession, run_result: RunResult) {
+    session.run_id = Some(run_result.run_id);
+    session.call_log = run_result.call_log.into_records();
+    session.output = None;
+    session.pending_seq = None;
+    session.pending_prompt = None;
+    session.pending_signal_name = None;
+    session.pending_signal_names = Vec::new();
+    session.pending_signal_deadline = None;
+    session.pending_approval = None;
+    if let Some(pending) = run_result.paused {
+        session.status = SessionStatus::Paused;
+        session.pending_seq = Some(pending.seq);
+        session.pending_prompt = Some(pending.prompt);
+    } else if let Some(signal) = run_result.paused_signal {
+        // A signal listen point with an empty mailbox. Reuse `Paused`;
+        // `pending_signal_name(s)` (not the status) marks it as a signal pause
+        // so the delivery endpoint can match the name. A `timeoutMs` pause
+        // persists its absolute deadline so a timer (or restarted server) can
+        // resolve it with the timeout sentinel.
+        session.status = SessionStatus::Paused;
+        session.pending_seq = Some(signal.seq);
+        session.pending_signal_name = Some(signal.name.clone());
+        session.pending_signal_names = signal.listen_names();
+        session.pending_signal_deadline = signal
+            .timeout_ms
+            .map(|ms| chrono::Utc::now() + chrono::Duration::milliseconds(ms as i64));
+    } else if let Some(appr) = run_result.paused_approval {
+        session.status = SessionStatus::AwaitingApproval;
+        session.pending_approval = Some(appr);
+    } else {
+        session.status = SessionStatus::Completed;
+        session.output = Some(run_result.output);
+    }
+}
+
+/// The awaited listen set of a signal-paused session, tolerating sessions
+/// persisted before `pending_signal_names` existed (fall back to the single
+/// `pending_signal_name`). Empty when the session is not paused on a signal.
+fn pending_listen_names(session: &StoredSession) -> Vec<String> {
+    if !session.pending_signal_names.is_empty() {
+        session.pending_signal_names.clone()
+    } else {
+        session.pending_signal_name.clone().into_iter().collect()
+    }
+}
+
+/// Arm the in-process timer for a session just persisted with a signal-pause
+/// deadline (`timeoutMs`, `docs/signals.md` Phase 2). No-op when the session
+/// has no deadline. The timer re-validates against the stored session before
+/// firing, so a delivery that resolves the pause first wins and the timer
+/// becomes a no-op.
+fn arm_signal_timeout(state: &AppState, session: &StoredSession) {
+    let Some(deadline) = session.pending_signal_deadline else {
+        return;
+    };
+    if session.status != SessionStatus::Paused {
+        return;
+    }
+    let Some(seq) = session.pending_seq else {
+        return;
+    };
+    let state = state.clone();
+    let id = session.id.clone();
+    tokio::spawn(async move {
+        let wait = (deadline - chrono::Utc::now()).to_std().unwrap_or_default();
+        tokio::time::sleep(wait).await;
+        fire_signal_timeout(&state, &id, seq).await;
+    });
+}
+
+/// Resolve an expired signal pause with the `{ timedOut: true }` sentinel and
+/// resume the run — the timer-side twin of `signal_session`'s resolve+resume
+/// branch. Validates that the session is still paused on the SAME listen point
+/// (a delivery may have already resolved it) and that no live streaming worker
+/// owns the session (the Phase 3 supervisor runs its own deadline).
+async fn fire_signal_timeout(state: &AppState, id: &str, seq: u64) {
+    let Ok(Some(session)) = state.session_store.get(id) else {
+        return;
+    };
+    let names = pending_listen_names(&session);
+    if session.status != SessionStatus::Paused
+        || session.pending_seq != Some(seq)
+        || names.is_empty()
+    {
+        return;
+    }
+    if state.active_sessions.lock().unwrap().contains_key(id) {
+        return;
+    }
+
+    let sentinel = signal_timeout_sentinel(&names);
+    let lock = state.signal_inbox_lock(session.run_id.as_deref().unwrap_or(id));
+    let completed = {
+        let _guard = lock.lock().unwrap();
+        complete_persisted_pending_host_operation(
+            &state.run_base,
+            session.run_id.as_deref(),
+            Some((seq, PendingHostOperationKind::Signal)),
+            HostPromiseCompletion::Resolved(sentinel.clone()),
+        )
+    };
+    // No matching pending op on disk means the pause was already resolved (or
+    // never persisted); either way there is nothing to time out.
+    let Ok(Some(pending)) = completed else {
+        return;
+    };
+    let mut call_log = session.call_log.clone();
+    call_log.push(signal_resolution_record(&pending, seq, sentinel));
+    let _ = complete_pending_and_resume(state, session, call_log).await;
+}
+
+/// The synthetic CallRecord a server-side signal resolution injects at the
+/// pending seq, so the replaying engine returns the delivered value (or the
+/// timeout sentinel) to the agent's listen call. Uses the persisted pending
+/// op's function name and match-key args, so a `signal_any` pause replays as
+/// `signal_any` with its `{names}` key and a `signal` pause as `signal` with
+/// `{name}`.
+fn signal_resolution_record(pending: &PendingHostOperation, seq: u64, value: Value) -> CallRecord {
+    CallRecord {
+        seq,
+        parent_seq: None,
+        function: pending
+            .function
+            .clone()
+            .unwrap_or_else(|| "signal".to_string()),
+        args: pending.args.clone(),
+        result: value,
+        duration_ms: 0,
+        token_usage: None,
+        timestamp: chrono::Utc::now(),
+        error: None,
+    }
 }
 
 /// Shared tail of `resume_session` and `signal_session` (doc §9: "factor its
@@ -1657,41 +1964,14 @@ async fn complete_pending_and_resume(
     let mut session = original;
     match result {
         Ok(run_result) => {
-            session.run_id = Some(run_result.run_id);
-            session.call_log = run_result.call_log.into_records();
-            if let Some(pending) = run_result.paused {
-                session.status = SessionStatus::Paused;
-                session.pending_seq = Some(pending.seq);
-                session.pending_prompt = Some(pending.prompt.clone());
-                session.pending_signal_name = None;
-                session.pending_approval = None;
-            } else if let Some(signal) = run_result.paused_signal {
-                // Re-run reached a NEW signal listen point with an empty mailbox.
-                // Persist it exactly like an input pause (the pending op + host
-                // promise table + shrunken inbox were already written to disk by
-                // the runtime safepoints); surface the awaited name in the view.
-                session.status = SessionStatus::Paused;
-                session.pending_seq = Some(signal.seq);
-                session.pending_prompt = None;
-                session.pending_signal_name = Some(signal.name);
-                session.pending_approval = None;
-            } else if let Some(appr) = run_result.paused_approval {
-                session.status = SessionStatus::AwaitingApproval;
-                session.pending_seq = None;
-                session.pending_prompt = None;
-                session.pending_signal_name = None;
-                session.pending_approval = Some(appr);
-            } else {
-                session.status = SessionStatus::Completed;
-                session.output = Some(run_result.output.clone());
-                session.pending_seq = None;
-                session.pending_prompt = None;
-                session.pending_signal_name = None;
-                session.pending_approval = None;
-            }
+            // A re-run that reached a NEW pause persists it exactly like the
+            // initial run does (the pending op + host promise table + shrunken
+            // inbox were already written to disk by the runtime safepoints).
+            apply_run_outcome(&mut session, run_result);
             if let Some(err) = store_or_500(state, &session) {
                 return err;
             }
+            arm_signal_timeout(state, &session);
             (StatusCode::OK, Json(session_view(&session))).into_response()
         }
         Err(e) => {
@@ -1865,15 +2145,50 @@ async fn signal_session(
             .into_response();
     }
 
-    // Paused waiting on THIS exact name: resolve the pending pause with the
-    // newly arrived signal and resume. Tie-break (doc §11, pinned decision):
-    // "pending-pause-wins-with-newest" — when the run is paused on name X and a
-    // same-name entry is ALSO already queued in the inbox, the pending pause
-    // resolves with THIS just-delivered signal; the older queued entry stays in
-    // the inbox (threaded into the resumed run by `complete_pending_and_resume`)
-    // for the next `signal(name)` listen point.
+    // Phase 3 (`docs/signals.md`): a live streaming worker supervises this
+    // session — deliver in-memory. The signal is write-through enqueued into
+    // the live run's mailbox (durably mirrored to `signals/inbox.json` in the
+    // same critical section) and the worker is woken; a run mid-execution
+    // drains it at its next listen point, and a run idling on a matching
+    // listen point is resolved+resumed in-process by the worker, skipping the
+    // HTTP pause→resume round-trip.
+    let live = state
+        .active_sessions
+        .lock()
+        .unwrap()
+        .get(&id)
+        .and_then(|active| active.signals.clone());
+    if let Some(live) = live {
+        let queued = {
+            let ctx = live.ctx_slot.lock().unwrap();
+            ctx.enqueue_live_signal(&body.name, body.payload.clone(), body.from.clone())
+        };
+        let _ = live
+            .signal_tx
+            .send((queued.delivery_seq, queued.name.clone()));
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "id": id,
+                "status": "delivered_live",
+                "name": queued.name,
+                "delivery_seq": queued.delivery_seq,
+            })),
+        )
+            .into_response();
+    }
+
+    // Paused waiting on THIS name (or a `signalAny` listen set containing it):
+    // resolve the pending pause with the newly arrived signal and resume.
+    // Tie-break (doc §11, pinned decision): "pending-pause-wins-with-newest" —
+    // when the run is paused on name X and a same-name entry is ALSO already
+    // queued in the inbox, the pending pause resolves with THIS just-delivered
+    // signal; the older queued entry stays in the inbox (threaded into the
+    // resumed run by `complete_pending_and_resume`) for the next listen point.
     let waiting_on_this_name = original.status == SessionStatus::Paused
-        && original.pending_signal_name.as_deref() == Some(body.name.as_str());
+        && pending_listen_names(&original)
+            .iter()
+            .any(|n| n == &body.name);
 
     if waiting_on_this_name {
         let Some(seq) = original.pending_seq else {
@@ -1916,22 +2231,13 @@ async fn signal_session(
             HostPromiseCompletion::Resolved(value.clone()),
         );
         match completed {
-            // The pending op matched a `Signal` at this seq: inject the synthetic
-            // `signal` record and resume (reusing the resume tail).
-            Ok(Some(_)) => {
+            // The pending op matched a `Signal` at this seq: inject the
+            // synthetic resolution record (a `signal` or `signal_any` record,
+            // taken from the persisted op) and resume (reusing the resume tail).
+            Ok(Some(pending)) => {
                 drop(_guard);
                 let mut call_log = original.call_log.clone();
-                call_log.push(CallRecord {
-                    seq,
-                    parent_seq: None,
-                    function: "signal".to_string(),
-                    args: json!({ "name": body.name }),
-                    result: value,
-                    duration_ms: 0,
-                    token_usage: None,
-                    timestamp: chrono::Utc::now(),
-                    error: None,
-                });
+                call_log.push(signal_resolution_record(&pending, seq, value));
                 complete_pending_and_resume(&state, original, call_log).await
             }
             // No matching pending op on disk (e.g. nothing persisted). Fall back
@@ -2328,6 +2634,7 @@ mod tests {
                 cancelled: cancelled.clone(),
                 cancel_tx,
                 attempt_number: Some(7),
+                signals: None,
             },
         );
         state
@@ -2343,6 +2650,8 @@ mod tests {
                 pending_seq: None,
                 pending_prompt: None,
                 pending_signal_name: None,
+                pending_signal_names: Vec::new(),
+                pending_signal_deadline: None,
                 pending_approval: None,
                 approvals: Vec::new(),
                 policy_profile: None,
@@ -2623,6 +2932,8 @@ mod tests {
             pending_seq: None,
             pending_prompt: None,
             pending_signal_name: None,
+            pending_signal_names: Vec::new(),
+            pending_signal_deadline: None,
             pending_approval: None,
             approvals: Vec::new(),
             policy_profile: None,
@@ -2688,6 +2999,8 @@ mod tests {
             pending_seq: None,
             pending_prompt: None,
             pending_signal_name: None,
+            pending_signal_names: Vec::new(),
+            pending_signal_deadline: None,
             pending_approval: None,
             approvals: Vec::new(),
             policy_profile: None,
@@ -2755,6 +3068,8 @@ mod tests {
             pending_seq: None,
             pending_prompt: None,
             pending_signal_name: None,
+            pending_signal_names: Vec::new(),
+            pending_signal_deadline: None,
             pending_approval: None,
             approvals: Vec::new(),
             policy_profile: None,
@@ -2826,6 +3141,8 @@ mod tests {
             pending_seq: None,
             pending_prompt: None,
             pending_signal_name: None,
+            pending_signal_names: Vec::new(),
+            pending_signal_deadline: None,
             pending_approval: None,
             approvals: Vec::new(),
             policy_profile: None,
@@ -2913,6 +3230,8 @@ mod tests {
             pending_seq: Some(2),
             pending_prompt: Some("continue?".to_string()),
             pending_signal_name: None,
+            pending_signal_names: Vec::new(),
+            pending_signal_deadline: None,
             pending_approval: None,
             approvals: Vec::new(),
             policy_profile: None,
@@ -3012,6 +3331,8 @@ mod tests {
             pending_seq: Some(2),
             pending_prompt: Some("continue?".to_string()),
             pending_signal_name: None,
+            pending_signal_names: Vec::new(),
+            pending_signal_deadline: None,
             pending_approval: None,
             approvals: Vec::new(),
             policy_profile: None,
@@ -3116,6 +3437,8 @@ mod tests {
             pending_seq: Some(2),
             pending_prompt: Some("continue?".to_string()),
             pending_signal_name: None,
+            pending_signal_names: Vec::new(),
+            pending_signal_deadline: None,
             pending_approval: None,
             approvals: Vec::new(),
             policy_profile: None,
@@ -4173,6 +4496,438 @@ mod tests {
         // Inbox file is untouched by replay.
         let inbox_after = load_persisted_signal_inbox(&state.run_base, Some(&run_id));
         assert_eq!(inbox_after, inbox_before);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: signalAny + timeoutMs (`docs/signals.md` §14 Phase 2).
+    // -----------------------------------------------------------------------
+
+    /// Poll the session store until `id` reaches `status` (the timeout timers
+    /// and streaming supervisor advance sessions asynchronously).
+    async fn wait_for_status(state: &AppState, id: &str, status: SessionStatus) -> StoredSession {
+        for _ in 0..400 {
+            if let Ok(Some(s)) = state.session_store.get(id) {
+                if s.status == status {
+                    return s;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("session {id} never reached {status:?}");
+    }
+
+    /// `chidori.signalAny([..])` pauses on the whole listen set, advertises it
+    /// in the session view, and a delivery matching ANY listed name resolves
+    /// the pause; the recorded call replays as `signal_any` with its `{names}`
+    /// match key and the bare fired signal as result.
+    #[tokio::test]
+    async fn signal_any_pauses_on_set_and_resolves_on_any_listed_name() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("chidori-signal-any-{}", uuid::Uuid::new_v4()));
+        let agent_path = write_agent(
+            &temp_dir,
+            r#"
+                export async function agent(input, chidori) {
+                    const fired = await chidori.signalAny(["review", "steer"]);
+                    return { fired: fired.name, payload: fired.payload, by: fired.from.id };
+                }
+            "#,
+        );
+        let state = signal_test_state(&temp_dir, agent_path);
+
+        let created = create_paused_session(&state, "any-1", json!({})).await;
+        assert_eq!(created["status"], json!("paused"));
+        assert_eq!(created["pending_signal_name"], json!("review"));
+        assert_eq!(created["pending_signal_names"], json!(["review", "steer"]));
+
+        // Deliver the SECOND listed name — it must resolve the pause.
+        let (status, body) = response_json(
+            signal_session(
+                State(state.clone()),
+                Path("any-1".to_string()),
+                Json(SignalRequest {
+                    name: "steer".to_string(),
+                    payload: json!({ "dir": "left" }),
+                    from: json!({ "kind": "human", "id": "sam" }),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], json!("completed"));
+        assert_eq!(
+            body["output"],
+            json!({ "fired": "steer", "payload": { "dir": "left" }, "by": "sam" })
+        );
+
+        // The synthetic record uses the persisted op's function + match key.
+        let stored = state.session_store.get("any-1").unwrap().unwrap();
+        let record = stored
+            .call_log
+            .iter()
+            .find(|r| r.function == "signal_any")
+            .expect("signal_any record");
+        assert_eq!(record.args, json!({ "names": ["review", "steer"] }));
+        assert_eq!(record.result["name"], json!("steer"));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// A `timeoutMs` signal pause persists its deadline, and the armed server
+    /// timer resolves it with the `{timedOut: true}` sentinel; a replay of the
+    /// timed-out session reproduces the sentinel from the recorded call.
+    #[tokio::test]
+    async fn signal_timeout_resolves_with_sentinel_and_replays() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("chidori-signal-timeout-{}", uuid::Uuid::new_v4()));
+        let agent_path = write_agent(
+            &temp_dir,
+            r#"
+                export async function agent(input, chidori) {
+                    const result = await chidori.signal("review", { timeoutMs: 150 });
+                    if (result.timedOut) {
+                        return { timedOut: true, name: result.name };
+                    }
+                    return { timedOut: false, decision: result.payload.decision };
+                }
+            "#,
+        );
+        let state = signal_test_state(&temp_dir, agent_path);
+
+        let created = create_paused_session(&state, "to-1", json!({})).await;
+        assert_eq!(created["status"], json!("paused"));
+        assert!(
+            !created["pending_signal_deadline"].is_null(),
+            "timeoutMs pause must persist its deadline: {created}"
+        );
+
+        // No delivery: the armed timer fires and resolves the sentinel.
+        let stored = wait_for_status(&state, "to-1", SessionStatus::Completed).await;
+        assert_eq!(
+            stored.output,
+            Some(json!({ "timedOut": true, "name": "review" }))
+        );
+        let record = stored
+            .call_log
+            .iter()
+            .find(|r| r.function == "signal")
+            .expect("signal record");
+        assert_eq!(record.result["timedOut"], json!(true));
+
+        // Replay reproduces the sentinel deterministically.
+        let (status, body) =
+            response_json(replay_session(State(state.clone()), Path("to-1".to_string())).await)
+                .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            body["output"],
+            json!({ "timedOut": true, "name": "review" })
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// A delivery that lands before the `timeoutMs` deadline wins; the timer
+    /// later fires as a no-op (the pause is already resolved).
+    #[tokio::test]
+    async fn signal_delivery_before_timeout_wins() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("chidori-signal-race-{}", uuid::Uuid::new_v4()));
+        let agent_path = write_agent(
+            &temp_dir,
+            r#"
+                export async function agent(input, chidori) {
+                    const result = await chidori.signal("review", { timeoutMs: 60000 });
+                    if (result.timedOut) {
+                        return { timedOut: true };
+                    }
+                    return { timedOut: false, decision: result.payload.decision };
+                }
+            "#,
+        );
+        let state = signal_test_state(&temp_dir, agent_path);
+
+        create_paused_session(&state, "race-1", json!({})).await;
+        let (status, body) = response_json(
+            signal_session(
+                State(state.clone()),
+                Path("race-1".to_string()),
+                Json(SignalRequest {
+                    name: "review".to_string(),
+                    payload: json!({ "decision": "approve" }),
+                    from: json!({ "id": "mara" }),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["output"],
+            json!({ "timedOut": false, "decision": "approve" })
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// A timed-out multi-name `signalAny` resolves to the sentinel with a null
+    /// `name` (no name fired).
+    #[tokio::test]
+    async fn signal_any_timeout_sentinel_has_null_name() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("chidori-signal-any-to-{}", uuid::Uuid::new_v4()));
+        let agent_path = write_agent(
+            &temp_dir,
+            r#"
+                export async function agent(input, chidori) {
+                    const result = await chidori.signalAny(["a", "b"], { timeoutMs: 150 });
+                    return { timedOut: result.timedOut === true, name: result.name };
+                }
+            "#,
+        );
+        let state = signal_test_state(&temp_dir, agent_path);
+
+        let created = create_paused_session(&state, "any-to", json!({})).await;
+        assert_eq!(created["pending_signal_names"], json!(["a", "b"]));
+
+        let stored = wait_for_status(&state, "any-to", SessionStatus::Completed).await;
+        assert_eq!(
+            stored.output,
+            Some(json!({ "timedOut": true, "name": null }))
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: live in-memory delivery to streaming runs (`docs/signals.md`).
+    // -----------------------------------------------------------------------
+
+    /// Drive a streaming session through `stream_session` and collect its full
+    /// SSE body in a background task (the body future drives the supervisor).
+    async fn start_stream(
+        state: &AppState,
+        session_id: &str,
+        input: Value,
+    ) -> tokio::task::JoinHandle<String> {
+        let response = stream_session(
+            State(state.clone()),
+            Json(
+                serde_json::from_value(json!({
+                    "input": input,
+                    "session_id": session_id,
+                }))
+                .unwrap(),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::spawn(async move {
+            let bytes = body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&bytes).to_string()
+        })
+    }
+
+    /// A streaming run that pauses on `signal()` stays live: the delivery
+    /// endpoint reports `delivered_live` and the supervisor resolves the pause
+    /// in-process (no `/resume` round-trip), the stream carrying a `paused`
+    /// event and then `done`. The recorded signal call matches the durable
+    /// persist-resume path byte-for-byte on its match key and result.
+    #[tokio::test]
+    async fn stream_session_resolves_signal_pause_in_process() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("chidori-stream-signal-{}", uuid::Uuid::new_v4()));
+        let source = r#"
+            export async function agent(input, chidori) {
+                const review = await chidori.signal("review");
+                return { decision: review.payload.decision, by: review.from.id };
+            }
+        "#;
+        let agent_path = write_agent(&temp_dir, source);
+        let state = signal_test_state(&temp_dir, agent_path);
+
+        let sse = start_stream(&state, "live-1", json!({})).await;
+
+        // Wait for the worker to persist the supervised signal pause; the
+        // session must STAY in active_sessions (live supervision continues).
+        let paused = wait_for_status(&state, "live-1", SessionStatus::Paused).await;
+        assert_eq!(paused.pending_signal_name.as_deref(), Some("review"));
+        assert!(state.active_sessions.lock().unwrap().contains_key("live-1"));
+
+        // Deliver: routed to the live worker, not the durable resume path.
+        let (status, body) = response_json(
+            signal_session(
+                State(state.clone()),
+                Path("live-1".to_string()),
+                Json(SignalRequest {
+                    name: "review".to_string(),
+                    payload: json!({ "decision": "approve" }),
+                    from: json!({ "kind": "human", "id": "mara" }),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["status"], json!("delivered_live"));
+
+        // The supervisor resumes in-process and completes the session.
+        let stored = wait_for_status(&state, "live-1", SessionStatus::Completed).await;
+        assert_eq!(
+            stored.output,
+            Some(json!({ "decision": "approve", "by": "mara" }))
+        );
+        assert!(!state.active_sessions.lock().unwrap().contains_key("live-1"));
+
+        // The stream announced the pause and finished with done/completed.
+        let sse_text = sse.await.unwrap();
+        assert!(sse_text.contains("event: paused"), "sse: {sse_text}");
+        assert!(sse_text.contains("event: done"), "sse: {sse_text}");
+        assert!(
+            sse_text.contains("\"status\":\"completed\""),
+            "sse: {sse_text}"
+        );
+
+        // Determinism: the same agent driven through the durable
+        // create→deliver path records the identical signal call.
+        let dir_b =
+            std::env::temp_dir().join(format!("chidori-stream-signal-b-{}", uuid::Uuid::new_v4()));
+        let agent_b = write_agent(&dir_b, source);
+        let state_b = signal_test_state(&dir_b, agent_b);
+        create_paused_session(&state_b, "durable-1", json!({})).await;
+        response_json(
+            signal_session(
+                State(state_b.clone()),
+                Path("durable-1".to_string()),
+                Json(SignalRequest {
+                    name: "review".to_string(),
+                    payload: json!({ "decision": "approve" }),
+                    from: json!({ "kind": "human", "id": "mara" }),
+                }),
+            )
+            .await,
+        )
+        .await;
+        let durable = state_b.session_store.get("durable-1").unwrap().unwrap();
+        let sig_live = stored
+            .call_log
+            .iter()
+            .find(|r| r.function == "signal")
+            .unwrap();
+        let sig_durable = durable
+            .call_log
+            .iter()
+            .find(|r| r.function == "signal")
+            .unwrap();
+        assert_eq!(sig_live.args, sig_durable.args);
+        assert_eq!(sig_live.result, sig_durable.result);
+        assert_eq!(sig_live.seq, sig_durable.seq);
+        assert_eq!(stored.output, durable.output);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    /// A signal delivered live for a name the run is NOT waiting on lands in
+    /// the live in-memory mailbox (write-through persisted) and survives the
+    /// in-process resume: the resumed run drains it at a later `pollSignal`.
+    #[tokio::test]
+    async fn stream_session_live_mailbox_carries_over_in_process_resume() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("chidori-stream-mailbox-{}", uuid::Uuid::new_v4()));
+        let agent_path = write_agent(
+            &temp_dir,
+            r#"
+                export async function agent(input, chidori) {
+                    const review = await chidori.signal("review");
+                    const steer = await chidori.pollSignal("steer");
+                    return {
+                        decision: review.payload.decision,
+                        steer: steer ? steer.payload.dir : null,
+                    };
+                }
+            "#,
+        );
+        let state = signal_test_state(&temp_dir, agent_path);
+
+        let sse = start_stream(&state, "live-2", json!({})).await;
+        wait_for_status(&state, "live-2", SessionStatus::Paused).await;
+
+        // Deliver a NON-matching name first: enqueued live, no resume.
+        let (status, body) = response_json(
+            signal_session(
+                State(state.clone()),
+                Path("live-2".to_string()),
+                Json(SignalRequest {
+                    name: "steer".to_string(),
+                    payload: json!({ "dir": "left" }),
+                    from: json!({ "id": "sam" }),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["status"], json!("delivered_live"));
+
+        // Now resolve the supervised pause; the resumed run must still see the
+        // queued "steer" at its pollSignal.
+        response_json(
+            signal_session(
+                State(state.clone()),
+                Path("live-2".to_string()),
+                Json(SignalRequest {
+                    name: "review".to_string(),
+                    payload: json!({ "decision": "approve" }),
+                    from: json!({ "id": "mara" }),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        let stored = wait_for_status(&state, "live-2", SessionStatus::Completed).await;
+        assert_eq!(
+            stored.output,
+            Some(json!({ "decision": "approve", "steer": "left" }))
+        );
+        let _ = sse.await.unwrap();
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// A streaming run paused with `timeoutMs` resolves to the sentinel from
+    /// the supervisor's own deadline (no external delivery, stream stays one
+    /// continuous session through to done).
+    #[tokio::test]
+    async fn stream_session_signal_timeout_resolves_in_process() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("chidori-stream-timeout-{}", uuid::Uuid::new_v4()));
+        let agent_path = write_agent(
+            &temp_dir,
+            r#"
+                export async function agent(input, chidori) {
+                    const result = await chidori.signal("review", { timeoutMs: 150 });
+                    return { timedOut: result.timedOut === true };
+                }
+            "#,
+        );
+        let state = signal_test_state(&temp_dir, agent_path);
+
+        let sse = start_stream(&state, "live-3", json!({})).await;
+        let stored = wait_for_status(&state, "live-3", SessionStatus::Completed).await;
+        assert_eq!(stored.output, Some(json!({ "timedOut": true })));
+        let sse_text = sse.await.unwrap();
+        assert!(sse_text.contains("event: paused"), "sse: {sse_text}");
+        assert!(
+            sse_text.contains("\"status\":\"completed\""),
+            "sse: {sse_text}"
+        );
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

@@ -326,6 +326,13 @@ impl RunSpan {
             append_tool_attributes(&mut attrs, record);
         }
 
+        if matches!(
+            record.function.as_str(),
+            "signal" | "poll_signal" | "signal_any"
+        ) {
+            append_signal_attributes(&mut attrs, record);
+        }
+
         let builder = SpanBuilder::from_name(span_name_for(record))
             .with_kind(span_kind_for(&record.function))
             .with_start_time(start_time)
@@ -538,6 +545,52 @@ fn span_name_for(record: &CallRecord) -> String {
     }
 }
 
+/// Stamp signal provenance on a `signal` / `poll_signal` / `signal_any` span
+/// (`docs/signals.md` Phase 2): the consumed signal's name and the sender
+/// (`from = {kind, id, runId?}`), so a multiplayer trace is filterable by
+/// participant. A `poll_signal` that found nothing stamps only the polled name;
+/// a timed-out listen point stamps `signal.timed_out`.
+fn append_signal_attributes(attrs: &mut Vec<KeyValue>, record: &CallRecord) {
+    // The fired name lives in the result; fall back to the listen-point args
+    // (`{name}` / `{names}`) when the result has none (poll miss, timeout).
+    let name = record
+        .result
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| record.args.get("name").and_then(Value::as_str));
+    if let Some(name) = name {
+        attrs.push(KeyValue::new("signal.name", name.to_string()));
+    }
+    if let Some(names) = record.args.get("names").and_then(Value::as_array) {
+        let listen_set = names
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
+        attrs.push(KeyValue::new("signal.listen_names", listen_set));
+    }
+    if record
+        .result
+        .get("timedOut")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        attrs.push(KeyValue::new("signal.timed_out", true));
+    }
+    let Some(from) = record.result.get("from").filter(|v| !v.is_null()) else {
+        return;
+    };
+    if let Some(kind) = from.get("kind").and_then(Value::as_str) {
+        attrs.push(KeyValue::new("signal.from.kind", kind.to_string()));
+    }
+    if let Some(id) = from.get("id").and_then(Value::as_str) {
+        attrs.push(KeyValue::new("signal.from.id", id.to_string()));
+    }
+    if let Some(run_id) = from.get("runId").and_then(Value::as_str) {
+        attrs.push(KeyValue::new("signal.from.run_id", run_id.to_string()));
+    }
+}
+
 fn append_tool_attributes(attrs: &mut Vec<KeyValue>, record: &CallRecord) {
     let tool_name = record
         .args
@@ -675,6 +728,60 @@ mod tests {
         assert!(rendered.contains("tool.source=MedlinePlus"));
         assert!(rendered.contains("tool.result_count=1"));
         assert!(rendered.contains("tool.status=ok"));
+    }
+
+    #[test]
+    fn signal_attributes_stamp_name_and_sender_provenance() {
+        // A consumed signal: name + from ride in the result.
+        let record = CallRecord {
+            seq: 3,
+            parent_seq: None,
+            function: "signal".to_string(),
+            args: json!({"name": "review"}),
+            result: json!({
+                "name": "review",
+                "payload": {"decision": "approve"},
+                "from": {"kind": "agent", "id": "compliance-bot", "runId": "run-9"},
+            }),
+            duration_ms: 0,
+            token_usage: None,
+            timestamp: Utc::now(),
+            error: None,
+        };
+        let mut attrs = Vec::new();
+        append_signal_attributes(&mut attrs, &record);
+        let rendered = attrs
+            .iter()
+            .map(|attr| format!("{}={}", attr.key, attr.value))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("signal.name=review"));
+        assert!(rendered.contains("signal.from.kind=agent"));
+        assert!(rendered.contains("signal.from.id=compliance-bot"));
+        assert!(rendered.contains("signal.from.run_id=run-9"));
+
+        // A timed-out signalAny: listen set from args, timed_out flag, no from.
+        let timeout = CallRecord {
+            seq: 4,
+            parent_seq: None,
+            function: "signal_any".to_string(),
+            args: json!({"names": ["review", "steer"]}),
+            result: json!({"name": null, "payload": null, "from": null, "timedOut": true}),
+            duration_ms: 0,
+            token_usage: None,
+            timestamp: Utc::now(),
+            error: None,
+        };
+        let mut attrs = Vec::new();
+        append_signal_attributes(&mut attrs, &timeout);
+        let rendered = attrs
+            .iter()
+            .map(|attr| format!("{}={}", attr.key, attr.value))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("signal.listen_names=review,steer"));
+        assert!(rendered.contains("signal.timed_out=true"));
+        assert!(!rendered.contains("signal.from"));
     }
 
     #[test]

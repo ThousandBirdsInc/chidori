@@ -30,6 +30,7 @@ export type {
   Signal,
   SignalOptions,
   SignalSender,
+  SignalTimeout,
   ToolDefinition,
   ToolFunction,
   TryCallResult,
@@ -194,15 +195,18 @@ export class Checkpoint {
 }
 
 /**
- * Returned by `client.signal` when the run was not paused-waiting on this name
- * (it was running, or paused on something else), so the signal was enqueued
- * into the durable mailbox to be drained at the next matching listen point.
- * Mirrors the server's 202 Accepted body.
+ * Returned by `client.signal` when the signal was accepted but did not resolve
+ * a pause synchronously. Mirrors the server's 202 Accepted body:
+ *   * `"queued"` — the run was not waiting on this name; the signal sits in
+ *     the durable mailbox until a matching listen point drains it.
+ *   * `"delivered_live"` — a live streaming worker supervises the run; the
+ *     signal was enqueued into the running agent's in-memory mailbox and the
+ *     worker was woken to resume a matching pause in-process.
  */
 export interface SignalQueued {
   /** Session id the signal was delivered to. */
   id: string;
-  status: "queued";
+  status: "queued" | "delivered_live";
   /** The signal name, echoed back. */
   name: string;
   /** Monotonic per-run sequence freezing global arrival order across senders. */
@@ -225,7 +229,8 @@ export interface SignalDelivery {
  * descriptor (the signal was enqueued for a later listen point).
  */
 export function isSignalQueued(result: Session | SignalQueued): result is SignalQueued {
-  return (result as SignalQueued).status === "queued";
+  const status = (result as SignalQueued).status;
+  return status === "queued" || status === "delivered_live";
 }
 
 /** One execution of an agent — result + call log + status. */
@@ -246,6 +251,18 @@ export class Session {
      * `null` for plain `input()` pauses and non-signal states.
      */
     public pendingSignalName: string | null = null,
+    /**
+     * The full awaited name set when paused on a signal listen point: `[name]`
+     * for `chidori.signal(name)`, the listen set for `chidori.signalAny(names)`.
+     * Empty for non-signal states.
+     */
+    public pendingSignalNames: string[] = [],
+    /**
+     * Absolute deadline (ISO timestamp) for a signal pause created with
+     * `timeoutMs`; the server resolves the pause with the timeout sentinel
+     * when it passes. `null` when the pause has no timeout.
+     */
+    public pendingSignalDeadline: string | null = null,
   ) {}
 
   get ok(): boolean {
@@ -298,6 +315,21 @@ export type StreamEvent =
       seq: number;
       prompt_type?: string | null;
       error?: string | null;
+    }
+  | {
+      /**
+       * The streamed run paused at a `signal()` / `signalAny()` listen point
+       * and stays live: the worker keeps supervising, and a delivered signal
+       * (or the `timeoutMs` deadline) resumes it in-process — further events
+       * follow on the same stream. Deliver with `client.signal`.
+       */
+      type: "paused";
+      id: string;
+      status: "paused";
+      pending_seq: number;
+      pending_signal_name?: string | null;
+      pending_signal_names?: string[];
+      pending_signal_deadline?: string | null;
     }
   | { type: "done"; id: string; status: SessionStatus; output?: Json; error?: string };
 
@@ -372,9 +404,11 @@ export class AgentClient {
    *   * the run was paused-waiting on this exact name → it resolves the pause
    *     and resumes; this returns the advanced `Session` (200), now `completed`
    *     or re-`paused`.
-   *   * the run was running or paused on something else → the signal is enqueued
-   *     into the durable mailbox; this returns a `SignalQueued` descriptor (202)
-   *     carrying the assigned `delivery_seq`.
+   *   * otherwise → the signal is accepted asynchronously; this returns a
+   *     `SignalQueued` descriptor (202) carrying the assigned `delivery_seq`,
+   *     with `status` `"queued"` (durable mailbox) or `"delivered_live"` (a
+   *     live streaming worker received it in-memory and resumes a matching
+   *     pause in-process).
    *
    * Throws on 400 (empty name), 404 (unknown session), or 409 (terminal run).
    */
@@ -390,7 +424,8 @@ export class AgentClient {
         from: delivery.from ?? null,
       },
     );
-    if (status === 202 || (data as { status?: string }).status === "queued") {
+    const accepted = (data as { status?: string }).status;
+    if (status === 202 || accepted === "queued" || accepted === "delivered_live") {
       return data as unknown as SignalQueued;
     }
     return this.sessionFrom(data, (data.input as Json | undefined) ?? null);
@@ -477,6 +512,8 @@ export class AgentClient {
       this,
       (data.snapshot_manifest as SnapshotManifest | undefined) ?? null,
       (data.pending_signal_name as string | undefined) ?? null,
+      (data.pending_signal_names as string[] | undefined) ?? [],
+      (data.pending_signal_deadline as string | undefined) ?? null,
     );
   }
 
@@ -528,6 +565,9 @@ function parseSseFrame(frame: string): StreamEvent | null {
     }
     if (event === "prompt_end") {
       return { type: "prompt_end", ...(data as object) } as StreamEvent;
+    }
+    if (event === "paused") {
+      return { type: "paused", ...(data as object) } as StreamEvent;
     }
     if (event === "done") return { type: "done", ...(data as object) } as StreamEvent;
   } catch {

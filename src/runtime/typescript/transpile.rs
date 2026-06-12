@@ -314,7 +314,7 @@ pub fn validate_imports(
     let mut node_resolver: Option<Resolver> = None;
 
     for (line_no, specifier) in import_specifiers(source) {
-        if specifier == "chidori" {
+        if is_chidori_sdk_specifier(&specifier) {
             imports.push(ModuleImport {
                 specifier,
                 resolved_path: None,
@@ -414,8 +414,18 @@ fn import_specifiers(source: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// The virtual SDK module has no on-disk form at runtime; the host injects its
+/// exports. Agents may import it by the bare historical name or by the
+/// published npm package name.
+fn is_chidori_sdk_specifier(specifier: &str) -> bool {
+    specifier == "chidori" || specifier == "@1kbirds/chidori"
+}
+
 fn is_chidori_sdk_import(line: &str) -> bool {
-    line.starts_with("import ") && specifier_after_from(line).as_deref() == Some("chidori")
+    line.starts_with("import ")
+        && specifier_after_from(line)
+            .as_deref()
+            .is_some_and(is_chidori_sdk_specifier)
 }
 
 fn specifier_after_from(line: &str) -> Option<String> {
@@ -747,6 +757,33 @@ mod tests {
         assert!(js.contains(r#"type: "object""#));
         assert!(js.contains("now: Date.now()"));
         assert!(js.contains("iso: new Date().toISOString()"));
+    }
+
+    #[test]
+    fn transpile_strips_scoped_chidori_sdk_imports() {
+        let source = r#"
+            import { chidori } from "@1kbirds/chidori";
+            import type { Chidori, ToolDefinition } from "@1kbirds/chidori";
+
+            export async function agent(input, chidori: Chidori) {
+                return { ok: true };
+            }
+        "#;
+
+        let js = transpile_module(
+            Path::new("/tmp/project/agents/scoped.ts"),
+            source,
+            &TranspileOptions {
+                import_policy: TypeScriptImportPolicy::Relative,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !js.contains("@1kbirds/chidori"),
+            "scoped import survived:\n{js}"
+        );
+        assert!(js.contains("return { ok: true }"));
     }
 
     #[test]

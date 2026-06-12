@@ -171,7 +171,12 @@ replay with an empty mailbox still reproduces every consumed signal.
 
 - chidori-js (the pure-Rust JS engine) is the only runtime; no engine env var or
   cargo feature is needed.
-- Phase 1 + `pollSignal` are shipped: a blocking named signal, a durable per-run
-  mailbox, the `/signal` delivery endpoint, and deterministic replay. `signalAny`,
-  `timeoutMs`, and zero-latency in-memory delivery to a running task are future
-  work (see [`docs/signals.md`](../../docs/signals.md) §14).
+- All three phases of [`docs/signals.md`](../../docs/signals.md) §14 are
+  shipped: the blocking named signal, durable per-run mailbox, `/signal`
+  delivery endpoint, and deterministic replay (Phase 1); `pollSignal`, the
+  fan-in `chidori.signalAny(["review", "steer"])`, `timeoutMs` (resolves to a
+  `{timedOut: true}` sentinel after the deadline), and sender provenance as
+  OTEL span attributes (Phase 2); and live in-memory delivery — a signal sent
+  to a run streaming over `/sessions/stream` lands in the running agent's
+  mailbox in-memory and resumes a matching pause in-process, the response
+  reporting `"delivered_live"` (Phase 3).

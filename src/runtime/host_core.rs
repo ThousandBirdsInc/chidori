@@ -196,7 +196,7 @@ fn host_operation_kind(function: &str) -> Option<PendingHostOperationKind> {
         "memory" => Some(PendingHostOperationKind::Memory),
         "checkpoint" => Some(PendingHostOperationKind::Checkpoint),
         "log" => Some(PendingHostOperationKind::Log),
-        "signal" | "poll_signal" => Some(PendingHostOperationKind::Signal),
+        "signal" | "poll_signal" | "signal_any" => Some(PendingHostOperationKind::Signal),
         _ => None,
     }
 }
@@ -270,6 +270,55 @@ fn signal_name(function: &str, args: &Value) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("chidori.{function} requires a string name"))
 }
 
+/// Pull the required non-empty `names` string array from a `signalAny`
+/// binding's args (`{ "names": [<string>...], "opts": <json|null> }`).
+fn signal_names(args: &Value) -> Result<Vec<String>> {
+    let names: Vec<String> = args
+        .get("names")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|v| v.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+        })
+        .ok_or_else(|| anyhow::anyhow!("chidori.signalAny requires an array of names"))?
+        .ok_or_else(|| anyhow::anyhow!("chidori.signalAny names must all be strings"))?;
+    if names.is_empty() {
+        anyhow::bail!("chidori.signalAny requires at least one name");
+    }
+    Ok(names)
+}
+
+/// Optional positive `timeoutMs` from a signal binding's opts
+/// (`{ ..., "opts": { "timeoutMs": <number> } }`). The runtime only records it
+/// on the pause; enforcement (resolving the pause with the
+/// [`signal_timeout_sentinel`] after the deadline) is the supervising server's
+/// job, since a paused run is not a live task.
+fn signal_timeout_ms(args: &Value) -> Option<u64> {
+    args.get("opts")
+        .and_then(|opts| opts.get("timeoutMs"))
+        .and_then(Value::as_u64)
+        .filter(|ms| *ms > 0)
+}
+
+/// The result a timed-out signal listen point resolves to (`docs/signals.md`
+/// §16, pinned: resolve-to-sentinel rather than reject). Shaped like a signal
+/// with `payload`/`from` nulled and `timedOut: true`, so agent code
+/// discriminates with `"timedOut" in result`. `name` is the single awaited
+/// name, or `null` for a multi-name `signalAny` (no name fired).
+pub fn signal_timeout_sentinel(names: &[String]) -> Value {
+    let name = match names {
+        [single] => Value::String(single.clone()),
+        _ => Value::Null,
+    };
+    json!({
+        "name": name,
+        "payload": Value::Null,
+        "from": Value::Null,
+        "timedOut": true,
+    })
+}
+
 /// `chidori.signal(name, opts)` — the blocking, named, externally-deliverable
 /// flavor of `input`, fronted by a durable per-run mailbox. See
 /// `docs/signals.md` §5/§8.3. Order:
@@ -338,9 +387,81 @@ pub fn execute_signal(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
     ctx.set_pending_signal(PendingSignal {
         seq,
         name: name.clone(),
+        names: vec![name.clone()],
+        timeout_ms: signal_timeout_ms(args),
         id: host_operation,
     });
     Err(anyhow::anyhow!("{PAUSE_MARKER}: signal {name}"))
+}
+
+/// `chidori.signalAny(names, opts)` — the fan-in listen point (`docs/signals.md`
+/// §6.1): pause until ANY of the named signals is delivered (or one is already
+/// queued). Same shape as `execute_signal` with the match key `{ "names":
+/// [...] }` and function name `"signal_any"`. The result is the bare consumed
+/// signal `{name, payload, from}` — its `name` says which fired (§16, pinned).
+/// The mailbox drain takes the lowest-`delivery_seq` entry across the whole
+/// name set, freezing arrival order into the recorded result.
+pub fn execute_signal_any(ctx: &RuntimeContext, args: &Value) -> Result<Value> {
+    let names = signal_names(args)?;
+    let match_args = json!({ "names": names });
+    let seq = ctx.next_seq();
+
+    if let Some(record) = ctx
+        .try_replay_checked(seq, "signal_any")
+        .map_err(|err| anyhow::anyhow!(err))?
+    {
+        return Ok(record.result);
+    }
+
+    if let Some(result) = replay_completed_host_operation(
+        ctx,
+        seq,
+        "signal_any",
+        PendingHostOperationKind::Signal,
+        &match_args,
+    )? {
+        return Ok(result);
+    }
+
+    let host_operation = ctx.begin_host_operation_with_function(
+        seq,
+        PendingHostOperationKind::Signal,
+        Some("signal_any".to_string()),
+        match_args.clone(),
+    );
+    ctx.run_host_operation_safepoint(host_operation)?;
+
+    if let Some(queued) = ctx.take_queued_signal_any(&names) {
+        let result = json!({
+            "name": queued.name,
+            "payload": queued.payload,
+            "from": queued.from,
+        });
+        ctx.resolve_host_operation(host_operation, result.clone())?;
+        ctx.record_call(CallRecord {
+            seq,
+            parent_seq: None,
+            function: "signal_any".to_string(),
+            args: match_args,
+            result: result.clone(),
+            duration_ms: 0,
+            token_usage: None,
+            timestamp: Utc::now(),
+            error: None,
+        });
+        ctx.run_host_operation_completion_safepoint(host_operation)?;
+        return Ok(result);
+    }
+
+    let joined = names.join(", ");
+    ctx.set_pending_signal(PendingSignal {
+        seq,
+        name: names[0].clone(),
+        names,
+        timeout_ms: signal_timeout_ms(args),
+        id: host_operation,
+    });
+    Err(anyhow::anyhow!("{PAUSE_MARKER}: signalAny [{joined}]"))
 }
 
 /// `chidori.pollSignal(name)` — non-blocking signal consumption (`docs/signals.md`
@@ -2276,6 +2397,132 @@ mod tests {
         let ctx = RuntimeContext::new();
         let err = execute_signal(&ctx, &json!({ "name": 42, "opts": null })).unwrap_err();
         assert!(err.to_string().contains("requires a string name"));
+    }
+
+    #[test]
+    fn signal_pause_records_timeout_ms_from_opts() {
+        let ctx = RuntimeContext::new();
+
+        let err = execute_signal(
+            &ctx,
+            &json!({ "name": "review", "opts": { "timeoutMs": 1500 } }),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains(PAUSE_MARKER));
+        let pending = ctx.take_pending_signal().expect("pending signal set");
+        assert_eq!(pending.timeout_ms, Some(1500));
+        assert_eq!(pending.listen_names(), vec!["review".to_string()]);
+        // The durable match key stays name-only — timeoutMs must not leak into
+        // the args the resume matcher compares.
+        let ops = ctx.pending_host_operations();
+        assert_eq!(ops[0].args, json!({ "name": "review" }));
+    }
+
+    #[test]
+    fn signal_any_pauses_with_listen_set_when_inbox_empty() {
+        let ctx = RuntimeContext::new();
+
+        let err = execute_signal_any(&ctx, &json!({ "names": ["review", "steer"], "opts": null }))
+            .unwrap_err();
+
+        assert!(err.to_string().contains(PAUSE_MARKER));
+        let pending = ctx.pending_host_operations();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind, PendingHostOperationKind::Signal);
+        assert_eq!(pending[0].function.as_deref(), Some("signal_any"));
+        assert_eq!(pending[0].args, json!({ "names": ["review", "steer"] }));
+        let pending_signal = ctx.take_pending_signal().expect("pending signal set");
+        assert_eq!(
+            pending_signal.listen_names(),
+            vec!["review".to_string(), "steer".to_string()]
+        );
+        assert_eq!(pending_signal.name, "review");
+        assert!(ctx.call_log().into_records().is_empty());
+    }
+
+    #[test]
+    fn signal_any_consumes_lowest_delivery_seq_across_name_set() {
+        let ctx = RuntimeContext::new();
+        // Two candidates with DIFFERENT names; the earlier-arriving one (lower
+        // delivery_seq) must win regardless of name order in the listen set.
+        ctx.set_signal_inbox(vec![
+            queued_signal("review", json!("later"), json!({ "id": "r" }), 12),
+            queued_signal("steer", json!("earlier"), json!({ "id": "s" }), 4),
+        ]);
+
+        let result =
+            execute_signal_any(&ctx, &json!({ "names": ["review", "steer"], "opts": null }))
+                .unwrap();
+
+        assert_eq!(result["name"], json!("steer"));
+        assert_eq!(result["payload"], json!("earlier"));
+        // The non-consumed candidate stays queued for a later listen point.
+        assert_eq!(ctx.signal_inbox().len(), 1);
+        assert_eq!(ctx.signal_inbox()[0].name, "review");
+        let records = ctx.call_log().into_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].function, "signal_any");
+        assert_eq!(records[0].args, json!({ "names": ["review", "steer"] }));
+    }
+
+    #[test]
+    fn signal_any_replays_recorded_value_without_touching_inbox() {
+        let recorded = vec![CallRecord {
+            seq: 1,
+            parent_seq: None,
+            function: "signal_any".to_string(),
+            args: json!({ "names": ["review", "steer"] }),
+            result: json!({
+                "name": "steer",
+                "payload": { "priority": "high" },
+                "from": { "kind": "human", "id": "sam" },
+            }),
+            duration_ms: 0,
+            token_usage: None,
+            timestamp: Utc::now(),
+            error: None,
+        }];
+        let ctx = RuntimeContext::with_replay(recorded);
+        ctx.set_signal_inbox(vec![queued_signal(
+            "review",
+            json!("other"),
+            json!({ "id": "x" }),
+            1,
+        )]);
+
+        let result =
+            execute_signal_any(&ctx, &json!({ "names": ["review", "steer"], "opts": null }))
+                .unwrap();
+
+        assert_eq!(result["name"], json!("steer"));
+        assert_eq!(ctx.signal_inbox().len(), 1);
+    }
+
+    #[test]
+    fn signal_any_rejects_empty_or_non_string_names() {
+        let ctx = RuntimeContext::new();
+        let err = execute_signal_any(&ctx, &json!({ "names": [], "opts": null })).unwrap_err();
+        assert!(err.to_string().contains("at least one name"));
+
+        let err =
+            execute_signal_any(&ctx, &json!({ "names": ["ok", 42], "opts": null })).unwrap_err();
+        assert!(err.to_string().contains("must all be strings"));
+
+        let err = execute_signal_any(&ctx, &json!({ "names": null, "opts": null })).unwrap_err();
+        assert!(err.to_string().contains("requires an array of names"));
+    }
+
+    #[test]
+    fn signal_timeout_sentinel_shapes() {
+        let single = signal_timeout_sentinel(&["review".to_string()]);
+        assert_eq!(
+            single,
+            json!({ "name": "review", "payload": null, "from": null, "timedOut": true })
+        );
+        let multi = signal_timeout_sentinel(&["a".to_string(), "b".to_string()]);
+        assert_eq!(multi["name"], Value::Null);
+        assert_eq!(multi["timedOut"], json!(true));
     }
 
     #[test]
