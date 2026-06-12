@@ -783,38 +783,7 @@ fn install_object(vm: &mut Vm) {
     // Object.prototype.toString honoring a string-valued Symbol.toStringTag
     // (spec 20.1.3.6). For null/undefined this returns the fixed tags.
     vm.define_method(&proto, "toString", 0, |vm, this, _args| {
-        match &this {
-            Value::Undefined => return Ok(Value::str("[object Undefined]")),
-            Value::Null => return Ok(Value::str("[object Null]")),
-            _ => {}
-        }
-        let o = vm.to_object(&this)?;
-        // Spec 20.1.3.6: IsArray (proxy-aware) → Callable → other internal slots.
-        let builtin_tag = if is_array_exotic(vm, &o)? {
-            "Array"
-        } else if vm.is_callable(&Value::Object(o.clone())) {
-            "Function"
-        } else if is_regexp(&Value::Object(o.clone())) {
-            "RegExp"
-        } else {
-            let b = o.borrow();
-            match &b.internal {
-                Internal::Error => "Error",
-                Internal::Boolean(_) => "Boolean",
-                Internal::Number(_) => "Number",
-                Internal::StringObj(_) => "String",
-                Internal::Date(_) => "Date",
-                Internal::Arguments => "Arguments",
-                _ => "Object",
-            }
-        };
-        let tag_sym = vm.realm.symbol_to_string_tag.clone();
-        let tag_val = vm.get_prop(&Value::Object(o.clone()), &PropertyKey::Sym(tag_sym))?;
-        let tag = match &tag_val {
-            Value::String(s) => s.as_str().to_string(),
-            _ => builtin_tag.to_string(),
-        };
-        Ok(Value::str(format!("[object {tag}]")))
+        object_to_string(vm, &this)
     });
     // toLocaleString defers to this.toString().
     vm.define_method(&proto, "toLocaleString", 0, |vm, this, _args| {
@@ -1354,7 +1323,45 @@ fn define_accessor_or_throw(
 
 /// IsArray (spec 7.2.2): true for an Array exotic object, or a non-revoked
 /// Proxy whose target is (transitively) an Array. Throws on a revoked Proxy.
-fn is_array_exotic(vm: &Vm, o: &JsObject) -> Result<bool, Value> {
+/// `%Object.prototype.toString%` (20.1.3.6) as a callable intrinsic: shared by
+/// the installed method and `Array.prototype.toString`'s non-callable-`join`
+/// fallback (which must use the intrinsic even if the property was deleted).
+pub(crate) fn object_to_string(vm: &mut Vm, this: &Value) -> Result<Value, Value> {
+    match this {
+        Value::Undefined => return Ok(Value::str("[object Undefined]")),
+        Value::Null => return Ok(Value::str("[object Null]")),
+        _ => {}
+    }
+    let o = vm.to_object(this)?;
+    // Spec 20.1.3.6: IsArray (proxy-aware) → Callable → other internal slots.
+    let builtin_tag = if is_array_exotic(vm, &o)? {
+        "Array"
+    } else if vm.is_callable(&Value::Object(o.clone())) {
+        "Function"
+    } else if is_regexp(&Value::Object(o.clone())) {
+        "RegExp"
+    } else {
+        let b = o.borrow();
+        match &b.internal {
+            Internal::Error => "Error",
+            Internal::Boolean(_) => "Boolean",
+            Internal::Number(_) => "Number",
+            Internal::StringObj(_) => "String",
+            Internal::Date(_) => "Date",
+            Internal::Arguments => "Arguments",
+            _ => "Object",
+        }
+    };
+    let tag_sym = vm.realm.symbol_to_string_tag.clone();
+    let tag_val = vm.get_prop(&Value::Object(o.clone()), &PropertyKey::Sym(tag_sym))?;
+    let tag = match &tag_val {
+        Value::String(s) => s.as_str().to_string(),
+        _ => builtin_tag.to_string(),
+    };
+    Ok(Value::str(format!("[object {tag}]")))
+}
+
+pub(crate) fn is_array_exotic(vm: &Vm, o: &JsObject) -> Result<bool, Value> {
     let mut cur = o.clone();
     loop {
         let target = {

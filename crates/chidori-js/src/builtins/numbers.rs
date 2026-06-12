@@ -791,6 +791,19 @@ fn install_json(vm: &mut Vm) {
             None => Ok(Value::Undefined),
         }
     });
+    // JSON[Symbol.toStringTag] = "JSON" (non-writable, non-enumerable, configurable).
+    let tag = vm.realm.symbol_to_string_tag.clone();
+    json.borrow_mut().props.insert(
+        PropertyKey::Sym(tag),
+        Property {
+            kind: PropertyKind::Data {
+                value: Value::str("JSON"),
+                writable: false,
+            },
+            enumerable: false,
+            configurable: true,
+        },
+    );
     vm.define_value(&vm.realm.global.clone(), "JSON", Value::Object(json));
 }
 

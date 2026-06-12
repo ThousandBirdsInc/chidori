@@ -241,6 +241,9 @@ pub struct Vm {
     /// uncatchable throw. Used by the conformance runner's per-test timeout so a
     /// slow test stops grinding instead of being abandoned to leak a CPU core.
     pub interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Wrapping counter so [`Vm::native_tick`] only polls the interrupt flag
+    /// every 256 iterations (same cadence as the interpreter loop).
+    pub(crate) native_poll: u32,
     /// Module evaluation: when set, `run_frame` snapshots the final cell vector of
     /// the frame whose proto pointer matches, into `module_capture`. This lets the
     /// module linker recover a module's top-level binding cells (its live exports)
@@ -295,6 +298,7 @@ impl Vm {
             rng_state: 0x2545F4914F6CDD1D,
             op_budget: None,
             interrupt: None,
+            native_poll: 0,
             module_capture_proto: None,
             module_capture: None,
             trace_sink: None,
@@ -711,6 +715,34 @@ impl Vm {
         }
     }
 
+    /// Consume one unit of the opcode budget from a native builtin loop. The
+    /// spec mandates O(len) walks for the generic Array methods, and `len` can
+    /// be up to 2^53-1 on an array-like — without metering, a hostile
+    /// `{length: 2**53}` receiver would hang the engine where a JS `while`
+    /// loop could not. Same semantics as the interpreter loop: budget
+    /// exhaustion and observed interrupts throw uncatchably (the budget is
+    /// zeroed so `try/catch` cannot resume).
+    pub fn native_tick(&mut self) -> Result<(), Value> {
+        if let Some(budget) = self.op_budget.as_mut() {
+            if *budget == 0 {
+                return Err(self.throw_range("execution budget exceeded"));
+            }
+            *budget -= 1;
+        }
+        if self.interrupt.is_some() {
+            self.native_poll = self.native_poll.wrapping_add(1);
+            if self.native_poll & 0xFF == 0 {
+                if let Some(flag) = &self.interrupt {
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.op_budget = Some(0);
+                        return Err(self.throw_range("execution interrupted"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn to_length(&mut self, v: &Value) -> Result<usize, Value> {
         let n = self.to_number(v)?;
         if n.is_nan() || n <= 0.0 {
@@ -1102,6 +1134,27 @@ impl Vm {
                         }
                     }
                     None => {
+                        // Array exotic own data slots live in `internal`, not
+                        // `props`: the virtual `length` and any live (non-hole)
+                        // dense element are own writable data properties, so
+                        // the write must not consult the prototype chain
+                        // (which could hold a proxy trap or a read-only index
+                        // that would wrongly veto the assignment). A hole IS
+                        // absent, so it still walks the chain like the spec's
+                        // ordinary [[Set]].
+                        let dense_own = match &b.internal {
+                            Internal::Array(arr) => match key.as_str() {
+                                Some("length") => true,
+                                _ => key.array_index().map_or(false, |i| {
+                                    (i as usize) < arr.len()
+                                        && !matches!(arr[i as usize], Value::Hole)
+                                }),
+                            },
+                            _ => false,
+                        };
+                        if dense_own {
+                            break;
+                        }
                         let proto = b.proto.clone();
                         drop(b);
                         match proto {

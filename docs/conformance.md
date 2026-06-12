@@ -34,7 +34,7 @@ The runner prints, e.g.:
 
 ```
 Test262 (chidori pure-Rust engine, bare context)
-  pass 38271  fail 1503  skip 7517  =>  96.22% of executed
+  pass 38375  fail 1399  skip 7517  =>  96.48% of executed
 ```
 
 ## Current result
@@ -44,7 +44,7 @@ pinned suite commit:
 
 | | pass | fail | skip | % of executed |
 |---|---|---|---|---|
-| chidori pure-Rust engine, bare context | 38,271 | 1,503 | 7,517 | **96.22%** |
+| chidori pure-Rust engine, bare context | 38,375 | 1,399 | 7,517 | **96.48%** |
 
 The headline percentage is `pass / (pass + fail)` over *executed* tests; the
 skip count is reported alongside so the denominator is never hidden.
@@ -159,19 +159,19 @@ a single readable line in review).
 
 ## Remaining gaps
 
-The residual failures, by area (top clusters of the 1,503 total):
+The residual failures, by area (top clusters of the 1,399 total):
 
 | count | area | nature |
 |--:|---|---|
 | 303 | `language/expressions` | class element corners, dynamic-`import()` semantics, `yield*` delegation ordering |
 | 222 | `language/statements` | remaining class element corners, `for-of` iterator-close |
-| 136 | `built-ins/Array` | species/proxy interplay, length-boundary semantics |
 | 98 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings); `v`-flag; `prototype` long tail |
 | 96 | `built-ins/TypedArray` | resizable-`ArrayBuffer` / out-of-bounds tracking |
 | 59 | `built-ins/String` | `normalize`, Unicode/surrogate edge cases |
+| 52 | `built-ins/Object` | descriptor/integrity-level corner cases |
 | 52 | `built-ins/Promise` | spec-detailed async ordering combinations |
 | 51 | `language/module-code` | TLA ordering, cyclic-graph corner cases |
-| 23 | `language/arguments-object` | mapped-arguments index/parameter aliasing |
+| 40 | `built-ins/Array` | resizable-`ArrayBuffer` interplay; sparse indices beyond the dense cap |
 
 (Recent sweeps: the dynamic-`import()`/`with`-scope work cleared 268
 failures; the derived-class construction model — `super()` as a real
@@ -185,7 +185,13 @@ identifier semantics — cleared 194 more. The legacy normative-optional
 `using`/`await using` with spec disposal on every exit path, awaited
 async disposal, SuppressedError chaining, and per-iteration `for-of`
 disposal — landed next and cleared its entire 66-test cluster, +68 with
-the `for (const …)` immutability fix it exposed.)
+the `for (const …)` immutability fix it exposed. The Array sweep followed:
+spec-generic `Get`/`Set` loops with 2^53-range index arithmetic across
+`Array.prototype`, proxy-piercing `IsArray`, species in `flat`/`flatMap`,
+spec change-array-by-copy semantics, `@@unscopables`, a dense-array own
+`length`/element fix in the engine's `[[Set]]` path, and a
+`Reflect.set`-with-receiver fix — +104, taking `built-ins/Array` from 136
+failures to 40.)
 
 Each failure is individually identifiable from a `--json` report, so the
 clusters can be picked off as engine work warrants. See
