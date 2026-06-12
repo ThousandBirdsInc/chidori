@@ -34,7 +34,7 @@ The runner prints, e.g.:
 
 ```
 Test262 (chidori pure-Rust engine, bare context)
-  pass 37618  fail 2179  skip 7494  =>  94.52% of executed
+  pass 38271  fail 1503  skip 7517  =>  96.22% of executed
 ```
 
 ## Current result
@@ -44,7 +44,7 @@ pinned suite commit:
 
 | | pass | fail | skip | % of executed |
 |---|---|---|---|---|
-| chidori pure-Rust engine, bare context | 37,618 | 2,179 | 7,494 | **94.52%** |
+| chidori pure-Rust engine, bare context | 38,271 | 1,503 | 7,517 | **96.22%** |
 
 The headline percentage is `pass / (pass + fail)` over *executed* tests; the
 skip count is reported alongside so the denominator is never hidden.
@@ -84,6 +84,28 @@ both statically and dynamically yields the same namespace object). Without a
 hook installed — e.g. in the production chidori runtime, which forbids dynamic
 import by policy — `import()` rejects with a TypeError, as before.
 
+## Parallel execution
+
+The runner fans the per-file loop out across **one worker per CPU** by default
+(override with `TEST262_JOBS`). Workers pull file indices off a shared atomic
+cursor — dynamic load-balancing, because second-level directories vary by orders
+of magnitude in cost — and each holds its own harness cache. Per-test
+timeout/panic isolation is unchanged: every execution still runs on its own
+worker thread, which confines the `Rc`-based (non-`Send`) engine to that thread.
+
+Results are **merged back in path order**, so the printed totals, the `--json`
+report, the `--state` store, and the `--baseline` gate are byte-for-byte
+identical regardless of how many workers ran or how the work was scheduled
+(`TEST262_JOBS=1` and `TEST262_JOBS=16` produce the same output). On a 4-core box
+the file loop runs ~3–4× faster; it scales with core count.
+
+Each test also has a wall-clock budget (`TEST262_TIMEOUT_MS`, default 5 s) so a
+single pathological test — a catastrophic regex, a near-op-budget loop — is
+recorded as a timeout failure instead of stalling a worker. A conformant engine
+runs each Test262 file in well under a second, so the budget only ever catches
+pathologies. The gate scripts pin this explicitly (see [CI gate](#ci-gate)) so
+the committed baseline is reproducible no matter what the compiled-in default is.
+
 ## Why the run is chunked
 
 `chidori-js` uses reference-counting (`Rc<RefCell<…>>`); cycles are reclaimed
@@ -100,8 +122,11 @@ Both `scripts/test262.sh --gate` and `--update-baseline` still run the suite
 for memory, but for crash isolation: a single engine abort (e.g. a stack
 overflow on a pathological test) kills only its chunk, not the whole sweep.
 The runner's `--state <file>` flag merges per-test results across chunks;
-`--baseline <file>` gates each chunk against the full baseline. A full chunked
-pass is ~24 minutes on a dev box.
+`--baseline <file>` gates each chunk against the full baseline. Each chunk now
+runs its own files in parallel across all cores (see [Parallel
+execution](#parallel-execution)), so a full chunked pass is several times faster
+than the old ~24-minute single-threaded sweep — scaling with the core count of
+the box (or CI runner) it lands on.
 
 ## Honest skips
 
@@ -134,19 +159,33 @@ a single readable line in review).
 
 ## Remaining gaps
 
-The residual failures, by area (top clusters of the 2,179 total):
+The residual failures, by area (top clusters of the 1,503 total):
 
 | count | area | nature |
 |--:|---|---|
-| 447 | `language/statements` | class field/accessor corners, derived-ctor `this`-TDZ, `for`-loop scope |
-| 405 | `language/expressions` | class element corners, `yield*` return-delegation, `super` edge cases |
-| 194 | `language/eval-code` | direct `eval` does not see the caller's scope (declares into the global) |
-| 150 | `built-ins/Array` | species/proxy interplay, length-boundary semantics |
-| 102 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings); `v`-flag; `prototype` long tail |
+| 303 | `language/expressions` | class element corners, dynamic-`import()` semantics, `yield*` delegation ordering |
+| 222 | `language/statements` | remaining class element corners, `for-of` iterator-close |
+| 136 | `built-ins/Array` | species/proxy interplay, length-boundary semantics |
+| 98 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings); `v`-flag; `prototype` long tail |
 | 96 | `built-ins/TypedArray` | resizable-`ArrayBuffer` / out-of-bounds tracking |
-| 69 | `built-ins/String` | `normalize`, Unicode/surrogate edge cases |
-| 53 | `built-ins/Promise` | spec-detailed async ordering combinations |
+| 59 | `built-ins/String` | `normalize`, Unicode/surrogate edge cases |
+| 52 | `built-ins/Promise` | spec-detailed async ordering combinations |
 | 51 | `language/module-code` | TLA ordering, cyclic-graph corner cases |
+| 23 | `language/arguments-object` | mapped-arguments index/parameter aliasing |
+
+(Recent sweeps: the dynamic-`import()`/`with`-scope work cleared 268
+failures; the derived-class construction model — `super()` as a real
+`Construct`, `this`-TDZ, builtin subclassing, `new.target`-derived
+prototypes, class constructors uncallable without `new` — cleared another
+144; and the 2026-06-12 batch — named function/class self-bindings, a real
+`arguments` exotic object, %ThrowTypeError% restricted properties,
+object-literal `__proto__`, computed-key SetFunctionName, and `delete`
+identifier semantics — cleared 194 more. The legacy normative-optional
+`caller` feature is now an honest skip. Explicit resource management —
+`using`/`await using` with spec disposal on every exit path, awaited
+async disposal, SuppressedError chaining, and per-iteration `for-of`
+disposal — landed next and cleared its entire 66-test cluster, +68 with
+the `for (const …)` immutability fix it exposed.)
 
 Each failure is individually identifiable from a `--json` report, so the
 clusters can be picked off as engine work warrants. See
@@ -182,3 +221,11 @@ test262-runner [--test262 <dir>] [--filter <substr>] [--max <n>]
 - `--verbose` — print each failure with the thrown message.
 - `--no-modules` — skip `module`-flag tests (they run by default).
 - `--intl` — opt into `intl402` tests.
+
+Environment:
+
+- `TEST262_JOBS` — parallel workers (default: one per CPU). `1` forces a serial
+  run; results are identical either way.
+- `TEST262_TIMEOUT_MS` — per-test wall-clock budget (default 5000). The gate
+  scripts pin this so the committed baseline stays reproducible.
+- `TEST262_DIR` — an existing Test262 checkout to use instead of vendoring.

@@ -48,9 +48,16 @@ pub enum FuncKind {
     AsyncGenerator,
     AsyncGeneratorMethod,
     ClassCtor,
+    /// Constructor of a class with an `extends` clause: `this` is in TDZ until
+    /// `super()` constructs it, and `return` follows the derived-constructor
+    /// rules (object | undefined-becomes-this | else TypeError).
+    DerivedCtor,
 }
 
 impl FuncKind {
+    pub fn is_class_ctor(self) -> bool {
+        matches!(self, FuncKind::ClassCtor | FuncKind::DerivedCtor)
+    }
     pub fn is_async(self) -> bool {
         matches!(
             self,
@@ -123,6 +130,13 @@ pub struct FuncProto {
     /// Scope snapshots for the direct-`eval` call sites in this function,
     /// indexed by `Op::DirectEval`'s `scope` payload.
     pub eval_scopes: Vec<std::rc::Rc<EvalScopeDesc>>,
+    /// For a [`FuncKind::DerivedCtor`]: the cell holding `%this`, listed in
+    /// `stable_cells` so [[Construct]] can watch the SAME `Rc` across the call
+    /// and apply the derived-constructor completion rules (object passes;
+    /// undefined yields the bound `this` or a ReferenceError when `super()`
+    /// never ran; other primitives are a TypeError) at frame exit — i.e.
+    /// after `finally` blocks have run.
+    pub this_cell: Option<u32>,
 }
 
 impl FuncProto {
@@ -143,6 +157,7 @@ impl FuncProto {
             is_strict: false,
             stable_cells: Vec::new(),
             eval_scopes: Vec::new(),
+            this_cell: None,
         }
     }
 }
@@ -255,7 +270,12 @@ pub enum Op {
     LoadGlobal(u32),  // const index of name
     StoreGlobal(u32), // const index of name
     /// Declare a global var/function binding (const index of name).
-    DeclareGlobal(u32),
+    DeclareGlobal {
+        name: u32,
+        /// CreateGlobalVarBinding's D argument: eval-created globals are
+        /// deletable (configurable); script-level ones are not.
+        deletable: bool,
+    },
     /// Throw ReferenceError if the named global is not defined (TDZ-ish for
     /// `typeof`-safe reads we use LoadGlobalOrUndefined instead).
     LoadGlobalTypeof(u32),
@@ -352,14 +372,27 @@ pub enum Op {
     /// `#x in obj`: `[obj] -> [bool]` — whether obj OWNS the key (a field's
     /// storage key, or a method/accessor's brand key).
     PrivateHasOwn(u32),
-    /// `[superResult, superCtor] -> []`: constructor return-override — when
-    /// the parent is a BYTECODE constructor (a JS class/function) that
-    /// returned an object, substitute it as `this`; the `%this` cell (index
-    /// payload) is updated IN PLACE so closures that captured it before
-    /// `super()` observe the adopted object. Native parents (Error, Object,
-    /// Set, …) initialize the pre-created `this` via the super_target pattern
-    /// instead, so their call-handler results stay discarded.
-    AdoptSuperThis(u32),
+    /// `[super, args.., newTarget] -> [instance]`: the construct step of
+    /// `super(...)` — `Construct(super, args, newTarget)` (argc is the
+    /// payload). The parent allocates `this` (so subclassing a builtin yields
+    /// a real exotic instance) with `newTarget.prototype` as its prototype.
+    ConstructSuper(u32),
+    /// `[super, argsArray, newTarget] -> [instance]`: spread form.
+    ConstructSuperSpread,
+    /// `[instance] -> [instance]`: BindThisValue — initialize the derived
+    /// constructor's `%this` cell (index payload) IN PLACE so closures that
+    /// captured it before `super()` observe the value. Throws a
+    /// ReferenceError if the cell is already initialized (`super()` twice).
+    BindThisCell(u32),
+    /// Same, for a `%this` captured as an upvalue (`super()` in an arrow).
+    BindThisUpvalue(u32),
+    /// `[ctor, superclass] -> []`: ClassDefinitionEvaluation prototype wiring:
+    /// `ctor.prototype.[[Prototype]] = superclass.prototype` and
+    /// `ctor.[[Prototype]] = superclass`, handling `extends null` (proto chain
+    /// ends; ctor still inherits %Function.prototype%) and throwing TypeError
+    /// when the heritage is not a constructor or its `prototype` is neither
+    /// object nor null.
+    ClassLinkSuper,
 
     // ---- stack manipulation ----
     Pop,
@@ -426,9 +459,6 @@ pub enum Op {
     /// Call with a spread-collected argument array: func this argsArray -> result
     CallSpread,
     NewSpread,
-    /// super(...) call inside a derived constructor: argc on stack.
-    SuperCall(u32),
-    SuperCallSpread,
     Return,
     /// Implicit return of `this`/last completion for scripts.
     ReturnUndefined,
@@ -548,16 +578,40 @@ pub enum Op {
         pattern: u32,
         flags: u32,
     },
+    /// `[.., key, fn] -> [.., key, fn]` (peek): SetFunctionName for a
+    /// computed-key anonymous function/class value — name becomes the runtime
+    /// key (a Symbol key yields "[description]" or ""), with the payload
+    /// const ("", "get", "set") as prefix.
+    SetFunctionNameFromKey(u32),
+    /// `[obj, v] -> [obj]`: object-literal `__proto__: v` — set obj's
+    /// [[Prototype]] to v when v is an Object or null; ignore otherwise.
+    SetProtoFromLiteral,
+    /// Open a `using` dispose capability for the entering block/body.
+    PushDisposeScope,
+    /// `[v] -> [v]` (peek): AddDisposableResource — record `v` and its
+    /// dispose method (`@@dispose`; for `await using`, `@@asyncDispose`
+    /// falling back to `@@dispose`) in the innermost dispose scope.
+    /// Nullish `v` records nothing; a non-object or a missing/uncallable
+    /// method is a TypeError (thrown BEFORE the binding initializes).
+    TrackDisposable {
+        is_await: bool,
+    },
+    /// DisposeResources: pop the innermost dispose scope and call each
+    /// method (reverse order). Runs on a finally landing pad with the
+    /// in-flight completion parked: a dispose error converts the parked
+    /// completion to a throw, chaining prior throws via SuppressedError.
+    DisposeScope,
+    /// Async DisposeResources step: take the TOP resource off the innermost
+    /// dispose scope and call its method (a call error merges like
+    /// [`Op::DisposeScope`]); pushes `[result, more]` — when the scope is
+    /// exhausted it is popped and `[undefined, false]` is pushed. The
+    /// compiled landing pad Awaits `result` between steps (`await using`).
+    DisposeAsyncNext,
+    /// `[error] -> []`: merge an awaited dispose rejection into the parked
+    /// completion (same chaining as [`Op::DisposeScope`]).
+    MergeDisposeError,
     /// no-op / line marker
     Nop,
-    /// Push the current function's `home object`'s prototype for `super.x`.
-    LoadSuperBase,
-    /// `super.prop` get: base key -> value (uses this for receiver)
-    SuperGet(u32),
-    SuperGetDynamic,
-    SuperSet(u32),
-    /// spread an iterable onto the stack as call args (used with CallSpread prep)
-    SpreadIntoArray,
     /// Create the `arguments` object from current frame.
     LoadArguments,
 }

@@ -55,6 +55,9 @@ pub struct Realm {
     pub data_view_proto: JsObject,
     /// Base %TypedArray%.prototype (shared by all typed-array prototypes).
     pub typed_array_proto: JsObject,
+    /// %ThrowTypeError%: the unique-per-realm restricted-property accessor
+    /// (Function.prototype.caller/arguments, strict arguments.callee).
+    pub throw_type_error: JsObject,
 
     // Well-known symbols.
     pub symbol_iterator: JsSymbol,
@@ -123,6 +126,7 @@ impl Realm {
             self.array_buffer_proto.clone(),
             self.data_view_proto.clone(),
             self.typed_array_proto.clone(),
+            self.throw_type_error.clone(),
         ]
     }
 }
@@ -177,6 +181,7 @@ impl Realm {
             array_buffer_proto: bare(),
             data_view_proto: bare(),
             typed_array_proto: bare(),
+            throw_type_error: bare(),
             symbol_iterator: bare_symbol(1, "Symbol.iterator"),
             symbol_async_iterator: bare_symbol(2, "Symbol.asyncIterator"),
             symbol_to_primitive: bare_symbol(3, "Symbol.toPrimitive"),

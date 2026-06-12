@@ -97,6 +97,13 @@ pub struct Frame {
     pub pending_return: Option<Value>,
     /// `arguments`-style raw args retained when the function uses `arguments`.
     pub args: Vec<Value>,
+    /// The function OBJECT being executed (when known) — `arguments.callee`
+    /// for mapped (sloppy, simple-params) arguments objects.
+    pub func_obj: Option<JsObject>,
+    /// Active `using`-declaration dispose capabilities, innermost last. Each
+    /// entry is the (resource, disposeMethod) stack recorded by
+    /// `TrackDisposable` and run (in reverse) by `DisposeScope`.
+    pub dispose_scopes: Vec<Vec<(Value, Value)>>,
     /// Completion value for script-level evaluation (eval result).
     pub completion: Value,
     /// for-in enumerator stacks (key lists with cursor).

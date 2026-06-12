@@ -55,16 +55,35 @@ echo "Building runner ..."
 cargo build --release -p test262-runner
 RUNNER="$REPO_ROOT/target/release/test262-runner"
 
+# The runner now fans the file loop out across cores (one worker per CPU by
+# default; override with TEST262_JOBS). Pin the per-test timeout the *committed
+# baseline was recorded with* so the gate stays reproducible no matter what the
+# runner's compiled-in default is — otherwise a slow-but-passing test could flip
+# to a timeout failure and read as a phantom regression. Refresh the baseline
+# (and this pin) deliberately if the budget ever changes.
+export TEST262_TIMEOUT_MS="${TEST262_TIMEOUT_MS:-10000}"
+
 # The runner's reference-counting GC cannot reclaim every object cycle, so a
 # single process that walks all ~47k tests grows until it is OOM-killed. We
 # therefore run the suite one second-level directory at a time, in a fresh
 # process each, so memory is reclaimed between chunks. The --state file merges
 # results across chunks; --baseline gates each chunk against the full baseline.
+#
+# Optional CI sharding: when TEST262_SHARD_TOTAL > 1, this process is one of N
+# shards (0-based TEST262_SHARD_INDEX) and runs only its slice of the dirs,
+# assigned round-robin so the heavy dirs (language/expressions, language/
+# statements, built-ins/Array, built-ins/TypedArray, …) are spread across shards
+# rather than piling onto one. Each shard still gates its slice against the FULL
+# committed baseline, so every test is owned by exactly one shard and the union
+# is complete. Default (total=1) runs everything. Sharding applies only to the
+# default dir sweep, not to explicit path arguments.
 chunk_dirs() {
   if [[ ${#forward[@]} -gt 0 ]]; then
     printf '%s\n' "${forward[@]}"
   else
-    (cd "$VENDOR_DIR" && ls -d test/language/*/ test/built-ins/*/)
+    local total="${TEST262_SHARD_TOTAL:-1}" index="${TEST262_SHARD_INDEX:-0}"
+    (cd "$VENDOR_DIR" && ls -d test/language/*/ test/built-ins/*/) \
+      | awk -v t="$total" -v i="$index" 't <= 1 || ((NR - 1) % t) == i'
   fi
 }
 

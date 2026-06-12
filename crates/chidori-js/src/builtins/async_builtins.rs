@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::{arg, super_target};
+use super::arg;
 use crate::generator::ResumeKind;
 use crate::value::*;
 use crate::vm::Vm;
@@ -18,35 +18,7 @@ fn install_promise(vm: &mut Vm) {
     let ctor = vm.new_native_ctor(
         "Promise",
         1,
-        |vm, t, args| {
-            // Only reachable via `super(...)` from a Promise subclass (the
-            // construct handler serves `new Promise`): initialize the subclass
-            // instance's promise internals in place, like Set/Map/TypedArray.
-            let proto = vm.realm.promise_proto.clone();
-            // The target must be an UNinitialized instance (Internal::Ordinary):
-            // `Promise.call(existingPromise, ...)` throws rather than re-init.
-            let target = super_target(&t, &proto)
-                .filter(|o| matches!(o.borrow().internal, Internal::Ordinary))
-                .ok_or_else(|| {
-                    vm.throw_type("Promise constructor cannot be invoked without 'new'")
-                })?;
-            let executor = arg(args, 0);
-            if !vm.is_callable(&executor) {
-                return Err(vm.throw_type("Promise resolver is not a function"));
-            }
-            target.borrow_mut().internal = Internal::Promise(crate::vm::PromiseData {
-                state: crate::vm::PromiseState::Pending,
-                fulfill_reactions: Vec::new(),
-                reject_reactions: Vec::new(),
-                handled: false,
-                host_id: None,
-            });
-            let (resolve, reject) = make_resolving_functions(vm, &target);
-            if let Err(e) = vm.call(executor, Value::Undefined, &[resolve, reject]) {
-                vm.reject_promise(&target, e);
-            }
-            Ok(Value::Undefined)
-        },
+        |vm, _t, _args| Err(vm.throw_type("Promise constructor cannot be invoked without 'new'")),
         |vm, _t, args| {
             // 1. If executor is not callable, throw a TypeError.
             let executor = arg(args, 0);
