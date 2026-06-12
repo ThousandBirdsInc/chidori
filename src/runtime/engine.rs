@@ -348,6 +348,55 @@ impl Engine {
         self.run_with_context(path, inputs, ctx)
     }
 
+    /// As `run_replay_pausable_with_host_promises_and_vfs`, but also threads the
+    /// durable signal mailbox (`signals/inbox.json`) into the resumed run so a
+    /// re-run that reaches a `chidori.signal(name)`/`pollSignal(name)` listen
+    /// point drains any queued entries instead of pausing. See `docs/signals.md`
+    /// §9 (the resume worker loads the inbox).
+    pub fn run_replay_pausable_with_host_promises_vfs_and_signals(
+        &self,
+        path: &Path,
+        inputs: &Value,
+        replay_log: Vec<CallRecord>,
+        host_promises: Vec<HostPromiseRecord>,
+        vfs: crate::runtime::vfs::Vfs,
+        signal_inbox: Vec<crate::runtime::snapshot::QueuedSignal>,
+    ) -> Result<RunResult> {
+        let ctx = RuntimeContext::with_replay_host_promises_vfs_and_signals(
+            replay_log,
+            host_promises,
+            vfs,
+            signal_inbox,
+        );
+        ctx.set_input_mode(InputMode::Pause);
+        self.run_with_context(path, inputs, ctx)
+    }
+
+    /// As above, preserving the original run id (so the resumed run keeps its
+    /// persisted run directory) AND threading the signal mailbox. This is the
+    /// method the server's resume/signal-delivery paths use.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_replay_pausable_with_host_promises_vfs_signals_preserving_run_id(
+        &self,
+        path: &Path,
+        inputs: &Value,
+        replay_log: Vec<CallRecord>,
+        host_promises: Vec<HostPromiseRecord>,
+        vfs: crate::runtime::vfs::Vfs,
+        signal_inbox: Vec<crate::runtime::snapshot::QueuedSignal>,
+        run_id: String,
+    ) -> Result<RunResult> {
+        let ctx = RuntimeContext::with_replay_host_promises_vfs_and_signals(
+            replay_log,
+            host_promises,
+            vfs,
+            signal_inbox,
+        );
+        ctx.set_run_id(run_id);
+        ctx.set_input_mode(InputMode::Pause);
+        self.run_with_context(path, inputs, ctx)
+    }
+
     /// Resume/replay an interactive streaming run with persisted host-promise
     /// state. Used by embedders that mirror the server session interaction
     /// without routing through HTTP.

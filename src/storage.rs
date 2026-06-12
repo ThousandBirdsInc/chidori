@@ -43,6 +43,13 @@ pub struct StoredSession {
     pub error: Option<String>,
     pub pending_seq: Option<u64>,
     pub pending_prompt: Option<String>,
+    /// Set when status == Paused on a `chidori.signal(name)` listen point.
+    /// Carries the listen-point name so the view advertises which signal the
+    /// run is awaiting and the delivery endpoint can match `body.name` against
+    /// it. A signal pause reuses `SessionStatus::Paused`; this field (not the
+    /// status) distinguishes it from an `input()` pause. See `docs/signals.md`.
+    #[serde(default)]
+    pub pending_signal_name: Option<String>,
     /// Set when status == AwaitingApproval. Carries the (target, args)
     /// the policy is asking about so the UI can render a prompt.
     #[serde(default)]
