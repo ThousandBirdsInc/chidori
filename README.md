@@ -1,20 +1,32 @@
-<div align="center">
+<p align="center">
+  <img src=".github/chidori-banner.svg" alt="Chidori — checkpoint · replay · resume: durable TypeScript agents on a Rust core" width="800" />
+</p>
 
-# &nbsp; Chidori (v3) &nbsp;
+<h1 align="center">Chidori</h1>
 
-**An agent framework where TypeScript agents can checkpoint, replay, and resume by default.**
+<p align="center">
+  An <b>agent framework where TypeScript agents checkpoint, replay, and resume by default</b>.
+  Agents are plain async TypeScript; every side effect flows through the runtime as a recorded
+  <b>host call</b> — so a finished run can be saved to disk, replayed for identical output with
+  <b>zero LLM calls</b>, and resumed from any pause. One Rust binary, an embedded pure-Rust
+  JavaScript engine, and TypeScript + Python SDKs.
+</p>
 
-<p>
+<p align="center">
 <a href="https://github.com/ThousandBirdsInc/chidori/commits"><img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/ThousandBirdsInc/chidori" /></a>
 <a href="https://crates.io/crates/chidori"><img alt="crates.io version" src="https://img.shields.io/crates/v/chidori" /></a>
 <a href="https://pypi.org/project/chidori/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/chidori" /></a>
 <a href="https://www.npmjs.com/package/chidori"><img alt="npm version" src="https://img.shields.io/npm/v/chidori" /></a>
 <a href="https://github.com/ThousandBirdsInc/chidori/blob/main/LICENSE"><img alt="License Apache-2.0" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" /></a>
 </p>
-<br />
-</div>
 
-Star us on GitHub! Join us on [Discord](https://discord.gg/CJwKsPSgew).
+<p align="center">
+  <a href="#️-quick-start"><b>⚡️ Quick Start</b></a> ·
+  <a href="#-core-concepts"><b>🧩 Core Concepts</b></a> ·
+  <a href="#-how-replay-works"><b>⏪ Replay</b></a> ·
+  <a href="DESIGN.md"><b>📐 Design</b></a> ·
+  <a href="https://discord.gg/CJwKsPSgew"><b>💬 Discord</b></a>
+</p>
 
 > **About v3.** Chidori began as a reactive runtime exploring how to build durable, debuggable agents. v3 is a ground-up rewrite that distills those ideas into a smaller, sharper core: a single Rust binary, TypeScript agent authoring, and replay as the foundation for tests, debugging, resume, and human-in-the-loop workflows. Earlier versions of Chidori live in the git history and on prior tags.
 
@@ -38,6 +50,13 @@ Star us on GitHub! Join us on [Discord](https://discord.gg/CJwKsPSgew).
 - **Zero-cost checkpointing.** Save a session's call log to disk, replay it later for identical output with zero LLM calls.
 - **Event-driven agents.** Agents can run as HTTP servers that react to webhooks and other events.
 - **Rust core, TS and Python SDKs.** The runtime is a single binary. SDKs talk to it over HTTP without native bindings.
+
+The whole model fits in one picture — agents never touch the world directly, so the runtime
+sees (and records) everything:
+
+<p align="center">
+  <img src=".github/host-call-loop.svg" alt="Animation: a TypeScript agent calls host functions on the Chidori runtime; the runtime performs each side effect against the world (LLMs, HTTP, tools) and records it in the call log" width="860" />
+</p>
 
 ## ⚡️ Quick Start
 
@@ -149,7 +168,11 @@ RUN_ID=$(ls -t examples/agents/.chidori/runs | head -1)
 ### Human-In-The-Loop Demo
 
 This demo shows the session API pausing on `chidori.input(...)` and resuming
-from the persisted call log.
+from the persisted call log:
+
+<p align="center">
+  <img src=".github/pause-resume.svg" alt="Animation: an agent runs until input() pauses it, the session is persisted to disk, and when a human responds the runtime replays the call log to the pause point and continues live from there" width="860" />
+</p>
 
 Start the server:
 
@@ -346,6 +369,10 @@ assert replayed.output == session.output  # identical output
 ```
 
 ## ⏪ How Replay Works
+
+<p align="center">
+  <img src=".github/record-replay.svg" alt="Animation: an original run executes prompt, tool, and http calls while recording each one into a numbered call log; the call log becomes a JSON checkpoint; replay re-runs the same code answering every host call from the log — identical output, zero LLM calls" width="860" />
+</p>
 
 TypeScript durable runs use deterministic runtime policy plus cached host-call
 results. Given the same inputs, compatible source hashes, and the same cached
