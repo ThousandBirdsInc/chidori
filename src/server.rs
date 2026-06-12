@@ -434,6 +434,7 @@ pub async fn serve(
     agent_path: PathBuf,
     port: u16,
     policy: Arc<PolicyConfig>,
+    policy_posture: String,
 ) -> anyhow::Result<()> {
     // Configurable concurrency cap. Default 8 is low enough to keep one
     // LLM provider from being flooded and high enough that a small agent
@@ -569,6 +570,7 @@ pub async fn serve(
             "disabled (set CHIDORI_API_KEY to enable)"
         }
     );
+    eprintln!("  Policy:      {}", policy_posture);
     eprintln!(
         "  CORS:        {}",
         match std::env::var("CHIDORI_CORS_ORIGINS").ok() {
@@ -3912,6 +3914,29 @@ mod tests {
         assert!(
             error.contains("unknown policy profile 'nonsense'") && error.contains("untrusted"),
             "expected an unknown-profile error listing the builtins, got: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn serve_default_profile_denies_sessions_and_explains_the_opt_out() {
+        // The policy `chidori serve` resolves when the operator configured
+        // nothing: sessions are deny-by-default and the denial tells the
+        // operator how to relax the posture.
+        let (temp_dir, mut state) =
+            policy_test_project("chidori-server-policy-serve-default", HTTP_AGENT);
+        state.policy = Arc::new(crate::policy::serve_default_profile());
+
+        let (status, body) =
+            response_json(create_session(State(state), Json(create_request(None))).await).await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["status"], json!("failed"));
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("policy: `http` denied") && error.contains("--trusted"),
+            "expected an actionable deny-by-default error, got: {error}"
         );
 
         let _ = std::fs::remove_dir_all(temp_dir);

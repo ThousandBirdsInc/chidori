@@ -54,8 +54,8 @@ remaining distance.
 | Hang the host with an infinite loop | ✅ Yes — opcode budget |
 | OOM the host (string / heap growth) | ✅ Yes — string cap + memory ceiling |
 | Crash the host with a panic | ✅ Yes — `catch_unwind` boundary |
-| Abuse an injected powerful effect (`http`, `workspace`) | ⚠️ Only if the host gates it — see [gaps](#current-gaps) |
-| Starve co-tenant agents / exceed a precise per-agent memory quota | ⚠️ Coarse only — see [gaps](#current-gaps) |
+| Abuse an injected powerful effect (`http`, `workspace`) | ✅ On the server (deny-by-default unless the operator opts out); ⚠️ on the bare CLI only if the operator gates it — see [gaps](#current-gaps) |
+| Starve co-tenant agents / exceed a per-agent memory quota | ✅ Per-run meter (thread-attributed; small cross-thread drift) — see [gaps](#current-gaps) |
 | Break out of the process / OS | ❌ No process or OS isolation |
 
 ## Architecture: capability injection, not ambient authority
@@ -141,15 +141,20 @@ Two complementary layers:
    opcode can allocate without bound.
 
 2. **Per-run live-heap ceiling (watchdog).** A `CountingAllocator`
-   (`src/mem_guard.rs`) is installed as the binary's `#[global_allocator]` and
-   tracks live (allocated-minus-freed) bytes with one relaxed atomic per
-   alloc/free. A background watchdog samples baseline-relative growth and trips the
-   VM's cooperative-cancellation flag (`vm.interrupt`, polled every 256 ops) when a
+   (`src/mem_guard.rs`) is installed as the binary's `#[global_allocator]`. Each
+   run registers a **per-run meter** on its execution thread (`RunMeterGuard`);
+   every alloc/free performed on that thread is charged to that run, so under
+   concurrent multi-agent execution one run's allocations are attributed to that
+   run rather than to whichever co-tenant happens to be sampled (nested
+   `callAgent` children meter themselves and hand accounting back to the
+   parent). A background watchdog samples the meter and trips the VM's
+   cooperative-cancellation flag (`vm.interrupt`, polled every 256 ops) when a
    run exceeds its cap — catching the vector a per-op cap cannot: accumulating many
    capped objects in a long-lived container (`Map`/`Set`/array). The VM unwinds with
    `RangeError: execution interrupted`.
 
-   - Env: `CHIDORI_JS_MEM_CAP_MB` (default `4096`; `0` disables).
+   - Env: `CHIDORI_JS_MEM_CAP_MB` (default `4096`; `0` disables) and
+     `CHIDORI_JS_MEM_POLL_MS` (watchdog sampling interval, default `10`).
 
 ### Wall-clock deadline — optional, off by default
 
@@ -180,7 +185,8 @@ The same watchdog can enforce a wall-clock deadline, also via `vm.interrupt`.
 | Control | Env var | Default | Disable |
 |---|---|---|---|
 | Opcode budget | `CHIDORI_JS_OP_BUDGET` | `5_000_000_000` | `0` |
-| Memory ceiling (MB, baseline-relative) | `CHIDORI_JS_MEM_CAP_MB` | `4096` | `0` |
+| Memory ceiling (MB, per-run meter) | `CHIDORI_JS_MEM_CAP_MB` | `4096` | `0` |
+| Memory watchdog poll interval (ms) | `CHIDORI_JS_MEM_POLL_MS` | `10` | — |
 | Wall-clock deadline (ms) | `CHIDORI_JS_DEADLINE_MS` | off | — |
 | String length | (compile constant) | 16 MB | — |
 | Dense array length | (compile constant) | 1,000,000 | — |
@@ -193,35 +199,37 @@ These are the known limitations as of this writing. None of them are
 memory-safety holes (the engine is safe Rust); they are confinement and
 resource-precision gaps.
 
-1. **Not every powerful effect is gated yet.** The remaining powerful effects are
-   `http` (real outbound network requests) and `workspace.*` (real disk I/O within
-   a sanitized root); the `exec*` snippet sandboxes were removed in #39. Both `http`
-   and every `workspace.*` action now pass through the policy enforcement gate
-   (`enforce_policy`): `http` against the `http` target, and workspace actions
-   against `workspace:list` / `workspace:read` / `workspace:write` /
-   `workspace:delete` / `workspace:manifest`. A restrictive profile can therefore
-   deny or require approval for disk writes while still allowing reads. The
-   remaining gap is the *default*: the fallback decision is still `AlwaysAllow`, so
-   out of the box nothing is denied. Deny-by-default is now one switch away — the
-   built-in [`untrusted` profile](#the-untrusted-policy-profile-deny-by-default),
-   selectable as `chidori run --untrusted` / `chidori serve --untrusted` or via
-   `CHIDORI_POLICY_PROFILE=untrusted` — but it is opt-in, not automatic.
-   *Remaining fix:* make it the default for untrusted runs.
+1. **The bare-CLI default is still allow.** The powerful effects — `http` (real
+   outbound network requests) and `workspace.*` (real disk I/O within a sanitized
+   root) — all pass through the policy enforcement gate (`enforce_policy`), and the
+   surface where untrusted callers actually arrive is now deny-by-default:
+   **`chidori serve` runs under the [`untrusted` profile](#the-untrusted-policy-profile-deny-by-default)
+   unless the operator explicitly configures policy** (any valid `CHIDORI_POLICY*`
+   source, or the `--trusted` flag to opt back into the permissive default;
+   malformed policy configuration fails closed to deny rather than falling back to
+   allow-all). What deliberately remains permissive is `chidori run` without
+   flags: local CLI runs of developer-authored code keep the historical
+   `AlwaysAllow` fallback, with `--untrusted` /
+   `CHIDORI_POLICY_PROFILE=untrusted` available when the code being run is not
+   trusted.
 
-2. **The memory ceiling is process-wide, not per-VM.** The `CountingAllocator`
-   counter is global; the watchdog caps *baseline-relative* growth
-   (`current - baseline_at_run_start`). Under concurrent multi-agent execution, one
-   run's allocations can be attributed to another, so the cap is a coarse safety
-   backstop tuned generously — **not** a precise per-agent quota, and it can in
-   principle trip an innocent co-tenant under heavy load. *Fix:* precise per-VM
-   byte accounting (e.g. a thread-local meter charged at string/object allocation
-   and credited on `Drop`).
+2. **Per-run memory accounting is thread-attributed, not ownership-attributed.**
+   Each run registers a per-run meter on its execution thread
+   (`src/mem_guard.rs::RunMeterGuard`), so the cap measures that run's own
+   allocations and concurrent runs no longer trip each other's caps. The residual
+   imprecision: bytes a host effect allocates on *other* threads (e.g. tokio
+   workers buffering an HTTP response) are not charged until they reach the run
+   thread, and a value allocated on the run thread but freed elsewhere stays
+   charged (the meter clamps at zero in the other direction). For a
+   single-threaded VM run this drift is small; true ownership accounting (charge
+   at string/object allocation, credit on `Drop` inside the engine) remains the
+   eventual fix.
 
 3. **Memory enforcement granularity.** The live-heap check is polled (watchdog
-   every ~20 ms; the VM observes the trip every 256 ops). A run can therefore
-   overshoot the cap briefly before unwinding. Bounded in practice because the
-   per-op size caps mean no single opcode allocates more than ~16 MB, but it is not
-   a hard instantaneous ceiling.
+   every ~10 ms by default, tunable via `CHIDORI_JS_MEM_POLL_MS`; the VM observes
+   the trip every 256 ops). A run can therefore overshoot the cap briefly before
+   unwinding. Bounded in practice because the per-op size caps mean no single
+   opcode allocates more than ~16 MB, but it is not a hard instantaneous ceiling.
 
 4. **No process / OS-level isolation.** The engine runs in-process with the host;
    there is no seccomp, namespace, or separate-process boundary. Isolation is
@@ -251,17 +259,20 @@ resource-precision gaps.
 
 The permission policy (`src/policy.rs`) gates the powerful host effects — `http`
 and every `workspace:*` action (`workspace:list` / `read` / `write` / `delete` /
-`manifest`) — through `enforce_policy`. By default the fallback for an unmatched
-effect is `AlwaysAllow`, so out of the box nothing is denied; deny-by-default is
-something you turn on.
+`manifest`) — through `enforce_policy`. The fallback for an unmatched effect
+depends on the surface: on `chidori run` (trusted, developer-authored code on the
+developer's own machine) it is `AlwaysAllow`; on **`chidori serve`** — the surface
+untrusted callers reach — it is **deny-by-default** unless the operator
+explicitly configures policy.
 
 The **`untrusted`** profile is a ready-made, deny-by-default policy you can select
-by name — no hand-written JSON. Enable it with a CLI flag (on `run` and `serve`)
-or an environment variable:
+by name — no hand-written JSON. It is what `chidori serve` runs under out of the
+box; select it explicitly with a CLI flag (on `run` and `serve`) or an
+environment variable:
 
 ```sh
 chidori run --untrusted agent.ts                       # CLI flag
-chidori serve --untrusted agent.ts                     # also on serve
+chidori serve --untrusted agent.ts                     # also on serve (already the default there)
 CHIDORI_POLICY_PROFILE=untrusted chidori run agent.ts  # env-var equivalent
 ```
 
@@ -284,11 +295,20 @@ The fallback governs exactly the powerful surface, because the *pure* effects
 (`log`, `template`, `memory`, `prompt`, …) never call `enforce_policy` and so run
 regardless of the profile — they have no ambient authority to abuse.
 
-Selection order is the `--untrusted` flag first, then `PolicyConfig::from_env`:
+Selection order is the `--untrusted` flag first, then env-driven resolution:
 `CHIDORI_POLICY_FILE` → `CHIDORI_POLICY` (inline JSON) → `CHIDORI_POLICY_PROFILE`
-(a built-in name) → default. The **default profile is unchanged** (`AlwaysAllow` fallback, no rules):
-the `untrusted` profile is purely opt-in. To customize further, copy the profile's
-shape into your own `CHIDORI_POLICY` JSON (rules + `"default": "never_allow"`).
+(a built-in name) → the surface default. The surface default differs:
+
+- **`chidori run`** falls back to the permissive profile (`AlwaysAllow`, no
+  rules) — the historical default for trusted local development.
+- **`chidori serve`** falls back to the `untrusted` profile, with a denial
+  reason that names the opt-outs. A malformed `CHIDORI_POLICY*` source fails
+  closed to this default rather than silently serving allow-all. Pass
+  `--trusted` to restore the permissive `chidori run` resolution (the startup
+  banner's `Policy:` line reports the active posture either way).
+
+To customize further, copy the profile's shape into your own `CHIDORI_POLICY`
+JSON (rules + `"default": "never_allow"`).
 
 ### The `supervised` profile (ask-by-default)
 
@@ -338,14 +358,16 @@ TypeScript, `client.run(input, policy_profile="untrusted")` in Python.
 If you intend to run code you do not trust on this engine today:
 
 1. Select the deny-by-default policy: `chidori run --untrusted` (or
-   `CHIDORI_POLICY_PROFILE=untrusted`, above). This denies `http` and `workspace`
-   mutations while leaving read-only workspace introspection available.
-2. Lower `CHIDORI_JS_OP_BUDGET` and `CHIDORI_JS_MEM_CAP_MB` to fit the workload, and
-   enable `CHIDORI_JS_DEADLINE_MS` (acceptable because untrusted code should not be
+   `CHIDORI_POLICY_PROFILE=untrusted`, above); `chidori serve` is already there
+   by default. This denies `http` and `workspace` mutations while leaving
+   read-only workspace introspection available.
+2. Lower `CHIDORI_JS_OP_BUDGET` and `CHIDORI_JS_MEM_CAP_MB` to fit the workload
+   (and tighten `CHIDORI_JS_MEM_POLL_MS` alongside a small cap), and enable
+   `CHIDORI_JS_DEADLINE_MS` (acceptable because untrusted code should not be
    making slow trusted host calls).
-3. Run each agent in its own process (or container) so the process-wide memory
-   counter and the lack of OS isolation (gaps 2, 4) do not allow cross-tenant
-   interference or a true breakout.
+3. Run each agent in its own process (or container) so the lack of OS isolation
+   (gap 4) does not allow a true breakout; per-run memory accounting (gap 2)
+   already keeps co-tenant caps separate within one process.
 4. Keep `node:fs` on `FsPolicy::Captured` (the VFS) and avoid `workspace.*`.
 
 ## Verification

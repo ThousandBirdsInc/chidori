@@ -66,6 +66,11 @@ pub struct PolicyConfig {
     /// Fallback when no rule matches.
     #[serde(default)]
     pub default: Decision,
+    /// Optional reason attached to the fallback decision, surfaced in the
+    /// denial/approval message so an operator hitting a deny-by-default
+    /// posture is told how to relax it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reason: Option<String>,
     /// An additional policy layered on top of this one: the effective decision
     /// for a call is the *stricter* of the two. Set via [`restricted_by`]
     /// (e.g. a per-session profile on the server) so a caller-selected policy
@@ -77,17 +82,29 @@ pub struct PolicyConfig {
 
 impl PolicyConfig {
     pub fn from_env() -> Arc<Self> {
+        Self::from_env_configured().unwrap_or_else(|| Arc::new(PolicyConfig::default()))
+    }
+
+    /// Env-driven policy resolution that distinguishes "the operator
+    /// configured a policy" from "nothing was configured". Returns `Some`
+    /// only when a `CHIDORI_POLICY*` source resolved successfully; a
+    /// malformed source warns and falls through to the next, exactly as
+    /// [`from_env`] always has. Callers that want a deny-by-default posture
+    /// when nothing (valid) is configured — `chidori serve` — map `None` to
+    /// [`serve_default_profile`] so misconfiguration fails closed instead of
+    /// silently running allow-all.
+    pub fn from_env_configured() -> Option<Arc<Self>> {
         if let Ok(path) = std::env::var("CHIDORI_POLICY_FILE") {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 match serde_json::from_str::<PolicyConfig>(&text) {
-                    Ok(cfg) => return Arc::new(cfg),
+                    Ok(cfg) => return Some(Arc::new(cfg)),
                     Err(e) => tracing::warn!("CHIDORI_POLICY_FILE parse error: {}", e),
                 }
             }
         }
         if let Ok(inline) = std::env::var("CHIDORI_POLICY") {
             match serde_json::from_str::<PolicyConfig>(&inline) {
-                Ok(cfg) => return Arc::new(cfg),
+                Ok(cfg) => return Some(Arc::new(cfg)),
                 Err(e) => tracing::warn!("CHIDORI_POLICY parse error: {}", e),
             }
         }
@@ -95,7 +112,7 @@ impl PolicyConfig {
             let profile = profile.trim();
             if !profile.is_empty() {
                 match builtin_profile(profile) {
-                    Some(cfg) => return Arc::new(cfg),
+                    Some(cfg) => return Some(Arc::new(cfg)),
                     None => tracing::warn!(
                         "CHIDORI_POLICY_PROFILE: unknown profile `{}` (known: {})",
                         profile,
@@ -104,7 +121,7 @@ impl PolicyConfig {
                 }
             }
         }
-        Arc::new(PolicyConfig::default())
+        None
     }
 
     /// Resolve a call against the policy. `target` is the normalized target
@@ -138,7 +155,7 @@ impl PolicyConfig {
             }
             return (rule.decision, rule.reason.clone());
         }
-        (self.default, None)
+        (self.default, self.default_reason.clone())
     }
 
     /// Layer `profile` on top of this policy: every decision becomes the
@@ -196,8 +213,25 @@ fn untrusted_profile() -> PolicyConfig {
     PolicyConfig {
         rules: read_only_workspace_allowlist(),
         default: Decision::NeverAllow,
+        default_reason: None,
         overlay: None,
     }
+}
+
+/// The policy `chidori serve` runs under when the operator has not configured
+/// one. The server is the surface untrusted callers reach, so sessions there
+/// are deny-by-default out of the box: the `untrusted` profile, with a
+/// fallback reason telling the operator how to relax it. `chidori run` keeps
+/// the permissive default — the primary model for local CLI runs is trusted,
+/// developer-authored agent code.
+pub fn serve_default_profile() -> PolicyConfig {
+    let mut cfg = untrusted_profile();
+    cfg.default_reason = Some(
+        "chidori serve is deny-by-default: configure CHIDORI_POLICY / CHIDORI_POLICY_FILE / \
+         CHIDORI_POLICY_PROFILE, or start the server with --trusted, to allow this effect"
+            .to_string(),
+    );
+    cfg
 }
 
 /// Ask-by-default profile: identical allowlist to `untrusted`, but unmatched
@@ -209,6 +243,7 @@ fn supervised_profile() -> PolicyConfig {
     PolicyConfig {
         rules: read_only_workspace_allowlist(),
         default: Decision::AskBefore,
+        default_reason: None,
         overlay: None,
     }
 }
@@ -356,6 +391,7 @@ mod tests {
                 reason: Some("operator denies egress".to_string()),
             }],
             default: Decision::AlwaysAllow,
+            default_reason: None,
             overlay: None,
         };
         let layered = base.restricted_by(Arc::new(builtin_profile("supervised").unwrap()));
@@ -379,6 +415,41 @@ mod tests {
         assert_eq!(decision, Decision::NeverAllow);
         let (decision, _) = layered.decide("workspace:read", &json!({}));
         assert_eq!(decision, Decision::AlwaysAllow);
+    }
+
+    #[test]
+    fn serve_default_profile_denies_with_actionable_reason() {
+        let cfg = serve_default_profile();
+        assert_eq!(cfg.default, Decision::NeverAllow);
+
+        let (decision, reason) = cfg.decide("http", &json!({ "url": "https://example.com" }));
+        assert_eq!(decision, Decision::NeverAllow);
+        let reason = reason.expect("serve default denial carries a how-to-relax reason");
+        assert!(
+            reason.contains("--trusted"),
+            "reason should name the opt-out: {reason}"
+        );
+        assert!(
+            reason.contains("CHIDORI_POLICY"),
+            "reason should name the env config: {reason}"
+        );
+
+        let (decision, reason) = cfg.decide("workspace:write", &json!({ "path": "a.txt" }));
+        assert_eq!(decision, Decision::NeverAllow);
+        assert!(reason.is_some());
+    }
+
+    #[test]
+    fn serve_default_profile_keeps_read_only_workspace_allowlist() {
+        let cfg = serve_default_profile();
+        for target in ["workspace:list", "workspace:read", "workspace:manifest"] {
+            let (decision, _) = cfg.decide(target, &json!({}));
+            assert_eq!(
+                decision,
+                Decision::AlwaysAllow,
+                "{target} should be allowed"
+            );
+        }
     }
 
     #[test]

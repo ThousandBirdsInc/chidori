@@ -170,11 +170,16 @@ struct ExecutionLimits {
     /// `while (true) {}` terminates with a `RangeError`. `None` disables.
     /// Env `CHIDORI_JS_OP_BUDGET` (default 5e9; `0` disables).
     op_budget: Option<u64>,
-    /// Live process-heap growth ceiling in bytes, enforced by the watchdog via the
-    /// counting allocator. `None` disables. Env `CHIDORI_JS_MEM_CAP_MB` (default
-    /// 4096; `0` disables). A coarse process-wide backstop, not a precise per-agent
-    /// quota — see [`crate::mem_guard`].
+    /// Live heap growth ceiling in bytes for this run, enforced by the watchdog
+    /// via the counting allocator's per-run meter (allocations made on the run's
+    /// own thread — see [`crate::mem_guard`]). `None` disables. Env
+    /// `CHIDORI_JS_MEM_CAP_MB` (default 4096; `0` disables).
     mem_cap: Option<usize>,
+    /// Watchdog sampling interval for the memory cap and deadline checks.
+    /// Env `CHIDORI_JS_MEM_POLL_MS` (default 10; clamped to at least 1).
+    /// A run can overshoot the cap by what it allocates within one interval,
+    /// so tighten this together with the cap when confining untrusted code.
+    poll_interval: Duration,
     /// Optional wall-clock deadline. `None` disables (the default).
     /// Env `CHIDORI_JS_DEADLINE_MS`.
     ///
@@ -206,9 +211,12 @@ impl ExecutionLimits {
             0 => None,
             ms => Some(Duration::from_millis(ms)),
         };
+        let poll_interval =
+            Duration::from_millis(env_u64("CHIDORI_JS_MEM_POLL_MS").unwrap_or(10).max(1));
         ExecutionLimits {
             op_budget,
             mem_cap,
+            poll_interval,
             deadline,
         }
     }
@@ -222,6 +230,10 @@ impl ExecutionLimits {
 struct ExecutionGuard {
     done: Arc<AtomicBool>,
     watchdog: Option<JoinHandle<()>>,
+    /// Keeps the per-run allocation meter registered on the run thread for the
+    /// lifetime of the run. Declared after `watchdog` is irrelevant — `Drop`
+    /// joins the watchdog explicitly before this guard unregisters.
+    _meter: Option<crate::mem_guard::RunMeterGuard>,
 }
 
 impl ExecutionGuard {
@@ -233,14 +245,23 @@ impl ExecutionGuard {
         let interrupt = Arc::new(AtomicBool::new(false));
         vm.interrupt = Some(interrupt.clone());
 
+        // Per-run accounting: register a meter on this thread (the thread the
+        // VM runs on) so the cap measures this run's own allocations rather
+        // than process-wide growth — concurrent runs no longer trip each
+        // other's caps.
+        let meter_guard = limits
+            .mem_cap
+            .map(|_| crate::mem_guard::RunMeterGuard::install());
+
         let done = Arc::new(AtomicBool::new(false));
         // Only spend a thread when there is something time- or memory-based to
         // watch; the opcode budget is enforced inline by the VM and needs none.
         let watchdog = if limits.mem_cap.is_some() || limits.deadline.is_some() {
             let done_w = done.clone();
-            let baseline = crate::mem_guard::current_allocated_bytes();
             let deadline_at = limits.deadline.map(|d| Instant::now() + d);
             let mem_cap = limits.mem_cap;
+            let meter = meter_guard.as_ref().map(|g| g.handle());
+            let poll_interval = limits.poll_interval;
             Some(std::thread::spawn(move || loop {
                 if done_w.load(Ordering::Relaxed) {
                     return;
@@ -251,19 +272,22 @@ impl ExecutionGuard {
                         return;
                     }
                 }
-                if let Some(cap) = mem_cap {
-                    let used = crate::mem_guard::current_allocated_bytes().saturating_sub(baseline);
-                    if used > cap {
+                if let (Some(cap), Some(meter)) = (mem_cap, meter.as_ref()) {
+                    if crate::mem_guard::run_meter_bytes(meter) > cap {
                         interrupt.store(true, Ordering::Relaxed);
                         return;
                     }
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                std::thread::sleep(poll_interval);
             }))
         } else {
             None
         };
-        ExecutionGuard { done, watchdog }
+        ExecutionGuard {
+            done,
+            watchdog,
+            _meter: meter_guard,
+        }
     }
 }
 

@@ -116,8 +116,9 @@ cargo build
 ./target/debug/chidori run examples/agents/parallel.ts \
   --input '{"topic": "runtime snapshots"}'
 
-# Event-driven webhook handler
-./target/debug/chidori serve examples/agents/webhook.ts --port 8080
+# Event-driven webhook handler (--trusted: the example makes outbound
+# http calls, which the server's deny-by-default policy would refuse)
+./target/debug/chidori serve examples/agents/webhook.ts --port 8080 --trusted
 ```
 
 ## ▶️ Try The Demo
@@ -296,6 +297,12 @@ chidori tools --dir tools/                   # list available tools
 chidori serve agents/my_agent.ts --port 8080
 ```
 
+The server is **deny-by-default**: unless you configure a policy
+(`CHIDORI_POLICY*` env vars) or pass `--trusted`, gated effects (`chidori.http`,
+workspace mutations) are refused — sessions arrive from callers you may not
+control. Local `chidori run` keeps the permissive default. See
+[docs/sandbox-model.md](./docs/sandbox-model.md).
+
 Exposes:
 - `GET  /health` — health check
 - `ANY  /*` — any request is passed to `agent(event)` as an event dict
@@ -331,7 +338,7 @@ export async function agent(
 ```
 
 ```bash
-chidori serve agents/webhook.ts --port 8080
+chidori serve agents/webhook.ts --port 8080 --trusted   # the agent calls chidori.http
 
 curl -X POST http://localhost:8080/github \
   -H "Content-Type: application/json" \
