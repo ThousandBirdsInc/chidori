@@ -74,11 +74,12 @@ hashes, pending host operation, and snapshot file name. Clients can use it to
 display durable-resume state or diagnose why resume is blocked without handling
 the raw `runtime.snapshot` VM bytes.
 
-`client.replay(checkpoint)` still uses the call log for deterministic replay.
-Durable resume is exposed through `client.resume(sessionId, response)` for
-paused sessions. Today it resumes through persisted host-promise metadata and
-replay/scaffold recovery; direct live VM continuation from the server-side
-snapshot is still gated on the QuickJS serializer.
+`client.replay(checkpoint)` uses the call log for deterministic replay. Durable
+resume is exposed through `client.resume(sessionId, response)` for paused
+sessions, recovering through persisted host-promise metadata and the replay
+journal. Replay **is** the resume mechanism by design — the QuickJS live-VM
+snapshot path was removed in #39, not merely deferred, so the manifest carries
+journal/scaffold metadata rather than serialized VM bytes.
 
 Use `client.getSnapshotManifest(sessionId)` when a UI needs only snapshot
 metadata. The endpoint never returns the binary VM snapshot.

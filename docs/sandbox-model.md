@@ -1,9 +1,8 @@
 # Sandbox model of the chidori-js runtime
 
 > **Status:** Implemented, with documented gaps (see [Current gaps](#current-gaps)).
-> **Target engine:** the pure-Rust `chidori-js` engine (`CHIDORI_JS_ENGINE=rust`,
-> `rust-engine` feature). The default QuickJS path has its own isolation story and
-> is out of scope here.
+> **Target engine:** the pure-Rust `chidori-js` engine — the only JS engine in
+> the tree (the QuickJS/C path was removed in #39).
 > **Related:** [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md),
 > [`docs/captured-effects-vfs-crypto-timers.md`](./captured-effects-vfs-crypto-timers.md),
 > [`docs/conformance.md`](./conformance.md).
@@ -28,7 +27,7 @@ cannot corrupt memory, escape into host code, or reach a capability it was not
 given.
 
 What it is **not**: a containment boundary for the powerful effects the host
-*does* inject (`execPython`, `execWasm`, `http`, `workspace.*`). Those are real
+*does* inject (`http`, `workspace.*`). Those are real
 capabilities; whether granting them is "safe" depends entirely on whether the
 agent code is trusted. There is also no process/OS isolation — the engine runs
 in-process with the host.
@@ -55,7 +54,7 @@ remaining distance.
 | Hang the host with an infinite loop | ✅ Yes — opcode budget |
 | OOM the host (string / heap growth) | ✅ Yes — string cap + memory ceiling |
 | Crash the host with a panic | ✅ Yes — `catch_unwind` boundary |
-| Abuse an injected powerful effect (`execPython`, `http`, `workspace`) | ⚠️ Only if the host gates it — see [gaps](#current-gaps) |
+| Abuse an injected powerful effect (`http`, `workspace`) | ⚠️ Only if the host gates it — see [gaps](#current-gaps) |
 | Starve co-tenant agents / exceed a precise per-agent memory quota | ⚠️ Coarse only — see [gaps](#current-gaps) |
 | Break out of the process / OS | ❌ No process or OS isolation |
 
@@ -76,8 +75,10 @@ stack VM with `Rc<RefCell>` reference counting. Two properties make it a sandbox
    I/O exists **only** because the host installs it:
    - `Engine::install_chidori_effects` (`crates/chidori-js/src/lib.rs`) wires the
      async `chidori.*` effect surface (`log`, `tool`, `prompt`, `input`, `http`,
-     `memory`, `template`, `checkpoint`, `callAgent`, `execJs`/`execPython`/
-     `execWasm`, `workspace.*`).
+     `memory`, `template`, `checkpoint`, `callAgent`, `workspace.*`). The
+     `execJs`/`execPython`/`execWasm` JS stubs remain defined but are inert — the
+     host backend rejects the effect (`… is not supported on the rust engine`)
+     since the snippet sandboxes were removed in #39.
    - `Engine::install_sync_natives` wires the synchronous `__chidori_*` natives the
      `node:` shims call (crypto hashing/HMAC, captured randomness, the VFS).
 
@@ -87,8 +88,9 @@ stack VM with `Rc<RefCell>` reference counting. Two properties make it a sandbox
 
 The production wiring lives in `src/runtime/rust_engine.rs::run_module`, which
 builds a fresh engine per run, installs the captured-effect natives + determinism
-prelude, forwards `chidori.*` to the shared `HostBindingBackend` (the same durable
-host machinery the QuickJS path uses), then runs the agent's entrypoint.
+prelude, forwards `chidori.*` to the shared `HostBindingBackend` (the durable
+host machinery — call log, replay, policy, MCP, OTEL), then runs the agent's
+entrypoint.
 
 ## Filesystem isolation (`node:fs` → VFS)
 
@@ -238,7 +240,7 @@ resource-precision gaps.
    accumulate leaked bytes across runs; the baseline-relative memory cap is robust
    to this within a run but not across many runs on a reused thread.
 
-7. **Engine maturity.** The pure-Rust engine is at ~91% Test262 (see
+7. **Engine maturity.** The pure-Rust engine is at 96.22% Test262 (see
    [`docs/conformance.md`](./conformance.md)); spec deviations are not
    memory-unsafe but can produce surprising behavior or, in edge cases, perturb
    determinism/replay. This is a correctness-maturity caveat, not a containment
@@ -248,8 +250,8 @@ resource-precision gaps.
 
 If you intend to run code you do not trust on this engine today:
 
-1. Gate or disable `execPython`/`execJs`/`execWasm`/`workspace.*` (gap 1) — do not
-   install those effects, or add a deny-by-default policy check.
+1. Gate or disable `workspace.*` (gap 1) with a deny-by-default policy check (the
+   `exec*` snippet sandboxes were already removed in #39).
 2. Lower `CHIDORI_JS_OP_BUDGET` and `CHIDORI_JS_MEM_CAP_MB` to fit the workload, and
    enable `CHIDORI_JS_DEADLINE_MS` (acceptable because untrusted code should not be
    making slow trusted host calls).

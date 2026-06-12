@@ -279,21 +279,30 @@ Both SDKs are zero-dependency and mirror each other. Gaps:
 ### Examples and docs — the doc-drift list
 
 Examples (~20 agents plus `examples/record-replay/`) remain in good shape.
-The docs are the main debt: a body of them still describes the QuickJS era.
-Concretely:
+The docs *were* the main debt: a body of them still described the QuickJS era.
+**Update (2026-06-12): this list is now resolved** — see recommendation 6.
+The original items, for the record:
 
-- `README.md` (~lines 358–410): says agents run on "an embedded QuickJS
+- ~~`README.md` (~lines 358–410): says agents run on "an embedded QuickJS
   runtime", cites the dead 99.5 % QuickJS number, and describes
-  `chidori-js` as the "younger" alternative path.
-- `docs/sandbox-model.md`: frames the rust engine as opt-in via a
-  `rust-engine` cargo feature (removed in #39).
-- `docs/rust-engine-quickjs-removal-gaps.md` and
+  `chidori-js` as the "younger" alternative path.~~ Rewritten: `chidori-js`
+  is now described as the sole engine at 96.22 %, with no QuickJS framing,
+  no `--engine rust` example, and a current cluster-table of remaining gaps.
+- ~~`docs/sandbox-model.md`: frames the rust engine as opt-in via a
+  `rust-engine` cargo feature (removed in #39).~~ Preamble rewritten; the
+  `CHIDORI_JS_ENGINE`/`rust-engine`/"default QuickJS path" framing, the
+  `exec*` capability references, and the stale "~91 %" number are gone.
+- ~~`docs/rust-engine-quickjs-removal-gaps.md` and
   `docs/pure-rust-js-engine-plan.md`: the migration they track is done;
-  they should be marked historical (their "decision: default stays QuickJS"
-  sections actively contradict the tree).
-- `scripts/conformance.sh`: still advertises `ENGINE=rust|quickjs`.
-- SDK READMEs (above), and `crates/chidori-js/src/lib.rs` ~420 ("rust
-  engine path yet").
+  they should be marked historical.~~ Both now carry a "historical —
+  superseded" banner up top.
+- ~~`scripts/conformance.sh`: still advertises `ENGINE=rust|quickjs`.~~
+  Already gone — the script wraps `test262-runner --state` with no engine knob.
+- ~~SDK READMEs (above), and `crates/chidori-js/src/lib.rs` ~420 ("rust
+  engine path yet").~~ Both SDK READMEs no longer claim resume is "gated on
+  the QuickJS serializer"; the `lib.rs` string already read "not supported in
+  single-file entrypoints". The stale "QuickJS path / `--features rust-engine`"
+  comments in `src/runtime/engine.rs` were corrected too.
 
 ---
 
@@ -329,9 +338,15 @@ Concretely:
    ready-made untrusted profile is the next step.
 4. ~~Run Test262 in CI~~ — **done** (#41). Add TypeScript SDK tests next.
 5. **Automate SDK publishing** to npm/PyPI, or remove the registry badges.
-6. **Pay down the doc drift** (the list above): README engine section, SDK
+6. ~~**Pay down the doc drift** (the list above): README engine section, SDK
    READMEs, sandbox-model preamble, archive the two migration docs, the
-   conformance.sh `ENGINE` knob.
+   conformance.sh `ENGINE` knob.~~ — **done**: the README engine/conformance
+   section now describes `chidori-js` as the sole engine at 96.22 % (no QuickJS,
+   no `--engine rust`); `docs/sandbox-model.md`'s preamble drops the
+   `CHIDORI_JS_ENGINE`/`rust-engine` framing and the `exec*` references; the two
+   migration docs carry a "historical — superseded" banner; both SDK READMEs no
+   longer claim resume is "gated on the QuickJS serializer"; and the stale
+   QuickJS-path comments in `src/runtime/engine.rs` are corrected.
 7. Longer-term, as adoption demands: per-VM memory accounting, value
    checkpointing for long journals (P6), a broader `node:` allowlist
    (`path`, `events`, `url` are cheap wins), more native providers or

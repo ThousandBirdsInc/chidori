@@ -1,5 +1,13 @@
 # Removing QuickJS: gaps to close first
 
+> **⚠️ Historical — superseded.** The migration this document tracks is
+> **complete**: QuickJS was removed in #39 and `chidori-js` is now the only JS
+> engine in the tree. The "G5 conformance bar still pending" and "default stays
+> QuickJS" framing below describes the in-progress state and **no longer reflects
+> the codebase**. Kept for historical context only. For the current state see
+> [`docs/conformance.md`](./conformance.md) and
+> [`docs/fable_review.md`](./fable_review.md).
+
 **Status:** G1, G2, G3, G4, G6 **closed**; only G5 (conformance bar) remains.
 **Goal:** make the pure-Rust `chidori-js` engine the *only* engine and delete the
 QuickJS/C path entirely.
