@@ -1,17 +1,22 @@
 # In-Agent Execution Branching — Design Doc & Implementation Plan
 
-> **Status:** Phase 1 (MVP) **implemented** — `chidori.branch` ships as a host
+> **Status:** Phases 1 and 2 **implemented** — `chidori.branch` ships as a host
 > effect (`src/runtime/host_branch.rs`, dispatched from `bindings.rs`), with
-> SDK types, tests, and `examples/branching/`. Phases 2 (pausable/persisted
-> branches) and 3 (whole-agent replay-prefix model) remain future work.
+> persisted branch stores, out-of-band resume and edit-and-rerun (CLI:
+> `chidori branches` / `branch-resume` / `branch-rerun`), concurrency-capped
+> wave execution, SDK types, tests, and `examples/branching/`. Phase 3 (the
+> whole-agent replay-prefix model) remains future work.
 > **Target engine:** the doc was drafted before the QuickJS removal (#39);
 > `chidori-js` is now the only engine, so the `CHIDORI_JS_ENGINE=rust` /
 > `rust-engine`-feature framing below is historical. Implementation notes where
-> the shipped MVP deviates from the draft:
+> the shipped version deviates from the draft:
 > - Branch `source` paths resolve like `callAgent` paths (relative to the
 >   working directory) — the host backend doesn't track the parent agent's
->   path. `source` is **required** in Phase 1 ("omit to reuse parent" would
->   re-reach `chidori.branch` and recurse, §8.2).
+>   path. `source` is **required** ("omit to reuse parent" would re-reach
+>   `chidori.branch` and recurse, §8.2).
+> - `branchId` is `<parent run id>-op<branch seq>-branch-<k>` (not
+>   `<parent run id>-branch-<k>`) so ids stay unique when one run forks more
+>   than once; it maps 1:1 to the branch-store path.
 > - Sequence ranges still come from `ParallelBranchManifest::with_sequence_width`,
 >   but the slot id is derived from the parent's `branch`-call seq
 >   (`slot = seq / (width × count) + 1`) instead of a host-promise op id, so
@@ -23,8 +28,24 @@
 > - Nested `chidori.branch` inside a branch is rejected (`is_branch` on the
 >   branch `RuntimeContext`): a nested fork would allocate ranges outside the
 >   parent branch's reserved range.
-> - Phase 1 reports a suspended branch as `status: "paused"` (+`pendingPrompt`)
->   without persisting it for out-of-band resume; that is the Phase 2 work.
+> - Phase 2 persistence is **replay-native**, not VM snapshots: the QuickJS-era
+>   `save_live_parallel_branch_runtime_snapshot` / `resume_live_parallel_branch_from_store`
+>   blob helpers were not used (resume is call-log replay everywhere post-#39).
+>   Each branch persists `source.ts` + `checkpoint.json` + `branch.json` under
+>   `.chidori/runs/<run>/branches/op-<seq>/branch-<k>/`, with the fork-time VFS
+>   in a per-op `anchor.json`. Resume = replay the branch checkpoint with a
+>   synthetic `input` record (the server's `/resume` mechanism); edit-and-rerun
+>   = fresh run from the anchor with the stored (editable) source. The "relaxed
+>   `ensure_sources_match` loader" is moot — branch runs never go through the
+>   manifest source gate. Resume answers `input()` pauses; approval/signal
+>   pauses are reported but not yet resumable out-of-band.
+> - Concurrency runs variants in waves of `options.concurrency` OS threads
+>   (default 1 — sequential), settling/merging in variant order after each wave
+>   joins, so the durable log and outcome order are deterministic regardless of
+>   completion order. (The server's `run_semaphore` is not involved — branches
+>   are in-process workers under the parent run's slot.)
+> - A resumed/re-run branch updates only its own store; the parent's recorded
+>   `branch` outcome is immutable history (compare, don't merge).
 > **Related:** [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md),
 > [`docs/captured-effects-vfs-crypto-timers.md`](./captured-effects-vfs-crypto-timers.md).
 
@@ -405,14 +426,26 @@ satisfies the stated goal.
 - [x] Example: `examples/branching/` — shared research, two strategy modules, compare
   and pick; replays via `chidori resume`.
 
-**Phase 2 — pausable + editable + persisted branches**
-- Persist each branch under `branch_store` (`source.ts`, `checkpoint.json`, snapshot
-  blob). Pause → `save_live_parallel_branch_runtime_snapshot`; resume →
-  `resume_live_parallel_branch_from_store`. `status:"paused"`+`branchId` outcomes.
-- Relaxed branch loader: skip `ensure_sources_match` for branches.
-- Edit-and-rerun a single branch from the parent anchor with edited `source.ts`.
-- Tests: pause a branch on `chidori.input`, resume with a value, assert continuation;
-  edit a branch source, re-run, assert divergent output from the same anchor.
+**Phase 2 — pausable + editable + persisted branches** ✅ **shipped**
+(replay-native adaptation — see the status header for the deltas from this draft)
+- [x] Persist each branch under `.chidori/runs/<run>/branches/op-<seq>/branch-<k>/`
+  (`source.ts`, `checkpoint.json`, `branch.json`; fork-time VFS in the per-op
+  `anchor.json`). The anchor and source copies are written *before* the fan-out
+  runs, so a crash mid-fan-out still leaves re-runnable stores.
+  `status:"paused"`+`branchId` outcomes carry the resume handle.
+- [x] Resume: `resume_branch` (host_branch.rs; `Engine::resume_branch`;
+  `chidori branch-resume <run> <branch-id> --value …`) — synthetic `input`
+  record + checkpoint replay, continuing live to the next outcome.
+- [x] Edit-and-rerun: `rerun_branch` (`Engine::rerun_branch`;
+  `chidori branch-rerun <run> <branch-id>`) — fresh run from the anchor with
+  the edited `source.ts`; `ensure_sources_match` never applies to branch runs.
+- [x] `chidori branches <run>` lists a run's persisted branch stores.
+- [x] Concurrency (from §15): `options.concurrency` runs variants in waves of
+  worker threads; outcome order and the merged log stay variant-ordered.
+- [x] Tests: pause a branch on `chidori.input`, resume with a value out-of-band,
+  assert continuation + store update + range confinement; edit a branch source,
+  re-run, assert divergent output from the same anchor (fork-time VFS + input
+  preserved); a rendezvous tool proves real overlap under `concurrency: 2`.
 
 **Phase 3 — whole-agent replay-prefix model (optional, §8.9)**
 - `try_replay_checked` branch-mode soft divergence; `replay.rs` `Mode::Branch` +
@@ -444,7 +477,8 @@ satisfies the stated goal.
 
 ## 15. Future work
 - Merge/promote a chosen branch into the parent run.
-- Concurrent branch execution via `run_semaphore`.
+- ~~Concurrent branch execution via `run_semaphore`.~~ Done — in-process worker
+  threads capped by `options.concurrency` (see the status header).
 - A comparison view in tael keyed on the `branch` span (diff branch subtrees).
 - Server/SDK surface (`POST /sessions/{id}/fork`, `session.fork()`) if a programmatic
   (non-in-agent) driver is later wanted.

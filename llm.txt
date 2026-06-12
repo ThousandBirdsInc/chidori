@@ -180,9 +180,24 @@ source module (resolved like `callAgent` paths) on a fresh context whose
 records occupy a reserved, disjoint sequence range nested under the `branch`
 call, and returns `{ label, branchId, status, output?, pendingPrompt?,
 error? }`. The whole fan-out is one recorded durable call: replay returns the
-outcomes from the call log without re-running the branches. Nested
-`chidori.branch` inside a branch is rejected. See
-`docs/branching-execution.md`.
+outcomes from the call log without re-running the branches. Variants run in
+waves of `options.concurrency` worker threads (default 1 — sequential);
+outcome order always follows variant order. Nested `chidori.branch` inside a
+branch is rejected.
+
+When the parent run persists, each branch is stored under
+`.chidori/runs/<run>/branches/op-<seq>/branch-<k>/` (`source.ts`,
+`checkpoint.json`, `branch.json`, plus the fork-time VFS anchor), making
+branches independently operable after the parent moves on:
+
+```bash
+chidori branches <run-id>                                   # list branch stores
+chidori branch-resume <run-id> <branch-id> --value "blue"   # answer a paused input()
+chidori branch-rerun <run-id> <branch-id>                   # re-run edited source.ts from the anchor
+```
+
+A resumed or re-run branch updates only its own store; the parent's recorded
+`branch` outcome is immutable history. See `docs/branching-execution.md`.
 
 ### http
 

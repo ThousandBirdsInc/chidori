@@ -56,7 +56,7 @@ LLM spend is live — cap the fan-out accordingly).
 ```ts
 type BranchOutcome = {
   label: string;
-  branchId: string;              // <parent run id>-branch-<k>
+  branchId: string;              // <parent run id>-op<branch seq>-branch-<k>
   status: "completed" | "paused" | "failed";
   output?: Json;                 // when completed
   pendingPrompt?: string;        // when paused (e.g. a chidori.input prompt)
@@ -64,6 +64,29 @@ type BranchOutcome = {
 };
 ```
 
-A `paused` branch is reported (Phase 1) — resuming it out-of-band is the
-Phase 2 follow-up in the design doc. Nested `chidori.branch` inside a branch
-is rejected.
+Nested `chidori.branch` inside a branch is rejected. Pass
+`{ concurrency: N }` as the second argument to run up to N branches at once
+(default 1 — sequential); outcome order always follows variant order.
+
+## The branch store: resume and edit-and-rerun
+
+Each branch persists under the parent run
+(`.chidori/runs/<run>/branches/op-<seq>/branch-<k>/`): its own editable
+`source.ts`, its call log, and the fork-time anchor. That makes a branch
+independently operable **after the parent has moved on**:
+
+```bash
+# List this run's branches and their states:
+chidori branches <run-id> --dir examples/branching
+
+# A branch paused on chidori.input()? Answer it — the branch replays its
+# checkpoint with the response and runs to its next outcome:
+chidori branch-resume <run-id> <branch-id> --value "blue" --dir examples/branching
+
+# Edit a strategy and re-run ONLY that branch from the same anchored state:
+$EDITOR examples/branching/.chidori/runs/<run-id>/branches/op-*/branch-001/source.ts
+chidori branch-rerun <run-id> <branch-id> --dir examples/branching
+```
+
+A resumed or re-run branch updates its own store; the parent's recorded
+outcome is immutable history (compare, don't merge).

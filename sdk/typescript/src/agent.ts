@@ -176,7 +176,11 @@ export type BranchStatus = "completed" | "paused" | "failed";
 /** The result of one branch sub-run, returned for comparison (not merged). */
 export interface BranchOutcome<T extends AgentJson = AgentJson> {
   label: string;
-  /** `<parent run id>-branch-<k>` — identifies the branch sub-run. */
+  /**
+   * `<parent run id>-op<branch seq>-branch-<k>` — identifies the branch
+   * sub-run, including for out-of-band `chidori branch-resume` /
+   * `branch-rerun` against its persisted store.
+   */
   branchId: string;
   status: BranchStatus;
   /** The branch's output, when `status` is `"completed"`. */
@@ -188,7 +192,11 @@ export interface BranchOutcome<T extends AgentJson = AgentJson> {
 }
 
 export interface BranchOptions {
-  /** Requested live-branch concurrency (cost cap). The MVP runs sequentially. */
+  /**
+   * Maximum branches running live at once (cost cap). Defaults to 1 —
+   * sequential. Higher values run variants in concurrent waves; outcome
+   * order always follows variant order.
+   */
   concurrency?: number;
 }
 

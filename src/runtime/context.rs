@@ -455,9 +455,62 @@ impl RuntimeContext {
         }
     }
 
+    /// Rebuild the context for one persisted `chidori.branch` sub-run resumed
+    /// or re-run **out-of-band** — after the parent run has moved on (or its
+    /// process exited), so there is no live parent context to inherit from.
+    /// The anchor state comes from the branch store instead: the fork-time VFS
+    /// snapshot, the branch's reserved base sequence, and the parent `branch`
+    /// call's seq for call-stack seeding (so re-recorded records keep the same
+    /// parentage the original run stamped). `replay_log` carries the branch's
+    /// recorded records (plus a synthetic `input` record when resuming a
+    /// pause); pass an empty log for a fresh edit-and-rerun from the anchor.
+    /// Input mode is `Pause` so an unanswered later `input()` pauses again
+    /// rather than reading stdin.
+    pub fn for_branch_resume(
+        replay_log: Vec<CallRecord>,
+        vfs: Vfs,
+        base_seq: u64,
+        parent_branch_seq: u64,
+        run_id: String,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RuntimeContextInner {
+                config: AgentConfig::default(),
+                call_log: CallLog::new(),
+                seq: base_seq,
+                replay_log: Some(replay_log),
+                run_id,
+                persist_dir: None,
+                input_mode: InputMode::Pause,
+                pending_input: None,
+                pending_approval: None,
+                pending_signal: None,
+                signal_inbox: Vec::new(),
+                host_promises: HostPromiseTable::new(),
+                event_sender: None,
+                emit_call_events: true,
+                otel_run: None,
+                host_operation_safepoint: None,
+                host_operation_completion_safepoint: None,
+                workspace_root: default_workspace_root(),
+                call_stack: vec![parent_branch_seq],
+                capabilities: CapabilityLedger::new(),
+                vfs,
+                is_branch: true,
+                model_override: None,
+            })),
+        }
+    }
+
     /// Whether this context belongs to a `chidori.branch` sub-run.
     pub fn is_branch(&self) -> bool {
         self.inner.lock().unwrap().is_branch
+    }
+
+    /// The run's persistence directory, when persistence is enabled. Branch
+    /// sub-runs persist their stores under `<persist_dir>/branches/`.
+    pub fn persist_dir(&self) -> Option<PathBuf> {
+        self.inner.lock().unwrap().persist_dir.clone()
     }
 
     /// Fold a completed branch sub-run's records into this (parent) log without

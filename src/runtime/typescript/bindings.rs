@@ -1,7 +1,5 @@
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
-use std::rc::Rc;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use serde::{Deserialize, Serialize};
@@ -1216,17 +1214,20 @@ fn context_request_parts(
 
 #[derive(Debug, Clone, Default)]
 pub struct HostBindingRecorder {
-    calls: Rc<RefCell<Vec<HostBindingCall>>>,
+    // Arc<Mutex> (not Rc<RefCell>) so HostBindingBackend is Send — branch
+    // sub-runs execute on their own threads when `chidori.branch` runs with
+    // `concurrency > 1`.
+    calls: Arc<StdMutex<Vec<HostBindingCall>>>,
 }
 
 impl HostBindingRecorder {
     #[allow(dead_code)]
     pub fn calls(&self) -> Vec<HostBindingCall> {
-        self.calls.borrow().clone()
+        self.calls.lock().unwrap().clone()
     }
 
     fn push(&self, function: impl Into<String>, args: serde_json::Value) {
-        self.calls.borrow_mut().push(HostBindingCall {
+        self.calls.lock().unwrap().push(HostBindingCall {
             function: function.into(),
             args,
         });
