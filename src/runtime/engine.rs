@@ -1008,6 +1008,7 @@ mod tests {
                 reason: Some("test approval".to_string()),
             }],
             default: crate::policy::Decision::AlwaysAllow,
+            overlay: None,
         });
 
         let engine = Engine::new(

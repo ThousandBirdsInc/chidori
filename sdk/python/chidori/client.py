@@ -127,15 +127,25 @@ class AgentClient:
         """Check server health."""
         return self._get("/health")
 
-    def run(self, input: dict) -> Session:
+    def run(self, input: dict, policy_profile: str | None = None) -> Session:
         """Create a new session and run the agent with the given input.
 
         Returns a Session with the output, status, and call log. If the
         agent called `input()`, the returned Session will have
         status == "paused" and a populated `pending_prompt` — use
         `client.resume(session.id, response)` to continue.
+
+        `policy_profile` optionally names a built-in policy profile
+        ("untrusted" or "supervised") applied to every run of this session.
+        It is layered on the server policy with stricter-wins semantics —
+        it can tighten what the operator allows, never relax it. Under
+        "supervised", gated calls pause the session as "awaitingapproval";
+        approve or deny them via the server's /approve endpoint.
         """
-        data = self._post("/sessions", {"input": input})
+        body: dict[str, Any] = {"input": input}
+        if policy_profile is not None:
+            body["policy_profile"] = policy_profile
+        data = self._post("/sessions", body)
         return Session(
             id=data["id"],
             status=data["status"],

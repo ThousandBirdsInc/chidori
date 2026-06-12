@@ -225,7 +225,10 @@ The real gaps, restated post-#39:
    built-in `untrusted` profile (#48), selectable via
    `CHIDORI_POLICY_PROFILE=untrusted` or the `--untrusted` flag on
    `chidori run` / `chidori serve` (the flag wins over all `CHIDORI_POLICY*`
-   env vars) — but it is still opt-in, not automatic.
+   env vars) — but it is still opt-in, not automatic. A `supervised`
+   sibling (ask-by-default, settled through the server's `/approve` flow)
+   and per-session profile selection over the HTTP API (stricter-wins
+   layering on the server policy) landed on this branch.
 2. **Memory accounting is process-wide, not per-VM** (`src/mem_guard.rs`):
    under concurrent agents one run's allocations can be attributed to
    another; enforcement is polled, so brief overshoot is possible.
@@ -354,7 +357,15 @@ The original items, for the record:
    behind `CHIDORI_POLICY_PROFILE=untrusted` and an `--untrusted` flag on
    `chidori run` / `chidori serve`; the flag takes precedence over all
    `CHIDORI_POLICY*` env vars, with CLI integration tests covering denial,
-   the read-only allowlist, and flag-over-env precedence. The default
+   the read-only allowlist, and flag-over-env precedence. Two follow-ups
+   from this review also landed on this branch: a **`supervised`** profile
+   (same allowlist, `AskBefore` fallback — gated calls suspend as
+   `awaiting_approval` and settle through `/approve` instead of failing)
+   and **per-session policy selection** over the HTTP API (`policy_profile`
+   on `POST /sessions` / `/sessions/stream`, persisted on the session and
+   re-applied across resume/approve/replay, exposed in both SDKs). Session
+   profiles layer on the server policy with stricter-wins semantics, so a
+   caller can tighten but never relax the operator's policy. The default
    profile remains `AlwaysAllow` — making `untrusted` automatic for
    untrusted callers is the remaining (design-level) follow-up.
 4. ~~Run Test262 in CI~~ — **done** (#41). Add TypeScript SDK tests next.

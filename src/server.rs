@@ -78,6 +78,7 @@ fn session_view(s: &StoredSession) -> Value {
         "pending_seq": s.pending_seq,
         "pending_prompt": s.pending_prompt,
         "pending_approval": s.pending_approval,
+        "policy_profile": s.policy_profile,
     })
 }
 
@@ -584,7 +585,11 @@ async fn health() -> impl IntoResponse {
 /// wired up: MCP tools merged into the ToolRegistry, permission policy, and
 /// MCP manager. Every server handler that spawns an agent goes through here
 /// so the config surface stays in one place.
-fn build_engine(app: &AppState) -> Engine {
+/// Build an engine for one run of a session. `policy_profile` is the
+/// session's stored profile (if any), layered on the server policy — passing
+/// it here (rather than only at create time) keeps the tightened policy in
+/// force across resume/approve/replay re-runs of the same session.
+fn build_engine(app: &AppState, policy_profile: Option<&str>) -> Engine {
     let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
     // Reuse the app's provider registry so a replay-based resume sees the same
     // providers as the live-VM resume path (which drives `state.providers`
@@ -604,7 +609,7 @@ fn build_engine(app: &AppState) -> Engine {
     }
     Engine::new(providers, app.template_engine.clone(), rt)
         .with_tools(Arc::new(registry))
-        .with_policy(app.policy.clone())
+        .with_policy(session_policy(app, policy_profile))
         .with_mcp(app.mcp.clone())
         .with_persist_base(app.run_base.clone())
 }
@@ -613,7 +618,7 @@ fn build_engine(app: &AppState) -> Engine {
 /// the current thread (already inside spawn_blocking) and returns the output
 /// JSON. Any error is bubbled as an anyhow::Error.
 fn run_agent_sync(app: &AppState, inputs: Value) -> anyhow::Result<Value> {
-    let engine = build_engine(app);
+    let engine = build_engine(app, None);
     let result = engine.run(&app.agent_path, &inputs)?;
     Ok(result.output)
 }
@@ -687,6 +692,47 @@ struct CreateSessionRequest {
     /// agent is used.
     #[serde(default)]
     agent: Option<String>,
+    /// Optional: a built-in policy profile name ("untrusted" or "supervised")
+    /// applied to every run of this session, layered on the server policy
+    /// with stricter-wins semantics — it can only tighten, never relax, what
+    /// the operator configured. Lets a multi-tenant front-end mix trusted
+    /// and untrusted callers on one server.
+    #[serde(default, alias = "policyProfile")]
+    policy_profile: Option<String>,
+}
+
+/// Validate a client-supplied policy profile name at session creation.
+fn validate_policy_profile(requested: Option<&str>) -> Result<(), (StatusCode, String)> {
+    match requested {
+        None => Ok(()),
+        Some(name) if crate::policy::builtin_profile(name).is_some() => Ok(()),
+        Some(name) => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown policy profile '{}' (known: {})",
+                name,
+                crate::policy::BUILTIN_PROFILES.join(", ")
+            ),
+        )),
+    }
+}
+
+/// Resolve the effective policy for a session: the server policy, optionally
+/// tightened by the session's profile. A stored profile name that no longer
+/// resolves (e.g. after a downgrade) fails closed to `untrusted` rather than
+/// silently running under the looser server policy.
+fn session_policy(app: &AppState, profile: Option<&str>) -> Arc<PolicyConfig> {
+    let Some(name) = profile else {
+        return app.policy.clone();
+    };
+    let profile_cfg = crate::policy::builtin_profile(name).unwrap_or_else(|| {
+        tracing::warn!(
+            "session policy profile '{}' is unknown; failing closed to 'untrusted'",
+            name
+        );
+        crate::policy::builtin_profile("untrusted").expect("untrusted profile exists")
+    });
+    Arc::new(app.policy.restricted_by(Arc::new(profile_cfg)))
 }
 
 /// Resolve an optional per-session agent override against the server's
@@ -788,6 +834,10 @@ async fn create_session(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let input = body.input.clone();
     let replay_from = body.replay_from.clone();
+    if let Err((status, msg)) = validate_policy_profile(body.policy_profile.as_deref()) {
+        return (status, Json(json!({"error": msg}))).into_response();
+    }
+    let policy_profile = body.policy_profile.clone();
     // Resolve an optional per-session agent override before spawning
     // the blocking worker — cheaper to reject here than to take a
     // concurrency permit for an invalid request.
@@ -803,7 +853,7 @@ async fn create_session(
     let app_state = state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let engine = build_engine(&app_state);
+        let engine = build_engine(&app_state, body.policy_profile.as_deref());
         match replay_from {
             Some(log) => engine.run_replay_pausable(&effective_agent_path, &body.input, log),
             None => engine.run_pausable(&effective_agent_path, &body.input),
@@ -852,6 +902,7 @@ async fn create_session(
                 pending_prompt,
                 pending_approval,
                 approvals: Vec::new(),
+                policy_profile: policy_profile.clone(),
                 created_at: chrono::Utc::now(),
             }
         }
@@ -867,6 +918,7 @@ async fn create_session(
             pending_prompt: None,
             pending_approval: None,
             approvals: Vec::new(),
+            policy_profile,
             created_at: chrono::Utc::now(),
         },
     };
@@ -1009,10 +1061,11 @@ async fn replay_session(State(state): State<AppState>, Path(id): Path<String>) -
     let input_clone = input.clone();
     let approvals = original.approvals.clone();
     let vfs = load_persisted_vfs(&state.run_base, original.run_id.as_deref());
+    let policy_profile = original.policy_profile.clone();
     let app_state = state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let engine = build_engine(&app_state).with_approvals(approvals);
+        let engine = build_engine(&app_state, policy_profile.as_deref()).with_approvals(approvals);
         engine.run_with_replay_host_promises_and_vfs(
             &app_state.agent_path,
             &input_clone,
@@ -1039,6 +1092,7 @@ async fn replay_session(State(state): State<AppState>, Path(id): Path<String>) -
                 pending_prompt: None,
                 pending_approval: None,
                 approvals: original.approvals.clone(),
+                policy_profile: original.policy_profile.clone(),
                 created_at: chrono::Utc::now(),
             };
             if let Some(err) = store_or_500(&state, &session) {
@@ -1154,6 +1208,11 @@ async fn stream_session(
         Err(resp) => return resp,
     };
 
+    if let Err((status, msg)) = validate_policy_profile(body.policy_profile.as_deref()) {
+        return (status, Json(json!({"error": msg}))).into_response();
+    }
+    let policy_profile = body.policy_profile.clone();
+
     let session_id = body
         .session_id
         .as_deref()
@@ -1194,6 +1253,7 @@ async fn stream_session(
         pending_prompt: None,
         pending_approval: None,
         approvals: Vec::new(),
+        policy_profile: policy_profile.clone(),
         created_at: chrono::Utc::now(),
     };
     let _ = state.session_store.put(&running_session);
@@ -1206,7 +1266,7 @@ async fn stream_session(
     // agent run. Dropping it at the end of the closure releases the slot.
     tokio::task::spawn_blocking(move || {
         let _run_permit = permit;
-        let engine = build_engine(&app_state);
+        let engine = build_engine(&app_state, policy_profile.as_deref());
 
         let result = engine.run_streaming(&agent_path, &input, event_tx);
         let final_event = match result {
@@ -1239,6 +1299,7 @@ async fn stream_session(
                     pending_prompt: None,
                     pending_approval: None,
                     approvals: Vec::new(),
+                    policy_profile: policy_profile.clone(),
                     created_at: chrono::Utc::now(),
                 };
                 let _ = app_state.session_store.put(&completed_session);
@@ -1279,6 +1340,7 @@ async fn stream_session(
                     pending_prompt: None,
                     pending_approval: None,
                     approvals: Vec::new(),
+                    policy_profile: policy_profile.clone(),
                     created_at: chrono::Utc::now(),
                 });
                 json!({
@@ -1370,6 +1432,7 @@ async fn cancel_session(
             pending_prompt: None,
             pending_approval: None,
             approvals: Vec::new(),
+            policy_profile: None,
             created_at: chrono::Utc::now(),
         },
         Ok(None) => {
@@ -1517,10 +1580,11 @@ async fn resume_session(
     let approvals = original.approvals.clone();
     let vfs = load_persisted_vfs(&state.run_base, original.run_id.as_deref());
     let resume_run_id = original.run_id.clone();
+    let policy_profile = original.policy_profile.clone();
     let app_state = state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let engine = build_engine(&app_state).with_approvals(approvals);
+        let engine = build_engine(&app_state, policy_profile.as_deref()).with_approvals(approvals);
         // Continue under the original run id (when known) so the resumed run
         // keeps its persisted run directory and stays a single durable run,
         // matching the live-VM resume path. Falls back to a fresh id only when
@@ -1707,9 +1771,10 @@ async fn approve_session(
     let call_log = original.call_log.clone();
     let resume_run_id = original.run_id.clone();
     let vfs = load_persisted_vfs(&state.run_base, original.run_id.as_deref());
+    let policy_profile = original.policy_profile.clone();
     let app_state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let engine = build_engine(&app_state).with_approvals(approvals);
+        let engine = build_engine(&app_state, policy_profile.as_deref()).with_approvals(approvals);
         // Replay the recorded call log (so any host calls the agent made before
         // the policy block — e.g. a prior `input()` — return their recorded
         // results instead of pausing again) with the approval seeded in the
@@ -1814,7 +1879,7 @@ async fn handle_event(
     let app_state = state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let engine = build_engine(&app_state);
+        let engine = build_engine(&app_state, None);
         engine.run(&app_state.agent_path, &input)
     })
     .await
@@ -1931,6 +1996,7 @@ mod tests {
                 pending_prompt: None,
                 pending_approval: None,
                 approvals: Vec::new(),
+                policy_profile: None,
                 created_at: chrono::Utc::now(),
             })
             .unwrap();
@@ -2203,6 +2269,7 @@ mod tests {
             pending_prompt: None,
             pending_approval: None,
             approvals: Vec::new(),
+            policy_profile: None,
             created_at: chrono::Utc::now(),
         };
 
@@ -2266,6 +2333,7 @@ mod tests {
             pending_prompt: None,
             pending_approval: None,
             approvals: Vec::new(),
+            policy_profile: None,
             created_at: chrono::Utc::now(),
         };
         state.session_store.put(&session).unwrap();
@@ -2331,6 +2399,7 @@ mod tests {
             pending_prompt: None,
             pending_approval: None,
             approvals: Vec::new(),
+            policy_profile: None,
             created_at: chrono::Utc::now(),
         };
         state.session_store.put(&session).unwrap();
@@ -2400,6 +2469,7 @@ mod tests {
             pending_prompt: None,
             pending_approval: None,
             approvals: Vec::new(),
+            policy_profile: None,
             created_at: chrono::Utc::now(),
         };
         state.session_store.put(&session).unwrap();
@@ -2485,6 +2555,7 @@ mod tests {
             pending_prompt: Some("continue?".to_string()),
             pending_approval: None,
             approvals: Vec::new(),
+            policy_profile: None,
             created_at: chrono::Utc::now(),
         };
         state.session_store.put(&session).unwrap();
@@ -2582,6 +2653,7 @@ mod tests {
             pending_prompt: Some("continue?".to_string()),
             pending_approval: None,
             approvals: Vec::new(),
+            policy_profile: None,
             created_at: chrono::Utc::now(),
         };
         state.session_store.put(&session).unwrap();
@@ -2684,6 +2756,7 @@ mod tests {
             pending_prompt: Some("continue?".to_string()),
             pending_approval: None,
             approvals: Vec::new(),
+            policy_profile: None,
             created_at: chrono::Utc::now(),
         };
         state.session_store.put(&session).unwrap();
@@ -3108,6 +3181,119 @@ mod tests {
             }
             other => panic!("expected rejected host promise, got {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    fn policy_test_project(name: &str, agent_source: &str) -> (PathBuf, AppState) {
+        let temp_dir = std::env::temp_dir().join(format!("{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let agent_path = temp_dir.join("agent.ts");
+        std::fs::write(&agent_path, agent_source).unwrap();
+        let run_base = temp_dir.join(".chidori").join("runs");
+        let state = test_state(run_base, agent_path);
+        (temp_dir, state)
+    }
+
+    fn create_request(policy_profile: Option<&str>) -> CreateSessionRequest {
+        CreateSessionRequest {
+            input: json!({}),
+            session_id: None,
+            attempt_number: None,
+            replay_from: None,
+            agent: None,
+            policy_profile: policy_profile.map(ToOwned::to_owned),
+        }
+    }
+
+    const HTTP_AGENT: &str = r#"
+        export async function agent(input, chidori) {
+            const res = await chidori.http({ url: "https://example.invalid/" });
+            return { res };
+        }
+    "#;
+
+    #[tokio::test]
+    async fn create_session_rejects_unknown_policy_profile() {
+        let (temp_dir, state) = policy_test_project("chidori-server-policy-unknown", HTTP_AGENT);
+
+        let (status, body) = response_json(
+            create_session(State(state), Json(create_request(Some("nonsense")))).await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("unknown policy profile 'nonsense'") && error.contains("untrusted"),
+            "expected an unknown-profile error listing the builtins, got: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn untrusted_session_denies_gated_effects_despite_permissive_server_policy() {
+        let (temp_dir, state) = policy_test_project("chidori-server-policy-untrusted", HTTP_AGENT);
+        // The server policy is the permissive default (AlwaysAllow); the
+        // session profile must tighten it, not the other way around.
+
+        let (status, body) = response_json(
+            create_session(State(state), Json(create_request(Some("untrusted")))).await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["status"], json!("failed"));
+        assert_eq!(body["policy_profile"], json!("untrusted"));
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("policy: `http` denied"),
+            "expected the http call to be denied, got: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn supervised_session_pauses_for_approval_then_operator_denies() {
+        let (temp_dir, state) = policy_test_project("chidori-server-policy-supervised", HTTP_AGENT);
+
+        let (status, body) = response_json(
+            create_session(
+                State(state.clone()),
+                Json(create_request(Some("supervised"))),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["status"], json!("awaitingapproval"));
+        assert_eq!(body["policy_profile"], json!("supervised"));
+        assert_eq!(body["pending_approval"]["target"], json!("http"));
+        let id = body["id"].as_str().unwrap().to_string();
+
+        // Operator denies: the session fails without the call executing.
+        let (status, body) = response_json(
+            approve_session(
+                State(state),
+                Path(id),
+                Json(ApproveRequest {
+                    decision: "deny".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], json!("failed"));
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("denied by operator"),
+            "expected an operator-denied error, got: {error}"
+        );
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

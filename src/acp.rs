@@ -73,6 +73,7 @@ async fn create_thread(
         pending_prompt: None,
         pending_approval: None,
         approvals: Vec::new(),
+        policy_profile: None,
         created_at: chrono::Utc::now(),
     };
     if let Err(e) = state.store.put(&session) {

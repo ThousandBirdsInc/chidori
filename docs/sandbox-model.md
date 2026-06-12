@@ -288,8 +288,50 @@ Selection order is the `--untrusted` flag first, then `PolicyConfig::from_env`:
 `CHIDORI_POLICY_FILE` → `CHIDORI_POLICY` (inline JSON) → `CHIDORI_POLICY_PROFILE`
 (a built-in name) → default. The **default profile is unchanged** (`AlwaysAllow` fallback, no rules):
 the `untrusted` profile is purely opt-in. To customize further, copy the profile's
-shape into your own `CHIDORI_POLICY` JSON (rules + `"default": "never_allow"`), or
-add `AskBefore` rules to surface an approval prompt instead of a hard refusal.
+shape into your own `CHIDORI_POLICY` JSON (rules + `"default": "never_allow"`).
+
+### The `supervised` profile (ask-by-default)
+
+The **`supervised`** profile is the approval-flow sibling of `untrusted`: the same
+read-only workspace allowlist, but the fallback is `AskBefore` instead of
+`NeverAllow`. Under the server, a gated call suspends the run — the session
+transitions to `awaitingapproval` with a `pending_approval` carrying the
+`(target, args)` being asked about — and `POST /sessions/:id/approve` with
+`{"decision": "allow"}` or `{"decision": "deny"}` settles it. Approvals are
+remembered per `(target, args)` for the rest of the session, so the agent does not
+re-ask for an identical call. On the bare CLI (where nothing can answer the
+prompt) the gated call errors instead, unless `CHIDORI_POLICY_AUTO_APPROVE=1`.
+
+Select it anywhere a profile name is accepted: `CHIDORI_POLICY_PROFILE=supervised`
+or a session's `policy_profile` field (below).
+
+### Per-session profiles over the HTTP API
+
+A multi-tenant server can mix trusted and untrusted callers without restarting or
+re-configuring: `POST /sessions` and `POST /sessions/stream` accept an optional
+`policy_profile` field (alias `policyProfile`) naming a built-in profile.
+
+```sh
+curl -X POST localhost:8080/sessions \
+  -d '{"input": {}, "policy_profile": "untrusted"}'
+```
+
+Semantics:
+
+- **Stricter-wins layering.** The session profile is layered on the server
+  policy and, for every gated call, the *stricter* of the two decisions applies
+  (`never_allow` > `ask_before` > `always_allow`). A caller-selected profile can
+  therefore tighten what the operator's policy allows but can never relax it —
+  selecting a profile is not an escalation path even on a hardened server.
+- **Sticky for the session's lifetime.** The profile name is persisted on the
+  session and re-applied on every re-run: `input()` resume, approval replay, and
+  `/replay`. It is reported back in the session JSON as `policy_profile`.
+- **Validated up front.** An unknown profile name is a `400` at creation; a
+  stored name that no longer resolves (e.g. after a version change) fails closed
+  to `untrusted` rather than silently running under the looser server policy.
+
+Both SDKs expose this: `client.run(input, { policyProfile: "untrusted" })` in
+TypeScript, `client.run(input, policy_profile="untrusted")` in Python.
 
 ## How to harden for untrusted code
 

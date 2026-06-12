@@ -883,6 +883,7 @@ mod tests {
                 reason: Some("test approval".to_string()),
             }],
             default: Decision::AlwaysAllow,
+            overlay: None,
         }));
 
         let request = NativeAgentRequest {
@@ -1102,6 +1103,7 @@ mod tests {
                 reason: Some("write tool requires approval".to_string()),
             }],
             default: Decision::AlwaysAllow,
+            overlay: None,
         }));
 
         let request = NativeAgentRequest {
