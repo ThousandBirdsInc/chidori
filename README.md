@@ -5,11 +5,14 @@
 <h1 align="center">Chidori</h1>
 
 <p align="center">
-  An <b>agent framework where TypeScript agents checkpoint, replay, and resume by default</b>.
+  <b>An agent framework where TypeScript agents checkpoint, replay, and resume by default.</b>
+</p>
+
+<p align="center">
   Agents are plain async TypeScript; every side effect flows through the runtime as a recorded
-  <b>host call</b> — so a finished run can be saved to disk, replayed for identical output with
-  <b>zero LLM calls</b>, and resumed from any pause. One Rust binary, an embedded pure-Rust
-  JavaScript engine, and TypeScript + Python SDKs.
+  <b>host call</b>. So a finished run can be saved to disk, replayed for identical output with
+  <b>zero LLM calls</b>, and resumed from any pause — all on one Rust binary with an embedded
+  pure-Rust JavaScript engine and TypeScript + Python SDKs.
 </p>
 
 <p align="center">
@@ -31,25 +34,22 @@
 > **About v3.** Chidori began as a reactive runtime exploring how to build durable, debuggable agents. v3 is a ground-up rewrite that distills those ideas into a smaller, sharper core: a single Rust binary, TypeScript agent authoring, and replay as the foundation for tests, debugging, resume, and human-in-the-loop workflows. Earlier versions of Chidori live in the git history and on prior tags.
 
 ## Contents
-- [📖 About](#-about)
-- [⚡️ Quick Start](#️-quick-start)
-- [▶️ Try The Demo](#️-try-the-demo)
-- [🧩 Core Concepts](#-core-concepts)
-- [🚦 Running Modes](#-running-modes)
-- [🐍 Python SDK](#-python-sdk)
-- [⏪ How Replay Works](#-how-replay-works)
-- [🧪 Examples](#-examples)
-- [✅ JavaScript Conformance (Test262)](#-javascript-conformance-test262)
-- [🏗 Architecture](#-architecture)
-- [📦 Project Structure](#-project-structure)
+
+| Get started | Understand | Reference |
+| --- | --- | --- |
+| [📖 About](#-about) | [🧩 Core Concepts](#-core-concepts) | [🧪 Examples](#-examples) |
+| [⚡️ Quick Start](#️-quick-start) | [🚦 Running Modes](#-running-modes) | [✅ JavaScript Conformance (Test262)](#-javascript-conformance-test262) |
+| [▶️ Try The Demo](#️-try-the-demo) | [⏪ How Replay Works](#-how-replay-works) | [🏗 Architecture](#-architecture) |
+| [🐍 Python SDK](#-python-sdk) | | [📦 Project Structure](#-project-structure) |
 
 ## 📖 About
 
-- **Agents are TypeScript.** Native async control flow, typed inputs, imports, and editor tooling with no template DSL.
-- **Deterministic execution.** Every side effect goes through a host function the runtime can log, cache, and replay.
-- **Zero-cost checkpointing.** Save a session's call log to disk, replay it later for identical output with zero LLM calls.
+- **Agents are TypeScript.** Native async control flow, type-safe inputs, tool calls, and imports with full editor tooling — no template DSL.
+- **Durable execution.** Every side effect goes through a host function the runtime can log, cache, and replay, so a run survives crashes and restarts and resumes exactly where it left off.
+- **Deterministic checkpoint & replay.** Save a session's call log to disk and replay it later for identical output with zero LLM calls — the foundation for tests, debugging, and resume.
+- **Human-in-the-loop.** Pause an agent for approval or input, persist the checkpoint, and resume from the call log later — even in a new process.
 - **Event-driven agents.** Agents can run as HTTP servers that react to webhooks and other events.
-- **Rust core, TS and Python SDKs.** The runtime is a single binary. SDKs talk to it over HTTP without native bindings.
+- **Rust core, TypeScript and Python SDKs.** The runtime is a single binary; SDKs talk to it over HTTP with no native bindings.
 
 The whole model fits in one picture — agents never touch the world directly, so the runtime
 sees (and records) everything:
