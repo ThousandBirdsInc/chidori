@@ -616,12 +616,22 @@ fn to_iso_string(t: f64) -> String {
     }
 }
 
+/// A year padded to at least 4 DIGITS, with the sign outside the padding
+/// (`-1` -> `"-0001"`, not `"-001"`). The `{:04}` width counts the minus.
+fn pad_year(year: i64) -> String {
+    if year < 0 {
+        format!("-{:04}", -year)
+    } else {
+        format!("{:04}", year)
+    }
+}
+
 fn to_date_string(t: f64) -> String {
     let wd = DAY_NAMES[week_day(t) as usize];
     let mon = MONTH_NAMES[month_from_time(t) as usize];
     let day = date_from_time(t);
     let year = year_from_time(t) as i64;
-    format!("{} {} {} {:04}", wd, mon, pad2(day), year)
+    format!("{} {} {} {}", wd, mon, pad2(day), pad_year(year))
 }
 
 fn to_time_string(t: f64) -> String {
@@ -647,11 +657,11 @@ fn to_utc_string(t: f64) -> String {
     let wd = DAY_NAMES[week_day(t) as usize];
     let mon = MONTH_NAMES[month_from_time(t) as usize];
     format!(
-        "{}, {} {} {:04} {}:{}:{} GMT",
+        "{}, {} {} {} {}:{}:{} GMT",
         wd,
         pad2(date_from_time(t)),
         mon,
-        year_from_time(t) as i64,
+        pad_year(year_from_time(t) as i64),
         pad2(hours_from_time(t)),
         pad2(min_from_time(t)),
         pad2(sec_from_time(t))
@@ -883,7 +893,9 @@ pub fn install(vm: &mut Vm) {
             None
         };
         if t.is_nan() {
-            set_date_value(&o, f64::NAN);
+            // Spec: "If t is NaN, return NaN" — WITHOUT writing [[DateValue]].
+            // A `valueOf` during argument coercion may have made the date
+            // valid; that value must survive (the result is still NaN).
             return Ok(Value::Number(f64::NAN));
         }
         let date = date_arg.unwrap_or_else(|| date_from_time(t));
@@ -901,7 +913,9 @@ pub fn install(vm: &mut Vm) {
         let t = date_this(vm, &this)?;
         let date = vm.to_number(&arg(args, 0))?;
         if t.is_nan() {
-            set_date_value(&o, f64::NAN);
+            // Spec: "If t is NaN, return NaN" — WITHOUT writing [[DateValue]].
+            // A `valueOf` during argument coercion may have made the date
+            // valid; that value must survive (the result is still NaN).
             return Ok(Value::Number(f64::NAN));
         }
         let day = make_day(year_from_time(t), month_from_time(t), date);
@@ -933,7 +947,9 @@ pub fn install(vm: &mut Vm) {
             None
         };
         if t.is_nan() {
-            set_date_value(&o, f64::NAN);
+            // Spec: "If t is NaN, return NaN" — WITHOUT writing [[DateValue]].
+            // A `valueOf` during argument coercion may have made the date
+            // valid; that value must survive (the result is still NaN).
             return Ok(Value::Number(f64::NAN));
         }
         let mi = mi_arg.unwrap_or_else(|| min_from_time(t));
@@ -963,7 +979,9 @@ pub fn install(vm: &mut Vm) {
             None
         };
         if t.is_nan() {
-            set_date_value(&o, f64::NAN);
+            // Spec: "If t is NaN, return NaN" — WITHOUT writing [[DateValue]].
+            // A `valueOf` during argument coercion may have made the date
+            // valid; that value must survive (the result is still NaN).
             return Ok(Value::Number(f64::NAN));
         }
         let se = se_arg.unwrap_or_else(|| sec_from_time(t));
@@ -987,7 +1005,9 @@ pub fn install(vm: &mut Vm) {
             None
         };
         if t.is_nan() {
-            set_date_value(&o, f64::NAN);
+            // Spec: "If t is NaN, return NaN" — WITHOUT writing [[DateValue]].
+            // A `valueOf` during argument coercion may have made the date
+            // valid; that value must survive (the result is still NaN).
             return Ok(Value::Number(f64::NAN));
         }
         let ms = ms_arg.unwrap_or_else(|| ms_from_time(t));
@@ -1005,7 +1025,9 @@ pub fn install(vm: &mut Vm) {
         let t = date_this(vm, &this)?;
         let ms = vm.to_number(&arg(args, 0))?;
         if t.is_nan() {
-            set_date_value(&o, f64::NAN);
+            // Spec: "If t is NaN, return NaN" — WITHOUT writing [[DateValue]].
+            // A `valueOf` during argument coercion may have made the date
+            // valid; that value must survive (the result is still NaN).
             return Ok(Value::Number(f64::NAN));
         }
         let time = make_time(hours_from_time(t), min_from_time(t), sec_from_time(t), ms);

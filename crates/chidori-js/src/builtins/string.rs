@@ -168,6 +168,36 @@ fn chars(s: &str) -> Vec<char> {
     s.chars().collect()
 }
 
+/// `ToIntegerOrInfinity(value)` as an f64 (NaN -> 0, truncation towards 0,
+/// infinities preserved).
+fn to_integer_or_infinity(vm: &mut Vm, v: &Value) -> Result<f64, Value> {
+    let n = vm.to_number(v)?;
+    Ok(if n.is_nan() { 0.0 } else { n.trunc() })
+}
+
+/// Fallback path of `match`/`matchAll`/`search`: RegExpCreate from the
+/// argument, then Invoke(rx, @@sym, «S») — observable: a patched
+/// `RegExp.prototype[@@sym]` is called, and its absence is a TypeError.
+fn invoke_regexp_sym(
+    vm: &mut Vm,
+    regexp: &Value,
+    flags: &str,
+    sym: JsSymbol,
+    s: String,
+) -> Result<Value, Value> {
+    let src = if regexp.is_undefined() {
+        String::new()
+    } else {
+        vm.to_js_string(regexp)?.as_str().to_string()
+    };
+    let re = vm.make_regexp(&src, flags)?;
+    let m = vm.get_prop(&re, &PropertyKey::Sym(sym))?;
+    if !vm.is_callable(&m) {
+        return Err(vm.throw_type("RegExp prototype method is not callable"));
+    }
+    vm.call(m, re, &[Value::str(s)])
+}
+
 /// `GetMethod(V, key)` (spec 7.3.11): get the property; `undefined`/`null`
 /// yields `None`; a non-callable result throws a TypeError; otherwise return the
 /// callable. `V` must be a value whose properties can be read (object-coercible).
@@ -183,16 +213,30 @@ fn get_method(vm: &mut Vm, v: &Value, key: &PropertyKey) -> Result<Option<Value>
 }
 
 fn install_proto(vm: &mut Vm, proto: &JsObject) {
+    // thisStringValue: a primitive string or a String wrapper object — any
+    // other receiver is a TypeError (NOT generic ToString coercion).
+    fn this_string_value(vm: &mut Vm, this: &Value) -> Result<Value, Value> {
+        match this {
+            Value::String(s) => Ok(Value::String(s.clone())),
+            Value::Object(o) => {
+                if let Internal::StringObj(s) = &o.borrow().internal {
+                    return Ok(Value::String(s.clone()));
+                }
+                Err(vm.throw_type("String.prototype.toString requires that 'this' be a String"))
+            }
+            _ => Err(vm.throw_type("String.prototype.toString requires that 'this' be a String")),
+        }
+    }
     vm.define_method(proto, "toString", 0, |vm, this, _a| {
-        Ok(Value::str(str_this(vm, &this)?))
+        this_string_value(vm, &this)
     });
     vm.define_method(proto, "valueOf", 0, |vm, this, _a| {
-        Ok(Value::str(str_this(vm, &this)?))
+        this_string_value(vm, &this)
     });
     vm.define_method(proto, "charAt", 1, |vm, this, args| {
         let s = chars(&str_this(vm, &this)?);
-        let i = vm.to_int32(&arg(args, 0))?;
-        Ok(Value::str(if i >= 0 && (i as usize) < s.len() {
+        let i = to_integer_or_infinity(vm, &arg(args, 0))?;
+        Ok(Value::str(if i >= 0.0 && i < s.len() as f64 {
             s[i as usize].to_string()
         } else {
             String::new()
@@ -200,8 +244,8 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
     });
     vm.define_method(proto, "charCodeAt", 1, |vm, this, args| {
         let s = chars(&str_this(vm, &this)?);
-        let i = vm.to_int32(&arg(args, 0))?;
-        if i >= 0 && (i as usize) < s.len() {
+        let i = to_integer_or_infinity(vm, &arg(args, 0))?;
+        if i >= 0.0 && i < s.len() as f64 {
             Ok(Value::Number(s[i as usize] as u32 as f64))
         } else {
             Ok(Value::Number(f64::NAN))
@@ -209,8 +253,8 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
     });
     vm.define_method(proto, "codePointAt", 1, |vm, this, args| {
         let s = chars(&str_this(vm, &this)?);
-        let i = vm.to_int32(&arg(args, 0))?;
-        if i >= 0 && (i as usize) < s.len() {
+        let i = to_integer_or_infinity(vm, &arg(args, 0))?;
+        if i >= 0.0 && i < s.len() as f64 {
             // Scalar-indexed model: each char is a full code point.
             Ok(Value::Number(s[i as usize] as u32 as f64))
         } else {
@@ -219,7 +263,15 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
     });
     vm.define_method(proto, "at", 1, |vm, this, args| {
         let s = chars(&str_this(vm, &this)?);
-        let mut i = vm.to_int32(&arg(args, 0))? as isize;
+        let rel = to_integer_or_infinity(vm, &arg(args, 0))?;
+        if !rel.is_finite() && rel > 0.0 {
+            return Ok(Value::Undefined);
+        }
+        let mut i = if rel.is_finite() {
+            rel as isize
+        } else {
+            isize::MIN / 2
+        };
         if i < 0 {
             i += s.len() as isize;
         }
@@ -231,18 +283,13 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
     });
     vm.define_method(proto, "indexOf", 1, |vm, this, args| {
         let s = str_this(vm, &this)?;
-        let needle = vm.to_string_lossy(&arg(args, 0));
-        // Optional `position` argument: start the search at the given index.
+        // Coercion order: ToString(searchString) BEFORE ToInteger(position).
+        let needle = vm.to_js_string(&arg(args, 0))?.as_str().to_string();
         let s_chars = chars(&s);
-        let pos = {
-            let p = arg(args, 1);
-            if p.is_undefined() {
-                0isize
-            } else {
-                vm.to_int32(&p)? as isize
-            }
-        }
-        .clamp(0, s_chars.len() as isize) as usize;
+        // ToIntegerOrInfinity(position), clamped to [0, len] (+Infinity finds
+        // nothing but an empty needle at the very end finds the clamp point).
+        let pos =
+            to_integer_or_infinity(vm, &arg(args, 1))?.clamp(0.0, s_chars.len() as f64) as usize;
         let byte_start: usize = s_chars[..pos].iter().map(|c| c.len_utf8()).sum();
         Ok(Value::Number(match s[byte_start..].find(&needle) {
             Some(byte) => s[..byte_start + byte].chars().count() as f64,
@@ -251,11 +298,27 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
     });
     vm.define_method(proto, "lastIndexOf", 1, |vm, this, args| {
         let s = str_this(vm, &this)?;
-        let needle = vm.to_string_lossy(&arg(args, 0));
-        Ok(Value::Number(match s.rfind(&needle) {
-            Some(byte) => s[..byte].chars().count() as f64,
-            None => -1.0,
-        }))
+        // Coercion order: ToString(searchString) BEFORE ToNumber(position).
+        let needle = vm.to_js_string(&arg(args, 0))?.as_str().to_string();
+        let num_pos = vm.to_number(&arg(args, 1))?;
+        let s_chars = chars(&s);
+        let len = s_chars.len() as f64;
+        // NaN position means +Infinity (search from the very end).
+        let last = if num_pos.is_nan() {
+            len
+        } else {
+            num_pos.trunc().clamp(0.0, len)
+        } as usize;
+        // Largest start <= last where the needle matches.
+        let needle_chars = chars(&needle);
+        let mut found = -1.0;
+        for start in (0..=last.min(s_chars.len())).rev() {
+            if s_chars[start..].starts_with(&needle_chars[..]) {
+                found = start as f64;
+                break;
+            }
+        }
+        Ok(Value::Number(found))
     });
     vm.define_method(proto, "includes", 1, |vm, this, args| {
         let s = str_this(vm, &this)?;
@@ -264,7 +327,7 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
                 "First argument to String.prototype.includes must not be a regular expression",
             ));
         }
-        let needle = vm.to_string_lossy(&arg(args, 0));
+        let needle = vm.to_js_string(&arg(args, 0))?.as_str().to_string();
         let s_chars = chars(&s);
         let pos = clamp_pos(vm, &arg(args, 1), s_chars.len())?;
         let byte_start: usize = s_chars[..pos].iter().map(|c| c.len_utf8()).sum();
@@ -277,7 +340,7 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
                 "First argument to String.prototype.startsWith must not be a regular expression",
             ));
         }
-        let needle = vm.to_string_lossy(&arg(args, 0));
+        let needle = vm.to_js_string(&arg(args, 0))?.as_str().to_string();
         let s_chars = chars(&s);
         let pos = clamp_pos(vm, &arg(args, 1), s_chars.len())?;
         let byte_start: usize = s_chars[..pos].iter().map(|c| c.len_utf8()).sum();
@@ -290,7 +353,7 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
                 "First argument to String.prototype.endsWith must not be a regular expression",
             ));
         }
-        let needle = vm.to_string_lossy(&arg(args, 0));
+        let needle = vm.to_js_string(&arg(args, 0))?.as_str().to_string();
         let s_chars = chars(&s);
         let end = {
             let p = arg(args, 1);
@@ -397,29 +460,56 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
         }
         Ok(Value::str(s.repeat(count as usize)))
     });
-    vm.define_method(proto, "padStart", 2, |vm, this, args| {
+    vm.define_method(proto, "padStart", 1, |vm, this, args| {
         pad(vm, &this, args, true)
     });
-    vm.define_method(proto, "padEnd", 2, |vm, this, args| {
+    vm.define_method(proto, "padEnd", 1, |vm, this, args| {
         pad(vm, &this, args, false)
     });
     vm.define_method(proto, "concat", 1, |vm, this, args| {
         let mut s = str_this(vm, &this)?;
         for a in args {
-            s.push_str(&vm.to_string_lossy(a));
+            let part = vm.to_js_string(a)?;
+            s.push_str(part.as_str());
         }
         Ok(Value::str(s))
     });
-    vm.define_method(proto, "normalize", 0, |vm, this, _a| {
-        // No Unicode normalization tables yet; return the string unchanged. The
-        // form argument (if any) is validated to one of the four canonical
-        // names, throwing RangeError otherwise (per spec).
-        Ok(Value::str(str_this(vm, &this)?))
+    vm.define_method(proto, "normalize", 0, |vm, this, args| {
+        use unicode_normalization::UnicodeNormalization;
+        let s = str_this(vm, &this)?;
+        // `form` coerces with ToString (a Symbol form is a TypeError, a
+        // throwing toString propagates); undefined defaults to "NFC".
+        let form_v = arg(args, 0);
+        let form = if form_v.is_undefined() {
+            "NFC".to_string()
+        } else {
+            vm.to_js_string(&form_v)?.as_str().to_string()
+        };
+        let out: String = match form.as_str() {
+            "NFC" => s.chars().nfc().collect(),
+            "NFD" => s.chars().nfd().collect(),
+            "NFKC" => s.chars().nfkc().collect(),
+            "NFKD" => s.chars().nfkd().collect(),
+            _ => {
+                return Err(
+                    vm.throw_range("The normalization form should be one of NFC, NFD, NFKC, NFKD")
+                )
+            }
+        };
+        Ok(Value::str(out))
     });
     vm.define_method(proto, "localeCompare", 1, |vm, this, args| {
-        // Simple ordinal comparison over code points (no collation tables).
-        let s = str_this(vm, &this)?;
-        let that = vm.to_string_lossy(&arg(args, 0));
+        // Ordinal comparison over NFC-normalized code points: no collation
+        // tables, but canonically-equivalent strings compare equal (the spec
+        // requires consistency with canonical equivalence).
+        use unicode_normalization::UnicodeNormalization;
+        let s: String = str_this(vm, &this)?.chars().nfc().collect();
+        let that: String = vm
+            .to_js_string(&arg(args, 0))?
+            .as_str()
+            .chars()
+            .nfc()
+            .collect();
         let ord = s.cmp(&that);
         Ok(Value::Number(match ord {
             std::cmp::Ordering::Less => -1.0,
@@ -552,10 +642,10 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
                 return vm.call(m, regexp.clone(), &[this.clone()]);
             }
         }
-        // Fall back: coerce to a RegExp and invoke its @@search.
+        // Fall back: RegExpCreate then Invoke(rx, @@search, «S»).
         let s = str_this(vm, &this)?;
-        let re = coerce_regexp(vm, &regexp)?;
-        crate::builtins::regexp_builtin::sym_search_generic(vm, &Value::Object(re), &s)
+        let sym = vm.realm.symbol_search.clone();
+        invoke_regexp_sym(vm, &regexp, "", sym, s)
     });
 
     // String.prototype.match(regexp): dispatches to regexp[@@match](this) when
@@ -574,8 +664,8 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
             }
         }
         let s = str_this(vm, &this)?;
-        let re = coerce_regexp(vm, &regexp)?;
-        crate::builtins::regexp_builtin::sym_match_generic(vm, &Value::Object(re), &s)
+        let sym = vm.realm.symbol_match.clone();
+        invoke_regexp_sym(vm, &regexp, "", sym, s)
     });
 
     // String.prototype.matchAll(regexp): dispatches to regexp[@@matchAll](this)
@@ -604,18 +694,11 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
                 return vm.call(m, regexp.clone(), &[this.clone()]);
             }
         }
-        // Fall back: build a global RegExp from the (string) argument.
+        // Fall back: S = ToString(this), then RegExpCreate(regexp, "g") and
+        // Invoke(rx, @@matchAll, «S»).
         let s = str_this(vm, &this)?;
-        let src = if regexp.is_undefined() {
-            String::new()
-        } else {
-            vm.to_string_lossy(&regexp)
-        };
-        let re = match vm.make_regexp(&src, "g")? {
-            Value::Object(o) => o,
-            _ => return Err(vm.throw_type("RegExp coercion failed")),
-        };
-        crate::builtins::regexp_builtin::sym_match_all_generic(vm, &Value::Object(re), &s)
+        let sym = vm.realm.symbol_match_all.clone();
+        invoke_regexp_sym(vm, &regexp, "g", sym, s)
     });
 
     // [Symbol.iterator]
@@ -656,7 +739,7 @@ fn pad(vm: &mut Vm, this: &Value, args: &[Value], start: bool) -> Result<Value, 
         if f.is_undefined() {
             " ".to_string()
         } else {
-            vm.to_string_lossy(&f)
+            vm.to_js_string(&f)?.as_str().to_string()
         }
     };
     if filler.is_empty() {
@@ -694,10 +777,22 @@ fn replace_impl(vm: &mut Vm, this: &Value, args: &[Value], all: bool) -> Result<
     let mut replaced_any = false;
     loop {
         if pattern.is_empty() {
-            // Empty pattern matches at the start once (prepend the replacement).
+            // An empty pattern matches at the start; `replaceAll` matches at
+            // EVERY position (between all characters and at the end).
             let replacement = compute_replacement(vm, &repl, repl_str.as_deref(), "", &s, 0)?;
             result.push_str(&replacement);
-            result.push_str(rest);
+            if all {
+                let mut byte = 0usize;
+                for ch in s.chars() {
+                    result.push(ch);
+                    byte += ch.len_utf8();
+                    let replacement =
+                        compute_replacement(vm, &repl, repl_str.as_deref(), "", &s, byte)?;
+                    result.push_str(&replacement);
+                }
+            } else {
+                result.push_str(rest);
+            }
             break;
         }
         match rest.find(&pattern) {
@@ -781,24 +876,26 @@ fn rel(vm: &mut Vm, v: &Value, len: isize, default: isize) -> Result<isize, Valu
     if v.is_undefined() {
         return Ok(default);
     }
-    let mut i = vm.to_int32(v)? as isize;
-    if i < 0 {
-        i += len;
+    // ToIntegerOrInfinity: ±Infinity clamps to the ends (never wraps to 0).
+    let mut i = to_integer_or_infinity(vm, v)?;
+    if i < 0.0 {
+        i += len as f64;
     }
-    Ok(i.clamp(0, len))
+    Ok(i.clamp(0.0, len as f64) as isize)
 }
 
 fn clamp_idx(vm: &mut Vm, v: &Value, len: isize, default: isize) -> Result<isize, Value> {
     if v.is_undefined() {
         return Ok(default);
     }
-    let i = vm.to_int32(v)? as isize;
-    Ok(i.clamp(0, len))
+    let i = to_integer_or_infinity(vm, v)?;
+    Ok(i.clamp(0.0, len as f64) as isize)
 }
 
 /// Coerce a value to a RegExp object for the String fallback paths
 /// (match/search): pass through an existing RegExp, otherwise build one from its
 /// string source.
+#[allow(dead_code)]
 fn coerce_regexp(vm: &mut Vm, v: &Value) -> Result<JsObject, Value> {
     if crate::regexp::is_regexp(v) {
         if let Value::Object(o) = v {

@@ -69,6 +69,10 @@ pub struct TryHandler {
     /// unwind into the catch/finally, the with-scope stack is restored to this
     /// depth so a `with` body that throws does not leak its environment.
     pub with_depth: usize,
+    /// The frame's private-environment chain when this handler was installed,
+    /// restored on unwind (a class definition that throws mid-evaluation must
+    /// not leak its private scope).
+    pub priv_env: Option<Rc<crate::value::PrivateEnv>>,
     /// A `yield*` delegation handler: it catches only EXTERNAL `.throw()`
     /// resumptions (to forward them to the inner iterator). The async-generator
     /// machinery's internal await-of-yielded-value rejection sets the frame's
@@ -131,6 +135,9 @@ pub struct Frame {
     /// eval-introduced `var`s (also pushed as the outermost with-scope, so
     /// dynamic name ops and nested closures resolve them). `None` elsewhere.
     pub eval_vars: Option<JsObject>,
+    /// The active PrivateEnvironment chain: seeded from the closure's captured
+    /// chain, pushed/popped by class definitions evaluating in this frame.
+    pub priv_env: Option<Rc<crate::value::PrivateEnv>>,
 }
 
 /// Promise internal state.
@@ -220,6 +227,9 @@ pub struct Vm {
     pub realm: Realm,
     pub microtasks: VecDeque<Microtask>,
     pub symbol_counter: u64,
+    /// Monotonic allocator for [`crate::value::PrivateName::id`] — one fresh
+    /// id per private name per class definition *evaluation*.
+    pub private_name_counter: u64,
     pub call_depth: usize,
     pub max_call_depth: usize,
     /// Pending host operations (id -> promise object) awaiting resolution.
@@ -292,6 +302,7 @@ impl Vm {
             realm: Realm::placeholder(),
             microtasks: VecDeque::new(),
             symbol_counter: 1,
+            private_name_counter: 1,
             call_depth: 0,
             max_call_depth: 2000,
             pending_host: indexmap::IndexMap::new(),
@@ -1351,6 +1362,25 @@ impl Vm {
                 }
             }
         }
+        // Exotic non-configurable own slots that aren't reified in `props`:
+        // an array's `length`, and a String object's `length` and in-range
+        // index characters — none are deletable (delete returns false).
+        if !has_props_entry {
+            match &b.internal {
+                Internal::Array(_) if key.as_str() == Some("length") => return Ok(false),
+                Internal::StringObj(s) => {
+                    if key.as_str() == Some("length") {
+                        return Ok(false);
+                    }
+                    if let Some(i) = key.array_index() {
+                        if (i as usize) < s.as_str().chars().count() {
+                            return Ok(false);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         match b.props.get(key) {
             Some(p) if !p.configurable => Ok(false),
             Some(_) => {
@@ -1487,13 +1517,7 @@ impl Vm {
         }
         for k in b.props.keys() {
             match k {
-                PropertyKey::Str(s) => {
-                    // Private names (`#x`) are modeled internally as `"#x"` string
-                    // keys but must be invisible to all reflection (OwnPropertyKeys,
-                    // getOwnPropertyNames, Reflect.ownKeys, for-in, JSON, ...).
-                    if s.as_str().starts_with('#') {
-                        continue;
-                    }
+                PropertyKey::Str(_) => {
                     if let Some(idx) = k.array_index() {
                         int_keys.push(idx);
                     } else {
@@ -1529,10 +1553,24 @@ impl Vm {
     /// the `ownKeys` + `getOwnPropertyDescriptor` traps; ordinary objects read
     /// their property map directly. Used by `Object.assign`, object spread, etc.
     pub fn enumerable_own_keys_dyn(&mut self, o: &JsObject) -> Result<Vec<PropertyKey>, Value> {
+        self.enumerable_own_keys_excluding(o, &[])
+    }
+
+    /// Own enumerable keys, skipping `excluded` BEFORE any per-key descriptor
+    /// access (CopyDataProperties: a proxy source must not observe a
+    /// [[GetOwnProperty]] for an excluded key).
+    pub fn enumerable_own_keys_excluding(
+        &mut self,
+        o: &JsObject,
+        excluded: &[PropertyKey],
+    ) -> Result<Vec<PropertyKey>, Value> {
         let keys = self.own_property_keys(o)?;
         let is_proxy = matches!(o.borrow().internal, Internal::Proxy(_));
         let mut out = Vec::new();
         for k in keys {
+            if excluded.contains(&k) {
+                continue;
+            }
             let enumerable = if is_proxy {
                 let desc = self.proxy_get_own_descriptor(o, &k)?;
                 match &desc {

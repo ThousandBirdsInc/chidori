@@ -34,7 +34,7 @@ The runner prints, e.g.:
 
 ```
 Test262 (chidori pure-Rust engine, bare context)
-  pass 39017  fail 757  skip 7517  =>  98.10% of executed
+  pass 39282  fail 492  skip 7517  =>  98.76% of executed
 ```
 
 ## Current result
@@ -44,7 +44,7 @@ pinned suite commit:
 
 | | pass | fail | skip | % of executed |
 |---|---|---|---|---|
-| chidori pure-Rust engine, bare context | 39,017 | 757 | 7,517 | **98.10%** |
+| chidori pure-Rust engine, bare context | 39,282 | 492 | 7,517 | **98.76%** |
 
 The headline percentage is `pass / (pass + fail)` over *executed* tests; the
 skip count is reported alongside so the denominator is never hidden.
@@ -159,20 +159,21 @@ a single readable line in review).
 
 ## Remaining gaps
 
-The residual failures, by area (top clusters of the 757 total):
+The residual failures, by area (top clusters of the 492 total):
 
 | count | area | nature |
 |--:|---|---|
-| 198 | `language/expressions` | class element corners (direct-eval contexts, per-evaluation private brands), dynamic-`import()` semantics, tagged-template caching |
-| 111 | `language/statements` | remaining class element corners, labelled/eval interplay |
 | 94 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings); `v`-flag; `prototype` long tail |
-| 59 | `built-ins/String` | `normalize`, Unicode/surrogate edge cases |
-| 36 | `built-ins/Object` | array `length` descriptor corners; sparse indices beyond the dense cap |
-| 22 | `language/module-code` | namespace internals, hoisted default-function exports, TLA ordering |
-| 18 | `language/eval-code` | eval-created binding attribute corners |
-| 15 | `built-ins/Array` | sparse indices beyond the dense cap; UTF-16 string spread |
-| 15 | `built-ins/Date` | parse/format edge cases |
-| 13 | `built-ins/Proxy` | proxy-of-proxy forwarding details |
+| 93 | `language/expressions` | dynamic-`import()` semantics, tagged-template caching, the last class/eval corners |
+| 27 | `language/statements` | labelled/eval interplay and remaining class corners |
+| 23 | `built-ins/Array` | sparse indices beyond the dense cap; UTF-16 string spread |
+| 21 | `built-ins/Object` | sparse indices beyond the dense cap; descriptor corners |
+| 20 | `language/module-code` | namespace internals, hoisted default-function exports, TLA ordering |
+| 18 | `language/eval-code` | eval-created global binding attributes, lexical/var collisions |
+| 15 | `built-ins/String` | UTF-16 surrogate edge cases (the scalar-string model) |
+| 12 | `built-ins/TypedArray` | `subarray`/`set` corners on resizable buffers |
+| 11 | `built-ins/JSON` | proxy/array replacer ordering, BigInt serialization |
+| 11 | `built-ins/Proxy` | proxy-of-proxy forwarding details |
 
 (Recent sweeps: the dynamic-`import()`/`with`-scope work cleared 268
 failures; the derived-class construction model — `super()` as a real
@@ -192,7 +193,27 @@ spec-generic `Get`/`Set` loops with 2^53-range index arithmetic across
 spec change-array-by-copy semantics, `@@unscopables`, a dense-array own
 `length`/element fix in the engine's `[[Set]]` path, and a
 `Reflect.set`-with-receiver fix — +104, taking `built-ins/Array` from 136
-failures to 40.)
+failures to 40. Most recently, a class/private-elements rewrite — a real
+spec PrivateEnvironment (fresh per-evaluation Private Names in a runtime
+`[[PrivateElements]]` side table, not `#name@id` string keys), so brand
+checks, multiple class evaluations, private methods/accessors on proxies,
+`#x`-visible-to-direct-eval, and the non-extensible/double-init TypeErrors
+all hold; spec super property references (`super.x`/`super[e]` read, write,
+compound-assign and update through `[[HomeObject]]` + GetSuperBase, with
+the derived-ctor `this`-TDZ and `delete super.x` ReferenceError); class
+static blocks and the deferred static-initializer phase; class bodies as
+strict-mode code; object-rest `CopyDataProperties` with computed
+excluded-key ordering; a `String.prototype` sweep (`normalize`/
+`localeCompare` via `unicode-normalization`, ToInteger/ToString coercion
+order across the search/pad methods, `replaceAll` empty-pattern, the
+`match`/`matchAll`/`search` RegExpCreate+Invoke fallback, `thisStringValue`
+for `toString`/`valueOf`); `Object.freeze`/`seal`/`isFrozen`/`isSealed`
+rebuilt on spec SetIntegrityLevel/TestIntegrityLevel (proxy-aware); Date
+setters that no longer clobber a `valueOf`-mutated invalid date and
+sign-padded negative years; and the `delete` operator's nullish-base
+ToObject TypeError, non-deletable array `length`, and non-reference operand
+evaluation — together taking the suite from 757 to 492 failures
+(98.10% -> 98.76%).)
 
 Each failure is individually identifiable from a `--json` report, so the
 clusters can be picked off as engine work warrants. See

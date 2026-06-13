@@ -141,6 +141,11 @@ pub struct FuncProto {
     /// never ran; other primitives are a TypeError) at frame exit — i.e.
     /// after `finally` blocks have run.
     pub this_cell: Option<u32>,
+    /// Closures over this proto inherit the CREATING frame's [[HomeObject]]
+    /// (arrows do this implicitly; set for synthetic in-class closures like a
+    /// derived constructor's `%fieldinit`, so `super.x` in field initializers
+    /// resolves against the class prototype).
+    pub inherit_home: bool,
 }
 
 impl FuncProto {
@@ -163,6 +168,7 @@ impl FuncProto {
             stable_cells: Vec::new(),
             eval_scopes: Vec::new(),
             this_cell: None,
+            inherit_home: false,
         }
     }
 }
@@ -195,6 +201,28 @@ pub struct EvalBinding {
     pub is_param: bool,
 }
 
+/// The kind of a private class element, resolved lexically at compile time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PrivKind {
+    Field,
+    Method,
+    Accessor,
+    StaticField,
+    StaticMethod,
+    StaticAccessor,
+}
+
+/// One enclosing class body's private-name declarations, snapshotted at a
+/// direct-`eval` call site so the eval body can compile `this.#x` against the
+/// caller's private scope (the runtime names come from the caller frame's
+/// private environment chain).
+#[derive(Clone, Debug)]
+pub struct EvalClassPriv {
+    /// The compile-time class id (`#name@<id>` storage-key suffix).
+    pub id: u32,
+    pub names: Vec<(String, PrivKind)>,
+}
+
 /// Compile-time snapshot of the scope at a direct-`eval` call site. The
 /// runtime compiles the eval source against these bindings (they become the
 /// eval body's upvalues, wired to the caller frame's live cells) and uses the
@@ -202,6 +230,12 @@ pub struct EvalBinding {
 #[derive(Clone, Debug)]
 pub struct EvalScopeDesc {
     pub bindings: Vec<EvalBinding>,
+    /// Enclosing class bodies' private names (outermost first); empty outside
+    /// class bodies.
+    pub class_privs: Vec<EvalClassPriv>,
+    /// The eval site is inside a class field initializer or class static
+    /// block: the eval body may not contain `arguments` (early SyntaxError).
+    pub in_field_initializer: bool,
     /// An enclosing NON-ARROW function exists (`new.target` is legal; the
     /// parse wrapper is a function).
     pub in_function: bool,
@@ -361,24 +395,26 @@ pub enum Op {
     InitEvalVars,
 
     // ---- private class elements ----
-    /// Brand-checked private METHOD/ACCESSOR read: `[obj] -> [value]`. The
-    /// receiver must OWN the `brand` key (instances are branded at
-    /// construction); the element itself is then read through the prototype
-    /// chain (methods/accessors live on the class prototype under `key`).
-    PrivateGetB {
-        brand: u32,
-        key: u32,
-    },
-    /// Brand-checked private METHOD/ACCESSOR write: `[obj, value] -> [value]`.
-    /// A method is never writable (TypeError); an accessor routes through its
-    /// setter (TypeError when it has none).
-    PrivateSetB {
-        brand: u32,
-        key: u32,
-        is_method: bool,
-    },
-    /// `#x in obj`: `[obj] -> [bool]` — whether obj OWNS the key (a field's
-    /// storage key, or a method/accessor's brand key).
+    /// ClassDefinitionEvaluation's NewPrivateEnvironment: mint a fresh runtime
+    /// [`crate::value::PrivateName`] for each compile-time storage key (string
+    /// const indices) and push the environment onto the frame's chain. Closures
+    /// created while it is active capture the chain.
+    PushPrivateEnv(Rc<[u32]>),
+    /// Pop the innermost private environment (end of class definition).
+    PopPrivateEnv,
+    /// PrivateFieldAdd: `[obj, value] -> [obj]` — append a Field element for
+    /// the resolved name; TypeError if the object already has it (a field
+    /// initializer re-entered on the same object via return-override).
+    PrivateFieldAdd(u32),
+    /// PrivateMethodOrAccessorAdd for a method: `[obj, value] -> [obj]`;
+    /// TypeError on a duplicate (double initialization).
+    PrivateMethodAdd(u32),
+    /// PrivateMethodOrAccessorAdd for a merged accessor pair:
+    /// `[obj, getter, setter] -> [obj]` (`undefined` = absent side);
+    /// TypeError on a duplicate.
+    PrivateAccessorAdd(u32),
+    /// `#x in obj`: `[obj] -> [bool]` — whether obj's [[PrivateElements]] has
+    /// the resolved private name.
     PrivateHasOwn(u32),
     /// `[super, args.., newTarget] -> [instance]`: the construct step of
     /// `super(...)` — `Construct(super, args, newTarget)` (argc is the
@@ -433,19 +469,41 @@ pub enum Op {
     /// [[HomeObject]] to `obj` (MakeMethod). Emitted for object-literal concise
     /// methods/accessors so their `super.prop` resolves against the object.
     SetHomeObject,
-    /// `super.prop` read in an object method: pushes
-    /// `getPrototypeOf([[HomeObject]])[name]` with `this` as the get receiver.
-    GetSuperProp(u32),
-    /// `super[expr]` read: pops the key, then like [`GetSuperProp`].
-    GetSuperPropDynamic,
+    /// Stack unchanged; sets the top value closure's [[HomeObject]] to the
+    /// object `n` slots below the top (MakeMethod for private static
+    /// methods/accessors, whose stack shape carries no key).
+    SetHomeObjectAt(u32),
+    /// GetSuperBase: push `[[HomeObject]].[[GetPrototypeOf]]()` from the
+    /// frame's function (`undefined` when the home prototype is null).
+    GetSuperBase,
+    /// `super.NAME` read: `[this, base] -> [value]` — Get(base, NAME) with
+    /// receiver `this`.
+    SuperGet(u32),
+    /// `super[key]` read: `[this, base, key] -> [value]` — ToPropertyKey runs
+    /// here (after GetSuperBase, per MakeSuperPropertyReference ordering).
+    SuperGetDynamic,
+    /// `super.NAME = v`: `[this, base, value] -> [value]` — Set(base, NAME,
+    /// value, receiver=this); a failed write throws in strict code.
+    SuperSet(u32),
+    /// `super[key] = v`: `[this, base, key, value] -> [value]`.
+    SuperSetDynamic,
     /// Spread source object into target ( target source -> target ).
     ObjectSpread,
+    /// CopyDataProperties with excludedItems for object-rest destructuring:
+    /// `[target, src, key1..keyN] -> [target]` (N is the payload; the keys
+    /// are already property keys). Excluded keys are never read on the
+    /// source — not even [[GetOwnProperty]].
+    CopyDataPropertiesExcept(u32),
     GetProp(u32), // const index of name; obj -> value
-    /// Private field/method read `obj.#x`: brand-checks (the object must have the
-    /// private name in its chain, else a TypeError) then reads it. obj -> value.
+    /// PrivateGet `obj.#x`: resolve the storage key (const index) through the
+    /// frame's private environment, then read the element from the receiver's
+    /// own [[PrivateElements]] (TypeError when absent — the brand check).
+    /// obj -> value.
     PrivateGet(u32),
     SetProp(u32), // const index of name; obj value -> value
-    /// Private field write `obj.#x = v`: brand-checks then writes. obj value -> value.
+    /// PrivateSet `obj.#x = v`: brand-checks like [`Op::PrivateGet`], then
+    /// writes the field / calls the setter (methods and setter-less accessors
+    /// are TypeErrors). obj value -> value.
     PrivateSet(u32),
     GetPropDynamic, // obj key -> value
     SetPropDynamic, // obj key value -> value

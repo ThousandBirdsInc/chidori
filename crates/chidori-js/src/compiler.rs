@@ -149,15 +149,32 @@ pub fn compile_direct_eval(src: &str, desc: &EvalScopeDesc) -> Result<CompiledEv
     let sem = oxc::semantic::SemanticBuilder::new()
         .with_check_syntax_error(true)
         .build(&program);
-    if !sem.errors.is_empty() {
-        return Err(format!(
-            "SyntaxError: {}",
-            sem.errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
-        ));
+    // oxc checks the eval body standalone, so `this.#x` references that
+    // legally resolve against the CALLER's private scopes (seeded from the
+    // call-site snapshot) are misreported as undeclared — suppress exactly
+    // those two diagnostics for seeded names.
+    let seeded: std::collections::HashSet<&str> = desc
+        .class_privs
+        .iter()
+        .flat_map(|p| p.names.iter().map(|(n, _)| n.as_str()))
+        .collect();
+    let sem_errors: Vec<String> = sem
+        .errors
+        .iter()
+        .map(|e| e.to_string())
+        .filter(|msg| {
+            let name = msg
+                .strip_prefix("Private identifier '#")
+                .or_else(|| msg.strip_prefix("Private field '#"))
+                .and_then(|r| r.split('\'').next());
+            match name {
+                Some(n) => !seeded.contains(n),
+                None => true,
+            }
+        })
+        .collect();
+    if !sem_errors.is_empty() {
+        return Err(format!("SyntaxError: {}", sem_errors.join("; ")));
     }
     // Extract the real body statements + directives from the wrapper.
     let (stmts, directives): (&[Statement], &[Directive]) = match wrap {
@@ -202,6 +219,22 @@ pub fn compile_direct_eval(src: &str, desc: &EvalScopeDesc) -> Result<CompiledEv
 
     let mut c = Compiler::new();
     c.source = wrapped.clone();
+    // Seed the caller's enclosing class private scopes (outermost first) so
+    // `this.#x` in the eval body resolves to the caller's storage keys; the
+    // runtime names come from the caller frame's private environment chain.
+    // Classes declared INSIDE the eval get ids above the seeded range.
+    c.class_privs = desc
+        .class_privs
+        .iter()
+        .map(|p| ClassPrivCtx {
+            id: p.id,
+            names: p.names.iter().cloned().collect(),
+            order: p.names.iter().map(|(n, _)| n.clone()).collect(),
+            instance_groups: Vec::new(),
+        })
+        .collect();
+    c.next_class_id = desc.class_privs.iter().map(|p| p.id + 1).max().unwrap_or(0);
+    c.in_field_initializer = desc.in_field_initializer;
 
     // Synthetic parent scope: one cell per visible caller binding, in order —
     // the body's upvalue descriptors index straight into `desc.bindings`.
@@ -490,6 +523,9 @@ struct FnCtx {
     home_super: bool,
     /// Scope snapshots for this function's direct-eval call sites.
     eval_scopes: Vec<std::rc::Rc<EvalScopeDesc>>,
+    /// Synthetic in-class closure (e.g. `%fieldinit`): inherits the creating
+    /// frame's [[HomeObject]] at closure creation (see `FuncProto`).
+    inherit_home: bool,
 }
 
 impl FnCtx {
@@ -526,6 +562,7 @@ impl FnCtx {
             finally_depth: 0,
             strict: false,
             stable_cells: Vec::new(),
+            inherit_home: false,
             home_super: false,
             eval_scopes: Vec::new(),
         }
@@ -543,33 +580,22 @@ enum Resolved {
     Global,
 }
 
-/// The kind of a private class element, resolved lexically at compile time.
-#[derive(Clone, Copy, PartialEq)]
-enum PrivKind {
-    Field,
-    Method,
-    Accessor,
-    StaticField,
-    StaticMethod,
-    StaticAccessor,
-}
-
-/// Private-name scope of one `class` body being compiled. Each class gets a
-/// compile-time-unique id; a private element's runtime storage key is
-/// `#name@<id>` (so same-named privates of nested/sibling classes can never
-/// collide), and instances are stamped with the own brand key `#brand@<id>`
-/// at construction when the class has private instance methods/accessors.
+/// Private-name scope of one `class` body being compiled. Each class body
+/// gets a compile-time-unique id; a private element's COMPILE-TIME storage
+/// key is `#name@<id>` (so same-named privates of nested/sibling classes can
+/// never collide within a compilation). At runtime, `Op::PushPrivateEnv`
+/// mints a fresh spec Private Name per key per class *evaluation*; the keys
+/// only index into that environment chain.
 struct ClassPrivCtx {
     id: u32,
     names: std::collections::HashMap<String, PrivKind>,
-}
-
-impl ClassPrivCtx {
-    fn has_instance_branded(&self) -> bool {
-        self.names
-            .values()
-            .any(|k| matches!(k, PrivKind::Method | PrivKind::Accessor))
-    }
+    /// Declaration order of the private names (deterministic key list for
+    /// `Op::PushPrivateEnv`).
+    order: Vec<String>,
+    /// Private INSTANCE methods/accessors in declaration order: installed on
+    /// `this` at construction (InitializeInstanceElements) from the class
+    /// scope cells the element walk fills (`%privm#x` / `%privg#x`+`%privs#x`).
+    instance_groups: Vec<(String, PrivKind)>,
 }
 
 struct Compiler {
@@ -602,6 +628,17 @@ struct Compiler {
     /// Escaping `var`/function names collected while compiling a SLOPPY
     /// direct-eval body (see `FnCtx::eval_sloppy`).
     eval_var_names: Vec<String>,
+    /// One-shot: the next `compile_function` compiles a METHOD (class or
+    /// object-literal concise method/accessor): the closure is a
+    /// non-constructor with no `prototype` property.
+    pending_method: bool,
+    /// Lexically inside a `class` body (heritage, keys, methods,
+    /// initializers): ALL class code is strict-mode code.
+    in_class_body: bool,
+    /// Compiling a class field initializer (or static block): direct eval
+    /// here may not contain `arguments` (spec early error). Cleared on entry
+    /// to non-arrow nested functions, which own their own `arguments`.
+    in_field_initializer: bool,
 }
 
 impl Compiler {
@@ -620,6 +657,9 @@ impl Compiler {
             is_module: false,
             source: String::new(),
             eval_var_names: Vec::new(),
+            pending_method: false,
+            in_class_body: false,
+            in_field_initializer: false,
         }
     }
 
@@ -981,6 +1021,45 @@ impl Compiler {
     /// current context — which forces upvalue capture, so the caller frame can
     /// hand the eval body live cells. `%`-internal names are excluded except
     /// `%superclass` (so `super.x` inside the eval can resolve).
+    /// Whether `super.prop` is syntactically legal here: the innermost
+    /// non-arrow function context is a method, accessor, class constructor,
+    /// or a context flagged `home_super` (object methods, static blocks,
+    /// eval bodies at such sites). Arrows are transparent.
+    fn super_prop_allowed(&self) -> bool {
+        for fc in self.fns.iter().rev() {
+            if fc.kind.is_arrow() {
+                continue;
+            }
+            return fc.home_super
+                || fc.inherit_home
+                || fc.kind.is_method()
+                || fc.kind.is_class_ctor();
+        }
+        false
+    }
+
+    /// Emit `throw new <ErrorCtor>(<message>)` (the error constructor is
+    /// resolved from the global at runtime).
+    fn emit_throw_error(&mut self, ctor: &str, message: &str) {
+        let tk = self.str_const(ctor);
+        self.emit(Op::LoadGlobal(tk));
+        let mk = self.str_const(message);
+        self.emit(Op::LoadConst(mk));
+        self.emit(Op::New(1));
+        self.emit(Op::Throw);
+    }
+
+    /// Emit `[this, base]` for a super property reference: GetThisBinding
+    /// (with the derived-constructor TDZ ReferenceError) then GetSuperBase.
+    fn emit_super_ref(&mut self) -> R {
+        if !self.super_prop_allowed() {
+            return Err("'super' keyword is only valid inside a class or method".to_string());
+        }
+        self.load_binding("%this");
+        self.emit(Op::GetSuperBase);
+        Ok(())
+    }
+
     fn collect_eval_scope(&mut self) -> std::rc::Rc<EvalScopeDesc> {
         use std::collections::HashSet;
         // Phase 1: gather candidate names + kind metadata (innermost first).
@@ -1064,11 +1143,23 @@ impl Compiler {
             .map(|f| !f.kind.is_arrow() || f.all_param_names.iter().any(|p| p == "arguments"))
             .unwrap_or(false);
         let is_global_var_scope = self.fns.len() == 1;
-        let home_super = self.fns.iter().any(|f| f.home_super);
-        let allow_super_prop = home_super || bindings.iter().any(|b| b.name == "%superclass");
+        let home_super = self.super_prop_allowed();
+        let allow_super_prop = home_super;
         let strict = self.cur_ref().strict;
+        // Enclosing class bodies' private names (outermost first), so the
+        // eval body can compile `this.#x` against the caller's private scope.
+        let class_privs = self
+            .class_privs
+            .iter()
+            .map(|c| EvalClassPriv {
+                id: c.id,
+                names: c.order.iter().map(|n| (n.clone(), c.names[n])).collect(),
+            })
+            .collect();
         std::rc::Rc::new(EvalScopeDesc {
             bindings,
+            class_privs,
+            in_field_initializer: self.in_field_initializer,
             in_function,
             arguments_param_scope,
             is_global_var_scope,
@@ -1504,6 +1595,7 @@ impl Compiler {
             is_strict: fc.strict,
             stable_cells: fc.stable_cells.clone(),
             this_cell: fc.this_cell,
+            inherit_home: fc.inherit_home,
         }
     }
 
@@ -2359,10 +2451,21 @@ impl Compiler {
                 // property access (so an empty `{}`/`{...r}` pattern still throws).
                 self.emit(Op::RequireObjectCoercible);
                 let mut taken: Vec<String> = Vec::new();
+                let mut taken_cells: Vec<u32> = Vec::new();
+                let has_rest = o.rest.is_some();
                 for p in &o.properties {
                     self.emit(Op::Dup);
                     if p.computed {
                         self.compile_property_key_expr(&p.key)?;
+                        if has_rest {
+                            // The coerced computed key joins the rest
+                            // exclusion set (CopyDataProperties excludedNames).
+                            self.emit(Op::ToPropertyKey);
+                            let t = self.temp();
+                            self.emit(Op::InitCell(t));
+                            self.emit(Op::LoadCell(t));
+                            taken_cells.push(t);
+                        }
                         self.emit(Op::GetPropDynamic);
                     } else {
                         let name = property_key_name(&p.key);
@@ -2373,9 +2476,9 @@ impl Compiler {
                     self.bind_pattern_kind(&p.value, function_scoped, is_const)?;
                 }
                 if let Some(rest) = &o.rest {
-                    // rest object: shallow copy excluding taken keys (approx: copy all).
+                    // rest object: own-enumerable copy excluding the taken keys.
                     self.emit(Op::Dup);
-                    self.compile_object_rest(&taken)?;
+                    self.compile_object_rest(&taken, &taken_cells)?;
                     self.bind_pattern_kind(&rest.argument, function_scoped, is_const)?;
                 }
                 self.emit(Op::Pop); // drop source
@@ -2384,19 +2487,21 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_object_rest(&mut self, taken: &[String]) -> R {
-        // Object rest `{ ...rest }`: copy the source's own enumerable properties,
-        // then remove the keys already bound by preceding pattern properties
-        // (CopyDataProperties with `excludedNames`). stack: src -> restObj
+    fn compile_object_rest(&mut self, taken: &[String], taken_cells: &[u32]) -> R {
+        // Object rest `{ ...rest }`: CopyDataProperties with excludedNames —
+        // the source's own enumerable properties minus the keys already bound
+        // by preceding pattern properties (static names plus the coerced
+        // computed keys parked in `taken_cells`). stack: src -> restObj
         self.emit(Op::NewObject);
-        self.emit(Op::Swap);
-        self.emit(Op::ObjectSpread); // [restObj]  (all own-enumerable keys)
+        self.emit(Op::Swap); // [restObj, src]
         for k in taken {
-            self.emit(Op::Dup);
-            let kc = self.str_const(k);
-            self.emit(Op::DeleteProp(kc)); // [restObj, bool]
-            self.emit(Op::Pop); // [restObj]
+            self.load_str(k);
         }
+        for &c in taken_cells {
+            self.emit(Op::LoadCell(c));
+        }
+        let n = (taken.len() + taken_cells.len()) as u32;
+        self.emit(Op::CopyDataPropertiesExcept(n)); // [restObj]
         Ok(())
     }
 
@@ -3151,7 +3256,15 @@ impl Compiler {
             }
             Expression::StringLiteral(s) => self.load_str(s.value.as_str()),
             Expression::TemplateLiteral(t) => self.compile_template(t)?,
-            Expression::Identifier(id) => self.load_binding(id.name.as_str()),
+            Expression::Identifier(id) => {
+                // ClassFieldDefinition early error: ContainsArguments — the
+                // initializer (and any direct eval / arrow inside it) may not
+                // reference `arguments`.
+                if self.in_field_initializer && id.name == "arguments" {
+                    return Err("'arguments' is not allowed in class field initializer".to_string());
+                }
+                self.load_binding(id.name.as_str())
+            }
             Expression::ThisExpression(_) => self.load_binding("%this"),
             Expression::MetaProperty(m) => {
                 if m.meta.name.as_str() == "new" {
@@ -3191,33 +3304,20 @@ impl Compiler {
             Expression::NewExpression(n) => self.compile_new(n)?,
             Expression::ChainExpression(c) => self.compile_chain(&c.expression)?,
             Expression::PrivateInExpression(p) => {
-                // `#x in obj` — own-key presence: a field's storage key, or a
-                // method/accessor's per-instance brand key.
+                // `#x in obj` — PrivateElementFind on the RHS's own
+                // [[PrivateElements]] (field, method, or accessor alike).
                 self.compile_expr(&p.right)?;
-                let name = p.left.name.as_str();
-                let probe = match self.resolve_private(name) {
-                    Some((key, id, kind)) => match kind {
-                        PrivKind::Method | PrivKind::Accessor => Self::private_brand_key(id),
-                        _ => key,
-                    },
-                    None => format!("#{name}"),
-                };
-                let k = self.str_const(&probe);
+                let key = self.private_storage_key(p.left.name.as_str())?;
+                let k = self.str_const(&key);
                 self.emit(Op::PrivateHasOwn(k));
             }
             Expression::StaticMemberExpression(m) => {
                 if matches!(m.object, Expression::Super(_)) {
-                    if self.cur().home_super {
-                        // Object-method super: getPrototypeOf([[HomeObject]])[name].
-                        let k = self.str_const(m.property.name.as_str());
-                        self.emit(Op::GetSuperProp(k));
-                    } else {
-                        self.load_binding("%superclass");
-                        let proto = self.str_const("prototype");
-                        self.emit(Op::GetProp(proto));
-                        let k = self.str_const(m.property.name.as_str());
-                        self.emit(Op::GetProp(k));
-                    }
+                    // `super.x`: this-binding (TDZ-checked), GetSuperBase, then
+                    // Get(base, "x") with `this` as receiver.
+                    self.emit_super_ref()?;
+                    let k = self.str_const(m.property.name.as_str());
+                    self.emit(Op::SuperGet(k));
                 } else {
                     self.compile_expr(&m.object)?;
                     if m.optional {
@@ -3230,18 +3330,20 @@ impl Compiler {
             }
             Expression::ComputedMemberExpression(m) => {
                 if matches!(m.object, Expression::Super(_)) {
-                    if self.cur().home_super {
-                        self.compile_expr(&m.expression)?;
-                        self.emit(Op::GetSuperPropDynamic);
-                    } else {
-                        // `super[expr]`: read from the superclass prototype
-                        // (mirrors the `super.prop` static-member case above).
-                        self.load_binding("%superclass");
-                        let proto = self.str_const("prototype");
-                        self.emit(Op::GetProp(proto));
-                        self.compile_expr(&m.expression)?;
-                        self.emit(Op::GetPropDynamic);
+                    // `super[expr]`: this-binding (TDZ), the key expression,
+                    // THEN GetSuperBase (MakeSuperPropertyReference order) —
+                    // ToPropertyKey runs inside SuperGetDynamic, after the
+                    // base fetch.
+                    if !self.super_prop_allowed() {
+                        return Err(
+                            "'super' keyword is only valid inside a class or method".to_string()
+                        );
                     }
+                    self.load_binding("%this");
+                    self.compile_expr(&m.expression)?;
+                    self.emit(Op::GetSuperBase);
+                    self.emit(Op::Swap); // [this, base, key]
+                    self.emit(Op::SuperGetDynamic);
                 } else {
                     self.compile_expr(&m.object)?;
                     if m.optional {
@@ -3257,7 +3359,7 @@ impl Compiler {
                 // (suffixed storage keys + per-instance brand checks); see
                 // `resolve_private`/`emit_private_get_op`.
                 self.compile_expr(&m.object)?;
-                self.emit_private_get_op(m.field.name.as_str());
+                self.emit_private_get_op(m.field.name.as_str())?;
             }
             Expression::FunctionExpression(f) => {
                 let name = f.id.as_ref().map(|i| i.name.as_str().to_string());
@@ -3451,6 +3553,7 @@ impl Compiler {
                     let is_method = p.method || is_accessor;
                     if is_method {
                         self.pending_home_super = true;
+                        self.pending_method = true;
                     }
                     // value
                     if !p.computed {
@@ -3476,6 +3579,7 @@ impl Compiler {
                         }
                     }
                     self.pending_home_super = false;
+                    self.pending_method = false;
                     if is_method {
                         // [obj, key, value] — stamp value.[[HomeObject]] = obj.
                         self.emit(Op::SetHomeObject);
@@ -3672,6 +3776,41 @@ impl Compiler {
             }
             U::Delete => {
                 match &u.argument {
+                    // `delete super.x` / `delete super[e]`: a Super Reference is
+                    // never deletable. Evaluate the reference components in spec
+                    // order — GetThisBinding (TDZ-checked), the computed key's
+                    // GetValue (but NOT ToPropertyKey), GetSuperBase — then
+                    // throw a ReferenceError (spec 13.5.1.2 step 5.b).
+                    Expression::StaticMemberExpression(m)
+                        if matches!(m.object, Expression::Super(_)) =>
+                    {
+                        if !self.super_prop_allowed() {
+                            return Err(
+                                "'super' keyword is only valid inside a class or method".into()
+                            );
+                        }
+                        self.load_binding("%this");
+                        self.emit(Op::GetSuperBase);
+                        self.emit(Op::Pop);
+                        self.emit(Op::Pop);
+                        self.emit_throw_error("ReferenceError", "Unsupported reference to 'super'");
+                    }
+                    Expression::ComputedMemberExpression(m)
+                        if matches!(m.object, Expression::Super(_)) =>
+                    {
+                        if !self.super_prop_allowed() {
+                            return Err(
+                                "'super' keyword is only valid inside a class or method".into()
+                            );
+                        }
+                        self.load_binding("%this");
+                        self.compile_expr(&m.expression)?;
+                        self.emit(Op::GetSuperBase);
+                        self.emit(Op::Pop);
+                        self.emit(Op::Pop);
+                        self.emit(Op::Pop);
+                        self.emit_throw_error("ReferenceError", "Unsupported reference to 'super'");
+                    }
                     Expression::StaticMemberExpression(m) => {
                         self.compile_expr(&m.object)?;
                         let k = self.str_const(m.property.name.as_str());
@@ -3711,7 +3850,12 @@ impl Compiler {
                             };
                         }
                     }
-                    _ => {
+                    other => {
+                        // `delete <non-reference>`: the operand is still
+                        // EVALUATED (spec step 1, `delete foo()` calls foo),
+                        // then — not being a Reference — `delete` is `true`.
+                        self.compile_expr(other)?;
+                        self.emit(Op::Pop);
                         self.emit(Op::LoadTrue);
                     }
                 }
@@ -3779,6 +3923,16 @@ impl Compiler {
                     self.store_binding(name);
                 }
             }
+            SimpleAssignmentTarget::StaticMemberExpression(m)
+                if matches!(m.object, Expression::Super(_)) =>
+            {
+                self.super_update(Some(m.property.name.as_str()), None, inc, u.prefix)?;
+            }
+            SimpleAssignmentTarget::ComputedMemberExpression(m)
+                if matches!(m.object, Expression::Super(_)) =>
+            {
+                self.super_update(None, Some(&m.expression), inc, u.prefix)?;
+            }
             SimpleAssignmentTarget::StaticMemberExpression(m) => {
                 let t_obj = self.temp();
                 self.compile_expr(&m.object)?;
@@ -3840,14 +3994,14 @@ impl Compiler {
                 self.compile_expr(&m.object)?;
                 self.emit(Op::InitCell(t_obj));
                 self.emit(Op::LoadCell(t_obj));
-                self.emit_private_get_op(&name);
+                self.emit_private_get_op(&name)?;
                 self.emit(Op::ToNumeric);
                 let t_old = self.temp();
                 self.emit(Op::InitCell(t_old));
                 self.emit(Op::LoadCell(t_obj));
                 self.emit(Op::LoadCell(t_old));
                 self.emit(if inc { Op::Inc } else { Op::Dec });
-                self.emit_private_set_op(&name);
+                self.emit_private_set_op(&name)?;
                 self.emit(Op::Pop);
                 if u.prefix {
                     self.emit(Op::LoadCell(t_old));
@@ -3909,7 +4063,7 @@ impl Compiler {
                     let j = self.emit(Op::JumpIfNullish(0));
                     self.chain_jumps.push(j);
                 }
-                self.emit_private_get_op(m.field.name.as_str());
+                self.emit_private_get_op(m.field.name.as_str())?;
                 Ok(())
             }
         }
@@ -3966,19 +4120,13 @@ impl Compiler {
             self.emit_super_bind_and_init();
             return Ok(());
         }
-        // super.method(...) — look up on Super.prototype, call with `this`.
+        // super.method(...) — Get(base, name) with `this` receiver, call
+        // with `this`.
         if let Expression::StaticMemberExpression(m) = &c.callee {
             if matches!(m.object, Expression::Super(_)) {
-                if self.cur().home_super {
-                    let k = self.str_const(m.property.name.as_str());
-                    self.emit(Op::GetSuperProp(k)); // [method]
-                } else {
-                    self.load_binding("%superclass");
-                    let proto = self.str_const("prototype");
-                    self.emit(Op::GetProp(proto));
-                    let k = self.str_const(m.property.name.as_str());
-                    self.emit(Op::GetProp(k)); // [method]
-                }
+                self.emit_super_ref()?;
+                let k = self.str_const(m.property.name.as_str());
+                self.emit(Op::SuperGet(k)); // [method]
                 self.load_binding("%this"); // [method, this]
                 self.finish_call(c)?;
                 return Ok(());
@@ -3987,16 +4135,16 @@ impl Compiler {
         // super[expr](...) — same, with a computed key.
         if let Expression::ComputedMemberExpression(m) = &c.callee {
             if matches!(m.object, Expression::Super(_)) {
-                if self.cur().home_super {
-                    self.compile_expr(&m.expression)?;
-                    self.emit(Op::GetSuperPropDynamic); // [method]
-                } else {
-                    self.load_binding("%superclass");
-                    let proto = self.str_const("prototype");
-                    self.emit(Op::GetProp(proto));
-                    self.compile_expr(&m.expression)?;
-                    self.emit(Op::GetPropDynamic); // [method]
+                if !self.super_prop_allowed() {
+                    return Err(
+                        "'super' keyword is only valid inside a class or method".to_string()
+                    );
                 }
+                self.load_binding("%this");
+                self.compile_expr(&m.expression)?;
+                self.emit(Op::GetSuperBase);
+                self.emit(Op::Swap);
+                self.emit(Op::SuperGetDynamic); // [method]
                 self.load_binding("%this"); // [method, this]
                 self.finish_call(c)?;
                 return Ok(());
@@ -4037,7 +4185,7 @@ impl Compiler {
                 self.emit(Op::Dup); // [obj, obj]
                                     // Brand-checking read: calling a private method on an object that
                                     // doesn't have it must throw a TypeError (not silently read undefined).
-                self.emit_private_get_op(m.field.name.as_str()); // [obj, method]
+                self.emit_private_get_op(m.field.name.as_str())?; // [obj, method]
                 self.emit(Op::Swap); // [method, obj]
                 self.finish_call(c)?;
             }
@@ -4359,10 +4507,19 @@ impl Compiler {
             }
             AssignmentTarget::StaticMemberExpression(m) => {
                 let k = self.str_const(m.property.name.as_str());
-                self.member_assign(&m.object, k, a)?;
+                if matches!(m.object, Expression::Super(_)) {
+                    self.super_member_assign(Some(k), None, a)?;
+                } else {
+                    self.member_assign(&m.object, k, a)?;
+                }
             }
             AssignmentTarget::PrivateFieldExpression(m) => {
                 self.member_assign_private(&m.object, m.field.name.as_str(), a)?;
+            }
+            AssignmentTarget::ComputedMemberExpression(m)
+                if matches!(m.object, Expression::Super(_)) =>
+            {
+                self.super_member_assign(None, Some(&m.expression), a)?;
             }
             AssignmentTarget::ComputedMemberExpression(m) => match a.operator {
                 A::Assign => {
@@ -4422,6 +4579,141 @@ impl Compiler {
         Ok(())
     }
 
+    /// `super.x <op>= v` / `super[key] <op>= v`: the reference components
+    /// (`this`, the raw key for the computed form, then the super base)
+    /// evaluate once, before the RHS, per MakeSuperPropertyReference.
+    fn super_member_assign(
+        &mut self,
+        key_const: Option<u32>,
+        key_expr: Option<&Expression>,
+        a: &AssignmentExpression,
+    ) -> R {
+        use oxc::syntax::operator::AssignmentOperator as A;
+        if !self.super_prop_allowed() {
+            return Err("'super' keyword is only valid inside a class or method".to_string());
+        }
+        let t_this = self.temp();
+        let t_base = self.temp();
+        let t_key = key_expr.map(|_| self.temp());
+        self.load_binding("%this");
+        self.emit(Op::InitCell(t_this));
+        if let (Some(e), Some(tk)) = (key_expr, t_key) {
+            self.compile_expr(e)?;
+            self.emit(Op::InitCell(tk));
+        }
+        self.emit(Op::GetSuperBase);
+        self.emit(Op::InitCell(t_base));
+        let load_ref = |c: &mut Self| {
+            c.emit(Op::LoadCell(t_this));
+            c.emit(Op::LoadCell(t_base));
+            if let Some(tk) = t_key {
+                c.emit(Op::LoadCell(tk));
+            }
+        };
+        let get = |c: &mut Self| {
+            match key_const {
+                Some(k) => c.emit(Op::SuperGet(k)),
+                None => c.emit(Op::SuperGetDynamic),
+            };
+        };
+        let set = |c: &mut Self| {
+            match key_const {
+                Some(k) => c.emit(Op::SuperSet(k)),
+                None => c.emit(Op::SuperSetDynamic),
+            };
+        };
+        match a.operator {
+            A::Assign => {
+                load_ref(self);
+                self.compile_expr(&a.right)?;
+                set(self);
+            }
+            A::LogicalAnd | A::LogicalOr | A::LogicalNullish => {
+                load_ref(self);
+                get(self);
+                let j = match a.operator {
+                    A::LogicalAnd => self.emit(Op::JumpIfFalsyPeek(0)),
+                    A::LogicalOr => self.emit(Op::JumpIfTruthyPeek(0)),
+                    _ => self.emit(Op::JumpIfNullishPeek(0)),
+                };
+                self.compile_expr(&a.right)?;
+                let t_val = self.temp();
+                self.emit(Op::InitCell(t_val));
+                load_ref(self);
+                self.emit(Op::LoadCell(t_val));
+                set(self);
+                let end = self.here();
+                self.patch_jump(j, end);
+            }
+            other => {
+                load_ref(self);
+                get(self);
+                self.compile_expr(&a.right)?;
+                self.emit(compound_op(other));
+                let t_val = self.temp();
+                self.emit(Op::InitCell(t_val));
+                load_ref(self);
+                self.emit(Op::LoadCell(t_val));
+                set(self);
+            }
+        }
+        Ok(())
+    }
+
+    /// `super.x++` / `super[key]--` (prefix and suffix forms): reference
+    /// components evaluate once; read, ToNumeric, write, produce old/new.
+    fn super_update(
+        &mut self,
+        key_name: Option<&str>,
+        key_expr: Option<&Expression>,
+        inc: bool,
+        prefix: bool,
+    ) -> R {
+        if !self.super_prop_allowed() {
+            return Err("'super' keyword is only valid inside a class or method".to_string());
+        }
+        let key_const = key_name.map(|n| self.str_const(n));
+        let t_this = self.temp();
+        let t_base = self.temp();
+        let t_key = key_expr.map(|_| self.temp());
+        self.load_binding("%this");
+        self.emit(Op::InitCell(t_this));
+        if let (Some(e), Some(tk)) = (key_expr, t_key) {
+            self.compile_expr(e)?;
+            self.emit(Op::InitCell(tk));
+        }
+        self.emit(Op::GetSuperBase);
+        self.emit(Op::InitCell(t_base));
+        let load_ref = |c: &mut Self| {
+            c.emit(Op::LoadCell(t_this));
+            c.emit(Op::LoadCell(t_base));
+            if let Some(tk) = t_key {
+                c.emit(Op::LoadCell(tk));
+            }
+        };
+        load_ref(self);
+        match key_const {
+            Some(k) => self.emit(Op::SuperGet(k)),
+            None => self.emit(Op::SuperGetDynamic),
+        };
+        self.emit(Op::ToNumeric);
+        let t_old = self.temp();
+        self.emit(Op::InitCell(t_old));
+        load_ref(self);
+        self.emit(Op::LoadCell(t_old));
+        self.emit(if inc { Op::Inc } else { Op::Dec });
+        match key_const {
+            Some(k) => self.emit(Op::SuperSet(k)),
+            None => self.emit(Op::SuperSetDynamic),
+        };
+        self.emit(Op::Pop);
+        self.emit(Op::LoadCell(t_old));
+        if prefix {
+            self.emit(if inc { Op::Inc } else { Op::Dec });
+        }
+        Ok(())
+    }
+
     /// Assign to `obj.<k>` (static-name key const `k`) with the given operator.
     fn member_assign(&mut self, obj: &Expression, k: u32, a: &AssignmentExpression) -> R {
         self.member_assign_kind(obj, k, a, false)
@@ -4441,14 +4733,14 @@ impl Compiler {
             A::Assign => {
                 self.compile_expr(obj)?;
                 self.compile_expr(&a.right)?;
-                self.emit_private_set_op(name);
+                self.emit_private_set_op(name)?;
             }
             A::LogicalAnd | A::LogicalOr | A::LogicalNullish => {
                 let t_obj = self.temp();
                 self.compile_expr(obj)?;
                 self.emit(Op::InitCell(t_obj));
                 self.emit(Op::LoadCell(t_obj));
-                self.emit_private_get_op(name);
+                self.emit_private_get_op(name)?;
                 let j = match a.operator {
                     A::LogicalAnd => self.emit(Op::JumpIfFalsyPeek(0)),
                     A::LogicalOr => self.emit(Op::JumpIfTruthyPeek(0)),
@@ -4459,7 +4751,7 @@ impl Compiler {
                 self.emit(Op::InitCell(t_val));
                 self.emit(Op::LoadCell(t_obj));
                 self.emit(Op::LoadCell(t_val));
-                self.emit_private_set_op(name);
+                self.emit_private_set_op(name)?;
                 let end = self.here();
                 self.patch_jump(j, end);
             }
@@ -4468,14 +4760,14 @@ impl Compiler {
                 self.compile_expr(obj)?;
                 self.emit(Op::InitCell(t_obj));
                 self.emit(Op::LoadCell(t_obj));
-                self.emit_private_get_op(name);
+                self.emit_private_get_op(name)?;
                 self.compile_expr(&a.right)?;
                 self.emit(compound_op(other));
                 let t_val = self.temp();
                 self.emit(Op::InitCell(t_val));
                 self.emit(Op::LoadCell(t_obj));
                 self.emit(Op::LoadCell(t_val));
-                self.emit_private_set_op(name);
+                self.emit_private_set_op(name)?;
             }
         }
         Ok(())
@@ -4561,9 +4853,21 @@ impl Compiler {
                 let k = self.str_const(m.property.name.as_str());
                 let t = self.temp();
                 self.emit(Op::InitCell(t));
-                self.compile_expr(&m.object)?;
-                self.emit(Op::LoadCell(t));
-                self.emit(Op::SetProp(k));
+                if matches!(m.object, Expression::Super(_)) {
+                    if !self.super_prop_allowed() {
+                        return Err(
+                            "'super' keyword is only valid inside a class or method".to_string()
+                        );
+                    }
+                    self.load_binding("%this");
+                    self.emit(Op::GetSuperBase);
+                    self.emit(Op::LoadCell(t));
+                    self.emit(Op::SuperSet(k));
+                } else {
+                    self.compile_expr(&m.object)?;
+                    self.emit(Op::LoadCell(t));
+                    self.emit(Op::SetProp(k));
+                }
                 self.emit(Op::Pop);
             }
             // Private field as a destructuring target: `[obj.#x] = [...]`.
@@ -4572,16 +4876,30 @@ impl Compiler {
                 self.emit(Op::InitCell(t));
                 self.compile_expr(&m.object)?;
                 self.emit(Op::LoadCell(t));
-                self.emit_private_set_op(m.field.name.as_str());
+                self.emit_private_set_op(m.field.name.as_str())?;
                 self.emit(Op::Pop);
             }
             AssignmentTarget::ComputedMemberExpression(m) => {
                 let t = self.temp();
                 self.emit(Op::InitCell(t));
-                self.compile_expr(&m.object)?;
-                self.compile_expr(&m.expression)?;
-                self.emit(Op::LoadCell(t));
-                self.emit(Op::SetPropDynamic);
+                if matches!(m.object, Expression::Super(_)) {
+                    if !self.super_prop_allowed() {
+                        return Err(
+                            "'super' keyword is only valid inside a class or method".to_string()
+                        );
+                    }
+                    self.load_binding("%this");
+                    self.compile_expr(&m.expression)?;
+                    self.emit(Op::GetSuperBase);
+                    self.emit(Op::Swap); // [this, base, key]
+                    self.emit(Op::LoadCell(t));
+                    self.emit(Op::SuperSetDynamic);
+                } else {
+                    self.compile_expr(&m.object)?;
+                    self.compile_expr(&m.expression)?;
+                    self.emit(Op::LoadCell(t));
+                    self.emit(Op::SetPropDynamic);
+                }
                 self.emit(Op::Pop);
             }
             AssignmentTarget::ArrayAssignmentTarget(arr) => {
@@ -4704,7 +5022,7 @@ impl Compiler {
                             self.emit(Op::InitCell(t_val));
                             self.emit(Op::LoadCell(t_obj));
                             self.emit(Op::LoadCell(t_val));
-                            self.emit_private_set_op(&name);
+                            self.emit_private_set_op(&name)?;
                             self.emit(Op::Pop);
                         }
                         RestPre::Plain => {
@@ -4733,6 +5051,8 @@ impl Compiler {
                 // still rejects a nullish source).
                 self.emit(Op::RequireObjectCoercible);
                 let mut taken: Vec<String> = Vec::new();
+                let mut taken_cells: Vec<u32> = Vec::new();
+                let has_rest = o.rest.is_some();
                 for prop in &o.properties {
                     match prop {
                         AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(pi) => {
@@ -4757,6 +5077,13 @@ impl Compiler {
                             self.emit(Op::Dup);
                             if let Some(e) = pp.name.as_expression() {
                                 self.compile_expr(e)?;
+                                if has_rest {
+                                    self.emit(Op::ToPropertyKey);
+                                    let t = self.temp();
+                                    self.emit(Op::InitCell(t));
+                                    self.emit(Op::LoadCell(t));
+                                    taken_cells.push(t);
+                                }
                                 self.emit(Op::GetPropDynamic);
                             } else {
                                 let name = property_key_name(&pp.name);
@@ -4772,7 +5099,7 @@ impl Compiler {
                     // `{ ...rest } = obj`: copy own-enumerable keys minus the taken
                     // ones, then assign the resulting object to the rest target.
                     self.emit(Op::Dup); // [src, src]
-                    self.compile_object_rest(&taken)?; // [src, restObj]
+                    self.compile_object_rest(&taken, &taken_cells)?; // [src, restObj]
                     self.assign_target(&rest.target)?; // [src]
                 }
                 self.emit(Op::Pop);
@@ -4859,7 +5186,7 @@ impl Compiler {
                 self.emit(Op::InitCell(t_val));
                 self.emit(Op::LoadCell(t_obj));
                 self.emit(Op::LoadCell(t_val));
-                self.emit_private_set_op(pm.field.name.as_str());
+                self.emit_private_set_op(pm.field.name.as_str())?;
                 self.emit(Op::Pop);
             }
             _ => {
@@ -4948,14 +5275,16 @@ fn expr_kind(e: &Expression) -> &'static str {
 
 impl Compiler {
     fn compile_function(&mut self, f: &Function, name: Option<&str>) -> R {
-        let kind = if f.r#async && f.generator {
-            FuncKind::AsyncGenerator
-        } else if f.generator {
-            FuncKind::Generator
-        } else if f.r#async {
-            FuncKind::Async
-        } else {
-            FuncKind::Normal
+        let method = std::mem::take(&mut self.pending_method);
+        let kind = match (f.r#async, f.generator, method) {
+            (true, true, true) => FuncKind::AsyncGeneratorMethod,
+            (true, true, false) => FuncKind::AsyncGenerator,
+            (false, true, true) => FuncKind::GeneratorMethod,
+            (false, true, false) => FuncKind::Generator,
+            (true, false, true) => FuncKind::AsyncMethod,
+            (true, false, false) => FuncKind::Async,
+            (false, false, true) => FuncKind::Method,
+            (false, false, false) => FuncKind::Normal,
         };
         let body = f.body.as_deref();
         self.emit_function_core(&f.params, body, false, None, kind, name, None)
@@ -5021,7 +5350,7 @@ impl Compiler {
                     .any(|d| d.directive.as_str() == "use strict")
             })
             .unwrap_or(false);
-        let class_strict = kind.is_class_ctor();
+        let class_strict = kind.is_class_ctor() || self.in_class_body;
         fc.strict = parent_strict || own_strict || class_strict;
         // One-shot: an object-literal concise method/accessor resolves `super`
         // against its [[HomeObject]]. Arrows never consume it (they take the flag
@@ -5033,6 +5362,13 @@ impl Compiler {
         }
         self.fns.push(fc);
         self.enter_scope(true);
+        // A nested non-arrow function owns its own `arguments`/`new.target`:
+        // for the field-initializer eval early errors it is no longer
+        // "inside" the initializer. Arrows are transparent.
+        let saved_in_field_init = self.in_field_initializer;
+        if !arrow {
+            self.in_field_initializer = false;
+        }
 
         if !arrow {
             let tc = self.declare("%this", false);
@@ -5203,7 +5539,7 @@ impl Compiler {
         // derived one defers them to `super()` (see %fieldinit above).
         if kind != FuncKind::DerivedCtor {
             if let Some(fields) = ctor_fields {
-                self.emit_private_brand_stamp();
+                self.emit_instance_private_stamps();
                 self.emit_field_definitions(fields)?;
             }
         }
@@ -5250,6 +5586,7 @@ impl Compiler {
             self.emit(Op::Return);
         }
 
+        self.in_field_initializer = saved_in_field_init;
         self.exit_scope();
         let fc = self.fns.pop().unwrap();
         let proto = self.finish(fc);
@@ -5260,8 +5597,7 @@ impl Compiler {
 
     /// Resolve `#name` against the enclosing class bodies (innermost first):
     /// the runtime storage key, the class id, and the element kind. `None`
-    /// when no enclosing class declares it (e.g. eval'd fragments) — callers
-    /// fall back to the un-suffixed legacy key.
+    /// when no enclosing class (or seeded direct-eval scope) declares it.
     fn resolve_private(&self, name: &str) -> Option<(String, u32, PrivKind)> {
         for ctx in self.class_privs.iter().rev() {
             if let Some(k) = ctx.names.get(name) {
@@ -5271,82 +5607,62 @@ impl Compiler {
         None
     }
 
-    fn private_brand_key(id: u32) -> String {
-        format!("#brand@{id}")
-    }
-
-    /// `[obj] -> [value]`: brand-checked private read for `#name`.
-    fn emit_private_get_op(&mut self, name: &str) {
-        match self.resolve_private(name) {
-            Some((key, id, kind)) => {
-                let k = self.str_const(&key);
-                match kind {
-                    // Fields and static elements are own properties of their
-                    // carrier (instance / constructor): own-key check suffices.
-                    PrivKind::Field
-                    | PrivKind::StaticField
-                    | PrivKind::StaticMethod
-                    | PrivKind::StaticAccessor => {
-                        self.emit(Op::PrivateGet(k));
-                    }
-                    // Instance methods/accessors live on the prototype; the
-                    // brand is an own key stamped at construction.
-                    PrivKind::Method | PrivKind::Accessor => {
-                        let b = self.str_const(&Self::private_brand_key(id));
-                        self.emit(Op::PrivateGetB { brand: b, key: k });
-                    }
-                }
-            }
+    /// Compile a class field initializer VALUE with the initializer's
+    /// function-environment shape: `new.target` is `undefined` (initializers
+    /// run as ordinary Calls of synthetic functions), and `arguments` is an
+    /// early error — including via direct eval and through arrows.
+    /// `[..] -> [.., value]`.
+    fn compile_field_initializer_value(
+        &mut self,
+        init: Option<&Expression>,
+        named: Option<&str>,
+    ) -> R {
+        self.enter_scope(false);
+        let nt = self.declare("%newtarget", false);
+        self.emit(Op::LoadUndefined);
+        self.emit(Op::InitCell(nt));
+        let was = std::mem::replace(&mut self.in_field_initializer, true);
+        let r = match init {
+            Some(e) => match named {
+                Some(n) => self.compile_named_expr(e, n),
+                None => self.compile_expr(e),
+            },
             None => {
-                let k = self.str_const(&format!("#{name}"));
-                self.emit(Op::PrivateGet(k));
+                self.emit(Op::LoadUndefined);
+                Ok(())
             }
-        }
+        };
+        self.in_field_initializer = was;
+        self.exit_scope();
+        r
     }
 
-    /// `[obj, value] -> [value]`: brand-checked private write for `#name`.
-    fn emit_private_set_op(&mut self, name: &str) {
+    /// The compile-time storage key for `#name`, or the spec's early
+    /// SyntaxError when no enclosing class (or seeded eval scope) declares it.
+    fn private_storage_key(&self, name: &str) -> Result<String, String> {
         match self.resolve_private(name) {
-            Some((key, id, kind)) => {
-                let k = self.str_const(&key);
-                match kind {
-                    PrivKind::Field | PrivKind::StaticField => {
-                        self.emit(Op::PrivateSet(k));
-                    }
-                    PrivKind::Method | PrivKind::Accessor => {
-                        let b = self.str_const(&Self::private_brand_key(id));
-                        self.emit(Op::PrivateSetB {
-                            brand: b,
-                            key: k,
-                            is_method: kind == PrivKind::Method,
-                        });
-                    }
-                    // Static method/accessor: the element IS the own key.
-                    PrivKind::StaticMethod | PrivKind::StaticAccessor => {
-                        self.emit(Op::PrivateSetB {
-                            brand: k,
-                            key: k,
-                            is_method: kind == PrivKind::StaticMethod,
-                        });
-                    }
-                }
-            }
-            None => {
-                let k = self.str_const(&format!("#{name}"));
-                self.emit(Op::PrivateSet(k));
-            }
+            Some((key, _, _)) => Ok(key),
+            None => Err(format!(
+                "Private field '#{name}' must be declared in an enclosing class"
+            )),
         }
     }
 
-    /// The runtime storage key for a class element's property key (suffixed
-    /// for private identifiers, `property_key_name` otherwise).
-    fn class_element_key(&self, key: &PropertyKey) -> String {
-        if let PropertyKey::PrivateIdentifier(id) = key {
-            if let Some((k, _, _)) = self.resolve_private(id.name.as_str()) {
-                return k;
-            }
-        }
-        property_key_name(key)
+    /// `[obj] -> [value]`: private read for `#name`, resolved at runtime
+    /// through the frame's PrivateEnvironment chain.
+    fn emit_private_get_op(&mut self, name: &str) -> R {
+        let key = self.private_storage_key(name)?;
+        let k = self.str_const(&key);
+        self.emit(Op::PrivateGet(k));
+        Ok(())
+    }
+
+    /// `[obj, value] -> [value]`: private write for `#name`.
+    fn emit_private_set_op(&mut self, name: &str) -> R {
+        let key = self.private_storage_key(name)?;
+        let k = self.str_const(&key);
+        self.emit(Op::PrivateSet(k));
+        Ok(())
     }
 
     fn compile_class(&mut self, class: &Class, name: Option<&str>) -> R {
@@ -5358,12 +5674,18 @@ impl Compiler {
             self.next_class_id += 1;
             let mut names: std::collections::HashMap<String, PrivKind> =
                 std::collections::HashMap::new();
+            let mut order: Vec<String> = Vec::new();
+            let mut instance_groups: Vec<(String, PrivKind)> = Vec::new();
             for el in &class.body.body {
                 match el {
                     ClassElement::PropertyDefinition(p) => {
                         if let PropertyKey::PrivateIdentifier(pid) = &p.key {
+                            let name = pid.name.as_str().to_string();
+                            if !names.contains_key(&name) {
+                                order.push(name.clone());
+                            }
                             names.insert(
-                                pid.name.as_str().to_string(),
+                                name,
                                 if p.r#static {
                                     PrivKind::StaticField
                                 } else {
@@ -5384,15 +5706,29 @@ impl Compiler {
                                 (true, false) => PrivKind::StaticMethod,
                                 (true, true) => PrivKind::StaticAccessor,
                             };
-                            names.insert(pid.name.as_str().to_string(), kind);
+                            let name = pid.name.as_str().to_string();
+                            if !names.contains_key(&name) {
+                                order.push(name.clone());
+                                if matches!(kind, PrivKind::Method | PrivKind::Accessor) {
+                                    instance_groups.push((name.clone(), kind));
+                                }
+                            }
+                            names.insert(name, kind);
                         }
                     }
                     _ => {}
                 }
             }
-            self.class_privs.push(ClassPrivCtx { id, names });
+            self.class_privs.push(ClassPrivCtx {
+                id,
+                names,
+                order,
+                instance_groups,
+            });
         }
+        let was_class_body = std::mem::replace(&mut self.in_class_body, true);
         let result = self.compile_class_inner(class, name);
+        self.in_class_body = was_class_body;
         self.class_privs.pop();
         result
     }
@@ -5408,6 +5744,23 @@ impl Compiler {
     }
 
     fn compile_class_scoped(&mut self, class: &Class, name: Option<&str>) -> R {
+        // NewPrivateEnvironment for this class evaluation — before the
+        // heritage evaluates (an `extends` expression can reference `#x`) and
+        // before any member closure is created (they capture the chain). A
+        // fresh runtime name per key per evaluation is what makes brand
+        // checks fail across two evaluations of the same class literal.
+        let has_priv_env = self.class_privs.last().is_some_and(|c| !c.order.is_empty());
+        if has_priv_env {
+            let keys: Vec<String> = {
+                let ctx = self.class_privs.last().unwrap();
+                ctx.order
+                    .iter()
+                    .map(|n| format!("#{}@{}", n, ctx.id))
+                    .collect()
+            };
+            let keys: Vec<u32> = keys.iter().map(|k| self.str_const(k)).collect();
+            self.emit(Op::PushPrivateEnv(keys.into()));
+        }
         // A class with a binding identifier binds it INSIDE the class scope as
         // an immutable (const) self-reference: in TDZ while the heritage and
         // computed keys evaluate, then initialized to the constructor; methods
@@ -5454,6 +5807,27 @@ impl Compiler {
             }
         }
 
+        // Class-scope cells for private INSTANCE methods/accessors, declared
+        // (TDZ) before the constructor compiles so its construction-time
+        // stamp code captures them; the element walk below fills them. The
+        // cells mutate in place (StoreCell), so the capture stays live.
+        let instance_groups: Vec<(String, PrivKind)> = self
+            .class_privs
+            .last()
+            .map(|c| c.instance_groups.clone())
+            .unwrap_or_default();
+        for (n, k) in &instance_groups {
+            if matches!(k, PrivKind::Method) {
+                let c = self.declare(&format!("%privm#{n}"), false);
+                self.emit(Op::InitCellTdz(c));
+            } else {
+                let c = self.declare(&format!("%privg#{n}"), false);
+                self.emit(Op::InitCellTdz(c));
+                let c = self.declare(&format!("%privs#{n}"), false);
+                self.emit(Op::InitCellTdz(c));
+            }
+        }
+
         // Build the constructor closure, then stash it in a temp cell so the rest
         // of class building can address it cleanly.
         if let Some(m) = ctor_method {
@@ -5483,20 +5857,120 @@ impl Compiler {
             self.emit(Op::StoreCell(c));
         }
 
+        // The constructor's [[HomeObject]] is the class prototype, so
+        // `super.x` in the constructor body (and in instance field
+        // initializers, which run inline in the constructor frame) resolves
+        // against the superclass prototype chain.
+        self.emit(Op::LoadCell(ctor_cell));
+        let proto_k = self.str_const("prototype");
+        self.emit(Op::GetProp(proto_k)); // [proto]
+        self.emit(Op::LoadCell(ctor_cell)); // [proto, ctor]
+        self.emit(Op::SetHomeObjectAt(1));
+        self.emit(Op::Pop);
+        self.emit(Op::Pop);
+
         if has_super {
             self.class_link_super(ctor_cell)?;
         }
 
+        // Group private method/accessor elements by name, emitted at the
+        // FIRST element of each group: closure creation is unobservable, so
+        // pairing a getter with its later setter there is equivalent to the
+        // spec's merge of accessor halves into one PrivateElement.
+        struct PrivGroup<'a, 'b> {
+            is_static: bool,
+            method: Option<&'b MethodDefinition<'a>>,
+            getter: Option<&'b MethodDefinition<'a>>,
+            setter: Option<&'b MethodDefinition<'a>>,
+            emitted: bool,
+        }
+        let mut priv_groups: std::collections::HashMap<String, PrivGroup> =
+            std::collections::HashMap::new();
+        for el in &class.body.body {
+            if let ClassElement::MethodDefinition(m) = el {
+                if matches!(m.kind, MethodDefinitionKind::Constructor) {
+                    continue;
+                }
+                if let PropertyKey::PrivateIdentifier(pid) = &m.key {
+                    let g = priv_groups
+                        .entry(pid.name.as_str().to_string())
+                        .or_insert(PrivGroup {
+                            is_static: m.r#static,
+                            method: None,
+                            getter: None,
+                            setter: None,
+                            emitted: false,
+                        });
+                    match m.kind {
+                        MethodDefinitionKind::Get => g.getter = Some(m),
+                        MethodDefinitionKind::Set => g.setter = Some(m),
+                        _ => g.method = Some(m),
+                    }
+                }
+            }
+        }
+
+        // ClassDefinitionEvaluation phases: the element walk defines all
+        // methods and evaluates every computed KEY in element order, but
+        // STATIC initializers (field values and `static {}` blocks) are
+        // deferred and run AFTER the walk, in element order — so a static
+        // initializer can see methods declared after it, and a later
+        // element's computed key evaluates before any static value runs.
+        enum StaticEl<'a, 'b> {
+            Field(&'b PropertyDefinition<'a>, Option<u32>),
+            Block(&'b StaticBlock<'a>),
+        }
+        let mut static_els: Vec<StaticEl> = Vec::new();
         let mut ifield_idx = 0usize;
         for el in &class.body.body {
             match el {
                 ClassElement::MethodDefinition(m)
                     if !matches!(m.kind, MethodDefinitionKind::Constructor) =>
                 {
-                    self.class_define_method(ctor_cell, m)?;
+                    if let PropertyKey::PrivateIdentifier(pid) = &m.key {
+                        let name = pid.name.as_str().to_string();
+                        let (is_static, method, getter, setter, emitted) = {
+                            let g = priv_groups.get_mut(&name).unwrap();
+                            let was = g.emitted;
+                            g.emitted = true;
+                            (g.is_static, g.method, g.getter, g.setter, was)
+                        };
+                        if !emitted {
+                            self.class_define_private_group(
+                                ctor_cell, &name, is_static, method, getter, setter,
+                            )?;
+                        }
+                    } else {
+                        self.class_define_method(ctor_cell, m)?;
+                    }
                 }
                 ClassElement::PropertyDefinition(p) if p.r#static => {
-                    self.class_define_static_field(ctor_cell, p)?;
+                    // Evaluate a computed KEY now (in element order, including
+                    // the "prototype" runtime TypeError); the VALUE runs in
+                    // the static phase below.
+                    let key_cell = if p.computed {
+                        self.compile_property_key_expr(&p.key)?;
+                        self.emit(Op::ToPropertyKey);
+                        self.emit(Op::Dup);
+                        self.load_str("prototype");
+                        self.emit(Op::StrictEq);
+                        let jok = self.emit(Op::JumpIfFalse(0));
+                        let tk = self.str_const("TypeError");
+                        self.emit(Op::LoadGlobal(tk));
+                        let mk = self
+                            .str_const("Classes may not have a static property named 'prototype'");
+                        self.emit(Op::LoadConst(mk));
+                        self.emit(Op::New(1));
+                        self.emit(Op::Throw);
+                        let ok = self.here();
+                        self.patch_jump(jok, ok);
+                        let cell = self.temp();
+                        self.emit(Op::InitCell(cell));
+                        Some(cell)
+                    } else {
+                        None
+                    };
+                    static_els.push(StaticEl::Field(p, key_cell));
                 }
                 ClassElement::PropertyDefinition(p) => {
                     // Non-static field: evaluate a computed KEY now, in element
@@ -5512,29 +5986,160 @@ impl Compiler {
                         };
                     }
                 }
+                ClassElement::StaticBlock(b) => static_els.push(StaticEl::Block(b)),
                 _ => {}
             }
         }
 
+        // Static phase: field initializers and `static {}` blocks, in order.
+        for el in static_els {
+            match el {
+                StaticEl::Field(p, key_cell) => {
+                    self.class_define_static_field(ctor_cell, p, key_cell)?;
+                }
+                StaticEl::Block(b) => self.emit_static_block(ctor_cell, &b.body)?,
+            }
+        }
+
+        if has_priv_env {
+            self.emit(Op::PopPrivateEnv);
+        }
         // Leave the class (constructor) value on the stack.
         self.emit(Op::LoadCell(ctor_cell));
         Ok(())
     }
 
-    /// Stamp `this` with the current class's private brand (an own marker
-    /// key) when the class has private instance methods/accessors — the spec's
-    /// PrivateMethodOrAccessorAdd, which makes constructed instances (and only
-    /// them) pass the brand check.
-    fn emit_private_brand_stamp(&mut self) {
-        let brand = match self.class_privs.last() {
-            Some(ctx) if ctx.has_instance_branded() => Self::private_brand_key(ctx.id),
-            _ => return,
+    /// Emit one private method/accessor group. A STATIC group stamps the
+    /// constructor's [[PrivateElements]] now (with [[HomeObject]] = ctor so
+    /// `super.x` resolves); an INSTANCE group fills the pre-declared class
+    /// scope cells that `emit_instance_private_stamps` reads at construction.
+    #[allow(clippy::too_many_arguments)]
+    fn class_define_private_group(
+        &mut self,
+        ctor_cell: u32,
+        name: &str,
+        is_static: bool,
+        method: Option<&MethodDefinition>,
+        getter: Option<&MethodDefinition>,
+        setter: Option<&MethodDefinition>,
+    ) -> R {
+        let key = match self.resolve_private(name) {
+            Some((key, _, _)) => key,
+            None => return Err(format!("private name #{name} not declared")),
         };
-        self.load_binding("%this");
-        self.load_str(&brand);
-        self.emit(Op::LoadTrue);
-        self.emit(Op::DefineField);
-        self.emit(Op::Pop);
+        let k = self.str_const(&key);
+        if is_static {
+            self.emit(Op::LoadCell(ctor_cell)); // [ctor]
+            if let Some(m) = method {
+                self.pending_home_super = true;
+                self.pending_method = true;
+                self.compile_function(&m.value, Some(&format!("#{name}")))?;
+                self.pending_home_super = false;
+                self.emit(Op::SetHomeObjectAt(1)); // [ctor, fn]
+                self.emit(Op::PrivateMethodAdd(k)); // [ctor]
+            } else {
+                match getter {
+                    Some(g) => {
+                        self.pending_home_super = true;
+                        self.pending_method = true;
+                        self.compile_function(&g.value, Some(&format!("get #{name}")))?;
+                        self.pending_home_super = false;
+                        self.emit(Op::SetHomeObjectAt(1));
+                    }
+                    None => {
+                        self.emit(Op::LoadUndefined);
+                    }
+                }
+                match setter {
+                    Some(st) => {
+                        self.pending_home_super = true;
+                        self.pending_method = true;
+                        self.compile_function(&st.value, Some(&format!("set #{name}")))?;
+                        self.pending_home_super = false;
+                        self.emit(Op::SetHomeObjectAt(2));
+                    }
+                    None => {
+                        self.emit(Op::LoadUndefined);
+                    }
+                }
+                self.emit(Op::PrivateAccessorAdd(k)); // [ctor]
+            }
+            self.emit(Op::Pop);
+        } else {
+            // Instance group: fill the class-scope cells, stamping each
+            // closure's [[HomeObject]] = the class prototype so its
+            // `super.x` resolves like a public instance method's.
+            self.emit(Op::LoadCell(ctor_cell));
+            let proto_k = self.str_const("prototype");
+            self.emit(Op::GetProp(proto_k)); // [proto]
+            if let Some(m) = method {
+                self.pending_method = true;
+                self.compile_function(&m.value, Some(&format!("#{name}")))?;
+                self.emit(Op::SetHomeObjectAt(1)); // [proto, fn]
+                self.store_priv_cell(&format!("%privm#{name}"));
+            } else {
+                match getter {
+                    Some(g) => {
+                        self.pending_method = true;
+                        self.compile_function(&g.value, Some(&format!("get #{name}")))?;
+                        self.emit(Op::SetHomeObjectAt(1));
+                    }
+                    None => {
+                        self.emit(Op::LoadUndefined);
+                    }
+                }
+                self.store_priv_cell(&format!("%privg#{name}"));
+                match setter {
+                    Some(st) => {
+                        self.pending_method = true;
+                        self.compile_function(&st.value, Some(&format!("set #{name}")))?;
+                        self.emit(Op::SetHomeObjectAt(1));
+                    }
+                    None => {
+                        self.emit(Op::LoadUndefined);
+                    }
+                }
+                self.store_priv_cell(&format!("%privs#{name}"));
+            }
+            self.emit(Op::Pop); // drop proto
+        }
+        Ok(())
+    }
+
+    /// `StoreCell` (pops the value) into a `%priv…` cell declared in the
+    /// current class scope.
+    fn store_priv_cell(&mut self, name: &str) {
+        match self.resolve(name) {
+            Resolved::Cell(c) => {
+                self.emit(Op::StoreCell(c));
+            }
+            _ => unreachable!("%priv cell declared in class scope"),
+        }
+    }
+
+    /// InitializeInstanceElements step 1: install the class's private
+    /// instance methods/accessors on `this` (PrivateMethodOrAccessorAdd, the
+    /// spec's brand) from the class-scope cells, before any field
+    /// initializers run. A duplicate add — the same object initialized twice
+    /// via return-override — is the runtime's TypeError.
+    fn emit_instance_private_stamps(&mut self) {
+        let (class_id, groups) = match self.class_privs.last() {
+            Some(ctx) => (ctx.id, ctx.instance_groups.clone()),
+            None => return,
+        };
+        for (name, kind) in groups {
+            let k = self.str_const(&format!("#{name}@{class_id}"));
+            self.load_binding("%this");
+            if matches!(kind, PrivKind::Method) {
+                self.load_binding(&format!("%privm#{name}"));
+                self.emit(Op::PrivateMethodAdd(k));
+            } else {
+                self.load_binding(&format!("%privg#{name}"));
+                self.load_binding(&format!("%privs#{name}"));
+                self.emit(Op::PrivateAccessorAdd(k));
+            }
+            self.emit(Op::Pop);
+        }
     }
 
     fn synthesize_constructor(
@@ -5585,7 +6190,7 @@ impl Compiler {
             self.emit_super_bind_and_init();
             self.emit(Op::Return); // super() evaluates to the bound `this`
         } else {
-            self.emit_private_brand_stamp();
+            self.emit_instance_private_stamps();
             self.emit_field_definitions(fields)?;
             self.emit(Op::LoadUndefined);
             self.emit(Op::Return);
@@ -5604,30 +6209,42 @@ impl Compiler {
     fn emit_field_definitions(&mut self, fields: &[&PropertyDefinition]) -> R {
         for (i, field) in fields.iter().enumerate() {
             self.load_binding("%this");
+            if let PropertyKey::PrivateIdentifier(pid) = &field.key {
+                // Private field: evaluate the initializer (NamedEvaluation
+                // uses the source-visible "#x"), then PrivateFieldAdd —
+                // straight onto the receiver's [[PrivateElements]], with
+                // no traps and no extensibility check.
+                let name = pid.name.as_str();
+                let key = self.private_storage_key(name)?;
+                self.compile_field_initializer_value(
+                    field.value.as_ref(),
+                    Some(&format!("#{name}")),
+                )?;
+                let k = self.str_const(&key);
+                self.emit(Op::PrivateFieldAdd(k)); // [this]
+                self.emit(Op::Pop);
+                continue;
+            }
             if field.computed {
                 // Computed field key: already evaluated (with ToPropertyKey) at
                 // class-definition time into the class-scope `%fieldkey{i}` cell.
                 self.load_binding(&format!("%fieldkey{i}")); // [this, key]
+                self.compile_field_initializer_value(field.value.as_ref(), None)?;
+                // Computed key + anonymous value: NamedEvaluation takes the
+                // runtime key.
                 if let Some(init) = &field.value {
-                    self.compile_expr(init)?;
-                    // Computed key + anonymous value: NamedEvaluation takes the
-                    // runtime key.
                     if Self::is_anonymous_fn_expr(init) {
                         let prefix = self.str_const("");
                         self.emit(Op::SetFunctionNameFromKey(prefix));
                     }
-                } else {
-                    self.emit(Op::LoadUndefined);
                 }
             } else {
-                let key = self.class_element_key(&field.key);
+                let key = property_key_name(&field.key);
                 self.load_str(&key); // [this, key]
-                if let Some(init) = &field.value {
-                    // NamedEvaluation uses the source-visible name ("#x").
-                    self.compile_named_expr(init, &property_key_name(&field.key))?;
-                } else {
-                    self.emit(Op::LoadUndefined);
-                }
+                self.compile_field_initializer_value(
+                    field.value.as_ref(),
+                    Some(&property_key_name(&field.key)),
+                )?;
             }
             // DefineField (CreateDataPropertyOrThrow): a field is an own data
             // property — an inherited setter/read-only slot must not be hit.
@@ -5644,6 +6261,10 @@ impl Compiler {
     /// arrows or direct eval, which reach it lexically.
     fn emit_field_init_closure(&mut self, fields: &[&PropertyDefinition]) -> R {
         let mut fc = FnCtx::new("", FuncKind::Method);
+        // `super.x` in an instance field initializer resolves against the
+        // class prototype — the constructor's [[HomeObject]], inherited at
+        // closure creation (the closure is created inside the ctor frame).
+        fc.inherit_home = true;
         fc.enclosed_in_with = self
             .fns
             .last()
@@ -5661,7 +6282,7 @@ impl Compiler {
         if self.cur_ref().contains_eval {
             self.emit(Op::InitEvalVars);
         }
-        self.emit_private_brand_stamp();
+        self.emit_instance_private_stamps();
         self.emit_field_definitions(fields)?;
         self.emit(Op::LoadUndefined);
         self.emit(Op::Return);
@@ -5715,7 +6336,7 @@ impl Compiler {
             // SetFunctionNameFromKey must not re-run coercion side effects.
             self.emit(Op::ToPropertyKey);
         } else {
-            let name = self.class_element_key(&m.key);
+            let name = property_key_name(&m.key);
             self.load_str(&name);
         }
         // Accessors take a prefixed function name (`get x` / `set x`).
@@ -5731,6 +6352,7 @@ impl Compiler {
         if m.r#static {
             self.pending_home_super = true;
         }
+        self.pending_method = true;
         self.compile_function(&m.value, Some(&fname))?;
         // Computed-key method/accessor: the compile-time name above is just
         // "[computed]" — SetFunctionName with the runtime key.
@@ -5743,10 +6365,10 @@ impl Compiler {
             self.emit(Op::SetFunctionNameFromKey(prefix));
         }
         self.pending_home_super = false;
-        if m.r#static {
-            // [ctor, key, value] — stamp value.[[HomeObject]] = ctor.
-            self.emit(Op::SetHomeObject);
-        }
+        // [target, key, value] — stamp value.[[HomeObject]] = target (the
+        // ctor for statics, the prototype for instance methods), so super
+        // property references resolve through the home path.
+        self.emit(Op::SetHomeObject);
         match m.kind {
             MethodDefinitionKind::Get => {
                 self.emit(Op::DefineMethodGetter);
@@ -5763,45 +6385,158 @@ impl Compiler {
         Ok(())
     }
 
-    fn class_define_static_field(&mut self, ctor_cell: u32, p: &PropertyDefinition) -> R {
+    /// Run one STATIC field's initializer (static phase): `this` is the
+    /// constructor, `new.target` is undefined, and a computed key was already
+    /// evaluated into `key_cell` during the element walk.
+    fn class_define_static_field(
+        &mut self,
+        ctor_cell: u32,
+        p: &PropertyDefinition,
+        key_cell: Option<u32>,
+    ) -> R {
         self.emit(Op::LoadCell(ctor_cell)); // [ctor]
-        if p.computed {
-            self.compile_property_key_expr(&p.key)?; // [ctor, key]
-            self.emit(Op::ToPropertyKey);
-            // A computed static field named "prototype" is a runtime TypeError
-            // (the literal spelling is the early SyntaxError).
-            self.emit(Op::Dup);
-            self.load_str("prototype");
-            self.emit(Op::StrictEq);
-            let jok = self.emit(Op::JumpIfFalse(0));
-            let tk = self.str_const("TypeError");
-            self.emit(Op::LoadGlobal(tk));
-            let mk = self.str_const("Classes may not have a static property named 'prototype'");
-            self.emit(Op::LoadConst(mk));
-            self.emit(Op::New(1));
-            self.emit(Op::Throw);
-            let ok = self.here();
-            self.patch_jump(jok, ok);
+        if let PropertyKey::PrivateIdentifier(pid) = &p.key {
+            // Private static field: PrivateFieldAdd on the constructor.
+            let name = pid.name.as_str();
+            let key = self.private_storage_key(name)?;
+            self.emit_static_initializer_closure(p.value.as_ref(), Some(&format!("#{name}")))?; // [ctor, fn]
+            self.emit(Op::SetHomeObjectAt(1));
+            self.emit(Op::LoadCell(ctor_cell)); // [ctor, fn, ctor(this)]
+            self.emit(Op::Call(0)); // [ctor, value]
+            let k = self.str_const(&key);
+            self.emit(Op::PrivateFieldAdd(k)); // [ctor]
+            self.emit(Op::Pop);
+            return Ok(());
+        }
+        if let Some(cell) = key_cell {
+            self.emit(Op::LoadCell(cell)); // [ctor, key]
+            self.emit_static_initializer_closure(p.value.as_ref(), None)?;
+        } else {
+            let key = property_key_name(&p.key);
+            self.load_str(&key); // [ctor, key]
+            self.emit_static_initializer_closure(
+                p.value.as_ref(),
+                Some(&property_key_name(&p.key)),
+            )?;
+        }
+        // [ctor, key, fn] — home = ctor, then call with this = ctor.
+        self.emit(Op::SetHomeObject);
+        self.emit(Op::LoadCell(ctor_cell)); // [ctor, key, fn, ctor(this)]
+        self.emit(Op::Call(0)); // [ctor, key, value]
+        if key_cell.is_some() {
             if let Some(init) = &p.value {
-                self.compile_expr(init)?;
                 if Self::is_anonymous_fn_expr(init) {
                     let prefix = self.str_const("");
                     self.emit(Op::SetFunctionNameFromKey(prefix));
                 }
-            } else {
-                self.emit(Op::LoadUndefined);
-            }
-        } else {
-            let key = self.class_element_key(&p.key);
-            self.load_str(&key); // [ctor, key]
-            if let Some(init) = &p.value {
-                // NamedEvaluation uses the source-visible name ("#x").
-                self.compile_named_expr(init, &property_key_name(&p.key))?;
-            } else {
-                self.emit(Op::LoadUndefined);
             }
         }
         self.emit(Op::DefineField); // [ctor]
+        self.emit(Op::Pop);
+        Ok(())
+    }
+
+    /// Build the synthetic method closure for one STATIC field initializer:
+    /// called with `this` = the constructor, `new.target` = undefined,
+    /// [[HomeObject]] = the constructor (stamped by the caller), `arguments`
+    /// an early error. Leaves the closure on the stack.
+    fn emit_static_initializer_closure(
+        &mut self,
+        init: Option<&Expression>,
+        named: Option<&str>,
+    ) -> R {
+        let mut fc = FnCtx::new("", FuncKind::Method);
+        fc.enclosed_in_with = self
+            .fns
+            .last()
+            .map(|f| f.with_depth > 0 || f.enclosed_in_with || f.contains_eval)
+            .unwrap_or(false);
+        // Conservative: runs once per class definition.
+        fc.contains_eval = true;
+        fc.strict = true; // class bodies are always strict
+        fc.home_super = true;
+        self.fns.push(fc);
+        self.enter_scope(true);
+        let tc = self.declare("%this", false);
+        self.emit(Op::LoadThis);
+        self.emit(Op::InitCell(tc));
+        let nt = self.declare("%newtarget", false);
+        self.emit(Op::LoadUndefined);
+        self.emit(Op::InitCell(nt));
+        self.emit(Op::InitEvalVars);
+        let was = std::mem::replace(&mut self.in_field_initializer, true);
+        let compiled: R = match init {
+            Some(e) => match named {
+                Some(n) => self.compile_named_expr(e, n),
+                None => self.compile_expr(e),
+            },
+            None => {
+                self.emit(Op::LoadUndefined);
+                Ok(())
+            }
+        };
+        self.in_field_initializer = was;
+        compiled?;
+        self.emit(Op::Return);
+        self.exit_scope();
+        let fc = self.fns.pop().unwrap();
+        let proto = self.finish(fc);
+        let idx = self.konst(Const::Func(Rc::new(proto)));
+        self.emit(Op::Closure(idx));
+        Ok(())
+    }
+
+    /// `static { … }`: ClassStaticBlockDefinitionEvaluation — the body runs at
+    /// class-definition time, in element order with the static field
+    /// initializers, as a synthetic method Call with `this` = the
+    /// constructor, `new.target` = undefined, [[HomeObject]] = the
+    /// constructor, and `arguments` an early error (functions declared inside
+    /// get their own).
+    fn emit_static_block(&mut self, ctor_cell: u32, body: &[Statement]) -> R {
+        self.emit(Op::LoadCell(ctor_cell)); // [ctor]
+        let mut fc = FnCtx::new("", FuncKind::Method);
+        fc.enclosed_in_with = self
+            .fns
+            .last()
+            .map(|f| f.with_depth > 0 || f.enclosed_in_with || f.contains_eval)
+            .unwrap_or(false);
+        // Conservative: scanning the statement spans needs the source region;
+        // static blocks are rare and run once, so always install eval-vars.
+        fc.contains_eval = true;
+        fc.strict = true; // class bodies are always strict
+        fc.home_super = true; // super.x resolves via [[HomeObject]] = ctor
+        self.fns.push(fc);
+        self.enter_scope(true);
+        let tc = self.declare("%this", false);
+        self.emit(Op::LoadThis);
+        self.emit(Op::InitCell(tc));
+        let nt = self.declare("%newtarget", false);
+        self.emit(Op::LoadUndefined);
+        self.emit(Op::InitCell(nt));
+        self.emit(Op::InitEvalVars);
+        let was = std::mem::replace(&mut self.in_field_initializer, true);
+        let compiled: R = (|c: &mut Self| {
+            c.hoist_lexical(body);
+            c.hoist_vars_all(body);
+            c.hoist_funcs(body)?;
+            for st in body {
+                c.compile_stmt(st)?;
+            }
+            Ok(())
+        })(self);
+        self.in_field_initializer = was;
+        compiled?;
+        self.emit(Op::LoadUndefined);
+        self.emit(Op::Return);
+        self.exit_scope();
+        let fc = self.fns.pop().unwrap();
+        let proto = self.finish(fc);
+        let idx = self.konst(Const::Func(Rc::new(proto)));
+        self.emit(Op::Closure(idx)); // [ctor, block]
+        self.emit(Op::SetHomeObjectAt(1));
+        self.emit(Op::LoadCell(ctor_cell)); // [ctor, block, ctor(this)]
+        self.emit(Op::Call(0)); // [ctor, result]
+        self.emit(Op::Pop);
         self.emit(Op::Pop);
         Ok(())
     }
