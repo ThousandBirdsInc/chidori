@@ -37,16 +37,29 @@
 
 ## 💡 Why Chidori
 
-Agents are non-deterministic, expensive, and long-running — which makes them
-miserable to test, debug, and operate. A single bug surfaces three runs deep and
-you can't reproduce it. Every debugging cycle re-bills the same tokens. A crash
-halfway through a multi-step run loses everything, and "wait for a human to
-approve" usually means keeping a process alive for hours.
+**Agents are non-deterministic, expensive, and long-running.** That combination
+is what makes them miserable to build:
 
-Most frameworks layer orchestration *on top of* this chaos. Chidori removes the
-chaos at the source. **Every side effect an agent performs flows through one
-boundary — a recorded host call.** Because the runtime sees everything, it can
-log it, cache it, replay it, pause on it, and resume from it:
+- 🐛 A bug surfaces three runs deep — and you can't reproduce it.
+- 💸 Every debugging cycle re-bills the same tokens.
+- 💥 A crash halfway through a multi-step run loses everything.
+- ⏳ "Wait for a human to approve" means keeping a process alive for hours.
+
+Most frameworks layer orchestration *on top of* this chaos. **Chidori removes it
+at the source.**
+
+The trick is a single boundary. Every side effect an agent performs — every LLM
+call, tool call, and HTTP request — flows through the runtime as a recorded
+**host call**. Agents never touch the world directly, so the runtime sees (and
+records) *everything*:
+
+<p align="center">
+  <img src=".github/host-call-loop.svg" alt="Animation: a TypeScript agent calls host functions on the Chidori runtime; the runtime performs each side effect against the world (LLMs, HTTP, tools) and records it in the call log" width="860" />
+</p>
+
+Once the runtime sees every side effect, it can log it, cache it, replay it,
+pause on it, and resume from it. That one mechanism is what turns each of the
+four problems above into a feature:
 
 - 🔁 **Replay any run with zero LLM calls.** The call log is a deterministic
   record. Re-run the exact same code against it — for tests, for debugging, for
@@ -64,15 +77,9 @@ log it, cache it, replay it, pause on it, and resume from it:
   the agent's behavior hasn't drifted — a full integration test that costs $0
   and runs in milliseconds.
 
-You get the durability guarantees of a workflow engine *and* LLM-native
-primitives, while writing nothing but ordinary `async`/`await` TypeScript.
-
-The whole model fits in one picture — agents never touch the world directly, so
-the runtime sees (and records) everything:
-
-<p align="center">
-  <img src=".github/host-call-loop.svg" alt="Animation: a TypeScript agent calls host functions on the Chidori runtime; the runtime performs each side effect against the world (LLMs, HTTP, tools) and records it in the call log" width="860" />
-</p>
+The payoff: you get the durability guarantees of a workflow engine *and*
+LLM-native primitives, while writing nothing but ordinary `async`/`await`
+TypeScript.
 
 ### What makes it different
 
