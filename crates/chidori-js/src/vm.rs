@@ -1519,6 +1519,15 @@ impl Vm {
                 int_keys.push(i as u32);
             }
         }
+        // An array's (and a String object's) `length` is an own property
+        // surfaced by [[OwnPropertyKeys]] right after the integer indices and
+        // before the other string keys — unless it has already been reified
+        // into `props` (e.g. by freeze/seal, where the props loop emits it).
+        if matches!(b.internal, Internal::Array(_) | Internal::StringObj(_))
+            && !b.props.contains_key(&PropertyKey::str("length"))
+        {
+            str_keys.push(PropertyKey::str("length"));
+        }
         // Module Namespace exotic [[OwnPropertyKeys]]: the (pre-sorted) export
         // names come first, then the ordinary symbol keys (@@toStringTag).
         if let Internal::ModuleNamespace(ns) = &b.internal {

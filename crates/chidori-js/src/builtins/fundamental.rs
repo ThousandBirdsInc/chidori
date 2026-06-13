@@ -743,23 +743,33 @@ fn install_object(vm: &mut Vm) {
         Ok(Value::Bool(has))
     });
 
-    vm.define_method(&proto, "isPrototypeOf", 1, |_vm, this, args| {
+    vm.define_method(&proto, "isPrototypeOf", 1, |vm, this, args| {
+        // A non-object argument returns false BEFORE ToObject(this) (so a
+        // nullish receiver with a primitive arg does not throw); an object
+        // argument with a nullish receiver does throw via ToObject.
         let v = arg(args, 0);
-        let target = match &this {
-            Value::Object(o) => o.clone(),
-            _ => return Ok(Value::Bool(false)),
-        };
-        let mut cur = match &v {
-            Value::Object(o) => o.borrow().proto.clone(),
-            _ => return Ok(Value::Bool(false)),
-        };
-        while let Some(p) = cur {
-            if p.same(&target) {
-                return Ok(Value::Bool(true));
-            }
-            cur = p.borrow().proto.clone();
+        if !matches!(v, Value::Object(_)) {
+            return Ok(Value::Bool(false));
         }
-        Ok(Value::Bool(false))
+        let target = this_object(vm, &this)?;
+        let mut cur = v;
+        // Walk the chain via [[GetPrototypeOf]] so a proxy in the chain
+        // consults its trap (its own `proto` is None).
+        loop {
+            let proto = match &cur {
+                Value::Object(o) => vm.proxy_or_ordinary_get_prototype_of(&o.clone())?,
+                _ => return Ok(Value::Bool(false)),
+            };
+            match proto {
+                Value::Object(p) => {
+                    if p.same(&target) {
+                        return Ok(Value::Bool(true));
+                    }
+                    cur = Value::Object(p);
+                }
+                _ => return Ok(Value::Bool(false)),
+            }
+        }
     });
 
     vm.define_method(&proto, "propertyIsEnumerable", 1, |vm, this, args| {

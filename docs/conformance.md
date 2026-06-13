@@ -34,7 +34,7 @@ The runner prints, e.g.:
 
 ```
 Test262 (chidori pure-Rust engine, bare context)
-  pass 39352  fail 422  skip 7517  =>  98.94% of executed
+  pass 39359  fail 415  skip 7517  =>  98.96% of executed
 ```
 
 ## Current result
@@ -44,7 +44,7 @@ pinned suite commit:
 
 | | pass | fail | skip | % of executed |
 |---|---|---|---|---|
-| chidori pure-Rust engine, bare context | 39,352 | 422 | 7,517 | **98.94%** |
+| chidori pure-Rust engine, bare context | 39,359 | 415 | 7,517 | **98.96%** |
 
 The headline percentage is `pass / (pass + fail)` over *executed* tests; the
 skip count is reported alongside so the denominator is never hidden.
@@ -159,7 +159,7 @@ a single readable line in review).
 
 ## Remaining gaps
 
-The residual failures, by area (top clusters of the 422 total):
+The residual failures, by area (top clusters of the 415 total):
 
 | count | area | nature |
 |--:|---|---|
@@ -234,7 +234,12 @@ CreateGlobalFunctionBinding gives the global property the right
 writable/enumerable/configurable attributes — 445 -> 432 (98.91%). Then
 `ArrayBuffer.prototype.slice` was made species-aware (SpeciesConstructor +
 the result-buffer validations) and the constructor's `options` argument
-ignores a non-object value instead of throwing — 432 -> 422 (98.94%).)
+ignores a non-object value instead of throwing — 432 -> 422 (98.94%). Then
+`Object.prototype.isPrototypeOf` (non-object arg returns false before
+ToObject(this); the chain walk follows proxy `[[GetPrototypeOf]]`) and
+`[[OwnPropertyKeys]]` surfacing an array's / String object's `length`
+(so `getOwnPropertyNames`/`Reflect.ownKeys` include it in order) — 422 ->
+415 (98.96%).)
 
 Each failure is individually identifiable from a `--json` report, so the
 clusters can be picked off as engine work warrants. See
