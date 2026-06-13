@@ -1436,17 +1436,36 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
     let sym = vm.realm.symbol_iterator.clone();
     vm.define_value_sym(proto, sym, values);
 
-    // toString() = join(",")  (also toLocaleString)
-    vm.define_method(proto, "toString", 0, |vm, this, _a| {
-        let o = ta_this(vm, &this)?;
-        let len = vm.ta_length(&o).unwrap_or(0);
-        let mut parts = Vec::with_capacity(len);
-        for i in 0..len {
-            let v = vm.ta_get(&o, i);
-            parts.push(vm.to_string_lossy(&v));
+    // %TypedArray%.prototype.toString is the SAME function object as
+    // %Array%.prototype.toString (spec 23.2.3.32). Array installs first, so
+    // copy its function; fall back to a local join if it is somehow absent.
+    let array_to_string = vm
+        .realm
+        .array_proto
+        .borrow()
+        .props
+        .get(&PropertyKey::str("toString"))
+        .and_then(|p| p.value().cloned());
+    match array_to_string {
+        Some(f) => {
+            proto
+                .borrow_mut()
+                .props
+                .insert(PropertyKey::str("toString"), Property::builtin(f));
         }
-        Ok(Value::str(parts.join(",")))
-    });
+        None => {
+            vm.define_method(proto, "toString", 0, |vm, this, _a| {
+                let o = ta_this(vm, &this)?;
+                let len = vm.ta_length(&o).unwrap_or(0);
+                let mut parts = Vec::with_capacity(len);
+                for i in 0..len {
+                    let v = vm.ta_get(&o, i);
+                    parts.push(vm.to_string_lossy(&v));
+                }
+                Ok(Value::str(parts.join(",")))
+            });
+        }
+    }
     vm.define_method(proto, "toLocaleString", 0, |vm, this, _a| {
         let o = ta_this(vm, &this)?;
         let len = vm.ta_length(&o).unwrap_or(0);

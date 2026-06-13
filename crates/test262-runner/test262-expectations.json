@@ -7842,7 +7842,7 @@
     "test/built-ins/Object/assign/Target-Undefined.js": "pass",
     "test/built-ins/Object/assign/assign-descriptor.js": "pass",
     "test/built-ins/Object/assign/assign-length.js": "pass",
-    "test/built-ins/Object/assign/assignment-to-readonly-property-of-target-must-throw-a-typeerror-exception.js": "fail",
+    "test/built-ins/Object/assign/assignment-to-readonly-property-of-target-must-throw-a-typeerror-exception.js": "pass",
     "test/built-ins/Object/assign/invoked-as-ctor.js": "pass",
     "test/built-ins/Object/assign/name.js": "pass",
     "test/built-ins/Object/assign/not-a-constructor.js": "pass",
@@ -22172,7 +22172,7 @@
     "test/built-ins/TypedArray/prototype/toSorted/not-a-constructor.js": "pass",
     "test/built-ins/TypedArray/prototype/toSorted/property-descriptor.js": "pass",
     "test/built-ins/TypedArray/prototype/toSorted/this-value-invalid.js": "pass",
-    "test/built-ins/TypedArray/prototype/toString.js": "fail",
+    "test/built-ins/TypedArray/prototype/toString.js": "pass",
     "test/built-ins/TypedArray/prototype/toString/BigInt/detached-buffer.js": "pass",
     "test/built-ins/TypedArray/prototype/toString/detached-buffer.js": "pass",
     "test/built-ins/TypedArray/prototype/toString/not-a-constructor.js": "pass",
@@ -47293,9 +47293,9 @@
     "test/language/white-space/string-vertical-tab.js": "pass"
   },
   "summary": {
-    "fail": 415,
-    "pass": 39359,
-    "pass_pct": 98.95660481721728,
+    "fail": 413,
+    "pass": 39361,
+    "pass_pct": 98.96163322773671,
     "skip": 7517
   }
 }

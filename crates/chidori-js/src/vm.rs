@@ -1083,6 +1083,27 @@ impl Vm {
                 }
             }
         }
+        // String exotic [[Set]]: an in-range integer index names a
+        // non-writable own data property (the character), so a write fails —
+        // strict throws, sloppy is a silent no-op. (Out-of-range indices and
+        // other keys fall through to ordinary behavior.)
+        {
+            let blocked = if let Internal::StringObj(s) = &obj.borrow().internal {
+                key.array_index()
+                    .is_some_and(|i| (i as usize) < s.as_str().chars().count())
+            } else {
+                false
+            };
+            if blocked {
+                if strict {
+                    return Err(self.throw_type(&format!(
+                        "Cannot assign to read only property '{}' of a String",
+                        key_display(key)
+                    )));
+                }
+                return Ok(());
+            }
+        }
         // Walk proto chain to find a setter / writable check.
         let mut cur = obj.clone();
         loop {

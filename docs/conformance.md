@@ -34,7 +34,7 @@ The runner prints, e.g.:
 
 ```
 Test262 (chidori pure-Rust engine, bare context)
-  pass 39359  fail 415  skip 7517  =>  98.96% of executed
+  pass 39361  fail 413  skip 7517  =>  98.96% of executed
 ```
 
 ## Current result
@@ -44,7 +44,7 @@ pinned suite commit:
 
 | | pass | fail | skip | % of executed |
 |---|---|---|---|---|
-| chidori pure-Rust engine, bare context | 39,359 | 415 | 7,517 | **98.96%** |
+| chidori pure-Rust engine, bare context | 39,361 | 413 | 7,517 | **98.96%** |
 
 The headline percentage is `pass / (pass + fail)` over *executed* tests; the
 skip count is reported alongside so the denominator is never hidden.
@@ -159,7 +159,7 @@ a single readable line in review).
 
 ## Remaining gaps
 
-The residual failures, by area (top clusters of the 415 total):
+The residual failures, by area (top clusters of the 413 total):
 
 | count | area | nature |
 |--:|---|---|
@@ -239,7 +239,10 @@ ignores a non-object value instead of throwing — 432 -> 422 (98.94%). Then
 ToObject(this); the chain walk follows proxy `[[GetPrototypeOf]]`) and
 `[[OwnPropertyKeys]]` surfacing an array's / String object's `length`
 (so `getOwnPropertyNames`/`Reflect.ownKeys` include it in order) — 422 ->
-415 (98.96%).)
+415 (98.96%). A String exotic object's in-range integer index is now a
+non-writable own property for `[[Set]]` (so `Object.assign` onto a string
+throws), and `%TypedArray%.prototype.toString` is the same function object
+as `%Array%.prototype.toString` — 415 -> 413.)
 
 Each failure is individually identifiable from a `--json` report, so the
 clusters can be picked off as engine work warrants. See
