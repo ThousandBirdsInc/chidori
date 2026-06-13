@@ -44,11 +44,12 @@
 
 ## 📖 About
 
-- **Agents are TypeScript.** Native async control flow, typed inputs, imports, and editor tooling with no template DSL.
-- **Deterministic execution.** Every side effect goes through a host function the runtime can log, cache, and replay.
-- **Zero-cost checkpointing.** Save a session's call log to disk, replay it later for identical output with zero LLM calls.
+- **Agents are TypeScript.** Native async control flow, type-safe inputs, tool calls, and imports with full editor tooling — no template DSL.
+- **Durable execution.** Every side effect goes through a host function the runtime can log, cache, and replay, so a run survives crashes and restarts and resumes exactly where it left off.
+- **Deterministic checkpoint & replay.** Save a session's call log to disk and replay it later for identical output with zero LLM calls — the foundation for tests, debugging, and resume.
+- **Human-in-the-loop.** Pause an agent for approval or input, persist the checkpoint, and resume from the call log later — even in a new process.
 - **Event-driven agents.** Agents can run as HTTP servers that react to webhooks and other events.
-- **Rust core, TS and Python SDKs.** The runtime is a single binary. SDKs talk to it over HTTP without native bindings.
+- **Rust core, TypeScript and Python SDKs.** The runtime is a single binary; SDKs talk to it over HTTP with no native bindings.
 
 The whole model fits in one picture — agents never touch the world directly, so the runtime
 sees (and records) everything:
