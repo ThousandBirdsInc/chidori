@@ -743,9 +743,8 @@ impl HostBindingBackend {
         host_core::execute_http(tokio_rt, args).map_err(|err| err.to_string())
     }
 
-    /// Build the runtime backend. Shared by the QuickJS bindings and the
-    /// pure-Rust engine's effect dispatcher so both route host effects through
-    /// identical durable machinery.
+    /// Build the runtime backend that the engine's effect dispatcher routes
+    /// host effects through, into the durable host machinery.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_runtime(
         runtime_ctx: RuntimeContext,
@@ -810,9 +809,9 @@ impl HostBindingBackend {
         }
     }
 
-    /// The durable runtime policy, when this is the runtime backend. The rust
+    /// The durable runtime policy, when this is the runtime backend. The
     /// engine reads it to install the captured-effect natives (`node:` crypto /
-    /// fs / timers) under the same fs/crypto/timer gates the QuickJS path honors.
+    /// fs / timers) under the fs/crypto/timer gates the policy declares.
     pub(crate) fn runtime_policy(&self) -> Option<crate::runtime::snapshot::RuntimePolicy> {
         match self {
             HostBindingBackend::Runtime { runtime_policy, .. } => Some(runtime_policy.clone()),
@@ -820,10 +819,9 @@ impl HostBindingBackend {
         }
     }
 
-    /// Route one `chidori.<effect>(args)` call from the pure-Rust engine through
-    /// the same durable host machinery the QuickJS bindings use. The arg shapes
-    /// mirror what `chidori-js`'s `install_chidori_effects` forwards, so the two
-    /// engines produce identical call logs.
+    /// Route one `chidori.<effect>(args)` call from the engine through the
+    /// durable host machinery. The arg shapes mirror what `chidori-js`'s
+    /// `install_chidori_effects` forwards.
     pub(crate) fn dispatch(
         &self,
         effect: &str,
@@ -987,9 +985,7 @@ impl HostBindingBackend {
                         .to_string();
                     (url, first.clone())
                 } else {
-                    return Err(
-                        "http request requires a URL string or options object".to_string()
-                    );
+                    return Err("http request requires a URL string or options object".to_string());
                 };
                 let mut method = options
                     .get("method")
