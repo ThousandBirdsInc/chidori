@@ -324,8 +324,17 @@ impl Engine {
                 )
             });
         let d = dispatch.clone();
+        // The captured networking host op. There is no public `chidori.http`:
+        // the base networking surface the runtime installs — `globalThis.fetch`
+        // (+ `Headers`/`Request`/`Response`) and the `node:http`/`node:https`
+        // client shims — all route through this internal global, so every
+        // network call (including ones made deep inside a dependency) inherits
+        // the same policy enforcement, approval-pause, and record/replay. It is
+        // a global rather than a method on `chidori` so those polyfills and shims
+        // can reach it without the host object in scope.
+        let http_global = self.vm.realm.global.clone();
         self.vm
-            .define_method(&chidori, "http", 2, move |vm, _t, args| {
+            .define_method(&http_global, "__chidori_http", 2, move |vm, _t, args| {
                 let arg0 = args
                     .first()
                     .map(|v| vm.value_to_json(v))

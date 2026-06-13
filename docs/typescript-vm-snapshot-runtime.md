@@ -66,7 +66,8 @@ Chidori currently has these relevant pieces:
   forwards those helpers and now installs `RuntimeContext`/`host_core`-backed
   native `chidori.log`, `chidori.checkpoint`, `chidori.memory`, and
   `chidori.template`, plus `chidori.execJs`, `chidori.execPython`, and
-  `chidori.execWasm`. Native `chidori.http` covers policy denial and native
+  `chidori.execWasm`. The captured networking host op (reached via `fetch`/
+  `node:http`, not a public `chidori.http`) covers policy denial and native
   `chidori.input` covers pause-mode pending input. Provider-backed native
   `chidori.prompt` covers the plain-text prompt path and non-suspending prompt
   tool loops, and registry-backed native `chidori.tool`/`chidori.callAgent`
@@ -123,10 +124,12 @@ export const tool: ToolDefinition = {
 };
 
 export async function run(args: { query: string }, chidori: Chidori) {
-  return chidori.http("https://example.com/search", {
+  const res = await fetch("https://example.com/search", {
     method: "POST",
-    body: args,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(args),
   });
+  return res.json();
 }
 ```
 
@@ -299,8 +302,8 @@ The native callback bridge is available at the TypeScript snapshot wrapper
 layer, and `chidori.log`, `chidori.checkpoint`, `chidori.memory`,
 `chidori.template`, `chidori.execJs`, `chidori.execPython`, and
 `chidori.execWasm` record through `RuntimeContext` and the shared host core.
-`chidori.http` policy denial and `chidori.input` pause setup are covered on the
-native snapshot-host path.
+Captured-networking (`fetch`/`node:http`) policy denial and `chidori.input`
+pause setup are covered on the native snapshot-host path.
 Plain-text `chidori.prompt` and non-suspending prompt tool loops are covered
 through the provider-backed host core; non-suspending `chidori.tool` and
 `chidori.callAgent` are covered through the registry-backed native path. Nested
@@ -759,8 +762,8 @@ No automatic migration converter is required.
 - [x] Install `RuntimeContext`/`host_core`-backed native `chidori.execJs`,
       `chidori.execPython`, and `chidori.execWasm` on the TypeScript snapshot
       context.
-- [x] Install native `chidori.http` policy denial and `chidori.input` pause
-      paths on the TypeScript snapshot context.
+- [x] Install captured-networking (`fetch`/`node:http`) policy denial and
+      `chidori.input` pause paths on the TypeScript snapshot context.
 - [x] Install provider-backed native plain-text `chidori.prompt` on the
       TypeScript snapshot context.
 - [x] Execute provider-requested `chidori.prompt` tool loops through the native

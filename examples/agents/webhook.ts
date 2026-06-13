@@ -1,12 +1,14 @@
-import type { Chidori } from "chidori";
-
-export async function agent(input: { url: string; payload?: { [key: string]: unknown } }, chidori: Chidori) {
-  const response = await chidori.http(input.url, {
+export async function agent(input: { url: string; payload?: { [key: string]: unknown } }, _chidori: unknown) {
+  // `fetch` is the runtime's captured networking surface: this POST is
+  // policy-gated, pausable for approval, and recorded for deterministic replay,
+  // exactly like any network call a dependency would make under the hood.
+  const response = await fetch(input.url, {
     method: "POST",
-    body: input.payload ?? { source: "chidori" },
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input.payload ?? { source: "chidori" }),
   });
   return {
     status: response.status,
-    body: response.body,
+    body: await response.json(),
   };
 }

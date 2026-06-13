@@ -521,6 +521,171 @@ pub(crate) const WEB_CRYPTO_POLYFILL: &str = r#"
 })();
 "#;
 
+/// The WHATWG `fetch` surface — `fetch` plus the `Headers`/`Request`/`Response`
+/// classes — implemented on top of the captured networking host op
+/// (`globalThis.__chidori_http`). This is the runtime's *replacement* for the
+/// base networking APIs Node/the platform would otherwise provide: there is no
+/// public `chidori.http`. Because real packages reach the network through
+/// `fetch` (and `node:http`/`node:https`, whose shims route through the same
+/// host op), installing the capture here means every dependent library
+/// automatically inherits the security policy (allow / ask / deny), the
+/// approval-pause path, and deterministic record/replay — without any per-call
+/// opt-in.
+///
+/// `__chidori_http` is synchronous (the host dispatch returns the response
+/// object inline). `fetch` performs that call *outside* any `try`/`catch` so an
+/// AskBefore policy's pause sentinel keeps unwinding to the engine exactly as it
+/// does for the `node:http` shim; the result is then wrapped in a resolved
+/// `Promise<Response>`. Installed after `install_chidori_effects` (which defines
+/// `__chidori_http`), so it is absent from the side-effect-free tool-metadata
+/// prelude where `globalThis.fetch` is explicitly nulled.
+pub(crate) const FETCH_POLYFILL: &str = r#"
+(function () {
+    if (typeof globalThis.fetch === "function" && globalThis.fetch.__chidori) return;
+
+    // Case-insensitive header bag — the WHATWG Headers subset packages touch.
+    class Headers {
+        constructor(init) {
+            this._map = {};
+            if (init instanceof Headers) {
+                init.forEach((v, k) => this.append(k, v));
+            } else if (Array.isArray(init)) {
+                for (const pair of init) this.append(pair[0], pair[1]);
+            } else if (init && typeof init === "object") {
+                for (const k of Object.keys(init)) this.append(k, init[k]);
+            }
+        }
+        append(name, value) {
+            const key = String(name).toLowerCase();
+            const v = String(value);
+            this._map[key] = this._map[key] === undefined ? v : this._map[key] + ", " + v;
+        }
+        set(name, value) { this._map[String(name).toLowerCase()] = String(value); }
+        get(name) {
+            const v = this._map[String(name).toLowerCase()];
+            return v === undefined ? null : v;
+        }
+        has(name) { return Object.prototype.hasOwnProperty.call(this._map, String(name).toLowerCase()); }
+        delete(name) { delete this._map[String(name).toLowerCase()]; }
+        forEach(cb, thisArg) {
+            for (const k of Object.keys(this._map)) cb.call(thisArg, this._map[k], k, this);
+        }
+        keys() { return Object.keys(this._map)[Symbol.iterator](); }
+        values() { return Object.keys(this._map).map((k) => this._map[k])[Symbol.iterator](); }
+        entries() { return Object.keys(this._map).map((k) => [k, this._map[k]])[Symbol.iterator](); }
+        [Symbol.iterator]() { return this.entries(); }
+    }
+
+    // Normalize a request body to what the captured host op accepts: a string on
+    // the wire (objects JSON-encoded, matching the node:http shim), or undefined.
+    function normalizeBody(body) {
+        if (body === undefined || body === null) return undefined;
+        if (typeof body === "string") return body;
+        if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) {
+            return body.toString();
+        }
+        if (body instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(body));
+        if (ArrayBuffer.isView(body)) {
+            return new TextDecoder().decode(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
+        }
+        return JSON.stringify(body);
+    }
+
+    // The host returns a parsed JSON value when the body is JSON, else a string.
+    // Recover text for `.text()`/`.arrayBuffer()` symmetrically with the shim.
+    function bodyToText(raw) {
+        if (raw === undefined || raw === null) return "";
+        return typeof raw === "string" ? raw : JSON.stringify(raw);
+    }
+
+    class Response {
+        constructor(body, init) {
+            init = init || {};
+            this._raw = body;
+            this.status = init.status === undefined ? 200 : init.status;
+            this.statusText = init.statusText || "";
+            this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers || {});
+            this.ok = this.status >= 200 && this.status < 300;
+            this.url = init.url || "";
+            this.redirected = false;
+            this.bodyUsed = false;
+            this.type = "basic";
+        }
+        async text() { this.bodyUsed = true; return bodyToText(this._raw); }
+        async json() {
+            this.bodyUsed = true;
+            if (this._raw && typeof this._raw === "object") return this._raw;
+            const t = bodyToText(this._raw);
+            return t === "" ? null : JSON.parse(t);
+        }
+        async arrayBuffer() {
+            this.bodyUsed = true;
+            return new TextEncoder().encode(bodyToText(this._raw)).buffer;
+        }
+        clone() {
+            return new Response(this._raw, {
+                status: this.status, statusText: this.statusText,
+                headers: this.headers, url: this.url,
+            });
+        }
+    }
+
+    class Request {
+        constructor(input, init) {
+            init = init || {};
+            this.url = typeof input === "string" ? input : (input && input.url) || String(input);
+            const inheritedMethod = (input && input.method) || "GET";
+            this.method = String(init.method || inheritedMethod).toUpperCase();
+            this.headers = new Headers(init.headers || (input && input.headers) || {});
+            this.body = init.body !== undefined ? init.body : (input && input.body);
+        }
+    }
+
+    function fetch(input, init) {
+        init = init || {};
+        let url, method, headers, body;
+        if (input instanceof Request) {
+            url = input.url;
+            method = String(init.method || input.method || "GET").toUpperCase();
+            headers = new Headers(input.headers);
+            if (init.headers) new Headers(init.headers).forEach((v, k) => headers.set(k, v));
+            body = init.body !== undefined ? init.body : input.body;
+        } else {
+            url = typeof input === "string" ? input : (input && input.href) || String(input);
+            method = String(init.method || "GET").toUpperCase();
+            headers = new Headers(init.headers || {});
+            body = init.body;
+        }
+        const headerObj = {};
+        headers.forEach((v, k) => { headerObj[k] = v; });
+        const options = { method: method, headers: headerObj };
+        const normalized = normalizeBody(body);
+        if (normalized !== undefined) options.body = normalized;
+
+        // Synchronous, policy-gated, captured host call. Deliberately not wrapped
+        // in try/catch: an AskBefore policy throws the pause sentinel here and it
+        // must keep unwinding to the engine (same contract as the node:http shim).
+        const res = globalThis.__chidori_http(url, options);
+        // fetch only rejects on transport failure (status 0 + error), never on a
+        // non-2xx HTTP status — that surfaces via `response.ok`/`response.status`.
+        if (res && res.status === 0 && res.error) {
+            return Promise.reject(new TypeError("fetch failed: " + res.error));
+        }
+        return Promise.resolve(new Response(res ? res.body : null, {
+            status: res ? res.status : 0,
+            headers: res ? res.headers : {},
+            url: url,
+        }));
+    }
+    fetch.__chidori = true;
+
+    globalThis.fetch = fetch;
+    globalThis.Headers = Headers;
+    globalThis.Request = Request;
+    globalThis.Response = Response;
+})();
+"#;
+
 pub(crate) const URL_SEARCH_PARAMS_POLYFILL: &str = r#"
 globalThis.URLSearchParams = class URLSearchParams {
     constructor(init) {

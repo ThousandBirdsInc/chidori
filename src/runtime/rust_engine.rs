@@ -368,6 +368,15 @@ fn run_module(
     engine
         .eval(crate::runtime::typescript::helpers::CHIDORI_JS_HELPERS_SCRIPT)
         .map_err(|e| anyhow::anyhow!("installing chidori JS SDK helpers: {e}"))?;
+    // Install the base networking surface (`globalThis.fetch` + Headers/Request/
+    // Response) over the captured `__chidori_http` host op that
+    // `install_chidori_effects` just defined. This replaces the platform's
+    // networking APIs, so every network call — including ones made inside a
+    // dependency — is policy-gated, pausable, and recorded. The `node:http`/
+    // `node:https` client shims route through the same host op.
+    engine
+        .eval(crate::runtime::typescript::helpers::FETCH_POLYFILL)
+        .map_err(|e| anyhow::anyhow!("installing fetch polyfill: {e}"))?;
     let slot = engine.install_entrypoint();
 
     let entry_key = path.to_string_lossy().to_string();
@@ -1677,6 +1686,85 @@ mod tests {
         assert_eq!(out["countAfter"], serde_json::json!(0));
         assert_eq!(out["names"], serde_json::json!(["other"]));
         assert_eq!(out["readyArgs"], serde_json::json!(["go"]));
+    }
+
+    #[test]
+    fn run_agent_fetch_routes_through_captured_http() {
+        use std::io::{Read, Write};
+
+        // A one-shot local HTTP server so the request goes through the real
+        // captured networking host op (`__chidori_http`) end to end.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).unwrap();
+            let body = r#"{"ok":true,"n":7}"#;
+            let response = format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+
+        let source = format!(
+            r#"
+            export async function agent() {{
+                const res = await fetch("http://{addr}/data", {{
+                    method: "POST",
+                    headers: {{ "x-test": "1" }},
+                    body: JSON.stringify({{ hello: "world" }}),
+                }});
+                const json = await res.json();
+                return {{
+                    status: res.status,
+                    ok: res.ok,
+                    contentType: res.headers.get("content-type"),
+                    n: json.n,
+                    isResponse: res instanceof Response,
+                    hasFetch: typeof fetch === "function",
+                }};
+            }}
+            "#
+        );
+        let out = run_compute_agent("fetch-capture", &source);
+        server.join().unwrap();
+        assert_eq!(out["status"], serde_json::json!(201));
+        assert_eq!(out["ok"], serde_json::json!(true));
+        assert_eq!(out["contentType"], serde_json::json!("application/json"));
+        assert_eq!(out["n"], serde_json::json!(7));
+        assert_eq!(out["isResponse"], serde_json::json!(true));
+        assert_eq!(out["hasFetch"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn run_agent_node_http_and_fetch_share_captured_http_op() {
+        // `node:http` and `fetch` must use the SAME capture point, so a library
+        // reaching for either inherits identical policy + record/replay. Here we
+        // only assert the surfaces coexist and route through `__chidori_http`
+        // (no public `chidori.http`): the actual transport is covered above.
+        let out = run_compute_agent(
+            "fetch-no-public-http",
+            r#"
+            import http from "node:http";
+            export async function agent(input, chidori) {
+                return {
+                    fetchInstalled: typeof fetch === "function",
+                    headersInstalled: typeof Headers === "function",
+                    nodeHttpRequest: typeof http.request === "function",
+                    chidoriHttpRemoved: typeof (chidori && chidori.http),
+                    captureNative: typeof globalThis.__chidori_http,
+                };
+            }
+            "#,
+        );
+        assert_eq!(out["fetchInstalled"], serde_json::json!(true));
+        assert_eq!(out["headersInstalled"], serde_json::json!(true));
+        assert_eq!(out["nodeHttpRequest"], serde_json::json!(true));
+        assert_eq!(out["chidoriHttpRemoved"], serde_json::json!("undefined"));
+        assert_eq!(out["captureNative"], serde_json::json!("function"));
     }
 
     #[test]

@@ -21,7 +21,6 @@ API reference.
 | `chidori.signal(name, options)` | Multiplayer — pause at a named listen point until an outside party (human or agent) delivers `{ name, payload, from }`; drains a durable mailbox if one is queued; `timeoutMs` resolves to a `{ timedOut: true }` sentinel after the deadline |
 | `chidori.pollSignal(name)` | Non-blocking signal check — consume a queued signal of this name or resolve to `null` |
 | `chidori.signalAny(names, options)` | Fan-in — pause until ANY of the named signals is delivered; the result's `name` says which fired |
-| `chidori.http(url, options)` | Make an HTTP request |
 | `chidori.memory(action, ...)` | Persistent storage (key-value + vector) |
 | `chidori.log(msg, data)` | Structured logging |
 | `chidori.checkpoint(label, meta)` | Record an explicit call-log marker for trace/replay |
@@ -29,8 +28,27 @@ API reference.
 | `chidori.retry(fn, options)` | Retry with backoff |
 | `chidori.tryCall(fn)` | Capture errors without raising |
 
-See also [`docs/signals.md`](./signals.md) for the multiplayer signal model and
-[`docs/value-checkpoints.md`](./value-checkpoints.md) for `chidori.step`.
+There is no `chidori.http`. Networking is done with the **standard web/Node
+APIs** — `fetch` (plus `Headers`/`Request`/`Response`) and the
+`node:http`/`node:https` client modules — which the runtime replaces with
+captured versions backed by a single policy-gated host op. Because the capture
+lives at the base networking layer, every request inherits the same security
+policy (allow / ask / deny), approval-pause, and deterministic record/replay —
+including requests made deep inside a dependency:
+
+```ts
+const res = await fetch("https://example.com/search", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ q: "chidori" }),
+});
+const data = await res.json();
+```
+
+See also [`docs/signals.md`](./signals.md) for the multiplayer signal model,
+[`docs/value-checkpoints.md`](./value-checkpoints.md) for `chidori.step`, and
+[`docs/captured-effects-vfs-crypto-timers.md`](./captured-effects-vfs-crypto-timers.md)
+for the captured networking/filesystem/crypto/timer model.
 
 ## Streaming prompt progress
 

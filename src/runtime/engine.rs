@@ -1141,7 +1141,7 @@ mod tests {
             &path,
             r#"
                 export async function agent(input, chidori) {
-                    await chidori.http("https://example.invalid");
+                    await fetch("https://example.invalid");
                     return { ok: true };
                 }
             "#,
@@ -1247,7 +1247,7 @@ mod tests {
             &path,
             r#"
                 export async function agent(input, chidori) {
-                    await chidori.http("not a url");
+                    await fetch("not a url");
                     return { ok: true };
                 }
             "#,

@@ -261,20 +261,6 @@ export interface TryCallResult<T> {
   error?: string;
 }
 
-export interface HttpRequestOptions {
-  method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD";
-  headers?: Record<string, string>;
-  query?: Record<string, string | number | boolean>;
-  body?: AgentJson | string;
-  timeoutMs?: number;
-}
-
-export interface HttpResponse {
-  status: number;
-  headers: Record<string, string>;
-  body: AgentJson | string | null;
-}
-
 export interface TemplateOptions {
   source?: "file" | "inline";
 }
@@ -396,7 +382,6 @@ export interface Chidori {
   ): Promise<{ [Index in keyof TTasks]: Awaited<ReturnType<TTasks[Index]>> }>;
   retry<T>(fn: () => Promise<T>, options?: RetryOptions): Promise<T>;
   tryCall<T>(fn: () => Promise<T>): Promise<TryCallResult<T>>;
-  http(url: string, options?: HttpRequestOptions): Promise<HttpResponse>;
   template(pathOrText: string, vars?: JsonObject, options?: TemplateOptions): Promise<string>;
   log(message: string, fields?: JsonObject): Promise<void>;
   memory<T extends AgentJson = AgentJson>(

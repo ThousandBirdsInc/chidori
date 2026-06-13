@@ -861,7 +861,7 @@ mod tests {
     fn transpile_strips_multiline_as_type_assertion_and_catch_annotation() {
         let source = r#"
             export async function run(args, chidori) {
-                const response = await chidori.http("https://example.test");
+                const response = await fetch("https://example.test");
                 let content: string;
                 const data = response.body as {
                     web?: {
@@ -902,7 +902,7 @@ mod tests {
     fn transpile_preserves_colons_inside_initializers() {
         let source = r#"
             export async function run(args, chidori) {
-                const response = await chidori.http("https://api.search.brave.com/res/v1/web/search", {
+                const response = await fetch("https://api.search.brave.com/res/v1/web/search", {
                     method: "GET",
                 });
                 const message = args.ok ? "ok" : String(args.error);
@@ -919,7 +919,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(js.contains(r#"chidori.http("https://api.search.brave.com/res/v1/web/search", {"#));
+        assert!(js.contains(r#"fetch("https://api.search.brave.com/res/v1/web/search", {"#));
         assert!(js.contains(r#"const message = args.ok ? "ok" : String(args.error);"#));
     }
 

@@ -241,20 +241,25 @@ chidori branch-rerun <run-id> <branch-id>                   # re-run edited sour
 A resumed or re-run branch updates only its own store; the parent's recorded
 `branch` outcome is immutable history. See `docs/branching-execution.md`.
 
-### http
+### http (fetch / node:http)
+
+There is no `chidori.http`. Use the standard `fetch` API (or the
+`node:http`/`node:https` client modules); the runtime replaces them with
+captured versions backed by one policy-gated host op:
 
 ```ts
-const response = await chidori.http("https://example.com/webhook", {
+const response = await fetch("https://example.com/webhook", {
   method: "POST",
   headers: { "content-type": "application/json" },
-  query: { source: "chidori" },
-  body: { ok: true },
-  timeoutMs: 10_000,
+  body: JSON.stringify({ ok: true }),
 });
+const data = await response.json();
 ```
 
-HTTP calls are policy-checked, logged, and replayed from the call log when
-available.
+Because the capture lives at the base networking layer, every request — even
+one made inside a dependency — is policy-checked, logged, and replayed from the
+call log when available. `fetch` returns a standard `Response`
+(`status`/`ok`/`headers`/`json()`/`text()`).
 
 ### template
 
@@ -313,7 +318,7 @@ Use structured logs for progress and debugging. Logs are call-log records.
 
 ```ts
 const value = await chidori.retry(
-  () => chidori.http("https://example.com"),
+  () => fetch("https://example.com").then((r) => r.json()),
   { attempts: 3, delayMs: 250, backoff: "exponential" },
 );
 
@@ -391,8 +396,9 @@ chidori serve examples/agents/webhook.ts --port 8080 --trusted
 ```
 
 `chidori serve` is deny-by-default: without `--trusted` or explicit
-`CHIDORI_POLICY*` configuration, gated effects (`chidori.http`, workspace
-mutations) are refused under the built-in `untrusted` profile (read-only
+`CHIDORI_POLICY*` configuration, gated effects (network requests via
+`fetch`/`node:http`, workspace mutations) are refused under the built-in
+`untrusted` profile (read-only
 workspace introspection stays allowed). `--untrusted` forces that profile over
 any env configuration; `chidori run` keeps the permissive default.
 

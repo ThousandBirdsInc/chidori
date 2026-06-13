@@ -1273,8 +1273,8 @@ fn execute_http_with_secrets(
             // callers that pre-serialize with `JSON.stringify` aren't double-
             // encoded, and they keep control of `Content-Type` via headers).
             // Any other JSON value is sent as a JSON body with reqwest setting
-            // `Content-Type: application/json` — the original `chidori.http`
-            // object-body convenience.
+            // `Content-Type: application/json` — the object-body convenience the
+            // `node:http` shim relies on when a caller passes a non-string body.
             match body {
                 Value::String(text) => {
                     req = req.body(text);

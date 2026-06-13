@@ -66,7 +66,7 @@ completion audit lives in
       The whole-agent replay-prefix model (Phase 3) is future work.
 - [x] `chidori.retry()`
 - [x] `chidori.tryCall()`
-- [x] `chidori.http()`
+- [x] Captured networking via `fetch`/`node:http` (replaces `chidori.http`)
 - [x] `chidori.template()`
 - [x] `chidori.log()`
 - [x] `chidori.memory()`
@@ -184,8 +184,9 @@ completion audit lives in
 - [x] Install `RuntimeContext`/`host_core`-backed native `chidori.execJs`,
   `chidori.execPython`, and `chidori.execWasm` methods on
   `TypeScriptSnapshotContext`.
-- [x] Install `RuntimeContext`/`host_core`-backed native `chidori.http` policy
-  denial and `chidori.input` pause paths on `TypeScriptSnapshotContext`.
+- [x] Install `RuntimeContext`/`host_core`-backed captured-networking
+  (`fetch`/`node:http`) policy denial and `chidori.input` pause paths on
+  `TypeScriptSnapshotContext`.
 - [x] Install `RuntimeContext`/provider-backed native plain-text
   `chidori.prompt` on `TypeScriptSnapshotContext`.
 - [x] Run provider-requested `chidori.prompt` tool loops through the native
