@@ -12,6 +12,7 @@ API reference.
 |---|---|
 | `chidori.prompt(text, { type, ... })` | Send to an LLM, return string or parsed JSON; streamed prompt events carry the optional type |
 | `chidori.context()` | Immutable multi-turn prompt builder with prefix sharing and provider prompt caching |
+| `chidori.conversation(options)` | Stateful chat-assistant wrapper over `context()` — `say(message)` per turn, or `loop()` for an interactive `input()` dialogue |
 | `chidori.template(strOrPath, vars)` | Render a Jinja2 template with minijinja |
 | `chidori.tool(name, args)` | Invoke a registered tool |
 | `chidori.callAgent(path, input)` | Call a sub-agent |
@@ -96,3 +97,36 @@ a fresh cache breakpoint. And setting `CHIDORI_PROMPT_CACHE_DIR=<dir>` opts
 into a local content-addressed response cache: an exact repeat of a prompt,
 even across runs, is served locally without calling the provider and still
 recorded as a normal call-log entry.
+
+## Conversational agents
+
+A chat assistant is the most common agent shape, so `chidori.conversation()`
+wraps `context()` for it directly. It owns the running dialogue — the system
+prompt is frozen once as the cacheable prefix, and each `say(message)` appends
+the user turn, makes one durable `prompt` host call, and threads the assistant
+turn back in — so you don't re-plumb `ctx = (await ctx.user(m).prompt()).context`
+by hand:
+
+```ts
+const chat = chidori.conversation({
+  system: "You are a concise, friendly assistant.",
+  compact: { budgetTokens: 8000 }, // opt-in window management, per turn
+});
+
+const a = await chat.say("Hi, who are you?");
+const b = await chat.say("What can you help with?");
+```
+
+Every turn is still one recorded host call, so the whole conversation replays
+for $0 and each turn after the first reads the shared prefix at the cached rate.
+For an interactive dialogue, `chat.loop()` reads each human message via
+`chidori.input()` — terminal stdin under `chidori run`, a paused session resume
+under `chidori serve` — and replies until the user exits:
+
+```ts
+const transcript = await chat.loop({ prompt: "you>" }); // type "exit" to end
+```
+
+Drop to `chat.context` whenever you need the lower-level API (manual `compact`,
+`digest`, forking), and use `chat.respond(message)` for author-driven tool
+loops. See [`examples/agents/conversation.ts`](../examples/agents/conversation.ts).

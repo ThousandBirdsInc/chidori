@@ -1232,6 +1232,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    const CONVERSATION_AGENT_SRC: &str = r#"
+        export async function agent(input: { messages: string[] }) {
+            const chat = chidori.conversation({
+                system: "You are a terse test assistant.",
+                model: "test-model",
+            });
+            const replies: string[] = [];
+            for (const message of input.messages) {
+                replies.push(await chat.say(message));
+            }
+            return {
+                replies,
+                length: chat.length,
+                history: chat.history(),
+                turnCount: chat.history().length,
+            };
+        }
+    "#;
+
+    #[test]
+    fn conversation_helper_threads_turns_and_replays() {
+        let _env = PROMPT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-rust-conversation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(&path, CONVERSATION_AGENT_SRC).unwrap();
+        let input = serde_json::json!({ "messages": ["hi", "again"] });
+
+        // Record a live run: each say() is one durable prompt host call, and the
+        // assistant turn threads back into the context for the next message.
+        let live_ctx = RuntimeContext::new();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut providers = crate::providers::ProviderRegistry::new();
+        providers.register(Box::new(SequenceProvider {
+            responses: vec!["reply one".to_string(), "reply two".to_string()],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            requests: Arc::clone(&requests),
+        }));
+        let live_backend = context_test_backend(live_ctx.clone(), providers);
+        let live_output =
+            run_agent(&path, CONVERSATION_AGENT_SRC, &input, &live_backend).unwrap();
+
+        assert_eq!(
+            live_output["replies"],
+            serde_json::json!(["reply one", "reply two"])
+        );
+        assert_eq!(live_output["length"], serde_json::json!(2));
+        assert_eq!(live_output["turnCount"], serde_json::json!(4));
+
+        // Turn 2 extends turn 1's prefix: [user hi] then [user hi, assistant,
+        // user again]. The shared head is what the provider cache keys on.
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].messages.len(), 1);
+            assert_eq!(requests[1].messages.len(), 3);
+            for request in requests.iter() {
+                assert!(request
+                    .system
+                    .as_deref()
+                    .unwrap()
+                    .contains("terse test assistant"));
+                assert!(request.cache.system.is_some(), "system head must be marked");
+            }
+        }
+
+        // Replay against an EMPTY provider registry: any live LLM call would
+        // fail, so identical output proves the dialogue came from the call log.
+        let records = live_ctx.call_log().into_records();
+        let replay_ctx = RuntimeContext::with_replay(records);
+        let replay_backend =
+            context_test_backend(replay_ctx, crate::providers::ProviderRegistry::new());
+        let replay_output =
+            run_agent(&path, CONVERSATION_AGENT_SRC, &input, &replay_backend).unwrap();
+        assert_eq!(live_output, replay_output);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     const COMPACT_AGENT_SRC: &str = r#"
         export async function agent(input: { questions: string[] }) {
             let ctx = chidori.context()
