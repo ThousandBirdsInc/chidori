@@ -33,12 +33,15 @@ impl Vm {
                 let b = o.borrow();
                 (b.is_callable(), matches!(b.internal, Internal::Proxy(_)))
             };
-            if callable {
+            // A callable Proxy ([[Call]] forwards to the apply trap / target);
+            // checked before the ordinary function path, since a proxy now
+            // reports `is_callable` via its captured flag.
+            if is_proxy {
+                if callable {
+                    return self.proxy_call(&o, this, args);
+                }
+            } else if callable {
                 return self.call_object(&o, this, args, Value::Undefined);
-            }
-            // A callable Proxy ([[Call]] forwards to the apply trap / target).
-            if is_proxy && self.is_callable(&func) {
-                return self.proxy_call(&o, this, args);
             }
         }
         let desc = self.describe(&func);
@@ -334,14 +337,16 @@ impl Vm {
         new_target: &Value,
     ) -> Result<Value, Value> {
         let cobj = match ctor {
-            Value::Object(o) if o.borrow().is_callable() => o.clone(),
-            // A constructable Proxy ([[Construct]] forwards to the construct trap).
+            // A constructable Proxy ([[Construct]] forwards to the construct
+            // trap) — checked first, since a callable proxy now reports
+            // `is_callable` and must not fall into the ordinary path.
             Value::Object(o) if matches!(o.borrow().internal, Internal::Proxy(_)) => {
                 if !self.is_constructor(ctor) {
                     return Err(self.throw_type("not a constructor"));
                 }
                 return self.proxy_construct(&o.clone(), args, new_target.clone());
             }
+            Value::Object(o) if o.borrow().is_callable() => o.clone(),
             _ => return Err(self.throw_type("not a constructor")),
         };
         self.call_depth += 1;
@@ -2993,17 +2998,24 @@ impl Vm {
             Value::Object(o) => o,
             _ => return Err(self.throw_type("prototype is not an object")),
         };
+        // OrdinaryHasInstance walks the chain via [[GetPrototypeOf]], which a
+        // proxy in the chain routes through its trap (its own `proto` is None).
         let mut cur = match obj {
-            Value::Object(o) => o.borrow().proto.clone(),
+            Value::Object(o) => o.clone(),
             _ => return Ok(false),
         };
-        while let Some(p) = cur {
-            if p.same(&target_proto) {
-                return Ok(true);
+        loop {
+            let proto = self.proxy_or_ordinary_get_prototype_of(&cur)?;
+            match proto {
+                Value::Object(p) => {
+                    if p.same(&target_proto) {
+                        return Ok(true);
+                    }
+                    cur = p;
+                }
+                _ => return Ok(false),
             }
-            cur = p.borrow().proto.clone();
         }
-        Ok(false)
     }
 }
 

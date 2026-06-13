@@ -1016,7 +1016,11 @@ fn install_object(vm: &mut Vm) {
     vm.define_method(&ctor, "preventExtensions", 1, |vm, _t, args| {
         if let Value::Object(o) = arg(args, 0) {
             if vm.is_proxy(&o) {
-                vm.proxy_prevent_extensions(&o)?;
+                // Object.preventExtensions throws if [[PreventExtensions]]
+                // reports failure (e.g. a trap returning false).
+                if !vm.proxy_prevent_extensions(&o)? {
+                    return Err(vm.throw_type("Object.preventExtensions failed"));
+                }
                 return Ok(Value::Object(o));
             }
             o.borrow_mut().extensible = false;

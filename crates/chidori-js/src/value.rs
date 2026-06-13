@@ -444,7 +444,12 @@ impl ObjectData {
         true
     }
     pub fn is_callable(&self) -> bool {
-        matches!(self.internal, Internal::Function(_))
+        match &self.internal {
+            Internal::Function(_) => true,
+            // A proxy is callable iff it captured `[[Call]]` at creation.
+            Internal::Proxy(p) => p.callable,
+            _ => false,
+        }
     }
     pub fn is_array(&self) -> bool {
         matches!(self.internal, Internal::Array(_))
@@ -537,6 +542,10 @@ pub struct ProxyData {
     pub target: JsObject,
     pub handler: JsObject,
     pub revoked: bool,
+    /// Whether the proxy exposes `[[Call]]` — fixed at creation from the
+    /// target's callability (spec ProxyCreate). It survives revocation, so
+    /// `IsCallable`/`typeof` of a revoked function proxy stays `"function"`.
+    pub callable: bool,
 }
 
 /// Element type of a typed array.

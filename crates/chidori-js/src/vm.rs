@@ -777,22 +777,10 @@ impl Vm {
     // ---------------------------------------------------------------------
 
     pub fn is_callable(&self, v: &Value) -> bool {
-        let o = match v {
-            Value::Object(o) => o,
-            _ => return false,
-        };
-        // A Proxy is callable iff its (non-revoked) target is callable.
-        let target = {
-            let b = o.borrow();
-            if b.is_callable() {
-                return true;
-            }
-            match &b.internal {
-                Internal::Proxy(p) if !p.revoked => p.target.clone(),
-                _ => return false,
-            }
-        };
-        self.is_callable(&Value::Object(target))
+        // A proxy carries its callability flag (captured at creation), so
+        // `ObjectData::is_callable` already answers correctly for proxies,
+        // including revoked function proxies.
+        matches!(v, Value::Object(o) if o.borrow().is_callable())
     }
 
     /// IsConstructor: the value is a function with a `[[Construct]]` — a native
@@ -1088,8 +1076,15 @@ impl Vm {
         let mut cur = obj.clone();
         loop {
             // Proxy exotic [[Set]]: dispatch the trap (base or inherited proxy).
+            // A strict assignment throws when [[Set]] reports failure (PutValue).
             if matches!(cur.borrow().internal, Internal::Proxy(_)) {
-                self.proxy_set(&cur, key, value, base.clone())?;
+                let ok = self.proxy_set(&cur, key, value, base.clone())?;
+                if !ok && strict {
+                    return Err(self.throw_type(&format!(
+                        "Cannot assign to read only property '{}'",
+                        key_display(key)
+                    )));
+                }
                 return Ok(());
             }
             // Module Namespace exotic [[Set]]: always returns false (a strict
