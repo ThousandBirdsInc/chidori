@@ -336,6 +336,17 @@ impl Vm {
         vm
     }
 
+    /// Compile and run `src` as a top-level SCRIPT in this realm (the host
+    /// `$262.evalScript` hook): global `var`/function declarations create
+    /// global-object bindings. A compile error becomes a thrown SyntaxError;
+    /// the completion value is returned.
+    pub fn eval_script(&mut self, src: &str) -> Result<Value, Value> {
+        let proto = crate::compiler::compile_script(src)
+            .map_err(|e| self.throw_syntax(e.trim_start_matches("SyntaxError: ")))?;
+        let func = self.make_closure(std::rc::Rc::new(proto), Vec::new());
+        self.call(Value::Object(func), Value::Undefined, &[])
+    }
+
     pub fn alloc_symbol(&mut self, description: Option<&str>) -> JsSymbol {
         let id = self.symbol_counter;
         self.symbol_counter += 1;

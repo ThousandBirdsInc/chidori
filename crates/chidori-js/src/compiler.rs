@@ -316,6 +316,7 @@ pub fn compile_direct_eval(src: &str, desc: &EvalScopeDesc) -> Result<CompiledEv
     }
     let compile_body = |c: &mut Compiler| -> Result<(), String> {
         c.hoist_lexical(stmts);
+        c.predeclare_global_funcs(stmts);
         c.hoist_vars_all(stmts);
         c.hoist_funcs(stmts)?;
         for stmt in stmts {
@@ -1291,6 +1292,7 @@ impl Compiler {
         self.emit(Op::LoadUndefined);
         self.emit(Op::InitCell(nt_cell));
         self.hoist_lexical(&program.body);
+        self.predeclare_global_funcs(&program.body);
         self.hoist_vars_all(&program.body);
         self.hoist_funcs(&program.body)?;
         for stmt in &program.body {
@@ -1698,6 +1700,31 @@ impl Compiler {
 
     /// Declare + emit closures for function declarations directly in `stmts`
     /// (hoisted to the top of the current scope).
+    /// Emit the CanDeclareGlobalFunction checks for every top-level function
+    /// name (declaration order, deduped), to run BEFORE any global var/
+    /// function binding is created — so a non-definable name (e.g.
+    /// `function NaN(){}`, or a name shadowing a writable non-enumerable
+    /// non-configurable property) aborts GlobalDeclarationInstantiation
+    /// before it leaks a `var` binding. No-op outside the global scope.
+    fn predeclare_global_funcs(&mut self, stmts: &[Statement]) {
+        if !self.in_global_scope() || self.cur_ref().eval_sloppy {
+            return;
+        }
+        let mut seen: Vec<String> = Vec::new();
+        for s in stmts {
+            if let Statement::FunctionDeclaration(f) = s {
+                if let Some(id) = &f.id {
+                    let name = id.name.as_str().to_string();
+                    if !seen.contains(&name) {
+                        seen.push(name.clone());
+                        let n = self.str_const(&name);
+                        self.emit(Op::CanDeclareGlobalFunc(n));
+                    }
+                }
+            }
+        }
+    }
+
     fn hoist_funcs(&mut self, stmts: &[Statement]) -> R {
         // Sloppy direct-eval body: function declarations escape to the caller's
         // var scope. Collect the names (runtime pre-creates the bindings) and
@@ -1722,19 +1749,21 @@ impl Compiler {
         // bodies reference each other via `LoadGlobal` (resolved at call time), so
         // a single definition pass suffices.
         if self.in_global_scope() {
+            let deletable = self.cur_ref().is_eval_body;
+            // The CanDeclareGlobalFunction checks are emitted earlier by
+            // `predeclare_global_funcs` (before ANY binding is created), so a
+            // non-definable name aborts instantiation before vars/functions
+            // exist. Here we only build and bind the closures (last
+            // declaration of a duplicate name wins via DefineGlobalFunc).
             for s in stmts {
                 if let Statement::FunctionDeclaration(f) = s {
                     if let Some(id) = &f.id {
                         self.compile_function(f, Some(id.name.as_str()))?;
+                        // CreateGlobalFunctionBinding: (re)define the property
+                        // with function-binding attributes (or keep a
+                        // non-configurable existing property's and just set it).
                         let n = self.str_const(id.name.as_str());
-                        // A function declaration *creates* the global binding
-                        // (CreateGlobalFunctionBinding) — it is not an assignment
-                        // to an existing one, so establish the property first.
-                        // Otherwise the strict-mode unresolvable-reference check on
-                        // `StoreGlobal` would reject the install itself.
-                        let deletable = self.cur_ref().is_eval_body;
-                        self.emit(Op::DeclareGlobal { name: n, deletable });
-                        self.emit(Op::StoreGlobal(n));
+                        self.emit(Op::DefineGlobalFunc { name: n, deletable });
                     }
                 }
             }

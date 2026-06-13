@@ -607,6 +607,7 @@ globalThis.$262 = {
   global: globalThis,
   gc: function () {},
   detachArrayBuffer: globalThis.__t262_detachArrayBuffer,
+  evalScript: globalThis.__t262_evalScript,
   agent: undefined,
 };
 "#;
@@ -797,10 +798,23 @@ fn evaluate_rust_module(
                     }
                     Ok(JsValue::Undefined)
                 });
+            let eval_script = engine.vm.new_native("evalScript", 1, |vm, _this, args| {
+                let src = match args.first() {
+                    Some(JsValue::String(s)) => s.as_str().to_string(),
+                    other => vm
+                        .to_js_string(other.unwrap_or(&JsValue::Undefined))?
+                        .as_str()
+                        .to_string(),
+                };
+                vm.eval_script(&src)
+            });
             let g = engine.vm.realm.global.clone();
             engine
                 .vm
                 .define_value(&g, "__t262_detachArrayBuffer", JsValue::Object(detach));
+            engine
+                .vm
+                .define_value(&g, "__t262_evalScript", JsValue::Object(eval_script));
         }
         // Dynamic `import()` resolves against the entry's directory and shares
         // the registry with the static graph (same module record → same
@@ -1021,10 +1035,23 @@ fn evaluate_rust(
                     }
                     Ok(JsValue::Undefined)
                 });
+            let eval_script = engine.vm.new_native("evalScript", 1, |vm, _this, args| {
+                let src = match args.first() {
+                    Some(JsValue::String(s)) => s.as_str().to_string(),
+                    other => vm
+                        .to_js_string(other.unwrap_or(&JsValue::Undefined))?
+                        .as_str()
+                        .to_string(),
+                };
+                vm.eval_script(&src)
+            });
             let g = engine.vm.realm.global.clone();
             engine
                 .vm
                 .define_value(&g, "__t262_detachArrayBuffer", JsValue::Object(detach));
+            engine
+                .vm
+                .define_value(&g, "__t262_evalScript", JsValue::Object(eval_script));
         }
         let result = engine.eval(&program);
         (engine, result)

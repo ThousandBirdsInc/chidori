@@ -331,6 +331,20 @@ pub enum Op {
         /// deletable (configurable); script-level ones are not.
         deletable: bool,
     },
+    /// CanDeclareGlobalFunction check for a global function declaration
+    /// (const index of name): throw a TypeError when an existing
+    /// non-configurable own property can't be redefined as a writable,
+    /// enumerable data property. Emitted before the closure is built so the
+    /// spec's instantiation-time error precedes any function evaluation.
+    CanDeclareGlobalFunc(u32),
+    /// CreateGlobalFunctionBinding `[value] -> []` (const index of name): if
+    /// the existing property is absent or configurable, (re)define it as
+    /// `{value, writable, enumerable, configurable: deletable}`; otherwise
+    /// keep its attributes and just set the value.
+    DefineGlobalFunc {
+        name: u32,
+        deletable: bool,
+    },
     /// Throw ReferenceError if the named global is not defined (TDZ-ish for
     /// `typeof`-safe reads we use LoadGlobalOrUndefined instead).
     LoadGlobalTypeof(u32),

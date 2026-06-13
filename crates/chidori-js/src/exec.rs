@@ -1049,6 +1049,71 @@ impl Vm {
                 }
             }
 
+            Op::CanDeclareGlobalFunc(i) => {
+                let name = self.const_name(frame, i);
+                let g = self.realm.global.clone();
+                let key = PropertyKey::Str(name.clone());
+                // CanDeclareGlobalFunction (9.1.1.4.16): an existing
+                // non-configurable property is acceptable only if it is a
+                // writable, enumerable data property; otherwise (or, when
+                // absent, on a non-extensible global) the declaration fails.
+                let definable = {
+                    let b = g.borrow();
+                    match b.props.get(&key) {
+                        None => b.extensible,
+                        Some(p) => {
+                            p.configurable
+                                || matches!(
+                                    &p.kind,
+                                    PropertyKind::Data { writable, .. }
+                                        if *writable && p.enumerable
+                                )
+                        }
+                    }
+                };
+                if !definable {
+                    return Err(self.throw_type(&format!(
+                        "Cannot declare global function '{}'",
+                        name.as_str()
+                    )));
+                }
+            }
+            Op::DefineGlobalFunc { name: i, deletable } => {
+                let name = self.const_name(frame, i);
+                let value = pop!();
+                let g = self.realm.global.clone();
+                let key = PropertyKey::Str(name.clone());
+                // CreateGlobalFunctionBinding (9.1.1.4.18): an absent or
+                // configurable existing property is (re)defined with function
+                // attributes; a non-configurable one keeps its attributes and
+                // is just assigned the new value.
+                let redefine = {
+                    let b = g.borrow();
+                    match b.props.get(&key) {
+                        None => true,
+                        Some(p) => p.configurable,
+                    }
+                };
+                let mut b = g.borrow_mut();
+                if redefine {
+                    b.props.insert(
+                        key,
+                        Property {
+                            kind: PropertyKind::Data {
+                                value,
+                                writable: true,
+                            },
+                            enumerable: true,
+                            configurable: deletable,
+                        },
+                    );
+                } else if let Some(p) = b.props.get_mut(&key) {
+                    if let PropertyKind::Data { value: slot, .. } = &mut p.kind {
+                        *slot = value;
+                    }
+                }
+            }
+
             Op::PushWithScope => {
                 let v = pop!();
                 let obj = self.to_object(&v)?;
