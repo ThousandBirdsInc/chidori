@@ -25,12 +25,15 @@ impl Vm {
     /// Allocate a Proxy exotic object wrapping `target` with `handler`.
     pub fn new_proxy(&self, target: JsObject, handler: JsObject) -> JsObject {
         // Proxies have no [[Prototype]] of their own; lookups are trapped.
+        // Callability is captured now (ProxyCreate) and survives revocation.
+        let callable = target.borrow().is_callable();
         self.alloc(ObjectData::new(
             None,
             Internal::Proxy(ProxyData {
                 target,
                 handler,
                 revoked: false,
+                callable,
             }),
         ))
     }
@@ -122,7 +125,10 @@ impl Vm {
     ) -> Result<bool, Value> {
         let (target, handler) = self.proxy_parts(o)?;
         match self.proxy_trap(&handler, "set")? {
-            None => self.ordinary_set(&target, key, value, receiver),
+            // Forward to the target's own [[Set]] — which, when the target is
+            // itself a proxy, runs its trap/revoked machinery rather than an
+            // ordinary set on the proxy object.
+            None => crate::builtins::reflect::reflect_set(self, &target, key, value, receiver),
             Some(trap) => {
                 let r = self.call(
                     trap,
@@ -717,7 +723,10 @@ impl Vm {
     }
 
     /// `[[GetPrototypeOf]]` of an object, dispatching the trap if it is a Proxy.
-    fn proxy_or_ordinary_get_prototype_of(&mut self, o: &JsObject) -> Result<Value, Value> {
+    pub(crate) fn proxy_or_ordinary_get_prototype_of(
+        &mut self,
+        o: &JsObject,
+    ) -> Result<Value, Value> {
         if matches!(o.borrow().internal, Internal::Proxy(_)) {
             self.proxy_get_prototype_of(o)
         } else {

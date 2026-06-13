@@ -232,6 +232,53 @@ impl Value {
     }
 }
 
+/// A spec Private Name: the runtime identity of a `#name` class element.
+/// A fresh one is allocated per name per class *evaluation* (not per class
+/// source text), so two evaluations of the same `class` literal mint
+/// distinct names — the basis of brand checks.
+#[derive(Clone)]
+pub struct PrivateName {
+    /// VM-unique identity (allocated from `Vm::next_private_id`).
+    pub id: u64,
+    /// Source-visible spelling (`#x`) for error messages.
+    pub description: JsString,
+}
+
+/// One entry in an object's `[[PrivateElements]]` list.
+#[derive(Clone)]
+pub enum PrivateElement {
+    Field(Value),
+    Method(Value),
+    Accessor {
+        get: Option<Value>,
+        set: Option<Value>,
+    },
+}
+
+/// A PrivateEnvironment record: maps the compiler's per-class-body storage
+/// keys (`#x@<class id>`) to the runtime [`PrivateName`]s minted when the
+/// class definition evaluated. Chained towards the outer class bodies;
+/// closures created inside a class body capture the chain.
+pub struct PrivateEnv {
+    pub parent: Option<Rc<PrivateEnv>>,
+    /// Compile-time storage key -> runtime name. Small per class; linear scan.
+    pub names: Vec<(JsString, PrivateName)>,
+}
+
+impl PrivateEnv {
+    /// Resolve a compile-time storage key through the chain (innermost first).
+    pub fn resolve(env: &Option<Rc<PrivateEnv>>, key: &str) -> Option<PrivateName> {
+        let mut cur = env.as_ref();
+        while let Some(e) = cur {
+            if let Some((_, n)) = e.names.iter().find(|(k, _)| k.as_str() == key) {
+                return Some(n.clone());
+            }
+            cur = e.parent.as_ref();
+        }
+        None
+    }
+}
+
 /// A property key: string or symbol. Integer-index keys are stored as their
 /// string form; enumeration re-derives integer ordering.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -366,6 +413,11 @@ pub struct ObjectData {
     pub props: IndexMap<PropertyKey, Property>,
     pub extensible: bool,
     pub internal: Internal,
+    /// The spec `[[PrivateElements]]` list, keyed by [`PrivateName::id`].
+    /// Boxed so the common no-privates object pays one pointer. Attached
+    /// directly to the receiver — even a Proxy — with no traps and no
+    /// extensibility check.
+    pub privates: Option<Box<IndexMap<u64, PrivateElement>>>,
 }
 
 impl ObjectData {
@@ -375,10 +427,29 @@ impl ObjectData {
             props: IndexMap::new(),
             extensible: true,
             internal,
+            privates: None,
         }
     }
+    pub fn private_get(&self, id: u64) -> Option<&PrivateElement> {
+        self.privates.as_ref().and_then(|p| p.get(&id))
+    }
+    /// Append a private element; `false` (no insert) when `id` is already
+    /// present — the caller's duplicate-initialization TypeError.
+    pub fn private_add(&mut self, id: u64, el: PrivateElement) -> bool {
+        let table = self.privates.get_or_insert_with(Default::default);
+        if table.contains_key(&id) {
+            return false;
+        }
+        table.insert(id, el);
+        true
+    }
     pub fn is_callable(&self) -> bool {
-        matches!(self.internal, Internal::Function(_))
+        match &self.internal {
+            Internal::Function(_) => true,
+            // A proxy is callable iff it captured `[[Call]]` at creation.
+            Internal::Proxy(p) => p.callable,
+            _ => false,
+        }
     }
     pub fn is_array(&self) -> bool {
         matches!(self.internal, Internal::Array(_))
@@ -471,6 +542,10 @@ pub struct ProxyData {
     pub target: JsObject,
     pub handler: JsObject,
     pub revoked: bool,
+    /// Whether the proxy exposes `[[Call]]` — fixed at creation from the
+    /// target's callability (spec ProxyCreate). It survives revocation, so
+    /// `IsCallable`/`typeof` of a revoked function proxy stays `"function"`.
+    pub callable: bool,
 }
 
 /// Element type of a typed array.
@@ -697,6 +772,10 @@ pub struct BytecodeFunction {
     /// identifiers against `o` even when called after the block; the chain
     /// seeds the callee frame's with-scope stack.
     pub captured_with: Vec<JsObject>,
+    /// The PrivateEnvironment chain active when this closure was created.
+    /// Methods/initializers defined inside a class body resolve `#x` storage
+    /// keys against it; `None` outside class bodies.
+    pub captured_priv_env: Option<Rc<PrivateEnv>>,
 }
 
 pub struct BoundFunction {

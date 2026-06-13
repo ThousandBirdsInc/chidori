@@ -308,6 +308,7 @@ impl Vm {
             home_object: None,
             is_class_ctor: false,
             captured_with: Vec::new(),
+            captured_priv_env: None,
         };
         let mut frame = self.make_frame(bf, Value::Undefined, &[], Value::Undefined);
         frame.cells = cells;

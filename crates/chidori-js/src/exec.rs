@@ -33,12 +33,15 @@ impl Vm {
                 let b = o.borrow();
                 (b.is_callable(), matches!(b.internal, Internal::Proxy(_)))
             };
-            if callable {
+            // A callable Proxy ([[Call]] forwards to the apply trap / target);
+            // checked before the ordinary function path, since a proxy now
+            // reports `is_callable` via its captured flag.
+            if is_proxy {
+                if callable {
+                    return self.proxy_call(&o, this, args);
+                }
+            } else if callable {
                 return self.call_object(&o, this, args, Value::Undefined);
-            }
-            // A callable Proxy ([[Call]] forwards to the apply trap / target).
-            if is_proxy && self.is_callable(&func) {
-                return self.proxy_call(&o, this, args);
             }
         }
         let desc = self.describe(&func);
@@ -297,6 +300,7 @@ impl Vm {
         // chain; seed the frame's with-scope stack with it so the body's
         // dynamic name ops resolve against it (under any with the body enters).
         let with_scope = bf.captured_with.clone();
+        let priv_env = bf.captured_priv_env.clone();
         Frame {
             func: bf,
             ip: 0,
@@ -318,6 +322,7 @@ impl Vm {
             trace_token: None,
             skip_delegation_throw: false,
             eval_vars: None,
+            priv_env,
         }
     }
 
@@ -332,14 +337,16 @@ impl Vm {
         new_target: &Value,
     ) -> Result<Value, Value> {
         let cobj = match ctor {
-            Value::Object(o) if o.borrow().is_callable() => o.clone(),
-            // A constructable Proxy ([[Construct]] forwards to the construct trap).
+            // A constructable Proxy ([[Construct]] forwards to the construct
+            // trap) — checked first, since a callable proxy now reports
+            // `is_callable` and must not fall into the ordinary path.
             Value::Object(o) if matches!(o.borrow().internal, Internal::Proxy(_)) => {
                 if !self.is_constructor(ctor) {
                     return Err(self.throw_type("not a constructor"));
                 }
                 return self.proxy_construct(&o.clone(), args, new_target.clone());
             }
+            Value::Object(o) if o.borrow().is_callable() => o.clone(),
             _ => return Err(self.throw_type("not a constructor")),
         };
         self.call_depth += 1;
@@ -375,7 +382,10 @@ impl Vm {
                     if bf.proto.kind.is_async()
                         || bf.proto.kind.is_generator()
                         || bf.proto.kind.is_arrow()
+                        || bf.proto.kind.is_method()
                     {
+                        // Methods and accessors are not constructors
+                        // (no [[Construct]]).
                         Disp::NotCtor
                     } else {
                         Disp::Bytecode(bf.clone())
@@ -741,6 +751,8 @@ impl Vm {
             home_object: frame.func.home_object.clone(),
             is_class_ctor: false,
             captured_with: frame.with_scope.clone(),
+            // The eval body resolves `#x` against the caller's private scope.
+            captured_priv_env: frame.priv_env.clone(),
         };
         self.call_depth += 1;
         if self.call_depth > self.max_call_depth {
@@ -770,6 +782,9 @@ impl Vm {
             frame.stack.truncate(h.stack_depth);
             // Discard any `with` environments entered after this handler.
             frame.with_scope.truncate(h.with_depth);
+            // Restore the private-environment chain (a class definition that
+            // threw mid-evaluation must not leak its private scope).
+            frame.priv_env = h.priv_env.clone();
             if let Completion::Throw(err) = &comp {
                 if let Some(catch_ip) = h.catch_ip {
                     if !(skip_delegation && h.delegation) {
@@ -811,6 +826,21 @@ impl Vm {
                 Value::bigint(parse_string_bigint(s).unwrap_or_else(|| num_bigint::BigInt::from(0)))
             }
         }
+    }
+
+    /// Resolve a private storage-key constant (`#x@<class id>`) through the
+    /// frame's PrivateEnvironment chain to its runtime [`PrivateName`].
+    fn resolve_private_name(&mut self, frame: &Frame, idx: u32) -> Result<PrivateName, Value> {
+        let key = self.const_name(frame, idx);
+        PrivateEnv::resolve(&frame.priv_env, key.as_str()).ok_or_else(|| {
+            let desc = key
+                .as_str()
+                .rfind('@')
+                .map_or(key.as_str(), |at| &key.as_str()[..at]);
+            self.throw_syntax(&format!(
+                "Private field '{desc}' must be declared in an enclosing class"
+            ))
+        })
     }
 
     fn const_name(&self, frame: &Frame, idx: u32) -> JsString {
@@ -1019,6 +1049,71 @@ impl Vm {
                 }
             }
 
+            Op::CanDeclareGlobalFunc(i) => {
+                let name = self.const_name(frame, i);
+                let g = self.realm.global.clone();
+                let key = PropertyKey::Str(name.clone());
+                // CanDeclareGlobalFunction (9.1.1.4.16): an existing
+                // non-configurable property is acceptable only if it is a
+                // writable, enumerable data property; otherwise (or, when
+                // absent, on a non-extensible global) the declaration fails.
+                let definable = {
+                    let b = g.borrow();
+                    match b.props.get(&key) {
+                        None => b.extensible,
+                        Some(p) => {
+                            p.configurable
+                                || matches!(
+                                    &p.kind,
+                                    PropertyKind::Data { writable, .. }
+                                        if *writable && p.enumerable
+                                )
+                        }
+                    }
+                };
+                if !definable {
+                    return Err(self.throw_type(&format!(
+                        "Cannot declare global function '{}'",
+                        name.as_str()
+                    )));
+                }
+            }
+            Op::DefineGlobalFunc { name: i, deletable } => {
+                let name = self.const_name(frame, i);
+                let value = pop!();
+                let g = self.realm.global.clone();
+                let key = PropertyKey::Str(name.clone());
+                // CreateGlobalFunctionBinding (9.1.1.4.18): an absent or
+                // configurable existing property is (re)defined with function
+                // attributes; a non-configurable one keeps its attributes and
+                // is just assigned the new value.
+                let redefine = {
+                    let b = g.borrow();
+                    match b.props.get(&key) {
+                        None => true,
+                        Some(p) => p.configurable,
+                    }
+                };
+                let mut b = g.borrow_mut();
+                if redefine {
+                    b.props.insert(
+                        key,
+                        Property {
+                            kind: PropertyKind::Data {
+                                value,
+                                writable: true,
+                            },
+                            enumerable: true,
+                            configurable: deletable,
+                        },
+                    );
+                } else if let Some(p) = b.props.get_mut(&key) {
+                    if let PropertyKind::Data { value: slot, .. } = &mut p.kind {
+                        *slot = value;
+                    }
+                }
+            }
+
             Op::PushWithScope => {
                 let v = pop!();
                 let obj = self.to_object(&v)?;
@@ -1162,6 +1257,49 @@ impl Vm {
                 let elems = frame.stack.split_off(at);
                 push!(Value::Object(self.new_array(elems)));
             }
+            Op::GetTemplateObject(idx) => {
+                let key = (Rc::as_ptr(&frame.func.proto) as *const () as usize, idx);
+                if let Some(o) = self.template_cache.get(&key) {
+                    push!(Value::Object(o.clone()));
+                } else {
+                    let parts = frame.func.proto.templates[idx as usize].clone();
+                    // Cooked strings (an illegal escape cooks to `undefined`).
+                    let cooked: Vec<Value> = parts
+                        .cooked
+                        .iter()
+                        .map(|c| match c {
+                            Some(s) => Value::String(JsString(s.clone())),
+                            None => Value::Undefined,
+                        })
+                        .collect();
+                    let arr = self.new_array(cooked);
+                    let raw: Vec<Value> = parts
+                        .raw
+                        .iter()
+                        .map(|s| Value::String(JsString(s.clone())))
+                        .collect();
+                    let raw_arr = self.new_array(raw);
+                    // The `raw` array is frozen; `raw` is a non-enumerable,
+                    // non-writable, non-configurable own property of the
+                    // template object, which is itself frozen (spec
+                    // GetTemplateObject / TemplateString integrity).
+                    crate::builtins::fundamental::set_integrity_level(self, &raw_arr, true)?;
+                    arr.borrow_mut().props.insert(
+                        PropertyKey::str("raw"),
+                        Property {
+                            kind: PropertyKind::Data {
+                                value: Value::Object(raw_arr),
+                                writable: false,
+                            },
+                            enumerable: false,
+                            configurable: false,
+                        },
+                    );
+                    crate::builtins::fundamental::set_integrity_level(self, &arr, true)?;
+                    self.template_cache.insert(key, arr.clone());
+                    push!(Value::Object(arr));
+                }
+            }
             Op::ArrayPushElision => {
                 // For array literals we build via NewArray; elisions handled by
                 // pushing undefined holes at compile time.
@@ -1185,28 +1323,21 @@ impl Vm {
                 let obj = pop!();
                 let key = self.to_property_key(&key_v)?;
                 if let Value::Object(o) = &obj {
-                    // Private storage keys ("#x@id") are spec Private Names:
-                    // they attach directly to the receiver — even a Proxy —
-                    // without [[DefineOwnProperty]] (no trap, no extensibility
-                    // check). Everything else is CreateDataPropertyOrThrow.
-                    let is_private =
-                        matches!(&key, PropertyKey::Str(s) if s.as_str().starts_with('#'));
-                    if is_private {
-                        o.borrow_mut().props.insert(key, Property::data(value));
-                    } else {
-                        crate::builtins::fundamental::create_data_property_or_throw(
-                            self, o, &key, value,
-                        )?;
-                    }
+                    crate::builtins::fundamental::create_data_property_or_throw(
+                        self, o, &key, value,
+                    )?;
                 }
                 push!(obj);
             }
             Op::DefineMethod => {
-                // Class methods are non-enumerable (writable, configurable).
+                // Class methods are non-enumerable (writable, configurable),
+                // defined with DefinePropertyOrThrow (a non-configurable own
+                // key — e.g. a computed static "prototype" — is a TypeError).
                 let value = pop!();
                 let key_v = pop!();
                 let obj = pop!();
                 let key = self.to_property_key(&key_v)?;
+                self.check_redefinable(&obj, &key)?;
                 if let Value::Object(o) = &obj {
                     o.borrow_mut().props.insert(key, Property::builtin(value));
                 }
@@ -1217,6 +1348,7 @@ impl Vm {
                 let key_v = pop!();
                 let obj = pop!();
                 let key = self.to_property_key(&key_v)?;
+                self.check_redefinable(&obj, &key)?;
                 self.define_accessor_with(&obj, key, Some(getter), None, true);
                 push!(obj);
             }
@@ -1225,6 +1357,7 @@ impl Vm {
                 let key_v = pop!();
                 let obj = pop!();
                 let key = self.to_property_key(&key_v)?;
+                self.check_redefinable(&obj, &key)?;
                 self.define_accessor_with(&obj, key, None, Some(setter), true);
                 push!(obj);
             }
@@ -1233,6 +1366,7 @@ impl Vm {
                 let key_v = pop!();
                 let obj = pop!();
                 let key = self.to_property_key(&key_v)?;
+                self.check_redefinable(&obj, &key)?;
                 self.define_accessor_with(&obj, key, Some(getter), None, false);
                 push!(obj);
             }
@@ -1241,6 +1375,7 @@ impl Vm {
                 let key_v = pop!();
                 let obj = pop!();
                 let key = self.to_property_key(&key_v)?;
+                self.check_redefinable(&obj, &key)?;
                 self.define_accessor_with(&obj, key, None, Some(setter), false);
                 push!(obj);
             }
@@ -1261,35 +1396,64 @@ impl Vm {
                     }
                 }
             }
-            Op::GetSuperProp(k) => {
-                let name = self.const_name(frame, k);
-                let key = PropertyKey::Str(name);
-                let recv = frame.this.clone();
+            Op::SetHomeObjectAt(n) => {
+                let len = frame.stack.len();
+                if len >= n as usize + 1 {
+                    let home = frame.stack[len - 1 - n as usize].clone();
+                    if let (Value::Object(home), Value::Object(m)) =
+                        (home, frame.stack[len - 1].clone())
+                    {
+                        if let Internal::Function(FunctionInner::Bytecode(bf)) =
+                            &mut m.borrow_mut().internal
+                        {
+                            bf.home_object = Some(home);
+                        }
+                    }
+                }
+            }
+            Op::GetSuperBase => {
                 let base = frame
                     .func
                     .home_object
                     .as_ref()
-                    .and_then(|h| h.borrow().proto.clone());
-                let v = match base {
-                    Some(proto) => self.get_from_object(&proto, &key, recv)?,
-                    None => Value::Undefined,
-                };
+                    .and_then(|h| h.borrow().proto.clone())
+                    .map(Value::Object)
+                    .unwrap_or(Value::Undefined);
+                push!(base);
+            }
+            Op::SuperGet(k) => {
+                let name = self.const_name(frame, k);
+                let base = pop!();
+                let this = pop!();
+                let key = PropertyKey::Str(name);
+                let v = self.super_get(&base, &key, this)?;
                 push!(v);
             }
-            Op::GetSuperPropDynamic => {
+            Op::SuperGetDynamic => {
                 let key_v = pop!();
+                let base = pop!();
+                let this = pop!();
                 let key = self.to_property_key(&key_v)?;
-                let recv = frame.this.clone();
-                let base = frame
-                    .func
-                    .home_object
-                    .as_ref()
-                    .and_then(|h| h.borrow().proto.clone());
-                let v = match base {
-                    Some(proto) => self.get_from_object(&proto, &key, recv)?,
-                    None => Value::Undefined,
-                };
+                let v = self.super_get(&base, &key, this)?;
                 push!(v);
+            }
+            Op::SuperSet(k) => {
+                let name = self.const_name(frame, k);
+                let value = pop!();
+                let base = pop!();
+                let this = pop!();
+                let key = PropertyKey::Str(name);
+                self.super_set(&base, &key, value.clone(), this, frame.func.proto.is_strict)?;
+                push!(value);
+            }
+            Op::SuperSetDynamic => {
+                let value = pop!();
+                let key_v = pop!();
+                let base = pop!();
+                let this = pop!();
+                let key = self.to_property_key(&key_v)?;
+                self.super_set(&base, &key, value.clone(), this, frame.func.proto.is_strict)?;
+                push!(value);
             }
             Op::ObjectSpread => {
                 let src = pop!();
@@ -1311,6 +1475,39 @@ impl Vm {
                 }
                 push!(target);
             }
+            Op::CopyDataPropertiesExcept(n) => {
+                let at = frame.stack.len() - n as usize;
+                let raw_keys = frame.stack.split_off(at);
+                let mut excluded: Vec<PropertyKey> = Vec::with_capacity(raw_keys.len());
+                for k in raw_keys {
+                    excluded.push(self.to_property_key(&k)?);
+                }
+                let src = pop!();
+                let target = pop!();
+                if let Value::Object(t) = &target {
+                    if let Value::Object(s) = &src {
+                        // Excluded keys are skipped before ANY source access
+                        // (CopyDataProperties step 4.b.i): a proxy source must
+                        // not observe a [[GetOwnProperty]]/[[Get]] for them.
+                        for k in self.enumerable_own_keys_excluding(s, &excluded)? {
+                            let val = self.get_prop(&src, &k)?;
+                            t.borrow_mut().props.insert(k, Property::data(val));
+                        }
+                    } else if let Value::String(st) = &src {
+                        // A primitive-string source contributes its index keys.
+                        for (i, c) in st.as_str().chars().enumerate() {
+                            let k = PropertyKey::from_index(i as u32);
+                            if excluded.contains(&k) {
+                                continue;
+                            }
+                            t.borrow_mut()
+                                .props
+                                .insert(k, Property::data(Value::str(c.to_string())));
+                        }
+                    }
+                }
+                push!(target);
+            }
             Op::GetProp(i) => {
                 let name = self.const_name(frame, i);
                 let obj = pop!();
@@ -1318,113 +1515,183 @@ impl Vm {
                 push!(v);
             }
             Op::PrivateGet(i) => {
-                let name = self.const_name(frame, i);
+                let name = self.resolve_private_name(frame, i)?;
                 let obj = pop!();
-                let key = PropertyKey::Str(name.clone());
-                // PrivateBrandCheck: the receiver must OWN the private storage
-                // key (fields/static elements are own properties; a prototype-
-                // chain hit must NOT pass — `Object.create(instance)` is not an
-                // instance). Foreign receivers throw TypeError.
-                if !private_owns(&obj, &key) {
-                    return Err(self.throw_type(&format!(
-                        "Cannot read private member {} from an object whose class did not declare it",
-                        private_display(name.as_str())
-                    )));
-                }
-                // A private accessor with only a setter has no [[Get]] (spec
-                // PrivateFieldGet step 6.b) — reading it is a TypeError.
-                if let Some((has_get, _)) = private_accessor_kind(&obj, &key) {
-                    if !has_get {
+                // PrivateGet: the receiver's own [[PrivateElements]] must have
+                // the name (the brand check — never the prototype chain, never
+                // Proxy traps; `Object.create(instance)` is not an instance).
+                let el = obj
+                    .as_object()
+                    .and_then(|o| o.borrow().private_get(name.id).cloned());
+                let v = match el {
+                    Some(PrivateElement::Field(v)) | Some(PrivateElement::Method(v)) => v,
+                    Some(PrivateElement::Accessor { get: Some(g), .. }) => {
+                        self.call(g, obj.clone(), &[])?
+                    }
+                    // An accessor with only a setter has no [[Get]].
+                    Some(PrivateElement::Accessor { get: None, .. }) => {
                         return Err(self.throw_type(&format!(
                             "'{}' was defined without a getter",
-                            private_display(name.as_str())
+                            name.description.as_str()
                         )));
                     }
-                }
-                let v = self.get_prop(&obj, &key)?;
-                push!(v);
-            }
-            Op::PrivateGetB { brand, key } => {
-                let brand_name = self.const_name(frame, brand);
-                let key_name = self.const_name(frame, key);
-                let obj = pop!();
-                // PrivateBrandCheck for methods/accessors: the instance carries
-                // an own brand key stamped at construction; the element itself
-                // lives on the class prototype.
-                if !private_owns(&obj, &PropertyKey::Str(brand_name)) {
-                    return Err(self.throw_type(&format!(
-                        "Cannot read private member {} from an object whose class did not declare it",
-                        private_display(key_name.as_str())
-                    )));
-                }
-                let pkey = PropertyKey::Str(key_name.clone());
-                if let Some((has_get, _)) = private_accessor_kind(&obj, &pkey) {
-                    if !has_get {
+                    None => {
                         return Err(self.throw_type(&format!(
-                            "'{}' was defined without a getter",
-                            private_display(key_name.as_str())
+                            "Cannot read private member {} from an object whose class did not declare it",
+                            name.description.as_str()
                         )));
                     }
-                }
-                let v = self.get_prop(&obj, &pkey)?;
+                };
                 push!(v);
             }
             Op::PrivateSet(i) => {
-                let name = self.const_name(frame, i);
+                let name = self.resolve_private_name(frame, i)?;
                 let value = pop!();
                 let obj = pop!();
-                let key = PropertyKey::Str(name.clone());
-                if !private_owns(&obj, &key) {
-                    return Err(self.throw_type(&format!(
-                        "Cannot write private member {} to an object whose class did not declare it",
-                        private_display(name.as_str())
-                    )));
-                }
-                // A private accessor with no [[Set]] is a TypeError to assign.
-                if let Some((_, has_set)) = private_accessor_kind(&obj, &key) {
-                    if !has_set {
+                let el = obj
+                    .as_object()
+                    .and_then(|o| o.borrow().private_get(name.id).cloned());
+                match el {
+                    Some(PrivateElement::Field(_)) => {
+                        if let Some(o) = obj.as_object() {
+                            if let Some(t) = o.borrow_mut().privates.as_mut() {
+                                t.insert(name.id, PrivateElement::Field(value.clone()));
+                            }
+                        }
+                    }
+                    // A private METHOD is never writable (spec PrivateSet step 6).
+                    Some(PrivateElement::Method(_)) => {
+                        return Err(self.throw_type(&format!(
+                            "Cannot assign to private method {}",
+                            name.description.as_str()
+                        )));
+                    }
+                    Some(PrivateElement::Accessor { set: Some(s), .. }) => {
+                        self.call(s, obj.clone(), std::slice::from_ref(&value))?;
+                    }
+                    Some(PrivateElement::Accessor { set: None, .. }) => {
                         return Err(self.throw_type(&format!(
                             "'{}' was defined without a setter",
-                            private_display(name.as_str())
+                            name.description.as_str()
+                        )));
+                    }
+                    None => {
+                        return Err(self.throw_type(&format!(
+                            "Cannot write private member {} to an object whose class did not declare it",
+                            name.description.as_str()
                         )));
                     }
                 }
-                self.set_prop(&obj, &key, value.clone())?;
                 push!(value);
             }
-            Op::PrivateSetB {
-                brand,
-                key,
-                is_method,
-            } => {
-                let brand_name = self.const_name(frame, brand);
-                let key_name = self.const_name(frame, key);
+            Op::PushPrivateEnv(keys) => {
+                // NewPrivateEnvironment + AddPrivateName: mint a fresh runtime
+                // name per declared key for THIS evaluation of the class.
+                let mut names = Vec::with_capacity(keys.len());
+                for &k in keys.iter() {
+                    let key = self.const_name(frame, k);
+                    // Source-visible description: strip the "@<class id>" suffix.
+                    let desc = match key.as_str().rfind('@') {
+                        Some(at) => JsString::new(&key.as_str()[..at]),
+                        None => key.clone(),
+                    };
+                    let id = self.private_name_counter;
+                    self.private_name_counter += 1;
+                    names.push((
+                        key,
+                        PrivateName {
+                            id,
+                            description: desc,
+                        },
+                    ));
+                }
+                frame.priv_env = Some(Rc::new(PrivateEnv {
+                    parent: frame.priv_env.take(),
+                    names,
+                }));
+            }
+            Op::PopPrivateEnv => {
+                frame.priv_env = frame.priv_env.take().and_then(|e| e.parent.clone());
+            }
+            Op::PrivateFieldAdd(i) => {
+                let name = self.resolve_private_name(frame, i)?;
                 let value = pop!();
                 let obj = pop!();
-                if !private_owns(&obj, &PropertyKey::Str(brand_name)) {
+                let Some(o) = obj.as_object() else {
+                    return Err(self.throw_type("Cannot define a private field on a non-object"));
+                };
+                // PrivateFieldAdd / PrivateMethodOrAccessorAdd step 1: a
+                // non-extensible receiver rejects new private elements.
+                if !o.borrow().extensible {
                     return Err(self.throw_type(&format!(
-                        "Cannot write private member {} to an object whose class did not declare it",
-                        private_display(key_name.as_str())
+                        "Cannot define private member {} on a non-extensible object",
+                        name.description.as_str()
                     )));
                 }
-                // A private METHOD is never writable (spec PrivateSet step 6).
-                if is_method {
+                if !o
+                    .borrow_mut()
+                    .private_add(name.id, PrivateElement::Field(value))
+                {
                     return Err(self.throw_type(&format!(
-                        "Cannot assign to private method {}",
-                        private_display(key_name.as_str())
+                        "Cannot initialize {} twice on the same object",
+                        name.description.as_str()
                     )));
                 }
-                let pkey = PropertyKey::Str(key_name.clone());
-                if let Some((_, has_set)) = private_accessor_kind(&obj, &pkey) {
-                    if !has_set {
-                        return Err(self.throw_type(&format!(
-                            "'{}' was defined without a setter",
-                            private_display(key_name.as_str())
-                        )));
-                    }
+                push!(obj);
+            }
+            Op::PrivateMethodAdd(i) => {
+                let name = self.resolve_private_name(frame, i)?;
+                let value = pop!();
+                let obj = pop!();
+                let Some(o) = obj.as_object() else {
+                    return Err(self.throw_type("Cannot define a private method on a non-object"));
+                };
+                // PrivateFieldAdd / PrivateMethodOrAccessorAdd step 1: a
+                // non-extensible receiver rejects new private elements.
+                if !o.borrow().extensible {
+                    return Err(self.throw_type(&format!(
+                        "Cannot define private member {} on a non-extensible object",
+                        name.description.as_str()
+                    )));
                 }
-                self.set_prop(&obj, &pkey, value.clone())?;
-                push!(value);
+                if !o
+                    .borrow_mut()
+                    .private_add(name.id, PrivateElement::Method(value))
+                {
+                    return Err(self.throw_type(&format!(
+                        "Cannot initialize {} twice on the same object",
+                        name.description.as_str()
+                    )));
+                }
+                push!(obj);
+            }
+            Op::PrivateAccessorAdd(i) => {
+                let name = self.resolve_private_name(frame, i)?;
+                let set = pop!();
+                let get = pop!();
+                let obj = pop!();
+                let Some(o) = obj.as_object() else {
+                    return Err(self.throw_type("Cannot define a private accessor on a non-object"));
+                };
+                // PrivateFieldAdd / PrivateMethodOrAccessorAdd step 1: a
+                // non-extensible receiver rejects new private elements.
+                if !o.borrow().extensible {
+                    return Err(self.throw_type(&format!(
+                        "Cannot define private member {} on a non-extensible object",
+                        name.description.as_str()
+                    )));
+                }
+                let el = PrivateElement::Accessor {
+                    get: (!get.is_undefined()).then_some(get),
+                    set: (!set.is_undefined()).then_some(set),
+                };
+                if !o.borrow_mut().private_add(name.id, el) {
+                    return Err(self.throw_type(&format!(
+                        "Cannot initialize {} twice on the same object",
+                        name.description.as_str()
+                    )));
+                }
+                push!(obj);
             }
             Op::ConstructSuper(argc) => {
                 let nt = pop!();
@@ -1672,15 +1939,16 @@ impl Vm {
                 }
             }
             Op::PrivateHasOwn(i) => {
-                let name = self.const_name(frame, i);
+                let name = self.resolve_private_name(frame, i)?;
                 let obj = pop!();
                 // `#x in v`: the RHS must be an object (spec 13.10.1 step 5).
-                if !matches!(obj, Value::Object(_)) {
+                let Some(o) = obj.as_object() else {
                     return Err(
                         self.throw_type("Cannot use 'in' operator to search in a non-object")
                     );
-                }
-                push!(Value::Bool(private_owns(&obj, &PropertyKey::Str(name))));
+                };
+                let has = o.borrow().private_get(name.id).is_some();
+                push!(Value::Bool(has));
             }
             Op::SetProp(i) => {
                 let name = self.const_name(frame, i);
@@ -1713,6 +1981,9 @@ impl Vm {
             Op::DeleteProp(i) => {
                 let name = self.const_name(frame, i);
                 let obj = pop!();
+                // `delete base.x` does ToObject(base) (spec step 5.b): a
+                // nullish base is a TypeError before any delete is attempted.
+                self.require_object_coercible(&obj, "delete properties of")?;
                 let r = self.delete_prop(&obj, &PropertyKey::Str(name.clone()))?;
                 // Strict-mode `delete` that fails throws (spec 13.5.1.2 step 5.c).
                 if !r && frame.func.proto.is_strict {
@@ -1744,6 +2015,11 @@ impl Vm {
             Op::JumpIfNullish(t) => {
                 let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
                 if v.is_nullish() {
+                    // An optional chain short-circuits to `undefined` even when
+                    // the base was `null` (the other emit sites pop the value).
+                    if let Some(top) = frame.stack.last_mut() {
+                        *top = Value::Undefined;
+                    }
                     return Ok(Ctl::Jump(t as usize));
                 }
             }
@@ -1813,14 +2089,27 @@ impl Vm {
                         }
                     })
                     .collect();
+                let inherit_home = proto.kind.is_arrow() || proto.inherit_home;
                 let f = self.make_closure(proto, upvalues);
                 // Capture the active with-scope chain (closures defined inside
-                // `with` resolve free identifiers against it after the block).
-                if !frame.with_scope.is_empty() {
+                // `with` resolve free identifiers against it after the block)
+                // and the active private-environment chain (methods and
+                // initializers defined inside class bodies resolve `#x`
+                // against it). Arrows (and synthetic in-class closures) also
+                // inherit the creating frame's [[HomeObject]], so `super.x`
+                // inside them resolves like the enclosing method.
+                if !frame.with_scope.is_empty()
+                    || frame.priv_env.is_some()
+                    || (inherit_home && frame.func.home_object.is_some())
+                {
                     if let Internal::Function(FunctionInner::Bytecode(bf)) =
                         &mut f.borrow_mut().internal
                     {
                         bf.captured_with = frame.with_scope.clone();
+                        bf.captured_priv_env = frame.priv_env.clone();
+                        if inherit_home {
+                            bf.home_object = frame.func.home_object.clone();
+                        }
                     }
                 }
                 push!(Value::Object(f));
@@ -2025,6 +2314,7 @@ impl Vm {
                     },
                     stack_depth: frame.stack.len(),
                     with_depth: frame.with_scope.len(),
+                    priv_env: frame.priv_env.clone(),
                     delegation: false,
                     delegation_return_ip: None,
                 });
@@ -2271,6 +2561,56 @@ impl Vm {
         }
     }
 
+    /// `super.x` read: Get(base, key) with an explicit receiver. A nullish
+    /// base (null home prototype) is a TypeError, like reading a property of
+    /// undefined.
+    fn super_get(&mut self, base: &Value, key: &PropertyKey, recv: Value) -> Result<Value, Value> {
+        match base {
+            Value::Object(o) => self.get_from_object(&o.clone(), key, recv),
+            _ => Err(self.throw_type(&format!(
+                "Cannot read properties of undefined (reading {key:?})"
+            ))),
+        }
+    }
+
+    /// `super.x = v`: Set(base, key, v, receiver=this); a failed write throws
+    /// in strict code, like any strict PutValue.
+    fn super_set(
+        &mut self,
+        base: &Value,
+        key: &PropertyKey,
+        value: Value,
+        recv: Value,
+        strict: bool,
+    ) -> Result<(), Value> {
+        match base {
+            Value::Object(o) => {
+                let ok = crate::builtins::reflect::reflect_set(self, &o.clone(), key, value, recv)?;
+                if !ok && strict {
+                    return Err(
+                        self.throw_type(&format!("Cannot assign to read only property {key:?}"))
+                    );
+                }
+                Ok(())
+            }
+            _ => Err(self.throw_type(&format!(
+                "Cannot set properties of undefined (setting {key:?})"
+            ))),
+        }
+    }
+
+    /// DefinePropertyOrThrow's non-configurable guard for method/accessor
+    /// definitions (`static ['prototype']() {}` must throw, not overwrite).
+    fn check_redefinable(&mut self, obj: &Value, key: &PropertyKey) -> Result<(), Value> {
+        if let Value::Object(o) = obj {
+            let non_config = o.borrow().props.get(key).is_some_and(|p| !p.configurable);
+            if non_config {
+                return Err(self.throw_type(&format!("Cannot redefine property: {key:?}")));
+            }
+        }
+        Ok(())
+    }
+
     pub fn define_accessor(
         &self,
         obj: &Value,
@@ -2354,6 +2694,7 @@ impl Vm {
             home_object: None,
             is_class_ctor: kind.is_class_ctor(),
             captured_with: Vec::new(),
+            captured_priv_env: None,
         };
         // [[Prototype]] is the function-kind intrinsic: %GeneratorFunction.prototype%,
         // %AsyncFunction.prototype%, %AsyncGeneratorFunction.prototype%, or
@@ -2414,7 +2755,10 @@ impl Vm {
                 Property {
                     kind: PropertyKind::Data {
                         value: Value::Object(proto_obj),
-                        writable: true,
+                        // A CLASS constructor's `prototype` is read-only
+                        // (spec ClassDefinitionEvaluation); an ordinary
+                        // function's is writable.
+                        writable: !kind.is_class_ctor(),
                     },
                     enumerable: false,
                     configurable: false,
@@ -2719,17 +3063,24 @@ impl Vm {
             Value::Object(o) => o,
             _ => return Err(self.throw_type("prototype is not an object")),
         };
+        // OrdinaryHasInstance walks the chain via [[GetPrototypeOf]], which a
+        // proxy in the chain routes through its trap (its own `proto` is None).
         let mut cur = match obj {
-            Value::Object(o) => o.borrow().proto.clone(),
+            Value::Object(o) => o.clone(),
             _ => return Ok(false),
         };
-        while let Some(p) = cur {
-            if p.same(&target_proto) {
-                return Ok(true);
+        loop {
+            let proto = self.proxy_or_ordinary_get_prototype_of(&cur)?;
+            match proto {
+                Value::Object(p) => {
+                    if p.same(&target_proto) {
+                        return Ok(true);
+                    }
+                    cur = p;
+                }
+                _ => return Ok(false),
             }
-            cur = p.borrow().proto.clone();
         }
-        Ok(false)
     }
 }
 
@@ -2883,48 +3234,5 @@ pub fn parse_string_bigint(s: &str) -> Option<num_bigint::BigInt> {
 impl Value {
     fn same_obj(&self, other: &JsObject) -> bool {
         matches!(self, Value::Object(o) if o.same(other))
-    }
-}
-
-/// If `key` (a private `#name`) resolves on `obj` or its prototype chain to an
-/// accessor property, return `(has_getter, has_setter)`; otherwise `None` (a data
-/// field/method). Used by `PrivateGet`/`PrivateSet` to enforce the spec's
-/// accessor-without-getter / accessor-without-setter TypeErrors.
-/// Whether `obj` OWNS the private storage/brand key — the spec's
-/// PrivateElementFind over the receiver's own [[PrivateElements]] (never the
-/// prototype chain, never Proxy traps).
-fn private_owns(obj: &Value, key: &PropertyKey) -> bool {
-    match obj {
-        Value::Object(o) => o.borrow().props.contains_key(key),
-        _ => false,
-    }
-}
-
-/// The source-visible form of an internal private key: `#name@<classid>`
-/// renders as `#name` in error messages.
-fn private_display(key: &str) -> &str {
-    key.split('@').next().unwrap_or(key)
-}
-
-fn private_accessor_kind(obj: &Value, key: &PropertyKey) -> Option<(bool, bool)> {
-    let mut cur = match obj {
-        Value::Object(o) => o.clone(),
-        _ => return None,
-    };
-    loop {
-        let next = {
-            let b = cur.borrow();
-            if let Some(p) = b.props.get(key) {
-                return match &p.kind {
-                    PropertyKind::Accessor { get, set } => Some((get.is_some(), set.is_some())),
-                    PropertyKind::Data { .. } => None,
-                };
-            }
-            b.proto.clone()
-        };
-        match next {
-            Some(p) => cur = p,
-            None => return None,
-        }
     }
 }

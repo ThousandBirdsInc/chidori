@@ -154,7 +154,9 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
                     );
                 }
             }
-            _ => return Err(vm.throw_type("ArrayBuffer options must be an object")),
+            // GetArrayBufferMaxByteLengthOption: a non-object `options` is
+            // ignored (the buffer is non-resizable), not a TypeError.
+            _ => {}
         }
         Ok(Value::Object(buf))
     };
@@ -311,7 +313,43 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
         let start = rel_index(vm, &arg(args, 0), len, 0)?;
         let end = rel_index(vm, &arg(args, 1), len, len)?;
         let new_len = (end - start).max(0) as usize;
-        let new_buf = vm.new_array_buffer(new_len);
+        // SpeciesConstructor(O, %ArrayBuffer%), then Construct(ctor, «newLen»),
+        // validating the result (spec 25.1.5.3 steps 14–20).
+        let default_ctor = vm.get_prop(
+            &Value::Object(vm.realm.global.clone()),
+            &PropertyKey::str("ArrayBuffer"),
+        )?;
+        let ctor = ta_species_constructor(vm, &o, &default_ctor)?;
+        let new_obj = vm.construct(&ctor, &[Value::Number(new_len as f64)], &ctor)?;
+        let new_buf = match &new_obj {
+            Value::Object(b) if matches!(b.borrow().internal, Internal::ArrayBuffer(_)) => {
+                b.clone()
+            }
+            _ => {
+                return Err(vm.throw_type(
+                    "ArrayBuffer.prototype.slice: species did not return an ArrayBuffer",
+                ))
+            }
+        };
+        if matches!(new_buf.borrow().internal, Internal::ArrayBuffer(None)) {
+            return Err(
+                vm.throw_type("ArrayBuffer.prototype.slice: species returned a detached buffer")
+            );
+        }
+        if new_buf.same(&o) {
+            return Err(
+                vm.throw_type("ArrayBuffer.prototype.slice: species returned the same buffer")
+            );
+        }
+        if (buffer_byte_length(&new_buf) as usize) < new_len {
+            return Err(vm.throw_type(
+                "ArrayBuffer.prototype.slice: species returned a buffer that is too small",
+            ));
+        }
+        // The species constructor may have detached the source buffer.
+        if matches!(o.borrow().internal, Internal::ArrayBuffer(None)) {
+            return Err(vm.throw_type("ArrayBuffer.prototype.slice: source buffer was detached"));
+        }
         // Copy bytes [start, end) into the new buffer.
         {
             let src = o.borrow();
@@ -1398,17 +1436,36 @@ fn install_ta_methods(vm: &mut Vm, proto: &JsObject) {
     let sym = vm.realm.symbol_iterator.clone();
     vm.define_value_sym(proto, sym, values);
 
-    // toString() = join(",")  (also toLocaleString)
-    vm.define_method(proto, "toString", 0, |vm, this, _a| {
-        let o = ta_this(vm, &this)?;
-        let len = vm.ta_length(&o).unwrap_or(0);
-        let mut parts = Vec::with_capacity(len);
-        for i in 0..len {
-            let v = vm.ta_get(&o, i);
-            parts.push(vm.to_string_lossy(&v));
+    // %TypedArray%.prototype.toString is the SAME function object as
+    // %Array%.prototype.toString (spec 23.2.3.32). Array installs first, so
+    // copy its function; fall back to a local join if it is somehow absent.
+    let array_to_string = vm
+        .realm
+        .array_proto
+        .borrow()
+        .props
+        .get(&PropertyKey::str("toString"))
+        .and_then(|p| p.value().cloned());
+    match array_to_string {
+        Some(f) => {
+            proto
+                .borrow_mut()
+                .props
+                .insert(PropertyKey::str("toString"), Property::builtin(f));
         }
-        Ok(Value::str(parts.join(",")))
-    });
+        None => {
+            vm.define_method(proto, "toString", 0, |vm, this, _a| {
+                let o = ta_this(vm, &this)?;
+                let len = vm.ta_length(&o).unwrap_or(0);
+                let mut parts = Vec::with_capacity(len);
+                for i in 0..len {
+                    let v = vm.ta_get(&o, i);
+                    parts.push(vm.to_string_lossy(&v));
+                }
+                Ok(Value::str(parts.join(",")))
+            });
+        }
+    }
     vm.define_method(proto, "toLocaleString", 0, |vm, this, _a| {
         let o = ta_this(vm, &this)?;
         let len = vm.ta_length(&o).unwrap_or(0);

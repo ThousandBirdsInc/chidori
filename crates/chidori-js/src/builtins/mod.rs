@@ -15,7 +15,7 @@ mod numbers;
 
 mod regexp_builtin;
 
-mod reflect;
+pub(crate) mod reflect;
 mod string;
 mod typedarray;
 

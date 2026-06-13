@@ -743,23 +743,33 @@ fn install_object(vm: &mut Vm) {
         Ok(Value::Bool(has))
     });
 
-    vm.define_method(&proto, "isPrototypeOf", 1, |_vm, this, args| {
+    vm.define_method(&proto, "isPrototypeOf", 1, |vm, this, args| {
+        // A non-object argument returns false BEFORE ToObject(this) (so a
+        // nullish receiver with a primitive arg does not throw); an object
+        // argument with a nullish receiver does throw via ToObject.
         let v = arg(args, 0);
-        let target = match &this {
-            Value::Object(o) => o.clone(),
-            _ => return Ok(Value::Bool(false)),
-        };
-        let mut cur = match &v {
-            Value::Object(o) => o.borrow().proto.clone(),
-            _ => return Ok(Value::Bool(false)),
-        };
-        while let Some(p) = cur {
-            if p.same(&target) {
-                return Ok(Value::Bool(true));
-            }
-            cur = p.borrow().proto.clone();
+        if !matches!(v, Value::Object(_)) {
+            return Ok(Value::Bool(false));
         }
-        Ok(Value::Bool(false))
+        let target = this_object(vm, &this)?;
+        let mut cur = v;
+        // Walk the chain via [[GetPrototypeOf]] so a proxy in the chain
+        // consults its trap (its own `proto` is None).
+        loop {
+            let proto = match &cur {
+                Value::Object(o) => vm.proxy_or_ordinary_get_prototype_of(&o.clone())?,
+                _ => return Ok(Value::Bool(false)),
+            };
+            match proto {
+                Value::Object(p) => {
+                    if p.same(&target) {
+                        return Ok(Value::Bool(true));
+                    }
+                    cur = Value::Object(p);
+                }
+                _ => return Ok(Value::Bool(false)),
+            }
+        }
     });
 
     vm.define_method(&proto, "propertyIsEnumerable", 1, |vm, this, args| {
@@ -1002,78 +1012,25 @@ fn install_object(vm: &mut Vm) {
         }
         Ok(Value::Object(target))
     });
-    vm.define_method(&ctor, "freeze", 1, |_vm, _t, args| {
+    vm.define_method(&ctor, "freeze", 1, |vm, _t, args| {
         if let Value::Object(o) = arg(args, 0) {
-            let mut b = o.borrow_mut();
-            b.extensible = false;
-            // For arrays, record a non-writable length marker so isFrozen and
-            // the writable invariant are observable.
-            if let Internal::Array(arr) = &b.internal {
-                let len = arr.len();
-                b.props.insert(
-                    PropertyKey::str("length"),
-                    Property {
-                        kind: PropertyKind::Data {
-                            value: Value::Number(len as f64),
-                            writable: false,
-                        },
-                        enumerable: false,
-                        configurable: false,
-                    },
-                );
-            }
-            for (_, p) in b.props.iter_mut() {
-                p.configurable = false;
-                if let PropertyKind::Data { writable, .. } = &mut p.kind {
-                    *writable = false;
-                }
-            }
-            drop(b);
+            set_integrity_level(vm, &o, true)?;
             return Ok(Value::Object(o));
         }
         Ok(arg(args, 0))
     });
-    vm.define_method(&ctor, "isFrozen", 1, |_vm, _t, args| {
-        match arg(args, 0) {
-            Value::Object(o) => {
-                let b = o.borrow();
-                if b.extensible {
-                    return Ok(Value::Bool(false));
-                }
-                // Arrays with any live dense elements are not frozen (those
-                // index slots are writable/configurable data properties).
-                if let Internal::Array(arr) = &b.internal {
-                    if !arr.is_empty() {
-                        return Ok(Value::Bool(false));
-                    }
-                    // Length must be recorded non-writable.
-                    let len_ok = b
-                        .props
-                        .get(&PropertyKey::str("length"))
-                        .map(
-                            |p| matches!(&p.kind, PropertyKind::Data { writable, .. } if !writable),
-                        )
-                        .unwrap_or(false);
-                    if !len_ok {
-                        return Ok(Value::Bool(false));
-                    }
-                }
-                let frozen = b.props.values().all(|p| {
-                    !p.configurable
-                        && match &p.kind {
-                            PropertyKind::Data { writable, .. } => !writable,
-                            PropertyKind::Accessor { .. } => true,
-                        }
-                });
-                Ok(Value::Bool(frozen))
-            }
-            _ => Ok(Value::Bool(true)),
-        }
+    vm.define_method(&ctor, "isFrozen", 1, |vm, _t, args| match arg(args, 0) {
+        Value::Object(o) => Ok(Value::Bool(test_integrity_level(vm, &o, true)?)),
+        _ => Ok(Value::Bool(true)),
     });
     vm.define_method(&ctor, "preventExtensions", 1, |vm, _t, args| {
         if let Value::Object(o) = arg(args, 0) {
             if vm.is_proxy(&o) {
-                vm.proxy_prevent_extensions(&o)?;
+                // Object.preventExtensions throws if [[PreventExtensions]]
+                // reports failure (e.g. a trap returning false).
+                if !vm.proxy_prevent_extensions(&o)? {
+                    return Err(vm.throw_type("Object.preventExtensions failed"));
+                }
                 return Ok(Value::Object(o));
             }
             o.borrow_mut().extensible = false;
@@ -1259,64 +1216,16 @@ fn install_object_extra(vm: &mut Vm) {
             .collect();
         Ok(Value::Object(vm.new_array(syms)))
     });
-    vm.define_method(&ctor, "seal", 1, |_vm, _t, args| {
+    vm.define_method(&ctor, "seal", 1, |vm, _t, args| {
         if let Value::Object(o) = arg(args, 0) {
-            let mut b = o.borrow_mut();
-            b.extensible = false;
-            // For arrays, reify a non-configurable length marker.
-            if let Internal::Array(arr) = &b.internal {
-                let len = arr.len();
-                let writable = b
-                    .props
-                    .get(&PropertyKey::str("length"))
-                    .map(|p| matches!(&p.kind, PropertyKind::Data { writable, .. } if *writable))
-                    .unwrap_or(true);
-                b.props.insert(
-                    PropertyKey::str("length"),
-                    Property {
-                        kind: PropertyKind::Data {
-                            value: Value::Number(len as f64),
-                            writable,
-                        },
-                        enumerable: false,
-                        configurable: false,
-                    },
-                );
-            }
-            for (_, p) in b.props.iter_mut() {
-                p.configurable = false;
-            }
-            drop(b);
+            set_integrity_level(vm, &o, false)?;
             return Ok(Value::Object(o));
         }
         Ok(arg(args, 0))
     });
-    vm.define_method(&ctor, "isSealed", 1, |_vm, _t, args| {
-        match arg(args, 0) {
-            Value::Object(o) => {
-                let b = o.borrow();
-                if b.extensible {
-                    return Ok(Value::Bool(false));
-                }
-                // Arrays with dense elements have configurable index props.
-                if let Internal::Array(arr) = &b.internal {
-                    if !arr.is_empty() {
-                        return Ok(Value::Bool(false));
-                    }
-                    let len_present = b
-                        .props
-                        .get(&PropertyKey::str("length"))
-                        .map(|p| !p.configurable)
-                        .unwrap_or(false);
-                    if !len_present {
-                        return Ok(Value::Bool(false));
-                    }
-                }
-                let sealed = b.props.values().all(|p| !p.configurable);
-                Ok(Value::Bool(sealed))
-            }
-            _ => Ok(Value::Bool(true)),
-        }
+    vm.define_method(&ctor, "isSealed", 1, |vm, _t, args| match arg(args, 0) {
+        Value::Object(o) => Ok(Value::Bool(test_integrity_level(vm, &o, false)?)),
+        _ => Ok(Value::Bool(true)),
     });
     vm.define_method(&ctor, "hasOwn", 2, |vm, _t, args| {
         let o = vm.to_object(&arg(args, 0))?;
@@ -1325,10 +1234,158 @@ fn install_object_extra(vm: &mut Vm) {
     });
 }
 
-/// A private name (`#x`), modeled internally as a `"#x"` string key. These must
-/// be invisible to all reflection (hasOwnProperty, getOwnPropertyDescriptor, ...).
-pub(crate) fn is_private_key(key: &PropertyKey) -> bool {
-    matches!(key.as_str(), Some(s) if s.starts_with('#'))
+/// SetIntegrityLevel (spec 7.3.16): [[PreventExtensions]] — through Proxy
+/// traps, TypeError when it reports failure — then one DefinePropertyOrThrow
+/// per own key, in [[OwnPropertyKeys]] order: `{configurable: false}` for
+/// sealing, plus `{writable: false}` for frozen DATA keys.
+pub(crate) fn set_integrity_level(vm: &mut Vm, o: &JsObject, frozen: bool) -> Result<(), Value> {
+    let ok = if vm.is_proxy(o) {
+        vm.proxy_prevent_extensions(o)?
+    } else {
+        o.borrow_mut().extensible = false;
+        true
+    };
+    if !ok {
+        return Err(vm.throw_type("preventExtensions trap returned falsish"));
+    }
+    let keys = vm.own_property_keys(o)?;
+    let is_proxy = vm.is_proxy(o);
+    for k in keys {
+        // The key's CURRENT shape decides the descriptor (a frozen accessor
+        // keeps its get/set; only data keys lose writability). An absent key
+        // (e.g. a lying proxy ownKeys) is skipped.
+        let cur_accessor = if is_proxy {
+            let desc = vm.proxy_get_own_descriptor(o, &k)?;
+            if desc.is_undefined() {
+                continue;
+            }
+            let g = vm.get_prop(&desc, &PropertyKey::str("get"))?;
+            let st = vm.get_prop(&desc, &PropertyKey::str("set"))?;
+            !g.is_undefined() || !st.is_undefined()
+        } else {
+            match own_property_descriptor(o, &k) {
+                None => continue,
+                Some(p) => {
+                    // Skip keys already at the target level — notably the
+                    // synthesized exotic slots (string-object indices) that
+                    // are born non-writable/non-configurable and which the
+                    // ordinary define path cannot see.
+                    let already = !p.configurable
+                        && match &p.kind {
+                            PropertyKind::Accessor { .. } => true,
+                            PropertyKind::Data { writable, .. } => !frozen || !*writable,
+                        };
+                    if already {
+                        continue;
+                    }
+                    matches!(p.kind, PropertyKind::Accessor { .. })
+                }
+            }
+        };
+        let d = PropDesc {
+            value: None,
+            writable: if frozen && !cur_accessor {
+                Some(false)
+            } else {
+                None
+            },
+            get: None,
+            set: None,
+            has_get: false,
+            has_set: false,
+            enumerable: None,
+            configurable: Some(false),
+        };
+        if is_proxy {
+            let dv = vm.new_object();
+            let dvv = Value::Object(dv);
+            if let Some(w) = d.writable {
+                vm.set_prop(&dvv, &PropertyKey::str("writable"), Value::Bool(w))?;
+            }
+            vm.set_prop(&dvv, &PropertyKey::str("configurable"), Value::Bool(false))?;
+            if !vm.proxy_define_property(o, &k, dvv)? {
+                return Err(vm.throw_type("defineProperty trap returned falsish"));
+            }
+        } else {
+            define_own_property(vm, o, &k, &d, true)?;
+        }
+    }
+    // An array's `length` is an own property the key walk above doesn't
+    // surface (it is derived, not stored in `props` until reified). Reify
+    // its integrity marker so freeze makes it non-writable and seal makes it
+    // non-configurable, matching `length`'s appearance in [[OwnPropertyKeys]].
+    if !is_proxy {
+        let mut b = o.borrow_mut();
+        if let Internal::Array(arr) = &b.internal {
+            let len = arr.len() as f64;
+            let cur_writable = b
+                .props
+                .get(&PropertyKey::str("length"))
+                .map(|p| matches!(&p.kind, PropertyKind::Data { writable, .. } if *writable))
+                .unwrap_or(true);
+            b.props.insert(
+                PropertyKey::str("length"),
+                Property {
+                    kind: PropertyKind::Data {
+                        value: Value::Number(len),
+                        writable: cur_writable && !frozen,
+                    },
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+/// TestIntegrityLevel (spec 7.3.17): extensible objects fail; otherwise every
+/// own key must be non-configurable (and, for `frozen`, data keys
+/// non-writable).
+fn test_integrity_level(vm: &mut Vm, o: &JsObject, frozen: bool) -> Result<bool, Value> {
+    let extensible = if vm.is_proxy(o) {
+        vm.proxy_is_extensible(o)?
+    } else {
+        o.borrow().extensible
+    };
+    if extensible {
+        return Ok(false);
+    }
+    let is_proxy = vm.is_proxy(o);
+    for k in vm.own_property_keys(o)? {
+        if is_proxy {
+            let desc = vm.proxy_get_own_descriptor(o, &k)?;
+            if desc.is_undefined() {
+                continue;
+            }
+            let c = vm.get_prop(&desc, &PropertyKey::str("configurable"))?;
+            if vm.to_boolean(&c) {
+                return Ok(false);
+            }
+            if frozen {
+                let g = vm.get_prop(&desc, &PropertyKey::str("get"))?;
+                let st = vm.get_prop(&desc, &PropertyKey::str("set"))?;
+                if g.is_undefined() && st.is_undefined() {
+                    let w = vm.get_prop(&desc, &PropertyKey::str("writable"))?;
+                    if vm.to_boolean(&w) {
+                        return Ok(false);
+                    }
+                }
+            }
+        } else if let Some(p) = own_property_descriptor(o, &k) {
+            if p.configurable {
+                return Ok(false);
+            }
+            if frozen {
+                if let PropertyKind::Data { writable, .. } = &p.kind {
+                    if *writable {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Whether `o` has an own property `key` (string/symbol or array/string
@@ -1561,9 +1618,6 @@ fn enumerable_own_strings_dyn(vm: &mut Vm, o: &JsObject) -> Result<Vec<JsString>
 }
 
 fn own_property_exists(o: &JsObject, key: &PropertyKey) -> bool {
-    if is_private_key(key) {
-        return false;
-    }
     let b = o.borrow();
     if b.props.contains_key(key) {
         return true;
@@ -1601,9 +1655,6 @@ fn own_property_exists(o: &JsObject, key: &PropertyKey) -> bool {
 /// The own property descriptor for `key`, including array/string exotic
 /// index/length slots reified into `Property` values.
 pub(crate) fn own_property_descriptor(o: &JsObject, key: &PropertyKey) -> Option<Property> {
-    if is_private_key(key) {
-        return None;
-    }
     let b = o.borrow();
     if let Some(p) = b.props.get(key) {
         let mut p = p.clone();

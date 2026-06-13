@@ -24,6 +24,7 @@ serde_json = "1"
 num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"
+unicode-normalization = "0.1.25"
 
 [dev-dependencies]
 criterion = "0.5"

@@ -907,13 +907,12 @@ fn json_build_replacer(
         return Ok((Some(replacer.clone()), None));
     }
     if let Value::Object(o) = replacer {
-        let is_array = matches!(o.borrow().internal, Internal::Array(_));
+        // IsArray pierces proxies (a revoked proxy throws); a proxy array
+        // replacer reads its length and elements through [[Get]] traps.
+        let is_array = crate::builtins::fundamental::is_array_exotic(vm, o)?;
         if is_array {
-            let len = if let Internal::Array(a) = &o.borrow().internal {
-                a.len()
-            } else {
-                0
-            };
+            let len_v = vm.get_prop(replacer, &PropertyKey::str("length"))?;
+            let len = vm.to_length(&len_v)?;
             let mut list: Vec<String> = Vec::new();
             for i in 0..len {
                 let el = vm.get_prop(replacer, &PropertyKey::from_index(i as u32))?;
@@ -1319,12 +1318,13 @@ fn json_stringify(
 ) -> Result<Option<String>, Value> {
     let mut value = vm.get_prop(holder, &PropertyKey::str(key))?;
 
-    // toJSON
-    if let Value::Object(o) = &value {
-        let o = o.clone();
+    // toJSON: looked up for an Object OR a BigInt value (spec
+    // SerializeJSONProperty step 2), called with the value as `this`.
+    if matches!(&value, Value::Object(_) | Value::BigInt(_)) {
         let to_json = vm.get_prop(&value, &PropertyKey::str("toJSON"))?;
         if vm.is_callable(&to_json) {
-            value = vm.call(to_json, Value::Object(o), &[Value::str(key)])?;
+            let this = value.clone();
+            value = vm.call(to_json, this, &[Value::str(key)])?;
         }
     }
 
@@ -1338,7 +1338,7 @@ fn json_stringify(
     if let Value::Object(o) = &value {
         // Determine the boxed class and (for Boolean) its primitive without
         // holding the borrow across the reassignment below.
-        let (cls, boxed_bool) = {
+        let (cls, boxed_bool, boxed_bigint) = {
             let b = o.borrow();
             let cls = b.class_name();
             let bb = if let Internal::Boolean(v) = &b.internal {
@@ -1346,13 +1346,25 @@ fn json_stringify(
             } else {
                 None
             };
-            (cls, bb)
+            let bi = if let Internal::BigIntObj(n) = &b.internal {
+                Some(n.clone())
+            } else {
+                None
+            };
+            (cls, bb, bi)
         };
         let boxed = value.clone();
         match cls {
             "Number" => value = Value::Number(vm.to_number(&boxed)?),
             "String" => value = Value::String(vm.to_js_string(&boxed)?),
             "Boolean" => value = Value::Bool(boxed_bool.unwrap_or(false)),
+            // A boxed BigInt unwraps to its primitive (step 4.d), which step
+            // 10 then rejects with a TypeError.
+            "BigInt" => {
+                if let Some(n) = boxed_bigint {
+                    value = Value::BigInt(n);
+                }
+            }
             _ => {}
         }
     }
@@ -1383,7 +1395,7 @@ fn json_stringify(
                 return Err(vm.throw_type("Converting circular structure to JSON"));
             }
             state.seen.push(id);
-            let is_array = matches!(o.borrow().internal, Internal::Array(_));
+            let is_array = crate::builtins::fundamental::is_array_exotic(vm, o)?;
             let indent = state.indent.clone();
             let new_indent = format!("{cur_indent}{indent}");
             let (nl, sp) = if indent.is_empty() {
@@ -1392,11 +1404,10 @@ fn json_stringify(
                 (format!("\n{new_indent}"), " ".to_string())
             };
             let result = if is_array {
-                let len = if let Internal::Array(a) = &o.borrow().internal {
-                    a.len()
-                } else {
-                    0
-                };
+                // SerializeJSONArray reads `length` via [[Get]] (a proxy trap
+                // fires) and ToLength; elements go through [[Get]] too.
+                let len_v = vm.get_prop(&value, &PropertyKey::str("length"))?;
+                let len = vm.to_length(&len_v)?;
                 if len == 0 {
                     "[]".to_string()
                 } else {
@@ -1420,9 +1431,14 @@ fn json_stringify(
                 let keys: Vec<String> = if let Some(list) = &state.rep_list {
                     list.clone()
                 } else {
-                    vm.enumerable_own_string_keys(o)
+                    // EnumerableOwnPropertyNames via [[OwnPropertyKeys]] +
+                    // [[GetOwnProperty]] (proxy-aware); JSON keeps string keys.
+                    vm.enumerable_own_keys_dyn(o)?
                         .into_iter()
-                        .map(|k| k.as_str().to_string())
+                        .filter_map(|k| match k {
+                            PropertyKey::Str(s) => Some(s.as_str().to_string()),
+                            PropertyKey::Sym(_) => None,
+                        })
                         .collect()
                 };
                 let mut parts = Vec::new();

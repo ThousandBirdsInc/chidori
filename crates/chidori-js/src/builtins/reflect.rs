@@ -295,7 +295,7 @@ fn reflect_get(
 /// receiver is the target this delegates to `vm.set_prop`. With a distinct
 /// receiver, accessor setters receive `receiver` as `this`; a plain data write
 /// is performed against the receiver object.
-fn reflect_set(
+pub(crate) fn reflect_set(
     vm: &mut Vm,
     target: &JsObject,
     key: &PropertyKey,

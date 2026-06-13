@@ -206,6 +206,7 @@ pub(crate) fn clear_object_edges(o: &JsObject) {
     b.props.clear();
     b.proto = None;
     b.internal = Internal::Ordinary;
+    b.privates = None;
 }
 
 /// Enumerate every traced strong `JsObject` reference held by `data`, exactly
@@ -224,6 +225,22 @@ fn trace_object(
     }
     for (_k, prop) in &data.props {
         trace_property(prop, f);
+    }
+    if let Some(privs) = &data.privates {
+        for el in privs.values() {
+            match el {
+                crate::value::PrivateElement::Field(v)
+                | crate::value::PrivateElement::Method(v) => trace_value(v, f),
+                crate::value::PrivateElement::Accessor { get, set } => {
+                    if let Some(g) = get {
+                        trace_value(g, f);
+                    }
+                    if let Some(s) = set {
+                        trace_value(s, f);
+                    }
+                }
+            }
+        }
     }
     match &data.internal {
         Internal::Array(v) => {

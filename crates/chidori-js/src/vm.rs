@@ -69,6 +69,10 @@ pub struct TryHandler {
     /// unwind into the catch/finally, the with-scope stack is restored to this
     /// depth so a `with` body that throws does not leak its environment.
     pub with_depth: usize,
+    /// The frame's private-environment chain when this handler was installed,
+    /// restored on unwind (a class definition that throws mid-evaluation must
+    /// not leak its private scope).
+    pub priv_env: Option<Rc<crate::value::PrivateEnv>>,
     /// A `yield*` delegation handler: it catches only EXTERNAL `.throw()`
     /// resumptions (to forward them to the inner iterator). The async-generator
     /// machinery's internal await-of-yielded-value rejection sets the frame's
@@ -131,6 +135,9 @@ pub struct Frame {
     /// eval-introduced `var`s (also pushed as the outermost with-scope, so
     /// dynamic name ops and nested closures resolve them). `None` elsewhere.
     pub eval_vars: Option<JsObject>,
+    /// The active PrivateEnvironment chain: seeded from the closure's captured
+    /// chain, pushed/popped by class definitions evaluating in this frame.
+    pub priv_env: Option<Rc<crate::value::PrivateEnv>>,
 }
 
 /// Promise internal state.
@@ -220,6 +227,9 @@ pub struct Vm {
     pub realm: Realm,
     pub microtasks: VecDeque<Microtask>,
     pub symbol_counter: u64,
+    /// Monotonic allocator for [`crate::value::PrivateName::id`] — one fresh
+    /// id per private name per class definition *evaluation*.
+    pub private_name_counter: u64,
     pub call_depth: usize,
     pub max_call_depth: usize,
     /// Pending host operations (id -> promise object) awaiting resolution.
@@ -284,6 +294,10 @@ pub struct Vm {
     /// an object reachable only through such a shared cell could be collected
     /// while the host can still reach it.
     pub gc_cell_roots: Vec<std::rc::Rc<RefCell<Value>>>,
+    /// Per-realm tagged-template cache: `(FuncProto pointer, template index)`
+    /// -> the cached frozen template object (spec GetTemplateObject). A shared
+    /// proto is the same Parse Node, so all closures over it reuse one object.
+    pub template_cache: std::collections::HashMap<(usize, u32), JsObject>,
 }
 
 impl Vm {
@@ -292,6 +306,7 @@ impl Vm {
             realm: Realm::placeholder(),
             microtasks: VecDeque::new(),
             symbol_counter: 1,
+            private_name_counter: 1,
             call_depth: 0,
             max_call_depth: 2000,
             pending_host: indexmap::IndexMap::new(),
@@ -310,6 +325,7 @@ impl Vm {
             all_objects: std::cell::RefCell::new(Vec::new()),
             gc_compact_at: std::cell::Cell::new(1 << 12),
             gc_cell_roots: Vec::new(),
+            template_cache: std::collections::HashMap::new(),
         };
         crate::realm::init_realm(&mut vm);
         // The placeholder realm's intrinsic objects were created before the VM
@@ -318,6 +334,17 @@ impl Vm {
             vm.track_object(&o);
         }
         vm
+    }
+
+    /// Compile and run `src` as a top-level SCRIPT in this realm (the host
+    /// `$262.evalScript` hook): global `var`/function declarations create
+    /// global-object bindings. A compile error becomes a thrown SyntaxError;
+    /// the completion value is returned.
+    pub fn eval_script(&mut self, src: &str) -> Result<Value, Value> {
+        let proto = crate::compiler::compile_script(src)
+            .map_err(|e| self.throw_syntax(e.trim_start_matches("SyntaxError: ")))?;
+        let func = self.make_closure(std::rc::Rc::new(proto), Vec::new());
+        self.call(Value::Object(func), Value::Undefined, &[])
     }
 
     pub fn alloc_symbol(&mut self, description: Option<&str>) -> JsSymbol {
@@ -761,22 +788,10 @@ impl Vm {
     // ---------------------------------------------------------------------
 
     pub fn is_callable(&self, v: &Value) -> bool {
-        let o = match v {
-            Value::Object(o) => o,
-            _ => return false,
-        };
-        // A Proxy is callable iff its (non-revoked) target is callable.
-        let target = {
-            let b = o.borrow();
-            if b.is_callable() {
-                return true;
-            }
-            match &b.internal {
-                Internal::Proxy(p) if !p.revoked => p.target.clone(),
-                _ => return false,
-            }
-        };
-        self.is_callable(&Value::Object(target))
+        // A proxy carries its callability flag (captured at creation), so
+        // `ObjectData::is_callable` already answers correctly for proxies,
+        // including revoked function proxies.
+        matches!(v, Value::Object(o) if o.borrow().is_callable())
     }
 
     /// IsConstructor: the value is a function with a `[[Construct]]` — a native
@@ -1068,12 +1083,40 @@ impl Vm {
                 }
             }
         }
+        // String exotic [[Set]]: an in-range integer index names a
+        // non-writable own data property (the character), so a write fails —
+        // strict throws, sloppy is a silent no-op. (Out-of-range indices and
+        // other keys fall through to ordinary behavior.)
+        {
+            let blocked = if let Internal::StringObj(s) = &obj.borrow().internal {
+                key.array_index()
+                    .is_some_and(|i| (i as usize) < s.as_str().chars().count())
+            } else {
+                false
+            };
+            if blocked {
+                if strict {
+                    return Err(self.throw_type(&format!(
+                        "Cannot assign to read only property '{}' of a String",
+                        key_display(key)
+                    )));
+                }
+                return Ok(());
+            }
+        }
         // Walk proto chain to find a setter / writable check.
         let mut cur = obj.clone();
         loop {
             // Proxy exotic [[Set]]: dispatch the trap (base or inherited proxy).
+            // A strict assignment throws when [[Set]] reports failure (PutValue).
             if matches!(cur.borrow().internal, Internal::Proxy(_)) {
-                self.proxy_set(&cur, key, value, base.clone())?;
+                let ok = self.proxy_set(&cur, key, value, base.clone())?;
+                if !ok && strict {
+                    return Err(self.throw_type(&format!(
+                        "Cannot assign to read only property '{}'",
+                        key_display(key)
+                    )));
+                }
                 return Ok(());
             }
             // Module Namespace exotic [[Set]]: always returns false (a strict
@@ -1351,6 +1394,25 @@ impl Vm {
                 }
             }
         }
+        // Exotic non-configurable own slots that aren't reified in `props`:
+        // an array's `length`, and a String object's `length` and in-range
+        // index characters — none are deletable (delete returns false).
+        if !has_props_entry {
+            match &b.internal {
+                Internal::Array(_) if key.as_str() == Some("length") => return Ok(false),
+                Internal::StringObj(s) => {
+                    if key.as_str() == Some("length") {
+                        return Ok(false);
+                    }
+                    if let Some(i) = key.array_index() {
+                        if (i as usize) < s.as_str().chars().count() {
+                            return Ok(false);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         match b.props.get(key) {
             Some(p) if !p.configurable => Ok(false),
             Some(_) => {
@@ -1478,6 +1540,15 @@ impl Vm {
                 int_keys.push(i as u32);
             }
         }
+        // An array's (and a String object's) `length` is an own property
+        // surfaced by [[OwnPropertyKeys]] right after the integer indices and
+        // before the other string keys — unless it has already been reified
+        // into `props` (e.g. by freeze/seal, where the props loop emits it).
+        if matches!(b.internal, Internal::Array(_) | Internal::StringObj(_))
+            && !b.props.contains_key(&PropertyKey::str("length"))
+        {
+            str_keys.push(PropertyKey::str("length"));
+        }
         // Module Namespace exotic [[OwnPropertyKeys]]: the (pre-sorted) export
         // names come first, then the ordinary symbol keys (@@toStringTag).
         if let Internal::ModuleNamespace(ns) = &b.internal {
@@ -1487,13 +1558,7 @@ impl Vm {
         }
         for k in b.props.keys() {
             match k {
-                PropertyKey::Str(s) => {
-                    // Private names (`#x`) are modeled internally as `"#x"` string
-                    // keys but must be invisible to all reflection (OwnPropertyKeys,
-                    // getOwnPropertyNames, Reflect.ownKeys, for-in, JSON, ...).
-                    if s.as_str().starts_with('#') {
-                        continue;
-                    }
+                PropertyKey::Str(_) => {
                     if let Some(idx) = k.array_index() {
                         int_keys.push(idx);
                     } else {
@@ -1529,10 +1594,24 @@ impl Vm {
     /// the `ownKeys` + `getOwnPropertyDescriptor` traps; ordinary objects read
     /// their property map directly. Used by `Object.assign`, object spread, etc.
     pub fn enumerable_own_keys_dyn(&mut self, o: &JsObject) -> Result<Vec<PropertyKey>, Value> {
+        self.enumerable_own_keys_excluding(o, &[])
+    }
+
+    /// Own enumerable keys, skipping `excluded` BEFORE any per-key descriptor
+    /// access (CopyDataProperties: a proxy source must not observe a
+    /// [[GetOwnProperty]] for an excluded key).
+    pub fn enumerable_own_keys_excluding(
+        &mut self,
+        o: &JsObject,
+        excluded: &[PropertyKey],
+    ) -> Result<Vec<PropertyKey>, Value> {
         let keys = self.own_property_keys(o)?;
         let is_proxy = matches!(o.borrow().internal, Internal::Proxy(_));
         let mut out = Vec::new();
         for k in keys {
+            if excluded.contains(&k) {
+                continue;
+            }
             let enumerable = if is_proxy {
                 let desc = self.proxy_get_own_descriptor(o, &k)?;
                 match &desc {
@@ -1650,6 +1729,7 @@ impl Vm {
         // records hold realm values); drop it so those cells don't keep cycles.
         self.dynamic_import = None;
         self.gc_cell_roots.clear();
+        self.template_cache.clear();
         self.module_capture = None;
 
         // Primary teardown: break the outgoing edges of EVERY object this VM
