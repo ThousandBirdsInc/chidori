@@ -5,11 +5,14 @@
 <h1 align="center">Chidori</h1>
 
 <p align="center">
-  An <b>agent framework where TypeScript agents checkpoint, replay, and resume by default</b>.
+  <b>An agent framework where TypeScript agents checkpoint, replay, and resume by default.</b>
+</p>
+
+<p align="center">
   Agents are plain async TypeScript; every side effect flows through the runtime as a recorded
-  <b>host call</b> — so a finished run can be saved to disk, replayed for identical output with
-  <b>zero LLM calls</b>, and resumed from any pause. One Rust binary, an embedded pure-Rust
-  JavaScript engine, and TypeScript + Python SDKs.
+  <b>host call</b>. So a finished run can be saved to disk, replayed for identical output with
+  <b>zero LLM calls</b>, and resumed from any pause — all on one Rust binary with an embedded
+  pure-Rust JavaScript engine and TypeScript + Python SDKs.
 </p>
 
 <p align="center">
@@ -31,17 +34,13 @@
 > **About v3.** Chidori began as a reactive runtime exploring how to build durable, debuggable agents. v3 is a ground-up rewrite that distills those ideas into a smaller, sharper core: a single Rust binary, TypeScript agent authoring, and replay as the foundation for tests, debugging, resume, and human-in-the-loop workflows. Earlier versions of Chidori live in the git history and on prior tags.
 
 ## Contents
-- [📖 About](#-about)
-- [⚡️ Quick Start](#️-quick-start)
-- [▶️ Try The Demo](#️-try-the-demo)
-- [🧩 Core Concepts](#-core-concepts)
-- [🚦 Running Modes](#-running-modes)
-- [🐍 Python SDK](#-python-sdk)
-- [⏪ How Replay Works](#-how-replay-works)
-- [🧪 Examples](#-examples)
-- [✅ JavaScript Conformance (Test262)](#-javascript-conformance-test262)
-- [🏗 Architecture](#-architecture)
-- [📦 Project Structure](#-project-structure)
+
+| Get started | Understand | Reference |
+| --- | --- | --- |
+| [📖 About](#-about) | [🧩 Core Concepts](#-core-concepts) | [🧪 Examples](#-examples) |
+| [⚡️ Quick Start](#️-quick-start) | [🚦 Running Modes](#-running-modes) | [✅ JavaScript Conformance (Test262)](#-javascript-conformance-test262) |
+| [▶️ Try The Demo](#️-try-the-demo) | [⏪ How Replay Works](#-how-replay-works) | [🏗 Architecture](#-architecture) |
+| [🐍 Python SDK](#-python-sdk) | | [📦 Project Structure](#-project-structure) |
 
 ## 📖 About
 
