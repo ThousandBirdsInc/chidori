@@ -154,7 +154,9 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
                     );
                 }
             }
-            _ => return Err(vm.throw_type("ArrayBuffer options must be an object")),
+            // GetArrayBufferMaxByteLengthOption: a non-object `options` is
+            // ignored (the buffer is non-resizable), not a TypeError.
+            _ => {}
         }
         Ok(Value::Object(buf))
     };
@@ -311,7 +313,43 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
         let start = rel_index(vm, &arg(args, 0), len, 0)?;
         let end = rel_index(vm, &arg(args, 1), len, len)?;
         let new_len = (end - start).max(0) as usize;
-        let new_buf = vm.new_array_buffer(new_len);
+        // SpeciesConstructor(O, %ArrayBuffer%), then Construct(ctor, «newLen»),
+        // validating the result (spec 25.1.5.3 steps 14–20).
+        let default_ctor = vm.get_prop(
+            &Value::Object(vm.realm.global.clone()),
+            &PropertyKey::str("ArrayBuffer"),
+        )?;
+        let ctor = ta_species_constructor(vm, &o, &default_ctor)?;
+        let new_obj = vm.construct(&ctor, &[Value::Number(new_len as f64)], &ctor)?;
+        let new_buf = match &new_obj {
+            Value::Object(b) if matches!(b.borrow().internal, Internal::ArrayBuffer(_)) => {
+                b.clone()
+            }
+            _ => {
+                return Err(vm.throw_type(
+                    "ArrayBuffer.prototype.slice: species did not return an ArrayBuffer",
+                ))
+            }
+        };
+        if matches!(new_buf.borrow().internal, Internal::ArrayBuffer(None)) {
+            return Err(
+                vm.throw_type("ArrayBuffer.prototype.slice: species returned a detached buffer")
+            );
+        }
+        if new_buf.same(&o) {
+            return Err(
+                vm.throw_type("ArrayBuffer.prototype.slice: species returned the same buffer")
+            );
+        }
+        if (buffer_byte_length(&new_buf) as usize) < new_len {
+            return Err(vm.throw_type(
+                "ArrayBuffer.prototype.slice: species returned a buffer that is too small",
+            ));
+        }
+        // The species constructor may have detached the source buffer.
+        if matches!(o.borrow().internal, Internal::ArrayBuffer(None)) {
+            return Err(vm.throw_type("ArrayBuffer.prototype.slice: source buffer was detached"));
+        }
         // Copy bytes [start, end) into the new buffer.
         {
             let src = o.borrow();
