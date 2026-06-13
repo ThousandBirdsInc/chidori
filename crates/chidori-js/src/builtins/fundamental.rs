@@ -1224,7 +1224,7 @@ fn install_object_extra(vm: &mut Vm) {
 /// traps, TypeError when it reports failure — then one DefinePropertyOrThrow
 /// per own key, in [[OwnPropertyKeys]] order: `{configurable: false}` for
 /// sealing, plus `{writable: false}` for frozen DATA keys.
-fn set_integrity_level(vm: &mut Vm, o: &JsObject, frozen: bool) -> Result<(), Value> {
+pub(crate) fn set_integrity_level(vm: &mut Vm, o: &JsObject, frozen: bool) -> Result<(), Value> {
     let ok = if vm.is_proxy(o) {
         vm.proxy_prevent_extensions(o)?
     } else {
@@ -1294,6 +1294,32 @@ fn set_integrity_level(vm: &mut Vm, o: &JsObject, frozen: bool) -> Result<(), Va
             }
         } else {
             define_own_property(vm, o, &k, &d, true)?;
+        }
+    }
+    // An array's `length` is an own property the key walk above doesn't
+    // surface (it is derived, not stored in `props` until reified). Reify
+    // its integrity marker so freeze makes it non-writable and seal makes it
+    // non-configurable, matching `length`'s appearance in [[OwnPropertyKeys]].
+    if !is_proxy {
+        let mut b = o.borrow_mut();
+        if let Internal::Array(arr) = &b.internal {
+            let len = arr.len() as f64;
+            let cur_writable = b
+                .props
+                .get(&PropertyKey::str("length"))
+                .map(|p| matches!(&p.kind, PropertyKind::Data { writable, .. } if *writable))
+                .unwrap_or(true);
+            b.props.insert(
+                PropertyKey::str("length"),
+                Property {
+                    kind: PropertyKind::Data {
+                        value: Value::Number(len),
+                        writable: cur_writable && !frozen,
+                    },
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
         }
     }
     Ok(())

@@ -526,6 +526,8 @@ struct FnCtx {
     /// Synthetic in-class closure (e.g. `%fieldinit`): inherits the creating
     /// frame's [[HomeObject]] at closure creation (see `FuncProto`).
     inherit_home: bool,
+    /// Tagged-template literals compiled in this function (see `FuncProto`).
+    templates: Vec<TemplateParts>,
 }
 
 impl FnCtx {
@@ -563,6 +565,7 @@ impl FnCtx {
             strict: false,
             stable_cells: Vec::new(),
             inherit_home: false,
+            templates: Vec::new(),
             home_super: false,
             eval_scopes: Vec::new(),
         }
@@ -1596,6 +1599,7 @@ impl Compiler {
             stable_cells: fc.stable_cells.clone(),
             this_cell: fc.this_cell,
             inherit_home: fc.inherit_home,
+            templates: fc.templates,
         }
     }
 
@@ -3649,22 +3653,56 @@ impl Compiler {
     }
 
     fn compile_tagged_template(&mut self, t: &TaggedTemplateExpression) -> R {
-        // tag(strings, ...exprs) where strings has a `raw` property.
-        // Build the strings array.
-        self.compile_expr(&t.tag)?; // [tag]
-        self.emit(Op::LoadUndefined); // this
-                                      // strings array
-        for q in &t.quasi.quasis {
-            let cooked = q.value.cooked.as_ref().map(|s| s.as_str()).unwrap_or("");
-            self.load_str(cooked);
+        // tag(templateObject, ...exprs). The template object is cached per
+        // source position and frozen (GetTemplateObject builds it once); the
+        // tag callee and the substitution expressions evaluate on every call.
+        //
+        // A member-call tag (`obj.tag\`...\``) keeps `obj` as the `this`
+        // receiver, mirroring an ordinary method call.
+        let parts = TemplateParts {
+            cooked: t
+                .quasi
+                .quasis
+                .iter()
+                .map(|q| q.value.cooked.as_ref().map(|s| Rc::from(s.as_str())))
+                .collect(),
+            raw: t
+                .quasi
+                .quasis
+                .iter()
+                .map(|q| Rc::from(q.value.raw.as_str()))
+                .collect(),
+        };
+        let idx = {
+            let fc = self.cur();
+            fc.templates.push(parts);
+            (fc.templates.len() - 1) as u32
+        };
+        // Evaluate the callee with the correct `this` (the receiver for a
+        // member-expression tag, else undefined).
+        match &t.tag {
+            Expression::StaticMemberExpression(m) if !matches!(m.object, Expression::Super(_)) => {
+                self.compile_expr(&m.object)?; // [obj]
+                self.emit(Op::Dup); // [obj, obj]
+                let k = self.str_const(m.property.name.as_str());
+                self.emit(Op::GetProp(k)); // [obj, fn]
+                self.emit(Op::Swap); // [fn, obj(this)]
+            }
+            Expression::ComputedMemberExpression(m)
+                if !matches!(m.object, Expression::Super(_)) =>
+            {
+                self.compile_expr(&m.object)?; // [obj]
+                self.emit(Op::Dup); // [obj, obj]
+                self.compile_expr(&m.expression)?; // [obj, obj, key]
+                self.emit(Op::GetPropDynamic); // [obj, fn]
+                self.emit(Op::Swap); // [fn, obj(this)]
+            }
+            _ => {
+                self.compile_expr(&t.tag)?; // [fn]
+                self.emit(Op::LoadUndefined); // [fn, this=undefined]
+            }
         }
-        self.emit(Op::NewArray(t.quasi.quasis.len() as u32)); // [tag, this, strings]
-                                                              // raw property = same strings (approx)
-        self.emit(Op::Dup);
-        self.emit(Op::Dup);
-        let raw = self.str_const("raw");
-        self.emit(Op::SetProp(raw));
-        self.emit(Op::Pop);
+        self.emit(Op::GetTemplateObject(idx)); // [fn, this, templateObject]
         for e in &t.quasi.expressions {
             self.compile_expr(e)?;
         }

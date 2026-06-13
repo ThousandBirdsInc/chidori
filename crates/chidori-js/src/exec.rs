@@ -1187,6 +1187,49 @@ impl Vm {
                 let elems = frame.stack.split_off(at);
                 push!(Value::Object(self.new_array(elems)));
             }
+            Op::GetTemplateObject(idx) => {
+                let key = (Rc::as_ptr(&frame.func.proto) as *const () as usize, idx);
+                if let Some(o) = self.template_cache.get(&key) {
+                    push!(Value::Object(o.clone()));
+                } else {
+                    let parts = frame.func.proto.templates[idx as usize].clone();
+                    // Cooked strings (an illegal escape cooks to `undefined`).
+                    let cooked: Vec<Value> = parts
+                        .cooked
+                        .iter()
+                        .map(|c| match c {
+                            Some(s) => Value::String(JsString(s.clone())),
+                            None => Value::Undefined,
+                        })
+                        .collect();
+                    let arr = self.new_array(cooked);
+                    let raw: Vec<Value> = parts
+                        .raw
+                        .iter()
+                        .map(|s| Value::String(JsString(s.clone())))
+                        .collect();
+                    let raw_arr = self.new_array(raw);
+                    // The `raw` array is frozen; `raw` is a non-enumerable,
+                    // non-writable, non-configurable own property of the
+                    // template object, which is itself frozen (spec
+                    // GetTemplateObject / TemplateString integrity).
+                    crate::builtins::fundamental::set_integrity_level(self, &raw_arr, true)?;
+                    arr.borrow_mut().props.insert(
+                        PropertyKey::str("raw"),
+                        Property {
+                            kind: PropertyKind::Data {
+                                value: Value::Object(raw_arr),
+                                writable: false,
+                            },
+                            enumerable: false,
+                            configurable: false,
+                        },
+                    );
+                    crate::builtins::fundamental::set_integrity_level(self, &arr, true)?;
+                    self.template_cache.insert(key, arr.clone());
+                    push!(Value::Object(arr));
+                }
+            }
             Op::ArrayPushElision => {
                 // For array literals we build via NewArray; elisions handled by
                 // pushing undefined holes at compile time.

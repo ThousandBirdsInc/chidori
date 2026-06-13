@@ -294,6 +294,10 @@ pub struct Vm {
     /// an object reachable only through such a shared cell could be collected
     /// while the host can still reach it.
     pub gc_cell_roots: Vec<std::rc::Rc<RefCell<Value>>>,
+    /// Per-realm tagged-template cache: `(FuncProto pointer, template index)`
+    /// -> the cached frozen template object (spec GetTemplateObject). A shared
+    /// proto is the same Parse Node, so all closures over it reuse one object.
+    pub template_cache: std::collections::HashMap<(usize, u32), JsObject>,
 }
 
 impl Vm {
@@ -321,6 +325,7 @@ impl Vm {
             all_objects: std::cell::RefCell::new(Vec::new()),
             gc_compact_at: std::cell::Cell::new(1 << 12),
             gc_cell_roots: Vec::new(),
+            template_cache: std::collections::HashMap::new(),
         };
         crate::realm::init_realm(&mut vm);
         // The placeholder realm's intrinsic objects were created before the VM
@@ -1688,6 +1693,7 @@ impl Vm {
         // records hold realm values); drop it so those cells don't keep cycles.
         self.dynamic_import = None;
         self.gc_cell_roots.clear();
+        self.template_cache.clear();
         self.module_capture = None;
 
         // Primary teardown: break the outgoing edges of EVERY object this VM

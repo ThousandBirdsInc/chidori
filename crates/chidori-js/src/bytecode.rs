@@ -146,6 +146,11 @@ pub struct FuncProto {
     /// derived constructor's `%fieldinit`, so `super.x` in field initializers
     /// resolves against the class prototype).
     pub inherit_home: bool,
+    /// Tagged-template literals in this function, indexed by
+    /// [`Op::GetTemplateObject`]. The cached frozen template object is keyed
+    /// at runtime by `(this proto's pointer, index)` — the spec's per-Parse
+    /// Node template cache (a shared proto is the same Parse Node).
+    pub templates: Vec<TemplateParts>,
 }
 
 impl FuncProto {
@@ -169,8 +174,19 @@ impl FuncProto {
             eval_scopes: Vec::new(),
             this_cell: None,
             inherit_home: false,
+            templates: Vec::new(),
         }
     }
+}
+
+/// The compile-time parts of one tagged-template literal: the cooked strings
+/// (`None` for an illegal escape, which cooks to `undefined`) and the raw
+/// strings. Used by [`Op::GetTemplateObject`] to build the cached, frozen
+/// template object on first evaluation.
+#[derive(Clone, Debug)]
+pub struct TemplateParts {
+    pub cooked: Vec<Option<Rc<str>>>,
+    pub raw: Vec<Rc<str>>,
 }
 
 /// A local binding slot — either a plain stack slot or a heap cell (captured).
@@ -449,6 +465,10 @@ pub enum Op {
     // ---- objects / arrays ----
     NewObject,
     NewArray(u32), // number of initial elements popped
+    /// Push the cached, frozen template object for tagged-template literal
+    /// `index` (into the function's `templates`): `[] -> [templateObject]`.
+    /// Built once per `(proto, index)` and reused on later evaluations.
+    GetTemplateObject(u32),
     /// Push a hole into array-literal construction (for elisions).
     ArrayPushElision,
     /// Spread the iterable on top into the array being built (array literal).
