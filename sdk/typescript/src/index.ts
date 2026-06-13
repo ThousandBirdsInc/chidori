@@ -14,8 +14,6 @@ export type {
   CompactOptions,
   Context,
   DatePolicy,
-  HttpRequestOptions,
-  HttpResponse,
   InputOptions,
   JsonObject,
   JsonSchema,

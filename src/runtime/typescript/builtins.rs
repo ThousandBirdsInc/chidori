@@ -399,14 +399,15 @@ export default promises;
 
 // node:http client shim. Only the *client* surface is provided (request/get);
 // there are no listening sockets. Every request is performed by the captured
-// `chidori.http` host op, so a `node:http` request is subject to the security
-// policy and the approval-pause path exactly like `chidori.http`/`fetch`: the
-// network call happens synchronously inside `ClientRequest.end()`, so an
-// AskBefore policy throws the pause sentinel from there and the engine pauses
-// the run. Response events (`response`/`data`/`end`) are emitted after the
-// blocking call resolves, on a microtask, so listeners registered inside the
-// response callback still fire. `createHttpModule` is exported so `node:https`
-// can reuse this implementation with an `https:` default protocol.
+// `__chidori_http` host op — the same networking capture `globalThis.fetch`
+// uses — so a `node:http` request is subject to the security policy and the
+// approval-pause path exactly like `fetch`: the network call happens
+// synchronously inside `ClientRequest.end()`, so an AskBefore policy throws the
+// pause sentinel from there and the engine pauses the run. Response events
+// (`response`/`data`/`end`) are emitted after the blocking call resolves, on a
+// microtask, so listeners registered inside the response callback still fire.
+// `createHttpModule` is exported so `node:https` can reuse this implementation
+// with an `https:` default protocol.
 const HTTP_SHIM: &str = r#"
 class EventEmitter {
     constructor() { this._ev = {}; }
@@ -482,7 +483,7 @@ function createHttpModule(defaultProtocol) {
             try {
                 // Synchronous, policy-gated host call. An AskBefore policy throws
                 // the pause sentinel here; we let it propagate so the run pauses.
-                res = globalThis.chidori.http(this._url, options);
+                res = globalThis.__chidori_http(this._url, options);
             } catch (err) {
                 // Surface transport-style failures through the 'error' event, the
                 // node convention — but never swallow the pause sentinel, which
@@ -1532,8 +1533,12 @@ mod tests {
     fn http_and_https_shims_are_registered_and_route_through_chidori_http() {
         let http = PathBuf::from("/ws/__node_builtins__/http.js");
         assert_eq!(builtin_name_from_path(&http).as_deref(), Some("http"));
-        // The shim must perform requests via the policy-gated host op.
+        // The shim must perform requests via the captured networking host op
+        // (the same one `globalThis.fetch` uses), never a public `chidori.http`.
         assert!(source_for(&http)
+            .unwrap()
+            .contains("globalThis.__chidori_http"));
+        assert!(!source_for(&http)
             .unwrap()
             .contains("globalThis.chidori.http"));
 

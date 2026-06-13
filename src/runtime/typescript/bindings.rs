@@ -737,7 +737,7 @@ impl HostBindingBackend {
         args: &serde_json::Value,
     ) -> std::result::Result<serde_json::Value, String> {
         let HostBindingBackend::Runtime { tokio_rt, .. } = self else {
-            return Err("chidori.http requires the runtime host backend".to_string());
+            return Err("network requests require the runtime host backend".to_string());
         };
 
         host_core::execute_http(tokio_rt, args).map_err(|err| err.to_string())
@@ -981,11 +981,15 @@ impl HostBindingBackend {
                     let url = map
                         .get("url")
                         .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| "chidori.http options must include string url".to_string())?
+                        .ok_or_else(|| {
+                            "http request options must include a string url".to_string()
+                        })?
                         .to_string();
                     (url, first.clone())
                 } else {
-                    return Err("chidori.http requires a URL string or options object".to_string());
+                    return Err(
+                        "http request requires a URL string or options object".to_string()
+                    );
                 };
                 let mut method = options
                     .get("method")

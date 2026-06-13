@@ -20,10 +20,10 @@ chidori serve agents/my_agent.ts --port 8080
 ```
 
 The server is **deny-by-default**: unless you configure a policy
-(`CHIDORI_POLICY*` env vars) or pass `--trusted`, gated effects (`chidori.http`,
-workspace mutations) are refused — sessions arrive from callers you may not
-control. Local `chidori run` keeps the permissive default. See
-[`docs/sandbox-model.md`](./sandbox-model.md).
+(`CHIDORI_POLICY*` env vars) or pass `--trusted`, gated effects (network
+requests via `fetch`/`node:http`, workspace mutations) are refused — sessions
+arrive from callers you may not control. Local `chidori run` keeps the
+permissive default. See [`docs/sandbox-model.md`](./sandbox-model.md).
 
 Exposes:
 - `GET  /health` — health check
@@ -51,16 +51,19 @@ export async function agent(
   input: { url: string; payload?: Record<string, unknown> },
   chidori: Chidori,
 ) {
-  const response = await chidori.http(input.url, {
+  // `fetch` is the runtime's captured networking surface — policy-gated,
+  // pausable for approval, and recorded for replay.
+  const response = await fetch(input.url, {
     method: "POST",
-    body: input.payload ?? { source: "chidori" },
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input.payload ?? { source: "chidori" }),
   });
-  return { status: response.status, body: response.body };
+  return { status: response.status, body: await response.json() };
 }
 ```
 
 ```bash
-chidori serve agents/webhook.ts --port 8080 --trusted   # the agent calls chidori.http
+chidori serve agents/webhook.ts --port 8080 --trusted   # the agent makes a network call via fetch
 
 curl -X POST http://localhost:8080/github \
   -H "Content-Type: application/json" \

@@ -163,13 +163,16 @@ parallel path.
 
 - No `node:net`, `node:child_process`, `node:worker_threads`, `node:dns`, or
   `node:http(s)` *server* sockets in this work. These stay rejected for now.
-- Outbound HTTP is served by the first-class captured host op (`http`). The
-  stdlib net surface is built on top of it: `globalThis.fetch`
+- Outbound HTTP is served by the first-class captured host op (`http`), reached
+  through an internal `globalThis.__chidori_http` native. There is **no** public
+  `chidori.http`: the stdlib net surface *is* the public API. `globalThis.fetch`
   (+ `Headers`/`Request`/`Response`) and the `node:http`/`node:https` *client*
-  APIs (`request`/`get`) all delegate to `chidori.http`, so every network call
-  inherits its security-policy enforcement (allow / ask / deny) and the
-  approval-pause path. See `FETCH_POLYFILL` in `runtime::typescript::snapshot`
-  and the `HTTP_SHIM`/`HTTPS_SHIM` in `runtime::typescript::builtins`.
+  APIs (`request`/`get`) all route through `__chidori_http`, so every network
+  call — including ones made inside a dependency — inherits its security-policy
+  enforcement (allow / ask / deny), the approval-pause path, and record/replay.
+  See `FETCH_POLYFILL` in `runtime::typescript::helpers` (installed by the rust
+  engine after `install_chidori_effects`) and the `HTTP_SHIM`/`HTTPS_SHIM` in
+  `runtime::typescript::builtins`.
 - No real concurrent wall-clock scheduling. Timers are virtualized against a
   logical clock (see Timers); we do not run a real OS timer wheel.
 - No POSIX completeness for the VFS (no permissions bits enforcement, symlink

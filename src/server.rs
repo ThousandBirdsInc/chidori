@@ -3895,8 +3895,8 @@ mod tests {
 
     const HTTP_AGENT: &str = r#"
         export async function agent(input, chidori) {
-            const res = await chidori.http({ url: "https://example.invalid/" });
-            return { res };
+            const res = await fetch("https://example.invalid/");
+            return { status: res.status };
         }
     "#;
 

@@ -130,10 +130,14 @@ export const tool: ToolDefinition = {
 };
 
 export async function run(args: { query: string }, chidori: Chidori) {
-  return chidori.http("https://example.com/search", {
+  // Networking uses the standard `fetch` API, which the runtime replaces with a
+  // captured, policy-gated, replayable version.
+  const res = await fetch("https://example.com/search", {
     method: "POST",
-    body: args,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(args),
   });
+  return res.json();
 }
 ```
 
@@ -148,7 +152,6 @@ The injected `chidori` object provides:
 - `parallel(tasks, options?)`
 - `retry(fn, options?)`
 - `tryCall(fn)`
-- `http(url, options?)`
 - `template(pathOrText, vars?, options?)`
 - `log(message, fields?)`
 - `memory(action, key?, value?, options?)`
@@ -157,6 +160,12 @@ The injected `chidori` object provides:
 All side-effecting APIs are promise-returning durable host operations. Pure
 helpers may return synchronously only when they cannot suspend and do not need a
 call-log boundary.
+
+Networking is **not** on the `chidori` object: agents use the standard `fetch`
+(plus `Headers`/`Request`/`Response`) and `node:http`/`node:https` client APIs.
+The runtime replaces those base networking APIs with captured implementations
+that route through one policy-gated, replayable host op, so every request — even
+one issued inside a dependency — is gated and recorded automatically.
 
 ## Execution Flow
 
