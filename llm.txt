@@ -50,10 +50,10 @@ chidori snapshot <run_id>
 ```
 
 `chidori chat` is an interactive multi-turn REPL backed by `conversation()` — no
-agent file needed. Each turn is a durable host call; the prior turns replay for
-free, so only your newest message reaches the provider. Flags: `--system`,
-`--model`, `--tools <dir>` (discovered tools are offered every turn). Type
-`exit`/`quit` or Ctrl-D to end.
+agent file needed. Each turn is a durable host call and streams its reply
+token-by-token; the prior turns replay for free, so only your newest message
+reaches the provider. Flags: `--system`, `--model`, `--tools <dir>` (discovered
+tools are offered every turn). Type `exit`/`quit` or Ctrl-D to end.
 
 `chidori snapshot <run_id>` prints `runtime.snapshot.json` metadata without
 printing raw VM snapshot bytes.

@@ -294,6 +294,23 @@ impl Engine {
         self.run_with_context(path, inputs, ctx)
     }
 
+    /// Run an agent with a replay log *and* a live event sender. Prior turns
+    /// in the log replay silently (their host calls short-circuit before any
+    /// provider request, so they emit no prompt stream); only calls past the
+    /// end of the log execute live and stream token deltas. Used by the
+    /// `chidori chat` REPL to stream just the newest turn's reply.
+    pub fn run_with_replay_streaming(
+        &self,
+        path: &Path,
+        inputs: &Value,
+        replay_log: Vec<CallRecord>,
+        sender: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+    ) -> Result<RunResult> {
+        let ctx = RuntimeContext::with_replay(replay_log);
+        ctx.set_event_sender(sender);
+        self.run_with_context(path, inputs, ctx)
+    }
+
     /// Run an agent while forwarding live events and pausing on input or
     /// approval requests. This is the in-process equivalent of the session
     /// server's interactive execution path for embedders that already own
@@ -2389,6 +2406,83 @@ def agent(value):
             resumed.output,
             serde_json::json!({ "total": 42, "approved": true })
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_with_replay_streaming_streams_only_the_new_turn() {
+        // The `chidori chat` streaming path: replaying a prior turn must emit no
+        // prompt deltas (it short-circuits before the provider), so only the
+        // newest turn's reply streams.
+        let dir =
+            std::env::temp_dir().join(format!("chidori-engine-chat-stream-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(
+            &path,
+            r#"
+                export async function agent(input, chidori) {
+                    const chat = chidori.conversation({ system: "terse" });
+                    for (const m of input.messages) await chat.say(m);
+                    return { history: chat.history() };
+                }
+            "#,
+        )
+        .unwrap();
+
+        let engine = |content: &str| {
+            let mut providers = ProviderRegistry::new();
+            providers.register(Box::new(FixedTestProvider {
+                content: content.to_string(),
+                input_tokens: 10,
+                output_tokens: 5,
+            }));
+            Engine::new(
+                Arc::new(providers),
+                Arc::new(TemplateEngine::new(&dir)),
+                Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            )
+        };
+
+        // Turn 1: one live message, capture the call log.
+        let turn1 = engine("reply one")
+            .run(&path, &serde_json::json!({ "messages": ["hi"] }))
+            .unwrap();
+        let call_log = turn1.call_log.into_records();
+
+        // Turn 2: replay turn 1 and stream the new message. Collect deltas.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+        let deltas = std::thread::spawn(move || {
+            let mut rx = rx;
+            let mut collected = String::new();
+            while let Some(evt) = rx.blocking_recv() {
+                if let RuntimeEvent::PromptDelta { delta, .. } = evt {
+                    collected.push_str(&delta);
+                }
+            }
+            collected
+        });
+        let turn2 = engine("reply two")
+            .run_with_replay_streaming(
+                &path,
+                &serde_json::json!({ "messages": ["hi", "again"] }),
+                call_log,
+                tx,
+            )
+            .unwrap();
+        let streamed = deltas.join().unwrap();
+
+        // Both replies are in the returned history (turn 1 replayed, turn 2
+        // live), but ONLY the new turn streamed deltas.
+        let history = turn2.output["history"].as_array().unwrap();
+        let texts: Vec<&str> = history
+            .iter()
+            .filter(|t| t["role"] == "assistant")
+            .map(|t| t["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, vec!["reply one", "reply two"]);
+        assert_eq!(streamed, "reply two");
 
         let _ = std::fs::remove_dir_all(dir);
     }

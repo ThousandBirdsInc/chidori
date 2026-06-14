@@ -133,5 +133,5 @@ loops. See [`examples/agents/conversation.ts`](../examples/agents/conversation.t
 
 To chat with the model directly — no agent file — run `chidori chat` (`--system`,
 `--model`, `--tools <dir>`). It is a thin REPL over `conversation()`: each turn
-is durable and the prior turns replay for free, so only your newest message
-reaches the provider.
+is durable and streams its reply token-by-token, and the prior turns replay for
+free, so only your newest message reaches the provider.

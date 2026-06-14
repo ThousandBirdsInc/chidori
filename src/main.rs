@@ -832,6 +832,7 @@ fn cmd_chat(
     extra_tool_dirs: &[PathBuf],
     untrusted: bool,
 ) -> Result<()> {
+    use crate::runtime::context::RuntimeEvent;
     use std::io::Write;
 
     // The agent source lives in a temp file so it works from an installed
@@ -898,28 +899,58 @@ fn cmd_chat(
             input_value["tools"] = serde_json::json!(tool_names);
         }
 
-        match engine.run_with_replay(&agent_path, &input_value, call_log.clone()) {
+        // Stream just the new turn's reply. The drain thread prints token
+        // deltas while the engine runs; joining it before the next prompt is a
+        // barrier, so all terminal output stays serialized (no stdin/stdout
+        // race). Prior turns replay silently and emit no deltas.
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+        let drain = std::thread::spawn(move || {
+            let mut rx = event_rx;
+            let mut out = std::io::stdout();
+            let mut streamed = false;
+            while let Some(evt) = rx.blocking_recv() {
+                if let RuntimeEvent::PromptDelta { delta, .. } = evt {
+                    print!("{delta}");
+                    out.flush().ok();
+                    streamed = true;
+                }
+            }
+            streamed
+        });
+
+        let result =
+            engine.run_with_replay_streaming(&agent_path, &input_value, call_log.clone(), event_tx);
+        // event_tx was moved into the engine and is dropped when the run
+        // returns, ending the drain loop; join flushes every queued delta
+        // before we print anything else.
+        let streamed = drain.join().unwrap_or(false);
+
+        match result {
             Ok(result) => {
-                let reply = result
-                    .output
-                    .get("transcript")
-                    .and_then(Value::as_array)
-                    .and_then(|turns| {
-                        turns
-                            .iter()
-                            .rev()
-                            .find(|turn| turn.get("role").and_then(Value::as_str) == Some("assistant"))
-                    })
-                    .and_then(|turn| turn.get("text").and_then(Value::as_str))
-                    .unwrap_or("");
-                println!("{reply}");
+                // Fallback for non-streaming providers (no deltas emitted):
+                // print the newest assistant turn from the returned transcript.
+                if !streamed {
+                    let reply = result
+                        .output
+                        .get("transcript")
+                        .and_then(Value::as_array)
+                        .and_then(|turns| {
+                            turns.iter().rev().find(|turn| {
+                                turn.get("role").and_then(Value::as_str) == Some("assistant")
+                            })
+                        })
+                        .and_then(|turn| turn.get("text").and_then(Value::as_str))
+                        .unwrap_or("");
+                    print!("{reply}");
+                }
+                println!();
                 call_log = result.call_log.into_records();
             }
             Err(e) => {
                 // Drop the failed turn so the next message starts clean, and keep
                 // the prior call log (the failed turn left no durable record).
                 messages.pop();
-                eprintln!("error: {e:#}");
+                eprintln!("\nerror: {e:#}");
             }
         }
     }
