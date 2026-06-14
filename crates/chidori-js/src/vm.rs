@@ -298,6 +298,14 @@ pub struct Vm {
     /// -> the cached frozen template object (spec GetTemplateObject). A shared
     /// proto is the same Parse Node, so all closures over it reuse one object.
     pub template_cache: std::collections::HashMap<(usize, u32), JsObject>,
+    /// Free-list of recycled `Vec<Value>` buffers. Every call frame allocates an
+    /// operand stack, a locals vector, and an args vector; on synchronous frame
+    /// exit those buffers are cleared and returned here so the next (often
+    /// immediately recursive) call reuses the allocation instead of hitting the
+    /// allocator three times. Recursion makes the access pattern naturally LIFO.
+    /// Best-effort: a suspended (generator/async) frame keeps its buffers, and
+    /// the list is size-capped so it never grows without bound.
+    pub(crate) value_vec_pool: Vec<Vec<Value>>,
 }
 
 impl Vm {
@@ -326,6 +334,7 @@ impl Vm {
             gc_compact_at: std::cell::Cell::new(1 << 12),
             gc_cell_roots: Vec::new(),
             template_cache: std::collections::HashMap::new(),
+            value_vec_pool: Vec::new(),
         };
         crate::realm::init_realm(&mut vm);
         // The placeholder realm's intrinsic objects were created before the VM
