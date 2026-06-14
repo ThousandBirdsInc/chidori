@@ -906,103 +906,117 @@ impl Vm {
                 }
             }
         }
-        // Array exotic: index + length.
+        // Walk the prototype chain. Each level is resolved under a SINGLE
+        // `RefCell` borrow that decides the outcome, then releases the borrow
+        // before any re-entrant call (getter / proxy trap). The decision is
+        // captured in `Step` so the borrow never spans `self.call`/`proxy_get`.
+        enum Step {
+            /// A resolved value (data property, array/string element, namespace
+            /// export, or a missing namespace key → `undefined`).
+            Value(Value),
+            /// An accessor — call this getter with `receiver`.
+            Getter(Value),
+            /// This level is a Proxy — dispatch its `[[Get]]` trap.
+            Proxy,
+            /// A namespace binding read in the Temporal Dead Zone.
+            NsUninitialized,
+            /// Not an own property here — continue to this `[[Prototype]]`
+            /// (`None` ends the chain with `undefined`).
+            Climb(Option<JsObject>),
+        }
+        // Ordinary own-property resolution shared by every (non-exotic) level.
+        // A reified `props` entry shadows any dense array/string element.
+        let ordinary = |b: &ObjectData| -> Step {
+            match b.props.get(key) {
+                Some(prop) => match &prop.kind {
+                    PropertyKind::Data { value, .. } => Step::Value(value.clone()),
+                    PropertyKind::Accessor { get, .. } => match get {
+                        Some(g) => Step::Getter(g.clone()),
+                        None => Step::Value(Value::Undefined),
+                    },
+                },
+                None => Step::Climb(b.proto.clone()),
+            }
+        };
         let mut cur = start.clone();
         loop {
-            // Proxy exotic [[Get]]: dispatch the trap (handles both a proxy base
-            // and a proxy encountered while walking the prototype chain).
-            if matches!(cur.borrow().internal, Internal::Proxy(_)) {
-                return self.proxy_get(&cur, key, receiver);
-            }
-            // Module Namespace exotic [[Get]]: a string key reads the live
-            // export binding (an uninitialized binding throws ReferenceError);
-            // symbols (@@toStringTag) fall through to the ordinary props.
-            {
-                let cell = match &cur.borrow().internal {
-                    Internal::ModuleNamespace(ns) => match key {
-                        PropertyKey::Str(s) => ns.exports.get(s).cloned().map(Some).unwrap_or({
-                            // Unknown string export: namespace proto is null.
-                            None
-                        }),
-                        PropertyKey::Sym(_) => None,
-                    },
-                    _ => None,
-                };
-                if let Some(cell) = cell {
-                    let v = cell.borrow().clone();
-                    if matches!(v, Value::Uninitialized) {
-                        return Err(
-                            self.throw_reference("Cannot access binding before initialization")
-                        );
-                    }
-                    return Ok(v);
-                }
-                let is_ns = matches!(cur.borrow().internal, Internal::ModuleNamespace(_));
-                if is_ns {
-                    if let PropertyKey::Str(_) = key {
-                        return Ok(Value::Undefined);
-                    }
-                }
-            }
-            // Inspect own property without holding the borrow across calls.
-            let found = {
+            let step = {
                 let b = cur.borrow();
-                // array elements. A reified `props` entry for an index/length (a
-                // non-dense descriptor defined via defineProperty) is
-                // authoritative and shadows the dense-Vec slot, so only consult
-                // the Vec when there is no own `props` entry for the key.
-                // Mapped arguments: an aliased index reads the parameter
-                // CELL (live aliasing), not the stale props value.
-                if let Internal::Arguments(map) = &b.internal {
-                    if let Some(idx) = key.array_index() {
-                        if b.props.contains_key(key) {
-                            if let Some(Some(cell)) = map.get(idx as usize) {
-                                return Ok(cell.borrow().clone());
-                            }
-                        }
-                    }
-                }
-                if let Internal::Array(arr) = &b.internal {
-                    if let Some("length") = key.as_str() {
-                        if !b.props.contains_key(key) {
-                            return Ok(Value::Number(arr.len() as f64));
-                        }
-                    } else if let Some(idx) = key.array_index() {
-                        if !b.props.contains_key(key) {
-                            // A hole is an absent index: skip it so the lookup
-                            // continues up the prototype chain (reads undefined).
-                            if let Some(v) = arr.get(idx as usize) {
-                                if !matches!(v, Value::Hole) {
-                                    return Ok(v.clone());
+                match &b.internal {
+                    // Proxy [[Get]] (base or encountered up the chain): trap.
+                    Internal::Proxy(_) => Step::Proxy,
+                    // Module Namespace [[Get]]: a string key reads the live
+                    // export binding (uninitialized → ReferenceError; unknown →
+                    // undefined, the namespace proto is null); symbols
+                    // (@@toStringTag) fall through to ordinary props.
+                    Internal::ModuleNamespace(ns) => match key {
+                        PropertyKey::Str(s) => match ns.exports.get(s) {
+                            Some(cell) => {
+                                let v = cell.borrow().clone();
+                                if matches!(v, Value::Uninitialized) {
+                                    Step::NsUninitialized
+                                } else {
+                                    Step::Value(v)
                                 }
                             }
+                            None => Step::Value(Value::Undefined),
+                        },
+                        PropertyKey::Sym(_) => ordinary(&b),
+                    },
+                    // Mapped arguments: an aliased index reads the live
+                    // parameter CELL, not the stale `props` value.
+                    Internal::Arguments(map) => {
+                        let aliased = key.array_index().and_then(|idx| {
+                            if b.props.contains_key(key) {
+                                map.get(idx as usize).and_then(|c| c.clone())
+                            } else {
+                                None
+                            }
+                        });
+                        match aliased {
+                            Some(cell) => Step::Value(cell.borrow().clone()),
+                            None => ordinary(&b),
                         }
                     }
-                }
-                if let Internal::StringObj(s) = &b.internal {
-                    if let Some(v) = self.string_own_prop(s, key) {
-                        return Ok(v);
+                    // Array exotic: `length` and dense indices. A reified
+                    // `props` entry for the key shadows the dense Vec; a hole is
+                    // an absent index (climb the chain → undefined).
+                    Internal::Array(arr) => {
+                        if let Some("length") = key.as_str() {
+                            if b.props.contains_key(key) {
+                                ordinary(&b)
+                            } else {
+                                Step::Value(Value::Number(arr.len() as f64))
+                            }
+                        } else if let Some(idx) = key.array_index() {
+                            if b.props.contains_key(key) {
+                                ordinary(&b)
+                            } else {
+                                match arr.get(idx as usize) {
+                                    Some(v) if !matches!(v, Value::Hole) => Step::Value(v.clone()),
+                                    _ => ordinary(&b),
+                                }
+                            }
+                        } else {
+                            ordinary(&b)
+                        }
                     }
+                    Internal::StringObj(s) => match self.string_own_prop(s, key) {
+                        Some(v) => Step::Value(v),
+                        None => ordinary(&b),
+                    },
+                    _ => ordinary(&b),
                 }
-                b.props.get(key).cloned()
             };
-            match found {
-                Some(prop) => match prop.kind {
-                    PropertyKind::Data { value, .. } => return Ok(value),
-                    PropertyKind::Accessor { get, .. } => {
-                        return match get {
-                            Some(getter) => self.call(getter, receiver, &[]),
-                            None => Ok(Value::Undefined),
-                        }
-                    }
-                },
-                None => {
-                    let proto = cur.borrow().proto.clone();
-                    match proto {
-                        Some(p) => cur = p,
-                        None => return Ok(Value::Undefined),
-                    }
+            match step {
+                Step::Value(v) => return Ok(v),
+                Step::Getter(g) => return self.call(g, receiver, &[]),
+                Step::Proxy => return self.proxy_get(&cur, key, receiver),
+                Step::NsUninitialized => {
+                    return Err(self.throw_reference("Cannot access binding before initialization"))
                 }
+                Step::Climb(Some(p)) => cur = p,
+                Step::Climb(None) => return Ok(Value::Undefined),
             }
         }
     }
