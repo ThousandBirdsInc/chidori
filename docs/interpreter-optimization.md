@@ -504,21 +504,51 @@ operand-stack traffic in exactly the hot loops.
 | --- | --- | --- |
 | **1 — hot-loop cleanup** | **GO** | Lowest risk; validates the gating harness; the per-op `Result<Ctl,_>` round-trip and per-op `Option::take`s are real overhead on the data-movement ops that make up ~40% of execution. |
 | **2 — fusion** | **GO** | Data shows clear high-frequency pairs (load+binop, compare-and-branch) and a 40%-data-movement profile. Target the §11.3 candidates, validated by the survey rather than intuition. |
-| **3 — inline caches** | **CONDITIONAL** | Property ops did *not* crack the top-15 in this loop/arith-heavy mix, so the win is unproven *for this workload*. Gate on the agent profile (below): pursue only if property access registers there. |
-| **4 — register bytecode** | **DEFER** | The 40%-data-movement figure is the strongest argument for it, but it's a back-end rewrite; revisit only if Phases 1–2 leave a measured, workload-relevant gap. |
-| **Bonus — warm-realm reuse** | **INVESTIGATE** | `engine_new` ≈ 3.6 ms is unexpectedly large and dominates short scripts; worth scoping independently of the dispatch work. |
+| **3 — inline caches** | **DEFER (live); optional for replay/test** | Property ops didn't crack the top-15 here, AND §11.5 now shows JS is <1% of live wall-clock — so for *live* perf this is firmly not worth its cache-invalidation risk. Reconsider only to speed the replay/test path on property-heavy agents, gated on a property-heavy profile. |
+| **4 — register bytecode** | **DEFER** | A back-end rewrite whose payoff (the 40%-data-movement figure) lands almost entirely on the <1%-of-live JS path. Revisit only if replay/test throughput becomes a real pain point after Phases 1–2. |
+| **Bonus — warm-realm reuse** | **INVESTIGATE** | `engine_new` ≈ 3.6 ms is unexpectedly large and dominates short scripts; it is also pure setup unrelated to dispatch, so it is the most likely *replay/test*-throughput win still on the table. |
 
-### 11.5 Remaining Phase 0 item (carried forward)
+### 11.5 Agent-replay benchmark — DONE (the decisive number)
 
-The **representative-agent replay benchmark** (JS-execution share of an agent
-run replayed from a committed journal) is **not yet implemented** — it needs a
-checked-in journal fixture and pulls in the larger `chidori` crate's host
-runtime, out of scope for this `chidori-js`-local pass. It is the gate for
-Phase 3 and for sizing the whole effort. *A-priori* signal: even the heaviest
-micro-workload here (~75 ms) is small next to typical per-LLM-call latency
-(hundreds of ms to seconds), so JS execution is likely a *minority* of agent
-wall-clock — which is the core argument for the whole "no JIT" stance. **This
-must be measured, not assumed, before committing to Phases 3–4.**
+Built as `examples/agent_replay.rs` (record→replay entirely within `chidori-js`,
+no `chidori`-crate host runtime needed): a representative agent — real glue
+compute (prompt building, string scanning, modular arithmetic) interleaved with
+one recorded `llm` host effect per step — over **200 steps / 200 host calls**.
+It measures `compute_only` (pure JS), `record` (live, host=0), and `replay`
+(journal-served, no host), then models live wall-clock under a range of LLM
+latencies. Measured here (min-of-N, so robust to the §7.6 noise):
+
+| quantity | value |
+| --- | ---: |
+| JS compute only | 20.2 ms (~0.10 ms/step) |
+| journal + promise/microtask machinery | **0.75 ms** |
+| full replay (no host) | 21.0 ms |
+| journal size | 17 KB |
+
+**Modeled live wall-clock — JS+journal as a share of the total:**
+
+| LLM latency / call | live total (200 calls) | JS+journal share |
+| ---: | ---: | ---: |
+| 50 ms (optimistic) | 10.0 s | **0.21%** |
+| 200 ms | 40.0 s | 0.053% |
+| 500 ms | 100 s | 0.021% |
+| 2000 ms | 400 s | 0.005% |
+
+**Conclusions.**
+1. **JS execution is well under 1% of an agent's live wall-clock** — a fraction
+   of a percent even at an unrealistically fast 50 ms/call. This is the empirical
+   backbone of the no-JIT stance: a JIT only speeds the JS sliver of that sliver,
+   so its end-to-end payoff is negligible. The a-priori argument from §11.4 is now
+   measured, not assumed.
+2. **The durability layer is cheap.** Journal + promise/microtask machinery is
+   0.75 ms — ~3.6% of replay, and invisible against host latency. Replay cost is
+   dominated by *JS interpretation*, not the journal.
+3. **Where the interpreter work (Phases 1–2) actually pays off: replay and
+   tests.** The zero-host replay path — used for the committed-checkpoint tests,
+   debugging, and crash resume — is ~97% interpreter. So faster dispatch
+   meaningfully speeds *replay/test throughput* and compute-heavy steps, even
+   though it barely moves live wall-clock. That, not live latency, is the honest
+   justification for Phases 1–2.
 
 ---
 
