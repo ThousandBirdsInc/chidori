@@ -285,8 +285,41 @@ impl Vm {
         error
     }
 
+    /// Cap on the pooled buffer free-list. Comfortably exceeds any realistic
+    /// synchronous recursion depth (`max_call_depth` is 2000) so deep recursion
+    /// keeps recycling, while a pathological churn can't retain unbounded memory.
+    const VALUE_VEC_POOL_CAP: usize = 4096;
+
+    /// Pull a cleared `Vec<Value>` from the pool, or allocate a fresh one.
+    fn take_value_vec(&mut self) -> Vec<Value> {
+        self.value_vec_pool.pop().unwrap_or_default()
+    }
+
+    /// Return a buffer to the pool for reuse (clearing it drops any residual
+    /// values). A never-grown (capacity 0) buffer isn't worth pooling; the list
+    /// is size-capped so it can't retain memory without bound.
+    fn recycle_value_vec(&mut self, mut v: Vec<Value>) {
+        if v.capacity() == 0 || self.value_vec_pool.len() >= Self::VALUE_VEC_POOL_CAP {
+            return;
+        }
+        v.clear();
+        self.value_vec_pool.push(v);
+    }
+
+    /// Reclaim a synchronously-finished frame's reusable buffers into the pool.
+    /// Only called on `Return`/`Throw` exits — a suspended frame keeps its
+    /// buffers (they ride inside the `Suspension`/generator state).
+    fn recycle_frame(&mut self, frame: &mut Frame) {
+        let stack = std::mem::take(&mut frame.stack);
+        let locals = std::mem::take(&mut frame.locals);
+        let args = std::mem::take(&mut frame.args);
+        self.recycle_value_vec(stack);
+        self.recycle_value_vec(locals);
+        self.recycle_value_vec(args);
+    }
+
     pub fn make_frame(
-        &self,
+        &mut self,
         bf: BytecodeFunction,
         this: Value,
         args: &[Value],
@@ -301,11 +334,19 @@ impl Vm {
         // dynamic name ops resolve against it (under any with the body enters).
         let with_scope = bf.captured_with.clone();
         let priv_env = bf.captured_priv_env.clone();
+        // Reuse pooled buffers for the three per-call vectors (operand stack,
+        // locals, args) instead of allocating each one fresh.
+        let mut stack = self.take_value_vec();
+        stack.reserve(8);
+        let mut locals = self.take_value_vec();
+        locals.resize(proto.num_locals as usize, Value::Undefined);
+        let mut args_buf = self.take_value_vec();
+        args_buf.extend_from_slice(args);
         Frame {
             func: bf,
             ip: 0,
-            stack: Vec::with_capacity(8),
-            locals: vec![Value::Undefined; proto.num_locals as usize],
+            stack,
+            locals,
             cells,
             this,
             new_target,
@@ -313,7 +354,7 @@ impl Vm {
             pending_completion: None,
             pending_throw: None,
             pending_return: None,
-            args: args.to_vec(),
+            args: args_buf,
             func_obj: None,
             dispose_scopes: Vec::new(),
             completion: Value::Undefined,
@@ -510,12 +551,27 @@ impl Vm {
     // =====================================================================
 
     pub fn run_frame(&mut self, mut frame: Frame) -> Flow {
+        // Recycle this frame's pooled buffers into the free-list, then return the
+        // (already-owned) outcome. Used only on synchronous Return/Throw exits;
+        // the Suspend paths move the whole frame (buffers included) into the
+        // Suspension/generator state, so they must NOT recycle here.
+        macro_rules! done {
+            ($flow:expr) => {{
+                let outcome = $flow;
+                self.recycle_frame(&mut frame);
+                return outcome;
+            }};
+        }
+        // The frame's compiled function is fixed for its whole lifetime; clone
+        // the `Rc` once so the per-op fetch borrows from this local rather than
+        // re-deriving it (and so it doesn't alias the `&mut frame` step needs).
+        let proto = frame.func.proto.clone();
         let mut interrupt_poll: u32 = 0;
         loop {
             if let Some(budget) = self.op_budget.as_mut() {
                 if *budget == 0 {
                     // Uncatchable so execution is guaranteed to terminate.
-                    return Flow::Throw(self.throw_range("execution budget exceeded"));
+                    done!(Flow::Throw(self.throw_range("execution budget exceeded")));
                 }
                 *budget -= 1;
             }
@@ -531,7 +587,7 @@ impl Vm {
                     if let Some(flag) = &self.interrupt {
                         if flag.load(std::sync::atomic::Ordering::Relaxed) {
                             self.op_budget = Some(0);
-                            return Flow::Throw(self.throw_range("execution interrupted"));
+                            done!(Flow::Throw(self.throw_range("execution interrupted")));
                         }
                     }
                 }
@@ -542,9 +598,9 @@ impl Vm {
                         frame.ip = t;
                         continue;
                     }
-                    Ok(Ctl::Return(v)) => return Flow::Return(v),
+                    Ok(Ctl::Return(v)) => done!(Flow::Return(v)),
                     Ok(_) => unreachable!("throw completion yields jump or return"),
-                    Err(e) => return Flow::Throw(e),
+                    Err(e) => done!(Flow::Throw(e)),
                 }
             }
             // Injected `.return(v)` on a suspended generator: dispatch a Return
@@ -556,26 +612,29 @@ impl Vm {
                         frame.ip = t;
                         continue;
                     }
-                    Ok(Ctl::Return(rv)) => return Flow::Return(rv),
+                    Ok(Ctl::Return(rv)) => done!(Flow::Return(rv)),
                     Ok(_) => unreachable!("return completion yields jump or return"),
                     Err(e) => match self.do_completion(&mut frame, Completion::Throw(e)) {
                         Ok(Ctl::Jump(t)) => {
                             frame.ip = t;
                             continue;
                         }
-                        Ok(Ctl::Return(rv)) => return Flow::Return(rv),
+                        Ok(Ctl::Return(rv)) => done!(Flow::Return(rv)),
                         Ok(_) => unreachable!(),
-                        Err(e) => return Flow::Throw(e),
+                        Err(e) => done!(Flow::Throw(e)),
                     },
                 }
             }
             let ip = frame.ip;
-            if ip >= frame.func.proto.code.len() {
-                return Flow::Return(Value::Undefined);
+            if ip >= proto.code.len() {
+                done!(Flow::Return(Value::Undefined));
             }
-            let op = frame.func.proto.code[ip].clone();
             frame.ip = ip + 1;
-            match self.step(&mut frame, op) {
+            // Dispatch on a borrow of the instruction. `proto` is a clone of the
+            // frame's (immutable) `FuncProto` Rc taken once per frame, so the
+            // borrow is independent of `frame` and costs no per-op `Op::clone`
+            // (previously ~5% of a call-heavy run's instructions).
+            match self.step(&mut frame, &proto.code[ip]) {
                 Ok(Ctl::Next) => continue,
                 Ok(Ctl::Jump(target)) => {
                     frame.ip = target;
@@ -585,11 +644,11 @@ impl Vm {
                     // Module linker hook: snapshot this frame's final cells when it
                     // is the module body being evaluated (matched by proto pointer).
                     if let Some(p) = &self.module_capture_proto {
-                        if Rc::ptr_eq(&frame.func.proto, p) {
+                        if Rc::ptr_eq(&proto, p) {
                             self.module_capture = Some(frame.cells.clone());
                         }
                     }
-                    return Flow::Return(v);
+                    done!(Flow::Return(v));
                 }
                 Ok(Ctl::Await(v)) => {
                     return Flow::Suspend(Suspension {
@@ -620,9 +679,9 @@ impl Vm {
                         frame.ip = t;
                         continue;
                     }
-                    Ok(Ctl::Return(v)) => return Flow::Return(v),
+                    Ok(Ctl::Return(v)) => done!(Flow::Return(v)),
                     Ok(_) => unreachable!("throw completion yields jump or return"),
-                    Err(e) => return Flow::Throw(e),
+                    Err(e) => done!(Flow::Throw(e)),
                 },
             }
         }
@@ -866,7 +925,7 @@ impl Vm {
         }
     }
 
-    fn step(&mut self, frame: &mut Frame, op: Op) -> Result<Ctl, Value> {
+    fn step(&mut self, frame: &mut Frame, op: &Op) -> Result<Ctl, Value> {
         macro_rules! pop {
             () => {
                 frame.stack.pop().unwrap_or(Value::Undefined)
@@ -879,7 +938,7 @@ impl Vm {
         }
         match op {
             Op::Nop => {}
-            Op::LoadConst(i) => push!(self.const_val(frame, i)),
+            Op::LoadConst(i) => push!(self.const_val(frame, *i)),
             Op::LoadUndefined => push!(Value::Undefined),
             Op::LoadHole => push!(Value::Hole),
             Op::LoadNull => push!(Value::Null),
@@ -904,12 +963,12 @@ impl Vm {
             Op::LoadNewTarget => push!(frame.new_target.clone()),
             Op::LoadArg(i) => push!(frame
                 .args
-                .get(i as usize)
+                .get(*i as usize)
                 .cloned()
                 .unwrap_or(Value::Undefined)),
             Op::LoadRestArgs(n) => {
-                let rest: Vec<Value> = if (n as usize) < frame.args.len() {
-                    frame.args[n as usize..].to_vec()
+                let rest: Vec<Value> = if (*n as usize) < frame.args.len() {
+                    frame.args[*n as usize..].to_vec()
                 } else {
                     Vec::new()
                 };
@@ -920,13 +979,13 @@ impl Vm {
                 push!(o);
             }
 
-            Op::LoadLocal(i) => push!(frame.locals[i as usize].clone()),
+            Op::LoadLocal(i) => push!(frame.locals[*i as usize].clone()),
             Op::StoreLocal(i) => {
                 let v = pop!();
-                frame.locals[i as usize] = v;
+                frame.locals[*i as usize] = v;
             }
             Op::LoadCell(i) => {
-                let v = frame.cells[i as usize].borrow().clone();
+                let v = frame.cells[*i as usize].borrow().clone();
                 if matches!(v, Value::Uninitialized) {
                     return Err(self.throw_reference("Cannot access binding before initialization"));
                 }
@@ -934,11 +993,11 @@ impl Vm {
             }
             Op::StoreCell(i) => {
                 let v = pop!();
-                *frame.cells[i as usize].borrow_mut() = v;
+                *frame.cells[*i as usize].borrow_mut() = v;
             }
             Op::StoreCellChecked(i) => {
                 let v = pop!();
-                let mut slot = frame.cells[i as usize].borrow_mut();
+                let mut slot = frame.cells[*i as usize].borrow_mut();
                 if matches!(*slot, Value::Uninitialized) {
                     drop(slot);
                     return Err(self.throw_reference("Cannot access binding before initialization"));
@@ -952,22 +1011,22 @@ impl Vm {
                 // the live cell. All other bindings get a fresh `Rc` (needed for
                 // per-iteration `let` semantics).
                 if frame.func.proto.stable_cells.contains(&i) {
-                    *frame.cells[i as usize].borrow_mut() = v;
+                    *frame.cells[*i as usize].borrow_mut() = v;
                 } else {
-                    frame.cells[i as usize] = Rc::new(RefCell::new(v));
+                    frame.cells[*i as usize] = Rc::new(RefCell::new(v));
                 }
             }
             Op::InitCellTdz(i) => {
                 // Fresh cell holding the Temporal Dead Zone marker (a hoisted
                 // `let`/`const`/`class` binding before its initializer runs).
                 if frame.func.proto.stable_cells.contains(&i) {
-                    *frame.cells[i as usize].borrow_mut() = Value::Uninitialized;
+                    *frame.cells[*i as usize].borrow_mut() = Value::Uninitialized;
                 } else {
-                    frame.cells[i as usize] = Rc::new(RefCell::new(Value::Uninitialized));
+                    frame.cells[*i as usize] = Rc::new(RefCell::new(Value::Uninitialized));
                 }
             }
             Op::LoadUpvalue(i) => {
-                let v = frame.func.upvalues[i as usize].borrow().clone();
+                let v = frame.func.upvalues[*i as usize].borrow().clone();
                 if matches!(v, Value::Uninitialized) {
                     return Err(self.throw_reference("Cannot access binding before initialization"));
                 }
@@ -975,11 +1034,11 @@ impl Vm {
             }
             Op::StoreUpvalue(i) => {
                 let v = pop!();
-                *frame.func.upvalues[i as usize].borrow_mut() = v;
+                *frame.func.upvalues[*i as usize].borrow_mut() = v;
             }
             Op::StoreUpvalueChecked(i) => {
                 let v = pop!();
-                let mut slot = frame.func.upvalues[i as usize].borrow_mut();
+                let mut slot = frame.func.upvalues[*i as usize].borrow_mut();
                 if matches!(*slot, Value::Uninitialized) {
                     drop(slot);
                     return Err(self.throw_reference("Cannot access binding before initialization"));
@@ -987,24 +1046,50 @@ impl Vm {
                 *slot = v;
             }
             Op::LoadGlobal(i) => {
-                let name = self.const_name(frame, i);
+                let name = self.const_name(frame, *i);
                 let key = PropertyKey::Str(name.clone());
                 let g = self.realm.global.clone();
-                if !self.has_own_or_proto(&g, &key) {
-                    return Err(self.throw_reference(&format!("{} is not defined", name.as_str())));
-                }
-                let v = self.get_prop(&Value::Object(g), &key)?;
+                // Fast path: an own data property directly on the global object —
+                // the case for every top-level `function`/`var`/`let` binding,
+                // including a function's own recursive self-reference. Resolves
+                // in a single hash with no prototype walk, replacing the previous
+                // existence-check-then-get that walked (and hashed) the chain
+                // twice on every global read.
+                let fast = {
+                    let b = g.borrow();
+                    match b.props.get(&key) {
+                        Some(Property {
+                            kind: PropertyKind::Data { value, .. },
+                            ..
+                        }) => Some(value.clone()),
+                        _ => None,
+                    }
+                };
+                let v = match fast {
+                    Some(v) => v,
+                    None => {
+                        // Accessor global, or a binding inherited via the global's
+                        // prototype chain: fall back to the full [[Get]] (after the
+                        // unresolvable-reference check that yields a ReferenceError).
+                        if !self.has_own_or_proto(&g, &key) {
+                            return Err(
+                                self.throw_reference(&format!("{} is not defined", name.as_str()))
+                            );
+                        }
+                        self.get_prop(&Value::Object(g), &key)?
+                    }
+                };
                 push!(v);
             }
             Op::LoadGlobalTypeof(i) => {
-                let name = self.const_name(frame, i);
+                let name = self.const_name(frame, *i);
                 let key = PropertyKey::Str(name);
                 let g = self.realm.global.clone();
                 let v = self.get_prop(&Value::Object(g), &key)?;
                 push!(v);
             }
             Op::StoreGlobal(i) => {
-                let name = self.const_name(frame, i);
+                let name = self.const_name(frame, *i);
                 let v = pop!();
                 let g = self.realm.global.clone();
                 let strict = frame.func.proto.is_strict;
@@ -1019,7 +1104,7 @@ impl Vm {
                 self.put_value(&Value::Object(g), &key, v, strict)?;
             }
             Op::DeclareGlobal { name: i, deletable } => {
-                let name = self.const_name(frame, i);
+                let name = self.const_name(frame, *i);
                 let g = self.realm.global.clone();
                 let key = PropertyKey::Str(name.clone());
                 let (present, extensible) = {
@@ -1043,14 +1128,14 @@ impl Vm {
                                 writable: true,
                             },
                             enumerable: true,
-                            configurable: deletable,
+                            configurable: *deletable,
                         },
                     );
                 }
             }
 
             Op::CanDeclareGlobalFunc(i) => {
-                let name = self.const_name(frame, i);
+                let name = self.const_name(frame, *i);
                 let g = self.realm.global.clone();
                 let key = PropertyKey::Str(name.clone());
                 // CanDeclareGlobalFunction (9.1.1.4.16): an existing
@@ -1079,7 +1164,7 @@ impl Vm {
                 }
             }
             Op::DefineGlobalFunc { name: i, deletable } => {
-                let name = self.const_name(frame, i);
+                let name = self.const_name(frame, *i);
                 let value = pop!();
                 let g = self.realm.global.clone();
                 let key = PropertyKey::Str(name.clone());
@@ -1104,7 +1189,7 @@ impl Vm {
                                 writable: true,
                             },
                             enumerable: true,
-                            configurable: deletable,
+                            configurable: *deletable,
                         },
                     );
                 } else if let Some(p) = b.props.get_mut(&key) {
@@ -1123,7 +1208,7 @@ impl Vm {
                 frame.with_scope.pop();
             }
             Op::LoadName { name, fallback } => {
-                let nm = self.const_name(frame, name);
+                let nm = self.const_name(frame, *name);
                 let key = PropertyKey::Str(nm);
                 if let Some(obj) = self.with_lookup(frame, &key)? {
                     // Object Environment Record GetBindingValue: re-check
@@ -1137,22 +1222,22 @@ impl Vm {
                         push!(Value::Undefined);
                     }
                 } else {
-                    return self.step(frame, (*fallback).clone());
+                    return self.step(frame, &(*fallback).clone());
                 }
             }
             Op::StoreName { name, fallback } => {
-                let nm = self.const_name(frame, name);
+                let nm = self.const_name(frame, *name);
                 let key = PropertyKey::Str(nm);
                 if let Some(obj) = self.with_lookup(frame, &key)? {
                     let v = pop!();
                     let strict = frame.func.proto.is_strict;
                     self.put_value(&Value::Object(obj), &key, v, strict)?;
                 } else {
-                    return self.step(frame, (*fallback).clone());
+                    return self.step(frame, &(*fallback).clone());
                 }
             }
             Op::DeleteName(name) => {
-                let nm = self.const_name(frame, name);
+                let nm = self.const_name(frame, *name);
                 let key = PropertyKey::Str(nm);
                 if let Some(obj) = self.with_lookup(frame, &key)? {
                     let r = self.delete_prop(&Value::Object(obj), &key)?;
@@ -1172,7 +1257,7 @@ impl Vm {
                 }
             }
             Op::ResolveNameBase(name) => {
-                let nm = self.const_name(frame, name);
+                let nm = self.const_name(frame, *name);
                 let key = PropertyKey::Str(nm);
                 match self.with_lookup(frame, &key)? {
                     Some(obj) => push!(Value::Object(obj)),
@@ -1182,7 +1267,7 @@ impl Vm {
             Op::LoadFromBase { name, fallback } => {
                 let base = pop!();
                 if let Value::Object(_) = &base {
-                    let nm = self.const_name(frame, name);
+                    let nm = self.const_name(frame, *name);
                     let key = PropertyKey::Str(nm);
                     // Object Environment Record GetBindingValue: re-check
                     // HasProperty (the binding may have been deleted since the
@@ -1194,14 +1279,14 @@ impl Vm {
                         push!(Value::Undefined);
                     }
                 } else {
-                    return self.step(frame, (*fallback).clone());
+                    return self.step(frame, &(*fallback).clone());
                 }
             }
             Op::StoreToBase { name, fallback } => {
                 let v = pop!();
                 let base = pop!();
                 if let Value::Object(_) = &base {
-                    let nm = self.const_name(frame, name);
+                    let nm = self.const_name(frame, *name);
                     let key = PropertyKey::Str(nm.clone());
                     let strict = frame.func.proto.is_strict;
                     // Object Environment Record SetMutableBinding: if the
@@ -1215,7 +1300,7 @@ impl Vm {
                     self.put_value(&base, &key, v, strict)?;
                 } else {
                     frame.stack.push(v);
-                    return self.step(frame, (*fallback).clone());
+                    return self.step(frame, &(*fallback).clone());
                 }
             }
             Op::RequireCoercible => {
@@ -1252,17 +1337,17 @@ impl Vm {
 
             Op::NewObject => push!(Value::Object(self.new_object())),
             Op::NewArray(n) => {
-                let n = n as usize;
+                let n = *n as usize;
                 let at = frame.stack.len() - n;
                 let elems = frame.stack.split_off(at);
                 push!(Value::Object(self.new_array(elems)));
             }
             Op::GetTemplateObject(idx) => {
-                let key = (Rc::as_ptr(&frame.func.proto) as *const () as usize, idx);
+                let key = (Rc::as_ptr(&frame.func.proto) as *const () as usize, *idx);
                 if let Some(o) = self.template_cache.get(&key) {
                     push!(Value::Object(o.clone()));
                 } else {
-                    let parts = frame.func.proto.templates[idx as usize].clone();
+                    let parts = frame.func.proto.templates[*idx as usize].clone();
                     // Cooked strings (an illegal escape cooks to `undefined`).
                     let cooked: Vec<Value> = parts
                         .cooked
@@ -1398,8 +1483,8 @@ impl Vm {
             }
             Op::SetHomeObjectAt(n) => {
                 let len = frame.stack.len();
-                if len >= n as usize + 1 {
-                    let home = frame.stack[len - 1 - n as usize].clone();
+                if len >= *n as usize + 1 {
+                    let home = frame.stack[len - 1 - *n as usize].clone();
                     if let (Value::Object(home), Value::Object(m)) =
                         (home, frame.stack[len - 1].clone())
                     {
@@ -1422,7 +1507,7 @@ impl Vm {
                 push!(base);
             }
             Op::SuperGet(k) => {
-                let name = self.const_name(frame, k);
+                let name = self.const_name(frame, *k);
                 let base = pop!();
                 let this = pop!();
                 let key = PropertyKey::Str(name);
@@ -1438,7 +1523,7 @@ impl Vm {
                 push!(v);
             }
             Op::SuperSet(k) => {
-                let name = self.const_name(frame, k);
+                let name = self.const_name(frame, *k);
                 let value = pop!();
                 let base = pop!();
                 let this = pop!();
@@ -1476,7 +1561,7 @@ impl Vm {
                 push!(target);
             }
             Op::CopyDataPropertiesExcept(n) => {
-                let at = frame.stack.len() - n as usize;
+                let at = frame.stack.len() - *n as usize;
                 let raw_keys = frame.stack.split_off(at);
                 let mut excluded: Vec<PropertyKey> = Vec::with_capacity(raw_keys.len());
                 for k in raw_keys {
@@ -1509,13 +1594,13 @@ impl Vm {
                 push!(target);
             }
             Op::GetProp(i) => {
-                let name = self.const_name(frame, i);
+                let name = self.const_name(frame, *i);
                 let obj = pop!();
                 let v = self.get_prop(&obj, &PropertyKey::Str(name))?;
                 push!(v);
             }
             Op::PrivateGet(i) => {
-                let name = self.resolve_private_name(frame, i)?;
+                let name = self.resolve_private_name(frame, *i)?;
                 let obj = pop!();
                 // PrivateGet: the receiver's own [[PrivateElements]] must have
                 // the name (the brand check — never the prototype chain, never
@@ -1545,7 +1630,7 @@ impl Vm {
                 push!(v);
             }
             Op::PrivateSet(i) => {
-                let name = self.resolve_private_name(frame, i)?;
+                let name = self.resolve_private_name(frame, *i)?;
                 let value = pop!();
                 let obj = pop!();
                 let el = obj
@@ -1614,7 +1699,7 @@ impl Vm {
                 frame.priv_env = frame.priv_env.take().and_then(|e| e.parent.clone());
             }
             Op::PrivateFieldAdd(i) => {
-                let name = self.resolve_private_name(frame, i)?;
+                let name = self.resolve_private_name(frame, *i)?;
                 let value = pop!();
                 let obj = pop!();
                 let Some(o) = obj.as_object() else {
@@ -1640,7 +1725,7 @@ impl Vm {
                 push!(obj);
             }
             Op::PrivateMethodAdd(i) => {
-                let name = self.resolve_private_name(frame, i)?;
+                let name = self.resolve_private_name(frame, *i)?;
                 let value = pop!();
                 let obj = pop!();
                 let Some(o) = obj.as_object() else {
@@ -1666,7 +1751,7 @@ impl Vm {
                 push!(obj);
             }
             Op::PrivateAccessorAdd(i) => {
-                let name = self.resolve_private_name(frame, i)?;
+                let name = self.resolve_private_name(frame, *i)?;
                 let set = pop!();
                 let get = pop!();
                 let obj = pop!();
@@ -1695,7 +1780,7 @@ impl Vm {
             }
             Op::ConstructSuper(argc) => {
                 let nt = pop!();
-                let at = frame.stack.len() - argc as usize;
+                let at = frame.stack.len() - *argc as usize;
                 let args = frame.stack.split_off(at);
                 let sup = pop!();
                 let r = self.construct(&sup, &args, &nt)?;
@@ -1711,7 +1796,7 @@ impl Vm {
             }
             Op::BindThisCell(i) => {
                 let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                let mut slot = frame.cells[i as usize].borrow_mut();
+                let mut slot = frame.cells[*i as usize].borrow_mut();
                 if !matches!(*slot, Value::Uninitialized) {
                     drop(slot);
                     return Err(self.throw_reference("Super constructor may only be called once"));
@@ -1720,7 +1805,7 @@ impl Vm {
             }
             Op::BindThisUpvalue(i) => {
                 let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                let mut slot = frame.func.upvalues[i as usize].borrow_mut();
+                let mut slot = frame.func.upvalues[*i as usize].borrow_mut();
                 if !matches!(*slot, Value::Uninitialized) {
                     drop(slot);
                     return Err(self.throw_reference("Super constructor may only be called once"));
@@ -1743,7 +1828,7 @@ impl Vm {
                                 },
                                 other => self.to_string_lossy(other),
                             };
-                            let prefix = self.const_name(frame, prefix);
+                            let prefix = self.const_name(frame, *prefix);
                             let name = if prefix.as_str().is_empty() {
                                 base
                             } else {
@@ -1785,7 +1870,7 @@ impl Vm {
                     // `await using x = null` still records an entry (method
                     // undefined) so disposal performs its Await tick; sync
                     // `using` records nothing.
-                    if is_await {
+                    if *is_await {
                         if let Some(scope) = frame.dispose_scopes.last_mut() {
                             scope.push((Value::Undefined, Value::Undefined));
                         }
@@ -1810,7 +1895,7 @@ impl Vm {
                             }
                             Ok(Some(m))
                         };
-                    let method = if is_await {
+                    let method = if *is_await {
                         let asym = self.realm.symbol_async_dispose.clone();
                         match get_method(self, &asym)? {
                             Some(m) => Some(m),
@@ -1939,7 +2024,7 @@ impl Vm {
                 }
             }
             Op::PrivateHasOwn(i) => {
-                let name = self.resolve_private_name(frame, i)?;
+                let name = self.resolve_private_name(frame, *i)?;
                 let obj = pop!();
                 // `#x in v`: the RHS must be an object (spec 13.10.1 step 5).
                 let Some(o) = obj.as_object() else {
@@ -1951,7 +2036,7 @@ impl Vm {
                 push!(Value::Bool(has));
             }
             Op::SetProp(i) => {
-                let name = self.const_name(frame, i);
+                let name = self.const_name(frame, *i);
                 let value = pop!();
                 let obj = pop!();
                 let strict = frame.func.proto.is_strict;
@@ -1979,7 +2064,7 @@ impl Vm {
                 push!(value);
             }
             Op::DeleteProp(i) => {
-                let name = self.const_name(frame, i);
+                let name = self.const_name(frame, *i);
                 let obj = pop!();
                 // `delete base.x` does ToObject(base) (spec step 5.b): a
                 // nullish base is a TypeError before any delete is attempted.
@@ -2020,26 +2105,32 @@ impl Vm {
                     if let Some(top) = frame.stack.last_mut() {
                         *top = Value::Undefined;
                     }
-                    return Ok(Ctl::Jump(t as usize));
+                    return Ok(Ctl::Jump(*t as usize));
                 }
             }
 
             Op::Call(argc) => {
-                let n = argc as usize;
+                let n = *argc as usize;
                 let at = frame.stack.len() - n;
-                let args = frame.stack.split_off(at);
+                // Move the argument values into a pooled buffer rather than
+                // `split_off` (which allocates a fresh Vec on every call).
+                let mut args = self.take_value_vec();
+                args.extend(frame.stack.drain(at..));
                 let this = pop!();
                 let func = pop!();
-                let r = self.call(func, this, &args)?;
-                push!(r);
+                let r = self.call(func, this, &args);
+                self.recycle_value_vec(args);
+                push!(r?);
             }
             Op::CallMethodless(argc) => {
-                let n = argc as usize;
+                let n = *argc as usize;
                 let at = frame.stack.len() - n;
-                let args = frame.stack.split_off(at);
+                let mut args = self.take_value_vec();
+                args.extend(frame.stack.drain(at..));
                 let func = pop!();
-                let r = self.call(func, Value::Undefined, &args)?;
-                push!(r);
+                let r = self.call(func, Value::Undefined, &args);
+                self.recycle_value_vec(args);
+                push!(r?);
             }
             Op::CallSpread => {
                 let args_arr = pop!();
@@ -2050,7 +2141,7 @@ impl Vm {
                 push!(r);
             }
             Op::New(argc) => {
-                let n = argc as usize;
+                let n = *argc as usize;
                 let at = frame.stack.len() - n;
                 let args = frame.stack.split_off(at);
                 let ctor = pop!();
@@ -2075,7 +2166,7 @@ impl Vm {
             }
 
             Op::Closure(i) => {
-                let proto = match &frame.func.proto.consts[i as usize] {
+                let proto = match &frame.func.proto.consts[*i as usize] {
                     Const::Func(p) => p.clone(),
                     _ => return Err(self.throw_type("internal: bad closure const")),
                 };
@@ -2264,37 +2355,37 @@ impl Vm {
             }
 
             // ---- control flow ----
-            Op::Jump(t) => return Ok(Ctl::Jump(t as usize)),
+            Op::Jump(t) => return Ok(Ctl::Jump(*t as usize)),
             Op::JumpIfTrue(t) => {
                 let v = pop!();
                 if self.to_boolean(&v) {
-                    return Ok(Ctl::Jump(t as usize));
+                    return Ok(Ctl::Jump(*t as usize));
                 }
             }
             Op::JumpIfFalse(t) => {
                 let v = pop!();
                 if !self.to_boolean(&v) {
-                    return Ok(Ctl::Jump(t as usize));
+                    return Ok(Ctl::Jump(*t as usize));
                 }
             }
             Op::JumpIfFalsyPeek(t) => {
                 let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
                 if !self.to_boolean(&v) {
-                    return Ok(Ctl::Jump(t as usize));
+                    return Ok(Ctl::Jump(*t as usize));
                 }
                 frame.stack.pop();
             }
             Op::JumpIfTruthyPeek(t) => {
                 let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
                 if self.to_boolean(&v) {
-                    return Ok(Ctl::Jump(t as usize));
+                    return Ok(Ctl::Jump(*t as usize));
                 }
                 frame.stack.pop();
             }
             Op::JumpIfNullishPeek(t) => {
                 let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
                 if !v.is_nullish() {
-                    return Ok(Ctl::Jump(t as usize));
+                    return Ok(Ctl::Jump(*t as usize));
                 }
                 frame.stack.pop();
             }
@@ -2306,11 +2397,15 @@ impl Vm {
             }
             Op::PushTryHandler { catch, finally } => {
                 frame.handlers.push(TryHandler {
-                    catch_ip: if catch == u32::MAX { None } else { Some(catch) },
-                    finally_ip: if finally == u32::MAX {
+                    catch_ip: if *catch == u32::MAX {
                         None
                     } else {
-                        Some(finally)
+                        Some(*catch)
+                    },
+                    finally_ip: if *finally == u32::MAX {
+                        None
+                    } else {
+                        Some(*finally)
                     },
                     stack_depth: frame.stack.len(),
                     with_depth: frame.with_scope.len(),
@@ -2322,10 +2417,10 @@ impl Vm {
             Op::MarkDelegationHandler(return_ip) => {
                 if let Some(h) = frame.handlers.last_mut() {
                     h.delegation = true;
-                    h.delegation_return_ip = if return_ip == u32::MAX {
+                    h.delegation_return_ip = if *return_ip == u32::MAX {
                         None
                     } else {
-                        Some(return_ip)
+                        Some(*return_ip)
                     };
                 }
             }
@@ -2339,8 +2434,8 @@ impl Vm {
                 frame.eval_vars = Some(o);
             }
             Op::DirectEval { argc, scope } => {
-                let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
-                for _ in 0..argc {
+                let mut args: Vec<Value> = Vec::with_capacity(*argc as usize);
+                for _ in 0..*argc {
                     args.push(pop!());
                 }
                 args.reverse();
@@ -2354,7 +2449,7 @@ impl Vm {
                     let r = self.call(callee, Value::Undefined, &args)?;
                     push!(r);
                 } else {
-                    let v = self.perform_direct_eval(frame, scope, args)?;
+                    let v = self.perform_direct_eval(frame, *scope, args)?;
                     push!(v);
                 }
             }
@@ -2362,7 +2457,13 @@ impl Vm {
                 frame.handlers.pop();
             }
             Op::CompletionJump { target, boundary } => {
-                return self.do_completion(frame, Completion::Jump { target, boundary });
+                return self.do_completion(
+                    frame,
+                    Completion::Jump {
+                        target: *target,
+                        boundary: *boundary,
+                    },
+                );
             }
             Op::EndFinally => {
                 // If a non-local completion is parked, resume it (run the next
@@ -2483,7 +2584,7 @@ impl Vm {
                 push!(Value::String(s));
             }
             Op::ConcatStrings(n) => {
-                let n = n as usize;
+                let n = *n as usize;
                 let at = frame.stack.len() - n;
                 let parts = frame.stack.split_off(at);
                 let mut out = String::new();
@@ -2499,8 +2600,8 @@ impl Vm {
                 push!(Value::str(out));
             }
             Op::NewRegExp { pattern, flags } => {
-                let p = self.const_name(frame, pattern);
-                let f = self.const_name(frame, flags);
+                let p = self.const_name(frame, *pattern);
+                let f = self.const_name(frame, *flags);
                 let re = self.make_regexp(p.as_str(), f.as_str())?;
                 push!(re);
             }
