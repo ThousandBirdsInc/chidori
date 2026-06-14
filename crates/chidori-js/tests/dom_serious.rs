@@ -449,3 +449,110 @@ fn inner_html_parses_into_journaled_dom_and_is_queryable() {
     );
     assert_eq!(out, "Pro|2|Buy & go|1");
 }
+
+#[test]
+fn advanced_css_selectors() {
+    let mut engine = Engine::new();
+    let _dom = engine.install_dom();
+    let out = eval_str(
+        &mut engine,
+        r#"
+        const root = document.createElement('div');
+        root.innerHTML =
+            '<nav><ul class="menu">' +
+            '<li class="item active" data-id="1"><a href="/a">A</a></li>' +
+            '<li class="item" data-id="2"><a href="/b">B</a></li>' +
+            '<li class="item" data-id="3"><a href="/c">C</a></li>' +
+            '</ul></nav>';
+        document.body.appendChild(root);
+        [
+            root.querySelectorAll('ul.menu > li').length,        // child combinator
+            root.querySelectorAll('nav li a').length,            // descendant chain
+            root.querySelector('li.active').getAttribute('data-id'),  // compound class
+            root.querySelectorAll('[data-id]').length,           // attribute exists
+            root.querySelector('[data-id="2"] a').textContent,   // attr equals + descendant
+            root.querySelector('li:first-child').getAttribute('data-id'),
+            root.querySelector('li:last-child').getAttribute('data-id'),
+            root.querySelector('li:nth-child(2)').getAttribute('data-id'),
+            root.querySelectorAll('a[href^="/"]').length,        // prefix match
+        ].join('|')
+        "#,
+    );
+    assert_eq!(out, "3|3|1|3|B|1|3|2|3");
+}
+
+#[test]
+fn selector_list_groups() {
+    let mut engine = Engine::new();
+    let _dom = engine.install_dom();
+    let out = eval_str(
+        &mut engine,
+        r#"
+        const root = document.createElement('div');
+        root.innerHTML = '<h1>t</h1><h2>u</h2><p>v</p>';
+        document.body.appendChild(root);
+        root.querySelectorAll('h1, h2').length
+        "#,
+    );
+    assert_eq!(out, "2");
+}
+
+#[test]
+fn insert_adjacent_html_positions() {
+    let mut engine = Engine::new();
+    let _dom = engine.install_dom();
+    let out = eval_str(
+        &mut engine,
+        r#"
+        const box = document.createElement('div');
+        box.id = 'box';
+        box.innerHTML = '<span id="mid">mid</span>';
+        document.body.appendChild(box);
+        const mid = document.getElementById('mid');
+        mid.insertAdjacentHTML('beforebegin', '<b>before</b>');
+        mid.insertAdjacentHTML('afterend', '<i>after</i>');
+        box.insertAdjacentHTML('afterbegin', '<u>first</u>');
+        box.insertAdjacentHTML('beforeend', '<s>last</s>');
+        box.innerHTML
+        "#,
+    );
+    assert_eq!(
+        out,
+        "<u>first</u><b>before</b><span id=\"mid\">mid</span><i>after</i><s>last</s>"
+    );
+}
+
+#[test]
+fn normalize_merges_adjacent_text() {
+    let mut engine = Engine::new();
+    let _dom = engine.install_dom();
+    let out = eval_str(
+        &mut engine,
+        r#"
+        const p = document.createElement('p');
+        p.appendChild(document.createTextNode('Hello, '));
+        p.appendChild(document.createTextNode('world'));
+        p.appendChild(document.createTextNode(''));
+        const before = p.childNodes.length;
+        p.normalize();
+        [before, p.childNodes.length, p.textContent].join('|')
+        "#,
+    );
+    assert_eq!(out, "3|1|Hello, world");
+}
+
+#[test]
+fn session_journal_is_versioned() {
+    use chidori_js::dom::PROTOCOL_VERSION;
+    let mut engine = Engine::new();
+    let dom = engine.install_dom();
+    engine.eval("document.body.appendChild(document.createElement('div'));").unwrap();
+    let batch = dom.drain_render_batch();
+    assert_eq!(batch.version, PROTOCOL_VERSION);
+    assert!(!batch.mutations.is_empty());
+    let j = dom.journal();
+    assert_eq!(j.version, PROTOCOL_VERSION);
+    // round-trips with the version field
+    let s = serde_json::to_string(&j).unwrap();
+    assert!(s.contains("\"version\""));
+}

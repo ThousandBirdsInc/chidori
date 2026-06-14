@@ -56,6 +56,24 @@ pub enum Mutation {
     Remove { parent: usize, child: usize },
 }
 
+/// Version of the render/journal wire format. Bump on any breaking change to
+/// [`Mutation`], [`EventRecord`], [`MeasureRecord`], or [`SessionJournal`] so
+/// external renderers/consumers can detect incompatibility.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+fn protocol_version() -> u32 {
+    PROTOCOL_VERSION
+}
+
+/// A versioned batch of mutations — the render protocol payload an embedder
+/// flushes to a renderer (or through the durable host as a `dom_render` effect).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RenderBatch {
+    #[serde(default = "protocol_version")]
+    pub version: u32,
+    pub mutations: Vec<Mutation>,
+}
+
 /// One delivered UI event (the input journal).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EventRecord {
@@ -86,10 +104,18 @@ pub struct MeasureRecord {
 
 /// The complete non-deterministic input journal for a session: everything needed
 /// to replay a recorded run into byte-identical output.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SessionJournal {
+    #[serde(default = "protocol_version")]
+    pub version: u32,
     pub events: Vec<EventRecord>,
     pub measurements: Vec<MeasureRecord>,
+}
+
+impl Default for SessionJournal {
+    fn default() -> Self {
+        SessionJournal { version: PROTOCOL_VERSION, events: Vec::new(), measurements: Vec::new() }
+    }
 }
 
 /// Record live and journal, or replay from a loaded journal.
@@ -341,6 +367,88 @@ impl Dom {
             self.detach(k);
         }
         self.parse_into(id, html);
+    }
+
+    /// `insertAdjacentHTML(position, html)` — parse `html` and insert relative to
+    /// `id`. Supports beforebegin / afterbegin / beforeend / afterend.
+    fn insert_adjacent_html(&mut self, id: usize, position: &str, html: &str) {
+        match position {
+            "beforeend" => self.parse_into(id, html),
+            "afterbegin" => {
+                let before = self.nodes[id].children.clone();
+                self.parse_into(id, html);
+                let new: Vec<usize> =
+                    self.nodes[id].children.iter().copied().filter(|c| !before.contains(c)).collect();
+                if let Some(&first) = before.first() {
+                    for nn in new {
+                        let _ = self.insert_before(id, nn, first);
+                    }
+                }
+            }
+            "beforebegin" | "afterend" => {
+                let parent = match self.nodes[id].parent {
+                    Some(p) => p,
+                    None => return,
+                };
+                let before = self.nodes[parent].children.clone();
+                self.parse_into(parent, html);
+                let new: Vec<usize> = self.nodes[parent]
+                    .children
+                    .iter()
+                    .copied()
+                    .filter(|c| !before.contains(c))
+                    .collect();
+                let pos = before.iter().position(|&c| c == id);
+                let anchor = match (position, pos) {
+                    ("beforebegin", _) => Some(id),
+                    ("afterend", Some(ix)) => before.get(ix + 1).copied(),
+                    _ => None,
+                };
+                for nn in new {
+                    match anchor {
+                        Some(a) => {
+                            let _ = self.insert_before(parent, nn, a);
+                        }
+                        None => {
+                            let _ = self.append_child(parent, nn);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `normalize()` — merge adjacent text nodes and drop empty ones, recursively.
+    fn normalize(&mut self, id: usize) {
+        for c in self.nodes[id].children.clone() {
+            if matches!(self.nodes[c].kind, NodeKind::Element(_)) {
+                self.normalize(c);
+            }
+        }
+        let mut i = 0;
+        while i < self.nodes[id].children.len() {
+            let c = self.nodes[id].children[i];
+            if matches!(self.nodes[c].kind, NodeKind::Text) {
+                if self.nodes[c].text.is_empty() {
+                    self.detach(c);
+                    continue;
+                }
+                while i + 1 < self.nodes[id].children.len() {
+                    let nx = self.nodes[id].children[i + 1];
+                    if matches!(self.nodes[nx].kind, NodeKind::Text) {
+                        let t = self.nodes[nx].text.clone();
+                        self.nodes[c].text.push_str(&t);
+                        let merged = self.nodes[c].text.clone();
+                        self.mutations.push(Mutation::SetText { id: c, data: merged });
+                        self.detach(nx);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            i += 1;
+        }
     }
 
     fn parse_into(&mut self, parent: usize, html: &str) {
@@ -609,47 +717,127 @@ impl Dom {
             .find_map(|(i, n)| n.attrs.iter().any(|(k, v)| k == "id" && v == dom_id).then_some(i))
     }
 
-    /// Collect descendants of `root` matching a simple selector, in document order.
-    fn select(&self, root: usize, sel: &Selector, first_only: bool) -> Vec<usize> {
+    fn element_children(&self, parent: usize) -> Vec<usize> {
+        self.nodes[parent]
+            .children
+            .iter()
+            .copied()
+            .filter(|&c| matches!(self.nodes[c].kind, NodeKind::Element(_)))
+            .collect()
+    }
+
+    /// Collect descendants of `root` matching any selector in `list`, document order.
+    fn select(&self, root: usize, list: &SelectorList, first_only: bool) -> Vec<usize> {
         let mut out = Vec::new();
-        self.select_into(root, sel, first_only, &mut out);
+        self.select_into(root, list, first_only, &mut out);
         out
     }
 
-    fn select_into(&self, node: usize, sel: &Selector, first_only: bool, out: &mut Vec<usize>) {
+    fn select_into(&self, node: usize, list: &SelectorList, first_only: bool, out: &mut Vec<usize>) {
         for &c in &self.nodes[node].children {
-            if self.matches(c, sel) {
+            if matches!(self.nodes[c].kind, NodeKind::Element(_))
+                && list.iter().any(|cx| self.matches_complex(c, cx))
+            {
                 out.push(c);
                 if first_only {
                     return;
                 }
             }
-            self.select_into(c, sel, first_only, out);
+            self.select_into(c, list, first_only, out);
             if first_only && !out.is_empty() {
                 return;
             }
         }
     }
 
-    fn matches(&self, id: usize, sel: &Selector) -> bool {
+    /// Right-to-left match of a complex selector (combinator chain) against `id`.
+    fn matches_complex(&self, id: usize, cx: &Complex) -> bool {
+        let last = cx.simples.len() - 1;
+        if !self.matches_simple(id, &cx.simples[last]) {
+            return false;
+        }
+        let mut cur = id;
+        let mut j = last;
+        while j > 0 {
+            let target = &cx.simples[j - 1];
+            match cx.combs[j - 1] {
+                Comb::Child => match self.nodes[cur].parent {
+                    Some(p) if self.matches_simple(p, target) => cur = p,
+                    _ => return false,
+                },
+                Comb::Descendant => {
+                    let mut anc = self.nodes[cur].parent;
+                    let mut ok = false;
+                    while let Some(a) = anc {
+                        if self.matches_simple(a, target) {
+                            cur = a;
+                            ok = true;
+                            break;
+                        }
+                        anc = self.nodes[a].parent;
+                    }
+                    if !ok {
+                        return false;
+                    }
+                }
+            }
+            j -= 1;
+        }
+        true
+    }
+
+    fn matches_simple(&self, id: usize, s: &Simple) -> bool {
         let tag = match &self.nodes[id].kind {
             NodeKind::Element(t) => t.as_str(),
             _ => return false,
         };
-        if let Some(t) = &sel.tag {
-            if !tag.eq_ignore_ascii_case(t) {
+        if let Some(t) = &s.tag {
+            if t != "*" && !tag.eq_ignore_ascii_case(t) {
                 return false;
             }
         }
-        if let Some(want) = &sel.id {
+        if let Some(want) = &s.id {
             if self.get_attribute(id, "id").as_deref() != Some(want.as_str()) {
                 return false;
             }
         }
-        if !sel.classes.is_empty() {
+        if !s.classes.is_empty() {
             let have = self.classes(id);
-            if !sel.classes.iter().all(|c| have.contains(c)) {
+            if !s.classes.iter().all(|c| have.contains(c)) {
                 return false;
+            }
+        }
+        for a in &s.attrs {
+            let got = self.get_attribute(id, &a.name);
+            let ok = match (&a.op, got.as_deref()) {
+                (AttrOp::Exists, Some(_)) => true,
+                (_, None) => false,
+                (AttrOp::Eq, Some(v)) => v == a.value,
+                (AttrOp::Includes, Some(v)) => v.split_whitespace().any(|p| p == a.value),
+                (AttrOp::Prefix, Some(v)) => v.starts_with(&a.value),
+                (AttrOp::Suffix, Some(v)) => v.ends_with(&a.value),
+                (AttrOp::Substring, Some(v)) => v.contains(&a.value),
+                (AttrOp::Exists, None) => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        if !s.pseudos.is_empty() {
+            let sibs = match self.nodes[id].parent {
+                Some(p) => self.element_children(p),
+                None => vec![id],
+            };
+            let idx = sibs.iter().position(|&c| c == id).unwrap_or(0);
+            for p in &s.pseudos {
+                let ok = match p {
+                    Pseudo::FirstChild => idx == 0,
+                    Pseudo::LastChild => idx + 1 == sibs.len(),
+                    Pseudo::NthChild(n) => idx + 1 == *n,
+                };
+                if !ok {
+                    return false;
+                }
             }
         }
         true
@@ -706,49 +894,226 @@ fn decode_entities(s: &str) -> String {
     out
 }
 
-/// A single compound selector: optional tag, optional `#id`, zero or more
-/// `.class`. Descendant combinator only (whitespace is not parsed as a
-/// combinator here — one compound term).
-struct Selector {
+// A pragmatic CSS selector engine: comma-separated selector lists, descendant
+// (` `) and child (`>`) combinators, type/`#id`/`.class`, attribute selectors
+// (`[a]`, `[a=v]`, `~= ^= $= *=`), and `:first-child`/`:last-child`/`:nth-child(n)`.
+#[derive(Clone, Copy)]
+enum Comb {
+    Descendant,
+    Child,
+}
+
+#[derive(Clone)]
+enum AttrOp {
+    Exists,
+    Eq,
+    Includes,
+    Prefix,
+    Suffix,
+    Substring,
+}
+
+#[derive(Clone)]
+struct AttrSel {
+    name: String,
+    op: AttrOp,
+    value: String,
+}
+
+#[derive(Clone)]
+enum Pseudo {
+    FirstChild,
+    LastChild,
+    NthChild(usize),
+}
+
+#[derive(Clone, Default)]
+struct Simple {
     tag: Option<String>,
     id: Option<String>,
     classes: Vec<String>,
+    attrs: Vec<AttrSel>,
+    pseudos: Vec<Pseudo>,
 }
 
-fn parse_selector(s: &str) -> Selector {
-    let s = s.trim();
-    let mut tag = None;
-    let mut id = None;
-    let mut classes = Vec::new();
-    let mut chars = s.chars().peekable();
-    // leading tag (until a '.' or '#')
-    let mut lead = String::new();
-    while let Some(&c) = chars.peek() {
-        if c == '.' || c == '#' {
+#[derive(Clone)]
+struct Complex {
+    simples: Vec<Simple>,
+    /// `combs[j]` is the combinator between `simples[j]` and `simples[j+1]`.
+    combs: Vec<Comb>,
+}
+
+type SelectorList = Vec<Complex>;
+
+fn parse_selector_list(input: &str) -> SelectorList {
+    input
+        .split(',')
+        .filter_map(|part| parse_complex(part.trim()))
+        .collect()
+}
+
+fn parse_complex(s: &str) -> Option<Complex> {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    let mut simples: Vec<Simple> = Vec::new();
+    let mut combs: Vec<Comb> = Vec::new();
+    let mut pending: Option<Comb> = None;
+    while i < n {
+        if chars[i].is_whitespace() {
+            if !simples.is_empty() {
+                pending = Some(pending.unwrap_or(Comb::Descendant));
+            }
+            i += 1;
+            continue;
+        }
+        if chars[i] == '>' {
+            pending = Some(Comb::Child);
+            i += 1;
+            continue;
+        }
+        let (simple, ni) = parse_simple(&chars, i);
+        if ni == i {
+            break; // no progress — bail on malformed input
+        }
+        if !simples.is_empty() {
+            combs.push(pending.take().unwrap_or(Comb::Descendant));
+        }
+        pending = None;
+        simples.push(simple);
+        i = ni;
+    }
+    if simples.is_empty() {
+        None
+    } else {
+        Some(Complex { simples, combs })
+    }
+}
+
+fn ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '-' || c == '_'
+}
+
+fn parse_simple(chars: &[char], mut i: usize) -> (Simple, usize) {
+    let n = chars.len();
+    let mut s = Simple::default();
+    let mut tag = String::new();
+    while i < n && (chars[i].is_alphanumeric() || chars[i] == '*' || chars[i] == '-') {
+        tag.push(chars[i]);
+        i += 1;
+    }
+    if !tag.is_empty() {
+        s.tag = Some(tag);
+    }
+    loop {
+        if i >= n {
             break;
         }
-        lead.push(c);
-        chars.next();
-    }
-    if !lead.is_empty() && lead != "*" {
-        tag = Some(lead);
-    }
-    while let Some(c) = chars.next() {
-        let mut tok = String::new();
-        while let Some(&n) = chars.peek() {
-            if n == '.' || n == '#' {
-                break;
+        match chars[i] {
+            '#' => {
+                i += 1;
+                let mut t = String::new();
+                while i < n && ident_char(chars[i]) {
+                    t.push(chars[i]);
+                    i += 1;
+                }
+                s.id = Some(t);
             }
-            tok.push(n);
-            chars.next();
-        }
-        match c {
-            '#' => id = Some(tok),
-            '.' => classes.push(tok),
-            _ => {}
+            '.' => {
+                i += 1;
+                let mut t = String::new();
+                while i < n && ident_char(chars[i]) {
+                    t.push(chars[i]);
+                    i += 1;
+                }
+                s.classes.push(t);
+            }
+            '[' => {
+                i += 1;
+                let (attr, ni) = parse_attr(chars, i);
+                s.attrs.push(attr);
+                i = ni;
+                if i < n && chars[i] == ']' {
+                    i += 1;
+                }
+            }
+            ':' => {
+                i += 1;
+                let mut name = String::new();
+                while i < n && (chars[i].is_alphanumeric() || chars[i] == '-') {
+                    name.push(chars[i]);
+                    i += 1;
+                }
+                let mut arg = String::new();
+                if i < n && chars[i] == '(' {
+                    i += 1;
+                    while i < n && chars[i] != ')' {
+                        arg.push(chars[i]);
+                        i += 1;
+                    }
+                    if i < n {
+                        i += 1;
+                    }
+                }
+                match name.as_str() {
+                    "first-child" => s.pseudos.push(Pseudo::FirstChild),
+                    "last-child" => s.pseudos.push(Pseudo::LastChild),
+                    "nth-child" => {
+                        if let Ok(k) = arg.trim().parse::<usize>() {
+                            s.pseudos.push(Pseudo::NthChild(k));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => break,
         }
     }
-    Selector { tag, id, classes }
+    (s, i)
+}
+
+fn parse_attr(chars: &[char], mut i: usize) -> (AttrSel, usize) {
+    let n = chars.len();
+    let mut name = String::new();
+    while i < n && (ident_char(chars[i]) || chars[i] == ':') {
+        name.push(chars[i]);
+        i += 1;
+    }
+    let mut op = AttrOp::Exists;
+    let mut value = String::new();
+    if i < n && chars[i] != ']' {
+        let c = chars[i];
+        if c == '=' {
+            op = AttrOp::Eq;
+            i += 1;
+        } else if i + 1 < n && chars[i + 1] == '=' {
+            op = match c {
+                '~' => AttrOp::Includes,
+                '^' => AttrOp::Prefix,
+                '$' => AttrOp::Suffix,
+                '*' => AttrOp::Substring,
+                _ => AttrOp::Eq,
+            };
+            i += 2;
+        }
+        if i < n && (chars[i] == '"' || chars[i] == '\'') {
+            let q = chars[i];
+            i += 1;
+            while i < n && chars[i] != q {
+                value.push(chars[i]);
+                i += 1;
+            }
+            if i < n {
+                i += 1;
+            }
+        } else {
+            while i < n && chars[i] != ']' && !chars[i].is_whitespace() {
+                value.push(chars[i]);
+                i += 1;
+            }
+        }
+    }
+    (AttrSel { name, op, value }, i)
 }
 
 // ---------------------------------------------------------------------------
@@ -786,6 +1151,12 @@ impl DomHandle {
         std::mem::take(&mut self.0.borrow_mut().mutations)
     }
 
+    /// Take the pending mutations as a versioned [`RenderBatch`] — the render
+    /// protocol payload (what flows through the durable host's `dom_render`).
+    pub fn drain_render_batch(&self) -> RenderBatch {
+        RenderBatch { version: PROTOCOL_VERSION, mutations: self.drain_mutations() }
+    }
+
     pub fn events(&self) -> Vec<EventRecord> {
         self.0.borrow().events.clone()
     }
@@ -794,6 +1165,7 @@ impl DomHandle {
     pub fn journal(&self) -> SessionJournal {
         let dom = self.0.borrow();
         SessionJournal {
+            version: PROTOCOL_VERSION,
             events: dom.events.clone(),
             measurements: dom.measurements.clone(),
         }
@@ -1208,6 +1580,24 @@ fn install_node_api(vm: &mut Vm, dom: &Rc<RefCell<Dom>>, obj: &JsObject) {
 
     // ---- events ----
     let d = weak.clone();
+    vm.define_method(obj, "insertAdjacentHTML", 2, move |vm, this, args| {
+        let dom = dom_or_return!(d);
+        let id = nid_of(vm, &this).ok_or_else(|| type_err(vm, "insertAdjacentHTML: not a node"))?;
+        let position = vm.to_string_lossy(args.first().unwrap_or(&Value::Undefined));
+        let html = vm.to_string_lossy(args.get(1).unwrap_or(&Value::Undefined));
+        dom.borrow_mut().insert_adjacent_html(id, &position, &html);
+        Ok(Value::Undefined)
+    });
+
+    let d = weak.clone();
+    vm.define_method(obj, "normalize", 0, move |vm, this, _| {
+        let dom = dom_or_return!(d);
+        let id = nid_of(vm, &this).ok_or_else(|| type_err(vm, "normalize: not a node"))?;
+        dom.borrow_mut().normalize(id);
+        Ok(Value::Undefined)
+    });
+
+    let d = weak.clone();
     vm.define_method(obj, "addEventListener", 3, move |vm, this, args| {
         let dom = dom_or_return!(d);
         let id = nid_of(vm, &this).ok_or_else(|| type_err(vm, "addEventListener: not a node"))?;
@@ -1606,7 +1996,7 @@ fn install_query(vm: &mut Vm, weak: &Weak<RefCell<Dom>>, obj: &JsObject) {
     vm.define_method(obj, "querySelector", 1, move |vm, this, args| {
         let dom = dom_or_return!(d);
         let id = nid_of(vm, &this).ok_or_else(|| type_err(vm, "querySelector: not a node"))?;
-        let sel = parse_selector(&vm.to_string_lossy(args.first().unwrap_or(&Value::Undefined)));
+        let sel = parse_selector_list(&vm.to_string_lossy(args.first().unwrap_or(&Value::Undefined)));
         let found = dom.borrow().select(id, &sel, true).first().copied();
         Ok(match found {
             Some(c) => node_wrapper(vm, &dom, c),
@@ -1617,7 +2007,7 @@ fn install_query(vm: &mut Vm, weak: &Weak<RefCell<Dom>>, obj: &JsObject) {
     vm.define_method(obj, "querySelectorAll", 1, move |vm, this, args| {
         let dom = dom_or_return!(d);
         let id = nid_of(vm, &this).ok_or_else(|| type_err(vm, "querySelectorAll: not a node"))?;
-        let sel = parse_selector(&vm.to_string_lossy(args.first().unwrap_or(&Value::Undefined)));
+        let sel = parse_selector_list(&vm.to_string_lossy(args.first().unwrap_or(&Value::Undefined)));
         let found = dom.borrow().select(id, &sel, false);
         let vals: Vec<Value> = found.into_iter().map(|c| node_wrapper(vm, &dom, c)).collect();
         Ok(Value::Object(vm.new_array(vals)))
@@ -1627,7 +2017,10 @@ fn install_query(vm: &mut Vm, weak: &Weak<RefCell<Dom>>, obj: &JsObject) {
         let dom = dom_or_return!(d);
         let id = nid_of(vm, &this).ok_or_else(|| type_err(vm, "getElementsByTagName: not a node"))?;
         let tag = vm.to_string_lossy(args.first().unwrap_or(&Value::Undefined));
-        let sel = Selector { tag: Some(tag), id: None, classes: vec![] };
+        let sel = vec![Complex {
+            simples: vec![Simple { tag: Some(tag), ..Default::default() }],
+            combs: vec![],
+        }];
         let found = dom.borrow().select(id, &sel, false);
         let vals: Vec<Value> = found.into_iter().map(|c| node_wrapper(vm, &dom, c)).collect();
         Ok(Value::Object(vm.new_array(vals)))
@@ -1637,7 +2030,10 @@ fn install_query(vm: &mut Vm, weak: &Weak<RefCell<Dom>>, obj: &JsObject) {
         let dom = dom_or_return!(d);
         let id = nid_of(vm, &this).ok_or_else(|| type_err(vm, "getElementsByClassName: not a node"))?;
         let cls = vm.to_string_lossy(args.first().unwrap_or(&Value::Undefined));
-        let sel = Selector { tag: None, id: None, classes: vec![cls] };
+        let sel = vec![Complex {
+            simples: vec![Simple { classes: vec![cls], ..Default::default() }],
+            combs: vec![],
+        }];
         let found = dom.borrow().select(id, &sel, false);
         let vals: Vec<Value> = found.into_iter().map(|c| node_wrapper(vm, &dom, c)).collect();
         Ok(Value::Object(vm.new_array(vals)))
