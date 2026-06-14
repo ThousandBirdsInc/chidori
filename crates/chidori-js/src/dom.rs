@@ -46,14 +46,40 @@ use std::rc::{Rc, Weak};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum Mutation {
-    Create { id: usize, tag: String },
-    CreateText { id: usize, data: String },
-    SetAttribute { id: usize, name: String, value: String },
-    RemoveAttribute { id: usize, name: String },
-    SetText { id: usize, data: String },
-    Append { parent: usize, child: usize },
-    InsertBefore { parent: usize, child: usize, before: usize },
-    Remove { parent: usize, child: usize },
+    Create {
+        id: usize,
+        tag: String,
+    },
+    CreateText {
+        id: usize,
+        data: String,
+    },
+    SetAttribute {
+        id: usize,
+        name: String,
+        value: String,
+    },
+    RemoveAttribute {
+        id: usize,
+        name: String,
+    },
+    SetText {
+        id: usize,
+        data: String,
+    },
+    Append {
+        parent: usize,
+        child: usize,
+    },
+    InsertBefore {
+        parent: usize,
+        child: usize,
+        before: usize,
+    },
+    Remove {
+        parent: usize,
+        child: usize,
+    },
 }
 
 /// Version of the render/journal wire format. Bump on any breaking change to
@@ -114,7 +140,11 @@ pub struct SessionJournal {
 
 impl Default for SessionJournal {
     fn default() -> Self {
-        SessionJournal { version: PROTOCOL_VERSION, events: Vec::new(), measurements: Vec::new() }
+        SessionJournal {
+            version: PROTOCOL_VERSION,
+            events: Vec::new(),
+            measurements: Vec::new(),
+        }
     }
 }
 
@@ -244,9 +274,18 @@ impl Dom {
         dom.nodes[document].children.push(html);
         dom.nodes[body].parent = Some(html);
         dom.nodes[html].children.push(body);
-        dom.mutations.push(Mutation::Create { id: html, tag: "html".to_string() });
-        dom.mutations.push(Mutation::Create { id: body, tag: "body".to_string() });
-        dom.mutations.push(Mutation::Append { parent: html, child: body });
+        dom.mutations.push(Mutation::Create {
+            id: html,
+            tag: "html".to_string(),
+        });
+        dom.mutations.push(Mutation::Create {
+            id: body,
+            tag: "body".to_string(),
+        });
+        dom.mutations.push(Mutation::Append {
+            parent: html,
+            child: body,
+        });
         dom
     }
 
@@ -258,14 +297,20 @@ impl Dom {
 
     fn create_element(&mut self, tag: &str) -> usize {
         let id = self.new_node(NodeKind::Element(tag.to_string()));
-        self.mutations.push(Mutation::Create { id, tag: tag.to_string() });
+        self.mutations.push(Mutation::Create {
+            id,
+            tag: tag.to_string(),
+        });
         id
     }
 
     fn create_text(&mut self, data: &str) -> usize {
         let id = self.new_node(NodeKind::Text);
         self.nodes[id].text = data.to_string();
-        self.mutations.push(Mutation::CreateText { id, data: data.to_string() });
+        self.mutations.push(Mutation::CreateText {
+            id,
+            data: data.to_string(),
+        });
         id
     }
 
@@ -315,7 +360,11 @@ impl Dom {
             .expect("reference child present");
         self.nodes[child].parent = Some(parent);
         self.nodes[parent].children.insert(idx, child);
-        self.mutations.push(Mutation::InsertBefore { parent, child, before });
+        self.mutations.push(Mutation::InsertBefore {
+            parent,
+            child,
+            before,
+        });
         Ok(())
     }
 
@@ -323,28 +372,43 @@ impl Dom {
         if let Some(slot) = self.nodes[id].attrs.iter_mut().find(|(n, _)| n == name) {
             slot.1 = value.to_string();
         } else {
-            self.nodes[id].attrs.push((name.to_string(), value.to_string()));
+            self.nodes[id]
+                .attrs
+                .push((name.to_string(), value.to_string()));
         }
-        self.mutations
-            .push(Mutation::SetAttribute { id, name: name.to_string(), value: value.to_string() });
+        self.mutations.push(Mutation::SetAttribute {
+            id,
+            name: name.to_string(),
+            value: value.to_string(),
+        });
     }
 
     fn get_attribute(&self, id: usize, name: &str) -> Option<String> {
-        self.nodes[id].attrs.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+        self.nodes[id]
+            .attrs
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
     }
 
     fn remove_attribute(&mut self, id: usize, name: &str) {
         let before = self.nodes[id].attrs.len();
         self.nodes[id].attrs.retain(|(n, _)| n != name);
         if self.nodes[id].attrs.len() != before {
-            self.mutations.push(Mutation::RemoveAttribute { id, name: name.to_string() });
+            self.mutations.push(Mutation::RemoveAttribute {
+                id,
+                name: name.to_string(),
+            });
         }
     }
 
     fn set_text_content(&mut self, id: usize, data: &str) {
         if matches!(self.nodes[id].kind, NodeKind::Text) {
             self.nodes[id].text = data.to_string();
-            self.mutations.push(Mutation::SetText { id, data: data.to_string() });
+            self.mutations.push(Mutation::SetText {
+                id,
+                data: data.to_string(),
+            });
             return;
         }
         let kids = self.nodes[id].children.clone();
@@ -377,8 +441,12 @@ impl Dom {
             "afterbegin" => {
                 let before = self.nodes[id].children.clone();
                 self.parse_into(id, html);
-                let new: Vec<usize> =
-                    self.nodes[id].children.iter().copied().filter(|c| !before.contains(c)).collect();
+                let new: Vec<usize> = self.nodes[id]
+                    .children
+                    .iter()
+                    .copied()
+                    .filter(|c| !before.contains(c))
+                    .collect();
                 if let Some(&first) = before.first() {
                     for nn in new {
                         let _ = self.insert_before(id, nn, first);
@@ -440,7 +508,10 @@ impl Dom {
                         let t = self.nodes[nx].text.clone();
                         self.nodes[c].text.push_str(&t);
                         let merged = self.nodes[c].text.clone();
-                        self.mutations.push(Mutation::SetText { id: c, data: merged });
+                        self.mutations.push(Mutation::SetText {
+                            id: c,
+                            data: merged,
+                        });
                         self.detach(nx);
                     } else {
                         break;
@@ -453,8 +524,8 @@ impl Dom {
 
     fn parse_into(&mut self, parent: usize, html: &str) {
         const VOID: &[&str] = &[
-            "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
-            "meta", "param", "source", "track", "wbr",
+            "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+            "source", "track", "wbr",
         ];
         let s: Vec<char> = html.chars().collect();
         let n = s.len();
@@ -488,9 +559,9 @@ impl Dom {
                     }
                     i += 1;
                     let name = name.trim().to_lowercase();
-                    if let Some(pos) = stack.iter().rposition(|&nid| {
-                        matches!(&self.nodes[nid].kind, NodeKind::Element(t) if *t == name)
-                    }) {
+                    if let Some(pos) = stack.iter().rposition(
+                        |&nid| matches!(&self.nodes[nid].kind, NodeKind::Element(t) if *t == name),
+                    ) {
                         if pos > 0 {
                             stack.truncate(pos);
                         }
@@ -521,7 +592,11 @@ impl Dom {
                         continue;
                     }
                     let mut an = String::new();
-                    while i < n && !s[i].is_whitespace() && s[i] != '=' && s[i] != '>' && s[i] != '/'
+                    while i < n
+                        && !s[i].is_whitespace()
+                        && s[i] != '='
+                        && s[i] != '>'
+                        && s[i] != '/'
                     {
                         an.push(s[i]);
                         i += 1;
@@ -711,10 +786,12 @@ impl Dom {
     }
 
     fn find_by_id(&self, dom_id: &str) -> Option<usize> {
-        self.nodes
-            .iter()
-            .enumerate()
-            .find_map(|(i, n)| n.attrs.iter().any(|(k, v)| k == "id" && v == dom_id).then_some(i))
+        self.nodes.iter().enumerate().find_map(|(i, n)| {
+            n.attrs
+                .iter()
+                .any(|(k, v)| k == "id" && v == dom_id)
+                .then_some(i)
+        })
     }
 
     fn element_children(&self, parent: usize) -> Vec<usize> {
@@ -733,7 +810,13 @@ impl Dom {
         out
     }
 
-    fn select_into(&self, node: usize, list: &SelectorList, first_only: bool, out: &mut Vec<usize>) {
+    fn select_into(
+        &self,
+        node: usize,
+        list: &SelectorList,
+        first_only: bool,
+        out: &mut Vec<usize>,
+    ) {
         for &c in &self.nodes[node].children {
             if matches!(self.nodes[c].kind, NodeKind::Element(_))
                 && list.iter().any(|cx| self.matches_complex(c, cx))
@@ -845,7 +928,9 @@ impl Dom {
 }
 
 fn escape_text(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn escape_attr(s: &str) -> String {
@@ -874,7 +959,9 @@ fn decode_entities(s: &str) -> String {
                     "apos" => Some('\''),
                     "nbsp" => Some('\u{00a0}'),
                     _ if ent.starts_with("#x") || ent.starts_with("#X") => {
-                        u32::from_str_radix(&ent[2..], 16).ok().and_then(char::from_u32)
+                        u32::from_str_radix(&ent[2..], 16)
+                            .ok()
+                            .and_then(char::from_u32)
                     }
                     _ if ent.starts_with('#') => {
                         ent[1..].parse::<u32>().ok().and_then(char::from_u32)
@@ -1154,7 +1241,10 @@ impl DomHandle {
     /// Take the pending mutations as a versioned [`RenderBatch`] — the render
     /// protocol payload (what flows through the durable host's `dom_render`).
     pub fn drain_render_batch(&self) -> RenderBatch {
-        RenderBatch { version: PROTOCOL_VERSION, mutations: self.drain_mutations() }
+        RenderBatch {
+            version: PROTOCOL_VERSION,
+            mutations: self.drain_mutations(),
+        }
     }
 
     pub fn events(&self) -> Vec<EventRecord> {
@@ -1365,7 +1455,10 @@ fn define_accessor(target: &JsObject, name: &str, get: Value, set: Option<Value>
     target.borrow_mut().props.insert(
         PropertyKey::str(name),
         Property {
-            kind: PropertyKind::Accessor { get: Some(get), set },
+            kind: PropertyKind::Accessor {
+                get: Some(get),
+                set,
+            },
             enumerable: false,
             configurable: true,
         },
@@ -1505,7 +1598,8 @@ fn install_node_api(vm: &mut Vm, dom: &Rc<RefCell<Dom>>, obj: &JsObject) {
             .ok_or_else(|| type_err(vm, "replaceChild: old child is not a node"))?;
         {
             let mut b = dom.borrow_mut();
-            b.insert_before(parent, new_c, old_c).map_err(|e| type_err(vm, &e))?;
+            b.insert_before(parent, new_c, old_c)
+                .map_err(|e| type_err(vm, &e))?;
             b.detach(old_c);
         }
         Ok(node_wrapper(vm, &dom, old_c))
@@ -1614,7 +1708,12 @@ fn install_node_api(vm: &mut Vm, dom: &Rc<RefCell<Dom>>, obj: &JsObject) {
             .iter()
             .any(|l| l.ty == ty && l.capture == capture && same_obj(&l.handler, &handler));
         if !dup {
-            b.nodes[id].listeners.push(Listener { ty, handler, capture, once });
+            b.nodes[id].listeners.push(Listener {
+                ty,
+                handler,
+                capture,
+                once,
+            });
         }
         Ok(Value::Undefined)
     });
@@ -1622,7 +1721,8 @@ fn install_node_api(vm: &mut Vm, dom: &Rc<RefCell<Dom>>, obj: &JsObject) {
     let d = weak.clone();
     vm.define_method(obj, "removeEventListener", 3, move |vm, this, args| {
         let dom = dom_or_return!(d);
-        let id = nid_of(vm, &this).ok_or_else(|| type_err(vm, "removeEventListener: not a node"))?;
+        let id =
+            nid_of(vm, &this).ok_or_else(|| type_err(vm, "removeEventListener: not a node"))?;
         let ty = vm.to_string_lossy(args.first().unwrap_or(&Value::Undefined));
         let handler = args.get(1).cloned().unwrap_or(Value::Undefined);
         let (capture, _once) = parse_listener_opts(vm, args.get(2));
@@ -1654,11 +1754,19 @@ fn install_node_api(vm: &mut Vm, dom: &Rc<RefCell<Dom>>, obj: &JsObject) {
     let d = weak.clone();
     vm.define_method(obj, "getBoundingClientRect", 0, move |vm, this, _| {
         let dom = dom_or_return!(d);
-        let id = nid_of(vm, &this).ok_or_else(|| type_err(vm, "getBoundingClientRect: not a node"))?;
+        let id =
+            nid_of(vm, &this).ok_or_else(|| type_err(vm, "getBoundingClientRect: not a node"))?;
         let v = dom.borrow_mut().measure(id, "getBoundingClientRect");
         Ok(vm.json_to_value(&v))
     });
-    for prop in ["offsetWidth", "offsetHeight", "clientWidth", "clientHeight", "scrollWidth", "scrollHeight"] {
+    for prop in [
+        "offsetWidth",
+        "offsetHeight",
+        "clientWidth",
+        "clientHeight",
+        "scrollWidth",
+        "scrollHeight",
+    ] {
         let d = weak.clone();
         let getter = vm.new_native(&format!("get {prop}"), 0, move |vm, this, _| {
             let dom = match d.upgrade() {
@@ -1709,7 +1817,12 @@ fn install_node_api(vm: &mut Vm, dom: &Rc<RefCell<Dom>>, obj: &JsObject) {
         dom.borrow_mut().set_inner_html(id, &html);
         Ok(Value::Undefined)
     });
-    define_accessor(obj, "innerHTML", Value::Object(get_inner), Some(Value::Object(set_inner)));
+    define_accessor(
+        obj,
+        "innerHTML",
+        Value::Object(get_inner),
+        Some(Value::Object(set_inner)),
+    );
     let d = weak.clone();
     let get_outer = vm.new_native("get outerHTML", 0, move |vm, this, _| {
         let dom = match d.upgrade() {
@@ -1724,7 +1837,8 @@ fn install_node_api(vm: &mut Vm, dom: &Rc<RefCell<Dom>>, obj: &JsObject) {
 }
 
 fn vm_get(vm: &mut Vm, v: &Value, key: &str) -> Value {
-    vm.get_prop(v, &PropertyKey::str(key)).unwrap_or(Value::Undefined)
+    vm.get_prop(v, &PropertyKey::str(key))
+        .unwrap_or(Value::Undefined)
 }
 
 fn parse_listener_opts(vm: &mut Vm, arg: Option<&Value>) -> (bool, bool) {
@@ -1760,10 +1874,21 @@ fn install_text_accessor(vm: &mut Vm, weak: &Weak<RefCell<Dom>>, obj: &JsObject)
         dom.borrow_mut().set_text_content(id, &data);
         Ok(Value::Undefined)
     });
-    define_accessor(obj, "textContent", Value::Object(get), Some(Value::Object(set)));
+    define_accessor(
+        obj,
+        "textContent",
+        Value::Object(get),
+        Some(Value::Object(set)),
+    );
 }
 
-fn install_reflected_attr(vm: &mut Vm, weak: &Weak<RefCell<Dom>>, obj: &JsObject, prop: &'static str, attr: &'static str) {
+fn install_reflected_attr(
+    vm: &mut Vm,
+    weak: &Weak<RefCell<Dom>>,
+    obj: &JsObject,
+    prop: &'static str,
+    attr: &'static str,
+) {
     let d = weak.clone();
     let get = vm.new_native(&format!("get {prop}"), 0, move |vm, this, _| {
         let dom = match d.upgrade() {
@@ -1846,7 +1971,10 @@ fn install_tree_accessors(vm: &mut Vm, weak: &Weak<RefCell<Dom>>, obj: &JsObject
         let dom = dom_or_return!(d);
         let id = nid_of(vm, &this).ok_or_else(|| type_err(vm, "childNodes: not a node"))?;
         let kids = dom.borrow().nodes[id].children.clone();
-        let vals: Vec<Value> = kids.into_iter().map(|c| node_wrapper(vm, &dom, c)).collect();
+        let vals: Vec<Value> = kids
+            .into_iter()
+            .map(|c| node_wrapper(vm, &dom, c))
+            .collect();
         Ok(Value::Object(vm.new_array(vals)))
     });
     define_accessor(obj, "childNodes", Value::Object(get_child_nodes), None);
@@ -1864,7 +1992,10 @@ fn install_tree_accessors(vm: &mut Vm, weak: &Weak<RefCell<Dom>>, obj: &JsObject
                 .filter(|&c| matches!(b.nodes[c].kind, NodeKind::Element(_)))
                 .collect()
         };
-        let vals: Vec<Value> = kids.into_iter().map(|c| node_wrapper(vm, &dom, c)).collect();
+        let vals: Vec<Value> = kids
+            .into_iter()
+            .map(|c| node_wrapper(vm, &dom, c))
+            .collect();
         Ok(Value::Object(vm.new_array(vals)))
     });
     define_accessor(obj, "children", Value::Object(get_children), None);
@@ -1996,7 +2127,8 @@ fn install_query(vm: &mut Vm, weak: &Weak<RefCell<Dom>>, obj: &JsObject) {
     vm.define_method(obj, "querySelector", 1, move |vm, this, args| {
         let dom = dom_or_return!(d);
         let id = nid_of(vm, &this).ok_or_else(|| type_err(vm, "querySelector: not a node"))?;
-        let sel = parse_selector_list(&vm.to_string_lossy(args.first().unwrap_or(&Value::Undefined)));
+        let sel =
+            parse_selector_list(&vm.to_string_lossy(args.first().unwrap_or(&Value::Undefined)));
         let found = dom.borrow().select(id, &sel, true).first().copied();
         Ok(match found {
             Some(c) => node_wrapper(vm, &dom, c),
@@ -2007,35 +2139,53 @@ fn install_query(vm: &mut Vm, weak: &Weak<RefCell<Dom>>, obj: &JsObject) {
     vm.define_method(obj, "querySelectorAll", 1, move |vm, this, args| {
         let dom = dom_or_return!(d);
         let id = nid_of(vm, &this).ok_or_else(|| type_err(vm, "querySelectorAll: not a node"))?;
-        let sel = parse_selector_list(&vm.to_string_lossy(args.first().unwrap_or(&Value::Undefined)));
+        let sel =
+            parse_selector_list(&vm.to_string_lossy(args.first().unwrap_or(&Value::Undefined)));
         let found = dom.borrow().select(id, &sel, false);
-        let vals: Vec<Value> = found.into_iter().map(|c| node_wrapper(vm, &dom, c)).collect();
+        let vals: Vec<Value> = found
+            .into_iter()
+            .map(|c| node_wrapper(vm, &dom, c))
+            .collect();
         Ok(Value::Object(vm.new_array(vals)))
     });
     let d = weak.clone();
     vm.define_method(obj, "getElementsByTagName", 1, move |vm, this, args| {
         let dom = dom_or_return!(d);
-        let id = nid_of(vm, &this).ok_or_else(|| type_err(vm, "getElementsByTagName: not a node"))?;
+        let id =
+            nid_of(vm, &this).ok_or_else(|| type_err(vm, "getElementsByTagName: not a node"))?;
         let tag = vm.to_string_lossy(args.first().unwrap_or(&Value::Undefined));
         let sel = vec![Complex {
-            simples: vec![Simple { tag: Some(tag), ..Default::default() }],
+            simples: vec![Simple {
+                tag: Some(tag),
+                ..Default::default()
+            }],
             combs: vec![],
         }];
         let found = dom.borrow().select(id, &sel, false);
-        let vals: Vec<Value> = found.into_iter().map(|c| node_wrapper(vm, &dom, c)).collect();
+        let vals: Vec<Value> = found
+            .into_iter()
+            .map(|c| node_wrapper(vm, &dom, c))
+            .collect();
         Ok(Value::Object(vm.new_array(vals)))
     });
     let d = weak.clone();
     vm.define_method(obj, "getElementsByClassName", 1, move |vm, this, args| {
         let dom = dom_or_return!(d);
-        let id = nid_of(vm, &this).ok_or_else(|| type_err(vm, "getElementsByClassName: not a node"))?;
+        let id =
+            nid_of(vm, &this).ok_or_else(|| type_err(vm, "getElementsByClassName: not a node"))?;
         let cls = vm.to_string_lossy(args.first().unwrap_or(&Value::Undefined));
         let sel = vec![Complex {
-            simples: vec![Simple { classes: vec![cls], ..Default::default() }],
+            simples: vec![Simple {
+                classes: vec![cls],
+                ..Default::default()
+            }],
             combs: vec![],
         }];
         let found = dom.borrow().select(id, &sel, false);
-        let vals: Vec<Value> = found.into_iter().map(|c| node_wrapper(vm, &dom, c)).collect();
+        let vals: Vec<Value> = found
+            .into_iter()
+            .map(|c| node_wrapper(vm, &dom, c))
+            .collect();
         Ok(Value::Object(vm.new_array(vals)))
     });
 }
@@ -2095,7 +2245,12 @@ pub fn install(vm: &mut Vm) -> DomHandle {
         let html = dom.borrow().html;
         Ok(node_wrapper(vm, &dom, html))
     });
-    define_accessor(&document, "documentElement", Value::Object(get_doc_el), None);
+    define_accessor(
+        &document,
+        "documentElement",
+        Value::Object(get_doc_el),
+        None,
+    );
 
     // document is itself a node (so querySelector starts at <html>).
     {

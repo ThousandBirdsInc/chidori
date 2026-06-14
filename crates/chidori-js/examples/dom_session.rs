@@ -59,12 +59,17 @@ fn main() {
     let mut engine2 = Engine::new();
     let dom2 = engine2.install_dom();
     engine2.eval(APP).expect("app evaluates");
-    dom2.replay_events(&mut engine2.vm, &events).expect("replay");
+    dom2.replay_events(&mut engine2.vm, &events)
+        .expect("replay");
     let replayed_html = dom2.render_html();
 
     println!("\n=== Rendered HTML after replay ===\n  {replayed_html}");
     println!(
         "\nrecord == replay : {}",
-        if recorded_html == replayed_html { "YES ✓" } else { "NO ✗" }
+        if recorded_html == replayed_html {
+            "YES ✓"
+        } else {
+            "NO ✗"
+        }
     );
 }

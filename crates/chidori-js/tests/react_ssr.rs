@@ -14,7 +14,9 @@ fn load_react(engine: &mut Engine) -> DomHandle {
         std::fs::read_to_string(format!("{dir}/react-dom-server.js")).expect("server vendored");
     let dom = engine.install_dom();
     // UMD bundles resolve the global via `self` / `global`.
-    engine.eval("globalThis.self=globalThis; globalThis.global=globalThis;").unwrap();
+    engine
+        .eval("globalThis.self=globalThis; globalThis.global=globalThis;")
+        .unwrap();
     engine.eval(&react).expect("react evaluates");
     engine.eval(&server).expect("react-dom/server evaluates");
     dom
@@ -26,7 +28,9 @@ fn react_globals_are_present() {
     let _dom = load_react(&mut e);
     let ce = e.eval("typeof React.createElement").unwrap();
     assert_eq!(e.vm.to_string_lossy(&ce), "function");
-    let rs = e.eval("typeof ReactDOMServer.renderToStaticMarkup").unwrap();
+    let rs = e
+        .eval("typeof ReactDOMServer.renderToStaticMarkup")
+        .unwrap();
     assert_eq!(e.vm.to_string_lossy(&rs), "function");
 }
 
@@ -128,7 +132,10 @@ fn jsx_transpiles_to_classic_runtime_and_renders() {
         globalThis.App = App;
     "#;
     let js = transpile_jsx(jsx).expect("jsx transpiles");
-    assert!(js.contains("React.createElement"), "expected classic runtime, got:\n{js}");
+    assert!(
+        js.contains("React.createElement"),
+        "expected classic runtime, got:\n{js}"
+    );
 
     let mut e = Engine::new();
     let _dom = load_react(&mut e);

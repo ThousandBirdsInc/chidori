@@ -37,7 +37,9 @@ const COUNTER_APP: &str = r#"
 fn run_counter(clicks: usize) -> (Vec<Mutation>, Vec<EventRecord>, String) {
     let mut engine = Engine::new();
     let dom: DomHandle = engine.install_dom();
-    engine.eval(COUNTER_APP).expect("counter app should evaluate");
+    engine
+        .eval(COUNTER_APP)
+        .expect("counter app should evaluate");
 
     let btn = dom.element_by_id("btn").expect("button should exist");
     for _ in 0..clicks {
@@ -60,7 +62,10 @@ fn builds_dom_and_renders() {
 #[test]
 fn clicks_update_rendered_state() {
     let (_muts, events, html) = run_counter(3);
-    assert!(html.contains("<div id=\"label\" class=\"count\">3</div>"), "got: {html}");
+    assert!(
+        html.contains("<div id=\"label\" class=\"count\">3</div>"),
+        "got: {html}"
+    );
     assert_eq!(events.len(), 3);
     assert_eq!(events[0].ty, "click");
 }
@@ -87,7 +92,11 @@ fn replaying_event_journal_reproduces_state() {
     engine.eval(COUNTER_APP).unwrap();
     dom.replay_events(&mut engine.vm, &recorded_events).unwrap();
 
-    assert_eq!(dom.mutations(), recorded_muts, "replay diverged from record");
+    assert_eq!(
+        dom.mutations(),
+        recorded_muts,
+        "replay diverged from record"
+    );
     assert_eq!(dom.render_html(), recorded_html);
 }
 
@@ -101,7 +110,8 @@ fn prefix_replay_is_a_time_machine() {
     let mut engine = Engine::new();
     let dom = engine.install_dom();
     engine.eval(COUNTER_APP).unwrap();
-    dom.replay_events(&mut engine.vm, &full_events[..2]).unwrap();
+    dom.replay_events(&mut engine.vm, &full_events[..2])
+        .unwrap();
 
     assert_eq!(dom.mutations(), state_at_2);
     assert_eq!(dom.render_html(), html_at_2);
@@ -146,7 +156,10 @@ fn dom_mutation_methods_record_and_query() {
         )
         .unwrap();
     assert_eq!(engine.vm.to_string_lossy(&out), "2|true|list|ac");
-    assert_eq!(dom.render_html(), "<html><body><ul role=\"list\"><li>a</li><li>c</li></ul></body></html>");
+    assert_eq!(
+        dom.render_html(),
+        "<html><body><ul role=\"list\"><li>a</li><li>c</li></ul></body></html>"
+    );
 }
 
 #[test]
@@ -166,8 +179,13 @@ fn event_detail_reaches_handler() {
         )
         .unwrap();
     let input = dom.element_by_id("in").unwrap();
-    dom.dispatch_event(&mut engine.vm, input, "input", serde_json::json!({"value": "hello"}))
-        .unwrap();
+    dom.dispatch_event(
+        &mut engine.vm,
+        input,
+        "input",
+        serde_json::json!({"value": "hello"}),
+    )
+    .unwrap();
     let last = engine.eval("globalThis.last").unwrap();
     assert_eq!(engine.vm.to_string_lossy(&last), "hello");
 }
@@ -190,7 +208,8 @@ fn events_bubble_to_ancestor_listeners() {
         )
         .unwrap();
     let inner = dom.element_by_id("inner").unwrap();
-    dom.dispatch_event(&mut engine.vm, inner, "click", serde_json::json!({})).unwrap();
+    dom.dispatch_event(&mut engine.vm, inner, "click", serde_json::json!({}))
+        .unwrap();
     let hits = engine.eval("globalThis.hits.join(',')").unwrap();
     // target first, then bubble to ancestor.
     assert_eq!(engine.vm.to_string_lossy(&hits), "inner,outer");

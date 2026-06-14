@@ -29,11 +29,19 @@ pub fn transpile_jsx(src: &str) -> Result<String, String> {
     if !parsed.errors.is_empty() {
         return Err(format!(
             "SyntaxError: {}",
-            parsed.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ")
+            parsed
+                .errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
         ));
     }
     let mut program = parsed.program;
-    let scoping = SemanticBuilder::new().build(&program).semantic.into_scoping();
+    let scoping = SemanticBuilder::new()
+        .build(&program)
+        .semantic
+        .into_scoping();
 
     let mut options = TransformOptions::default();
     options.jsx.runtime = JsxRuntime::Classic; // emit React.createElement, not jsx-runtime imports
@@ -42,7 +50,11 @@ pub fn transpile_jsx(src: &str) -> Result<String, String> {
     if !ret.errors.is_empty() {
         return Err(format!(
             "JSX transform error: {}",
-            ret.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ")
+            ret.errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
         ));
     }
     Ok(Codegen::new().build(&program).code)

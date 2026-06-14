@@ -57,7 +57,8 @@ fn agent_effects_and_ui_share_one_journal() {
 
     let btn = dom.element_by_id("btn").unwrap();
     dispatch("dom_event", &json!({ "target": btn, "type": "click" })).unwrap();
-    dom.dispatch_event(&mut engine.vm, btn, "click", json!({})).unwrap();
+    dom.dispatch_event(&mut engine.vm, btn, "click", json!({}))
+        .unwrap();
 
     // ---- assertions: one journal, causally ordered ----
     let log = journal.borrow();
@@ -78,5 +79,8 @@ fn agent_effects_and_ui_share_one_journal() {
 
     // And the handler fired through the shared boundary.
     let (_, log_args) = log.iter().find(|(e, _)| e == "log").unwrap();
-    assert_eq!(log_args.get("message").and_then(|m| m.as_str()), Some("clicked"));
+    assert_eq!(
+        log_args.get("message").and_then(|m| m.as_str()),
+        Some("clicked")
+    );
 }

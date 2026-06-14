@@ -85,7 +85,14 @@ struct Host {
 
 impl Host {
     fn new() -> Host {
-        Host { journal: Vec::new(), cursor: 0, replay: false, model_calls: 0, inputs: 0, replayed: 0 }
+        Host {
+            journal: Vec::new(),
+            cursor: 0,
+            replay: false,
+            model_calls: 0,
+            inputs: 0,
+            replayed: 0,
+        }
     }
 
     fn respond(&mut self, effect: &str, spec: &str) -> String {
@@ -108,7 +115,10 @@ impl Host {
 }
 
 fn card_src(theme: &str, title: &str, price: &str, feats: &[&str], cta: &str) -> String {
-    let feat_els: String = feats.iter().map(|f| format!("e('li',null,'{f}'),")).collect();
+    let feat_els: String = feats
+        .iter()
+        .map(|f| format!("e('li',null,'{f}'),"))
+        .collect();
     format!(
         "globalThis.App=function(){{const e=React.createElement;return \
          e('div',{{className:'card {theme}'}},\
@@ -127,21 +137,43 @@ fn brain(effect: &str, spec: &str) -> String {
         return r#"{"choice":"B","tweak":"Start free trial"}"#.to_string();
     }
     match spec {
-        "variant:A" => card_src("light", "Starter", "$9/mo", &["Email support", "1 project"], "Sign up"),
+        "variant:A" => card_src(
+            "light",
+            "Starter",
+            "$9/mo",
+            &["Email support", "1 project"],
+            "Sign up",
+        ),
         "variant:B" => card_src(
             "light",
             "Pro",
             "$29/mo",
-            &["Priority support", "Unlimited projects", "Deterministic replay", "Time-travel debugging"],
+            &[
+                "Priority support",
+                "Unlimited projects",
+                "Deterministic replay",
+                "Time-travel debugging",
+            ],
             "Subscribe",
         ),
-        "variant:C" => card_src("dark", "Team", "$99/mo", &["SSO & SAML", "Audit log", "Replay sharing"], "Get started"),
+        "variant:C" => card_src(
+            "dark",
+            "Team",
+            "$99/mo",
+            &["SSO & SAML", "Audit log", "Replay sharing"],
+            "Get started",
+        ),
         // Converge: the chosen variant (B) with the user's tweak applied.
         "refine" => card_src(
             "light",
             "Pro",
             "$29/mo",
-            &["Priority support", "Unlimited projects", "Deterministic replay", "Time-travel debugging"],
+            &[
+                "Priority support",
+                "Unlimited projects",
+                "Deterministic replay",
+                "Time-travel debugging",
+            ],
             "Start free trial",
         ),
         _ => card_src("light", "Pro", "$29/mo", &["A", "B"], "Subscribe"),
@@ -154,20 +186,20 @@ fn setup(engine: &mut Engine, host: &Rc<RefCell<Host>>) -> DomHandle {
     let server = std::fs::read_to_string(format!("{dir}/react-dom-server.js")).unwrap();
     let dom = engine.install_dom();
     let h = host.clone();
-    engine.install_chidori_effects(Rc::new(move |effect: &str, args: &Value| {
-        match effect {
-            "prompt" => {
-                let spec = args.get("text").and_then(Value::as_str).unwrap_or("");
-                Ok(Value::String(h.borrow_mut().respond("prompt", spec)))
-            }
-            "input" => {
-                let spec = args.get("prompt").and_then(Value::as_str).unwrap_or("");
-                Ok(Value::String(h.borrow_mut().respond("input", spec)))
-            }
-            _ => Ok(Value::Null),
+    engine.install_chidori_effects(Rc::new(move |effect: &str, args: &Value| match effect {
+        "prompt" => {
+            let spec = args.get("text").and_then(Value::as_str).unwrap_or("");
+            Ok(Value::String(h.borrow_mut().respond("prompt", spec)))
         }
+        "input" => {
+            let spec = args.get("prompt").and_then(Value::as_str).unwrap_or("");
+            Ok(Value::String(h.borrow_mut().respond("input", spec)))
+        }
+        _ => Ok(Value::Null),
     }));
-    engine.eval("globalThis.self=globalThis; globalThis.global=globalThis;").unwrap();
+    engine
+        .eval("globalThis.self=globalThis; globalThis.global=globalThis;")
+        .unwrap();
     engine.eval(&react).unwrap();
     engine.eval(&server).unwrap();
     engine
@@ -201,7 +233,9 @@ fn prompt(engine: &mut Engine, spec: &str) -> String {
 }
 
 fn ask_user(engine: &mut Engine, question: &str) -> String {
-    let v = engine.eval(&format!("chidori.input({:?})", question)).unwrap();
+    let v = engine
+        .eval(&format!("chidori.input({:?})", question))
+        .unwrap();
     engine.vm.to_string_lossy(&v)
 }
 
@@ -250,7 +284,10 @@ fn main() {
             chosen: false,
         });
     }
-    let (mc, ic) = { let h = host.borrow(); (h.model_calls, h.inputs) };
+    let (mc, ic) = {
+        let h = host.borrow();
+        (h.model_calls, h.inputs)
+    };
     frames.push(Frame {
         kind: "branches".into(),
         caption: "1 · Agent branches into 3 experiments".into(),
@@ -275,7 +312,10 @@ fn main() {
     for c in &mut fb_cards {
         c.chosen = c.label.ends_with(&choice);
     }
-    let (mc, ic) = { let h = host.borrow(); (h.model_calls, h.inputs) };
+    let (mc, ic) = {
+        let h = host.borrow();
+        (h.model_calls, h.inputs)
+    };
     frames.push(Frame {
         kind: "feedback".into(),
         caption: "2 · Asks the user for feedback".into(),
@@ -293,10 +333,17 @@ fn main() {
     let refined = prompt(&mut main_eng, "refine");
     let (final_html, final_tests) = render_and_test(&mut main_eng, &refined);
     let passed = final_tests.iter().filter(|t| t.pass).count();
-    let (mc, ic) = { let h = host.borrow(); (h.model_calls, h.inputs) };
+    let (mc, ic) = {
+        let h = host.borrow();
+        (h.model_calls, h.inputs)
+    };
     frames.push(Frame {
         kind: "converged".into(),
-        caption: format!("3 · Converges on {choice} · {}/{} green", passed, final_tests.len()),
+        caption: format!(
+            "3 · Converges on {choice} · {}/{} green",
+            passed,
+            final_tests.len()
+        ),
         note: format!("applied the user's tweak (CTA → “{tweak}”) and shipped"),
         html: final_html.clone(),
         tests: final_tests.clone(),
@@ -322,7 +369,10 @@ fn main() {
     let refined2 = prompt(&mut rep, "refine");
     let (replay_html, replay_tests) = render_and_test(&mut rep, &refined2);
     let identical = replay_html == final_html;
-    let (mc, ic, rp) = { let h = host.borrow(); (h.model_calls, h.inputs, h.replayed) };
+    let (mc, ic, rp) = {
+        let h = host.borrow();
+        (h.model_calls, h.inputs, h.replayed)
+    };
     eprintln!("replay: identical={identical}, replayed={rp} calls, new model calls=0");
     frames.push(Frame {
         kind: "replay".into(),

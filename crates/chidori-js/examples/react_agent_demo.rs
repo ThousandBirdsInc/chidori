@@ -49,7 +49,13 @@ struct Agent {
 
 impl Agent {
     fn new() -> Agent {
-        Agent { journal: Vec::new(), cursor: 0, replay: false, calls: 0, replayed: 0 }
+        Agent {
+            journal: Vec::new(),
+            cursor: 0,
+            replay: false,
+            calls: 0,
+            replayed: 0,
+        }
     }
 
     fn prompt(&mut self, spec: &str) -> String {
@@ -112,7 +118,9 @@ fn setup(engine: &mut Engine, agent: &Rc<RefCell<Agent>>) -> DomHandle {
         }
     }));
     // React UMD reads `self`/`global` as the global object.
-    engine.eval("globalThis.self=globalThis; globalThis.global=globalThis;").unwrap();
+    engine
+        .eval("globalThis.self=globalThis; globalThis.global=globalThis;")
+        .unwrap();
     engine.eval(&react).unwrap();
     engine.eval(&server).unwrap();
     // The agent's acceptance suite — pure DOM-query assertions on the output.
@@ -219,7 +227,9 @@ fn main() {
     let _fdom = setup(&mut fork, &agent);
     // Replay the agent's prior drafts to reconstruct the green state — for free.
     for k in 0..3 {
-        let v = fork.eval(&format!("chidori.prompt({:?})", format!("draft:{k}"))).unwrap();
+        let v = fork
+            .eval(&format!("chidori.prompt({:?})", format!("draft:{k}")))
+            .unwrap();
         let src = fork.vm.to_string_lossy(&v);
         let _ = render_and_test(&mut fork, &src);
     }
@@ -255,7 +265,9 @@ fn main() {
     let _cdom = setup(&mut check, &agent);
     let mut check_html = String::new();
     for k in 0..3 {
-        let v = check.eval(&format!("chidori.prompt({:?})", format!("draft:{k}"))).unwrap();
+        let v = check
+            .eval(&format!("chidori.prompt({:?})", format!("draft:{k}")))
+            .unwrap();
         let src = check.vm.to_string_lossy(&v);
         let (h, _) = render_and_test(&mut check, &src);
         check_html = h;

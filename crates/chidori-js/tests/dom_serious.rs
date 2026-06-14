@@ -79,7 +79,8 @@ fn capture_target_bubble_ordering() {
         )
         .unwrap();
     let inner = dom.element_by_id("inner").unwrap();
-    dom.dispatch_event(&mut engine.vm, inner, "click", serde_json::json!({})).unwrap();
+    dom.dispatch_event(&mut engine.vm, inner, "click", serde_json::json!({}))
+        .unwrap();
     // Capture descends to target; at target both listeners fire in registration
     // order; then bubble ascends.
     assert_eq!(
@@ -104,8 +105,12 @@ fn stop_propagation_halts_bubble() {
         )
         .unwrap();
     let inner = dom.element_by_id("inner").unwrap();
-    dom.dispatch_event(&mut engine.vm, inner, "click", serde_json::json!({})).unwrap();
-    assert_eq!(eval_str(&mut engine, "hits.join(',')"), "outer-capture,inner");
+    dom.dispatch_event(&mut engine.vm, inner, "click", serde_json::json!({}))
+        .unwrap();
+    assert_eq!(
+        eval_str(&mut engine, "hits.join(',')"),
+        "outer-capture,inner"
+    );
 }
 
 #[test]
@@ -122,7 +127,8 @@ fn stop_immediate_propagation_halts_remaining_listeners() {
         )
         .unwrap();
     let inner = dom.element_by_id("inner").unwrap();
-    dom.dispatch_event(&mut engine.vm, inner, "click", serde_json::json!({})).unwrap();
+    dom.dispatch_event(&mut engine.vm, inner, "click", serde_json::json!({}))
+        .unwrap();
     assert_eq!(eval_str(&mut engine, "hits.join(',')"), "first");
 }
 
@@ -142,7 +148,10 @@ fn prevent_default_is_reported() {
     let not_cancelled = dom
         .dispatch_event(&mut engine.vm, inner, "click", serde_json::json!({}))
         .unwrap();
-    assert!(!not_cancelled, "dispatch should report the default was prevented");
+    assert!(
+        !not_cancelled,
+        "dispatch should report the default was prevented"
+    );
 }
 
 #[test]
@@ -158,8 +167,10 @@ fn once_listener_fires_a_single_time() {
         )
         .unwrap();
     let inner = dom.element_by_id("inner").unwrap();
-    dom.dispatch_event(&mut engine.vm, inner, "click", serde_json::json!({})).unwrap();
-    dom.dispatch_event(&mut engine.vm, inner, "click", serde_json::json!({})).unwrap();
+    dom.dispatch_event(&mut engine.vm, inner, "click", serde_json::json!({}))
+        .unwrap();
+    dom.dispatch_event(&mut engine.vm, inner, "click", serde_json::json!({}))
+        .unwrap();
     assert_eq!(eval_str(&mut engine, "hits.join(',')"), "x");
 }
 
@@ -178,7 +189,8 @@ fn remove_event_listener_works() {
         )
         .unwrap();
     let inner = dom.element_by_id("inner").unwrap();
-    dom.dispatch_event(&mut engine.vm, inner, "click", serde_json::json!({})).unwrap();
+    dom.dispatch_event(&mut engine.vm, inner, "click", serde_json::json!({}))
+        .unwrap();
     assert_eq!(eval_str(&mut engine, "hits.length"), "0");
 }
 
@@ -239,7 +251,10 @@ fn measurements_are_captured_in_record_mode() {
     let journal = dom.journal();
     assert_eq!(journal.measurements.len(), 2, "two captured reads expected");
     assert!(journal.measurements.iter().any(|m| m.kind == "offsetWidth"));
-    assert!(journal.measurements.iter().any(|m| m.kind == "getBoundingClientRect"));
+    assert!(journal
+        .measurements
+        .iter()
+        .any(|m| m.kind == "getBoundingClientRect"));
 }
 
 #[test]
@@ -274,12 +289,16 @@ fn full_session_journal_round_trips_as_json() {
     e.eval(MEASURE_APP).unwrap();
     let btn = {
         // add an event too so the journal has both kinds
-        e.eval("const b = document.createElement('button'); b.id='b'; document.body.appendChild(b);")
-            .unwrap();
+        e.eval(
+            "const b = document.createElement('button'); b.id='b'; document.body.appendChild(b);",
+        )
+        .unwrap();
         dom.element_by_id("b").unwrap()
     };
-    e.eval("document.getElementById('b').addEventListener('click', () => {});").unwrap();
-    dom.dispatch_event(&mut e.vm, btn, "click", serde_json::json!({"k": 1})).unwrap();
+    e.eval("document.getElementById('b').addEventListener('click', () => {});")
+        .unwrap();
+    dom.dispatch_event(&mut e.vm, btn, "click", serde_json::json!({"k": 1}))
+        .unwrap();
 
     let journal = dom.journal();
     let json = serde_json::to_string(&journal).unwrap();
@@ -546,7 +565,9 @@ fn session_journal_is_versioned() {
     use chidori_js::dom::PROTOCOL_VERSION;
     let mut engine = Engine::new();
     let dom = engine.install_dom();
-    engine.eval("document.body.appendChild(document.createElement('div'));").unwrap();
+    engine
+        .eval("document.body.appendChild(document.createElement('div'));")
+        .unwrap();
     let batch = dom.drain_render_batch();
     assert_eq!(batch.version, PROTOCOL_VERSION);
     assert!(!batch.mutations.is_empty());

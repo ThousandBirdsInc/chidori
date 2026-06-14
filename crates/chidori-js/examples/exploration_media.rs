@@ -105,7 +105,8 @@ fn main() {
     // Frame 3: user clicks task 2's label → toggles done (a real dispatched event).
     let lbl2 = dom.element_by_id("lbl-t2").unwrap();
     let mut j = vec!["● click  →  #lbl-t2".to_string()];
-    dom.dispatch_event(&mut engine.vm, lbl2, "click", serde_json::json!({})).unwrap();
+    dom.dispatch_event(&mut engine.vm, lbl2, "click", serde_json::json!({}))
+        .unwrap();
     j.extend(drain(&dom));
     frames.push(Frame {
         caption: "3 · User completes “Wire up the DOM”".into(),
@@ -118,7 +119,8 @@ fn main() {
     // Frame 4: user deletes task 1 (another real event).
     let del1 = dom.element_by_id("del-t1").unwrap();
     let mut j = vec!["● click  →  #del-t1".to_string()];
-    dom.dispatch_event(&mut engine.vm, del1, "click", serde_json::json!({})).unwrap();
+    dom.dispatch_event(&mut engine.vm, del1, "click", serde_json::json!({}))
+        .unwrap();
     j.extend(drain(&dom));
     let live_html = dom.render_html();
     frames.push(Frame {
@@ -140,7 +142,8 @@ fn main() {
     fork.eval("build('theme-dark');").unwrap();
     fork.eval("addTask('t1','Write design doc'); addTask('t2','Wire up the DOM'); addTask('t3','Ship the demo');")
         .unwrap();
-    fork.eval("document.querySelector('h1').textContent = 'Tasks · dark';").unwrap();
+    fork.eval("document.querySelector('h1').textContent = 'Tasks · dark';")
+        .unwrap();
     let _ = fdom.drain_mutations();
     // Replay the recorded clicks — same inputs, different code.
     fdom.replay(&mut fork.vm, &recorded.events).unwrap();
