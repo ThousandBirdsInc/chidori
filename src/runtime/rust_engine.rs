@@ -1302,8 +1302,7 @@ mod tests {
             requests: Arc::clone(&requests),
         }));
         let live_backend = context_test_backend(live_ctx.clone(), providers);
-        let live_output =
-            run_agent(&path, CONVERSATION_AGENT_SRC, &input, &live_backend).unwrap();
+        let live_output = run_agent(&path, CONVERSATION_AGENT_SRC, &input, &live_backend).unwrap();
 
         assert_eq!(
             live_output["replies"],
@@ -1348,8 +1347,7 @@ mod tests {
         // with the prior call log replayed and one more message appended, so
         // only the newest message reaches the provider.
         let _env = PROMPT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir =
-            std::env::temp_dir().join(format!("chidori-rust-chat-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("chidori-rust-chat-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("agent.ts");
         std::fs::write(&path, CONVERSATION_AGENT_SRC).unwrap();

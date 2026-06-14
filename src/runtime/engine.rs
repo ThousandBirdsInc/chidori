@@ -2415,8 +2415,10 @@ def agent(value):
         // The `chidori chat` streaming path: replaying a prior turn must emit no
         // prompt deltas (it short-circuits before the provider), so only the
         // newest turn's reply streams.
-        let dir =
-            std::env::temp_dir().join(format!("chidori-engine-chat-stream-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-engine-chat-stream-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("agent.ts");
         std::fs::write(
