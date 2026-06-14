@@ -130,3 +130,8 @@ const transcript = await chat.loop({ prompt: "you>" }); // type "exit" to end
 Drop to `chat.context` whenever you need the lower-level API (manual `compact`,
 `digest`, forking), and use `chat.respond(message)` for author-driven tool
 loops. See [`examples/agents/conversation.ts`](../examples/agents/conversation.ts).
+
+To chat with the model directly — no agent file — run `chidori chat` (`--system`,
+`--model`, `--tools <dir>`). It is a thin REPL over `conversation()`: each turn
+is durable and the prior turns replay for free, so only your newest message
+reaches the provider.

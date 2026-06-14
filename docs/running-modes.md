@@ -9,9 +9,17 @@ API, and event-driven HTTP handlers.
 chidori demo                                  # pick from runnable examples
 chidori run agents/my_agent.ts --input key=value
 chidori run agents/my_agent.ts --input '{"complex": "input"}'
+chidori chat --system "You are concise."     # interactive multi-turn chat REPL
 chidori check agents/my_agent.ts            # validate without running
 chidori tools --dir tools/                   # list available tools
 ```
+
+`chidori chat` is a built-in conversational REPL backed by
+[`chidori.conversation()`](./core-concepts.md#conversational-agents) — no agent
+file required. Each turn is a durable host call and the prior turns replay for
+free, so only your newest message reaches the provider. Flags: `--system`,
+`--model`, and `--tools <dir>` (discovered tools are offered to the model on
+every turn). Type `exit`/`quit` or Ctrl-D to end.
 
 ## 2. HTTP server (event-driven + session API)
 

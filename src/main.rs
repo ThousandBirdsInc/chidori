@@ -91,6 +91,28 @@ enum Commands {
         file: PathBuf,
     },
 
+    /// Start an interactive multi-turn chat with the model — no agent file
+    /// needed. Each turn is a durable host call; replaying the prior turns is
+    /// free, so only your newest message hits the provider.
+    Chat {
+        /// System prompt for the assistant.
+        #[arg(short, long)]
+        system: Option<String>,
+
+        /// Model override (otherwise the provider default).
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// Extra directories to scan for tool files (defaults to ./tools/).
+        /// Discovered tools are offered to the model on every turn.
+        #[arg(long)]
+        tools: Vec<PathBuf>,
+
+        /// Run under the built-in deny-by-default `untrusted` policy profile.
+        #[arg(long)]
+        untrusted: bool,
+    },
+
     /// List all available tools
     Tools {
         /// Tool directories to search (defaults to ./tools/)
@@ -243,6 +265,12 @@ fn main() {
             (result, false)
         }
         Commands::Demo => (cmd_demo(), false),
+        Commands::Chat {
+            system,
+            model,
+            tools,
+            untrusted,
+        } => (cmd_chat(system, model, &tools, untrusted), false),
         Commands::Check { file } => (cmd_check(&file), true),
         Commands::Tools { dir } => (cmd_tools(&dir), false),
         Commands::Stats { dir } => (cmd_stats(dir.as_deref()), false),
@@ -771,6 +799,133 @@ fn cmd_run_stream(
             Err(e)
         }
     }
+}
+
+/// A minimal conversational agent, driven one turn at a time by `cmd_chat`.
+/// It rebuilds the dialogue from the full message list each call; with replay
+/// every prior turn returns its recorded result for free, so only the newest
+/// message reaches the provider.
+const CHAT_AGENT_SRC: &str = r#"
+export async function agent(input, chidori) {
+    const chat = chidori.conversation({
+        system: input.system || "You are a helpful, concise assistant.",
+        model: input.model || undefined,
+        tools: Array.isArray(input.tools) && input.tools.length ? input.tools : undefined,
+        compact: { budgetTokens: 8000 },
+    });
+    const messages = Array.isArray(input.messages) ? input.messages : [];
+    for (const message of messages) {
+        await chat.say(message);
+    }
+    return { transcript: chat.history() };
+}
+"#;
+
+/// Interactive multi-turn chat REPL. Owns the loop in Rust so all terminal I/O
+/// is single-threaded (no streaming/stdin races): each turn appends the user's
+/// line, re-runs the conversational agent with the prior call log replayed
+/// (prior turns are free), prints the newest assistant reply, and carries the
+/// merged call log forward.
+fn cmd_chat(
+    system: Option<String>,
+    model: Option<String>,
+    extra_tool_dirs: &[PathBuf],
+    untrusted: bool,
+) -> Result<()> {
+    use std::io::Write;
+
+    // The agent source lives in a temp file so it works from an installed
+    // binary (no dependency on the examples/ tree).
+    let dir = std::env::temp_dir().join(format!("chidori-chat-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).context("Failed to create chat temp dir")?;
+    let agent_path = dir.join("chat_agent.ts");
+    std::fs::write(&agent_path, CHAT_AGENT_SRC).context("Failed to write chat agent")?;
+
+    // Build the runtime against the current working directory (tools/templates
+    // resolve from where the user launched `chidori chat`).
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let providers = Arc::new(ProviderRegistry::from_env());
+    let template_engine = Arc::new(TemplateEngine::new(&cwd));
+    let tokio_rt =
+        Arc::new(tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?);
+
+    let mut tool_dirs: Vec<PathBuf> = vec![cwd.join("tools")];
+    tool_dirs.extend(extra_tool_dirs.iter().cloned());
+    let tools =
+        Arc::new(ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()));
+    let tool_names: Vec<String> = tools.list().iter().map(|t| t.name.clone()).collect();
+
+    let engine = Engine::new(providers, template_engine, tokio_rt)
+        .with_tools(tools)
+        .with_policy(cli_policy(untrusted));
+
+    eprintln!("chidori chat — type a message and press enter. Type 'exit' or Ctrl-D to quit.");
+    if !tool_names.is_empty() {
+        eprintln!("tools available: {}", tool_names.join(", "));
+    }
+
+    let mut messages: Vec<String> = Vec::new();
+    let mut call_log: Vec<crate::runtime::call_log::CallRecord> = Vec::new();
+    let stdin = std::io::stdin();
+
+    loop {
+        print!("\nyou> ");
+        std::io::stdout().flush().ok();
+
+        let mut line = String::new();
+        if stdin.read_line(&mut line)? == 0 {
+            eprintln!("\nbye");
+            break;
+        }
+        let message = line.trim_end_matches(&['\r', '\n'][..]).trim().to_string();
+        if message.is_empty() {
+            continue;
+        }
+        if matches!(message.to_lowercase().as_str(), "exit" | "quit" | ":q") {
+            eprintln!("bye");
+            break;
+        }
+
+        messages.push(message);
+        let mut input_value = serde_json::json!({ "messages": messages });
+        if let Some(system) = &system {
+            input_value["system"] = Value::String(system.clone());
+        }
+        if let Some(model) = &model {
+            input_value["model"] = Value::String(model.clone());
+        }
+        if !tool_names.is_empty() {
+            input_value["tools"] = serde_json::json!(tool_names);
+        }
+
+        match engine.run_with_replay(&agent_path, &input_value, call_log.clone()) {
+            Ok(result) => {
+                let reply = result
+                    .output
+                    .get("transcript")
+                    .and_then(Value::as_array)
+                    .and_then(|turns| {
+                        turns
+                            .iter()
+                            .rev()
+                            .find(|turn| turn.get("role").and_then(Value::as_str) == Some("assistant"))
+                    })
+                    .and_then(|turn| turn.get("text").and_then(Value::as_str))
+                    .unwrap_or("");
+                println!("{reply}");
+                call_log = result.call_log.into_records();
+            }
+            Err(e) => {
+                // Drop the failed turn so the next message starts clean, and keep
+                // the prior call log (the failed turn left no durable record).
+                messages.pop();
+                eprintln!("error: {e:#}");
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
 }
 
 fn cmd_check(file: &PathBuf) -> Result<()> {

@@ -1059,6 +1059,34 @@ mod tests {
         }
     }
 
+    /// A provider that returns one fixed response and counts how many live
+    /// calls it received — used to prove replay short-circuits prior turns.
+    struct CountingProvider {
+        response: String,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::LlmProvider for CountingProvider {
+        fn supports_model(&self, _model: &str) -> bool {
+            true
+        }
+
+        async fn send(
+            &self,
+            _request: &crate::providers::LlmRequest,
+        ) -> anyhow::Result<crate::providers::LlmResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::providers::LlmResponse {
+                content: self.response.clone(),
+                blocks: vec![crate::providers::ContentBlock::Text {
+                    text: self.response.clone(),
+                }],
+                ..crate::providers::LlmResponse::default()
+            })
+        }
+    }
+
     /// Serializes the prompt-issuing context tests against the local
     /// prompt-cache test: `CHIDORI_PROMPT_CACHE_DIR` is process-global, and
     /// the two CONTEXT_AGENT_SRC tests send byte-identical requests — run
@@ -1310,6 +1338,68 @@ mod tests {
         let replay_output =
             run_agent(&path, CONVERSATION_AGENT_SRC, &input, &replay_backend).unwrap();
         assert_eq!(live_output, replay_output);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_turn_loop_replays_prior_turns_and_only_calls_provider_for_the_new_message() {
+        // Mirrors `chidori chat`: each turn re-runs the conversational agent
+        // with the prior call log replayed and one more message appended, so
+        // only the newest message reaches the provider.
+        let _env = PROMPT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("chidori-rust-chat-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(&path, CONVERSATION_AGENT_SRC).unwrap();
+
+        // Turn 1: messages = [hi]. One live provider call.
+        let ctx1 = RuntimeContext::new();
+        let mut providers1 = crate::providers::ProviderRegistry::new();
+        providers1.register(Box::new(SequenceProvider {
+            responses: vec!["reply one".to_string()],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            requests: Arc::new(StdMutex::new(Vec::new())),
+        }));
+        let backend1 = context_test_backend(ctx1.clone(), providers1);
+        let out1 = run_agent(
+            &path,
+            CONVERSATION_AGENT_SRC,
+            &serde_json::json!({ "messages": ["hi"] }),
+            &backend1,
+        )
+        .unwrap();
+        assert_eq!(out1["replies"], serde_json::json!(["reply one"]));
+        let call_log = ctx1.call_log().into_records();
+
+        // Turn 2: messages = [hi, again], replaying turn 1's log. The first
+        // say() replays "reply one" for free; only the second say() is live, so
+        // the provider — which has just ONE response — is called exactly once.
+        let calls2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ctx2 = RuntimeContext::with_replay(call_log);
+        let mut providers2 = crate::providers::ProviderRegistry::new();
+        providers2.register(Box::new(CountingProvider {
+            response: "reply two".to_string(),
+            calls: Arc::clone(&calls2),
+        }));
+        let backend2 = context_test_backend(ctx2, providers2);
+        let out2 = run_agent(
+            &path,
+            CONVERSATION_AGENT_SRC,
+            &serde_json::json!({ "messages": ["hi", "again"] }),
+            &backend2,
+        )
+        .unwrap();
+        assert_eq!(
+            out2["replies"],
+            serde_json::json!(["reply one", "reply two"])
+        );
+        assert_eq!(
+            calls2.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the new message should reach the provider"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

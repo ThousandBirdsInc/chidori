@@ -155,6 +155,9 @@ cargo build
 # Multi-turn chat assistant (scripted turns; omit --input to chat interactively)
 ./target/debug/chidori run examples/agents/conversation.ts \
   --input '{"messages": ["Hi, who are you?", "What can you help with?"]}'
+
+# Or chat with the model directly — no agent file, durable every turn
+./target/debug/chidori chat --system "You are a concise assistant."
 ```
 
 For a guided walkthrough — inspecting a run, the demo picker, and the
@@ -166,7 +169,8 @@ human-in-the-loop pause/resume loop — see
 - **Conversational chat assistants** — `chidori.conversation()` owns a multi-turn
   dialogue: `chat.say(message)` per turn, or `chat.loop()` for an interactive
   `input()`-driven session. Every turn is durable and prefix-cached, so the whole
-  conversation replays for $0. See [Core concepts](./docs/core-concepts.md#conversational-agents).
+  conversation replays for $0. Or just run `chidori chat` for a built-in REPL — no
+  agent file needed. See [Core concepts](./docs/core-concepts.md#conversational-agents).
 - **Durable, resumable agents** — runs survive crashes and restarts and resume
   exactly where they paused. See [How replay works](./docs/replay.md).
 - **Deterministic tests & free debugging** — check in a checkpoint and replay it
