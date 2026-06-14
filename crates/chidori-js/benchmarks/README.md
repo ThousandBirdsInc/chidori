@@ -58,7 +58,22 @@ Two tables are printed:
   loses the *execution* — this table makes that visible.
 
 Pass `--json PATH` to also dump every sample (min/median/mean/max per runtime)
-for offline analysis.
+for offline analysis, or `--markdown PATH` to write the same two tables as a
+Markdown report.
+
+## CI integration
+
+[`.github/workflows/js-benchmarks.yml`](../../../.github/workflows/js-benchmarks.yml)
+runs this suite on every PR that touches `crates/chidori-js/**` and posts the
+Markdown report (`--markdown`) as a **single sticky comment** on the PR —
+updated in place on each push, never re-posted. The full report is also uploaded
+as a build artifact (`js-benchmark-report`).
+
+The job only fails the build on a **correctness mismatch** between runtimes (the
+harness exits non-zero), never on timing — the numbers come from a shared
+GitHub-hosted runner and are meant as a ratio smell-test, not a hard perf gate.
+The comment step is skipped for fork PRs (their token can't comment) and for
+manual `workflow_dispatch` runs; the artifact is still available in both cases.
 
 ## How it stays honest
 

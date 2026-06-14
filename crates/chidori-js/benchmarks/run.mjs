@@ -22,6 +22,7 @@
 //   --chidori-bin PATH  path to the chidori `run` example binary
 //   --no-build          do not `cargo build` the chidori binary first
 //   --json PATH         also write the full results as JSON to PATH
+//   --markdown PATH     also write a Markdown report to PATH (used by CI)
 //   --quick             shorthand for --runs 3 --warmup 0
 //   -h, --help          show this help
 //
@@ -52,6 +53,7 @@ function parseArgs(argv) {
     chidoriBin: process.env.CHIDORI_RUN_BIN || null,
     build: true,
     json: null,
+    markdown: null,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -64,6 +66,7 @@ function parseArgs(argv) {
       case "--chidori-bin": opts.chidoriBin = next(); break;
       case "--no-build": opts.build = false; break;
       case "--json": opts.json = next(); break;
+      case "--markdown": opts.markdown = next(); break;
       case "--quick": opts.runs = 3; opts.warmup = 0; break;
       case "-h": case "--help": printHelp(); process.exit(0); break;
       default:
@@ -94,6 +97,7 @@ function printHelp() {
       "  --chidori-bin PATH  path to the chidori `run` example binary",
       "  --no-build          do not cargo build the chidori binary first",
       "  --json PATH         also write the full results as JSON to PATH",
+      "  --markdown PATH     also write a Markdown report to PATH (used by CI)",
       "  --quick             shorthand for --runs 3 --warmup 0",
       "  -h, --help          show this help",
     ].join("\n"),
@@ -231,6 +235,23 @@ function padLeft(s, w) {
   return s.length >= w ? s : " ".repeat(w - s.length) + s;
 }
 
+// Execution-only time per runtime for one workload (median minus that runtime's
+// startup baseline), plus which runtime was fastest. The fastest is the
+// reference for the "x" slowdown factors. Shared by the text and Markdown
+// reporters so they can't drift.
+function execTimes(w, rtNames, baselines) {
+  const execByName = {};
+  for (const n of rtNames) {
+    const r = w.byRuntime[n];
+    execByName[n] = r ? Math.max(0, r.median - baselines[n]) : null;
+  }
+  const finite = Object.values(execByName).filter((v) => v != null && v > 0);
+  const best = finite.length ? Math.min(...finite) : null;
+  let fastestName = "";
+  for (const n of rtNames) if (execByName[n] != null && execByName[n] === best) fastestName = n;
+  return { execByName, best, fastestName };
+}
+
 function printTable(workloads, runtimes, baselines) {
   const rtNames = runtimes.map((r) => r.name);
   // Fastest runtime per workload is the reference for the "x" speedup columns.
@@ -250,21 +271,12 @@ function printTable(workloads, runtimes, baselines) {
 
   for (const w of workloads) {
     let row = pad(w.name, nameW);
-    const execByName = {};
-    for (const n of rtNames) {
-      const r = w.byRuntime[n];
-      const exec = r ? Math.max(0, r.median - baselines[n]) : null;
-      execByName[n] = exec;
-    }
-    const finite = Object.values(execByName).filter((v) => v != null && v > 0);
-    const best = finite.length ? Math.min(...finite) : null;
-    let fastestName = "";
+    const { execByName, best, fastestName } = execTimes(w, rtNames, baselines);
     for (const n of rtNames) {
       const exec = execByName[n];
       if (exec == null) { row += "  " + padLeft("—", COL); continue; }
       const factor = best && exec > 0 ? exec / best : 1;
       const cell = factor <= 1.001 ? fmtMs(exec) : `${fmtMs(exec)} ${factor.toFixed(1)}x`;
-      if (exec === best) fastestName = n;
       row += "  " + padLeft(cell, COL);
     }
     row += "  " + padLeft(fastestName, 9);
@@ -284,6 +296,70 @@ function printTable(workloads, runtimes, baselines) {
     }
     console.log(row);
   }
+}
+
+// Stable HTML marker so CI can find-and-update its single sticky comment
+// instead of posting a new one every run.
+const MARKDOWN_MARKER = "<!-- chidori-js-benchmarks -->";
+
+// Render the results as a Markdown report (used for the PR comment).
+function renderMarkdown(workloads, runtimes, baselines, opts) {
+  const rtNames = runtimes.map((r) => r.name);
+  const lines = [];
+  lines.push(MARKDOWN_MARKER);
+  lines.push("## chidori-js cross-runtime benchmarks");
+  lines.push("");
+  lines.push(
+    `Same JS workloads run under **chidori-js**, **Node.js**, and **Bun** ` +
+      `(${opts.runs} timed run(s) + ${opts.warmup} warmup each, median reported). ` +
+      `All workloads cross-checked to produce identical results.`,
+  );
+  lines.push("");
+  lines.push(
+    "**Startup baselines:** " +
+      rtNames.map((n) => `${n} ${fmtMs(baselines[n])}`).join(" · "),
+  );
+  lines.push("");
+
+  // Table 1: execution-only (startup subtracted), with slowdown factors.
+  lines.push("### Execution-only time (startup baseline subtracted)");
+  lines.push("");
+  lines.push(`| workload | ${rtNames.join(" | ")} | fastest |`);
+  lines.push(`|${"---|".repeat(rtNames.length + 2)}`);
+  for (const w of workloads) {
+    const { execByName, best, fastestName } = execTimes(w, rtNames, baselines);
+    const cells = rtNames.map((n) => {
+      const exec = execByName[n];
+      if (exec == null) return "—";
+      const factor = best && exec > 0 ? exec / best : 1;
+      const txt = factor <= 1.001 ? `**${fmtMs(exec)}**` : `${fmtMs(exec)} (${factor.toFixed(1)}×)`;
+      return txt;
+    });
+    const flag = w.agree ? "" : " ⚠️";
+    lines.push(`| ${w.name}${flag} | ${cells.join(" | ")} | ${fastestName} |`);
+  }
+  lines.push("");
+
+  // Table 2: raw total wall-clock including startup.
+  lines.push("### Total time including startup (raw wall-clock)");
+  lines.push("");
+  lines.push(`| workload | ${rtNames.join(" | ")} |`);
+  lines.push(`|${"---|".repeat(rtNames.length + 1)}`);
+  for (const w of workloads) {
+    const cells = rtNames.map((n) => {
+      const r = w.byRuntime[n];
+      return r ? fmtMs(r.median) : "—";
+    });
+    lines.push(`| ${w.name} | ${cells.join(" | ")} |`);
+  }
+  lines.push("");
+  lines.push(
+    "<sub>Numbers are machine- and load-dependent (shared CI runner) — read them " +
+      "as ratios, not absolutes. chidori-js is an interpreter, so it trails the " +
+      "V8/JSC JITs on compute but starts far faster. A ⚠️ marks a workload whose " +
+      "result disagreed across runtimes.</sub>",
+  );
+  return lines.join("\n") + "\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +446,11 @@ async function main() {
     };
     writeFileSync(opts.json, JSON.stringify(payload, null, 2));
     console.log(`\nwrote ${opts.json}`);
+  }
+
+  if (opts.markdown) {
+    writeFileSync(opts.markdown, renderMarkdown(workloads, runtimes, baselines, opts));
+    console.log(`\nwrote ${opts.markdown}`);
   }
 
   process.exit(mismatches > 0 ? 1 : 0);
