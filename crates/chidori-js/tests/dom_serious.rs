@@ -425,3 +425,27 @@ fn hierarchy_request_error_on_cycle() {
     );
     assert_eq!(out, "threw");
 }
+
+#[test]
+fn inner_html_parses_into_journaled_dom_and_is_queryable() {
+    let mut engine = Engine::new();
+    let _dom = engine.install_dom();
+    let out = eval_str(
+        &mut engine,
+        r#"
+        const root = document.createElement('div');
+        root.innerHTML =
+            '<section class="card"><h2>Pro</h2><ul>' +
+            '<li class="feat">A</li><li class="feat">B</li></ul>' +
+            '<button>Buy &amp; go</button><img src="x"/></section>';
+        document.body.appendChild(root);
+        [
+            root.querySelector('h2').textContent,
+            root.querySelectorAll('.feat').length,
+            root.querySelector('button').textContent,
+            root.getElementsByTagName('img').length,
+        ].join('|')
+        "#,
+    );
+    assert_eq!(out, "Pro|2|Buy & go|1");
+}

@@ -141,6 +141,30 @@ The earlier sketch's gaps are now closed and tested:
   layer. (`innerHTML`/`outerHTML` are getters only — there is no HTML *parser*;
   build trees via the DOM API, not by assigning markup strings.)
 
+## Running real React on the runtime
+
+Because the engine is a real JavaScript engine and the DOM is real enough,
+**React 18 + `react-dom/server` execute unmodified on chidori-js** — function
+components, composition, props, and hooks (`useState` for the initial render).
+Its output mounts into the journaled DOM via `el.innerHTML = …` (backed by a
+small HTML parser for the well-formed markup server renderers emit), so the
+agent can test the result with ordinary DOM queries. See
+[`tests/react_ssr.rs`](../crates/chidori-js/tests/react_ssr.rs).
+
+That unlocks the killer loop — an agent iterating on a React component, gated by
+a test suite, with fork + replay (`examples/react_agent_demo.rs`, media in
+`docs/media/react-agent*.svg`):
+
+1. The agent drafts a component; it is server-rendered, mounted into the DOM, and
+   tested. Failing tests drive the next revision until the suite is green.
+2. **Fork → edit → replay.** A second engine replays the agent's recorded drafts
+   for *free* (0 new model calls) to reconstruct the green state, then makes one
+   fresh call for the edit (a dark, annual variant) — shown side by side.
+3. **Record == replay.** Re-running the journal yields byte-identical output.
+
+The point: every iteration is deterministic, testable, forkable, and cheap —
+the expensive model calls replay instead of re-running.
+
 ## The artifact, in one line
 
 A forkable, time-traveling, fully-journaled UI session where the agent and the

@@ -331,6 +331,150 @@ impl Dom {
         }
     }
 
+    /// `innerHTML` setter: replace all children with the result of parsing
+    /// `html`. Not a full HTML5 parser — it handles the well-formed, explicit
+    /// markup that server-side renderers (e.g. `react-dom/server`) emit: tags,
+    /// attributes, text, void/self-closing elements, comments, and entities.
+    fn set_inner_html(&mut self, id: usize, html: &str) {
+        let kids = self.nodes[id].children.clone();
+        for k in kids {
+            self.detach(k);
+        }
+        self.parse_into(id, html);
+    }
+
+    fn parse_into(&mut self, parent: usize, html: &str) {
+        const VOID: &[&str] = &[
+            "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+            "meta", "param", "source", "track", "wbr",
+        ];
+        let s: Vec<char> = html.chars().collect();
+        let n = s.len();
+        let mut i = 0;
+        let mut stack = vec![parent];
+        while i < n {
+            if s[i] == '<' {
+                // Comment / doctype.
+                if i + 1 < n && s[i + 1] == '!' {
+                    if i + 3 < n && s[i + 2] == '-' && s[i + 3] == '-' {
+                        i += 4;
+                        while i + 2 < n && !(s[i] == '-' && s[i + 1] == '-' && s[i + 2] == '>') {
+                            i += 1;
+                        }
+                        i = (i + 3).min(n);
+                    } else {
+                        while i < n && s[i] != '>' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                // Close tag.
+                if i + 1 < n && s[i + 1] == '/' {
+                    i += 2;
+                    let mut name = String::new();
+                    while i < n && s[i] != '>' {
+                        name.push(s[i]);
+                        i += 1;
+                    }
+                    i += 1;
+                    let name = name.trim().to_lowercase();
+                    if let Some(pos) = stack.iter().rposition(|&nid| {
+                        matches!(&self.nodes[nid].kind, NodeKind::Element(t) if *t == name)
+                    }) {
+                        if pos > 0 {
+                            stack.truncate(pos);
+                        }
+                    }
+                    continue;
+                }
+                // Open tag.
+                i += 1;
+                let mut name = String::new();
+                while i < n && !s[i].is_whitespace() && s[i] != '>' && s[i] != '/' {
+                    name.push(s[i]);
+                    i += 1;
+                }
+                let name = name.to_lowercase();
+                let mut attrs: Vec<(String, String)> = Vec::new();
+                let mut self_close = false;
+                loop {
+                    while i < n && s[i].is_whitespace() {
+                        i += 1;
+                    }
+                    if i >= n || s[i] == '>' {
+                        i += 1;
+                        break;
+                    }
+                    if s[i] == '/' {
+                        self_close = true;
+                        i += 1;
+                        continue;
+                    }
+                    let mut an = String::new();
+                    while i < n && !s[i].is_whitespace() && s[i] != '=' && s[i] != '>' && s[i] != '/'
+                    {
+                        an.push(s[i]);
+                        i += 1;
+                    }
+                    while i < n && s[i].is_whitespace() {
+                        i += 1;
+                    }
+                    let mut av = String::new();
+                    if i < n && s[i] == '=' {
+                        i += 1;
+                        while i < n && s[i].is_whitespace() {
+                            i += 1;
+                        }
+                        if i < n && (s[i] == '"' || s[i] == '\'') {
+                            let q = s[i];
+                            i += 1;
+                            let mut raw = String::new();
+                            while i < n && s[i] != q {
+                                raw.push(s[i]);
+                                i += 1;
+                            }
+                            i += 1;
+                            av = decode_entities(&raw);
+                        } else {
+                            let mut raw = String::new();
+                            while i < n && !s[i].is_whitespace() && s[i] != '>' {
+                                raw.push(s[i]);
+                                i += 1;
+                            }
+                            av = decode_entities(&raw);
+                        }
+                    }
+                    if !an.is_empty() {
+                        attrs.push((an, av));
+                    }
+                }
+                let el = self.create_element(&name);
+                for (k, v) in attrs {
+                    self.set_attribute(el, &k, &v);
+                }
+                let top = *stack.last().unwrap();
+                let _ = self.append_child(top, el);
+                if !self_close && !VOID.contains(&name.as_str()) {
+                    stack.push(el);
+                }
+            } else {
+                let mut txt = String::new();
+                while i < n && s[i] != '<' {
+                    txt.push(s[i]);
+                    i += 1;
+                }
+                let decoded = decode_entities(&txt);
+                if !decoded.trim().is_empty() {
+                    let top = *stack.last().unwrap();
+                    let t = self.create_text(&decoded);
+                    let _ = self.append_child(top, t);
+                }
+            }
+        }
+    }
+
     fn text_content(&self, id: usize) -> String {
         match &self.nodes[id].kind {
             NodeKind::Text => self.nodes[id].text.clone(),
@@ -518,6 +662,48 @@ fn escape_text(s: &str) -> String {
 
 fn escape_attr(s: &str) -> String {
     s.replace('&', "&amp;").replace('"', "&quot;")
+}
+
+/// Decode the HTML entities that server renderers emit (the five XML entities,
+/// `&apos;`/`&nbsp;`, and numeric `&#NN;` / `&#xHH;`). Unknown entities pass
+/// through verbatim.
+fn decode_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '&' {
+            if let Some(semi) = chars[i + 1..].iter().position(|&c| c == ';') {
+                let ent: String = chars[i + 1..i + 1 + semi].iter().collect();
+                let decoded = match ent.as_str() {
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    "nbsp" => Some('\u{00a0}'),
+                    _ if ent.starts_with("#x") || ent.starts_with("#X") => {
+                        u32::from_str_radix(&ent[2..], 16).ok().and_then(char::from_u32)
+                    }
+                    _ if ent.starts_with('#') => {
+                        ent[1..].parse::<u32>().ok().and_then(char::from_u32)
+                    }
+                    _ => None,
+                };
+                if let Some(c) = decoded {
+                    out.push(c);
+                    i += semi + 2;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 /// A single compound selector: optional tag, optional `#id`, zero or more
@@ -1125,7 +1311,15 @@ fn install_node_api(vm: &mut Vm, dom: &Rc<RefCell<Dom>>, obj: &JsObject) {
         let html = dom.borrow().render_children(id);
         Ok(Value::str(html))
     });
-    define_accessor(obj, "innerHTML", Value::Object(get_inner), None);
+    let d = weak.clone();
+    let set_inner = vm.new_native("set innerHTML", 1, move |vm, this, args| {
+        let dom = dom_or_return!(d);
+        let id = nid_of(vm, &this).ok_or_else(|| type_err(vm, "innerHTML: not a node"))?;
+        let html = vm.to_string_lossy(args.first().unwrap_or(&Value::Undefined));
+        dom.borrow_mut().set_inner_html(id, &html);
+        Ok(Value::Undefined)
+    });
+    define_accessor(obj, "innerHTML", Value::Object(get_inner), Some(Value::Object(set_inner)));
     let d = weak.clone();
     let get_outer = vm.new_native("get outerHTML", 0, move |vm, this, _| {
         let dom = match d.upgrade() {
