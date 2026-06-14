@@ -630,6 +630,12 @@ impl Vm {
                 done!(Flow::Return(Value::Undefined));
             }
             frame.ip = ip + 1;
+            // Phase-0 dynamic opcode-frequency instrumentation. Compiled out
+            // entirely in the default build (the `op-histogram` feature is OFF
+            // by default), so the shipping interpreter loop is byte-identical;
+            // see `opstats.rs` and `docs/interpreter-optimization.md` §Phase 0.
+            #[cfg(feature = "op-histogram")]
+            crate::opstats::record(&proto.code[ip]);
             // Dispatch on a borrow of the instruction. `proto` is a clone of the
             // frame's (immutable) `FuncProto` Rc taken once per frame, so the
             // borrow is independent of `frame` and costs no per-op `Op::clone`

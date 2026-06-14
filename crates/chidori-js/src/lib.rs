@@ -18,6 +18,10 @@ pub mod iter;
 pub mod journal;
 pub mod jsx;
 pub mod module;
+/// Phase-0 opcode-frequency instrumentation; present only under the
+/// `op-histogram` feature (see `docs/interpreter-optimization.md`).
+#[cfg(feature = "op-histogram")]
+pub mod opstats;
 pub mod promise;
 pub mod proxy;
 pub mod realm;

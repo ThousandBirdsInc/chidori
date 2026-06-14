@@ -1,10 +1,10 @@
 # Interpreter performance: optimizing `chidori-js` without a JIT
 
-> **Status:** Proposed (design only — no code yet). This document scopes a body
-> of work to make the `chidori-js` bytecode interpreter materially faster
-> **without** adding a JIT, while preserving the engine's three load-bearing
-> invariants: **zero `unsafe`**, **no new heavyweight dependencies**, and
-> **byte-identical deterministic replay**.
+> **Status:** Phase 0 (measurement) **done** — see §11; Phases 1–4 proposed.
+> This document scopes a body of work to make the `chidori-js` bytecode
+> interpreter materially faster **without** adding a JIT, while preserving the
+> engine's three load-bearing invariants: **zero `unsafe`**, **no new
+> heavyweight dependencies**, and **byte-identical deterministic replay**.
 >
 > **Related:** [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md)
 > (historical engine plan), [`docs/conformance.md`](./conformance.md) (Test262
@@ -169,10 +169,11 @@ dispatch (loop flattening), and fewer lookups (inline caches).**
 Each phase is independently shippable and independently gated. Phases 1–3 are the
 recommended scope; Phase 4 is a larger optional follow-up.
 
-### Phase 0 — Measurement baseline (prerequisite, no engine changes)
+### Phase 0 — Measurement baseline (prerequisite) ✅ done — results in §11
 
 **Goal:** establish where cycles actually go before changing anything, and make
-regressions visible.
+regressions visible. (The only engine touch is a feature-gated, off-by-default
+instrument that compiles out of the shipping build — see §11.)
 
 - Extend `benches/execution.rs` (criterion) so the `interp` group isolates the
   dispatch loop from the front end across the existing workloads
@@ -400,7 +401,115 @@ byte-identity), and §7.5 (no benchmark regressions).
 
 ---
 
-## 11. References
+## 11. Phase 0 results (measured 2026-06-14)
+
+Phase 0 is **complete**. Tooling landed:
+
+- A feature-gated dynamic opcode-frequency instrument (`src/opstats.rs` + one
+  `#[cfg(feature = "op-histogram")]` call site in `exec.rs::run_frame`). The
+  feature is **OFF by default**, so the shipping engine is byte-identical and
+  pays nothing (confirmed: `tests/smoke.rs` and `tests/replay.rs` pass unchanged
+  on the default build, including record→replay byte-identity).
+- An analyzer that reports static (as-emitted) and dynamic (as-executed) opcode
+  and adjacent-pair histograms: `cargo run --release --example opstats -p
+  chidori-js --features op-histogram`.
+
+> **Caveat:** the numbers below are from one developer machine and are a
+> *relative* baseline for tracking deltas across phases, not an absolute spec.
+> Re-run on the target machine before quoting wins.
+
+### 11.1 Timing baseline (criterion, default release build)
+
+Median per the existing `benches/execution.rs` workloads. `compile` = front end
+only; `interp` = VM loop only (compiled once); `eval` = end-to-end incl. realm
+setup; `engine_new` = realm/builtin construction alone.
+
+| workload | compile | interp | eval |
+| --- | ---: | ---: | ---: |
+| arith_loop | 4.4 µs | 6.3 ms | 7.0 ms |
+| fib_recursive | 5.4 µs | 74.6 ms | 73.9 ms |
+| property_access | 7.0 µs | 7.9 ms | 8.8 ms |
+| array_push_sum | 6.4 µs | 5.3 ms | 6.0 ms |
+| array_hof | 9.0 µs | 3.1 ms | 4.0 ms |
+| string_build | 4.5 µs | 2.2 ms | 4.8 ms |
+| closures | 8.4 µs | 5.9 ms | 9.3 ms |
+| **engine_new** | — | — | **3.6 ms** |
+
+**Findings.**
+1. **The front end is not the bottleneck.** Compilation is microseconds; the
+   interpreter loop is milliseconds — 3 orders of magnitude apart. Optimization
+   effort belongs in the VM loop, not the parser/compiler.
+2. **Realm setup (`engine_new`, ~3.6 ms) is a large fixed cost** — it rivals or
+   exceeds the *entire* interpreter time of the lighter workloads. For short
+   agent steps (a little JS between host calls), realm construction can dominate
+   interpreter-loop time. This is a previously-unscoped lever worth its own
+   investigation (cache/clone a warm realm) and may beat Phases 1–3 for the
+   short-script regime.
+3. The interpreter loop dominates only for compute-heavy code (fib ≈ 75 ms).
+
+### 11.2 Dynamic opcode frequency (execution-weighted, 4.43M executed ops)
+
+Top executed opcodes (combined across workloads):
+
+| % | opcode | | % | opcode |
+| ---: | --- | --- | ---: | --- |
+| 16.9% | `LoadCell` | | 3.8% | `Call` |
+| 12.2% | `InitCell` | | 3.8% | `LoadArg` |
+| 9.4% | `LoadConst` | | 3.7% | `Return` |
+| 4.6% | `JumpIfFalse` | | 3.6% | `LoadUndefined` |
+| 4.6% | `Lt` | | 3.6% | `LoadThis`/`LoadNewTarget`/`BindThisSloppy` |
+| 4.1% | `Sub` | | 3.6% | `LoadUpvalue` |
+| 3.1% | `Add` | | | |
+
+**~40% of all executed opcodes are pure data movement** (`LoadCell`,
+`InitCell`, `LoadConst`, `LoadArg`, `LoadUpvalue`, `LoadUndefined`). This is the
+operand-stack-shuffle overhead that fusion (Phase 2) and a register bytecode
+(Phase 4) directly target. `InitCell` at 12.2% is notably high — per-iteration
+`let` bindings in `for` loops and the call/param prologue mint fresh cells.
+
+### 11.3 Top fusion candidates (adjacent executed pairs)
+
+| % | pair | fuse to |
+| ---: | --- | --- |
+| 8.9% | `LoadCell ; LoadConst` | `LoadCellConst` |
+| 5.0% | `InitCell ; LoadCell` | prologue superinstruction |
+| 4.6% | `Lt ; JumpIfFalse` | `JumpIfNotLt` (compare-and-branch) |
+| 4.5% | `LoadConst ; Lt` | folds into `LoadCellConst ; Lt` |
+| 3.8% | `LoadArg ; InitCell` | param-bind superinstruction |
+| 3.6% | `LoadConst ; Sub` | `SubConst` |
+| 3.4% | `Sub ; Call` | — |
+
+The canonical loop-condition idiom `LoadCell(i); LoadConst(N); Lt; JumpIfFalse`
+shows up as a *chain* of high-frequency pairs (8.9% + 4.5% + 4.6%). Fusing
+load+binop (`LoadCell ; LoadConst ; <binop>`) and compare-and-branch
+(`Lt ; JumpIfFalse`) would remove a large, concrete slice of dispatches and
+operand-stack traffic in exactly the hot loops.
+
+### 11.4 Go / no-go decision
+
+| Phase | Decision | Rationale |
+| --- | --- | --- |
+| **1 — hot-loop cleanup** | **GO** | Lowest risk; validates the gating harness; the per-op `Result<Ctl,_>` round-trip and per-op `Option::take`s are real overhead on the data-movement ops that make up ~40% of execution. |
+| **2 — fusion** | **GO** | Data shows clear high-frequency pairs (load+binop, compare-and-branch) and a 40%-data-movement profile. Target the §11.3 candidates, validated by the survey rather than intuition. |
+| **3 — inline caches** | **CONDITIONAL** | Property ops did *not* crack the top-15 in this loop/arith-heavy mix, so the win is unproven *for this workload*. Gate on the agent profile (below): pursue only if property access registers there. |
+| **4 — register bytecode** | **DEFER** | The 40%-data-movement figure is the strongest argument for it, but it's a back-end rewrite; revisit only if Phases 1–2 leave a measured, workload-relevant gap. |
+| **Bonus — warm-realm reuse** | **INVESTIGATE** | `engine_new` ≈ 3.6 ms is unexpectedly large and dominates short scripts; worth scoping independently of the dispatch work. |
+
+### 11.5 Remaining Phase 0 item (carried forward)
+
+The **representative-agent replay benchmark** (JS-execution share of an agent
+run replayed from a committed journal) is **not yet implemented** — it needs a
+checked-in journal fixture and pulls in the larger `chidori` crate's host
+runtime, out of scope for this `chidori-js`-local pass. It is the gate for
+Phase 3 and for sizing the whole effort. *A-priori* signal: even the heaviest
+micro-workload here (~75 ms) is small next to typical per-LLM-call latency
+(hundreds of ms to seconds), so JS execution is likely a *minority* of agent
+wall-clock — which is the core argument for the whole "no JIT" stance. **This
+must be measured, not assumed, before committing to Phases 3–4.**
+
+---
+
+## 12. References
 
 - [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md) — engine
   decision record (pure Rust, no `boa_engine`, replay-not-snapshot).
