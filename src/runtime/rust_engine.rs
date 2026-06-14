@@ -351,6 +351,7 @@ fn run_module(
             .eval(&prelude)
             .map_err(|e| anyhow::anyhow!("installing node: builtin prelude: {e}"))?;
     }
+    let backend_for_dom = backend.clone();
     let backend = backend.clone();
     let dispatch: Rc<dyn Fn(&str, &Value) -> std::result::Result<Value, String>> =
         Rc::new(move |effect: &str, args: &Value| backend.dispatch(effect, args));
@@ -375,6 +376,41 @@ fn run_module(
     engine
         .eval(crate::runtime::typescript::helpers::FETCH_POLYFILL)
         .map_err(|e| anyhow::anyhow!("installing fetch polyfill: {e}"))?;
+
+    // Virtual DOM (additive): agents get a `document` / `window`, and a durable
+    // `chidori.renderDOM()` that flushes the pending mutation batch through the
+    // host boundary as a journaled `dom_render` effect — recorded live, served
+    // from the journal on replay (so resume/branch reproduce the rendered output
+    // without re-flushing). Building the DOM tree is a pure re-derivation of the
+    // re-run, so node ids stay deterministic across replay.
+    let dom_handle = engine.install_dom();
+    {
+        let backend_dom = backend_for_dom;
+        let dom = dom_handle.clone();
+        let dom_dispatch: Rc<dyn Fn(&str, &Value) -> std::result::Result<Value, String>> =
+            Rc::new(move |name: &str, _args: &Value| {
+                let ctx = backend_dom
+                    .runtime_ctx()
+                    .ok_or_else(|| "dom: no runtime context".to_string())?;
+                match name {
+                    "__chidori_dom_render" => crate::runtime::host_core::execute_durable_json_call(
+                        ctx,
+                        "dom_render",
+                        Value::Null,
+                        || Ok(serde_json::to_value(dom.drain_render_batch()).unwrap_or(Value::Null)),
+                    )
+                    .map_err(|e| e.to_string()),
+                    _ => Ok(Value::Null),
+                }
+            });
+        engine.install_sync_natives(&[("__chidori_dom_render", 0)], dom_dispatch);
+    }
+    engine
+        .eval(
+            "globalThis.chidori.renderDOM = function () { return globalThis.__chidori_dom_render(); };",
+        )
+        .map_err(|e| anyhow::anyhow!("installing chidori.renderDOM: {e}"))?;
+
     let slot = engine.install_entrypoint();
 
     let entry_key = path.to_string_lossy().to_string();
@@ -1474,6 +1510,58 @@ mod tests {
         let records = ctx.call_log().into_records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].function, "log");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dom_is_available_and_render_effect_is_journaled_and_replayed() {
+        // P0: the virtual DOM is wired into the durable runtime. An agent builds
+        // a tree via `document` and flushes it with `chidori.renderDOM()`, which
+        // records a durable `dom_render` effect. On replay the effect is served
+        // from the journal and the run reproduces identically.
+        let dir = std::env::temp_dir().join(format!("chidori-dom-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent(input: { name: string }, chidori) {
+                const el = document.createElement('div');
+                el.id = 'root';
+                el.textContent = 'hello ' + input.name;
+                document.body.appendChild(el);
+                const batch = chidori.renderDOM();
+                return {
+                    html: document.body.innerHTML,
+                    count: batch.mutations.length,
+                    version: batch.version,
+                };
+            }
+        "#;
+        std::fs::write(&path, src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), Arc::new(ToolRegistry::new()));
+        let out = run_agent(&path, src, &serde_json::json!({ "name": "world" }), &backend).unwrap();
+
+        assert!(
+            out["html"].as_str().unwrap().contains("<div id=\"root\">hello world</div>"),
+            "document built in the real runtime: {out:?}"
+        );
+        assert!(out["count"].as_u64().unwrap() > 0);
+        assert_eq!(out["version"].as_u64().unwrap(), 1);
+
+        let records = ctx.call_log().into_records();
+        assert!(
+            records.iter().any(|r| r.function == "dom_render"),
+            "dom_render was not journaled: {:?}",
+            records.iter().map(|r| &r.function).collect::<Vec<_>>()
+        );
+
+        // Replay: the recorded journal serves `dom_render`; the run reproduces.
+        let ctx2 = RuntimeContext::with_replay(records);
+        let backend2 = test_backend(ctx2.clone(), Arc::new(ToolRegistry::new()));
+        let out2 = run_agent(&path, src, &serde_json::json!({ "name": "world" }), &backend2).unwrap();
+        assert_eq!(out2, out, "replay diverged from the recorded run");
 
         let _ = std::fs::remove_dir_all(dir);
     }
