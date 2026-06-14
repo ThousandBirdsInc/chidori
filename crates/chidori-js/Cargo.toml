@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Front end only: we consume the oxc AST and write no lexer/parser of our own.
-oxc = { version = "0.133", features = ["semantic"] }
+oxc = { version = "0.133", features = ["semantic", "transformer", "codegen"] }
 # Deterministic, insertion-ordered property maps. Object/Map/Set iteration order
 # must be address-independent for replay to be correct (see determinism contract).
 indexmap = "2"

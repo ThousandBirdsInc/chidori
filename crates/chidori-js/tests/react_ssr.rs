@@ -111,3 +111,56 @@ fn use_state_initial_render_works_in_ssr() {
         .unwrap();
     assert_eq!(e.vm.to_string_lossy(&out), "<span>count: 7</span>");
 }
+
+#[test]
+fn jsx_transpiles_to_classic_runtime_and_renders() {
+    use chidori_js::jsx::transpile_jsx;
+    let jsx = r#"
+        function App(props) {
+            return (
+                <div className="card">
+                    <h2>{props.title}</h2>
+                    <ul>{props.items.map(function (t) { return <li>{t}</li>; })}</ul>
+                    <button>Subscribe</button>
+                </div>
+            );
+        }
+        globalThis.App = App;
+    "#;
+    let js = transpile_jsx(jsx).expect("jsx transpiles");
+    assert!(js.contains("React.createElement"), "expected classic runtime, got:\n{js}");
+
+    let mut e = Engine::new();
+    let _dom = load_react(&mut e);
+    e.eval(&js).unwrap();
+    let out = e
+        .eval("ReactDOMServer.renderToStaticMarkup(React.createElement(globalThis.App, { title: 'Pro', items: ['A','B'] }))")
+        .unwrap();
+    let html = e.vm.to_string_lossy(&out);
+    assert!(html.contains("<div class=\"card\">"), "got: {html}");
+    assert!(html.contains("<h2>Pro</h2>"), "got: {html}");
+    assert!(html.contains("<li>A</li><li>B</li>"), "got: {html}");
+    assert!(html.contains("<button>Subscribe</button>"), "got: {html}");
+}
+
+#[test]
+fn jsx_strips_typescript_types() {
+    use chidori_js::jsx::transpile_jsx;
+    let tsx = r#"
+        interface Props { label: string; }
+        function Tag(props: Props): JSX.Element {
+            const n: number = 3;
+            return <span data-n={n}>{props.label}</span>;
+        }
+        globalThis.App = Tag;
+    "#;
+    let js = transpile_jsx(tsx).expect("tsx transpiles");
+    assert!(!js.contains("interface"), "types should be stripped: {js}");
+    let mut e = Engine::new();
+    let _dom = load_react(&mut e);
+    e.eval(&js).unwrap();
+    let out = e
+        .eval("ReactDOMServer.renderToStaticMarkup(React.createElement(globalThis.App, { label: 'hi' }))")
+        .unwrap();
+    assert_eq!(e.vm.to_string_lossy(&out), "<span data-n=\"3\">hi</span>");
+}

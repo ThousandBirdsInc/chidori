@@ -15,6 +15,7 @@ pub mod gc;
 pub mod generator;
 pub mod host;
 pub mod iter;
+pub mod jsx;
 pub mod journal;
 pub mod module;
 pub mod promise;
