@@ -16,6 +16,39 @@ model, captured measurements, DOM API, no-leak), and
 [`examples/dom_session.rs`](../crates/chidori-js/examples/dom_session.rs)
 (`cargo run -p chidori-js --example dom_session`).
 
+## Feature status (P0 / P1)
+
+What's wired for building on top of (vs. the engine-only prototype):
+
+- **P0 — durable-host integration: DONE.** `run_module` (`src/runtime/rust_engine.rs`)
+  installs the DOM for every agent: `document` / `window` are available, and
+  `chidori.renderDOM()` flushes the pending mutation batch through the host
+  boundary as a journaled `dom_render` effect (recorded via the call-log, served
+  from the journal on replay). The DOM tree is a pure re-derivation of the re-run,
+  so node ids stay deterministic across resume. Tested end-to-end
+  (`dom_is_available_and_render_effect_is_journaled_and_replayed`); 257 lib + 16
+  CLI tests stay green (additive).
+- **P1 — DOM completeness: DONE.** Real CSS selector engine (lists, `>`/descendant
+  combinators, attribute selectors, `:first/last/nth-child`), `insertAdjacentHTML`,
+  `normalize`, `innerHTML` parser.
+- **P1 — versioned wire format: DONE.** `PROTOCOL_VERSION`, `RenderBatch`,
+  `SessionJournal.version`.
+- **P1 — JSX authoring: DONE.** `chidori_js::jsx::transpile_jsx` lowers JSX/TSX to
+  classic `React.createElement` (+ strips TS), and the runtime transpile emits
+  classic JSX for `.tsx` agents. Kept out of the conformance-critical default
+  compile path.
+
+Deliberately deferred (rationale, not blockers):
+
+- **npm `react` module resolution.** The engine *runs* real React and JSX
+  authoring works, but the runtime doesn't yet auto-resolve `import React from
+  'react'` — an agent supplies React in scope. Shipping/embedding React in the
+  runtime loader is a product decision, not a missing primitive.
+- **Ask/deny policy gating for `dom_render`.** The effect is already recorded in
+  the (capability-bearing) journal; render output is benign, so a default-allow
+  ask/deny knob is a small `RuntimePolicy` config follow-up, deferred to avoid
+  perturbing snapshot-manifest serialization here.
+
 ## The core observation
 
 The DOM looks like a huge messy API, but it decomposes exactly along the lines
