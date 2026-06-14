@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::bytecode::{Const, FuncKind, Op, UpvalueSource};
+use crate::bytecode::{CmpOp, Const, FuncKind, Op, UpvalueSource};
 use crate::value::*;
 use crate::vm::*;
 
@@ -567,6 +567,38 @@ impl Vm {
         // re-deriving it (and so it doesn't alias the `&mut frame` step needs).
         let proto = frame.func.proto.clone();
         let mut interrupt_poll: u32 = 0;
+        // Injected resume completions are handled ONCE here, before the loop,
+        // rather than re-checked on every iteration. `pending_throw` /
+        // `pending_return` are set only by `resume_frame_throw` /
+        // `resume_frame_return` immediately before `run_frame` (see `promise.rs`)
+        // — a generator `.return(v)` or an awaited rejection delivered at resume.
+        // Nothing inside the loop ever sets them, so once taken here they stay
+        // `None` for the rest of the frame; this lifts two per-op `Option::take`s
+        // off the hot path. A resolved `Jump` just positions `frame.ip` and falls
+        // into the loop. (Phase 1, docs/interpreter-optimization.md.)
+        if let Some(e) = frame.pending_throw.take() {
+            match self.do_completion(&mut frame, Completion::Throw(e)) {
+                Ok(Ctl::Jump(t)) => frame.ip = t,
+                Ok(Ctl::Return(v)) => done!(Flow::Return(v)),
+                Ok(_) => unreachable!("throw completion yields jump or return"),
+                Err(e) => done!(Flow::Throw(e)),
+            }
+        } else if let Some(v) = frame.pending_return.take() {
+            // Injected `.return(v)` on a suspended generator: dispatch a Return
+            // completion so enclosing `finally` blocks run before the frame ends
+            // (a `yield` in a finally re-suspends as a normal yield in the loop).
+            match self.do_completion(&mut frame, Completion::Return(v)) {
+                Ok(Ctl::Jump(t)) => frame.ip = t,
+                Ok(Ctl::Return(rv)) => done!(Flow::Return(rv)),
+                Ok(_) => unreachable!("return completion yields jump or return"),
+                Err(e) => match self.do_completion(&mut frame, Completion::Throw(e)) {
+                    Ok(Ctl::Jump(t)) => frame.ip = t,
+                    Ok(Ctl::Return(rv)) => done!(Flow::Return(rv)),
+                    Ok(_) => unreachable!(),
+                    Err(e) => done!(Flow::Throw(e)),
+                },
+            }
+        }
         loop {
             if let Some(budget) = self.op_budget.as_mut() {
                 if *budget == 0 {
@@ -592,44 +624,17 @@ impl Vm {
                     }
                 }
             }
-            if let Some(e) = frame.pending_throw.take() {
-                match self.do_completion(&mut frame, Completion::Throw(e)) {
-                    Ok(Ctl::Jump(t)) => {
-                        frame.ip = t;
-                        continue;
-                    }
-                    Ok(Ctl::Return(v)) => done!(Flow::Return(v)),
-                    Ok(_) => unreachable!("throw completion yields jump or return"),
-                    Err(e) => done!(Flow::Throw(e)),
-                }
-            }
-            // Injected `.return(v)` on a suspended generator: dispatch a Return
-            // completion so enclosing `finally` blocks run before the frame ends
-            // (a `yield` in a finally re-suspends here as a normal yield).
-            if let Some(v) = frame.pending_return.take() {
-                match self.do_completion(&mut frame, Completion::Return(v)) {
-                    Ok(Ctl::Jump(t)) => {
-                        frame.ip = t;
-                        continue;
-                    }
-                    Ok(Ctl::Return(rv)) => done!(Flow::Return(rv)),
-                    Ok(_) => unreachable!("return completion yields jump or return"),
-                    Err(e) => match self.do_completion(&mut frame, Completion::Throw(e)) {
-                        Ok(Ctl::Jump(t)) => {
-                            frame.ip = t;
-                            continue;
-                        }
-                        Ok(Ctl::Return(rv)) => done!(Flow::Return(rv)),
-                        Ok(_) => unreachable!(),
-                        Err(e) => done!(Flow::Throw(e)),
-                    },
-                }
-            }
             let ip = frame.ip;
             if ip >= proto.code.len() {
                 done!(Flow::Return(Value::Undefined));
             }
             frame.ip = ip + 1;
+            // Phase-0 dynamic opcode-frequency instrumentation. Compiled out
+            // entirely in the default build (the `op-histogram` feature is OFF
+            // by default), so the shipping interpreter loop is byte-identical;
+            // see `opstats.rs` and `docs/interpreter-optimization.md` §Phase 0.
+            #[cfg(feature = "op-histogram")]
+            crate::opstats::record(&proto.code[ip]);
             // Dispatch on a borrow of the instruction. `proto` is a clone of the
             // frame's (immutable) `FuncProto` Rc taken once per frame, so the
             // borrow is independent of `frame` and costs no per-op `Op::clone`
@@ -990,6 +995,17 @@ impl Vm {
                     return Err(self.throw_reference("Cannot access binding before initialization"));
                 }
                 push!(v);
+            }
+            // Fused `LoadCell(cell) ; LoadConst(konst)` (see `fuse.rs`). Identical
+            // to running the two ops: the cell read keeps the same TDZ check, then
+            // the constant is pushed.
+            Op::LoadCellConst { cell, konst } => {
+                let v = frame.cells[*cell as usize].borrow().clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                push!(v);
+                push!(self.const_val(frame, *konst));
             }
             Op::StoreCell(i) => {
                 let v = pop!();
@@ -2366,6 +2382,48 @@ impl Vm {
                 let v = pop!();
                 if !self.to_boolean(&v) {
                     return Ok(Ctl::Jump(*t as usize));
+                }
+            }
+            // Fused `cmp ; JumpIfFalse` (see `fuse.rs`). Each arm reuses the
+            // SAME helper as the standalone comparison op, so coercion and any
+            // thrown error are identical; the boolean the pair would materialize
+            // is consumed directly by the branch instead of round-tripping the
+            // operand stack. `to_boolean(Bool(r)) == r`, so the branch condition
+            // matches `JumpIfFalse` exactly.
+            Op::CmpBranchFalse { cmp, target } => {
+                let b = pop!();
+                let a = pop!();
+                let r = match cmp {
+                    CmpOp::Eq => self.loose_equals(&a, &b)?,
+                    CmpOp::Ne => !self.loose_equals(&a, &b)?,
+                    CmpOp::StrictEq => self.strict_equals(&a, &b),
+                    CmpOp::StrictNe => !self.strict_equals(&a, &b),
+                    CmpOp::Lt => self.less_than(&a, &b)? == Some(true),
+                    CmpOp::Gt => self.less_than(&b, &a)? == Some(true),
+                    CmpOp::Le => self.less_than(&b, &a)? == Some(false),
+                    CmpOp::Ge => self.less_than(&a, &b)? == Some(false),
+                };
+                if !r {
+                    return Ok(Ctl::Jump(*target as usize));
+                }
+            }
+            // Fused `cmp ; JumpIfTrue` — mirror of `CmpBranchFalse`; branches when
+            // the comparison is true. Same helpers, so behavior is identical.
+            Op::CmpBranchTrue { cmp, target } => {
+                let b = pop!();
+                let a = pop!();
+                let r = match cmp {
+                    CmpOp::Eq => self.loose_equals(&a, &b)?,
+                    CmpOp::Ne => !self.loose_equals(&a, &b)?,
+                    CmpOp::StrictEq => self.strict_equals(&a, &b),
+                    CmpOp::StrictNe => !self.strict_equals(&a, &b),
+                    CmpOp::Lt => self.less_than(&a, &b)? == Some(true),
+                    CmpOp::Gt => self.less_than(&b, &a)? == Some(true),
+                    CmpOp::Le => self.less_than(&b, &a)? == Some(false),
+                    CmpOp::Ge => self.less_than(&a, &b)? == Some(false),
+                };
+                if r {
+                    return Ok(Ctl::Jump(*target as usize));
                 }
             }
             Op::JumpIfFalsyPeek(t) => {

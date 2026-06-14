@@ -271,6 +271,21 @@ pub struct EvalScopeDesc {
     pub strict: bool,
 }
 
+/// Which comparison a fused [`Op::CmpBranchFalse`] performs. Each maps 1:1 to a
+/// standalone comparison opcode and is evaluated with the identical helper, so
+/// fusion never changes coercion or thrown-error behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    StrictEq,
+    StrictNe,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+}
+
 /// The instruction set. Jump targets are absolute indices into `code`, patched
 /// by the compiler.
 #[derive(Clone, Debug)]
@@ -305,6 +320,15 @@ pub enum Op {
     LoadLocal(u32),
     StoreLocal(u32),
     LoadCell(u32),
+    /// Superinstruction (fusion): `LoadCell(cell) ; LoadConst(konst)` — the
+    /// single most frequent adjacent pair in the Phase-0 survey (~8.9% of
+    /// executed pairs), e.g. the `i`, `n` operand loads of a `i < n` loop test.
+    /// Performs the cell read (including the same TDZ check as `LoadCell`, so a
+    /// use-before-init still throws identically) then pushes the constant.
+    LoadCellConst {
+        cell: u32,
+        konst: u32,
+    },
     StoreCell(u32),
     /// As [`StoreCell`], but throws a ReferenceError if the cell is still in the
     /// Temporal Dead Zone (assignment to a `let`/`const`/`class` binding before
@@ -610,6 +634,25 @@ pub enum Op {
     Jump(u32),
     JumpIfTrue(u32),
     JumpIfFalse(u32),
+    /// Superinstruction (peephole fusion, see `fuse.rs`): a comparison
+    /// immediately followed by `JumpIfFalse(target)` — the dominant loop-test
+    /// idiom (`for (…; i < n; …)`). Pops `b` then `a`, computes the comparison
+    /// using the **same** helpers as the standalone comparison op (identical
+    /// coercion and thrown errors), and branches to `target` when the result is
+    /// false. Exactly equivalent to the two-op sequence: the intermediate
+    /// boolean the pair would push/pop is never observable to JS.
+    CmpBranchFalse {
+        cmp: CmpOp,
+        target: u32,
+    },
+    /// Superinstruction: a comparison immediately followed by `JumpIfTrue` —
+    /// the bottom-tested loop back-edge (`do { … } while (cond)`) and negated
+    /// conditions. Mirror of [`Op::CmpBranchFalse`]; branches to `target` when
+    /// the comparison is true. Same helpers, same coercion/throw behavior.
+    CmpBranchTrue {
+        cmp: CmpOp,
+        target: u32,
+    },
     /// Pop; jump if falsy but leave the value if truthy (for `&&`). Actually we
     /// implement `&&`/`||`/`??` with peek-based jumps below.
     JumpIfFalsyPeek(u32), // peek top; if falsy jump (keep), else pop

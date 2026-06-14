@@ -11,6 +11,7 @@ pub mod compiler;
 pub mod convert;
 pub mod dom;
 pub mod exec;
+pub mod fuse;
 pub mod gc;
 pub mod generator;
 pub mod host;
@@ -18,6 +19,10 @@ pub mod iter;
 pub mod journal;
 pub mod jsx;
 pub mod module;
+/// Phase-0 opcode-frequency instrumentation; present only under the
+/// `op-histogram` feature (see `docs/interpreter-optimization.md`).
+#[cfg(feature = "op-histogram")]
+pub mod opstats;
 pub mod promise;
 pub mod proxy;
 pub mod realm;
