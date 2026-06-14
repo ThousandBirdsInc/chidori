@@ -101,6 +101,17 @@ TypeScript.
 
 ## ⚡️ Quick Start
 
+### 0. Scaffold a starter (optional)
+
+```bash
+chidori init my-agent --template chat     # or: --template worker
+# then follow the printed run command, e.g. `chidori chat agent.ts`
+```
+
+`chidori init` writes a ready-to-run agent (omit `--template` to pick
+interactively): **chat** is a conversational assistant, **worker** is an
+autonomous tool-using loop.
+
 ### 1. Write an agent
 
 ```ts
@@ -169,8 +180,12 @@ human-in-the-loop pause/resume loop — see
 - **Conversational chat assistants** — `chidori.conversation()` owns a multi-turn
   dialogue: `chat.say(message)` per turn, or `chat.loop()` for an interactive
   `input()`-driven session. Every turn is durable and prefix-cached, so the whole
-  conversation replays for $0. Or just run `chidori chat` for a built-in REPL — no
-  agent file needed. See [Core concepts](./docs/core-concepts.md#conversational-agents).
+  conversation replays for $0. Or run `chidori chat` (optionally through an agent
+  file) for a built-in REPL. See [Core concepts](./docs/core-concepts.md#conversational-agents).
+- **Autonomous tool-using agents** — a worker that loops (think → call a tool →
+  observe → repeat) until the task is done, via `context.respond()` and
+  `toolResult(...)`. Scaffold one with `chidori init --template worker`; see
+  [`examples/agents/worker.ts`](./examples/agents/worker.ts).
 - **Durable, resumable agents** — runs survive crashes and restarts and resume
   exactly where they paused. See [How replay works](./docs/replay.md).
 - **Deterministic tests & free debugging** — check in a checkpoint and replay it

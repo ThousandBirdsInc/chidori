@@ -6,21 +6,30 @@ API, and event-driven HTTP handlers.
 ## 1. One-shot CLI
 
 ```bash
+chidori init my-agent --template chat         # scaffold a starter project (or: worker)
 chidori demo                                  # pick from runnable examples
 chidori run agents/my_agent.ts --input key=value
 chidori run agents/my_agent.ts --input '{"complex": "input"}'
 chidori chat --system "You are concise."     # interactive multi-turn chat REPL
+chidori chat agents/chat.ts                   # chat through a conversational agent file
 chidori check agents/my_agent.ts            # validate without running
 chidori tools --dir tools/                   # list available tools
 ```
 
+`chidori init [dir] --template chat|worker` scaffolds a starter project — an
+agent and README, plus a `tools/` directory for the `worker` template. Omit
+`--template` to choose interactively. The `chat` template is a conversational
+agent; the `worker` template is an autonomous tool-using loop.
+
 `chidori chat` is a built-in conversational REPL backed by
-[`chidori.conversation()`](./core-concepts.md#conversational-agents) — no agent
-file required. Each turn is a durable host call and streams its reply
-token-by-token; the prior turns replay for free, so only your newest message
-reaches the provider. Flags: `--system`, `--model`, and `--tools <dir>`
-(discovered tools are offered to the model on every turn). Type `exit`/`quit` or
-Ctrl-D to end.
+[`chidori.conversation()`](./core-concepts.md#conversational-agents). With no
+agent file it chats with the model directly; pass a conversational agent file
+(one accepting `{ messages, system?, model?, tools? }` and returning
+`{ transcript }` or `{ history }`, like the `chat` init template) to chat through
+it. Each turn is a durable host call and streams its reply token-by-token; the
+prior turns replay for free, so only your newest message reaches the provider.
+Flags: `--system`, `--model`, and `--tools <dir>` (discovered tools are offered
+to the model on every turn). Type `exit`/`quit` or Ctrl-D to end.
 
 ## 2. HTTP server (event-driven + session API)
 

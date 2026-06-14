@@ -1,4 +1,5 @@
 mod acp;
+mod init;
 mod mcp;
 mod mem_guard;
 mod policy;
@@ -91,10 +92,26 @@ enum Commands {
         file: PathBuf,
     },
 
-    /// Start an interactive multi-turn chat with the model — no agent file
-    /// needed. Each turn is a durable host call; replaying the prior turns is
-    /// free, so only your newest message hits the provider.
+    /// Scaffold a new agent project from a starter template.
+    Init {
+        /// Directory to scaffold into (defaults to the current directory).
+        dir: Option<PathBuf>,
+
+        /// Template to use: `chat` or `worker`. Omit to pick interactively.
+        #[arg(short, long)]
+        template: Option<String>,
+    },
+
+    /// Start an interactive multi-turn chat. With no AGENT it chats with the
+    /// model directly (no agent file); pass a conversational agent file to chat
+    /// through it. Each turn is a durable host call; replaying the prior turns
+    /// is free, so only your newest message hits the provider.
     Chat {
+        /// Optional conversational agent .ts file to chat through. It must accept
+        /// `{ messages, system?, model?, tools? }` and return `{ transcript }`
+        /// (or `{ history }`) — see the `chat` init template.
+        agent: Option<PathBuf>,
+
         /// System prompt for the assistant.
         #[arg(short, long)]
         system: Option<String>,
@@ -265,12 +282,23 @@ fn main() {
             (result, false)
         }
         Commands::Demo => (cmd_demo(), false),
+        Commands::Init { dir, template } => (
+            init::run(
+                &dir.unwrap_or_else(|| PathBuf::from(".")),
+                template.as_deref(),
+            ),
+            false,
+        ),
         Commands::Chat {
+            agent,
             system,
             model,
             tools,
             untrusted,
-        } => (cmd_chat(system, model, &tools, untrusted), false),
+        } => (
+            cmd_chat(agent.as_deref(), system, model, &tools, untrusted),
+            false,
+        ),
         Commands::Check { file } => (cmd_check(&file), true),
         Commands::Tools { dir } => (cmd_tools(&dir), false),
         Commands::Stats { dir } => (cmd_stats(dir.as_deref()), false),
@@ -801,32 +829,18 @@ fn cmd_run_stream(
     }
 }
 
-/// A minimal conversational agent, driven one turn at a time by `cmd_chat`.
-/// It rebuilds the dialogue from the full message list each call; with replay
-/// every prior turn returns its recorded result for free, so only the newest
-/// message reaches the provider.
-const CHAT_AGENT_SRC: &str = r#"
-export async function agent(input, chidori) {
-    const chat = chidori.conversation({
-        system: input.system || "You are a helpful, concise assistant.",
-        model: input.model || undefined,
-        tools: Array.isArray(input.tools) && input.tools.length ? input.tools : undefined,
-        compact: { budgetTokens: 8000 },
-    });
-    const messages = Array.isArray(input.messages) ? input.messages : [];
-    for (const message of messages) {
-        await chat.say(message);
-    }
-    return { transcript: chat.history() };
-}
-"#;
-
 /// Interactive multi-turn chat REPL. Owns the loop in Rust so all terminal I/O
 /// is single-threaded (no streaming/stdin races): each turn appends the user's
 /// line, re-runs the conversational agent with the prior call log replayed
-/// (prior turns are free), prints the newest assistant reply, and carries the
+/// (prior turns are free), streams the newest assistant reply, and carries the
 /// merged call log forward.
+///
+/// With no `agent`, a built-in conversational agent (`init::CHAT_AGENT_SRC`) is
+/// written to a temp file. With an `agent`, that file is used instead; it must
+/// follow the same contract — accept `{ messages, system?, model?, tools? }` and
+/// return `{ transcript }` or `{ history }` of `{ role, text }` turns.
 fn cmd_chat(
+    agent: Option<&std::path::Path>,
     system: Option<String>,
     model: Option<String>,
     extra_tool_dirs: &[PathBuf],
@@ -835,22 +849,35 @@ fn cmd_chat(
     use crate::runtime::context::RuntimeEvent;
     use std::io::Write;
 
-    // The agent source lives in a temp file so it works from an installed
-    // binary (no dependency on the examples/ tree).
-    let dir = std::env::temp_dir().join(format!("chidori-chat-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).context("Failed to create chat temp dir")?;
-    let agent_path = dir.join("chat_agent.ts");
-    std::fs::write(&agent_path, CHAT_AGENT_SRC).context("Failed to write chat agent")?;
+    // Resolve the agent file and the base directory for tool/template discovery.
+    // A built-in agent goes to a temp file (so it works from an installed binary
+    // with no source tree); a provided agent runs in place.
+    let mut temp_dir: Option<PathBuf> = None;
+    let (agent_path, base_dir) = match agent {
+        Some(path) => (
+            path.to_path_buf(),
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf(),
+        ),
+        None => {
+            let dir = std::env::temp_dir().join(format!("chidori-chat-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).context("Failed to create chat temp dir")?;
+            let path = dir.join("chat_agent.ts");
+            std::fs::write(&path, init::CHAT_AGENT_SRC).context("Failed to write chat agent")?;
+            temp_dir = Some(dir);
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            (path, cwd)
+        }
+    };
 
-    // Build the runtime against the current working directory (tools/templates
-    // resolve from where the user launched `chidori chat`).
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let providers = Arc::new(ProviderRegistry::from_env());
-    let template_engine = Arc::new(TemplateEngine::new(&cwd));
+    let template_engine = Arc::new(TemplateEngine::new(&base_dir));
     let tokio_rt =
         Arc::new(tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?);
 
-    let mut tool_dirs: Vec<PathBuf> = vec![cwd.join("tools")];
+    let mut tool_dirs: Vec<PathBuf> = vec![base_dir.join("tools")];
     tool_dirs.extend(extra_tool_dirs.iter().cloned());
     let tools =
         Arc::new(ToolRegistry::load_from_dirs(&tool_dirs).unwrap_or_else(|_| ToolRegistry::new()));
@@ -933,6 +960,7 @@ fn cmd_chat(
                     let reply = result
                         .output
                         .get("transcript")
+                        .or_else(|| result.output.get("history"))
                         .and_then(Value::as_array)
                         .and_then(|turns| {
                             turns.iter().rev().find(|turn| {
@@ -955,7 +983,9 @@ fn cmd_chat(
         }
     }
 
-    let _ = std::fs::remove_dir_all(&dir);
+    if let Some(temp_dir) = temp_dir {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
     Ok(())
 }
 

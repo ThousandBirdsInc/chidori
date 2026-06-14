@@ -399,8 +399,8 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
                     const result = await ctx.respond(turnOptions(perTurn));
                     ctx = result.context;
                     const reply =
-                        result.response && typeof result.response.text === "string"
-                            ? result.response.text
+                        result.response && typeof result.response.content === "string"
+                            ? result.response.content
                             : "";
                     turns.push({ role: "assistant", text: reply });
                     return result.response;
