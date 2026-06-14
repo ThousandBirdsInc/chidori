@@ -1,16 +1,19 @@
-# DOM behind the host boundary — a prototype
+# DOM behind the host boundary
 
-This is a working prototype of an idea: put a DOM behind the *same journaled
-host boundary* that Chidori already uses for `prompt`, `tool`, and `fetch`, and
-you get a UI runtime where the agent's reasoning, its LLM/tool calls, the
-resulting DOM mutations, and the user's interactions all live in one
-deterministic, replayable journal.
+Put a DOM behind the *same journaled host boundary* that Chidori already uses
+for `prompt`, `tool`, and `fetch`, and you get a UI runtime where the agent's
+reasoning, its LLM/tool calls, the resulting DOM mutations, and the user's
+interactions all live in one deterministic, replayable journal.
 
 It lives in [`crates/chidori-js/src/dom.rs`](../crates/chidori-js/src/dom.rs),
 with tests in
-[`crates/chidori-js/tests/dom_prototype.rs`](../crates/chidori-js/tests/dom_prototype.rs)
-and a runnable demo in
-[`crates/chidori-js/examples/dom_session.rs`](../crates/chidori-js/examples/dom_session.rs)
+[`tests/dom_prototype.rs`](../crates/chidori-js/tests/dom_prototype.rs) (core
+journals),
+[`tests/dom_serious.rs`](../crates/chidori-js/tests/dom_serious.rs) (full event
+model, captured measurements, DOM API, no-leak), and
+[`tests/dom_host_integration.rs`](../crates/chidori-js/tests/dom_host_integration.rs)
+(one shared causal journal), plus a runnable demo in
+[`examples/dom_session.rs`](../crates/chidori-js/examples/dom_session.rs)
 (`cargo run -p chidori-js --example dom_session`).
 
 ## The core observation
@@ -36,41 +39,64 @@ integration is mostly *modeling*, not new machinery.
 * A Rust-side **virtual DOM arena** (`Dom`) addressed by sequential node ids, so
   ids are stable and replay-deterministic.
 * DOM-shaped JavaScript bindings installed as `document` / `window` globals:
-  `createElement`, `createTextNode`, `getElementById`, `body`,
-  `documentElement`; and on nodes: `appendChild`, `insertBefore`, `removeChild`,
-  `remove`, `setAttribute` / `getAttribute` / `removeAttribute`,
-  `addEventListener`, plus `textContent`, `id`, `className`, `tagName`,
-  `parentNode`, `childNodes` accessors.
+  `createElement`, `createTextNode`, `getElementById`, `querySelector(All)`,
+  `getElementsByTagName` / `ClassName`, `body`, `documentElement`; and on nodes:
+  `appendChild`, `insertBefore`, `removeChild`, `replaceChild`, `remove`,
+  `cloneNode`, `hasChildNodes`; `setAttribute` / `getAttribute` / `hasAttribute`
+  / `removeAttribute`; `addEventListener` / `removeEventListener` /
+  `dispatchEvent`; `getBoundingClientRect` and the `offset*` / `client*` /
+  `scroll*` size reads; plus accessors `textContent`, `id`, `className`,
+  `classList` (add/remove/toggle/contains), `tagName`, `nodeName`, `nodeType`,
+  `parentNode`, `children`, `childNodes`, `firstChild`, `lastChild`,
+  `nextSibling`, `previousSibling`, `innerHTML`, `outerHTML`, and
+  `querySelector(All)`.
 * A **mutation journal** — every structural/attribute/text change as an ordered,
   serde-serializable `Mutation`. This *is* the render protocol: ship it to a dumb
   renderer, or diff it against a prior run.
-* An **event journal** — every delivered event as an ordered `EventRecord`.
-* `DomHandle`, the embedder-facing seam: `drain_mutations()` (incremental render
-  batch), `dispatch_event()` / `replay_events()`, `render_html()`,
-  `element_by_id()`.
+* An **event journal** — every delivered event as an ordered `EventRecord`, with
+  full W3C dispatch (capture → target → bubble, `stopPropagation`,
+  `stopImmediatePropagation`, `preventDefault`/`defaultPrevented`, `once` and
+  `capture` listener options, de-duped registration, `removeEventListener`).
+* A **measurement journal** — every layout read as a `MeasureRecord`, addressed
+  by `(node, kind, seq)`. In record mode it is queried from a
+  [`MeasurementProvider`] (the renderer-side seam) and journaled; in replay mode
+  it is served from the journal with no provider. This is the captured-read
+  direction, modelled exactly like `fetch`/`crypto`/timers.
+* `SessionJournal` — `events + measurements`, the complete non-deterministic
+  input log for a run, serde-serializable so a session is persistable JSON.
+* `DomHandle`, the embedder-facing seam: `drain_mutations()`, `dispatch_event()`
+  / `replay()`, `journal()` / `load_journal_for_replay()`,
+  `set_measurement_provider()`, `render_html()`, `element_by_id()`,
+  `strong_count()` (lifetime assertion).
 
 ## The property that makes it interesting
 
-Events are the *only* source of non-determinism, and they are journaled.
-Therefore **the same program + the same event journal ⇒ byte-identical mutation
-journal + rendered HTML.** The tests assert exactly this:
+Events and measurements are the *only* sources of non-determinism, and both are
+journaled. Therefore **the same program + the same `SessionJournal` ⇒
+byte-identical mutation journal + rendered HTML.** The tests assert exactly this:
 
 * `mutation_stream_is_deterministic` — two independent runs match byte-for-byte.
 * `replaying_event_journal_reproduces_state` — record a session, replay only its
   event journal against a fresh document, get the identical mutation journal.
 * `prefix_replay_is_a_time_machine` — replaying the first *k* events lands on the
   exact state the live session had after *k* interactions (fork-at-step-*k*).
+* `measurements_replay_from_journal_without_a_provider` — a captured layout read
+  comes back identical in replay with the renderer entirely absent.
 
 That is the substrate for time-travel debugging of a UI, "record a session,
 replay it as a test", and fork-and-edit-rerun of an agent-built interface.
 
 ## How it slots into Chidori's durable host
 
-Today the engine's durability seam is `Engine::install_chidori_effects(dispatch)`
-in [`crates/chidori-js/src/lib.rs`](../crates/chidori-js/src/lib.rs): host effects
+The engine's durability seam is `Engine::install_chidori_effects(dispatch)` in
+[`crates/chidori-js/src/lib.rs`](../crates/chidori-js/src/lib.rs): host effects
 forward through `dispatch(effect, json) -> json`, and the main crate routes those
-through its call-log + journal (record/replay). The DOM joins that seam in two
-directions:
+through its call-log + journal (record/replay). The DOM joins that seam in three
+directions — and
+[`tests/dom_host_integration.rs`](../crates/chidori-js/tests/dom_host_integration.rs)
+exercises it: an agent calls `chidori.prompt()` to decide a UI, the render batch
+and the user click both flow through the *same* dispatcher, and the resulting log
+is one causal sequence `prompt → dom_render → dom_event → log`.
 
 1. **Output (render) as a captured effect.** Flush a `drain_mutations()` batch
    through `dispatch("dom_render", batch)`. On replay it is a no-op served from
@@ -79,31 +105,41 @@ directions:
 2. **Input (events) as a captured host input.** An inbound UI event becomes a
    recorded host result, exactly like `chidori.input()` today: in record mode the
    real event is journaled and delivered via `dispatch_event`; on replay the
-   journaled event is re-delivered, reproducing the mutation stream. This reuses
-   the existing pending/resume machinery — a UI event is just another thing the
-   agent durably waits on.
+   journaled event is re-delivered, reproducing the mutation stream.
+3. **Measurement (layout) as a captured read.** `getBoundingClientRect` & the
+   `offset*`/`client*` reads route through the `MeasurementProvider` in record
+   mode (journaled) and the journal in replay mode — the same record/replay
+   contract, for the one DOM read that genuinely depends on a renderer.
 
 Combined with the existing branch / edit-and-rerun flow
 (`src/runtime/host_branch.rs`), an agent iterating on a UI gets: fork at an
 interaction, edit the generating code, re-run — with all upstream LLM work
 replayed for free and the UI diff falling out of the mutation journal.
 
-## Known gaps (prototype, honestly scoped)
+## Closed gaps
 
-* **No layout/CSS/measurement.** `getBoundingClientRect` & friends are the other
-  captured-input direction and need a real renderer in the loop during record;
-  not implemented here.
-* **Wrapper cache leaks the arena.** Node wrappers are cached on the node for
-  stable JS identity (`el.parentNode === container` holds). That cache forms an
-  `Rc` cycle with the native closures it holds, so the document is freed at
-  session end, not incrementally. A production version would hold wrappers via
-  GC-traced host slots (the engine has a cycle collector in `gc.rs`; wiring DOM
-  nodes into it is the clean fix).
-* **Event model is minimal.** Dispatch bubbles target→root; no capture phase, no
-  `stopPropagation`/`stopImmediatePropagation`, no default actions.
+The earlier sketch's gaps are now closed and tested:
+
+* **Layout/measurement** — implemented as the captured-read journal above
+  (`MeasurementProvider`, `MeasureRecord`); record/replay verified end to end.
+* **No arena leak** — wrapper closures hold a `Weak` back-reference; the embedder
+  `DomHandle` holds the sole strong `Rc`, so the VM/realm never keeps the document
+  alive and it drops deterministically when the handle drops. The
+  `document_arena_is_not_leaked_into_a_cycle` test asserts `strong_count() == 1`
+  after building 25 listener-bearing nodes referenced from JS. (Trade-off: if the
+  embedder drops the handle while JS still holds `document`, DOM calls degrade to
+  graceful no-ops returning `undefined` rather than touching freed state.)
+* **Full event model** — capture/target/bubble phases, propagation control,
+  `preventDefault`, `once`/`capture` options, `removeEventListener`, de-duped
+  registration, and JS-side `dispatchEvent`.
+
+## Remaining limitation
+
 * **Engine performance.** A from-scratch RC-GC interpreter is well below V8 —
   fine for agent-driven iteration and server-authoritative diffing, not aimed at
-  60fps client-side production apps.
+  60fps client-side production apps. This is inherent to the engine, not the DOM
+  layer. (`innerHTML`/`outerHTML` are getters only — there is no HTML *parser*;
+  build trees via the DOM API, not by assigning markup strings.)
 
 ## The artifact, in one line
 
