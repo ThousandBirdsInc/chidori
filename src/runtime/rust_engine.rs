@@ -427,6 +427,13 @@ fn run_module(
                     .ok_or_else(|| format!("unsupported node: builtin '{specifier}'"))?;
                 return Ok((format!("node:{name}"), src.to_string()));
             }
+            // Vendored packages (react, react-dom/server, …): self-contained UMD
+            // wrapped as an ES module. Served from the built-in registry so
+            // `import React from 'react'` resolves without a node_modules install.
+            if let Some(resolved) = crate::runtime::typescript::builtins::vendored_module(specifier)
+            {
+                return Ok(resolved);
+            }
             load_module_source(specifier, importer_key)
         };
 
@@ -1562,6 +1569,49 @@ mod tests {
         let backend2 = test_backend(ctx2.clone(), Arc::new(ToolRegistry::new()));
         let out2 = run_agent(&path, src, &serde_json::json!({ "name": "world" }), &backend2).unwrap();
         assert_eq!(out2, out, "replay diverged from the recorded run");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_imports_react_and_renders_jsx() {
+        // P1: `import React from 'react'` resolves to the vendored bundle, JSX in
+        // a `.tsx` agent lowers to React.createElement, and react-dom/server
+        // renders it — all through the real runtime, no node_modules install.
+        let dir = std::env::temp_dir().join(format!("chidori-react-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.tsx");
+        let src = r#"
+            import React from "react";
+            import { renderToStaticMarkup } from "react-dom/server";
+
+            function Card(props: { title: string; items: string[] }) {
+                return (
+                    <div className="card">
+                        <h2>{props.title}</h2>
+                        <ul>{props.items.map((t) => <li>{t}</li>)}</ul>
+                        <button>Subscribe</button>
+                    </div>
+                );
+            }
+
+            export async function agent(input: { title: string }) {
+                const html = renderToStaticMarkup(
+                    React.createElement(Card, { title: input.title, items: ["A", "B"] }),
+                );
+                return { html };
+            }
+        "#;
+        std::fs::write(&path, src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx, Arc::new(ToolRegistry::new()));
+        let out = run_agent(&path, src, &serde_json::json!({ "title": "Pro" }), &backend).unwrap();
+        let html = out["html"].as_str().unwrap();
+        assert!(html.contains("<div class=\"card\">"), "got: {html}");
+        assert!(html.contains("<h2>Pro</h2>"), "got: {html}");
+        assert!(html.contains("<li>A</li><li>B</li>"), "got: {html}");
+        assert!(html.contains("<button>Subscribe</button>"), "got: {html}");
 
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -37,13 +37,22 @@ What's wired for building on top of (vs. the engine-only prototype):
   classic `React.createElement` (+ strips TS), and the runtime transpile emits
   classic JSX for `.tsx` agents. Kept out of the conformance-critical default
   compile path.
+- **P1 — npm package resolution: DONE.** `import React from 'react'` and
+  `import { renderToStaticMarkup } from 'react-dom/server'` resolve through a
+  built-in vendored-package registry (`builtins::vendored_module`): the
+  self-contained UMD bundles are wrapped as synthetic ES modules (the same
+  mechanism as the `node:` shims), so they link on the ESM-only engine without a
+  `node_modules` install. (npm `react` is CommonJS with internal `require`, which
+  can't link directly — the UMD is self-contained, so that's what we serve.)
+  Tested end to end: a `.tsx` agent imports React + react-dom/server, authors
+  JSX, and renders through the real runtime (`agent_imports_react_and_renders_jsx`).
 
 Deliberately deferred (rationale, not blockers):
 
-- **npm `react` module resolution.** The engine *runs* real React and JSX
-  authoring works, but the runtime doesn't yet auto-resolve `import React from
-  'react'` — an agent supplies React in scope. Shipping/embedding React in the
-  runtime loader is a product decision, not a missing primitive.
+- **General CommonJS `node_modules` interop.** Arbitrary CJS packages with
+  internal `require()` aren't linked (the engine is ESM-only). Self-contained
+  ESM/UMD packages work; full CJS interop (a synchronous `require` graph) is a
+  larger, separate feature.
 - **Ask/deny policy gating for `dom_render`.** The effect is already recorded in
   the (capability-bearing) journal; render output is benign, so a default-allow
   ask/deny knob is a small `RuntimePolicy` config follow-up, deferred to avoid

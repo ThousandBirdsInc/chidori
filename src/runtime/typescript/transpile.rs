@@ -328,6 +328,17 @@ pub fn validate_imports(
             continue;
         }
 
+        // Vendored packages (react, react-dom/server, …) are served from the
+        // built-in registry, not the filesystem — accept them under any policy.
+        if crate::runtime::typescript::builtins::is_vendored_package(&specifier) {
+            imports.push(ModuleImport {
+                specifier,
+                resolved_path: None,
+                kind: None,
+            });
+            continue;
+        }
+
         match policy {
             TypeScriptImportPolicy::None => {
                 anyhow::bail!(
