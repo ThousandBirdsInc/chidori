@@ -2800,6 +2800,13 @@ impl Vm {
     // =====================================================================
 
     pub fn op_add(&mut self, a: Value, b: Value) -> Result<Value, Value> {
+        // Fast path: Number + Number. Both operands are already primitive
+        // numbers, so ToPrimitive/ToNumeric are identities and the spec result
+        // is simply their f64 sum — skip the coercion ceremony entirely. This
+        // is by far the most common `+` in numeric code (loop counters, sums).
+        if let (Value::Number(x), Value::Number(y)) = (&a, &b) {
+            return Ok(Value::Number(x + y));
+        }
         let pa = self.to_primitive(&a, Hint::Default)?;
         let pb = self.to_primitive(&b, Hint::Default)?;
         if matches!(pa, Value::String(_)) || matches!(pb, Value::String(_)) {
@@ -2860,6 +2867,12 @@ impl Vm {
 
     /// Binary numeric/bigint operation (already-popped operands).
     pub fn arith(&mut self, a: Value, b: Value, kind: ArithKind) -> Result<Value, Value> {
+        // Fast path: Number op Number — already numeric primitives, so
+        // ToNumeric is the identity. Covers the common arithmetic/bitwise mix
+        // in hot loops without the per-operand ToPrimitive/ToNumber detour.
+        if let (Value::Number(x), Value::Number(y)) = (&a, &b) {
+            return Ok(number_arith(*x, *y, kind));
+        }
         let xa = self.to_numeric(&a)?;
         let xb = self.to_numeric(&b)?;
         match (&xa, &xb) {
@@ -2937,6 +2950,16 @@ impl Vm {
 
     /// Unary numeric/bigint operation.
     pub fn unary_arith(&mut self, a: Value, kind: UnaryKind) -> Result<Value, Value> {
+        // Fast path: a Number is already numeric, so ToNumeric is the identity.
+        // `++`/`--` on loop counters route through here every iteration.
+        if let Value::Number(n) = a {
+            return Ok(Value::Number(match kind {
+                UnaryKind::Neg => -n,
+                UnaryKind::Inc => n + 1.0,
+                UnaryKind::Dec => n - 1.0,
+                UnaryKind::BitNot => !crate::vm::to_int32(n) as f64,
+            }));
+        }
         let x = self.to_numeric(&a)?;
         match x {
             Value::BigInt(n) => {
@@ -3010,6 +3033,15 @@ impl Vm {
 
     /// Abstract Relational Comparison `a < b`. Returns None for unordered (NaN).
     pub fn less_than(&mut self, a: &Value, b: &Value) -> Result<Option<bool>, Value> {
+        // Fast path: Number < Number (loop bounds, sorts). NaN is unordered, so
+        // either operand being NaN yields `None` (all of `<`/`>`/`<=`/`>=`
+        // become false at the call site), matching the general path below.
+        if let (Value::Number(x), Value::Number(y)) = (a, b) {
+            if x.is_nan() || y.is_nan() {
+                return Ok(None);
+            }
+            return Ok(Some(x < y));
+        }
         let pa = self.to_primitive(a, Hint::Number)?;
         let pb = self.to_primitive(b, Hint::Number)?;
         if let (Value::String(x), Value::String(y)) = (&pa, &pb) {
