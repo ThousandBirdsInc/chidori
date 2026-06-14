@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::bytecode::{Const, FuncKind, Op, UpvalueSource};
+use crate::bytecode::{CmpOp, Const, FuncKind, Op, UpvalueSource};
 use crate::value::*;
 use crate::vm::*;
 
@@ -2371,6 +2371,29 @@ impl Vm {
                 let v = pop!();
                 if !self.to_boolean(&v) {
                     return Ok(Ctl::Jump(*t as usize));
+                }
+            }
+            // Fused `cmp ; JumpIfFalse` (see `fuse.rs`). Each arm reuses the
+            // SAME helper as the standalone comparison op, so coercion and any
+            // thrown error are identical; the boolean the pair would materialize
+            // is consumed directly by the branch instead of round-tripping the
+            // operand stack. `to_boolean(Bool(r)) == r`, so the branch condition
+            // matches `JumpIfFalse` exactly.
+            Op::CmpBranchFalse { cmp, target } => {
+                let b = pop!();
+                let a = pop!();
+                let r = match cmp {
+                    CmpOp::Eq => self.loose_equals(&a, &b)?,
+                    CmpOp::Ne => !self.loose_equals(&a, &b)?,
+                    CmpOp::StrictEq => self.strict_equals(&a, &b),
+                    CmpOp::StrictNe => !self.strict_equals(&a, &b),
+                    CmpOp::Lt => self.less_than(&a, &b)? == Some(true),
+                    CmpOp::Gt => self.less_than(&b, &a)? == Some(true),
+                    CmpOp::Le => self.less_than(&b, &a)? == Some(false),
+                    CmpOp::Ge => self.less_than(&a, &b)? == Some(false),
+                };
+                if !r {
+                    return Ok(Ctl::Jump(*target as usize));
                 }
             }
             Op::JumpIfFalsyPeek(t) => {

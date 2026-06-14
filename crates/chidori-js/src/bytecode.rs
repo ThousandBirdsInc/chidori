@@ -271,6 +271,21 @@ pub struct EvalScopeDesc {
     pub strict: bool,
 }
 
+/// Which comparison a fused [`Op::CmpBranchFalse`] performs. Each maps 1:1 to a
+/// standalone comparison opcode and is evaluated with the identical helper, so
+/// fusion never changes coercion or thrown-error behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    StrictEq,
+    StrictNe,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+}
+
 /// The instruction set. Jump targets are absolute indices into `code`, patched
 /// by the compiler.
 #[derive(Clone, Debug)]
@@ -610,6 +625,17 @@ pub enum Op {
     Jump(u32),
     JumpIfTrue(u32),
     JumpIfFalse(u32),
+    /// Superinstruction (peephole fusion, see `fuse.rs`): a comparison
+    /// immediately followed by `JumpIfFalse(target)` — the dominant loop-test
+    /// idiom (`for (…; i < n; …)`). Pops `b` then `a`, computes the comparison
+    /// using the **same** helpers as the standalone comparison op (identical
+    /// coercion and thrown errors), and branches to `target` when the result is
+    /// false. Exactly equivalent to the two-op sequence: the intermediate
+    /// boolean the pair would push/pop is never observable to JS.
+    CmpBranchFalse {
+        cmp: CmpOp,
+        target: u32,
+    },
     /// Pop; jump if falsy but leave the value if truthy (for `&&`). Actually we
     /// implement `&&`/`||`/`??` with peek-based jumps below.
     JumpIfFalsyPeek(u32), // peek top; if falsy jump (keep), else pop

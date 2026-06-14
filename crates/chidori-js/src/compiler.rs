@@ -22,17 +22,25 @@ use oxc::span::SourceType;
 use crate::bytecode::*;
 
 pub fn compile_script(src: &str) -> Result<FuncProto, String> {
-    compile_script_impl(src, false)
+    compile_script_impl(src, false, true)
+}
+
+/// Compile a script with the peephole op-fusion pass (`fuse.rs`) toggled. Used by
+/// the differential test that runs the same program with `fuse = true` and
+/// `fuse = false` and asserts byte-identical observable behavior. Production code
+/// uses [`compile_script`] (fusion on).
+pub fn compile_script_opts(src: &str, fuse: bool) -> Result<FuncProto, String> {
+    compile_script_impl(src, false, fuse)
 }
 
 /// Compile global eval code — `(0,eval)(src)`: identical to a script except
 /// `return` is illegal and the global `var`/function bindings it creates are
 /// DELETABLE (CreateGlobalVarBinding with D=true).
 pub fn compile_indirect_eval(src: &str) -> Result<FuncProto, String> {
-    compile_script_impl(src, true)
+    compile_script_impl(src, true, true)
 }
 
-fn compile_script_impl(src: &str, as_eval: bool) -> Result<FuncProto, String> {
+fn compile_script_impl(src: &str, as_eval: bool, fuse: bool) -> Result<FuncProto, String> {
     let allocator = Allocator::default();
     // Parse as a *script* (the JS default): sloppy unless a `"use strict"`
     // directive (or a class/`module` context) makes it strict. The conformance
@@ -71,6 +79,7 @@ fn compile_script_impl(src: &str, as_eval: bool) -> Result<FuncProto, String> {
     let mut c = Compiler::new();
     c.source = src.to_string();
     c.toplevel_is_eval = as_eval;
+    c.fuse = fuse;
     // A construct the lowering step rejects is, for our purposes, a syntax/early
     // error — surface it as SyntaxError so it is reported consistently.
     c.compile_toplevel(&program).map_err(|e| {
@@ -643,6 +652,11 @@ struct Compiler {
     /// here may not contain `arguments` (spec early error). Cleared on entry
     /// to non-arrow nested functions, which own their own `arguments`.
     in_field_initializer: bool,
+    /// Run the peephole op-fusion pass (`fuse.rs`) on every finished function's
+    /// bytecode. Always on in production; disabled only by `compile_script_opts`
+    /// for the differential test that proves fused and unfused bytecode execute
+    /// identically.
+    fuse: bool,
 }
 
 impl Compiler {
@@ -664,6 +678,7 @@ impl Compiler {
             pending_method: false,
             in_class_body: false,
             in_field_initializer: false,
+            fuse: true,
         }
     }
 
@@ -1582,10 +1597,18 @@ impl Compiler {
     }
 
     fn finish(&self, fc: FnCtx) -> FuncProto {
+        // Peephole op-fusion (Phase 2): every finished function — top-level and
+        // nested — flows through here, so applying it once covers the whole
+        // proto tree. Disabled only by the differential test.
+        let code = if self.fuse {
+            crate::fuse::fuse_code(fc.code)
+        } else {
+            fc.code
+        };
         FuncProto {
             eval_scopes: fc.eval_scopes.clone(),
             name: fc.name,
-            code: fc.code,
+            code,
             consts: fc.consts,
             num_locals: 0,
             num_cells: fc.num_cells,

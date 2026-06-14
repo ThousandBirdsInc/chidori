@@ -1,11 +1,12 @@
 # Interpreter performance: optimizing `chidori-js` without a JIT
 
 > **Status:** Phase 0 (measurement) **done** — see §11. Phase 1 (hot-loop
-> cleanup) **partially landed** — see §12. Phases 2–4 proposed. This document
-> scopes a body of work to make the `chidori-js` bytecode interpreter materially
-> faster **without** adding a JIT, while preserving the engine's three
-> load-bearing invariants: **zero `unsafe`**, **no new heavyweight
-> dependencies**, and **byte-identical deterministic replay**.
+> cleanup) **partially landed** — see §12. Phase 2 (op fusion) **first fusion
+> landed** — see §13. Phases 3–4 proposed. This document scopes a body of work
+> to make the `chidori-js` bytecode interpreter materially faster **without**
+> adding a JIT, while preserving the engine's three load-bearing invariants:
+> **zero `unsafe`**, **no new heavyweight dependencies**, and **byte-identical
+> deterministic replay**.
 >
 > **Related:** [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md)
 > (historical engine plan), [`docs/conformance.md`](./conformance.md) (Test262
@@ -210,7 +211,7 @@ the per-phase wins clear a "worth the complexity" bar.
 
 **Risk:** low. No bytecode or semantics change. Pure internal refactor.
 
-### Phase 2 — Superinstructions / op fusion
+### Phase 2 — Superinstructions / op fusion — first fusion landed (§13)
 
 **Goal:** fewer dispatches and less operand-stack traffic for the most common
 sequences.
@@ -562,7 +563,79 @@ coverage, rather than as a risky isolated refactor of the engine's hottest code.
 
 ---
 
-## 13. References
+## 13. Phase 2 results (op fusion — compare-and-branch, 2026-06-14)
+
+**Landed: the first superinstruction.** The Phase-0 survey's top dynamic
+finding was the loop-test idiom `LoadCell(i); LoadConst(n); <cmp>; JumpIfFalse`,
+with the `<cmp>; JumpIfFalse` pair alone covering a few percent of all executed
+opcodes (`Lt; JumpIfFalse` ≈ 4.6%, plus the other comparisons). Phase 2 adds:
+
+- **A new fused opcode** `CmpBranchFalse { cmp, target }` (`bytecode.rs`) and its
+  handler (`exec.rs`), covering all eight comparison ops (`< <= > >= == != ===
+  !==`). The handler reuses the **exact** same `less_than` / `loose_equals` /
+  `strict_equals` helpers as the standalone ops, so coercion and any thrown error
+  are byte-identical; the intermediate boolean — never observable to JS — is
+  consumed directly by the branch instead of round-tripping the operand stack.
+- **A peephole fusion pass** (`fuse.rs`) run once per finished `FuncProto` in
+  `Compiler::finish` (so it covers the whole proto tree). It rewrites
+  `cmp; JumpIfFalse` → `CmpBranchFalse`, which shortens the bytecode and so
+  shifts absolute jump targets; the pass remaps every code-offset operand through
+  a single `for_each_ip` accessor (the lone source of truth for "which operands
+  are instruction pointers"), which deliberately skips handler-stack *depths*
+  (`CompletionJump.boundary`) and `u32::MAX` "none" sentinels. A window is fused
+  only when nothing jumps into its interior; jumps to its head stay valid because
+  entering the fused op is equivalent to entering the sequence at its head.
+- **A fusion toggle** (`compile_script_opts(src, fuse)`): fusion is on in
+  production, off only for the differential test — so an unfused fallback always
+  exists, as required by the plan.
+
+**Correctness — gated by four independent layers, all green:**
+
+1. **Test262 (the authoritative gate), zero regressions.** Ran the committed
+   baseline gate over the areas fusion most stresses — every loop form (`for`,
+   `for-of`, `for-in`, `while`, `do-while`), `switch`, `try`/`catch`/`finally`,
+   labeled statements, `break`/`continue`, all comparison operators, conditional,
+   logical, and optional-chaining: **2062 tests, 0 regressions, 0 new failures,
+   0 progressions** (2016 pass / 29 fail / 17 skip = 98.58%, identical to
+   baseline). A mis-remapped jump in any of these would have flipped a passing
+   test to failing.
+2. **Differential test** (`tests/fusion.rs`): a control-flow-heavy corpus
+   (nested loops with `break`/`continue`, labeled break, `try/finally`, `switch`,
+   optional chaining, short-circuit ops, a coercion that throws) run with fusion
+   on vs. off — **byte-identical** console output and thrown errors. Plus a
+   structural check that fusion actually fires and the toggle genuinely suppresses
+   it.
+3. **Fusion-pass unit tests** (`fuse.rs`): target remapping after shortening, the
+   "don't fuse into a jump target" guard, and `boundary`-is-not-an-ip.
+4. **Full `chidori-js` suite**, including `tests/replay.rs` **record→replay
+   byte-identity** and the generator/`try-finally` paths — unchanged and green
+   with fusion on by default.
+
+No `unsafe`, no new dependencies. Determinism is preserved: fusion perturbs
+neither values nor host-call ordering, and the toggle-equivalence (fused ≡
+unfused) is exactly the property §7.3 calls for.
+
+**Performance — structural win, not separately benchmarked here.** Per §7.6 this
+environment cannot resolve a few-percent delta. The change is a strict reduction
+on the hottest path: for every fused pair it removes one interpreter dispatch
+(one fewer trip through the central `match` → one fewer likely branch mispredict)
+and one operand-stack push/pop of the intermediate boolean. Phase 0 put the
+fuseable `cmp; JumpIfFalse` pairs at several percent of all executed opcodes,
+concentrated in loop conditions — the code that runs most. Quantifying the
+wall-clock win belongs on a quiet, pinned machine (§7.6); the deterministic proxy
+(executed-op count drops by the number of fused pairs) is reproducible and
+already implied by the fusion firing.
+
+**Next fusions (same infrastructure, ranked by Phase 0 data).** The pass and the
+`for_each_ip` remap now exist, so further superinstructions are incremental:
+`LoadCell/LoadLocal; LoadConst` (8.9%), load+binop (`LoadConst; Sub` 3.6%), and a
+`JumpIfTrue` compare-and-branch variant. Each follows the same recipe: add the
+fused op, reuse the standalone helper in its handler, extend `fuse.rs`, and add a
+differential-corpus case.
+
+---
+
+## 14. References
 
 - [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md) — engine
   decision record (pure Rust, no `boa_engine`, replay-not-snapshot).
