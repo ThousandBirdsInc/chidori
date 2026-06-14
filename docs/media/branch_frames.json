@@ -1,0 +1,234 @@
+[
+  {
+    "kind": "branches",
+    "caption": "1 · Agent branches into 3 experiments",
+    "note": "each variant rendered (real React) + tested in its own engine",
+    "cards": [
+      {
+        "label": "Variant A",
+        "html": "<div class=\"card light\"><h2>Starter</h2><div class=\"price\">$9/mo</div><ul><li>Email support</li><li>1 project</li></ul><button>Sign up</button></div>",
+        "tests": [
+          {
+            "name": "has heading",
+            "pass": true
+          },
+          {
+            "name": "shows a $ price",
+            "pass": true
+          },
+          {
+            "name": "lists ≥2 features",
+            "pass": true
+          },
+          {
+            "name": "has a CTA",
+            "pass": true
+          }
+        ],
+        "features": 2,
+        "chosen": false
+      },
+      {
+        "label": "Variant B",
+        "html": "<div class=\"card light\"><h2>Pro</h2><div class=\"price\">$29/mo</div><ul><li>Priority support</li><li>Unlimited projects</li><li>Deterministic replay</li><li>Time-travel debugging</li></ul><button>Subscribe</button></div>",
+        "tests": [
+          {
+            "name": "has heading",
+            "pass": true
+          },
+          {
+            "name": "shows a $ price",
+            "pass": true
+          },
+          {
+            "name": "lists ≥2 features",
+            "pass": true
+          },
+          {
+            "name": "has a CTA",
+            "pass": true
+          }
+        ],
+        "features": 4,
+        "chosen": false
+      },
+      {
+        "label": "Variant C",
+        "html": "<div class=\"card dark\"><h2>Team</h2><div class=\"price\">$99/mo</div><ul><li>SSO &amp; SAML</li><li>Audit log</li><li>Replay sharing</li></ul><button>Get started</button></div>",
+        "tests": [
+          {
+            "name": "has heading",
+            "pass": true
+          },
+          {
+            "name": "shows a $ price",
+            "pass": true
+          },
+          {
+            "name": "lists ≥2 features",
+            "pass": true
+          },
+          {
+            "name": "has a CTA",
+            "pass": true
+          }
+        ],
+        "features": 3,
+        "chosen": false
+      }
+    ],
+    "html": "",
+    "tests": [],
+    "question": "",
+    "answer": "",
+    "model_calls": 3,
+    "inputs": 0,
+    "replayed": 0
+  },
+  {
+    "kind": "feedback",
+    "caption": "2 · Asks the user for feedback",
+    "note": "the human's answer is a captured host input — recorded in the journal",
+    "cards": [
+      {
+        "label": "Variant A",
+        "html": "<div class=\"card light\"><h2>Starter</h2><div class=\"price\">$9/mo</div><ul><li>Email support</li><li>1 project</li></ul><button>Sign up</button></div>",
+        "tests": [
+          {
+            "name": "has heading",
+            "pass": true
+          },
+          {
+            "name": "shows a $ price",
+            "pass": true
+          },
+          {
+            "name": "lists ≥2 features",
+            "pass": true
+          },
+          {
+            "name": "has a CTA",
+            "pass": true
+          }
+        ],
+        "features": 2,
+        "chosen": false
+      },
+      {
+        "label": "Variant B",
+        "html": "<div class=\"card light\"><h2>Pro</h2><div class=\"price\">$29/mo</div><ul><li>Priority support</li><li>Unlimited projects</li><li>Deterministic replay</li><li>Time-travel debugging</li></ul><button>Subscribe</button></div>",
+        "tests": [
+          {
+            "name": "has heading",
+            "pass": true
+          },
+          {
+            "name": "shows a $ price",
+            "pass": true
+          },
+          {
+            "name": "lists ≥2 features",
+            "pass": true
+          },
+          {
+            "name": "has a CTA",
+            "pass": true
+          }
+        ],
+        "features": 4,
+        "chosen": true
+      },
+      {
+        "label": "Variant C",
+        "html": "<div class=\"card dark\"><h2>Team</h2><div class=\"price\">$99/mo</div><ul><li>SSO &amp; SAML</li><li>Audit log</li><li>Replay sharing</li></ul><button>Get started</button></div>",
+        "tests": [
+          {
+            "name": "has heading",
+            "pass": true
+          },
+          {
+            "name": "shows a $ price",
+            "pass": true
+          },
+          {
+            "name": "lists ≥2 features",
+            "pass": true
+          },
+          {
+            "name": "has a CTA",
+            "pass": true
+          }
+        ],
+        "features": 3,
+        "chosen": false
+      }
+    ],
+    "html": "",
+    "tests": [],
+    "question": "Which direction should we ship — A, B, or C — and any tweak?",
+    "answer": "ship B · CTA → “Start free trial”",
+    "model_calls": 3,
+    "inputs": 1,
+    "replayed": 0
+  },
+  {
+    "kind": "converged",
+    "caption": "3 · Converges on B · 4/4 green",
+    "note": "applied the user's tweak (CTA → “Start free trial”) and shipped",
+    "cards": [],
+    "html": "<div class=\"card light\"><h2>Pro</h2><div class=\"price\">$29/mo</div><ul><li>Priority support</li><li>Unlimited projects</li><li>Deterministic replay</li><li>Time-travel debugging</li></ul><button>Start free trial</button></div>",
+    "tests": [
+      {
+        "name": "has heading",
+        "pass": true
+      },
+      {
+        "name": "shows a $ price",
+        "pass": true
+      },
+      {
+        "name": "lists ≥2 features",
+        "pass": true
+      },
+      {
+        "name": "has a CTA",
+        "pass": true
+      }
+    ],
+    "question": "",
+    "answer": "",
+    "model_calls": 4,
+    "inputs": 1,
+    "replayed": 0
+  },
+  {
+    "kind": "replay",
+    "caption": "4 · Record == replay",
+    "note": "replayed 5 calls incl. the human's answer → byte-identical, 0 new model calls ✓",
+    "cards": [],
+    "html": "<div class=\"card light\"><h2>Pro</h2><div class=\"price\">$29/mo</div><ul><li>Priority support</li><li>Unlimited projects</li><li>Deterministic replay</li><li>Time-travel debugging</li></ul><button>Start free trial</button></div>",
+    "tests": [
+      {
+        "name": "has heading",
+        "pass": true
+      },
+      {
+        "name": "shows a $ price",
+        "pass": true
+      },
+      {
+        "name": "lists ≥2 features",
+        "pass": true
+      },
+      {
+        "name": "has a CTA",
+        "pass": true
+      }
+    ],
+    "question": "",
+    "answer": "",
+    "model_calls": 4,
+    "inputs": 1,
+    "replayed": 5
+  }
+]
