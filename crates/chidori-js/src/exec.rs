@@ -567,6 +567,38 @@ impl Vm {
         // re-deriving it (and so it doesn't alias the `&mut frame` step needs).
         let proto = frame.func.proto.clone();
         let mut interrupt_poll: u32 = 0;
+        // Injected resume completions are handled ONCE here, before the loop,
+        // rather than re-checked on every iteration. `pending_throw` /
+        // `pending_return` are set only by `resume_frame_throw` /
+        // `resume_frame_return` immediately before `run_frame` (see `promise.rs`)
+        // — a generator `.return(v)` or an awaited rejection delivered at resume.
+        // Nothing inside the loop ever sets them, so once taken here they stay
+        // `None` for the rest of the frame; this lifts two per-op `Option::take`s
+        // off the hot path. A resolved `Jump` just positions `frame.ip` and falls
+        // into the loop. (Phase 1, docs/interpreter-optimization.md.)
+        if let Some(e) = frame.pending_throw.take() {
+            match self.do_completion(&mut frame, Completion::Throw(e)) {
+                Ok(Ctl::Jump(t)) => frame.ip = t,
+                Ok(Ctl::Return(v)) => done!(Flow::Return(v)),
+                Ok(_) => unreachable!("throw completion yields jump or return"),
+                Err(e) => done!(Flow::Throw(e)),
+            }
+        } else if let Some(v) = frame.pending_return.take() {
+            // Injected `.return(v)` on a suspended generator: dispatch a Return
+            // completion so enclosing `finally` blocks run before the frame ends
+            // (a `yield` in a finally re-suspends as a normal yield in the loop).
+            match self.do_completion(&mut frame, Completion::Return(v)) {
+                Ok(Ctl::Jump(t)) => frame.ip = t,
+                Ok(Ctl::Return(rv)) => done!(Flow::Return(rv)),
+                Ok(_) => unreachable!("return completion yields jump or return"),
+                Err(e) => match self.do_completion(&mut frame, Completion::Throw(e)) {
+                    Ok(Ctl::Jump(t)) => frame.ip = t,
+                    Ok(Ctl::Return(rv)) => done!(Flow::Return(rv)),
+                    Ok(_) => unreachable!(),
+                    Err(e) => done!(Flow::Throw(e)),
+                },
+            }
+        }
         loop {
             if let Some(budget) = self.op_budget.as_mut() {
                 if *budget == 0 {
@@ -590,39 +622,6 @@ impl Vm {
                             done!(Flow::Throw(self.throw_range("execution interrupted")));
                         }
                     }
-                }
-            }
-            if let Some(e) = frame.pending_throw.take() {
-                match self.do_completion(&mut frame, Completion::Throw(e)) {
-                    Ok(Ctl::Jump(t)) => {
-                        frame.ip = t;
-                        continue;
-                    }
-                    Ok(Ctl::Return(v)) => done!(Flow::Return(v)),
-                    Ok(_) => unreachable!("throw completion yields jump or return"),
-                    Err(e) => done!(Flow::Throw(e)),
-                }
-            }
-            // Injected `.return(v)` on a suspended generator: dispatch a Return
-            // completion so enclosing `finally` blocks run before the frame ends
-            // (a `yield` in a finally re-suspends here as a normal yield).
-            if let Some(v) = frame.pending_return.take() {
-                match self.do_completion(&mut frame, Completion::Return(v)) {
-                    Ok(Ctl::Jump(t)) => {
-                        frame.ip = t;
-                        continue;
-                    }
-                    Ok(Ctl::Return(rv)) => done!(Flow::Return(rv)),
-                    Ok(_) => unreachable!("return completion yields jump or return"),
-                    Err(e) => match self.do_completion(&mut frame, Completion::Throw(e)) {
-                        Ok(Ctl::Jump(t)) => {
-                            frame.ip = t;
-                            continue;
-                        }
-                        Ok(Ctl::Return(rv)) => done!(Flow::Return(rv)),
-                        Ok(_) => unreachable!(),
-                        Err(e) => done!(Flow::Throw(e)),
-                    },
                 }
             }
             let ip = frame.ip;

@@ -1,10 +1,11 @@
 # Interpreter performance: optimizing `chidori-js` without a JIT
 
-> **Status:** Phase 0 (measurement) **done** — see §11; Phases 1–4 proposed.
-> This document scopes a body of work to make the `chidori-js` bytecode
-> interpreter materially faster **without** adding a JIT, while preserving the
-> engine's three load-bearing invariants: **zero `unsafe`**, **no new
-> heavyweight dependencies**, and **byte-identical deterministic replay**.
+> **Status:** Phase 0 (measurement) **done** — see §11. Phase 1 (hot-loop
+> cleanup) **partially landed** — see §12. Phases 2–4 proposed. This document
+> scopes a body of work to make the `chidori-js` bytecode interpreter materially
+> faster **without** adding a JIT, while preserving the engine's three
+> load-bearing invariants: **zero `unsafe`**, **no new heavyweight
+> dependencies**, and **byte-identical deterministic replay**.
 >
 > **Related:** [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md)
 > (historical engine plan), [`docs/conformance.md`](./conformance.md) (Test262
@@ -190,7 +191,7 @@ instrument that compiles out of the shipping build — see §11.)
 **Exit criteria:** baseline numbers committed; a documented decision on whether
 the per-phase wins clear a "worth the complexity" bar.
 
-### Phase 1 — Hot-loop cleanup (flatten dispatch, de-overhead the common path)
+### Phase 1 — Hot-loop cleanup (flatten dispatch, de-overhead the common path) — partially landed (§12)
 
 **Goal:** remove avoidable per-op work without changing the bytecode.
 
@@ -350,6 +351,17 @@ Layered, with each phase required to pass all layers before merge.
   about real-world impact.
 - Add a CI **performance smoke** (informational, non-gating initially) that flags
   large interpreter-loop regressions on PRs.
+- **Measurement environment matters.** Phase 1 found that the cloud dev/CI
+  container cannot reliably resolve deltas below ~10–15%: re-running the *same
+  unchanged binary* produced criterion "regressions" of +3% to +8% and absolute
+  times that drifted upward run-over-run (e.g. `fib_recursive` 74→84→90 ms across
+  three identical runs). Consequences: (a) per-phase wins smaller than the noise
+  floor (Phase 1 is one) **cannot** be validated by wall-clock here — run on a
+  quiet, frequency-pinned, single-tenant machine; (b) the CI perf-smoke must
+  compare against a **same-session** baseline (measure HEAD and HEAD~ back to
+  back in one job), never a stored historical baseline; (c) for small changes,
+  prefer a **deterministic proxy** (executed-op count, branch count, allocations)
+  over wall-clock — these are reproducible and environment-independent.
 
 ### 7.6 Memory & safety
 
@@ -509,7 +521,48 @@ must be measured, not assumed, before committing to Phases 3–4.**
 
 ---
 
-## 12. References
+## 12. Phase 1 results (hot-loop cleanup, 2026-06-14)
+
+**Landed.** Hoisted the per-iteration `pending_throw` / `pending_return` checks
+out of `run_frame`'s dispatch loop (`exec.rs`). These two `Option::take`s ran on
+*every* opcode, but the fields are set **only** by `resume_frame_throw` /
+`resume_frame_return` immediately before `run_frame` (a generator `.return(v)`
+or an awaited rejection delivered at resume) and are never re-set inside the
+loop — so they can only ever fire on the first iteration. The hoist handles them
+once, before the loop, removing two branches from the hot path per executed op.
+
+**Correctness — fully validated.** The whole `chidori-js` suite is green,
+including the paths that exercise the hoisted fields: `tests/async_gen.rs`
+(generators / `await`), `tests/replay.rs` (**record→replay byte-identity**,
+suspend→persist→restore→resume), `tests/gc.rs`, the DOM suites, and
+`tests/smoke.rs`. No `unsafe`, no new deps, no bytecode change. The one
+acknowledged difference — the op-budget counter decrements one fewer time on the
+rare resume-with-injection path — is not observable to JS (the budget is a
+coarse, uncatchable safety bound, not a spec-visible quantity).
+
+**Performance — below the noise floor here; not separately claimed.** Hoisting
+two predictable-branch `Option::take`s is expected to be a sub-few-percent win,
+and the dev/CI container's noise floor (~10–15%, see §7.6) is far larger:
+re-running the unchanged binary swung +3–8% and times drifted upward across
+identical runs. So this environment **cannot** confirm or deny the delta. The
+change is kept on its own merits: it is a strict reduction in per-iteration work
+*and* a clarity win — it codifies in one place the invariant that `pending_*`
+are resume-only signals. The measurable dispatch wins come from Phase 2.
+
+**Scoping note — the "flatten the double dispatch" half is folded into Phase 2.**
+The other Phase 1 idea (collapse the `step → Result<Ctl, Value>` round-trip the
+outer loop immediately re-matches) was deliberately *not* done as a standalone
+step. Doing it safely requires either (a) a sweeping change to `step`'s return
+type touching hundreds of return sites, or (b) duplicating trivial-op logic into
+a loop fast-path — and (b) creates exactly the kind of two-sources-of-truth
+divergence risk the determinism contract warns against. Phase 2's superinstruction
+work restructures dispatch *by construction* (new fused ops handled in the loop),
+so the flatten lands there with a single source of truth and direct test
+coverage, rather than as a risky isolated refactor of the engine's hottest code.
+
+---
+
+## 13. References
 
 - [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md) — engine
   decision record (pure Rust, no `boa_engine`, replay-not-snapshot).
