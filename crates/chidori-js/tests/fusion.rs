@@ -81,18 +81,14 @@ fn fusion_preserves_observable_behavior() {
     }
 }
 
-/// Count `CmpBranchFalse` ops across a proto and its nested function templates.
-fn count_fused(proto: &FuncProto) -> usize {
-    let here = proto
-        .code
-        .iter()
-        .filter(|op| matches!(op, Op::CmpBranchFalse { .. }))
-        .count();
+/// Count ops matching `pred` across a proto and its nested function templates.
+fn count_ops(proto: &FuncProto, pred: fn(&Op) -> bool) -> usize {
+    let here = proto.code.iter().filter(|op| pred(op)).count();
     let nested: usize = proto
         .consts
         .iter()
         .map(|c| match c {
-            Const::Func(f) => count_fused(f),
+            Const::Func(f) => count_ops(f, pred),
             _ => 0,
         })
         .sum();
@@ -101,18 +97,31 @@ fn count_fused(proto: &FuncProto) -> usize {
 
 #[test]
 fn fusion_actually_fires() {
-    // A plain counting loop must fuse its `i < n ; JumpIfFalse` condition...
+    // A plain counting loop fuses both its operand-load pair (`LoadCell ;
+    // LoadConst`) and its compare-and-branch (`Lt ; JumpIfFalse`).
     let fused = compile_script_opts("for (let i = 0; i < 10; i++) { i + 1; }", true).unwrap();
     assert!(
-        count_fused(&fused) >= 1,
+        count_ops(&fused, |op| matches!(op, Op::CmpBranchFalse { .. })) >= 1,
         "expected the loop condition to fuse into CmpBranchFalse"
     );
-    // ...and the toggle must genuinely suppress it (proving the unfused fallback
-    // exercised by the differential test is really unfused).
-    let unfused = compile_script_opts("for (let i = 0; i < 10; i++) { i + 1; }", false).unwrap();
-    assert_eq!(
-        count_fused(&unfused),
-        0,
-        "fusion toggle off must emit no CmpBranchFalse"
+    assert!(
+        count_ops(&fused, |op| matches!(op, Op::LoadCellConst { .. })) >= 1,
+        "expected the operand loads to fuse into LoadCellConst"
     );
+    // A bottom-tested loop fuses its back-edge into CmpBranchTrue.
+    let dw = compile_script_opts("let i = 0; do { i++; } while (i < 5);", true).unwrap();
+    assert!(
+        count_ops(&dw, |op| matches!(op, Op::CmpBranchTrue { .. })) >= 1,
+        "expected the do/while back-edge to fuse into CmpBranchTrue"
+    );
+    // The toggle must genuinely suppress every fusion (so the unfused side of the
+    // differential test is really unfused).
+    let unfused = compile_script_opts("for (let i = 0; i < 10; i++) { i + 1; }", false).unwrap();
+    let any_fused = count_ops(&unfused, |op| {
+        matches!(
+            op,
+            Op::CmpBranchFalse { .. } | Op::CmpBranchTrue { .. } | Op::LoadCellConst { .. }
+        )
+    });
+    assert_eq!(any_fused, 0, "fusion toggle off must emit no fused ops");
 }

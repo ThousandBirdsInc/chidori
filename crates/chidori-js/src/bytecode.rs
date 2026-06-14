@@ -320,6 +320,15 @@ pub enum Op {
     LoadLocal(u32),
     StoreLocal(u32),
     LoadCell(u32),
+    /// Superinstruction (fusion): `LoadCell(cell) ; LoadConst(konst)` — the
+    /// single most frequent adjacent pair in the Phase-0 survey (~8.9% of
+    /// executed pairs), e.g. the `i`, `n` operand loads of a `i < n` loop test.
+    /// Performs the cell read (including the same TDZ check as `LoadCell`, so a
+    /// use-before-init still throws identically) then pushes the constant.
+    LoadCellConst {
+        cell: u32,
+        konst: u32,
+    },
     StoreCell(u32),
     /// As [`StoreCell`], but throws a ReferenceError if the cell is still in the
     /// Temporal Dead Zone (assignment to a `let`/`const`/`class` binding before
@@ -633,6 +642,14 @@ pub enum Op {
     /// false. Exactly equivalent to the two-op sequence: the intermediate
     /// boolean the pair would push/pop is never observable to JS.
     CmpBranchFalse {
+        cmp: CmpOp,
+        target: u32,
+    },
+    /// Superinstruction: a comparison immediately followed by `JumpIfTrue` —
+    /// the bottom-tested loop back-edge (`do { … } while (cond)`) and negated
+    /// conditions. Mirror of [`Op::CmpBranchFalse`]; branches to `target` when
+    /// the comparison is true. Same helpers, same coercion/throw behavior.
+    CmpBranchTrue {
         cmp: CmpOp,
         target: u32,
     },

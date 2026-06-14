@@ -55,7 +55,7 @@ fn for_each_ip(op: &mut Op, mut f: impl FnMut(&mut u32)) {
         | Op::JumpIfTruthyPeek(t)
         | Op::JumpIfNullishPeek(t)
         | Op::JumpIfNullish(t) => f(t),
-        Op::CmpBranchFalse { target, .. } => f(target),
+        Op::CmpBranchFalse { target, .. } | Op::CmpBranchTrue { target, .. } => f(target),
         Op::PushTryHandler { catch, finally } => {
             f(catch);
             if *finally != u32::MAX {
@@ -73,7 +73,7 @@ fn for_each_ip(op: &mut Op, mut f: impl FnMut(&mut u32)) {
     }
 }
 
-/// The comparison kind a `cmp ; JumpIfFalse` pair fuses to, if `op` is one of the
+/// The comparison kind a `cmp ; Jump…` pair fuses to, if `op` is one of the
 /// fuseable comparison opcodes.
 fn cmp_of(op: &Op) -> Option<CmpOp> {
     Some(match op {
@@ -87,6 +87,24 @@ fn cmp_of(op: &Op) -> Option<CmpOp> {
         Op::Ge => CmpOp::Ge,
         _ => return None,
     })
+}
+
+/// If the adjacent pair `(a, b)` is a recognized fusion, return the single op it
+/// fuses to. Each fused op must be observably equivalent to running `a` then `b`
+/// (the `exec.rs` handlers reuse the standalone ops' helpers). The jump targets
+/// carried here are still OLD indices; the caller remaps them afterwards.
+fn try_fuse(a: &Op, b: &Op) -> Option<Op> {
+    match (a, b) {
+        // Highest-frequency pair in the Phase-0 survey (~8.9%).
+        (Op::LoadCell(cell), Op::LoadConst(konst)) => Some(Op::LoadCellConst {
+            cell: *cell,
+            konst: *konst,
+        }),
+        // Compare-and-branch: the loop-test idiom and its bottom-tested mirror.
+        (_, Op::JumpIfFalse(t)) => cmp_of(a).map(|cmp| Op::CmpBranchFalse { cmp, target: *t }),
+        (_, Op::JumpIfTrue(t)) => cmp_of(a).map(|cmp| Op::CmpBranchTrue { cmp, target: *t }),
+        _ => None,
+    }
 }
 
 /// Rewrite `code` in place, fusing recognized adjacent sequences. Safe to call
@@ -123,21 +141,19 @@ pub fn fuse_code(code: Vec<Op>) -> Vec<Op> {
     let mut old_to_new = vec![0u32; n + 1];
     let mut i = 0usize;
     while i < n {
-        // Candidate: `cmp ; JumpIfFalse(target)` with nothing jumping between them.
-        if i + 1 < n {
-            if let (Some(cmp), Op::JumpIfFalse(target)) = (cmp_of(&code[i]), &code[i + 1]) {
-                if !is_target[i + 1] {
-                    old_to_new[i] = out.len() as u32;
-                    // The fused op replaces both slots; old index i+1 is interior
-                    // and never a jump target, so its mapping is unobservable.
-                    old_to_new[i + 1] = out.len() as u32;
-                    out.push(Op::CmpBranchFalse {
-                        cmp,
-                        target: *target,
-                    });
-                    i += 2;
-                    continue;
-                }
+        // A window may fuse only when nothing jumps into its interior (`i + 1`):
+        // jumps to its head stay valid (entering the fused op == entering the
+        // sequence at its head), but a jump landing on the second op needs that
+        // op to remain independently addressable.
+        if i + 1 < n && !is_target[i + 1] {
+            if let Some(fused) = try_fuse(&code[i], &code[i + 1]) {
+                old_to_new[i] = out.len() as u32;
+                // The fused op replaces both slots; old index i+1 is interior and
+                // never a jump target, so its mapping is unobservable.
+                old_to_new[i + 1] = out.len() as u32;
+                out.push(fused);
+                i += 2;
+                continue;
             }
         }
         old_to_new[i] = out.len() as u32;

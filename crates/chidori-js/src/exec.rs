@@ -996,6 +996,17 @@ impl Vm {
                 }
                 push!(v);
             }
+            // Fused `LoadCell(cell) ; LoadConst(konst)` (see `fuse.rs`). Identical
+            // to running the two ops: the cell read keeps the same TDZ check, then
+            // the constant is pushed.
+            Op::LoadCellConst { cell, konst } => {
+                let v = frame.cells[*cell as usize].borrow().clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                push!(v);
+                push!(self.const_val(frame, *konst));
+            }
             Op::StoreCell(i) => {
                 let v = pop!();
                 *frame.cells[*i as usize].borrow_mut() = v;
@@ -2393,6 +2404,25 @@ impl Vm {
                     CmpOp::Ge => self.less_than(&a, &b)? == Some(false),
                 };
                 if !r {
+                    return Ok(Ctl::Jump(*target as usize));
+                }
+            }
+            // Fused `cmp ; JumpIfTrue` — mirror of `CmpBranchFalse`; branches when
+            // the comparison is true. Same helpers, so behavior is identical.
+            Op::CmpBranchTrue { cmp, target } => {
+                let b = pop!();
+                let a = pop!();
+                let r = match cmp {
+                    CmpOp::Eq => self.loose_equals(&a, &b)?,
+                    CmpOp::Ne => !self.loose_equals(&a, &b)?,
+                    CmpOp::StrictEq => self.strict_equals(&a, &b),
+                    CmpOp::StrictNe => !self.strict_equals(&a, &b),
+                    CmpOp::Lt => self.less_than(&a, &b)? == Some(true),
+                    CmpOp::Gt => self.less_than(&b, &a)? == Some(true),
+                    CmpOp::Le => self.less_than(&b, &a)? == Some(false),
+                    CmpOp::Ge => self.less_than(&a, &b)? == Some(false),
+                };
+                if r {
                     return Ok(Ctl::Jump(*target as usize));
                 }
             }
