@@ -351,6 +351,7 @@ fn run_module(
             .eval(&prelude)
             .map_err(|e| anyhow::anyhow!("installing node: builtin prelude: {e}"))?;
     }
+    let backend_for_dom = backend.clone();
     let backend = backend.clone();
     let dispatch: Rc<dyn Fn(&str, &Value) -> std::result::Result<Value, String>> =
         Rc::new(move |effect: &str, args: &Value| backend.dispatch(effect, args));
@@ -375,24 +376,71 @@ fn run_module(
     engine
         .eval(crate::runtime::typescript::helpers::FETCH_POLYFILL)
         .map_err(|e| anyhow::anyhow!("installing fetch polyfill: {e}"))?;
+
+    // Virtual DOM (additive): agents get a `document` / `window`, and a durable
+    // `chidori.renderDOM()` that flushes the pending mutation batch through the
+    // host boundary as a journaled `dom_render` effect — recorded live, served
+    // from the journal on replay (so resume/branch reproduce the rendered output
+    // without re-flushing). Building the DOM tree is a pure re-derivation of the
+    // re-run, so node ids stay deterministic across replay.
+    let dom_handle = engine.install_dom();
+    {
+        let backend_dom = backend_for_dom;
+        let dom = dom_handle.clone();
+        let dom_dispatch: Rc<dyn Fn(&str, &Value) -> std::result::Result<Value, String>> =
+            Rc::new(move |name: &str, _args: &Value| {
+                let ctx = backend_dom
+                    .runtime_ctx()
+                    .ok_or_else(|| "dom: no runtime context".to_string())?;
+                match name {
+                    "__chidori_dom_render" => {
+                        crate::runtime::host_core::execute_durable_json_call(
+                            ctx,
+                            "dom_render",
+                            Value::Null,
+                            || {
+                                Ok(serde_json::to_value(dom.drain_render_batch())
+                                    .unwrap_or(Value::Null))
+                            },
+                        )
+                        .map_err(|e| e.to_string())
+                    }
+                    _ => Ok(Value::Null),
+                }
+            });
+        engine.install_sync_natives(&[("__chidori_dom_render", 0)], dom_dispatch);
+    }
+    engine
+        .eval(
+            "globalThis.chidori.renderDOM = function () { return globalThis.__chidori_dom_render(); };",
+        )
+        .map_err(|e| anyhow::anyhow!("installing chidori.renderDOM: {e}"))?;
+
     let slot = engine.install_entrypoint();
 
     let entry_key = path.to_string_lossy().to_string();
     // Resolve each `(specifier, importer)` to a sibling `.ts`/`.js` file (or, for
     // `node:` specifiers, the synthetic builtin shim) and hand the linker its
     // transpiled ES module source.
-    let mut load =
-        |specifier: &str, importer_key: &str| -> std::result::Result<(String, String), String> {
-            if let Some(name) = specifier.strip_prefix("node:") {
-                // Serve the shim by name under a stable synthetic key. The shim's own
-                // `node:` imports (e.g. `node:buffer`) recurse through this same
-                // branch; its body is plain JS, so it needs no transpilation.
-                let src = crate::runtime::typescript::builtins::shim_source(name)
-                    .ok_or_else(|| format!("unsupported node: builtin '{specifier}'"))?;
-                return Ok((format!("node:{name}"), src.to_string()));
-            }
-            load_module_source(specifier, importer_key)
-        };
+    let mut load = |specifier: &str,
+                    importer_key: &str|
+     -> std::result::Result<(String, String), String> {
+        if let Some(name) = specifier.strip_prefix("node:") {
+            // Serve the shim by name under a stable synthetic key. The shim's own
+            // `node:` imports (e.g. `node:buffer`) recurse through this same
+            // branch; its body is plain JS, so it needs no transpilation.
+            let src = crate::runtime::typescript::builtins::shim_source(name)
+                .ok_or_else(|| format!("unsupported node: builtin '{specifier}'"))?;
+            return Ok((format!("node:{name}"), src.to_string()));
+        }
+        // Vendored packages (react, react-dom/server, …): self-contained UMD
+        // wrapped as an ES module. Served from the built-in registry so
+        // `import React from 'react'` resolves without a node_modules install.
+        if let Some(resolved) = crate::runtime::typescript::builtins::vendored_module(specifier) {
+            return Ok(resolved);
+        }
+        load_module_source(specifier, importer_key)
+    };
 
     // Install per-run resource limits (opcode budget + memory/deadline watchdog)
     // before any agent code runs, and isolate the host from an engine panic: a
@@ -1644,6 +1692,116 @@ mod tests {
         let records = ctx.call_log().into_records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].function, "log");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dom_is_available_and_render_effect_is_journaled_and_replayed() {
+        // P0: the virtual DOM is wired into the durable runtime. An agent builds
+        // a tree via `document` and flushes it with `chidori.renderDOM()`, which
+        // records a durable `dom_render` effect. On replay the effect is served
+        // from the journal and the run reproduces identically.
+        let dir = std::env::temp_dir().join(format!("chidori-dom-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent(input: { name: string }, chidori) {
+                const el = document.createElement('div');
+                el.id = 'root';
+                el.textContent = 'hello ' + input.name;
+                document.body.appendChild(el);
+                const batch = chidori.renderDOM();
+                return {
+                    html: document.body.innerHTML,
+                    count: batch.mutations.length,
+                    version: batch.version,
+                };
+            }
+        "#;
+        std::fs::write(&path, src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), Arc::new(ToolRegistry::new()));
+        let out = run_agent(
+            &path,
+            src,
+            &serde_json::json!({ "name": "world" }),
+            &backend,
+        )
+        .unwrap();
+
+        assert!(
+            out["html"]
+                .as_str()
+                .unwrap()
+                .contains("<div id=\"root\">hello world</div>"),
+            "document built in the real runtime: {out:?}"
+        );
+        assert!(out["count"].as_u64().unwrap() > 0);
+        assert_eq!(out["version"].as_u64().unwrap(), 1);
+
+        let records = ctx.call_log().into_records();
+        assert!(
+            records.iter().any(|r| r.function == "dom_render"),
+            "dom_render was not journaled: {:?}",
+            records.iter().map(|r| &r.function).collect::<Vec<_>>()
+        );
+
+        // Replay: the recorded journal serves `dom_render`; the run reproduces.
+        let ctx2 = RuntimeContext::with_replay(records);
+        let backend2 = test_backend(ctx2.clone(), Arc::new(ToolRegistry::new()));
+        let out2 = run_agent(
+            &path,
+            src,
+            &serde_json::json!({ "name": "world" }),
+            &backend2,
+        )
+        .unwrap();
+        assert_eq!(out2, out, "replay diverged from the recorded run");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_imports_react_and_renders_jsx() {
+        // P1: `import React from 'react'` resolves to the vendored bundle, JSX in
+        // a `.tsx` agent lowers to React.createElement, and react-dom/server
+        // renders it — all through the real runtime, no node_modules install.
+        let dir = std::env::temp_dir().join(format!("chidori-react-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.tsx");
+        let src = r#"
+            import React from "react";
+            import { renderToStaticMarkup } from "react-dom/server";
+
+            function Card(props: { title: string; items: string[] }) {
+                return (
+                    <div className="card">
+                        <h2>{props.title}</h2>
+                        <ul>{props.items.map((t) => <li>{t}</li>)}</ul>
+                        <button>Subscribe</button>
+                    </div>
+                );
+            }
+
+            export async function agent(input: { title: string }) {
+                const html = renderToStaticMarkup(
+                    React.createElement(Card, { title: input.title, items: ["A", "B"] }),
+                );
+                return { html };
+            }
+        "#;
+        std::fs::write(&path, src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx, Arc::new(ToolRegistry::new()));
+        let out = run_agent(&path, src, &serde_json::json!({ "title": "Pro" }), &backend).unwrap();
+        let html = out["html"].as_str().unwrap();
+        assert!(html.contains("<div class=\"card\">"), "got: {html}");
+        assert!(html.contains("<h2>Pro</h2>"), "got: {html}");
+        assert!(html.contains("<li>A</li><li>B</li>"), "got: {html}");
+        assert!(html.contains("<button>Subscribe</button>"), "got: {html}");
 
         let _ = std::fs::remove_dir_all(dir);
     }

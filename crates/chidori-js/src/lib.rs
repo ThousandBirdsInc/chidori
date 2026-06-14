@@ -9,12 +9,14 @@ pub mod builtins;
 pub mod bytecode;
 pub mod compiler;
 pub mod convert;
+pub mod dom;
 pub mod exec;
 pub mod gc;
 pub mod generator;
 pub mod host;
 pub mod iter;
 pub mod journal;
+pub mod jsx;
 pub mod module;
 pub mod promise;
 pub mod proxy;
@@ -73,6 +75,14 @@ impl Engine {
     /// Console output collected so far.
     pub fn console(&self) -> &[String] {
         &self.vm.console_log
+    }
+
+    /// Install a deterministic virtual DOM (`document` / `window` globals) into
+    /// this engine and return the handle the embedder drives — drain mutations to
+    /// render, dispatch events to interact, render to HTML to assert/visualize.
+    /// See [`crate::dom`] for the design (DOM-behind-the-host-boundary).
+    pub fn install_dom(&mut self) -> dom::DomHandle {
+        dom::install(&mut self.vm)
     }
 
     /// Install a global `chidori` host object whose methods forward to

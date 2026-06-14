@@ -1,0 +1,154 @@
+[
+  {
+    "caption": "Iteration 1 · 2/4 tests pass",
+    "note": "failing tests drive the next revision",
+    "html": "<div class=\"card light\"><h2>Pro</h2><ul><li>Unlimited projects</li><li>Deterministic replay</li><li>Time-travel debugging</li></ul><button>Buy</button></div>",
+    "html_b": null,
+    "tests": [
+      {
+        "name": "renders a heading",
+        "pass": true
+      },
+      {
+        "name": "shows a $ price",
+        "pass": false
+      },
+      {
+        "name": "lists 3 features",
+        "pass": true
+      },
+      {
+        "name": "CTA says “Subscribe”",
+        "pass": false
+      }
+    ],
+    "tests_b": null,
+    "model_calls": 1,
+    "replayed": 0
+  },
+  {
+    "caption": "Iteration 2 · 3/4 tests pass",
+    "note": "failing tests drive the next revision",
+    "html": "<div class=\"card light\"><h2>Pro</h2><div class=\"price\">$29/mo</div><ul><li>Unlimited projects</li><li>Deterministic replay</li><li>Time-travel debugging</li></ul><button>Buy now</button></div>",
+    "html_b": null,
+    "tests": [
+      {
+        "name": "renders a heading",
+        "pass": true
+      },
+      {
+        "name": "shows a $ price",
+        "pass": true
+      },
+      {
+        "name": "lists 3 features",
+        "pass": true
+      },
+      {
+        "name": "CTA says “Subscribe”",
+        "pass": false
+      }
+    ],
+    "tests_b": null,
+    "model_calls": 2,
+    "replayed": 0
+  },
+  {
+    "caption": "Iteration 3 · 4/4 tests pass",
+    "note": "all green — the agent accepts this draft",
+    "html": "<div class=\"card light\"><h2>Pro</h2><div class=\"price\">$29/mo</div><ul><li>Unlimited projects</li><li>Deterministic replay</li><li>Time-travel debugging</li></ul><button>Subscribe</button></div>",
+    "html_b": null,
+    "tests": [
+      {
+        "name": "renders a heading",
+        "pass": true
+      },
+      {
+        "name": "shows a $ price",
+        "pass": true
+      },
+      {
+        "name": "lists 3 features",
+        "pass": true
+      },
+      {
+        "name": "CTA says “Subscribe”",
+        "pass": true
+      }
+    ],
+    "tests_b": null,
+    "model_calls": 3,
+    "replayed": 0
+  },
+  {
+    "caption": "Fork → edit → replay",
+    "note": "replayed 3 prior LLM calls for free · 1 new call for the edit",
+    "html": "<div class=\"card light\"><h2>Pro</h2><div class=\"price\">$29/mo</div><ul><li>Unlimited projects</li><li>Deterministic replay</li><li>Time-travel debugging</li></ul><button>Subscribe</button></div>",
+    "html_b": "<div class=\"card dark\"><h2>Pro · Annual</h2><div class=\"price\">$290/yr</div><ul><li>Unlimited projects</li><li>Deterministic replay</li><li>Time-travel debugging</li></ul><button>Subscribe</button></div>",
+    "tests": [
+      {
+        "name": "renders a heading",
+        "pass": true
+      },
+      {
+        "name": "shows a $ price",
+        "pass": true
+      },
+      {
+        "name": "lists 3 features",
+        "pass": true
+      },
+      {
+        "name": "CTA says “Subscribe”",
+        "pass": true
+      }
+    ],
+    "tests_b": [
+      {
+        "name": "renders a heading",
+        "pass": true
+      },
+      {
+        "name": "shows a $ price",
+        "pass": true
+      },
+      {
+        "name": "lists 3 features",
+        "pass": true
+      },
+      {
+        "name": "CTA says “Subscribe”",
+        "pass": true
+      }
+    ],
+    "model_calls": 4,
+    "replayed": 3
+  },
+  {
+    "caption": "Record == replay",
+    "note": "same drafts + same journal → byte-identical UI ✓",
+    "html": "<div class=\"card light\"><h2>Pro</h2><div class=\"price\">$29/mo</div><ul><li>Unlimited projects</li><li>Deterministic replay</li><li>Time-travel debugging</li></ul><button>Subscribe</button></div>",
+    "html_b": null,
+    "tests": [
+      {
+        "name": "renders a heading",
+        "pass": true
+      },
+      {
+        "name": "shows a $ price",
+        "pass": true
+      },
+      {
+        "name": "lists 3 features",
+        "pass": true
+      },
+      {
+        "name": "CTA says “Subscribe”",
+        "pass": true
+      }
+    ],
+    "tests_b": null,
+    "model_calls": 4,
+    "replayed": 6
+  }
+]

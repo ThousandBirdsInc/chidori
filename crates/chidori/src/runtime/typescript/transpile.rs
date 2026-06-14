@@ -135,7 +135,12 @@ pub fn transpile_module(path: &Path, source: &str, options: &TranspileOptions) -
     // downlevel async/await, optional chaining, and nullish coalescing into
     // helper-import-heavy generator code — the engine supports the
     // modern forms natively, so we explicitly avoid that.
-    let transform_options = TransformOptions::default();
+    let mut transform_options = TransformOptions::default();
+    // Lower JSX in `.tsx` agents to `React.createElement` (classic runtime) so it
+    // runs against an in-scope `React` (the engine executes real React), rather
+    // than the automatic runtime's unresolvable `react/jsx-runtime` imports.
+    // No effect on `.ts` sources (not JSX) — only JSX syntax is rewritten.
+    transform_options.jsx.runtime = oxc::transformer::JsxRuntime::Classic;
     let transformer_ret = Transformer::new(&allocator, path, &transform_options)
         .build_with_scoping(scoping, &mut program);
     if !transformer_ret.errors.is_empty() {
@@ -315,6 +320,17 @@ pub fn validate_imports(
 
     for (line_no, specifier) in import_specifiers(source) {
         if is_chidori_sdk_specifier(&specifier) {
+            imports.push(ModuleImport {
+                specifier,
+                resolved_path: None,
+                kind: None,
+            });
+            continue;
+        }
+
+        // Vendored packages (react, react-dom/server, …) are served from the
+        // built-in registry, not the filesystem — accept them under any policy.
+        if crate::runtime::typescript::builtins::is_vendored_package(&specifier) {
             imports.push(ModuleImport {
                 specifier,
                 resolved_path: None,
