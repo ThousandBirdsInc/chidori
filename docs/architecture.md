@@ -1,8 +1,8 @@
 # Architecture & project structure
 
 A high-level map of the runtime. For the full design rationale, durable VM
-snapshot model, and roadmap, see [`DESIGN.md`](../DESIGN.md) and
-[`TODO.md`](../TODO.md).
+snapshot model, and roadmap, see [`DESIGN.md`](./DESIGN.md) and
+[`TODO.md`](./TODO.md).
 
 ## Architecture
 
@@ -41,23 +41,25 @@ Test262; see [`docs/conformance.md`](./conformance.md).
 
 ```
 chidori/
-├── src/
-│   ├── main.rs             # CLI entry point
-│   ├── server.rs           # HTTP server (serve + session API)
-│   ├── runtime/
-│   │   ├── engine.rs       # agent dispatch + runtime persistence
-│   │   ├── typescript/     # TypeScript runtime, bindings, tools, transpile
-│   │   ├── host_core.rs    # language-neutral durable host behavior
-│   │   ├── context.rs      # Runtime context (call log + replay)
-│   │   ├── call_log.rs     # Checkpoint data structures
-│   │   └── template.rs     # minijinja integration
-│   ├── providers/
-│   │   ├── mod.rs          # Provider registry, model routing
-│   │   ├── anthropic.rs    # Anthropic Messages API
-│   │   └── openai.rs       # OpenAI-compatible (incl. LiteLLM)
-│   └── tools/
-│       └── mod.rs          # Tool discovery + JSON schema generation
 ├── crates/
+│   ├── chidori/            # The `chidori` CLI crate (runtime, server, providers)
+│   │   ├── src/
+│   │   │   ├── main.rs         # CLI entry point
+│   │   │   ├── server.rs       # HTTP server (serve + session API)
+│   │   │   ├── runtime/
+│   │   │   │   ├── engine.rs       # agent dispatch + runtime persistence
+│   │   │   │   ├── typescript/     # TypeScript runtime, bindings, tools, transpile
+│   │   │   │   ├── host_core.rs    # language-neutral durable host behavior
+│   │   │   │   ├── context.rs      # Runtime context (call log + replay)
+│   │   │   │   ├── call_log.rs     # Checkpoint data structures
+│   │   │   │   └── template.rs     # minijinja integration
+│   │   │   ├── providers/
+│   │   │   │   ├── mod.rs          # Provider registry, model routing
+│   │   │   │   ├── anthropic.rs    # Anthropic Messages API
+│   │   │   │   └── openai.rs       # OpenAI-compatible (incl. LiteLLM)
+│   │   │   └── tools/
+│   │   │       └── mod.rs          # Tool discovery + JSON schema generation
+│   │   └── tests/             # CLI integration tests
 │   ├── chidori-js/         # Pure-Rust JS engine (oxc → bytecode → VM), the only engine
 │   └── test262-runner/     # Test262 conformance harness + baseline gate
 ├── sdk/
@@ -69,7 +71,8 @@ chidori/
 │   ├── tools/              # Example tools
 │   ├── legacy-starlark/    # Archived .star examples
 │   └── sdk_demo.py         # Python SDK demo
-├── DESIGN.md               # Architecture & design rationale
-├── TODO.md                 # Implementation roadmap
+├── docs/
+│   ├── DESIGN.md           # Architecture & design rationale
+│   └── TODO.md             # Implementation roadmap
 └── llm.txt                 # Complete API reference for LLM-assisted development
 ```

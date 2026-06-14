@@ -38,15 +38,31 @@ Rules:
 ## CLI
 
 ```bash
+chidori init my-agent --template chat      # scaffold a starter project (or: worker)
 chidori check agents/my_agent.ts
 chidori run agents/my_agent.ts --input key=value
 chidori run agents/my_agent.ts --input '{"document": "text"}'
 chidori run agents/my_agent.ts --stream
 chidori run agents/my_agent.ts --trace
+chidori chat --system "You are a concise assistant." --model claude-sonnet
+chidori chat agents/chat.ts                 # chat through a conversational agent file
 chidori serve agents/webhook.ts --port 8080 --trusted
 chidori trace <run_id>
 chidori snapshot <run_id>
 ```
+
+`chidori init [dir] --template chat|worker` scaffolds a starter project (agent +
+README, plus a `tools/` dir for `worker`); omit `--template` to pick
+interactively. The `chat` template is a conversational agent; the `worker`
+template is an autonomous tool-using loop (see `examples/agents/worker.ts`).
+
+`chidori chat` is an interactive multi-turn REPL backed by `conversation()`. With
+no agent file it chats with the model directly; pass a conversational agent file
+(one accepting `{ messages, system?, model?, tools? }` and returning
+`{ transcript }` or `{ history }`, like the `chat` template) to chat through it.
+Each turn is a durable host call and streams its reply token-by-token; the prior
+turns replay for free, so only your newest message reaches the provider. Flags:
+`--system`, `--model`, `--tools <dir>`. Type `exit`/`quit` or Ctrl-D to end.
 
 `chidori snapshot <run_id>` prints `runtime.snapshot.json` metadata without
 printing raw VM snapshot bytes.
@@ -128,6 +144,48 @@ first reads the shared prefix at the discounted cached rate.
   always an author decision.
 
 See `examples/agents/context_qa.ts` for a complete corpus-Q&A agent.
+
+### conversation
+
+```ts
+const chat = chidori.conversation({
+  system: "You are a concise, friendly assistant.",
+  tools: ["web_search"],          // available on every turn
+  compact: { budgetTokens: 8000 }, // opt-in per-turn window management
+});
+
+const reply = await chat.say("Hi, who are you?"); // one durable prompt call
+await chat.say("What can you help with?");         // prefix read at cached rate
+
+chat.length;       // number of completed exchanges
+chat.history();    // [{ role, text }, ...]
+chat.context;      // the underlying immutable Context, for the lower-level API
+```
+
+A stateful chat-assistant wrapper over `context()` — the most common agent
+shape. It owns the running dialogue: the system/tools head is frozen once as a
+cacheable prefix, and each `say(message)` appends the user turn, makes one
+durable `prompt` host call, and threads the assistant turn back in for the next
+message. So the whole conversation is recorded, replays for $0, and reads the
+shared prefix at the cached rate each turn.
+
+- `say(message, options?)` → `Promise<string>`: send a user message, return the
+  assistant reply text; the dialogue advances in place. `options` are
+  per-turn `PromptOptions` (override the conversation defaults).
+- `respond(message, options?)` → `Promise<LlmResponseJson>`: like `say()` but
+  returns the structured response (`tool_calls`, `blocks`) for author-driven
+  tool loops; append results with `chat.context.toolResult(...)`, then `say()`.
+- `loop(options?)` → `Promise<{role,text}[]>`: drive an interactive dialogue —
+  read each human message via `chidori.input()` (terminal stdin under
+  `chidori run`, a paused session resume under `chidori serve`), reply with
+  `say()`, repeat until the user types an exit word (`"exit"`/`"quit"`) or
+  `until` returns true. Options: `prompt`, `inputOptions`, `exit`, `maxTurns`,
+  `skipEmpty`, `turn`, `onReply`, `until`.
+
+`conversation(options)` accepts `system`, `tools`, default `type`/`model`/
+`maxTokens`/`temperature`/`cache`, `cacheTtl`, and `compact` (a `CompactOptions`
+applied before each turn — a no-op until the tail exceeds budget). See
+`examples/agents/conversation.ts`.
 
 Setting `CHIDORI_PROMPT_CACHE_DIR=<dir>` opts into a local content-addressed
 prompt cache keyed on the assembled `request_digest`: an exact repeat of a

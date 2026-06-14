@@ -150,6 +150,98 @@ export interface Context {
   estimateTokens(): number;
 }
 
+/** One recorded exchange in a {@link Conversation} transcript. */
+export interface ConversationTurn {
+  role: "user" | "assistant";
+  text: string;
+}
+
+/** Options for `chidori.conversation()`. */
+export interface ConversationOptions {
+  /** System prompt — frozen once as the conversation's cacheable prefix. */
+  system?: string;
+  /** Tool names available on every turn (resolved like `prompt({ tools })`). */
+  tools?: string[];
+  /** Default stream label for each turn's prompt (default `"final"`). */
+  type?: PromptStreamType;
+  /** Default model for each turn (a per-turn override still wins). */
+  model?: string;
+  /** Default output token cap for each turn. */
+  maxTokens?: number;
+  /** Default sampling temperature for each turn. */
+  temperature?: number;
+  /** Default cache posture for each turn (see {@link PromptOptions.cache}). */
+  cache?: boolean | CacheTtl | { ttl?: CacheTtl };
+  /** TTL of the cache breakpoint frozen over the system/tools head. */
+  cacheTtl?: CacheTtl;
+  /**
+   * Opt-in window management: when set, each turn first runs the same budgeted
+   * `Context.compact()` — a pure no-op until the running tail exceeds budget,
+   * then the older turns fold into one recorded summary segment.
+   */
+  compact?: CompactOptions;
+}
+
+/** Options for `Conversation.loop()` — an interactive `input()`-driven loop. */
+export interface ConversationLoopOptions {
+  /** Prompt shown to the human each turn (or a function of the turn index). */
+  prompt?: string | ((turn: number) => string);
+  /** Extra options forwarded to `chidori.input()` (defaults to `{ type: "message" }`). */
+  inputOptions?: InputOptions;
+  /** Words that end the loop, case-insensitive (default `["exit", "quit"]`). */
+  exit?: string | string[];
+  /** Hard cap on the number of exchanges before returning. */
+  maxTurns?: number;
+  /** Skip blank input lines instead of sending them (default `true`). */
+  skipEmpty?: boolean;
+  /** Per-turn prompt options applied to every `say()` in the loop. */
+  turn?: PromptOptions;
+  /** Called with the assistant reply (and the user message) after each turn. */
+  onReply?: (reply: string, message: string) => void | Promise<void>;
+  /** Return `true` after a turn to end the loop (checked after `onReply`). */
+  until?: (message: string, reply: string) => boolean;
+}
+
+/**
+ * A small stateful wrapper over {@link Context} for the most common shape — a
+ * multi-turn chat assistant. It owns the running context (system + tools frozen
+ * as a cacheable prefix) and threads each turn through it, so you write
+ * `chat.say(message)` instead of re-plumbing `ctx = (await
+ * ctx.user(message).prompt()).context` by hand. Every turn is still one durable
+ * `prompt`/`respond` host call that replays for free.
+ *
+ * ```ts
+ * const chat = chidori.conversation({ system: "You are concise." });
+ * const a = await chat.say("Hi, who are you?");
+ * const b = await chat.say("What can you help with?");
+ * // or drive it interactively:
+ * const transcript = await chat.loop({ prompt: "you>" });
+ * ```
+ */
+export interface Conversation {
+  /** The underlying immutable context, for dropping to the lower-level API. */
+  readonly context: Context;
+  /** Number of completed exchanges (user+assistant pairs) so far. */
+  readonly length: number;
+  /** The transcript so far as plain `{ role, text }` entries. */
+  history(): ConversationTurn[];
+  /** Send one user message; resolves to the assistant's reply text. */
+  say(message: string, options?: PromptOptions): Promise<string>;
+  /**
+   * Like `say()`, but resolves to the structured response (`tool_calls`,
+   * `blocks`) for author-driven tool loops. Append tool results with
+   * `chat.context.toolResult(...)`, then call `say()` again.
+   */
+  respond(message: string, options?: PromptOptions): Promise<LlmResponseJson>;
+  /**
+   * Drive an interactive loop: read a human message via `chidori.input()`
+   * (terminal stdin under `chidori run`, a paused session resume under `chidori
+   * serve`), reply with `say()`, and repeat until the user types an exit word
+   * or `until` returns true. Resolves to the full transcript.
+   */
+  loop(options?: ConversationLoopOptions): Promise<ConversationTurn[]>;
+}
+
 export interface InputOptions {
   type?: string;
   default?: string;
@@ -318,6 +410,12 @@ export interface Chidori {
   workspace: WorkspaceHost;
   /** Start an immutable multi-turn prompt context (optionally seeded). */
   context(seed?: { system?: string; tools?: string[] }): Context;
+  /**
+   * Start a multi-turn chat assistant — a stateful wrapper over `context()`
+   * that owns the running dialogue. Send turns with `chat.say(message)` or drive
+   * an interactive `input()` loop with `chat.loop()`.
+   */
+  conversation(options?: ConversationOptions): Conversation;
   prompt(text: string, options?: PromptOptions): Promise<string>;
   input(message: string, options?: InputOptions): Promise<string>;
   /**

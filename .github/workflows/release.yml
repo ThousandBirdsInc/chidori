@@ -9,7 +9,7 @@ name: Release SDKs
 # packages but publishes nothing.
 #
 # One-time registry setup is documented in docs/releasing.md. Rust crates are
-# published separately via ./publish.sh.
+# published separately via ./scripts/publish.sh.
 
 on:
   push:
