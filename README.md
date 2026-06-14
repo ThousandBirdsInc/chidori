@@ -227,7 +227,7 @@ deterministic, replayable, and testable for free.
 | [Sandbox & security model](./docs/sandbox-model.md) | Deny-by-default policy, capability injection, resource limits |
 | [Context management & caching](./docs/context-management.md) | Immutable contexts, compaction, cost accounting |
 | [Signals & multiplayer](./docs/signals.md) | Named listen points, mailboxes, fan-in |
-| [Design rationale](./DESIGN.md) · [Roadmap](./TODO.md) | Full design notes and implementation roadmap |
+| [Design rationale](./docs/DESIGN.md) · [Roadmap](./docs/TODO.md) | Full design notes and implementation roadmap |
 | [Python SDK](./sdk/python/README.md) · [TypeScript SDK](./sdk/typescript/README.md) | HTTP clients with no native bindings |
 | [`llm.txt`](./llm.txt) | Complete API reference, optimized for LLMs generating agents |
 
