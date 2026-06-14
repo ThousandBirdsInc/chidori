@@ -710,8 +710,10 @@ pub enum SnapshotBlobKind {
     /// Current scaffold: a serialized set of TypeScript context roots after
     /// initial module evaluation, not a suspended VM continuation.
     InitialTypeScriptStateScaffold,
-    /// Future production path: a live QuickJS VM snapshot containing async
-    /// continuations, job queues, module records, and heap roots.
+    /// Legacy blob kind for a live VM-image snapshot (async continuations, job
+    /// queues, module records, and heap roots). VM-image snapshots are descoped
+    /// — durability is the deterministic-replay journal — but the variant is
+    /// retained for manifest compatibility (serialized as `live_quick_js_vm`).
     LiveQuickJsVm,
 }
 

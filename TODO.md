@@ -1,317 +1,129 @@
 # TODO - Chidori TypeScript Runtime
 
-This roadmap tracks the TypeScript-runtime migration. Historical Starlark work
-is preserved in git history and under `examples/legacy-starlark/`, but new
-runtime, CLI, server, and tool work should target `.ts` agents and tools.
+This roadmap tracks the TypeScript runtime. Historical Starlark work is
+preserved in git history and under `examples/legacy-starlark/`; new runtime,
+CLI, server, and tool work targets `.ts` agents and tools.
+
+The TypeScript-runtime migration and the JavaScript-engine consolidation are
+**complete**. Agents, tools, sub-agents, and the conformance harness all run on
+the single in-tree pure-Rust engine `crates/chidori-js`; the vendored QuickJS
+fork, the `rquickjs` parity path, and the WASM/Python exec sandboxes were
+removed (#39). Durability is the deterministic-replay journal, not VM-image
+snapshots — so the bulk of the remaining work is now the standing conformance
+bar plus product follow-through, not migration.
 
 ## Status At A Glance
 
 | Area | Status |
 | --- | --- |
-| TypeScript agent dispatch | Done |
-| TypeScript host API bindings | Done |
+| TypeScript agent/tool/sub-agent dispatch | Done |
+| Single pure-Rust JS engine (`chidori-js`), QuickJS removed | Done (#39) |
 | Language-neutral host core | Done |
-| Call-log replay | Done |
-| Human input and policy approval pause/resume | Done through live VM resume with replay fallback |
-| Multiplayer signals (`chidori.signal` / `pollSignal` / `signalAny` + `timeoutMs`, `POST /sessions/{id}/signal`, live in-memory delivery to streaming runs) | Done — Phases 1–3 of `docs/signals.md` |
-| Context management (provider prompt caching, `chidori.context` builder, `Context.compact()`, opt-in local prompt cache via `CHIDORI_PROMPT_CACHE_DIR`) | Done — Phases 1–3 of `docs/context-management.md` |
-| TypeScript tool discovery | Done |
-| TypeScript and Python SDK parity | Done |
-| Snapshot manifests, policy/source validation, host promise records | Done |
-| In-repo QuickJS fork and Rust wrapper | Done for current runtime surface |
-| Full live VM continuation snapshot/restore | Done for current TypeScript runtime surface |
-| Server resume from `LiveQuickJsVm` blobs | Done for current production TypeScript host paths |
+| Captured base effects: networking (`fetch`/`node:http`), `node:fs` VFS, crypto, timers | Done |
+| Call-log replay + durable pause/resume (`input()`, policy approval, suspending host calls) | Done |
+| Value checkpoints (`chidori.step`) | Done — `docs/value-checkpoints.md` |
+| Multiplayer signals (`signal`/`pollSignal`/`signalAny`, `POST /sessions/{id}/signal`, live delivery) | Done — `docs/signals.md` |
+| Context management (prompt caching, `chidori.context`, `Context.compact()`, local prompt cache) | Done — `docs/context-management.md` |
+| In-agent branching (`chidori.branch`, branch stores, resume/rerun, capped waves) | Done (Phases 1–2) — `docs/branching-execution.md` |
+| Policy profiles (`untrusted`/`supervised`, `--untrusted`/`--trusted`, per-session) + deny-by-default `serve` | Done |
+| Test262 conformance with committed-baseline CI gate | Done; bar is now load-bearing (no fallback engine) |
+| TypeScript and Python SDK parity (run/replay/resume/checkpoint/stream) | Done |
 
-See [DESIGN.md](./DESIGN.md) for the top-level design and
-[docs/typescript-vm-snapshot-runtime.md](./docs/typescript-vm-snapshot-runtime.md)
-for the durable VM snapshot design. The concrete migration evidence and
-completion audit lives in
-[docs/typescript-migration-audit.md](./docs/typescript-migration-audit.md).
+See [DESIGN.md](./DESIGN.md) for the top-level design,
+[docs/conformance.md](./docs/conformance.md) for the conformance methodology and
+gate, [docs/sandbox-model.md](./docs/sandbox-model.md) for the confinement model
+and its gaps, and [docs/fable_review.md](./docs/fable_review.md) for the most
+recent full-repository review and prioritized recommendations.
 
-## Completed Migration Work
+## Completed Work (summary)
 
-### TypeScript Runtime
+Detailed, dated history lives in git and in the per-feature docs. At a high
+level:
 
-- [x] Require `.ts` agent files in runtime dispatch.
-- [x] Reject unsupported non-TypeScript agent files with clear errors.
-- [x] Transpile TypeScript at runtime without requiring `tsc`.
-- [x] Install deterministic `Date` and `Math.random` behavior.
-- [x] Enforce durable-run policy for host date/random settings.
-- [x] Reject dynamic imports and unsupported local import policies.
-- [x] Support relative TypeScript imports under runtime policy.
-- [x] Convert JS values to JSON-compatible host values.
-- [x] Fail clearly for functions, unsupported native values, class instances,
-  shared memory, WeakRef, and finalizers at the host boundary.
-- [x] Run TypeScript agents from CLI and server paths.
-
-### Host API
-
-- [x] `chidori.prompt()`
-- [x] `chidori.input()`
-- [x] `chidori.signal()` / `chidori.pollSignal()` / `chidori.signalAny()` —
-      multiplayer named signals: blocking listen point, fan-in listen sets,
-      durable per-run mailbox, `timeoutMs` with a deterministic
-      `{timedOut: true}` sentinel (server-armed deadline timers, re-armed on
-      restart), `POST /sessions/{id}/signal` delivery (resolve+resume / enqueue /
-      live in-memory to streaming runs / 409), sender provenance as OTEL span
-      attributes, deterministic replay (Phases 1–3 of `docs/signals.md`).
-- [x] `chidori.callAgent()`
-- [x] `chidori.tool()`
-- [x] `chidori.parallel()`
-- [x] `chidori.branch()` — in-agent execution branching (Phases 1 + 2 of
-      `docs/branching-execution.md`): fork into per-strategy sub-runs from the
-      anchored state with outcomes returned for comparison; persisted branch
-      stores with out-of-band resume and edit-and-rerun (`chidori branches` /
-      `branch-resume` / `branch-rerun`) and concurrency-capped wave execution.
-      The whole-agent replay-prefix model (Phase 3) is future work.
-- [x] `chidori.retry()`
-- [x] `chidori.tryCall()`
-- [x] Captured networking via `fetch`/`node:http` (replaces `chidori.http`)
-- [x] `chidori.template()`
-- [x] `chidori.log()`
-- [x] `chidori.memory()`
-- [x] `chidori.checkpoint()`
-- [x] `chidori.step()` — durable value checkpoints (plan P6): memoize pure
-      compute into the call log so replay/resume never re-pays it
-      (`docs/value-checkpoints.md`).
-- [x] `chidori.execJs()`
-- [x] `chidori.execPython()`
-- [x] `chidori.execWasm()`
-- [x] Replay cached host-call results without repeating side effects.
-- [x] Record host promise lifecycle metadata for durable host operations.
-- [x] Persist safepoints before live side effects and after results.
-
-### Tools And Examples
-
-- [x] Discover `.ts` tools and evaluate exported `tool` metadata.
-- [x] Validate TypeScript tool JSON schema metadata.
-- [x] Invoke TypeScript tool `run(args, chidori)` exports.
-- [x] Ignore `.star` files during tool discovery.
-- [x] Convert first-party examples to TypeScript.
-- [x] Move legacy Starlark examples to `examples/legacy-starlark/`.
-- [x] Reject Starlark sub-agents from TypeScript agents.
-
-### CLI, Server, And SDKs
-
-- [x] `chidori check <file.ts>`
-- [x] `chidori run <file.ts>`
-- [x] `chidori serve <file.ts>`
-- [x] `chidori trace <run_id>`
-- [x] `chidori stats`
-- [x] Snapshot metadata command/endpoint without exposing raw VM bytes.
-- [x] Session create/list/get/checkpoint/replay/resume APIs.
-- [x] Server-sent streaming for host calls and labelled prompt progress.
-- [x] Python SDK run/replay/resume/checkpoint/stream support.
-- [x] TypeScript SDK run/replay/resume/checkpoint/stream support.
-- [x] SDK snapshot manifest metadata types.
-
-### Snapshot Data Model
-
-- [x] Snapshot manifest types.
-- [x] Snapshot store read/write helpers.
-- [x] ABI, source, module graph, and policy validation.
-- [x] Snapshot blob kind gating.
-- [x] Pending host operation persistence.
-- [x] Host promise records for pending/resolved/rejected operations.
-- [x] Branch snapshot metadata and merge helpers.
-- [x] Live VM store helpers that reject invalid snapshot envelopes.
-
-### QuickJS Fork Bootstrap
-
-- [x] Add `crates/chidori-quickjs-sys`.
-- [x] Add `crates/chidori-quickjs`.
-- [x] Vendor QuickJS source under `crates/chidori-quickjs-sys/quickjs`.
-- [x] Use local path dependency from the main runtime.
-- [x] Add runtime memory limits and interrupt budget.
-- [x] Expose raw snapshot/restore FFI symbols.
-- [x] Expose host promise FFI symbols.
-- [x] Expose run-jobs-until-blocked FFI symbol.
-- [x] Add Rust snapshot reader/writer callback ABI.
-- [x] Add unsupported-value callback ABI.
-- [x] Validate runtime snapshot byte envelopes before persisting or loading.
-- [x] Exercise value/bytecode snapshot coverage in wrapper tests.
-- [x] Exercise snapshot-side generic `chidori.<method>()` host-promise
-  pause/restore coverage in wrapper-backed TypeScript tests, including
-  `input()` and `prompt()`.
-- [x] Include active host operation id and host-call records in default
-  TypeScript snapshot roots.
-- [x] Clear the snapshot-side active host operation id after restored host
-  promise resolution or rejection.
-- [x] Preserve queued snapshot-side host method promises so a restored agent can
-  pause again on a later host call with a distinct operation id.
-- [x] Return `BlockedOnHostOperation` from snapshot wrapper job draining when
-  resumed execution reaches another host pause.
-- [x] Add snapshot wrapper resolve/reject-and-run helpers that return the next
-  run state for future server restore wiring.
-- [x] Add TypeScript snapshot restore-from-snapshot plus resolve/reject helpers
-  that return the restored context plus next run state.
-- [x] Add a snapshot-side adapter from persisted pending host operations to
-  `chidori` host-promise method queues for unambiguous host APIs.
-- [x] Add a snapshot-side adapter from persisted host-promise records that
-  installs only pending operations for restore.
+- **TypeScript runtime** — `.ts`-only agent/tool dispatch, runtime oxc
+  transpilation (type-stripping), deterministic `Date`/`Math.random`, durable
+  import/date/random/fs/crypto/timer policy, JSON host-boundary validation.
+- **Host API** — `prompt`, `input`, `signal`/`pollSignal`/`signalAny`,
+  `callAgent`, `tool`, `parallel`, `branch`, `retry`, `tryCall`, `step`,
+  `context`/`Context.compact`, `template`, `log`, `memory`, `checkpoint`,
+  `workspace`; captured `fetch`/`node:http` networking replacing `chidori.http`.
+- **Engine consolidation (#39)** — moved all execution off the QuickJS fork /
+  `rquickjs` onto `crates/chidori-js`, deleted the vendored C, the WASM/Python
+  exec sandboxes, and the `chidori-quickjs{,-sys}` crates; replaced VM-image
+  snapshot/resume with the deterministic-replay journal.
+- **Conformance** — `crates/test262-runner` against the pinned Test262 corpus,
+  a committed per-test baseline, and a CI gate that fails on regressions and
+  hints on new passes (PRs touching the engine, pushes to `main`, nightly).
+- **CLI / server / SDKs** — `check`, `run`, `serve`, `trace`, `stats`, `demo`,
+  `branches`/`branch-resume`/`branch-rerun`; session create/list/get/checkpoint/
+  replay/resume APIs with SSE streaming; OTEL trace emission; zero-dependency
+  TypeScript and Python HTTP clients with snapshot-manifest types.
 
 ## Remaining Work
 
-### Runtime Backend Convergence
+### Conformance (standing bar)
 
-- [x] Move the active TypeScript host-binding execution path off `rquickjs` or
-  teach it to capture equivalent live snapshots from the in-repo QuickJS fork.
-- [x] Install the full non-suspending `chidori` host object on the
-  snapshot-capable `crates/chidori-quickjs` context for the active
-  TypeScript execution path.
-- [x] Complete the remaining server direct live-resume bookkeeping for nested
-  suspending `callAgent()` rejection paths, including `return await
-  chidori.callAgent(...)` and grandchild `input()` rejection propagation through
-  parent `try/catch` handlers.
-- [x] Move recorder/no-context TypeScript agent evaluation from `rquickjs` to
-  `crates/chidori-quickjs`, including deterministic runtime policy prelude.
-- [x] Move TypeScript tool metadata evaluation from `rquickjs` to
-  `crates/chidori-quickjs` so tool discovery exercises the in-repo runtime.
-- [x] Enforce Chidori JSON host-boundary validation in the
-  `crates/chidori-quickjs` wrapper for function and class-instance results.
-- [x] Expose the minimal QuickJS native callback/context-opaque FFI and
-  `SnapshotContext` wrapper API needed to start installing production
-  Rust-backed `chidori` methods in `crates/chidori-quickjs`.
-- [x] Add `SnapshotContext` native object-method installation and callback
-  argument/JSON return helpers, with Rust-backed `chidori.log`-style coverage.
-- [x] Wire native callback/context-opaque helpers through
-  `TypeScriptSnapshotContext`, with TypeScript agent coverage calling a
-  Rust-backed `chidori.log` method.
-- [x] Install `RuntimeContext`/`host_core`-backed native `chidori.log`,
-  `chidori.checkpoint`, `chidori.memory`, and `chidori.template` methods on
-  `TypeScriptSnapshotContext` as the first real snapshot-runtime host method
-  slices.
-- [x] Install `RuntimeContext`/`host_core`-backed native `chidori.execJs`,
-  `chidori.execPython`, and `chidori.execWasm` methods on
-  `TypeScriptSnapshotContext`.
-- [x] Install `RuntimeContext`/`host_core`-backed captured-networking
-  (`fetch`/`node:http`) policy denial and `chidori.input` pause paths on
-  `TypeScriptSnapshotContext`.
-- [x] Install `RuntimeContext`/provider-backed native plain-text
-  `chidori.prompt` on `TypeScriptSnapshotContext`.
-- [x] Run provider-requested `chidori.prompt` tool loops through the native
-  snapshot host path for non-suspending registered TypeScript tools.
-- [x] Install `RuntimeContext`/registry-backed native `chidori.tool` and
-  `chidori.callAgent` paths on `TypeScriptSnapshotContext` for non-suspending
-  TypeScript tools and child agents.
-- [x] Install snapshot-runtime JavaScript helpers for `chidori.tryCall`,
-  `chidori.retry`, and `chidori.parallel`.
-- [x] Persist concrete sandbox host function names in pending host operation
-  metadata so `execJs`, `execPython`, and `execWasm` can be restored without
-  ambiguity.
-- [x] Persist restorable `LiveQuickJsVm` blobs from ordinary TypeScript
-  persisted safepoints by rebuilding the continuation from persisted host
-  promise records, without test-only injected snapshotters.
+Test262 conformance is load-bearing now that there is no fallback engine. Keep
+picking off the cluster table in `docs/conformance.md`. The current top
+clusters:
 
-### Full QuickJS Runtime Snapshot Serialization
+- [ ] **UTF-16 string representation** — the engine's scalar-string model blocks
+  RegExp lone-surrogate matching, the `v`-flag long tail, and String surrogate
+  edge cases. This is the single highest-leverage project; it unlocks the
+  largest RegExp cluster plus String/Array surrogate failures at once.
+- [ ] `language/expressions` corners — dynamic-`import()` semantics and the last
+  class/eval corners.
+- [ ] `language/module-code` — namespace internals, hoisted default-function
+  exports, TLA ordering.
+- [ ] `language/eval-code` / `language/global-code` — eval-created global
+  binding attributes and lexical/var binding interactions.
+- [ ] Sparse-index semantics beyond the dense cap (`built-ins/Object`,
+  `built-ins/Array`).
+- [ ] Resizable-`ArrayBuffer` corners (`built-ins/TypedArray`,
+  `built-ins/ArrayBuffer`): `subarray`/`set`/`slice`/transfer.
 
-The in-repo fork already exercises value/object graph, bytecode, host promise,
-async continuation, and microtask queue snapshots through
-`chidori_quickjs::SnapshotContext`. The context ABI now exposes selected
-Chidori TypeScript roots and the microtask queue through
-`CHIDORI_JS_SnapshotContext` / `CHIDORI_JS_RestoreContext`. Ordinary Chidori
-TypeScript runs use a bundled selected-root module scaffold, so full QuickJS
-`JSModule` record serialization is deferred until the runtime supports a
-broader JavaScript module surface.
+### Product follow-through (from `docs/fable_review.md`)
 
-- [x] Implement `CHIDORI_JS_SnapshotRuntime` as a versioned runtime envelope.
-- [x] Implement `CHIDORI_JS_RestoreRuntime` by restoring a fresh QuickJS
-  runtime for the context payload.
-- [x] Implement `CHIDORI_JS_SnapshotContext` for selected Chidori TypeScript
-  roots and the microtask/job queue.
-- [x] Implement `CHIDORI_JS_RestoreContext` for selected Chidori TypeScript
-  roots and the microtask/job queue.
-- [x] Compose runtime and context payload restore for a suspended Chidori host
-  call completed by host promise id.
-- [x] Preserve selected-root bundled TypeScript module namespace exports through
-  snapshot restore, including exported functions that close over exported
-  constants.
-- [x] Fail selected-root context snapshot creation with path/type detail for
-  unsupported native values.
-- [x] Add fork-level context snapshot tests for suspended async functions and
-  host promise resolution after restore.
-- [x] Add fork-level `CHIDORI_JS_SnapshotContext` /
-  `CHIDORI_JS_RestoreContext` entrypoint coverage for a suspended Chidori host
-  call restored and completed by host promise id.
-- [x] Add fork-level runtime-plus-context entrypoint tests for suspended async
-  functions and host promise resolution after restore.
-- [x] Add ordinary engine persistence coverage that restores a
-  `LiveQuickJsVm` input pause and resolves the suspended host promise.
+- [ ] **SDK publishing** — both SDKs are at 3.0.0 and the README badges
+  npm/PyPI, but there is no publish automation. Wire it up or drop the badges.
+- [ ] **TypeScript SDK tests** — there are none; CI only typechecks and builds
+  the TS SDK. The 8 Python-SDK integration tests against a real server are the
+  template.
+- [ ] **Broader `node:` allowlist** — `stream`, `zlib`, and `child_process`
+  remain unsupported (the current allowlist covers `process`, `buffer`, `util`,
+  `fs`, `fs/promises`, `crypto`, `http`, `https`, `path`, `events`, `url`,
+  `assert`, `os`).
+- [ ] **Providers and modalities** — only Anthropic and OpenAI stream natively
+  (LiteLLM is the escape hatch). No embeddings, image/audio modalities, or
+  JSON-mode/structured-output plumbing beyond tool calls.
+- [ ] **Code-comment doc drift** — several `src/` comments still explain intent
+  by reference to "the QuickJS path" (e.g. `engine.rs`, `bindings.rs`,
+  `rust_engine.rs`, `server.rs`). Low-priority cleanup now that the
+  roadmap docs are corrected.
 
-### Server Resume From Live VM Snapshots
+### Sandbox hardening (from `docs/sandbox-model.md`)
 
-- [x] Remove the server resume validation guard that rejected
-  `LiveQuickJsVm` manifests up front.
-- [x] On `input()` resume, load `runtime.snapshot`, restore the QuickJS
-  runtime/context, resolve the saved host promise id, and use the live result
-  when it completes.
-- [x] Persist a newly reached direct live-VM `input()` pause, including the
-  next pending host operation, host-promise table entry, and updated live
-  snapshot.
-- [x] Execute and record an awaited direct live-VM `log()` host operation
-  without falling back to replay.
-- [x] Execute and record an awaited direct live-VM `template()` host operation
-  without falling back to replay.
-- [x] Execute and record awaited direct live-VM `memory()` host operations
-  without falling back to replay.
-- [x] Execute and record awaited direct live-VM `checkpoint()` host operations
-  without falling back to replay.
-- [x] Execute and record awaited direct live-VM sandbox host operations
-  (`execJs`, `execPython`, `execWasm`) without falling back to replay.
-- [x] Reject failed direct live-VM host promises for handled operations and
-  continue the live VM when agent code catches the error.
-- [x] Reject direct live-VM `http()` calls denied by policy without falling
-  back to replay.
-- [x] Execute and record always-allowed direct live-VM `http()` calls without
-  falling back to replay.
-- [x] Persist direct live-VM `http()` policy approval pauses without falling
-  back to replay.
-- [x] Continue approved policy-gated direct live-VM `http()` calls without
-  falling back to replay.
-- [x] Execute and record direct live-VM TypeScript `tool()` calls without
-  falling back to replay for non-suspending tools.
-- [x] Execute and record direct live-VM TypeScript `callAgent()` calls without
-  falling back to replay for non-suspending child agents.
-- [x] Execute and record direct live-VM plain-text `prompt()` calls without
-  falling back to replay.
-- [x] Execute and record direct live-VM `prompt()` tool loops without falling
-  back to replay for non-suspending tools.
-- [x] Persist and resume direct live-VM `prompt()` tool loops when a
-  TypeScript tool suspends on nested `input()`.
-- [x] Persist and resume top-level direct live-VM TypeScript `tool()` calls
-  that suspend on nested `input()`.
-- [x] Persist and resume top-level direct live-VM TypeScript `callAgent()`
-  calls when the child agent suspends on nested `input()`.
-- [x] Persist and resume nested direct live-VM TypeScript `callAgent()` calls
-  when a grandchild agent suspends on nested `input()`.
-- [x] Preserve top-level suspending `tool()`/`callAgent()` rejection paths
-  after nested `input()` resumes, including parent `try/catch` handlers.
-- [x] Keep replay recovery covered as a fallback for nested suspending
-  `callAgent()` rejection paths.
-- [x] Persist final output for direct live-VM completion.
-- [x] Extend server direct live-VM resume bookkeeping to the nested
-  `callAgent()` rejection path after a grandchild `input()` resumes.
-- [x] Keep replay as an explicit recovery path when direct live-VM resume
-  cannot drive a newly reached production host call.
+- [ ] Per-VM (ownership-attributed) memory accounting — the per-run meter is
+  thread-attributed today, so concurrent runs can still drift.
+- [ ] Per-tenant CPU quota — the opcode budget bounds a run, not a tenant.
+- [ ] Deeper policy matching — `match_args` is shallow; approvals are cached
+  per-session and policy cannot change mid-run.
+- OS-level isolation (seccomp/namespace/process) remains an explicit non-goal;
+  the engine is capability confinement, not a container.
 
-### Tool Metadata Hardening
+### Optional feature extensions
 
-- [x] Replace static text metadata extraction with restricted VM-backed
-  TypeScript metadata evaluation.
-- [x] Capture tool source fingerprints in tool registry entries.
-- [x] Snapshot and directly resume TypeScript tool execution when a tool
-  suspends on nested `input()`, with replay retained as a fallback.
-
-### Quality Gates
-
-- [x] Root Rust test suite passes with TypeScript runtime coverage.
-- [x] Add CI for `cargo fmt --check`.
-- [x] Add CI for `cargo test --workspace`.
-- [x] Add CI for `npm run typecheck` in `sdk/typescript`.
-- [x] Add CI for `npm run build` in `sdk/typescript`.
-- [x] Add CI for Python SDK tests.
-- [x] Add focused integration tests for CLI `.ts` examples.
-- [x] Add end-to-end pause/resume tests that exercise `LiveQuickJsVm` restore.
+- [ ] Branching Phase 3 — the whole-agent replay-prefix model
+  (`docs/branching-execution.md` §8.9); deferred because the §8.2 fork-return
+  model already covers the MVP. Branch merge/promote into the parent run, a
+  tael comparison view, and a programmatic `POST /sessions/{id}/fork` surface
+  are smaller follow-ups.
+- [ ] Signals — per-branch addressing, a typed signal-schema registry, a
+  symmetric `chidori.sendSignal(runId, name, payload)` send side, and
+  broadcast/pub-sub to multiple runs (`docs/signals.md` §17).
+- [ ] Context management — a raw-`Message[]` escape hatch, a typed
+  prompt/segment schema registry, fleet-wide content-addressed cache sharing,
+  and per-provider cache-strategy plugins (`docs/context-management.md` §16).
 
 ## Useful Verification Commands
 
@@ -319,6 +131,7 @@ broader JavaScript module surface.
 cargo fmt --check
 cargo test
 cargo test --workspace
+scripts/test262.sh --gate            # conformance baseline gate
 cd sdk/typescript && npm run build
 cd sdk/typescript && npm run typecheck
 python -m unittest sdk/python/tests/test_session_api.py
@@ -326,16 +139,14 @@ python -m unittest sdk/python/tests/test_session_api.py
 
 ## Deferred Or Descoped
 
-- Visual editor work is not planned for this migration.
-- Automatic `.star` to `.ts` conversion is not required for v1.
-- Node package compatibility inside agents is not required for v1.
-- Arbitrary mid-instruction snapshots for CPU-bound loops are not required for
-  v1.
-- Full QuickJS `JSModule` record serialization beyond Chidori's bundled
-  selected-root TypeScript module scaffold is future runtime generalization
-  work.
-- Promoting the runtime envelope beyond fresh-runtime plus selected context
-  roots is deferred until production host bindings require runtime-global heap
-  state outside those roots.
-- Unsupported-value path/type detail for future runtime roots outside the
-  selected context-root graph is deferred with those roots.
+- Visual editor work is not planned.
+- Automatic `.star` to `.ts` conversion is not required.
+- Node package compatibility (npm) inside agents is not required for v1.
+- Polyglot snippet execution (`execJs`/`execPython`/`execWasm`) was removed with
+  the WASM/Python sandboxes (#39) and has no replacement.
+- VM-image snapshot/restore of suspended continuations is descoped: durability
+  is the deterministic-replay journal. (The QuickJS-era live-VM snapshot design
+  in `docs/typescript-vm-snapshot-runtime.md` is historical.)
+- `Intl`, `Temporal`, `Atomics`/`SharedArrayBuffer`, `WeakRef`/finalizers,
+  `ShadowRealm`, decorators, and iterator helpers are intentionally unsupported
+  and skipped honestly by the conformance runner.

@@ -133,7 +133,7 @@ pub fn transpile_module(path: &Path, source: &str, options: &TranspileOptions) -
     // Defaults strip TypeScript syntax (types, interfaces, `as`/`satisfies`,
     // `import type`) and leave modern JS untouched. `enable_all()` would also
     // downlevel async/await, optional chaining, and nullish coalescing into
-    // helper-import-heavy generator code — the quickjs runtime supports the
+    // helper-import-heavy generator code — the engine supports the
     // modern forms natively, so we explicitly avoid that.
     let transform_options = TransformOptions::default();
     let transformer_ret = Transformer::new(&allocator, path, &transform_options)
@@ -471,7 +471,7 @@ pub(crate) fn resolve_relative_import(
     }
     // Bundler-style extension probing. ts-node, Bun, Deno, and the TS Bundler
     // resolver all let `import "./tools/x"` resolve to `./tools/x.ts`; agents
-    // should not have to know our quickjs loader is stricter. If the specifier
+    // should not have to know our module loader is stricter. If the specifier
     // already names a file (with or without a known extension), use it as-is.
     // Otherwise probe `.ts`/`.tsx`/`.js`/`.mjs`/`.cjs` and return the first
     // that exists. If none exist, default to the `.ts` candidate so a missing-

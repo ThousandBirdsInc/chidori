@@ -1452,9 +1452,9 @@ pub fn source_for(path: &Path) -> Option<&'static str> {
 
 /// Return the synthetic builtin source for a `node:` builtin *name* (e.g.
 /// `"crypto"` or `"fs/promises"`), or `None` if the name isn't an allowlisted
-/// builtin. The rust engine's module loader serves `node:` specifiers straight
-/// from this (no synthetic filesystem path), while the QuickJS bundler reaches
-/// it through [`source_for`].
+/// builtin. The module loader serves `node:` specifiers straight from this by
+/// name; [`source_for`] is the by-path wrapper for the synthetic
+/// `__node_builtins__/` resolved paths.
 pub fn shim_source(name: &str) -> Option<&'static str> {
     match name {
         "process" => Some(PROCESS_SHIM),

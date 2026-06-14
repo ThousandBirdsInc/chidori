@@ -2384,11 +2384,10 @@ async fn approve_session(
         return (StatusCode::OK, Json(session_view(&original))).into_response();
     }
 
-    // Allow path: record the approval. The live-VM resume below handles the
-    // QuickJS path by resuming the frozen VM; if that doesn't apply (e.g. the
-    // rust engine, whose durability is call-log replay), the fallback further
-    // down replays the recorded log with the approval seeded so prior host
-    // calls return their results and only the blocked call re-executes.
+    // Allow path: record the approval. Durability is call-log replay, so the
+    // resume below replays the recorded log with the approval seeded — prior
+    // host calls return their recorded results and only the blocked call
+    // re-executes.
     original
         .approvals
         .push((pending.target.clone(), pending.args.clone()));

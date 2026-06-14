@@ -102,12 +102,11 @@ pub fn run_agent(
     run_module(path, source, "agent", inputs, backend)
 }
 
-/// Reframe a chidori-js entrypoint error the way the QuickJS host does, so an
-/// uncaught JS exception surfaces identically on both engines: as
-/// `JavaScript exception: <message>` (see `snapshot_export_error` on the QuickJS
-/// path). chidori-js stringifies a thrown `Error` as `"<Name>: <message>"`; we
-/// strip the standard error-class prefix to recover the bare message and apply
-/// the host framing. Pause sentinels pass through untouched — they are control
+/// Reframe a chidori-js entrypoint error so an uncaught JS exception surfaces
+/// as `JavaScript exception: <message>` — the shape the durable format, the
+/// host-call span tree, and the SDKs expect. chidori-js stringifies a thrown
+/// `Error` as `"<Name>: <message>"`; we strip the standard error-class prefix
+/// to recover the bare message and apply the host framing. Pause sentinels pass through untouched — they are control
 /// flow, not exceptions, and `engine.rs` / `host_core` detect them by substring.
 fn js_exception_message(err: &str) -> String {
     if err.contains(crate::runtime::context::PAUSE_MARKER) {
@@ -133,8 +132,7 @@ fn js_exception_message(err: &str) -> String {
 
 /// Run a nested TypeScript **tool** file natively on the rust engine (G4).
 ///
-/// Re-enters [`run_module`] with the tool's `run(args)` entrypoint instead of
-/// bouncing the nested call back into QuickJS via `TypeScriptVmRuntime`. The
+/// Re-enters [`run_module`] with the tool's `run(args)` entrypoint. The
 /// same `backend` (hence the same `RuntimeContext`) is threaded through, so the
 /// tool's host effects nest under the parent tool call (`parent_seq`) and share
 /// the durable call log, policy, MCP, and OTEL span tree. A suspension inside
@@ -314,8 +312,8 @@ fn panic_payload_message(panic: &(dyn std::any::Any + Send)) -> String {
 /// Transpile `source`, run it as a module on a fresh `chidori-js` engine, and
 /// invoke its entrypoint with `input`. The entrypoint is whatever the module
 /// passed to `run(handler)`, or `fallback_export` (e.g. `agent` for agents). The
-/// VM's `chidori.*` effects are forwarded to `backend.dispatch`, the same
-/// durable host machinery the QuickJS bindings use.
+/// VM's `chidori.*` effects are forwarded to `backend.dispatch`, the durable
+/// host machinery in `host_core`.
 fn run_module(
     path: &Path,
     source: &str,
@@ -325,8 +323,8 @@ fn run_module(
 ) -> Result<Value> {
     // `Node` accepts relative `./foo` imports *and* allowlisted `node:` builtins
     // (the special-cased `chidori` SDK import is stripped by transpilation). This
-    // matches the QuickJS path's durable default so `node:fs`/`crypto`/`timers`
-    // reach the captured-effect natives installed below.
+    // is the durable default so `node:fs`/`crypto`/`timers` reach the
+    // captured-effect natives installed below.
     let opts = TranspileOptions {
         import_policy: TypeScriptImportPolicy::Node,
     };
@@ -358,7 +356,7 @@ fn run_module(
         Rc::new(move |effect: &str, args: &Value| backend.dispatch(effect, args));
     engine.install_chidori_effects(dispatch);
     // Install the JS-level `chidori` SDK sugar (tryCall/retry/parallel + the
-    // memory.set/get/delete/clear wrappers) that the QuickJS path also installs.
+    // memory.set/get/delete/clear wrappers).
     // These are pure-JS helpers layered on top of the native host object, so they
     // must run *after* `install_chidori_effects` (the memory sugar wraps the
     // native `chidori.memory`, and the script's guarded workspace shim no-ops
@@ -491,11 +489,9 @@ fn fs_policy_guard(policy: &RuntimePolicy) -> std::result::Result<(), String> {
     }
 }
 
-/// Captured randomness, replaying byte-for-byte with the QuickJS path: the
-/// result is keyed by the shared call-log sequence and recorded as a
-/// `crypto.random` `CallRecord` (unless `crypto=host`), so a resumed run draws
-/// the identical bytes. Mirrors `execute_captured_random` in the QuickJS
-/// snapshot host.
+/// Captured randomness: the result is keyed by the call-log sequence and
+/// recorded as a `crypto.random` `CallRecord` (unless `crypto=host`), so a
+/// resumed run draws the identical bytes byte-for-byte on replay.
 fn execute_captured_random(
     ctx: &RuntimeContext,
     policy: &RuntimePolicy,
@@ -542,8 +538,8 @@ fn execute_captured_random(
 
 /// Build the `__chidori_*` sync-native dispatcher. Crypto hashing/HMAC are pure
 /// and inline; randomness is captured through the call log; the VFS ops operate
-/// on the same snapshot-resident `RuntimeContext` filesystem the QuickJS path
-/// uses — so a `node:fs`/`node:crypto` agent replays identically on either engine.
+/// on the snapshot-resident `RuntimeContext` filesystem — so a
+/// `node:fs`/`node:crypto` agent records and replays deterministically.
 fn build_sync_native_dispatch(
     ctx: RuntimeContext,
     policy: RuntimePolicy,
@@ -682,9 +678,8 @@ fn build_sync_native_dispatch(
 /// The determinism prelude installed on the rust engine before an agent runs:
 /// the logical clock, `process.env`, UTF-8/base64 text primitives, the Web
 /// Crypto subset, and the virtual timer queue. Date and `Math.random`
-/// determinism are already native to `chidori-js`, so (unlike the QuickJS
-/// prelude) this installs no Date/random shims. The polyfill sources are shared
-/// verbatim with the QuickJS path.
+/// determinism are already native to `chidori-js`, so this installs no
+/// Date/random shims.
 fn rust_engine_prelude(policy: &RuntimePolicy) -> String {
     use crate::runtime::typescript::helpers::{
         chidori_agent_env_json, TEXT_ENCODING_POLYFILL, TIMER_DISABLED_POLYFILL,
@@ -803,7 +798,7 @@ mod tests {
         assert_eq!(output, serde_json::json!({ "value": 42 }));
 
         // The host effect flowed through host_core → the RuntimeContext call log,
-        // exactly like the QuickJS path (so durability + host-call spans work).
+        // so durability + host-call spans work.
         let records = ctx.call_log().into_records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].function, "log");
@@ -849,7 +844,7 @@ mod tests {
     fn run_agent_nests_tool_internal_calls_under_the_tool_on_rust_engine() {
         // A TypeScript tool whose `run` makes its own chidori.log calls: those
         // must be recorded as CHILDREN of the tool call (parent_seq = tool seq),
-        // exactly like the QuickJS path — so the trace nests on the rust engine.
+        // so the trace nests correctly.
         let ctx = RuntimeContext::new();
         let dir = std::env::temp_dir().join(format!("chidori-rust-tool-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("tools")).unwrap();
@@ -971,8 +966,8 @@ mod tests {
     #[test]
     fn run_agent_exposes_chidori_js_sdk_helpers() {
         // The JS-level SDK sugar (tryCall/retry/parallel + memory.set/get/delete/
-        // clear) is shared with the QuickJS path via CHIDORI_JS_HELPERS_SCRIPT and
-        // installed after the native host object. The agent below never defines
+        // clear) is loaded from CHIDORI_JS_HELPERS_SCRIPT and installed after
+        // the native host object. The agent below never defines
         // these itself, so it only passes if the engine layered them on — a
         // regression guard for the meta-agent's `chidori.retry`/`chidori.parallel`
         // calls, which otherwise hit "undefined is not a function".

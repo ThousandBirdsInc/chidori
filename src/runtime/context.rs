@@ -139,8 +139,9 @@ struct RuntimeContextInner {
     /// `delivery_seq` matching entry and immediately re-persists the shrunken
     /// inbox so a crash can't double-deliver (see `docs/signals.md` §8.4/§10).
     pub signal_inbox: Vec<QueuedSignal>,
-    /// Durable host-promise bookkeeping. This is snapshot-serializable Rust
-    /// state; the QuickJS fork will bind these ids to real JS promises.
+    /// Durable host-promise bookkeeping: snapshot-serializable Rust state that
+    /// pairs each pending host operation id with its eventual result for the
+    /// deterministic-replay journal.
     #[allow(dead_code)]
     pub host_promises: HostPromiseTable,
     /// Optional live-event sink. When set, every `record_call` is also
