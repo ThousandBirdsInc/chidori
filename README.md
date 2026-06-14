@@ -101,6 +101,17 @@ TypeScript.
 
 ## ⚡️ Quick Start
 
+### 0. Scaffold a starter (optional)
+
+```bash
+chidori init my-agent --template chat     # or: --template worker
+# then follow the printed run command, e.g. `chidori chat agent.ts`
+```
+
+`chidori init` writes a ready-to-run agent (omit `--template` to pick
+interactively): **chat** is a conversational assistant, **worker** is an
+autonomous tool-using loop.
+
 ### 1. Write an agent
 
 ```ts
@@ -151,6 +162,13 @@ cargo build
 # Local TypeScript tool — no LLM calls needed
 ./target/debug/chidori run examples/agents/tool_use.ts \
   --input query=chidori --tools examples/tools
+
+# Multi-turn chat assistant (scripted turns; omit --input to chat interactively)
+./target/debug/chidori run examples/agents/conversation.ts \
+  --input '{"messages": ["Hi, who are you?", "What can you help with?"]}'
+
+# Or chat with the model directly — no agent file, durable every turn
+./target/debug/chidori chat --system "You are a concise assistant."
 ```
 
 For a guided walkthrough — inspecting a run, the demo picker, and the
@@ -159,6 +177,15 @@ human-in-the-loop pause/resume loop — see
 
 ## 🧰 What You Can Build
 
+- **Conversational chat assistants** — `chidori.conversation()` owns a multi-turn
+  dialogue: `chat.say(message)` per turn, or `chat.loop()` for an interactive
+  `input()`-driven session. Every turn is durable and prefix-cached, so the whole
+  conversation replays for $0. Or run `chidori chat` (optionally through an agent
+  file) for a built-in REPL. See [Core concepts](./docs/core-concepts.md#conversational-agents).
+- **Autonomous tool-using agents** — a worker that loops (think → call a tool →
+  observe → repeat) until the task is done, via `context.respond()` and
+  `toolResult(...)`. Scaffold one with `chidori init --template worker`; see
+  [`examples/agents/worker.ts`](./examples/agents/worker.ts).
 - **Durable, resumable agents** — runs survive crashes and restarts and resume
   exactly where they paused. See [How replay works](./docs/replay.md).
 - **Deterministic tests & free debugging** — check in a checkpoint and replay it
