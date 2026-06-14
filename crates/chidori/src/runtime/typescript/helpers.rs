@@ -324,6 +324,131 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
             if (seed && Array.isArray(seed.tools)) ctx = ctx.tools(seed.tools);
             return ctx;
         };
+
+        // chidori.conversation(): a small stateful wrapper over context() for the
+        // most common shape — a multi-turn chat assistant. It owns the current
+        // immutable context (system + tools head frozen as a cacheable prefix)
+        // and threads each turn through it, so authors write `chat.say(msg)`
+        // instead of re-plumbing `ctx = (await ctx.user(msg).prompt()).context`
+        // by hand. Every turn is still one durable `prompt`/`respond` host call,
+        // replays for free, and reads the shared prefix at the cached rate.
+        globalThis.chidori.conversation = function conversation(options) {
+            const opts = options || {};
+            // Per-turn LLM options carried forward on every turn (a per-call
+            // override still wins). `tools` live in the context head instead.
+            const defaults = {};
+            for (const key of ["model", "maxTokens", "max_tokens", "temperature", "cache"]) {
+                if (opts[key] !== undefined) defaults[key] = opts[key];
+            }
+            const defaultType = typeof opts.type === "string" ? opts.type : "final";
+            // Opt-in window management: when set, each turn first runs the same
+            // budgeted `context.compact()` no-op until the tail exceeds budget.
+            const compactOptions =
+                opts.compact && typeof opts.compact === "object" ? opts.compact : null;
+
+            let ctx = globalThis.chidori.context({
+                system: opts.system,
+                tools: opts.tools,
+            });
+            // Freeze the stable head (system + tools) as a cacheable prefix so
+            // every turn after the first reads it at the discounted cached rate.
+            if (opts.system || (Array.isArray(opts.tools) && opts.tools.length)) {
+                ctx = ctx.cacheBreakpoint(opts.cacheTtl === "1h" ? "1h" : "5m");
+            }
+            const turns = [];
+
+            function turnOptions(perTurn) {
+                return Object.assign({ type: defaultType }, defaults, perTurn || {});
+            }
+
+            const api = {
+                // The underlying immutable context, for dropping down to the
+                // lower-level API (digest, estimateTokens, manual compact, fork).
+                get context() {
+                    return ctx;
+                },
+                // Number of completed exchanges (user+assistant pairs) recorded.
+                get length() {
+                    return turns.filter((t) => t.role === "assistant").length;
+                },
+                // The transcript so far as plain {role, text} entries.
+                history() {
+                    return turns.map((t) => ({ role: t.role, text: t.text }));
+                },
+                // Send one user message, return the assistant's reply text. The
+                // conversation advances in place: the user and assistant turns
+                // are appended to the context for the next call.
+                async say(message, perTurn) {
+                    const text = String(message == null ? "" : message);
+                    if (compactOptions) ctx = await ctx.compact(compactOptions);
+                    ctx = ctx.user(text);
+                    turns.push({ role: "user", text });
+                    const result = await ctx.prompt(turnOptions(perTurn));
+                    ctx = result.context;
+                    turns.push({ role: "assistant", text: result.text });
+                    return result.text;
+                },
+                // Like say(), but returns the structured response (tool_calls,
+                // blocks) for author-driven tool loops. Append tool results with
+                // `chat.context.toolResult(...)` then call `chat.say(...)` again.
+                async respond(message, perTurn) {
+                    const text = String(message == null ? "" : message);
+                    if (compactOptions) ctx = await ctx.compact(compactOptions);
+                    ctx = ctx.user(text);
+                    turns.push({ role: "user", text });
+                    const result = await ctx.respond(turnOptions(perTurn));
+                    ctx = result.context;
+                    const reply =
+                        result.response && typeof result.response.content === "string"
+                            ? result.response.content
+                            : "";
+                    turns.push({ role: "assistant", text: reply });
+                    return result.response;
+                },
+                // Drive an interactive loop: read a human message via
+                // chidori.input() (terminal stdin under `chidori run`, a paused
+                // session resume under `chidori serve`), reply with say(), repeat
+                // until the user types an exit word or `until` returns true.
+                // Returns the full transcript.
+                async loop(loopOptions) {
+                    const lo = loopOptions || {};
+                    const exits = (
+                        Array.isArray(lo.exit)
+                            ? lo.exit
+                            : lo.exit != null
+                              ? [lo.exit]
+                              : ["exit", "quit"]
+                    ).map((s) => String(s).toLowerCase());
+                    const maxTurns = Number.isFinite(Number(lo.maxTurns))
+                        ? Number(lo.maxTurns)
+                        : Infinity;
+                    let turn = 0;
+                    while (turn < maxTurns) {
+                        const promptText =
+                            typeof lo.prompt === "function"
+                                ? lo.prompt(turn)
+                                : lo.prompt || "You:";
+                        const raw = await globalThis.chidori.input(
+                            promptText,
+                            lo.inputOptions || { type: "message" },
+                        );
+                        const message = String(raw == null ? "" : raw).trim();
+                        if (message === "" && lo.skipEmpty !== false) continue;
+                        if (exits.indexOf(message.toLowerCase()) !== -1) break;
+                        const reply = await api.say(message, lo.turn);
+                        if (typeof lo.onReply === "function") {
+                            await lo.onReply(reply, message);
+                        }
+                        turn += 1;
+                        if (typeof lo.until === "function" && lo.until(message, reply)) {
+                            break;
+                        }
+                    }
+                    return api.history();
+                },
+            };
+            return api;
+        };
     })();
 
     if (typeof globalThis.__chidori_workspace_write === "function") {
