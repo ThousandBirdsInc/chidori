@@ -116,11 +116,11 @@ const WORKER: Template = Template {
     files: &[
         TemplateFile {
             path: "agent.ts",
-            contents: include_str!("../examples/agents/worker.ts"),
+            contents: include_str!("../../../examples/agents/worker.ts"),
         },
         TemplateFile {
             path: "tools/reverse.ts",
-            contents: include_str!("../examples/tools/reverse.ts"),
+            contents: include_str!("../../../examples/tools/reverse.ts"),
         },
         TemplateFile {
             path: "README.md",

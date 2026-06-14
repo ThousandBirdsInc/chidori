@@ -6,7 +6,7 @@ release is cut by pushing a `vX.Y.Z` tag.
 
 | Artifact | Registry | Name | How it publishes |
 | --- | --- | --- | --- |
-| Rust crates | crates.io | `chidori`, `chidori-js` | Manually, via `./publish.sh` (see that script's header) |
+| Rust crates | crates.io | `chidori`, `chidori-js` | Manually, via `./scripts/publish.sh` (see that script's header) |
 | TypeScript SDK | npm | [`@1kbirds/chidori`](https://www.npmjs.com/package/@1kbirds/chidori) | `.github/workflows/release.yml` on tag push |
 | Python SDK | PyPI | [`chidori`](https://pypi.org/project/chidori/) | `.github/workflows/release.yml` on tag push |
 
@@ -45,7 +45,7 @@ SDK module specifier in agent files.
 4. The `Release SDKs` workflow verifies the tag matches the version train,
    builds both SDKs, and publishes each one — skipping any version that is
    already on its registry, so re-running the workflow is safe.
-5. Publish the crates separately: `CARGO_REGISTRY_TOKEN=... ./publish.sh`
+5. Publish the crates separately: `CARGO_REGISTRY_TOKEN=... ./scripts/publish.sh`
    from the tagged commit.
 
 To rehearse without publishing, run the workflow manually from the Actions

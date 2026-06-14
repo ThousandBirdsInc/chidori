@@ -1,99 +1,14 @@
-[package]
-name = "chidori"
-version = "3.0.0"
-edition = "2021"
-authors = ["Colton Pierson <colton@thousandbirds.ai>"]
-license = "Apache-2.0"
-description = "YAML-free AI agent framework where agents are deterministic TypeScript modules with built-in checkpointing and replay."
-homepage = "https://docs.thousandbirds.ai"
-repository = "https://github.com/ThousandBirdsInc/chidori"
-readme = "README.md"
-keywords = ["agent", "ai", "llm", "typescript", "replay"]
-categories = ["development-tools", "command-line-utilities"]
-
 [workspace]
 members = [
-    ".",
+    "crates/chidori",
     "crates/chidori-js",
     "crates/test262-runner",
 ]
 resolver = "2"
 
-[[bin]]
-name = "chidori"
-path = "src/main.rs"
-
-[dependencies]
-# Async runtime
-tokio = { version = "1", features = ["full"] }
-
-# HTTP client for LLM providers
-reqwest = { version = "0.12", features = ["json", "stream", "gzip"] }
-url = "2"
-
-# HTTP server for serve command
-axum = "0.8"
-tower = "0.5"
-tower-http = { version = "0.6", features = ["cors"] }
-
-# Template engine
-minijinja = { version = "2", features = ["loader"] }
-
-# CLI
-clap = { version = "4", features = ["derive"] }
-
-# Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# Tracing
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-
-# Utilities
-anyhow = "1"
-thiserror = "2"
-uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
-futures = "0.3"
-tokio-stream = "0.1"
-async-stream = "0.3"
-sha2 = "0.10"
-sha1 = "0.10"
-hmac = "0.12"
-base64 = "0.22"
-hex = "0.4"
-rand = "0.8"
-
-# Pure-Rust JS engine + deterministic-replay durable runtime. The only JS engine.
-chidori-js = { path = "crates/chidori-js", version = "0.1.0" }
-async-trait = "0.1"
-derive_more = { version = "1", features = ["display"] }
-
-# SQLite session store
-rusqlite = { version = "0.32", features = ["bundled"] }
-
-# Cron scheduler for recipes
-cron = "0.12"
-
-# YAML recipe parsing
-serde_yaml = "0.9"
-
-# OpenTelemetry OTLP export — emits one span per host function call so agents
-# can be shipped into any OTLP-compatible backend (tael, Jaeger, Tempo, etc.).
-# Activated at runtime when OTEL_EXPORTER_OTLP_ENDPOINT is set.
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
-
-# TypeScript-to-JavaScript stripping. Replaces a hand-rolled line-based stripper
-# that missed constructs like type predicates (`(t): t is string => ...`),
-# `satisfies` in odd positions, and overload signatures. oxc parses to a real
-# AST and emits JS via codegen, so unsupported sugar can't slip through.
-oxc = { version = "0.133", features = ["transformer", "codegen", "semantic"] }
-
-[dev-dependencies]
-tempfile = "3"
-# In-memory span exporter for asserting OTEL span-tree shape in tests. Unions
-# with the runtime `opentelemetry_sdk` features for test builds.
-opentelemetry_sdk = { version = "0.27", features = ["testing"] }
+# Shared metadata for the published crates. Inherited with `field.workspace =
+# true`; paths (like `readme`) resolve relative to this workspace root.
+[workspace.package]
+readme = "README.md"
+repository = "https://github.com/ThousandBirdsInc/chidori"
+license = "Apache-2.0"
