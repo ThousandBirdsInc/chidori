@@ -1,0 +1,98 @@
+name: JS benchmarks
+
+# Runs the chidori-js cross-runtime benchmark suite (chidori-js vs Node.js vs
+# Bun) on PRs that touch the engine, and posts the results table as a single
+# sticky comment on the PR (updated in place on each run, not re-posted).
+#
+# These numbers come from a shared GitHub-hosted runner, so treat them as
+# ratios for a quick smell-test, not as a precise performance gate — the job
+# never fails the build on timing, only on a correctness mismatch between
+# runtimes (which the harness exits non-zero on).
+on:
+  pull_request:
+    paths:
+      - "crates/chidori-js/**"
+      - ".github/workflows/js-benchmarks.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: js-benchmarks-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  benchmark:
+    name: chidori-js vs Node vs Bun
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Reuse the engine build cache so we don't pay a cold compile every run.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: js-benchmarks
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build chidori-js run example (release)
+        run: cargo build --release -p chidori-js --example run
+
+      - name: Run cross-runtime benchmarks
+        run: |
+          node crates/chidori-js/benchmarks/run.mjs \
+            --no-build \
+            --markdown benchmark-report.md \
+            --json benchmark-report.json
+
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-benchmark-report
+          path: |
+            benchmark-report.md
+            benchmark-report.json
+
+      # Post/update the sticky PR comment. Skipped for fork PRs (their token is
+      # read-only and can't comment) and for manual workflow_dispatch runs.
+      - name: Comment benchmark results on PR
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- chidori-js-benchmarks -->';
+            const body = fs.readFileSync('benchmark-report.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number, per_page: 100 },
+            );
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body,
+              });
+              core.info(`Updated benchmark comment ${existing.id}`);
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body,
+              });
+              core.info('Created benchmark comment');
+            }
