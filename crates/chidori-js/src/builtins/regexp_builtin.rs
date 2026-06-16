@@ -50,14 +50,14 @@ pub fn install(vm: &mut Vm) {
     vm.define_method(&proto, "exec", 1, |vm, this, args| {
         let re = regexp_this(vm, &this)?;
         let s = vm.to_js_string(&arg(args, 0))?;
-        regexp_exec_impl(vm, &re, s.as_str())
+        regexp_exec_impl(vm, &re, &s)
     });
 
     // RegExp.prototype.test = !!RegExpExec(this, S) — generic over the receiver.
     vm.define_method(&proto, "test", 1, |vm, this, args| {
         require_object(vm, &this, "test")?;
         let s = vm.to_js_string(&arg(args, 0))?;
-        let res = regexp_exec_abstract(vm, &this, s.as_str())?;
+        let res = regexp_exec_abstract(vm, &this, &s)?;
         Ok(Value::Bool(!res.is_null()))
     });
 
@@ -127,7 +127,7 @@ fn install_symbol_protocol(vm: &mut Vm, proto: &JsObject) {
     let f = vm.new_native("[Symbol.match]", 1, |vm, this, args| {
         require_object(vm, &this, "Symbol.match")?;
         let s = vm.to_js_string(&arg(args, 0))?;
-        sym_match_generic(vm, &this, s.as_str())
+        sym_match_generic(vm, &this, &s)
     });
     let sym = vm.realm.symbol_match.clone();
     vm.define_value_sym(proto, sym, Value::Object(f));
@@ -136,7 +136,7 @@ fn install_symbol_protocol(vm: &mut Vm, proto: &JsObject) {
     let f = vm.new_native("[Symbol.matchAll]", 1, |vm, this, args| {
         require_object(vm, &this, "Symbol.matchAll")?;
         let s = vm.to_js_string(&arg(args, 0))?;
-        sym_match_all_generic(vm, &this, s.as_str())
+        sym_match_all_generic(vm, &this, &s)
     });
     let sym = vm.realm.symbol_match_all.clone();
     vm.define_value_sym(proto, sym, Value::Object(f));
@@ -145,7 +145,7 @@ fn install_symbol_protocol(vm: &mut Vm, proto: &JsObject) {
     let f = vm.new_native("[Symbol.replace]", 2, |vm, this, args| {
         require_object(vm, &this, "Symbol.replace")?;
         let s = vm.to_js_string(&arg(args, 0))?;
-        sym_replace_generic(vm, &this, s.as_str(), &arg(args, 1))
+        sym_replace_generic(vm, &this, &s, &arg(args, 1))
     });
     let sym = vm.realm.symbol_replace.clone();
     vm.define_value_sym(proto, sym, Value::Object(f));
@@ -154,7 +154,7 @@ fn install_symbol_protocol(vm: &mut Vm, proto: &JsObject) {
     let f = vm.new_native("[Symbol.search]", 1, |vm, this, args| {
         require_object(vm, &this, "Symbol.search")?;
         let s = vm.to_js_string(&arg(args, 0))?;
-        sym_search_generic(vm, &this, s.as_str())
+        sym_search_generic(vm, &this, &s)
     });
     let sym = vm.realm.symbol_search.clone();
     vm.define_value_sym(proto, sym, Value::Object(f));
@@ -165,7 +165,7 @@ fn install_symbol_protocol(vm: &mut Vm, proto: &JsObject) {
     // subclasses and RegExp-like plain objects both work.
     let f = vm.new_native("[Symbol.split]", 2, |vm, this, args| {
         require_object(vm, &this, "Symbol.split")?;
-        let s = vm.to_js_string(&arg(args, 0))?.as_str().to_string();
+        let s = vm.to_js_string(&arg(args, 0))?;
         let default_ctor = vm.get_prop(
             &Value::Object(vm.realm.regexp_proto.clone()),
             &PropertyKey::str("constructor"),
@@ -190,12 +190,12 @@ fn install_symbol_protocol(vm: &mut Vm, proto: &JsObject) {
         if lim == 0 {
             return Ok(Value::Object(vm.new_array(out)));
         }
-        let chars: Vec<char> = s.chars().collect();
-        let size = chars.len();
+        let units = s.to_utf16_vec();
+        let size = units.len();
         if size == 0 {
             let z = regexp_exec_abstract(vm, &splitter, &s)?;
             if z.is_null() {
-                out.push(Value::str(&s));
+                out.push(Value::String(s.clone()));
             }
             return Ok(Value::Object(vm.new_array(out)));
         }
@@ -206,14 +206,14 @@ fn install_symbol_protocol(vm: &mut Vm, proto: &JsObject) {
             vm.set_prop_strict(&splitter, &li_key, Value::Number(q as f64))?;
             let z = regexp_exec_abstract(vm, &splitter, &s)?;
             if z.is_null() {
-                q = advance_string_index(q, unicode);
+                q = advance_string_index(&units, q, unicode);
             } else {
                 let li = vm.get_prop(&splitter, &li_key)?;
                 let e = vm.to_length(&li)?.min(size);
                 if e == p {
-                    q = advance_string_index(q, unicode);
+                    q = advance_string_index(&units, q, unicode);
                 } else {
-                    out.push(Value::str(chars[p..q].iter().collect::<String>()));
+                    out.push(Value::String(JsString::from_code_units(&units[p..q])));
                     if out.len() == lim {
                         return Ok(Value::Object(vm.new_array(out)));
                     }
@@ -231,7 +231,7 @@ fn install_symbol_protocol(vm: &mut Vm, proto: &JsObject) {
                 }
             }
         }
-        out.push(Value::str(chars[p..size].iter().collect::<String>()));
+        out.push(Value::String(JsString::from_code_units(&units[p..size])));
         Ok(Value::Object(vm.new_array(out)))
     });
     let sym = vm.realm.symbol_split.clone();
@@ -390,12 +390,12 @@ fn regexp_this(vm: &mut Vm, this: &Value) -> Result<JsObject, Value> {
 /// updates it after a match, resets it to 0 on a failed global/sticky match,
 /// and returns a match array with `.index`, `.input`, and `groups` (always
 /// `undefined` since named groups are not supported), or `null`.
-pub fn regexp_exec_impl(vm: &mut Vm, re: &JsObject, input: &str) -> Result<Value, Value> {
+pub fn regexp_exec_impl(vm: &mut Vm, re: &JsObject, input: &JsString) -> Result<Value, Value> {
     let (source, flags) = regexp_source_flags(re);
     let global = flags.contains('g');
     let sticky = flags.contains('y');
 
-    let units: Vec<u16> = input.encode_utf16().collect();
+    let units: Vec<u16> = input.to_utf16_vec();
 
     // Read lastIndex via Get (it is a writable data property), then ToLength.
     let last_index = {
@@ -457,10 +457,10 @@ pub fn regexp_exec_impl(vm: &mut Vm, re: &JsObject, input: &str) -> Result<Value
 /// the result is Object or Null); otherwise fall back to the builtin exec, which
 /// requires `R` to be a real RegExp. Lets the generic `@@match`/`@@replace`/etc.
 /// honor a user-overridden `exec`.
-fn regexp_exec_abstract(vm: &mut Vm, rx: &Value, s: &str) -> Result<Value, Value> {
+fn regexp_exec_abstract(vm: &mut Vm, rx: &Value, s: &JsString) -> Result<Value, Value> {
     let exec = vm.get_prop(rx, &PropertyKey::str("exec"))?;
     if vm.is_callable(&exec) {
-        let result = vm.call(exec, rx.clone(), &[Value::str(s)])?;
+        let result = vm.call(exec, rx.clone(), &[Value::String(s.clone())])?;
         if !matches!(result, Value::Object(_) | Value::Null) {
             return Err(vm.throw_type("RegExp exec method returned a non-object, non-null value"));
         }
@@ -479,16 +479,23 @@ fn regexp_exec_abstract(vm: &mut Vm, rx: &Value, s: &str) -> Result<Value, Value
     regexp_exec_impl(vm, &o, s)
 }
 
-/// AdvanceStringIndex. The engine represents strings as code points (Rust
-/// `char`s), so a single step always advances one code point regardless of the
-/// unicode flag.
-fn advance_string_index(index: usize, _unicode: bool) -> usize {
-    index + 1
+/// Spec `AdvanceStringIndex`: in unicode mode, step over a whole surrogate pair
+/// (`+2`) when `index` begins one; otherwise advance one code unit.
+fn advance_string_index(units: &[u16], index: usize, unicode: bool) -> usize {
+    if unicode
+        && index + 1 < units.len()
+        && (0xD800..=0xDBFF).contains(&units[index])
+        && (0xDC00..=0xDFFF).contains(&units[index + 1])
+    {
+        index + 2
+    } else {
+        index + 1
+    }
 }
 
 /// Generic `RegExp.prototype[@@match]` (spec 22.2.6.8): operates on any receiver
 /// via `RegExpExec` and the `global`/`unicode`/`lastIndex` properties.
-pub fn sym_match_generic(vm: &mut Vm, rx: &Value, s: &str) -> Result<Value, Value> {
+pub fn sym_match_generic(vm: &mut Vm, rx: &Value, s: &JsString) -> Result<Value, Value> {
     let g = vm.get_prop(rx, &PropertyKey::str("global"))?;
     let global = vm.to_boolean(&g);
     if !global {
@@ -496,6 +503,7 @@ pub fn sym_match_generic(vm: &mut Vm, rx: &Value, s: &str) -> Result<Value, Valu
     }
     let u = vm.get_prop(rx, &PropertyKey::str("unicode"))?;
     let unicode = vm.to_boolean(&u);
+    let units = s.to_utf16_vec();
     vm.set_prop(rx, &PropertyKey::str("lastIndex"), Value::Number(0.0))?;
     let mut out: Vec<Value> = Vec::new();
     loop {
@@ -505,12 +513,12 @@ pub fn sym_match_generic(vm: &mut Vm, rx: &Value, s: &str) -> Result<Value, Valu
         }
         let m0 = vm.get_prop(&result, &PropertyKey::from_index(0))?;
         let match_str = vm.to_js_string(&m0)?;
-        let empty = match_str.as_str().is_empty();
-        out.push(Value::str(match_str.as_str()));
+        let empty = match_str.len_utf16() == 0;
+        out.push(Value::String(match_str));
         if empty {
             let li = vm.get_prop(rx, &PropertyKey::str("lastIndex"))?;
             let li = vm.to_length(&li)?;
-            let next = advance_string_index(li, unicode);
+            let next = advance_string_index(&units, li, unicode);
             vm.set_prop(
                 rx,
                 &PropertyKey::str("lastIndex"),
@@ -526,7 +534,7 @@ pub fn sym_match_generic(vm: &mut Vm, rx: &Value, s: &str) -> Result<Value, Valu
 }
 
 /// Generic `RegExp.prototype[@@search]` (spec 22.2.6.12).
-pub fn sym_search_generic(vm: &mut Vm, rx: &Value, s: &str) -> Result<Value, Value> {
+pub fn sym_search_generic(vm: &mut Vm, rx: &Value, s: &JsString) -> Result<Value, Value> {
     let prev = vm.get_prop(rx, &PropertyKey::str("lastIndex"))?;
     if !crate::value::same_value(&prev, &Value::Number(0.0)) {
         vm.set_prop(rx, &PropertyKey::str("lastIndex"), Value::Number(0.0))?;
@@ -567,7 +575,7 @@ fn species_constructor(vm: &mut Vm, o: &Value, default_ctor: &Value) -> Result<V
 /// Generic `RegExp.prototype[@@matchAll]` (spec 22.2.6.9): build a fresh matcher
 /// via the species constructor, copy `lastIndex`, and return a lazy
 /// RegExpStringIterator over it.
-pub fn sym_match_all_generic(vm: &mut Vm, rx: &Value, s: &str) -> Result<Value, Value> {
+pub fn sym_match_all_generic(vm: &mut Vm, rx: &Value, s: &JsString) -> Result<Value, Value> {
     let default_ctor = vm.get_prop(
         &Value::Object(vm.realm.regexp_proto.clone()),
         &PropertyKey::str("constructor"),
@@ -593,7 +601,7 @@ pub fn sym_match_all_generic(vm: &mut Vm, rx: &Value, s: &str) -> Result<Value, 
 fn make_regexp_string_iterator(
     vm: &mut Vm,
     matcher: Value,
-    s: &str,
+    s: &JsString,
     global: bool,
     unicode: bool,
 ) -> Value {
@@ -602,9 +610,9 @@ fn make_regexp_string_iterator(
     let proto = vm.realm.iterator_proto.clone();
     let iter = vm.new_object_proto(Some(proto));
     // (matcher, S, global, unicode, done)
-    let state: Rc<RefCell<(Value, String, bool, bool, bool)>> = Rc::new(RefCell::new((
+    let state: Rc<RefCell<(Value, JsString, bool, bool, bool)>> = Rc::new(RefCell::new((
         matcher,
-        s.to_string(),
+        s.clone(),
         global,
         unicode,
         false,
@@ -628,10 +636,10 @@ fn make_regexp_string_iterator(
         }
         let m0 = vm.get_prop(&result, &PropertyKey::from_index(0))?;
         let match_str = vm.to_js_string(&m0)?;
-        if match_str.as_str().is_empty() {
+        if match_str.len_utf16() == 0 {
             let li = vm.get_prop(&matcher, &PropertyKey::str("lastIndex"))?;
             let li = vm.to_length(&li)?;
-            let next_i = advance_string_index(li, unicode);
+            let next_i = advance_string_index(&s.to_utf16_vec(), li, unicode);
             vm.set_prop(
                 &matcher,
                 &PropertyKey::str("lastIndex"),
@@ -650,14 +658,21 @@ fn make_regexp_string_iterator(
 /// Generic `RegExp.prototype[@@replace]` (spec 22.2.6.11): honors a user
 /// `exec`, the `global`/`unicode` flags, and reads each result's
 /// `index`/`length`/captures/`groups` via property access.
-pub fn sym_replace_generic(vm: &mut Vm, rx: &Value, s: &str, repl: &Value) -> Result<Value, Value> {
-    let s_chars: Vec<char> = s.chars().collect();
-    let length_s = s_chars.len();
+pub fn sym_replace_generic(
+    vm: &mut Vm,
+    rx: &Value,
+    s: &JsString,
+    repl: &Value,
+) -> Result<Value, Value> {
+    let units = s.to_utf16_vec();
+    let length_s = units.len();
     let functional = vm.is_callable(repl);
-    let repl_str = if functional {
-        String::new()
+    // The replacement template is itself a string of code units (its `$…`
+    // syntax is ASCII, but the literal text may carry surrogates).
+    let templ: Vec<u16> = if functional {
+        Vec::new()
     } else {
-        vm.to_string_lossy(repl)
+        vm.to_js_string(repl)?.to_utf16_vec()
     };
     let g = vm.get_prop(rx, &PropertyKey::str("global"))?;
     let global = vm.to_boolean(&g);
@@ -682,10 +697,10 @@ pub fn sym_replace_generic(vm: &mut Vm, rx: &Value, s: &str, repl: &Value) -> Re
         }
         let m0 = vm.get_prop(&result, &PropertyKey::from_index(0))?;
         let match_str = vm.to_js_string(&m0)?;
-        if match_str.as_str().is_empty() {
+        if match_str.len_utf16() == 0 {
             let li = vm.get_prop(rx, &PropertyKey::str("lastIndex"))?;
             let li = vm.to_length(&li)?;
-            let next = advance_string_index(li, unicode);
+            let next = advance_string_index(&units, li, unicode);
             vm.set_prop(
                 rx,
                 &PropertyKey::str("lastIndex"),
@@ -693,18 +708,19 @@ pub fn sym_replace_generic(vm: &mut Vm, rx: &Value, s: &str, repl: &Value) -> Re
             )?;
         }
     }
-    let mut accumulated = String::new();
+    let mut accumulated: Vec<u16> = Vec::new();
     let mut next_pos = 0usize;
     for result in &results {
         let len_v = vm.get_prop(result, &PropertyKey::str("length"))?;
         let result_length = vm.to_length(&len_v)?;
         let n_captures = result_length.saturating_sub(1);
         let m0 = vm.get_prop(result, &PropertyKey::from_index(0))?;
-        let matched = vm.to_js_string(&m0)?.as_str().to_string();
-        let match_length = matched.chars().count();
+        let matched_js = vm.to_js_string(&m0)?;
+        let matched: Vec<u16> = matched_js.to_utf16_vec();
+        let match_length = matched.len();
         let pos_v = vm.get_prop(result, &PropertyKey::str("index"))?;
         let position = vm.to_length(&pos_v)?.min(length_s);
-        let mut captures: Vec<Option<String>> = Vec::with_capacity(n_captures);
+        let mut captures: Vec<Option<Vec<u16>>> = Vec::with_capacity(n_captures);
         for n in 1..=n_captures.max(1) {
             if n > n_captures {
                 break;
@@ -713,46 +729,44 @@ pub fn sym_replace_generic(vm: &mut Vm, rx: &Value, s: &str, repl: &Value) -> Re
             if cap.is_undefined() {
                 captures.push(None);
             } else {
-                captures.push(Some(vm.to_string_lossy(&cap)));
+                captures.push(Some(vm.to_js_string(&cap)?.to_utf16_vec()));
             }
         }
         let named = vm.get_prop(result, &PropertyKey::str("groups"))?;
-        let replacement = if functional {
+        let replacement: Vec<u16> = if functional {
             let mut args: Vec<Value> = Vec::with_capacity(captures.len() + 4);
-            args.push(Value::str(&matched));
+            args.push(Value::String(matched_js.clone()));
             for c in &captures {
                 args.push(match c {
-                    Some(cs) => Value::str(cs),
+                    Some(cs) => Value::String(JsString::from_code_units(cs)),
                     None => Value::Undefined,
                 });
             }
             args.push(Value::Number(position as f64));
-            args.push(Value::str(s));
+            args.push(Value::String(s.clone()));
             if !named.is_undefined() {
                 args.push(named.clone());
             }
             let r = vm.call(repl.clone(), Value::Undefined, &args)?;
-            vm.to_string_lossy(&r)
+            vm.to_js_string(&r)?.to_utf16_vec()
         } else {
             let named_obj = if named.is_undefined() {
                 Value::Undefined
             } else {
                 Value::Object(vm.to_object(&named)?)
             };
-            get_substitution(
-                vm, &matched, &s_chars, position, &captures, &named_obj, &repl_str,
-            )?
+            get_substitution(vm, &matched, &units, position, &captures, &named_obj, &templ)?
         };
         if position >= next_pos {
-            accumulated.extend(s_chars[next_pos..position].iter());
-            accumulated.push_str(&replacement);
+            accumulated.extend_from_slice(&units[next_pos..position]);
+            accumulated.extend_from_slice(&replacement);
             next_pos = position + match_length;
         }
     }
     if next_pos < length_s {
-        accumulated.extend(s_chars[next_pos..].iter());
+        accumulated.extend_from_slice(&units[next_pos..]);
     }
-    Ok(Value::str(accumulated))
+    Ok(Value::String(JsString::from_code_units(&accumulated)))
 }
 
 /// GetSubstitution (spec 22.2.6.10.1): expand `$`-substitutions in a string
@@ -760,62 +774,66 @@ pub fn sym_replace_generic(vm: &mut Vm, rx: &Value, s: &str, repl: &Value) -> Re
 /// `named` captures object for `$<name>`.
 fn get_substitution(
     vm: &mut Vm,
-    matched: &str,
-    s_chars: &[char],
+    matched: &[u16],
+    units: &[u16],
     position: usize,
-    captures: &[Option<String>],
+    captures: &[Option<Vec<u16>>],
     named: &Value,
-    templ: &str,
-) -> Result<String, Value> {
-    let tail = position + matched.chars().count();
-    let bytes: Vec<char> = templ.chars().collect();
-    let mut out = String::new();
+    templ: &[u16],
+) -> Result<Vec<u16>, Value> {
+    // The `$…` substitution syntax is all ASCII, so it is read directly off the
+    // code units; the inserted segments (match, captures, `$\`` / `$'` slices)
+    // carry through as code units so surrogates survive.
+    const DOLLAR: u16 = b'$' as u16;
+    let is_digit = |u: u16| (b'0' as u16..=b'9' as u16).contains(&u);
+    let tail = position + matched.len();
+    let mut out: Vec<u16> = Vec::new();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == '$' && i + 1 < bytes.len() {
-            let c = bytes[i + 1];
+    while i < templ.len() {
+        if templ[i] == DOLLAR && i + 1 < templ.len() {
+            let c = templ[i + 1];
             match c {
-                '$' => {
-                    out.push('$');
+                _ if c == DOLLAR => {
+                    out.push(DOLLAR);
                     i += 2;
                 }
-                '&' => {
-                    out.push_str(matched);
+                _ if c == b'&' as u16 => {
+                    out.extend_from_slice(matched);
                     i += 2;
                 }
-                '`' => {
-                    out.extend(s_chars[..position].iter());
+                _ if c == b'`' as u16 => {
+                    out.extend_from_slice(&units[..position]);
                     i += 2;
                 }
-                '\'' => {
-                    if tail < s_chars.len() {
-                        out.extend(s_chars[tail..].iter());
+                _ if c == b'\'' as u16 => {
+                    if tail < units.len() {
+                        out.extend_from_slice(&units[tail..]);
                     }
                     i += 2;
                 }
-                '<' if !named.is_undefined() => {
-                    match bytes[i + 2..].iter().position(|&ch| ch == '>') {
+                _ if c == b'<' as u16 && !named.is_undefined() => {
+                    match templ[i + 2..].iter().position(|&ch| ch == b'>' as u16) {
                         Some(rel) => {
                             let gt = i + 2 + rel;
-                            let name: String = bytes[i + 2..gt].iter().collect();
+                            let name = String::from_utf16_lossy(&templ[i + 2..gt]);
                             let cap = vm.get_prop(named, &PropertyKey::str(&name))?;
                             if !cap.is_undefined() {
-                                out.push_str(&vm.to_string_lossy(&cap));
+                                out.extend(vm.to_js_string(&cap)?.code_units());
                             }
                             i = gt + 1;
                         }
                         None => {
-                            out.push('$');
+                            out.push(DOLLAR);
                             i += 1;
                         }
                     }
                 }
-                d if d.is_ascii_digit() => {
-                    let mut n = (d as u8 - b'0') as usize;
+                _ if is_digit(c) => {
+                    let mut n = (c - b'0' as u16) as usize;
                     let mut consumed = 2;
                     // Prefer the two-digit form when it names a valid capture.
-                    if i + 2 < bytes.len() && bytes[i + 2].is_ascii_digit() {
-                        let nn = n * 10 + (bytes[i + 2] as u8 - b'0') as usize;
+                    if i + 2 < templ.len() && is_digit(templ[i + 2]) {
+                        let nn = n * 10 + (templ[i + 2] - b'0' as u16) as usize;
                         if nn >= 1 && nn <= captures.len() {
                             n = nn;
                             consumed = 3;
@@ -823,21 +841,21 @@ fn get_substitution(
                     }
                     if n >= 1 && n <= captures.len() {
                         if let Some(Some(cap)) = captures.get(n - 1) {
-                            out.push_str(cap);
+                            out.extend_from_slice(cap);
                         }
                         i += consumed;
                     } else {
-                        out.push('$');
+                        out.push(DOLLAR);
                         i += 1;
                     }
                 }
                 _ => {
-                    out.push('$');
+                    out.push(DOLLAR);
                     i += 1;
                 }
             }
         } else {
-            out.push(bytes[i]);
+            out.push(templ[i]);
             i += 1;
         }
     }
@@ -853,7 +871,7 @@ pub fn build_match_array(
     vm: &mut Vm,
     units: &[u16],
     mat: &ReMatch,
-    input: &str,
+    input: &JsString,
     names: &[(String, usize)],
     has_indices: bool,
 ) -> Value {
@@ -931,8 +949,10 @@ pub fn build_match_array(
             PropertyKey::str("index"),
             Property::data(Value::Number(mat.start as f64)),
         );
-        b.props
-            .insert(PropertyKey::str("input"), Property::data(Value::str(input)));
+        b.props.insert(
+            PropertyKey::str("input"),
+            Property::data(Value::String(input.clone())),
+        );
         b.props
             .insert(PropertyKey::str("groups"), Property::data(groups));
         if let Some(indices) = indices {

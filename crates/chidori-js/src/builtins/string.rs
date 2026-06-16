@@ -608,7 +608,7 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
                 return vm.call(m, sep.clone(), &[this.clone(), limit_arg]);
             }
         }
-        let s = str_this(vm, &this)?;
+        let units = units_this(vm, &this)?;
         let limit = if limit_arg.is_undefined() {
             u32::MAX as usize
         } else {
@@ -616,31 +616,48 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
         };
         // ToString(separator) is observable and happens before the limit==0 check.
         let sep_undefined = sep.is_undefined();
-        let sep_s = if sep_undefined {
-            String::new()
+        let sep_units = if sep_undefined {
+            Vec::new()
         } else {
-            vm.to_string_lossy(&sep)
+            units_of(vm, &sep)?
         };
         if limit == 0 {
             return Ok(Value::Object(vm.new_array(vec![])));
         }
         if sep_undefined {
-            return Ok(Value::Object(vm.new_array(vec![Value::str(s)])));
+            return Ok(Value::Object(
+                vm.new_array(vec![Value::String(JsString::from_code_units(&units))]),
+            ));
         }
         let mut out = Vec::new();
-        if sep_s.is_empty() {
-            for c in s.chars() {
+        if sep_units.is_empty() {
+            // Empty separator: one element per UTF-16 code unit (an astral char
+            // splits into its two surrogates).
+            for &u in &units {
                 if out.len() >= limit {
                     break;
                 }
-                out.push(Value::str(c.to_string()));
+                out.push(Value::String(JsString::from_code_units(&[u])));
             }
         } else {
-            for part in s.split(&sep_s) {
-                if out.len() >= limit {
-                    break;
+            // Split around each non-overlapping occurrence of `sep_units`,
+            // including the (possibly empty) trailing remainder.
+            let mut start = 0;
+            let mut i = 0;
+            while i + sep_units.len() <= units.len() {
+                if units[i..i + sep_units.len()] == sep_units[..] {
+                    if out.len() >= limit {
+                        break;
+                    }
+                    out.push(Value::String(JsString::from_code_units(&units[start..i])));
+                    i += sep_units.len();
+                    start = i;
+                } else {
+                    i += 1;
                 }
-                out.push(Value::str(part.to_string()));
+            }
+            if out.len() < limit {
+                out.push(Value::String(JsString::from_code_units(&units[start..])));
             }
         }
         Ok(Value::Object(vm.new_array(out)))
