@@ -705,7 +705,12 @@ impl HostBindingBackend {
         path: String,
         input: serde_json::Value,
     ) -> std::result::Result<serde_json::Value, String> {
-        let HostBindingBackend::Runtime { runtime_ctx, .. } = self else {
+        let HostBindingBackend::Runtime {
+            runtime_ctx,
+            template_engine,
+            ..
+        } = self
+        else {
             return Err("chidori.callAgent requires the runtime host backend".to_string());
         };
         let args = serde_json::json!({
@@ -720,11 +725,22 @@ impl HostBindingBackend {
             let input = args.get("input").unwrap_or(&serde_json::Value::Null);
             match Path::new(path).extension().and_then(|ext| ext.to_str()) {
                 Some("ts") => {
+                    // Anchor relative sub-agent paths to the project root (the
+                    // entrypoint's directory, same anchor templates use) so
+                    // `chidori.callAgent("agents/x.ts")` works regardless of
+                    // the host process's working directory. The durable args
+                    // keep the original relative path so replay keys are
+                    // stable across hosts.
+                    let resolved = if Path::new(path).is_absolute() {
+                        std::path::PathBuf::from(path)
+                    } else {
+                        template_engine.base_dir().join(path)
+                    };
                     // Nested execution: run the sub-agent on the rust engine,
                     // sharing this backend so the child's host effects nest
                     // under the callAgent and a suspension propagates to the
                     // parent run.
-                    crate::runtime::rust_engine::run_agent_file(Path::new(path), input, self)
+                    crate::runtime::rust_engine::run_agent_file(&resolved, input, self)
                 }
                 _ => Err(anyhow::anyhow!("chidori.callAgent supports .ts agents")),
             }

@@ -1035,11 +1035,19 @@ mod tests {
                     async () => "a",
                     async () => "b",
                 ], { concurrency: 2 });
+                // Promise.all idiom: promises and plain values are accepted
+                // alongside thunks instead of throwing "must be a function".
+                const parMixed = await chidori.parallel([
+                    Promise.resolve("p"),
+                    "v",
+                    async () => "t",
+                ]);
                 const caught = await chidori.tryCall(async () => { throw new Error("boom"); });
                 return {
                     value,
                     attempts,
                     par,
+                    parMixed,
                     caughtOk: caught.ok,
                     memorySet: typeof chidori.memory.set,
                 };
@@ -1056,6 +1064,7 @@ mod tests {
                 "value": 42,
                 "attempts": 2,
                 "par": ["a", "b"],
+                "parMixed": ["p", "v", "t"],
                 "caughtOk": false,
                 "memorySet": "function",
             })

@@ -51,26 +51,28 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
         if (!Array.isArray(tasks)) {
             throw new Error("chidori.parallel expects an array of task functions");
         }
-        for (const [index, task] of tasks.entries()) {
-            if (typeof task !== "function") {
-                throw new Error(`chidori.parallel task ${index} must be a function`);
-            }
-        }
+        // Accept the Promise.all idiom too: a task may be a thunk (preferred —
+        // it lets the scheduler control start time and concurrency), an
+        // already-started promise, or a plain value. Promises/values are
+        // wrapped as pre-resolved tasks instead of throwing.
+        const normalized = tasks.map((task) =>
+            typeof task === "function" ? task : () => task,
+        );
         const concurrency = Math.max(
             1,
             Math.min(
-                tasks.length || 1,
-                Number(options && options.concurrency) || tasks.length || 1,
+                normalized.length || 1,
+                Number(options && options.concurrency) || normalized.length || 1,
             ),
         );
-        const results = new Array(tasks.length);
+        const results = new Array(normalized.length);
         let next = 0;
 
         async function worker() {
-            while (next < tasks.length) {
+            while (next < normalized.length) {
                 const index = next;
                 next += 1;
-                results[index] = await tasks[index]();
+                results[index] = await normalized[index]();
             }
         }
 

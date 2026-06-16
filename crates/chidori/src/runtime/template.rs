@@ -20,6 +20,12 @@ impl TemplateEngine {
         }
     }
 
+    /// The project root templates resolve against — also the anchor for other
+    /// project-relative resources (e.g. `chidori.callAgent` sub-agent paths).
+    pub fn base_dir(&self) -> &std::path::Path {
+        &self.base_dir
+    }
+
     /// Render an inline template string with the given variables.
     pub fn render_string(&self, template: &str, vars: &Value) -> Result<String> {
         let mut env = self.create_env();

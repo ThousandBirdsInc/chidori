@@ -1711,6 +1711,54 @@ mod tests {
     }
 
     #[test]
+    fn engine_call_agent_resolves_relative_path_against_project_root() {
+        // Sub-agent paths like "agents/child.ts" must resolve against the
+        // project root (the TemplateEngine base dir), not the process cwd —
+        // the host (e.g. the builder's oneshot runner) may spawn the engine
+        // from an unrelated working directory.
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-engine-ts-call-agent-relative-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join("agents")).unwrap();
+        std::fs::write(
+            dir.join("agents").join("child.ts"),
+            r#"
+                export async function agent(input, chidori) {
+                    return { value: input.value + 1 };
+                }
+            "#,
+        )
+        .unwrap();
+        let parent_path = dir.join("parent.ts");
+        std::fs::write(
+            &parent_path,
+            r#"
+                export async function agent(input, chidori) {
+                    return await chidori.callAgent("agents/child.ts", { value: input.value });
+                }
+            "#,
+        )
+        .unwrap();
+        assert_ne!(
+            std::env::current_dir().unwrap(),
+            dir,
+            "test must run with cwd outside the project for the resolution to be exercised"
+        );
+        let engine = Engine::new(
+            Arc::new(ProviderRegistry::new()),
+            Arc::new(TemplateEngine::new(&dir)),
+            Arc::new(tokio::runtime::Runtime::new().unwrap()),
+        );
+        let result = engine
+            .run(&parent_path, &serde_json::json!({ "value": 41 }))
+            .expect("relative sub-agent path should resolve against project root");
+        assert_eq!(result.output, serde_json::json!({ "value": 42 }));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn engine_call_agent_completion_safepoint_persists_sub_agent_result_record() {
         let dir = std::env::temp_dir().join(format!(
             "chidori-engine-ts-call-agent-completion-safepoint-{}",
