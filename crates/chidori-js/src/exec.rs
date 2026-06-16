@@ -884,7 +884,7 @@ impl Vm {
             Const::Null => Value::Null,
             Const::Bool(b) => Value::Bool(*b),
             Const::Number(n) => Value::Number(*n),
-            Const::String(s) => Value::String(JsString::from_rc_str(s.clone())),
+            Const::String(s) => Value::String(s.clone()),
             Const::Func(_) => Value::Undefined, // handled by Closure
             Const::BigInt(s) => {
                 Value::bigint(parse_string_bigint(s).unwrap_or_else(|| num_bigint::BigInt::from(0)))
@@ -909,7 +909,7 @@ impl Vm {
 
     fn const_name(&self, frame: &Frame, idx: u32) -> JsString {
         match &frame.func.proto.consts[idx as usize] {
-            Const::String(s) => JsString::from_rc_str(s.clone()),
+            Const::String(s) => s.clone(),
             _ => JsString::new(""),
         }
     }
@@ -2645,17 +2645,36 @@ impl Vm {
                 let n = *n as usize;
                 let at = frame.stack.len() - n;
                 let parts = frame.stack.split_off(at);
-                let mut out = String::new();
+                let mut strs = Vec::with_capacity(parts.len());
+                let mut total = 0usize;
                 for p in &parts {
                     let s = self.to_js_string(p)?;
                     // Same bound as `op_add`: a template-literal join in a doubling
                     // loop (`` s = `${s}${s}` ``) must not grow without limit.
-                    if out.len() + s.as_str().len() > crate::value::MAX_STRING_LEN {
+                    total += s.wtf8_bytes().len();
+                    if total > crate::value::MAX_STRING_LEN {
                         return Err(self.throw_range("invalid string length"));
                     }
-                    out.push_str(s.as_str());
+                    strs.push(s);
                 }
-                push!(Value::str(out));
+                // Fast path when every part is well-formed (the common case):
+                // a plain UTF-8 join. Otherwise go through code units so a
+                // surrogate straddling a boundary re-pairs (and lone surrogates
+                // survive instead of becoming U+FFFD).
+                let out = if strs.iter().all(|s| s.is_well_formed()) {
+                    let mut out = String::with_capacity(total);
+                    for s in &strs {
+                        out.push_str(s.as_str());
+                    }
+                    JsString::new(out)
+                } else {
+                    let mut units = Vec::new();
+                    for s in &strs {
+                        units.extend(s.code_units());
+                    }
+                    JsString::from_code_units(&units)
+                };
+                push!(Value::String(out));
             }
             Op::NewRegExp { pattern, flags } => {
                 let p = self.const_name(frame, *pattern);

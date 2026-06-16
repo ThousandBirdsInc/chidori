@@ -20,6 +20,37 @@ use oxc::parser::Parser;
 use oxc::span::SourceType;
 
 use crate::bytecode::*;
+use crate::value::JsString;
+
+/// Decode oxc's lone-surrogate string encoding (see
+/// `oxc StringLiteral::lone_surrogates`): U+FFFD is an escape — `U+FFFD XXXX`
+/// (four lowercase hex digits) denotes the single code unit `XXXX` (a lone
+/// surrogate, or U+FFFD itself when `XXXX == fffd`); all other characters are
+/// literal. Only called when the literal is flagged as containing surrogates.
+fn decode_lone_surrogates(value: &str) -> JsString {
+    let mut units: Vec<u16> = Vec::new();
+    let mut it = value.chars();
+    while let Some(c) = it.next() {
+        if c == '\u{FFFD}' {
+            let mut hex = 0u16;
+            let mut ok = true;
+            for _ in 0..4 {
+                match it.next().and_then(|d| d.to_digit(16)) {
+                    Some(d) => hex = (hex << 4) | d as u16,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            units.push(if ok { hex } else { 0xFFFD });
+        } else {
+            let mut buf = [0u16; 2];
+            units.extend_from_slice(c.encode_utf16(&mut buf));
+        }
+    }
+    JsString::from_code_units(&units)
+}
 
 pub fn compile_script(src: &str) -> Result<FuncProto, String> {
     compile_script_impl(src, false, true)
@@ -744,23 +775,41 @@ impl Compiler {
         (c.consts.len() - 1) as u32
     }
 
-    fn str_const(&mut self, s: &str) -> u32 {
+    fn intern_str(&mut self, js: JsString) -> u32 {
         // Dedup string constants.
         let c = self.cur();
         for (i, k) in c.consts.iter().enumerate() {
             if let Const::String(existing) = k {
-                if existing.as_ref() == s {
+                if *existing == js {
                     return i as u32;
                 }
             }
         }
-        c.consts.push(Const::String(Rc::from(s)));
+        c.consts.push(Const::String(js));
         (c.consts.len() - 1) as u32
+    }
+
+    fn str_const(&mut self, s: &str) -> u32 {
+        self.intern_str(JsString::new(s))
     }
 
     fn load_str(&mut self, s: &str) {
         let i = self.str_const(s);
         self.emit(Op::LoadConst(i));
+    }
+
+    /// Load a string literal, decoding oxc's lone-surrogate encoding when the
+    /// literal contains unpaired surrogates (e.g. `'\uD83D'`). oxc cannot store
+    /// such a value as UTF-8, so it escapes it: U+FFFD followed by four hex
+    /// digits is one code unit (the surrogate, or U+FFFD itself for `fffd`).
+    fn load_string_literal(&mut self, s: &StringLiteral) {
+        if s.lone_surrogates {
+            let js = decode_lone_surrogates(s.value.as_str());
+            let i = self.intern_str(js);
+            self.emit(Op::LoadConst(i));
+        } else {
+            self.load_str(s.value.as_str());
+        }
     }
 
     // ---- scopes & bindings ----
@@ -3310,7 +3359,7 @@ impl Compiler {
                 let idx = self.konst(Const::BigInt(Rc::from(b.value.as_str())));
                 self.emit(Op::LoadConst(idx));
             }
-            Expression::StringLiteral(s) => self.load_str(s.value.as_str()),
+            Expression::StringLiteral(s) => self.load_string_literal(s),
             Expression::TemplateLiteral(t) => self.compile_template(t)?,
             Expression::Identifier(id) => {
                 // ClassFieldDefinition early error: ContainsArguments — the
@@ -3692,7 +3741,14 @@ impl Compiler {
                 .as_ref()
                 .map(|s| s.as_str())
                 .unwrap_or("");
-            self.load_str(cooked);
+            if quasi.lone_surrogates {
+                // oxc FFFD-encodes a cooked quasi containing lone surrogates
+                // (same scheme as string literals); decode to real code units.
+                let idx = self.intern_str(decode_lone_surrogates(cooked));
+                self.emit(Op::LoadConst(idx));
+            } else {
+                self.load_str(cooked);
+            }
             parts += 1;
             if i < t.expressions.len() {
                 self.compile_expr(&t.expressions[i])?;

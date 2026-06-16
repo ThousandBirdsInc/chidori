@@ -8,6 +8,8 @@
 
 use std::rc::Rc;
 
+use crate::value::JsString;
+
 /// A compile-time constant referenced by index from `OpLoadConst`.
 #[derive(Clone, Debug)]
 pub enum Const {
@@ -15,7 +17,10 @@ pub enum Const {
     Null,
     Bool(bool),
     Number(f64),
-    String(Rc<str>),
+    /// An interned string constant. Holds a `JsString` (not `Rc<str>`) so a
+    /// literal containing lone surrogates (`'\uD83D'`) is representable; loading
+    /// it is a cheap clone.
+    String(JsString),
     /// A nested function template (compiled). `OpClosure` instantiates it.
     Func(Rc<FuncProto>),
     /// A `BigInt` literal stored as its decimal string (parsed on load).

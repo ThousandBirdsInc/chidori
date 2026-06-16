@@ -379,15 +379,15 @@ fn install_globals(vm: &mut Vm) {
     });
     vm.define_method(&global, "decodeURI", 1, |vm, _t, args| {
         let s = vm.to_js_string(&arg(args, 0))?;
-        match uri_decode(s.as_str(), URI_RESERVED_URI) {
-            Ok(out) => Ok(Value::str(out)),
+        match uri_decode_units(&s.to_utf16_vec(), URI_RESERVED_URI) {
+            Ok(units) => Ok(Value::String(JsString::from_code_units(&units))),
             Err(msg) => Err(vm.make_error(crate::vm::ErrorKind::Uri, msg)),
         }
     });
     vm.define_method(&global, "decodeURIComponent", 1, |vm, _t, args| {
         let s = vm.to_js_string(&arg(args, 0))?;
-        match uri_decode(s.as_str(), "") {
-            Ok(out) => Ok(Value::str(out)),
+        match uri_decode_units(&s.to_utf16_vec(), "") {
+            Ok(units) => Ok(Value::String(JsString::from_code_units(&units))),
             Err(msg) => Err(vm.make_error(crate::vm::ErrorKind::Uri, msg)),
         }
     });
@@ -665,34 +665,45 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-/// Decode percent-escapes. `preserved` lists reserved characters whose escapes
-/// are kept verbatim (used by decodeURI). Returns an error message string on
-/// malformed input.
-fn uri_decode(s: &str, preserved: &str) -> Result<String, &'static str> {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+/// Code-unit-preserving `Decode`: every non-`%` UTF-16 code unit is copied
+/// through unchanged — including a lone surrogate, which a byte-oriented decode
+/// over the lossy `&str` view would drop. `%XX` escape runs (always ASCII)
+/// decode as UTF-8 to code points, then to code units.
+fn uri_decode_units(units: &[u16], preserved: &str) -> Result<Vec<u16>, &'static str> {
+    // Read the octet of a `%XX` escape at `pos` (which must point at `%`); the
+    // escape characters are ASCII, so they live in the low byte of each unit.
+    let octet = |pos: usize| -> Result<u8, &'static str> {
+        if pos + 2 >= units.len() || units[pos] != b'%' as u16 {
+            return Err("URI malformed");
+        }
+        let hi = (units[pos + 1] < 0x100)
+            .then(|| hex_val(units[pos + 1] as u8))
+            .flatten()
+            .ok_or("URI malformed")?;
+        let lo = (units[pos + 2] < 0x100)
+            .then(|| hex_val(units[pos + 2] as u8))
+            .flatten()
+            .ok_or("URI malformed")?;
+        Ok((hi << 4) | lo)
+    };
+    let mut out: Vec<u16> = Vec::with_capacity(units.len());
     let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if c != b'%' {
-            out.push(c);
+    while i < units.len() {
+        if units[i] != b'%' as u16 {
+            out.push(units[i]);
             i += 1;
             continue;
         }
-        // Read one %XX byte.
-        let b0 = decode_one_octet(bytes, i)?;
+        let b0 = octet(i)?;
         if b0 < 0x80 {
-            // Single ASCII byte.
             if preserved.as_bytes().contains(&b0) {
-                // Keep the original "%XX" escape verbatim.
-                out.extend_from_slice(&bytes[i..i + 3]);
+                out.extend_from_slice(&units[i..i + 3]); // keep "%XX" verbatim
             } else {
-                out.push(b0);
+                out.push(b0 as u16);
             }
             i += 3;
             continue;
         }
-        // Multi-byte UTF-8 sequence: determine length from the lead byte.
         let extra = if b0 & 0xe0 == 0xc0 {
             1
         } else if b0 & 0xf0 == 0xe0 {
@@ -705,7 +716,7 @@ fn uri_decode(s: &str, preserved: &str) -> Result<String, &'static str> {
         let mut seq = vec![b0];
         let mut j = i + 3;
         for _ in 0..extra {
-            let cont = decode_one_octet(bytes, j)?;
+            let cont = octet(j)?;
             if cont & 0xc0 != 0x80 {
                 return Err("URI malformed");
             }
@@ -713,20 +724,10 @@ fn uri_decode(s: &str, preserved: &str) -> Result<String, &'static str> {
             j += 3;
         }
         match std::str::from_utf8(&seq) {
-            Ok(valid) => out.extend_from_slice(valid.as_bytes()),
+            Ok(valid) => out.extend(valid.encode_utf16()),
             Err(_) => return Err("URI malformed"),
         }
         i = j;
     }
-    String::from_utf8(out).map_err(|_| "URI malformed")
-}
-
-/// Decode a single `%XX` octet starting at `pos` (which must point at `%`).
-fn decode_one_octet(bytes: &[u8], pos: usize) -> Result<u8, &'static str> {
-    if pos + 2 >= bytes.len() || bytes[pos] != b'%' {
-        return Err("URI malformed");
-    }
-    let hi = hex_val(bytes[pos + 1]).ok_or("URI malformed")?;
-    let lo = hex_val(bytes[pos + 2]).ok_or("URI malformed")?;
-    Ok((hi << 4) | lo)
+    Ok(out)
 }

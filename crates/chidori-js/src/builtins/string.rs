@@ -50,6 +50,12 @@ pub fn install(vm: &mut Vm) {
     vm.install_ctor("String", &ctor, &proto);
 
     vm.define_method(&ctor, "fromCharCode", 1, |vm, _t, args| {
+        // Each argument is truncated to a UTF-16 code unit (ToUint16). NOTE: lone
+        // surrogates are currently replaced with U+FFFD rather than preserved.
+        // Producing real lone surrogates here is deferred to the RegExp stage,
+        // where the regex-source / eval-source pipeline (`eval("/"+cu+"/").source`)
+        // is made surrogate-aware in lockstep — otherwise those round-trip tests
+        // regress against the UTF-8 (oxc) front end.
         let mut s = String::new();
         for a in args {
             let n = vm.to_uint32(a)? as u16;
@@ -580,13 +586,10 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
         }))
     });
     vm.define_method(proto, "isWellFormed", 0, |vm, this, _a| {
-        // The scalar-string model cannot represent lone surrogates, so every
-        // string is well-formed.
-        let _ = str_this(vm, &this)?;
-        Ok(Value::Bool(true))
+        Ok(Value::Bool(jsstr_this(vm, &this)?.is_well_formed()))
     });
     vm.define_method(proto, "toWellFormed", 0, |vm, this, _a| {
-        Ok(Value::str(str_this(vm, &this)?))
+        Ok(Value::String(jsstr_this(vm, &this)?.to_well_formed()))
     });
 
     // String.prototype.split(separator, limit). Dispatches to
