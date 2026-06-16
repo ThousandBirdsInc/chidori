@@ -113,7 +113,7 @@ This builds the `chidori` binary from [crates.io](https://crates.io/crates/chido
 and puts it on your `PATH` (in `~/.cargo/bin`). Check it with `chidori --version`.
 
 Prefer to build from a checkout (also gets you the bundled `examples/` used in
-step 3)? The repo pins nightly via `rust-toolchain.toml`, so `cargo` picks it up
+step 4)? The repo pins nightly via `rust-toolchain.toml`, so `cargo` picks it up
 automatically:
 
 ```bash
@@ -122,32 +122,46 @@ cd chidori
 cargo build --release   # binary at ./target/release/chidori
 ```
 
-### 1. Scaffold a starter (optional)
+### 1. Chat with the Chidori docs (30 seconds)
+
+The fastest way to feel what Chidori does: scaffold an agent that answers
+questions from a local docs folder, and chat with it.
 
 ```bash
-chidori init my-agent --template chat     # or: --template worker
-# then follow the printed run command, e.g. `chidori chat agent.ts`
+export ANTHROPIC_API_KEY=sk-ant-...   # or OPENAI_API_KEY=...
+chidori init my-agent --template docs
+cd my-agent
+chidori chat agent.ts
 ```
 
-`chidori init` writes a ready-to-run agent (omit `--template` to pick
-interactively): **chat** is a conversational assistant, **worker** is an
-autonomous tool-using loop.
+Then ask it things like *"What is a host call?"* or *"How do I write a tool?"*.
 
-### 2. Write an agent
+The scaffold is a complete, readable project: a ~50-line `agent.ts`, a
+`docs/chidori.md` knowledge file, and a README. The agent reads the Markdown
+under `docs/` with `chidori.workspace.read(...)` and answers from it.
+
+**What it touches:** only the files in this project folder. Chidori scopes the
+workspace to the project directory — the agent can't read elsewhere on your
+machine — and the only thing sent to the model is your question plus the
+bundled docs. Drop your own `.md` files into `docs/` to chat with those instead.
+
+Every turn is a recorded host call, so replaying the whole conversation costs
+zero tokens. Two other starters ship too — `--template chat` (a plain
+assistant) and `--template worker` (an autonomous tool-using loop); omit
+`--template` to pick interactively.
+
+### 2. Write your own agent
+
+An agent is just an exported `agent` function. Every model call is a recorded
+host call:
 
 ```ts
-// agents/summarizer.ts
+// summarizer.ts
 import type { Chidori } from "chidori";
 
 export async function agent(input: { document: string }, chidori: Chidori) {
-  const summary = await chidori.prompt(
-    "Summarize in 3 bullets:\n" + input.document,
-    { type: "summary" },
-  );
-  const actionItems = await chidori.prompt(
-    "Extract action items:\n" + summary,
-    { type: "actions" },
-  );
+  const summary = await chidori.prompt("Summarize in 3 bullets:\n" + input.document);
+  const actionItems = await chidori.prompt("Extract action items:\n" + summary);
   return { summary, actionItems };
 }
 ```
@@ -158,40 +172,30 @@ for free.
 ### 3. Run it
 
 ```bash
-# Set up LLM provider (uses LiteLLM in this example)
-export LITELLM_API_URL=http://localhost:4401/v1
-export LITELLM_API_KEY=sk-litellm-master-key
+# A provider key (set in step 1) is all you need:
+export ANTHROPIC_API_KEY=sk-ant-...        # or OPENAI_API_KEY=...
+# Or route through a LiteLLM proxy:
+# export LITELLM_API_URL=http://localhost:4401/v1
+# export LITELLM_API_KEY=sk-litellm-master-key
 
-# Or use providers directly
-# export ANTHROPIC_API_KEY=sk-ant-...
-# export OPENAI_API_KEY=sk-...
-
-chidori run agents/summarizer.ts \
+chidori run summarizer.ts \
   --input document="Rust is a systems programming language..."
 ```
 
-### 4. Try the example agents — no API key required
+Re-run the same agent with `chidori resume summarizer.ts <run_id>` to replay it
+byte-for-byte with zero model calls (the run id is printed under
+`.chidori/runs/`).
 
-These reference files under `examples/`, so run them from a checkout of the
-repo (see the build-from-source option in step 0).
+### 4. No API key? Try the bundled examples
+
+From a checkout of the repo (the build-from-source option in step 0), several
+examples run with no provider key at all:
 
 ```bash
-# Interactive example picker
-chidori demo
-
-# Minimal agent — no LLM calls needed
-chidori run examples/agents/hello.ts --input name=Colton
-
-# Local TypeScript tool — no LLM calls needed
+chidori demo                                              # interactive picker
+chidori run examples/agents/hello.ts --input name=Colton  # no LLM calls
 chidori run examples/agents/tool_use.ts \
-  --input query=chidori --tools examples/tools
-
-# Multi-turn chat assistant (scripted turns; omit --input to chat interactively)
-chidori run examples/agents/conversation.ts \
-  --input '{"messages": ["Hi, who are you?", "What can you help with?"]}'
-
-# Or chat with the model directly — no agent file, durable every turn
-chidori chat --system "You are a concise assistant."
+  --input query=chidori --tools examples/tools            # local TS tool, no LLM
 ```
 
 For a guided walkthrough — inspecting a run, the demo picker, and the

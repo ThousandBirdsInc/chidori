@@ -1,6 +1,6 @@
 [package]
 name = "chidori"
-version = "3.1.0"
+version = "3.2.0"
 edition = "2021"
 authors = ["Colton Pierson <colton@thousandbirds.ai>"]
 description = "YAML-free AI agent framework where agents are deterministic TypeScript modules with built-in checkpointing and replay."
