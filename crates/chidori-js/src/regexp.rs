@@ -1287,7 +1287,7 @@ impl<'a> MatchCtx<'a> {
             // Canonicalize via simple case folding (lower/upper). Sufficient for
             // the common ASCII + Latin cases; full Unicode case folding is a
             // long-tail item.
-            return fold(a) == fold(b);
+            return fold(a, self.flags.unicode) == fold(b, self.flags.unicode);
         }
         false
     }
@@ -1318,7 +1318,7 @@ impl<'a> MatchCtx<'a> {
             }
             Node::Class { negated, items } => {
                 if let Some((cp, w)) = self.code_point_at(pos) {
-                    let matched = class_matches(items, cp, self.flags.ignore_case);
+                    let matched = class_matches(items, cp, self.flags.ignore_case, self.flags.unicode);
                     if matched != *negated {
                         return k(pos + w, caps);
                     }
@@ -1522,7 +1522,7 @@ impl<'a> MatchCtx<'a> {
             Node::Char(c) => self.char_eq(cp, *c),
             Node::AnyChar => self.flags.dot_all || !is_line_terminator(cp),
             Node::Class { negated, items } => {
-                class_matches(items, cp, self.flags.ignore_case) != *negated
+                class_matches(items, cp, self.flags.ignore_case, self.flags.unicode) != *negated
             }
             _ => false,
         };
@@ -1645,23 +1645,24 @@ fn is_simple_one_char(node: &Node) -> bool {
     matches!(node, Node::Char(_) | Node::AnyChar | Node::Class { .. })
 }
 
-fn class_matches(items: &[ClassItem], ch: u32, ignore_case: bool) -> bool {
+fn class_matches(items: &[ClassItem], ch: u32, ignore_case: bool, unicode: bool) -> bool {
     // ASCII case toggles on a code unit (used for letter-range folding).
     let ascii_upper = |c: u32| if (0x61..=0x7a).contains(&c) { c - 0x20 } else { c };
     let ascii_lower = |c: u32| if (0x41..=0x5a).contains(&c) { c + 0x20 } else { c };
     let is_ascii_digit = |c: u32| (0x30..=0x39).contains(&c);
     for item in items {
-        // Class atoms are still scalar (`char`); widen to compare against the
-        // code-unit subject value `ch`.
+        // Class atoms are code points; compare against the subject value `ch`.
         let hit = match item {
-            ClassItem::Char(c) => ch == *c || (ignore_case && fold(ch) == fold(*c)),
+            ClassItem::Char(c) => {
+                ch == *c || (ignore_case && fold(ch, unicode) == fold(*c, unicode))
+            }
             ClassItem::Range(lo, hi) => {
                 let (lo, hi) = (*lo, *hi);
                 let in_range = lo <= ch && ch <= hi;
                 if in_range {
                     true
                 } else if ignore_case {
-                    let f = fold(ch);
+                    let f = fold(ch, unicode);
                     (lo <= f && f <= hi) || {
                         // Also try folding the bounds for ASCII letter ranges.
                         let u = ascii_upper(ch);
@@ -1704,18 +1705,37 @@ fn class_matches(items: &[ClassItem], ch: u32, ignore_case: bool) -> bool {
     false
 }
 
-fn fold(c: u32) -> u32 {
-    // Simple case fold: map to lowercase. Adequate for ASCII / common Latin. A
-    // lone surrogate (non-scalar) has no case mapping and folds to itself.
-    match char::from_u32(c) {
-        Some(ch) => {
-            let mut it = ch.to_lowercase();
-            match (it.next(), it.next()) {
-                (Some(x), None) => x as u32,
-                _ => c,
-            }
+/// `Canonicalize(ch)` for case-insensitive matching. A lone surrogate (non-
+/// scalar) has no case mapping and folds to itself. Full Unicode case folding is
+/// a long-tail item; this approximates with the simple lower/upper mappings.
+fn fold(c: u32, unicode: bool) -> u32 {
+    let Some(ch) = char::from_u32(c) else {
+        return c;
+    };
+    if unicode {
+        // Unicode mode: simple case fold (approximated by lowercase). Operates
+        // on whole code points, so astral case pairs fold correctly.
+        let mut it = ch.to_lowercase();
+        match (it.next(), it.next()) {
+            (Some(x), None) => x as u32,
+            _ => c,
         }
-        None => c,
+    } else {
+        // Legacy mode: uppercase, single code unit only, with the guard that a
+        // non-ASCII character must not fold *to* ASCII (so e.g. `K` Kelvin
+        // sign does not match `k` without the `u` flag).
+        let mut it = ch.to_uppercase();
+        match (it.next(), it.next()) {
+            (Some(u), None) => {
+                let cu = u as u32;
+                if cu > 0xFFFF || (c >= 128 && cu < 128) {
+                    c
+                } else {
+                    cu
+                }
+            }
+            _ => c,
+        }
     }
 }
 
