@@ -2,8 +2,13 @@
 //! `Vm::make_regexp` builder that the bytecode compiler calls for regexp
 //! literals.
 //!
-//! The engine works over `&[char]` (Unicode scalar values), matching the rest of
-//! the engine's code-point string model. It supports the common JS subset:
+//! The matcher works over `&[u16]` UTF-16 code units (the JS string model): in
+//! non-unicode mode it steps per code unit (lone surrogates are matchable), and
+//! in unicode (`u`/`v`) mode it reads code points (a surrogate pair is one
+//! unit). All reported match/capture offsets are code-unit offsets. The pattern
+//! parser still scans `&[char]` source but stores atoms as `u32` code points, so
+//! a lone-surrogate pattern atom (`\uD800`) is representable. It supports the
+//! common JS subset:
 //!
 //!   * literals and escaped metacharacters
 //!   * the dot `.` (any char except line terminators, unless the `s` flag is set)
@@ -21,12 +26,14 @@
 //!   * alternation `|`
 //!   * quantifiers `*` `+` `?` `{n}` `{n,}` `{n,m}` and their lazy `?` variants
 //!   * backreferences `\1` .. `\99` and named backreferences `\k<name>`
-//!   * flags `g i m s y` (`u`/`d`/`v` are accepted; `u` is largely a no-op)
+//!   * flags `g i m s y d`, and `u`/`v` (unicode mode: code-point iteration,
+//!     surrogate-pair combining, and `\p{...}` property escapes)
+//!   * Unicode property escapes `\p{...}` / `\P{...}` (unicode mode only)
 //!
-//! Unsupported constructs (currently Unicode property escapes `\p{...}`) cause
-//! the parser to return an error, which surfaces as a SyntaxError at
-//! `make_regexp` time rather than a panic. The matcher never indexes out of
-//! bounds and bounds catastrophic backtracking with a shared step budget.
+//! Unsupported constructs cause the parser to return an error, which surfaces as
+//! a SyntaxError at `make_regexp` time rather than a panic. The matcher never
+//! indexes out of bounds and bounds catastrophic backtracking with a shared step
+//! budget.
 
 use crate::value::*;
 use crate::vm::Vm;
@@ -35,7 +42,7 @@ use crate::vm::Vm;
 // Public API
 // =========================================================================
 
-/// The result of a successful match: char-index span of the whole match
+/// The result of a successful match: code-unit-index span of the whole match
 /// (`group 0`) plus each capture group's span (`None` when the group did not
 /// participate).
 #[derive(Clone, Debug)]
@@ -140,8 +147,9 @@ impl Flags {
 enum Node {
     /// Matches the empty string.
     Empty,
-    /// A single literal character.
-    Char(char),
+    /// A single literal code point (`u32` so a lone surrogate `\uD800` is
+    /// representable as a pattern atom, not just in the subject).
+    Char(u32),
     /// `.` — any char (line terminators excluded unless dotAll).
     AnyChar,
     /// A character class.
@@ -181,8 +189,8 @@ enum Node {
 
 #[derive(Clone, Debug)]
 enum ClassItem {
-    Char(char),
-    Range(char, char),
+    Char(u32),
+    Range(u32, u32),
     Digit,
     NotDigit,
     Word,
@@ -192,7 +200,7 @@ enum ClassItem {
     /// A Unicode property escape `\p{...}` / `\P{...}`, resolved to code-point
     /// ranges at parse time. `negated` is true for `\P`.
     Unicode {
-        ranges: std::rc::Rc<Vec<(char, char)>>,
+        ranges: std::rc::Rc<Vec<(u32, u32)>>,
         negated: bool,
     },
 }
@@ -469,7 +477,7 @@ impl<'a> Parser<'a> {
             }
             Some(c) => {
                 self.pos += 1;
-                Ok(Node::Char(c))
+                Ok(Node::Char(c as u32))
             }
             None => Ok(Node::Empty),
         }
@@ -611,7 +619,7 @@ impl<'a> Parser<'a> {
                     let hi = self.parse_class_atom()?;
                     match hi {
                         ClassAtom::Char(hi_c) => {
-                            if (lo_c as u32) > (hi_c as u32) {
+                            if lo_c > hi_c {
                                 return Err("Range out of order in character class".to_string());
                             }
                             items.push(ClassItem::Range(lo_c, hi_c));
@@ -629,7 +637,7 @@ impl<'a> Parser<'a> {
                                 );
                             }
                             items.push(ClassItem::Char(lo_c));
-                            items.push(ClassItem::Char('-'));
+                            items.push(ClassItem::Char('-' as u32));
                             items.push(item);
                             continue;
                         }
@@ -661,14 +669,14 @@ impl<'a> Parser<'a> {
         match self.next() {
             None => Err("Unterminated character class".to_string()),
             Some('\\') => self.parse_class_escape(),
-            Some(c) => Ok(ClassAtom::Char(c)),
+            Some(c) => Ok(ClassAtom::Char(c as u32)),
         }
     }
 
     /// Parse the `{...}` body of a `\p`/`\P` escape (the `p`/`P` is already
     /// consumed) and resolve it to code-point ranges. The `u`/`v` flag must be
     /// set (callers gate on `self.unicode`).
-    fn parse_unicode_property(&mut self) -> Result<std::rc::Rc<Vec<(char, char)>>, String> {
+    fn parse_unicode_property(&mut self) -> Result<std::rc::Rc<Vec<(u32, u32)>>, String> {
         if self.peek() != Some('{') {
             return Err("Invalid property escape: expected '{' after \\p".to_string());
         }
@@ -726,32 +734,32 @@ impl<'a> Parser<'a> {
                         let ranges = self.parse_unicode_property()?;
                         ClassAtom::Class(ClassItem::Unicode { ranges, negated })
                     } else {
-                        ClassAtom::Char(c)
+                        ClassAtom::Char(c as u32)
                     }
                 }
                 'n' => {
                     self.pos += 1;
-                    ClassAtom::Char('\n')
+                    ClassAtom::Char('\n' as u32)
                 }
                 't' => {
                     self.pos += 1;
-                    ClassAtom::Char('\t')
+                    ClassAtom::Char('\t' as u32)
                 }
                 'r' => {
                     self.pos += 1;
-                    ClassAtom::Char('\r')
+                    ClassAtom::Char('\r' as u32)
                 }
                 'f' => {
                     self.pos += 1;
-                    ClassAtom::Char('\u{000C}')
+                    ClassAtom::Char('\u{000C}' as u32)
                 }
                 'v' => {
                     self.pos += 1;
-                    ClassAtom::Char('\u{000B}')
+                    ClassAtom::Char('\u{000B}' as u32)
                 }
                 'b' => {
                     self.pos += 1;
-                    ClassAtom::Char('\u{0008}') // \b is backspace inside a class
+                    ClassAtom::Char('\u{0008}' as u32) // \b is backspace inside a class
                 }
                 'c' => {
                     // \cX control escape; if not a valid control letter, treat
@@ -760,23 +768,23 @@ impl<'a> Parser<'a> {
                     match self.peek() {
                         Some(ch) if ch.is_ascii_alphabetic() => {
                             self.pos += 1;
-                            ClassAtom::Char(((ch as u8) & 0x1f) as char)
+                            ClassAtom::Char(((ch as u8) & 0x1f) as u32)
                         }
-                        _ => ClassAtom::Char('\\'),
+                        _ => ClassAtom::Char('\\' as u32),
                     }
                 }
                 'x' => {
                     self.pos += 1;
                     match self.parse_hex(2) {
                         Some(ch) => ClassAtom::Char(ch),
-                        None => ClassAtom::Char('x'),
+                        None => ClassAtom::Char('x' as u32),
                     }
                 }
                 'u' => {
                     self.pos += 1;
                     match self.parse_unicode_escape() {
-                        Some(ch) => ClassAtom::Char(ch),
-                        None => ClassAtom::Char('u'),
+                        Some(ch) => ClassAtom::Char(self.combine_surrogate(ch)),
+                        None => ClassAtom::Char('u' as u32),
                     }
                 }
                 '0'..='7' => {
@@ -786,7 +794,7 @@ impl<'a> Parser<'a> {
                 }
                 _ => {
                     let other = self.next().unwrap();
-                    ClassAtom::Char(other)
+                    ClassAtom::Char(other as u32)
                 }
             }),
         }
@@ -852,23 +860,23 @@ impl<'a> Parser<'a> {
             }
             'n' => {
                 self.pos += 1;
-                Node::Char('\n')
+                Node::Char('\n' as u32)
             }
             't' => {
                 self.pos += 1;
-                Node::Char('\t')
+                Node::Char('\t' as u32)
             }
             'r' => {
                 self.pos += 1;
-                Node::Char('\r')
+                Node::Char('\r' as u32)
             }
             'f' => {
                 self.pos += 1;
-                Node::Char('\u{000C}')
+                Node::Char('\u{000C}' as u32)
             }
             'v' => {
                 self.pos += 1;
-                Node::Char('\u{000B}')
+                Node::Char('\u{000B}' as u32)
             }
             'c' => {
                 // \cX control escape; if not a valid control letter, treat the
@@ -878,10 +886,10 @@ impl<'a> Parser<'a> {
                 match self.peek() {
                     Some(ch) if ch.is_ascii_alphabetic() => {
                         self.pos += 1;
-                        Node::Char(((ch as u8) & 0x1f) as char)
+                        Node::Char(((ch as u8) & 0x1f) as u32)
                     }
                     _ if self.unicode => return Err("Invalid \\c escape".to_string()),
-                    _ => Node::Char('\\'),
+                    _ => Node::Char('\\' as u32),
                 }
             }
             'x' => {
@@ -889,15 +897,15 @@ impl<'a> Parser<'a> {
                 match self.parse_hex(2) {
                     Some(ch) => Node::Char(ch),
                     None if self.unicode => return Err("Invalid \\x escape".to_string()),
-                    None => Node::Char('x'),
+                    None => Node::Char('x' as u32),
                 }
             }
             'u' => {
                 self.pos += 1;
                 match self.parse_unicode_escape() {
-                    Some(ch) => Node::Char(ch),
+                    Some(ch) => Node::Char(self.combine_surrogate(ch)),
                     None if self.unicode => return Err("Invalid \\u escape".to_string()),
-                    None => Node::Char('u'),
+                    None => Node::Char('u' as u32),
                 }
             }
             'k' => {
@@ -908,7 +916,7 @@ impl<'a> Parser<'a> {
                         return Err("Invalid \\k escape".to_string());
                     }
                     // Annex B: `\k` not followed by `<` is an identity escape.
-                    return Ok(Node::Char('k'));
+                    return Ok(Node::Char('k' as u32));
                 }
                 self.pos += 1; // consume '<'
                 let name = self.parse_group_name()?;
@@ -931,7 +939,7 @@ impl<'a> Parser<'a> {
                         items: vec![ClassItem::Unicode { ranges, negated }],
                     }
                 } else {
-                    Node::Char(c)
+                    Node::Char(c as u32)
                 }
             }
             '0' => {
@@ -975,14 +983,14 @@ impl<'a> Parser<'a> {
                     ));
                 }
                 self.pos += 1;
-                Node::Char(other)
+                Node::Char(other as u32)
             }
         })
     }
 
     /// Parse a (possibly multi-digit) octal escape. The caller has positioned us
     /// at the first octal digit. Consumes 1..=3 octal digits with value <= 0o377.
-    fn parse_octal_escape(&mut self) -> char {
+    fn parse_octal_escape(&mut self) -> u32 {
         let mut v: u32 = 0;
         let mut count = 0;
         while count < 3 {
@@ -1000,10 +1008,13 @@ impl<'a> Parser<'a> {
                 _ => break,
             }
         }
-        char::from_u32(v).unwrap_or('\0')
+        v
     }
 
-    fn parse_hex(&mut self, count: usize) -> Option<char> {
+    /// Parse `count` hex digits as a code point. Returns the raw value (a 4-digit
+    /// `\uHHHH` is a single UTF-16 code unit, so surrogate values are kept, not
+    /// rejected — that is what makes a lone-surrogate pattern atom possible).
+    fn parse_hex(&mut self, count: usize) -> Option<u32> {
         let save = self.pos;
         let mut v: u32 = 0;
         for _ in 0..count {
@@ -1024,16 +1035,10 @@ impl<'a> Parser<'a> {
             v = v * 16 + d;
             self.pos += 1;
         }
-        match char::from_u32(v) {
-            Some(c) => Some(c),
-            None => {
-                self.pos = save;
-                None
-            }
-        }
+        Some(v)
     }
 
-    fn parse_unicode_escape(&mut self) -> Option<char> {
+    fn parse_unicode_escape(&mut self) -> Option<u32> {
         if self.peek() == Some('{') {
             let save = self.pos;
             self.pos += 1;
@@ -1048,20 +1053,36 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
-            if !any || !self.eat('}') {
+            // `\u{...}` admits any code point up to 0x10FFFF (surrogates allowed);
+            // beyond that is invalid.
+            if !any || v > 0x10_FFFF || !self.eat('}') {
                 self.pos = save;
                 return None;
             }
-            match char::from_u32(v) {
-                Some(c) => Some(c),
-                None => {
-                    self.pos = save;
-                    None
-                }
-            }
+            Some(v)
         } else {
             self.parse_hex(4)
         }
+    }
+
+    /// In unicode mode, if `hi` is a high surrogate immediately followed by a
+    /// `\uHHHH` low-surrogate escape, consume that escape and combine the two
+    /// into a single astral code point (per the unicode-mode
+    /// `RegExpUnicodeEscapeSequence` grammar, so `/😀/u` matches "😀").
+    /// Otherwise returns `hi` unchanged.
+    fn combine_surrogate(&mut self, hi: u32) -> u32 {
+        if self.unicode && (0xD800..=0xDBFF).contains(&hi) {
+            let save = self.pos;
+            if self.eat('\\') && self.eat('u') {
+                if let Some(lo) = self.parse_unicode_escape() {
+                    if (0xDC00..=0xDFFF).contains(&lo) {
+                        return 0x1_0000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
+                    }
+                }
+            }
+            self.pos = save;
+        }
+        hi
     }
 }
 
@@ -1106,7 +1127,7 @@ fn resolve_named_backrefs(node: &mut Node, targets: &[usize]) {
 }
 
 enum ClassAtom {
-    Char(char),
+    Char(u32),
     Class(ClassItem),
 }
 
@@ -1281,7 +1302,7 @@ impl<'a> MatchCtx<'a> {
             Node::Empty => k(pos, caps),
             Node::Char(c) => {
                 if let Some((cp, w)) = self.code_point_at(pos) {
-                    if self.char_eq(cp, *c as u32) {
+                    if self.char_eq(cp, *c) {
                         return k(pos + w, caps);
                     }
                 }
@@ -1498,7 +1519,7 @@ impl<'a> MatchCtx<'a> {
     fn node_matches_one(&self, node: &Node, pos: usize) -> Option<usize> {
         let (cp, w) = self.code_point_at(pos)?;
         let ok = match node {
-            Node::Char(c) => self.char_eq(cp, *c as u32),
+            Node::Char(c) => self.char_eq(cp, *c),
             Node::AnyChar => self.flags.dot_all || !is_line_terminator(cp),
             Node::Class { negated, items } => {
                 class_matches(items, cp, self.flags.ignore_case) != *negated
@@ -1633,9 +1654,9 @@ fn class_matches(items: &[ClassItem], ch: u32, ignore_case: bool) -> bool {
         // Class atoms are still scalar (`char`); widen to compare against the
         // code-unit subject value `ch`.
         let hit = match item {
-            ClassItem::Char(c) => ch == *c as u32 || (ignore_case && fold(ch) == fold(*c as u32)),
+            ClassItem::Char(c) => ch == *c || (ignore_case && fold(ch) == fold(*c)),
             ClassItem::Range(lo, hi) => {
-                let (lo, hi) = (*lo as u32, *hi as u32);
+                let (lo, hi) = (*lo, *hi);
                 let in_range = lo <= ch && ch <= hi;
                 if in_range {
                     true
@@ -1664,9 +1685,9 @@ fn class_matches(items: &[ClassItem], ch: u32, ignore_case: bool) -> bool {
                 // `/^\p{...}+$/u`-over-a-huge-string property-escapes tests.
                 let inside = ranges
                     .binary_search_by(|(lo, hi)| {
-                        if ch < *lo as u32 {
+                        if ch < *lo {
                             std::cmp::Ordering::Greater
-                        } else if ch > *hi as u32 {
+                        } else if ch > *hi {
                             std::cmp::Ordering::Less
                         } else {
                             std::cmp::Ordering::Equal
@@ -1708,7 +1729,7 @@ fn is_word_char(c: u32) -> bool {
 /// `\p{L}`, `\p{Greek}`, `\p{White_Space}`) or `Property=Value`
 /// (`\p{Script=Latin}`, `\p{gc=Nd}`). Returns an error (→ SyntaxError) for an
 /// unknown property, per spec.
-fn resolve_unicode_property(name: &str) -> Result<std::rc::Rc<Vec<(char, char)>>, String> {
+fn resolve_unicode_property(name: &str) -> Result<std::rc::Rc<Vec<(u32, u32)>>, String> {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
@@ -1717,7 +1738,7 @@ fn resolve_unicode_property(name: &str) -> Result<std::rc::Rc<Vec<(char, char)>>
     // engine re-parses a regex pattern on every match call, so without this
     // cache a `\p{...}` regex looped over many inputs would rebuild it each time.
     thread_local! {
-        static CACHE: RefCell<HashMap<String, Option<Rc<Vec<(char, char)>>>>> =
+        static CACHE: RefCell<HashMap<String, Option<Rc<Vec<(u32, u32)>>>>> =
             RefCell::new(HashMap::new());
     }
     let err = || format!("Invalid property name in regular expression: \\p{{{name}}}");
@@ -1725,17 +1746,10 @@ fn resolve_unicode_property(name: &str) -> Result<std::rc::Rc<Vec<(char, char)>>
         return hit.ok_or_else(err);
     }
     let resolved = crate::unicode_tables::lookup(name).map(|ranges| {
-        Rc::new(
-            ranges
-                .iter()
-                // The generated tables only contain valid scalar/surrogate code
-                // points; `from_u32` can only fail for surrogates, which the
-                // gc=Cs / Any tables never reach as match targets (JS strings
-                // are UTF-16, but the matcher iterates scalar values). Clamp
-                // defensively by skipping any unrepresentable endpoint pair.
-                .filter_map(|&(lo, hi)| Some((char::from_u32(lo)?, char::from_u32(hi)?)))
-                .collect(),
-        )
+        // The generated tables are `u32` ranges and may legitimately include the
+        // surrogate block (e.g. `gc=Cs`, `\p{Any}`); keep them as-is so the
+        // matcher's code-unit/code-point values can hit them.
+        Rc::new(ranges.to_vec())
     });
     CACHE.with(|c| c.borrow_mut().insert(name.to_string(), resolved.clone()));
     resolved.ok_or_else(err)
