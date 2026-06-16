@@ -33,6 +33,7 @@ pub mod typed_array;
 mod unicode_tables;
 pub mod value;
 pub mod vm;
+pub mod wtf8;
 
 pub use trace::{TraceEnter, TraceObserver};
 pub use value::Value;

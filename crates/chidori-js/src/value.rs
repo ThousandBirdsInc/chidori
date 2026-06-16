@@ -19,34 +19,161 @@ use std::rc::Rc;
 
 use crate::bytecode::FuncProto;
 
-/// An interned-ish JS string. We start with `Rc<str>` (cheap clone, value
-/// equality); ropes/atoms are a later optimization.
+/// A JS string: a sequence of UTF-16 code units (the spec's string model),
+/// stored as WTF-8 bytes so lone surrogates and astral `.length`/indexing are
+/// representable. The overwhelmingly common case — a string with no unpaired
+/// surrogate — takes the `Utf8` arm, which is byte-identical to the old
+/// `Rc<str>` model: cheap clone, `as_str()` borrows directly, zero overhead.
+/// Only strings that actually contain an unpaired surrogate pay for the `Wtf8`
+/// arm. See [`crate::wtf8`].
 #[derive(Clone)]
-pub struct JsString(pub Rc<str>);
+pub struct JsString(Repr);
+
+#[derive(Clone)]
+enum Repr {
+    /// No unpaired surrogate: the bytes are valid UTF-8 (== the legacy model).
+    Utf8(Rc<str>),
+    /// Contains ≥1 unpaired surrogate. `bytes` is well-formed WTF-8; `lossy`
+    /// is the U+FFFD-replaced UTF-8 view that backs `as_str()` (and the host
+    /// boundary); `units` is the exact UTF-16 code-unit count.
+    Wtf8(Rc<Wtf8Buf>),
+}
+
+struct Wtf8Buf {
+    bytes: Box<[u8]>,
+    lossy: Box<str>,
+    units: u32,
+}
+
+/// Iterator over a `JsString`'s UTF-16 code units (`s.code_units()`).
+pub enum CodeUnits<'a> {
+    Utf8(std::str::EncodeUtf16<'a>),
+    Wtf8(crate::wtf8::Wtf8Units<'a>),
+}
+impl Iterator for CodeUnits<'_> {
+    type Item = u16;
+    #[inline]
+    fn next(&mut self) -> Option<u16> {
+        match self {
+            CodeUnits::Utf8(it) => it.next(),
+            CodeUnits::Wtf8(it) => it.next(),
+        }
+    }
+}
 
 impl JsString {
+    /// Build from valid UTF-8 (the source of nearly every string: literals,
+    /// number/JSON conversions, host input). Always the cheap `Utf8` arm.
     pub fn new(s: impl AsRef<str>) -> Self {
-        JsString(Rc::from(s.as_ref()))
+        JsString(Repr::Utf8(Rc::from(s.as_ref())))
     }
+    /// Adopt an existing `Rc<str>` without reallocating — used for bytecode
+    /// string-constant loads, which are a hot path.
+    pub fn from_rc_str(s: Rc<str>) -> Self {
+        JsString(Repr::Utf8(s))
+    }
+    /// Build from a UTF-16 code-unit sequence, re-pairing adjacent surrogates.
+    /// Takes the `Utf8` arm when the result is well-formed.
+    pub fn from_code_units(units: &[u16]) -> Self {
+        if crate::wtf8::is_well_formed(units) {
+            // Well-formed ⇒ `from_utf16` cannot fail.
+            JsString(Repr::Utf8(Rc::from(String::from_utf16_lossy(units).as_str())))
+        } else {
+            let bytes = crate::wtf8::encode_wtf8(units);
+            let lossy = crate::wtf8::to_string_lossy(&bytes);
+            JsString(Repr::Wtf8(Rc::new(Wtf8Buf {
+                bytes: bytes.into_boxed_slice(),
+                lossy: lossy.into_boxed_str(),
+                units: units.len() as u32,
+            })))
+        }
+    }
+    /// A `&str` view. For well-formed strings this is the exact contents and a
+    /// free borrow; for strings holding unpaired surrogates it is the
+    /// U+FFFD-replaced (lossy) view — which is precisely what every UTF-8-only
+    /// consumer (the host JSON boundary) wants. Internal operations that must
+    /// preserve surrogates use the code-unit API instead.
     pub fn as_str(&self) -> &str {
-        &self.0
+        match &self.0 {
+            Repr::Utf8(s) => s,
+            Repr::Wtf8(w) => &w.lossy,
+        }
+    }
+    /// Canonical well-formed WTF-8 bytes — the basis for equality and hashing.
+    pub fn wtf8_bytes(&self) -> &[u8] {
+        match &self.0 {
+            Repr::Utf8(s) => s.as_bytes(),
+            Repr::Wtf8(w) => &w.bytes,
+        }
+    }
+    /// Length in UTF-16 code units (the JS `.length`). O(n) for the `Utf8`
+    /// arm — same cost as the previous code-point `.length`.
+    pub fn len_utf16(&self) -> usize {
+        match &self.0 {
+            Repr::Utf8(s) => s.chars().map(|c| c.len_utf16()).sum(),
+            Repr::Wtf8(w) => w.units as usize,
+        }
+    }
+    /// The UTF-16 code unit at index `i`, or `None` if out of range.
+    pub fn code_unit_at(&self, i: usize) -> Option<u16> {
+        self.code_units().nth(i)
+    }
+    /// Iterate the UTF-16 code units.
+    pub fn code_units(&self) -> CodeUnits<'_> {
+        match &self.0 {
+            Repr::Utf8(s) => CodeUnits::Utf8(s.encode_utf16()),
+            Repr::Wtf8(w) => CodeUnits::Wtf8(crate::wtf8::decode_units(&w.bytes)),
+        }
+    }
+    /// Collect the UTF-16 code units (the regexp / split boundary).
+    pub fn to_utf16_vec(&self) -> Vec<u16> {
+        self.code_units().collect()
+    }
+    /// `true` if the string contains no unpaired surrogate.
+    pub fn is_well_formed(&self) -> bool {
+        matches!(self.0, Repr::Utf8(_))
+    }
+    /// Replace every unpaired surrogate with U+FFFD (`String.prototype.toWellFormed`).
+    pub fn to_well_formed(&self) -> JsString {
+        match &self.0 {
+            Repr::Utf8(_) => self.clone(),
+            Repr::Wtf8(w) => JsString::new(&*w.lossy),
+        }
+    }
+    /// Concatenate, preserving code units. Two well-formed strings concatenate
+    /// as plain UTF-8; otherwise we route through code units so a high+low
+    /// surrogate straddling the boundary re-pairs into one astral code point.
+    pub fn concat(&self, other: &JsString) -> JsString {
+        match (&self.0, &other.0) {
+            (Repr::Utf8(a), Repr::Utf8(b)) => {
+                let mut s = String::with_capacity(a.len() + b.len());
+                s.push_str(a);
+                s.push_str(b);
+                JsString(Repr::Utf8(Rc::from(s.as_str())))
+            }
+            _ => {
+                let mut units = self.to_utf16_vec();
+                units.extend(other.code_units());
+                JsString::from_code_units(&units)
+            }
+        }
     }
 }
 
 impl PartialEq for JsString {
     fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
+        self.wtf8_bytes() == other.wtf8_bytes()
     }
 }
 impl Eq for JsString {}
 impl std::hash::Hash for JsString {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.hash(state)
+        self.wtf8_bytes().hash(state)
     }
 }
 impl fmt::Debug for JsString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", &self.0)
+        write!(f, "{:?}", self.as_str())
     }
 }
 impl From<&str> for JsString {
@@ -56,7 +183,7 @@ impl From<&str> for JsString {
 }
 impl From<String> for JsString {
     fn from(s: String) -> Self {
-        JsString(Rc::from(s.as_str()))
+        JsString(Repr::Utf8(Rc::from(s.as_str())))
     }
 }
 

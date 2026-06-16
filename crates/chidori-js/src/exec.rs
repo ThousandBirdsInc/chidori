@@ -884,7 +884,7 @@ impl Vm {
             Const::Null => Value::Null,
             Const::Bool(b) => Value::Bool(*b),
             Const::Number(n) => Value::Number(*n),
-            Const::String(s) => Value::String(JsString(s.clone())),
+            Const::String(s) => Value::String(JsString::from_rc_str(s.clone())),
             Const::Func(_) => Value::Undefined, // handled by Closure
             Const::BigInt(s) => {
                 Value::bigint(parse_string_bigint(s).unwrap_or_else(|| num_bigint::BigInt::from(0)))
@@ -909,7 +909,7 @@ impl Vm {
 
     fn const_name(&self, frame: &Frame, idx: u32) -> JsString {
         match &frame.func.proto.consts[idx as usize] {
-            Const::String(s) => JsString(s.clone()),
+            Const::String(s) => JsString::from_rc_str(s.clone()),
             _ => JsString::new(""),
         }
     }
@@ -1369,7 +1369,7 @@ impl Vm {
                         .cooked
                         .iter()
                         .map(|c| match c {
-                            Some(s) => Value::String(JsString(s.clone())),
+                            Some(s) => Value::String(JsString::from_rc_str(s.clone())),
                             None => Value::Undefined,
                         })
                         .collect();
@@ -1377,7 +1377,7 @@ impl Vm {
                     let raw: Vec<Value> = parts
                         .raw
                         .iter()
-                        .map(|s| Value::String(JsString(s.clone())))
+                        .map(|s| Value::String(JsString::from_rc_str(s.clone())))
                         .collect();
                     let raw_arr = self.new_array(raw);
                     // The `raw` array is frozen; `raw` is a non-enumerable,
@@ -2971,7 +2971,7 @@ impl Vm {
         if matches!(pa, Value::String(_)) || matches!(pb, Value::String(_)) {
             let sa = self.to_js_string(&pa)?;
             let sb = self.to_js_string(&pb)?;
-            let total = sa.as_str().len() + sb.as_str().len();
+            let total = sa.wtf8_bytes().len() + sb.wtf8_bytes().len();
             // Bound a single concatenation so a doubling loop (`s += s`) cannot
             // grow a string without limit and OOM the host. The cap is well above
             // any legitimate string; exceeding it throws RangeError, matching how
@@ -2979,10 +2979,10 @@ impl Vm {
             if total > crate::value::MAX_STRING_LEN {
                 return Err(self.throw_range("invalid string length"));
             }
-            let mut s = String::with_capacity(total);
-            s.push_str(sa.as_str());
-            s.push_str(sb.as_str());
-            Ok(Value::str(s))
+            // Code-unit-preserving concatenation (re-pairs surrogates that
+            // straddle the boundary); the common all-UTF-8 case is a plain
+            // `push_str` under the hood.
+            Ok(Value::String(sa.concat(&sb)))
         } else {
             let xa = self.to_numeric(&pa)?;
             let xb = self.to_numeric(&pb)?;
