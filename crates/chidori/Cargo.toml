@@ -1,6 +1,6 @@
 [package]
 name = "chidori"
-version = "3.0.0"
+version = "3.1.0"
 edition = "2021"
 authors = ["Colton Pierson <colton@thousandbirds.ai>"]
 description = "YAML-free AI agent framework where agents are deterministic TypeScript modules with built-in checkpointing and replay."
@@ -58,7 +58,7 @@ hex = "0.4"
 rand = "0.8"
 
 # Pure-Rust JS engine + deterministic-replay durable runtime. The only JS engine.
-chidori-js = { path = "../chidori-js", version = "0.1.0" }
+chidori-js = { path = "../chidori-js", version = "0.2.0" }
 async-trait = "0.1"
 derive_more = { version = "1", features = ["display"] }
 
