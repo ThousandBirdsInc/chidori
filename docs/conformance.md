@@ -159,21 +159,28 @@ a single readable line in review).
 
 ## Remaining gaps
 
-The residual failures, by area (top clusters of the 413 total):
+The residual failures, by area (top clusters of the ~376 total). Strings are now
+WTF-8-backed with full UTF-16 code-unit semantics — `.length`/indexing/iteration,
+the `String.prototype` surface, the RegExp matcher (non-unicode per code unit,
+unicode per code point), lone-surrogate subjects and patterns, literals,
+`decodeURI`, and `iu` case folding — so the former "scalar-string model" clusters
+are largely cleared; the counts below shift accordingly (refresh from a `--json`
+report before targeting):
 
-| count | area | nature |
-|--:|---|---|
-| 94 | `built-ins/RegExp` | lone-surrogate matching (needs UTF-16 strings); `v`-flag; `prototype` long tail |
-| 77 | `language/expressions` | dynamic-`import()` semantics and the last class/eval corners |
-| 27 | `language/statements` | labelled/eval interplay and remaining class corners |
-| 20 | `built-ins/Object` | sparse indices beyond the dense cap; descriptor corners |
-| 20 | `language/module-code` | namespace internals, hoisted default-function exports, TLA ordering |
-| 18 | `language/eval-code` | eval-created global binding attributes, lexical/var collisions |
-| 15 | `built-ins/Array` | sparse indices beyond the dense cap; UTF-16 string spread |
-| 13 | `built-ins/String` | UTF-16 surrogate edge cases (the scalar-string model) |
-| 12 | `built-ins/TypedArray` | `subarray`/`set` corners on resizable buffers |
-| 12 | `language/global-code` | global lexical/var binding interactions |
-| 10 | `built-ins/ArrayBuffer` | resizable-buffer `slice`/transfer corners |
+| area | nature |
+|---|---|
+| `built-ins/RegExp` | `v`-flag set operations (`unicodeSets`); `\p{...}` property-of-strings; `prototype` long tail |
+| `language/expressions` | dynamic-`import()` semantics and the last class/eval corners |
+| `language/statements` | labelled/eval interplay and remaining class corners |
+| `built-ins/Object` | sparse indices beyond the dense cap; descriptor corners |
+| `language/module-code` | namespace internals, hoisted default-function exports, TLA ordering |
+| `language/eval-code` | eval-created global binding attributes, lexical/var collisions |
+| `built-ins/Array` | sparse indices beyond the dense cap |
+| `built-ins/String` | full Unicode case folding (`fold` is a simple-fold approximation) |
+| `built-ins/TypedArray` | `subarray`/`set` corners on resizable buffers |
+| `language/global-code` | global lexical/var binding interactions |
+| `language/literals/regexp` | `eval("/"+fromCharCode(cu)+"/").source` round-trip — a UTF-8 (oxc) front-end limit; `String.fromCharCode` is kept lossy until regex-/eval-source byte-span fidelity lands |
+| `built-ins/ArrayBuffer` | resizable-buffer `slice`/transfer corners |
 
 (Recent sweeps: the dynamic-`import()`/`with`-scope work cleared 268
 failures; the derived-class construction model — `super()` as a real

@@ -67,10 +67,18 @@ Test262 conformance is load-bearing now that there is no fallback engine. Keep
 picking off the cluster table in `docs/conformance.md`. The current top
 clusters:
 
-- [ ] **UTF-16 string representation** — the engine's scalar-string model blocks
-  RegExp lone-surrogate matching, the `v`-flag long tail, and String surrogate
-  edge cases. This is the single highest-leverage project; it unlocks the
-  largest RegExp cluster plus String/Array surrogate failures at once.
+- [x] **UTF-16 string representation** — `JsString` is now WTF-8-backed with
+  full UTF-16 code-unit semantics (`docs/conformance.md`): `.length`/indexing/
+  iteration, all `String.prototype` methods, the RegExp matcher (non-unicode
+  per code unit, unicode per code point) and its builtin layer, lone-surrogate
+  subjects **and** patterns, string/template literals, `decodeURI`, and `iu`
+  case folding. Remaining sub-item: `String.fromCharCode` still replaces lone
+  surrogates with U+FFFD instead of preserving them — emitting real lone
+  surrogates must land with regex-/eval-source fidelity (the UTF-8 oxc front end
+  loses a lone surrogate in `eval("/"+cu+"/").source`; the fix recovers the
+  literal's code units from the original WTF-8 by byte span, since a lossy
+  U+FFFD and a WTF-8 lone surrogate are both 3 bytes), else `S7.8.5_*_T2`
+  regress.
 - [ ] `language/expressions` corners — dynamic-`import()` semantics and the last
   class/eval corners.
 - [ ] `language/module-code` — namespace internals, hoisted default-function
