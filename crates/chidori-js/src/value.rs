@@ -91,7 +91,9 @@ impl JsString {
     pub fn from_code_units(units: &[u16]) -> Self {
         if crate::wtf8::is_well_formed(units) {
             // Well-formed ⇒ `from_utf16` cannot fail.
-            JsString(Repr::Utf8(Rc::from(String::from_utf16_lossy(units).as_str())))
+            JsString(Repr::Utf8(Rc::from(
+                String::from_utf16_lossy(units).as_str(),
+            )))
         } else {
             let bytes = crate::wtf8::encode_wtf8(units);
             let lossy = crate::wtf8::to_string_lossy(&bytes);

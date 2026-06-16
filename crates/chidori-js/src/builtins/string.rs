@@ -1,9 +1,12 @@
 //! String constructor and `String.prototype`.
 //!
-//! Note: strings are indexed by Unicode scalar (code point), not UTF-16 code
-//! unit. This diverges from the spec for astral-plane characters and lone
-//! surrogates — an explicit conformance long-tail item (plan P5). It is
-//! internally consistent (length, indexing, iteration all agree).
+//! Strings are UTF-16 code-unit sequences (the spec model): `.length`,
+//! indexing, `charCodeAt`, `slice`, etc. operate on code units (an astral char
+//! is two units, slicing one yields a lone surrogate), via the code-unit API on
+//! [`crate::value::JsString`]. The String iterator is code-point-granular
+//! (combining surrogate pairs) but preserves lone surrogates. `str_this` is the
+//! lossy (U+FFFD) view for the code-point-defined methods (case mapping,
+//! normalize); `jsstr_this`/`units_this` preserve surrogates for the rest.
 //!
 //! RegExp-aware methods (`match`, `matchAll`, `search`, `replace`,
 //! `replaceAll`, `split`) dispatch through the well-known symbol protocol
@@ -625,9 +628,9 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
             return Ok(Value::Object(vm.new_array(vec![])));
         }
         if sep_undefined {
-            return Ok(Value::Object(
-                vm.new_array(vec![Value::String(JsString::from_code_units(&units))]),
-            ));
+            return Ok(Value::Object(vm.new_array(vec![Value::String(
+                JsString::from_code_units(&units),
+            )])));
         }
         let mut out = Vec::new();
         if sep_units.is_empty() {

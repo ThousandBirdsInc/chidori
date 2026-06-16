@@ -610,13 +610,8 @@ fn make_regexp_string_iterator(
     let proto = vm.realm.iterator_proto.clone();
     let iter = vm.new_object_proto(Some(proto));
     // (matcher, S, global, unicode, done)
-    let state: Rc<RefCell<(Value, JsString, bool, bool, bool)>> = Rc::new(RefCell::new((
-        matcher,
-        s.clone(),
-        global,
-        unicode,
-        false,
-    )));
+    let state: Rc<RefCell<(Value, JsString, bool, bool, bool)>> =
+        Rc::new(RefCell::new((matcher, s.clone(), global, unicode, false)));
     let next = vm.new_native("next", 0, move |vm, _this, _a| {
         let (matcher, s, global, unicode, done) = {
             let st = state.borrow();
@@ -755,7 +750,9 @@ pub fn sym_replace_generic(
             } else {
                 Value::Object(vm.to_object(&named)?)
             };
-            get_substitution(vm, &matched, &units, position, &captures, &named_obj, &templ)?
+            get_substitution(
+                vm, &matched, &units, position, &captures, &named_obj, &templ,
+            )?
         };
         if position >= next_pos {
             accumulated.extend_from_slice(&units[next_pos..position]);
@@ -966,7 +963,6 @@ pub fn build_match_array(
 // =========================================================================
 // Symbol protocol implementations (operate on a branded RegExp `re`)
 // =========================================================================
-
 
 /// Install a string-valued accessor getter (`source`, `flags`) on the
 /// prototype. On the bare `RegExp.prototype` receiver the canonical empty

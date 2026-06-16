@@ -1318,7 +1318,8 @@ impl<'a> MatchCtx<'a> {
             }
             Node::Class { negated, items } => {
                 if let Some((cp, w)) = self.code_point_at(pos) {
-                    let matched = class_matches(items, cp, self.flags.ignore_case, self.flags.unicode);
+                    let matched =
+                        class_matches(items, cp, self.flags.ignore_case, self.flags.unicode);
                     if matched != *negated {
                         return k(pos + w, caps);
                     }
@@ -1647,8 +1648,20 @@ fn is_simple_one_char(node: &Node) -> bool {
 
 fn class_matches(items: &[ClassItem], ch: u32, ignore_case: bool, unicode: bool) -> bool {
     // ASCII case toggles on a code unit (used for letter-range folding).
-    let ascii_upper = |c: u32| if (0x61..=0x7a).contains(&c) { c - 0x20 } else { c };
-    let ascii_lower = |c: u32| if (0x41..=0x5a).contains(&c) { c + 0x20 } else { c };
+    let ascii_upper = |c: u32| {
+        if (0x61..=0x7a).contains(&c) {
+            c - 0x20
+        } else {
+            c
+        }
+    };
+    let ascii_lower = |c: u32| {
+        if (0x41..=0x5a).contains(&c) {
+            c + 0x20
+        } else {
+            c
+        }
+    };
     let is_ascii_digit = |c: u32| (0x30..=0x39).contains(&c);
     for item in items {
         // Class atoms are code points; compare against the subject value `ch`.
