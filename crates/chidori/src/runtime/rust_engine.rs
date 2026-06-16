@@ -1807,6 +1807,99 @@ mod tests {
     }
 
     #[test]
+    fn generative_ui_agent_renders_a_prompted_spec_and_journals_the_render() {
+        // Generative agent UI (docs/design/generative-agent-ui.md): the model
+        // "generates" the interface by filling a JSON UiSpec; a trusted React
+        // `Screen` renders it; the markup mounts into the journaled DOM and
+        // flushes a durable `dom_render`. We seed the prompt result in a replay
+        // log (the model's generated spec) so the whole loop is deterministic
+        // with no live provider, then assert the rendered DOM, the journaled
+        // render effect, and that re-running the journal is byte-identical.
+        use crate::runtime::call_log::CallRecord;
+
+        let path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/agents/generative_ui.tsx"
+        ));
+        let src = std::fs::read_to_string(&path).expect("generative_ui.tsx example present");
+
+        // The model's "generated" UI, served from the journal as the prompt
+        // result. The agent's first host call is the prompt, so seq == 1.
+        let spec_json = r#"{
+            "title": "Pro",
+            "subtitle": "For teams that ship",
+            "features": ["Unlimited projects", "Deterministic replay"],
+            "badges": [{ "label": "Price", "value": "$29/mo" }],
+            "cta": "Subscribe"
+        }"#;
+        let seed = vec![CallRecord {
+            seq: 1,
+            parent_seq: None,
+            function: "prompt".to_string(),
+            args: serde_json::json!({ "text": "generate ui" }),
+            result: serde_json::json!(spec_json),
+            duration_ms: 0,
+            token_usage: None,
+            timestamp: chrono::Utc::now(),
+            error: None,
+        }];
+
+        let ctx = RuntimeContext::with_replay(seed);
+        let backend = test_backend(ctx.clone(), Arc::new(ToolRegistry::new()));
+        let out = run_agent(
+            &path,
+            &src,
+            &serde_json::json!({ "description": "a pricing card for a Pro plan" }),
+            &backend,
+        )
+        .unwrap();
+
+        // The seeded spec rendered through the trusted Screen component.
+        let html = out["html"].as_str().unwrap();
+        assert!(html.contains("<h1>Pro</h1>"), "got: {html}");
+        assert!(
+            html.contains("<p class=\"subtitle\">For teams that ship</p>"),
+            "got: {html}"
+        );
+        assert!(
+            html.contains("<dt>Price</dt><dd>$29/mo</dd>"),
+            "got: {html}"
+        );
+        assert!(
+            html.contains("<li>Unlimited projects</li><li>Deterministic replay</li>"),
+            "got: {html}"
+        );
+        assert!(html.contains("<button>Subscribe</button>"), "got: {html}");
+        assert_eq!(out["spec"]["title"], serde_json::json!("Pro"));
+        assert!(out["mutations"].as_u64().unwrap() > 0);
+        assert_eq!(out["version"].as_u64().unwrap(), 1);
+
+        // The render flowed through the durable host as a `dom_render` effect.
+        let records = ctx.call_log().into_records();
+        assert!(
+            records.iter().any(|r| r.function == "dom_render"),
+            "dom_render was not journaled: {:?}",
+            records.iter().map(|r| &r.function).collect::<Vec<_>>()
+        );
+
+        // Record == replay: re-run the full journal (prompt + render) and get
+        // byte-identical output, zero model calls.
+        let ctx2 = RuntimeContext::with_replay(records);
+        let backend2 = test_backend(ctx2, Arc::new(ToolRegistry::new()));
+        let out2 = run_agent(
+            &path,
+            &src,
+            &serde_json::json!({ "description": "a pricing card for a Pro plan" }),
+            &backend2,
+        )
+        .unwrap();
+        assert_eq!(
+            out2, out,
+            "replay diverged from the recorded generative run"
+        );
+    }
+
+    #[test]
     fn run_agent_opcode_budget_terminates_infinite_loop() {
         // The opcode budget wired into `run_module` must bound pure-JS compute so
         // a runaway loop terminates with an error instead of hanging the host. We
