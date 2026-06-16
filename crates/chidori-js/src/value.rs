@@ -45,6 +45,20 @@ struct Wtf8Buf {
     units: u32,
 }
 
+/// Code-unit index one past the code point starting at `i`: `i + 2` when
+/// `units[i]` begins a surrogate pair, else `i + 1`. Used to step a code-unit
+/// buffer by code point (the String iterator / `codePointAt`).
+pub fn next_code_point_boundary(units: &[u16], i: usize) -> usize {
+    if (0xD800..=0xDBFF).contains(&units[i])
+        && i + 1 < units.len()
+        && (0xDC00..=0xDFFF).contains(&units[i + 1])
+    {
+        i + 2
+    } else {
+        i + 1
+    }
+}
+
 /// Iterator over a `JsString`'s UTF-16 code units (`s.code_units()`).
 pub enum CodeUnits<'a> {
     Utf8(std::str::EncodeUtf16<'a>),
@@ -128,6 +142,21 @@ impl JsString {
     /// Collect the UTF-16 code units (the regexp / split boundary).
     pub fn to_utf16_vec(&self) -> Vec<u16> {
         self.code_units().collect()
+    }
+    /// Split into code points — combining surrogate pairs — each as a
+    /// `JsString` of its 1–2 code units. This is the String iterator's
+    /// granularity (`for..of`, spread, `[...s]`): code-point-wise, but a lone
+    /// surrogate is preserved as a single one-unit string (not U+FFFD).
+    pub fn code_point_strings(&self) -> Vec<JsString> {
+        let units = self.to_utf16_vec();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < units.len() {
+            let end = next_code_point_boundary(&units, i);
+            out.push(JsString::from_code_units(&units[i..end]));
+            i = end;
+        }
+        out
     }
     /// `true` if the string contains no unpaired surrogate.
     pub fn is_well_formed(&self) -> bool {

@@ -385,7 +385,7 @@ impl Vm {
     }
 
     pub fn new_string_object(&self, s: JsString) -> JsObject {
-        let len = s.as_str().chars().count();
+        let len = s.len_utf16();
         let o = self.alloc(ObjectData::new(
             Some(self.realm.string_proto.clone()),
             Internal::StringObj(s),
@@ -883,12 +883,11 @@ impl Vm {
 
     fn string_own_prop(&self, s: &JsString, key: &PropertyKey) -> Option<Value> {
         if let Some("length") = key.as_str() {
-            return Some(Value::Number(s.as_str().chars().count() as f64));
+            return Some(Value::Number(s.len_utf16() as f64));
         }
         if let Some(idx) = key.array_index() {
-            let mut chars = s.as_str().chars();
-            if let Some(c) = chars.nth(idx as usize) {
-                return Some(Value::str(c.to_string()));
+            if let Some(u) = s.code_unit_at(idx as usize) {
+                return Some(Value::String(JsString::from_code_units(&[u])));
             }
         }
         None
@@ -1113,7 +1112,7 @@ impl Vm {
         {
             let blocked = if let Internal::StringObj(s) = &obj.borrow().internal {
                 key.array_index()
-                    .is_some_and(|i| (i as usize) < s.as_str().chars().count())
+                    .is_some_and(|i| (i as usize) < s.len_utf16())
             } else {
                 false
             };
@@ -1428,7 +1427,7 @@ impl Vm {
                         return Ok(false);
                     }
                     if let Some(i) = key.array_index() {
-                        if (i as usize) < s.as_str().chars().count() {
+                        if (i as usize) < s.len_utf16() {
                             return Ok(false);
                         }
                     }
@@ -1514,7 +1513,7 @@ impl Vm {
                     if let Some("length") = key.as_str() {
                         has = true;
                     } else if let Some(idx) = key.array_index() {
-                        if (idx as usize) < s.as_str().chars().count() {
+                        if (idx as usize) < s.len_utf16() {
                             has = true;
                         }
                     }
@@ -1551,7 +1550,7 @@ impl Vm {
             }
         }
         if let Internal::StringObj(s) = &b.internal {
-            for i in 0..s.as_str().chars().count() {
+            for i in 0..s.len_utf16() {
                 int_keys.push(i as u32);
             }
         }
@@ -1656,7 +1655,7 @@ impl Vm {
                             .unwrap_or(false),
                         Internal::StringObj(s) => k
                             .array_index()
-                            .map(|i| (i as usize) < s.as_str().chars().count())
+                            .map(|i| (i as usize) < s.len_utf16())
                             .unwrap_or(false),
                         _ => false,
                     },
@@ -1695,7 +1694,7 @@ impl Vm {
                     .unwrap_or(false),
                 Internal::StringObj(s) => key
                     .array_index()
-                    .map(|i| (i as usize) < s.as_str().chars().count())
+                    .map(|i| (i as usize) < s.len_utf16())
                     .unwrap_or(false),
                 _ => false,
             },

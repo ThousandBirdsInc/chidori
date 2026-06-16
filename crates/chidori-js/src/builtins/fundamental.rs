@@ -795,7 +795,7 @@ fn install_object(vm: &mut Vm) {
                     .unwrap_or(false),
                 Internal::StringObj(s) => key
                     .array_index()
-                    .map(|i| (i as usize) < s.as_str().chars().count())
+                    .map(|i| (i as usize) < s.len_utf16())
                     .unwrap_or(false),
                 _ => false,
             },
@@ -1642,7 +1642,7 @@ fn own_property_exists(o: &JsObject, key: &PropertyKey) -> bool {
                 return true;
             }
             if let Some(i) = key.array_index() {
-                if (i as usize) < s.as_str().chars().count() {
+                if (i as usize) < s.len_utf16() {
                     return true;
                 }
             }
@@ -1753,7 +1753,7 @@ pub(crate) fn own_property_descriptor(o: &JsObject, key: &PropertyKey) -> Option
             if let Some("length") = key.as_str() {
                 return Some(Property {
                     kind: PropertyKind::Data {
-                        value: Value::Number(s.as_str().chars().count() as f64),
+                        value: Value::Number(s.len_utf16() as f64),
                         writable: false,
                     },
                     enumerable: false,
@@ -1761,10 +1761,10 @@ pub(crate) fn own_property_descriptor(o: &JsObject, key: &PropertyKey) -> Option
                 });
             }
             if let Some(idx) = key.array_index() {
-                if let Some(c) = s.as_str().chars().nth(idx as usize) {
+                if let Some(u) = s.code_unit_at(idx as usize) {
                     return Some(Property {
                         kind: PropertyKind::Data {
-                            value: Value::str(c.to_string()),
+                            value: Value::String(JsString::from_code_units(&[u])),
                             writable: false,
                         },
                         enumerable: true,
@@ -1830,7 +1830,7 @@ fn define_properties(vm: &mut Vm, obj: &JsObject, props: &Value) -> Result<(), V
                         .unwrap_or(false),
                     Internal::StringObj(s) => k
                         .array_index()
-                        .map(|i| (i as usize) < s.as_str().chars().count())
+                        .map(|i| (i as usize) < s.len_utf16())
                         .unwrap_or(false),
                     _ => false,
                 },

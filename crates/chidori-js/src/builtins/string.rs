@@ -168,6 +168,80 @@ fn chars(s: &str) -> Vec<char> {
     s.chars().collect()
 }
 
+/// `this` as a `JsString`, preserving lone surrogates (unlike `str_this`, whose
+/// `String` is the lossy U+FFFD view). RequireObjectCoercible + ToString.
+fn jsstr_this(vm: &mut Vm, this: &Value) -> Result<JsString, Value> {
+    if this.is_nullish() {
+        return Err(vm.throw_type("String.prototype method called on null or undefined"));
+    }
+    match this {
+        Value::String(s) => Ok(s.clone()),
+        Value::Object(o) => {
+            let so = if let Internal::StringObj(s) = &o.borrow().internal {
+                Some(s.clone())
+            } else {
+                None
+            };
+            match so {
+                Some(s) => Ok(s),
+                None => vm.to_js_string(this),
+            }
+        }
+        _ => vm.to_js_string(this),
+    }
+}
+
+/// `this` as UTF-16 code units — the basis for the code-unit-indexed methods
+/// (`charAt`, `slice`, `indexOf`, …).
+fn units_this(vm: &mut Vm, this: &Value) -> Result<Vec<u16>, Value> {
+    Ok(jsstr_this(vm, this)?.to_utf16_vec())
+}
+
+/// `ToString(v)` as UTF-16 code units (search needles, etc.).
+fn units_of(vm: &mut Vm, v: &Value) -> Result<Vec<u16>, Value> {
+    Ok(vm.to_js_string(v)?.to_utf16_vec())
+}
+
+/// First index `>= from` at which `needle` occurs in `hay` (code-unit
+/// subsequence search). An empty needle matches at `min(from, hay.len())`.
+fn find_units(hay: &[u16], needle: &[u16], from: usize) -> Option<usize> {
+    let from = from.min(hay.len());
+    if needle.is_empty() {
+        return Some(from);
+    }
+    if needle.len() > hay.len() {
+        return None;
+    }
+    (from..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+/// Largest index `<= last` at which `needle` occurs in `hay`.
+fn rfind_units(hay: &[u16], needle: &[u16], last: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(last.min(hay.len()));
+    }
+    if needle.len() > hay.len() {
+        return None;
+    }
+    let max_start = (hay.len() - needle.len()).min(last);
+    (0..=max_start)
+        .rev()
+        .find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+/// The code point at code-unit index `i`, combining a surrogate pair.
+fn code_point_at_units(units: &[u16], i: usize) -> u32 {
+    let u = units[i];
+    if (0xD800..=0xDBFF).contains(&u)
+        && i + 1 < units.len()
+        && (0xDC00..=0xDFFF).contains(&units[i + 1])
+    {
+        0x1_0000 + (((u as u32 - 0xD800) << 10) | (units[i + 1] as u32 - 0xDC00))
+    } else {
+        u as u32
+    }
+}
+
 /// `ToIntegerOrInfinity(value)` as an f64 (NaN -> 0, truncation towards 0,
 /// infinities preserved).
 fn to_integer_or_infinity(vm: &mut Vm, v: &Value) -> Result<f64, Value> {
@@ -234,35 +308,35 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
         this_string_value(vm, &this)
     });
     vm.define_method(proto, "charAt", 1, |vm, this, args| {
-        let s = chars(&str_this(vm, &this)?);
+        let s = units_this(vm, &this)?;
         let i = to_integer_or_infinity(vm, &arg(args, 0))?;
-        Ok(Value::str(if i >= 0.0 && i < s.len() as f64 {
-            s[i as usize].to_string()
+        Ok(if i >= 0.0 && i < s.len() as f64 {
+            Value::String(JsString::from_code_units(&[s[i as usize]]))
         } else {
-            String::new()
-        }))
+            Value::str("")
+        })
     });
     vm.define_method(proto, "charCodeAt", 1, |vm, this, args| {
-        let s = chars(&str_this(vm, &this)?);
+        let s = units_this(vm, &this)?;
         let i = to_integer_or_infinity(vm, &arg(args, 0))?;
         if i >= 0.0 && i < s.len() as f64 {
-            Ok(Value::Number(s[i as usize] as u32 as f64))
+            Ok(Value::Number(s[i as usize] as f64))
         } else {
             Ok(Value::Number(f64::NAN))
         }
     });
     vm.define_method(proto, "codePointAt", 1, |vm, this, args| {
-        let s = chars(&str_this(vm, &this)?);
+        let s = units_this(vm, &this)?;
         let i = to_integer_or_infinity(vm, &arg(args, 0))?;
         if i >= 0.0 && i < s.len() as f64 {
-            // Scalar-indexed model: each char is a full code point.
-            Ok(Value::Number(s[i as usize] as u32 as f64))
+            // Code point at the code-unit index, combining a surrogate pair.
+            Ok(Value::Number(code_point_at_units(&s, i as usize) as f64))
         } else {
             Ok(Value::Undefined)
         }
     });
     vm.define_method(proto, "at", 1, |vm, this, args| {
-        let s = chars(&str_this(vm, &this)?);
+        let s = units_this(vm, &this)?;
         let rel = to_integer_or_infinity(vm, &arg(args, 0))?;
         if !rel.is_finite() && rel > 0.0 {
             return Ok(Value::Undefined);
@@ -276,121 +350,109 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
             i += s.len() as isize;
         }
         if i >= 0 && (i as usize) < s.len() {
-            Ok(Value::str(s[i as usize].to_string()))
+            Ok(Value::String(JsString::from_code_units(&[s[i as usize]])))
         } else {
             Ok(Value::Undefined)
         }
     });
     vm.define_method(proto, "indexOf", 1, |vm, this, args| {
-        let s = str_this(vm, &this)?;
+        let s = units_this(vm, &this)?;
         // Coercion order: ToString(searchString) BEFORE ToInteger(position).
-        let needle = vm.to_js_string(&arg(args, 0))?.as_str().to_string();
-        let s_chars = chars(&s);
+        let needle = units_of(vm, &arg(args, 0))?;
         // ToIntegerOrInfinity(position), clamped to [0, len] (+Infinity finds
         // nothing but an empty needle at the very end finds the clamp point).
-        let pos =
-            to_integer_or_infinity(vm, &arg(args, 1))?.clamp(0.0, s_chars.len() as f64) as usize;
-        let byte_start: usize = s_chars[..pos].iter().map(|c| c.len_utf8()).sum();
-        Ok(Value::Number(match s[byte_start..].find(&needle) {
-            Some(byte) => s[..byte_start + byte].chars().count() as f64,
+        let pos = to_integer_or_infinity(vm, &arg(args, 1))?.clamp(0.0, s.len() as f64) as usize;
+        Ok(Value::Number(match find_units(&s, &needle, pos) {
+            Some(i) => i as f64,
             None => -1.0,
         }))
     });
     vm.define_method(proto, "lastIndexOf", 1, |vm, this, args| {
-        let s = str_this(vm, &this)?;
+        let s = units_this(vm, &this)?;
         // Coercion order: ToString(searchString) BEFORE ToNumber(position).
-        let needle = vm.to_js_string(&arg(args, 0))?.as_str().to_string();
+        let needle = units_of(vm, &arg(args, 0))?;
         let num_pos = vm.to_number(&arg(args, 1))?;
-        let s_chars = chars(&s);
-        let len = s_chars.len() as f64;
+        let len = s.len() as f64;
         // NaN position means +Infinity (search from the very end).
         let last = if num_pos.is_nan() {
             len
         } else {
             num_pos.trunc().clamp(0.0, len)
         } as usize;
-        // Largest start <= last where the needle matches.
-        let needle_chars = chars(&needle);
-        let mut found = -1.0;
-        for start in (0..=last.min(s_chars.len())).rev() {
-            if s_chars[start..].starts_with(&needle_chars[..]) {
-                found = start as f64;
-                break;
-            }
-        }
-        Ok(Value::Number(found))
+        Ok(Value::Number(match rfind_units(&s, &needle, last) {
+            Some(i) => i as f64,
+            None => -1.0,
+        }))
     });
     vm.define_method(proto, "includes", 1, |vm, this, args| {
-        let s = str_this(vm, &this)?;
+        let s = units_this(vm, &this)?;
         if is_regexp_spec(vm, &arg(args, 0))? {
             return Err(vm.throw_type(
                 "First argument to String.prototype.includes must not be a regular expression",
             ));
         }
-        let needle = vm.to_js_string(&arg(args, 0))?.as_str().to_string();
-        let s_chars = chars(&s);
-        let pos = clamp_pos(vm, &arg(args, 1), s_chars.len())?;
-        let byte_start: usize = s_chars[..pos].iter().map(|c| c.len_utf8()).sum();
-        Ok(Value::Bool(s[byte_start..].contains(&needle)))
+        let needle = units_of(vm, &arg(args, 0))?;
+        let pos = clamp_pos(vm, &arg(args, 1), s.len())?;
+        Ok(Value::Bool(find_units(&s, &needle, pos).is_some()))
     });
     vm.define_method(proto, "startsWith", 1, |vm, this, args| {
-        let s = str_this(vm, &this)?;
+        let s = units_this(vm, &this)?;
         if is_regexp_spec(vm, &arg(args, 0))? {
             return Err(vm.throw_type(
                 "First argument to String.prototype.startsWith must not be a regular expression",
             ));
         }
-        let needle = vm.to_js_string(&arg(args, 0))?.as_str().to_string();
-        let s_chars = chars(&s);
-        let pos = clamp_pos(vm, &arg(args, 1), s_chars.len())?;
-        let byte_start: usize = s_chars[..pos].iter().map(|c| c.len_utf8()).sum();
-        Ok(Value::Bool(s[byte_start..].starts_with(&needle)))
+        let needle = units_of(vm, &arg(args, 0))?;
+        let pos = clamp_pos(vm, &arg(args, 1), s.len())?;
+        Ok(Value::Bool(
+            pos + needle.len() <= s.len() && s[pos..pos + needle.len()] == needle[..],
+        ))
     });
     vm.define_method(proto, "endsWith", 1, |vm, this, args| {
-        let s = str_this(vm, &this)?;
+        let s = units_this(vm, &this)?;
         if is_regexp_spec(vm, &arg(args, 0))? {
             return Err(vm.throw_type(
                 "First argument to String.prototype.endsWith must not be a regular expression",
             ));
         }
-        let needle = vm.to_js_string(&arg(args, 0))?.as_str().to_string();
-        let s_chars = chars(&s);
+        let needle = units_of(vm, &arg(args, 0))?;
         let end = {
             let p = arg(args, 1);
             if p.is_undefined() {
-                s_chars.len()
+                s.len()
             } else {
-                clamp_pos(vm, &p, s_chars.len())?
+                clamp_pos(vm, &p, s.len())?
             }
         };
-        let byte_end: usize = s_chars[..end].iter().map(|c| c.len_utf8()).sum();
-        Ok(Value::Bool(s[..byte_end].ends_with(&needle)))
+        Ok(Value::Bool(
+            end >= needle.len() && s[end - needle.len()..end] == needle[..],
+        ))
     });
     vm.define_method(proto, "slice", 2, |vm, this, args| {
-        let s = chars(&str_this(vm, &this)?);
+        let s = units_this(vm, &this)?;
         let len = s.len() as isize;
         let start = rel(vm, &arg(args, 0), len, 0)?;
         let end = rel(vm, &arg(args, 1), len, len)?;
-        Ok(Value::str(if start < end {
-            s[start as usize..end as usize].iter().collect::<String>()
+        Ok(if start < end {
+            Value::String(JsString::from_code_units(&s[start as usize..end as usize]))
         } else {
-            String::new()
-        }))
+            Value::str("")
+        })
     });
     vm.define_method(proto, "substring", 2, |vm, this, args| {
-        let s = chars(&str_this(vm, &this)?);
+        let s = units_this(vm, &this)?;
         let len = s.len() as isize;
         let mut start = clamp_idx(vm, &arg(args, 0), len, 0)?;
         let mut end = clamp_idx(vm, &arg(args, 1), len, len)?;
         if start > end {
             std::mem::swap(&mut start, &mut end);
         }
-        Ok(Value::str(
-            s[start as usize..end as usize].iter().collect::<String>(),
-        ))
+        Ok(Value::String(JsString::from_code_units(
+            &s[start as usize..end as usize],
+        )))
     });
     vm.define_method(proto, "substr", 2, |vm, this, args| {
-        let s = chars(&str_this(vm, &this)?);
+        let s = units_this(vm, &this)?;
         let len = s.len() as isize;
         let mut start = vm.to_int32(&arg(args, 0))? as isize;
         if start < 0 {
@@ -406,11 +468,11 @@ fn install_proto(vm: &mut Vm, proto: &JsObject) {
         }
         .max(0);
         let end = (start + count).min(len);
-        Ok(Value::str(if start < end {
-            s[start as usize..end as usize].iter().collect::<String>()
+        Ok(if start < end {
+            Value::String(JsString::from_code_units(&s[start as usize..end as usize]))
         } else {
-            String::new()
-        }))
+            Value::str("")
+        })
     });
     vm.define_method(proto, "toUpperCase", 0, |vm, this, _a| {
         Ok(Value::str(str_this(vm, &this)?.to_uppercase()))

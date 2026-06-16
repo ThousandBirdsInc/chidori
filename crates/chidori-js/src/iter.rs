@@ -85,9 +85,9 @@ impl Vm {
         }
         if let Value::String(s) = v {
             return Ok(s
-                .as_str()
-                .chars()
-                .map(|c| Value::str(c.to_string()))
+                .code_point_strings()
+                .into_iter()
+                .map(Value::String)
                 .collect());
         }
         let it = self.get_iterator(v)?;
@@ -240,13 +240,17 @@ impl Vm {
                 let kind = st.kind;
                 let res = match kind {
                     IterKind::StringChars => {
+                        // `index` is a UTF-16 code-unit offset; each step yields
+                        // one code point (combining a surrogate pair), preserving
+                        // lone surrogates as a single one-unit string.
                         let s = st.string.clone().unwrap_or_else(|| JsString::new(""));
-                        match s.as_str().chars().nth(idx) {
-                            Some(c) => {
-                                st.index += 1;
-                                Some(Value::str(c.to_string()))
-                            }
-                            None => None,
+                        let units = s.to_utf16_vec();
+                        if idx < units.len() {
+                            let end = crate::value::next_code_point_boundary(&units, idx);
+                            st.index = end;
+                            Some(Value::String(JsString::from_code_units(&units[idx..end])))
+                        } else {
+                            None
                         }
                     }
                     IterKind::ArrayKeys | IterKind::ArrayValues | IterKind::ArrayEntries => {

@@ -259,12 +259,11 @@ fn reflect_get(
             }
             if let Internal::StringObj(s) = &b.internal {
                 if let Some("length") = key.as_str() {
-                    return Ok(Value::Number(s.as_str().chars().count() as f64));
+                    return Ok(Value::Number(s.len_utf16() as f64));
                 }
                 if let Some(idx) = key.array_index() {
-                    let mut chars = s.as_str().chars();
-                    if let Some(c) = chars.nth(idx as usize) {
-                        return Ok(Value::str(c.to_string()));
+                    if let Some(u) = s.code_unit_at(idx as usize) {
+                        return Ok(Value::String(JsString::from_code_units(&[u])));
                     }
                 }
             }
