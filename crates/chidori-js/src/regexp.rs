@@ -49,7 +49,7 @@ pub struct ReMatch {
 /// Compile `pattern`/`flags` and search `input` for a match at or after `start`
 /// (unless the `y` sticky flag forces a match exactly at `start`). Returns
 /// `None` if the pattern is unsupported or no match is found.
-pub fn regex_exec(pattern: &str, flags: &str, input: &[char], start: usize) -> Option<ReMatch> {
+pub fn regex_exec(pattern: &str, flags: &str, input: &[u16], start: usize) -> Option<ReMatch> {
     let re = Regex::compile(pattern, flags).ok()?;
     re.exec(input, start)
 }
@@ -63,7 +63,7 @@ pub fn regex_exec(pattern: &str, flags: &str, input: &[char], start: usize) -> O
 pub fn regex_exec_named(
     pattern: &str,
     flags: &str,
-    input: &[char],
+    input: &[u16],
     start: usize,
 ) -> Option<(ReMatch, Vec<(String, usize)>)> {
     let re = Regex::compile(pattern, flags).ok()?;
@@ -1181,7 +1181,7 @@ impl Regex {
         })
     }
 
-    fn exec(&self, input: &[char], start: usize) -> Option<ReMatch> {
+    fn exec(&self, input: &[u16], start: usize) -> Option<ReMatch> {
         let mut at = start.min(input.len() + 1);
         // One shared step budget across the whole search bounds catastrophic
         // backtracking (e.g. /(a*)*b/ on a long non-matching input).
@@ -1206,7 +1206,11 @@ impl Regex {
             if self.flags.sticky {
                 return None;
             }
-            at += 1;
+            // Advance the search start by a whole code point. In unicode mode
+            // this steps over a surrogate pair so the scan never starts
+            // mid-pair (e.g. `/[^💚]/u` must not match the trailing low
+            // surrogate of "💚"); otherwise it is one code unit.
+            at += ctx.code_point_at(at).map_or(1, |(_, w)| w);
         }
     }
 }
@@ -1215,9 +1219,37 @@ impl Regex {
 const REGEX_STEP_LIMIT: u64 = 100_000;
 
 struct MatchCtx<'a> {
-    input: &'a [char],
+    /// The subject as UTF-16 code units. All match positions and reported
+    /// capture spans are code-unit offsets into this slice. Patterns are still
+    /// scalar (`char`) — a code unit is widened to `u32` for comparison — so a
+    /// lone surrogate in the *subject* is matchable; lone-surrogate *patterns*
+    /// are a later step.
+    input: &'a [u16],
     flags: Flags,
     steps: std::cell::Cell<u64>,
+}
+
+impl MatchCtx<'_> {
+    /// The code point starting at code-unit `pos` and its width in code units.
+    /// In unicode (`u`/`v`) mode a high+low surrogate pair combines into one
+    /// astral code point (width 2); otherwise — and for an unpaired surrogate —
+    /// each code unit is its own value (width 1). This is the seam that gives
+    /// non-unicode mode exact code-unit semantics (lone surrogates matchable)
+    /// while unicode mode matches per code point (a pair is one unit, `.` never
+    /// splits it).
+    #[inline]
+    fn code_point_at(&self, pos: usize) -> Option<(u32, usize)> {
+        let u = *self.input.get(pos)?;
+        if self.flags.unicode && (0xD800..=0xDBFF).contains(&u) {
+            if let Some(&lo) = self.input.get(pos + 1) {
+                if (0xDC00..=0xDFFF).contains(&lo) {
+                    let cp = 0x1_0000 + (((u as u32 - 0xD800) << 10) | (lo as u32 - 0xDC00));
+                    return Some((cp, 2));
+                }
+            }
+        }
+        Some((u as u32, 1))
+    }
 }
 
 /// A continuation: given the position reached after this node and the current
@@ -1226,7 +1258,7 @@ struct MatchCtx<'a> {
 type Cont<'k> = dyn Fn(usize, &mut Caps) -> Option<usize> + 'k;
 
 impl<'a> MatchCtx<'a> {
-    fn char_eq(&self, a: char, b: char) -> bool {
+    fn char_eq(&self, a: u32, b: u32) -> bool {
         if a == b {
             return true;
         }
@@ -1248,33 +1280,34 @@ impl<'a> MatchCtx<'a> {
         match node {
             Node::Empty => k(pos, caps),
             Node::Char(c) => {
-                if pos < self.input.len() && self.char_eq(self.input[pos], *c) {
-                    k(pos + 1, caps)
-                } else {
-                    None
+                if let Some((cp, w)) = self.code_point_at(pos) {
+                    if self.char_eq(cp, *c as u32) {
+                        return k(pos + w, caps);
+                    }
                 }
+                None
             }
             Node::AnyChar => {
-                if pos < self.input.len() {
-                    let ch = self.input[pos];
-                    if self.flags.dot_all || !is_line_terminator(ch) {
-                        return k(pos + 1, caps);
+                if let Some((cp, w)) = self.code_point_at(pos) {
+                    if self.flags.dot_all || !is_line_terminator(cp) {
+                        return k(pos + w, caps);
                     }
                 }
                 None
             }
             Node::Class { negated, items } => {
-                if pos < self.input.len() {
-                    let ch = self.input[pos];
-                    let matched = class_matches(items, ch, self.flags.ignore_case);
+                if let Some((cp, w)) = self.code_point_at(pos) {
+                    let matched = class_matches(items, cp, self.flags.ignore_case);
                     if matched != *negated {
-                        return k(pos + 1, caps);
+                        return k(pos + w, caps);
                     }
                 }
                 None
             }
             Node::Start => {
-                if pos == 0 || (self.flags.multiline && is_line_terminator(self.input[pos - 1])) {
+                if pos == 0
+                    || (self.flags.multiline && is_line_terminator(self.input[pos - 1] as u32))
+                {
                     k(pos, caps)
                 } else {
                     None
@@ -1282,7 +1315,7 @@ impl<'a> MatchCtx<'a> {
             }
             Node::End => {
                 if pos == self.input.len()
-                    || (self.flags.multiline && is_line_terminator(self.input[pos]))
+                    || (self.flags.multiline && is_line_terminator(self.input[pos] as u32))
                 {
                     k(pos, caps)
                 } else {
@@ -1290,8 +1323,8 @@ impl<'a> MatchCtx<'a> {
                 }
             }
             Node::WordBoundary(want) => {
-                let before = pos > 0 && is_word_char(self.input[pos - 1]);
-                let after = pos < self.input.len() && is_word_char(self.input[pos]);
+                let before = pos > 0 && is_word_char(self.input[pos - 1] as u32);
+                let after = pos < self.input.len() && is_word_char(self.input[pos] as u32);
                 let boundary = before != after;
                 if boundary == *want {
                     k(pos, caps)
@@ -1360,7 +1393,7 @@ impl<'a> MatchCtx<'a> {
                             return None;
                         }
                         for j in 0..len {
-                            if !self.char_eq(self.input[pos + j], self.input[s + j]) {
+                            if !self.char_eq(self.input[pos + j] as u32, self.input[s + j] as u32) {
                                 return None;
                             }
                         }
@@ -1458,21 +1491,21 @@ impl<'a> MatchCtx<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    /// Whether `node` matches exactly one input char and never backtracks
-    /// internally — eligible for the iterative quantifier fast path.
-    fn node_matches_one(&self, node: &Node, pos: usize) -> bool {
-        if pos >= self.input.len() {
-            return false;
-        }
-        let ch = self.input[pos];
-        match node {
-            Node::Char(c) => self.char_eq(ch, *c),
-            Node::AnyChar => self.flags.dot_all || !is_line_terminator(ch),
+    /// If `node` matches the single code point at `pos`, the number of code
+    /// units it consumes (1, or 2 for an astral pair in unicode mode); else
+    /// `None`. `node` must be a simple one-code-point atom with no internal
+    /// backtracking (the iterative quantifier fast path).
+    fn node_matches_one(&self, node: &Node, pos: usize) -> Option<usize> {
+        let (cp, w) = self.code_point_at(pos)?;
+        let ok = match node {
+            Node::Char(c) => self.char_eq(cp, *c as u32),
+            Node::AnyChar => self.flags.dot_all || !is_line_terminator(cp),
             Node::Class { negated, items } => {
-                class_matches(items, ch, self.flags.ignore_case) != *negated
+                class_matches(items, cp, self.flags.ignore_case) != *negated
             }
             _ => false,
-        }
+        };
+        ok.then_some(w)
     }
 
     fn match_repeat(
@@ -1495,11 +1528,21 @@ impl<'a> MatchCtx<'a> {
         // what makes those matches feasible at all.
         if is_simple_one_char(node) {
             let cap = max.unwrap_or(usize::MAX);
+            // `bounds[i]` is the code-unit position after `done + i` repetitions.
+            // Atoms can consume two code units (an astral pair in unicode mode),
+            // so backtracking indexes recorded boundaries rather than `±1`.
+            let mut bounds = vec![pos];
             let mut p = pos;
             let mut total = done;
-            while total < cap && self.node_matches_one(node, p) {
-                p += 1;
-                total += 1;
+            while total < cap {
+                match self.node_matches_one(node, p) {
+                    Some(w) => {
+                        p += w;
+                        total += 1;
+                        bounds.push(p);
+                    }
+                    None => break,
+                }
             }
             let floor = min.max(done);
             if total < floor {
@@ -1507,29 +1550,25 @@ impl<'a> MatchCtx<'a> {
             }
             if greedy {
                 let mut tn = total;
-                let mut tp = p;
                 loop {
-                    if let Some(r) = k(tp, caps) {
+                    if let Some(r) = k(bounds[tn - done], caps) {
                         return Some(r);
                     }
                     if tn == floor {
                         return None;
                     }
                     tn -= 1;
-                    tp -= 1;
                 }
             } else {
                 let mut tn = floor;
-                let mut tp = pos + (floor - done);
                 loop {
-                    if let Some(r) = k(tp, caps) {
+                    if let Some(r) = k(bounds[tn - done], caps) {
                         return Some(r);
                     }
                     if tn == total {
                         return None;
                     }
                     tn += 1;
-                    tp += 1;
                 }
             }
         }
@@ -1585,29 +1624,35 @@ fn is_simple_one_char(node: &Node) -> bool {
     matches!(node, Node::Char(_) | Node::AnyChar | Node::Class { .. })
 }
 
-fn class_matches(items: &[ClassItem], ch: char, ignore_case: bool) -> bool {
+fn class_matches(items: &[ClassItem], ch: u32, ignore_case: bool) -> bool {
+    // ASCII case toggles on a code unit (used for letter-range folding).
+    let ascii_upper = |c: u32| if (0x61..=0x7a).contains(&c) { c - 0x20 } else { c };
+    let ascii_lower = |c: u32| if (0x41..=0x5a).contains(&c) { c + 0x20 } else { c };
+    let is_ascii_digit = |c: u32| (0x30..=0x39).contains(&c);
     for item in items {
+        // Class atoms are still scalar (`char`); widen to compare against the
+        // code-unit subject value `ch`.
         let hit = match item {
-            ClassItem::Char(c) => ch == *c || (ignore_case && fold(ch) == fold(*c)),
+            ClassItem::Char(c) => ch == *c as u32 || (ignore_case && fold(ch) == fold(*c as u32)),
             ClassItem::Range(lo, hi) => {
-                let in_range = (*lo as u32) <= (ch as u32) && (ch as u32) <= (*hi as u32);
+                let (lo, hi) = (*lo as u32, *hi as u32);
+                let in_range = lo <= ch && ch <= hi;
                 if in_range {
                     true
                 } else if ignore_case {
                     let f = fold(ch);
-                    ((*lo as u32) <= (f as u32) && (f as u32) <= (*hi as u32)) || {
+                    (lo <= f && f <= hi) || {
                         // Also try folding the bounds for ASCII letter ranges.
-                        let u = ch.to_ascii_uppercase();
-                        let l = ch.to_ascii_lowercase();
-                        ((*lo as u32) <= (u as u32) && (u as u32) <= (*hi as u32))
-                            || ((*lo as u32) <= (l as u32) && (l as u32) <= (*hi as u32))
+                        let u = ascii_upper(ch);
+                        let l = ascii_lower(ch);
+                        (lo <= u && u <= hi) || (lo <= l && l <= hi)
                     }
                 } else {
                     false
                 }
             }
-            ClassItem::Digit => ch.is_ascii_digit(),
-            ClassItem::NotDigit => !ch.is_ascii_digit(),
+            ClassItem::Digit => is_ascii_digit(ch),
+            ClassItem::NotDigit => !is_ascii_digit(ch),
             ClassItem::Word => is_word_char(ch),
             ClassItem::NotWord => !is_word_char(ch),
             ClassItem::Space => is_regex_space(ch),
@@ -1619,9 +1664,9 @@ fn class_matches(items: &[ClassItem], ch: char, ignore_case: bool) -> bool {
                 // `/^\p{...}+$/u`-over-a-huge-string property-escapes tests.
                 let inside = ranges
                     .binary_search_by(|(lo, hi)| {
-                        if ch < *lo {
+                        if ch < *lo as u32 {
                             std::cmp::Ordering::Greater
-                        } else if ch > *hi {
+                        } else if ch > *hi as u32 {
                             std::cmp::Ordering::Less
                         } else {
                             std::cmp::Ordering::Equal
@@ -1638,17 +1683,23 @@ fn class_matches(items: &[ClassItem], ch: char, ignore_case: bool) -> bool {
     false
 }
 
-fn fold(c: char) -> char {
-    // Simple case fold: map to lowercase. Adequate for ASCII / common Latin.
-    let mut it = c.to_lowercase();
-    match (it.next(), it.next()) {
-        (Some(x), None) => x,
-        _ => c,
+fn fold(c: u32) -> u32 {
+    // Simple case fold: map to lowercase. Adequate for ASCII / common Latin. A
+    // lone surrogate (non-scalar) has no case mapping and folds to itself.
+    match char::from_u32(c) {
+        Some(ch) => {
+            let mut it = ch.to_lowercase();
+            match (it.next(), it.next()) {
+                (Some(x), None) => x as u32,
+                _ => c,
+            }
+        }
+        None => c,
     }
 }
 
-fn is_word_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
+fn is_word_char(c: u32) -> bool {
+    matches!(c, 0x30..=0x39 | 0x41..=0x5a | 0x61..=0x7a | 0x5f)
 }
 
 /// Resolve a `\p{...}` property name to code-point ranges via the generated
@@ -1690,24 +1741,17 @@ fn resolve_unicode_property(name: &str) -> Result<std::rc::Rc<Vec<(char, char)>>
     resolved.ok_or_else(err)
 }
 
-fn is_line_terminator(c: char) -> bool {
-    matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
+fn is_line_terminator(c: u32) -> bool {
+    matches!(c, 0x0A | 0x0D | 0x2028 | 0x2029)
 }
 
-fn is_regex_space(c: char) -> bool {
-    // \s per spec: WhiteSpace + LineTerminator.
+fn is_regex_space(c: u32) -> bool {
+    // \s per spec: WhiteSpace + LineTerminator. All members are BMP, so a code
+    // unit is sufficient; widen to `char` for the general White_Space test.
     matches!(
         c,
-        ' ' | '\t'
-            | '\u{000B}'
-            | '\u{000C}'
-            | '\u{00A0}'
-            | '\u{FEFF}'
-            | '\n'
-            | '\r'
-            | '\u{2028}'
-            | '\u{2029}'
-    ) || c.is_whitespace()
+        0x20 | 0x09 | 0x0B | 0x0C | 0xA0 | 0xFEFF | 0x0A | 0x0D | 0x2028 | 0x2029
+    ) || char::from_u32(c).is_some_and(|ch| ch.is_whitespace())
 }
 
 // =========================================================================

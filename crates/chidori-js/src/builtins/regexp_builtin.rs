@@ -395,7 +395,7 @@ pub fn regexp_exec_impl(vm: &mut Vm, re: &JsObject, input: &str) -> Result<Value
     let global = flags.contains('g');
     let sticky = flags.contains('y');
 
-    let chars: Vec<char> = input.chars().collect();
+    let units: Vec<u16> = input.encode_utf16().collect();
 
     // Read lastIndex via Get (it is a writable data property), then ToLength.
     let last_index = {
@@ -406,7 +406,7 @@ pub fn regexp_exec_impl(vm: &mut Vm, re: &JsObject, input: &str) -> Result<Value
     // Only the g and y flags observe and advance lastIndex; otherwise scan from 0.
     let start = if global || sticky { last_index } else { 0 };
 
-    if start > chars.len() {
+    if start > units.len() {
         if global || sticky {
             vm.set_prop(
                 &Value::Object(re.clone()),
@@ -419,7 +419,7 @@ pub fn regexp_exec_impl(vm: &mut Vm, re: &JsObject, input: &str) -> Result<Value
 
     // For a sticky regexp the matcher itself enforces a match exactly at
     // `start`; for plain/global it scans forward from `start`.
-    let m = regex_exec(&source, &flags, &chars, start);
+    let m = regex_exec(&source, &flags, &units, start);
     match m {
         None => {
             if global || sticky {
@@ -443,7 +443,7 @@ pub fn regexp_exec_impl(vm: &mut Vm, re: &JsObject, input: &str) -> Result<Value
             let has_indices = flags.contains('d');
             Ok(build_match_array(
                 vm,
-                &chars,
+                &units,
                 &mat,
                 input,
                 &names,
@@ -851,7 +851,7 @@ fn get_substitution(
 /// `undefined` (the property is always present).
 pub fn build_match_array(
     vm: &mut Vm,
-    chars: &[char],
+    units: &[u16],
     mat: &ReMatch,
     input: &str,
     names: &[(String, usize)],
@@ -861,8 +861,7 @@ pub fn build_match_array(
     for g in &mat.groups {
         match g {
             Some((s, e)) => {
-                let slice: String = chars[*s..*e].iter().collect();
-                elems.push(Value::str(slice));
+                elems.push(Value::String(JsString::from_code_units(&units[*s..*e])));
             }
             None => elems.push(Value::Undefined),
         }
@@ -877,7 +876,7 @@ pub fn build_match_array(
             let mut gb = obj.borrow_mut();
             for (name, idx) in names {
                 let val = match mat.groups.get(*idx).and_then(|g| *g) {
-                    Some((s, e)) => Value::str(chars[s..e].iter().collect::<String>()),
+                    Some((s, e)) => Value::String(JsString::from_code_units(&units[s..e])),
                     None => Value::Undefined,
                 };
                 gb.props.insert(PropertyKey::str(name), Property::data(val));
@@ -948,77 +947,6 @@ pub fn build_match_array(
 // Symbol protocol implementations (operate on a branded RegExp `re`)
 // =========================================================================
 
-/// `RegExp.prototype[@@split]`: split honoring capture groups and `limit`.
-pub fn sym_split(vm: &mut Vm, re: &JsObject, s: &str, limit_arg: &Value) -> Result<Value, Value> {
-    let limit = if limit_arg.is_undefined() {
-        u32::MAX as usize
-    } else {
-        vm.to_uint32(limit_arg)? as usize
-    };
-    if limit == 0 {
-        return Ok(Value::Object(vm.new_array(vec![])));
-    }
-    Ok(regex_split(vm, s, re, limit))
-}
-
-/// RegExp-based split. Splits `s` around each match, including the contents of
-/// each capture group between pieces (per spec), honoring `limit`.
-pub fn regex_split(vm: &mut Vm, s: &str, re: &JsObject, limit: usize) -> Value {
-    let (source, flags) = regexp_source_flags(re);
-    let chars: Vec<char> = s.chars().collect();
-    let size = chars.len();
-    let mut out: Vec<Value> = Vec::new();
-
-    // Empty input: a match of the empty string yields []; otherwise [s].
-    if size == 0 {
-        if regex_exec(&source, &flags, &chars, 0).is_none() {
-            out.push(Value::str(s));
-        }
-        return Value::Object(vm.new_array(out));
-    }
-
-    // `p` is the start of the current unsplit segment; `q` is the candidate
-    // match position. Per spec we test for a match *starting exactly at q*
-    // (sticky semantics), advancing q by one when there is no such match or it
-    // is empty and ends at p. This deliberately ignores matches found further
-    // ahead, so e.g. `"a".split(/$/)` yields `["a"]`.
-    let mut p = 0usize;
-    let mut q = 0usize;
-    while q < size {
-        let m = regex_exec(&source, &flags, &chars, q);
-        match m {
-            Some(m) if m.start == q && m.end <= size && m.end != p => {
-                let e = m.end;
-                // Emit the segment [p, q).
-                out.push(Value::str(chars[p..q].iter().collect::<String>()));
-                if out.len() >= limit {
-                    return Value::Object(vm.new_array(out));
-                }
-                // Emit capture groups.
-                for g in m.groups.iter().skip(1) {
-                    out.push(match g {
-                        Some((gs, ge)) => Value::str(chars[*gs..*ge].iter().collect::<String>()),
-                        None => Value::Undefined,
-                    });
-                    if out.len() >= limit {
-                        return Value::Object(vm.new_array(out));
-                    }
-                }
-                p = e;
-                q = e;
-            }
-            _ => {
-                q += 1;
-            }
-        }
-    }
-    // Trailing segment [p, size).
-    out.push(Value::str(chars[p..].iter().collect::<String>()));
-    if out.len() > limit {
-        out.truncate(limit);
-    }
-    Value::Object(vm.new_array(out))
-}
 
 /// Install a string-valued accessor getter (`source`, `flags`) on the
 /// prototype. On the bare `RegExp.prototype` receiver the canonical empty
