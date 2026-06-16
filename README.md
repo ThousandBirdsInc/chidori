@@ -33,8 +33,6 @@
   <a href="https://discord.gg/CJwKsPSgew"><b>💬 Discord</b></a>
 </p>
 
-> **About v3.** Chidori began as a reactive runtime exploring how to build durable, debuggable agents. v3 is a ground-up rewrite that distills those ideas into a smaller, sharper core: a single Rust binary, TypeScript agent authoring, and replay as the foundation for tests, debugging, resume, and human-in-the-loop workflows. Earlier versions of Chidori live in the git history and on prior tags.
-
 ## 💡 Why Chidori
 
 **Agents are non-deterministic, expensive, and long-running.** That combination
