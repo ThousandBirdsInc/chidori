@@ -99,7 +99,25 @@ TypeScript.
 
 ## ⚡️ Quick Start
 
-### 0. Scaffold a starter (optional)
+### 0. Install
+
+```bash
+cargo install chidori
+```
+
+This builds the `chidori` binary from [crates.io](https://crates.io/crates/chidori)
+and puts it on your `PATH` (in `~/.cargo/bin`). Check it with `chidori --version`.
+
+Prefer to build from a checkout (also gets you the bundled `examples/` used in
+step 3)?
+
+```bash
+git clone https://github.com/ThousandBirdsInc/chidori
+cd chidori
+cargo build --release   # binary at ./target/release/chidori
+```
+
+### 1. Scaffold a starter (optional)
 
 ```bash
 chidori init my-agent --template chat     # or: --template worker
@@ -110,7 +128,7 @@ chidori init my-agent --template chat     # or: --template worker
 interactively): **chat** is a conversational assistant, **worker** is an
 autonomous tool-using loop.
 
-### 1. Write an agent
+### 2. Write an agent
 
 ```ts
 // agents/summarizer.ts
@@ -132,7 +150,7 @@ export async function agent(input: { document: string }, chidori: Chidori) {
 That's a complete, durable agent. Both prompts are recorded; replay returns them
 for free.
 
-### 2. Run it
+### 3. Run it
 
 ```bash
 # Set up LLM provider (uses LiteLLM in this example)
@@ -143,30 +161,32 @@ export LITELLM_API_KEY=sk-litellm-master-key
 # export ANTHROPIC_API_KEY=sk-ant-...
 # export OPENAI_API_KEY=sk-...
 
-cargo build
-./target/debug/chidori run agents/summarizer.ts \
+chidori run agents/summarizer.ts \
   --input document="Rust is a systems programming language..."
 ```
 
-### 3. Try the example agents — no API key required
+### 4. Try the example agents — no API key required
+
+These reference files under `examples/`, so run them from a checkout of the
+repo (see the build-from-source option in step 0).
 
 ```bash
 # Interactive example picker
-./target/debug/chidori demo
+chidori demo
 
 # Minimal agent — no LLM calls needed
-./target/debug/chidori run examples/agents/hello.ts --input name=Colton
+chidori run examples/agents/hello.ts --input name=Colton
 
 # Local TypeScript tool — no LLM calls needed
-./target/debug/chidori run examples/agents/tool_use.ts \
+chidori run examples/agents/tool_use.ts \
   --input query=chidori --tools examples/tools
 
 # Multi-turn chat assistant (scripted turns; omit --input to chat interactively)
-./target/debug/chidori run examples/agents/conversation.ts \
+chidori run examples/agents/conversation.ts \
   --input '{"messages": ["Hi, who are you?", "What can you help with?"]}'
 
 # Or chat with the model directly — no agent file, durable every turn
-./target/debug/chidori chat --system "You are a concise assistant."
+chidori chat --system "You are a concise assistant."
 ```
 
 For a guided walkthrough — inspecting a run, the demo picker, and the
