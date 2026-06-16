@@ -101,15 +101,20 @@ TypeScript.
 
 ### 0. Install
 
+Chidori currently builds on the **nightly** toolchain (a dependency uses a
+feature stabilized in Rust 1.97), so install with `+nightly`:
+
 ```bash
-cargo install chidori
+rustup toolchain install nightly   # if you don't have it
+cargo +nightly install chidori
 ```
 
 This builds the `chidori` binary from [crates.io](https://crates.io/crates/chidori)
 and puts it on your `PATH` (in `~/.cargo/bin`). Check it with `chidori --version`.
 
 Prefer to build from a checkout (also gets you the bundled `examples/` used in
-step 3)?
+step 3)? The repo pins nightly via `rust-toolchain.toml`, so `cargo` picks it up
+automatically:
 
 ```bash
 git clone https://github.com/ThousandBirdsInc/chidori
