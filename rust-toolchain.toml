@@ -1,11 +1,12 @@
 [toolchain]
-# oxc_transformer 0.133 uses `if let` match-arm guards, an unstable feature
-# until Rust 1.97 (currently in beta). Pin to nightly until 1.97 ships stable,
-# then this file can be deleted. rustup auto-fetches the channel on first
-# build, including inside the rust:1-bookworm grpc image.
-channel = "nightly"
-# Ensure `cargo fmt`/`cargo clippy` work on the pinned channel: the
-# auto-fetched nightly otherwise omits these components, which breaks the
-# CI "Check formatting" step (it runs against this pinned toolchain, not
-# the stable one the workflow installs).
+# Build on stable. The previous nightly pin existed only because
+# oxc_transformer 0.133 used `if let` match-arm guards, an unstable feature
+# (rust-lang/rust#51114) stabilized in Rust 1.95. With a stable toolchain >=
+# 1.95 the whole workspace compiles on stable, so the pin is now just a floor.
+# rustup auto-fetches the channel on first build, including inside the
+# rust:1-bookworm grpc image.
+channel = "stable"
+# Ensure `cargo fmt`/`cargo clippy` ship with the pinned channel: the
+# auto-fetched toolchain otherwise omits these components, which breaks the
+# CI "Check formatting" step (it runs against this pinned toolchain).
 components = ["rustfmt", "clippy"]

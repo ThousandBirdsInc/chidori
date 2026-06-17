@@ -15,7 +15,7 @@ EXPECTED="${1:-}"
 
 crate_version() {
   python3 -c 'import tomllib
-with open("Cargo.toml", "rb") as f:
+with open("crates/chidori/Cargo.toml", "rb") as f:
     print(tomllib.load(f)["package"]["version"])'
 }
 

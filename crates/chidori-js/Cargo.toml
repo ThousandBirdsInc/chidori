@@ -2,6 +2,8 @@
 name = "chidori-js"
 version = "0.3.0"
 edition = "2021"
+# oxc 0.133 relies on `if let` guards, stabilized in Rust 1.95.
+rust-version = "1.95"
 license = "Apache-2.0"
 description = "Pure-Rust JavaScript engine with deterministic-replay durable execution. No C, no boa_engine."
 repository = "https://github.com/ThousandBirdsInc/chidori"

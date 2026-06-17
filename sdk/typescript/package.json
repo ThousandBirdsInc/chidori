@@ -1,6 +1,6 @@
 {
   "name": "@1kbirds/chidori",
-  "version": "3.0.0",
+  "version": "3.3.0",
   "description": "TypeScript SDK for the Chidori agent framework — HTTP client plus agent authoring types.",
   "publishConfig": { "access": "public" },
   "homepage": "https://github.com/ThousandBirdsInc/chidori",
