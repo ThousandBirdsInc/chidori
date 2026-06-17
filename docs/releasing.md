@@ -6,9 +6,10 @@ release is cut by pushing a `vX.Y.Z` tag.
 
 | Artifact | Registry | Name | How it publishes |
 | --- | --- | --- | --- |
-| Rust crates | crates.io | `chidori`, `chidori-js` | Manually, via `./scripts/publish.sh` (see that script's header) |
+| Rust crates | crates.io | `chidori-js`, `chidori` | `.github/workflows/release.yml` on tag push (or manually via `./scripts/publish.sh`) |
 | TypeScript SDK | npm | [`@1kbirds/chidori`](https://www.npmjs.com/package/@1kbirds/chidori) | `.github/workflows/release.yml` on tag push |
 | Python SDK | PyPI | [`chidori`](https://pypi.org/project/chidori/) | `.github/workflows/release.yml` on tag push |
+| GitHub release | GitHub | tag `vX.Y.Z` | `.github/workflows/release.yml` on tag push (auto-generated notes) |
 
 The unscoped npm name `chidori` belongs to an unrelated project, so the
 TypeScript SDK publishes under the `@1kbirds` scope (which also carries the
@@ -25,7 +26,7 @@ SDK module specifier in agent files.
 ## Cutting a release
 
 1. Bump the version in all three places:
-   - `Cargo.toml` (`[package] version`)
+   - `crates/chidori/Cargo.toml` (`[package] version`)
    - `sdk/typescript/package.json` (then `npm install --package-lock-only`
      in `sdk/typescript` to refresh the lock file)
    - `sdk/python/pyproject.toml` (`[project] version`)
@@ -42,41 +43,60 @@ SDK module specifier in agent files.
    git push origin vX.Y.Z
    ```
 
-4. The `Release SDKs` workflow verifies the tag matches the version train,
-   builds both SDKs, and publishes each one — skipping any version that is
-   already on its registry, so re-running the workflow is safe.
-5. Publish the crates separately: `CARGO_REGISTRY_TOKEN=... ./scripts/publish.sh`
-   from the tagged commit.
+4. The `Release` workflow verifies the tag matches the version train, then
+   publishes the whole train — the `chidori-js` and `chidori` crates to
+   crates.io, the TypeScript SDK to npm, and the Python SDK to PyPI — skipping
+   any version already on its registry, and finally creates the matching
+   GitHub release with auto-generated notes. Re-running the workflow on the
+   same tag is safe: each publish step is a no-op once that version exists, and
+   the GitHub release step skips if the release is already there.
 
 To rehearse without publishing, run the workflow manually from the Actions
-tab (`workflow_dispatch`): it builds both packages, runs `npm publish
---dry-run` and `twine check`, and uploads nothing.
+tab (`workflow_dispatch`): it runs the crates `cargo publish --dry-run`, `npm
+publish --dry-run`, and `twine check`, uploads nothing, and creates no GitHub
+release.
+
+The `crates` job reuses `./scripts/publish.sh`, so you can still publish the
+crates by hand from a tagged commit if CI is unavailable:
+`CARGO_REGISTRY_TOKEN=... ./scripts/publish.sh`.
 
 ## One-time registry setup
 
-Both publish jobs authenticate with OIDC trusted publishing — no long-lived
-tokens stored in repository secrets. Each registry needs a one-time trusted
-publisher configuration by an owner of the package:
+Create the three environments under repository Settings → Environments → New
+environment (`npm`, `pypi`, `crates-io`), then configure each registry — done
+by an owner of the package. All three authenticate with OIDC trusted
+publishing, so no long-lived registry tokens are stored.
 
-**npm (`@1kbirds/chidori`)** — on npmjs.com, package → Settings → Trusted
-publisher → GitHub Actions, with:
+**npm (`@1kbirds/chidori`)** → environment `npm`, OIDC trusted publishing (no
+secret). On npmjs.com, package → Settings → Trusted Publisher → GitHub Actions,
+with:
 
 - Organization or user: `ThousandBirdsInc`
 - Repository: `chidori`
 - Workflow filename: `release.yml`
 - Environment: `npm`
 
-**PyPI (`chidori`)** — on pypi.org, project → Manage → Publishing → Add a new
-publisher → GitHub, with:
+**PyPI (`chidori`)** → environment `pypi`, OIDC trusted publishing (no secret).
+On pypi.org, project → Manage → Publishing → Add a new publisher → GitHub, with:
 
 - Owner: `ThousandBirdsInc`
 - Repository name: `chidori`
 - Workflow name: `release.yml`
 - Environment name: `pypi`
 
-**GitHub** — create the `npm` and `pypi` environments under repository
-Settings → Environments (they can be empty; add required reviewers if
-publishes should need manual approval).
+**crates.io (`chidori` and `chidori-js`)** → environment `crates-io`, OIDC
+trusted publishing (no secret). On crates.io, for *each* crate go to Settings →
+Trusted Publishing → Add, with:
 
-Until the trusted publishers are configured, tag pushes will fail in the
-publish steps with an authentication error; the build/verify steps still run.
+- Repository owner: `ThousandBirdsInc`
+- Repository name: `chidori`
+- Workflow filename: `release.yml`
+- Environment: `crates-io`
+
+Add required reviewers to any environment if a publish should need manual
+approval. Until the npm/PyPI/crates.io trusted publishers are configured, tag
+pushes fail in that registry's publish step with an authentication error; the
+verify step still runs.
+
+The GitHub release step needs no setup — it uses the workflow's built-in
+`GITHUB_TOKEN` with `contents: write`.

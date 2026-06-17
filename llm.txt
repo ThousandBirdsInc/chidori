@@ -528,9 +528,10 @@ catch-all test provider and avoids external network calls.
 Current resume/replay uses the call log plus persisted host-promise metadata:
 the agent re-executes and host calls return cached records. Persisted
 TypeScript runs also write `runtime.snapshot` and `runtime.snapshot.json`
-metadata. Direct live VM continuation from `runtime.snapshot` without replay is
-still gated on the QuickJS runtime serializer and server `LiveQuickJsVm`
-restore path.
+metadata. Replay **is** the resume mechanism by design — the QuickJS live-VM
+snapshot path (direct VM continuation from `runtime.snapshot` without replay)
+was removed in #39, not merely deferred, so the manifest carries
+journal/scaffold metadata rather than serialized VM bytes.
 
 Snapshot manifests record:
 
