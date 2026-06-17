@@ -62,41 +62,41 @@ crates by hand from a tagged commit if CI is unavailable:
 
 ## One-time registry setup
 
-The npm and PyPI jobs authenticate with OIDC trusted publishing — no
-long-lived tokens. The crates.io job uses a `CARGO_REGISTRY_TOKEN` secret. Each
-needs a one-time configuration by an owner of the package:
+Create the three environments under repository Settings → Environments → New
+environment (`npm`, `pypi`, `crates-io`), then configure each registry — done
+by an owner of the package. All three authenticate with OIDC trusted
+publishing, so no long-lived registry tokens are stored.
 
-**npm (`@1kbirds/chidori`)** — on npmjs.com, package → Settings → Trusted
-publisher → GitHub Actions, with:
+**npm (`@1kbirds/chidori`)** → environment `npm`, OIDC trusted publishing (no
+secret). On npmjs.com, package → Settings → Trusted Publisher → GitHub Actions,
+with:
 
 - Organization or user: `ThousandBirdsInc`
 - Repository: `chidori`
 - Workflow filename: `release.yml`
 - Environment: `npm`
 
-**PyPI (`chidori`)** — on pypi.org, project → Manage → Publishing → Add a new
-publisher → GitHub, with:
+**PyPI (`chidori`)** → environment `pypi`, OIDC trusted publishing (no secret).
+On pypi.org, project → Manage → Publishing → Add a new publisher → GitHub, with:
 
 - Owner: `ThousandBirdsInc`
 - Repository name: `chidori`
 - Workflow name: `release.yml`
 - Environment name: `pypi`
 
-**crates.io (`chidori` and `chidori-js`)** — create a crates.io API token at
-<https://crates.io/settings/tokens> (scoped to publish-update, and ideally
-limited to these two crates), then store it as a secret named
-`CARGO_REGISTRY_TOKEN`. Put it on the `crates-io` environment (repository
-Settings → Environments → `crates-io` → Secrets) so it's only exposed to the
-`crates` job, or as a repository secret if you prefer.
+**crates.io (`chidori` and `chidori-js`)** → environment `crates-io`, OIDC
+trusted publishing (no secret). On crates.io, for *each* crate go to Settings →
+Trusted Publishing → Add, with:
 
-**GitHub** — create the `npm`, `pypi`, and `crates-io` environments under
-repository Settings → Environments. The `npm` and `pypi` ones can be empty; the
-`crates-io` one carries the `CARGO_REGISTRY_TOKEN` secret. Add required
-reviewers to any of them if publishes should need manual approval.
+- Repository owner: `ThousandBirdsInc`
+- Repository name: `chidori`
+- Workflow filename: `release.yml`
+- Environment: `crates-io`
 
-Until the OIDC publishers and the crates.io token are configured, tag pushes
-will fail in the publish steps with an authentication error; the verify step
-still runs.
+Add required reviewers to any environment if a publish should need manual
+approval. Until the npm/PyPI/crates.io trusted publishers are configured, tag
+pushes fail in that registry's publish step with an authentication error; the
+verify step still runs.
 
 The GitHub release step needs no setup — it uses the workflow's built-in
 `GITHUB_TOKEN` with `contents: write`.
