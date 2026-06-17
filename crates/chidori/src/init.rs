@@ -181,10 +181,9 @@ Node, no native bindings) plus TypeScript and Python SDKs.
 
 ## Installing
 
-Chidori currently builds on the nightly Rust toolchain:
+Chidori builds on stable Rust (1.95 or newer):
 
-    rustup toolchain install nightly
-    cargo +nightly install chidori
+    cargo install chidori
 
 This puts the `chidori` binary on your PATH. Check it with `chidori --version`.
 

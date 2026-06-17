@@ -2,6 +2,8 @@
 name = "chidori"
 version = "3.3.0"
 edition = "2021"
+# oxc 0.133 relies on `if let` guards, stabilized in Rust 1.95.
+rust-version = "1.95"
 authors = ["Colton Pierson <colton@thousandbirds.ai>"]
 description = "YAML-free AI agent framework where agents are deterministic TypeScript modules with built-in checkpointing and replay."
 homepage = "https://docs.thousandbirds.ai"
