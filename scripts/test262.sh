@@ -9,6 +9,8 @@
 #   scripts/test262.sh --gate          # run the full suite against the committed
 #                                      #   baseline; non-zero exit on a regression
 #   scripts/test262.sh --update-baseline   # re-record the committed expectations
+#   scripts/test262.sh --report        # full run -> Markdown coverage table
+#                                      #   (test262-coverage.md; CI posts it on PRs)
 #   scripts/test262.sh test/language/expressions/addition   # run a subdir
 #   scripts/test262.sh --filter Array  # run only paths containing "Array"
 #
@@ -29,12 +31,14 @@ TEST262_REF="${TEST262_REF:-05bb032907160d66c212589d345fa0e335e2738c}"
 update=0
 gate=0
 update_baseline=0
+report=0
 forward=()
 for arg in "$@"; do
   case "$arg" in
     --update) update=1 ;;
     --gate) gate=1 ;;
     --update-baseline) update_baseline=1 ;;
+    --report) report=1 ;;
     *) forward+=("$arg") ;;
   esac
 done
@@ -114,6 +118,22 @@ if [[ "$gate" == "1" ]]; then
   [[ "$status" -eq 0 ]] && echo "PASS: no conformance regressions." \
     || echo "FAIL: conformance regression(s) above."
   exit "$status"
+fi
+
+if [[ "$report" == "1" ]]; then
+  # Run the whole suite (chunked, never sharded) into a fresh state file, then
+  # render a Markdown coverage table. Unlike --gate this never fails on
+  # regressions — it is a reporting pass (CI posts it as a PR comment).
+  REPORT_OUT="${TEST262_REPORT_OUT:-$REPO_ROOT/test262-coverage.md}"
+  state="$(mktemp)"
+  echo "Measuring coverage (chunked) ..." >&2
+  while IFS= read -r d; do
+    TEST262_SHARD_TOTAL=1 "$RUNNER" --test262 "$VENDOR_DIR" --state "$state" "$d" >/dev/null || true
+  done < <(TEST262_SHARD_TOTAL=1 chunk_dirs)
+  python3 "$REPO_ROOT/scripts/test262-coverage.py" "$state" >"$REPORT_OUT"
+  echo "Coverage report -> $REPORT_OUT" >&2
+  cat "$REPORT_OUT"
+  exit 0
 fi
 
 exec "$RUNNER" --test262 "$VENDOR_DIR" "${forward[@]}"

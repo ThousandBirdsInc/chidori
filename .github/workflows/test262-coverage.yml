@@ -1,0 +1,84 @@
+name: Test262 coverage
+
+# Runs the full Test262 suite against the pure-Rust engine and posts a
+# conformance-coverage table as a single sticky comment on the PR (updated in
+# place each run, like the JS-benchmarks comment).
+#
+# This is the *reporting* counterpart to the test262.yml baseline gate: the gate
+# fails the build on regressions, this one never fails on coverage — it just
+# surfaces the current pass-rate and the per-area breakdown so a PR's effect on
+# conformance is visible at a glance.
+on:
+  pull_request:
+    paths:
+      - "crates/chidori-js/**"
+      - "crates/test262-runner/**"
+      - "scripts/test262.sh"
+      - "scripts/test262-coverage.py"
+      - ".github/workflows/test262-coverage.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: test262-coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  coverage:
+    name: Test262 coverage table
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Share the gate's build cache so we don't pay a cold compile.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test262-runner
+
+      - name: Run full Test262 suite and render coverage table
+        run: scripts/test262.sh --report
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test262-coverage
+          path: test262-coverage.md
+
+      # Post/update the sticky PR comment. Skipped for fork PRs (read-only token)
+      # and for manual workflow_dispatch runs.
+      - name: Comment coverage table on PR
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- test262-coverage -->';
+            const body = fs.readFileSync('test262-coverage.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number, per_page: 100 },
+            );
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body,
+              });
+              core.info(`Updated coverage comment ${existing.id}`);
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body,
+              });
+              core.info('Created coverage comment');
+            }
