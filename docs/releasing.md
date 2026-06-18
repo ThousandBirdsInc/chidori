@@ -9,7 +9,18 @@ release is cut by pushing a `vX.Y.Z` tag.
 | Rust crates | crates.io | `chidori-js`, `chidori` | `.github/workflows/release.yml` on tag push (or manually via `./scripts/publish.sh`) |
 | TypeScript SDK | npm | [`@1kbirds/chidori`](https://www.npmjs.com/package/@1kbirds/chidori) | `.github/workflows/release.yml` on tag push |
 | Python SDK | PyPI | [`chidori`](https://pypi.org/project/chidori/) | `.github/workflows/release.yml` on tag push |
-| GitHub release | GitHub | tag `vX.Y.Z` | `.github/workflows/release.yml` on tag push (auto-generated notes) |
+| Prebuilt binaries | GitHub release assets | `chidori-vX.Y.Z-<target>.tar.gz` (each with a `.sha256`) | `.github/workflows/release.yml` `binaries` job on tag push |
+| GitHub release | GitHub | tag `vX.Y.Z` | `.github/workflows/release.yml` on tag push (auto-generated notes, with the prebuilt binaries attached) |
+
+The prebuilt binaries are what `scripts/install.sh` (the `curl | sh` quickstart)
+downloads, so users get the `chidori` runtime without a Rust toolchain. The
+`binaries` job builds one natively per target — `aarch64`/`x86_64-apple-darwin`
+and `x86_64`/`aarch64-unknown-linux-gnu` — and the `github-release` job attaches
+them to the release. The binary links rustls (not OpenSSL/native-tls), so each
+tarball is self-contained; Linux builds on the oldest supported runner for a low
+glibc floor. Windows isn't prebuilt — those users install with `cargo install
+chidori`. To add or drop a target, edit the `binaries` matrix and keep the
+asset-name pattern in `scripts/install.sh` in sync.
 
 The unscoped npm name `chidori` belongs to an unrelated project, so the
 TypeScript SDK publishes under the `@1kbirds` scope (which also carries the

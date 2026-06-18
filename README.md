@@ -101,24 +101,51 @@ TypeScript.
 
 ### 0. Install
 
-Chidori builds on a recent **stable** toolchain (Rust 1.95 or newer):
+Chidori is **one self-contained binary** — the runtime that runs your agents.
+There's nothing else to install: no Node, no Python, no Rust toolchain, no native
+bindings. The fastest way to get it is the prebuilt binary:
 
 ```bash
-cargo install chidori
+curl -fsSL https://raw.githubusercontent.com/ThousandBirdsInc/chidori/main/scripts/install.sh | sh
 ```
 
-This builds the `chidori` binary from [crates.io](https://crates.io/crates/chidori)
-and puts it on your `PATH` (in `~/.cargo/bin`). Check it with `chidori --version`.
+This downloads the right binary for macOS (Apple Silicon or Intel) or Linux
+(x86_64 or arm64) from the [latest GitHub release](https://github.com/ThousandBirdsInc/chidori/releases/latest),
+puts it in `~/.chidori/bin`, and prints a one-line PATH tweak if needed. Check it
+with `chidori --version`. Prefer to grab the tarball by hand? Every release page
+lists one per platform.
 
-Prefer to build from a checkout (also gets you the bundled `examples/` used in
-step 4)? The repo pins its toolchain via `rust-toolchain.toml`, so `cargo` picks
-it up automatically:
+<details>
+<summary>Other ways to install (build from source, contributors)</summary>
+
+**From crates.io** — builds the binary from source, so you need a **stable** Rust
+toolchain (1.95 or newer). Slower than the prebuilt binary, but handy if you
+already have `cargo`:
+
+```bash
+cargo install chidori   # binary lands in ~/.cargo/bin
+```
+
+**From a checkout** — also gets you the bundled `examples/` used in step 4. The
+repo pins its toolchain via `rust-toolchain.toml`, so `cargo` picks it up
+automatically:
 
 ```bash
 git clone https://github.com/ThousandBirdsInc/chidori
 cd chidori
 cargo build --release   # binary at ./target/release/chidori
 ```
+
+</details>
+
+> **Which package is which?** The thing you install here is the **runtime** (the
+> `chidori` binary). The [npm](https://www.npmjs.com/package/@1kbirds/chidori) and
+> [PyPI](https://pypi.org/project/chidori/) packages are the **SDKs** — thin,
+> optional clients for driving the runtime over HTTP from a TypeScript or Python
+> app. You don't need them to write or run agents (you author those in plain
+> `.ts` files the runtime executes directly); reach for an SDK only when you want
+> to embed Chidori in an existing service. `npm i @1kbirds/chidori` does **not**
+> install the runtime.
 
 ### 1. Chat with the Chidori docs (30 seconds)
 

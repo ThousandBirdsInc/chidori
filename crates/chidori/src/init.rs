@@ -181,11 +181,17 @@ Node, no native bindings) plus TypeScript and Python SDKs.
 
 ## Installing
 
-Chidori builds on stable Rust (1.95 or newer):
+Chidori is one self-contained binary. Grab the prebuilt one (no Rust toolchain
+needed) on macOS or Linux:
+
+    curl -fsSL https://raw.githubusercontent.com/ThousandBirdsInc/chidori/main/scripts/install.sh | sh
+
+Or build it from source with stable Rust (1.95 or newer):
 
     cargo install chidori
 
-This puts the `chidori` binary on your PATH. Check it with `chidori --version`.
+Either way the `chidori` binary lands on your PATH. Check it with
+`chidori --version`.
 
 ## Writing an agent
 

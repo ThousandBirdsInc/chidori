@@ -3,6 +3,13 @@
 Zero-dependency TypeScript client for a running `chidori serve` instance.
 Uses the global `fetch` (Node 18+, browsers). Mirrors the Python SDK.
 
+> **This package is not the runtime.** It's an optional HTTP client for driving
+> the Chidori **runtime** — the `chidori` binary — from a TypeScript app. You
+> don't need it to write or run agents (those are plain `.ts` files the runtime
+> executes directly). Install the runtime separately, no Rust toolchain needed:
+> `curl -fsSL https://raw.githubusercontent.com/ThousandBirdsInc/chidori/main/scripts/install.sh | sh`
+> — see the [project README](https://github.com/ThousandBirdsInc/chidori#%EF%B8%8F-quick-start).
+
 ## Install
 
 The package is published to npm as
