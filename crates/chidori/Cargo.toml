@@ -5,7 +5,7 @@ edition = "2021"
 # oxc 0.133 relies on `if let` guards, stabilized in Rust 1.95.
 rust-version = "1.95"
 authors = ["Colton Pierson <colton@thousandbirds.ai>"]
-description = "YAML-free AI agent framework where agents are deterministic TypeScript modules with built-in checkpointing and replay."
+description = "The agent framework where every run is durable, replayable, and resumable by default. Plain async TypeScript agents on an embedded pure-Rust JS engine."
 homepage = "https://docs.thousandbirds.ai"
 keywords = ["agent", "ai", "llm", "typescript", "replay"]
 categories = ["development-tools", "command-line-utilities"]

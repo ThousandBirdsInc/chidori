@@ -10,7 +10,7 @@ readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
 authors = [{ name = "Colton Pierson", email = "colton@thousandbirds.ai" }]
-keywords = ["ai", "agents", "typescript", "llm", "chidori"]
+keywords = ["ai", "agents", "typescript", "llm", "replay"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3",
