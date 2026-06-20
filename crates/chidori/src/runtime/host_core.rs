@@ -1427,7 +1427,10 @@ mod tests {
             Some("http://127.0.0.1:49874/__mock/gmail/gmail/v1/users/me/messages?q=is:unread")
         );
         // Unmapped host → no rewrite (production passthrough).
-        assert_eq!(rewrite_to_override("https://api.openai.com/v1/chat", &map), None);
+        assert_eq!(
+            rewrite_to_override("https://api.openai.com/v1/chat", &map),
+            None
+        );
     }
 
     #[test]
