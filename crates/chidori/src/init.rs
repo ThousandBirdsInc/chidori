@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 /// (written to `agent.ts`) and the fileless `chidori chat` (written to a temp
 /// file). Driven mode (a fixed `messages` list) is how `chidori chat` feeds each
 /// turn; with no messages it reads the terminal interactively.
-pub const CHAT_AGENT_SRC: &str = r#"import type { Chidori } from "chidori";
+pub const CHAT_AGENT_SRC: &str = r#"import type { Chidori } from "chidori:agent";
 
 export async function agent(
   input: { messages?: string[]; system?: string; model?: string; tools?: string[] },
@@ -81,7 +81,7 @@ Add your own tools under `tools/` and list their names in the agent's
 /// (scoped to this project — the agent can only see files placed here) plus the
 /// conversation + replay model. The only thing sent to the model is the user's
 /// question and these scaffolded docs; nothing else on the machine is touched.
-const DOCS_AGENT_SRC: &str = r#"import type { Chidori } from "chidori";
+const DOCS_AGENT_SRC: &str = r#"import type { Chidori } from "chidori:agent";
 
 /**
  * Chat with the Chidori docs.
@@ -198,7 +198,7 @@ Either way the `chidori` binary lands on your PATH. Check it with
 An agent is a TypeScript file that exports an `agent` function taking the run
 input and the `chidori` host object:
 
-    import type { Chidori } from "chidori";
+    import type { Chidori } from "chidori:agent";
 
     export async function agent(input: { document: string }, chidori: Chidori) {
       const summary = await chidori.prompt("Summarize:\n" + input.document);
@@ -244,7 +244,7 @@ A tool is a TypeScript file in a directory you pass with `--tools`. It exports a
 `tool` definition (name, description, JSON-schema parameters) and a `run`
 function:
 
-    import type { ToolDefinition } from "chidori";
+    import type { ToolDefinition } from "chidori:agent";
 
     export const tool: ToolDefinition = {
       name: "reverse",
@@ -367,7 +367,7 @@ const CHAT: Template = Template {
 // Inlined rather than include_str!'d from examples/ so the crate packages
 // self-contained for crates.io (examples/ lives outside the package root).
 // Mirrors examples/agents/worker.ts and examples/tools/reverse.ts.
-const WORKER_AGENT_SRC: &str = r#"import type { Chidori } from "chidori";
+const WORKER_AGENT_SRC: &str = r#"import type { Chidori } from "chidori:agent";
 
 /**
  * An autonomous "worker" agent: it loops — think, call a tool, observe the
@@ -423,7 +423,7 @@ export async function agent(
 }
 "#;
 
-const REVERSE_TOOL_SRC: &str = r#"import type { ToolDefinition } from "chidori";
+const REVERSE_TOOL_SRC: &str = r#"import type { ToolDefinition } from "chidori:agent";
 
 /**
  * A sample tool for the worker agent. Reverses a string. Replace the body (and

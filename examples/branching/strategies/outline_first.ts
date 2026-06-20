@@ -1,4 +1,4 @@
-import type { Chidori } from "chidori";
+import type { Chidori } from "chidori:agent";
 
 /**
  * Strategy A: build an outline from the handed-over research, then expand each

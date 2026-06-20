@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn accepts_tool_metadata_and_run_export() {
         let source = r#"
-            import { Chidori, ToolDefinition } from "chidori";
+            import { Chidori, ToolDefinition } from "chidori:agent";
 
             const apiKey = process.env.BRAVE_SEARCH_API_KEY ?? "";
 

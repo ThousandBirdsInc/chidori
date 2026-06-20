@@ -1,4 +1,4 @@
-import type { Chidori, ToolDefinition } from "chidori";
+import type { Chidori, ToolDefinition } from "chidori:agent";
 
 // Offline stand-in for a weather API, keyed on coordinates so it pairs with
 // geocode in the fan-out example.

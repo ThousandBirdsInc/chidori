@@ -10,7 +10,11 @@
     "rootDir": "src",
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    "baseUrl": ".",
+    "paths": {
+      "@1kbirds/chidori/agent": ["./src/agent.ts"]
+    }
   },
   "include": ["src/**/*"]
 }

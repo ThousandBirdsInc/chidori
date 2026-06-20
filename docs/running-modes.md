@@ -63,7 +63,7 @@ An agent can handle incoming HTTP events:
 
 ```ts
 // agents/webhook.ts
-import type { Chidori } from "chidori";
+import type { Chidori } from "chidori:agent";
 
 export async function agent(
   input: { url: string; payload?: Record<string, unknown> },

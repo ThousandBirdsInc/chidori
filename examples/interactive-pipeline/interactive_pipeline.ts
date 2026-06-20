@@ -1,4 +1,4 @@
-import { chidori, run } from "chidori";
+import { chidori, run } from "chidori:agent";
 
 type Input = {
   /** Name shown in logs and as the agent name in the OTEL trace. */

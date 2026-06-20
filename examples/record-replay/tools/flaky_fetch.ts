@@ -1,4 +1,4 @@
-import type { Chidori, ToolDefinition } from "chidori";
+import type { Chidori, ToolDefinition } from "chidori:agent";
 
 // A deliberately flaky tool, deterministic on the attempt number the agent
 // passes in: the first two attempts report failure, the third succeeds. The

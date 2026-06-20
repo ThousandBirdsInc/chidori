@@ -1,4 +1,4 @@
-import type { Chidori } from "chidori";
+import type { Chidori } from "chidori:agent";
 
 export async function agent(input: { request: string }, chidori: Chidori) {
   const approval = await chidori.input("Approve this request?", {

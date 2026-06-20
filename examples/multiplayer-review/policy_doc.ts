@@ -1,4 +1,4 @@
-import type { Chidori, Signal } from "chidori";
+import type { Chidori, Signal } from "chidori:agent";
 
 /**
  * Multiplayer policy-doc drafting agent (docs/signals.md §7).

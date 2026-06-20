@@ -215,7 +215,7 @@ call_log; a replay run never re-reads the inbox.
 
 ### 6.1 Agent-facing (`chidori.signal`)
 ```ts
-import { chidori } from "chidori";
+import { chidori } from "chidori:agent";
 
 type Signal<T = Json> = { name: string; payload: T; from: SignalSender };
 type SignalSender = { kind: "human" | "agent"; id: string; runId?: string };
@@ -268,7 +268,7 @@ agent only *consumes* those pushes at the points it declares safe.
 ### 7.2 The agent (`examples/multiplayer-review/policy_doc.ts`)
 
 ```ts
-import { chidori, run } from "chidori";
+import { chidori, run } from "chidori:agent";
 
 type Brief = { topic: string; audience: string };
 type Review = { decision: "approve" | "changes"; notes: string };

@@ -508,7 +508,7 @@ export type ToolFunction<TArgs extends JsonObject = JsonObject, TResult extends 
  * need for a `(input, chidori)` second parameter):
  *
  * ```ts
- * import { chidori, run } from "chidori";
+ * import { chidori, run } from "chidori:agent";
  * run(async (input: { topic: string }) => {
  *   await chidori.log("starting", { topic: input.topic });
  *   return { ok: true };
@@ -533,7 +533,7 @@ export const chidori: Chidori = new Proxy({} as Chidori, {
  * named `agent`" convention.
  *
  * ```ts
- * import { run } from "chidori";
+ * import { run } from "chidori:agent";
  * run(async (input) => ({ greeting: `hello ${input.name}` }));
  * ```
  */

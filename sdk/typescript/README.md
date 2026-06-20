@@ -13,24 +13,16 @@ Uses the global `fetch` (Node 18+, browsers). Mirrors the Python SDK.
 ## Install
 
 The package is published to npm as
-[`@1kbirds/chidori`](https://www.npmjs.com/package/@1kbirds/chidori) (the
-unscoped `chidori` npm name belongs to an unrelated project). Installing it
-under the `chidori` alias keeps the historical import spelling working:
-
-```bash
-npm install chidori@npm:@1kbirds/chidori
-```
-
-```ts
-import { AgentClient, Checkpoint } from "chidori";
-```
-
-Or install under the scoped name directly — the Chidori runtime accepts both
-`"chidori"` and `"@1kbirds/chidori"` as the SDK module specifier in agent
-files:
+[`@1kbirds/chidori`](https://www.npmjs.com/package/@1kbirds/chidori). The
+unscoped `chidori` npm name belongs to an unrelated project, so **always import
+the scoped name** — never `npm install chidori`:
 
 ```bash
 npm install @1kbirds/chidori
+```
+
+```ts
+import { AgentClient, Checkpoint } from "@1kbirds/chidori";
 ```
 
 To build from source instead:
@@ -41,16 +33,28 @@ npm install
 npm run build
 ```
 
-Agent and tool authoring types are also exported:
+### Authoring agents and tools
+
+Agent and tool files run *inside* the Chidori runtime, not as a normal Node
+program. They get their authoring types — and the `chidori`/`run` globals — from
+the **virtual** module `chidori:agent`:
 
 ```ts
-import type { Chidori, ToolDefinition } from "chidori";
+/// <reference types="@1kbirds/chidori/agent-env" />
+import type { Chidori, ToolDefinition } from "chidori:agent";
 ```
+
+There is no installable package behind `chidori:agent`; it is a URL-style scheme
+(like `node:fs`) that the runtime strips and injects at execution time, so the
+unrelated `chidori` npm package can never be pulled in by mistake. The
+`/// <reference …>` line (or a `compilerOptions.types: ["@1kbirds/chidori/agent-env"]`
+entry in `tsconfig.json`) gives editors and `tsc` the types while you author;
+the runtime itself needs nothing installed.
 
 ## Usage
 
 ```ts
-import { AgentClient, Checkpoint, isSignalQueued } from "chidori";
+import { AgentClient, Checkpoint, isSignalQueued } from "@1kbirds/chidori";
 
 const client = new AgentClient("http://localhost:8080");
 

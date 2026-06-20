@@ -24,15 +24,24 @@ asset-name pattern in `scripts/install.sh` in sync.
 
 The unscoped npm name `chidori` belongs to an unrelated project, so the
 TypeScript SDK publishes under the `@1kbirds` scope (which also carries the
-legacy 0.1.x SDK releases). Agent authors who want the historical
-`import ... from "chidori"` spelling can install via an npm alias:
+legacy 0.1.x SDK releases). The two import contexts use different specifiers,
+and neither can pull the unrelated package:
 
-```bash
-npm install chidori@npm:@1kbirds/chidori
-```
+- **Agent and tool files** (executed by the runtime) import their authoring
+  types from the virtual module `"chidori:agent"`. It is a URL-style scheme —
+  like `node:fs` — with no registry name behind it, so it can never be
+  `npm install`ed by mistake. The runtime strips the import and injects the
+  values at execution time; editor types ship as an ambient declaration in
+  `@1kbirds/chidori` (pulled in with
+  `/// <reference types="@1kbirds/chidori/agent-env" />`). The runtime accepts
+  only `"chidori:agent"`; the old `"chidori"` / `"@1kbirds/chidori"` spellings
+  now fail with a migration error.
+- **Client/driver code** (a normal Node program talking to `chidori serve`)
+  imports the HTTP client from the real package, `"@1kbirds/chidori"`:
 
-The runtime accepts both `"chidori"` and `"@1kbirds/chidori"` as the virtual
-SDK module specifier in agent files.
+  ```bash
+  npm install @1kbirds/chidori
+  ```
 
 ## Cutting a release
 

@@ -1,4 +1,4 @@
-import type { ToolDefinition } from "chidori";
+import type { ToolDefinition } from "chidori:agent";
 
 /**
  * A sample tool for the worker agent. Reverses a string. Replace the body (and

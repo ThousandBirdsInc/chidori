@@ -1,4 +1,4 @@
-import type { Chidori } from "chidori";
+import type { Chidori } from "chidori:agent";
 
 /**
  * A multi-turn conversational agent — the "chat assistant" shape — built on

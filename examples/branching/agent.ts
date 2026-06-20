@@ -1,4 +1,4 @@
-import type { BranchOutcome, Chidori } from "chidori";
+import type { BranchOutcome, Chidori } from "chidori:agent";
 
 /**
  * Branching example (docs/branching-execution.md).

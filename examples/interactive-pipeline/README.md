@@ -10,7 +10,7 @@ current authoring convention: **import the host object and define the entrypoint
 with `run(handler)`** — no second `chidori` parameter, no magic `agent` export.
 
 ```ts
-import { chidori, run } from "chidori";
+import { chidori, run } from "chidori:agent";
 
 run(async (input) => {
   await chidori.log("hello", { input });
@@ -19,7 +19,7 @@ run(async (input) => {
 });
 ```
 
-The runtime strips the `from "chidori"` import and supplies `chidori` + `run`
+The runtime strips the `from "chidori:agent"` import and supplies `chidori` + `run`
 at execution time. The agent ([`interactive_pipeline.ts`](./interactive_pipeline.ts))
 runs several review stages; each stage delegates a batch to the
 [`review_batch`](./tools/review_batch.ts) tool and then stops at a **checkpoint**

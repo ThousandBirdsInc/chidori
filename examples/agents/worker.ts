@@ -1,4 +1,4 @@
-import type { Chidori } from "chidori";
+import type { Chidori } from "chidori:agent";
 
 /**
  * An autonomous "worker" agent: it loops — think, call a tool, observe the

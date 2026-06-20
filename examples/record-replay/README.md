@@ -20,7 +20,7 @@ The same idea is shown at two layers:
 | Layer | Where | Run without a server? | The primitive |
 |-------|-------|-----------------------|---------------|
 | **`chidori-js` engine (Rust)** | `crates/chidori-js/examples/*.rs` | ✅ yes | `ReplayRuntime::record` / `restore` / `drive` |
-| **TypeScript SDK (`chidori`)** | this directory | needs `chidori run`/`serve` | `chidori.tool` / `input` / `memory` + `AgentClient.replay` |
+| **TypeScript SDK (`@1kbirds/chidori`)** | this directory | needs `chidori run`/`serve` | `chidori.tool` / `input` / `memory` + `AgentClient.replay` |
 
 ---
 
@@ -182,8 +182,8 @@ cargo run -- resume examples/record-replay/exactly_once.ts <run-id> -d examples/
 
 ### Option B — the SDK (`AgentClient`, over HTTP)
 
-This mirrors how you'd use the published `chidori` npm package
-(`import { AgentClient } from "chidori"`). Start a server for one agent, then run
+This mirrors how you'd use the published `@1kbirds/chidori` npm package
+(`import { AgentClient } from "@1kbirds/chidori"`). Start a server for one agent, then run
 the matching driver scenario:
 
 ```bash

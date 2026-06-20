@@ -575,7 +575,7 @@ fn cli_stream_accepts_multiline_typed_agent_signature() {
     fs::write(
         &agent,
         r#"
-            import type { Chidori } from "chidori";
+            import type { Chidori } from "chidori:agent";
 
             export async function agent(
                 input: { name?: string },

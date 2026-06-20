@@ -860,7 +860,7 @@ mod tests {
 
     #[test]
     fn run_agent_supports_run_entrypoint_and_import_convention() {
-        // The current convention: `import { chidori, run } from "chidori"` (the
+        // The current convention: `import { chidori, run } from "chidori:agent"` (the
         // import is stripped, both resolve to globals) and `run(handler)` as the
         // entrypoint — no second `chidori` param, no magic `agent` export.
         let ctx = RuntimeContext::new();
@@ -868,7 +868,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("agent.ts");
         let src = r#"
-            import { chidori, run } from "chidori";
+            import { chidori, run } from "chidori:agent";
             run(async (input: { value: number }) => {
                 await chidori.log("via run() entrypoint");
                 return { value: input.value + 1 };
@@ -1678,7 +1678,7 @@ mod tests {
 
         let agent_path = dir.join("agent.ts");
         let agent_src = r#"
-            import { chidori } from "chidori";
+            import { chidori } from "chidori:agent";
             import { triple, BONUS } from "./lib/math";
             export async function agent(input: { value: number }) {
                 chidori.log("computing");

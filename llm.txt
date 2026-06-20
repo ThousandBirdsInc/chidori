@@ -13,7 +13,7 @@ and tools.
 An agent is a `.ts` file that exports `agent(input, chidori)`:
 
 ```ts
-import type { Chidori } from "chidori";
+import type { Chidori } from "chidori:agent";
 
 export async function agent(input: { document: string }, chidori: Chidori) {
   const summary = await chidori.prompt(
@@ -393,7 +393,7 @@ A TypeScript tool exports JSON-compatible metadata and an async
 value in a restricted metadata VM context before registration.
 
 ```ts
-import type { Chidori, ToolDefinition } from "chidori";
+import type { Chidori, ToolDefinition } from "chidori:agent";
 
 export const tool: ToolDefinition = {
   name: "web_search",
@@ -481,7 +481,7 @@ restarts.
 ## TypeScript SDK
 
 ```ts
-import { AgentClient, Checkpoint } from "chidori";
+import { AgentClient, Checkpoint } from "@1kbirds/chidori";
 
 const client = new AgentClient("http://localhost:8080");
 const session = await client.run({ document: "Rust is a systems language." });
