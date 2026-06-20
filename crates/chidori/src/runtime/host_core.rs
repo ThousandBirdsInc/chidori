@@ -1149,6 +1149,46 @@ const DEFAULT_USER_AGENT: &str = concat!(
     " (+https://github.com/ThousandBirdsInc/chidori)",
 );
 
+/// Rewrite `url` to the per-agent Mock Gateway when its host is listed in the
+/// `CHIDORI_INTEGRATION_BASE_URLS` env map (`{host: "http://127.0.0.1:port/__mock/<id>"}`),
+/// preserving path and query. Returns `None` (no rewrite) when the env var is
+/// unset/invalid or the host is not mapped — the production default.
+///
+/// The map is parsed once per process. Each agent run is its own subprocess
+/// (`chidori run`/`serve`) with its own env, so process-global caching is correct.
+fn apply_base_url_override(url: &str) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    static MAP: OnceLock<Option<HashMap<String, String>>> = OnceLock::new();
+    let map = MAP
+        .get_or_init(|| {
+            let raw = std::env::var("CHIDORI_INTEGRATION_BASE_URLS").ok()?;
+            serde_json::from_str::<HashMap<String, String>>(&raw).ok()
+        })
+        .as_ref()?;
+    rewrite_to_override(url, map)
+}
+
+/// Pure rewrite: swap `url`'s origin to the mapped base (keyed by host),
+/// preserving path + query. Split from [`apply_base_url_override`] so it is
+/// testable without the process-global env cache.
+fn rewrite_to_override(
+    url: &str,
+    map: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    let replacement = map.get(host)?;
+    let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
+    Some(format!(
+        "{}{}{}",
+        replacement.trim_end_matches('/'),
+        parsed.path(),
+        query
+    ))
+}
+
 pub fn execute_http(tokio_rt: &tokio::runtime::Runtime, args: &Value) -> Result<Value> {
     execute_http_with_secrets(
         tokio_rt,
@@ -1183,6 +1223,20 @@ fn execute_http_with_secrets(
         Value::Object(map) => Some(map.clone()),
         _ => None,
     });
+
+    // Test-mode base-URL override (runs before secret substitution). When the
+    // harness injects CHIDORI_INTEGRATION_BASE_URLS (host → mock gateway base),
+    // any request to a mapped host is transparently rewritten to the per-agent
+    // Mock Gateway, keeping the original path + query. This is the single seam
+    // that makes "test mode" work for every integration regardless of the npm
+    // package versions a generated agent installs. In production the env var is
+    // absent and this is a no-op. After rewriting, the host becomes
+    // 127.0.0.1:<port>, which is on no secret allowlist — so secrets never
+    // substitute into a mock request (and in test mode none are injected
+    // anyway). See app-agent-builder docs/design/mock-integrations-test-mode.md.
+    if let Some(rewritten) = apply_base_url_override(&url) {
+        url = rewritten;
+    }
 
     // Secret broker: guest code only ever holds opaque placeholder tokens
     // (its `process.env` is built that way by the harness); the real values
@@ -1346,6 +1400,38 @@ mod tests {
         HostOperationId, HostPromiseRecord, HostPromiseState, PendingHostOperation, QueuedSignal,
         PENDING_HOST_OPERATION_FILE,
     };
+
+    #[test]
+    fn base_url_override_rewrites_mapped_host_keeping_path_and_query() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "slack.com".to_string(),
+            "http://127.0.0.1:49874/__mock/slack".to_string(),
+        );
+        map.insert(
+            "gmail.googleapis.com".to_string(),
+            "http://127.0.0.1:49874/__mock/gmail/".to_string(), // trailing slash tolerated
+        );
+
+        assert_eq!(
+            rewrite_to_override("https://slack.com/api/chat.postMessage", &map).as_deref(),
+            Some("http://127.0.0.1:49874/__mock/slack/api/chat.postMessage")
+        );
+        // Path + query preserved; trailing slash on the replacement trimmed.
+        assert_eq!(
+            rewrite_to_override(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages?q=is:unread",
+                &map
+            )
+            .as_deref(),
+            Some("http://127.0.0.1:49874/__mock/gmail/gmail/v1/users/me/messages?q=is:unread")
+        );
+        // Unmapped host → no rewrite (production passthrough).
+        assert_eq!(
+            rewrite_to_override("https://api.openai.com/v1/chat", &map),
+            None
+        );
+    }
 
     #[test]
     fn durable_json_call_replays_without_live_execution() {

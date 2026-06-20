@@ -153,28 +153,88 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: ./scripts/publish.sh --skip-tests --yes
 
+  # Prebuilt macOS/Linux `chidori` binaries, attached to the GitHub release so
+  # `scripts/install.sh` (curl | sh) and the README quickstart can hand users a
+  # binary without a Rust toolchain. Each target builds natively on its own
+  # runner; the binary links no system TLS (rustls), so the tarballs are
+  # self-contained. Linux builds on the oldest supported runner for a low glibc
+  # floor. Windows users install from source (cargo install chidori). This job
+  # runs on dispatch too (a build smoke test) but only the github-release job
+  # below publishes the artifacts.
+  binaries:
+    name: Build ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin chidori --target ${{ matrix.target }}
+
+      - name: Package (tar.gz)
+        shell: bash
+        run: |
+          name="chidori-${GITHUB_REF_NAME:-dev}-${{ matrix.target }}"
+          tar -C "target/${{ matrix.target }}/release" -czf "${name}.tar.gz" chidori
+          shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chidori-${{ matrix.target }}
+          path: |
+            chidori-*.tar.gz
+            chidori-*.tar.gz.sha256
+          if-no-files-found: error
+
   github-release:
     name: Create GitHub release
-    needs: [npm, pypi, crates]
+    needs: [npm, pypi, crates, binaries]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     permissions:
-      contents: write # create the release
+      contents: write # create the release + upload assets
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # full history so --generate-notes finds the prior tag
 
-      - name: Create the release if it does not exist
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: chidori-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release (if missing) and upload binaries
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="$GITHUB_REF_NAME"
           if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release ${tag} already exists; skipping"
+            echo "Release ${tag} already exists; updating assets"
+            gh release upload "$tag" dist/* --clobber
           else
             gh release create "$tag" \
               --title "$tag" \
               --generate-notes \
-              --verify-tag
+              --verify-tag \
+              dist/*
           fi

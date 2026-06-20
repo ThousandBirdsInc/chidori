@@ -12,3 +12,10 @@ resolver = "2"
 readme = "README.md"
 repository = "https://github.com/ThousandBirdsInc/chidori"
 license = "Apache-2.0"
+
+# Optimized release build. LTO + a single codegen unit give the interpreter a
+# meaningful speedup at the cost of longer compile times. The `bench` profile
+# inherits from `release`, so criterion micro-benchmarks pick this up too.
+[profile.release]
+lto = true
+codegen-units = 1

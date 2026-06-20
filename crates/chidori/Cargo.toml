@@ -21,8 +21,19 @@ path = "src/main.rs"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# HTTP client for LLM providers
-reqwest = { version = "0.12", features = ["json", "stream", "gzip"] }
+# HTTP client for LLM providers. rustls (no OpenSSL/native-tls) so the published
+# `chidori` binary links no system TLS libraries and cross-compiles cleanly for
+# every release target. `*-native-roots` keeps using the platform trust store,
+# preserving custom/corporate-CA support (e.g. self-hosted LiteLLM proxies).
+reqwest = { version = "0.12", default-features = false, features = [
+    "charset",
+    "http2",
+    "system-proxy",
+    "json",
+    "stream",
+    "gzip",
+    "rustls-tls-native-roots",
+] }
 url = "2"
 
 # HTTP server for serve command

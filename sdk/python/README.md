@@ -3,6 +3,13 @@
 Pure-stdlib HTTP client for a running `chidori serve` instance. No native
 bindings, no third-party dependencies.
 
+> **This package is not the runtime.** It's an optional HTTP client for driving
+> the Chidori **runtime** — the `chidori` binary — from a Python app. You don't
+> need it to write or run agents (those are plain `.ts` files the runtime
+> executes directly). Install the runtime separately, no Rust toolchain needed:
+> `curl -fsSL https://raw.githubusercontent.com/ThousandBirdsInc/chidori/main/scripts/install.sh | sh`
+> — see the [project README](https://github.com/ThousandBirdsInc/chidori#%EF%B8%8F-quick-start).
+
 ## Install
 
 From [PyPI](https://pypi.org/project/chidori/):
