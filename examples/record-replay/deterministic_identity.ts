@@ -1,4 +1,4 @@
-import type { Chidori } from "chidori";
+import type { Chidori } from "chidori:agent";
 
 /**
  * Deterministic non-determinism — reproducible ids, clocks, and choices.

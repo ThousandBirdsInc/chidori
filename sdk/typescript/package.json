@@ -18,6 +18,10 @@
     "./agent": {
       "import": "./dist/agent.js",
       "types": "./dist/agent.d.ts"
+    },
+    "./agent-env": {
+      "import": "./dist/agent-env.js",
+      "types": "./dist/agent-env.d.ts"
     }
   },
   "files": ["dist", "src", "README.md"],

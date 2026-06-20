@@ -113,7 +113,7 @@ The runtime has these production pieces in place:
 Agents are `.ts` files that export `async function agent(input, chidori)`.
 
 ```ts
-import type { Chidori } from "chidori";
+import type { Chidori } from "chidori:agent";
 
 export async function agent(
   input: { document: string },
@@ -138,7 +138,7 @@ export. Discovery evaluates metadata in a restricted VM context before
 registering the tool.
 
 ```ts
-import type { Chidori, ToolDefinition } from "chidori";
+import type { Chidori, ToolDefinition } from "chidori:agent";
 
 export const tool: ToolDefinition = {
   name: "web_search",

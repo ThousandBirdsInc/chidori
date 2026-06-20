@@ -1,4 +1,4 @@
-import type { Chidori } from "chidori";
+import type { Chidori } from "chidori:agent";
 
 /**
  * Cache-aware multi-turn Q&A over a fixed corpus, using `chidori.context`.

@@ -87,7 +87,7 @@ and runtime roots beyond the selected-root scaffold.
 Agents are `.ts` files exporting `async function agent(input, chidori)`.
 
 ```ts
-import type { Chidori } from "chidori";
+import type { Chidori } from "chidori:agent";
 
 export async function agent(
   input: { document: string },
@@ -109,7 +109,7 @@ export async function agent(
 Tools are `.ts` files with explicit metadata and an async `run` export.
 
 ```ts
-import type { Chidori, ToolDefinition } from "chidori";
+import type { Chidori, ToolDefinition } from "chidori:agent";
 
 export const tool: ToolDefinition = {
   name: "web_search",

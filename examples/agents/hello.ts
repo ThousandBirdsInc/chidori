@@ -1,4 +1,4 @@
-import type { Chidori } from "chidori";
+import type { Chidori } from "chidori:agent";
 
 export async function agent(input: { name?: string }, chidori: Chidori) {
   const name = input.name ?? "world";

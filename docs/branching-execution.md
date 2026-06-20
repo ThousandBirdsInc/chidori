@@ -211,7 +211,7 @@ extra mechanisms (soft divergence + a `fork()`-style return).
 
 ### 6.1 Agent-facing (`chidori.branch`)
 ```ts
-import { chidori } from "chidori";
+import { chidori } from "chidori:agent";
 
 type BranchVariant = {
   /** Branch label (shown in outcomes + trace). */

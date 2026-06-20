@@ -1,4 +1,4 @@
-import type { Chidori, ToolDefinition } from "chidori";
+import type { Chidori, ToolDefinition } from "chidori:agent";
 
 // A side-effecting tool: in a real system this would POST to a ticketing API.
 // Here it just mints a deterministic id so the example runs offline. The point

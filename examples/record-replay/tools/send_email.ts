@@ -1,4 +1,4 @@
-import type { Chidori, ToolDefinition } from "chidori";
+import type { Chidori, ToolDefinition } from "chidori:agent";
 
 // A side-effecting tool. The `chidori.log` line marks where a real send would
 // happen — on replay this tool is NOT re-invoked, so the email is sent exactly

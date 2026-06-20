@@ -308,7 +308,7 @@ mod tests {
         std::fs::write(
             dir.join("web_search.ts"),
             r#"
-                import type { Chidori, ToolDefinition } from "chidori";
+                import type { Chidori, ToolDefinition } from "chidori:agent";
 
                 export const tool: ToolDefinition = {
                   name: "web_search",

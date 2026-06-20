@@ -879,7 +879,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"
-                import type { Chidori } from "chidori";
+                import type { Chidori } from "chidori:agent";
                 export async function agent(input: { name: string }, chidori: Chidori) {
                     await chidori.log("starting");
                     return { greeting: "Hello, " + input.name };

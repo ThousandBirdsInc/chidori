@@ -118,7 +118,7 @@ done   = client.signal(paused.id, "review",
 ```
 
 ```ts
-import { AgentClient, isSignalQueued } from "chidori";
+import { AgentClient, isSignalQueued } from "@1kbirds/chidori";
 const client = new AgentClient("http://localhost:8080");
 const res = await client.signal(run, { name: "review", payload: { decision: "approve", notes: "LGTM" } });
 if (isSignalQueued(res)) console.log("queued at", res.delivery_seq);

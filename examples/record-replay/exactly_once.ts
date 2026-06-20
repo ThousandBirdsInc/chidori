@@ -1,4 +1,4 @@
-import type { Chidori } from "chidori";
+import type { Chidori } from "chidori:agent";
 
 /**
  * Exactly-once side effects — the core durability guarantee for agents.

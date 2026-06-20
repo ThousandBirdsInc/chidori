@@ -168,11 +168,12 @@ pub fn transpile_module(path: &Path, source: &str, options: &TranspileOptions) -
         })
         .build(&program);
 
-    // The `chidori` SDK import marks host-injected globals (Chidori, ToolDefinition,
-    // etc.) — there's no real module at module-resolution time, so any surviving
-    // `import ... from "chidori"` would crash the loader. oxc's TS pass elides
-    // import-of-type-only specifiers but keeps value imports, so we filter the
-    // remaining `from "chidori"` lines out of the emitted code.
+    // The `chidori:agent` SDK import marks host-injected globals (Chidori,
+    // ToolDefinition, etc.) — there's no real module at module-resolution time,
+    // so any surviving `import ... from "chidori:agent"` would crash the loader.
+    // oxc's TS pass elides import-of-type-only specifiers but keeps value
+    // imports, so we filter the remaining `from "chidori:agent"` lines out of
+    // the emitted code.
     let js = strip_chidori_sdk_imports(&codegen_ret.code);
     // The snapshot bundler line-walks the output to rewrite `import` / `export`
     // statements. oxc splits object literals and function bodies across many
@@ -328,6 +329,20 @@ pub fn validate_imports(
             continue;
         }
 
+        if is_legacy_chidori_specifier(&specifier) {
+            anyhow::bail!(
+                "{}:{}: importing the agent SDK from \"{}\" is no longer supported. \
+                 Import from \"{}\" instead — the bare `chidori` npm name belongs to \
+                 an unrelated package, so the SDK now uses an un-installable virtual \
+                 specifier. (For editor types: `npm install -D @1kbirds/chidori` and \
+                 add `/// <reference types=\"@1kbirds/chidori/agent-env\" />`.)",
+                path.display(),
+                line_no,
+                specifier,
+                CHIDORI_AGENT_SPECIFIER,
+            );
+        }
+
         // Vendored packages (react, react-dom/server, …) are served from the
         // built-in registry, not the filesystem — accept them under any policy.
         if crate::runtime::typescript::builtins::is_vendored_package(&specifier) {
@@ -433,8 +448,28 @@ fn import_specifiers(source: &str) -> Vec<(usize, String)> {
 /// The virtual SDK module has no on-disk form at runtime; the host injects its
 /// exports. Agents may import it by the bare historical name or by the
 /// published npm package name.
+/// The virtual module specifier that marks the host-injected agent SDK
+/// (`Chidori`, `ToolDefinition`, the `chidori`/`run` globals, …). It is
+/// deliberately a URL-style scheme — like `node:fs` or `bun:test` — that can
+/// never be an installable npm package, so there is no third-party package to
+/// confuse it with. The runtime strips this import and supplies the values at
+/// execution time.
+pub(crate) const CHIDORI_AGENT_SPECIFIER: &str = "chidori:agent";
+
+/// Specifiers that used to mark the injected SDK. The bare `chidori` name
+/// belongs to an unrelated npm package — a dependency-confusion hazard, since an
+/// author (or an LLM generating agent code) who tried to `npm install chidori`
+/// for editor types would pull a package we don't control. Agent files must now
+/// import from `chidori:agent`; we still recognize the old spellings so we can
+/// emit a clear migration error rather than an opaque resolution failure.
+const LEGACY_CHIDORI_SPECIFIERS: &[&str] = &["chidori", "@1kbirds/chidori"];
+
 fn is_chidori_sdk_specifier(specifier: &str) -> bool {
-    specifier == "chidori" || specifier == "@1kbirds/chidori"
+    specifier == CHIDORI_AGENT_SPECIFIER
+}
+
+fn is_legacy_chidori_specifier(specifier: &str) -> bool {
+    LEGACY_CHIDORI_SPECIFIERS.contains(&specifier)
 }
 
 fn is_chidori_sdk_import(line: &str) -> bool {
@@ -540,7 +575,7 @@ mod tests {
     #[test]
     fn transpile_strips_basic_type_syntax() {
         let source = r#"
-            import type { Chidori } from "chidori";
+            import type { Chidori } from "chidori:agent";
             type Input = { name: string };
             export async function agent(input: Input, chidori: Chidori): Promise<object> {
                 const greeting: string = input.name;
@@ -566,7 +601,7 @@ mod tests {
     #[test]
     fn transpile_strips_multiline_function_parameter_types() {
         let source = r#"
-            import type { Chidori } from "chidori";
+            import type { Chidori } from "chidori:agent";
             export async function agent(
                 input: { name?: string },
                 chidori: Chidori,
@@ -596,7 +631,7 @@ mod tests {
     #[test]
     fn transpile_strips_multiline_type_and_interface_declarations() {
         let source = r#"
-            import type { Chidori } from "chidori";
+            import type { Chidori } from "chidori:agent";
             export interface Input {
                 topic: string;
                 limit?: number;
@@ -747,7 +782,7 @@ mod tests {
     #[test]
     fn transpile_preserves_object_literal_values() {
         let source = r#"
-            import { Chidori, ToolDefinition } from "chidori";
+            import { Chidori, ToolDefinition } from "chidori:agent";
 
             export const tool: ToolDefinition = {
                 name: "web_search",
@@ -767,7 +802,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!js.contains("from \"chidori\""));
+        assert!(!js.contains("chidori:agent"));
         assert!(!js.contains(": ToolDefinition"));
         assert!(js.contains(r#"name: "web_search""#));
         assert!(js.contains(r#"type: "object""#));
@@ -776,18 +811,50 @@ mod tests {
     }
 
     #[test]
-    fn transpile_strips_scoped_chidori_sdk_imports() {
-        let source = r#"
-            import { chidori } from "@1kbirds/chidori";
-            import type { Chidori, ToolDefinition } from "@1kbirds/chidori";
+    fn transpile_rejects_legacy_chidori_specifiers_with_migration_error() {
+        // The bare `chidori` name and the `@1kbirds/chidori` scope used to mark
+        // the injected SDK. Both are now rejected in favor of `chidori:agent`,
+        // with an error that names the new specifier.
+        for legacy in ["chidori", "@1kbirds/chidori"] {
+            let source = format!(
+                "import type {{ Chidori }} from \"{legacy}\";\n\
+                 export async function agent(input, chidori: Chidori) {{ return {{ ok: true }}; }}\n"
+            );
 
-            export async function agent(input, chidori: Chidori) {
+            let err = transpile_module(
+                Path::new("/tmp/project/agents/legacy.ts"),
+                &source,
+                &TranspileOptions {
+                    import_policy: TypeScriptImportPolicy::Relative,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(
+                err.contains("chidori:agent"),
+                "error should point at the new specifier, got: {err}"
+            );
+            assert!(
+                err.contains(legacy),
+                "error should name the legacy specifier {legacy}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn transpile_strips_value_imports_from_virtual_specifier() {
+        let source = r#"
+            import { chidori, run } from "chidori:agent";
+
+            run(async (input) => {
+                await chidori.log("hi");
                 return { ok: true };
-            }
+            });
         "#;
 
         let js = transpile_module(
-            Path::new("/tmp/project/agents/scoped.ts"),
+            Path::new("/tmp/project/agents/inline.ts"),
             source,
             &TranspileOptions {
                 import_policy: TypeScriptImportPolicy::Relative,
@@ -796,16 +863,16 @@ mod tests {
         .unwrap();
 
         assert!(
-            !js.contains("@1kbirds/chidori"),
-            "scoped import survived:\n{js}"
+            !js.contains("chidori:agent"),
+            "virtual SDK import survived:\n{js}"
         );
-        assert!(js.contains("return { ok: true }"));
+        assert!(js.contains("run(async"));
     }
 
     #[test]
     fn transpile_strips_satisfies_and_as_const_assertions() {
         let source = r#"
-            import { ToolDefinition } from "chidori";
+            import { ToolDefinition } from "chidori:agent";
 
             const prompt = "Only call chidori.tool(name, args) directly for deterministic work when the exact args are already known and the tool is either implemented by this project or explicitly described by the user as an available runtime tool. ";
             const template = `Do not strip as const or satisfies ToolDefinition inside templates`;
@@ -842,7 +909,7 @@ mod tests {
     #[test]
     fn transpile_strips_return_type_with_object_literal() {
         let source = r#"
-            import { Chidori } from "chidori";
+            import { Chidori } from "chidori:agent";
 
             export async function run(
                 args: { url: string },

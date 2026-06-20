@@ -1,4 +1,4 @@
-import type { Chidori } from "chidori";
+import type { Chidori } from "chidori:agent";
 
 export async function agent(input: { document: string }, chidori: Chidori) {
   const summary = await chidori.prompt(

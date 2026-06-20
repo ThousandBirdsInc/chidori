@@ -1,4 +1,4 @@
-import type { Chidori, ToolDefinition } from "chidori";
+import type { Chidori, ToolDefinition } from "chidori:agent";
 
 // Offline stand-in for an FX-rate API. Fixed table keeps the fan-out example
 // deterministic.

@@ -348,7 +348,7 @@ never consults a cache.** Caching lives entirely on the live path.
 ### 6.1 Agent-facing (`chidori.context`)
 
 ```ts
-import { chidori } from "chidori";
+import { chidori } from "chidori:agent";
 
 type Role = "system" | "user" | "assistant" | "tool_result";
 type CacheTtl = "5m" | "1h";
@@ -415,7 +415,7 @@ chidori would re-bill the full ~20K prefix on every single turn.
 ### 7.1 The agent
 
 ```ts
-import { chidori, run } from "chidori";
+import { chidori, run } from "chidori:agent";
 
 type Brief = { corpusPath: string; questions: string[] };
 

@@ -12,7 +12,7 @@
 //   2. Run the matching driver scenario:
 //        node examples/record-replay/driver.mjs --scenario exactly_once
 //
-// In your own code the import is simply `import { AgentClient } from "chidori"`.
+// In your own code the import is simply `import { AgentClient } from "@1kbirds/chidori"`.
 // Here we point at the built SDK in this repo so the example runs in-tree.
 import { AgentClient } from "../../sdk/typescript/dist/index.js";
 

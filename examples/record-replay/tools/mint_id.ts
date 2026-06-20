@@ -1,4 +1,4 @@
-import type { Chidori, ToolDefinition } from "chidori";
+import type { Chidori, ToolDefinition } from "chidori:agent";
 
 // Non-deterministic by nature: a fresh id + wall-clock reading. Because the
 // result is recorded in the call log, every replay reproduces the SAME id and

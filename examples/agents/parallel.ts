@@ -1,4 +1,4 @@
-import type { Chidori } from "chidori";
+import type { Chidori } from "chidori:agent";
 
 export async function agent(input: { topic: string }, chidori: Chidori) {
   const drafts = await chidori.parallel(

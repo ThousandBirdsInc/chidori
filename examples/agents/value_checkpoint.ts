@@ -9,7 +9,7 @@
 //
 // The run pauses on `input()`; resume it and the "index" step is served from
 // the journal instead of being recomputed. See docs/value-checkpoints.md.
-import type { Chidori } from "chidori";
+import type { Chidori } from "chidori:agent";
 
 export async function agent(input: { docs?: number }, chidori: Chidori) {
   const docs = input.docs ?? 1000;

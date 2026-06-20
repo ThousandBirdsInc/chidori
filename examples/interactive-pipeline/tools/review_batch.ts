@@ -1,4 +1,4 @@
-import { chidori } from "chidori";
+import { chidori } from "chidori:agent";
 
 export const tool = {
   name: "review_batch",

@@ -182,7 +182,7 @@ host call:
 
 ```ts
 // summarizer.ts
-import type { Chidori } from "chidori";
+import type { Chidori } from "chidori:agent";
 
 export async function agent(input: { document: string }, chidori: Chidori) {
   const summary = await chidori.prompt("Summarize in 3 bullets:\n" + input.document);

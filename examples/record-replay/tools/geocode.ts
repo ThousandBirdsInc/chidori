@@ -1,4 +1,4 @@
-import type { Chidori, ToolDefinition } from "chidori";
+import type { Chidori, ToolDefinition } from "chidori:agent";
 
 // Offline stand-in for a geocoding API. Returns a fixed lat/lng per city so the
 // fan-out example is deterministic without network access.
