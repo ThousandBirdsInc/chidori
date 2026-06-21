@@ -1,12 +1,12 @@
 # OS-level isolation: process-per-run with brokered effects
 
-> **Status:** Phases 1–4 implemented (`crates/chidori/src/runtime/isolate/`):
+> **Status:** Phases 1–5 implemented (`crates/chidori/src/runtime/isolate/`):
 > process-per-run brokering, the rlimits/deadline-kill resource floor, a Linux
-> confinement stack (network namespace + Landlock + seccomp), and a macOS Seatbelt
-> profile — each best-effort with graceful fallback, behind a per-OS `apply()`
-> dispatch. Remaining: cgroup v2 `memory.max` (needs delegation), tightening
-> seccomp toward an allowlist, rootless net-ns via user namespaces, and phase-5
-> polish.
+> confinement stack (network namespace + Landlock + seccomp), a macOS Seatbelt
+> profile, and the `--isolate` CLI/UX — each best-effort with graceful fallback,
+> behind a per-OS `apply()` dispatch. Smaller follow-ups remain: cgroup v2
+> `memory.max` (needs delegation), tightening seccomp toward an allowlist,
+> rootless net-ns via user namespaces, and a macOS CI gate for the Seatbelt path.
 > **Closes:** [`docs/sandbox-model.md`](./sandbox-model.md) gap #4 ("No process / OS-level
 > isolation"), and as a side effect tightens gaps #2, #3, #6 (memory accounting
 > precision and cross-run heap hygiene).
@@ -365,7 +365,30 @@ error frame the child writes from its `catch_unwind` boundary before exiting:
    link) but **runtime-unverified** — no macOS host in this environment; the
    best-effort design means a profile/load failure degrades to a logged skip
    rather than breaking a run.
-5. **Polish:** `--isolate` UX, policy-profile coupling, docs, optional warm pool.
+5. **Polish.** ✅ **Done (warm pool deliberately skipped)** — `--isolate` on both
+   `chidori run` and `chidori serve` (and `CHIDORI_ISOLATE=process`); a startup
+   `Isolation:` banner line describing the posture; and an `--untrusted`→isolation
+   hint. Per the chosen design the two stay **orthogonal but composable**:
+   `--untrusted` (policy) and `--isolate` (process sandbox) are independent, and
+   running untrusted without isolation prints a nudge rather than silently
+   changing behavior. The **warm worker pool is intentionally not built**:
+   spawn-per-run is what makes the child disposable and leak-free (it is what
+   resolves the memory-accounting/cycle-leak gaps #2/#3/#6 for the isolated path),
+   and a pool would reintroduce cross-run state hygiene concerns for a latency win
+   that the LLM/tool-dominated workload doesn't need. Revisit only if a
+   high-throughput, compute-bound deployment shows worker spawn as a real cost.
+
+### Configuration reference
+
+| Env var | Default | Effect |
+|---|---|---|
+| `CHIDORI_ISOLATE` | unset (off) | `process` runs each agent in a confined child worker. Set by `--isolate`. |
+| `CHIDORI_ISOLATE_REQUIRE_SANDBOX` | off | Fail the run closed if the platform's core confinement (seccomp/Seatbelt) can't be applied. |
+| `CHIDORI_ISOLATE_DEADLINE_MS` | off | Parent-side wall-clock `SIGKILL` of a wedged worker. |
+| `CHIDORI_ISOLATE_CPU_SECS` | off | Hard `RLIMIT_CPU` ceiling on worker compute. |
+| `CHIDORI_ISOLATE_NOFILE` | 256 | `RLIMIT_NOFILE` (clamped to the inherited hard limit). |
+| `CHIDORI_ISOLATE_FSIZE_BYTES` | off | `RLIMIT_FSIZE` (opt-in; off because a `0` cap also kills a redirected regular-file stderr). |
+| `CHIDORI_ISOLATE_NO_CORE` | on | Disable core dumps (`RLIMIT_CORE=0`). |
 
 ## Verification
 

@@ -269,6 +269,12 @@ enum Commands {
         /// Explicit CHIDORI_POLICY* configuration still applies.
         #[arg(long)]
         trusted: bool,
+
+        /// Run each request in an isolated child process, brokering its host
+        /// effects back over a pipe (see docs/os-isolation-plan.md). Equivalent
+        /// to CHIDORI_ISOLATE=process. Composes with --untrusted.
+        #[arg(long)]
+        isolate: bool,
     },
 }
 
@@ -303,8 +309,9 @@ fn main() {
             // `run_agent` reads this env var to decide whether to spawn a worker;
             // setting it here keeps the isolation decision in one place.
             if isolate {
-                std::env::set_var("CHIDORI_ISOLATE", "process");
+                crate::runtime::isolate::enable();
             }
+            crate::runtime::isolate::warn_if_untrusted_without_isolation(untrusted);
             let result = if stream {
                 cmd_run_stream(&file, &input, verbose, &tools, untrusted)
             } else {
@@ -360,7 +367,13 @@ fn main() {
             verbose,
             untrusted,
             trusted,
-        } => (cmd_serve(&file, port, verbose, untrusted, trusted), false),
+            isolate,
+        } => {
+            if isolate {
+                crate::runtime::isolate::enable();
+            }
+            (cmd_serve(&file, port, verbose, untrusted, trusted), false)
+        }
     };
 
     // Flush any buffered OTLP spans before the process exits. No-op when
@@ -1396,6 +1409,10 @@ fn cmd_serve(
     }
 
     eprintln!("Agent: {}", file.display());
+    eprintln!("Isolation: {}", crate::runtime::isolate::describe());
+    // The server is deny-by-default unless explicitly trusted; if it is confining
+    // callers by policy but not by process, point at --isolate.
+    crate::runtime::isolate::warn_if_untrusted_without_isolation(!trusted);
 
     let (policy, policy_posture) = serve_policy(untrusted, trusted);
     let tokio_rt = tokio::runtime::Runtime::new().context("Failed to create server runtime")?;
