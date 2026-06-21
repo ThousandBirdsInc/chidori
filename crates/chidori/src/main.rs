@@ -84,7 +84,20 @@ enum Commands {
         /// takes precedence over all CHIDORI_POLICY* env vars.
         #[arg(long)]
         untrusted: bool,
+
+        /// Run the agent in an isolated child process, brokering its host
+        /// effects back over a pipe (see docs/os-isolation-plan.md). Equivalent
+        /// to CHIDORI_ISOLATE=process. Phase 1: process separation + brokering;
+        /// per-OS syscall sandboxing lands in a later phase.
+        #[arg(long)]
+        isolate: bool,
     },
+
+    /// Internal: the isolate worker. Runs one agent over a stdin/stdout frame
+    /// protocol on behalf of a parent supervisor; not meant to be invoked
+    /// directly. See `crate::runtime::isolate`.
+    #[command(name = "__run-worker", hide = true)]
+    RunWorker,
 
     /// Validate a TypeScript agent file without running it
     Check {
@@ -262,6 +275,18 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
 
+    // The isolate worker speaks a binary frame protocol over stdout, so it must
+    // short-circuit before any of the normal startup path can write there.
+    if let Commands::RunWorker = cli.command {
+        std::process::exit(match crate::runtime::isolate::worker::run() {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("isolate worker error: {e}");
+                1
+            }
+        });
+    }
+
     // Commands that only do parsing/validation return exit code 2 on failure;
     // everything else returns 1. Success is 0.
     let (result, parse_only) = match cli.command {
@@ -273,7 +298,13 @@ fn main() {
             tools,
             stream,
             untrusted,
+            isolate,
         } => {
+            // `run_agent` reads this env var to decide whether to spawn a worker;
+            // setting it here keeps the isolation decision in one place.
+            if isolate {
+                std::env::set_var("CHIDORI_ISOLATE", "process");
+            }
             let result = if stream {
                 cmd_run_stream(&file, &input, verbose, &tools, untrusted)
             } else {
@@ -281,6 +312,7 @@ fn main() {
             };
             (result, false)
         }
+        Commands::RunWorker => unreachable!("handled before the dispatch match"),
         Commands::Demo => (cmd_demo(), false),
         Commands::Init { dir, template } => (
             init::run(

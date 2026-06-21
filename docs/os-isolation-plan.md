@@ -1,6 +1,7 @@
 # OS-level isolation: process-per-run with brokered effects
 
-> **Status:** Design / proposal. Not yet implemented.
+> **Status:** Phase 1 implemented (`crates/chidori/src/runtime/isolate/`); phases
+> 2–5 (resource floor + per-OS sandbox) not yet started.
 > **Closes:** [`docs/sandbox-model.md`](./sandbox-model.md) gap #4 ("No process / OS-level
 > isolation"), and as a side effect tightens gaps #2, #3, #6 (memory accounting
 > precision and cross-run heap hygiene).
@@ -291,10 +292,16 @@ error frame the child writes from its `catch_unwind` boundary before exiting:
 
 ## Phasing
 
-1. **Worker mode + broker, no sandbox.** Add `__run-worker`, the pipe protocol,
-   the prelinked-graph handoff, the parent broker loop, and failure mapping. Get
-   byte-identical results vs in-process across the existing test suite. *This is
-   the bulk of the work and is independently testable.*
+1. **Worker mode + broker, no sandbox.** ✅ **Done** —
+   `crates/chidori/src/runtime/isolate/` (`protocol`, `worker`, `supervisor`).
+   `run_module` now routes every host op through a single `RunHost` seam
+   (`InProcessHost` in-process; `BrokeredHost` in the worker); `chidori run
+   --isolate` / `CHIDORI_ISOLATE=process` spawns `chidori __run-worker` and
+   brokers `chidori.*` effects, captured natives, DOM flushes, and module loads
+   over stdin/stdout. Parity is asserted byte-for-byte (output **and** host-call
+   log) against the in-process path
+   (`rust_engine::tests::isolated_run_matches_in_process_byte_for_byte`). No
+   sandbox yet — the child is a separate process with brokered effects only.
 2. **Resource floor.** rlimits + cgroup `memory.max`; move the memory ceiling off
    the in-process watchdog for the isolated path; deadline-kill from the parent.
 3. **Linux syscall confinement.** seccomp allowlist + empty netns + mount ns +

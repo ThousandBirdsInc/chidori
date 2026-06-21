@@ -97,9 +97,23 @@ pub fn run_agent(
     inputs: &Value,
     backend: &HostBindingBackend,
 ) -> Result<Value> {
+    // When OS isolation is enabled, run the agent in a sandboxed child process
+    // and broker its host effects back here over a pipe (see
+    // `crate::runtime::isolate` and `docs/os-isolation-plan.md`). Only the
+    // runtime backend is isolated — the recorder/metadata backend has no live
+    // host machinery to broker into.
+    if crate::runtime::isolate::enabled() && backend.runtime_ctx().is_some() {
+        return crate::runtime::isolate::run_agent_isolated(path, source, inputs, backend);
+    }
     // Agents define their entrypoint with `run(handler)`; fall back to a legacy
     // `agent` export if `run(...)` wasn't called.
-    run_module(path, source, "agent", inputs, backend)
+    run_module(
+        path,
+        source,
+        "agent",
+        inputs,
+        Rc::new(InProcessHost::new(backend.clone())),
+    )
 }
 
 /// Reframe a chidori-js entrypoint error so an uncaught JS exception surfaces
@@ -145,7 +159,13 @@ pub(crate) fn run_tool_file(
 ) -> Result<Value> {
     let source = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("reading tool {}: {e}", path.display()))?;
-    run_module(path, &source, "run", kwargs, backend)
+    run_module(
+        path,
+        &source,
+        "run",
+        kwargs,
+        Rc::new(InProcessHost::new(backend.clone())),
+    )
 }
 
 /// Run a nested TypeScript **sub-agent** file natively on the rust engine (G4).
@@ -157,7 +177,121 @@ pub(crate) fn run_agent_file(
 ) -> Result<Value> {
     let source = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("reading sub-agent {}: {e}", path.display()))?;
-    run_module(path, &source, "agent", input, backend)
+    run_module(
+        path,
+        &source,
+        "agent",
+        input,
+        Rc::new(InProcessHost::new(backend.clone())),
+    )
+}
+
+/// The host surface [`run_module`] needs, routed by op name. This is the single
+/// seam that the OS-isolation worker replaces with a pipe (see
+/// [`crate::runtime::isolate`] and `docs/os-isolation-plan.md`): in-process it is
+/// [`InProcessHost`] (which forwards straight to the durable host machinery);
+/// in the worker it is a `BrokeredHost` that serializes each call over to the
+/// parent. Because every `chidori.*` effect and captured native already flows
+/// through one synchronous `(name, args) -> JSON` call, brokering is a drop-in.
+pub(crate) trait RunHost {
+    /// Route a single host op to its handler and return the JSON result. `op` is
+    /// a `chidori.*` effect name (`log`, `prompt`, `http`, …), a `__chidori_*`
+    /// captured native, `"__chidori_dom_render"` (args = the drained DOM batch),
+    /// or `"__module_load"` (`{specifier, importer}` → `{key, source}`).
+    fn call(&self, op: &str, args: &Value) -> std::result::Result<Value, String>;
+
+    /// The determinism prelude to `eval` before user code, or `None` to install
+    /// neither the prelude nor the captured-effect sync natives (the recorder
+    /// backend, which has no runtime policy/context).
+    fn prelude(&self) -> Option<String>;
+
+    /// An optional JS-level trace observer to install on the VM for this run.
+    fn trace_sink(&self, _js: &str) -> Option<Box<dyn chidori_js::TraceObserver>> {
+        None
+    }
+}
+
+/// Route a host op against an in-process [`HostBindingBackend`]. Shared by
+/// [`InProcessHost`] and the isolate broker loop
+/// ([`crate::runtime::isolate::supervisor`]) so both reach the identical
+/// handlers — the only difference is whether the call arrived inline or over a
+/// pipe. `sync` is the captured-effect native dispatch
+/// ([`build_sync_native_dispatch`]), present only for the runtime backend.
+pub(crate) fn route_host_op(
+    backend: &HostBindingBackend,
+    sync: Option<&Rc<dyn Fn(&str, &Value) -> std::result::Result<Value, String>>>,
+    op: &str,
+    args: &Value,
+) -> std::result::Result<Value, String> {
+    if op == "__module_load" {
+        let specifier = args
+            .get("specifier")
+            .and_then(|v| v.as_str())
+            .ok_or("__module_load: missing `specifier`")?;
+        let importer = args
+            .get("importer")
+            .and_then(|v| v.as_str())
+            .ok_or("__module_load: missing `importer`")?;
+        let (key, source) = load_module_source(specifier, importer)?;
+        return Ok(serde_json::json!({ "key": key, "source": source }));
+    }
+    if op == "__chidori_dom_render" {
+        let ctx = backend
+            .runtime_ctx()
+            .ok_or("dom_render: no runtime context")?;
+        return crate::runtime::host_core::execute_durable_json_call(
+            ctx,
+            "dom_render",
+            Value::Null,
+            || Ok(args.clone()),
+        )
+        .map_err(|e| e.to_string());
+    }
+    // The captured natives are matched by exact name (not the `__chidori_` prefix)
+    // so sibling host ops that share the prefix — e.g. the `__chidori_http` op the
+    // fetch polyfill calls — still fall through to the async effect dispatch.
+    if SYNC_NATIVE_NAMES.iter().any(|(n, _)| *n == op) {
+        let sync = sync.ok_or("captured natives unavailable on this backend")?;
+        return sync(op, args);
+    }
+    backend.dispatch(op, args)
+}
+
+/// The in-process [`RunHost`]: forwards every op straight into the durable host
+/// machinery on the same thread (the historical behaviour, now behind the trait).
+pub(crate) struct InProcessHost {
+    backend: HostBindingBackend,
+    sync: Option<Rc<dyn Fn(&str, &Value) -> std::result::Result<Value, String>>>,
+}
+
+impl InProcessHost {
+    pub(crate) fn new(backend: HostBindingBackend) -> Self {
+        let sync = match (backend.runtime_policy(), backend.runtime_ctx()) {
+            (Some(policy), Some(ctx)) => Some(build_sync_native_dispatch(ctx.clone(), policy)),
+            _ => None,
+        };
+        InProcessHost { backend, sync }
+    }
+}
+
+impl RunHost for InProcessHost {
+    fn call(&self, op: &str, args: &Value) -> std::result::Result<Value, String> {
+        route_host_op(&self.backend, self.sync.as_ref(), op, args)
+    }
+
+    fn prelude(&self) -> Option<String> {
+        self.backend
+            .runtime_policy()
+            .map(|policy| rust_engine_prelude(&policy))
+    }
+
+    fn trace_sink(&self, js: &str) -> Option<Box<dyn chidori_js::TraceObserver>> {
+        if !js_tracing_enabled() {
+            return None;
+        }
+        let run = self.backend.runtime_ctx()?.otel_run()?;
+        Some(Box::new(run.js_trace_observer(js, JS_TRACE_MAX_DEPTH)))
+    }
 }
 
 /// Resource limits applied to every rust-engine agent run, read from the
@@ -314,12 +448,12 @@ fn panic_payload_message(panic: &(dyn std::any::Any + Send)) -> String {
 /// passed to `run(handler)`, or `fallback_export` (e.g. `agent` for agents). The
 /// VM's `chidori.*` effects are forwarded to `backend.dispatch`, the durable
 /// host machinery in `host_core`.
-fn run_module(
+pub(crate) fn run_module(
     path: &Path,
     source: &str,
     fallback_export: &str,
     input: &Value,
-    backend: &HostBindingBackend,
+    host: Rc<dyn RunHost>,
 ) -> Result<Value> {
     // `Node` accepts relative `./foo` imports *and* allowlisted `node:` builtins
     // (the special-cased `chidori` SDK import is stripped by transpilation). This
@@ -331,30 +465,29 @@ fn run_module(
     let js = transpile_module(path, source, &opts)?;
 
     let mut engine = chidori_js::Engine::new();
-    if js_tracing_enabled() {
-        if let Some(ctx) = backend.runtime_ctx() {
-            if let Some(run) = ctx.otel_run() {
-                engine.vm.trace_sink =
-                    Some(Box::new(run.js_trace_observer(&js, JS_TRACE_MAX_DEPTH)));
-            }
-        }
+    if let Some(sink) = host.trace_sink(&js) {
+        engine.vm.trace_sink = Some(sink);
     }
     // Captured-effect natives (`node:` crypto/fs) + the determinism prelude
     // (process env, TextEncoder/atob, Web Crypto, virtual timers). Installed only
-    // for the runtime backend — the recorder/metadata backend has no policy or
-    // call log to capture into, and `node:`-using agent code doesn't run there.
-    if let (Some(policy), Some(ctx)) = (backend.runtime_policy(), backend.runtime_ctx()) {
-        let sync = build_sync_native_dispatch(ctx.clone(), policy.clone());
+    // when the host exposes a runtime policy — the recorder/metadata backend has
+    // none, and its `node:`-using agent code doesn't run there. The sync natives
+    // are routed back through `host.call`, so the in-process host reaches
+    // `build_sync_native_dispatch` while the isolate worker brokers them to the
+    // parent process (where the VFS / captured-crypto state lives).
+    if let Some(prelude) = host.prelude() {
+        let h = host.clone();
+        let sync: Rc<dyn Fn(&str, &Value) -> std::result::Result<Value, String>> =
+            Rc::new(move |name, args| h.call(name, args));
         engine.install_sync_natives(SYNC_NATIVE_NAMES, sync);
-        let prelude = rust_engine_prelude(&policy);
         engine
             .eval(&prelude)
             .map_err(|e| anyhow::anyhow!("installing node: builtin prelude: {e}"))?;
     }
-    let backend_for_dom = backend.clone();
-    let backend = backend.clone();
-    let dispatch: Rc<dyn Fn(&str, &Value) -> std::result::Result<Value, String>> =
-        Rc::new(move |effect: &str, args: &Value| backend.dispatch(effect, args));
+    let dispatch: Rc<dyn Fn(&str, &Value) -> std::result::Result<Value, String>> = {
+        let h = host.clone();
+        Rc::new(move |effect: &str, args: &Value| h.call(effect, args))
+    };
     engine.install_chidori_effects(dispatch);
     // Install the JS-level `chidori` SDK sugar (tryCall/retry/parallel + the
     // memory.set/get/delete/clear wrappers).
@@ -385,28 +518,21 @@ fn run_module(
     // re-run, so node ids stay deterministic across replay.
     let dom_handle = engine.install_dom();
     {
-        let backend_dom = backend_for_dom;
+        let h = host.clone();
         let dom = dom_handle.clone();
+        // Drain the pending DOM mutation batch in the engine's process, then hand
+        // it to the host to journal: the in-process host runs it through
+        // `execute_durable_json_call`; the isolate worker ships the batch over the
+        // pipe and the parent journals it. Either way the rendered output is
+        // recorded live and served from the journal on replay.
         let dom_dispatch: Rc<dyn Fn(&str, &Value) -> std::result::Result<Value, String>> =
-            Rc::new(move |name: &str, _args: &Value| {
-                let ctx = backend_dom
-                    .runtime_ctx()
-                    .ok_or_else(|| "dom: no runtime context".to_string())?;
-                match name {
-                    "__chidori_dom_render" => {
-                        crate::runtime::host_core::execute_durable_json_call(
-                            ctx,
-                            "dom_render",
-                            Value::Null,
-                            || {
-                                Ok(serde_json::to_value(dom.drain_render_batch())
-                                    .unwrap_or(Value::Null))
-                            },
-                        )
-                        .map_err(|e| e.to_string())
-                    }
-                    _ => Ok(Value::Null),
+            Rc::new(move |name: &str, _args: &Value| match name {
+                "__chidori_dom_render" => {
+                    let batch =
+                        serde_json::to_value(dom.drain_render_batch()).unwrap_or(Value::Null);
+                    h.call("__chidori_dom_render", &batch)
                 }
+                _ => Ok(Value::Null),
             });
         engine.install_sync_natives(&[("__chidori_dom_render", 0)], dom_dispatch);
     }
@@ -421,7 +547,11 @@ fn run_module(
     let entry_key = path.to_string_lossy().to_string();
     // Resolve each `(specifier, importer)` to a sibling `.ts`/`.js` file (or, for
     // `node:` specifiers, the synthetic builtin shim) and hand the linker its
-    // transpiled ES module source.
+    // transpiled ES module source. `node:` shims and vendored packages are pure
+    // string lookups resolved here (identically in-process and in the worker);
+    // only the disk-reading sibling resolution is routed through `host.call` so
+    // the isolate worker — which has no filesystem — brokers it to the parent.
+    let load_host = host.clone();
     let mut load = |specifier: &str,
                     importer_key: &str|
      -> std::result::Result<(String, String), String> {
@@ -439,7 +569,19 @@ fn run_module(
         if let Some(resolved) = crate::runtime::typescript::builtins::vendored_module(specifier) {
             return Ok(resolved);
         }
-        load_module_source(specifier, importer_key)
+        let resolved = load_host.call(
+            "__module_load",
+            &serde_json::json!({ "specifier": specifier, "importer": importer_key }),
+        )?;
+        let key = resolved
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "__module_load: response missing `key`".to_string())?;
+        let src = resolved
+            .get("source")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "__module_load: response missing `source`".to_string())?;
+        Ok((key.to_string(), src.to_string()))
     };
 
     // Install per-run resource limits (opcode budget + memory/deadline watchdog)
@@ -588,7 +730,7 @@ fn execute_captured_random(
 /// and inline; randomness is captured through the call log; the VFS ops operate
 /// on the snapshot-resident `RuntimeContext` filesystem — so a
 /// `node:fs`/`node:crypto` agent records and replays deterministically.
-fn build_sync_native_dispatch(
+pub(crate) fn build_sync_native_dispatch(
     ctx: RuntimeContext,
     policy: RuntimePolicy,
 ) -> Rc<dyn Fn(&str, &Value) -> std::result::Result<Value, String>> {
@@ -728,7 +870,7 @@ fn build_sync_native_dispatch(
 /// Crypto subset, and the virtual timer queue. Date and `Math.random`
 /// determinism are already native to `chidori-js`, so this installs no
 /// Date/random shims.
-fn rust_engine_prelude(policy: &RuntimePolicy) -> String {
+pub(crate) fn rust_engine_prelude(policy: &RuntimePolicy) -> String {
     use crate::runtime::typescript::helpers::{
         chidori_agent_env_json, TEXT_ENCODING_POLYFILL, TIMER_DISABLED_POLYFILL,
         TIMER_VIRTUAL_POLYFILL, WEB_CRYPTO_POLYFILL,
@@ -821,6 +963,102 @@ mod tests {
             tools,
             Arc::new(McpManager::new()),
         )
+    }
+
+    /// An agent run via the isolate broker must produce byte-identical output and
+    /// host-call records to the same agent run in-process. Exercises the three
+    /// brokered surfaces at once: a `chidori.log` effect (async dispatch), a
+    /// `node:crypto` hash (a `__chidori_*` captured native), and a sibling
+    /// `./helper.ts` import (a brokered `__module_load`), plus the determinism
+    /// prelude that `createHash` relies on. Runs the broker over an in-process
+    /// `socketpair` so the real protocol/worker/parent loop are exercised without
+    /// the cost (or flakiness) of spawning a subprocess.
+    #[cfg(unix)]
+    #[test]
+    fn isolated_run_matches_in_process_byte_for_byte() {
+        use std::os::unix::net::UnixStream;
+
+        use crate::runtime::isolate::protocol::FromParent;
+        use crate::runtime::isolate::supervisor::broker;
+
+        let dir = std::env::temp_dir().join(format!("chidori-isolate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.ts");
+        std::fs::write(
+            dir.join("helper.ts"),
+            "export function bump(n: number): number { return n + 1; }\n",
+        )
+        .unwrap();
+        let src = r#"
+            import { chidori, run } from "chidori:agent";
+            import { bump } from "./helper.ts";
+            import { createHash } from "node:crypto";
+            run(async (input: { value: number }) => {
+                await chidori.log("isolation parity check");
+                const h = createHash("sha256").update("chidori").digest("hex");
+                return { value: bump(input.value), hash: h };
+            });
+        "#;
+        std::fs::write(&path, src).unwrap();
+        let input = serde_json::json!({ "value": 41 });
+
+        // Host calls are compared by (function, args) — the durable shape — rather
+        // than the whole record, which carries non-semantic fields like sequence.
+        let host_calls = |ctx: &RuntimeContext| -> Vec<(String, Value)> {
+            ctx.call_log()
+                .into_records()
+                .into_iter()
+                .map(|r| (r.function, r.args))
+                .collect()
+        };
+
+        // 1) In-process baseline.
+        let ctx_inproc = RuntimeContext::new();
+        let backend_inproc = test_backend(ctx_inproc.clone(), Arc::new(ToolRegistry::new()));
+        let out_inproc = run_agent(&path, src, &input, &backend_inproc).unwrap();
+
+        // 2) Brokered run: a worker thread on one socket end, the parent broker on
+        //    the other, with its own context so the two logs can be compared.
+        let (parent_sock, child_sock) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let reader = child_sock.try_clone().unwrap();
+            crate::runtime::isolate::worker::serve(reader, child_sock)
+        });
+
+        let ctx_brokered = RuntimeContext::new();
+        let backend_brokered = test_backend(ctx_brokered.clone(), Arc::new(ToolRegistry::new()));
+        let init = FromParent::Init {
+            entry_path: path.to_string_lossy().into_owned(),
+            entry_source: src.to_string(),
+            fallback_export: "agent".to_string(),
+            input: input.clone(),
+            prelude: backend_brokered
+                .runtime_policy()
+                .map(|p| rust_engine_prelude(&p)),
+        };
+        let mut to_child = parent_sock.try_clone().unwrap();
+        let mut from_child: UnixStream = parent_sock;
+        let out_brokered = broker(&mut from_child, &mut to_child, &backend_brokered, init).unwrap();
+        worker.join().unwrap().unwrap();
+
+        // The whole point: identical output and identical host-call log.
+        assert_eq!(
+            out_brokered, out_inproc,
+            "isolated output must match in-process"
+        );
+        assert_eq!(
+            host_calls(&ctx_brokered),
+            host_calls(&ctx_inproc),
+            "isolated host-call log must match in-process"
+        );
+        // Sanity: the agent's compute (sibling import) and captured crypto landed.
+        assert_eq!(out_brokered.get("value"), Some(&serde_json::json!(42)));
+        assert!(out_brokered
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .is_some_and(|h| h.len() == 64));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
