@@ -21,6 +21,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::limits::ResourceLimits;
+
 /// Hard ceiling on a single frame's body (parent-side hardening: a hostile or
 /// buggy child must not be able to make the parent allocate without bound).
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -39,6 +41,10 @@ pub enum FromParent {
         /// `Some` for a runtime run (installs captured natives + prelude);
         /// `None` only for backends that wouldn't be isolated in the first place.
         prelude: Option<String>,
+        /// Per-process resource limits the worker applies to itself before
+        /// running the agent (phase 2). Centralised here so the parent owns the
+        /// policy and the child only enforces it.
+        limits: ResourceLimits,
     },
     /// The result of one brokered host op.
     Reply(Outcome),

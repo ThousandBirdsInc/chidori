@@ -10,6 +10,7 @@
 //! Seatbelt on macOS) lands in later phases; until then the child is a separate
 //! process with brokered effects but no syscall confinement yet.
 
+pub mod limits;
 pub mod protocol;
 pub mod supervisor;
 pub mod worker;

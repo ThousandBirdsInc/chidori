@@ -1,7 +1,8 @@
 # OS-level isolation: process-per-run with brokered effects
 
-> **Status:** Phase 1 implemented (`crates/chidori/src/runtime/isolate/`); phases
-> 2–5 (resource floor + per-OS sandbox) not yet started.
+> **Status:** Phases 1–2 implemented (`crates/chidori/src/runtime/isolate/`):
+> process-per-run brokering + the rlimits/deadline-kill resource floor. Phases
+> 3–5 (cgroup memory ceiling + per-OS syscall sandbox) not yet started.
 > **Closes:** [`docs/sandbox-model.md`](./sandbox-model.md) gap #4 ("No process / OS-level
 > isolation"), and as a side effect tightens gaps #2, #3, #6 (memory accounting
 > precision and cross-run heap hygiene).
@@ -302,8 +303,21 @@ error frame the child writes from its `catch_unwind` boundary before exiting:
    log) against the in-process path
    (`rust_engine::tests::isolated_run_matches_in_process_byte_for_byte`). No
    sandbox yet — the child is a separate process with brokered effects only.
-2. **Resource floor.** rlimits + cgroup `memory.max`; move the memory ceiling off
-   the in-process watchdog for the isolated path; deadline-kill from the parent.
+2. **Resource floor.** ✅ **Done (rlimits + deadline-kill)** —
+   `runtime::isolate::limits` applies a per-process `setrlimit` floor in the
+   worker before any agent code runs (`RLIMIT_CPU` hard CPU-seconds backstop to
+   the opcode budget — ignores broker-wait time; `RLIMIT_FSIZE=0` since the child
+   has no filesystem; `RLIMIT_CORE=0`; `RLIMIT_NOFILE`), and the supervisor adds
+   a `SIGKILL` **deadline-kill** watchdog (`CHIDORI_ISOLATE_DEADLINE_MS`) plus
+   **signal-aware failure mapping** (CPU/file/OOM/deadline → precise errors).
+   Limits ride the `Init` frame so the parent owns the policy; the in-process
+   `serve` path never self-limits. Note: running the engine in its own process
+   *already* makes the existing heap watchdog a clean per-run ceiling (no
+   cross-tenant attribution drift — gaps #2/#3). **Remaining (deferred):** a hard
+   memory ceiling via cgroup v2 `memory.max` (needs delegation; `RLIMIT_AS` is
+   too blunt — a multi-threaded VM over-reserves virtual memory) and `RLIMIT_NPROC`
+   (fragile under shared-uid concurrency; blocking `fork` belongs to the seccomp
+   phase). Env: `CHIDORI_ISOLATE_{CPU_SECS,FSIZE_BYTES,NOFILE,NO_CORE,DEADLINE_MS}`.
 3. **Linux syscall confinement.** seccomp allowlist + empty netns + mount ns +
    Landlock; negative tests (a worker that calls `socket()`/`open("/etc/passwd")`
    is killed).

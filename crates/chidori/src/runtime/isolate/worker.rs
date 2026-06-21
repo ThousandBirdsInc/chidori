@@ -66,31 +66,54 @@ impl<R: Read, W: Write> RunHost for BrokeredHost<R, W> {
 /// Entry point for the hidden `chidori __run-worker` subcommand: drive the
 /// protocol over this process's stdin/stdout. stderr is left untouched for
 /// diagnostics — nothing but frames may go to stdout or the stream desyncs.
+///
+/// This is the only caller that applies the `setrlimit` floor, because the
+/// limits are applied to the *current process* — sound only when that process is
+/// a dedicated worker. The in-process [`serve`] path (used by tests) must never
+/// self-limit, or it would mutate the limits of whatever process is hosting it.
 pub fn run() -> io::Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    serve(stdin.lock(), stdout.lock())
+    serve_inner(stdin.lock(), stdout.lock(), true)
 }
 
-/// Run one agent to completion over an arbitrary reader/writer pair. Factored out
-/// of [`run`] so tests can drive it over an in-process socket without spawning a
-/// subprocess. Always reports the run outcome as a final [`FromChild::Done`];
-/// protocol/IO failures (a dead parent) surface as the returned `io::Result`.
+/// Run one agent to completion over an arbitrary reader/writer pair *without*
+/// applying any per-process resource limits. Factored out of [`run`] so tests
+/// can drive the worker over an in-process socket without a subprocess — and
+/// without the worker's `setrlimit` floor leaking onto the test process.
 pub fn serve<R: Read + 'static, W: Write + 'static>(reader: R, writer: W) -> io::Result<()> {
+    serve_inner(reader, writer, false)
+}
+
+/// Shared worker body. `apply_limits` gates the per-process `setrlimit` floor —
+/// see [`run`] vs [`serve`].
+fn serve_inner<R: Read + 'static, W: Write + 'static>(
+    reader: R,
+    writer: W,
+    apply_limits: bool,
+) -> io::Result<()> {
     let io = Rc::new(RefCell::new(WorkerIo { reader, writer }));
 
     let init: FromParent = {
         let mut guard = io.borrow_mut();
         read_frame(&mut guard.reader)?
     };
-    let (entry_path, entry_source, fallback_export, input, prelude) = match init {
+    let (entry_path, entry_source, fallback_export, input, prelude, limits) = match init {
         FromParent::Init {
             entry_path,
             entry_source,
             fallback_export,
             input,
             prelude,
-        } => (entry_path, entry_source, fallback_export, input, prelude),
+            limits,
+        } => (
+            entry_path,
+            entry_source,
+            fallback_export,
+            input,
+            prelude,
+            limits,
+        ),
         FromParent::Reply(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -98,6 +121,15 @@ pub fn serve<R: Read + 'static, W: Write + 'static>(reader: R, writer: W) -> io:
             ));
         }
     };
+
+    // Slam the resource floor shut before any agent code runs — but only in a
+    // real worker process (see `serve_inner`'s `apply_limits`). Best-effort: a
+    // limit that can't be set degrades isolation but never fails the run.
+    if apply_limits {
+        limits.apply_to_self();
+    } else {
+        let _ = &limits;
+    }
 
     let host: Rc<dyn RunHost> = Rc::new(BrokeredHost {
         io: io.clone(),

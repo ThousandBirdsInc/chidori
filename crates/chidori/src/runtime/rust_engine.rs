@@ -1035,6 +1035,7 @@ mod tests {
             prelude: backend_brokered
                 .runtime_policy()
                 .map(|p| rust_engine_prelude(&p)),
+            limits: crate::runtime::isolate::limits::ResourceLimits::default(),
         };
         let mut to_child = parent_sock.try_clone().unwrap();
         let mut from_child: UnixStream = parent_sock;
