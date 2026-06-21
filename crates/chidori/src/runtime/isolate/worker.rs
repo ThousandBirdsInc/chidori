@@ -218,14 +218,17 @@ fn run_selftest(mode: &str, sandbox: &crate::runtime::isolate::sandbox::SandboxO
             eprintln!("isolate-selftest: socket-not-blocked (fd={fd})");
             std::process::exit(97);
         }
-        // Landlock: creating a file must be denied (EACCES) under the read-only
-        // policy. Distinct from RLIMIT_FSIZE, which blocks the *write*, not the open.
+        // Filesystem-write confinement: creating a file must be denied — by
+        // Landlock's read-only policy on Linux, or the Seatbelt `(deny
+        // file-write*)` rule on macOS. Distinct from RLIMIT_FSIZE, which blocks
+        // the *write*, not the *open*. This is the cross-platform proof that the
+        // OS sandbox actually loaded and is enforcing.
         "fs-write" => {
-            if !sandbox.landlock_enforced {
-                eprintln!("isolate-selftest: landlock-unavailable");
+            if !(sandbox.landlock_enforced || sandbox.seatbelt_applied) {
+                eprintln!("isolate-selftest: fs-write-confinement-unavailable");
                 std::process::exit(0);
             }
-            let path = c"/tmp/chidori-landlock-selftest";
+            let path = c"/tmp/chidori-fs-write-selftest";
             // SAFETY: `open` takes a valid NUL-terminated path and scalar flags.
             let fd = unsafe {
                 libc::open(

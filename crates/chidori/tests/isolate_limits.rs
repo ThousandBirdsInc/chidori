@@ -129,13 +129,16 @@ fn seccomp_blocks_a_denied_syscall() {
 }
 
 #[test]
-fn landlock_blocks_file_creation() {
-    // Probe a file create once the sandbox is in place. Under the Landlock
-    // read-only policy the `open(O_CREAT)` is denied with EACCES; if Landlock
-    // isn't enforced in this environment (older kernel, or the LSM isn't in the
-    // active set) the worker says so and we skip rather than fail.
+fn filesystem_writes_are_blocked_when_confined() {
+    // Probe a file create once the sandbox is in place. The OS filesystem-write
+    // confinement — Landlock read-only on Linux, the Seatbelt `(deny file-write*)`
+    // rule on macOS — must deny the `open(O_CREAT)`. This is the cross-platform
+    // proof the sandbox actually loaded and enforces; in particular it is how the
+    // macOS Seatbelt path is verified at runtime in CI. If no such layer is
+    // active in this environment (older Linux kernel without Landlock, etc.) the
+    // worker says so and we skip rather than fail.
     let agent = write_agent(
-        "landlock",
+        "fs-write",
         r#"
         import { run } from "chidori:agent";
         run(async () => ({}));
@@ -144,19 +147,68 @@ fn landlock_blocks_file_creation() {
     let out = run_isolated(&agent, &[("CHIDORI_ISOLATE_SELFTEST", "fs-write")]);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    if stderr.contains("landlock-unavailable") {
-        eprintln!("skipping landlock test: not enforced in this environment");
+    if stderr.contains("fs-write-confinement-unavailable") {
+        eprintln!("skipping fs-write test: no filesystem-write confinement in this environment");
         let _ = fs::remove_dir_all(agent.parent().unwrap());
         return;
     }
     assert!(
         !stderr.contains("fs-write-not-blocked"),
-        "file creation was NOT blocked by Landlock; stderr={stderr}"
+        "file creation was NOT blocked by the OS sandbox; stderr={stderr}"
     );
     assert!(
         stderr.contains("fs-write-blocked"),
-        "expected the Landlock-blocked marker; stderr={stderr}"
+        "expected the sandbox-blocked marker; stderr={stderr}"
     );
+    let _ = fs::remove_dir_all(agent.parent().unwrap());
+}
+
+/// macOS-only: the runtime verification of the phase-4 Seatbelt FFI that a Linux
+/// dev/CI host cannot perform. Unlike the skip-aware test above, this one *fails*
+/// (not skips) if Seatbelt does not load and enforce, so the macOS CI job catches
+/// a regression in `sandbox_init` / the SBPL profile. It asserts: the worker did
+/// not report the profile as unapplied, the normal isolated run still works
+/// (i.e. `(deny file-write*)` did not also wedge the broker pipe), and a file
+/// create is denied.
+#[cfg(target_os = "macos")]
+#[test]
+fn seatbelt_loads_and_enforces_on_macos() {
+    let agent = write_agent(
+        "seatbelt",
+        r#"
+        import { chidori, run } from "chidori:agent";
+        run(async (input: { value: number }) => {
+            await chidori.log("seatbelt smoke");
+            return { value: (input?.value ?? 0) + 1 };
+        });
+        "#,
+    );
+
+    // 1) A normal isolated run must still succeed — proves the Seatbelt profile
+    //    didn't also block the worker's stdout broker pipe.
+    let ok = run_isolated(&agent, &[]);
+    let ok_err = String::from_utf8_lossy(&ok.stderr);
+    assert!(
+        ok.status.success(),
+        "isolated run failed under Seatbelt; stderr={ok_err}"
+    );
+    assert!(
+        !ok_err.contains("seatbelt not applied"),
+        "Seatbelt profile failed to load; stderr={ok_err}"
+    );
+
+    // 2) The fs-write probe must be blocked (Seatbelt is actually enforcing).
+    let probe = run_isolated(&agent, &[("CHIDORI_ISOLATE_SELFTEST", "fs-write")]);
+    let probe_err = String::from_utf8_lossy(&probe.stderr);
+    assert!(
+        !probe_err.contains("fs-write-confinement-unavailable"),
+        "Seatbelt reported no filesystem-write confinement; stderr={probe_err}"
+    );
+    assert!(
+        probe_err.contains("fs-write-blocked"),
+        "Seatbelt did not block a file create; stderr={probe_err}"
+    );
+
     let _ = fs::remove_dir_all(agent.parent().unwrap());
 }
 
