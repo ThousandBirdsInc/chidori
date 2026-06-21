@@ -105,7 +105,7 @@ fn seccomp_blocks_a_denied_syscall() {
         run(async () => { await chidori.log("unreachable: killed before running"); return {}; });
         "#,
     );
-    let out = run_isolated(&agent, &[("CHIDORI_ISOLATE_SELFTEST_SOCKET", "1")]);
+    let out = run_isolated(&agent, &[("CHIDORI_ISOLATE_SELFTEST", "socket")]);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
     if stderr.contains("seccomp-unavailable") {
@@ -124,6 +124,38 @@ fn seccomp_blocks_a_denied_syscall() {
     assert!(
         stderr.contains("seccomp"),
         "error should name the seccomp violation; stderr={stderr}"
+    );
+    let _ = fs::remove_dir_all(agent.parent().unwrap());
+}
+
+#[test]
+fn landlock_blocks_file_creation() {
+    // Probe a file create once the sandbox is in place. Under the Landlock
+    // read-only policy the `open(O_CREAT)` is denied with EACCES; if Landlock
+    // isn't enforced in this environment (older kernel, or the LSM isn't in the
+    // active set) the worker says so and we skip rather than fail.
+    let agent = write_agent(
+        "landlock",
+        r#"
+        import { run } from "chidori:agent";
+        run(async () => ({}));
+        "#,
+    );
+    let out = run_isolated(&agent, &[("CHIDORI_ISOLATE_SELFTEST", "fs-write")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    if stderr.contains("landlock-unavailable") {
+        eprintln!("skipping landlock test: not enforced in this environment");
+        let _ = fs::remove_dir_all(agent.parent().unwrap());
+        return;
+    }
+    assert!(
+        !stderr.contains("fs-write-not-blocked"),
+        "file creation was NOT blocked by Landlock; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("fs-write-blocked"),
+        "expected the Landlock-blocked marker; stderr={stderr}"
     );
     let _ = fs::remove_dir_all(agent.parent().unwrap());
 }

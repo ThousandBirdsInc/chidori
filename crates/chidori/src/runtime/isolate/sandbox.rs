@@ -18,6 +18,108 @@
 //! the engine's watchdog thread needs them and a fork that cannot `exec` gains no
 //! new code — so the `exec*` denial is what actually forecloses code execution.
 
+/// What each best-effort confinement layer achieved for a worker. Layers that
+/// could not be applied (older kernel, rootless container, …) leave their flag
+/// `false` and append a human-readable reason to `notes`; the worker logs the
+/// notes and, under `CHIDORI_ISOLATE_REQUIRE_SANDBOX`, fails closed if the
+/// portable core (seccomp) did not apply.
+#[derive(Debug, Default)]
+pub struct SandboxOutcome {
+    /// The worker runs in its own (empty) network namespace.
+    pub network_isolated: bool,
+    /// Landlock is enforcing a read-only view of the filesystem.
+    pub landlock_enforced: bool,
+    /// The seccomp denylist is installed.
+    pub seccomp_applied: bool,
+    /// Human-readable reasons for any layer that was skipped.
+    pub notes: Vec<String>,
+}
+
+/// Apply every confinement layer to the current process, in the order that keeps
+/// each one legal: namespace + Landlock first (they need syscalls — `unshare`,
+/// `landlock_*` — that seccomp then denies), and the seccomp denylist last. Every
+/// layer is best-effort; the returned [`SandboxOutcome`] records what stuck.
+///
+/// Sound only when the caller *is* the dedicated worker process, since each layer
+/// mutates the current process irreversibly.
+pub fn apply() -> SandboxOutcome {
+    let mut outcome = SandboxOutcome::default();
+
+    match apply_network_namespace() {
+        Ok(()) => outcome.network_isolated = true,
+        Err(e) => outcome
+            .notes
+            .push(format!("network namespace not isolated: {e}")),
+    }
+    match apply_landlock_readonly() {
+        Ok(true) => outcome.landlock_enforced = true,
+        Ok(false) => outcome
+            .notes
+            .push("landlock not enforced: no kernel support".to_string()),
+        Err(e) => outcome.notes.push(format!("landlock not enforced: {e}")),
+    }
+    match install_seccomp() {
+        Ok(()) => outcome.seccomp_applied = true,
+        Err(e) => outcome.notes.push(format!("seccomp not applied: {e}")),
+    }
+    outcome
+}
+
+/// Move the worker into a fresh, empty network namespace (`unshare(CLONE_NEWNET)`)
+/// — only loopback, and that down — so network egress is impossible at the kernel
+/// level, belt-and-suspenders with the seccomp socket block. Needs `CAP_SYS_ADMIN`
+/// (root or a privileged container); rootless callers fail with `EPERM` and the
+/// layer is skipped. (Rootless support via an intermediate user namespace is a
+/// future enhancement — see `docs/os-isolation-plan.md`.)
+#[cfg(target_os = "linux")]
+fn apply_network_namespace() -> Result<(), String> {
+    // SAFETY: `unshare` takes a scalar flag and affects only this process.
+    let rc = unsafe { libc::unshare(libc::CLONE_NEWNET) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_network_namespace() -> Result<(), String> {
+    Err("network namespaces are only available on Linux".to_string())
+}
+
+/// Enforce a **read-only** view of the filesystem via Landlock: every write-class
+/// access (create / write / truncate / rename / delete / mkdir / …) is denied,
+/// while reads are left untouched so the C runtime can still load what it needs.
+/// The worker brokers all of its I/O, so it never legitimately writes to disk —
+/// this closes the filesystem-tamper surface the seccomp denylist deliberately
+/// leaves open (it does not block `openat`, to avoid false-positive kills).
+///
+/// Best-effort (`CompatLevel::BestEffort`): on a kernel without Landlock the
+/// ruleset reports `NotEnforced` (returns `Ok(false)`) rather than erroring.
+/// Returns `Ok(true)` when Landlock is enforcing (fully or partially).
+#[cfg(target_os = "linux")]
+fn apply_landlock_readonly() -> Result<bool, String> {
+    use landlock::{AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetStatus, ABI};
+
+    // V5 (Linux 6.10) is a modern baseline; BestEffort downgrades the handled
+    // write-access set to whatever the running kernel actually supports.
+    let abi = ABI::V5;
+    let status = Ruleset::default()
+        .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(AccessFs::from_write(abi))
+        .map_err(|e| format!("handle_access: {e}"))?
+        .create()
+        .map_err(|e| format!("create: {e}"))?
+        // No path rules are granted, so every handled (write) access is denied.
+        .restrict_self()
+        .map_err(|e| format!("restrict_self: {e}"))?;
+    Ok(!matches!(status.ruleset, RulesetStatus::NotEnforced))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_landlock_readonly() -> Result<bool, String> {
+    Err("landlock is only available on Linux".to_string())
+}
+
 /// Install the worker's seccomp filter on the current thread; every thread or
 /// child it later spawns inherits it. Returns `Ok(())` on success, or a
 /// human-readable reason it could not be applied (a denied/absent `seccomp`

@@ -40,7 +40,12 @@ pub struct ResourceLimits {
     /// bounds compute gracefully). Env: `CHIDORI_ISOLATE_CPU_SECS`.
     pub cpu_secs: Option<u64>,
     /// Max bytes the child may write to any regular file (`RLIMIT_FSIZE`).
-    /// Defaults to `Some(0)`. Env: `CHIDORI_ISOLATE_FSIZE_BYTES`.
+    /// **Off by default** (`None`): a `0` cap is too blunt — it also kills writes
+    /// to an inherited `stderr` that happens to be a *regular file* (redirected
+    /// logs), which the worker legitimately uses for diagnostics. File-write
+    /// confinement is Landlock's job (it blocks *opening* new files while leaving
+    /// inherited fds alone); see [`super::sandbox`]. Opt in via
+    /// `CHIDORI_ISOLATE_FSIZE_BYTES` for workloads with no such stderr.
     pub fsize_bytes: Option<u64>,
     /// Max open file descriptors (`RLIMIT_NOFILE`), clamped to the inherited hard
     /// limit. Defaults to `Some(256)`. Env: `CHIDORI_ISOLATE_NOFILE`.
@@ -53,7 +58,7 @@ impl Default for ResourceLimits {
     fn default() -> Self {
         ResourceLimits {
             cpu_secs: None,
-            fsize_bytes: Some(0),
+            fsize_bytes: None,
             nofile: Some(256),
             no_core: true,
         }
@@ -156,7 +161,9 @@ mod tests {
     #[test]
     fn defaults_are_safe() {
         let l = ResourceLimits::default();
-        assert_eq!(l.fsize_bytes, Some(0));
+        // FSIZE is off by default: a 0 cap also kills writes to a redirected
+        // (regular-file) stderr, which the worker uses for diagnostics.
+        assert_eq!(l.fsize_bytes, None);
         assert_eq!(l.nofile, Some(256));
         assert!(l.no_core);
         assert_eq!(l.cpu_secs, None);

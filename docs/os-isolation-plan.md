@@ -1,10 +1,11 @@
 # OS-level isolation: process-per-run with brokered effects
 
-> **Status:** Phases 1–3 implemented (`crates/chidori/src/runtime/isolate/`):
+> **Status:** Phases 1–3b implemented (`crates/chidori/src/runtime/isolate/`):
 > process-per-run brokering, the rlimits/deadline-kill resource floor, and a
-> Linux seccomp denylist. Remaining: the namespace/cgroup layer (deferred — needs
-> privilege/delegation), tightening seccomp toward an allowlist, and macOS
-> Seatbelt (phase 4).
+> Linux confinement stack — empty network namespace + Landlock read-only
+> filesystem + seccomp denylist, each best-effort with graceful fallback.
+> Remaining: cgroup v2 `memory.max` (needs delegation), tightening seccomp toward
+> an allowlist, rootless net-ns via user namespaces, and macOS Seatbelt (phase 4).
 > **Closes:** [`docs/sandbox-model.md`](./sandbox-model.md) gap #4 ("No process / OS-level
 > isolation"), and as a side effect tightens gaps #2, #3, #6 (memory accounting
 > precision and cross-run heap hygiene).
@@ -308,8 +309,10 @@ error frame the child writes from its `catch_unwind` boundary before exiting:
 2. **Resource floor.** ✅ **Done (rlimits + deadline-kill)** —
    `runtime::isolate::limits` applies a per-process `setrlimit` floor in the
    worker before any agent code runs (`RLIMIT_CPU` hard CPU-seconds backstop to
-   the opcode budget — ignores broker-wait time; `RLIMIT_FSIZE=0` since the child
-   has no filesystem; `RLIMIT_CORE=0`; `RLIMIT_NOFILE`), and the supervisor adds
+   the opcode budget — ignores broker-wait time; `RLIMIT_CORE=0`; `RLIMIT_NOFILE`;
+   `RLIMIT_FSIZE` opt-in only — a `0` cap also kills writes to a redirected
+   regular-file `stderr`, so file-write confinement is Landlock's job instead),
+   and the supervisor adds
    a `SIGKILL` **deadline-kill** watchdog (`CHIDORI_ISOLATE_DEADLINE_MS`) plus
    **signal-aware failure mapping** (CPU/file/OOM/deadline → precise errors).
    Limits ride the `Init` frame so the parent owns the policy; the in-process
@@ -320,7 +323,7 @@ error frame the child writes from its `catch_unwind` boundary before exiting:
    too blunt — a multi-threaded VM over-reserves virtual memory) and `RLIMIT_NPROC`
    (fragile under shared-uid concurrency; blocking `fork` belongs to the seccomp
    phase). Env: `CHIDORI_ISOLATE_{CPU_SECS,FSIZE_BYTES,NOFILE,NO_CORE,DEADLINE_MS}`.
-3. **Linux syscall confinement.** ⏳ **Partly done (seccomp denylist)** —
+3. **Linux syscall confinement.** ✅ **Done (seccomp denylist)** —
    `runtime::isolate::sandbox` installs a seccomp-bpf filter in the worker (via
    `seccompiler`) before any agent code runs: default-allow, `KILL_PROCESS` on a
    curated denylist (the whole socket family, `exec*`, `ptrace`/`process_vm_*`,
@@ -334,10 +337,20 @@ error frame the child writes from its `catch_unwind` boundary before exiting:
    skip-aware). **Chosen denylist over allowlist** deliberately — it cannot
    false-positive-kill the engine and the primary boundary is still
    capability-confinement + brokering; the near-empty allowlist remains the end
-   goal. **Deferred:** empty net namespace + mount/pid/user namespaces + Landlock
-   and cgroup v2 `memory.max` — all need privilege or cgroup delegation that many
-   deploy targets (rootless containers, CI) lack, so they need a capability probe
-   + graceful fallback before they can ship without regressing the common case.
+   goal (a future tightening).
+3b. **Namespaces + Landlock + cgroup.** ⏳ **Partly done (net-ns + Landlock)** —
+   `sandbox::apply()` now layers, before seccomp (so `unshare`/`landlock_*` are
+   still legal): an **empty network namespace** (`unshare(CLONE_NEWNET)` —
+   belt-and-suspenders with the socket block; needs `CAP_SYS_ADMIN`, skipped
+   rootless) and a **Landlock read-only filesystem** (deny every write-class
+   access, leave reads for the C runtime; closes the `openat`-write surface
+   seccomp leaves open, and unlike `RLIMIT_FSIZE` it spares inherited fds like a
+   redirected `stderr`). Both best-effort with graceful skip + a `notes` log; a
+   single `SandboxOutcome` drives `REQUIRE_SANDBOX` (seccomp is the required
+   core) and the skip-aware self-tests (`isolate_limits::landlock_blocks_file_creation`).
+   **Deferred:** cgroup v2 `memory.max` (needs delegation — the per-process heap
+   watchdog from phase 2 is the graceful stand-in), rootless net-ns via an
+   intermediate user namespace, and mount/pid namespaces.
 4. **macOS Seatbelt** profile + the `Sandbox` trait FFI; CI parity.
 5. **Polish:** `--isolate` UX, policy-profile coupling, docs, optional warm pool.
 

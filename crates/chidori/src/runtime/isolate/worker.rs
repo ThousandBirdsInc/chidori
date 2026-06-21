@@ -6,8 +6,10 @@
 //! back to the parent over the pipe via [`BrokeredHost`]. It never touches the
 //! filesystem, the network, or a clock of its own — those live behind the seam.
 //!
-//! Phase 1 wires the broker but applies no sandbox yet; the seccomp / namespace
-//! confinement lands in a later phase (see `docs/os-isolation-plan.md`).
+//! Before running the agent the worker seals itself in: the `setrlimit` floor
+//! ([`super::limits`]) then the best-effort confinement layers — network
+//! namespace, Landlock, and the seccomp denylist ([`super::sandbox`]). See
+//! `docs/os-isolation-plan.md`.
 
 use std::cell::RefCell;
 use std::io::{self, Read, Write};
@@ -122,43 +124,44 @@ fn serve_inner<R: Read + 'static, W: Write + 'static>(
         }
     };
 
-    // Slam the resource floor shut, then the syscall door — before any agent code
-    // runs, and only in a real worker process (see `serve_inner`'s `apply_limits`;
-    // these mutate the *current* process, which is sound only when it is a
-    // dedicated worker). Both are best-effort: a limit or filter that can't be
+    // Slam the resource floor shut, then the confinement layers — before any agent
+    // code runs, and only in a real worker process (see `serve_inner`'s
+    // `apply_limits`; these mutate the *current* process, which is sound only when
+    // it is a dedicated worker). Every layer is best-effort: one that can't be
     // installed degrades isolation but never fails the run, unless the operator
-    // demands `CHIDORI_ISOLATE_REQUIRE_SANDBOX`, in which case we fail closed.
-    let seccomp_applied = if apply_limits {
+    // demands `CHIDORI_ISOLATE_REQUIRE_SANDBOX`, in which case a missing seccomp
+    // core fails closed.
+    let sandbox = if apply_limits {
         limits.apply_to_self();
-        match super::sandbox::install_seccomp() {
-            Ok(()) => true,
-            Err(reason) => {
-                eprintln!("isolate worker: seccomp not applied: {reason}");
-                if env_truthy("CHIDORI_ISOLATE_REQUIRE_SANDBOX") {
-                    let mut guard = io.borrow_mut();
-                    return write_frame(
-                        &mut guard.writer,
-                        &FromChild::Done {
-                            outcome: Outcome::Err(format!(
-                                "isolation sandbox required but unavailable: {reason}"
-                            )),
-                        },
-                    );
-                }
-                false
-            }
-        }
+        super::sandbox::apply()
     } else {
         let _ = &limits;
-        false
+        super::sandbox::SandboxOutcome::default()
     };
+    for note in &sandbox.notes {
+        eprintln!("isolate worker: sandbox: {note}");
+    }
+    if apply_limits && env_truthy("CHIDORI_ISOLATE_REQUIRE_SANDBOX") && !sandbox.seccomp_applied {
+        let mut guard = io.borrow_mut();
+        return write_frame(
+            &mut guard.writer,
+            &FromChild::Done {
+                outcome: Outcome::Err(
+                    "isolation sandbox required but the seccomp core could not be applied"
+                        .to_string(),
+                ),
+            },
+        );
+    }
 
-    // Test-only probe: once the sandbox is in place, attempt a denied syscall to
-    // prove the filter blocks it (the process is killed by SIGSYS and never
-    // returns). Gated behind an env var so it is inert in normal operation.
+    // Test-only probes: once the sandbox is in place, attempt an operation a given
+    // layer must forbid, to prove it does. Gated behind an env var so it is inert
+    // in normal operation.
     #[cfg(unix)]
-    if std::env::var_os("CHIDORI_ISOLATE_SELFTEST_SOCKET").is_some() {
-        selftest_denied_socket(seccomp_applied);
+    if apply_limits {
+        if let Some(mode) = std::env::var_os("CHIDORI_ISOLATE_SELFTEST") {
+            run_selftest(&mode.to_string_lossy(), &sandbox);
+        }
     }
 
     let host: Rc<dyn RunHost> = Rc::new(BrokeredHost {
@@ -193,21 +196,56 @@ fn env_truthy(key: &str) -> bool {
     }
 }
 
-/// Self-test for the seccomp denylist (driven by `isolate_limits` integration
-/// tests). With the filter active, `socket()` must trigger `SIGSYS` and kill the
-/// process before it returns — so this function never returns in that case. If
-/// seccomp could not be applied (e.g. a kernel/container that forbids it), it
-/// says so and exits cleanly so the test can *skip* rather than fail.
+/// Dispatch a sandbox self-test probe (driven by `isolate_limits` integration
+/// tests via `CHIDORI_ISOLATE_SELFTEST`). Each probe attempts an operation the
+/// named layer must forbid and reports the result on stderr; if the relevant
+/// layer wasn't applied in this environment it prints an `*-unavailable` marker
+/// so the test can *skip* rather than fail. Always terminates the process.
 #[cfg(unix)]
-fn selftest_denied_socket(seccomp_applied: bool) -> ! {
-    if !seccomp_applied {
-        eprintln!("isolate-selftest: seccomp-unavailable");
-        std::process::exit(0);
+fn run_selftest(mode: &str, sandbox: &crate::runtime::isolate::sandbox::SandboxOutcome) -> ! {
+    match mode {
+        // seccomp: `socket()` must raise SIGSYS and kill us before it returns.
+        "socket" => {
+            if !sandbox.seccomp_applied {
+                eprintln!("isolate-selftest: seccomp-unavailable");
+                std::process::exit(0);
+            }
+            // SAFETY: `socket` takes scalar args. With the filter active the call
+            // never returns (the kernel raises SIGSYS); if it does, the filter
+            // failed to block it — a real test failure.
+            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            eprintln!("isolate-selftest: socket-not-blocked (fd={fd})");
+            std::process::exit(97);
+        }
+        // Landlock: creating a file must be denied (EACCES) under the read-only
+        // policy. Distinct from RLIMIT_FSIZE, which blocks the *write*, not the open.
+        "fs-write" => {
+            if !sandbox.landlock_enforced {
+                eprintln!("isolate-selftest: landlock-unavailable");
+                std::process::exit(0);
+            }
+            let path = c"/tmp/chidori-landlock-selftest";
+            // SAFETY: `open` takes a valid NUL-terminated path and scalar flags.
+            let fd = unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+                    0o600,
+                )
+            };
+            if fd >= 0 {
+                // SAFETY: closing an fd we just opened.
+                unsafe { libc::close(fd) };
+                eprintln!("isolate-selftest: fs-write-not-blocked");
+                std::process::exit(96);
+            }
+            let err = std::io::Error::last_os_error();
+            eprintln!("isolate-selftest: fs-write-blocked ({err})");
+            std::process::exit(0);
+        }
+        other => {
+            eprintln!("isolate-selftest: unknown mode `{other}`");
+            std::process::exit(95);
+        }
     }
-    // SAFETY: `socket` takes scalar args and has no memory-safety contract. With
-    // the filter active the call never returns (the kernel raises SIGSYS); if it
-    // *does* return, the filter failed to block it — a real test failure.
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    eprintln!("isolate-selftest: socket-not-blocked (fd={fd})");
-    std::process::exit(97);
 }
