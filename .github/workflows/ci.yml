@@ -45,6 +45,9 @@ jobs:
       - name: Build package
         run: npm run build
 
+      - name: Test
+        run: npm test
+
   python-sdk:
     name: Python SDK integration
     runs-on: ubuntu-24.04

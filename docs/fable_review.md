@@ -305,8 +305,11 @@ fresh clone.
 
 Both SDKs are zero-dependency and mirror each other. Gaps:
 
-- **No npm or PyPI publish automation** despite both SDKs being at 3.0.0 and
-  the README badging npm/PyPI.
+- ~~**No npm or PyPI publish automation** despite both SDKs being at 3.0.0 and
+  the README badging npm/PyPI.~~ *(Update 2026-06-21: resolved —
+  `.github/workflows/release.yml` publishes the TypeScript SDK to npm and the
+  Python SDK to PyPI via OIDC trusted publishing on tag push, alongside the
+  crates.io and binary jobs.)*
 - Both SDK READMEs say checkpoint resume goes through call-log replay
   because "direct live VM continuation … is still gated on the QuickJS
   serializer". That was stale before; it is wrong in a new way now — live-VM
@@ -318,8 +321,10 @@ Both SDKs are zero-dependency and mirror each other. Gaps:
 - Good: engine unit/integration tests (`crates/chidori-js/tests/`), CLI
   integration tests, 8 Python-SDK integration tests against a real server,
   and Test262 in CI.
-- Missing: **any TypeScript SDK tests** (CI only typechecks and builds it);
-  MCP/ACP protocol tests.
+- ~~Missing: **any TypeScript SDK tests** (CI only typechecks and builds
+  it)~~ *(Update 2026-06-21: added — `sdk/typescript/test/` drives the HTTP
+  client against a `node:http` mock via Node's built-in test runner, wired
+  into CI as a `npm test` step)*; MCP/ACP protocol tests remain absent.
 
 ### Examples and docs — the doc-drift list
 
@@ -397,8 +402,12 @@ The original items, for the record:
    configured no `CHIDORI_POLICY*` source (malformed configuration fails
    closed), with `--trusted` as the explicit opt-out; `chidori run` keeps
    the permissive default for local developer-authored code.
-4. ~~Run Test262 in CI~~ — **done** (#41). Add TypeScript SDK tests next.
-5. **Automate SDK publishing** to npm/PyPI, or remove the registry badges.
+4. ~~Run Test262 in CI~~ — **done** (#41). ~~Add TypeScript SDK tests next.~~
+   — **done** (2026-06-21): `sdk/typescript/test/` runs on Node's built-in
+   test runner and is gated in CI.
+5. ~~**Automate SDK publishing** to npm/PyPI, or remove the registry badges.~~
+   — **done**: `.github/workflows/release.yml` publishes both SDKs (npm + PyPI
+   via OIDC trusted publishing) on tag.
 6. ~~**Pay down the doc drift** (the list above): README engine section, SDK
    READMEs, sandbox-model preamble, archive the two migration docs, the
    conformance.sh `ENGINE` knob.~~ — **done**: the README engine/conformance
