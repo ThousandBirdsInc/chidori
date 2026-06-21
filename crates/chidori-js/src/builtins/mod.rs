@@ -11,6 +11,7 @@ mod disposable;
 
 mod date;
 pub(crate) mod fundamental;
+mod intl;
 mod numbers;
 
 mod regexp_builtin;
@@ -40,6 +41,7 @@ pub fn install(vm: &mut Vm) {
     typedarray::install(vm);
     crate::proxy::install(vm);
     disposable::install(vm);
+    intl::install(vm);
     install_globals(vm);
 }
 

@@ -1547,6 +1547,7 @@ impl Vm {
             PropertyKey::Sym(sym) => {
                 *sym == self.realm.symbol_array_buffer_shared
                     || *sym == self.realm.symbol_disposable_state
+                    || *sym == self.realm.symbol_intl_locale
             }
         }
     }

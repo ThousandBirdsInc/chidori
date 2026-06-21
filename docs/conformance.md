@@ -148,6 +148,27 @@ agent. `Atomics.wait` reports that the calling agent cannot block (as a browser
 main thread does); `Atomics.waitAsync` and the genuinely-concurrent
 `$262.agent` tests stay skipped, since a second agent cannot be hosted.
 
+## Intl (opt-in: `--intl`)
+
+A foundational slice of ECMA-402 is implemented, backed by ICU4X
+(`icu_locale_core` + the CLDR-data `icu_locale` canonicalizer/expander):
+the `Intl` namespace, `Intl.getCanonicalLocales`, and the full `Intl.Locale`
+constructor + prototype (`baseName`/`language`/`script`/`region`/`variants`
+and the `calendar`/`collation`/`hourCycle`/`caseFirst`/`numeric`/
+`numberingSystem` Unicode-extension accessors, plus `maximize`/`minimize`/
+`toString`). Against `test/intl402/Intl` + `test/intl402/Locale` (run with
+`--intl`) the engine passes **134** of the executed tests.
+
+Not yet implemented (so still failing/skipped under `--intl`): the
+formatters (`NumberFormat`, `DateTimeFormat`, `Collator`, `PluralRules`,
+`ListFormat`, …), `Intl.supportedValuesOf`, the `Intl.Locale-info`
+accessors (`getCalendars`/`getWeekInfo`/…, an honest skip via that feature
+tag), and the long tail of Unicode-extension *keyword-value*
+canonicalization (e.g. `-u-ca-gregorian` → `-u-ca-gregory`), which needs
+the CLDR bcp47 alias tables the `icu_locale` canonicalizer does not apply.
+`intl402/` remains skipped in the default gate (it is opt-in via `--intl`),
+so this surface is not yet part of the committed baseline.
+
 ## CI gate
 
 `.github/workflows/test262.yml` runs `scripts/test262.sh --gate` on:

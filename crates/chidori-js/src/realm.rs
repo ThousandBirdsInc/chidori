@@ -86,6 +86,9 @@ pub struct Realm {
     /// (`IsSharedArrayBuffer`). A symbol — script-unreachable — so it cannot be
     /// observed; `own_keys` also filters it from `getOwnPropertySymbols`.
     pub symbol_array_buffer_shared: JsSymbol,
+    /// Engine-private key holding an `Intl.Locale`'s canonical `[[Locale]]`
+    /// string (the brand for `IsInitializedLocale`). Filtered from `own_keys`.
+    pub symbol_intl_locale: JsSymbol,
 
     /// Registry for `Symbol.for`.
     pub symbol_registry: indexmap::IndexMap<String, JsSymbol>,
@@ -208,6 +211,7 @@ impl Realm {
             symbol_async_dispose: bare_symbol(15, "Symbol.asyncDispose"),
             symbol_disposable_state: bare_symbol(16, "[[DisposableState]]"),
             symbol_array_buffer_shared: bare_symbol(17, "[[ArrayBufferShared]]"),
+            symbol_intl_locale: bare_symbol(18, "[[InitializedLocale]]"),
             symbol_registry: indexmap::IndexMap::new(),
         }
     }

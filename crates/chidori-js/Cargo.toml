@@ -35,6 +35,11 @@ num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"
 unicode-normalization = "0.1.25"
+# Intl: locale identifier parsing/canonicalization (`icu_locale_core`, already in
+# the tree via oxc) plus the CLDR-data-backed canonicalizer/expander (`icu_locale`,
+# `compiled_data`) that powers `Intl.getCanonicalLocales` and `Intl.Locale`.
+icu_locale_core = "2"
+icu_locale = "2"
 
 [dev-dependencies]
 criterion = "0.5"
