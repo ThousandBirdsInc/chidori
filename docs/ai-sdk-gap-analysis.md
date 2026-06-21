@@ -248,7 +248,9 @@ Gap:
 - No mock provider API exposed to agent authors beyond environment-level static
   provider behavior.
 - No stream simulation utilities for frontend/client tests.
-- TypeScript SDK tests are still listed as product follow-through work.
+- The TypeScript SDK now has a client test suite (`sdk/typescript/test/`,
+  Node's built-in runner), but there is still no published mock-provider or
+  stream-simulation test-helper package comparable to `ai/test`.
 
 ### 10. Package And Ecosystem Fit
 

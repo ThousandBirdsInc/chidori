@@ -92,11 +92,15 @@ clusters:
 
 ### Product follow-through (from `docs/fable_review.md`)
 
-- [ ] **SDK publishing** — both SDKs are at 3.0.0 and the README badges
-  npm/PyPI, but there is no publish automation. Wire it up or drop the badges.
-- [ ] **TypeScript SDK tests** — there are none; CI only typechecks and builds
-  the TS SDK. The 8 Python-SDK integration tests against a real server are the
-  template.
+- [x] **SDK publishing** — `.github/workflows/release.yml` publishes the
+  TypeScript SDK to npm and the Python SDK to PyPI (both via OIDC trusted
+  publishing), alongside the crates.io and prebuilt-binary jobs, on tag push.
+  The npm/PyPI README badges are now backed by automation.
+- [x] **TypeScript SDK tests** — `sdk/typescript/test/` exercises the HTTP
+  client (run/replay/resume/signal/stream/checkpoint), SSE parsing, and
+  manifest/serialization round-trips against a mock server via Node's built-in
+  test runner (`npm test`), wired into CI. The Python-SDK integration tests
+  against a real server remain the end-to-end complement.
 - [ ] **Broader `node:` allowlist** — `stream`, `zlib`, and `child_process`
   remain unsupported (the current allowlist covers `process`, `buffer`, `util`,
   `fs`, `fs/promises`, `crypto`, `http`, `https`, `path`, `events`, `url`,

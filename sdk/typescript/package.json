@@ -27,7 +27,9 @@
   "files": ["dist", "src", "README.md"],
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "pretest": "tsc",
+    "test": "node --test test/*.test.mjs"
   },
   "devDependencies": {
     "typescript": "^5.4.0"

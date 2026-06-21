@@ -126,3 +126,17 @@ journal/scaffold metadata rather than serialized VM bytes.
 
 Use `client.getSnapshotManifest(sessionId)` when a UI needs only snapshot
 metadata. The endpoint never returns the binary VM snapshot.
+
+## Tests
+
+The SDK ships a dependency-free test suite (Node's built-in `node:test`
+runner) that drives `AgentClient` against a stdlib `node:http` mock server,
+covering run/replay/resume/signal, SSE stream parsing, checkpoint
+serialization, and error handling:
+
+```bash
+npm test   # builds, then runs node --test test/*.test.mjs
+```
+
+End-to-end coverage against a real `chidori serve` binary lives in the Python
+SDK integration tests (`sdk/python/tests/`).
