@@ -235,7 +235,9 @@ resource-precision gaps.
    there is no seccomp, namespace, or separate-process boundary. Isolation is
    purely capability-confinement plus Rust memory safety. A panic is contained
    (gap-free via `catch_unwind`), but this is not a substitute for OS containment
-   when running genuinely hostile code.
+   when running genuinely hostile code. A proposed additive fix —
+   process-per-run with brokered effects + per-OS sandboxing — is specified in
+   [`docs/os-isolation-plan.md`](./os-isolation-plan.md).
 
 5. **Container element counts beyond arrays are uncapped.** Arrays are bounded by
    `MAX_DENSE_ARRAY` (1M), but `Map`/`Set`/object property counts are not
