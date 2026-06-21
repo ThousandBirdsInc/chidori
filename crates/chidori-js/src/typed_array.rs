@@ -7,6 +7,11 @@ use crate::value::*;
 use crate::vm::Vm;
 use num_bigint::{BigInt, Sign};
 
+/// Hidden own-property name holding a resizable/growable buffer's
+/// `[[ArrayBufferMaxByteLength]]`. An internal slot, never a real property:
+/// `Vm::own_keys` filters it out of `[[OwnPropertyKeys]]`.
+pub const ARRAY_BUFFER_MAX_SLOT: &str = "[[ArrayBufferMaxByteLength]]";
+
 // =========================================================================
 // Element codec (little-endian, matching the platform/spec default)
 // =========================================================================
@@ -180,6 +185,47 @@ impl Vm {
             Some(self.realm.array_buffer_proto.clone()),
             Internal::ArrayBuffer(Some(vec![0u8; len])),
         ))
+    }
+
+    /// `IsSharedArrayBuffer(O)`: true when the buffer carries the engine-private
+    /// shared brand. (A SharedArrayBuffer shares the `Internal::ArrayBuffer`
+    /// byte storage; only the brand and prototype distinguish it.)
+    pub fn is_shared_buffer(&self, o: &JsObject) -> bool {
+        o.borrow().props.contains_key(&PropertyKey::Sym(
+            self.realm.symbol_array_buffer_shared.clone(),
+        ))
+    }
+
+    /// A fresh `SharedArrayBuffer` of `len` zero bytes — an `Internal::ArrayBuffer`
+    /// stamped with the shared brand and (when `max` is set) the growable-max
+    /// internal slot. Both live in `props` but are hidden by `own_keys`.
+    pub fn new_shared_array_buffer(&self, len: usize, max: Option<usize>) -> JsObject {
+        let o = self.alloc(ObjectData::new(
+            Some(self.realm.shared_array_buffer_proto.clone()),
+            Internal::ArrayBuffer(Some(vec![0u8; len])),
+        ));
+        {
+            let mut b = o.borrow_mut();
+            let slot = |value: Value| Property {
+                kind: PropertyKind::Data {
+                    value,
+                    writable: false,
+                },
+                enumerable: false,
+                configurable: false,
+            };
+            b.props.insert(
+                PropertyKey::Sym(self.realm.symbol_array_buffer_shared.clone()),
+                slot(Value::Bool(true)),
+            );
+            if let Some(m) = max {
+                b.props.insert(
+                    PropertyKey::str(ARRAY_BUFFER_MAX_SLOT),
+                    slot(Value::Number(m as f64)),
+                );
+            }
+        }
+        o
     }
 
     /// A typed array view. `proto` is the per-kind prototype.

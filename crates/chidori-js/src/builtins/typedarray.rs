@@ -1,8 +1,9 @@
-//! ArrayBuffer, %TypedArray% (the shared base), the nine concrete typed-array
-//! constructors, and DataView. The element storage and indexed `[[Get]]`/`[[Set]]`
-//! exotic behavior live in `crate::typed_array` and the VM; this module builds the
-//! observable builtin surface (constructors, prototype methods, static helpers) on
-//! top of those primitives.
+//! ArrayBuffer, SharedArrayBuffer, %TypedArray% (the shared base), the nine
+//! concrete typed-array constructors, DataView, and the Atomics namespace. The
+//! element storage and indexed `[[Get]]`/`[[Set]]` exotic behavior live in
+//! `crate::typed_array` and the VM; this module builds the observable builtin
+//! surface (constructors, prototype methods, static helpers) on top of those
+//! primitives.
 
 use super::arg;
 use crate::value::*;
@@ -14,9 +15,11 @@ pub fn install(vm: &mut Vm) {
     let species = vm.realm.symbol_species.clone();
 
     install_array_buffer(vm, &species);
+    install_shared_array_buffer(vm, &species);
     let ta_ctor = install_typed_array_base(vm, &species);
     install_kind_ctors(vm, &ta_ctor);
     install_data_view(vm);
+    install_atomics(vm);
 }
 
 // =========================================================================
@@ -40,6 +43,34 @@ fn define_species_getter(vm: &mut Vm, ctor: &JsObject, species: &JsSymbol) {
 // ArrayBuffer
 // =========================================================================
 
+/// Validate that `this` is an ArrayBuffer object whose shared-ness matches
+/// `want_shared`, returning its handle or a TypeError naming the surface. This
+/// is the brand split between the `ArrayBuffer.prototype` and
+/// `SharedArrayBuffer.prototype` method/accessor families (both share the
+/// `[[ArrayBufferData]]` slot; only `IsSharedArrayBuffer` tells them apart).
+fn ab_receiver(
+    vm: &mut Vm,
+    this: &Value,
+    want_shared: bool,
+    what: &str,
+) -> Result<JsObject, Value> {
+    if let Value::Object(o) = this {
+        if matches!(o.borrow().internal, Internal::ArrayBuffer(_))
+            && vm.is_shared_buffer(o) == want_shared
+        {
+            return Ok(o.clone());
+        }
+    }
+    let proto = if want_shared {
+        "SharedArrayBuffer"
+    } else {
+        "ArrayBuffer"
+    };
+    Err(vm.throw_type(&format!(
+        "{proto}.prototype.{what} called on incompatible receiver"
+    )))
+}
+
 /// Read the byte length of an ArrayBuffer object (0 if detached or not a buffer).
 fn buffer_byte_length(o: &JsObject) -> usize {
     match &o.borrow().internal {
@@ -48,8 +79,9 @@ fn buffer_byte_length(o: &JsObject) -> usize {
     }
 }
 
-/// Hidden own-property holding a resizable ArrayBuffer's `[[ArrayBufferMaxByteLength]]`.
-const AB_MAX: &str = "[[ArrayBufferMaxByteLength]]";
+/// Hidden own-property holding a resizable ArrayBuffer's
+/// `[[ArrayBufferMaxByteLength]]` (an internal slot; see the engine-core const).
+use crate::typed_array::ARRAY_BUFFER_MAX_SLOT as AB_MAX;
 
 /// The resizable max for a buffer, or `None` when it is fixed-length.
 fn ab_max_byte_length(o: &JsObject) -> Option<usize> {
@@ -75,14 +107,7 @@ fn ab_transfer(
     args: &[Value],
     preserve_resizable: bool,
 ) -> Result<Value, Value> {
-    let o = match this {
-        Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => o.clone(),
-        _ => {
-            return Err(
-                vm.throw_type("ArrayBuffer.prototype.transfer called on incompatible receiver")
-            )
-        }
-    };
+    let o = ab_receiver(vm, this, false, "transfer")?;
     let (old_bytes, max) = {
         let b = o.borrow();
         match &b.internal {
@@ -184,15 +209,10 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
     // ArrayBuffer[Symbol.species] => ArrayBuffer
     define_species_getter(vm, &ctor, species);
 
-    // get ArrayBuffer.prototype.byteLength
-    let bl_getter = vm.new_native("get byteLength", 0, |vm, this, _a| match &this {
-        Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => {
-            Ok(Value::Number(buffer_byte_length(o) as f64))
-        }
-        _ => {
-            Err(vm
-                .throw_type("get ArrayBuffer.prototype.byteLength called on incompatible receiver"))
-        }
+    // get ArrayBuffer.prototype.byteLength (throws on a SharedArrayBuffer)
+    let bl_getter = vm.new_native("get byteLength", 0, |vm, this, _a| {
+        let o = ab_receiver(vm, &this, false, "byteLength")?;
+        Ok(Value::Number(buffer_byte_length(&o) as f64))
     });
     vm.define_accessor(
         &Value::Object(proto.clone()),
@@ -203,15 +223,12 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
 
     // get ArrayBuffer.prototype.maxByteLength — the resizable max, or (for a
     // fixed-length buffer) its current byteLength.
-    let mbl_getter = vm.new_native("get maxByteLength", 0, |vm, this, _a| match &this {
-        Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => {
-            let max = ab_max_byte_length(o);
-            Ok(Value::Number(
-                max.unwrap_or_else(|| buffer_byte_length(o)) as f64
-            ))
-        }
-        _ => Err(vm
-            .throw_type("get ArrayBuffer.prototype.maxByteLength called on incompatible receiver")),
+    let mbl_getter = vm.new_native("get maxByteLength", 0, |vm, this, _a| {
+        let o = ab_receiver(vm, &this, false, "maxByteLength")?;
+        let max = ab_max_byte_length(&o);
+        Ok(Value::Number(
+            max.unwrap_or_else(|| buffer_byte_length(&o)) as f64
+        ))
     });
     vm.define_accessor(
         &Value::Object(proto.clone()),
@@ -221,14 +238,10 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
     );
 
     // get ArrayBuffer.prototype.resizable
-    let rsz_getter =
-        vm.new_native("get resizable", 0, |vm, this, _a| match &this {
-            Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => {
-                Ok(Value::Bool(ab_max_byte_length(o).is_some()))
-            }
-            _ => Err(vm
-                .throw_type("get ArrayBuffer.prototype.resizable called on incompatible receiver")),
-        });
+    let rsz_getter = vm.new_native("get resizable", 0, |vm, this, _a| {
+        let o = ab_receiver(vm, &this, false, "resizable")?;
+        Ok(Value::Bool(ab_max_byte_length(&o).is_some()))
+    });
     vm.define_accessor(
         &Value::Object(proto.clone()),
         PropertyKey::str("resizable"),
@@ -236,14 +249,11 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
         None,
     );
 
-    // get ArrayBuffer.prototype.detached
-    let det_getter = vm.new_native("get detached", 0, |vm, this, _a| match &this {
-        Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => Ok(
-            Value::Bool(matches!(o.borrow().internal, Internal::ArrayBuffer(None))),
-        ),
-        _ => {
-            Err(vm.throw_type("get ArrayBuffer.prototype.detached called on incompatible receiver"))
-        }
+    // get ArrayBuffer.prototype.detached (throws on a SharedArrayBuffer)
+    let det_getter = vm.new_native("get detached", 0, |vm, this, _a| {
+        let o = ab_receiver(vm, &this, false, "detached")?;
+        let detached = matches!(o.borrow().internal, Internal::ArrayBuffer(None));
+        Ok(Value::Bool(detached))
     });
     vm.define_accessor(
         &Value::Object(proto.clone()),
@@ -254,16 +264,7 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
 
     // ArrayBuffer.prototype.resize(newByteLength)
     vm.define_method(&proto, "resize", 1, |vm, this, args| {
-        let o = match &this {
-            Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => {
-                o.clone()
-            }
-            _ => {
-                return Err(
-                    vm.throw_type("ArrayBuffer.prototype.resize called on incompatible receiver")
-                )
-            }
-        };
+        let o = ab_receiver(vm, &this, false, "resize")?;
         let max = match ab_max_byte_length(&o) {
             Some(m) => m,
             None => {
@@ -296,16 +297,7 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
 
     // ArrayBuffer.prototype.slice(begin, end)
     vm.define_method(&proto, "slice", 2, |vm, this, args| {
-        let o = match &this {
-            Value::Object(o) if matches!(o.borrow().internal, Internal::ArrayBuffer(_)) => {
-                o.clone()
-            }
-            _ => {
-                return Err(
-                    vm.throw_type("ArrayBuffer.prototype.slice called on incompatible receiver")
-                )
-            }
-        };
+        let o = ab_receiver(vm, &this, false, "slice")?;
         if matches!(o.borrow().internal, Internal::ArrayBuffer(None)) {
             return Err(vm.throw_type("ArrayBuffer.prototype.slice called on a detached buffer"));
         }
@@ -377,6 +369,193 @@ fn install_array_buffer(vm: &mut Vm, species: &JsSymbol) {
         Property {
             kind: PropertyKind::Data {
                 value: Value::str("ArrayBuffer"),
+                writable: false,
+            },
+            enumerable: false,
+            configurable: true,
+        },
+    );
+}
+
+// =========================================================================
+// SharedArrayBuffer
+// =========================================================================
+
+/// `GetArrayBufferMaxByteLengthOption`: read `options.maxByteLength` (if
+/// `options` is an object and the property is not `undefined`), validating it
+/// against the buffer's initial `len`. `None` ⇒ the buffer is fixed-length.
+fn max_byte_length_option(
+    vm: &mut Vm,
+    options: &Value,
+    len: usize,
+) -> Result<Option<usize>, Value> {
+    let Value::Object(opts) = options else {
+        return Ok(None);
+    };
+    let mbl = vm.get_prop(
+        &Value::Object(opts.clone()),
+        &PropertyKey::str("maxByteLength"),
+    )?;
+    if mbl.is_undefined() {
+        return Ok(None);
+    }
+    let max = byte_length_arg(vm, &mbl)?;
+    if len > max {
+        return Err(vm.throw_range("buffer length exceeds maxByteLength"));
+    }
+    Ok(Some(max))
+}
+
+fn install_shared_array_buffer(vm: &mut Vm, species: &JsSymbol) {
+    let proto = vm.realm.shared_array_buffer_proto.clone();
+
+    let construct = |vm: &mut Vm, _this: Value, args: &[Value]| -> Result<Value, Value> {
+        let len = byte_length_arg(vm, &arg(args, 0))?;
+        // Optional `{ maxByteLength }` makes the buffer growable.
+        let max = max_byte_length_option(vm, &arg(args, 1), len)?;
+        Ok(Value::Object(vm.new_shared_array_buffer(len, max)))
+    };
+    let ctor = vm.new_native_ctor(
+        "SharedArrayBuffer",
+        1,
+        |vm, _t, _a| Err(vm.throw_type("Constructor SharedArrayBuffer requires 'new'")),
+        construct,
+    );
+    vm.install_ctor("SharedArrayBuffer", &ctor, &proto);
+
+    // SharedArrayBuffer[Symbol.species] => SharedArrayBuffer
+    define_species_getter(vm, &ctor, species);
+
+    // get SharedArrayBuffer.prototype.byteLength
+    let bl_getter = vm.new_native("get byteLength", 0, |vm, this, _a| {
+        let o = ab_receiver(vm, &this, true, "byteLength")?;
+        Ok(Value::Number(buffer_byte_length(&o) as f64))
+    });
+    vm.define_accessor(
+        &Value::Object(proto.clone()),
+        PropertyKey::str("byteLength"),
+        Some(Value::Object(bl_getter)),
+        None,
+    );
+
+    // get SharedArrayBuffer.prototype.maxByteLength — the growable max, or (for a
+    // fixed-length buffer) its current byteLength.
+    let mbl_getter = vm.new_native("get maxByteLength", 0, |vm, this, _a| {
+        let o = ab_receiver(vm, &this, true, "maxByteLength")?;
+        let max = ab_max_byte_length(&o);
+        Ok(Value::Number(
+            max.unwrap_or_else(|| buffer_byte_length(&o)) as f64
+        ))
+    });
+    vm.define_accessor(
+        &Value::Object(proto.clone()),
+        PropertyKey::str("maxByteLength"),
+        Some(Value::Object(mbl_getter)),
+        None,
+    );
+
+    // get SharedArrayBuffer.prototype.growable
+    let grw_getter = vm.new_native("get growable", 0, |vm, this, _a| {
+        let o = ab_receiver(vm, &this, true, "growable")?;
+        Ok(Value::Bool(ab_max_byte_length(&o).is_some()))
+    });
+    vm.define_accessor(
+        &Value::Object(proto.clone()),
+        PropertyKey::str("growable"),
+        Some(Value::Object(grw_getter)),
+        None,
+    );
+
+    // SharedArrayBuffer.prototype.grow(newByteLength) — grow-only (never shrinks).
+    vm.define_method(&proto, "grow", 1, |vm, this, args| {
+        let o = ab_receiver(vm, &this, true, "grow")?;
+        let max = match ab_max_byte_length(&o) {
+            Some(m) => m,
+            None => {
+                return Err(
+                    vm.throw_type("SharedArrayBuffer.prototype.grow: buffer is not growable")
+                )
+            }
+        };
+        let new_len = byte_length_arg(vm, &arg(args, 0))?;
+        if new_len > max {
+            return Err(
+                vm.throw_range("SharedArrayBuffer.prototype.grow: length exceeds maxByteLength")
+            );
+        }
+        let mut b = o.borrow_mut();
+        if let Internal::ArrayBuffer(Some(bytes)) = &mut b.internal {
+            if new_len < bytes.len() {
+                return Err(vm.throw_range("SharedArrayBuffer.prototype.grow: cannot shrink"));
+            }
+            bytes.resize(new_len, 0);
+        }
+        Ok(Value::Undefined)
+    });
+
+    // SharedArrayBuffer.prototype.slice(begin, end)
+    vm.define_method(&proto, "slice", 2, |vm, this, args| {
+        let o = ab_receiver(vm, &this, true, "slice")?;
+        let len = buffer_byte_length(&o) as isize;
+        let start = rel_index(vm, &arg(args, 0), len, 0)?;
+        let end = rel_index(vm, &arg(args, 1), len, len)?;
+        let new_len = (end - start).max(0) as usize;
+        // SpeciesConstructor(O, %SharedArrayBuffer%), then Construct(ctor, «newLen»).
+        let default_ctor = vm.get_prop(
+            &Value::Object(vm.realm.global.clone()),
+            &PropertyKey::str("SharedArrayBuffer"),
+        )?;
+        let ctor = ta_species_constructor(vm, &o, &default_ctor)?;
+        let new_obj = vm.construct(&ctor, &[Value::Number(new_len as f64)], &ctor)?;
+        let new_buf =
+            match &new_obj {
+                Value::Object(b)
+                    if matches!(b.borrow().internal, Internal::ArrayBuffer(_))
+                        && vm.is_shared_buffer(b) =>
+                {
+                    b.clone()
+                }
+                _ => return Err(vm.throw_type(
+                    "SharedArrayBuffer.prototype.slice: species did not return a SharedArrayBuffer",
+                )),
+            };
+        if new_buf.same(&o) {
+            return Err(vm.throw_type(
+                "SharedArrayBuffer.prototype.slice: species returned the same buffer",
+            ));
+        }
+        if buffer_byte_length(&new_buf) < new_len {
+            return Err(vm.throw_type(
+                "SharedArrayBuffer.prototype.slice: species returned a buffer that is too small",
+            ));
+        }
+        // Copy bytes [start, end) into the new buffer.
+        {
+            let src = o.borrow();
+            if let Internal::ArrayBuffer(Some(src_bytes)) = &src.internal {
+                let s = (start as usize).min(src_bytes.len());
+                let e = (end.max(0) as usize).min(src_bytes.len());
+                if e > s {
+                    let slice: Vec<u8> = src_bytes[s..e].to_vec();
+                    drop(src);
+                    let mut dst = new_buf.borrow_mut();
+                    if let Internal::ArrayBuffer(Some(dst_bytes)) = &mut dst.internal {
+                        let n = slice.len().min(dst_bytes.len());
+                        dst_bytes[..n].copy_from_slice(&slice[..n]);
+                    }
+                }
+            }
+        }
+        Ok(Value::Object(new_buf))
+    });
+
+    // SharedArrayBuffer.prototype[Symbol.toStringTag] = "SharedArrayBuffer"
+    let tag = vm.realm.symbol_to_string_tag.clone();
+    proto.borrow_mut().props.insert(
+        PropertyKey::Sym(tag),
+        Property {
+            kind: PropertyKind::Data {
+                value: Value::str("SharedArrayBuffer"),
                 writable: false,
             },
             enumerable: false,
@@ -2438,6 +2617,377 @@ fn rel_index(vm: &mut Vm, v: &Value, len: isize, default: isize) -> Result<isize
         rel.min(lenf)
     };
     Ok(idx as isize)
+}
+
+// =========================================================================
+// Atomics
+// =========================================================================
+//
+// The embedded runtime is single-threaded (the engine is `Rc`-based and
+// non-`Send`), so every Atomics operation is a plain sequential read /
+// read-modify-write — there is no contention to be atomic against, and that is
+// observationally indistinguishable from a real atomic on a single agent.
+// `Atomics.wait` therefore reports that the calling agent cannot block (as a
+// browser main thread does); the genuinely-concurrent Test262 agent tests are
+// skipped separately. Atomics operate on both shared and non-shared integer
+// typed arrays (ES2024+); only `wait`/`notify` require a SharedArrayBuffer.
+
+#[derive(Clone, Copy)]
+enum AtomicOp {
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
+    Exchange,
+}
+
+/// `ToIndex`: a non-negative integer ≤ 2^53−1, else a RangeError.
+fn to_index(vm: &mut Vm, v: &Value) -> Result<usize, Value> {
+    let n = to_integer_or_infinity(vm, v)?;
+    if n < 0.0 || n > 9007199254740991.0 {
+        return Err(vm.throw_range("Atomics: index out of range"));
+    }
+    Ok(n as usize)
+}
+
+/// `ValidateIntegerTypedArray(typedArray, waitable)`: the receiver must be a
+/// non-detached typed array whose element type is integral. `waitable` narrows
+/// that to `Int32Array` / `BigInt64Array` (the only types `wait`/`notify` accept).
+fn atomic_ta(vm: &mut Vm, value: &Value, waitable: bool) -> Result<(JsObject, TAKind), Value> {
+    let o = match value {
+        Value::Object(o) if matches!(o.borrow().internal, Internal::TypedArray(_)) => o.clone(),
+        _ => return Err(vm.throw_type("Atomics: argument is not an integer TypedArray")),
+    };
+    if ta_out_of_bounds(&o) {
+        return Err(vm.throw_type("Atomics: TypedArray is detached or out of bounds"));
+    }
+    let kind = match &o.borrow().internal {
+        Internal::TypedArray(t) => t.kind,
+        _ => unreachable!(),
+    };
+    let ok = if waitable {
+        matches!(kind, TAKind::I32 | TAKind::I64)
+    } else {
+        !matches!(kind, TAKind::F32 | TAKind::F64 | TAKind::U8Clamped)
+    };
+    if !ok {
+        return Err(vm.throw_type("Atomics: unsupported TypedArray element type"));
+    }
+    Ok((o, kind))
+}
+
+/// `ValidateAtomicAccess(taRecord, requestIndex)`: coerce the index, bounds-check
+/// it against the (live) element count, and return the absolute byte offset of
+/// the element within the backing buffer.
+fn atomic_byte_index(
+    vm: &mut Vm,
+    o: &JsObject,
+    kind: TAKind,
+    index_arg: &Value,
+) -> Result<usize, Value> {
+    let (_, byte_offset, len, _) = ta_fields(o).unwrap();
+    let access = to_index(vm, index_arg)?;
+    if access >= len {
+        return Err(vm.throw_range("Atomics: index out of bounds"));
+    }
+    Ok(byte_offset + access * kind.bytes())
+}
+
+/// `RevalidateAtomicAccess`: after value/index coercion (which can run user code
+/// that detaches or shrinks the buffer), confirm the element still fits.
+fn atomic_revalidate(
+    vm: &mut Vm,
+    o: &JsObject,
+    kind: TAKind,
+    byte_index: usize,
+) -> Result<(), Value> {
+    let oob = match &o.borrow().internal {
+        Internal::TypedArray(t) => {
+            let buf_len = match &t.buffer.borrow().internal {
+                Internal::ArrayBuffer(Some(x)) => x.len(),
+                _ => 0,
+            };
+            byte_index + kind.bytes() > buf_len
+        }
+        _ => true,
+    };
+    if oob {
+        return Err(vm.throw_type("Atomics: typed array became out of bounds"));
+    }
+    Ok(())
+}
+
+/// The backing buffer of a (validated) typed array.
+fn ta_buffer(o: &JsObject) -> JsObject {
+    match &o.borrow().internal {
+        Internal::TypedArray(t) => t.buffer.clone(),
+        _ => unreachable!(),
+    }
+}
+
+/// Wrap a number operand to the element type's raw value (round-trip through the
+/// codec — the spec's `NumberToRawBytes` then `RawBytesToNumber`).
+fn wrap_int(kind: TAKind, v: f64) -> f64 {
+    let mut scratch = [0u8; 8];
+    crate::typed_array::encode(&mut scratch, 0, kind, v);
+    crate::typed_array::decode(&scratch, 0, kind)
+}
+
+fn wrap_big(kind: TAKind, v: &num_bigint::BigInt) -> num_bigint::BigInt {
+    let mut scratch = [0u8; 8];
+    crate::typed_array::encode_big(&mut scratch, 0, kind, v);
+    crate::typed_array::decode_big(&scratch, 0, kind)
+}
+
+/// Read-modify-write on an integer (non-BigInt) element; returns the prior value.
+fn do_integer_rmw(
+    o: &JsObject,
+    byte_index: usize,
+    kind: TAKind,
+    op: AtomicOp,
+    operand: f64,
+) -> f64 {
+    let buffer = ta_buffer(o);
+    let mut b = buffer.borrow_mut();
+    if let Internal::ArrayBuffer(Some(bytes)) = &mut b.internal {
+        let old = crate::typed_array::decode(bytes, byte_index, kind);
+        let opnd = wrap_int(kind, operand);
+        let (oi, vi) = (old as i64, opnd as i64);
+        let res = match op {
+            AtomicOp::Add => oi.wrapping_add(vi),
+            AtomicOp::Sub => oi.wrapping_sub(vi),
+            AtomicOp::And => oi & vi,
+            AtomicOp::Or => oi | vi,
+            AtomicOp::Xor => oi ^ vi,
+            AtomicOp::Exchange => vi,
+        };
+        crate::typed_array::encode(bytes, byte_index, kind, res as f64);
+        old
+    } else {
+        f64::NAN
+    }
+}
+
+/// Read-modify-write on a BigInt element; returns the prior value.
+fn do_bigint_rmw(
+    o: &JsObject,
+    byte_index: usize,
+    kind: TAKind,
+    op: AtomicOp,
+    operand: &num_bigint::BigInt,
+) -> num_bigint::BigInt {
+    let buffer = ta_buffer(o);
+    let mut b = buffer.borrow_mut();
+    if let Internal::ArrayBuffer(Some(bytes)) = &mut b.internal {
+        let old = crate::typed_array::decode_big(bytes, byte_index, kind);
+        let v = wrap_big(kind, operand);
+        let res = match op {
+            AtomicOp::Add => &old + &v,
+            AtomicOp::Sub => &old - &v,
+            AtomicOp::And => &old & &v,
+            AtomicOp::Or => &old | &v,
+            AtomicOp::Xor => &old ^ &v,
+            AtomicOp::Exchange => v,
+        };
+        crate::typed_array::encode_big(bytes, byte_index, kind, &res);
+        old
+    } else {
+        num_bigint::BigInt::from(0)
+    }
+}
+
+fn atomic_rmw(vm: &mut Vm, args: &[Value], op: AtomicOp) -> Result<Value, Value> {
+    let (o, kind) = atomic_ta(vm, &arg(args, 0), false)?;
+    let byte_index = atomic_byte_index(vm, &o, kind, &arg(args, 1))?;
+    if kind.is_bigint() {
+        let v = vm.to_bigint(&arg(args, 2))?;
+        atomic_revalidate(vm, &o, kind, byte_index)?;
+        Ok(Value::bigint(do_bigint_rmw(&o, byte_index, kind, op, &v)))
+    } else {
+        let v = to_integer_or_infinity(vm, &arg(args, 2))?;
+        atomic_revalidate(vm, &o, kind, byte_index)?;
+        Ok(Value::Number(do_integer_rmw(&o, byte_index, kind, op, v)))
+    }
+}
+
+fn atomic_compare_exchange(vm: &mut Vm, args: &[Value]) -> Result<Value, Value> {
+    let (o, kind) = atomic_ta(vm, &arg(args, 0), false)?;
+    let byte_index = atomic_byte_index(vm, &o, kind, &arg(args, 1))?;
+    if kind.is_bigint() {
+        let expected = vm.to_bigint(&arg(args, 2))?;
+        let replacement = vm.to_bigint(&arg(args, 3))?;
+        atomic_revalidate(vm, &o, kind, byte_index)?;
+        let buffer = ta_buffer(&o);
+        let mut b = buffer.borrow_mut();
+        if let Internal::ArrayBuffer(Some(bytes)) = &mut b.internal {
+            let old = crate::typed_array::decode_big(bytes, byte_index, kind);
+            if old == wrap_big(kind, &expected) {
+                crate::typed_array::encode_big(bytes, byte_index, kind, &replacement);
+            }
+            return Ok(Value::bigint(old));
+        }
+        Ok(Value::bigint(num_bigint::BigInt::from(0)))
+    } else {
+        let expected = to_integer_or_infinity(vm, &arg(args, 2))?;
+        let replacement = to_integer_or_infinity(vm, &arg(args, 3))?;
+        atomic_revalidate(vm, &o, kind, byte_index)?;
+        let buffer = ta_buffer(&o);
+        let mut b = buffer.borrow_mut();
+        if let Internal::ArrayBuffer(Some(bytes)) = &mut b.internal {
+            let old = crate::typed_array::decode(bytes, byte_index, kind);
+            if old == wrap_int(kind, expected) {
+                crate::typed_array::encode(bytes, byte_index, kind, replacement);
+            }
+            return Ok(Value::Number(old));
+        }
+        Ok(Value::Number(f64::NAN))
+    }
+}
+
+fn atomic_load(vm: &mut Vm, args: &[Value]) -> Result<Value, Value> {
+    let (o, kind) = atomic_ta(vm, &arg(args, 0), false)?;
+    let byte_index = atomic_byte_index(vm, &o, kind, &arg(args, 1))?;
+    atomic_revalidate(vm, &o, kind, byte_index)?;
+    let buffer = ta_buffer(&o);
+    let b = buffer.borrow();
+    if let Internal::ArrayBuffer(Some(bytes)) = &b.internal {
+        if kind.is_bigint() {
+            return Ok(Value::bigint(crate::typed_array::decode_big(
+                bytes, byte_index, kind,
+            )));
+        }
+        return Ok(Value::Number(crate::typed_array::decode(
+            bytes, byte_index, kind,
+        )));
+    }
+    Ok(Value::Undefined)
+}
+
+fn atomic_store(vm: &mut Vm, args: &[Value]) -> Result<Value, Value> {
+    let (o, kind) = atomic_ta(vm, &arg(args, 0), false)?;
+    let byte_index = atomic_byte_index(vm, &o, kind, &arg(args, 1))?;
+    // `store` returns the fully-coerced input value, not the (possibly truncated)
+    // value actually written to the element.
+    if kind.is_bigint() {
+        let v = vm.to_bigint(&arg(args, 2))?;
+        atomic_revalidate(vm, &o, kind, byte_index)?;
+        let buffer = ta_buffer(&o);
+        let mut b = buffer.borrow_mut();
+        if let Internal::ArrayBuffer(Some(bytes)) = &mut b.internal {
+            crate::typed_array::encode_big(bytes, byte_index, kind, &v);
+        }
+        Ok(Value::bigint(v))
+    } else {
+        // ToIntegerOrInfinity is mathematical: `-0` normalizes to `+0`, both for
+        // the stored element and for the returned value.
+        let v = to_integer_or_infinity(vm, &arg(args, 2))? + 0.0;
+        atomic_revalidate(vm, &o, kind, byte_index)?;
+        let buffer = ta_buffer(&o);
+        let mut b = buffer.borrow_mut();
+        if let Internal::ArrayBuffer(Some(bytes)) = &mut b.internal {
+            crate::typed_array::encode(bytes, byte_index, kind, v);
+        }
+        Ok(Value::Number(v))
+    }
+}
+
+/// `Atomics.pause([N])`: a no-op back-off hint. `N`, if present, must be an
+/// integral Number (the spec validates the type but otherwise ignores it).
+fn atomic_pause(vm: &mut Vm, args: &[Value]) -> Result<Value, Value> {
+    let n = arg(args, 0);
+    if !n.is_undefined() {
+        let integral = matches!(&n, Value::Number(x) if x.is_finite() && x.fract() == 0.0);
+        if !integral {
+            return Err(vm.throw_type("Atomics.pause: argument must be an integral Number"));
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+fn atomic_wait(vm: &mut Vm, args: &[Value]) -> Result<Value, Value> {
+    let (o, kind) = atomic_ta(vm, &arg(args, 0), true)?;
+    // `wait` requires shared memory.
+    let shared = match &o.borrow().internal {
+        Internal::TypedArray(t) => vm.is_shared_buffer(&t.buffer),
+        _ => false,
+    };
+    if !shared {
+        return Err(
+            vm.throw_type("Atomics.wait: typed array must be backed by a SharedArrayBuffer")
+        );
+    }
+    let byte_index = atomic_byte_index(vm, &o, kind, &arg(args, 1))?;
+    let _ = byte_index;
+    // Coerce the comparison value and timeout (observable side effects) before
+    // reporting that this agent cannot block.
+    if kind.is_bigint() {
+        vm.to_bigint(&arg(args, 2))?;
+    } else {
+        vm.to_int32(&arg(args, 2))?;
+    }
+    vm.to_number(&arg(args, 3))?;
+    Err(vm.throw_type("Atomics.wait cannot be used: the calling agent cannot block"))
+}
+
+fn atomic_notify(vm: &mut Vm, args: &[Value]) -> Result<Value, Value> {
+    let (o, kind) = atomic_ta(vm, &arg(args, 0), true)?;
+    atomic_byte_index(vm, &o, kind, &arg(args, 1))?;
+    // Coerce the count (may throw) even though no agent is ever waiting here.
+    let count = arg(args, 2);
+    if !count.is_undefined() {
+        to_integer_or_infinity(vm, &count)?;
+    }
+    Ok(Value::Number(0.0))
+}
+
+fn install_atomics(vm: &mut Vm) {
+    let atomics = vm.new_object();
+    vm.define_method(&atomics, "add", 3, |vm, _t, a| {
+        atomic_rmw(vm, a, AtomicOp::Add)
+    });
+    vm.define_method(&atomics, "sub", 3, |vm, _t, a| {
+        atomic_rmw(vm, a, AtomicOp::Sub)
+    });
+    vm.define_method(&atomics, "and", 3, |vm, _t, a| {
+        atomic_rmw(vm, a, AtomicOp::And)
+    });
+    vm.define_method(&atomics, "or", 3, |vm, _t, a| {
+        atomic_rmw(vm, a, AtomicOp::Or)
+    });
+    vm.define_method(&atomics, "xor", 3, |vm, _t, a| {
+        atomic_rmw(vm, a, AtomicOp::Xor)
+    });
+    vm.define_method(&atomics, "exchange", 3, |vm, _t, a| {
+        atomic_rmw(vm, a, AtomicOp::Exchange)
+    });
+    vm.define_method(&atomics, "compareExchange", 4, |vm, _t, a| {
+        atomic_compare_exchange(vm, a)
+    });
+    vm.define_method(&atomics, "load", 2, |vm, _t, a| atomic_load(vm, a));
+    vm.define_method(&atomics, "store", 3, |vm, _t, a| atomic_store(vm, a));
+    vm.define_method(&atomics, "isLockFree", 1, |vm, _t, a| {
+        let n = to_integer_or_infinity(vm, &arg(a, 0))?;
+        Ok(Value::Bool(n == 1.0 || n == 2.0 || n == 4.0 || n == 8.0))
+    });
+    vm.define_method(&atomics, "wait", 4, |vm, _t, a| atomic_wait(vm, a));
+    vm.define_method(&atomics, "notify", 3, |vm, _t, a| atomic_notify(vm, a));
+    vm.define_method(&atomics, "pause", 0, |vm, _t, a| atomic_pause(vm, a));
+
+    // Atomics[Symbol.toStringTag] = "Atomics" (non-writable, non-enumerable, configurable).
+    let tag = vm.realm.symbol_to_string_tag.clone();
+    atomics.borrow_mut().props.insert(
+        PropertyKey::Sym(tag),
+        Property {
+            kind: PropertyKind::Data {
+                value: Value::str("Atomics"),
+                writable: false,
+            },
+            enumerable: false,
+            configurable: true,
+        },
+    );
+    vm.define_value(&vm.realm.global.clone(), "Atomics", Value::Object(atomics));
 }
 
 fn is_iterable(vm: &mut Vm, v: &Value) -> Result<bool, Value> {

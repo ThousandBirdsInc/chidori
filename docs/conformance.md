@@ -133,11 +133,20 @@ the box (or CI runner) it lands on.
 The runner **skips** (does not count as failure) tests that require features the
 engine intentionally does not implement — the same way Bun/Node skip what their
 engines lack. The list lives in `UNSUPPORTED_FEATURES` in
-`crates/test262-runner/src/main.rs` (e.g. `Atomics`, `SharedArrayBuffer`,
-`Temporal`, `decorators`, `iterator-helpers`, `import-attributes`,
-`WeakRef`/`FinalizationRegistry`), plus `intl402/` (skipped unless `--intl`) and
-the agent (`CanBlock`) tests. When the engine grows to cover a skipped feature,
-delete its entry and the suite starts holding it to account.
+`crates/test262-runner/src/main.rs` (e.g. `Temporal`, `decorators`,
+`iterator-helpers`, `import-attributes`, `WeakRef`/`FinalizationRegistry`), plus
+`intl402/` (skipped unless `--intl`) and the agent (`CanBlock`, and the
+`atomicsHelper.js` multi-agent harness) tests. When the engine grows to cover a
+skipped feature, delete its entry and the suite starts holding it to account.
+
+`SharedArrayBuffer` and `Atomics` **are** implemented (so their feature tags are
+no longer skipped). The embedded runtime is single-threaded — the engine is
+`Rc`-based and non-`Send` — so a SharedArrayBuffer is an ArrayBuffer that never
+detaches and grows in place, and every Atomics operation is a sequential
+read / read-modify-write, observationally identical to a real atomic on a single
+agent. `Atomics.wait` reports that the calling agent cannot block (as a browser
+main thread does); `Atomics.waitAsync` and the genuinely-concurrent
+`$262.agent` tests stay skipped, since a second agent cannot be hosted.
 
 ## CI gate
 

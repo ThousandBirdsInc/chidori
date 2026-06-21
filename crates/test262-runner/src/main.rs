@@ -105,9 +105,10 @@ enum Outcome {
 /// so the conformance number reflects the implemented surface honestly. Bun and
 /// Node likewise skip features their engines lack.
 const UNSUPPORTED_FEATURES: &[&str] = &[
-    // Concurrency / shared memory — not in the embedded runtime.
-    "Atomics",
-    "SharedArrayBuffer",
+    // SharedArrayBuffer + Atomics are implemented (single-agent semantics: every
+    // op is a sequential read/RMW, `wait` reports the agent cannot block). Only
+    // `Atomics.waitAsync` — which needs the job queue to resolve a wait — and the
+    // genuinely-concurrent agent tests (skipped via the CanBlock flags) are out.
     "Atomics.waitAsync",
     // Intl — QuickJS ships no ICU/Intl.
     "Intl.Locale-info",
@@ -563,6 +564,15 @@ fn run_test(
         return vec![(Variant::Sloppy, Outcome::Skip(format!("feature:{feat}")))];
     }
     if meta.has_flag("CanBlockIsFalse") || meta.has_flag("CanBlockIsTrue") {
+        return vec![(Variant::Sloppy, Outcome::Skip("agent".into()))];
+    }
+    // Multi-agent Atomics tests coordinate worker agents through `$262.agent`
+    // (the `atomicsHelper.js` harness). The single-threaded, non-`Send` engine
+    // cannot host a second agent, so — like the CanBlock agent tests above —
+    // these are honest skips rather than failures. The single-agent Atomics
+    // surface (load/store/RMW/wait-cannot-block/notify-zero) is still exercised
+    // by the many non-agent tests.
+    if meta.includes.iter().any(|i| i == "atomicsHelper.js") {
         return vec![(Variant::Sloppy, Outcome::Skip("agent".into()))];
     }
 
