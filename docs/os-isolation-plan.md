@@ -1,11 +1,12 @@
 # OS-level isolation: process-per-run with brokered effects
 
-> **Status:** Phases 1–3b implemented (`crates/chidori/src/runtime/isolate/`):
-> process-per-run brokering, the rlimits/deadline-kill resource floor, and a
-> Linux confinement stack — empty network namespace + Landlock read-only
-> filesystem + seccomp denylist, each best-effort with graceful fallback.
-> Remaining: cgroup v2 `memory.max` (needs delegation), tightening seccomp toward
-> an allowlist, rootless net-ns via user namespaces, and macOS Seatbelt (phase 4).
+> **Status:** Phases 1–4 implemented (`crates/chidori/src/runtime/isolate/`):
+> process-per-run brokering, the rlimits/deadline-kill resource floor, a Linux
+> confinement stack (network namespace + Landlock + seccomp), and a macOS Seatbelt
+> profile — each best-effort with graceful fallback, behind a per-OS `apply()`
+> dispatch. Remaining: cgroup v2 `memory.max` (needs delegation), tightening
+> seccomp toward an allowlist, rootless net-ns via user namespaces, and phase-5
+> polish.
 > **Closes:** [`docs/sandbox-model.md`](./sandbox-model.md) gap #4 ("No process / OS-level
 > isolation"), and as a side effect tightens gaps #2, #3, #6 (memory accounting
 > precision and cross-run heap hygiene).
@@ -351,7 +352,19 @@ error frame the child writes from its `catch_unwind` boundary before exiting:
    **Deferred:** cgroup v2 `memory.max` (needs delegation — the per-process heap
    watchdog from phase 2 is the graceful stand-in), rootless net-ns via an
    intermediate user namespace, and mount/pid namespaces.
-4. **macOS Seatbelt** profile + the `Sandbox` trait FFI; CI parity.
+4. **macOS Seatbelt.** ✅ **Done** — `sandbox::apply()` dispatches per-OS
+   (`apply_linux` vs `apply_macos`); on macOS it confines the worker with a
+   Seatbelt profile via `sandbox_init` (the deprecated-but-stable libSystem FFI
+   Chromium's renderer uses). The SBPL is **allow-default with targeted denies**
+   (`(deny network*)` + `(deny file-write*)`) — the same posture as the Linux
+   seccomp denylist + Landlock read-only, and low-risk: a brokered compute worker
+   still reads files and allocates freely. Best-effort with the same graceful-skip
+   contract; `SandboxOutcome::core_confined()` abstracts the per-OS "primary
+   layer" (seccomp on Linux, Seatbelt on macOS) for the `REQUIRE_SANDBOX` gate.
+   The FFI is type-checked on the Linux host (via `cargo check`, which doesn't
+   link) but **runtime-unverified** — no macOS host in this environment; the
+   best-effort design means a profile/load failure degrades to a logged skip
+   rather than breaking a run.
 5. **Polish:** `--isolate` UX, policy-profile coupling, docs, optional warm pool.
 
 ## Verification

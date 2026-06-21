@@ -141,13 +141,14 @@ fn serve_inner<R: Read + 'static, W: Write + 'static>(
     for note in &sandbox.notes {
         eprintln!("isolate worker: sandbox: {note}");
     }
-    if apply_limits && env_truthy("CHIDORI_ISOLATE_REQUIRE_SANDBOX") && !sandbox.seccomp_applied {
+    if apply_limits && env_truthy("CHIDORI_ISOLATE_REQUIRE_SANDBOX") && !sandbox.core_confined() {
         let mut guard = io.borrow_mut();
         return write_frame(
             &mut guard.writer,
             &FromChild::Done {
                 outcome: Outcome::Err(
-                    "isolation sandbox required but the seccomp core could not be applied"
+                    "isolation sandbox required but the platform's core confinement \
+                     (seccomp on Linux, Seatbelt on macOS) could not be applied"
                         .to_string(),
                 ),
             },
