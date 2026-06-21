@@ -92,6 +92,43 @@ fn parent_deadline_kills_a_wedged_worker() {
 }
 
 #[test]
+fn seccomp_blocks_a_denied_syscall() {
+    // A normal agent, but the worker is told to probe `socket()` once the seccomp
+    // filter is installed. With the filter active that syscall raises SIGSYS and
+    // kills the worker, which the parent maps to a seccomp error. If seccomp can't
+    // be installed in this environment, the worker says so and we skip rather than
+    // report a false failure.
+    let agent = write_agent(
+        "seccomp",
+        r#"
+        import { chidori, run } from "chidori:agent";
+        run(async () => { await chidori.log("unreachable: killed before running"); return {}; });
+        "#,
+    );
+    let out = run_isolated(&agent, &[("CHIDORI_ISOLATE_SELFTEST_SOCKET", "1")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    if stderr.contains("seccomp-unavailable") {
+        eprintln!("skipping seccomp test: seccomp could not be applied in this environment");
+        let _ = fs::remove_dir_all(agent.parent().unwrap());
+        return;
+    }
+    assert!(
+        !stderr.contains("socket-not-blocked"),
+        "socket() was NOT blocked by the seccomp filter; stderr={stderr}"
+    );
+    assert!(
+        !out.status.success(),
+        "worker probing a denied syscall should fail the run; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("seccomp"),
+        "error should name the seccomp violation; stderr={stderr}"
+    );
+    let _ = fs::remove_dir_all(agent.parent().unwrap());
+}
+
+#[test]
 fn cpu_limit_terminates_a_busy_worker() {
     // With compute bounds disabled, a busy loop burns CPU until RLIMIT_CPU fires
     // (SIGXCPU), which the parent maps to a CPU-time error. No deadline set, so

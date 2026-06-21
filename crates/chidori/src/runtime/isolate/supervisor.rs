@@ -209,6 +209,9 @@ fn exit_cause(status: &std::process::ExitStatus) -> Option<String> {
     use std::os::unix::process::ExitStatusExt;
     let sig = status.signal()?;
     Some(match sig {
+        libc::SIGSYS => {
+            "isolate worker attempted a blocked syscall and was killed (seccomp/SIGSYS)".to_string()
+        }
         libc::SIGKILL => {
             "isolate worker was killed (out of memory, or an external SIGKILL)".to_string()
         }

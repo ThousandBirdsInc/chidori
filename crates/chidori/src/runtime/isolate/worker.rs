@@ -122,13 +122,43 @@ fn serve_inner<R: Read + 'static, W: Write + 'static>(
         }
     };
 
-    // Slam the resource floor shut before any agent code runs — but only in a
-    // real worker process (see `serve_inner`'s `apply_limits`). Best-effort: a
-    // limit that can't be set degrades isolation but never fails the run.
-    if apply_limits {
+    // Slam the resource floor shut, then the syscall door — before any agent code
+    // runs, and only in a real worker process (see `serve_inner`'s `apply_limits`;
+    // these mutate the *current* process, which is sound only when it is a
+    // dedicated worker). Both are best-effort: a limit or filter that can't be
+    // installed degrades isolation but never fails the run, unless the operator
+    // demands `CHIDORI_ISOLATE_REQUIRE_SANDBOX`, in which case we fail closed.
+    let seccomp_applied = if apply_limits {
         limits.apply_to_self();
+        match super::sandbox::install_seccomp() {
+            Ok(()) => true,
+            Err(reason) => {
+                eprintln!("isolate worker: seccomp not applied: {reason}");
+                if env_truthy("CHIDORI_ISOLATE_REQUIRE_SANDBOX") {
+                    let mut guard = io.borrow_mut();
+                    return write_frame(
+                        &mut guard.writer,
+                        &FromChild::Done {
+                            outcome: Outcome::Err(format!(
+                                "isolation sandbox required but unavailable: {reason}"
+                            )),
+                        },
+                    );
+                }
+                false
+            }
+        }
     } else {
         let _ = &limits;
+        false
+    };
+
+    // Test-only probe: once the sandbox is in place, attempt a denied syscall to
+    // prove the filter blocks it (the process is killed by SIGSYS and never
+    // returns). Gated behind an env var so it is inert in normal operation.
+    #[cfg(unix)]
+    if std::env::var_os("CHIDORI_ISOLATE_SELFTEST_SOCKET").is_some() {
+        selftest_denied_socket(seccomp_applied);
     }
 
     let host: Rc<dyn RunHost> = Rc::new(BrokeredHost {
@@ -150,4 +180,34 @@ fn serve_inner<R: Read + 'static, W: Write + 'static>(
 
     let mut guard = io.borrow_mut();
     write_frame(&mut guard.writer, &FromChild::Done { outcome })
+}
+
+/// Whether an env var holds a truthy value (set and not `0`/`off`/`false`/`no`).
+fn env_truthy(key: &str) -> bool {
+    match std::env::var(key) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && !matches!(v.as_str(), "0" | "off" | "false" | "no")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Self-test for the seccomp denylist (driven by `isolate_limits` integration
+/// tests). With the filter active, `socket()` must trigger `SIGSYS` and kill the
+/// process before it returns — so this function never returns in that case. If
+/// seccomp could not be applied (e.g. a kernel/container that forbids it), it
+/// says so and exits cleanly so the test can *skip* rather than fail.
+#[cfg(unix)]
+fn selftest_denied_socket(seccomp_applied: bool) -> ! {
+    if !seccomp_applied {
+        eprintln!("isolate-selftest: seccomp-unavailable");
+        std::process::exit(0);
+    }
+    // SAFETY: `socket` takes scalar args and has no memory-safety contract. With
+    // the filter active the call never returns (the kernel raises SIGSYS); if it
+    // *does* return, the filter failed to block it — a real test failure.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    eprintln!("isolate-selftest: socket-not-blocked (fd={fd})");
+    std::process::exit(97);
 }

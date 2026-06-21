@@ -102,6 +102,11 @@ oxc = { version = "0.133", features = ["transformer", "codegen", "semantic"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Linux-only: seccomp-bpf syscall confinement for the isolation worker. See
+# `runtime::isolate::sandbox`.
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.5"
+
 [dev-dependencies]
 tempfile = "3"
 # In-memory span exporter for asserting OTEL span-tree shape in tests. Unions

@@ -1,8 +1,10 @@
 # OS-level isolation: process-per-run with brokered effects
 
-> **Status:** Phases 1–2 implemented (`crates/chidori/src/runtime/isolate/`):
-> process-per-run brokering + the rlimits/deadline-kill resource floor. Phases
-> 3–5 (cgroup memory ceiling + per-OS syscall sandbox) not yet started.
+> **Status:** Phases 1–3 implemented (`crates/chidori/src/runtime/isolate/`):
+> process-per-run brokering, the rlimits/deadline-kill resource floor, and a
+> Linux seccomp denylist. Remaining: the namespace/cgroup layer (deferred — needs
+> privilege/delegation), tightening seccomp toward an allowlist, and macOS
+> Seatbelt (phase 4).
 > **Closes:** [`docs/sandbox-model.md`](./sandbox-model.md) gap #4 ("No process / OS-level
 > isolation"), and as a side effect tightens gaps #2, #3, #6 (memory accounting
 > precision and cross-run heap hygiene).
@@ -318,9 +320,24 @@ error frame the child writes from its `catch_unwind` boundary before exiting:
    too blunt — a multi-threaded VM over-reserves virtual memory) and `RLIMIT_NPROC`
    (fragile under shared-uid concurrency; blocking `fork` belongs to the seccomp
    phase). Env: `CHIDORI_ISOLATE_{CPU_SECS,FSIZE_BYTES,NOFILE,NO_CORE,DEADLINE_MS}`.
-3. **Linux syscall confinement.** seccomp allowlist + empty netns + mount ns +
-   Landlock; negative tests (a worker that calls `socket()`/`open("/etc/passwd")`
-   is killed).
+3. **Linux syscall confinement.** ⏳ **Partly done (seccomp denylist)** —
+   `runtime::isolate::sandbox` installs a seccomp-bpf filter in the worker (via
+   `seccompiler`) before any agent code runs: default-allow, `KILL_PROCESS` on a
+   curated denylist (the whole socket family, `exec*`, `ptrace`/`process_vm_*`,
+   namespace/mount, privilege-change, kernel-module/`bpf`/`perf_event_open`, and
+   keyring syscalls). `apply_filter` sets `NO_NEW_PRIVS`, so it works rootless.
+   Best-effort by default (degrades to brokering + rlimits where seccomp is
+   unavailable); `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` fails closed. A SIGSYS kill
+   maps to a precise "blocked syscall (seccomp/SIGSYS)" error. Verified: a normal
+   isolated run is unaffected (no false positives), and a worker probing
+   `socket()` post-filter is killed (`isolate_limits::seccomp_blocks_a_denied_syscall`,
+   skip-aware). **Chosen denylist over allowlist** deliberately — it cannot
+   false-positive-kill the engine and the primary boundary is still
+   capability-confinement + brokering; the near-empty allowlist remains the end
+   goal. **Deferred:** empty net namespace + mount/pid/user namespaces + Landlock
+   and cgroup v2 `memory.max` — all need privilege or cgroup delegation that many
+   deploy targets (rootless containers, CI) lack, so they need a capability probe
+   + graceful fallback before they can ship without regressing the common case.
 4. **macOS Seatbelt** profile + the `Sandbox` trait FFI; CI parity.
 5. **Polish:** `--isolate` UX, policy-profile coupling, docs, optional warm pool.
 
