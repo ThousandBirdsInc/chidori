@@ -161,24 +161,33 @@ A foundational slice of ECMA-402 is implemented, backed by ICU4X
   Unicode-extension accessors, plus `maximize`/`minimize`/`toString`);
 - `Intl.PluralRules` (`select`, `selectRange`, `resolvedOptions`,
   `supportedLocalesOf`), with cardinal/ordinal rules and the
-  fraction/significant digit operand options.
+  fraction/significant digit operand options;
+- `Intl.NumberFormat` (`format`, `formatToParts`, `resolvedOptions`,
+  `supportedLocalesOf`) for the `decimal` and `percent` styles — full option
+  parsing/validation, locale-aware grouping and numbering systems (via
+  `icu_decimal`), the integer/fraction/significant digit options, all nine
+  rounding modes, and `signDisplay`. It is callable with or without `new`,
+  and `format` is the spec's once-bound getter.
 
-Against `test/intl402/Intl` + `test/intl402/Locale` +
-`test/intl402/PluralRules` (run with `--intl`) the engine passes **182** of
-the executed tests.
+Against `test/intl402/Intl` + `Locale` + `PluralRules` + `NumberFormat` (run
+with `--intl`) the engine passes **317** of the executed tests.
 
 Not yet implemented (so still failing/skipped under `--intl`): the other
-formatters (`NumberFormat`, `DateTimeFormat`, `Collator`, `ListFormat`, …),
+formatters (`DateTimeFormat`, `Collator`, `ListFormat`, …),
 `Intl.supportedValuesOf`, the `Intl.Locale-info` accessors
-(`getCalendars`/`getWeekInfo`/…, an honest skip via that feature tag),
-full best-fit/lookup locale resolution (`supportedLocalesOf` over-returns),
-`PluralRules` compact-notation operands and `selectRange`'s CLDR
-plural-range table (only in ICU4X's `unstable` surface; approximated by the
-end value's category), and the long tail of Unicode-extension
-*keyword-value* canonicalization (e.g. `-u-ca-gregorian` → `-u-ca-gregory`),
-which needs the CLDR bcp47 alias tables the `icu_locale` canonicalizer does
-not apply. `intl402/` remains skipped in the default gate (it is opt-in via
-`--intl`), so this surface is not yet part of the committed baseline.
+(`getCalendars`/`getWeekInfo`/…, an honest skip via that feature tag), and —
+for `NumberFormat` — the `currency`/`unit` styles, `compact`/`scientific`/
+`engineering` notation, `formatRange`/`formatRangeToParts`, and
+`roundingIncrement` (all of which need ICU4X's experimental formatters or the
+increment-decomposition table). Also missing: full best-fit/lookup locale
+resolution (`supportedLocalesOf` over-returns), `PluralRules` compact-notation
+operands and `selectRange`'s CLDR plural-range table (only in ICU4X's
+`unstable` surface; approximated by the end value's category), and the long
+tail of Unicode-extension *keyword-value* canonicalization (e.g.
+`-u-ca-gregorian` → `-u-ca-gregory`), which needs the CLDR bcp47 alias tables
+the `icu_locale` canonicalizer does not apply. `intl402/` remains skipped in
+the default gate (it is opt-in via `--intl`), so this surface is not yet part
+of the committed baseline.
 
 ## CI gate
 

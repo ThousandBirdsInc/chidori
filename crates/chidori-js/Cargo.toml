@@ -44,6 +44,8 @@ icu_locale = "2"
 # (`ryu` enables building an operand decimal from an f64).
 icu_plurals = "2"
 fixed_decimal = { version = "0.7", features = ["ryu"] }
+# Intl.NumberFormat: locale-aware decimal formatting (grouping, digits).
+icu_decimal = "2"
 
 [dev-dependencies]
 criterion = "0.5"
