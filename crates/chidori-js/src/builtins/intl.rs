@@ -31,6 +31,7 @@ pub fn install(vm: &mut Vm) {
     });
 
     install_locale(vm, &intl);
+    install_plural_rules(vm, &intl);
 
     // Intl[Symbol.toStringTag] = "Intl" (non-writable, non-enumerable, configurable).
     let tag = vm.realm.symbol_to_string_tag.clone();
@@ -458,5 +459,497 @@ fn define_locale_getter(
         PropertyKey::str(name),
         Some(Value::Object(getter)),
         None,
+    );
+}
+
+// =========================================================================
+// Intl.PluralRules
+// =========================================================================
+
+use fixed_decimal::{Decimal, FloatPrecision, SignedRoundingMode, UnsignedRoundingMode};
+use icu_plurals::{PluralCategory, PluralRuleType, PluralRules};
+
+/// `CoerceOptionsToObject`: undefined → an empty **null-prototype** options bag
+/// (so a polluted `Object.prototype` is not consulted), else `ToObject`.
+fn coerce_options(vm: &mut Vm, options: Value) -> Result<Value, Value> {
+    if options.is_undefined() {
+        Ok(Value::Object(
+            vm.alloc(ObjectData::new(None, Internal::Ordinary)),
+        ))
+    } else {
+        Ok(Value::Object(vm.to_object(&options)?))
+    }
+}
+
+/// Insert an enumerable, writable, configurable data property (the
+/// `CreateDataPropertyOrThrow` used to build a `resolvedOptions` result).
+fn data_prop(target: &JsObject, key: &str, value: Value) {
+    target.borrow_mut().props.insert(
+        PropertyKey::str(key),
+        Property {
+            kind: PropertyKind::Data {
+                value,
+                writable: true,
+            },
+            enumerable: true,
+            configurable: true,
+        },
+    );
+}
+
+/// `DefaultNumberOption`: coerce, range-check `[min, max]`, and floor.
+fn default_number_option(
+    vm: &mut Vm,
+    v: &Value,
+    min: f64,
+    max: f64,
+    default: f64,
+) -> Result<f64, Value> {
+    if v.is_undefined() {
+        return Ok(default);
+    }
+    let n = vm.to_number(v)?;
+    if n.is_nan() || n < min || n > max {
+        return Err(vm.throw_range("numeric option out of range"));
+    }
+    Ok(n.floor())
+}
+
+/// `GetNumberOption(options, prop, min, max, default)`.
+fn get_number_option(
+    vm: &mut Vm,
+    options: &Value,
+    prop: &str,
+    min: f64,
+    max: f64,
+    default: f64,
+) -> Result<f64, Value> {
+    let v = vm.get_prop(options, &PropertyKey::str(prop))?;
+    default_number_option(vm, &v, min, max, default)
+}
+
+/// The resolved digit options of a number-formatting consumer (the subset
+/// `Intl.PluralRules` needs: integer/fraction digits and the optional
+/// significant-digit override).
+#[derive(Clone, Copy)]
+struct DigitOptions {
+    min_integer: u32,
+    min_fraction: u32,
+    max_fraction: u32,
+    min_significant: Option<u32>,
+    max_significant: Option<u32>,
+}
+
+/// `SetNumberFormatDigitOptions` with `mnfdDefault = 0`, `mxfdDefault = 3`,
+/// `notation = "standard"` (the `Intl.PluralRules` configuration).
+fn set_digit_options(vm: &mut Vm, options: &Value) -> Result<DigitOptions, Value> {
+    let min_integer =
+        get_number_option(vm, options, "minimumIntegerDigits", 1.0, 21.0, 1.0)? as u32;
+    let mnfd = vm.get_prop(options, &PropertyKey::str("minimumFractionDigits"))?;
+    let mxfd = vm.get_prop(options, &PropertyKey::str("maximumFractionDigits"))?;
+    let mnsd = vm.get_prop(options, &PropertyKey::str("minimumSignificantDigits"))?;
+    let mxsd = vm.get_prop(options, &PropertyKey::str("maximumSignificantDigits"))?;
+
+    if !mnsd.is_undefined() || !mxsd.is_undefined() {
+        let min_s = default_number_option(vm, &mnsd, 1.0, 21.0, 1.0)? as u32;
+        let max_s = default_number_option(vm, &mxsd, min_s as f64, 21.0, 21.0)? as u32;
+        return Ok(DigitOptions {
+            min_integer,
+            min_fraction: 0,
+            max_fraction: 0,
+            min_significant: Some(min_s),
+            max_significant: Some(max_s),
+        });
+    }
+    let (min_fraction, max_fraction) = if !mnfd.is_undefined() || !mxfd.is_undefined() {
+        let min_f = default_number_option(vm, &mnfd, 0.0, 100.0, 0.0)? as u32;
+        let mxfd_default = min_f.max(3);
+        let max_f =
+            default_number_option(vm, &mxfd, min_f as f64, 100.0, mxfd_default as f64)? as u32;
+        (min_f, max_f)
+    } else {
+        (0, 3)
+    };
+    Ok(DigitOptions {
+        min_integer,
+        min_fraction,
+        max_fraction,
+        min_significant: None,
+        max_significant: None,
+    })
+}
+
+/// Read a string field of the internal PluralRules record.
+fn rec_str(rec: &JsObject, key: &str) -> String {
+    match rec.borrow().props.get(&PropertyKey::str(key)) {
+        Some(Property {
+            kind:
+                PropertyKind::Data {
+                    value: Value::String(s),
+                    ..
+                },
+            ..
+        }) => s.as_str().to_owned(),
+        _ => String::new(),
+    }
+}
+
+/// Read a numeric field of the internal PluralRules record (`None` if absent).
+fn rec_num(rec: &JsObject, key: &str) -> Option<u32> {
+    match rec.borrow().props.get(&PropertyKey::str(key)) {
+        Some(Property {
+            kind:
+                PropertyKind::Data {
+                    value: Value::Number(n),
+                    ..
+                },
+            ..
+        }) => Some(*n as u32),
+        _ => None,
+    }
+}
+
+/// The internal record object of an Intl.PluralRules receiver, if `this` is one.
+fn plural_record(vm: &Vm, this: &Value) -> Option<JsObject> {
+    let Value::Object(o) = this else { return None };
+    match o
+        .borrow()
+        .props
+        .get(&PropertyKey::Sym(vm.realm.symbol_intl_plural_rules.clone()))
+    {
+        Some(Property {
+            kind:
+                PropertyKind::Data {
+                    value: Value::Object(rec),
+                    ..
+                },
+            ..
+        }) => Some(rec.clone()),
+        _ => None,
+    }
+}
+
+fn rule_type(rec: &JsObject) -> PluralRuleType {
+    if rec_str(rec, "type") == "ordinal" {
+        PluralRuleType::Ordinal
+    } else {
+        PluralRuleType::Cardinal
+    }
+}
+
+fn build_rules(rec: &JsObject) -> PluralRules {
+    let loc = Locale::try_from_str(&rec_str(rec, "locale")).unwrap_or(Locale::UNKNOWN);
+    PluralRules::try_new((&loc.id).into(), rule_type(rec).into()).unwrap_or_else(|_| {
+        PluralRules::try_new(Default::default(), rule_type(rec).into()).unwrap()
+    })
+}
+
+fn category_name(c: PluralCategory) -> &'static str {
+    match c {
+        PluralCategory::Zero => "zero",
+        PluralCategory::One => "one",
+        PluralCategory::Two => "two",
+        PluralCategory::Few => "few",
+        PluralCategory::Many => "many",
+        PluralCategory::Other => "other",
+    }
+}
+
+/// Format `|n|` into a `Decimal` carrying the visible digits implied by the
+/// record's digit options (the plural-operand input), or `None` for non-finite.
+fn operand_decimal(rec: &JsObject, n: f64) -> Option<Decimal> {
+    if !n.is_finite() {
+        return None;
+    }
+    let opts = DigitOptions {
+        min_integer: rec_num(rec, "minimumIntegerDigits").unwrap_or(1),
+        min_fraction: rec_num(rec, "minimumFractionDigits").unwrap_or(0),
+        max_fraction: rec_num(rec, "maximumFractionDigits").unwrap_or(3),
+        min_significant: rec_num(rec, "minimumSignificantDigits"),
+        max_significant: rec_num(rec, "maximumSignificantDigits"),
+    };
+    let mut dec = Decimal::try_from_f64(n.abs(), FloatPrecision::RoundTrip).ok()?;
+    let half_expand = SignedRoundingMode::Unsigned(UnsignedRoundingMode::HalfExpand);
+    if let Some(max_s) = opts.max_significant {
+        let mag = dec.nonzero_magnitude_start();
+        dec.round_with_mode(mag - max_s as i16 + 1, half_expand);
+        if let Some(min_s) = opts.min_significant {
+            dec.pad_end(mag - min_s as i16 + 1);
+        }
+    } else {
+        dec.round_with_mode(-(opts.max_fraction as i16), half_expand);
+        dec.pad_end(-(opts.min_fraction as i16));
+    }
+    dec.pad_start(opts.min_integer as i16);
+    Some(dec)
+}
+
+/// Resolve the plural category name of `n` under the record's options.
+fn resolve_plural(rec: &JsObject, n: f64) -> &'static str {
+    match operand_decimal(rec, n) {
+        Some(dec) => category_name(build_rules(rec).category_for(&dec)),
+        None => "other",
+    }
+}
+
+fn construct_plural_rules(vm: &mut Vm, args: &[Value], proto: &JsObject) -> Result<Value, Value> {
+    let requested = canonicalize_locale_list(vm, &arg(args, 0))?;
+    let options = coerce_options(vm, arg(args, 1))?;
+
+    // Options are read in spec order (constructor-option-read-order observes
+    // every `Get`); most are validated then ignored by this implementation.
+    get_enum_option(vm, &options, "localeMatcher", &["lookup", "best fit"])?;
+    let typ = get_enum_option(vm, &options, "type", &["cardinal", "ordinal"])?
+        .unwrap_or_else(|| "cardinal".to_string());
+    let notation = get_enum_option(
+        vm,
+        &options,
+        "notation",
+        &["standard", "scientific", "engineering", "compact"],
+    )?
+    .unwrap_or_else(|| "standard".to_string());
+    let compact_display = get_enum_option(vm, &options, "compactDisplay", &["short", "long"])?
+        .unwrap_or_else(|| "short".to_string());
+    let digits = set_digit_options(vm, &options)?;
+    // Rounding options (read for order/validation; defaults are reported as-is).
+    get_number_option(vm, &options, "roundingIncrement", 1.0, 5000.0, 1.0)?;
+    get_enum_option(
+        vm,
+        &options,
+        "roundingMode",
+        &[
+            "ceil",
+            "floor",
+            "expand",
+            "trunc",
+            "halfCeil",
+            "halfFloor",
+            "halfExpand",
+            "halfTrunc",
+            "halfEven",
+        ],
+    )?;
+    get_enum_option(
+        vm,
+        &options,
+        "roundingPriority",
+        &["auto", "morePrecision", "lessPrecision"],
+    )?;
+    get_enum_option(
+        vm,
+        &options,
+        "trailingZeroDisplay",
+        &["auto", "stripIfInteger"],
+    )?;
+
+    // ResolveLocale (lookup): the first requested tag that parses, else the
+    // default. ICU4X supplies plural data for the language, falling back to
+    // root, so the language-level base name is the resolved locale.
+    let locale = requested
+        .iter()
+        .find_map(|t| Locale::try_from_str(t).ok())
+        .map(|l| l.id.to_string())
+        .unwrap_or_else(|| "en".to_string());
+
+    let rec = vm.new_object();
+    {
+        let mut b = rec.borrow_mut();
+        let mut put = |k: &str, v: Value| {
+            b.props.insert(PropertyKey::str(k), Property::builtin(v));
+        };
+        put("locale", Value::str(locale));
+        put("type", Value::str(typ));
+        put("notation", Value::str(notation.clone()));
+        if notation == "compact" {
+            put("compactDisplay", Value::str(compact_display));
+        }
+        put(
+            "minimumIntegerDigits",
+            Value::Number(digits.min_integer as f64),
+        );
+        if let (Some(min_s), Some(max_s)) = (digits.min_significant, digits.max_significant) {
+            put("minimumSignificantDigits", Value::Number(min_s as f64));
+            put("maximumSignificantDigits", Value::Number(max_s as f64));
+        } else {
+            put(
+                "minimumFractionDigits",
+                Value::Number(digits.min_fraction as f64),
+            );
+            put(
+                "maximumFractionDigits",
+                Value::Number(digits.max_fraction as f64),
+            );
+        }
+    }
+
+    let o = vm.alloc(ObjectData::new(Some(proto.clone()), Internal::Ordinary));
+    o.borrow_mut().props.insert(
+        PropertyKey::Sym(vm.realm.symbol_intl_plural_rules.clone()),
+        Property {
+            kind: PropertyKind::Data {
+                value: Value::Object(rec),
+                writable: false,
+            },
+            enumerable: false,
+            configurable: false,
+        },
+    );
+    Ok(Value::Object(o))
+}
+
+fn install_plural_rules(vm: &mut Vm, intl: &JsObject) {
+    let proto = vm.new_object();
+    let ctor_proto = proto.clone();
+    let ctor = vm.new_native_ctor(
+        "PluralRules",
+        0,
+        |vm, _t, _a| Err(vm.throw_type("Constructor Intl.PluralRules requires 'new'")),
+        move |vm, _this, args| construct_plural_rules(vm, args, &ctor_proto),
+    );
+    ctor.borrow_mut().props.insert(
+        PropertyKey::str("prototype"),
+        Property {
+            kind: PropertyKind::Data {
+                value: Value::Object(proto.clone()),
+                writable: false,
+            },
+            enumerable: false,
+            configurable: false,
+        },
+    );
+    proto.borrow_mut().props.insert(
+        PropertyKey::str("constructor"),
+        Property::builtin(Value::Object(ctor.clone())),
+    );
+
+    // Intl.PluralRules.supportedLocalesOf(locales) — the canonicalized requested
+    // list (ICU4X supports every language via root fallback).
+    vm.define_method(&ctor, "supportedLocalesOf", 1, |vm, _t, args| {
+        let list = canonicalize_locale_list(vm, &arg(args, 0))?;
+        let vals: Vec<Value> = list.into_iter().map(Value::str).collect();
+        Ok(Value::Object(vm.new_array(vals)))
+    });
+
+    vm.define_method(&proto, "select", 1, |vm, this, args| {
+        let rec = plural_record(vm, &this).ok_or_else(|| {
+            vm.throw_type("Intl.PluralRules.prototype.select on incompatible receiver")
+        })?;
+        let n = vm.to_number(&arg(args, 0))?;
+        Ok(Value::str(resolve_plural(&rec, n)))
+    });
+
+    vm.define_method(&proto, "selectRange", 2, |vm, this, args| {
+        let rec = plural_record(vm, &this).ok_or_else(|| {
+            vm.throw_type("Intl.PluralRules.prototype.selectRange on incompatible receiver")
+        })?;
+        if arg(args, 0).is_undefined() || arg(args, 1).is_undefined() {
+            return Err(
+                vm.throw_type("Intl.PluralRules.prototype.selectRange: start and end are required")
+            );
+        }
+        let x = vm.to_number(&arg(args, 0))?;
+        let y = vm.to_number(&arg(args, 1))?;
+        if x.is_nan() || y.is_nan() {
+            return Err(
+                vm.throw_range("Intl.PluralRules.prototype.selectRange: arguments must be numbers")
+            );
+        }
+        // PluralRuleSelectRange proper needs the CLDR plural-range table (only in
+        // ICU4X's `unstable` surface); approximate with the end value's category.
+        Ok(Value::str(resolve_plural(&rec, y)))
+    });
+
+    vm.define_method(&proto, "resolvedOptions", 0, |vm, this, _a| {
+        let rec = plural_record(vm, &this).ok_or_else(|| {
+            vm.throw_type("Intl.PluralRules.prototype.resolvedOptions on incompatible receiver")
+        })?;
+        let out = vm.new_object();
+        // Enumerable data properties, emitted in the spec's resolvedOptions order:
+        // locale, type, notation, [compactDisplay,] minimumIntegerDigits,
+        // {fraction | significant} digits, pluralCategories, rounding*.
+        data_prop(&out, "locale", Value::str(rec_str(&rec, "locale")));
+        data_prop(&out, "type", Value::str(rec_str(&rec, "type")));
+        let notation = rec_str(&rec, "notation");
+        data_prop(&out, "notation", Value::str(notation.clone()));
+        if notation == "compact" {
+            data_prop(
+                &out,
+                "compactDisplay",
+                Value::str(rec_str(&rec, "compactDisplay")),
+            );
+        }
+        data_prop(
+            &out,
+            "minimumIntegerDigits",
+            Value::Number(rec_num(&rec, "minimumIntegerDigits").unwrap_or(1) as f64),
+        );
+        if let (Some(min_s), Some(max_s)) = (
+            rec_num(&rec, "minimumSignificantDigits"),
+            rec_num(&rec, "maximumSignificantDigits"),
+        ) {
+            data_prop(
+                &out,
+                "minimumSignificantDigits",
+                Value::Number(min_s as f64),
+            );
+            data_prop(
+                &out,
+                "maximumSignificantDigits",
+                Value::Number(max_s as f64),
+            );
+        } else {
+            data_prop(
+                &out,
+                "minimumFractionDigits",
+                Value::Number(rec_num(&rec, "minimumFractionDigits").unwrap_or(0) as f64),
+            );
+            data_prop(
+                &out,
+                "maximumFractionDigits",
+                Value::Number(rec_num(&rec, "maximumFractionDigits").unwrap_or(3) as f64),
+            );
+        }
+        // pluralCategories: the locale's categories, in canonical order.
+        let rules = build_rules(&rec);
+        let present: Vec<PluralCategory> = rules.categories().collect();
+        let order = [
+            PluralCategory::Zero,
+            PluralCategory::One,
+            PluralCategory::Two,
+            PluralCategory::Few,
+            PluralCategory::Many,
+            PluralCategory::Other,
+        ];
+        let cats: Vec<Value> = order
+            .iter()
+            .filter(|c| present.contains(c))
+            .map(|c| Value::str(category_name(*c)))
+            .collect();
+        let arr = vm.new_array(cats);
+        data_prop(&out, "pluralCategories", Value::Object(arr));
+        data_prop(&out, "roundingIncrement", Value::Number(1.0));
+        data_prop(&out, "roundingMode", Value::str("halfExpand"));
+        data_prop(&out, "roundingPriority", Value::str("auto"));
+        data_prop(&out, "trailingZeroDisplay", Value::str("auto"));
+        Ok(Value::Object(out))
+    });
+
+    // Intl.PluralRules.prototype[Symbol.toStringTag] = "Intl.PluralRules"
+    let tag = vm.realm.symbol_to_string_tag.clone();
+    proto.borrow_mut().props.insert(
+        PropertyKey::Sym(tag),
+        Property {
+            kind: PropertyKind::Data {
+                value: Value::str("Intl.PluralRules"),
+                writable: false,
+            },
+            enumerable: false,
+            configurable: true,
+        },
+    );
+
+    intl.borrow_mut().props.insert(
+        PropertyKey::str("PluralRules"),
+        Property::builtin(Value::Object(ctor)),
     );
 }

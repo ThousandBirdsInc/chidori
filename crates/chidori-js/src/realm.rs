@@ -89,6 +89,9 @@ pub struct Realm {
     /// Engine-private key holding an `Intl.Locale`'s canonical `[[Locale]]`
     /// string (the brand for `IsInitializedLocale`). Filtered from `own_keys`.
     pub symbol_intl_locale: JsSymbol,
+    /// Engine-private key holding an `Intl.PluralRules`' internal record object
+    /// (locale/type/digit options). The brand for the receiver checks.
+    pub symbol_intl_plural_rules: JsSymbol,
 
     /// Registry for `Symbol.for`.
     pub symbol_registry: indexmap::IndexMap<String, JsSymbol>,
@@ -212,6 +215,7 @@ impl Realm {
             symbol_disposable_state: bare_symbol(16, "[[DisposableState]]"),
             symbol_array_buffer_shared: bare_symbol(17, "[[ArrayBufferShared]]"),
             symbol_intl_locale: bare_symbol(18, "[[InitializedLocale]]"),
+            symbol_intl_plural_rules: bare_symbol(19, "[[InitializedPluralRules]]"),
             symbol_registry: indexmap::IndexMap::new(),
         }
     }

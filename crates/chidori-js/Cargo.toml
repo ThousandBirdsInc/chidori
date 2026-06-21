@@ -40,6 +40,10 @@ unicode-normalization = "0.1.25"
 # `compiled_data`) that powers `Intl.getCanonicalLocales` and `Intl.Locale`.
 icu_locale_core = "2"
 icu_locale = "2"
+# Intl.PluralRules: plural-category rules + decimal operand model
+# (`ryu` enables building an operand decimal from an f64).
+icu_plurals = "2"
+fixed_decimal = { version = "0.7", features = ["ryu"] }
 
 [dev-dependencies]
 criterion = "0.5"

@@ -151,23 +151,34 @@ main thread does); `Atomics.waitAsync` and the genuinely-concurrent
 ## Intl (opt-in: `--intl`)
 
 A foundational slice of ECMA-402 is implemented, backed by ICU4X
-(`icu_locale_core` + the CLDR-data `icu_locale` canonicalizer/expander):
-the `Intl` namespace, `Intl.getCanonicalLocales`, and the full `Intl.Locale`
-constructor + prototype (`baseName`/`language`/`script`/`region`/`variants`
-and the `calendar`/`collation`/`hourCycle`/`caseFirst`/`numeric`/
-`numberingSystem` Unicode-extension accessors, plus `maximize`/`minimize`/
-`toString`). Against `test/intl402/Intl` + `test/intl402/Locale` (run with
-`--intl`) the engine passes **134** of the executed tests.
+(`icu_locale_core` + the CLDR-data `icu_locale` canonicalizer/expander, plus
+`icu_plurals` + `fixed_decimal`):
 
-Not yet implemented (so still failing/skipped under `--intl`): the
-formatters (`NumberFormat`, `DateTimeFormat`, `Collator`, `PluralRules`,
-`ListFormat`, …), `Intl.supportedValuesOf`, the `Intl.Locale-info`
-accessors (`getCalendars`/`getWeekInfo`/…, an honest skip via that feature
-tag), and the long tail of Unicode-extension *keyword-value*
-canonicalization (e.g. `-u-ca-gregorian` → `-u-ca-gregory`), which needs
-the CLDR bcp47 alias tables the `icu_locale` canonicalizer does not apply.
-`intl402/` remains skipped in the default gate (it is opt-in via `--intl`),
-so this surface is not yet part of the committed baseline.
+- the `Intl` namespace and `Intl.getCanonicalLocales`;
+- the full `Intl.Locale` constructor + prototype
+  (`baseName`/`language`/`script`/`region`/`variants` and the
+  `calendar`/`collation`/`hourCycle`/`caseFirst`/`numeric`/`numberingSystem`
+  Unicode-extension accessors, plus `maximize`/`minimize`/`toString`);
+- `Intl.PluralRules` (`select`, `selectRange`, `resolvedOptions`,
+  `supportedLocalesOf`), with cardinal/ordinal rules and the
+  fraction/significant digit operand options.
+
+Against `test/intl402/Intl` + `test/intl402/Locale` +
+`test/intl402/PluralRules` (run with `--intl`) the engine passes **182** of
+the executed tests.
+
+Not yet implemented (so still failing/skipped under `--intl`): the other
+formatters (`NumberFormat`, `DateTimeFormat`, `Collator`, `ListFormat`, …),
+`Intl.supportedValuesOf`, the `Intl.Locale-info` accessors
+(`getCalendars`/`getWeekInfo`/…, an honest skip via that feature tag),
+full best-fit/lookup locale resolution (`supportedLocalesOf` over-returns),
+`PluralRules` compact-notation operands and `selectRange`'s CLDR
+plural-range table (only in ICU4X's `unstable` surface; approximated by the
+end value's category), and the long tail of Unicode-extension
+*keyword-value* canonicalization (e.g. `-u-ca-gregorian` → `-u-ca-gregory`),
+which needs the CLDR bcp47 alias tables the `icu_locale` canonicalizer does
+not apply. `intl402/` remains skipped in the default gate (it is opt-in via
+`--intl`), so this surface is not yet part of the committed baseline.
 
 ## CI gate
 
