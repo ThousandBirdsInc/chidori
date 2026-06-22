@@ -151,6 +151,8 @@ pub fn install(vm: &mut Vm) {
     install_plain_date_time(vm, &temporal);
     install_year_month(vm, &temporal);
     install_month_day(vm, &temporal);
+    install_zoned_date_time(vm, &temporal);
+    install_now(vm, &temporal);
 
     // Temporal[Symbol.toStringTag] = "Temporal" (non-writable, non-enumerable, configurable).
     let tag = vm.realm.symbol_to_string_tag.clone();
@@ -2309,5 +2311,407 @@ fn define_md_getter(
         PropertyKey::str(name),
         Some(Value::Object(getter)),
         None,
+    );
+}
+
+// =========================================================================
+// Temporal.ZonedDateTime
+// =========================================================================
+
+use temporal_rs::options::{Disambiguation, DisplayOffset, DisplayTimeZone, OffsetDisambiguation};
+use temporal_rs::{TimeZone, ZonedDateTime};
+
+fn this_zdt(vm: &mut Vm, this: &Value) -> Result<ZonedDateTime, Value> {
+    if let Value::Object(o) = this {
+        if let Internal::Temporal(slot) = &o.borrow().internal {
+            if let TemporalSlot::ZonedDateTime(d) = slot.as_ref() {
+                return Ok(d.clone());
+            }
+        }
+    }
+    Err(vm.throw_type("receiver is not a Temporal.ZonedDateTime"))
+}
+
+/// `ToTemporalTimeZoneIdentifier`: a string identifier or offset.
+fn to_time_zone(vm: &mut Vm, v: &Value) -> Result<TimeZone, Value> {
+    match v {
+        Value::String(s) => {
+            TimeZone::try_from_identifier_str(s.as_str()).map_err(|e| temporal_err(vm, e))
+        }
+        _ => {
+            let s = vm.to_js_string(v)?.as_str().to_owned();
+            TimeZone::try_from_identifier_str(&s).map_err(|e| temporal_err(vm, e))
+        }
+    }
+}
+
+fn to_temporal_zdt(vm: &mut Vm, v: &Value) -> Result<ZonedDateTime, Value> {
+    if let Value::Object(o) = v {
+        if let Internal::Temporal(slot) = &o.borrow().internal {
+            if let TemporalSlot::ZonedDateTime(d) = slot.as_ref() {
+                return Ok(d.clone());
+            }
+        }
+    }
+    match v {
+        Value::String(s) => ZonedDateTime::from_utf8(
+            s.as_str().as_bytes(),
+            Disambiguation::Compatible,
+            OffsetDisambiguation::Reject,
+        )
+        .map_err(|e| temporal_err(vm, e)),
+        _ => Err(vm.throw_type("Temporal.ZonedDateTime: expected a ZonedDateTime or string")),
+    }
+}
+
+fn install_zoned_date_time(vm: &mut Vm, temporal: &JsObject) {
+    let proto = vm.new_object();
+    let ctor_proto = proto.clone();
+    let ctor = vm.new_native_ctor(
+        "ZonedDateTime",
+        0,
+        |vm, _t, _a| Err(vm.throw_type("Constructor Temporal.ZonedDateTime requires 'new'")),
+        move |vm, _this, args| {
+            let nanos = to_epoch_ns(vm, &arg(args, 0))?;
+            let tz = to_time_zone(vm, &arg(args, 1))?;
+            let calendar = to_calendar(vm, &arg(args, 2))?;
+            let d = ZonedDateTime::try_new(nanos, tz, calendar).map_err(|e| temporal_err(vm, e))?;
+            Ok(new_temporal(
+                vm,
+                TemporalSlot::ZonedDateTime(d),
+                &ctor_proto,
+            ))
+        },
+    );
+    install_ctor_proto(vm, &ctor, &proto);
+
+    vm.define_method(&ctor, "from", 1, |vm, _t, args| {
+        let d = to_temporal_zdt(vm, &arg(args, 0))?;
+        let proto = intrinsic_proto(vm, "ZonedDateTime")?;
+        Ok(new_temporal(vm, TemporalSlot::ZonedDateTime(d), &proto))
+    });
+    vm.define_method(&ctor, "compare", 2, |vm, _t, args| {
+        let a = to_temporal_zdt(vm, &arg(args, 0))?;
+        let b = to_temporal_zdt(vm, &arg(args, 1))?;
+        Ok(Value::Number(match a.compare_instant(&b) {
+            std::cmp::Ordering::Less => -1.0,
+            std::cmp::Ordering::Equal => 0.0,
+            std::cmp::Ordering::Greater => 1.0,
+        }))
+    });
+
+    define_zdt_getter(vm, &proto, "year", |d| Value::Number(d.year() as f64));
+    define_zdt_getter(vm, &proto, "month", |d| Value::Number(d.month() as f64));
+    define_zdt_getter(vm, &proto, "monthCode", |d| {
+        Value::str(d.month_code().as_str())
+    });
+    define_zdt_getter(vm, &proto, "day", |d| Value::Number(d.day() as f64));
+    define_zdt_getter(vm, &proto, "hour", |d| Value::Number(d.hour() as f64));
+    define_zdt_getter(vm, &proto, "minute", |d| Value::Number(d.minute() as f64));
+    define_zdt_getter(vm, &proto, "second", |d| Value::Number(d.second() as f64));
+    define_zdt_getter(vm, &proto, "millisecond", |d| {
+        Value::Number(d.millisecond() as f64)
+    });
+    define_zdt_getter(vm, &proto, "microsecond", |d| {
+        Value::Number(d.microsecond() as f64)
+    });
+    define_zdt_getter(vm, &proto, "nanosecond", |d| {
+        Value::Number(d.nanosecond() as f64)
+    });
+    define_zdt_getter(vm, &proto, "dayOfWeek", |d| {
+        Value::Number(d.day_of_week() as f64)
+    });
+    define_zdt_getter(vm, &proto, "dayOfYear", |d| {
+        Value::Number(d.day_of_year() as f64)
+    });
+    define_zdt_getter(vm, &proto, "daysInWeek", |d| {
+        Value::Number(d.days_in_week() as f64)
+    });
+    define_zdt_getter(vm, &proto, "daysInMonth", |d| {
+        Value::Number(d.days_in_month() as f64)
+    });
+    define_zdt_getter(vm, &proto, "daysInYear", |d| {
+        Value::Number(d.days_in_year() as f64)
+    });
+    define_zdt_getter(vm, &proto, "monthsInYear", |d| {
+        Value::Number(d.months_in_year() as f64)
+    });
+    define_zdt_getter(vm, &proto, "inLeapYear", |d| Value::Bool(d.in_leap_year()));
+    define_zdt_getter(vm, &proto, "offset", |d| Value::str(d.offset()));
+    define_zdt_getter(vm, &proto, "offsetNanoseconds", |d| {
+        Value::Number(d.offset_nanoseconds() as f64)
+    });
+    define_zdt_getter(vm, &proto, "epochMilliseconds", |d| {
+        Value::Number(d.epoch_milliseconds() as f64)
+    });
+    define_zdt_getter(vm, &proto, "epochNanoseconds", |d| {
+        Value::bigint(num_bigint::BigInt::from(d.to_instant().as_i128()))
+    });
+    define_zdt_getter(vm, &proto, "calendarId", |d| {
+        Value::str(d.calendar().identifier())
+    });
+    define_zdt_getter(vm, &proto, "era", |d| {
+        d.era()
+            .map(|e| Value::str(e.as_str()))
+            .unwrap_or(Value::Undefined)
+    });
+    define_zdt_getter(vm, &proto, "eraYear", |d| {
+        d.era_year()
+            .map(|y| Value::Number(y as f64))
+            .unwrap_or(Value::Undefined)
+    });
+    // timeZoneId needs the provider to resolve the canonical identifier.
+    let tzid = vm.new_native("get timeZoneId", 0, |vm, this, _a| {
+        let d = this_zdt(vm, &this)?;
+        let id = d
+            .time_zone()
+            .identifier()
+            .map_err(|e| temporal_err(vm, e))?;
+        Ok(Value::str(id))
+    });
+    vm.define_accessor(
+        &Value::Object(proto.clone()),
+        PropertyKey::str("timeZoneId"),
+        Some(Value::Object(tzid)),
+        None,
+    );
+    let hid = vm.new_native("get hoursInDay", 0, |vm, this, _a| {
+        let d = this_zdt(vm, &this)?;
+        Ok(Value::Number(
+            d.hours_in_day().map_err(|e| temporal_err(vm, e))?,
+        ))
+    });
+    vm.define_accessor(
+        &Value::Object(proto.clone()),
+        PropertyKey::str("hoursInDay"),
+        Some(Value::Object(hid)),
+        None,
+    );
+
+    vm.define_method(&proto, "add", 1, |vm, this, args| {
+        let d = this_zdt(vm, &this)?;
+        let dur = to_temporal_duration(vm, &arg(args, 0))?;
+        let overflow = get_overflow(vm, &arg(args, 1))?;
+        let nd = d.add(&dur, overflow).map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "ZonedDateTime")?;
+        Ok(new_temporal(vm, TemporalSlot::ZonedDateTime(nd), &proto))
+    });
+    vm.define_method(&proto, "subtract", 1, |vm, this, args| {
+        let d = this_zdt(vm, &this)?;
+        let dur = to_temporal_duration(vm, &arg(args, 0))?;
+        let overflow = get_overflow(vm, &arg(args, 1))?;
+        let nd = d
+            .subtract(&dur, overflow)
+            .map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "ZonedDateTime")?;
+        Ok(new_temporal(vm, TemporalSlot::ZonedDateTime(nd), &proto))
+    });
+    vm.define_method(&proto, "withCalendar", 1, |vm, this, args| {
+        let d = this_zdt(vm, &this)?;
+        let cal = to_calendar(vm, &arg(args, 0))?;
+        let nd = d.with_calendar(cal);
+        let proto = intrinsic_proto(vm, "ZonedDateTime")?;
+        Ok(new_temporal(vm, TemporalSlot::ZonedDateTime(nd), &proto))
+    });
+    vm.define_method(&proto, "withTimeZone", 1, |vm, this, args| {
+        let d = this_zdt(vm, &this)?;
+        let tz = to_time_zone(vm, &arg(args, 0))?;
+        let nd = d.with_timezone(tz).map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "ZonedDateTime")?;
+        Ok(new_temporal(vm, TemporalSlot::ZonedDateTime(nd), &proto))
+    });
+    vm.define_method(&proto, "until", 1, |vm, this, args| {
+        let d = this_zdt(vm, &this)?;
+        let other = to_temporal_zdt(vm, &arg(args, 0))?;
+        let settings = get_difference_settings(vm, &arg(args, 1))?;
+        let dur = d.until(&other, settings).map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "Duration")?;
+        Ok(new_temporal(vm, TemporalSlot::Duration(dur), &proto))
+    });
+    vm.define_method(&proto, "since", 1, |vm, this, args| {
+        let d = this_zdt(vm, &this)?;
+        let other = to_temporal_zdt(vm, &arg(args, 0))?;
+        let settings = get_difference_settings(vm, &arg(args, 1))?;
+        let dur = d.since(&other, settings).map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "Duration")?;
+        Ok(new_temporal(vm, TemporalSlot::Duration(dur), &proto))
+    });
+    vm.define_method(&proto, "round", 1, |vm, this, args| {
+        let d = this_zdt(vm, &this)?;
+        let ro = get_rounding_options(vm, &arg(args, 0))?;
+        let nd = d.round(ro).map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "ZonedDateTime")?;
+        Ok(new_temporal(vm, TemporalSlot::ZonedDateTime(nd), &proto))
+    });
+    vm.define_method(&proto, "equals", 1, |vm, this, args| {
+        let d = this_zdt(vm, &this)?;
+        let other = to_temporal_zdt(vm, &arg(args, 0))?;
+        Ok(Value::Bool(
+            d.equals(&other).map_err(|e| temporal_err(vm, e))?,
+        ))
+    });
+    vm.define_method(&proto, "startOfDay", 0, |vm, this, _a| {
+        let d = this_zdt(vm, &this)?;
+        let nd = d.start_of_day().map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "ZonedDateTime")?;
+        Ok(new_temporal(vm, TemporalSlot::ZonedDateTime(nd), &proto))
+    });
+    vm.define_method(&proto, "toInstant", 0, |vm, this, _a| {
+        let d = this_zdt(vm, &this)?;
+        let proto = intrinsic_proto(vm, "Instant")?;
+        Ok(new_temporal(
+            vm,
+            TemporalSlot::Instant(d.to_instant()),
+            &proto,
+        ))
+    });
+    vm.define_method(&proto, "toPlainDate", 0, |vm, this, _a| {
+        let d = this_zdt(vm, &this)?;
+        let proto = intrinsic_proto(vm, "PlainDate")?;
+        Ok(new_temporal(
+            vm,
+            TemporalSlot::PlainDate(d.to_plain_date()),
+            &proto,
+        ))
+    });
+    vm.define_method(&proto, "toPlainTime", 0, |vm, this, _a| {
+        let d = this_zdt(vm, &this)?;
+        let proto = intrinsic_proto(vm, "PlainTime")?;
+        Ok(new_temporal(
+            vm,
+            TemporalSlot::PlainTime(d.to_plain_time()),
+            &proto,
+        ))
+    });
+    vm.define_method(&proto, "toPlainDateTime", 0, |vm, this, _a| {
+        let d = this_zdt(vm, &this)?;
+        let proto = intrinsic_proto(vm, "PlainDateTime")?;
+        Ok(new_temporal(
+            vm,
+            TemporalSlot::PlainDateTime(d.to_plain_date_time()),
+            &proto,
+        ))
+    });
+    vm.define_method(&proto, "toString", 0, |vm, this, _a| {
+        let d = this_zdt(vm, &this)?;
+        let s = d
+            .to_ixdtf_string(
+                DisplayOffset::Auto,
+                DisplayTimeZone::Auto,
+                DisplayCalendar::Auto,
+                Default::default(),
+            )
+            .map_err(|e| temporal_err(vm, e))?;
+        Ok(Value::str(s))
+    });
+    vm.define_method(&proto, "toJSON", 0, |vm, this, _a| {
+        let d = this_zdt(vm, &this)?;
+        let s = d
+            .to_ixdtf_string(
+                DisplayOffset::Auto,
+                DisplayTimeZone::Auto,
+                DisplayCalendar::Auto,
+                Default::default(),
+            )
+            .map_err(|e| temporal_err(vm, e))?;
+        Ok(Value::str(s))
+    });
+    vm.define_method(&proto, "valueOf", 0, |vm, _this, _a| {
+        Err(vm.throw_type("Temporal.ZonedDateTime: use compare() instead of relational operators"))
+    });
+    set_tag(vm, &proto, "Temporal.ZonedDateTime");
+    temporal.borrow_mut().props.insert(
+        PropertyKey::str("ZonedDateTime"),
+        Property::builtin(Value::Object(ctor)),
+    );
+}
+
+fn define_zdt_getter(
+    vm: &mut Vm,
+    proto: &JsObject,
+    name: &str,
+    project: fn(&ZonedDateTime) -> Value,
+) {
+    let getter = vm.new_native(&format!("get {name}"), 0, move |vm, this, _a| {
+        let d = this_zdt(vm, &this)?;
+        Ok(project(&d))
+    });
+    vm.define_accessor(
+        &Value::Object(proto.clone()),
+        PropertyKey::str(name),
+        Some(Value::Object(getter)),
+        None,
+    );
+}
+
+// =========================================================================
+// Temporal.Now
+// =========================================================================
+
+/// A fresh system-clock `Now` (the bare conformance context reads real time,
+/// like `Date`; the durable runtime captures this as an effect at a higher layer).
+fn now_clock() -> temporal_rs::now::Now<temporal_rs::sys::LocalHostSystem> {
+    temporal_rs::Temporal::now()
+}
+
+/// The optional `temporalTimeZoneLike` argument of the `Now` methods.
+fn now_time_zone(vm: &mut Vm, v: &Value) -> Result<Option<TimeZone>, Value> {
+    if v.is_undefined() {
+        Ok(None)
+    } else {
+        Ok(Some(to_time_zone(vm, v)?))
+    }
+}
+
+fn install_now(vm: &mut Vm, temporal: &JsObject) {
+    let now = vm.new_object();
+
+    vm.define_method(&now, "timeZoneId", 0, |vm, _t, _a| {
+        let tz = now_clock().time_zone().map_err(|e| temporal_err(vm, e))?;
+        let id = tz.identifier().map_err(|e| temporal_err(vm, e))?;
+        Ok(Value::str(id))
+    });
+    vm.define_method(&now, "instant", 0, |vm, _t, _a| {
+        let i = now_clock().instant().map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "Instant")?;
+        Ok(new_temporal(vm, TemporalSlot::Instant(i), &proto))
+    });
+    vm.define_method(&now, "zonedDateTimeISO", 0, |vm, _t, args| {
+        let tz = now_time_zone(vm, &arg(args, 0))?;
+        let d = now_clock()
+            .zoned_date_time_iso(tz)
+            .map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "ZonedDateTime")?;
+        Ok(new_temporal(vm, TemporalSlot::ZonedDateTime(d), &proto))
+    });
+    vm.define_method(&now, "plainDateTimeISO", 0, |vm, _t, args| {
+        let tz = now_time_zone(vm, &arg(args, 0))?;
+        let d = now_clock()
+            .plain_date_time_iso(tz)
+            .map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "PlainDateTime")?;
+        Ok(new_temporal(vm, TemporalSlot::PlainDateTime(d), &proto))
+    });
+    vm.define_method(&now, "plainDateISO", 0, |vm, _t, args| {
+        let tz = now_time_zone(vm, &arg(args, 0))?;
+        let d = now_clock()
+            .plain_date_iso(tz)
+            .map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "PlainDate")?;
+        Ok(new_temporal(vm, TemporalSlot::PlainDate(d), &proto))
+    });
+    vm.define_method(&now, "plainTimeISO", 0, |vm, _t, args| {
+        let tz = now_time_zone(vm, &arg(args, 0))?;
+        let d = now_clock()
+            .plain_time_iso(tz)
+            .map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "PlainTime")?;
+        Ok(new_temporal(vm, TemporalSlot::PlainTime(d), &proto))
+    });
+
+    set_tag(vm, &now, "Temporal.Now");
+    temporal.borrow_mut().props.insert(
+        PropertyKey::str("Now"),
+        Property::builtin(Value::Object(now)),
     );
 }
