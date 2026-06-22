@@ -1,6 +1,6 @@
 [package]
 name = "chidori"
-version = "3.3.0"
+version = "3.4.0"
 edition = "2021"
 # oxc 0.133 relies on `if let` guards, stabilized in Rust 1.95.
 rust-version = "1.95"
@@ -71,7 +71,7 @@ hex = "0.4"
 rand = "0.8"
 
 # Pure-Rust JS engine + deterministic-replay durable runtime. The only JS engine.
-chidori-js = { path = "../chidori-js", version = "0.3.0" }
+chidori-js = { path = "../chidori-js", version = "0.3.1" }
 async-trait = "0.1"
 derive_more = { version = "1", features = ["display"] }
 
@@ -96,6 +96,17 @@ opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 # `satisfies` in odd positions, and overload signatures. oxc parses to a real
 # AST and emits JS via codegen, so unsupported sugar can't slip through.
 oxc = { version = "0.133", features = ["transformer", "codegen", "semantic"] }
+
+# Unix-only: apply per-process resource limits (setrlimit) and deadline-kill
+# (kill) to the OS-isolation worker child. See `runtime::isolate::limits`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Linux-only: seccomp-bpf syscall confinement + Landlock filesystem confinement
+# for the isolation worker. See `runtime::isolate::sandbox`.
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.5"
+landlock = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

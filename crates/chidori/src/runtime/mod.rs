@@ -1,3 +1,4 @@
+pub mod app_data;
 pub mod call_log;
 pub mod capability;
 pub mod context;
@@ -6,6 +7,9 @@ pub mod crypto;
 pub mod engine;
 pub mod host_branch;
 pub mod host_core;
+/// OS-level isolation: run an agent in a sandboxed child process and broker its
+/// host effects back over a pipe (see `docs/os-isolation-plan.md`).
+pub mod isolate;
 pub mod memory;
 pub mod native;
 pub mod otel;

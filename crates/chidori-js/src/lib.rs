@@ -540,6 +540,50 @@ impl Engine {
             });
         self.vm
             .define_value(&chidori, "workspace", Value::Object(workspace));
+        // chidori.appData.{write,query}(sql, params?) — the generative-UI
+        // agent-run write tool. Each method forwards the "app_data" effect
+        // tagged with its action; the host performs the write through the
+        // host boundary (the guest never holds a DB credential) and journals
+        // it. `params` are bound server-side ($1,$2,…), never string-concatted.
+        let app_data = self.vm.new_object();
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&app_data, "write", 2, move |vm, _t, args| {
+                let sql = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let params = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "app_data",
+                    serde_json::json!({ "action": "write", "sql": sql, "params": params }),
+                )
+            });
+        let d = dispatch.clone();
+        self.vm
+            .define_method(&app_data, "query", 2, move |vm, _t, args| {
+                let sql = args
+                    .first()
+                    .map(|v| vm.to_string_lossy(v))
+                    .unwrap_or_default();
+                let params = args
+                    .get(1)
+                    .map(|v| vm.value_to_json(v))
+                    .unwrap_or(serde_json::Value::Null);
+                forward_effect(
+                    vm,
+                    &d,
+                    "app_data",
+                    serde_json::json!({ "action": "query", "sql": sql, "params": params }),
+                )
+            });
+        self.vm
+            .define_value(&chidori, "appData", Value::Object(app_data));
         let global = self.vm.realm.global.clone();
         self.vm
             .define_value(&global, "chidori", Value::Object(chidori.clone()));

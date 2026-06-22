@@ -87,6 +87,15 @@ pub enum Mutation {
 /// external renderers/consumers can detect incompatibility.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Depth bound for the native tree-serialization walks (`render_html`).
+/// JS-level recursion in generated UI code is already converted to a catchable
+/// `RangeError` by the VM's `max_call_depth` (2000) guard; this bounds the
+/// separate *native* recursion over a pathologically deep DOM tree (built
+/// iteratively via `appendChild`, so the JS guard never sees it) so it degrades
+/// to a marker instead of overflowing the render stack and aborting the process
+/// (docs/design/chidori-handoff.md §3.3). Far above any real UI nesting.
+const MAX_DOM_DEPTH: usize = 5000;
+
 fn protocol_version() -> u32 {
     PROTOCOL_VERSION
 }
@@ -761,26 +770,35 @@ impl Dom {
     }
 
     fn render_html(&self, id: usize) -> String {
+        self.render_html_at(id, 0)
+    }
+
+    fn render_html_at(&self, id: usize, depth: usize) -> String {
+        if depth > MAX_DOM_DEPTH {
+            // Stop descending rather than overflow the native stack: a runaway
+            // generation could nest the DOM far deeper than any real UI.
+            return "<!-- chidori: DOM depth limit exceeded -->".to_string();
+        }
         match &self.nodes[id].kind {
             NodeKind::Text => escape_text(&self.nodes[id].text),
-            NodeKind::Document => self.render_children(id),
+            NodeKind::Document => self.render_children(id, depth),
             NodeKind::Element(tag) => {
                 let mut s = format!("<{tag}");
                 for (k, v) in &self.nodes[id].attrs {
                     s.push_str(&format!(" {k}=\"{}\"", escape_attr(v)));
                 }
                 s.push('>');
-                s.push_str(&self.render_children(id));
+                s.push_str(&self.render_children(id, depth));
                 s.push_str(&format!("</{tag}>"));
                 s
             }
         }
     }
 
-    fn render_children(&self, id: usize) -> String {
+    fn render_children(&self, id: usize, depth: usize) -> String {
         let mut s = String::new();
         for &c in &self.nodes[id].children {
-            s.push_str(&self.render_html(c));
+            s.push_str(&self.render_html_at(c, depth + 1));
         }
         s
     }
@@ -1806,7 +1824,7 @@ fn install_node_api(vm: &mut Vm, dom: &Rc<RefCell<Dom>>, obj: &JsObject) {
             None => return Ok(Value::str("")),
         };
         let id = nid_of(vm, &this).ok_or_else(|| type_err(vm, "innerHTML: not a node"))?;
-        let html = dom.borrow().render_children(id);
+        let html = dom.borrow().render_children(id, 0);
         Ok(Value::str(html))
     });
     let d = weak.clone();
@@ -2266,4 +2284,49 @@ pub fn install(vm: &mut Vm) -> DomHandle {
     vm.define_value(&global, "window", Value::Object(window));
 
     DomHandle(dom)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_html_bounds_depth_instead_of_overflowing() {
+        // A DOM nested past the bound serializes to a marker rather than
+        // overflowing the native render stack (chidori-handoff §3.3). Run on a
+        // large stack so the ~MAX_DOM_DEPTH-deep recursion the guard *does*
+        // allow can't itself overflow a small default test stack.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let mut dom = Dom::new();
+                let mut parent = dom.body;
+                for _ in 0..(MAX_DOM_DEPTH + 50) {
+                    let el = dom.create_element("div");
+                    dom.append_child(parent, el).unwrap();
+                    parent = el;
+                }
+                let html = dom.render_html(dom.document);
+                assert!(
+                    html.contains("DOM depth limit exceeded"),
+                    "expected depth marker in deep render"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn render_html_within_bound_is_unmarked() {
+        let mut dom = Dom::new();
+        let el = dom.create_element("span");
+        let text = dom.new_node(NodeKind::Text);
+        dom.nodes[text].text = "hi".to_string();
+        dom.append_child(el, text).unwrap();
+        dom.append_child(dom.body, el).unwrap();
+        let html = dom.render_html(dom.body);
+        assert!(html.contains("<span>hi</span>"));
+        assert!(!html.contains("depth limit"));
+    }
 }
