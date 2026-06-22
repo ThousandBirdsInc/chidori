@@ -8,6 +8,11 @@ name: Test262 coverage
 # fails the build on regressions, this one never fails on coverage — it just
 # surfaces the current pass-rate and the per-area breakdown so a PR's effect on
 # conformance is visible at a glance.
+#
+# Unlike the gate, the report runs the opt-in surfaces too (`--intl --temporal`
+# and the intl402 tree), so Intl and Temporal show up as their own areas with
+# real pass-rates instead of a wall of skips. They remain out of the committed
+# gate baseline; only this comment reflects them.
 on:
   pull_request:
     paths:

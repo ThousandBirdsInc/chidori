@@ -1536,6 +1536,24 @@ impl Vm {
 
     /// Own keys in spec order: integer indices ascending, then string keys in
     /// insertion order, then symbols in insertion order.
+    /// Whether `k` names an engine-internal slot stored in `props` for
+    /// convenience but invisible to the language (filtered from
+    /// `[[OwnPropertyKeys]]`, hence from `getOwnPropertyNames`/`-Symbols`/
+    /// `Reflect.ownKeys`). These are always non-enumerable, so the enumerable-only
+    /// surfaces (`Object.keys`, spread, `for-in`) already exclude them.
+    fn is_internal_slot_key(&self, k: &PropertyKey) -> bool {
+        match k {
+            PropertyKey::Str(s) => s.as_str() == crate::typed_array::ARRAY_BUFFER_MAX_SLOT,
+            PropertyKey::Sym(sym) => {
+                *sym == self.realm.symbol_array_buffer_shared
+                    || *sym == self.realm.symbol_disposable_state
+                    || *sym == self.realm.symbol_intl_locale
+                    || *sym == self.realm.symbol_intl_plural_rules
+                    || *sym == self.realm.symbol_intl_number_format
+            }
+        }
+    }
+
     pub fn own_keys(&self, obj: &JsObject) -> Vec<PropertyKey> {
         let b = obj.borrow();
         let mut int_keys: Vec<u32> = Vec::new();
@@ -1579,6 +1597,12 @@ impl Vm {
             }
         }
         for k in b.props.keys() {
+            // Engine-internal slots (a buffer's `[[ArrayBufferMaxByteLength]]`,
+            // the SharedArrayBuffer brand) are not real properties: they never
+            // surface through `[[OwnPropertyKeys]]`.
+            if self.is_internal_slot_key(k) {
+                continue;
+            }
             match k {
                 PropertyKey::Str(_) => {
                     if let Some(idx) = k.array_index() {

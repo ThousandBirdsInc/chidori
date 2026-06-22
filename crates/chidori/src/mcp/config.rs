@@ -143,8 +143,7 @@ mod tests {
 
     #[test]
     fn http_without_url_is_invalid() {
-        let cfg: McpServerConfig =
-            serde_json::from_str(r#"{"transport":"http"}"#).unwrap();
+        let cfg: McpServerConfig = serde_json::from_str(r#"{"transport":"http"}"#).unwrap();
         assert!(cfg.validate().is_err());
     }
 

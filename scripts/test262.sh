@@ -124,12 +124,27 @@ if [[ "$report" == "1" ]]; then
   # Run the whole suite (chunked, never sharded) into a fresh state file, then
   # render a Markdown coverage table. Unlike --gate this never fails on
   # regressions — it is a reporting pass (CI posts it as a PR comment).
+  #
+  # The report runs the opt-in surfaces too (`--intl --temporal`, and the
+  # `test/intl402/*/` tree the default sweep skips), so the table surfaces the
+  # real Intl and Temporal pass-rates as their own areas rather than a wall of
+  # skips. These stay out of the committed gate baseline — this is reporting,
+  # not gating — so enabling them here changes only what the comment shows.
   REPORT_OUT="${TEST262_REPORT_OUT:-$REPO_ROOT/test262-coverage.md}"
   state="$(mktemp)"
-  echo "Measuring coverage (chunked) ..." >&2
+  # Default sweep (language + built-ins) plus the intl402 tree, unless explicit
+  # paths were forwarded (then chunk_dirs already echoes exactly those).
+  report_dirs() {
+    TEST262_SHARD_TOTAL=1 chunk_dirs
+    if [[ ${#forward[@]} -eq 0 ]]; then
+      (cd "$VENDOR_DIR" && ls -d test/intl402/*/)
+    fi
+  }
+  echo "Measuring coverage (chunked, incl. --intl --temporal) ..." >&2
   while IFS= read -r d; do
-    TEST262_SHARD_TOTAL=1 "$RUNNER" --test262 "$VENDOR_DIR" --state "$state" "$d" >/dev/null || true
-  done < <(TEST262_SHARD_TOTAL=1 chunk_dirs)
+    TEST262_SHARD_TOTAL=1 "$RUNNER" --test262 "$VENDOR_DIR" --intl --temporal \
+      --state "$state" "$d" >/dev/null || true
+  done < <(report_dirs)
   python3 "$REPO_ROOT/scripts/test262-coverage.py" "$state" >"$REPORT_OUT"
   echo "Coverage report -> $REPORT_OUT" >&2
   cat "$REPORT_OUT"

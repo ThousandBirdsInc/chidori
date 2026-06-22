@@ -1230,7 +1230,10 @@ fn execute_app_data_with_config(
 ) -> Result<Value> {
     use crate::runtime::app_data::app_data_error;
 
-    let action = args.get("action").and_then(Value::as_str).unwrap_or("write");
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("write");
     let sql = args.get("sql").and_then(Value::as_str).unwrap_or("").trim();
     if sql.is_empty() {
         return Ok(app_data_error("sql", "empty SQL statement"));
@@ -1510,8 +1513,11 @@ mod tests {
         // CHIDORI_APP_DATA is unset in the test process, so the binding is
         // absent and the guest gets a structured `no_cluster` error.
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let out = execute_app_data(&rt, &json!({ "action": "write", "sql": "INSERT INTO t VALUES (1)" }))
-            .unwrap();
+        let out = execute_app_data(
+            &rt,
+            &json!({ "action": "write", "sql": "INSERT INTO t VALUES (1)" }),
+        )
+        .unwrap();
         assert_eq!(out["appDataError"]["kind"], "no_cluster");
     }
 
@@ -1548,7 +1554,10 @@ mod tests {
 
     #[test]
     fn app_data_4xx_maps_to_sql_error_with_message() {
-        let addr = canned_http_endpoint("400 Bad Request", r#"{"error":"syntax error at or near \"FROM\""}"#);
+        let addr = canned_http_endpoint(
+            "400 Bad Request",
+            r#"{"error":"syntax error at or near \"FROM\""}"#,
+        );
         let rt = tokio::runtime::Runtime::new().unwrap();
         let cfg = crate::runtime::app_data::AppDataConfig {
             endpoint: format!("http://{addr}/internal/app-data/write"),

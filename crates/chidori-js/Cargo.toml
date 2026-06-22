@@ -35,6 +35,20 @@ num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"
 unicode-normalization = "0.1.25"
+# Intl: locale identifier parsing/canonicalization (`icu_locale_core`, already in
+# the tree via oxc) plus the CLDR-data-backed canonicalizer/expander (`icu_locale`,
+# `compiled_data`) that powers `Intl.getCanonicalLocales` and `Intl.Locale`.
+icu_locale_core = "2"
+icu_locale = "2"
+# Intl.PluralRules: plural-category rules + decimal operand model
+# (`ryu` enables building an operand decimal from an f64).
+icu_plurals = "2"
+fixed_decimal = { version = "0.7", features = ["ryu"] }
+# Intl.NumberFormat: locale-aware decimal formatting (grouping, digits).
+icu_decimal = "2"
+# Temporal: the TC39 Temporal proposal implemented in Rust (calendars, time
+# zones, durations, and the spec arithmetic).
+temporal_rs = "0.2.3"
 
 [dev-dependencies]
 criterion = "0.5"

@@ -52,6 +52,9 @@ pub struct Realm {
     pub regexp_proto: JsObject,
     pub date_proto: JsObject,
     pub array_buffer_proto: JsObject,
+    /// %SharedArrayBuffer.prototype%. Distinct from `array_buffer_proto` so the
+    /// two byte-length/slice surfaces brand-check against each other.
+    pub shared_array_buffer_proto: JsObject,
     pub data_view_proto: JsObject,
     /// Base %TypedArray%.prototype (shared by all typed-array prototypes).
     pub typed_array_proto: JsObject,
@@ -79,6 +82,19 @@ pub struct Realm {
     /// array `[disposedBool, ...disposerFns]`). A symbol so it stays out of
     /// `getOwnPropertyNames` — fresh stacks must have no own string keys.
     pub symbol_disposable_state: JsSymbol,
+    /// Engine-private brand marking a buffer object as a SharedArrayBuffer
+    /// (`IsSharedArrayBuffer`). A symbol — script-unreachable — so it cannot be
+    /// observed; `own_keys` also filters it from `getOwnPropertySymbols`.
+    pub symbol_array_buffer_shared: JsSymbol,
+    /// Engine-private key holding an `Intl.Locale`'s canonical `[[Locale]]`
+    /// string (the brand for `IsInitializedLocale`). Filtered from `own_keys`.
+    pub symbol_intl_locale: JsSymbol,
+    /// Engine-private key holding an `Intl.PluralRules`' internal record object
+    /// (locale/type/digit options). The brand for the receiver checks.
+    pub symbol_intl_plural_rules: JsSymbol,
+    /// Engine-private key holding an `Intl.NumberFormat`'s internal record object
+    /// (locale/style/digit/grouping options). The brand for the receiver checks.
+    pub symbol_intl_number_format: JsSymbol,
 
     /// Registry for `Symbol.for`.
     pub symbol_registry: indexmap::IndexMap<String, JsSymbol>,
@@ -124,6 +140,7 @@ impl Realm {
             self.regexp_proto.clone(),
             self.date_proto.clone(),
             self.array_buffer_proto.clone(),
+            self.shared_array_buffer_proto.clone(),
             self.data_view_proto.clone(),
             self.typed_array_proto.clone(),
             self.throw_type_error.clone(),
@@ -179,6 +196,7 @@ impl Realm {
             regexp_proto: bare(),
             date_proto: bare(),
             array_buffer_proto: bare(),
+            shared_array_buffer_proto: bare(),
             data_view_proto: bare(),
             typed_array_proto: bare(),
             throw_type_error: bare(),
@@ -198,6 +216,10 @@ impl Realm {
             symbol_dispose: bare_symbol(14, "Symbol.dispose"),
             symbol_async_dispose: bare_symbol(15, "Symbol.asyncDispose"),
             symbol_disposable_state: bare_symbol(16, "[[DisposableState]]"),
+            symbol_array_buffer_shared: bare_symbol(17, "[[ArrayBufferShared]]"),
+            symbol_intl_locale: bare_symbol(18, "[[InitializedLocale]]"),
+            symbol_intl_plural_rules: bare_symbol(19, "[[InitializedPluralRules]]"),
+            symbol_intl_number_format: bare_symbol(20, "[[InitializedNumberFormat]]"),
             symbol_registry: indexmap::IndexMap::new(),
         }
     }
@@ -230,6 +252,7 @@ pub fn init_realm(vm: &mut Vm) {
         &vm.realm.regexp_proto,
         &vm.realm.date_proto,
         &vm.realm.array_buffer_proto,
+        &vm.realm.shared_array_buffer_proto,
         &vm.realm.data_view_proto,
         &vm.realm.typed_array_proto,
     ] {

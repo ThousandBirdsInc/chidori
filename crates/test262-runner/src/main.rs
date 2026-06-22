@@ -46,6 +46,7 @@ options:
   --verbose, -v     print each failure with the thrown message
   --no-modules      skip module-flag tests (they run by default)
   --intl            also run intl402 tests
+  --temporal        also run Temporal-tagged tests
   --help, -h        show this help";
 
 #[derive(Debug, Default, Deserialize)]
@@ -105,9 +106,10 @@ enum Outcome {
 /// so the conformance number reflects the implemented surface honestly. Bun and
 /// Node likewise skip features their engines lack.
 const UNSUPPORTED_FEATURES: &[&str] = &[
-    // Concurrency / shared memory — not in the embedded runtime.
-    "Atomics",
-    "SharedArrayBuffer",
+    // SharedArrayBuffer + Atomics are implemented (single-agent semantics: every
+    // op is a sequential read/RMW, `wait` reports the agent cannot block). Only
+    // `Atomics.waitAsync` — which needs the job queue to resolve a wait — and the
+    // genuinely-concurrent agent tests (skipped via the CanBlock flags) are out.
     "Atomics.waitAsync",
     // Intl — QuickJS ships no ICU/Intl.
     "Intl.Locale-info",
@@ -115,7 +117,6 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "decorators",
     "tail-call-optimization",
     "IsHTMLDDA",
-    "Temporal",
     "Array.fromAsync",
     "import-assertions",
     "import-attributes",
@@ -166,6 +167,7 @@ struct Args {
     verbose: bool,
     modules: bool,
     intl: bool,
+    temporal: bool,
     /// Persistent per-test result store. When set, this run UPDATES only the
     /// entries for the tests it executes, then recomputes and prints the
     /// whole-suite total from the merged store — so a targeted re-run (e.g. one
@@ -555,6 +557,11 @@ fn run_test(
     if rel.contains("intl402") && !args.intl {
         return vec![(Variant::Sloppy, Outcome::Skip("intl402".into()))];
     }
+    // Temporal is implemented incrementally; like intl402 it is opt-in (`--temporal`)
+    // so the default gate is not flooded with the not-yet-implemented surface.
+    if !args.temporal && meta.features.iter().any(|f| f == "Temporal") {
+        return vec![(Variant::Sloppy, Outcome::Skip("Temporal".into()))];
+    }
     if let Some(feat) = meta
         .features
         .iter()
@@ -563,6 +570,15 @@ fn run_test(
         return vec![(Variant::Sloppy, Outcome::Skip(format!("feature:{feat}")))];
     }
     if meta.has_flag("CanBlockIsFalse") || meta.has_flag("CanBlockIsTrue") {
+        return vec![(Variant::Sloppy, Outcome::Skip("agent".into()))];
+    }
+    // Multi-agent Atomics tests coordinate worker agents through `$262.agent`
+    // (the `atomicsHelper.js` harness). The single-threaded, non-`Send` engine
+    // cannot host a second agent, so — like the CanBlock agent tests above —
+    // these are honest skips rather than failures. The single-agent Atomics
+    // surface (load/store/RMW/wait-cannot-block/notify-zero) is still exercised
+    // by the many non-agent tests.
+    if meta.includes.iter().any(|i| i == "atomicsHelper.js") {
         return vec![(Variant::Sloppy, Outcome::Skip("agent".into()))];
     }
 
@@ -1264,6 +1280,7 @@ fn parse_args() -> Result<Args, String> {
     let mut verbose = false;
     let mut modules = true;
     let mut intl = false;
+    let mut temporal = false;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -1294,6 +1311,7 @@ fn parse_args() -> Result<Args, String> {
             "--modules" => modules = true,
             "--no-modules" => modules = false,
             "--intl" => intl = true,
+            "--temporal" => temporal = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -1318,6 +1336,7 @@ fn parse_args() -> Result<Args, String> {
         verbose,
         modules,
         intl,
+        temporal,
         state,
         baseline,
     })

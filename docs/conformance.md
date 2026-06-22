@@ -133,11 +133,100 @@ the box (or CI runner) it lands on.
 The runner **skips** (does not count as failure) tests that require features the
 engine intentionally does not implement — the same way Bun/Node skip what their
 engines lack. The list lives in `UNSUPPORTED_FEATURES` in
-`crates/test262-runner/src/main.rs` (e.g. `Atomics`, `SharedArrayBuffer`,
-`Temporal`, `decorators`, `iterator-helpers`, `import-attributes`,
-`WeakRef`/`FinalizationRegistry`), plus `intl402/` (skipped unless `--intl`) and
-the agent (`CanBlock`) tests. When the engine grows to cover a skipped feature,
-delete its entry and the suite starts holding it to account.
+`crates/test262-runner/src/main.rs` (e.g. `Temporal`, `decorators`,
+`iterator-helpers`, `import-attributes`, `WeakRef`/`FinalizationRegistry`), plus
+`intl402/` (skipped unless `--intl`) and the agent (`CanBlock`, and the
+`atomicsHelper.js` multi-agent harness) tests. When the engine grows to cover a
+skipped feature, delete its entry and the suite starts holding it to account.
+
+`SharedArrayBuffer` and `Atomics` **are** implemented (so their feature tags are
+no longer skipped). The embedded runtime is single-threaded — the engine is
+`Rc`-based and non-`Send` — so a SharedArrayBuffer is an ArrayBuffer that never
+detaches and grows in place, and every Atomics operation is a sequential
+read / read-modify-write, observationally identical to a real atomic on a single
+agent. `Atomics.wait` reports that the calling agent cannot block (as a browser
+main thread does); `Atomics.waitAsync` and the genuinely-concurrent
+`$262.agent` tests stay skipped, since a second agent cannot be hosted.
+
+## Intl (opt-in: `--intl`)
+
+A foundational slice of ECMA-402 is implemented, backed by ICU4X
+(`icu_locale_core` + the CLDR-data `icu_locale` canonicalizer/expander, plus
+`icu_plurals` + `fixed_decimal`):
+
+- the `Intl` namespace and `Intl.getCanonicalLocales`;
+- the full `Intl.Locale` constructor + prototype
+  (`baseName`/`language`/`script`/`region`/`variants` and the
+  `calendar`/`collation`/`hourCycle`/`caseFirst`/`numeric`/`numberingSystem`
+  Unicode-extension accessors, plus `maximize`/`minimize`/`toString`);
+- `Intl.PluralRules` (`select`, `selectRange`, `resolvedOptions`,
+  `supportedLocalesOf`), with cardinal/ordinal rules and the
+  fraction/significant digit operand options;
+- `Intl.NumberFormat` (`format`, `formatToParts`, `resolvedOptions`,
+  `supportedLocalesOf`) for the `decimal` and `percent` styles — full option
+  parsing/validation, locale-aware grouping and numbering systems (via
+  `icu_decimal`), the integer/fraction/significant digit options, all nine
+  rounding modes, and `signDisplay`. It is callable with or without `new`,
+  and `format` is the spec's once-bound getter.
+
+Against `test/intl402/Intl` + `Locale` + `PluralRules` + `NumberFormat` (run
+with `--intl`) the engine passes **317** of the executed tests.
+
+Not yet implemented (so still failing/skipped under `--intl`): the other
+formatters (`DateTimeFormat`, `Collator`, `ListFormat`, …),
+`Intl.supportedValuesOf`, the `Intl.Locale-info` accessors
+(`getCalendars`/`getWeekInfo`/…, an honest skip via that feature tag), and —
+for `NumberFormat` — the `currency`/`unit` styles, `compact`/`scientific`/
+`engineering` notation, `formatRange`/`formatRangeToParts`, and
+`roundingIncrement` (all of which need ICU4X's experimental formatters or the
+increment-decomposition table). Also missing: full best-fit/lookup locale
+resolution (`supportedLocalesOf` over-returns), `PluralRules` compact-notation
+operands and `selectRange`'s CLDR plural-range table (only in ICU4X's
+`unstable` surface; approximated by the end value's category), and the long
+tail of Unicode-extension *keyword-value* canonicalization (e.g.
+`-u-ca-gregorian` → `-u-ca-gregory`), which needs the CLDR bcp47 alias tables
+the `icu_locale` canonicalizer does not apply. `intl402/` remains skipped in
+the default gate (it is opt-in via `--intl`), so this surface is not yet part
+of the committed baseline.
+
+## Temporal (opt-in: `--temporal`)
+
+The TC39 Temporal proposal is being implemented incrementally on top of
+[`temporal_rs`](https://crates.io/crates/temporal_rs) (the proposal's Rust
+reference implementation: ISO-calendar arithmetic, durations, rounding, time
+zones). Each `Temporal.*` instance stores its backing `temporal_rs` value in an
+`Internal::Temporal` slot (a GC leaf — no JS references).
+
+All eight Temporal types are implemented, plus `Temporal.Now`. Against the
+full `test/built-ins/Temporal` tree (run with `--temporal`) the engine passes
+**3,886** of 4,603 executed tests (**84.4%**), from zero. Per type:
+
+| type | pass / executed |
+|---|---|
+| `Duration` | 452 / 540 |
+| `PlainTime` | ~468 / 493 |
+| `PlainDate` | 521 / 652 |
+| `Instant` | 412 / 465 |
+| `PlainDateTime` | 652 / 773 |
+| `PlainYearMonth` | 484 / 509 |
+| `PlainMonthDay` | 184 / 199 |
+| `ZonedDateTime` | 600 / 901 |
+| `Now` | 52 / 66 |
+
+Each type covers its constructor, accessors, arithmetic (`add`/`subtract`/
+`until`/`since`/`round`/`total` as applicable), `with`/`withCalendar`/
+`withTimeZone`, `equals`/`compare`, the cross-type converters
+(`toPlainDate`/`toPlainDateTime`/`toInstant`/…), `toString`/`toJSON`/
+`toLocaleString` with their rounding/calendar/offset display options, and
+`from`. `Duration.round`/`total`/`compare` honor a PlainDate `relativeTo`.
+`Temporal.Now` reads the system clock (the bare conformance context, like
+`Date`; the durable runtime captures it as an effect at a higher layer).
+
+The residual failures are concentrated in `ZonedDateTime`'s full property-bag
+`with` (a `PartialZonedDateTime` not yet wired), ZonedDateTime `relativeTo`,
+some non-ISO calendar corners, and option-read-order details. Temporal-tagged
+tests are skipped in the default gate (opt-in via `--temporal`), so this
+surface is not part of the committed baseline.
 
 ## CI gate
 

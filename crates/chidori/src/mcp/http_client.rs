@@ -63,7 +63,9 @@ impl McpHttpClient {
                 let host = url::Url::parse(&url)
                     .ok()
                     .and_then(|u| u.host_str().map(str::to_owned))
-                    .ok_or_else(|| anyhow!("http MCP server `{server_id}` has an unparseable url"))?;
+                    .ok_or_else(|| {
+                        anyhow!("http MCP server `{server_id}` has an unparseable url")
+                    })?;
                 let store = crate::runtime::secret_env::SecretStore::global();
                 let header = store
                     .substitute_str(&format!("Bearer {token}"), &host)
@@ -116,10 +118,7 @@ impl McpHttpClient {
 
     pub async fn call_tool(&self, name: &str, args: &Value) -> Result<Value> {
         let resp = self
-            .post_rpc(
-                "tools/call",
-                json!({ "name": name, "arguments": args }),
-            )
+            .post_rpc("tools/call", json!({ "name": name, "arguments": args }))
             .await?;
         // Collapse `{ content: [{type, text}, ...] }` to a single value for
         // agent ergonomics — identical to the stdio client.
@@ -139,10 +138,17 @@ impl McpHttpClient {
     }
 
     /// Apply the standard headers (auth, accept, session) to a request builder.
-    fn apply_headers(&self, mut req: reqwest::RequestBuilder, session: &Option<String>) -> reqwest::RequestBuilder {
+    fn apply_headers(
+        &self,
+        mut req: reqwest::RequestBuilder,
+        session: &Option<String>,
+    ) -> reqwest::RequestBuilder {
         // Streamable HTTP requires the client to accept both a single JSON
         // response and an SSE stream.
-        req = req.header(reqwest::header::ACCEPT, "application/json, text/event-stream");
+        req = req.header(
+            reqwest::header::ACCEPT,
+            "application/json, text/event-stream",
+        );
         if let Some(auth) = &self.auth_header {
             req = req.header(reqwest::header::AUTHORIZATION, auth);
         }
@@ -159,10 +165,7 @@ impl McpHttpClient {
         let id = 1;
         let payload = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         let session = self.session_id.lock().await.clone();
-        let req = self.apply_headers(
-            self.client.post(&self.url).json(&payload),
-            &session,
-        );
+        let req = self.apply_headers(self.client.post(&self.url).json(&payload), &session);
 
         let resp = tokio::time::timeout(std::time::Duration::from_secs(30), req.send())
             .await
@@ -207,8 +210,9 @@ impl McpHttpClient {
             // A notification-only POST can legitimately return 202 with no body.
             json!({ "jsonrpc": "2.0", "id": id, "result": {} })
         } else {
-            serde_json::from_str::<Value>(&text)
-                .map_err(|err| self.transport_error(method, &format!("invalid JSON-RPC body: {err}")))?
+            serde_json::from_str::<Value>(&text).map_err(|err| {
+                self.transport_error(method, &format!("invalid JSON-RPC body: {err}"))
+            })?
         };
 
         if let Some(err) = response.get("error") {
@@ -221,10 +225,7 @@ impl McpHttpClient {
     async fn post_notification(&self, method: &str, params: Value) -> Result<()> {
         let payload = json!({ "jsonrpc": "2.0", "method": method, "params": params });
         let session = self.session_id.lock().await.clone();
-        let req = self.apply_headers(
-            self.client.post(&self.url).json(&payload),
-            &session,
-        );
+        let req = self.apply_headers(self.client.post(&self.url).json(&payload), &session);
         // Best-effort: a notification failure shouldn't abort the handshake.
         let _ = req.send().await;
         Ok(())
@@ -268,10 +269,7 @@ fn parse_required_scopes(www_authenticate: &str) -> Option<Vec<String>> {
     let rest = &www_authenticate[idx + "scope=".len()..];
     let rest = rest.trim_start_matches('"');
     let end = rest.find('"').unwrap_or(rest.len());
-    let scopes: Vec<String> = rest[..end]
-        .split_whitespace()
-        .map(str::to_string)
-        .collect();
+    let scopes: Vec<String> = rest[..end].split_whitespace().map(str::to_string).collect();
     if scopes.is_empty() {
         None
     } else {
@@ -344,7 +342,9 @@ mod tests {
                 let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or(Value::Null);
                 let method = parsed.get("method").and_then(Value::as_str).unwrap_or("");
                 let result = match method {
-                    "initialize" => json!({"protocolVersion": PROTOCOL_VERSION, "serverInfo": {"name": "mock"}}),
+                    "initialize" => {
+                        json!({"protocolVersion": PROTOCOL_VERSION, "serverInfo": {"name": "mock"}})
+                    }
                     "tools/list" => json!({"tools": [{
                         "name": "echo",
                         "description": "echoes",
