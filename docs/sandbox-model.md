@@ -235,7 +235,9 @@ resource-precision gaps.
    there is no seccomp, namespace, or separate-process boundary. Isolation is
    purely capability-confinement plus Rust memory safety. A panic is contained
    (gap-free via `catch_unwind`), but this is not a substitute for OS containment
-   when running genuinely hostile code.
+   when running genuinely hostile code. A proposed additive fix —
+   process-per-run with brokered effects + per-OS sandboxing — is specified in
+   [`docs/os-isolation-plan.md`](./os-isolation-plan.md).
 
 5. **Container element counts beyond arrays are uncapped.** Arrays are bounded by
    `MAX_DENSE_ARRAY` (1M), but `Map`/`Set`/object property counts are not
@@ -365,9 +367,17 @@ If you intend to run code you do not trust on this engine today:
    (and tighten `CHIDORI_JS_MEM_POLL_MS` alongside a small cap), and enable
    `CHIDORI_JS_DEADLINE_MS` (acceptable because untrusted code should not be
    making slow trusted host calls).
-3. Run each agent in its own process (or container) so the lack of OS isolation
-   (gap 4) does not allow a true breakout; per-run memory accounting (gap 2)
-   already keeps co-tenant caps separate within one process.
+3. Add OS isolation with `--isolate` (`chidori run --isolate`, `chidori serve
+   --isolate`, or `CHIDORI_ISOLATE=process`): each run executes in a confined
+   child process and brokers its effects back over a pipe, so a breakout has no
+   ambient process to land in. On Linux the child runs under a network namespace
+   + Landlock read-only filesystem + a seccomp denylist; on macOS under a
+   Seatbelt profile; everywhere it gets a `setrlimit` floor (`CHIDORI_ISOLATE_*`)
+   and a parent-side deadline-kill. Layers are best-effort — set
+   `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` to fail closed if the platform's core
+   confinement can't be applied. See
+   [`docs/os-isolation-plan.md`](./os-isolation-plan.md). (Running each agent in
+   its own container is still complementary.)
 4. Keep `node:fs` on `FsPolicy::Captured` (the VFS) and avoid `workspace.*`.
 
 ## Verification

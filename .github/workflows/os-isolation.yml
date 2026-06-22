@@ -1,0 +1,58 @@
+name: OS isolation
+
+# Verifies the OS-level isolation worker (docs/os-isolation-plan.md) on both
+# Linux and macOS. The macOS leg is the one that matters most: it is the runtime
+# check of the phase-4 Seatbelt path that the Linux dev/CI hosts cannot perform
+# (`seatbelt_loads_and_enforces_on_macos` fails, rather than skips, if the
+# Seatbelt profile does not load and enforce). The Linux leg exercises the
+# network-namespace + seccomp + (where the kernel provides it) Landlock layers.
+#
+# Runs only when the isolation code, its tests, or this workflow change, since
+# the macOS runners are comparatively scarce.
+on:
+  pull_request:
+    paths:
+      - "crates/chidori/src/runtime/isolate/**"
+      - "crates/chidori/src/runtime/rust_engine.rs"
+      - "crates/chidori/tests/isolate_limits.rs"
+      - ".github/workflows/os-isolation.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "crates/chidori/src/runtime/isolate/**"
+      - "crates/chidori/src/runtime/rust_engine.rs"
+      - "crates/chidori/tests/isolate_limits.rs"
+      - ".github/workflows/os-isolation.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: os-isolation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  isolation:
+    name: Isolation tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: os-isolation-${{ matrix.os }}
+
+      # The integration tests spawn the real `chidori` binary as the isolation
+      # worker, so they exercise the per-OS sandbox end to end. `--nocapture`
+      # surfaces the `isolate-selftest:` / `sandbox:` markers in the CI log, which
+      # makes a skip (layer unavailable) easy to tell apart from a real failure.
+      - name: Isolation integration tests
+        run: cargo test -p chidori --test isolate_limits -- --nocapture
+
+      - name: Isolation unit tests
+        run: cargo test -p chidori --lib runtime::isolate
