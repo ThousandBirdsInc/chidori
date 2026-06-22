@@ -121,13 +121,22 @@ impl ResourceLimits {
     pub fn apply_to_self(&self) {}
 }
 
+/// The integer type `setrlimit`/`getrlimit` take for the resource selector:
+/// `__rlimit_resource_t` on glibc/Linux, plain `c_int` everywhere else
+/// (macOS/BSD). Matches the type of the `libc::RLIMIT_*` constants per platform,
+/// so callers pass `libc::RLIMIT_CPU` etc. unchanged.
+#[cfg(target_os = "linux")]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(all(unix, not(target_os = "linux")))]
+type RlimitResource = libc::c_int;
+
 /// Set the soft (`cur`) and hard (`max`) limit of `resource`. The kernel applies
 /// `RLIM_INFINITY` semantics; we only translate `u64`. The `as rlim_t` casts are
 /// load-bearing for portability — `rlim_t` is not `u64` on every Unix — even
 /// where this target makes them a no-op.
 #[cfg(unix)]
 #[allow(clippy::unnecessary_cast)]
-fn set_rlimit(resource: libc::__rlimit_resource_t, soft: u64, hard: u64, name: &str) {
+fn set_rlimit(resource: RlimitResource, soft: u64, hard: u64, name: &str) {
     let rlim = libc::rlimit {
         rlim_cur: soft as libc::rlim_t,
         rlim_max: hard as libc::rlim_t,
@@ -144,7 +153,7 @@ fn set_rlimit(resource: libc::__rlimit_resource_t, soft: u64, hard: u64, name: &
 /// The inherited hard limit for `resource`, if it can be read.
 #[cfg(unix)]
 #[allow(clippy::unnecessary_cast)] // `rlim_t` width is platform-dependent
-fn current_hard(resource: libc::__rlimit_resource_t) -> Option<u64> {
+fn current_hard(resource: RlimitResource) -> Option<u64> {
     let mut rlim = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
