@@ -80,7 +80,9 @@ impl McpManager {
             // stdio spawns a child; http connects to a remote endpoint. Both
             // yield the same `McpClientHandle` and the same ToolDefs.
             let handle = match server.transport {
-                McpTransport::Stdio => McpClient::spawn(server.clone()).await.map(McpClientHandle::Stdio),
+                McpTransport::Stdio => McpClient::spawn(server.clone())
+                    .await
+                    .map(McpClientHandle::Stdio),
                 McpTransport::Http => McpHttpClient::connect(id, server.clone())
                     .await
                     .map(McpClientHandle::Http),
