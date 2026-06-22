@@ -197,31 +197,36 @@ reference implementation: ISO-calendar arithmetic, durations, rounding, time
 zones). Each `Temporal.*` instance stores its backing `temporal_rs` value in an
 `Internal::Temporal` slot (a GC leaf — no JS references).
 
-Implemented so far: the `Temporal` namespace and two types.
+All eight Temporal types are implemented, plus `Temporal.Now`. Against the
+full `test/built-ins/Temporal` tree (run with `--temporal`) the engine passes
+**3,886** of 4,603 executed tests (**84.4%**), from zero. Per type:
 
-- **`Temporal.Duration`** — constructor, all ten field accessors plus
-  `sign`/`blank`, `with`, `negated`, `abs`, `add`, `subtract`, `round`,
-  `total`, `toString`/`toJSON`/`toLocaleString` (with `smallestUnit`/
-  `fractionalSecondDigits`/`roundingMode` options), `from`, and `compare`.
-  `round`/`total`/`compare` accept a PlainDate `relativeTo`. Passes **452** of
-  540 executed `Duration` tests.
-- **`Temporal.PlainTime`** — constructor, the six field accessors, `with`,
-  `add`, `subtract`, `until`, `since`, `round`, `equals`, `toString`/`toJSON`/
-  `toLocaleString`, `from`, and `compare`. Passes **~468** of 493 executed
-  `PlainTime` tests.
-- **`Temporal.PlainDate`** — constructor (ISO and named calendars), the full
-  accessor set (`year`/`month`/`monthCode`/`day`/`dayOfWeek`/`dayOfYear`/
-  `weekOfYear`/`daysInMonth`/`inLeapYear`/`era`/`calendarId`/…), `with`,
-  `withCalendar`, `add`, `subtract`, `until`, `since`, `equals`,
-  `toString`/`toJSON`/`toLocaleString` (with `calendarName`), `from`, and
-  `compare`. Passes **521** of 652 executed `PlainDate` tests.
+| type | pass / executed |
+|---|---|
+| `Duration` | 452 / 540 |
+| `PlainTime` | ~468 / 493 |
+| `PlainDate` | 521 / 652 |
+| `Instant` | 412 / 465 |
+| `PlainDateTime` | 652 / 773 |
+| `PlainYearMonth` | 484 / 509 |
+| `PlainMonthDay` | 184 / 199 |
+| `ZonedDateTime` | 600 / 901 |
+| `Now` | 52 / 66 |
 
-The remaining failures are largely cross-type conversions
-(`toPlainDateTime`/`toZonedDateTime`/…) and a few option-read-order corners.
-Not yet implemented: the remaining Temporal types (`Instant`,
-`PlainDateTime`, `PlainYearMonth`, `PlainMonthDay`, `ZonedDateTime`, `Now`).
-Temporal-tagged tests are skipped in the default gate (opt-in via
-`--temporal`), so this surface is not yet part of the committed baseline.
+Each type covers its constructor, accessors, arithmetic (`add`/`subtract`/
+`until`/`since`/`round`/`total` as applicable), `with`/`withCalendar`/
+`withTimeZone`, `equals`/`compare`, the cross-type converters
+(`toPlainDate`/`toPlainDateTime`/`toInstant`/…), `toString`/`toJSON`/
+`toLocaleString` with their rounding/calendar/offset display options, and
+`from`. `Duration.round`/`total`/`compare` honor a PlainDate `relativeTo`.
+`Temporal.Now` reads the system clock (the bare conformance context, like
+`Date`; the durable runtime captures it as an effect at a higher layer).
+
+The residual failures are concentrated in `ZonedDateTime`'s full property-bag
+`with` (a `PartialZonedDateTime` not yet wired), ZonedDateTime `relativeTo`,
+some non-ISO calendar corners, and option-read-order details. Temporal-tagged
+tests are skipped in the default gate (opt-in via `--temporal`), so this
+surface is not part of the committed baseline.
 
 ## CI gate
 
