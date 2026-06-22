@@ -637,6 +637,7 @@ impl ObjectData {
             Internal::BigIntObj(_) => "BigInt",
             Internal::Proxy(_) => "Proxy",
             Internal::ModuleNamespace(_) => "Module",
+            Internal::Temporal(_) => "Temporal",
         }
     }
 }
@@ -685,6 +686,22 @@ pub enum Internal {
     /// live {writable:true, enumerable:true, configurable:false} data
     /// properties whose [[Set]] always fails and whose [[Delete]] refuses.
     ModuleNamespace(NamespaceData),
+    /// A `Temporal.*` object. The spec arithmetic lives in `temporal_rs`; the
+    /// slot holds the immutable backing value (no JS references, so the GC
+    /// treats it as a leaf).
+    Temporal(Box<TemporalSlot>),
+}
+
+/// The backing value of a `Temporal.*` object (see `Internal::Temporal`).
+pub enum TemporalSlot {
+    Instant(temporal_rs::Instant),
+    Duration(temporal_rs::Duration),
+    PlainDate(temporal_rs::PlainDate),
+    PlainTime(temporal_rs::PlainTime),
+    PlainDateTime(temporal_rs::PlainDateTime),
+    PlainYearMonth(temporal_rs::PlainYearMonth),
+    PlainMonthDay(temporal_rs::PlainMonthDay),
+    ZonedDateTime(temporal_rs::ZonedDateTime),
 }
 
 /// Backing slots for a Module Namespace exotic object: export name → the

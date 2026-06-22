@@ -46,6 +46,7 @@ options:
   --verbose, -v     print each failure with the thrown message
   --no-modules      skip module-flag tests (they run by default)
   --intl            also run intl402 tests
+  --temporal        also run Temporal-tagged tests
   --help, -h        show this help";
 
 #[derive(Debug, Default, Deserialize)]
@@ -116,7 +117,6 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "decorators",
     "tail-call-optimization",
     "IsHTMLDDA",
-    "Temporal",
     "Array.fromAsync",
     "import-assertions",
     "import-attributes",
@@ -167,6 +167,7 @@ struct Args {
     verbose: bool,
     modules: bool,
     intl: bool,
+    temporal: bool,
     /// Persistent per-test result store. When set, this run UPDATES only the
     /// entries for the tests it executes, then recomputes and prints the
     /// whole-suite total from the merged store — so a targeted re-run (e.g. one
@@ -555,6 +556,11 @@ fn run_test(
     // Feature / category gating.
     if rel.contains("intl402") && !args.intl {
         return vec![(Variant::Sloppy, Outcome::Skip("intl402".into()))];
+    }
+    // Temporal is implemented incrementally; like intl402 it is opt-in (`--temporal`)
+    // so the default gate is not flooded with the not-yet-implemented surface.
+    if !args.temporal && meta.features.iter().any(|f| f == "Temporal") {
+        return vec![(Variant::Sloppy, Outcome::Skip("Temporal".into()))];
     }
     if let Some(feat) = meta
         .features
@@ -1274,6 +1280,7 @@ fn parse_args() -> Result<Args, String> {
     let mut verbose = false;
     let mut modules = true;
     let mut intl = false;
+    let mut temporal = false;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -1304,6 +1311,7 @@ fn parse_args() -> Result<Args, String> {
             "--modules" => modules = true,
             "--no-modules" => modules = false,
             "--intl" => intl = true,
+            "--temporal" => temporal = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -1328,6 +1336,7 @@ fn parse_args() -> Result<Args, String> {
         verbose,
         modules,
         intl,
+        temporal,
         state,
         baseline,
     })

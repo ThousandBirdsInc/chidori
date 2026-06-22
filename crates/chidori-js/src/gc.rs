@@ -332,7 +332,8 @@ fn trace_object(
         | Internal::Symbol(_)
         | Internal::Date(_)
         | Internal::ArrayBuffer(_)
-        | Internal::BigIntObj(_) => {}
+        | Internal::BigIntObj(_)
+        | Internal::Temporal(_) => {}
     }
 }
 

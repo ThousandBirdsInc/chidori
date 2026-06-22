@@ -46,6 +46,9 @@ icu_plurals = "2"
 fixed_decimal = { version = "0.7", features = ["ryu"] }
 # Intl.NumberFormat: locale-aware decimal formatting (grouping, digits).
 icu_decimal = "2"
+# Temporal: the TC39 Temporal proposal implemented in Rust (calendars, time
+# zones, durations, and the spec arithmetic).
+temporal_rs = "0.2.3"
 
 [dev-dependencies]
 criterion = "0.5"

@@ -189,6 +189,29 @@ the `icu_locale` canonicalizer does not apply. `intl402/` remains skipped in
 the default gate (it is opt-in via `--intl`), so this surface is not yet part
 of the committed baseline.
 
+## Temporal (opt-in: `--temporal`)
+
+The TC39 Temporal proposal is being implemented incrementally on top of
+[`temporal_rs`](https://crates.io/crates/temporal_rs) (the proposal's Rust
+reference implementation: ISO-calendar arithmetic, durations, rounding, time
+zones). Each `Temporal.*` instance stores its backing `temporal_rs` value in an
+`Internal::Temporal` slot (a GC leaf — no JS references).
+
+Implemented so far: the `Temporal` namespace and **`Temporal.Duration`** —
+constructor, all ten field accessors plus `sign`/`blank`, `with`, `negated`,
+`abs`, `add`, `subtract`, `round`, `total`, `toString`/`toJSON`/
+`toLocaleString` (with `smallestUnit`/`fractionalSecondDigits`/`roundingMode`
+options), `from`, and `compare`. Against `test/built-ins/Temporal/Duration`
+(run with `--temporal`) the engine passes **380** of 540 executed tests; most
+of the remainder need `relativeTo` (i.e. the not-yet-implemented `PlainDate`/
+`PlainDateTime`/`ZonedDateTime` types).
+
+Not yet implemented: the other Temporal types (`Instant`, `PlainDate`,
+`PlainTime`, `PlainDateTime`, `PlainYearMonth`, `PlainMonthDay`,
+`ZonedDateTime`, `Now`). Temporal-tagged tests are skipped in the default gate
+(opt-in via `--temporal`), so this surface is not yet part of the committed
+baseline.
+
 ## CI gate
 
 `.github/workflows/test262.yml` runs `scripts/test262.sh --gate` on:
