@@ -12,10 +12,12 @@ use crate::vm::Vm;
 
 use std::str::FromStr;
 use temporal_rs::options::{
-    RoundingIncrement, RoundingMode, RoundingOptions, ToStringRoundingOptions, Unit,
+    DifferenceSettings, Overflow, RoundingIncrement, RoundingMode, RoundingOptions,
+    ToStringRoundingOptions, Unit,
 };
 use temporal_rs::parsers::Precision;
-use temporal_rs::{Duration, Sign};
+use temporal_rs::partial::PartialTime;
+use temporal_rs::{Duration, PlainTime, Sign};
 
 /// Parse a Temporal unit string (singular or plural), RangeError otherwise.
 fn parse_unit(vm: &mut Vm, s: &str) -> Result<Unit, Value> {
@@ -59,10 +61,65 @@ fn get_increment(vm: &mut Vm, obj: &Value) -> Result<Option<RoundingIncrement>, 
         .map_err(|e| temporal_err(vm, e))
 }
 
+/// `GetTemporalOverflowOption`: `undefined`/object only; reads `overflow`
+/// (`constrain`/`reject`).
+fn get_overflow(vm: &mut Vm, opt: &Value) -> Result<Option<Overflow>, Value> {
+    if opt.is_undefined() {
+        return Ok(None);
+    }
+    if !matches!(opt, Value::Object(_)) {
+        return Err(vm.throw_type("Temporal: options must be an object or undefined"));
+    }
+    let v = vm.get_prop(opt, &PropertyKey::str("overflow"))?;
+    if v.is_undefined() {
+        return Ok(None);
+    }
+    match vm.to_js_string(&v)?.as_str() {
+        "constrain" => Ok(Some(Overflow::Constrain)),
+        "reject" => Ok(Some(Overflow::Reject)),
+        other => Err(vm.throw_range(&format!("invalid overflow: {other}"))),
+    }
+}
+
+/// Parse `RoundingOptions` from a `round` argument (a smallestUnit string or an
+/// options object; `largestUnit`/`roundingIncrement`/`roundingMode` optional).
+fn get_rounding_options(vm: &mut Vm, opt: &Value) -> Result<RoundingOptions, Value> {
+    let mut ro = RoundingOptions::default();
+    match opt {
+        Value::Undefined => return Err(vm.throw_type("round requires an argument")),
+        Value::String(s) => ro.smallest_unit = Some(parse_unit(vm, s.as_str())?),
+        Value::Object(_) => {
+            ro.largest_unit = get_unit_option(vm, opt, "largestUnit")?;
+            ro.increment = get_increment(vm, opt)?;
+            ro.rounding_mode = get_rounding_mode(vm, opt)?;
+            ro.smallest_unit = get_unit_option(vm, opt, "smallestUnit")?;
+        }
+        _ => return Err(vm.throw_type("round: invalid options")),
+    }
+    Ok(ro)
+}
+
+/// Parse `DifferenceSettings` (the `until`/`since` options object).
+fn get_difference_settings(vm: &mut Vm, opt: &Value) -> Result<DifferenceSettings, Value> {
+    let mut s = DifferenceSettings::default();
+    if opt.is_undefined() {
+        return Ok(s);
+    }
+    if !matches!(opt, Value::Object(_)) {
+        return Err(vm.throw_type("until/since: options must be an object"));
+    }
+    s.largest_unit = get_unit_option(vm, opt, "largestUnit")?;
+    s.increment = get_increment(vm, opt)?;
+    s.rounding_mode = get_rounding_mode(vm, opt)?;
+    s.smallest_unit = get_unit_option(vm, opt, "smallestUnit")?;
+    Ok(s)
+}
+
 pub fn install(vm: &mut Vm) {
     let temporal = vm.new_object();
 
     install_duration(vm, &temporal);
+    install_plain_time(vm, &temporal);
 
     // Temporal[Symbol.toStringTag] = "Temporal" (non-writable, non-enumerable, configurable).
     let tag = vm.realm.symbol_to_string_tag.clone();
@@ -402,7 +459,7 @@ fn install_duration(vm: &mut Vm, temporal: &JsObject) {
     // toString([options]): smallestUnit / fractionalSecondDigits / roundingMode.
     vm.define_method(&proto, "toString", 0, |vm, this, args| {
         let d = this_duration(vm, &this)?;
-        let opts = duration_to_string_options(vm, &arg(args, 0))?;
+        let opts = to_string_rounding_options(vm, &arg(args, 0))?;
         let s = d
             .as_temporal_string(opts)
             .map_err(|e| temporal_err(vm, e))?;
@@ -449,7 +506,7 @@ fn install_duration(vm: &mut Vm, temporal: &JsObject) {
 }
 
 /// Build `ToStringRoundingOptions` from a Duration.toString options argument.
-fn duration_to_string_options(vm: &mut Vm, opt: &Value) -> Result<ToStringRoundingOptions, Value> {
+fn to_string_rounding_options(vm: &mut Vm, opt: &Value) -> Result<ToStringRoundingOptions, Value> {
     let mut tso = ToStringRoundingOptions::default();
     if opt.is_undefined() {
         return Ok(tso);
@@ -463,18 +520,17 @@ fn duration_to_string_options(vm: &mut Vm, opt: &Value) -> Result<ToStringRoundi
     tso.rounding_mode = get_rounding_mode(vm, opt)?;
     let fsd = vm.get_prop(opt, &PropertyKey::str("fractionalSecondDigits"))?;
     if !fsd.is_undefined() {
-        tso.precision = if let Value::String(s) = &fsd {
-            if s.as_str() == "auto" {
-                Precision::Auto
-            } else {
-                return Err(vm.throw_range("invalid fractionalSecondDigits"));
-            }
-        } else {
-            let n = vm.to_number(&fsd)?;
+        // A Number must be an integer in 0..=9; any non-Number must stringify to
+        // exactly "auto" (so e.g. `null` is a RangeError, not 0).
+        tso.precision = if let Value::Number(n) = fsd {
             if !n.is_finite() || n.fract() != 0.0 || !(0.0..=9.0).contains(&n) {
                 return Err(vm.throw_range("invalid fractionalSecondDigits"));
             }
             Precision::Digit(n as u8)
+        } else if vm.to_js_string(&fsd)?.as_str() == "auto" {
+            Precision::Auto
+        } else {
+            return Err(vm.throw_range("invalid fractionalSecondDigits"));
         };
     }
     Ok(tso)
@@ -517,6 +573,317 @@ fn define_duration_getter(
     let getter = vm.new_native(&format!("get {name}"), 0, move |vm, this, _a| {
         let d = this_duration(vm, &this)?;
         Ok(project(&d))
+    });
+    vm.define_accessor(
+        &Value::Object(proto.clone()),
+        PropertyKey::str(name),
+        Some(Value::Object(getter)),
+        None,
+    );
+}
+
+// =========================================================================
+// Temporal.PlainTime
+// =========================================================================
+
+/// Fetch an intrinsic `Temporal.<name>.prototype` (for constructing method
+/// results, including cross-type ones like `until` → Duration).
+fn intrinsic_proto(vm: &mut Vm, name: &str) -> Result<JsObject, Value> {
+    let temporal = vm.get_prop(
+        &Value::Object(vm.realm.global.clone()),
+        &PropertyKey::str("Temporal"),
+    )?;
+    let ctor = vm.get_prop(&temporal, &PropertyKey::str(name))?;
+    let proto = vm.get_prop(&ctor, &PropertyKey::str("prototype"))?;
+    match proto {
+        Value::Object(o) => Ok(o),
+        _ => Err(vm.throw_type("missing Temporal prototype")),
+    }
+}
+
+/// `ToIntegerWithTruncation`: ToNumber, reject non-finite (RangeError), truncate.
+fn to_integer_with_truncation(vm: &mut Vm, v: &Value) -> Result<f64, Value> {
+    let n = vm.to_number(v)?;
+    if !n.is_finite() {
+        return Err(vm.throw_range("Temporal: value must be finite"));
+    }
+    Ok(n.trunc())
+}
+
+/// The `temporal_rs::PlainTime` backing a receiver.
+fn this_plain_time(vm: &mut Vm, this: &Value) -> Result<PlainTime, Value> {
+    if let Value::Object(o) = this {
+        if let Internal::Temporal(slot) = &o.borrow().internal {
+            if let TemporalSlot::PlainTime(t) = slot.as_ref() {
+                return Ok(*t);
+            }
+        }
+    }
+    Err(vm.throw_type("receiver is not a Temporal.PlainTime"))
+}
+
+/// Nanosecond-of-day, for `compare`.
+fn time_ns(t: &PlainTime) -> i64 {
+    t.hour() as i64 * 3_600_000_000_000
+        + t.minute() as i64 * 60_000_000_000
+        + t.second() as i64 * 1_000_000_000
+        + t.millisecond() as i64 * 1_000_000
+        + t.microsecond() as i64 * 1_000
+        + t.nanosecond() as i64
+}
+
+/// Read a `PartialTime` from an object in alphabetical field order; also returns
+/// whether any field was present.
+fn read_partial_time(vm: &mut Vm, obj: &Value) -> Result<(PartialTime, bool), Value> {
+    let mut pt = PartialTime {
+        hour: None,
+        minute: None,
+        second: None,
+        millisecond: None,
+        microsecond: None,
+        nanosecond: None,
+    };
+    let mut any = false;
+    for name in [
+        "hour",
+        "microsecond",
+        "millisecond",
+        "minute",
+        "nanosecond",
+        "second",
+    ] {
+        let v = vm.get_prop(obj, &PropertyKey::str(name))?;
+        if v.is_undefined() {
+            continue;
+        }
+        any = true;
+        let n = to_integer_with_truncation(vm, &v)?;
+        match name {
+            "hour" => pt.hour = Some(n as u8),
+            "minute" => pt.minute = Some(n as u8),
+            "second" => pt.second = Some(n as u8),
+            "millisecond" => pt.millisecond = Some(n as u16),
+            "microsecond" => pt.microsecond = Some(n as u16),
+            "nanosecond" => pt.nanosecond = Some(n as u16),
+            _ => {}
+        }
+    }
+    Ok((pt, any))
+}
+
+/// `ToTemporalTime`: a PlainTime is copied; a string is parsed; an object's
+/// fields build a PartialTime resolved with `overflow`.
+fn to_temporal_time(
+    vm: &mut Vm,
+    v: &Value,
+    overflow: Option<Overflow>,
+) -> Result<PlainTime, Value> {
+    if let Value::Object(o) = v {
+        if let Internal::Temporal(slot) = &o.borrow().internal {
+            if let TemporalSlot::PlainTime(t) = slot.as_ref() {
+                return Ok(*t);
+            }
+        }
+    }
+    match v {
+        Value::Object(_) => {
+            let (pt, any) = read_partial_time(vm, v)?;
+            if !any {
+                return Err(vm.throw_type("Temporal.PlainTime: object has no time fields"));
+            }
+            PlainTime::from_partial(pt, overflow).map_err(|e| temporal_err(vm, e))
+        }
+        Value::String(s) => {
+            PlainTime::from_utf8(s.as_str().as_bytes()).map_err(|e| temporal_err(vm, e))
+        }
+        _ => Err(vm.throw_type("Temporal.PlainTime: expected a time, string, or object")),
+    }
+}
+
+fn construct_plain_time(vm: &mut Vm, args: &[Value], proto: &JsObject) -> Result<Value, Value> {
+    let mut f = [0.0f64; 6];
+    for (i, item) in f.iter_mut().enumerate() {
+        let a = arg(args, i);
+        *item = if a.is_undefined() {
+            0.0
+        } else {
+            to_integer_with_truncation(vm, &a)?
+        };
+    }
+    // All PlainTime fields are non-negative; a negative would otherwise be hidden
+    // by the saturating float→uint cast below.
+    if f.iter().any(|&x| x < 0.0) {
+        return Err(vm.throw_range("Temporal.PlainTime: fields must be non-negative"));
+    }
+    let t = PlainTime::try_new(
+        f[0] as u8,
+        f[1] as u8,
+        f[2] as u8,
+        f[3] as u16,
+        f[4] as u16,
+        f[5] as u16,
+    )
+    .map_err(|e| temporal_err(vm, e))?;
+    Ok(new_temporal(vm, TemporalSlot::PlainTime(t), proto))
+}
+
+fn install_plain_time(vm: &mut Vm, temporal: &JsObject) {
+    let proto = vm.new_object();
+    let ctor_proto = proto.clone();
+    let ctor = vm.new_native_ctor(
+        "PlainTime",
+        0,
+        |vm, _t, _a| Err(vm.throw_type("Constructor Temporal.PlainTime requires 'new'")),
+        move |vm, _this, args| construct_plain_time(vm, args, &ctor_proto),
+    );
+    ctor.borrow_mut().props.insert(
+        PropertyKey::str("prototype"),
+        Property {
+            kind: PropertyKind::Data {
+                value: Value::Object(proto.clone()),
+                writable: false,
+            },
+            enumerable: false,
+            configurable: false,
+        },
+    );
+    proto.borrow_mut().props.insert(
+        PropertyKey::str("constructor"),
+        Property::builtin(Value::Object(ctor.clone())),
+    );
+
+    // Temporal.PlainTime.from(item[, options])
+    vm.define_method(&ctor, "from", 1, |vm, _t, args| {
+        let overflow = get_overflow(vm, &arg(args, 1))?;
+        let t = to_temporal_time(vm, &arg(args, 0), overflow)?;
+        let proto = intrinsic_proto(vm, "PlainTime")?;
+        Ok(new_temporal(vm, TemporalSlot::PlainTime(t), &proto))
+    });
+    // Temporal.PlainTime.compare(one, two)
+    vm.define_method(&ctor, "compare", 2, |vm, _t, args| {
+        let a = to_temporal_time(vm, &arg(args, 0), None)?;
+        let b = to_temporal_time(vm, &arg(args, 1), None)?;
+        Ok(Value::Number(match time_ns(&a).cmp(&time_ns(&b)) {
+            std::cmp::Ordering::Less => -1.0,
+            std::cmp::Ordering::Equal => 0.0,
+            std::cmp::Ordering::Greater => 1.0,
+        }))
+    });
+
+    define_time_getter(vm, &proto, "hour", |t| t.hour() as f64);
+    define_time_getter(vm, &proto, "minute", |t| t.minute() as f64);
+    define_time_getter(vm, &proto, "second", |t| t.second() as f64);
+    define_time_getter(vm, &proto, "millisecond", |t| t.millisecond() as f64);
+    define_time_getter(vm, &proto, "microsecond", |t| t.microsecond() as f64);
+    define_time_getter(vm, &proto, "nanosecond", |t| t.nanosecond() as f64);
+
+    vm.define_method(&proto, "add", 1, |vm, this, args| {
+        let t = this_plain_time(vm, &this)?;
+        let d = to_temporal_duration(vm, &arg(args, 0))?;
+        let nt = t.add(&d).map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "PlainTime")?;
+        Ok(new_temporal(vm, TemporalSlot::PlainTime(nt), &proto))
+    });
+    vm.define_method(&proto, "subtract", 1, |vm, this, args| {
+        let t = this_plain_time(vm, &this)?;
+        let d = to_temporal_duration(vm, &arg(args, 0))?;
+        let nt = t.subtract(&d).map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "PlainTime")?;
+        Ok(new_temporal(vm, TemporalSlot::PlainTime(nt), &proto))
+    });
+    vm.define_method(&proto, "with", 1, |vm, this, args| {
+        let t = this_plain_time(vm, &this)?;
+        let item = arg(args, 0);
+        if !matches!(item, Value::Object(_)) {
+            return Err(
+                vm.throw_type("Temporal.PlainTime.prototype.with: argument must be an object")
+            );
+        }
+        let (pt, any) = read_partial_time(vm, &item)?;
+        if !any {
+            return Err(vm.throw_type("Temporal.PlainTime.prototype.with: no recognized fields"));
+        }
+        let overflow = get_overflow(vm, &arg(args, 1))?;
+        let nt = t.with(pt, overflow).map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "PlainTime")?;
+        Ok(new_temporal(vm, TemporalSlot::PlainTime(nt), &proto))
+    });
+    vm.define_method(&proto, "round", 1, |vm, this, args| {
+        let t = this_plain_time(vm, &this)?;
+        let ro = get_rounding_options(vm, &arg(args, 0))?;
+        let nt = t.round(ro).map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "PlainTime")?;
+        Ok(new_temporal(vm, TemporalSlot::PlainTime(nt), &proto))
+    });
+    vm.define_method(&proto, "until", 1, |vm, this, args| {
+        let t = this_plain_time(vm, &this)?;
+        let other = to_temporal_time(vm, &arg(args, 0), None)?;
+        let settings = get_difference_settings(vm, &arg(args, 1))?;
+        let d = t.until(&other, settings).map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "Duration")?;
+        Ok(new_temporal(vm, TemporalSlot::Duration(d), &proto))
+    });
+    vm.define_method(&proto, "since", 1, |vm, this, args| {
+        let t = this_plain_time(vm, &this)?;
+        let other = to_temporal_time(vm, &arg(args, 0), None)?;
+        let settings = get_difference_settings(vm, &arg(args, 1))?;
+        let d = t.since(&other, settings).map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "Duration")?;
+        Ok(new_temporal(vm, TemporalSlot::Duration(d), &proto))
+    });
+    vm.define_method(&proto, "equals", 1, |vm, this, args| {
+        let t = this_plain_time(vm, &this)?;
+        let other = to_temporal_time(vm, &arg(args, 0), None)?;
+        Ok(Value::Bool(time_ns(&t) == time_ns(&other)))
+    });
+    vm.define_method(&proto, "toString", 0, |vm, this, args| {
+        let t = this_plain_time(vm, &this)?;
+        let opts = to_string_rounding_options(vm, &arg(args, 0))?;
+        Ok(Value::str(
+            t.to_ixdtf_string(opts).map_err(|e| temporal_err(vm, e))?,
+        ))
+    });
+    vm.define_method(&proto, "toJSON", 0, |vm, this, _a| {
+        let t = this_plain_time(vm, &this)?;
+        Ok(Value::str(
+            t.to_ixdtf_string(Default::default())
+                .map_err(|e| temporal_err(vm, e))?,
+        ))
+    });
+    vm.define_method(&proto, "toLocaleString", 0, |vm, this, _a| {
+        let t = this_plain_time(vm, &this)?;
+        Ok(Value::str(
+            t.to_ixdtf_string(Default::default())
+                .map_err(|e| temporal_err(vm, e))?,
+        ))
+    });
+    vm.define_method(&proto, "valueOf", 0, |vm, _this, _a| {
+        Err(vm.throw_type("Temporal.PlainTime: use compare() instead of relational operators"))
+    });
+
+    let tag = vm.realm.symbol_to_string_tag.clone();
+    proto.borrow_mut().props.insert(
+        PropertyKey::Sym(tag),
+        Property {
+            kind: PropertyKind::Data {
+                value: Value::str("Temporal.PlainTime"),
+                writable: false,
+            },
+            enumerable: false,
+            configurable: true,
+        },
+    );
+
+    temporal.borrow_mut().props.insert(
+        PropertyKey::str("PlainTime"),
+        Property::builtin(Value::Object(ctor)),
+    );
+}
+
+fn define_time_getter(vm: &mut Vm, proto: &JsObject, name: &str, project: fn(&PlainTime) -> f64) {
+    let getter = vm.new_native(&format!("get {name}"), 0, move |vm, this, _a| {
+        let t = this_plain_time(vm, &this)?;
+        Ok(Value::Number(project(&t)))
     });
     vm.define_accessor(
         &Value::Object(proto.clone()),

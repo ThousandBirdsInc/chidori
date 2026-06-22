@@ -197,20 +197,24 @@ reference implementation: ISO-calendar arithmetic, durations, rounding, time
 zones). Each `Temporal.*` instance stores its backing `temporal_rs` value in an
 `Internal::Temporal` slot (a GC leaf — no JS references).
 
-Implemented so far: the `Temporal` namespace and **`Temporal.Duration`** —
-constructor, all ten field accessors plus `sign`/`blank`, `with`, `negated`,
-`abs`, `add`, `subtract`, `round`, `total`, `toString`/`toJSON`/
-`toLocaleString` (with `smallestUnit`/`fractionalSecondDigits`/`roundingMode`
-options), `from`, and `compare`. Against `test/built-ins/Temporal/Duration`
-(run with `--temporal`) the engine passes **380** of 540 executed tests; most
-of the remainder need `relativeTo` (i.e. the not-yet-implemented `PlainDate`/
-`PlainDateTime`/`ZonedDateTime` types).
+Implemented so far: the `Temporal` namespace and two types.
 
-Not yet implemented: the other Temporal types (`Instant`, `PlainDate`,
-`PlainTime`, `PlainDateTime`, `PlainYearMonth`, `PlainMonthDay`,
-`ZonedDateTime`, `Now`). Temporal-tagged tests are skipped in the default gate
-(opt-in via `--temporal`), so this surface is not yet part of the committed
-baseline.
+- **`Temporal.Duration`** — constructor, all ten field accessors plus
+  `sign`/`blank`, `with`, `negated`, `abs`, `add`, `subtract`, `round`,
+  `total`, `toString`/`toJSON`/`toLocaleString` (with `smallestUnit`/
+  `fractionalSecondDigits`/`roundingMode` options), `from`, and `compare`.
+  Passes **380** of 540 executed `Duration` tests; most of the remainder need
+  `relativeTo` (the not-yet-implemented date types).
+- **`Temporal.PlainTime`** — constructor, the six field accessors, `with`,
+  `add`, `subtract`, `until`, `since`, `round`, `equals`, `toString`/`toJSON`/
+  `toLocaleString`, `from`, and `compare`. Passes **~468** of 493 executed
+  `PlainTime` tests; the rest are cross-type conversions and a few
+  option-read-order corners.
+
+Not yet implemented: the remaining Temporal types (`Instant`, `PlainDate`,
+`PlainDateTime`, `PlainYearMonth`, `PlainMonthDay`, `ZonedDateTime`, `Now`).
+Temporal-tagged tests are skipped in the default gate (opt-in via
+`--temporal`), so this surface is not yet part of the committed baseline.
 
 ## CI gate
 
