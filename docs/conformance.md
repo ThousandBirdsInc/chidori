@@ -203,15 +203,22 @@ Implemented so far: the `Temporal` namespace and two types.
   `sign`/`blank`, `with`, `negated`, `abs`, `add`, `subtract`, `round`,
   `total`, `toString`/`toJSON`/`toLocaleString` (with `smallestUnit`/
   `fractionalSecondDigits`/`roundingMode` options), `from`, and `compare`.
-  Passes **380** of 540 executed `Duration` tests; most of the remainder need
-  `relativeTo` (the not-yet-implemented date types).
+  `round`/`total`/`compare` accept a PlainDate `relativeTo`. Passes **452** of
+  540 executed `Duration` tests.
 - **`Temporal.PlainTime`** — constructor, the six field accessors, `with`,
   `add`, `subtract`, `until`, `since`, `round`, `equals`, `toString`/`toJSON`/
   `toLocaleString`, `from`, and `compare`. Passes **~468** of 493 executed
-  `PlainTime` tests; the rest are cross-type conversions and a few
-  option-read-order corners.
+  `PlainTime` tests.
+- **`Temporal.PlainDate`** — constructor (ISO and named calendars), the full
+  accessor set (`year`/`month`/`monthCode`/`day`/`dayOfWeek`/`dayOfYear`/
+  `weekOfYear`/`daysInMonth`/`inLeapYear`/`era`/`calendarId`/…), `with`,
+  `withCalendar`, `add`, `subtract`, `until`, `since`, `equals`,
+  `toString`/`toJSON`/`toLocaleString` (with `calendarName`), `from`, and
+  `compare`. Passes **521** of 652 executed `PlainDate` tests.
 
-Not yet implemented: the remaining Temporal types (`Instant`, `PlainDate`,
+The remaining failures are largely cross-type conversions
+(`toPlainDateTime`/`toZonedDateTime`/…) and a few option-read-order corners.
+Not yet implemented: the remaining Temporal types (`Instant`,
 `PlainDateTime`, `PlainYearMonth`, `PlainMonthDay`, `ZonedDateTime`, `Now`).
 Temporal-tagged tests are skipped in the default gate (opt-in via
 `--temporal`), so this surface is not yet part of the committed baseline.
