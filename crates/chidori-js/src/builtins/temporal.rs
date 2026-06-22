@@ -149,6 +149,8 @@ pub fn install(vm: &mut Vm) {
     install_plain_date(vm, &temporal);
     install_instant(vm, &temporal);
     install_plain_date_time(vm, &temporal);
+    install_year_month(vm, &temporal);
+    install_month_day(vm, &temporal);
 
     // Temporal[Symbol.toStringTag] = "Temporal" (non-writable, non-enumerable, configurable).
     let tag = vm.realm.symbol_to_string_tag.clone();
@@ -1811,6 +1813,495 @@ fn define_dt_getter(
 ) {
     let getter = vm.new_native(&format!("get {name}"), 0, move |vm, this, _a| {
         let d = this_plain_date_time(vm, &this)?;
+        Ok(project(&d))
+    });
+    vm.define_accessor(
+        &Value::Object(proto.clone()),
+        PropertyKey::str(name),
+        Some(Value::Object(getter)),
+        None,
+    );
+}
+
+// =========================================================================
+// Temporal.PlainYearMonth and Temporal.PlainMonthDay
+// =========================================================================
+
+use temporal_rs::fields::{CalendarFields, YearMonthCalendarFields};
+use temporal_rs::partial::PartialYearMonth;
+use temporal_rs::{PlainMonthDay, PlainYearMonth};
+
+fn this_year_month(vm: &mut Vm, this: &Value) -> Result<PlainYearMonth, Value> {
+    if let Value::Object(o) = this {
+        if let Internal::Temporal(slot) = &o.borrow().internal {
+            if let TemporalSlot::PlainYearMonth(d) = slot.as_ref() {
+                return Ok(d.clone());
+            }
+        }
+    }
+    Err(vm.throw_type("receiver is not a Temporal.PlainYearMonth"))
+}
+
+fn this_month_day(vm: &mut Vm, this: &Value) -> Result<PlainMonthDay, Value> {
+    if let Value::Object(o) = this {
+        if let Internal::Temporal(slot) = &o.borrow().internal {
+            if let TemporalSlot::PlainMonthDay(d) = slot.as_ref() {
+                return Ok(d.clone());
+            }
+        }
+    }
+    Err(vm.throw_type("receiver is not a Temporal.PlainMonthDay"))
+}
+
+/// Read year-month calendar fields (calendar + era/eraYear/year/month/monthCode)
+/// from an object.
+fn read_ym_fields(vm: &mut Vm, obj: &Value) -> Result<PartialYearMonth, Value> {
+    let cal_v = vm.get_prop(obj, &PropertyKey::str("calendar"))?;
+    let calendar = to_calendar(vm, &cal_v)?;
+    let mut cf = YearMonthCalendarFields {
+        year: None,
+        month: None,
+        month_code: None,
+        era: None,
+        era_year: None,
+    };
+    let era = vm.get_prop(obj, &PropertyKey::str("era"))?;
+    if !era.is_undefined() {
+        cf.era = vm.to_js_string(&era)?.as_str().parse().ok();
+    }
+    let era_year = vm.get_prop(obj, &PropertyKey::str("eraYear"))?;
+    if !era_year.is_undefined() {
+        cf.era_year = Some(to_integer_with_truncation(vm, &era_year)? as i32);
+    }
+    let month = vm.get_prop(obj, &PropertyKey::str("month"))?;
+    if !month.is_undefined() {
+        cf.month = Some(to_integer_with_truncation(vm, &month)? as u8);
+    }
+    let month_code = vm.get_prop(obj, &PropertyKey::str("monthCode"))?;
+    if !month_code.is_undefined() {
+        let s = vm.to_js_string(&month_code)?.as_str().to_owned();
+        cf.month_code = Some(MonthCode::from_str(&s).map_err(|e| temporal_err(vm, e))?);
+    }
+    let year = vm.get_prop(obj, &PropertyKey::str("year"))?;
+    if !year.is_undefined() {
+        cf.year = Some(to_integer_with_truncation(vm, &year)? as i32);
+    }
+    Ok(PartialYearMonth {
+        calendar_fields: cf,
+        calendar,
+    })
+}
+
+fn to_temporal_year_month(
+    vm: &mut Vm,
+    v: &Value,
+    overflow: Option<Overflow>,
+) -> Result<PlainYearMonth, Value> {
+    if let Value::Object(o) = v {
+        if let Internal::Temporal(slot) = &o.borrow().internal {
+            if let TemporalSlot::PlainYearMonth(d) = slot.as_ref() {
+                return Ok(d.clone());
+            }
+        }
+    }
+    match v {
+        Value::Object(_) => {
+            let p = read_ym_fields(vm, v)?;
+            PlainYearMonth::from_partial(p, overflow).map_err(|e| temporal_err(vm, e))
+        }
+        Value::String(s) => {
+            PlainYearMonth::from_utf8(s.as_str().as_bytes()).map_err(|e| temporal_err(vm, e))
+        }
+        _ => {
+            Err(vm.throw_type("Temporal.PlainYearMonth: expected a year-month, string, or object"))
+        }
+    }
+}
+
+fn to_temporal_month_day(
+    vm: &mut Vm,
+    v: &Value,
+    overflow: Option<Overflow>,
+) -> Result<PlainMonthDay, Value> {
+    if let Value::Object(o) = v {
+        if let Internal::Temporal(slot) = &o.borrow().internal {
+            if let TemporalSlot::PlainMonthDay(d) = slot.as_ref() {
+                return Ok(d.clone());
+            }
+        }
+    }
+    match v {
+        Value::Object(_) => {
+            let p = read_partial_date(vm, v)?;
+            PlainMonthDay::from_partial(p, overflow).map_err(|e| temporal_err(vm, e))
+        }
+        Value::String(s) => {
+            PlainMonthDay::from_utf8(s.as_str().as_bytes()).map_err(|e| temporal_err(vm, e))
+        }
+        _ => Err(vm.throw_type("Temporal.PlainMonthDay: expected a month-day, string, or object")),
+    }
+}
+
+fn empty_calendar_fields() -> CalendarFields {
+    CalendarFields {
+        year: None,
+        month: None,
+        month_code: None,
+        day: None,
+        era: None,
+        era_year: None,
+    }
+}
+
+fn install_year_month(vm: &mut Vm, temporal: &JsObject) {
+    let proto = vm.new_object();
+    let ctor_proto = proto.clone();
+    let ctor = vm.new_native_ctor(
+        "PlainYearMonth",
+        0,
+        |vm, _t, _a| Err(vm.throw_type("Constructor Temporal.PlainYearMonth requires 'new'")),
+        move |vm, _this, args| {
+            let year = to_integer_with_truncation(vm, &arg(args, 0))?;
+            let month = to_integer_with_truncation(vm, &arg(args, 1))?;
+            let calendar = to_calendar(vm, &arg(args, 2))?;
+            let ref_day = {
+                let a = arg(args, 3);
+                if a.is_undefined() {
+                    None
+                } else {
+                    Some(to_integer_with_truncation(vm, &a)? as u8)
+                }
+            };
+            if !(i32::MIN as f64..=i32::MAX as f64).contains(&year) || month < 0.0 {
+                return Err(vm.throw_range("Temporal.PlainYearMonth: field out of range"));
+            }
+            let d = PlainYearMonth::try_new(year as i32, month as u8, ref_day, calendar)
+                .map_err(|e| temporal_err(vm, e))?;
+            Ok(new_temporal(
+                vm,
+                TemporalSlot::PlainYearMonth(d),
+                &ctor_proto,
+            ))
+        },
+    );
+    install_ctor_proto(vm, &ctor, &proto);
+
+    vm.define_method(&ctor, "from", 1, |vm, _t, args| {
+        let overflow = get_overflow(vm, &arg(args, 1))?;
+        let d = to_temporal_year_month(vm, &arg(args, 0), overflow)?;
+        let proto = intrinsic_proto(vm, "PlainYearMonth")?;
+        Ok(new_temporal(vm, TemporalSlot::PlainYearMonth(d), &proto))
+    });
+    vm.define_method(&ctor, "compare", 2, |vm, _t, args| {
+        let a = to_temporal_year_month(vm, &arg(args, 0), None)?;
+        let b = to_temporal_year_month(vm, &arg(args, 1), None)?;
+        Ok(Value::Number(match a.compare_iso(&b) {
+            std::cmp::Ordering::Less => -1.0,
+            std::cmp::Ordering::Equal => 0.0,
+            std::cmp::Ordering::Greater => 1.0,
+        }))
+    });
+
+    define_ym_getter(vm, &proto, "year", |d| Value::Number(d.year() as f64));
+    define_ym_getter(vm, &proto, "month", |d| Value::Number(d.month() as f64));
+    define_ym_getter(vm, &proto, "monthCode", |d| {
+        Value::str(d.month_code().as_str())
+    });
+    define_ym_getter(vm, &proto, "daysInMonth", |d| {
+        Value::Number(d.days_in_month() as f64)
+    });
+    define_ym_getter(vm, &proto, "daysInYear", |d| {
+        Value::Number(d.days_in_year() as f64)
+    });
+    define_ym_getter(vm, &proto, "monthsInYear", |d| {
+        Value::Number(d.months_in_year() as f64)
+    });
+    define_ym_getter(vm, &proto, "inLeapYear", |d| Value::Bool(d.in_leap_year()));
+    define_ym_getter(vm, &proto, "era", |d| {
+        d.era()
+            .map(|e| Value::str(e.as_str()))
+            .unwrap_or(Value::Undefined)
+    });
+    define_ym_getter(vm, &proto, "eraYear", |d| {
+        d.era_year()
+            .map(|y| Value::Number(y as f64))
+            .unwrap_or(Value::Undefined)
+    });
+    define_ym_getter(vm, &proto, "calendarId", |d| {
+        Value::str(d.calendar().identifier())
+    });
+
+    vm.define_method(&proto, "add", 1, |vm, this, args| {
+        let d = this_year_month(vm, &this)?;
+        let dur = to_temporal_duration(vm, &arg(args, 0))?;
+        let overflow = get_overflow(vm, &arg(args, 1))?.unwrap_or(Overflow::Constrain);
+        let nd = d.add(&dur, overflow).map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "PlainYearMonth")?;
+        Ok(new_temporal(vm, TemporalSlot::PlainYearMonth(nd), &proto))
+    });
+    vm.define_method(&proto, "subtract", 1, |vm, this, args| {
+        let d = this_year_month(vm, &this)?;
+        let dur = to_temporal_duration(vm, &arg(args, 0))?;
+        let overflow = get_overflow(vm, &arg(args, 1))?.unwrap_or(Overflow::Constrain);
+        let nd = d
+            .subtract(&dur, overflow)
+            .map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "PlainYearMonth")?;
+        Ok(new_temporal(vm, TemporalSlot::PlainYearMonth(nd), &proto))
+    });
+    vm.define_method(&proto, "with", 1, |vm, this, args| {
+        let d = this_year_month(vm, &this)?;
+        let item = arg(args, 0);
+        if !matches!(item, Value::Object(_)) {
+            return Err(
+                vm.throw_type("Temporal.PlainYearMonth.prototype.with: argument must be an object")
+            );
+        }
+        let p = read_ym_fields(vm, &item)?;
+        let overflow = get_overflow(vm, &arg(args, 1))?;
+        let nd = d
+            .with(p.calendar_fields, overflow)
+            .map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "PlainYearMonth")?;
+        Ok(new_temporal(vm, TemporalSlot::PlainYearMonth(nd), &proto))
+    });
+    vm.define_method(&proto, "until", 1, |vm, this, args| {
+        let d = this_year_month(vm, &this)?;
+        let other = to_temporal_year_month(vm, &arg(args, 0), None)?;
+        let settings = get_difference_settings(vm, &arg(args, 1))?;
+        let dur = d.until(&other, settings).map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "Duration")?;
+        Ok(new_temporal(vm, TemporalSlot::Duration(dur), &proto))
+    });
+    vm.define_method(&proto, "since", 1, |vm, this, args| {
+        let d = this_year_month(vm, &this)?;
+        let other = to_temporal_year_month(vm, &arg(args, 0), None)?;
+        let settings = get_difference_settings(vm, &arg(args, 1))?;
+        let dur = d.since(&other, settings).map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "Duration")?;
+        Ok(new_temporal(vm, TemporalSlot::Duration(dur), &proto))
+    });
+    vm.define_method(&proto, "equals", 1, |vm, this, args| {
+        let d = this_year_month(vm, &this)?;
+        let other = to_temporal_year_month(vm, &arg(args, 0), None)?;
+        let eq = d.compare_iso(&other) == std::cmp::Ordering::Equal
+            && d.calendar().identifier() == other.calendar().identifier();
+        Ok(Value::Bool(eq))
+    });
+    vm.define_method(&proto, "toPlainDate", 1, |vm, this, args| {
+        let d = this_year_month(vm, &this)?;
+        let item = arg(args, 0);
+        let mut cf = empty_calendar_fields();
+        if let Value::Object(_) = &item {
+            let day = vm.get_prop(&item, &PropertyKey::str("day"))?;
+            if !day.is_undefined() {
+                cf.day = Some(to_integer_with_truncation(vm, &day)? as u8);
+            }
+        }
+        let nd = d.to_plain_date(Some(cf)).map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "PlainDate")?;
+        Ok(new_temporal(vm, TemporalSlot::PlainDate(nd), &proto))
+    });
+    vm.define_method(&proto, "toString", 0, |vm, this, args| {
+        let d = this_year_month(vm, &this)?;
+        let dc = get_display_calendar(vm, &arg(args, 0))?;
+        Ok(Value::str(d.to_ixdtf_string(dc)))
+    });
+    vm.define_method(&proto, "toJSON", 0, |vm, this, _a| {
+        let d = this_year_month(vm, &this)?;
+        Ok(Value::str(d.to_ixdtf_string(DisplayCalendar::Auto)))
+    });
+    vm.define_method(&proto, "toLocaleString", 0, |vm, this, _a| {
+        let d = this_year_month(vm, &this)?;
+        Ok(Value::str(d.to_ixdtf_string(DisplayCalendar::Auto)))
+    });
+    vm.define_method(&proto, "valueOf", 0, |vm, _this, _a| {
+        Err(vm.throw_type("Temporal.PlainYearMonth: use compare() instead of relational operators"))
+    });
+    set_tag(vm, &proto, "Temporal.PlainYearMonth");
+    temporal.borrow_mut().props.insert(
+        PropertyKey::str("PlainYearMonth"),
+        Property::builtin(Value::Object(ctor)),
+    );
+}
+
+fn install_month_day(vm: &mut Vm, temporal: &JsObject) {
+    let proto = vm.new_object();
+    let ctor_proto = proto.clone();
+    let ctor = vm.new_native_ctor(
+        "PlainMonthDay",
+        0,
+        |vm, _t, _a| Err(vm.throw_type("Constructor Temporal.PlainMonthDay requires 'new'")),
+        move |vm, _this, args| {
+            let month = to_integer_with_truncation(vm, &arg(args, 0))?;
+            let day = to_integer_with_truncation(vm, &arg(args, 1))?;
+            let calendar = to_calendar(vm, &arg(args, 2))?;
+            let ref_year = {
+                let a = arg(args, 3);
+                if a.is_undefined() {
+                    None
+                } else {
+                    Some(to_integer_with_truncation(vm, &a)? as i32)
+                }
+            };
+            if month < 0.0 || day < 0.0 {
+                return Err(vm.throw_range("Temporal.PlainMonthDay: field out of range"));
+            }
+            let d = PlainMonthDay::new_with_overflow(
+                month as u8,
+                day as u8,
+                calendar,
+                Overflow::Reject,
+                ref_year,
+            )
+            .map_err(|e| temporal_err(vm, e))?;
+            Ok(new_temporal(
+                vm,
+                TemporalSlot::PlainMonthDay(d),
+                &ctor_proto,
+            ))
+        },
+    );
+    install_ctor_proto(vm, &ctor, &proto);
+
+    vm.define_method(&ctor, "from", 1, |vm, _t, args| {
+        let overflow = get_overflow(vm, &arg(args, 1))?;
+        let d = to_temporal_month_day(vm, &arg(args, 0), overflow)?;
+        let proto = intrinsic_proto(vm, "PlainMonthDay")?;
+        Ok(new_temporal(vm, TemporalSlot::PlainMonthDay(d), &proto))
+    });
+
+    define_md_getter(vm, &proto, "monthCode", |d| {
+        Value::str(d.month_code().as_str())
+    });
+    define_md_getter(vm, &proto, "day", |d| Value::Number(d.day() as f64));
+    define_md_getter(vm, &proto, "calendarId", |d| {
+        Value::str(d.calendar().identifier())
+    });
+
+    vm.define_method(&proto, "with", 1, |vm, this, args| {
+        let d = this_month_day(vm, &this)?;
+        let item = arg(args, 0);
+        if !matches!(item, Value::Object(_)) {
+            return Err(
+                vm.throw_type("Temporal.PlainMonthDay.prototype.with: argument must be an object")
+            );
+        }
+        let p = read_partial_date(vm, &item)?;
+        let overflow = get_overflow(vm, &arg(args, 1))?;
+        let nd = d
+            .with(p.calendar_fields, overflow)
+            .map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "PlainMonthDay")?;
+        Ok(new_temporal(vm, TemporalSlot::PlainMonthDay(nd), &proto))
+    });
+    vm.define_method(&proto, "equals", 1, |vm, this, args| {
+        let d = this_month_day(vm, &this)?;
+        let other = to_temporal_month_day(vm, &arg(args, 0), None)?;
+        let eq = d.month_code().as_str() == other.month_code().as_str()
+            && d.day() == other.day()
+            && d.calendar().identifier() == other.calendar().identifier();
+        Ok(Value::Bool(eq))
+    });
+    vm.define_method(&proto, "toPlainDate", 1, |vm, this, args| {
+        let d = this_month_day(vm, &this)?;
+        let item = arg(args, 0);
+        let mut cf = empty_calendar_fields();
+        if let Value::Object(_) = &item {
+            let year = vm.get_prop(&item, &PropertyKey::str("year"))?;
+            if !year.is_undefined() {
+                cf.year = Some(to_integer_with_truncation(vm, &year)? as i32);
+            }
+        }
+        let nd = d.to_plain_date(Some(cf)).map_err(|e| temporal_err(vm, e))?;
+        let proto = intrinsic_proto(vm, "PlainDate")?;
+        Ok(new_temporal(vm, TemporalSlot::PlainDate(nd), &proto))
+    });
+    vm.define_method(&proto, "toString", 0, |vm, this, args| {
+        let d = this_month_day(vm, &this)?;
+        let dc = get_display_calendar(vm, &arg(args, 0))?;
+        Ok(Value::str(d.to_ixdtf_string(dc)))
+    });
+    vm.define_method(&proto, "toJSON", 0, |vm, this, _a| {
+        let d = this_month_day(vm, &this)?;
+        Ok(Value::str(d.to_ixdtf_string(DisplayCalendar::Auto)))
+    });
+    vm.define_method(&proto, "toLocaleString", 0, |vm, this, _a| {
+        let d = this_month_day(vm, &this)?;
+        Ok(Value::str(d.to_ixdtf_string(DisplayCalendar::Auto)))
+    });
+    vm.define_method(&proto, "valueOf", 0, |vm, _this, _a| {
+        Err(vm.throw_type("Temporal.PlainMonthDay: use equals() instead of relational operators"))
+    });
+    set_tag(vm, &proto, "Temporal.PlainMonthDay");
+    temporal.borrow_mut().props.insert(
+        PropertyKey::str("PlainMonthDay"),
+        Property::builtin(Value::Object(ctor)),
+    );
+}
+
+/// Wire `ctor.prototype` / `proto.constructor` (non-enumerable).
+fn install_ctor_proto(vm: &Vm, ctor: &JsObject, proto: &JsObject) {
+    let _ = vm;
+    ctor.borrow_mut().props.insert(
+        PropertyKey::str("prototype"),
+        Property {
+            kind: PropertyKind::Data {
+                value: Value::Object(proto.clone()),
+                writable: false,
+            },
+            enumerable: false,
+            configurable: false,
+        },
+    );
+    proto.borrow_mut().props.insert(
+        PropertyKey::str("constructor"),
+        Property::builtin(Value::Object(ctor.clone())),
+    );
+}
+
+/// Set a prototype's `[Symbol.toStringTag]`.
+fn set_tag(vm: &Vm, proto: &JsObject, tag: &str) {
+    let sym = vm.realm.symbol_to_string_tag.clone();
+    proto.borrow_mut().props.insert(
+        PropertyKey::Sym(sym),
+        Property {
+            kind: PropertyKind::Data {
+                value: Value::str(tag),
+                writable: false,
+            },
+            enumerable: false,
+            configurable: true,
+        },
+    );
+}
+
+fn define_ym_getter(
+    vm: &mut Vm,
+    proto: &JsObject,
+    name: &str,
+    project: fn(&PlainYearMonth) -> Value,
+) {
+    let getter = vm.new_native(&format!("get {name}"), 0, move |vm, this, _a| {
+        let d = this_year_month(vm, &this)?;
+        Ok(project(&d))
+    });
+    vm.define_accessor(
+        &Value::Object(proto.clone()),
+        PropertyKey::str(name),
+        Some(Value::Object(getter)),
+        None,
+    );
+}
+
+fn define_md_getter(
+    vm: &mut Vm,
+    proto: &JsObject,
+    name: &str,
+    project: fn(&PlainMonthDay) -> Value,
+) {
+    let getter = vm.new_native(&format!("get {name}"), 0, move |vm, this, _a| {
+        let d = this_month_day(vm, &this)?;
         Ok(project(&d))
     });
     vm.define_accessor(
