@@ -759,6 +759,16 @@ impl HostBindingBackend {
         host_core::execute_http(tokio_rt, args).map_err(|err| err.to_string())
     }
 
+    fn block_on_app_data(
+        &self,
+        args: &serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let HostBindingBackend::Runtime { tokio_rt, .. } = self else {
+            return Err("chidori.appData requires the runtime host backend".to_string());
+        };
+        host_core::execute_app_data(tokio_rt, args).map_err(|err| err.to_string())
+    }
+
     /// Build the runtime backend that the engine's effect dispatcher routes
     /// host effects through, into the durable host machinery.
     #[allow(clippy::too_many_arguments)]
@@ -1039,6 +1049,40 @@ impl HostBindingBackend {
                         }),
                     )?;
                     self.block_on_http(&args)
+                })
+                .map(opt_null)
+            }
+            // chidori.appData.{write,query}(sql, params?) — the generative-UI
+            // agent-run write tool. Journaled like `http`: the live closure runs
+            // once, the result is recorded, and replay serves it without
+            // touching the live cluster (docs/design/chidori-handoff.md §3.2.3).
+            "app_data" => {
+                let action = a
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("write")
+                    .to_string();
+                let sql = a
+                    .get("sql")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let params = a
+                    .get("params")
+                    .cloned()
+                    .filter(|v| !v.is_null())
+                    .unwrap_or_else(|| serde_json::json!([]));
+                let args = serde_json::json!({
+                    "action": action,
+                    "sql": sql,
+                    "params": params,
+                });
+                self.durable_call("app_data", args.clone(), || {
+                    self.enforce_policy(
+                        &format!("app_data:{action}"),
+                        &serde_json::json!({ "action": action }),
+                    )?;
+                    self.block_on_app_data(&args)
                 })
                 .map(opt_null)
             }

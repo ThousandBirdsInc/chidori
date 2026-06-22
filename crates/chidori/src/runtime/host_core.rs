@@ -1197,6 +1197,89 @@ pub fn execute_http(tokio_rt: &tokio::runtime::Runtime, args: &Value) -> Result<
     )
 }
 
+/// Perform an app-data write/query on behalf of a guest agent (the generative-UI
+/// agent-run write tool, docs/design/chidori-handoff.md §3.2). Reads the
+/// host-only `CHIDORI_APP_DATA` binding; absent → a structured `no_cluster`
+/// error so a clusterless agent gets a clear message rather than a silent no-op.
+///
+/// Option A: the write is issued as a loopback HTTP POST to agent-builder
+/// (which wraps `AppDataPlane::execute_write`), so it rides `execute_http` — the
+/// same host chokepoint as `chidori.http`. That gives the bearer-placeholder →
+/// real-token substitution and the host allowlist for free, and chidori never
+/// holds a libpq credential.
+///
+/// Returns a value in all cases (never throws): `{ rowsAffected }` / `{ rows }`
+/// on success, or `{ appDataError: { kind, message } }` on failure — so the
+/// call journals deterministically and replays byte-identically.
+pub fn execute_app_data(tokio_rt: &tokio::runtime::Runtime, args: &Value) -> Result<Value> {
+    match crate::runtime::app_data::AppDataConfig::from_env() {
+        Some(cfg) => execute_app_data_with_config(tokio_rt, args, &cfg),
+        None => Ok(crate::runtime::app_data::app_data_error(
+            "no_cluster",
+            "no app data cluster is bound to this run",
+        )),
+    }
+}
+
+/// `execute_app_data` with an explicit config — split out so tests can drive it
+/// against a local endpoint without touching the process-wide `CHIDORI_APP_DATA`.
+fn execute_app_data_with_config(
+    tokio_rt: &tokio::runtime::Runtime,
+    args: &Value,
+    cfg: &crate::runtime::app_data::AppDataConfig,
+) -> Result<Value> {
+    use crate::runtime::app_data::app_data_error;
+
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("write");
+    let sql = args.get("sql").and_then(Value::as_str).unwrap_or("").trim();
+    if sql.is_empty() {
+        return Ok(app_data_error("sql", "empty SQL statement"));
+    }
+    let params = args
+        .get("params")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+
+    // The bearer is a placeholder; the secret broker substitutes the real
+    // per-run token inside `execute_http`, locked to the endpoint's host.
+    let http_args = json!({
+        "url": cfg.endpoint,
+        "method": "POST",
+        "headers": {
+            "Authorization": format!("Bearer {}", cfg.token),
+            "Content-Type": "application/json",
+        },
+        "body": { "op": action, "sql": sql, "params": params },
+    });
+
+    let resp = execute_http(tokio_rt, &http_args)?;
+    if let Some(err) = resp.get("error").and_then(Value::as_str) {
+        return Ok(app_data_error("transport", err));
+    }
+    let status = resp.get("status").and_then(Value::as_u64).unwrap_or(0);
+    let body = resp.get("body").cloned().unwrap_or(Value::Null);
+    if (200..300).contains(&status) {
+        // Success: the endpoint returns `{ rowsAffected }` (write) or
+        // `{ rows }` (query). Pass the body straight back to the guest.
+        Ok(body)
+    } else {
+        // A bad statement is the agent's fault (surface as `sql`); anything
+        // else is the transport/endpoint's.
+        let message = body
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("app-data endpoint returned status {status}"));
+        let kind = if matches!(status, 400 | 409 | 422) {
+            "sql"
+        } else {
+            "transport"
+        };
+        Ok(app_data_error(kind, message))
+    }
+}
+
 /// `execute_http` with an explicit secret store — split out so tests can
 /// inject a store without touching the process-wide one.
 fn execute_http_with_secrets(
@@ -1400,6 +1483,89 @@ mod tests {
         HostOperationId, HostPromiseRecord, HostPromiseState, PendingHostOperation, QueuedSignal,
         PENDING_HOST_OPERATION_FILE,
     };
+
+    /// A one-shot canned HTTP/1.1 endpoint on an ephemeral port. Reads the
+    /// request, replies with `status` + JSON `body`, closes. Returns the bound
+    /// address so the test can point `AppDataConfig::endpoint` at it.
+    fn canned_http_endpoint(status: &'static str, body: &'static str) -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn app_data_no_cluster_when_env_absent() {
+        // CHIDORI_APP_DATA is unset in the test process, so the binding is
+        // absent and the guest gets a structured `no_cluster` error.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let out = execute_app_data(&rt, &json!({ "action": "write", "sql": "INSERT INTO t VALUES (1)" }))
+            .unwrap();
+        assert_eq!(out["appDataError"]["kind"], "no_cluster");
+    }
+
+    #[test]
+    fn app_data_empty_sql_is_a_sql_error() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cfg = crate::runtime::app_data::AppDataConfig {
+            endpoint: "http://127.0.0.1:1/never".into(),
+            token: "__CHIDORI_SECRET__t__".into(),
+        };
+        let out =
+            execute_app_data_with_config(&rt, &json!({ "action": "write", "sql": "   " }), &cfg)
+                .unwrap();
+        assert_eq!(out["appDataError"]["kind"], "sql");
+    }
+
+    #[test]
+    fn app_data_write_round_trips_rows_affected() {
+        let addr = canned_http_endpoint("200 OK", r#"{"rowsAffected":1}"#);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cfg = crate::runtime::app_data::AppDataConfig {
+            endpoint: format!("http://{addr}/internal/app-data/write"),
+            token: "__CHIDORI_SECRET__t__".into(),
+        };
+        let args = json!({
+            "action": "write",
+            "sql": "INSERT INTO notes (body) VALUES ($1)",
+            "params": ["hello"],
+        });
+        let out = execute_app_data_with_config(&rt, &args, &cfg).unwrap();
+        assert_eq!(out["rowsAffected"], 1);
+        assert!(out.get("appDataError").is_none());
+    }
+
+    #[test]
+    fn app_data_4xx_maps_to_sql_error_with_message() {
+        let addr = canned_http_endpoint("400 Bad Request", r#"{"error":"syntax error at or near \"FROM\""}"#);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cfg = crate::runtime::app_data::AppDataConfig {
+            endpoint: format!("http://{addr}/internal/app-data/write"),
+            token: "__CHIDORI_SECRET__t__".into(),
+        };
+        let out = execute_app_data_with_config(
+            &rt,
+            &json!({ "action": "write", "sql": "INSERT BOGUS" }),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(out["appDataError"]["kind"], "sql");
+        assert!(out["appDataError"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("syntax error"));
+    }
 
     #[test]
     fn base_url_override_rewrites_mapped_host_keeping_path_and_query() {
