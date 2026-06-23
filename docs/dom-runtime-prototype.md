@@ -39,7 +39,9 @@ What's wired for building on top of (vs. the engine-only prototype):
   compile path.
 - **P1 — npm package resolution: DONE.** `import React from 'react'` and
   `import { renderToStaticMarkup } from 'react-dom/server'` resolve through a
-  built-in vendored-package registry (`builtins::vendored_module`): the
+  built-in vendored-package registry
+  (`crates/chidori/src/runtime/typescript/builtins.rs::vendored_module`, resolution
+  wired in `crates/chidori/src/runtime/rust_engine.rs`): the
   self-contained UMD bundles are wrapped as synthetic ES modules (the same
   mechanism as the `node:` shims), so they link on the ESM-only engine without a
   `node_modules` install. (npm `react` is CommonJS with internal `require`, which

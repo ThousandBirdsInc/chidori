@@ -657,11 +657,13 @@ wall-clock win belongs on a quiet, pinned machine (§7.6); the deterministic pro
 already implied by the fusion firing.
 
 **Next fusions (same infrastructure, ranked by Phase 0 data).** The pass and the
-`for_each_ip` remap now exist, so further superinstructions are incremental:
-`LoadCell/LoadLocal; LoadConst` (8.9%), load+binop (`LoadConst; Sub` 3.6%), and a
-`JumpIfTrue` compare-and-branch variant. Each follows the same recipe: add the
-fused op, reuse the standalone helper in its handler, extend `fuse.rs`, and add a
-differential-corpus case.
+`for_each_ip` remap now exist, so further superinstructions are incremental. The
+genuinely-outstanding candidate is load+binop (`LoadConst; Sub` 3.6%). Each
+follows the same recipe: add the fused op, reuse the standalone helper in its
+handler, extend `fuse.rs`, and add a differential-corpus case.
+
+Landed since: `LoadCell; LoadConst → LoadCellConst` (`bytecode.rs`/`fuse.rs`/
+`exec.rs`) and the `JumpIfTrue` variant `CmpBranchTrue`.
 
 ---
 

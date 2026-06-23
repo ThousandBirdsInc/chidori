@@ -33,8 +33,8 @@ provider; swap them for `chidori.prompt(...)` to get real model spans.
 
 ```bash
 cargo run -- serve examples/multiplayer-review/policy_doc.ts --port 8080
-# or, with the prebuilt binary:
-./target/debug/chidori serve examples/multiplayer-review/policy_doc.ts --port 8080
+# or, with the from-source release build:
+./target/release/chidori serve examples/multiplayer-review/policy_doc.ts --port 8080
 ```
 
 Create a run (it drafts, then **pauses** at `signal("review")`):

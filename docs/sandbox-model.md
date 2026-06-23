@@ -74,8 +74,11 @@ stack VM with `Rc<RefCell>` reference counting. Two properties make it a sandbox
    `Engine::new()` running arbitrary JS can compute and allocate — nothing else.
    I/O exists **only** because the host installs it:
    - `Engine::install_chidori_effects` (`crates/chidori-js/src/lib.rs`) wires the
-     async `chidori.*` effect surface (`log`, `tool`, `prompt`, `input`, `http`,
-     `memory`, `template`, `checkpoint`, `callAgent`, `workspace.*`). The
+     async `chidori.*` effect surface (`log`, `tool`, `prompt`, `input`,
+     `memory`, `template`, `checkpoint`, `callAgent`, `workspace.*`). Networking
+     is **not** a `chidori.*` method — it is brokered through the internal
+     `globalThis.__chidori_http` global (forwarded as the `"http"` effect),
+     reached only via the captured `fetch`/`node:http` surface. The
      `execJs`/`execPython`/`execWasm` JS stubs remain defined but are inert — the
      host backend rejects the effect (`… is not supported on the rust engine`)
      since the snippet sandboxes were removed in #39.

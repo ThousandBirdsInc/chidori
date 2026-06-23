@@ -11,6 +11,12 @@ broker (#47) and the node-shim batch + built-in `untrusted` policy profile
 (#48); a `--untrusted` CLI flag landed on this branch. All of #39–#48 are
 merged into the branch history.*
 
+> **Historical snapshot (~2026-06-10/12).** This document is kept as a dated
+> record of repo state at that time. Its conformance numbers, LOC counts, and
+> bare `src/` paths predate the move of the main crate into `crates/chidori/`
+> and later conformance work; for the current conformance table see
+> [`docs/conformance.md`](./conformance.md).
+
 > **Addendum (2026-06-12, conformance campaign):** after this review was
 > taken, a focused sweep drove Test262 conformance from 96.22 % to
 > **98.10 %** (39,017 pass / 757 fail / 7,517 skip) — recommendation 2's
@@ -360,7 +366,7 @@ The original items, for the record:
 
 - TypeScript-only agent authoring with runtime transpilation; the
   `chidori.*` host API (prompt, input, tool, callAgent, parallel, retry,
-  tryCall, http, template, log, memory, checkpoint, workspace).
+  tryCall, template, log, memory, checkpoint, workspace).
 - Deterministic call-log record/replay with zero-LLM-call replays; durable
   pause/resume across `input()`, policy approval, and host calls, including
   nested tool/sub-agent suspension — all on the single pure-Rust engine.

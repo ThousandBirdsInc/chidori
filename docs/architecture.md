@@ -69,7 +69,6 @@ chidori/
 │   ├── agents/             # Example .ts agents
 │   ├── prompts/            # Example .jinja templates
 │   ├── tools/              # Example tools
-│   ├── legacy-starlark/    # Archived .star examples
 │   └── sdk_demo.py         # Python SDK demo
 ├── docs/
 │   ├── DESIGN.md           # Architecture & design rationale

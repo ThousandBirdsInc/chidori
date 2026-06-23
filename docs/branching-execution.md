@@ -132,11 +132,11 @@ record stream is the durable substrate; `CallRecord` lives in
 `src/runtime/call_log.rs`.
 
 ### 4.2 The rust-engine agent path (what `chidori.branch` plugs into)
-`src/runtime/rust_engine.rs`: `run_agent` → `run_module(path, source, fallback, input,
+`crates/chidori/src/runtime/rust_engine.rs`: `run_agent` → `run_module(path, source, fallback, input,
 ctx, tools)`. `run_module` transpiles TS→JS, builds a **plain `chidori_js::Engine`**,
 installs the `chidori` host object (`install_chidori_effects(make_dispatch(ctx.clone(),
-tools.clone()))`) whose methods route to `dispatch_effect(ctx, tools, effect, args)` →
-`host_core` on the **shared `RuntimeContext`**, installs the `run(handler)` entrypoint,
+tools.clone()))`) whose methods route through `RuntimeBindingBackend::dispatch(ctx, tools, effect, args)`
+(in `crates/chidori/src/runtime/typescript/bindings.rs`) → `host_core` on the **shared `RuntimeContext`**, installs the `run(handler)` entrypoint,
 and runs it. **Key fact:** on this path the durable record is the `RuntimeContext`
 `call_log` (global `seq`) — *not* the `crates/chidori-js/src/replay.rs` journal (that
 journal is only used by the `RustReplayEngine` snapshot seam). So branching here is
@@ -224,7 +224,7 @@ type BranchVariant = {
 
 type BranchOutcome = {
   label: string;
-  branchId: string;              // <parent_run_id>-branch-<k>
+  branchId: string;              // <parent_run_id>-op<branch_seq>-branch-<k>
   status: "completed" | "paused" | "failed";
   output?: Json;                 // when completed
   pendingPrompt?: string;        // when paused (e.g. chidori.input)
@@ -267,7 +267,7 @@ changes for the MVP (the journal `Mode::Branch` is phase 3 only).
 ## 8. Detailed design — orchestration (rust engine)
 
 ### 8.1 Dispatch
-`src/runtime/rust_engine.rs::dispatch_effect` gains `"branch" => run_branches(ctx,
+`crates/chidori/src/runtime/typescript/bindings.rs::dispatch` gains `"branch" => host_branch::run_branches(ctx,
 tools, args)`. `run_branches` wraps the whole fan-out in the durable boundary so it's
 one recorded, nested call:
 ```rust

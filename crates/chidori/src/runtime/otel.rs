@@ -399,9 +399,9 @@ impl RunSpan {
 /// activation in and out of "current" WITHOUT closing its (still-open) span — so
 /// a function that awaits/yields keeps the right parentage when it resumes.
 ///
-/// Feature-gated to `rust-engine`: only the pure-Rust engine can be observed at
-/// this granularity. Install on `ReplayRuntime.vm.trace_sink` for a run that has
-/// a [`RunSpan`]. A pure consumer of trace events — never affects execution.
+/// Only the pure-Rust `chidori-js` engine (the sole JS engine) can be observed
+/// at this granularity. Install on `ReplayRuntime.vm.trace_sink` for a run that
+/// has a [`RunSpan`]. A pure consumer of trace events — never affects execution.
 pub struct JsTraceObserver {
     run_cx: Context,
     agent_name: String,
@@ -526,11 +526,12 @@ impl RunSpan {
 /// sandbox, the memory store); INTERNAL is the default.
 fn span_kind_for(function: &str) -> SpanKind {
     match function {
-        // External-system calls. Function names here must match the strings
-        // actually recorded on `CallRecord::function` (see host_core.rs):
-        // sub-agents are recorded as `call_agent`, and the string/expr
-        // sandboxes as `exec_js`/`exec_python`/`exec_expr` (with `exec` for
-        // the WASM sandbox) — so all of those are spelled out explicitly.
+        // External-system calls. The live recorded `CallRecord::function`
+        // strings (see `host_core.rs::host_operation_kind`) are `prompt`,
+        // `http`, `tool`, `call_agent`, and `memory`. The `exec`/`exec_js`/
+        // `exec_python`/`exec_expr` names are reserved sandbox effects that the
+        // host does not currently record (the JS stubs are inert); they're kept
+        // here so they classify as CLIENT if a sandbox is ever wired up.
         "prompt" | "http" | "tool" | "call_agent" | "exec" | "exec_js" | "exec_python"
         | "exec_expr" | "memory" => SpanKind::Client,
         _ => SpanKind::Internal,
@@ -786,10 +787,11 @@ mod tests {
 
     #[test]
     fn span_kind_matches_recorded_function_names() {
-        // CLIENT for calls that reach external systems, using the exact
-        // function strings host_core records (regression guard against the
-        // old `agent`/`exec`-only mapping that missed `call_agent` and the
-        // `exec_js`/`exec_python`/`exec_expr` sandboxes).
+        // CLIENT for calls that reach external systems. The live host_core
+        // function strings are `prompt`/`http`/`tool`/`call_agent`/`memory`;
+        // the `exec`/`exec_js`/`exec_python`/`exec_expr` names are reserved
+        // (inert) sandbox effects also mapped to CLIENT. Regression guard
+        // against the old `agent`/`exec`-only mapping that missed `call_agent`.
         for f in [
             "prompt",
             "http",

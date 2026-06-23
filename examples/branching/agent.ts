@@ -12,8 +12,8 @@ import type { BranchOutcome, Chidori } from "chidori:agent";
  * variable is each branch's code.
  *
  * Durability: the whole fan-out is ONE recorded `branch` call. Replaying this
- * run (`chidori replay <run-id>`) returns the outcomes from the call log
- * without re-running either branch.
+ * run (`chidori resume examples/branching/agent.ts <run-id> --dir examples/branching`)
+ * returns the outcomes from the call log without re-running either branch.
  *
  * `summarizeBrief` is a local helper so the example runs offline with no LLM
  * provider; swap it (and the strategies) for `chidori.prompt(...)` calls to

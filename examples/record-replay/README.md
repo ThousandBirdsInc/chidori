@@ -35,7 +35,7 @@ All commands are run **from the repository root**.
 - Build the CLI once (needed for everything in Layer 2):
 
   ```bash
-  cargo build --bin chidori          # produces ./target/debug/chidori
+  cargo build --release          # produces ./target/release/chidori
   ```
 
 ### 1. Layer 1 — run the Rust engine examples (no server, fastest)
@@ -63,7 +63,7 @@ done
 to copy it by hand:
 
 ```bash
-BIN=./target/debug/chidori
+BIN=./target/release/chidori
 
 # record
 $BIN run examples/record-replay/exactly_once.ts -i name=Ada
@@ -152,7 +152,7 @@ re-invoked, so the "served from the journal" guarantee is enforced by the code.
 Build the CLI once:
 
 ```bash
-cargo build --bin chidori
+cargo build --release
 ```
 
 ### Option A — the CLI (`run` → `trace` → `resume`)

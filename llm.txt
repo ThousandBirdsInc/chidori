@@ -47,6 +47,7 @@ chidori run agents/my_agent.ts --trace
 chidori chat --system "You are a concise assistant." --model claude-sonnet
 chidori chat agents/chat.ts                 # chat through a conversational agent file
 chidori serve agents/webhook.ts --port 8080 --trusted
+chidori resume agents/my_agent.ts <run_id>  # replay a recorded run byte-for-byte with zero model calls (durable resume)
 chidori trace <run_id>
 chidori snapshot <run_id>
 ```
@@ -239,8 +240,8 @@ const result = await chidori.tool("web_search", { query: "snapshot runtime" });
 ```
 
 Tools discovered from disk are TypeScript `.ts` modules or MCP-backed remote
-tools. Archived Starlark tools under `examples/legacy-starlark/` are kept for
-migration reference and are no longer loaded by tool directory discovery.
+tools. The legacy Starlark dialect was removed; any `.star` tools left on disk
+are ignored by tool directory discovery.
 
 ### callAgent
 

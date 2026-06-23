@@ -231,8 +231,8 @@ pub enum Capability {
 
 - Emitted on the **snapshot manifest** (alongside `RuntimePolicy`) so a stored
   run advertises its capability surface.
-- Emitted as OTEL span attributes via the existing trace emitter
-  (`docs/trace-emitter.md`) — one attribute per capability, e.g.
+- Emitted as OTEL span attributes via the span emitter
+  (`crates/chidori/src/runtime/otel.rs`) — one attribute per capability, e.g.
   `chidori.capability.crypto_random=true`.
 - Returnable to the host (CLI/server) so a run can be gated: "this agent used
   `CryptoRandom`; require approval" reuses the `PolicyApproval` pause path.
