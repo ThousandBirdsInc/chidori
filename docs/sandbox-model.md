@@ -1,9 +1,14 @@
 # Sandbox model of the chidori-js runtime
 
 > **Status:** Implemented, with documented gaps (see [Current gaps](#current-gaps)).
+> Two layers ship today: the default **in-process** capability-confinement
+> sandbox, and an **opt-in OS-level isolation** mode (`--isolate`) that runs each
+> agent in a confined child process — see
+> [OS-level isolation](#os-level-isolation-opt-in---isolate).
 > **Target engine:** the pure-Rust `chidori-js` engine — the only JS engine in
 > the tree (the QuickJS/C path was removed in #39).
-> **Related:** [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md),
+> **Related:** [`docs/os-isolation-plan.md`](./os-isolation-plan.md),
+> [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md),
 > [`docs/captured-effects-vfs-crypto-timers.md`](./captured-effects-vfs-crypto-timers.md),
 > [`docs/conformance.md`](./conformance.md).
 
@@ -26,11 +31,22 @@ What it is **good** at: confining the *language* — a buggy or hostile script
 cannot corrupt memory, escape into host code, or reach a capability it was not
 given.
 
-What it is **not**: a containment boundary for the powerful effects the host
-*does* inject (`http`, `workspace.*`). Those are real
-capabilities; whether granting them is "safe" depends entirely on whether the
-agent code is trusted. There is also no process/OS isolation — the engine runs
-in-process with the host.
+What it is **not** (by default): a containment boundary for the powerful effects
+the host *does* inject (`http`, `workspace.*`). Those are real capabilities;
+whether granting them is "safe" depends entirely on whether the agent code is
+trusted.
+
+For that case there is now an **opt-in OS-level isolation mode**
+(`--isolate` / `CHIDORI_ISOLATE=process`): each run executes in a disposable
+child process that holds *only* the JS engine and brokers every effect back to
+the trusted parent over a pipe. The child runs under a per-OS sandbox (Linux:
+empty network namespace + Landlock read-only filesystem + seccomp syscall
+denylist; macOS: a Seatbelt deny profile) plus a `setrlimit` floor and a
+parent-side deadline-kill — so even a total compromise of the interpreter has no
+ambient network, filesystem, or sibling-run to reach. It is off by default
+(in-process stays the default for trusted local dev) and is additive: agent
+code, the SDKs, the durable format, and replay semantics are unchanged. See
+[OS-level isolation](#os-level-isolation-opt-in---isolate).
 
 ## Threat model
 
@@ -56,7 +72,7 @@ remaining distance.
 | Crash the host with a panic | ✅ Yes — `catch_unwind` boundary |
 | Abuse an injected powerful effect (`http`, `workspace`) | ✅ On the server (deny-by-default unless the operator opts out); ⚠️ on the bare CLI only if the operator gates it — see [gaps](#current-gaps) |
 | Starve co-tenant agents / exceed a per-agent memory quota | ✅ Per-run meter (thread-attributed; small cross-thread drift) — see [gaps](#current-gaps) |
-| Break out of the process / OS | ❌ No process or OS isolation |
+| Break out of the process / OS | ⚠️ Default: none (in-process). ✅ With `--isolate`: confined child process — seccomp/Seatbelt + netns/Landlock + rlimits — see [OS-level isolation](#os-level-isolation-opt-in---isolate) |
 
 ## Architecture: capability injection, not ambient authority
 
@@ -196,6 +212,163 @@ The same watchdog can enforce a wall-clock deadline, also via `vm.interrupt`.
 | Call depth | (compile constant) | 2,000 | — |
 | Regex steps | (compile constant) | 100,000 | — |
 
+## OS-level isolation (opt-in: `--isolate`)
+
+Everything above confines the *language* and bounds resources, but by default the
+VM runs **in-process** with the host: there is no OS boundary, so a hypothetical
+interpreter RCE would land in the host process. The `--isolate` mode adds that
+boundary. It is **off by default** (in-process stays the default for trusted
+local dev) and **additive** — agent code, the SDKs, the durable call log, and
+replay semantics are byte-for-byte unchanged (asserted by
+`rust_engine::tests::isolated_run_matches_in_process_byte_for_byte`). The design
+and phasing live in [`docs/os-isolation-plan.md`](./os-isolation-plan.md); this
+is the operator-facing summary. Code: `crates/chidori/src/runtime/isolate/`.
+
+### Process-per-run with brokered effects
+
+Each run executes in a **disposable child process** (`chidori __run-worker`, a
+hidden subcommand) that holds *only* the JavaScript engine. Every host op — each
+`chidori.*` effect (`log`, `prompt`, `tool`, `callAgent`, `http`, `memory`,
+`template`, `checkpoint`, `input`, `workspace.*`), every captured sync native
+(VFS read/write, crypto hash/HMAC/random, DOM render), and every module load — is
+**RPC'd back to the parent** over a length-prefixed JSON frame protocol on the
+child's stdin/stdout (`isolate/protocol.rs`). The parent keeps doing all real I/O
+and owns the durable call log, policy gate, MCP, providers, and OTEL; the child
+only computes JavaScript.
+
+This is cheap because the host-call boundary was *already* a single synchronous
+`(op, args) -> Result<Value, String>` seam (`route_host_op`). Brokering swaps the
+in-process `InProcessHost` for a `BrokeredHost` whose dispatch is a blocking pipe
+round-trip — semantically identical to the VM, which already blocks on effects
+inline. The cost is one IPC hop per effect, dwarfed by LLM/tool latency.
+
+- **Disposable, leak-free.** The child exits after one run, so the `Rc<RefCell>`
+  cross-run cycle-leak concern (gap #6) does not apply to the isolated path, and
+  the per-run heap meter becomes a clean per-process measure (no cross-tenant
+  attribution drift — gaps #2/#3).
+- **Pause/resume/replay for free.** Pause = the child returns the pause sentinel
+  and exits; resume/replay = the parent spawns a fresh worker and serves recorded
+  effect results over the same pipe (the child cannot tell record from replay).
+  **Zero** child-state serialization.
+- **Parent hardening.** A `MAX_FRAME_BYTES` (64 MB) ceiling stops a hostile child
+  from OOMing the parent with a giant frame; EOF / decode error / child death all
+  map to a run failure; reads never block past the deadline.
+
+### Resource floor (all platforms)
+
+Before any agent code runs, the worker applies a `setrlimit` floor to itself
+(`isolate/limits.rs`), shipped from the parent in the `Init` frame so the parent
+owns the policy:
+
+- `RLIMIT_CPU` — hard CPU-seconds backstop to the in-engine opcode budget. Like
+  the budget (and unlike a wall-clock deadline) it does **not** count time the
+  child spends blocked on a brokered effect, so it bounds runaway *compute*
+  without penalizing a legitimately slow agent. Opt-in (`CHIDORI_ISOLATE_CPU_SECS`).
+- `RLIMIT_FSIZE` — max bytes writable to a regular file (the child has no
+  filesystem, so this is belt-and-suspenders). Opt-in only, because a `0` cap
+  also kills writes to a redirected regular-file `stderr` — file-write
+  confinement is Landlock's job instead.
+- `RLIMIT_CORE = 0` — no core dumps (a crash must not splatter memory to disk).
+- `RLIMIT_NOFILE` — a small open-file ceiling (default 256).
+
+Deliberately **not** set: `RLIMIT_AS` (address-space caps are too blunt — a
+multi-threaded VM over-reserves virtual memory) and `RLIMIT_NPROC` (counts every
+process of the real uid, fragile under shared-uid concurrency; blocking `fork`
+belongs to seccomp). A hard per-run memory ceiling via cgroup v2 `memory.max` is
+the tracked follow-up; until then the in-process heap watchdog (now a clean
+per-process measure) is the stand-in.
+
+On top of the floor the **parent** runs a wall-clock **deadline-kill** watchdog
+(`CHIDORI_ISOLATE_DEADLINE_MS`): a thread that `SIGKILL`s a wedged child that has
+stopped cooperating entirely. This is the hard backstop distinct from the
+in-engine `CHIDORI_JS_DEADLINE_MS`.
+
+### Per-OS confinement (`isolate/sandbox.rs`)
+
+Because brokering means the child needs *no* outward capability on any platform,
+even a coarse per-OS sandbox is meaningfully strong — there is nothing wired for
+it to abuse. Each layer is **best-effort**: a layer that cannot be applied (older
+kernel, rootless container) logs a skip note and degrades rather than breaking
+the run. Set `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` to **fail closed** if the
+platform's core layer (seccomp on Linux, Seatbelt on macOS) cannot be applied.
+
+**Linux** (`apply_linux`), layered before seccomp so `unshare`/`landlock_*`
+remain legal:
+
+- **Empty network namespace** (`unshare(CLONE_NEWNET)`) — no interfaces, so
+  network egress is impossible at the OS even if a syscall slipped through. Needs
+  `CAP_SYS_ADMIN`; skipped rootless.
+- **Landlock read-only filesystem** (kernels ≥ 5.13) — denies every write-class
+  access while leaving reads for the C runtime, closing the `openat`-write
+  surface seccomp leaves open and sparing inherited fds like a redirected stderr.
+- **seccomp-bpf denylist** (via `seccompiler`, safe Rust) — `NO_NEW_PRIVS` +
+  `KILL_PROCESS` on a curated denylist: the whole socket family, `exec*`,
+  `ptrace`/`process_vm_*`, namespace/mount, privilege-change,
+  kernel-module/`bpf`/`perf_event_open`, and keyring syscalls. `fork`/`clone` are
+  *not* denied (the watchdog thread needs them, and a fork that cannot `exec`
+  gains no code) — the `exec*` denial is what forecloses code execution. It is a
+  **denylist, not an allowlist**, deliberately: it cannot false-positive-kill the
+  engine and ships real confinement today; the near-empty allowlist remains the
+  end goal.
+
+**macOS** (`apply_macos`):
+
+- **Seatbelt** via `sandbox_init` (the deprecated-but-stable libSystem FFI
+  Chromium's renderer uses) with an allow-default, targeted-deny SBPL profile
+  (`(deny network*)` + `(deny file-write*)`) — the same posture as the Linux
+  seccomp+Landlock pair. The one bit of `unsafe`/FFI in the feature is isolated
+  here, out of the engine crate. (Type-checked on the Linux host but
+  runtime-unverified — no macOS CI host yet; the best-effort design degrades a
+  load failure to a logged skip.)
+
+**Guarantee matrix:**
+
+| Mechanism | Linux | macOS |
+|---|---|---|
+| Separate process + brokered effects | ✅ | ✅ |
+| rlimits (CPU/FSIZE/CORE/NOFILE) | ✅ | ✅ |
+| Network egress blocked at OS | ✅ empty netns | ✅ Seatbelt deny |
+| Filesystem writes blocked at OS | ✅ Landlock + seccomp | ✅ Seatbelt deny |
+| Syscall confinement | ✅ seccomp denylist | ⚠️ Seatbelt (coarser) |
+| Hard memory ceiling | ⏳ cgroup `memory.max` (deferred) | ⏳ deferred |
+
+Windows is documented in the plan as a future tier (Job Object + restricted
+token); it is not a shipped target today.
+
+### Failure mapping
+
+The parent translates an OS kill into a precise host error (the child also writes
+a structured error frame from its `catch_unwind` boundary before exiting):
+
+| Child outcome | Host error |
+|---|---|
+| seccomp kill (`SIGSYS`) | blocked syscall (seccomp/SIGSYS) |
+| `RLIMIT_CPU` exceeded | CPU limit exceeded |
+| OOM / memory kill | memory limit exceeded |
+| parent deadline kill | wall-clock deadline exceeded |
+| opcode budget (in-child `RangeError`) | `JavaScript exception: …` (unchanged) |
+| panic → error frame, exit | `rust engine panicked: …` (unchanged shape) |
+| pipe EOF / oversized frame | isolated run failed: worker terminated |
+
+### Enabling it
+
+`--isolate` is accepted on both `chidori run` and `chidori serve` (equivalently
+`CHIDORI_ISOLATE=process`); the worker child always has the env var stripped so
+it never recursively re-isolates. The startup banner prints an `Isolation:` line
+describing the active posture. Isolation (process sandbox) and `--untrusted`
+(policy) are **orthogonal but composable** — running untrusted *without*
+isolation prints a nudge rather than silently changing behavior.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `CHIDORI_ISOLATE` | unset (off) | `process` runs each agent in a confined child worker. Set by `--isolate`. |
+| `CHIDORI_ISOLATE_REQUIRE_SANDBOX` | off | Fail the run closed if the platform's core confinement (seccomp/Seatbelt) can't be applied. |
+| `CHIDORI_ISOLATE_DEADLINE_MS` | off | Parent-side wall-clock `SIGKILL` of a wedged worker. |
+| `CHIDORI_ISOLATE_CPU_SECS` | off | Hard `RLIMIT_CPU` ceiling on worker compute. |
+| `CHIDORI_ISOLATE_NOFILE` | 256 | `RLIMIT_NOFILE` (clamped to the inherited hard limit). |
+| `CHIDORI_ISOLATE_FSIZE_BYTES` | off | `RLIMIT_FSIZE` (opt-in; off because a `0` cap also kills a redirected regular-file stderr). |
+| `CHIDORI_ISOLATE_NO_CORE` | on | Disable core dumps (`RLIMIT_CORE=0`). |
+
 ## Current gaps
 
 These are the known limitations as of this writing. None of them are
@@ -226,21 +399,37 @@ resource-precision gaps.
    charged (the meter clamps at zero in the other direction). For a
    single-threaded VM run this drift is small; true ownership accounting (charge
    at string/object allocation, credit on `Drop` inside the engine) remains the
-   eventual fix.
+   eventual fix. **Under [`--isolate`](#os-level-isolation-opt-in---isolate) this
+   drift disappears**: each run is its own process, so the meter is a clean
+   per-process measure with no cross-tenant attribution.
 
 3. **Memory enforcement granularity.** The live-heap check is polled (watchdog
    every ~10 ms by default, tunable via `CHIDORI_JS_MEM_POLL_MS`; the VM observes
    the trip every 256 ops). A run can therefore overshoot the cap briefly before
    unwinding. Bounded in practice because the per-op size caps mean no single
    opcode allocates more than ~16 MB, but it is not a hard instantaneous ceiling.
+   A *hard*, kernel-enforced ceiling (cgroup v2 `memory.max`) is the eventual fix
+   under [`--isolate`](#os-level-isolation-opt-in---isolate) but is deferred — see
+   gap #4.
 
-4. **No process / OS-level isolation.** The engine runs in-process with the host;
-   there is no seccomp, namespace, or separate-process boundary. Isolation is
-   purely capability-confinement plus Rust memory safety. A panic is contained
-   (gap-free via `catch_unwind`), but this is not a substitute for OS containment
-   when running genuinely hostile code. A proposed additive fix —
-   process-per-run with brokered effects + per-OS sandboxing — is specified in
-   [`docs/os-isolation-plan.md`](./os-isolation-plan.md).
+4. **OS-level isolation is opt-in, not the default.** By default the engine runs
+   in-process with the host — no seccomp, namespace, or separate-process boundary
+   — so the default posture is purely capability-confinement plus Rust memory
+   safety. The [`--isolate` mode](#os-level-isolation-opt-in---isolate) now
+   *provides* that boundary (process-per-run with brokered effects, seccomp /
+   Seatbelt, network namespace + Landlock, an rlimits floor, and a deadline-kill),
+   but the operator must enable it; in-process remains the default for trusted
+   local dev. Remaining sub-gaps within the isolated path:
+   - **No hard memory ceiling yet.** cgroup v2 `memory.max` needs delegation and
+     is deferred; `RLIMIT_AS` is too blunt for a multi-threaded VM. The polled
+     heap watchdog (cleaner per-process under isolation) is the stand-in.
+   - **seccomp is a denylist, not an allowlist.** Real confinement today but the
+     near-empty allowlist remains the stronger end state.
+   - **Rootless net-ns and mount/pid namespaces** are not yet wired (the empty
+     network namespace needs `CAP_SYS_ADMIN` and is skipped rootless; the socket
+     seccomp block is the rootless backstop).
+   - **The macOS Seatbelt path is runtime-unverified** (type-checked only — no
+     macOS CI host yet); it degrades to a logged skip on failure.
 
 5. **Container element counts beyond arrays are uncapped.** Arrays are bounded by
    `MAX_DENSE_ARRAY` (1M), but `Map`/`Set`/object property counts are not
@@ -252,7 +441,10 @@ resource-precision gaps.
    `run_module` builds a fresh engine per run and relies on process/run teardown
    rather than calling it. Long-lived worker threads that reuse state could
    accumulate leaked bytes across runs; the baseline-relative memory cap is robust
-   to this within a run but not across many runs on a reused thread.
+   to this within a run but not across many runs on a reused thread. **The
+   [`--isolate`](#os-level-isolation-opt-in---isolate) path sidesteps this
+   entirely**: the child process exits after one run (spawn-per-run, no warm
+   pool), so no state — leaked or otherwise — survives across runs.
 
 7. **Engine maturity.** The pure-Rust engine is at 98.10% Test262 (see
    [`docs/conformance.md`](./conformance.md)); spec deviations are not
@@ -379,8 +571,9 @@ If you intend to run code you do not trust on this engine today:
    and a parent-side deadline-kill. Layers are best-effort — set
    `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` to fail closed if the platform's core
    confinement can't be applied. See
-   [`docs/os-isolation-plan.md`](./os-isolation-plan.md). (Running each agent in
-   its own container is still complementary.)
+   [OS-level isolation](#os-level-isolation-opt-in---isolate) for the full
+   posture (and [`docs/os-isolation-plan.md`](./os-isolation-plan.md) for the
+   design). (Running each agent in its own container is still complementary.)
 4. Keep `node:fs` on `FsPolicy::Captured` (the VFS) and avoid `workspace.*`.
 
 ## Verification
@@ -393,3 +586,13 @@ The protections above are exercised by:
 - Manual end-to-end (rust engine + global allocator active): a Map-of-8 MB-strings
   agent trips at a 64 MB cap (`execution interrupted`) yet completes under a
   generous cap; an infinite loop trips a 500 ms deadline.
+
+OS isolation (`--isolate`) is exercised by:
+- `src/runtime/rust_engine.rs::tests::isolated_run_matches_in_process_byte_for_byte`
+  — the worker's output **and** host-call log match the in-process path exactly.
+- `crates/chidori/tests/isolate_limits.rs` (skip-aware where a layer is
+  unavailable): `isolated_run_succeeds_under_the_default_resource_floor` (no false
+  positives), `seccomp_blocks_a_denied_syscall` (a post-filter `socket()` probe is
+  killed), `filesystem_writes_are_blocked_when_confined` (Landlock/Seatbelt),
+  `parent_deadline_kills_a_wedged_worker`, `cpu_limit_terminates_a_busy_worker`,
+  and `seatbelt_loads_and_enforces_on_macos`.
