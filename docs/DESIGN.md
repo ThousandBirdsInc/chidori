@@ -9,9 +9,9 @@ APIs such as `fetch`). The host boundary is where Chidori records call logs,
 streams prompt progress, enforces policy, persists checkpoints, pauses for human
 input, and replays completed work.
 
-TypeScript is the only supported authoring format. Legacy Starlark examples are
-archived under `examples/legacy-starlark/` for reference, but the runtime, CLI,
-server, and tool discovery paths require `.ts` files.
+TypeScript is the only supported authoring format. The legacy Starlark dialect
+was removed (its examples live in git history); the runtime, CLI, server, and
+tool discovery paths require `.ts` files.
 
 Agents run on **`crates/chidori-js`**, an in-tree, pure-Rust JavaScript engine
 (zero `unsafe`, oxc parser). It is the *only* JavaScript engine in the tree —
@@ -77,33 +77,33 @@ The runtime has these production pieces in place:
   function seam (`host.rs`).
 - `crates/test262-runner` runs the pinned Test262 corpus against the engine and
   gates CI on a committed per-test baseline.
-- `src/runtime/engine.rs` dispatches TypeScript agents, validates `.ts` files,
+- `crates/chidori/src/runtime/engine.rs` dispatches TypeScript agents, validates `.ts` files,
   resolves durable runtime policy, wires replay and pause modes, and persists
   run checkpoints.
-- `src/runtime/rust_engine.rs` adapts `chidori-js` to the runtime via the
+- `crates/chidori/src/runtime/rust_engine.rs` adapts `chidori-js` to the runtime via the
   `SnapshotCapableJsEngine` trait, exposing host effects as global async
   functions and round-tripping a `{bundle, effects, journal}` blob for
   snapshot/restore.
-- `src/runtime/host_core.rs` owns the language-neutral host-call behavior:
+- `crates/chidori/src/runtime/host_core.rs` owns the language-neutral host-call behavior:
   sequence allocation, replay lookup, policy enforcement, provider/tool/network
   execution, memory, templates, call-log recording, events, and safepoints.
-- `src/runtime/context.rs`, `call_log.rs`, `capability.rs`, `cost.rs`,
+- `crates/chidori/src/runtime/context.rs`, `call_log.rs`, `capability.rs`, `cost.rs`,
   `crypto.rs`, `vfs.rs`, `memory.rs`, `template.rs`, `prompt_cache.rs`,
   `secret_env.rs`, `workspace.rs`, `host_branch.rs`, and `otel.rs` provide the
   surrounding host machinery (runtime context, captured effects, capability
   ledger, cost accounting, virtual filesystem, prompt caching, secrets,
   workspace, branching, OTEL).
-- `src/runtime/typescript/` owns TypeScript transpilation (`transpile.rs`, oxc),
+- `crates/chidori/src/runtime/typescript/` owns TypeScript transpilation (`transpile.rs`, oxc),
   native host bindings (`bindings.rs`), the module graph and resolver
   (`module_graph.rs`, `resolver.rs`), tool metadata evaluation (`tools.rs`),
   `check.rs`, and runtime prelude/builtins (`builtins.rs`, `helpers.rs`).
-- `src/runtime/snapshot.rs` defines snapshot/journal manifests, runtime policy,
+- `crates/chidori/src/runtime/snapshot.rs` defines snapshot/journal manifests, runtime policy,
   ABI/source/policy validation, capability ledgers, and store/load behavior.
-- `src/tools/mod.rs` discovers TypeScript `.ts` tools and ignores `.star` files.
-- `src/server.rs` and `src/main.rs` expose run, check, serve, sessions, replay,
+- `crates/chidori/src/tools/mod.rs` discovers TypeScript `.ts` tools and ignores `.star` files.
+- `crates/chidori/src/server.rs` and `crates/chidori/src/main.rs` expose run, check, serve, sessions, replay,
   resume, streaming events, trace, stats, branches, and snapshot metadata
-  commands. `src/providers/`, `src/mcp/`, `src/acp.rs`, `src/policy.rs`,
-  `src/scheduler.rs`, and `src/storage.rs` provide providers, MCP/ACP surfaces,
+  commands. `crates/chidori/src/providers/`, `crates/chidori/src/mcp/`, `crates/chidori/src/acp.rs`, `crates/chidori/src/policy.rs`,
+  `crates/chidori/src/scheduler.rs`, and `crates/chidori/src/storage.rs` provide providers, MCP/ACP surfaces,
   policy, scheduling, and persistence.
 - `sdk/typescript/` and `sdk/python/` expose zero-dependency HTTP clients for
   run, replay, resume, checkpoints, streaming, and snapshot manifest inspection.
@@ -272,34 +272,34 @@ snapshot-resident virtual filesystem (`node:fs`) is reachable.
 ## Project Layout
 
 ```text
-src/
-  runtime/
-    engine.rs              # agent dispatch, replay, pause, persistence
-    rust_engine.rs         # chidori-js adapter (SnapshotCapableJsEngine)
-    host_core.rs           # language-neutral host operation behavior
-    context.rs             # runtime context shared across host calls
-    snapshot.rs            # manifests, policy, journal validation, stores
-    call_log.rs            # call-log / journal records
-    capability.rs          # capability ledger
-    vfs.rs crypto.rs       # captured filesystem and crypto effects
-    memory.rs template.rs  # memory store and templates
-    prompt_cache.rs        # opt-in local prompt cache
-    workspace.rs           # policy-gated workspace access
-    host_branch.rs         # in-agent branching
-    cost.rs otel.rs        # cost accounting and OTEL spans
-    typescript/            # TS transpile, bindings, module graph, tools, check
-  server.rs                # HTTP/session/streaming APIs
-  providers/               # Anthropic, OpenAI, LiteLLM-compatible, static
-  tools/mod.rs             # TypeScript tool discovery
-  mcp/ acp.rs              # MCP and ACP protocol surfaces
-  policy.rs scheduler.rs storage.rs   # policy, scheduling, persistence
 crates/
+  chidori/
+    src/
+      runtime/
+        engine.rs              # agent dispatch, replay, pause, persistence
+        rust_engine.rs         # chidori-js adapter (SnapshotCapableJsEngine)
+        host_core.rs           # language-neutral host operation behavior
+        context.rs             # runtime context shared across host calls
+        snapshot.rs            # manifests, policy, journal validation, stores
+        call_log.rs            # call-log / journal records
+        capability.rs          # capability ledger
+        vfs.rs crypto.rs       # captured filesystem and crypto effects
+        memory.rs template.rs  # memory store and templates
+        prompt_cache.rs        # opt-in local prompt cache
+        workspace.rs           # policy-gated workspace access
+        host_branch.rs         # in-agent branching
+        cost.rs otel.rs        # cost accounting and OTEL spans
+        typescript/            # TS transpile, bindings, module graph, tools, check
+      server.rs                # HTTP/session/streaming APIs
+      providers/               # Anthropic, OpenAI, LiteLLM-compatible, static
+      tools/mod.rs             # TypeScript tool discovery
+      mcp/ acp.rs              # MCP and ACP protocol surfaces
+      policy.rs scheduler.rs storage.rs   # policy, scheduling, persistence
   chidori-js/              # the pure-Rust JavaScript engine (the only engine)
   test262-runner/          # Test262 conformance runner + baseline gate
 examples/
   agents/                  # TypeScript examples
   tools/                   # TypeScript tool examples
-  legacy-starlark/         # archived migration reference
 sdk/
   typescript/              # HTTP client and authoring types
   python/                  # HTTP client

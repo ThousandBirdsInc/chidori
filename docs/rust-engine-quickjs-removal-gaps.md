@@ -198,7 +198,12 @@ The dispatch logic also needs decoupling from `TypeScriptVmRuntime` (today
 reference it). ~Medium.
 
 ### G5 — Conformance bar
-94.52% of executed Test262 today (37,618 pass / 2,179 fail / 7,494 skip; full
+**Moot:** QuickJS was already removed (#39), so the G5 conformance bar no longer
+gates anything — defer to [`docs/conformance.md`](./conformance.md) for the live
+figure. The pure-Rust engine is at 98.96% of executed (39,361 pass / 413 fail /
+7,517 skip). Historical write-up follows.
+
+94.52% of executed Test262 (37,618 pass / 2,179 fail / 7,494 skip; full
 language + built-ins, rust engine, 2026-06-11 — was 91.69% on 2026-06-04; the
 2026-06-11 iterations added dynamic `import()` (host-hook loader, +~250),
 once-resolved `with`-scope references incl. closures capturing the with chain
@@ -232,11 +237,9 @@ real agents. Progress + highest-impact remaining gaps:
   brand-check (`obj.#m()` on a non-instance throws `TypeError`: `PrivateGet` not
   `GetProp` in the call path) — a correct fix (smoke-verified), though Test262-
   neutral on its own since those tests also need the per-instance private-element
-  model. Largest remaining class clusters: per-instance private-method/accessor
-  brand model (~50; brand added at construction, not via the prototype), and
-  derived-constructor `this`-TDZ (`this`/implicit-return before `super()` →
-  `ReferenceError`, needs the spec construction model where `super()` *creates*
-  `this`, ~40). `statements/class` ~92%, `expressions/class` ~95%.
+  model. (The per-instance private-method/accessor brand model is now implemented
+  via `[[PrivateElements]]`, and derived-constructor `this`-TDZ via
+  `BindThisValue`.) `statements/class` ~92%, `expressions/class` ~95%.
 - **Native-builtin subclassing** — `class X extends Set`/`Map`/`Uint8Array`
   now works: each native ctor's call-handler detects a `super()` invocation
   (this is a subclass instance) and adopts the exotic internal slot in place.
@@ -281,6 +284,9 @@ on G1. ~Medium.
    and the `rquickjs` dev-dependency, and collapse `selected_engine()`/`EngineKind`.
 
 ## Decision: runtime default stays QuickJS until the G5 bar
+
+**Historical — superseded:** the flip happened and QuickJS was deleted in #39;
+there is no `CHIDORI_JS_ENGINE` toggle or `rust-engine` feature.
 
 The earlier flip attempt failed **54 tests**, all in engine pause/resume/snapshot
 and server resume — exactly gates **G1**/**G2** (and the nested/suspension parts of

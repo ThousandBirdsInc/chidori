@@ -25,8 +25,8 @@ Why this beats re-running the whole agent per idea:
   `strategies/outline_first.ts` and re-run: the branch re-anchors to the same
   shared state, the other strategy is untouched.
 - **One durable record.** The fan-out is recorded as a single `branch` call
-  whose result is the outcomes array. `chidori replay <run-id>` returns it
-  from the call log without re-running either branch.
+  whose result is the outcomes array. `chidori resume examples/branching/agent.ts <run-id> --dir examples/branching`
+  returns it from the call log without re-running either branch.
 - **Branches nest in the trace.** Each branch's host calls carry
   `parent_seq = the branch call's seq`, so an OTLP viewer (tael) shows a
   `branch` span with one subtree per strategy, side by side.

@@ -1204,7 +1204,7 @@ pub fn execute_http(tokio_rt: &tokio::runtime::Runtime, args: &Value) -> Result<
 ///
 /// Option A: the write is issued as a loopback HTTP POST to agent-builder
 /// (which wraps `AppDataPlane::execute_write`), so it rides `execute_http` — the
-/// same host chokepoint as `chidori.http`. That gives the bearer-placeholder →
+/// same host chokepoint that `fetch`/`node:http` route through. That gives the bearer-placeholder →
 /// real-token substitution and the host allowlist for free, and chidori never
 /// holds a libpq credential.
 ///

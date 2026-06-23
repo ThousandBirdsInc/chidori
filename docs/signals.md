@@ -125,7 +125,7 @@ branch to keep. §12 covers the composition.
 ## 4. Background (verified, with file references)
 
 ### 4.1 The suspension model `input` already uses
-`src/runtime/host_core.rs::execute_input(ctx, args)` is the existing pause primitive:
+`crates/chidori/src/runtime/host_core.rs::execute_input(ctx, args)` is the existing pause primitive:
 `ctx.next_seq()`, `try_replay_checked(seq, "input")` (replay short-circuit), then
 `begin_host_operation_with_function(seq, PendingHostOperationKind::Input, Some("input"),
 args)`, a safepoint to persist the pending op, then either `InputMode::Stdin` (read
@@ -137,7 +137,7 @@ tries `try_replay_checked`, then `replay_completed_host_operation` (scans the
 runs `live()` + records a `CallRecord`.
 
 ### 4.2 Pending-operation + host-promise substrate
-`src/runtime/snapshot.rs`: `HostOperationId(u64)`; `PendingHostOperation { id, seq, kind,
+`crates/chidori/src/runtime/snapshot.rs`: `HostOperationId(u64)`; `PendingHostOperation { id, seq, kind,
 function, args, created_at }`; `PendingHostOperationKind` enum (Prompt/Input/Tool/
 CallAgent/Http/Timer/...); `HostPromiseState { Pending, Resolved{value}, Rejected{error}
 }`; `HostPromiseRecord { operation, state }`; `HostPromiseTable` (BTreeMap keyed by id:
@@ -149,7 +149,7 @@ resume). `SnapshotManifest` carries `pending`, `host_promises`, `vfs`, `call_log
 
 ### 4.3 Persistence + resume delivery (the path a signal reuses)
 A paused run persists `.chidori/runs/{id}/pending.json` (the `PendingHostOperation`) and
-`host_promises.json` (the table). `src/server.rs::resume_session` (the
+`host_promises.json` (the table). `crates/chidori/src/server.rs::resume_session` (the
 `/sessions/{id}/resume` handler) → `complete_persisted_pending_host_operation(run_base,
 run_id, expected=(seq,kind), HostPromiseCompletion::Resolved(value))` resolves the pending
 op, injects a synthetic `input` `CallRecord` at the pending seq, then
@@ -158,7 +158,7 @@ completion. `load_persisted_host_promises` / `load_persisted_vfs` rehydrate stat
 **exactly** the shape signal delivery needs, parameterized by `Signal` instead of `Input`.
 
 ### 4.4 Replay vs live decision
-`src/runtime/context.rs::try_replay_checked(seq, fn)` → cache hit from `replay_log`
+`crates/chidori/src/runtime/context.rs::try_replay_checked(seq, fn)` → cache hit from `replay_log`
 (records into the new log), `None` → run live, `Err` on function-name mismatch
 (divergence). For a value that arrives *after* the original journal was written (a fresh
 signal), `replay_completed_host_operation` finds it in the `HostPromiseTable` by `(seq,
@@ -166,7 +166,7 @@ kind, args)` and records a new `CallRecord` with the resolved value — i.e. a n
 delivered signal becomes a first-class recorded call, replayable thereafter.
 
 ### 4.5 Server run-lifecycle + live channels
-`src/server.rs`: router with `POST /sessions`, `/sessions/{id}/resume`, `/approve`,
+`crates/chidori/src/server.rs`: router with `POST /sessions`, `/sessions/{id}/resume`, `/approve`,
 `/cancel`, `/sessions/stream`. `create_session` runs `spawn_blocking` to first pause/
 completion, persists to disk. Paused runs live **on disk**, not in memory. Streaming runs
 have an in-memory `ActiveSession { cancelled: AtomicBool, cancel_tx: mpsc }` in
@@ -179,7 +179,7 @@ have an in-memory `ActiveSession { cancelled: AtomicBool, cancel_tx: mpsc }` in
 record and can be stamped as span attributes (Phase 2) — no new tracing pipeline.
 
 ### 4.7 ⚠️ Load-bearing prerequisite (a latent bug)
-`src/runtime/engine.rs` `run_with_context` (~lines 425–451): the **rust-engine arm**
+`crates/chidori/src/runtime/engine.rs` `run_with_context` (~lines 425–451): the **rust-engine arm**
 returns `Ok(output)` on success and `Err(e)` on *any* error, and **never calls
 `ctx.take_pending_input()`**. The TypeScript/QuickJS arm (~516–584) does the pause-
 surfacing dance; the rust arm does not. So today, on the rust engine, an `input()` in
@@ -401,12 +401,12 @@ self.vm.define_method(&chidori, "signal", 2, move |vm, _t, args| {
 **Reused:** `forward_effect`, `define_method`, `Vm::settle`/`run_jobs_until_blocked`.
 
 ### 8.2 New host-op kind & dispatch
-- `src/runtime/snapshot.rs`: add `PendingHostOperationKind::Signal` (one additive enum
+- `crates/chidori/src/runtime/snapshot.rs`: add `PendingHostOperationKind::Signal` (one additive enum
   variant; `snake_case` serde → `"signal"`; old manifests still deserialize).
-- `src/runtime/rust_engine.rs::dispatch_effect`: add arm `"signal" =>
+- `crates/chidori/src/runtime/typescript/bindings.rs::dispatch`: add arm `"signal" =>
   host_core::execute_signal(ctx, args)` (and Phase 2 `"poll_signal"`, `"signal_any"`).
 
-### 8.3 `execute_signal` (the core; `src/runtime/host_core.rs`)
+### 8.3 `execute_signal` (the core; `crates/chidori/src/runtime/host_core.rs`)
 Modeled on `execute_input`. The **match key is `args = { "name": name }`** — *not* the
 payload (which is unknown at pause time). The payload/from live in the **result**
 `{ name, payload, from }`, mirroring how `input` records `{prompt}` in args and the
@@ -448,7 +448,7 @@ recorded result is returned from cache — no re-delivery, no inbox read.
 
 ## 9. Delivery endpoint & routing (server)
 
-New route in `src/server.rs` (beside `/resume`):
+New route in `crates/chidori/src/server.rs` (beside `/resume`):
 ```
 POST /sessions/{id}/signal     body: { name, payload, from }
 ```
@@ -553,18 +553,18 @@ pick among them.
 ## 14. Implementation plan (phased)
 
 **Phase 1 — Named blocking signal + durable mailbox + paused-run delivery (deterministic)** *(shipped)*
-1. `src/runtime/engine.rs` (~425–451): **fix the rust-engine arm of `run_with_context`**
+1. `crates/chidori/src/runtime/engine.rs` (~425–451): **fix the rust-engine arm of `run_with_context`**
    to surface pauses via `take_pending_input()` / `take_pending_signal()` →
    `RunResult{paused}` (prerequisite; also fixes rust-engine `input()` pausing).
-2. `src/runtime/snapshot.rs`: add `PendingHostOperationKind::Signal`; `QueuedSignal`
+2. `crates/chidori/src/runtime/snapshot.rs`: add `PendingHostOperationKind::Signal`; `QueuedSignal`
    struct + `SIGNAL_INBOX_FILE` const.
-3. `src/runtime/context.rs`: `signal_inbox: Vec<QueuedSignal>` + `pending_signal:
+3. `crates/chidori/src/runtime/context.rs`: `signal_inbox: Vec<QueuedSignal>` + `pending_signal:
    Option<PendingSignal>`; `set/take_pending_signal`, `take_queued_signal(name)`,
    `load_signal_inbox`/`persist_signal_inbox`; a `with_replay_..._and_signals` variant.
-4. `src/runtime/host_core.rs`: `execute_signal` (§8.3).
-5. `src/runtime/rust_engine.rs`: `dispatch_effect` `"signal"` arm.
+4. `crates/chidori/src/runtime/host_core.rs`: `execute_signal` (§8.3).
+5. `crates/chidori/src/runtime/typescript/bindings.rs`: `dispatch` `"signal"` arm.
 6. `crates/chidori-js/src/lib.rs`: `chidori.signal` method (§8.1).
-7. `src/server.rs`: `POST /sessions/{id}/signal` route + `signal_session` handler;
+7. `crates/chidori/src/server.rs`: `POST /sessions/{id}/signal` route + `signal_session` handler;
    `load_persisted_signal_inbox` / `enqueue_signal_to_inbox`; extract
    `complete_pending_and_resume`; thread the inbox into the resume path.
 8. `sdk/typescript/src/agent.ts`: `Signal`/`SignalSender` + `signal` on `Chidori`.

@@ -5,9 +5,9 @@ your terminal (a REPL)** and **streams OpenTelemetry spans to [tael](../../../ap
 while it runs** — so you watch the trace fill in across the session instead of
 all at once at the end.
 
-It runs on the **pure-Rust JS runtime** (`CHIDORI_JS_ENGINE=rust`) and shows the
-current authoring convention: **import the host object and define the entrypoint
-with `run(handler)`** — no second `chidori` parameter, no magic `agent` export.
+It shows the current authoring convention: **import the host object and define
+the entrypoint with `run(handler)`** — no second `chidori` parameter, no magic
+`agent` export.
 
 ```ts
 import { chidori, run } from "chidori:agent";
@@ -27,15 +27,18 @@ for you to type a decision.
 
 ## Run it
 
-From the repo root (the convenience wrapper selects the rust engine, builds with
-`--features rust-engine`, and auto-points at tael when it's up on `:4317`):
+From the repo root (the convenience wrapper auto-points at tael when it's up on
+`:4317`):
 
 ```bash
 examples/interactive-pipeline/run.sh
 
 # …or directly
-CHIDORI_JS_ENGINE=rust cargo run --features rust-engine -- \
-  run examples/interactive-pipeline/interactive_pipeline.ts \
+chidori run examples/interactive-pipeline/interactive_pipeline.ts \
+  -i '{"pipeline":"triage","stages":5,"itemsPerStage":4}'
+
+# …or from source
+cargo run -- run examples/interactive-pipeline/interactive_pipeline.ts \
   -i '{"pipeline":"triage","stages":5,"itemsPerStage":4}'
 ```
 
@@ -58,8 +61,7 @@ chidori at it via the standard env var and run:
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317
 export OTEL_SERVICE_NAME=interactive-pipeline        # optional (defaults to "chidori")
 
-CHIDORI_JS_ENGINE=rust cargo run --features rust-engine -- \
-  run examples/interactive-pipeline/interactive_pipeline.ts \
+chidori run examples/interactive-pipeline/interactive_pipeline.ts \
   -i '{"pipeline":"triage","stages":5,"itemsPerStage":4}'
 ```
 
@@ -106,12 +108,12 @@ RUNS=examples/interactive-pipeline/.chidori/runs
 RUN_ID=$(ls -t "$RUNS" | head -1)
 
 # Pretty-print the recorded call log (the spans, as data).
-cargo run --features rust-engine -- trace "$RUN_ID" --dir examples/interactive-pipeline
+chidori trace "$RUN_ID" --dir examples/interactive-pipeline
 
 # Resume: replays your earlier answers from the journal (no re-prompting) and
 # continues from where it left off.
-CHIDORI_JS_ENGINE=rust cargo run --features rust-engine -- \
-  resume examples/interactive-pipeline/interactive_pipeline.ts "$RUN_ID"
+chidori resume examples/interactive-pipeline/interactive_pipeline.ts "$RUN_ID" \
+  --dir examples/interactive-pipeline
 ```
 
 On resume, the replayed calls are **not** re-exported to tael (a resume doesn't
@@ -124,6 +126,5 @@ duplicate the prior turn's spans) — only newly executed calls stream out.
 - Uses `chidori.log`, `chidori.input`, and `chidori.tool` — no API keys or
   external services. Swap a `chidori.log` for `chidori.prompt(...)` if you have
   an LLM provider configured and want real model spans (`gen_ai.*`) in tael.
-- The `run(handler)` entrypoint + `import { chidori }` convention currently runs
-  on the pure-Rust engine (`CHIDORI_JS_ENGINE=rust`). The default QuickJS engine
-  still uses the older `export async function agent(input, chidori)` form.
+- The `run(handler)` entrypoint + `import { chidori } from "chidori:agent"`
+  convention is the current (and only) authoring form.

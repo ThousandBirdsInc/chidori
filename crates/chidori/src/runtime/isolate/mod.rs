@@ -5,10 +5,11 @@
 //! version: the host-call boundary (`run_module`'s single `(op, args) -> JSON`
 //! seam) doubles as a serialization boundary, so the JavaScript engine can be
 //! moved into a disposable child process while every powerful effect stays in
-//! the trusted parent. This module is **phase 1** — the worker, the broker, and
-//! the wire protocol. The per-OS sandbox (seccomp / namespaces on Linux,
-//! Seatbelt on macOS) lands in later phases; until then the child is a separate
-//! process with brokered effects but no syscall confinement yet.
+//! the trusted parent. Phases 1-5 are implemented: the worker, the broker, and
+//! the wire protocol (`worker`/`supervisor`/`protocol`); rlimits and a
+//! deadline-kill (`limits`); and the per-OS sandbox (`sandbox`) — seccomp,
+//! network namespaces, and Landlock on Linux; Seatbelt on macOS — so the child
+//! runs with brokered effects *and* syscall/filesystem/network confinement.
 
 pub mod limits;
 pub mod protocol;

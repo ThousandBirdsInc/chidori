@@ -2,7 +2,7 @@
 //!
 //! A generated agent and the UI it drives can share one live-synced dataset:
 //! the agent writes a row to its app cluster and every subscribed client gets
-//! the diff. A guest agent running in the quickjs sandbox cannot speak the
+//! the diff. A guest agent running in the JS sandbox cannot speak the
 //! Postgres wire protocol and must never hold the cluster's read-write
 //! credential, so the write goes through a host function (`chidori.appData.*`)
 //! that crosses the host boundary, journaled like any other effect.

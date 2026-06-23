@@ -12,11 +12,11 @@
 
 **Phase 1 — cache-aware request layout + accounting** (no author API change):
 
-- `src/providers/mod.rs`: `CacheTtl` (`"5m"`/`"1h"`), request-level
+- `crates/chidori/src/providers/mod.rs`: `CacheTtl` (`"5m"`/`"1h"`), request-level
   `CacheLayout { system, tools }` on `LlmRequest`, and a per-message
   `Message.cache_control` marker for the conversation head. All additive and
   skip-serialized, so existing checkpoints round-trip unchanged.
-- `src/providers/anthropic.rs`: `build_request_body` emits
+- `crates/chidori/src/providers/anthropic.rs`: `build_request_body` emits
   `cache_control: {"type":"ephemeral"}` on the marked system block
   (structured-system form), the last tool entry, and each marked message's
   last content block; coalesces marks to Anthropic's 4-breakpoint cap
@@ -24,7 +24,7 @@
   when a `1h` TTL is requested; parses `cache_creation_input_tokens` /
   `cache_read_input_tokens` on both the blocking and SSE paths. An unmarked
   request serializes byte-identically to the pre-caching wire format.
-- `src/providers/openai.rs`: parses `prompt_tokens_details.cached_tokens`
+- `crates/chidori/src/providers/openai.rs`: parses `prompt_tokens_details.cached_tokens`
   (send + stream) and reports `input_tokens` as the fresh share so the two
   providers agree on semantics. No marker emission (OpenAI caching is
   automatic on exact prefixes — which the immutable-prefix design feeds).
@@ -43,11 +43,11 @@
 **Phase 2 — `chidori.context` + full-prompt recording:**
 
 - The immutable builder lives in the shared JS helpers
-  (`src/runtime/typescript/helpers.rs`): each builder call allocates one
+  (`crates/chidori/src/runtime/typescript/helpers.rs`): each builder call allocates one
   frozen segment node pointing at its parent (structural prefix sharing);
   only `.prompt()`/`.respond()` cross the host boundary, forwarding the
   flattened chain in the prompt effect's options (`__context`).
-- `src/runtime/typescript/bindings.rs` flattens segments into
+- `crates/chidori/src/runtime/typescript/bindings.rs` flattens segments into
   system/tools/messages plus the explicit `cacheBreakpoint` layout
   (`context_request_parts`), runs the same durable
   `execute_prompt_text`/`execute_prompt_response` path (tool loops included),
@@ -66,7 +66,7 @@
 
 **Phase 3 — window compaction + local content-addressed prompt cache:**
 
-- `Context.compact(options?)` (`src/runtime/typescript/helpers.rs`): explicit,
+- `Context.compact(options?)` (`crates/chidori/src/runtime/typescript/helpers.rs`): explicit,
   opt-in window compaction. Splits the chain into the stable head
   (system/tools/doc) and the conversation tail, summarizes everything older
   than the newest `keepTurns` turns (default 2) through a **recorded `prompt`
@@ -79,7 +79,7 @@
   the `summary` segment to a `<conversation-summary>…</conversation-summary>`
   user turn (`bindings.rs::context_request_parts`). Never automatic — silent
   truncation would change results invisibly (§3 non-goal holds).
-- Local content-addressed prompt cache (`src/runtime/prompt_cache.rs`):
+- Local content-addressed prompt cache (`crates/chidori/src/runtime/prompt_cache.rs`):
   opt-in via `CHIDORI_PROMPT_CACHE_DIR=<dir>`; one JSON entry per
   `request_digest` (the §8.3 digest over the fully assembled request,
   recomputed after model overrides so it keys on the request actually sent).
@@ -467,7 +467,7 @@ prefix sharing, with no change to the answers.
 ### 7.2 What the trace shows (tael)
 
 ```
-agent.run research-assistant
+agent.run context_qa.ts
 ├─ host.read_file   policy.md                      18,142 corpus tokens
 ├─ host.prompt      Q1   in=19,533  cache_creation=19,488  cache_read=0      ← warms cache
 ├─ host.log         answered  digest=9f2a1c4b…
@@ -704,20 +704,20 @@ layout every assembly.
 ## 13. Implementation plan (phased)
 
 **Phase 1 — Cache-aware request layout + accounting (no author API change)**
-1. `src/providers/mod.rs`: add `CacheControl` + optional cache markers on
+1. `crates/chidori/src/providers/mod.rs`: add `CacheControl` + optional cache markers on
    `ContentBlock`/`LlmRequest` (additive; default `None`).
-2. `src/providers/anthropic.rs`: emit `cache_control` on marked system/tools/head
+2. `crates/chidori/src/providers/anthropic.rs`: emit `cache_control` on marked system/tools/head
    blocks (`send` body build, `:134-144`); structured-system form; ≤4 breakpoints;
    `extended-cache-ttl` header only for `1h`. Parse cache token fields into
    `AnthropicUsage` (`:59-63`).
-3. `src/providers/openai.rs`: parse `cached_tokens`; no marker emission.
-4. `src/runtime/host_core.rs`: `assemble_request` helper with auto-marking (§8.1,
+3. `crates/chidori/src/providers/openai.rs`: parse `cached_tokens`; no marker emission.
+4. `crates/chidori/src/runtime/host_core.rs`: `assemble_request` helper with auto-marking (§8.1,
    §8.3); call it from `execute_prompt_text`/`execute_prompt_response` and from the
    native loop's request build.
-5. `src/runtime/native.rs`: route its per-turn request through `assemble_request`
+5. `crates/chidori/src/runtime/native.rs`: route its per-turn request through `assemble_request`
    so the existing tool-use loop caches its system+tools+head immediately.
-6. `src/runtime/call_log.rs`: extend `TokenUsage` with cache counts (skip-if-none).
-   `src/runtime/cost.rs`: price creation/read separately.
+6. `crates/chidori/src/runtime/call_log.rs`: extend `TokenUsage` with cache counts (skip-if-none).
+   `crates/chidori/src/runtime/cost.rs`: price creation/read separately.
 7. `RunSpan::stream_record`: stamp `cache_creation`/`cache_read` span attributes.
 8. `sdk/typescript/src/agent.ts`: add `cache?` to `PromptOptions`.
 
@@ -735,13 +735,13 @@ engine-agnostic):
 1. `crates/chidori-js/src/lib.rs`: `chidori.context` + builder methods over a
    `ContextTable` handle (§9.2); `.prompt()`/`.respond()` forward the flattened
    chain.
-2. `src/runtime/host_core.rs`: accept a context/messages payload in the prompt
+2. `crates/chidori/src/runtime/host_core.rs`: accept a context/messages payload in the prompt
    args; record the **full assembled request digest** in `CallRecord.args`
    (close §4.4); `chidori.prompt(text)` becomes sugar over a one-segment context.
-3. `src/runtime/context.rs` (or a new `context_value.rs`): the immutable Segment
+3. `crates/chidori/src/runtime/context.rs` (or a new `context_value.rs`): the immutable Segment
    chain + memoized `prefix_digest` (§9.1).
 4. `sdk/typescript/src/agent.ts`: `Context`/`Role`/`CacheTtl` types + `context()`.
-5. Example: `examples/research-assistant/` — the §7 agent (corpus + question
+5. Example: `examples/agents/context_qa.ts` — the §7 agent (corpus + question
    loop), run on the rust engine, streaming cache stats to tael.
 
 Tests:

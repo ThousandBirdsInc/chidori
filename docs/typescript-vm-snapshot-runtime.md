@@ -1,5 +1,16 @@
 # TypeScript VM Snapshot Runtime Design
 
+> **⚠️ Historical / superseded design proposal (not adopted).** This document
+> describes a QuickJS C-fork (`crates/chidori-quickjs`, `crates/chidori-quickjs-sys`)
+> plus binary VM-snapshot/restore approach that the project did **not** ship. The
+> actual engine is the pure-Rust `chidori-js` interpreter, and durability is
+> **deterministic replay** against a recorded host-call journal — no VM state is
+> ever serialized. See [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md),
+> [`docs/replay.md`](./replay.md), and [`docs/DESIGN.md`](./DESIGN.md) for the
+> shipped design. The `[x]` checkmarks and `crates/chidori-quickjs*` / `sandbox-js`
+> / root-`src/` references below are obsolete and retained only as a record of the
+> explored direction.
+
 ## Purpose
 
 This document defines the architecture for moving Chidori from legacy Starlark

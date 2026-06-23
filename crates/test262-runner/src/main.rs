@@ -100,7 +100,7 @@ enum Outcome {
     Skip(String),
 }
 
-/// Features QuickJS does not implement (or that this runner cannot host).
+/// Features the chidori-js engine does not implement (or that this runner cannot host).
 /// Tests requiring any of these are skipped rather than counted as failures,
 /// so the conformance number reflects the implemented surface honestly. Bun and
 /// Node likewise skip features their engines lack.
@@ -109,9 +109,9 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "Atomics",
     "SharedArrayBuffer",
     "Atomics.waitAsync",
-    // Intl — QuickJS ships no ICU/Intl.
+    // Intl — the engine ships no ICU/Intl.
     "Intl.Locale-info",
-    // Engine sugar QuickJS does not implement.
+    // Engine sugar the chidori-js engine does not implement.
     "decorators",
     "tail-call-optimization",
     "IsHTMLDDA",
@@ -133,11 +133,11 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "caller",
     // Host capabilities this runner does not provide. `cross-realm` needs
     // `$262.createRealm` (a second realm with cross-realm marshaling), which the
-    // bare context cannot host; `ShadowRealm` is unimplemented in QuickJS. Bun
+    // bare context cannot host; `ShadowRealm` is unimplemented in the chidori-js engine. Bun
     // and Node likewise skip what their host/engine lacks.
     "cross-realm",
     "ShadowRealm",
-    // Stage-2/3 proposals not implemented by this QuickJS build. Verified absent
+    // Stage-2/3 proposals not implemented by this engine build. Verified absent
     // (no implemented-surface passes to hide), so counting them as failures
     // would understate conformance of what IS implemented.
     "joint-iteration",        // Iterator.zip / Iterator.zipKeyed

@@ -159,7 +159,7 @@ a single readable line in review).
 
 ## Remaining gaps
 
-The residual failures, by area (top clusters of the ~376 total). Strings are now
+The residual failures, by area (top clusters of the ~413 total). Strings are now
 WTF-8-backed with full UTF-16 code-unit semantics — `.length`/indexing/iteration,
 the `String.prototype` surface, the RegExp matcher (non-unicode per code unit,
 unicode per code point), lone-surrogate subjects and patterns, literals,

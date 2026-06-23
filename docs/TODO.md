@@ -1,8 +1,8 @@
 # TODO - Chidori TypeScript Runtime
 
 This roadmap tracks the TypeScript runtime. Historical Starlark work is
-preserved in git history and under `examples/legacy-starlark/`; new runtime,
-CLI, server, and tool work targets `.ts` agents and tools.
+preserved in git history; new runtime, CLI, server, and tool work targets
+`.ts` agents and tools.
 
 The TypeScript-runtime migration and the JavaScript-engine consolidation are
 **complete**. Agents, tools, sub-agents, and the conformance harness all run on
@@ -108,7 +108,7 @@ clusters:
 - [ ] **Providers and modalities** — only Anthropic and OpenAI stream natively
   (LiteLLM is the escape hatch). No embeddings, image/audio modalities, or
   JSON-mode/structured-output plumbing beyond tool calls.
-- [ ] **Code-comment doc drift** — several `src/` comments still explain intent
+- [ ] **Code-comment doc drift** — several `crates/chidori/src/` comments still explain intent
   by reference to "the QuickJS path" (e.g. `engine.rs`, `bindings.rs`,
   `rust_engine.rs`, `server.rs`). Low-priority cleanup now that the
   roadmap docs are corrected.

@@ -1,5 +1,17 @@
 # TypeScript Migration Audit
 
+> **⚠️ Historical — superseded.** This audit describes the QuickJS-era
+> architecture that has since been removed. The QuickJS crates
+> (`crates/chidori-quickjs`, `crates/chidori-quickjs-sys`) and the
+> `crates/chidori/src/runtime/typescript/engine.rs` it cites **no longer exist**:
+> QuickJS was removed in #39 and `chidori-js` (pure-Rust) is now the sole JS
+> engine. The live VM snapshot/restore model described here (`LiveQuickJsVm`,
+> "snapshot-capable QuickJS wrapper", direct live-VM continuation restore with
+> replay as a fallback) was **descoped** — deterministic replay is now the
+> **only** durability mechanism, not a fallback. For the current state see
+> [`docs/DESIGN.md`](./DESIGN.md), [`docs/TODO.md`](./TODO.md), and
+> [`docs/conformance.md`](./conformance.md).
+
 This audit records the concrete state of the TypeScript runtime migration. It
 is intentionally separate from the roadmap so completion claims can be checked
 against files, tests, and known blockers.
@@ -26,7 +38,7 @@ against files, tests, and known blockers.
 | --- | --- |
 | TypeScript agent runtime | `src/runtime/typescript/`, `src/runtime/engine.rs`, `src/main.rs`; `cargo test --workspace` includes TypeScript runtime, CLI, and server tests. |
 | Snapshot backend status | Active runtime-context host-binding execution now runs through `crates/chidori-quickjs` via `src/runtime/typescript/engine.rs` and the native `TypeScriptSnapshotContext` host object. The legacy `rquickjs` binding module is compiled only for parity tests, and `rquickjs` is a dev-dependency rather than a production dependency. Full QuickJS `JSModule` and runtime-root coverage beyond Chidori's selected-root scaffold is deferred future runtime generalization work. |
-| Legacy Starlark removal | `src/runtime/dialect.rs` and `src/runtime/host_functions.rs` removed; `.star` examples moved under `examples/legacy-starlark/`; `.star` dispatch and tools are rejected/ignored by tests. |
+| Legacy Starlark removal | `src/runtime/dialect.rs` and `src/runtime/host_functions.rs` removed; `.star` examples removed (kept in git history); `.star` dispatch and tools are rejected/ignored by tests. |
 | Host API durability | `src/runtime/host_core.rs`, `src/runtime/context.rs`, `src/runtime/snapshot.rs`; tests cover pending/completed host promises, safepoints, replay, input pause, policy approval, prompt/tool/sub-agent recovery, and nested tool suspension. |
 | TypeScript tools | `src/runtime/typescript/tools.rs`, `src/tools/mod.rs`; metadata is evaluated in a restricted `crates/chidori-quickjs` VM context, tool source fingerprints are captured, `.star` tools are ignored, and TypeScript tool execution is tested. |
 | Fork runtime/context snapshots | `crates/chidori-quickjs/src/lib.rs`, `crates/chidori-quickjs-sys/quickjs/chidori_snapshot_stub.c`, and the patched `quickjs.c` cover a versioned runtime envelope, restored fresh runtime, selected Chidori TypeScript roots, value/object graph snapshots, bytecode, closures, pending promises, host promise ids, async continuation frames, microtask/job queue snapshots, JSON host-boundary rejection for function/class-instance results, and a `SnapshotContext` native Rust callback/context-opaque wrapper API. Wrapper tests install Rust-backed methods on `globalThis.chidori`, read JS arguments into Rust state, convert callback arguments to JSON, and return JSON to JS; `TypeScriptSnapshotContext` now forwards that native callback bridge and covers both a generic Rust callback and `RuntimeContext`/`host_core`-backed `chidori.log`/`chidori.checkpoint`/`chidori.memory`/`chidori.template`/`chidori.execJs`/`chidori.execPython`/`chidori.execWasm` methods called from TypeScript agents, captured-networking (`fetch`/`node:http`) policy denial and `chidori.input` pause paths, provider-backed `chidori.prompt` including non-suspending tool loops, registry-backed non-suspending `chidori.tool`/`chidori.callAgent`, and the pure JS `tryCall`/`retry`/`parallel` helpers. Runtime-plus-context tests restore a suspended Chidori host call and complete it by host promise id. This is now the active TypeScript host runtime for ordinary execution. |

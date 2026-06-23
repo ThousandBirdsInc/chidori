@@ -8,9 +8,7 @@
 #   INPUT='{"pipeline":"demo","stages":8,"itemsPerStage":6}' ./run.sh
 #
 # The agent uses the `run(handler)` entrypoint + `import { chidori } from
-# "chidori"`, which runs on the pure-Rust engine (CHIDORI_JS_ENGINE=rust, built
-# with `--features rust-engine`). Requires a bash with /dev/tcp for the tael
-# port probe.
+# "chidori:agent"`. Requires a bash with /dev/tcp for the tael port probe.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,9 +16,6 @@ REPO="$(cd "$SCRIPT_DIR/../.." && pwd)"
 AGENT="$SCRIPT_DIR/interactive_pipeline.ts"
 DEFAULT_INPUT='{"pipeline":"triage","stages":5,"itemsPerStage":4}'
 INPUT="${INPUT:-$DEFAULT_INPUT}"
-
-# Select the pure-Rust JS engine (the one that supports the run() entrypoint).
-export CHIDORI_JS_ENGINE=rust
 
 # Stream to tael only if something is actually listening on its default port —
 # that's the "emit to tael if it's running" part. (An unreachable OTLP endpoint
@@ -34,5 +29,5 @@ else
   echo "  (start tael, then re-run; or set OTEL_EXPORTER_OTLP_ENDPOINT yourself)" >&2
 fi
 
-exec cargo run --quiet --features rust-engine --manifest-path "$REPO/Cargo.toml" \
+exec cargo run --quiet --manifest-path "$REPO/Cargo.toml" \
   -- run "$AGENT" -i "$INPUT"
