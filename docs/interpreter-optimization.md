@@ -388,6 +388,15 @@ byte-identity), and §7.5 (no benchmark regressions).
 
 ## 9. Explicitly out of scope
 
+> **Experimental aside:** an experimental *closure-threading* backend —
+> a safe-Rust "JIT" that compiles each function's bytecode to a `Vec` of boxed
+> closures, keeping zero `unsafe`, no new deps, and byte-identical replay — was
+> prototyped on branch `claude/chidori-js-jit-compiler-btc3ec` and is documented
+> in [`docs/jit.md`](./jit.md). It is *not* a native-code JIT (the bullets below
+> still stand) and, consistent with §11.5, it moves live agent wall-clock
+> negligibly; its measured value is on the replay/test path. Listed here so the
+> "no JIT" stance and the experiment that tested it are cross-referenced.
+
 - **A JIT** (baseline or optimizing), for the reasons in §2.
 - **Literal threaded dispatch** (computed-goto / subroutine threading), because
   stable safe Rust lacks computed `goto` and guaranteed tail calls (§4).

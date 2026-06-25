@@ -1674,6 +1674,7 @@ impl Compiler {
             this_cell: fc.this_cell,
             inherit_home: fc.inherit_home,
             templates: fc.templates,
+            jit: crate::jit::JitCache::new(),
         }
     }
 

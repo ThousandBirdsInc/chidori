@@ -116,6 +116,40 @@ fn bench_interp(c: &mut Criterion) {
     g.finish();
 }
 
+/// Closure-threading JIT vs. the switch interpreter on the same workloads
+/// (`docs/jit.md`). Each workload is benched twice — `<name>/jit` with the
+/// experimental backend (the default) and `<name>/interp` with `jit_enabled =
+/// false` — so a single run reports the per-workload delta. NOTE: per
+/// `docs/interpreter-optimization.md` §7.6 the dev/CI container's wall-clock
+/// noise floor is ~10–15%, so treat small deltas here as inconclusive and lean
+/// on the deterministic dispatch proxy in `examples/jit_stats.rs`; run this on a
+/// quiet, frequency-pinned machine to resolve real wins.
+fn bench_jit_vs_interp(c: &mut Criterion) {
+    let mut g = c.benchmark_group("jit_vs_interp");
+    for (name, src) in WORKLOADS {
+        let proto = Rc::new(compile_script(src).expect("compiles"));
+
+        let mut jit_engine = Engine::new();
+        jit_engine.vm.jit_enabled = true;
+        g.bench_function(format!("{name}/jit"), |b| {
+            b.iter(|| {
+                let v = run_proto(&mut jit_engine, black_box(&proto));
+                black_box(v);
+            })
+        });
+
+        let mut interp_engine = Engine::new();
+        interp_engine.vm.jit_enabled = false;
+        g.bench_function(format!("{name}/interp"), |b| {
+            b.iter(|| {
+                let v = run_proto(&mut interp_engine, black_box(&proto));
+                black_box(v);
+            })
+        });
+    }
+    g.finish();
+}
+
 /// Cost of standing up a fresh realm (global object + all built-in prototypes) —
 /// paid on every `Engine::new()` / `eval()`.
 fn bench_engine_new(c: &mut Criterion) {
@@ -133,6 +167,6 @@ criterion_group! {
     config = Criterion::default()
         .warm_up_time(Duration::from_millis(500))
         .measurement_time(Duration::from_secs(3));
-    targets = bench_compile, bench_eval, bench_interp, bench_engine_new
+    targets = bench_compile, bench_eval, bench_interp, bench_jit_vs_interp, bench_engine_new
 }
 criterion_main!(benches);

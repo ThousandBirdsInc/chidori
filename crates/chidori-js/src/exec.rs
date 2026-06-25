@@ -9,7 +9,7 @@ use crate::value::*;
 use crate::vm::*;
 
 /// Control-flow signal from a single opcode step.
-enum Ctl {
+pub(crate) enum Ctl {
     Next,
     Jump(usize),
     Return(Value),
@@ -566,6 +566,18 @@ impl Vm {
         // the `Rc` once so the per-op fetch borrows from this local rather than
         // re-deriving it (and so it doesn't alias the `&mut frame` step needs).
         let proto = frame.func.proto.clone();
+        // Experimental closure-threading JIT (`src/jit.rs`): compile this proto's
+        // bytecode to one closure per op on first activation (cached on the proto)
+        // and dispatch through it. `None` falls back to the switch interpreter —
+        // the `jit_enabled` toggle is the differential oracle (`tests/jit.rs`).
+        // The thread is an independent `Rc`, not reachable through `self`, so
+        // calling its closures with `&mut self` is sound; the borrow is released
+        // inside `get_or_compile`, so direct recursion never double-borrows.
+        let jit = if self.jit_enabled {
+            Some(proto.jit.get_or_compile(&proto))
+        } else {
+            None
+        };
         let mut interrupt_poll: u32 = 0;
         // Injected resume completions are handled ONCE here, before the loop,
         // rather than re-checked on every iteration. `pending_throw` /
@@ -635,11 +647,18 @@ impl Vm {
             // see `opstats.rs` and `docs/interpreter-optimization.md` §Phase 0.
             #[cfg(feature = "op-histogram")]
             crate::opstats::record(&proto.code[ip]);
-            // Dispatch on a borrow of the instruction. `proto` is a clone of the
-            // frame's (immutable) `FuncProto` Rc taken once per frame, so the
-            // borrow is independent of `frame` and costs no per-op `Op::clone`
-            // (previously ~5% of a call-heavy run's instructions).
-            match self.step(&mut frame, &proto.code[ip]) {
+            // Dispatch this op. With the JIT enabled, call the proto's compiled
+            // closure for `ip` (operands pre-decoded; hot ops run inline, the
+            // long tail delegates to `step`); otherwise run the switch
+            // interpreter directly. Both yield the identical `Result<Ctl, Value>`,
+            // so the control-flow handling below is shared and unchanged.
+            // (`proto` is a per-frame clone of the immutable `FuncProto` Rc, so
+            // the `&proto.code[ip]` borrow is independent of `frame`.)
+            let stepped = match &jit {
+                Some(thread) => (thread.ops[ip])(self, &mut frame),
+                None => self.step(&mut frame, &proto.code[ip]),
+            };
+            match stepped {
                 Ok(Ctl::Next) => continue,
                 Ok(Ctl::Jump(target)) => {
                     frame.ip = target;
@@ -878,7 +897,7 @@ impl Vm {
         }
     }
 
-    fn const_val(&self, frame: &Frame, idx: u32) -> Value {
+    pub(crate) fn const_val(&self, frame: &Frame, idx: u32) -> Value {
         match &frame.func.proto.consts[idx as usize] {
             Const::Undefined => Value::Undefined,
             Const::Null => Value::Null,
@@ -930,7 +949,7 @@ impl Vm {
         }
     }
 
-    fn step(&mut self, frame: &mut Frame, op: &Op) -> Result<Ctl, Value> {
+    pub(crate) fn step(&mut self, frame: &mut Frame, op: &Op) -> Result<Ctl, Value> {
         macro_rules! pop {
             () => {
                 frame.stack.pop().unwrap_or(Value::Undefined)
@@ -3330,7 +3349,7 @@ pub enum UnaryKind {
     BitNot,
 }
 
-fn bin_arith(vm: &mut Vm, frame: &mut Frame, kind: ArithKind) -> Result<(), Value> {
+pub(crate) fn bin_arith(vm: &mut Vm, frame: &mut Frame, kind: ArithKind) -> Result<(), Value> {
     let b = frame.stack.pop().unwrap_or(Value::Undefined);
     let a = frame.stack.pop().unwrap_or(Value::Undefined);
     let r = vm.arith(a, b, kind)?;
