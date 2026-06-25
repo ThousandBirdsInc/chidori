@@ -6,8 +6,7 @@ This design is implemented. It originally shipped on the QuickJS path; the
 pure-Rust `chidori-js` engine now runs the same surface (`node:` crypto/fs/timers,
 `TextEncoder`, Web Crypto, virtual timers), reusing the same shim sources and
 polyfills and capturing through the same `RuntimeContext` call log + VFS — so a
-captured-effects agent records and replays identically on either engine. See the
-G3 section of `docs/rust-engine-quickjs-removal-gaps.md` for the rust-path wiring.
+captured-effects agent records and replays identically.
 
 What shipped, by phase:
 

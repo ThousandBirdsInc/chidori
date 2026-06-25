@@ -8,7 +8,6 @@
 > **Target engine:** the pure-Rust `chidori-js` engine — the only JS engine in
 > the tree (the QuickJS/C path was removed in #39).
 > **Related:** [`docs/os-isolation-plan.md`](./os-isolation-plan.md),
-> [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md),
 > [`docs/captured-effects-vfs-crypto-timers.md`](./captured-effects-vfs-crypto-timers.md),
 > [`docs/conformance.md`](./conformance.md).
 

@@ -341,9 +341,7 @@ throws), and `%TypedArray%.prototype.toString` is the same function object
 as `%Array%.prototype.toString` — 415 -> 413.)
 
 Each failure is individually identifiable from a `--json` report, so the
-clusters can be picked off as engine work warrants. See
-`docs/rust-engine-quickjs-removal-gaps.md` and `docs/pure-rust-js-engine-plan.md`
-for the prioritized engine plan behind these.
+clusters can be picked off as engine work warrants.
 
 ## Reproducibility
 

@@ -411,10 +411,6 @@ error frame the child writes from its `catch_unwind` boundary before exiting:
   pre-seed for the tightest profile; measure std's needs first.)
 - **cgroup without root:** require systemd delegation, or ship rlimits-only as the
   unprivileged fallback and document the reduced guarantee?
-- **birdcage vs hand-rolled:** adopt for macOS+Linux to cut code, or keep a
-  minimal hand-rolled profile for the near-empty allowlist? (Spike both.)
 - **Sync-native chattiness:** is a read-only VFS snapshot in-child worth it, or do
   real agents make few enough captured fs/crypto calls that brokering them is
   free? (Profile before optimizing.)
-- **Default coupling:** should `--untrusted` auto-enable `--isolate` where
-  supported, or keep them orthogonal so the operator opts in explicitly?

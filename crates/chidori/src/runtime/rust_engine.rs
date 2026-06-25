@@ -4,7 +4,7 @@
 //! agent, tool, and sub-agent execution (`engine.rs`, `server.rs`, `bindings.rs`).
 //!
 //! Durability here is the deterministic-replay journal (see
-//! `docs/pure-rust-js-engine-plan.md`), not a VM-image snapshot. Because the
+//! `docs/replay.md`), not a VM-image snapshot. Because the
 //! journal references the code bundle by content hash, `snapshot`/`restore`
 //! round-trip a self-describing blob of `{bundle, effects, journal}` rather than
 //! threading the bundle through the trait signature.

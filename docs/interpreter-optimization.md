@@ -8,8 +8,7 @@
 > **zero `unsafe`**, **no new heavyweight dependencies**, and **byte-identical
 > deterministic replay**.
 >
-> **Related:** [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md)
-> (historical engine plan), [`docs/conformance.md`](./conformance.md) (Test262
+> **Related:** [`docs/conformance.md`](./conformance.md) (Test262
 > gate), [`docs/architecture.md`](./architecture.md), [`docs/replay.md`](./replay.md),
 > [`docs/value-checkpoints.md`](./value-checkpoints.md).
 
@@ -63,8 +62,7 @@ For Chidori specifically, a JIT collides with the project's stated invariants:
    memory (W^X / `mmap` with `PROT_EXEC`), write raw bytes into it, and call
    through a transmuted function pointer. That is irreducibly `unsafe`. The
    alternative — a backend like Cranelift — is a large dependency that runs
-   against the crate's "pure Rust, vendor nothing" stance (see the decision
-   record in `docs/pure-rust-js-engine-plan.md`).
+   against the crate's "pure Rust, vendor nothing" stance.
 2. **Speculation + deoptimization is the hard, bug-prone part.** JIT speed comes
    from speculating on types/shapes; when an assumption breaks the engine must
    *deoptimize* — abandon native code mid-execution and reconstruct the exact
@@ -669,8 +667,6 @@ Landed since: `LoadCell; LoadConst → LoadCellConst` (`bytecode.rs`/`fuse.rs`/
 
 ## 14. References
 
-- [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md) — engine
-  decision record (pure Rust, no `boa_engine`, replay-not-snapshot).
 - [`docs/conformance.md`](./conformance.md) — Test262 harness and CI gate.
 - [`docs/replay.md`](./replay.md) — deterministic-replay durability model.
 - [`docs/architecture.md`](./architecture.md) — runtime map.

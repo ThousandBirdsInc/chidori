@@ -21,7 +21,7 @@
 > opt in, and no separate QuickJS path to keep untouched.
 > **Related:** [`docs/branching-execution.md`](./branching-execution.md),
 > [`docs/captured-effects-vfs-crypto-timers.md`](./captured-effects-vfs-crypto-timers.md),
-> [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md).
+> [`docs/architecture.md`](./architecture.md).
 
 ---
 
