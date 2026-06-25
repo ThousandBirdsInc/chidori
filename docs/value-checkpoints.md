@@ -6,8 +6,7 @@
 > engine-level prototype (`durableStep` on `chidori_js::ReplayRuntime`,
 > `crates/chidori-js/src/replay.rs`) shipped with the engine; this doc covers
 > the `chidori.*` host API every agent gets.
-> **Related:** [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md)
-> (historical; P6 row), [`docs/fable_review.md`](./fable_review.md),
+> **Related:** [`docs/architecture.md`](./architecture.md),
 > [`docs/signals.md`](./signals.md).
 
 ---

@@ -3,7 +3,8 @@
 //! AST); everything below — bytecode compiler, VM, object model, GC, builtins,
 //! microtask scheduler, and the replay runtime — is implemented here.
 //!
-//! See `docs/pure-rust-js-engine-plan.md` for the design and phasing.
+//! See `docs/architecture.md` and `docs/conformance.md` for the engine design
+//! and Test262 conformance status.
 
 pub mod builtins;
 pub mod bytecode;

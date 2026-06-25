@@ -1,8 +1,6 @@
 # Architecture & project structure
 
-A high-level map of the runtime. For the full design rationale, durable VM
-snapshot model, and roadmap, see [`DESIGN.md`](./DESIGN.md) and
-[`TODO.md`](./TODO.md).
+A high-level map of the runtime.
 
 ## Architecture
 
@@ -70,8 +68,5 @@ chidori/
 │   ├── prompts/            # Example .jinja templates
 │   ├── tools/              # Example tools
 │   └── sdk_demo.py         # Python SDK demo
-├── docs/
-│   ├── DESIGN.md           # Architecture & design rationale
-│   └── TODO.md             # Implementation roadmap
 └── llm.txt                 # Complete API reference for LLM-assisted development
 ```

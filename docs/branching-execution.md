@@ -46,7 +46,7 @@
 >   are in-process workers under the parent run's slot.)
 > - A resumed/re-run branch updates only its own store; the parent's recorded
 >   `branch` outcome is immutable history (compare, don't merge).
-> **Related:** [`docs/pure-rust-js-engine-plan.md`](./pure-rust-js-engine-plan.md),
+> **Related:** [`docs/architecture.md`](./architecture.md),
 > [`docs/captured-effects-vfs-crypto-timers.md`](./captured-effects-vfs-crypto-timers.md).
 
 ---

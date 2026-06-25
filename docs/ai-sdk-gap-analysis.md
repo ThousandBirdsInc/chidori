@@ -32,7 +32,7 @@ runtime semantics rather than library conventions.
 | Tool calling | TypeScript tools, MCP-backed tools, provider tool calls | `tool(...)`, model tool calling, multi-step tool execution |
 | Agent loop | Plain async TypeScript with `conversation()`, `Context.respond()`, examples/templates | `ToolLoopAgent`, `generateText`/`streamText` loops |
 | Multi-turn context | `chidori.context()`, `conversation()`, explicit compaction | Message arrays, agent context management, workflow patterns |
-| MCP | Stdio MCP subset: initialize, `tools/list`, `tools/call` | Documented MCP integration surface |
+| MCP | Stdio and streamable-HTTP transports: initialize, `tools/list`, `tools/call` | Documented MCP integration surface |
 | Subagents | `chidori.callAgent(...)`, branch sub-runs | Subagents modeled as tools around `ToolLoopAgent` instances |
 | Testing | Recorded call-log replay, static test provider | Mock providers and stream simulation helpers |
 | Telemetry | OTEL trace emission and call records | OpenTelemetry integration hooks and lifecycle callbacks |
@@ -303,8 +303,6 @@ Local references:
   compaction.
 - `docs/branching-execution.md` - Branching design and branch stores.
 - `docs/signals.md` - Multiplayer signal model.
-- `docs/TODO.md` - Current product gaps, including providers/modalities and
-  TypeScript SDK tests.
 
 External references reviewed:
 
