@@ -65,6 +65,21 @@ Two deliberate boundaries:
 - **Success-only, bounded.** Errors are deterministic and cheap to recompute;
   the map clears wholesale at a cap rather than tracking LRU order.
 
+Measured with the in-tree probe (`cargo test -p chidori --release
+transpile_cache_timing_probe -- --ignored --nocapture`, synthetic 71 KB
+agent-shaped source):
+
+| quantity | value |
+| --- | ---: |
+| transpile, cold (full oxc pipeline) | 4.0 ms |
+| transpile, warm (cached) | 0.13 ms |
+
+~3.9 ms removed per agent-sized transpile — the same order of magnitude as
+the realm build, and previously paid per source file on *every* execution
+(the entry plus each imported module, again on every resume re-execution).
+Of the two caches this is the larger win; the proto cache (§3) is smaller
+but free.
+
 ## 3. Landed: compiled-script proto cache (`crates/chidori-js`)
 
 `compiler::compile_script_cached` memoizes source → `Rc<FuncProto>` per
