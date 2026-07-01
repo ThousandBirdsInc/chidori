@@ -140,15 +140,17 @@ spreads it thinner:
 
 | section | ms | share |
 | --- | ---: | ---: |
-| **total `Engine::new()`** | **~1.0** | |
-| temporal | 0.21 | ~21% |
-| typedarray | 0.11 | ~11% |
-| fundamental | 0.07 | ~7% |
-| everything else (14 sections) | ≤0.05 each | ~60% |
+| **total `Engine::new()` (min of 20)** | **0.58** | |
+| temporal | 0.17 | 29% |
+| typedarray | 0.08 | 13% |
+| fundamental | 0.06 | 11% |
+| numbers | 0.05 | 9% |
+| everything else (13 sections) | ≤0.03 each | ~38% |
 
 Two conclusions. First, **re-measure before optimizing**: on this machine the
-realm build is ~1 ms, not 3.6 — still worth removing for high-frequency
-resume/test loops, but a quarter of the transpile win, not four times it.
+realm build is ~0.6 ms min-of-N, not 3.6 — still worth removing for
+high-frequency resume/test loops, but a fraction of the transpile win, not
+four times it.
 Second, **there is no cheap targeted fix**: no single section dominates
 enough that a spot optimization moves the total much. The real levers remain
 the invasive ones — lazily materializing rarely-used namespaces (`Temporal`
