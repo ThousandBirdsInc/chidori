@@ -672,6 +672,17 @@ handler, extend `fuse.rs`, and add a differential-corpus case.
 Landed since: `LoadCell; LoadConst → LoadCellConst` (`bytecode.rs`/`fuse.rs`/
 `exec.rs`) and the `JumpIfTrue` variant `CmpBranchTrue`.
 
+Also landed (same measure-then-cache discipline, outside the dispatch loop): a
+thread-local `(pattern, flags)` → compiled-regex cache (`regexp.rs::
+compile_cached`). Every RegExp entry point (`exec`/`test`/`match`/`replace`/
+`split`) re-derives the source/flags strings from the object and previously
+**re-compiled the pattern on every call** — a regex literal in a loop re-parsed
+per iteration. A compiled `Regex` is immutable (`exec` takes `&self`) and
+compilation is deterministic, so the cache is a pure performance side effect;
+success-only and bounded. Companion caches with the same contract: the
+source→proto script cache (`compiler.rs::compile_script_cached`) and the
+transpile cache in the main crate — see `docs/resume-performance.md`.
+
 ---
 
 ## 14. References
