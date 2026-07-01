@@ -125,11 +125,37 @@ bound.
 
 ## 4. What these caches do NOT fix
 
-The **O(history) re-execution term** and the **~3.6 ms realm build** are
-untouched. Bounding re-execution is `chidori.step`'s job today
-(`value-checkpoints.md`) and warm-standby's job tomorrow (§5); the realm cost
-is the lazy/shared-builtins work scoped in `interpreter-optimization.md`
-§11.4 ("warm-realm reuse — INVESTIGATE").
+The **O(history) re-execution term** and the **realm build** are untouched.
+Bounding re-execution is `chidori.step`'s job today (`value-checkpoints.md`)
+and warm-standby's job tomorrow (§5).
+
+### 4.1 The realm build, actually measured
+
+`interpreter-optimization.md` §11.1 reported `engine_new` ≈ 3.6 ms on one
+developer machine, which framed realm construction as a dominant fixed cost.
+A per-section profile on this container (release; the permanent tool is
+`cargo run --release --example realm_profile -p chidori-js`, which iterates
+the same `builtins::SECTIONS` table `install()` runs) puts it lower and
+spreads it thinner:
+
+| section | ms | share |
+| --- | ---: | ---: |
+| **total `Engine::new()`** | **~1.0** | |
+| temporal | 0.21 | ~21% |
+| typedarray | 0.11 | ~11% |
+| fundamental | 0.07 | ~7% |
+| everything else (14 sections) | ≤0.05 each | ~60% |
+
+Two conclusions. First, **re-measure before optimizing**: on this machine the
+realm build is ~1 ms, not 3.6 — still worth removing for high-frequency
+resume/test loops, but a quarter of the transpile win, not four times it.
+Second, **there is no cheap targeted fix**: no single section dominates
+enough that a spot optimization moves the total much. The real levers remain
+the invasive ones — lazily materializing rarely-used namespaces (`Temporal`
+is both the largest single section and the least likely to be touched by an
+agent, so it goes first), or build-once-clone-many shared templates — and
+they should be taken up only after warm-standby (§5), which removes far more
+per resume for comparable effort.
 
 ## 5. Proposed: warm-standby resume (design note)
 

@@ -24,27 +24,34 @@ mod typedarray;
 use crate::value::*;
 use crate::vm::Vm;
 
+/// The builtin installation sections, in installation order, name attached —
+/// the single source of truth for [`install`] and for the per-section realm
+/// profiler (`examples/realm_profile.rs`). Order matters only in that later
+/// sections may read prototypes earlier ones populated.
+pub const SECTIONS: &[(&str, fn(&mut Vm))] = &[
+    ("fundamental", fundamental::install),
+    ("restricted", install_restricted_properties),
+    ("numbers", numbers::install),
+    ("bigint", bigint::install),
+    ("array", array::install),
+    ("string", string::install),
+    ("regexp", regexp_builtin::install),
+    ("collections", collections::install),
+    ("date", date::install),
+    ("async", async_builtins::install),
+    ("reflect", reflect::install),
+    ("typedarray", typedarray::install),
+    ("proxy", crate::proxy::install),
+    ("disposable", disposable::install),
+    ("intl", intl::install),
+    ("temporal", temporal::install),
+    ("globals", install_globals),
+];
+
 pub fn install(vm: &mut Vm) {
-    fundamental::install(vm);
-    install_restricted_properties(vm);
-    numbers::install(vm);
-    bigint::install(vm);
-    array::install(vm);
-    string::install(vm);
-
-    regexp_builtin::install(vm);
-    collections::install(vm);
-
-    date::install(vm);
-    async_builtins::install(vm);
-
-    reflect::install(vm);
-    typedarray::install(vm);
-    crate::proxy::install(vm);
-    disposable::install(vm);
-    intl::install(vm);
-    temporal::install(vm);
-    install_globals(vm);
+    for (_, section) in SECTIONS {
+        section(vm);
+    }
 }
 
 /// Build the unique-per-realm %ThrowTypeError% intrinsic and poison
