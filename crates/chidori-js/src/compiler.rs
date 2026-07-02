@@ -1695,6 +1695,10 @@ impl Compiler {
         FuncProto {
             eval_scopes: fc.eval_scopes.clone(),
             name: fc.name,
+            ic: code
+                .iter()
+                .map(|_| std::cell::Cell::new(u32::MAX))
+                .collect(),
             code,
             consts: fc.consts,
             num_locals: 0,

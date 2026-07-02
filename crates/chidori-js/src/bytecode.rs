@@ -141,6 +141,16 @@ pub struct FuncProto {
     /// handlers test stability with one indexed load instead of a linear scan
     /// of `stable_cells` on every executed init.
     pub stable_flags: Box<[bool]>,
+    /// Per-op inline-cache slots (len == `code.len()`, indexed by instruction
+    /// pointer; `u32::MAX` = empty). Used by `GetProp`/`SetProp`/`LoadGlobal`
+    /// to remember the property's `IndexMap` slot index at that site. The hint
+    /// is **verified on every use** (the key stored at the cached slot must
+    /// equal the op's key), so a stale hint is a cache miss, never a wrong
+    /// answer — no invalidation protocol exists or is needed. Pure performance
+    /// side effect: never serialized, never observed by the journal; a shared
+    /// proto (source→proto cache) shares hints across `Vm`s harmlessly for the
+    /// same reason.
+    pub ic: Box<[std::cell::Cell<u32>]>,
     /// Scope snapshots for the direct-`eval` call sites in this function,
     /// indexed by `Op::DirectEval`'s `scope` payload.
     pub eval_scopes: Vec<std::rc::Rc<EvalScopeDesc>>,
@@ -182,6 +192,7 @@ impl FuncProto {
             is_strict: false,
             stable_cells: Vec::new(),
             stable_flags: Box::new([]),
+            ic: Box::new([]),
             eval_scopes: Vec::new(),
             this_cell: None,
             inherit_home: false,

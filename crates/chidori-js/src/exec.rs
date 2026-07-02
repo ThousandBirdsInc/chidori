@@ -1063,21 +1063,46 @@ impl Vm {
             }
             Op::LoadGlobal(i) => {
                 let name = self.const_name(frame, *i);
-                let key = PropertyKey::Str(name.clone());
                 let g = self.realm.global.clone();
+                // Inline cache (key-verified slot hint; see `FuncProto::ic`):
+                // after the first resolution, a global read — above all a
+                // function resolving its own recursive self-reference — is one
+                // indexed load plus a pointer-equality key check, no hashing.
+                if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
+                    let b = g.borrow();
+                    if let Some((PropertyKey::Str(k), prop)) = b.props.get_index(ic.get() as usize)
+                    {
+                        if let PropertyKind::Data { value, .. } = &prop.kind {
+                            if k == &name {
+                                let v = value.clone();
+                                drop(b);
+                                push!(v);
+                                return Ok(Ctl::Next);
+                            }
+                        }
+                    }
+                }
+                let key = PropertyKey::Str(name.clone());
                 // Fast path: an own data property directly on the global object —
-                // the case for every top-level `function`/`var`/`let` binding,
-                // including a function's own recursive self-reference. Resolves
-                // in a single hash with no prototype walk, replacing the previous
-                // existence-check-then-get that walked (and hashed) the chain
-                // twice on every global read.
+                // the case for every top-level `function`/`var`/`let` binding.
+                // Resolves in a single hash with no prototype walk, and refills
+                // the inline cache with the slot it finds.
                 let fast = {
                     let b = g.borrow();
-                    match b.props.get(&key) {
-                        Some(Property {
-                            kind: PropertyKind::Data { value, .. },
-                            ..
-                        }) => Some(value.clone()),
+                    match b.props.get_full(&key) {
+                        Some((
+                            idx,
+                            _,
+                            Property {
+                                kind: PropertyKind::Data { value, .. },
+                                ..
+                            },
+                        )) => {
+                            if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
+                                ic.set(idx as u32);
+                            }
+                            Some(value.clone())
+                        }
                         _ => None,
                     }
                 };
@@ -1612,6 +1637,41 @@ impl Vm {
             Op::GetProp(i) => {
                 let name = self.const_name(frame, *i);
                 let obj = pop!();
+                // Inline cache (key-verified slot hint; see `FuncProto::ic`).
+                // Fast path only for an ordinary object's own DATA property:
+                // every exotic case (array index/length, arguments aliasing,
+                // proxies, namespaces, accessors, prototype climbs) falls to
+                // the unchanged slow path, which also refills the hint when
+                // the receiver resolves to an own data property.
+                if let Value::Object(o) = &obj {
+                    if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
+                        let b = o.borrow();
+                        if matches!(b.internal, Internal::Ordinary) {
+                            if let Some((PropertyKey::Str(k), prop)) =
+                                b.props.get_index(ic.get() as usize)
+                            {
+                                if let PropertyKind::Data { value, .. } = &prop.kind {
+                                    if k == &name {
+                                        let v = value.clone();
+                                        drop(b);
+                                        push!(v);
+                                        return Ok(Ctl::Next);
+                                    }
+                                }
+                            }
+                            let key = PropertyKey::Str(name.clone());
+                            if let Some((idx, _, prop)) = b.props.get_full(&key) {
+                                if let PropertyKind::Data { value, .. } = &prop.kind {
+                                    ic.set(idx as u32);
+                                    let v = value.clone();
+                                    drop(b);
+                                    push!(v);
+                                    return Ok(Ctl::Next);
+                                }
+                            }
+                        }
+                    }
+                }
                 let v = self.get_prop(&obj, &PropertyKey::Str(name))?;
                 push!(v);
             }
@@ -2055,6 +2115,52 @@ impl Vm {
                 let name = self.const_name(frame, *i);
                 let value = pop!();
                 let obj = pop!();
+                // Inline cache (key-verified slot hint; see `FuncProto::ic`).
+                // Fast path only when the receiver is an ordinary object whose
+                // OWN property at the hinted slot is a WRITABLE data property —
+                // per OrdinarySetWithOwnDescriptor that assignment updates the
+                // value in place (attributes and slot order preserved, no
+                // prototype setter can intervene). Everything else (missing own
+                // key → proto-chain setters/read-only checks, accessors,
+                // non-writable → strict TypeError, exotics) takes the
+                // unchanged put_value path, which also refills the hint.
+                if let Value::Object(o) = &obj {
+                    if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
+                        let mut b = o.borrow_mut();
+                        if matches!(b.internal, Internal::Ordinary) {
+                            if let Some((PropertyKey::Str(k), prop)) =
+                                b.props.get_index_mut(ic.get() as usize)
+                            {
+                                if k == &name {
+                                    if let PropertyKind::Data {
+                                        value: slot,
+                                        writable: true,
+                                    } = &mut prop.kind
+                                    {
+                                        *slot = value.clone();
+                                        drop(b);
+                                        push!(value);
+                                        return Ok(Ctl::Next);
+                                    }
+                                }
+                            }
+                            let key = PropertyKey::Str(name.clone());
+                            if let Some((idx, _, prop)) = b.props.get_full_mut(&key) {
+                                if let PropertyKind::Data {
+                                    value: slot,
+                                    writable: true,
+                                } = &mut prop.kind
+                                {
+                                    ic.set(idx as u32);
+                                    *slot = value.clone();
+                                    drop(b);
+                                    push!(value);
+                                    return Ok(Ctl::Next);
+                                }
+                            }
+                        }
+                    }
+                }
                 let strict = frame.func.proto.is_strict;
                 self.put_value(&obj, &PropertyKey::Str(name), value.clone(), strict)?;
                 push!(value);
