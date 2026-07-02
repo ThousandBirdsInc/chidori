@@ -13,6 +13,7 @@ pub mod convert;
 pub mod dom;
 pub mod exec;
 pub mod fuse;
+pub mod fxhash;
 pub mod gc;
 pub mod generator;
 pub mod host;

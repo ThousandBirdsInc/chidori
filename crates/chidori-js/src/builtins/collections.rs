@@ -10,9 +10,9 @@
 //! `get_set_record` performs the spec's GetSetRecord coercion.
 
 use super::arg;
+use crate::fxhash::FxIndexMap;
 use crate::value::*;
 use crate::vm::Vm;
-use indexmap::IndexMap;
 
 pub fn install(vm: &mut Vm) {
     install_map(vm);
@@ -187,7 +187,7 @@ fn install_weakmap(vm: &mut Vm) {
         |vm, _t, args| {
             let m = vm.alloc(ObjectData::new(
                 Some(vm.realm.weak_map_proto.clone()),
-                Internal::WeakMap(IndexMap::new()),
+                Internal::WeakMap(FxIndexMap::default()),
             ));
             // AddEntriesFromIterable through the observable `set` method —
             // same shape as the Map constructor.
@@ -249,7 +249,7 @@ fn install_weakset(vm: &mut Vm) {
         |vm, _t, args| {
             let s = vm.alloc(ObjectData::new(
                 Some(vm.realm.weak_set_proto.clone()),
-                Internal::WeakSet(IndexMap::new()),
+                Internal::WeakSet(FxIndexMap::default()),
             ));
             // Per-element calls through the observable `add` method.
             init_weak_entries(vm, &s, &arg(args, 0), "add", false)?;
@@ -299,7 +299,7 @@ fn install_map(vm: &mut Vm) {
         |vm, _t, args| {
             let m = vm.alloc(ObjectData::new(
                 Some(vm.realm.map_proto.clone()),
-                Internal::Map(IndexMap::new()),
+                Internal::Map(FxIndexMap::default()),
             ));
             init_map_entries(vm, &m, &arg(args, 0))?;
             Ok(Value::Object(m))
@@ -320,7 +320,7 @@ fn install_map(vm: &mut Vm) {
         // Group by the callback result using Map key equality (SameValueZero,
         // with -0 canonicalized to +0), preserving first-seen key order.
         let values = vm.iterate_to_vec(&items)?;
-        let mut groups: IndexMap<MapKey, Vec<Value>> = IndexMap::new();
+        let mut groups: FxIndexMap<MapKey, Vec<Value>> = FxIndexMap::default();
         for (i, v) in values.into_iter().enumerate() {
             let mut key = vm.call(
                 cb.clone(),
@@ -332,7 +332,7 @@ fn install_map(vm: &mut Vm) {
             }
             groups.entry(MapKey(key)).or_default().push(v);
         }
-        let mut map: IndexMap<MapKey, Value> = IndexMap::new();
+        let mut map: FxIndexMap<MapKey, Value> = FxIndexMap::default();
         for (k, elements) in groups {
             let arr = vm.new_array(elements);
             map.insert(k, Value::Object(arr));
@@ -462,7 +462,7 @@ fn install_set(vm: &mut Vm) {
         |vm, _t, args| {
             let s = vm.alloc(ObjectData::new(
                 Some(vm.realm.set_proto.clone()),
-                Internal::Set(IndexMap::new()),
+                Internal::Set(FxIndexMap::default()),
             ));
             init_set_entries(vm, &s, &arg(args, 0))?;
             Ok(Value::Object(s))
@@ -852,7 +852,7 @@ fn set_has(vm: &mut Vm, this: &Value, key: &Value) -> Result<bool, Value> {
 /// Build a fresh `Set` from a list of values (deduplicated by SameValueZero,
 /// preserving first-insertion order).
 fn new_set(vm: &mut Vm, values: Vec<Value>) -> Value {
-    let mut map: IndexMap<MapKey, ()> = IndexMap::new();
+    let mut map: FxIndexMap<MapKey, ()> = FxIndexMap::default();
     for v in values {
         map.insert(MapKey(v), ());
     }

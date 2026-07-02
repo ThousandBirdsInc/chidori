@@ -568,7 +568,7 @@ impl Property {
 
 pub struct ObjectData {
     pub proto: Option<JsObject>,
-    pub props: IndexMap<PropertyKey, Property>,
+    pub props: crate::fxhash::FxIndexMap<PropertyKey, Property>,
     pub extensible: bool,
     pub internal: Internal,
     /// The spec `[[PrivateElements]]` list, keyed by [`PrivateName::id`].
@@ -582,7 +582,7 @@ impl ObjectData {
     pub fn new(proto: Option<JsObject>, internal: Internal) -> Self {
         ObjectData {
             proto,
-            props: IndexMap::new(),
+            props: crate::fxhash::FxIndexMap::default(),
             extensible: true,
             internal,
             privates: None,
@@ -653,14 +653,14 @@ pub enum Internal {
     Number(f64),
     StringObj(JsString),
     Symbol(JsSymbol),
-    Map(IndexMap<MapKey, Value>),
-    Set(IndexMap<MapKey, ()>),
+    Map(crate::fxhash::FxIndexMap<MapKey, Value>),
+    Set(crate::fxhash::FxIndexMap<MapKey, ()>),
     /// WeakMap/WeakSet. Our GC is reference-counting with no weak references, so
     /// these hold strong refs — observationally identical for all of Test262
     /// (which cannot force collection); only `WeakRef`/`FinalizationRegistry`
     /// expose collection and remain unsupported (determinism contract).
-    WeakMap(IndexMap<MapKey, Value>),
-    WeakSet(IndexMap<MapKey, ()>),
+    WeakMap(crate::fxhash::FxIndexMap<MapKey, Value>),
+    WeakSet(crate::fxhash::FxIndexMap<MapKey, ()>),
     Promise(crate::vm::PromiseData),
     Generator(crate::vm::GeneratorData),
     Date(f64),

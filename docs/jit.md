@@ -22,6 +22,12 @@
 > [`docs/interpreter-optimization.md`](./interpreter-optimization.md) — §2 and
 > §11.5 there explain why a JIT is the wrong tool for this engine; the
 > experiment confirmed it empirically.
+>
+> **Current thinking on a JIT** lives in
+> [`docs/js-performance-roadmap.md`](./js-performance-roadmap.md) §4 (2026-07):
+> what a `forbid(unsafe_code)`-compatible tier could and couldn't be, why the
+> determinism objection is narrower than §2 above states, and the product
+> trigger under which a Cranelift baseline tier would become rational.
 
 ---
 
