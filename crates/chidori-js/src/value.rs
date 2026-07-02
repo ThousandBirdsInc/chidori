@@ -37,12 +37,88 @@ enum Repr {
     /// is the U+FFFD-replaced UTF-8 view that backs `as_str()` (and the host
     /// boundary); `units` is the exact UTF-16 code-unit count.
     Wtf8(Rc<Wtf8Buf>),
+    /// Lazy concatenation of two WELL-FORMED strings (`Utf8`/`Rope` children
+    /// only — a `Wtf8` operand takes the eager code-unit path so surrogate
+    /// re-pairing stays correct). Makes the `s += chunk` build loop O(total)
+    /// instead of O(total²): each `+` is one rope node; the bytes are copied
+    /// exactly once, when something first observes them (`as_str`), into the
+    /// one-shot `flat` cache. `bytes`/`units` are stored so `.length` and the
+    /// engine's string-size guard stay O(1) without flattening.
+    Rope(Rc<Rope>),
 }
 
 struct Wtf8Buf {
     bytes: Box<[u8]>,
     lossy: Box<str>,
     units: u32,
+}
+
+struct Rope {
+    left: JsString,
+    right: JsString,
+    /// Total UTF-8 byte length of the tree (children are well-formed).
+    bytes: usize,
+    /// Total UTF-16 code-unit length (`.length`), precomputed.
+    units: usize,
+    /// The flattened form, built once on first byte-level observation.
+    flat: std::cell::OnceCell<Rc<str>>,
+}
+
+/// Minimum combined size before `concat` builds a rope node instead of
+/// copying. Below this, an eager copy is cheaper than the node + eventual
+/// flatten bookkeeping, and short-string behavior stays exactly as before.
+const ROPE_MIN_BYTES: usize = 64;
+
+thread_local! {
+    /// Shared empty backing for [`Rope`]'s iterative `Drop` (placeholder the
+    /// children are replaced with while dismantling — an `Rc` bump, not an
+    /// allocation per node).
+    static EMPTY_RC_STR: Rc<str> = Rc::from("");
+}
+
+impl Rope {
+    /// Append the whole tree's bytes to `out` without recursion (a build loop
+    /// makes left-leaning chains as deep as the number of appends).
+    fn append_to(&self, out: &mut String) {
+        let mut stack: Vec<&JsString> = vec![&self.right, &self.left];
+        while let Some(part) = stack.pop() {
+            match &part.0 {
+                Repr::Utf8(s) => out.push_str(s),
+                Repr::Rope(r) => match r.flat.get() {
+                    Some(f) => out.push_str(f),
+                    None => {
+                        stack.push(&r.right);
+                        stack.push(&r.left);
+                    }
+                },
+                // Ropes are built from well-formed parts only.
+                Repr::Wtf8(_) => unreachable!("rope over non-well-formed string"),
+            }
+        }
+    }
+}
+
+impl Drop for Rope {
+    /// Dismantle iteratively: dropping a chain of N appends must not recurse
+    /// N deep through nested `Rc<Rope>` drops.
+    fn drop(&mut self) {
+        let empty = EMPTY_RC_STR.with(|e| e.clone());
+        let take =
+            |slot: &mut JsString| std::mem::replace(slot, JsString(Repr::Utf8(empty.clone())));
+        let mut stack = vec![take(&mut self.left), take(&mut self.right)];
+        while let Some(part) = stack.pop() {
+            if let Repr::Rope(r) = part.0 {
+                // Only dismantle a uniquely-owned node; a shared one is kept
+                // alive by its other owner and must not be gutted.
+                if let Some(rope) = Rc::into_inner(r) {
+                    let mut rope = rope;
+                    stack.push(take(&mut rope.left));
+                    stack.push(take(&mut rope.right));
+                    // `rope` drops here with empty children: no recursion.
+                }
+            }
+        }
+    }
 }
 
 /// Code-unit index one past the code point starting at `i`: `i + 2` when
@@ -113,6 +189,20 @@ impl JsString {
         match &self.0 {
             Repr::Utf8(s) => s,
             Repr::Wtf8(w) => &w.lossy,
+            Repr::Rope(r) => r.flat.get_or_init(|| {
+                let mut out = String::with_capacity(r.bytes);
+                r.append_to(&mut out);
+                Rc::from(out.as_str())
+            }),
+        }
+    }
+    /// Total byte length WITHOUT flattening a rope — the basis for the
+    /// engine's string-size guard on every concatenation.
+    pub fn byte_len(&self) -> usize {
+        match &self.0 {
+            Repr::Utf8(s) => s.len(),
+            Repr::Wtf8(w) => w.bytes.len(),
+            Repr::Rope(r) => r.bytes,
         }
     }
     /// Canonical well-formed WTF-8 bytes — the basis for equality and hashing.
@@ -120,6 +210,8 @@ impl JsString {
         match &self.0 {
             Repr::Utf8(s) => s.as_bytes(),
             Repr::Wtf8(w) => &w.bytes,
+            // A rope is well-formed UTF-8; observing its bytes flattens once.
+            Repr::Rope(_) => self.as_str().as_bytes(),
         }
     }
     /// Length in UTF-16 code units (the JS `.length`). O(n) for the `Utf8`
@@ -128,6 +220,7 @@ impl JsString {
         match &self.0 {
             Repr::Utf8(s) => s.chars().map(|c| c.len_utf16()).sum(),
             Repr::Wtf8(w) => w.units as usize,
+            Repr::Rope(r) => r.units,
         }
     }
     /// The UTF-16 code unit at index `i`, or `None` if out of range.
@@ -139,6 +232,7 @@ impl JsString {
         match &self.0 {
             Repr::Utf8(s) => CodeUnits::Utf8(s.encode_utf16()),
             Repr::Wtf8(w) => CodeUnits::Wtf8(crate::wtf8::decode_units(&w.bytes)),
+            Repr::Rope(_) => CodeUnits::Utf8(self.as_str().encode_utf16()),
         }
     }
     /// Collect the UTF-16 code units (the regexp / split boundary).
@@ -162,12 +256,12 @@ impl JsString {
     }
     /// `true` if the string contains no unpaired surrogate.
     pub fn is_well_formed(&self) -> bool {
-        matches!(self.0, Repr::Utf8(_))
+        matches!(self.0, Repr::Utf8(_) | Repr::Rope(_))
     }
     /// Replace every unpaired surrogate with U+FFFD (`String.prototype.toWellFormed`).
     pub fn to_well_formed(&self) -> JsString {
         match &self.0 {
-            Repr::Utf8(_) => self.clone(),
+            Repr::Utf8(_) | Repr::Rope(_) => self.clone(),
             Repr::Wtf8(w) => JsString::new(&*w.lossy),
         }
     }
@@ -176,10 +270,32 @@ impl JsString {
     /// surrogate straddling the boundary re-pairs into one astral code point.
     pub fn concat(&self, other: &JsString) -> JsString {
         match (&self.0, &other.0) {
-            (Repr::Utf8(a), Repr::Utf8(b)) => {
-                let mut s = String::with_capacity(a.len() + b.len());
-                s.push_str(a);
-                s.push_str(b);
+            // Both sides well-formed: O(1) rope node once the result is big
+            // enough to matter; eager copy below the threshold (small-string
+            // behavior unchanged, no node overhead). This turns the
+            // `s += chunk` build loop from O(total²) into O(total).
+            (Repr::Utf8(_) | Repr::Rope(_), Repr::Utf8(_) | Repr::Rope(_)) => {
+                let (lb, rb) = (self.byte_len(), other.byte_len());
+                if lb == 0 {
+                    return other.clone();
+                }
+                if rb == 0 {
+                    return self.clone();
+                }
+                if lb + rb >= ROPE_MIN_BYTES {
+                    // `len_utf16` is O(1) for a rope child (stored), so the
+                    // accumulator side of a build loop never rescans.
+                    return JsString(Repr::Rope(Rc::new(Rope {
+                        bytes: lb + rb,
+                        units: self.len_utf16() + other.len_utf16(),
+                        left: self.clone(),
+                        right: other.clone(),
+                        flat: std::cell::OnceCell::new(),
+                    })));
+                }
+                let mut s = String::with_capacity(lb + rb);
+                s.push_str(self.as_str());
+                s.push_str(other.as_str());
                 JsString(Repr::Utf8(Rc::from(s.as_str())))
             }
             _ => {
@@ -200,6 +316,7 @@ impl PartialEq for JsString {
         match (&self.0, &other.0) {
             (Repr::Utf8(a), Repr::Utf8(b)) if Rc::ptr_eq(a, b) => true,
             (Repr::Wtf8(a), Repr::Wtf8(b)) if Rc::ptr_eq(a, b) => true,
+            (Repr::Rope(a), Repr::Rope(b)) if Rc::ptr_eq(a, b) => true,
             _ => self.wtf8_bytes() == other.wtf8_bytes(),
         }
     }

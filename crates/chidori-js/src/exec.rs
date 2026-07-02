@@ -2954,7 +2954,7 @@ impl Vm {
                     let s = self.to_js_string(p)?;
                     // Same bound as `op_add`: a template-literal join in a doubling
                     // loop (`` s = `${s}${s}` ``) must not grow without limit.
-                    total += s.wtf8_bytes().len();
+                    total += s.byte_len();
                     if total > crate::value::MAX_STRING_LEN {
                         return Err(self.throw_range("invalid string length"));
                     }
@@ -3293,7 +3293,7 @@ impl Vm {
         if matches!(pa, Value::String(_)) || matches!(pb, Value::String(_)) {
             let sa = self.to_js_string(&pa)?;
             let sb = self.to_js_string(&pb)?;
-            let total = sa.wtf8_bytes().len() + sb.wtf8_bytes().len();
+            let total = sa.byte_len() + sb.byte_len();
             // Bound a single concatenation so a doubling loop (`s += s`) cannot
             // grow a string without limit and OOM the host. The cap is well above
             // any legitimate string; exceeding it throws RangeError, matching how
