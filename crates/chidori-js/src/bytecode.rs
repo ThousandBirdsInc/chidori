@@ -136,6 +136,11 @@ pub struct FuncProto {
     /// exporter's cell, and have the body fill them without breaking the link.
     /// Empty for ordinary scripts/functions (default replace-the-`Rc` semantics).
     pub stable_cells: Vec<u32>,
+    /// `stable_cells` as a dense `bool` per cell index (len == `num_cells`),
+    /// precomputed at compile finish so the hot `InitCell`/`InitCellTdz`
+    /// handlers test stability with one indexed load instead of a linear scan
+    /// of `stable_cells` on every executed init.
+    pub stable_flags: Box<[bool]>,
     /// Scope snapshots for the direct-`eval` call sites in this function,
     /// indexed by `Op::DirectEval`'s `scope` payload.
     pub eval_scopes: Vec<std::rc::Rc<EvalScopeDesc>>,
@@ -176,6 +181,7 @@ impl FuncProto {
             mapped_param_cells: Vec::new(),
             is_strict: false,
             stable_cells: Vec::new(),
+            stable_flags: Box::new([]),
             eval_scopes: Vec::new(),
             this_cell: None,
             inherit_home: false,

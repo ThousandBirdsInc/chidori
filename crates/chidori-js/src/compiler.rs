@@ -1708,6 +1708,13 @@ impl Compiler {
             param_names: fc.param_names,
             mapped_param_cells: fc.mapped_param_cells,
             is_strict: fc.strict,
+            stable_flags: {
+                let mut flags = vec![false; fc.num_cells as usize].into_boxed_slice();
+                for &c in &fc.stable_cells {
+                    flags[c as usize] = true;
+                }
+                flags
+            },
             stable_cells: fc.stable_cells.clone(),
             this_cell: fc.this_cell,
             inherit_home: fc.inherit_home,

@@ -1026,7 +1026,7 @@ impl Vm {
                 // pre-wired import binding (or self-reference) keeps pointing at
                 // the live cell. All other bindings get a fresh `Rc` (needed for
                 // per-iteration `let` semantics).
-                if frame.func.proto.stable_cells.contains(&i) {
+                if frame.func.proto.stable_flags[*i as usize] {
                     *frame.cells[*i as usize].borrow_mut() = v;
                 } else {
                     frame.cells[*i as usize] = Rc::new(RefCell::new(v));
@@ -1035,7 +1035,7 @@ impl Vm {
             Op::InitCellTdz(i) => {
                 // Fresh cell holding the Temporal Dead Zone marker (a hoisted
                 // `let`/`const`/`class` binding before its initializer runs).
-                if frame.func.proto.stable_cells.contains(&i) {
+                if frame.func.proto.stable_flags[*i as usize] {
                     *frame.cells[*i as usize].borrow_mut() = Value::Uninitialized;
                 } else {
                     frame.cells[*i as usize] = Rc::new(RefCell::new(Value::Uninitialized));
@@ -3302,6 +3302,19 @@ fn js_mod(a: f64, b: f64) -> f64 {
     } else if a == 0.0 {
         a
     } else {
+        // Fast path: both operands integral and exactly representable (|x| <=
+        // 2^53) — the loop-counter case. Integer remainder matches libm fmod on
+        // integers (truncated division, sign of the dividend), except that a
+        // zero result must carry the dividend's sign (-6 % 3 is -0 in JS, as
+        // fmod also returns); restore that explicitly.
+        const MAX_EXACT: f64 = 9_007_199_254_740_992.0; // 2^53
+        if a.fract() == 0.0 && b.fract() == 0.0 && a.abs() <= MAX_EXACT && b.abs() <= MAX_EXACT {
+            let r = (a as i64) % (b as i64);
+            if r == 0 {
+                return if a.is_sign_negative() { -0.0 } else { 0.0 };
+            }
+            return r as f64;
+        }
         a % b
     }
 }

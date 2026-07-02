@@ -193,7 +193,15 @@ impl JsString {
 
 impl PartialEq for JsString {
     fn eq(&self, other: &Self) -> bool {
-        self.wtf8_bytes() == other.wtf8_bytes()
+        // Pointer-equality fast path: strings are shared by `Rc`, and the hot
+        // comparisons (property-map probes against bytecode-constant keys)
+        // usually compare a clone of the very same allocation. Content equality
+        // is unchanged — `ptr_eq` can only confirm, never deny.
+        match (&self.0, &other.0) {
+            (Repr::Utf8(a), Repr::Utf8(b)) if Rc::ptr_eq(a, b) => true,
+            (Repr::Wtf8(a), Repr::Wtf8(b)) if Rc::ptr_eq(a, b) => true,
+            _ => self.wtf8_bytes() == other.wtf8_bytes(),
+        }
     }
 }
 impl Eq for JsString {}
