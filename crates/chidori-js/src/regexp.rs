@@ -57,8 +57,44 @@ pub struct ReMatch {
 /// (unless the `y` sticky flag forces a match exactly at `start`). Returns
 /// `None` if the pattern is unsupported or no match is found.
 pub fn regex_exec(pattern: &str, flags: &str, input: &[u16], start: usize) -> Option<ReMatch> {
-    let re = Regex::compile(pattern, flags).ok()?;
+    let re = compile_cached(pattern, flags).ok()?;
     re.exec(input, start)
+}
+
+/// Compile through a thread-local `(pattern, flags)` → compiled-regex cache.
+///
+/// Every public entry point below re-derives `(pattern, flags)` strings from
+/// the RegExp object and recompiles — so a regex literal in a loop previously
+/// re-parsed its pattern on every iteration (`exec`, `test`, `match`,
+/// `replace`, `split` all funnel through here). A compiled [`Regex`] is
+/// immutable (`exec` takes `&self`; all match state lives in the per-call
+/// `MatchCtx`/`Caps`), and compilation is a pure, deterministic function of
+/// `(pattern, flags)` — so the cache is a pure performance side effect: a hit
+/// returns exactly the value a fresh compile would. Keyed by the full strings
+/// (hash + equality), success-only (errors are deterministic and cheap to
+/// recompute), and bounded by clearing wholesale at a cap.
+fn compile_cached(pattern: &str, flags: &str) -> Result<std::rc::Rc<Regex>, String> {
+    const CACHE_CAP: usize = 128;
+    thread_local! {
+        static REGEX_CACHE: std::cell::RefCell<
+            std::collections::HashMap<(String, String), std::rc::Rc<Regex>>,
+        > = std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    REGEX_CACHE.with(|cache| {
+        if let Some(re) = cache
+            .borrow()
+            .get(&(pattern.to_string(), flags.to_string()))
+        {
+            return Ok(re.clone());
+        }
+        let re = std::rc::Rc::new(Regex::compile(pattern, flags)?);
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert((pattern.to_string(), flags.to_string()), re.clone());
+        Ok(re)
+    })
 }
 
 /// Like [`regex_exec`], but additionally returns the `name -> group index`
@@ -73,7 +109,7 @@ pub fn regex_exec_named(
     input: &[u16],
     start: usize,
 ) -> Option<(ReMatch, Vec<(String, usize)>)> {
-    let re = Regex::compile(pattern, flags).ok()?;
+    let re = compile_cached(pattern, flags).ok()?;
     let names = re.group_names.clone();
     re.exec(input, start).map(|m| (m, names))
 }
@@ -83,8 +119,8 @@ pub fn regex_exec_named(
 /// to compile). Lets callers attach a `groups` object even on a `null` exec
 /// where the match itself failed.
 pub fn regexp_group_names(pattern: &str, flags: &str) -> Vec<(String, usize)> {
-    match Regex::compile(pattern, flags) {
-        Ok(re) => re.group_names,
+    match compile_cached(pattern, flags) {
+        Ok(re) => re.group_names.clone(),
         Err(_) => Vec::new(),
     }
 }
@@ -92,7 +128,7 @@ pub fn regexp_group_names(pattern: &str, flags: &str) -> Vec<(String, usize)> {
 /// Returns true if `pattern`/`flags` parse with the supported subset. Used to
 /// fail loudly (SyntaxError) on unsupported constructs.
 pub fn regex_is_valid(pattern: &str, flags: &str) -> Result<(), String> {
-    Regex::compile(pattern, flags).map(|_| ())
+    compile_cached(pattern, flags).map(|_| ())
 }
 
 // =========================================================================

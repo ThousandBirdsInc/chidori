@@ -79,6 +79,23 @@ impl Engine {
         Ok(result)
     }
 
+    /// As [`Engine::eval`], but compiling through the thread-local
+    /// source→proto cache (`compiler::compile_script_cached`). Use for scripts
+    /// evaluated verbatim on every fresh engine — the runtime's prelude/helper
+    /// scripts — so their parse+lower cost is paid once per thread instead of
+    /// once per engine. Execution (which must run to populate the new realm)
+    /// is unchanged; only the compile step is memoized.
+    pub fn eval_cached(&mut self, src: &str) -> Result<Value, String> {
+        let proto = compiler::compile_script_cached(src)?;
+        let func = self.vm.make_closure(proto, Vec::new());
+        let result = self
+            .vm
+            .call(Value::Object(func), Value::Undefined, &[])
+            .map_err(|e| self.vm.error_to_string(&e))?;
+        let _ = self.vm.run_jobs_until_blocked();
+        Ok(result)
+    }
+
     /// Console output collected so far.
     pub fn console(&self) -> &[String] {
         &self.vm.console_log

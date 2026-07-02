@@ -269,3 +269,53 @@ fn durable_step_memoizes() {
         "durableStep should not re-run on replay"
     );
 }
+
+/// Two runtimes restored from the same journal on one thread share a cached
+/// compiled proto (`compiler::compile_script_cached`). Sharing must be a pure
+/// performance side effect: both replay to completion independently, with
+/// byte-identical journals and no divergence — proving the cached proto
+/// carries no per-runtime state.
+#[test]
+fn shared_cached_proto_replays_are_independent_and_identical() {
+    let mut rt = ReplayRuntime::record(BUNDLE, &["fetchValue", "report"]);
+    let mut handler =
+        |name: &str, args: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
+            match name {
+                "fetchValue" => {
+                    let key = args[0].as_str().unwrap();
+                    Some(Ok(json!(if key == "a" { 10 } else { 32 })))
+                }
+                _ => Some(Ok(json!(null))),
+            }
+        };
+    assert!(matches!(
+        rt.drive(&mut handler).unwrap(),
+        DriveOutcome::Completed
+    ));
+    let journal = rt.journal_bytes();
+
+    // Restore the SAME bundle twice on this thread: the second restore hits the
+    // thread-local proto cache. Interleave their driving to catch any shared
+    // mutable state leaking through the proto.
+    let mut noop = |_: &str, _: &serde_json::Value| -> Option<Result<serde_json::Value, String>> {
+        Some(Ok(json!(null)))
+    };
+    let mut r1 = ReplayRuntime::restore(BUNDLE, &journal, &["fetchValue", "report"]).unwrap();
+    let mut r2 = ReplayRuntime::restore(BUNDLE, &journal, &["fetchValue", "report"]).unwrap();
+    assert!(matches!(
+        r1.drive(&mut noop).unwrap(),
+        DriveOutcome::Completed
+    ));
+    assert!(matches!(
+        r2.drive(&mut noop).unwrap(),
+        DriveOutcome::Completed
+    ));
+    assert_eq!(r1.divergence(), None);
+    assert_eq!(r2.divergence(), None);
+    assert_eq!(
+        r1.journal_bytes(),
+        r2.journal_bytes(),
+        "replays through the shared cached proto must be byte-identical"
+    );
+    assert_eq!(r1.journal_bytes(), journal);
+}

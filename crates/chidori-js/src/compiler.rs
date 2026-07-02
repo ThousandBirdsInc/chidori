@@ -56,6 +56,44 @@ pub fn compile_script(src: &str) -> Result<FuncProto, String> {
     compile_script_impl(src, false, true)
 }
 
+/// Compile a script through a thread-local source→proto cache, so repeated
+/// compilations of the same source (a durable restore/resume re-compiling its
+/// bundle, or the fixed runtime prelude scripts evaluated on every fresh
+/// engine) reuse one compiled [`FuncProto`] instead of re-running the whole
+/// oxc parse → lower pipeline.
+///
+/// Sharing one proto across VMs on the same thread is sound: a `FuncProto` is
+/// immutable after compilation — closures instantiated from it, the per-VM
+/// tagged-template cache (keyed by proto pointer *per VM*), and the module
+/// hook all hold their own per-VM state. The cache is keyed by the FULL
+/// source string (hash + equality via `HashMap`), so a hit can never alias two
+/// distinct programs, and it is a pure performance side effect: compilation is
+/// deterministic, so a cached proto is byte-for-byte the proto a fresh compile
+/// would produce. Errors are not cached (they are cheap to recompute and keep
+/// the cache success-only).
+pub fn compile_script_cached(src: &str) -> Result<Rc<FuncProto>, String> {
+    // Bound the cache: a process hosts a handful of distinct bundles/preludes;
+    // clearing wholesale at the cap is simpler than LRU and keeps worst-case
+    // memory proportional to the cap without order-dependent behavior.
+    const CACHE_CAP: usize = 64;
+    thread_local! {
+        static SCRIPT_CACHE: std::cell::RefCell<std::collections::HashMap<String, Rc<FuncProto>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    SCRIPT_CACHE.with(|cache| {
+        if let Some(proto) = cache.borrow().get(src) {
+            return Ok(proto.clone());
+        }
+        let proto = Rc::new(compile_script(src)?);
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(src.to_string(), proto.clone());
+        Ok(proto)
+    })
+}
+
 /// Compile a script with the peephole op-fusion pass (`fuse.rs`) toggled. Used by
 /// the differential test that runs the same program with `fuse = true` and
 /// `fuse = false` and asserts byte-identical observable behavior. Production code

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -90,8 +91,49 @@ pub fn find_workspace_root(start: &Path) -> PathBuf {
 }
 
 pub fn transpile_module(path: &Path, source: &str, options: &TranspileOptions) -> Result<String> {
+    // Import validation ALWAYS runs — it consults the filesystem (relative
+    // import resolution, package.json lookups), so its outcome can change
+    // between calls with identical source and must never be cached.
     validate_imports(path, source, options.import_policy)?;
 
+    // The oxc pipeline below (parse → semantic → transform → codegen → strip →
+    // collapse) is a pure function of `(path, source)` — the transform options
+    // are compile-time constants and nothing reads the environment — so its
+    // output is memoized process-wide. This is the dominant fixed cost paid on
+    // EVERY agent execution: initial runs, every pause→resume re-execution,
+    // tool files, sub-agents, branch waves/resumes, and each imported module —
+    // all re-transpile byte-identical sources today. Keyed by the full
+    // `(path, source)` pair (hash + equality via the map), so a hit can never
+    // alias distinct inputs; only successes are cached (errors are cheap and
+    // deterministic to recompute).
+    {
+        let cache = transpile_cache().lock().expect("transpile cache poisoned");
+        if let Some(js) = cache.get(&(path.to_path_buf(), source.to_string())) {
+            return Ok(js.clone());
+        }
+    }
+    let js = transpile_source(path, source)?;
+    {
+        let mut cache = transpile_cache().lock().expect("transpile cache poisoned");
+        // Bound the cache; a process sees dozens of distinct module sources.
+        // Clearing wholesale at the cap is simpler than LRU and has no
+        // order-dependent behavior.
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert((path.to_path_buf(), source.to_string()), js.clone());
+    }
+    Ok(js)
+}
+
+fn transpile_cache() -> &'static std::sync::Mutex<HashMap<(PathBuf, String), String>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<(PathBuf, String), String>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// The pure transpile pipeline (no import validation, no filesystem access).
+fn transpile_source(path: &Path, source: &str) -> Result<String> {
     // Treat input as TypeScript regardless of extension — agents may live in
     // `agent.ts` / `tools/*.ts` and the snapshot pipeline only calls us with TS.
     let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::ts());
@@ -1042,5 +1084,86 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("dynamic import"));
         assert!(err.to_string().contains(":1:"));
+    }
+
+    /// The transpile cache is keyed by `(path, source)` only — a warm cache
+    /// entry must never mask import-policy validation, which always re-runs.
+    #[test]
+    fn transpile_cache_never_skips_import_validation() {
+        let source = r#"
+            import { helper } from "./helper.ts";
+            export async function agent() { return helper(); }
+        "#;
+        let path = Path::new("/tmp/project-cache-validate/agent.ts");
+        // Permissive policy: succeeds and warms the cache for (path, source).
+        transpile_module(
+            path,
+            source,
+            &TranspileOptions {
+                import_policy: TypeScriptImportPolicy::Relative,
+            },
+        )
+        .unwrap();
+        // Restrictive policy, SAME (path, source): validation must still reject
+        // the local import even though the pipeline output is cached.
+        let err = transpile_module(
+            path,
+            source,
+            &TranspileOptions {
+                import_policy: TypeScriptImportPolicy::None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("imports are disabled"));
+    }
+
+    /// Repeated transpiles of identical input return byte-identical output
+    /// (the cached result IS the computed result), and distinct sources at the
+    /// same path never alias.
+    #[test]
+    fn transpile_cache_is_transparent_and_never_aliases() {
+        let path = Path::new("/tmp/project-cache-alias/agent.ts");
+        let opts = TranspileOptions {
+            import_policy: TypeScriptImportPolicy::Relative,
+        };
+        let a1 = transpile_module(path, "export const x: number = 1;", &opts).unwrap();
+        let a2 = transpile_module(path, "export const x: number = 1;", &opts).unwrap();
+        assert_eq!(a1, a2);
+        let b = transpile_module(path, "export const x: number = 2;", &opts).unwrap();
+        assert_ne!(a1, b);
+        assert!(b.contains("= 2"));
+    }
+
+    /// Timing probe (not a CI assertion — run with `--ignored --nocapture`):
+    /// prints the cold vs warm cost of `transpile_module` on a synthetic
+    /// agent-sized source, i.e. the per-execution cost the cache removes.
+    #[test]
+    #[ignore]
+    fn transpile_cache_timing_probe() {
+        let mut source = String::from("import type { Chidori } from \"chidori:agent\";\n");
+        for i in 0..400 {
+            source.push_str(&format!(
+                "export function tool{i}(input: {{ q: string; n?: number }}): {{ ok: boolean; v: number }} {{\n\
+                 const v: number = (input.n ?? {i}) * 2;\n\
+                 return {{ ok: true, v }} as {{ ok: boolean; v: number }};\n}}\n"
+            ));
+        }
+        let path = Path::new("/tmp/project-timing/agent.ts");
+        let opts = TranspileOptions {
+            import_policy: TypeScriptImportPolicy::Relative,
+        };
+        println!("source: {} KB", source.len() / 1024);
+        let t0 = std::time::Instant::now();
+        let a = transpile_module(path, &source, &opts).unwrap();
+        let cold = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let b = transpile_module(path, &source, &opts).unwrap();
+        let warm = t1.elapsed();
+        assert_eq!(a, b);
+        println!(
+            "transpile cold: {:.3} ms   warm (cached): {:.3} ms",
+            cold.as_secs_f64() * 1e3,
+            warm.as_secs_f64() * 1e3
+        );
     }
 }

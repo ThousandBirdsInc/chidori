@@ -317,8 +317,14 @@ impl ReplayRuntime {
             return Ok(());
         }
         self.started = true;
-        let proto = crate::compiler::compile_script(&self.bundle)?;
-        let func = self.vm.make_closure(Rc::new(proto), Vec::new());
+        // Compile through the thread-local source→proto cache: a restore/resume
+        // recompiles the SAME bundle the journal was recorded against (the
+        // common case — `bundle_hash` pins it), so replaying a run repeatedly
+        // (crash recovery, branch delivers, `chidori trace`) pays the oxc
+        // pipeline once per thread instead of once per restore. An *edited*
+        // bundle is a different source string and simply misses the cache.
+        let proto = crate::compiler::compile_script_cached(&self.bundle)?;
+        let func = self.vm.make_closure(proto, Vec::new());
         match self.vm.call(Value::Object(func), Value::Undefined, &[]) {
             Ok(_) => Ok(()),
             Err(e) => Err(self.vm.error_to_string(&e)),

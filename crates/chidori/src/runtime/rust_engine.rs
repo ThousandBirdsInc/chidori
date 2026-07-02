@@ -480,8 +480,12 @@ pub(crate) fn run_module(
         let sync: Rc<dyn Fn(&str, &Value) -> std::result::Result<Value, String>> =
             Rc::new(move |name, args| h.call(name, args));
         engine.install_sync_natives(SYNC_NATIVE_NAMES, sync);
+        // `eval_cached`: these setup scripts are evaluated verbatim on every
+        // fresh engine (each run, resume re-execution, tool file, sub-agent),
+        // so their compile step is memoized per thread; execution — which must
+        // run to populate this engine's realm — is unchanged.
         engine
-            .eval(&prelude)
+            .eval_cached(&prelude)
             .map_err(|e| anyhow::anyhow!("installing node: builtin prelude: {e}"))?;
     }
     let dispatch: Rc<dyn Fn(&str, &Value) -> std::result::Result<Value, String>> = {
@@ -498,7 +502,7 @@ pub(crate) fn run_module(
     // Without this the meta-agent's `chidori.retry(...)`/`chidori.parallel(...)`
     // calls hit `undefined is not a function`.
     engine
-        .eval(crate::runtime::typescript::helpers::CHIDORI_JS_HELPERS_SCRIPT)
+        .eval_cached(crate::runtime::typescript::helpers::CHIDORI_JS_HELPERS_SCRIPT)
         .map_err(|e| anyhow::anyhow!("installing chidori JS SDK helpers: {e}"))?;
     // Install the base networking surface (`globalThis.fetch` + Headers/Request/
     // Response) over the captured `__chidori_http` host op that
@@ -507,7 +511,7 @@ pub(crate) fn run_module(
     // dependency — is policy-gated, pausable, and recorded. The `node:http`/
     // `node:https` client shims route through the same host op.
     engine
-        .eval(crate::runtime::typescript::helpers::FETCH_POLYFILL)
+        .eval_cached(crate::runtime::typescript::helpers::FETCH_POLYFILL)
         .map_err(|e| anyhow::anyhow!("installing fetch polyfill: {e}"))?;
 
     // Virtual DOM (additive): agents get a `document` / `window`, and a durable
