@@ -525,6 +525,43 @@ fn define_typed_array_index(
     Ok(true)
 }
 
+/// `CreateDataPropertyOrThrow(O, ToString(idx), V)` specialized for integer
+/// keys — how every array-producing builtin (map/filter/from/...) fills its
+/// result. For a plain dense array with no reified props, an in-bounds write
+/// or exact append IS the defined default data property; anything else
+/// (holes, gaps, proxies, frozen/sealed, shadowed) takes the spec path.
+pub(crate) fn create_data_index(
+    vm: &mut Vm,
+    obj: &JsObject,
+    idx: u32,
+    value: Value,
+) -> Result<(), Value> {
+    {
+        let mut b = obj.borrow_mut();
+        if b.extensible && b.props.is_empty() {
+            if let Internal::Array(arr) = &mut b.internal {
+                let i = idx as usize;
+                match i.cmp(&arr.len()) {
+                    std::cmp::Ordering::Less => {
+                        if !matches!(arr[i], Value::Hole) {
+                            arr[i] = value;
+                            return Ok(());
+                        }
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if i < crate::value::MAX_DENSE_ARRAY {
+                            arr.push(value);
+                            return Ok(());
+                        }
+                    }
+                    std::cmp::Ordering::Greater => {}
+                }
+            }
+        }
+    }
+    create_data_property_or_throw(vm, obj, &PropertyKey::from_index(idx), value)
+}
+
 /// `CreateDataPropertyOrThrow(O, P, V)`: define a default data property (all
 /// attributes true) via [[DefineOwnProperty]], throwing TypeError if it fails.
 pub(crate) fn create_data_property_or_throw(

@@ -136,6 +136,28 @@ pub struct FuncProto {
     /// exporter's cell, and have the body fill them without breaking the link.
     /// Empty for ordinary scripts/functions (default replace-the-`Rc` semantics).
     pub stable_cells: Vec<u32>,
+    /// `stable_cells` as a dense `bool` per cell index (len == `num_cells`),
+    /// precomputed at compile finish so the hot `InitCell`/`InitCellTdz`
+    /// handlers test stability with one indexed load instead of a linear scan
+    /// of `stable_cells` on every executed init.
+    pub stable_flags: Box<[bool]>,
+    /// Per original cell index (len == `num_cells`): `true` when the
+    /// localization pass rewrote that binding to a `frame.locals` slot. Its
+    /// cell-vec slot is filled with a shared never-read placeholder at frame
+    /// setup instead of a pooled cell. See `localize.rs`.
+    pub localized: Box<[bool]>,
+    /// Per-op inline-cache entries (len == `code.len()`, indexed by
+    /// instruction pointer). Used by `GetProp`/`SetProp`/`LoadGlobal` to
+    /// remember where the property resolved at that site. Every hint is
+    /// **verified on every use** (the key stored at the cached slot must equal
+    /// the op's key; a cached prototype holder must be pointer-identical to
+    /// the receiver's CURRENT direct prototype), so a stale hint is a cache
+    /// miss, never a wrong answer — no invalidation protocol exists or is
+    /// needed. The holder identity check also keeps realms isolated when a
+    /// proto is shared across `Vm`s by the source→proto cache. Pure
+    /// performance side effect: never serialized, never observed by the
+    /// journal.
+    pub ic: Box<[IcEntry]>,
     /// Scope snapshots for the direct-`eval` call sites in this function,
     /// indexed by `Op::DirectEval`'s `scope` payload.
     pub eval_scopes: Vec<std::rc::Rc<EvalScopeDesc>>,
@@ -158,6 +180,17 @@ pub struct FuncProto {
     pub templates: Vec<TemplateParts>,
 }
 
+/// One inline-cache entry (see [`FuncProto::ic`]). `own_slot` indexes the
+/// RECEIVER's own property map; independently, `proto_slot` indexes `holder`
+/// (the receiver's direct prototype as last seen). Two separate slots keep
+/// the hot own-property hit path from ever touching the holder `RefCell`.
+#[derive(Debug, Default)]
+pub struct IcEntry {
+    pub own_slot: std::cell::Cell<u32>,
+    pub proto_slot: std::cell::Cell<u32>,
+    pub holder: std::cell::RefCell<Option<crate::value::JsObject>>,
+}
+
 impl FuncProto {
     pub fn empty(name: &str, kind: FuncKind) -> FuncProto {
         FuncProto {
@@ -176,6 +209,9 @@ impl FuncProto {
             mapped_param_cells: Vec::new(),
             is_strict: false,
             stable_cells: Vec::new(),
+            stable_flags: Box::new([]),
+            localized: Box::new([]),
+            ic: Box::new([]),
             eval_scopes: Vec::new(),
             this_cell: None,
             inherit_home: false,
@@ -322,8 +358,58 @@ pub enum Op {
     LoadRestArgs(u32),
 
     // ---- locals / cells / upvalues / globals ----
+    /// Read a `frame.locals` slot (a provably-uncaptured binding, rewritten
+    /// from `LoadCell` by the localization pass — see `localize.rs`). Keeps
+    /// the same TDZ check as `LoadCell`.
     LoadLocal(u32),
     StoreLocal(u32),
+    /// As [`Op::StoreLocal`] but throws a ReferenceError while the slot is in
+    /// the Temporal Dead Zone (mirror of `StoreCellChecked`).
+    StoreLocalChecked(u32),
+    /// Put the TDZ marker in a local slot (mirror of `InitCellTdz`).
+    InitLocalTdz(u32),
+    /// Superinstruction: `LoadLocal ; LoadConst` (mirror of `LoadCellConst`).
+    LoadLocalConst {
+        local: u32,
+        konst: u32,
+    },
+    /// Superinstruction: a whole `i < N` loop test on a localized binding
+    /// (mirror of `CmpCellConstBranchFalse`).
+    CmpLocalConstBranchFalse {
+        local: u32,
+        konst: u32,
+        cmp: CmpOp,
+        target: u32,
+    },
+    CmpLocalConstBranchTrue {
+        local: u32,
+        konst: u32,
+        cmp: CmpOp,
+        target: u32,
+    },
+    /// Superinstruction: `local + const` via `op_add` (mirror of `AddCellConst`).
+    AddLocalConst {
+        local: u32,
+        konst: u32,
+    },
+    /// Superinstruction: `local <op> const` via `Vm::arith`.
+    ArithLocalConst {
+        local: u32,
+        konst: u32,
+        kind: crate::exec::ArithKind,
+    },
+    /// Superinstruction: statement-position `i++`/`--i` on a localized binding
+    /// (mirror of `IncCellStmt`; same TDZ + ToNumeric + unary semantics).
+    IncLocalStmt {
+        local: u32,
+        dec: bool,
+    },
+    /// Superinstruction: `LoadLocal(src) ; StoreLocal(dest)` — the localized
+    /// per-iteration `let` copy. Keeps the TDZ check on the read.
+    CopyLocal {
+        src: u32,
+        dest: u32,
+    },
     LoadCell(u32),
     /// Superinstruction (fusion): `LoadCell(cell) ; LoadConst(konst)` — the
     /// single most frequent adjacent pair in the Phase-0 survey (~8.9% of
@@ -657,6 +743,59 @@ pub enum Op {
     CmpBranchTrue {
         cmp: CmpOp,
         target: u32,
+    },
+    /// Superinstruction: `LoadCellConst ; CmpBranchFalse` — the complete
+    /// top-tested loop condition (`i < N`) in ONE dispatch. The cell read keeps
+    /// the `LoadCell` TDZ check; the comparison and branch reuse the
+    /// `CmpBranchFalse` helpers, so coercion order and thrown errors are
+    /// identical to the unfused sequence.
+    CmpCellConstBranchFalse {
+        cell: u32,
+        konst: u32,
+        cmp: CmpOp,
+        target: u32,
+    },
+    /// Mirror of [`Op::CmpCellConstBranchFalse`] for `JumpIfTrue` back-edges.
+    CmpCellConstBranchTrue {
+        cell: u32,
+        konst: u32,
+        cmp: CmpOp,
+        target: u32,
+    },
+    /// Superinstruction: `LoadCellConst ; Add` — push `cell + konst` via the
+    /// same `op_add` helper (Number fast path, string concat, coercions and
+    /// throws identical). The `fib(n - 1)`-style argument computation.
+    AddCellConst {
+        cell: u32,
+        konst: u32,
+    },
+    /// Superinstruction: `LoadCellConst ; <binop>` for the non-`Add` binary
+    /// arithmetic/bitwise ops — push `cell <op> konst` via the same
+    /// `Vm::arith` helper.
+    ArithCellConst {
+        cell: u32,
+        konst: u32,
+        kind: crate::exec::ArithKind,
+    },
+    /// Superinstruction: a statement-position `i++`/`++i`/`i--`/`--i` on a cell
+    /// binding — the 6-op window `LoadCell; ToNumeric; Dup; Inc; StoreCell; Pop`
+    /// (or its prefix mirror) collapsed to one dispatch. Semantics preserved
+    /// exactly: TDZ check on the read, `ToNumeric` (which may run user code —
+    /// `valueOf` — that reassigns the binding first), then the same
+    /// `unary_arith` increment, then a plain in-place `StoreCell` write. The
+    /// old/new values the sequence would leave on the stack are consumed by the
+    /// window's own `Dup`/`Pop`, so eliding them is unobservable.
+    IncCellStmt {
+        cell: u32,
+        dec: bool,
+    },
+    /// Superinstruction: `LoadCell(src) ; InitCell(dest)` — the per-iteration
+    /// `let` copy at loop-body entry (5.0% of executed pairs in the Phase-0
+    /// survey). Same TDZ check on the read; the init keeps `InitCell`'s
+    /// stable-vs-fresh-`Rc` behavior for `dest`.
+    LoadCellInit {
+        src: u32,
+        dest: u32,
     },
     /// Pop; jump if falsy but leave the value if truthy (for `&&`). Actually we
     /// implement `&&`/`||`/`??` with peek-based jumps below.

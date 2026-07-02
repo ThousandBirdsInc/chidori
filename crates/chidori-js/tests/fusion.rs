@@ -67,6 +67,33 @@ const CORPUS: &[&str] = &[
     // A comparison whose operand coercion THROWS — fused and unfused must throw
     // identically (Symbol → number is a TypeError).
     "let s = Symbol(); for (let i = 0; i < 3; i++) { console.log(i < s); }",
+    // --- IncCellStmt (fused statement-position ++/--) ---
+    // Prefix and postfix, inc and dec, including via `var`.
+    "let i = 0; i++; ++i; console.log(i); var j = 5; j--; --j; console.log(j);",
+    // ToNumeric coercion runs user code that REASSIGNS the binding mid-update:
+    // the increment must apply to the coerced OLD value, exactly like the
+    // unfused sequence (i ends as valueOf-result + 1, not 100 + 1).
+    "let i = { valueOf() { i = 100; return 7; } }; i++; console.log(i);",
+    // BigInt increments must stay BigInt.
+    "let b = 1n; b++; ++b; console.log(b); let c = 0n; c--; console.log(c);",
+    // String coercion: '5'++ becomes number 6.
+    "let s5 = '5'; s5++; console.log(s5, typeof s5);",
+    // NaN from a non-numeric string.
+    "let q = 'x'; q++; console.log(q);",
+    // The RESULT-USED forms must NOT fuse (no trailing Pop) and stay correct.
+    "let k = 3; console.log(k++, k, ++k, k, k--, k, --k, k);",
+    // --- AddCellConst / ArithCellConst ---
+    // String concat via the fused Add (op_add semantics).
+    "let name = 'a'; for (let i = 0; i < 3; i++) { console.log(name + '!', i - 1, i * 2, i % 2, i / 2); }",
+    // Coercion order with a throwing valueOf on the cell operand.
+    "let t = { valueOf() { throw new Error('boom'); } }; try { let r = t - 1; } catch (e) { console.log('caught', e.message); }",
+    // Bitwise fused kinds.
+    "for (let i = 0; i < 4; i++) { console.log(i & 1, i | 8, i ^ 3, i << 2, i >> 1, i >>> 1); }",
+    // --- LoadCellInit (per-iteration let copy) + closures ---
+    // Each iteration's closure must capture a DISTINCT binding (fresh cell).
+    "const fs = []; for (let i = 0; i < 3; i++) { fs.push(() => i); } console.log(fs.map(f => f()).join(','));",
+    // TDZ: reading a hoisted let before init still throws through fused ops.
+    "try { xTdz++; } catch (e) { console.log(e.constructor.name); } let xTdz = 1;",
 ];
 
 #[test]
@@ -95,33 +122,92 @@ fn count_ops(proto: &FuncProto, pred: fn(&Op) -> bool) -> usize {
     here + nested
 }
 
+fn is_any_fused(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::CmpBranchFalse { .. }
+            | Op::CmpBranchTrue { .. }
+            | Op::LoadCellConst { .. }
+            | Op::CmpCellConstBranchFalse { .. }
+            | Op::CmpCellConstBranchTrue { .. }
+            | Op::AddCellConst { .. }
+            | Op::ArithCellConst { .. }
+            | Op::IncCellStmt { .. }
+            | Op::LoadCellInit { .. }
+            | Op::LoadLocalConst { .. }
+            | Op::CmpLocalConstBranchFalse { .. }
+            | Op::CmpLocalConstBranchTrue { .. }
+            | Op::AddLocalConst { .. }
+            | Op::ArithLocalConst { .. }
+            | Op::IncLocalStmt { .. }
+            | Op::CopyLocal { .. }
+    )
+}
+
 #[test]
 fn fusion_actually_fires() {
-    // A plain counting loop fuses both its operand-load pair (`LoadCell ;
-    // LoadConst`) and its compare-and-branch (`Lt ; JumpIfFalse`).
+    // A plain counting loop's whole condition (`Load* ; LoadConst ; Lt ;
+    // JumpIfFalse`) collapses — via the fixpoint over pair fusions — into a
+    // single compare-and-branch superinstruction, and its statement-position
+    // `i++` into a single Inc*Stmt. With the localization pass on (the
+    // default), the uncaptured loop counter takes the LOCAL forms; a captured
+    // counter takes the CELL forms (asserted separately below).
     let fused = compile_script_opts("for (let i = 0; i < 10; i++) { i + 1; }", true).unwrap();
     assert!(
-        count_ops(&fused, |op| matches!(op, Op::CmpBranchFalse { .. })) >= 1,
-        "expected the loop condition to fuse into CmpBranchFalse"
+        count_ops(&fused, |op| matches!(
+            op,
+            Op::CmpLocalConstBranchFalse { .. }
+        )) >= 1,
+        "expected the loop condition to fuse into CmpLocalConstBranchFalse"
     );
     assert!(
-        count_ops(&fused, |op| matches!(op, Op::LoadCellConst { .. })) >= 1,
-        "expected the operand loads to fuse into LoadCellConst"
+        count_ops(&fused, |op| matches!(
+            op,
+            Op::IncLocalStmt { dec: false, .. }
+        )) >= 1,
+        "expected the update i++ to fuse into IncLocalStmt"
     );
-    // A bottom-tested loop fuses its back-edge into CmpBranchTrue.
+    assert!(
+        count_ops(&fused, |op| matches!(op, Op::AddLocalConst { .. })) >= 1,
+        "expected the body's i + 1 to fuse into AddLocalConst"
+    );
+    // A CAPTURED counter stays a cell and takes the CELL superinstructions.
+    let cellfused = compile_script_opts(
+        "const fs = []; for (let i = 0; i < 10; i++) { fs.push(() => i); i + 1; }",
+        true,
+    )
+    .unwrap();
+    assert!(
+        count_ops(&cellfused, |op| matches!(
+            op,
+            Op::CmpCellConstBranchFalse { .. }
+        )) >= 1,
+        "expected a captured counter's loop test to fuse into CmpCellConstBranchFalse"
+    );
+    // A bottom-tested loop fuses its back-edge into CmpLocalConstBranchTrue.
     let dw = compile_script_opts("let i = 0; do { i++; } while (i < 5);", true).unwrap();
     assert!(
-        count_ops(&dw, |op| matches!(op, Op::CmpBranchTrue { .. })) >= 1,
-        "expected the do/while back-edge to fuse into CmpBranchTrue"
+        count_ops(&dw, |op| matches!(op, Op::CmpLocalConstBranchTrue { .. })) >= 1,
+        "expected the do/while back-edge to fuse into CmpLocalConstBranchTrue"
+    );
+    // Non-const RHS comparisons still stop at the pair-fused CmpBranchFalse.
+    let nc =
+        compile_script_opts("let n = 7; for (let i = 0; i < n; i++) { i * 2; }", true).unwrap();
+    assert!(
+        count_ops(&nc, |op| matches!(
+            op,
+            Op::CmpBranchFalse { .. }
+                | Op::CmpCellConstBranchFalse { .. }
+                | Op::CmpLocalConstBranchFalse { .. }
+        )) >= 1,
+        "expected a fused compare-and-branch for a non-const bound"
     );
     // The toggle must genuinely suppress every fusion (so the unfused side of the
     // differential test is really unfused).
     let unfused = compile_script_opts("for (let i = 0; i < 10; i++) { i + 1; }", false).unwrap();
-    let any_fused = count_ops(&unfused, |op| {
-        matches!(
-            op,
-            Op::CmpBranchFalse { .. } | Op::CmpBranchTrue { .. } | Op::LoadCellConst { .. }
-        )
-    });
-    assert_eq!(any_fused, 0, "fusion toggle off must emit no fused ops");
+    assert_eq!(
+        count_ops(&unfused, is_any_fused),
+        0,
+        "fusion toggle off must emit no fused ops"
+    );
 }

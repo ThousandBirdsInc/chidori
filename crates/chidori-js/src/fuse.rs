@@ -55,7 +55,12 @@ fn for_each_ip(op: &mut Op, mut f: impl FnMut(&mut u32)) {
         | Op::JumpIfTruthyPeek(t)
         | Op::JumpIfNullishPeek(t)
         | Op::JumpIfNullish(t) => f(t),
-        Op::CmpBranchFalse { target, .. } | Op::CmpBranchTrue { target, .. } => f(target),
+        Op::CmpBranchFalse { target, .. }
+        | Op::CmpBranchTrue { target, .. }
+        | Op::CmpCellConstBranchFalse { target, .. }
+        | Op::CmpCellConstBranchTrue { target, .. }
+        | Op::CmpLocalConstBranchFalse { target, .. }
+        | Op::CmpLocalConstBranchTrue { target, .. } => f(target),
         Op::PushTryHandler { catch, finally } => {
             f(catch);
             if *finally != u32::MAX {
@@ -94,16 +99,179 @@ fn cmp_of(op: &Op) -> Option<CmpOp> {
 /// (the `exec.rs` handlers reuse the standalone ops' helpers). The jump targets
 /// carried here are still OLD indices; the caller remaps them afterwards.
 fn try_fuse(a: &Op, b: &Op) -> Option<Op> {
+    use crate::exec::ArithKind;
     match (a, b) {
         // Highest-frequency pair in the Phase-0 survey (~8.9%).
         (Op::LoadCell(cell), Op::LoadConst(konst)) => Some(Op::LoadCellConst {
             cell: *cell,
             konst: *konst,
         }),
+        // Per-iteration `let` copy at loop-body entry (~5.0% of executed pairs).
+        (Op::LoadCell(src), Op::InitCell(dest)) => Some(Op::LoadCellInit {
+            src: *src,
+            dest: *dest,
+        }),
+        // Local mirrors (produced by the localization pass; see localize.rs).
+        (Op::LoadLocal(local), Op::LoadConst(konst)) => Some(Op::LoadLocalConst {
+            local: *local,
+            konst: *konst,
+        }),
+        (Op::LoadLocal(src), Op::StoreLocal(dest)) => Some(Op::CopyLocal {
+            src: *src,
+            dest: *dest,
+        }),
+        (Op::LoadLocalConst { local, konst }, Op::CmpBranchFalse { cmp, target }) => {
+            Some(Op::CmpLocalConstBranchFalse {
+                local: *local,
+                konst: *konst,
+                cmp: *cmp,
+                target: *target,
+            })
+        }
+        (Op::LoadLocalConst { local, konst }, Op::CmpBranchTrue { cmp, target }) => {
+            Some(Op::CmpLocalConstBranchTrue {
+                local: *local,
+                konst: *konst,
+                cmp: *cmp,
+                target: *target,
+            })
+        }
+        (Op::LoadLocalConst { local, konst }, Op::Add) => Some(Op::AddLocalConst {
+            local: *local,
+            konst: *konst,
+        }),
+        (Op::LoadLocalConst { local, konst }, op) => {
+            let kind = match op {
+                Op::Sub => ArithKind::Sub,
+                Op::Mul => ArithKind::Mul,
+                Op::Div => ArithKind::Div,
+                Op::Mod => ArithKind::Mod,
+                Op::Pow => ArithKind::Pow,
+                Op::BitAnd => ArithKind::BitAnd,
+                Op::BitOr => ArithKind::BitOr,
+                Op::BitXor => ArithKind::BitXor,
+                Op::Shl => ArithKind::Shl,
+                Op::Shr => ArithKind::Shr,
+                Op::UShr => ArithKind::UShr,
+                _ => return None,
+            };
+            Some(Op::ArithLocalConst {
+                local: *local,
+                konst: *konst,
+                kind,
+            })
+        }
+        // Second-round fusions over already-fused ops (the pass runs to a fixed
+        // point): a whole `i < N` loop test, or a `cell <op> const` operand
+        // computation, in one dispatch.
+        (Op::LoadCellConst { cell, konst }, Op::CmpBranchFalse { cmp, target }) => {
+            Some(Op::CmpCellConstBranchFalse {
+                cell: *cell,
+                konst: *konst,
+                cmp: *cmp,
+                target: *target,
+            })
+        }
+        (Op::LoadCellConst { cell, konst }, Op::CmpBranchTrue { cmp, target }) => {
+            Some(Op::CmpCellConstBranchTrue {
+                cell: *cell,
+                konst: *konst,
+                cmp: *cmp,
+                target: *target,
+            })
+        }
+        (Op::LoadCellConst { cell, konst }, Op::Add) => Some(Op::AddCellConst {
+            cell: *cell,
+            konst: *konst,
+        }),
+        (Op::LoadCellConst { cell, konst }, op) => {
+            let kind = match op {
+                Op::Sub => ArithKind::Sub,
+                Op::Mul => ArithKind::Mul,
+                Op::Div => ArithKind::Div,
+                Op::Mod => ArithKind::Mod,
+                Op::Pow => ArithKind::Pow,
+                Op::BitAnd => ArithKind::BitAnd,
+                Op::BitOr => ArithKind::BitOr,
+                Op::BitXor => ArithKind::BitXor,
+                Op::Shl => ArithKind::Shl,
+                Op::Shr => ArithKind::Shr,
+                Op::UShr => ArithKind::UShr,
+                _ => return None,
+            };
+            Some(Op::ArithCellConst {
+                cell: *cell,
+                konst: *konst,
+                kind,
+            })
+        }
         // Compare-and-branch: the loop-test idiom and its bottom-tested mirror.
         (_, Op::JumpIfFalse(t)) => cmp_of(a).map(|cmp| Op::CmpBranchFalse { cmp, target: *t }),
         (_, Op::JumpIfTrue(t)) => cmp_of(a).map(|cmp| Op::CmpBranchTrue { cmp, target: *t }),
         _ => None,
+    }
+}
+
+/// Match a fusable window starting at `code[i]`, longest patterns first.
+/// Returns the fused op and the window length. A window is only offered when
+/// none of its INTERIOR instructions is a jump target (`is_target`); the head
+/// may be one (entering the fused op == entering the sequence at its head).
+fn try_fuse_window(code: &[Op], i: usize, is_target: &[bool]) -> Option<(Op, usize)> {
+    let interior_free = |len: usize| (i + 1..i + len).all(|j| !is_target[j]);
+    // The 6-op statement-position increment idiom, postfix and prefix:
+    //   LoadCell(c); ToNumeric; Dup; Inc; StoreCell(c); Pop     (i++;)
+    //   LoadCell(c); ToNumeric; Inc; Dup; StoreCell(c); Pop     (++i;)
+    // (and the Dec mirrors). The window must read and write the SAME cell.
+    if i + 6 <= code.len() && interior_free(6) {
+        if let (Op::LoadCell(c), Op::ToNumeric) = (&code[i], &code[i + 1]) {
+            let dec = match (&code[i + 2], &code[i + 3]) {
+                (Op::Dup, Op::Inc) | (Op::Inc, Op::Dup) => Some(false),
+                (Op::Dup, Op::Dec) | (Op::Dec, Op::Dup) => Some(true),
+                _ => None,
+            };
+            if let Some(dec) = dec {
+                if matches!((&code[i + 4], &code[i + 5]), (Op::StoreCell(c2), Op::Pop) if c2 == c) {
+                    return Some((Op::IncCellStmt { cell: *c, dec }, 6));
+                }
+            }
+        }
+    }
+    // The same 6-op increment idiom on a LOCALIZED binding.
+    if i + 6 <= code.len() && interior_free(6) {
+        if let (Op::LoadLocal(c), Op::ToNumeric) = (&code[i], &code[i + 1]) {
+            let dec = match (&code[i + 2], &code[i + 3]) {
+                (Op::Dup, Op::Inc) | (Op::Inc, Op::Dup) => Some(false),
+                (Op::Dup, Op::Dec) | (Op::Dec, Op::Dup) => Some(true),
+                _ => None,
+            };
+            if let Some(dec) = dec {
+                if matches!((&code[i + 4], &code[i + 5]), (Op::StoreLocal(c2), Op::Pop) if c2 == c)
+                {
+                    return Some((Op::IncLocalStmt { local: *c, dec }, 6));
+                }
+            }
+        }
+    }
+    if i + 2 <= code.len() && interior_free(2) {
+        if let Some(op) = try_fuse(&code[i], &code[i + 1]) {
+            return Some((op, 2));
+        }
+    }
+    None
+}
+
+/// Fuse to a fixed point: some superinstructions are built from ops that are
+/// themselves fusion products (`LoadCellConst ; CmpBranchFalse` →
+/// `CmpCellConstBranchFalse`), so the single pass repeats until no window
+/// shrinks the code. Every fusion strictly shortens `code`, so this
+/// terminates in at most a few rounds.
+pub fn fuse_code_fixpoint(mut code: Vec<Op>) -> Vec<Op> {
+    loop {
+        let before = code.len();
+        code = fuse_code(code);
+        if code.len() == before {
+            return code;
+        }
     }
 }
 
@@ -141,20 +309,19 @@ pub fn fuse_code(code: Vec<Op>) -> Vec<Op> {
     let mut old_to_new = vec![0u32; n + 1];
     let mut i = 0usize;
     while i < n {
-        // A window may fuse only when nothing jumps into its interior (`i + 1`):
-        // jumps to its head stay valid (entering the fused op == entering the
-        // sequence at its head), but a jump landing on the second op needs that
-        // op to remain independently addressable.
-        if i + 1 < n && !is_target[i + 1] {
-            if let Some(fused) = try_fuse(&code[i], &code[i + 1]) {
-                old_to_new[i] = out.len() as u32;
-                // The fused op replaces both slots; old index i+1 is interior and
-                // never a jump target, so its mapping is unobservable.
-                old_to_new[i + 1] = out.len() as u32;
-                out.push(fused);
-                i += 2;
-                continue;
+        // A window may fuse only when nothing jumps into its interior: jumps to
+        // its head stay valid (entering the fused op == entering the sequence
+        // at its head), but a jump landing on any later op of the window needs
+        // that op to remain independently addressable.
+        if let Some((fused, len)) = try_fuse_window(&code, i, &is_target) {
+            // The fused op replaces the whole window; the interior old indices
+            // are never jump targets, so their mapping is unobservable.
+            for slot in &mut old_to_new[i..i + len] {
+                *slot = out.len() as u32;
             }
+            out.push(fused);
+            i += len;
+            continue;
         }
         old_to_new[i] = out.len() as u32;
         out.push(code[i].clone());

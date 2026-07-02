@@ -48,6 +48,140 @@ impl Vm {
         Err(self.throw_type(&format!("{desc} is not a function")))
     }
 
+    /// As [`Vm::call`], but takes OWNERSHIP of the argument buffer. The
+    /// interpreter's call ops route here so a plain JS->JS call moves its
+    /// (pooled) argument vec straight into the callee frame -- the &[Value]
+    /// path copies the arguments a second time in make_frame. Native/bound/
+    /// proxy callees borrow the vec and recycle it; every early error simply
+    /// drops it (a pool miss, never a leak).
+    pub(crate) fn call_valuevec(
+        &mut self,
+        func: Value,
+        this: Value,
+        args: Vec<Value>,
+    ) -> Result<Value, Value> {
+        if let Value::Object(o) = &func {
+            let o = o.clone();
+            let (callable, is_proxy) = {
+                let b = o.borrow();
+                (b.is_callable(), matches!(b.internal, Internal::Proxy(_)))
+            };
+            if is_proxy {
+                if callable {
+                    let r = self.proxy_call(&o, this, &args);
+                    self.recycle_value_vec(args);
+                    return r;
+                }
+            } else if callable {
+                return self.call_object_vec(&o, this, args, Value::Undefined);
+            }
+        }
+        let desc = self.describe(&func);
+        Err(self.throw_type(&format!("{desc} is not a function")))
+    }
+
+    pub(crate) fn call_object_vec(
+        &mut self,
+        obj: &JsObject,
+        this: Value,
+        args: Vec<Value>,
+        new_target: Value,
+    ) -> Result<Value, Value> {
+        self.call_depth += 1;
+        if self.call_depth > self.max_call_depth {
+            self.call_depth -= 1;
+            return Err(self.throw_range("Maximum call stack size exceeded"));
+        }
+        let result = self.call_object_inner_vec(obj, this, args, new_target);
+        self.call_depth -= 1;
+        result
+    }
+
+    fn call_object_inner_vec(
+        &mut self,
+        obj: &JsObject,
+        this: Value,
+        mut args: Vec<Value>,
+        new_target: Value,
+    ) -> Result<Value, Value> {
+        enum Disp {
+            Native(NativeFn),
+            Bytecode(Rc<BytecodeFunction>),
+            Bound(JsObject, Value, Vec<Value>),
+        }
+        let disp = {
+            let b = obj.borrow();
+            match b.as_function() {
+                Some(FunctionInner::Native(nf)) => Disp::Native(nf.func.clone()),
+                Some(FunctionInner::Bytecode(bf)) => Disp::Bytecode(bf.clone()),
+                Some(FunctionInner::Bound(bound)) => Disp::Bound(
+                    bound.target.clone(),
+                    bound.bound_this.clone(),
+                    bound.bound_args.clone(),
+                ),
+                None => return Err(self.throw_type("not a function")),
+            }
+        };
+        match disp {
+            Disp::Native(f) => {
+                let r = f(self, this, &args);
+                self.recycle_value_vec(args);
+                r
+            }
+            Disp::Bound(target, bthis, bargs) => {
+                let mut all = bargs;
+                all.append(&mut args);
+                self.recycle_value_vec(args);
+                self.call_object_vec(&target, bthis, all, new_target)
+            }
+            Disp::Bytecode(bf) => self.call_bytecode_vec(obj, bf, this, args, new_target),
+        }
+    }
+
+    fn call_bytecode_vec(
+        &mut self,
+        func_obj: &JsObject,
+        bf: Rc<BytecodeFunction>,
+        this: Value,
+        args: Vec<Value>,
+        new_target: Value,
+    ) -> Result<Value, Value> {
+        let kind = bf.proto.kind;
+        if bf.is_class_ctor {
+            return Err(self.throw_type(&format!(
+                "Class constructor {} cannot be invoked without 'new'",
+                bf.proto.name
+            )));
+        }
+        if kind.is_generator() {
+            let r = self.make_generator(func_obj, bf, this, &args, new_target);
+            self.recycle_value_vec(args);
+            return r;
+        }
+        let mut frame = self.make_frame_owned(bf, this, args, new_target);
+        frame.func_obj = Some(func_obj.clone());
+        let token = self.trace_enter(&frame.func.proto);
+        frame.trace_token = token;
+        if kind.is_async() {
+            Ok(self.start_async(frame))
+        } else {
+            match self.run_frame(frame) {
+                Flow::Return(v) => {
+                    self.trace_exit(token, false);
+                    Ok(v)
+                }
+                Flow::Throw(e) => {
+                    self.trace_exit(token, true);
+                    Err(e)
+                }
+                Flow::Suspend(_) => {
+                    let _ = func_obj;
+                    Err(self.throw_type("internal: sync function suspended"))
+                }
+            }
+        }
+    }
+
     fn describe(&self, v: &Value) -> String {
         match v {
             Value::Undefined | Value::Uninitialized | Value::Hole => "undefined".into(),
@@ -89,7 +223,7 @@ impl Vm {
         // recursive call.
         enum Disp {
             Native(NativeFn),
-            Bytecode(BytecodeFunction),
+            Bytecode(Rc<BytecodeFunction>),
             Bound(JsObject, Value, Vec<Value>),
         }
         let disp = {
@@ -119,7 +253,7 @@ impl Vm {
     fn call_bytecode(
         &mut self,
         func_obj: &JsObject,
-        bf: BytecodeFunction,
+        bf: Rc<BytecodeFunction>,
         this: Value,
         args: &[Value],
         new_target: Value,
@@ -316,19 +450,71 @@ impl Vm {
         self.recycle_value_vec(stack);
         self.recycle_value_vec(locals);
         self.recycle_value_vec(args);
+        let mut cells = std::mem::take(&mut frame.cells);
+        for cell in cells.drain(..) {
+            self.recycle_cell(cell);
+        }
+        if cells.capacity() > 0 && self.cells_vec_pool.len() < Self::VALUE_VEC_POOL_CAP {
+            self.cells_vec_pool.push(cells);
+        }
+    }
+
+    /// Pull a binding cell holding `v` from the pool, or allocate a fresh one.
+    pub(crate) fn take_cell(&mut self, v: Value) -> Rc<RefCell<Value>> {
+        match self.cell_pool.pop() {
+            Some(c) => {
+                *c.borrow_mut() = v;
+                c
+            }
+            None => Rc::new(RefCell::new(v)),
+        }
+    }
+
+    /// Return a cell to the pool — ONLY when nothing else can ever see it
+    /// (`strong_count == 1`; a cell captured by a closure, upvalue chain,
+    /// mapped-arguments alias, or module link stays out). Cleared on the way
+    /// in so the pool never extends a value's lifetime.
+    pub(crate) fn recycle_cell(&mut self, c: Rc<RefCell<Value>>) {
+        if Rc::strong_count(&c) == 1 && self.cell_pool.len() < Self::VALUE_VEC_POOL_CAP {
+            *c.borrow_mut() = Value::Undefined;
+            self.cell_pool.push(c);
+        }
     }
 
     pub fn make_frame(
         &mut self,
-        bf: BytecodeFunction,
+        bf: Rc<BytecodeFunction>,
         this: Value,
         args: &[Value],
         new_target: Value,
     ) -> Frame {
+        let mut args_buf = self.take_value_vec();
+        args_buf.extend_from_slice(args);
+        self.make_frame_owned(bf, this, args_buf, new_target)
+    }
+
+    /// As [`Vm::make_frame`], but adopts an already-owned argument buffer
+    /// (the interpreter's pooled call-op buffer) as `frame.args` directly,
+    /// skipping the copy. `recycle_frame` returns it to the pool at exit.
+    pub fn make_frame_owned(
+        &mut self,
+        bf: Rc<BytecodeFunction>,
+        this: Value,
+        args: Vec<Value>,
+        new_target: Value,
+    ) -> Frame {
         let proto = bf.proto.clone();
-        let cells = (0..proto.num_cells)
-            .map(|_| Rc::new(RefCell::new(Value::Undefined)))
-            .collect();
+        let mut cells = self.cells_vec_pool.pop().unwrap_or_default();
+        for i in 0..proto.num_cells as usize {
+            // A localized index lives in `frame.locals`; its cell slot is a
+            // shared never-read placeholder (`Rc` bump, no pool round-trip).
+            let c = if proto.localized.get(i).copied().unwrap_or(false) {
+                self.dummy_cell.clone()
+            } else {
+                self.take_cell(Value::Undefined)
+            };
+            cells.push(c);
+        }
         // A closure created inside `with (o) { … }` carries the with-object
         // chain; seed the frame's with-scope stack with it so the body's
         // dynamic name ops resolve against it (under any with the body enters).
@@ -340,8 +526,7 @@ impl Vm {
         stack.reserve(8);
         let mut locals = self.take_value_vec();
         locals.resize(proto.num_locals as usize, Value::Undefined);
-        let mut args_buf = self.take_value_vec();
-        args_buf.extend_from_slice(args);
+        let args_buf = args;
         Frame {
             func: bf,
             ip: 0,
@@ -408,7 +593,7 @@ impl Vm {
     ) -> Result<Value, Value> {
         enum Disp {
             Native(NativeFn),
-            Bytecode(BytecodeFunction),
+            Bytecode(Rc<BytecodeFunction>),
             Bound(JsObject, Vec<Value>),
             NotCtor,
         }
@@ -809,7 +994,7 @@ impl Vm {
             };
             upvalues.push(cell);
         }
-        let bf = BytecodeFunction {
+        let bf = Rc::new(BytecodeFunction {
             proto: Rc::new(compiled.proto),
             upvalues,
             home_object: frame.func.home_object.clone(),
@@ -817,7 +1002,7 @@ impl Vm {
             captured_with: frame.with_scope.clone(),
             // The eval body resolves `#x` against the caller's private scope.
             captured_priv_env: frame.priv_env.clone(),
-        };
+        });
         self.call_depth += 1;
         if self.call_depth > self.max_call_depth {
             self.call_depth -= 1;
@@ -984,10 +1169,104 @@ impl Vm {
                 push!(o);
             }
 
-            Op::LoadLocal(i) => push!(frame.locals[*i as usize].clone()),
+            Op::LoadLocal(i) => {
+                let v = frame.locals[*i as usize].clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                push!(v);
+            }
             Op::StoreLocal(i) => {
                 let v = pop!();
                 frame.locals[*i as usize] = v;
+            }
+            Op::StoreLocalChecked(i) => {
+                let v = pop!();
+                let slot = &mut frame.locals[*i as usize];
+                if matches!(slot, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                *slot = v;
+            }
+            Op::InitLocalTdz(i) => {
+                frame.locals[*i as usize] = Value::Uninitialized;
+            }
+            // Local mirrors of the cell superinstructions — same helpers, same
+            // TDZ checks, minus the Rc/RefCell indirection.
+            Op::LoadLocalConst { local, konst } => {
+                let v = frame.locals[*local as usize].clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                push!(v);
+                push!(self.const_val(frame, *konst));
+            }
+            Op::CmpLocalConstBranchFalse {
+                local,
+                konst,
+                cmp,
+                target,
+            } => {
+                let a = frame.locals[*local as usize].clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                if !self.cmp_values(*cmp, &a, &b)? {
+                    return Ok(Ctl::Jump(*target as usize));
+                }
+            }
+            Op::CmpLocalConstBranchTrue {
+                local,
+                konst,
+                cmp,
+                target,
+            } => {
+                let a = frame.locals[*local as usize].clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                if self.cmp_values(*cmp, &a, &b)? {
+                    return Ok(Ctl::Jump(*target as usize));
+                }
+            }
+            Op::AddLocalConst { local, konst } => {
+                let a = frame.locals[*local as usize].clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                let r = self.op_add(a, b)?;
+                push!(r);
+            }
+            Op::ArithLocalConst { local, konst, kind } => {
+                let a = frame.locals[*local as usize].clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                let r = self.arith(a, b, *kind)?;
+                push!(r);
+            }
+            Op::IncLocalStmt { local, dec } => {
+                let v = frame.locals[*local as usize].clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                // ToNumeric may run user code, but a localized binding is
+                // reachable only from this frame, so read-coerce-write is
+                // exactly the unfused sequence.
+                let n = self.to_numeric(&v)?;
+                let r = self.unary_arith(n, if *dec { UnaryKind::Dec } else { UnaryKind::Inc })?;
+                frame.locals[*local as usize] = r;
+            }
+            Op::CopyLocal { src, dest } => {
+                let v = frame.locals[*src as usize].clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                frame.locals[*dest as usize] = v;
             }
             Op::LoadCell(i) => {
                 let v = frame.cells[*i as usize].borrow().clone();
@@ -1026,19 +1305,23 @@ impl Vm {
                 // pre-wired import binding (or self-reference) keeps pointing at
                 // the live cell. All other bindings get a fresh `Rc` (needed for
                 // per-iteration `let` semantics).
-                if frame.func.proto.stable_cells.contains(&i) {
+                if frame.func.proto.stable_flags[*i as usize] {
                     *frame.cells[*i as usize].borrow_mut() = v;
                 } else {
-                    frame.cells[*i as usize] = Rc::new(RefCell::new(v));
+                    let fresh = self.take_cell(v);
+                    let old = std::mem::replace(&mut frame.cells[*i as usize], fresh);
+                    self.recycle_cell(old);
                 }
             }
             Op::InitCellTdz(i) => {
                 // Fresh cell holding the Temporal Dead Zone marker (a hoisted
                 // `let`/`const`/`class` binding before its initializer runs).
-                if frame.func.proto.stable_cells.contains(&i) {
+                if frame.func.proto.stable_flags[*i as usize] {
                     *frame.cells[*i as usize].borrow_mut() = Value::Uninitialized;
                 } else {
-                    frame.cells[*i as usize] = Rc::new(RefCell::new(Value::Uninitialized));
+                    let fresh = self.take_cell(Value::Uninitialized);
+                    let old = std::mem::replace(&mut frame.cells[*i as usize], fresh);
+                    self.recycle_cell(old);
                 }
             }
             Op::LoadUpvalue(i) => {
@@ -1063,21 +1346,47 @@ impl Vm {
             }
             Op::LoadGlobal(i) => {
                 let name = self.const_name(frame, *i);
-                let key = PropertyKey::Str(name.clone());
                 let g = self.realm.global.clone();
+                // Inline cache (key-verified slot hint; see `FuncProto::ic`):
+                // after the first resolution, a global read — above all a
+                // function resolving its own recursive self-reference — is one
+                // indexed load plus a pointer-equality key check, no hashing.
+                if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
+                    let b = g.borrow();
+                    if let Some((PropertyKey::Str(k), prop)) =
+                        b.props.get_index(ic.own_slot.get() as usize)
+                    {
+                        if let PropertyKind::Data { value, .. } = &prop.kind {
+                            if k == &name {
+                                let v = value.clone();
+                                drop(b);
+                                push!(v);
+                                return Ok(Ctl::Next);
+                            }
+                        }
+                    }
+                }
+                let key = PropertyKey::Str(name.clone());
                 // Fast path: an own data property directly on the global object —
-                // the case for every top-level `function`/`var`/`let` binding,
-                // including a function's own recursive self-reference. Resolves
-                // in a single hash with no prototype walk, replacing the previous
-                // existence-check-then-get that walked (and hashed) the chain
-                // twice on every global read.
+                // the case for every top-level `function`/`var`/`let` binding.
+                // Resolves in a single hash with no prototype walk, and refills
+                // the inline cache with the slot it finds.
                 let fast = {
                     let b = g.borrow();
-                    match b.props.get(&key) {
-                        Some(Property {
-                            kind: PropertyKind::Data { value, .. },
-                            ..
-                        }) => Some(value.clone()),
+                    match b.props.get_full(&key) {
+                        Some((
+                            idx,
+                            _,
+                            Property {
+                                kind: PropertyKind::Data { value, .. },
+                                ..
+                            },
+                        )) => {
+                            if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
+                                ic.own_slot.set(idx as u32);
+                            }
+                            Some(value.clone())
+                        }
                         _ => None,
                     }
                 };
@@ -1492,7 +1801,7 @@ impl Vm {
                         if let Internal::Function(FunctionInner::Bytecode(bf)) =
                             &mut m.borrow_mut().internal
                         {
-                            bf.home_object = Some(home);
+                            Rc::make_mut(bf).home_object = Some(home);
                         }
                     }
                 }
@@ -1507,7 +1816,7 @@ impl Vm {
                         if let Internal::Function(FunctionInner::Bytecode(bf)) =
                             &mut m.borrow_mut().internal
                         {
-                            bf.home_object = Some(home);
+                            Rc::make_mut(bf).home_object = Some(home);
                         }
                     }
                 }
@@ -1612,6 +1921,110 @@ impl Vm {
             Op::GetProp(i) => {
                 let name = self.const_name(frame, *i);
                 let obj = pop!();
+                // Inline cache (key-verified hints; see `FuncProto::ic`).
+                // Two levels:
+                //  - `holder == None`: the receiver's OWN data property at
+                //    `slot` (ordinary objects).
+                //  - `holder == Some(p)`: a data property at `slot` on `p`,
+                //    verified to still be the receiver's DIRECT prototype and
+                //    not shadowed by an own property — the method-lookup
+                //    pattern (`arr.push`, class instances calling prototype
+                //    methods). Array receivers exclude keys with exotic own
+                //    behavior (`length`, indices). Deeper chains, accessors,
+                //    proxies, and every other exotic fall to the unchanged
+                //    slow path.
+                if let Value::Object(o) = &obj {
+                    if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
+                        let b = o.borrow();
+                        let (is_ord, is_arr) = (
+                            matches!(b.internal, Internal::Ordinary),
+                            matches!(b.internal, Internal::Array(_)),
+                        );
+                        // Array exotics: `length` and index keys never take
+                        // the IC (they don't live in the props map).
+                        let plain_key = !is_arr
+                            || (name.as_str() != "length"
+                                && crate::value::canonical_index(name.as_str()).is_none());
+                        if (is_ord || is_arr) && plain_key {
+                            // Own-property hit: never touches the holder cell.
+                            if is_ord {
+                                if let Some((PropertyKey::Str(k), prop)) =
+                                    b.props.get_index(ic.own_slot.get() as usize)
+                                {
+                                    if let PropertyKind::Data { value, .. } = &prop.kind {
+                                        if k == &name {
+                                            let v = value.clone();
+                                            drop(b);
+                                            push!(v);
+                                            return Ok(Ctl::Next);
+                                        }
+                                    }
+                                }
+                            }
+                            // Proto hit: valid only when the receiver has no
+                            // own props (nothing can shadow) and its CURRENT
+                            // direct proto is the cached holder.
+                            if b.props.is_empty() {
+                                let holder = ic.holder.borrow();
+                                if let Some(h) = &*holder {
+                                    if b.proto.as_ref().is_some_and(|p| p.ptr_eq(h)) {
+                                        let hb = h.borrow();
+                                        if let Some((PropertyKey::Str(k), prop)) =
+                                            hb.props.get_index(ic.proto_slot.get() as usize)
+                                        {
+                                            if let PropertyKind::Data { value, .. } = &prop.kind {
+                                                if k == &name {
+                                                    let v = value.clone();
+                                                    drop(hb);
+                                                    drop(holder);
+                                                    drop(b);
+                                                    push!(v);
+                                                    return Ok(Ctl::Next);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Refill: own data property first (ordinary only),
+                            // then a one-level proto data property when no own
+                            // props can shadow.
+                            let key = PropertyKey::Str(name.clone());
+                            if is_ord {
+                                if let Some((idx, _, prop)) = b.props.get_full(&key) {
+                                    if let PropertyKind::Data { value, .. } = &prop.kind {
+                                        ic.own_slot.set(idx as u32);
+                                        let v = value.clone();
+                                        drop(b);
+                                        push!(v);
+                                        return Ok(Ctl::Next);
+                                    }
+                                }
+                            }
+                            if b.props.is_empty() {
+                                if let Some(p) = &b.proto {
+                                    let pb = p.borrow();
+                                    if matches!(pb.internal, Internal::Ordinary)
+                                        || matches!(pb.internal, Internal::Array(_))
+                                    {
+                                        if let Some((idx, _, prop)) = pb.props.get_full(&key) {
+                                            if let PropertyKind::Data { value, .. } = &prop.kind {
+                                                ic.proto_slot.set(idx as u32);
+                                                let v = value.clone();
+                                                let holder_obj = p.clone();
+                                                drop(pb);
+                                                *ic.holder.borrow_mut() = Some(holder_obj);
+                                                drop(b);
+                                                push!(v);
+                                                return Ok(Ctl::Next);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let v = self.get_prop(&obj, &PropertyKey::Str(name))?;
                 push!(v);
             }
@@ -2055,6 +2468,52 @@ impl Vm {
                 let name = self.const_name(frame, *i);
                 let value = pop!();
                 let obj = pop!();
+                // Inline cache (key-verified slot hint; see `FuncProto::ic`).
+                // Fast path only when the receiver is an ordinary object whose
+                // OWN property at the hinted slot is a WRITABLE data property —
+                // per OrdinarySetWithOwnDescriptor that assignment updates the
+                // value in place (attributes and slot order preserved, no
+                // prototype setter can intervene). Everything else (missing own
+                // key → proto-chain setters/read-only checks, accessors,
+                // non-writable → strict TypeError, exotics) takes the
+                // unchanged put_value path, which also refills the hint.
+                if let Value::Object(o) = &obj {
+                    if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
+                        let mut b = o.borrow_mut();
+                        if matches!(b.internal, Internal::Ordinary) {
+                            if let Some((PropertyKey::Str(k), prop)) =
+                                b.props.get_index_mut(ic.own_slot.get() as usize)
+                            {
+                                if k == &name {
+                                    if let PropertyKind::Data {
+                                        value: slot,
+                                        writable: true,
+                                    } = &mut prop.kind
+                                    {
+                                        *slot = value.clone();
+                                        drop(b);
+                                        push!(value);
+                                        return Ok(Ctl::Next);
+                                    }
+                                }
+                            }
+                            let key = PropertyKey::Str(name.clone());
+                            if let Some((idx, _, prop)) = b.props.get_full_mut(&key) {
+                                if let PropertyKind::Data {
+                                    value: slot,
+                                    writable: true,
+                                } = &mut prop.kind
+                                {
+                                    ic.own_slot.set(idx as u32);
+                                    *slot = value.clone();
+                                    drop(b);
+                                    push!(value);
+                                    return Ok(Ctl::Next);
+                                }
+                            }
+                        }
+                    }
+                }
                 let strict = frame.func.proto.is_strict;
                 self.put_value(&obj, &PropertyKey::Str(name), value.clone(), strict)?;
                 push!(value);
@@ -2062,6 +2521,31 @@ impl Vm {
             Op::GetPropDynamic => {
                 let key_v = pop!();
                 let obj = pop!();
+                // Integer fast path: `a[i]` on a dense array with an integral
+                // Number key reads the element directly — skipping
+                // ToPropertyKey's Number→String conversion (a float-format +
+                // heap allocation per access!), the reparse back to an index,
+                // and the property-map machinery. Only when no reified props
+                // entry can shadow the dense element (`props.is_empty()`) and
+                // the slot is a real element (in bounds, not a hole);
+                // everything else takes the unchanged spec path.
+                if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
+                    if n.fract() == 0.0 && *n >= 0.0 && *n < 4294967295.0 {
+                        let b = o.borrow();
+                        if let Internal::Array(arr) = &b.internal {
+                            if b.props.is_empty() {
+                                if let Some(v) = arr.get(*n as usize) {
+                                    if !matches!(v, Value::Hole) {
+                                        let v = v.clone();
+                                        drop(b);
+                                        push!(v);
+                                        return Ok(Ctl::Next);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // GetValue: RequireObjectCoercible(base) (via ToObject) throws
                 // BEFORE ToPropertyKey coerces the key expression's value.
                 self.require_object_coercible(&obj, "read properties of")?;
@@ -2073,6 +2557,30 @@ impl Vm {
                 let value = pop!();
                 let key_v = pop!();
                 let obj = pop!();
+                // Integer fast path mirroring `GetPropDynamic`: overwrite an
+                // EXISTING dense element in place. An in-bounds non-hole dense
+                // slot is a plain writable data property (per the array exotic
+                // [[Set]]), so no setter, no length change, and no
+                // extensibility interaction is observable. Appends, holes,
+                // out-of-bounds, and shadowed elements take the spec path.
+                if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
+                    if n.fract() == 0.0 && *n >= 0.0 && *n < 4294967295.0 {
+                        let mut b = o.borrow_mut();
+                        if b.props.is_empty() {
+                            if let Internal::Array(arr) = &mut b.internal {
+                                let i = *n as usize;
+                                if let Some(slot) = arr.get_mut(i) {
+                                    if !matches!(slot, Value::Hole) {
+                                        *slot = value.clone();
+                                        drop(b);
+                                        push!(value);
+                                        return Ok(Ctl::Next);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 self.require_object_coercible(&obj, "set properties of")?;
                 let key = self.to_property_key(&key_v)?;
                 let strict = frame.func.proto.is_strict;
@@ -2134,8 +2642,10 @@ impl Vm {
                 args.extend(frame.stack.drain(at..));
                 let this = pop!();
                 let func = pop!();
-                let r = self.call(func, this, &args);
-                self.recycle_value_vec(args);
+                // Owned-args path: the pooled buffer moves into the callee
+                // frame (recycled by its recycle_frame), skipping the second
+                // copy make_frame's slice path would do.
+                let r = self.call_valuevec(func, this, args);
                 push!(r?);
             }
             Op::CallMethodless(argc) => {
@@ -2144,8 +2654,7 @@ impl Vm {
                 let mut args = self.take_value_vec();
                 args.extend(frame.stack.drain(at..));
                 let func = pop!();
-                let r = self.call(func, Value::Undefined, &args);
-                self.recycle_value_vec(args);
+                let r = self.call_valuevec(func, Value::Undefined, args);
                 push!(r?);
             }
             Op::CallSpread => {
@@ -2212,6 +2721,7 @@ impl Vm {
                     if let Internal::Function(FunctionInner::Bytecode(bf)) =
                         &mut f.borrow_mut().internal
                     {
+                        let bf = Rc::make_mut(bf);
                         bf.captured_with = frame.with_scope.clone();
                         bf.captured_priv_env = frame.priv_env.clone();
                         if inherit_home {
@@ -2393,17 +2903,7 @@ impl Vm {
             Op::CmpBranchFalse { cmp, target } => {
                 let b = pop!();
                 let a = pop!();
-                let r = match cmp {
-                    CmpOp::Eq => self.loose_equals(&a, &b)?,
-                    CmpOp::Ne => !self.loose_equals(&a, &b)?,
-                    CmpOp::StrictEq => self.strict_equals(&a, &b),
-                    CmpOp::StrictNe => !self.strict_equals(&a, &b),
-                    CmpOp::Lt => self.less_than(&a, &b)? == Some(true),
-                    CmpOp::Gt => self.less_than(&b, &a)? == Some(true),
-                    CmpOp::Le => self.less_than(&b, &a)? == Some(false),
-                    CmpOp::Ge => self.less_than(&a, &b)? == Some(false),
-                };
-                if !r {
+                if !self.cmp_values(*cmp, &a, &b)? {
                     return Ok(Ctl::Jump(*target as usize));
                 }
             }
@@ -2412,18 +2912,89 @@ impl Vm {
             Op::CmpBranchTrue { cmp, target } => {
                 let b = pop!();
                 let a = pop!();
-                let r = match cmp {
-                    CmpOp::Eq => self.loose_equals(&a, &b)?,
-                    CmpOp::Ne => !self.loose_equals(&a, &b)?,
-                    CmpOp::StrictEq => self.strict_equals(&a, &b),
-                    CmpOp::StrictNe => !self.strict_equals(&a, &b),
-                    CmpOp::Lt => self.less_than(&a, &b)? == Some(true),
-                    CmpOp::Gt => self.less_than(&b, &a)? == Some(true),
-                    CmpOp::Le => self.less_than(&b, &a)? == Some(false),
-                    CmpOp::Ge => self.less_than(&a, &b)? == Some(false),
-                };
+                let r = self.cmp_values(*cmp, &a, &b)?;
                 if r {
                     return Ok(Ctl::Jump(*target as usize));
+                }
+            }
+            // Fused `LoadCellConst ; CmpBranchFalse` — a whole `i < N` loop test.
+            // Same TDZ check, comparison helpers, and branch as the sequence.
+            Op::CmpCellConstBranchFalse {
+                cell,
+                konst,
+                cmp,
+                target,
+            } => {
+                let a = frame.cells[*cell as usize].borrow().clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                if !self.cmp_values(*cmp, &a, &b)? {
+                    return Ok(Ctl::Jump(*target as usize));
+                }
+            }
+            Op::CmpCellConstBranchTrue {
+                cell,
+                konst,
+                cmp,
+                target,
+            } => {
+                let a = frame.cells[*cell as usize].borrow().clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                if self.cmp_values(*cmp, &a, &b)? {
+                    return Ok(Ctl::Jump(*target as usize));
+                }
+            }
+            // Fused `LoadCellConst ; Add` / `LoadCellConst ; <binop>` — the same
+            // op_add / arith helpers compute the result; only the intermediate
+            // stack traffic is elided.
+            Op::AddCellConst { cell, konst } => {
+                let a = frame.cells[*cell as usize].borrow().clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                let r = self.op_add(a, b)?;
+                push!(r);
+            }
+            Op::ArithCellConst { cell, konst, kind } => {
+                let a = frame.cells[*cell as usize].borrow().clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                let r = self.arith(a, b, *kind)?;
+                push!(r);
+            }
+            // Fused statement-position `i++`/`--i`-style update on a cell. The
+            // exact sequence semantics: TDZ-checked read, ToNumeric (which may
+            // run user code that reassigns the binding — the borrow is released
+            // before it runs), the same unary_arith step, plain in-place store.
+            Op::IncCellStmt { cell, dec } => {
+                let v = frame.cells[*cell as usize].borrow().clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let n = self.to_numeric(&v)?;
+                let r = self.unary_arith(n, if *dec { UnaryKind::Dec } else { UnaryKind::Inc })?;
+                *frame.cells[*cell as usize].borrow_mut() = r;
+            }
+            // Fused `LoadCell(src) ; InitCell(dest)` — per-iteration `let` copy.
+            Op::LoadCellInit { src, dest } => {
+                let v = frame.cells[*src as usize].borrow().clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                if frame.func.proto.stable_flags[*dest as usize] {
+                    *frame.cells[*dest as usize].borrow_mut() = v;
+                } else {
+                    let fresh = self.take_cell(v);
+                    let old = std::mem::replace(&mut frame.cells[*dest as usize], fresh);
+                    self.recycle_cell(old);
                 }
             }
             Op::JumpIfFalsyPeek(t) => {
@@ -2651,7 +3222,7 @@ impl Vm {
                     let s = self.to_js_string(p)?;
                     // Same bound as `op_add`: a template-literal join in a doubling
                     // loop (`` s = `${s}${s}` ``) must not grow without limit.
-                    total += s.wtf8_bytes().len();
+                    total += s.byte_len();
                     if total > crate::value::MAX_STRING_LEN {
                         return Err(self.throw_range("invalid string length"));
                     }
@@ -2866,14 +3437,14 @@ impl Vm {
         let length = proto.num_params;
         let name = proto.name.clone();
         let kind = proto.kind;
-        let bf = BytecodeFunction {
+        let bf = Rc::new(BytecodeFunction {
             proto,
             upvalues,
             home_object: None,
             is_class_ctor: kind.is_class_ctor(),
             captured_with: Vec::new(),
             captured_priv_env: None,
-        };
+        });
         // [[Prototype]] is the function-kind intrinsic: %GeneratorFunction.prototype%,
         // %AsyncFunction.prototype%, %AsyncGeneratorFunction.prototype%, or
         // %Function.prototype% for ordinary/arrow/method functions.
@@ -2990,7 +3561,7 @@ impl Vm {
         if matches!(pa, Value::String(_)) || matches!(pb, Value::String(_)) {
             let sa = self.to_js_string(&pa)?;
             let sb = self.to_js_string(&pb)?;
-            let total = sa.wtf8_bytes().len() + sb.wtf8_bytes().len();
+            let total = sa.byte_len() + sb.byte_len();
             // Bound a single concatenation so a doubling loop (`s += s`) cannot
             // grow a string without limit and OOM the host. The cap is well above
             // any legitimate string; exceeding it throws RangeError, matching how
@@ -3209,6 +3780,23 @@ impl Vm {
         })
     }
 
+    /// Evaluate one of the eight comparison operators — the single source of
+    /// truth shared by the standalone comparison ops and every fused
+    /// compare-and-branch superinstruction, so coercion order and thrown
+    /// errors cannot diverge between fused and unfused code.
+    pub fn cmp_values(&mut self, cmp: CmpOp, a: &Value, b: &Value) -> Result<bool, Value> {
+        Ok(match cmp {
+            CmpOp::Eq => self.loose_equals(a, b)?,
+            CmpOp::Ne => !self.loose_equals(a, b)?,
+            CmpOp::StrictEq => self.strict_equals(a, b),
+            CmpOp::StrictNe => !self.strict_equals(a, b),
+            CmpOp::Lt => self.less_than(a, b)? == Some(true),
+            CmpOp::Gt => self.less_than(b, a)? == Some(true),
+            CmpOp::Le => self.less_than(b, a)? == Some(false),
+            CmpOp::Ge => self.less_than(a, b)? == Some(false),
+        })
+    }
+
     /// Abstract Relational Comparison `a < b`. Returns None for unordered (NaN).
     pub fn less_than(&mut self, a: &Value, b: &Value) -> Result<Option<bool>, Value> {
         // Fast path: Number < Number (loop bounds, sorts). NaN is unordered, so
@@ -3302,12 +3890,25 @@ fn js_mod(a: f64, b: f64) -> f64 {
     } else if a == 0.0 {
         a
     } else {
+        // Fast path: both operands integral and exactly representable (|x| <=
+        // 2^53) — the loop-counter case. Integer remainder matches libm fmod on
+        // integers (truncated division, sign of the dividend), except that a
+        // zero result must carry the dividend's sign (-6 % 3 is -0 in JS, as
+        // fmod also returns); restore that explicitly.
+        const MAX_EXACT: f64 = 9_007_199_254_740_992.0; // 2^53
+        if a.fract() == 0.0 && b.fract() == 0.0 && a.abs() <= MAX_EXACT && b.abs() <= MAX_EXACT {
+            let r = (a as i64) % (b as i64);
+            if r == 0 {
+                return if a.is_sign_negative() { -0.0 } else { 0.0 };
+            }
+            return r as f64;
+        }
         a % b
     }
 }
 
 /// Binary arithmetic/bitwise operations dispatched by kind (Number or BigInt).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArithKind {
     Sub,
     Mul,

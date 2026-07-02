@@ -11,6 +11,12 @@
 > **Related:** [`docs/conformance.md`](./conformance.md) (Test262
 > gate), [`docs/architecture.md`](./architecture.md), [`docs/replay.md`](./replay.md),
 > [`docs/value-checkpoints.md`](./value-checkpoints.md).
+>
+> **Superseded for planning by:** [`docs/js-performance-roadmap.md`](./js-performance-roadmap.md)
+> (2026-07) — a callgrind instruction-exact profile of the cross-runtime
+> suite, the deterministic fast-hasher landing (property lookups were ~49%
+> of property-heavy execution), and the re-ranked roadmap toward JIT-class
+> throughput. This document remains the record of Phases 0–2.
 
 ---
 

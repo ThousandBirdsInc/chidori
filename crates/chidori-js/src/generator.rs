@@ -5,6 +5,7 @@
 
 use crate::value::*;
 use crate::vm::*;
+use std::rc::Rc;
 
 #[derive(Clone, Copy)]
 pub enum ResumeKind {
@@ -17,7 +18,7 @@ impl Vm {
     pub fn make_generator(
         &mut self,
         func_obj: &JsObject,
-        bf: BytecodeFunction,
+        bf: Rc<BytecodeFunction>,
         this: Value,
         args: &[Value],
         new_target: Value,
