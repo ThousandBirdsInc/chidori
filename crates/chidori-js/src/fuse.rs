@@ -58,7 +58,9 @@ fn for_each_ip(op: &mut Op, mut f: impl FnMut(&mut u32)) {
         Op::CmpBranchFalse { target, .. }
         | Op::CmpBranchTrue { target, .. }
         | Op::CmpCellConstBranchFalse { target, .. }
-        | Op::CmpCellConstBranchTrue { target, .. } => f(target),
+        | Op::CmpCellConstBranchTrue { target, .. }
+        | Op::CmpLocalConstBranchFalse { target, .. }
+        | Op::CmpLocalConstBranchTrue { target, .. } => f(target),
         Op::PushTryHandler { catch, finally } => {
             f(catch);
             if *finally != u32::MAX {
@@ -109,6 +111,56 @@ fn try_fuse(a: &Op, b: &Op) -> Option<Op> {
             src: *src,
             dest: *dest,
         }),
+        // Local mirrors (produced by the localization pass; see localize.rs).
+        (Op::LoadLocal(local), Op::LoadConst(konst)) => Some(Op::LoadLocalConst {
+            local: *local,
+            konst: *konst,
+        }),
+        (Op::LoadLocal(src), Op::StoreLocal(dest)) => Some(Op::CopyLocal {
+            src: *src,
+            dest: *dest,
+        }),
+        (Op::LoadLocalConst { local, konst }, Op::CmpBranchFalse { cmp, target }) => {
+            Some(Op::CmpLocalConstBranchFalse {
+                local: *local,
+                konst: *konst,
+                cmp: *cmp,
+                target: *target,
+            })
+        }
+        (Op::LoadLocalConst { local, konst }, Op::CmpBranchTrue { cmp, target }) => {
+            Some(Op::CmpLocalConstBranchTrue {
+                local: *local,
+                konst: *konst,
+                cmp: *cmp,
+                target: *target,
+            })
+        }
+        (Op::LoadLocalConst { local, konst }, Op::Add) => Some(Op::AddLocalConst {
+            local: *local,
+            konst: *konst,
+        }),
+        (Op::LoadLocalConst { local, konst }, op) => {
+            let kind = match op {
+                Op::Sub => ArithKind::Sub,
+                Op::Mul => ArithKind::Mul,
+                Op::Div => ArithKind::Div,
+                Op::Mod => ArithKind::Mod,
+                Op::Pow => ArithKind::Pow,
+                Op::BitAnd => ArithKind::BitAnd,
+                Op::BitOr => ArithKind::BitOr,
+                Op::BitXor => ArithKind::BitXor,
+                Op::Shl => ArithKind::Shl,
+                Op::Shr => ArithKind::Shr,
+                Op::UShr => ArithKind::UShr,
+                _ => return None,
+            };
+            Some(Op::ArithLocalConst {
+                local: *local,
+                konst: *konst,
+                kind,
+            })
+        }
         // Second-round fusions over already-fused ops (the pass runs to a fixed
         // point): a whole `i < N` loop test, or a `cell <op> const` operand
         // computation, in one dispatch.
@@ -180,6 +232,22 @@ fn try_fuse_window(code: &[Op], i: usize, is_target: &[bool]) -> Option<(Op, usi
             if let Some(dec) = dec {
                 if matches!((&code[i + 4], &code[i + 5]), (Op::StoreCell(c2), Op::Pop) if c2 == c) {
                     return Some((Op::IncCellStmt { cell: *c, dec }, 6));
+                }
+            }
+        }
+    }
+    // The same 6-op increment idiom on a LOCALIZED binding.
+    if i + 6 <= code.len() && interior_free(6) {
+        if let (Op::LoadLocal(c), Op::ToNumeric) = (&code[i], &code[i + 1]) {
+            let dec = match (&code[i + 2], &code[i + 3]) {
+                (Op::Dup, Op::Inc) | (Op::Inc, Op::Dup) => Some(false),
+                (Op::Dup, Op::Dec) | (Op::Dec, Op::Dup) => Some(true),
+                _ => None,
+            };
+            if let Some(dec) = dec {
+                if matches!((&code[i + 4], &code[i + 5]), (Op::StoreLocal(c2), Op::Pop) if c2 == c)
+                {
+                    return Some((Op::IncLocalStmt { local: *c, dec }, 6));
                 }
             }
         }

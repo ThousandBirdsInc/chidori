@@ -141,6 +141,11 @@ pub struct FuncProto {
     /// handlers test stability with one indexed load instead of a linear scan
     /// of `stable_cells` on every executed init.
     pub stable_flags: Box<[bool]>,
+    /// Per original cell index (len == `num_cells`): `true` when the
+    /// localization pass rewrote that binding to a `frame.locals` slot. Its
+    /// cell-vec slot is filled with a shared never-read placeholder at frame
+    /// setup instead of a pooled cell. See `localize.rs`.
+    pub localized: Box<[bool]>,
     /// Per-op inline-cache slots (len == `code.len()`, indexed by instruction
     /// pointer; `u32::MAX` = empty). Used by `GetProp`/`SetProp`/`LoadGlobal`
     /// to remember the property's `IndexMap` slot index at that site. The hint
@@ -192,6 +197,7 @@ impl FuncProto {
             is_strict: false,
             stable_cells: Vec::new(),
             stable_flags: Box::new([]),
+            localized: Box::new([]),
             ic: Box::new([]),
             eval_scopes: Vec::new(),
             this_cell: None,
@@ -339,8 +345,58 @@ pub enum Op {
     LoadRestArgs(u32),
 
     // ---- locals / cells / upvalues / globals ----
+    /// Read a `frame.locals` slot (a provably-uncaptured binding, rewritten
+    /// from `LoadCell` by the localization pass — see `localize.rs`). Keeps
+    /// the same TDZ check as `LoadCell`.
     LoadLocal(u32),
     StoreLocal(u32),
+    /// As [`Op::StoreLocal`] but throws a ReferenceError while the slot is in
+    /// the Temporal Dead Zone (mirror of `StoreCellChecked`).
+    StoreLocalChecked(u32),
+    /// Put the TDZ marker in a local slot (mirror of `InitCellTdz`).
+    InitLocalTdz(u32),
+    /// Superinstruction: `LoadLocal ; LoadConst` (mirror of `LoadCellConst`).
+    LoadLocalConst {
+        local: u32,
+        konst: u32,
+    },
+    /// Superinstruction: a whole `i < N` loop test on a localized binding
+    /// (mirror of `CmpCellConstBranchFalse`).
+    CmpLocalConstBranchFalse {
+        local: u32,
+        konst: u32,
+        cmp: CmpOp,
+        target: u32,
+    },
+    CmpLocalConstBranchTrue {
+        local: u32,
+        konst: u32,
+        cmp: CmpOp,
+        target: u32,
+    },
+    /// Superinstruction: `local + const` via `op_add` (mirror of `AddCellConst`).
+    AddLocalConst {
+        local: u32,
+        konst: u32,
+    },
+    /// Superinstruction: `local <op> const` via `Vm::arith`.
+    ArithLocalConst {
+        local: u32,
+        konst: u32,
+        kind: crate::exec::ArithKind,
+    },
+    /// Superinstruction: statement-position `i++`/`--i` on a localized binding
+    /// (mirror of `IncCellStmt`; same TDZ + ToNumeric + unary semantics).
+    IncLocalStmt {
+        local: u32,
+        dec: bool,
+    },
+    /// Superinstruction: `LoadLocal(src) ; StoreLocal(dest)` — the localized
+    /// per-iteration `let` copy. Keeps the TDZ check on the read.
+    CopyLocal {
+        src: u32,
+        dest: u32,
+    },
     LoadCell(u32),
     /// Superinstruction (fusion): `LoadCell(cell) ; LoadConst(konst)` — the
     /// single most frequent adjacent pair in the Phase-0 survey (~8.9% of

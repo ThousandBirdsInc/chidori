@@ -134,39 +134,61 @@ fn is_any_fused(op: &Op) -> bool {
             | Op::ArithCellConst { .. }
             | Op::IncCellStmt { .. }
             | Op::LoadCellInit { .. }
+            | Op::LoadLocalConst { .. }
+            | Op::CmpLocalConstBranchFalse { .. }
+            | Op::CmpLocalConstBranchTrue { .. }
+            | Op::AddLocalConst { .. }
+            | Op::ArithLocalConst { .. }
+            | Op::IncLocalStmt { .. }
+            | Op::CopyLocal { .. }
     )
 }
 
 #[test]
 fn fusion_actually_fires() {
-    // A plain counting loop's whole condition (`LoadCell ; LoadConst ; Lt ;
+    // A plain counting loop's whole condition (`Load* ; LoadConst ; Lt ;
     // JumpIfFalse`) collapses — via the fixpoint over pair fusions — into a
-    // single CmpCellConstBranchFalse, and its statement-position `i++` into a
-    // single IncCellStmt.
+    // single compare-and-branch superinstruction, and its statement-position
+    // `i++` into a single Inc*Stmt. With the localization pass on (the
+    // default), the uncaptured loop counter takes the LOCAL forms; a captured
+    // counter takes the CELL forms (asserted separately below).
     let fused = compile_script_opts("for (let i = 0; i < 10; i++) { i + 1; }", true).unwrap();
     assert!(
         count_ops(&fused, |op| matches!(
             op,
-            Op::CmpCellConstBranchFalse { .. }
+            Op::CmpLocalConstBranchFalse { .. }
         )) >= 1,
-        "expected the loop condition to fuse into CmpCellConstBranchFalse"
+        "expected the loop condition to fuse into CmpLocalConstBranchFalse"
     );
     assert!(
         count_ops(&fused, |op| matches!(
             op,
-            Op::IncCellStmt { dec: false, .. }
+            Op::IncLocalStmt { dec: false, .. }
         )) >= 1,
-        "expected the update i++ to fuse into IncCellStmt"
+        "expected the update i++ to fuse into IncLocalStmt"
     );
     assert!(
-        count_ops(&fused, |op| matches!(op, Op::AddCellConst { .. })) >= 1,
-        "expected the body's i + 1 to fuse into AddCellConst"
+        count_ops(&fused, |op| matches!(op, Op::AddLocalConst { .. })) >= 1,
+        "expected the body's i + 1 to fuse into AddLocalConst"
     );
-    // A bottom-tested loop fuses its back-edge into CmpCellConstBranchTrue.
+    // A CAPTURED counter stays a cell and takes the CELL superinstructions.
+    let cellfused = compile_script_opts(
+        "const fs = []; for (let i = 0; i < 10; i++) { fs.push(() => i); i + 1; }",
+        true,
+    )
+    .unwrap();
+    assert!(
+        count_ops(&cellfused, |op| matches!(
+            op,
+            Op::CmpCellConstBranchFalse { .. }
+        )) >= 1,
+        "expected a captured counter's loop test to fuse into CmpCellConstBranchFalse"
+    );
+    // A bottom-tested loop fuses its back-edge into CmpLocalConstBranchTrue.
     let dw = compile_script_opts("let i = 0; do { i++; } while (i < 5);", true).unwrap();
     assert!(
-        count_ops(&dw, |op| matches!(op, Op::CmpCellConstBranchTrue { .. })) >= 1,
-        "expected the do/while back-edge to fuse into CmpCellConstBranchTrue"
+        count_ops(&dw, |op| matches!(op, Op::CmpLocalConstBranchTrue { .. })) >= 1,
+        "expected the do/while back-edge to fuse into CmpLocalConstBranchTrue"
     );
     // Non-const RHS comparisons still stop at the pair-fused CmpBranchFalse.
     let nc =
@@ -174,7 +196,9 @@ fn fusion_actually_fires() {
     assert!(
         count_ops(&nc, |op| matches!(
             op,
-            Op::CmpBranchFalse { .. } | Op::CmpCellConstBranchFalse { .. }
+            Op::CmpBranchFalse { .. }
+                | Op::CmpCellConstBranchFalse { .. }
+                | Op::CmpLocalConstBranchFalse { .. }
         )) >= 1,
         "expected a fused compare-and-branch for a non-const bound"
     );

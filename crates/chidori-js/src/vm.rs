@@ -315,6 +315,12 @@ pub struct Vm {
     /// call path (one heap allocation per binding per call).
     pub(crate) cell_pool: Vec<Rc<RefCell<Value>>>,
     pub(crate) cells_vec_pool: Vec<Vec<Rc<RefCell<Value>>>>,
+    /// Shared placeholder filling the cell-vec slots of LOCALIZED bindings
+    /// (see `localize.rs`): those indices are never dereferenced (their ops
+    /// were rewritten to `frame.locals`), so one `Rc` bump replaces a pooled
+    /// cell per slot. Its strong count is always > 1, so `recycle_cell` can
+    /// never pull it into the pool.
+    pub(crate) dummy_cell: Rc<RefCell<Value>>,
 }
 
 impl Vm {
@@ -346,6 +352,7 @@ impl Vm {
             value_vec_pool: Vec::new(),
             cell_pool: Vec::new(),
             cells_vec_pool: Vec::new(),
+            dummy_cell: Rc::new(RefCell::new(Value::Undefined)),
         };
         crate::realm::init_realm(&mut vm);
         // The placeholder realm's intrinsic objects were created before the VM

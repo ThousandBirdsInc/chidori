@@ -20,6 +20,7 @@ pub mod host;
 pub mod iter;
 pub mod journal;
 pub mod jsx;
+pub mod localize;
 pub mod module;
 /// Phase-0 opcode-frequency instrumentation; present only under the
 /// `op-histogram` feature (see `docs/interpreter-optimization.md`).

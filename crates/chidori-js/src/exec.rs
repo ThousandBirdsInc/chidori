@@ -356,8 +356,14 @@ impl Vm {
     ) -> Frame {
         let proto = bf.proto.clone();
         let mut cells = self.cells_vec_pool.pop().unwrap_or_default();
-        for _ in 0..proto.num_cells {
-            let c = self.take_cell(Value::Undefined);
+        for i in 0..proto.num_cells as usize {
+            // A localized index lives in `frame.locals`; its cell slot is a
+            // shared never-read placeholder (`Rc` bump, no pool round-trip).
+            let c = if proto.localized.get(i).copied().unwrap_or(false) {
+                self.dummy_cell.clone()
+            } else {
+                self.take_cell(Value::Undefined)
+            };
             cells.push(c);
         }
         // A closure created inside `with (o) { … }` carries the with-object
@@ -1015,10 +1021,104 @@ impl Vm {
                 push!(o);
             }
 
-            Op::LoadLocal(i) => push!(frame.locals[*i as usize].clone()),
+            Op::LoadLocal(i) => {
+                let v = frame.locals[*i as usize].clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                push!(v);
+            }
             Op::StoreLocal(i) => {
                 let v = pop!();
                 frame.locals[*i as usize] = v;
+            }
+            Op::StoreLocalChecked(i) => {
+                let v = pop!();
+                let slot = &mut frame.locals[*i as usize];
+                if matches!(slot, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                *slot = v;
+            }
+            Op::InitLocalTdz(i) => {
+                frame.locals[*i as usize] = Value::Uninitialized;
+            }
+            // Local mirrors of the cell superinstructions — same helpers, same
+            // TDZ checks, minus the Rc/RefCell indirection.
+            Op::LoadLocalConst { local, konst } => {
+                let v = frame.locals[*local as usize].clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                push!(v);
+                push!(self.const_val(frame, *konst));
+            }
+            Op::CmpLocalConstBranchFalse {
+                local,
+                konst,
+                cmp,
+                target,
+            } => {
+                let a = frame.locals[*local as usize].clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                if !self.cmp_values(*cmp, &a, &b)? {
+                    return Ok(Ctl::Jump(*target as usize));
+                }
+            }
+            Op::CmpLocalConstBranchTrue {
+                local,
+                konst,
+                cmp,
+                target,
+            } => {
+                let a = frame.locals[*local as usize].clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                if self.cmp_values(*cmp, &a, &b)? {
+                    return Ok(Ctl::Jump(*target as usize));
+                }
+            }
+            Op::AddLocalConst { local, konst } => {
+                let a = frame.locals[*local as usize].clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                let r = self.op_add(a, b)?;
+                push!(r);
+            }
+            Op::ArithLocalConst { local, konst, kind } => {
+                let a = frame.locals[*local as usize].clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                let r = self.arith(a, b, *kind)?;
+                push!(r);
+            }
+            Op::IncLocalStmt { local, dec } => {
+                let v = frame.locals[*local as usize].clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                // ToNumeric may run user code, but a localized binding is
+                // reachable only from this frame, so read-coerce-write is
+                // exactly the unfused sequence.
+                let n = self.to_numeric(&v)?;
+                let r = self.unary_arith(n, if *dec { UnaryKind::Dec } else { UnaryKind::Inc })?;
+                frame.locals[*local as usize] = r;
+            }
+            Op::CopyLocal { src, dest } => {
+                let v = frame.locals[*src as usize].clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                frame.locals[*dest as usize] = v;
             }
             Op::LoadCell(i) => {
                 let v = frame.cells[*i as usize].borrow().clone();

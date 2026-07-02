@@ -53,7 +53,7 @@ fn decode_lone_surrogates(value: &str) -> JsString {
 }
 
 pub fn compile_script(src: &str) -> Result<FuncProto, String> {
-    compile_script_impl(src, false, true)
+    compile_script_impl(src, false, true, true)
 }
 
 /// Compile a script through a thread-local source→proto cache, so repeated
@@ -99,17 +99,30 @@ pub fn compile_script_cached(src: &str) -> Result<Rc<FuncProto>, String> {
 /// `fuse = false` and asserts byte-identical observable behavior. Production code
 /// uses [`compile_script`] (fusion on).
 pub fn compile_script_opts(src: &str, fuse: bool) -> Result<FuncProto, String> {
-    compile_script_impl(src, false, fuse)
+    compile_script_impl(src, false, fuse, true)
+}
+
+/// Compile with BOTH optimization passes toggled — used by the localization
+/// differential test (`tests/localize.rs`), which asserts that every
+/// combination executes identically. Production uses [`compile_script`]
+/// (both passes on).
+pub fn compile_script_passes(src: &str, fuse: bool, localize: bool) -> Result<FuncProto, String> {
+    compile_script_impl(src, false, fuse, localize)
 }
 
 /// Compile global eval code — `(0,eval)(src)`: identical to a script except
 /// `return` is illegal and the global `var`/function bindings it creates are
 /// DELETABLE (CreateGlobalVarBinding with D=true).
 pub fn compile_indirect_eval(src: &str) -> Result<FuncProto, String> {
-    compile_script_impl(src, true, true)
+    compile_script_impl(src, true, true, true)
 }
 
-fn compile_script_impl(src: &str, as_eval: bool, fuse: bool) -> Result<FuncProto, String> {
+fn compile_script_impl(
+    src: &str,
+    as_eval: bool,
+    fuse: bool,
+    localize: bool,
+) -> Result<FuncProto, String> {
     let allocator = Allocator::default();
     // Parse as a *script* (the JS default): sloppy unless a `"use strict"`
     // directive (or a class/`module` context) makes it strict. The conformance
@@ -149,6 +162,7 @@ fn compile_script_impl(src: &str, as_eval: bool, fuse: bool) -> Result<FuncProto
     c.source = src.to_string();
     c.toplevel_is_eval = as_eval;
     c.fuse = fuse;
+    c.localize = localize;
     // A construct the lowering step rejects is, for our purposes, a syntax/early
     // error — surface it as SyntaxError so it is reported consistently.
     c.compile_toplevel(&program).map_err(|e| {
@@ -726,6 +740,10 @@ struct Compiler {
     /// for the differential test that proves fused and unfused bytecode execute
     /// identically.
     fuse: bool,
+    /// Run the cells→locals localization pass (`localize.rs`) on every finished
+    /// function. Always on in production; disabled only for the differential
+    /// test that proves localized and cell-only bytecode execute identically.
+    localize: bool,
 }
 
 impl Compiler {
@@ -748,6 +766,7 @@ impl Compiler {
             in_class_body: false,
             in_field_initializer: false,
             fuse: true,
+            localize: true,
         }
     }
 
@@ -1684,13 +1703,35 @@ impl Compiler {
     }
 
     fn finish(&self, fc: FnCtx) -> FuncProto {
+        // Cells→locals localization (docs/js-performance-roadmap.md §3.2):
+        // provably-uncaptured bindings move from heap cells to pooled
+        // `frame.locals` slots. Runs BEFORE fusion so the fusion pass sees
+        // (and superinstructs) the rewritten local ops.
+        let loc = if self.localize {
+            crate::localize::localize(
+                fc.code,
+                fc.num_cells,
+                &fc.consts,
+                &fc.stable_cells,
+                fc.this_cell,
+                &fc.mapped_param_cells,
+                fc.uses_arguments,
+                !fc.eval_scopes.is_empty(),
+            )
+        } else {
+            crate::localize::Localized {
+                code: fc.code,
+                num_locals: 0,
+                localized: vec![false; fc.num_cells as usize].into_boxed_slice(),
+            }
+        };
         // Peephole op-fusion (Phase 2): every finished function — top-level and
         // nested — flows through here, so applying it once covers the whole
         // proto tree. Disabled only by the differential test.
         let code = if self.fuse {
-            crate::fuse::fuse_code_fixpoint(fc.code)
+            crate::fuse::fuse_code_fixpoint(loc.code)
         } else {
-            fc.code
+            loc.code
         };
         FuncProto {
             eval_scopes: fc.eval_scopes.clone(),
@@ -1701,7 +1742,7 @@ impl Compiler {
                 .collect(),
             code,
             consts: fc.consts,
-            num_locals: 0,
+            num_locals: loc.num_locals,
             num_cells: fc.num_cells,
             num_params: fc.num_params,
             has_rest: fc.has_rest,
@@ -1720,6 +1761,7 @@ impl Compiler {
                 flags
             },
             stable_cells: fc.stable_cells.clone(),
+            localized: loc.localized,
             this_cell: fc.this_cell,
             inherit_home: fc.inherit_home,
             templates: fc.templates,
@@ -5605,6 +5647,7 @@ impl Compiler {
             // doesn't, so a function containing eval always materializes it.
             let end = body.map(|b| b.span.end).unwrap_or(params.span.end);
             if self.region_has_arguments(params.span.start, end) || self.cur_ref().contains_eval {
+                self.cur().uses_arguments = true;
                 let ac = self.declare("arguments", false);
                 self.emit(Op::LoadArguments);
                 self.emit(Op::InitCell(ac));
@@ -5695,7 +5738,13 @@ impl Compiler {
         // A MAPPED `arguments` object (sloppy, simple parameter list) aliases
         // the parameter cells: record each positional parameter's cell index.
         // A name duplicated later in the list maps only its LAST index.
-        if !self.cur_ref().strict
+        // Only built when the function can actually materialize `arguments`
+        // (`uses_arguments`: the body mentions the word, or contains a direct
+        // eval that could). Otherwise the aliasing is dead data that would
+        // needlessly pin every parameter as a stable heap cell — blocking the
+        // cells→locals localization of the hottest binding class, parameters.
+        if self.cur_ref().uses_arguments
+            && !self.cur_ref().strict
             && params.rest.is_none()
             && !has_param_default
             && params
