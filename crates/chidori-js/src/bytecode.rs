@@ -675,6 +675,59 @@ pub enum Op {
         cmp: CmpOp,
         target: u32,
     },
+    /// Superinstruction: `LoadCellConst ; CmpBranchFalse` — the complete
+    /// top-tested loop condition (`i < N`) in ONE dispatch. The cell read keeps
+    /// the `LoadCell` TDZ check; the comparison and branch reuse the
+    /// `CmpBranchFalse` helpers, so coercion order and thrown errors are
+    /// identical to the unfused sequence.
+    CmpCellConstBranchFalse {
+        cell: u32,
+        konst: u32,
+        cmp: CmpOp,
+        target: u32,
+    },
+    /// Mirror of [`Op::CmpCellConstBranchFalse`] for `JumpIfTrue` back-edges.
+    CmpCellConstBranchTrue {
+        cell: u32,
+        konst: u32,
+        cmp: CmpOp,
+        target: u32,
+    },
+    /// Superinstruction: `LoadCellConst ; Add` — push `cell + konst` via the
+    /// same `op_add` helper (Number fast path, string concat, coercions and
+    /// throws identical). The `fib(n - 1)`-style argument computation.
+    AddCellConst {
+        cell: u32,
+        konst: u32,
+    },
+    /// Superinstruction: `LoadCellConst ; <binop>` for the non-`Add` binary
+    /// arithmetic/bitwise ops — push `cell <op> konst` via the same
+    /// `Vm::arith` helper.
+    ArithCellConst {
+        cell: u32,
+        konst: u32,
+        kind: crate::exec::ArithKind,
+    },
+    /// Superinstruction: a statement-position `i++`/`++i`/`i--`/`--i` on a cell
+    /// binding — the 6-op window `LoadCell; ToNumeric; Dup; Inc; StoreCell; Pop`
+    /// (or its prefix mirror) collapsed to one dispatch. Semantics preserved
+    /// exactly: TDZ check on the read, `ToNumeric` (which may run user code —
+    /// `valueOf` — that reassigns the binding first), then the same
+    /// `unary_arith` increment, then a plain in-place `StoreCell` write. The
+    /// old/new values the sequence would leave on the stack are consumed by the
+    /// window's own `Dup`/`Pop`, so eliding them is unobservable.
+    IncCellStmt {
+        cell: u32,
+        dec: bool,
+    },
+    /// Superinstruction: `LoadCell(src) ; InitCell(dest)` — the per-iteration
+    /// `let` copy at loop-body entry (5.0% of executed pairs in the Phase-0
+    /// survey). Same TDZ check on the read; the init keeps `InitCell`'s
+    /// stable-vs-fresh-`Rc` behavior for `dest`.
+    LoadCellInit {
+        src: u32,
+        dest: u32,
+    },
     /// Pop; jump if falsy but leave the value if truthy (for `&&`). Actually we
     /// implement `&&`/`||`/`??` with peek-based jumps below.
     JumpIfFalsyPeek(u32), // peek top; if falsy jump (keep), else pop

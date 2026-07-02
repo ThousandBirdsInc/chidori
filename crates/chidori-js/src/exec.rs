@@ -2499,17 +2499,7 @@ impl Vm {
             Op::CmpBranchFalse { cmp, target } => {
                 let b = pop!();
                 let a = pop!();
-                let r = match cmp {
-                    CmpOp::Eq => self.loose_equals(&a, &b)?,
-                    CmpOp::Ne => !self.loose_equals(&a, &b)?,
-                    CmpOp::StrictEq => self.strict_equals(&a, &b),
-                    CmpOp::StrictNe => !self.strict_equals(&a, &b),
-                    CmpOp::Lt => self.less_than(&a, &b)? == Some(true),
-                    CmpOp::Gt => self.less_than(&b, &a)? == Some(true),
-                    CmpOp::Le => self.less_than(&b, &a)? == Some(false),
-                    CmpOp::Ge => self.less_than(&a, &b)? == Some(false),
-                };
-                if !r {
+                if !self.cmp_values(*cmp, &a, &b)? {
                     return Ok(Ctl::Jump(*target as usize));
                 }
             }
@@ -2518,18 +2508,87 @@ impl Vm {
             Op::CmpBranchTrue { cmp, target } => {
                 let b = pop!();
                 let a = pop!();
-                let r = match cmp {
-                    CmpOp::Eq => self.loose_equals(&a, &b)?,
-                    CmpOp::Ne => !self.loose_equals(&a, &b)?,
-                    CmpOp::StrictEq => self.strict_equals(&a, &b),
-                    CmpOp::StrictNe => !self.strict_equals(&a, &b),
-                    CmpOp::Lt => self.less_than(&a, &b)? == Some(true),
-                    CmpOp::Gt => self.less_than(&b, &a)? == Some(true),
-                    CmpOp::Le => self.less_than(&b, &a)? == Some(false),
-                    CmpOp::Ge => self.less_than(&a, &b)? == Some(false),
-                };
+                let r = self.cmp_values(*cmp, &a, &b)?;
                 if r {
                     return Ok(Ctl::Jump(*target as usize));
+                }
+            }
+            // Fused `LoadCellConst ; CmpBranchFalse` — a whole `i < N` loop test.
+            // Same TDZ check, comparison helpers, and branch as the sequence.
+            Op::CmpCellConstBranchFalse {
+                cell,
+                konst,
+                cmp,
+                target,
+            } => {
+                let a = frame.cells[*cell as usize].borrow().clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                if !self.cmp_values(*cmp, &a, &b)? {
+                    return Ok(Ctl::Jump(*target as usize));
+                }
+            }
+            Op::CmpCellConstBranchTrue {
+                cell,
+                konst,
+                cmp,
+                target,
+            } => {
+                let a = frame.cells[*cell as usize].borrow().clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                if self.cmp_values(*cmp, &a, &b)? {
+                    return Ok(Ctl::Jump(*target as usize));
+                }
+            }
+            // Fused `LoadCellConst ; Add` / `LoadCellConst ; <binop>` — the same
+            // op_add / arith helpers compute the result; only the intermediate
+            // stack traffic is elided.
+            Op::AddCellConst { cell, konst } => {
+                let a = frame.cells[*cell as usize].borrow().clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                let r = self.op_add(a, b)?;
+                push!(r);
+            }
+            Op::ArithCellConst { cell, konst, kind } => {
+                let a = frame.cells[*cell as usize].borrow().clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                let r = self.arith(a, b, *kind)?;
+                push!(r);
+            }
+            // Fused statement-position `i++`/`--i`-style update on a cell. The
+            // exact sequence semantics: TDZ-checked read, ToNumeric (which may
+            // run user code that reassigns the binding — the borrow is released
+            // before it runs), the same unary_arith step, plain in-place store.
+            Op::IncCellStmt { cell, dec } => {
+                let v = frame.cells[*cell as usize].borrow().clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let n = self.to_numeric(&v)?;
+                let r = self.unary_arith(n, if *dec { UnaryKind::Dec } else { UnaryKind::Inc })?;
+                *frame.cells[*cell as usize].borrow_mut() = r;
+            }
+            // Fused `LoadCell(src) ; InitCell(dest)` — per-iteration `let` copy.
+            Op::LoadCellInit { src, dest } => {
+                let v = frame.cells[*src as usize].borrow().clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                if frame.func.proto.stable_flags[*dest as usize] {
+                    *frame.cells[*dest as usize].borrow_mut() = v;
+                } else {
+                    frame.cells[*dest as usize] = Rc::new(RefCell::new(v));
                 }
             }
             Op::JumpIfFalsyPeek(t) => {
@@ -3315,6 +3374,23 @@ impl Vm {
         })
     }
 
+    /// Evaluate one of the eight comparison operators — the single source of
+    /// truth shared by the standalone comparison ops and every fused
+    /// compare-and-branch superinstruction, so coercion order and thrown
+    /// errors cannot diverge between fused and unfused code.
+    pub fn cmp_values(&mut self, cmp: CmpOp, a: &Value, b: &Value) -> Result<bool, Value> {
+        Ok(match cmp {
+            CmpOp::Eq => self.loose_equals(a, b)?,
+            CmpOp::Ne => !self.loose_equals(a, b)?,
+            CmpOp::StrictEq => self.strict_equals(a, b),
+            CmpOp::StrictNe => !self.strict_equals(a, b),
+            CmpOp::Lt => self.less_than(a, b)? == Some(true),
+            CmpOp::Gt => self.less_than(b, a)? == Some(true),
+            CmpOp::Le => self.less_than(b, a)? == Some(false),
+            CmpOp::Ge => self.less_than(a, b)? == Some(false),
+        })
+    }
+
     /// Abstract Relational Comparison `a < b`. Returns None for unordered (NaN).
     pub fn less_than(&mut self, a: &Value, b: &Value) -> Result<Option<bool>, Value> {
         // Fast path: Number < Number (loop bounds, sorts). NaN is unordered, so
@@ -3426,7 +3502,7 @@ fn js_mod(a: f64, b: f64) -> f64 {
 }
 
 /// Binary arithmetic/bitwise operations dispatched by kind (Number or BigInt).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArithKind {
     Sub,
     Mul,

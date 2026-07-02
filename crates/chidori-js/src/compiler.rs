@@ -1688,7 +1688,7 @@ impl Compiler {
         // nested — flows through here, so applying it once covers the whole
         // proto tree. Disabled only by the differential test.
         let code = if self.fuse {
-            crate::fuse::fuse_code(fc.code)
+            crate::fuse::fuse_code_fixpoint(fc.code)
         } else {
             fc.code
         };
