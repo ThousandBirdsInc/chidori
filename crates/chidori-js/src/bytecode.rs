@@ -146,16 +146,18 @@ pub struct FuncProto {
     /// cell-vec slot is filled with a shared never-read placeholder at frame
     /// setup instead of a pooled cell. See `localize.rs`.
     pub localized: Box<[bool]>,
-    /// Per-op inline-cache slots (len == `code.len()`, indexed by instruction
-    /// pointer; `u32::MAX` = empty). Used by `GetProp`/`SetProp`/`LoadGlobal`
-    /// to remember the property's `IndexMap` slot index at that site. The hint
-    /// is **verified on every use** (the key stored at the cached slot must
-    /// equal the op's key), so a stale hint is a cache miss, never a wrong
-    /// answer — no invalidation protocol exists or is needed. Pure performance
-    /// side effect: never serialized, never observed by the journal; a shared
-    /// proto (source→proto cache) shares hints across `Vm`s harmlessly for the
-    /// same reason.
-    pub ic: Box<[std::cell::Cell<u32>]>,
+    /// Per-op inline-cache entries (len == `code.len()`, indexed by
+    /// instruction pointer). Used by `GetProp`/`SetProp`/`LoadGlobal` to
+    /// remember where the property resolved at that site. Every hint is
+    /// **verified on every use** (the key stored at the cached slot must equal
+    /// the op's key; a cached prototype holder must be pointer-identical to
+    /// the receiver's CURRENT direct prototype), so a stale hint is a cache
+    /// miss, never a wrong answer — no invalidation protocol exists or is
+    /// needed. The holder identity check also keeps realms isolated when a
+    /// proto is shared across `Vm`s by the source→proto cache. Pure
+    /// performance side effect: never serialized, never observed by the
+    /// journal.
+    pub ic: Box<[IcEntry]>,
     /// Scope snapshots for the direct-`eval` call sites in this function,
     /// indexed by `Op::DirectEval`'s `scope` payload.
     pub eval_scopes: Vec<std::rc::Rc<EvalScopeDesc>>,
@@ -176,6 +178,15 @@ pub struct FuncProto {
     /// at runtime by `(this proto's pointer, index)` — the spec's per-Parse
     /// Node template cache (a shared proto is the same Parse Node).
     pub templates: Vec<TemplateParts>,
+}
+
+/// One inline-cache entry (see [`FuncProto::ic`]). `holder == None` means
+/// `slot` indexes the RECEIVER's own property map; `holder == Some(p)` means
+/// the property was found on `p`, the receiver's direct prototype, at `slot`.
+#[derive(Debug, Default)]
+pub struct IcEntry {
+    pub slot: std::cell::Cell<u32>,
+    pub holder: std::cell::RefCell<Option<crate::value::JsObject>>,
 }
 
 impl FuncProto {

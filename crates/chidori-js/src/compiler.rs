@@ -1738,7 +1738,10 @@ impl Compiler {
             name: fc.name,
             ic: code
                 .iter()
-                .map(|_| std::cell::Cell::new(u32::MAX))
+                .map(|_| crate::bytecode::IcEntry {
+                    slot: std::cell::Cell::new(u32::MAX),
+                    holder: std::cell::RefCell::new(None),
+                })
                 .collect(),
             code,
             consts: fc.consts,

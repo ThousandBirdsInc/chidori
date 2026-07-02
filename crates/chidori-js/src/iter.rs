@@ -195,7 +195,7 @@ impl Vm {
                 }
                 return Ok(self.make_iter_result(Value::Undefined, true));
             }
-            let v = self.get_prop(&base, &PropertyKey::from_index(idx as u32))?;
+            let v = self.get_index(&base, idx as u32)?;
             if let Internal::Iterator(st) = &mut it.borrow_mut().internal {
                 st.index += 1;
             }

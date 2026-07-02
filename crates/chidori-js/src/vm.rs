@@ -861,6 +861,27 @@ impl Vm {
 
     /// Ordinary [[Get]] following the prototype chain, honoring accessors and
     /// array exotic behavior.
+    /// `Get(O, ToString(idx))` specialized for integer keys — the element
+    /// read every array builtin and iterator step performs. Reads a dense
+    /// element directly when nothing can shadow it (no reified props),
+    /// skipping the idx→String key allocation and property-map machinery;
+    /// every other case takes the exact spec path.
+    pub fn get_index(&mut self, base: &Value, idx: u32) -> Result<Value, Value> {
+        if let Value::Object(o) = base {
+            let b = o.borrow();
+            if let Internal::Array(arr) = &b.internal {
+                if b.props.is_empty() {
+                    if let Some(v) = arr.get(idx as usize) {
+                        if !matches!(v, Value::Hole) {
+                            return Ok(v.clone());
+                        }
+                    }
+                }
+            }
+        }
+        self.get_prop(base, &PropertyKey::from_index(idx))
+    }
+
     pub fn get_prop(&mut self, base: &Value, key: &PropertyKey) -> Result<Value, Value> {
         // Fast paths for primitives without boxing.
         match base {

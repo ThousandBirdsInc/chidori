@@ -394,6 +394,11 @@ impl JsObject {
     pub fn borrow_mut(&self) -> std::cell::RefMut<'_, ObjectData> {
         self.0.borrow_mut()
     }
+    /// Pointer identity (same heap object). Basis of the inline caches'
+    /// holder verification.
+    pub fn ptr_eq(&self, other: &JsObject) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
     pub fn ptr_id(&self) -> usize {
         Rc::as_ptr(&self.0) as *const () as usize
     }

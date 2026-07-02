@@ -48,6 +48,140 @@ impl Vm {
         Err(self.throw_type(&format!("{desc} is not a function")))
     }
 
+    /// As [`Vm::call`], but takes OWNERSHIP of the argument buffer. The
+    /// interpreter's call ops route here so a plain JS->JS call moves its
+    /// (pooled) argument vec straight into the callee frame -- the &[Value]
+    /// path copies the arguments a second time in make_frame. Native/bound/
+    /// proxy callees borrow the vec and recycle it; every early error simply
+    /// drops it (a pool miss, never a leak).
+    pub(crate) fn call_valuevec(
+        &mut self,
+        func: Value,
+        this: Value,
+        args: Vec<Value>,
+    ) -> Result<Value, Value> {
+        if let Value::Object(o) = &func {
+            let o = o.clone();
+            let (callable, is_proxy) = {
+                let b = o.borrow();
+                (b.is_callable(), matches!(b.internal, Internal::Proxy(_)))
+            };
+            if is_proxy {
+                if callable {
+                    let r = self.proxy_call(&o, this, &args);
+                    self.recycle_value_vec(args);
+                    return r;
+                }
+            } else if callable {
+                return self.call_object_vec(&o, this, args, Value::Undefined);
+            }
+        }
+        let desc = self.describe(&func);
+        Err(self.throw_type(&format!("{desc} is not a function")))
+    }
+
+    pub(crate) fn call_object_vec(
+        &mut self,
+        obj: &JsObject,
+        this: Value,
+        args: Vec<Value>,
+        new_target: Value,
+    ) -> Result<Value, Value> {
+        self.call_depth += 1;
+        if self.call_depth > self.max_call_depth {
+            self.call_depth -= 1;
+            return Err(self.throw_range("Maximum call stack size exceeded"));
+        }
+        let result = self.call_object_inner_vec(obj, this, args, new_target);
+        self.call_depth -= 1;
+        result
+    }
+
+    fn call_object_inner_vec(
+        &mut self,
+        obj: &JsObject,
+        this: Value,
+        mut args: Vec<Value>,
+        new_target: Value,
+    ) -> Result<Value, Value> {
+        enum Disp {
+            Native(NativeFn),
+            Bytecode(Rc<BytecodeFunction>),
+            Bound(JsObject, Value, Vec<Value>),
+        }
+        let disp = {
+            let b = obj.borrow();
+            match b.as_function() {
+                Some(FunctionInner::Native(nf)) => Disp::Native(nf.func.clone()),
+                Some(FunctionInner::Bytecode(bf)) => Disp::Bytecode(bf.clone()),
+                Some(FunctionInner::Bound(bound)) => Disp::Bound(
+                    bound.target.clone(),
+                    bound.bound_this.clone(),
+                    bound.bound_args.clone(),
+                ),
+                None => return Err(self.throw_type("not a function")),
+            }
+        };
+        match disp {
+            Disp::Native(f) => {
+                let r = f(self, this, &args);
+                self.recycle_value_vec(args);
+                r
+            }
+            Disp::Bound(target, bthis, bargs) => {
+                let mut all = bargs;
+                all.append(&mut args);
+                self.recycle_value_vec(args);
+                self.call_object_vec(&target, bthis, all, new_target)
+            }
+            Disp::Bytecode(bf) => self.call_bytecode_vec(obj, bf, this, args, new_target),
+        }
+    }
+
+    fn call_bytecode_vec(
+        &mut self,
+        func_obj: &JsObject,
+        bf: Rc<BytecodeFunction>,
+        this: Value,
+        args: Vec<Value>,
+        new_target: Value,
+    ) -> Result<Value, Value> {
+        let kind = bf.proto.kind;
+        if bf.is_class_ctor {
+            return Err(self.throw_type(&format!(
+                "Class constructor {} cannot be invoked without 'new'",
+                bf.proto.name
+            )));
+        }
+        if kind.is_generator() {
+            let r = self.make_generator(func_obj, bf, this, &args, new_target);
+            self.recycle_value_vec(args);
+            return r;
+        }
+        let mut frame = self.make_frame_owned(bf, this, args, new_target);
+        frame.func_obj = Some(func_obj.clone());
+        let token = self.trace_enter(&frame.func.proto);
+        frame.trace_token = token;
+        if kind.is_async() {
+            Ok(self.start_async(frame))
+        } else {
+            match self.run_frame(frame) {
+                Flow::Return(v) => {
+                    self.trace_exit(token, false);
+                    Ok(v)
+                }
+                Flow::Throw(e) => {
+                    self.trace_exit(token, true);
+                    Err(e)
+                }
+                Flow::Suspend(_) => {
+                    let _ = func_obj;
+                    Err(self.throw_type("internal: sync function suspended"))
+                }
+            }
+        }
+    }
+
     fn describe(&self, v: &Value) -> String {
         match v {
             Value::Undefined | Value::Uninitialized | Value::Hole => "undefined".into(),
@@ -354,6 +488,21 @@ impl Vm {
         args: &[Value],
         new_target: Value,
     ) -> Frame {
+        let mut args_buf = self.take_value_vec();
+        args_buf.extend_from_slice(args);
+        self.make_frame_owned(bf, this, args_buf, new_target)
+    }
+
+    /// As [`Vm::make_frame`], but adopts an already-owned argument buffer
+    /// (the interpreter's pooled call-op buffer) as `frame.args` directly,
+    /// skipping the copy. `recycle_frame` returns it to the pool at exit.
+    pub fn make_frame_owned(
+        &mut self,
+        bf: Rc<BytecodeFunction>,
+        this: Value,
+        args: Vec<Value>,
+        new_target: Value,
+    ) -> Frame {
         let proto = bf.proto.clone();
         let mut cells = self.cells_vec_pool.pop().unwrap_or_default();
         for i in 0..proto.num_cells as usize {
@@ -377,8 +526,7 @@ impl Vm {
         stack.reserve(8);
         let mut locals = self.take_value_vec();
         locals.resize(proto.num_locals as usize, Value::Undefined);
-        let mut args_buf = self.take_value_vec();
-        args_buf.extend_from_slice(args);
+        let args_buf = args;
         Frame {
             func: bf,
             ip: 0,
@@ -1205,7 +1353,8 @@ impl Vm {
                 // indexed load plus a pointer-equality key check, no hashing.
                 if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
                     let b = g.borrow();
-                    if let Some((PropertyKey::Str(k), prop)) = b.props.get_index(ic.get() as usize)
+                    if let Some((PropertyKey::Str(k), prop)) =
+                        b.props.get_index(ic.slot.get() as usize)
                     {
                         if let PropertyKind::Data { value, .. } = &prop.kind {
                             if k == &name {
@@ -1234,7 +1383,7 @@ impl Vm {
                             },
                         )) => {
                             if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
-                                ic.set(idx as u32);
+                                ic.slot.set(idx as u32);
                             }
                             Some(value.clone())
                         }
@@ -1772,21 +1921,86 @@ impl Vm {
             Op::GetProp(i) => {
                 let name = self.const_name(frame, *i);
                 let obj = pop!();
-                // Inline cache (key-verified slot hint; see `FuncProto::ic`).
-                // Fast path only for an ordinary object's own DATA property:
-                // every exotic case (array index/length, arguments aliasing,
-                // proxies, namespaces, accessors, prototype climbs) falls to
-                // the unchanged slow path, which also refills the hint when
-                // the receiver resolves to an own data property.
+                // Inline cache (key-verified hints; see `FuncProto::ic`).
+                // Two levels:
+                //  - `holder == None`: the receiver's OWN data property at
+                //    `slot` (ordinary objects).
+                //  - `holder == Some(p)`: a data property at `slot` on `p`,
+                //    verified to still be the receiver's DIRECT prototype and
+                //    not shadowed by an own property — the method-lookup
+                //    pattern (`arr.push`, class instances calling prototype
+                //    methods). Array receivers exclude keys with exotic own
+                //    behavior (`length`, indices). Deeper chains, accessors,
+                //    proxies, and every other exotic fall to the unchanged
+                //    slow path.
                 if let Value::Object(o) = &obj {
                     if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
                         let b = o.borrow();
-                        if matches!(b.internal, Internal::Ordinary) {
-                            if let Some((PropertyKey::Str(k), prop)) =
-                                b.props.get_index(ic.get() as usize)
-                            {
-                                if let PropertyKind::Data { value, .. } = &prop.kind {
-                                    if k == &name {
+                        let (is_ord, is_arr) = (
+                            matches!(b.internal, Internal::Ordinary),
+                            matches!(b.internal, Internal::Array(_)),
+                        );
+                        // Array exotics: `length` and index keys never take
+                        // the IC (they don't live in the props map).
+                        let plain_key = !is_arr
+                            || (name.as_str() != "length"
+                                && crate::value::canonical_index(name.as_str()).is_none());
+                        if (is_ord || is_arr) && plain_key {
+                            let slot = ic.slot.get() as usize;
+                            let holder = ic.holder.borrow();
+                            match &*holder {
+                                None if is_ord => {
+                                    if let Some((PropertyKey::Str(k), prop)) =
+                                        b.props.get_index(slot)
+                                    {
+                                        if let PropertyKind::Data { value, .. } = &prop.kind {
+                                            if k == &name {
+                                                let v = value.clone();
+                                                drop(holder);
+                                                drop(b);
+                                                push!(v);
+                                                return Ok(Ctl::Next);
+                                            }
+                                        }
+                                    }
+                                }
+                                Some(h) => {
+                                    // Proto hit: valid only when the receiver
+                                    // has no own props (nothing can shadow)
+                                    // and its CURRENT direct proto is the
+                                    // cached holder.
+                                    if b.props.is_empty()
+                                        && b.proto.as_ref().is_some_and(|p| p.ptr_eq(h))
+                                    {
+                                        let hb = h.borrow();
+                                        if let Some((PropertyKey::Str(k), prop)) =
+                                            hb.props.get_index(slot)
+                                        {
+                                            if let PropertyKind::Data { value, .. } = &prop.kind {
+                                                if k == &name {
+                                                    let v = value.clone();
+                                                    drop(hb);
+                                                    drop(holder);
+                                                    drop(b);
+                                                    push!(v);
+                                                    return Ok(Ctl::Next);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                None => {}
+                            }
+                            drop(holder);
+                            // Refill: own data property first (ordinary only),
+                            // then a one-level proto data property when no own
+                            // props can shadow.
+                            let key = PropertyKey::Str(name.clone());
+                            if is_ord {
+                                if let Some((idx, _, prop)) = b.props.get_full(&key) {
+                                    if let PropertyKind::Data { value, .. } = &prop.kind {
+                                        ic.slot.set(idx as u32);
+                                        *ic.holder.borrow_mut() = None;
                                         let v = value.clone();
                                         drop(b);
                                         push!(v);
@@ -1794,14 +2008,25 @@ impl Vm {
                                     }
                                 }
                             }
-                            let key = PropertyKey::Str(name.clone());
-                            if let Some((idx, _, prop)) = b.props.get_full(&key) {
-                                if let PropertyKind::Data { value, .. } = &prop.kind {
-                                    ic.set(idx as u32);
-                                    let v = value.clone();
-                                    drop(b);
-                                    push!(v);
-                                    return Ok(Ctl::Next);
+                            if b.props.is_empty() {
+                                if let Some(p) = &b.proto {
+                                    let pb = p.borrow();
+                                    if matches!(pb.internal, Internal::Ordinary)
+                                        || matches!(pb.internal, Internal::Array(_))
+                                    {
+                                        if let Some((idx, _, prop)) = pb.props.get_full(&key) {
+                                            if let PropertyKind::Data { value, .. } = &prop.kind {
+                                                ic.slot.set(idx as u32);
+                                                let v = value.clone();
+                                                let holder_obj = p.clone();
+                                                drop(pb);
+                                                *ic.holder.borrow_mut() = Some(holder_obj);
+                                                drop(b);
+                                                push!(v);
+                                                return Ok(Ctl::Next);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2262,9 +2487,10 @@ impl Vm {
                 if let Value::Object(o) = &obj {
                     if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
                         let mut b = o.borrow_mut();
-                        if matches!(b.internal, Internal::Ordinary) {
+                        if matches!(b.internal, Internal::Ordinary) && ic.holder.borrow().is_none()
+                        {
                             if let Some((PropertyKey::Str(k), prop)) =
-                                b.props.get_index_mut(ic.get() as usize)
+                                b.props.get_index_mut(ic.slot.get() as usize)
                             {
                                 if k == &name {
                                     if let PropertyKind::Data {
@@ -2286,7 +2512,7 @@ impl Vm {
                                     writable: true,
                                 } = &mut prop.kind
                                 {
-                                    ic.set(idx as u32);
+                                    ic.slot.set(idx as u32);
                                     *slot = value.clone();
                                     drop(b);
                                     push!(value);
@@ -2303,6 +2529,31 @@ impl Vm {
             Op::GetPropDynamic => {
                 let key_v = pop!();
                 let obj = pop!();
+                // Integer fast path: `a[i]` on a dense array with an integral
+                // Number key reads the element directly — skipping
+                // ToPropertyKey's Number→String conversion (a float-format +
+                // heap allocation per access!), the reparse back to an index,
+                // and the property-map machinery. Only when no reified props
+                // entry can shadow the dense element (`props.is_empty()`) and
+                // the slot is a real element (in bounds, not a hole);
+                // everything else takes the unchanged spec path.
+                if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
+                    if n.fract() == 0.0 && *n >= 0.0 && *n < 4294967295.0 {
+                        let b = o.borrow();
+                        if let Internal::Array(arr) = &b.internal {
+                            if b.props.is_empty() {
+                                if let Some(v) = arr.get(*n as usize) {
+                                    if !matches!(v, Value::Hole) {
+                                        let v = v.clone();
+                                        drop(b);
+                                        push!(v);
+                                        return Ok(Ctl::Next);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // GetValue: RequireObjectCoercible(base) (via ToObject) throws
                 // BEFORE ToPropertyKey coerces the key expression's value.
                 self.require_object_coercible(&obj, "read properties of")?;
@@ -2314,6 +2565,30 @@ impl Vm {
                 let value = pop!();
                 let key_v = pop!();
                 let obj = pop!();
+                // Integer fast path mirroring `GetPropDynamic`: overwrite an
+                // EXISTING dense element in place. An in-bounds non-hole dense
+                // slot is a plain writable data property (per the array exotic
+                // [[Set]]), so no setter, no length change, and no
+                // extensibility interaction is observable. Appends, holes,
+                // out-of-bounds, and shadowed elements take the spec path.
+                if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
+                    if n.fract() == 0.0 && *n >= 0.0 && *n < 4294967295.0 {
+                        let mut b = o.borrow_mut();
+                        if b.props.is_empty() {
+                            if let Internal::Array(arr) = &mut b.internal {
+                                let i = *n as usize;
+                                if let Some(slot) = arr.get_mut(i) {
+                                    if !matches!(slot, Value::Hole) {
+                                        *slot = value.clone();
+                                        drop(b);
+                                        push!(value);
+                                        return Ok(Ctl::Next);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 self.require_object_coercible(&obj, "set properties of")?;
                 let key = self.to_property_key(&key_v)?;
                 let strict = frame.func.proto.is_strict;
@@ -2375,8 +2650,10 @@ impl Vm {
                 args.extend(frame.stack.drain(at..));
                 let this = pop!();
                 let func = pop!();
-                let r = self.call(func, this, &args);
-                self.recycle_value_vec(args);
+                // Owned-args path: the pooled buffer moves into the callee
+                // frame (recycled by its recycle_frame), skipping the second
+                // copy make_frame's slice path would do.
+                let r = self.call_valuevec(func, this, args);
                 push!(r?);
             }
             Op::CallMethodless(argc) => {
@@ -2385,8 +2662,7 @@ impl Vm {
                 let mut args = self.take_value_vec();
                 args.extend(frame.stack.drain(at..));
                 let func = pop!();
-                let r = self.call(func, Value::Undefined, &args);
-                self.recycle_value_vec(args);
+                let r = self.call_valuevec(func, Value::Undefined, args);
                 push!(r?);
             }
             Op::CallSpread => {

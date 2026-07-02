@@ -234,6 +234,49 @@ fn create_data_on(vm: &mut Vm, target: &Value, key: &PropertyKey, v: Value) -> R
     create_data_property_or_throw(vm, &o, key, v)
 }
 
+/// The `HasProperty(O, k) ? Some(Get(O, k)) : None` step every array
+/// iteration builtin performs per element, with a dense fast path: an
+/// in-bounds non-hole element of an unshadowed dense array is present and
+/// IS the value — no idx→String key, no hashing, no prototype walk. Holes,
+/// out-of-bounds indices, shadowed elements, and array-likes take the exact
+/// spec sequence.
+fn has_get_elem(vm: &mut Vm, base: &Value, idx: f64) -> Result<Option<Value>, Value> {
+    if idx >= 0.0 && idx <= u32::MAX as f64 {
+        if let Value::Object(o) = base {
+            let b = o.borrow();
+            if let Internal::Array(arr) = &b.internal {
+                if b.props.is_empty() {
+                    if let Some(v) = arr.get(idx as usize) {
+                        if !matches!(v, Value::Hole) {
+                            return Ok(Some(v.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let key = elem_key(idx);
+    if vm.has_prop(base, &key)? {
+        Ok(Some(vm.get_prop(base, &key)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// `CreateDataPropertyOrThrow(O, ToString(k), V)` for the result arrays the
+/// iteration builtins fill: dense in-place write / exact append fast path,
+/// spec path otherwise (see `create_data_index`).
+fn create_data_elem(vm: &mut Vm, target: &Value, idx: f64, v: Value) -> Result<(), Value> {
+    let o = match target {
+        Value::Object(o) => o.clone(),
+        _ => return Err(vm.throw_type("result is not an object")),
+    };
+    if idx >= 0.0 && idx <= u32::MAX as f64 {
+        return super::fundamental::create_data_index(vm, &o, idx as u32, v);
+    }
+    create_data_property_or_throw(vm, &o, &elem_key(idx), v)
+}
+
 /// `DeletePropertyOrThrow(O, key)`: a failed delete (non-configurable property)
 /// raises a TypeError instead of silently succeeding.
 fn delete_or_throw(vm: &mut Vm, o: &Value, key: &PropertyKey) -> Result<(), Value> {
@@ -698,9 +741,7 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         let mut k = 0.0;
         while k < len {
             vm.native_tick()?;
-            let key = elem_key(k);
-            if vm.has_prop(&ov, &key)? {
-                let v = vm.get_prop(&ov, &key)?;
+            if let Some(v) = has_get_elem(vm, &ov, k)? {
                 vm.call(
                     cb.clone(),
                     this_arg.clone(),
@@ -719,15 +760,13 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         let mut k = 0.0;
         while k < len {
             vm.native_tick()?;
-            let key = elem_key(k);
-            if vm.has_prop(&ov, &key)? {
-                let v = vm.get_prop(&ov, &key)?;
+            if let Some(v) = has_get_elem(vm, &ov, k)? {
                 let mapped = vm.call(
                     cb.clone(),
                     this_arg.clone(),
                     &[v, Value::Number(k), ov.clone()],
                 )?;
-                create_data_on(vm, &a, &key, mapped)?;
+                create_data_elem(vm, &a, k, mapped)?;
             }
             k += 1.0;
         }
@@ -740,16 +779,14 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         let mut k = 0.0;
         while k < len {
             vm.native_tick()?;
-            let key = elem_key(k);
-            if vm.has_prop(&ov, &key)? {
-                let v = vm.get_prop(&ov, &key)?;
+            if let Some(v) = has_get_elem(vm, &ov, k)? {
                 let keep = vm.call(
                     cb.clone(),
                     this_arg.clone(),
                     &[v.clone(), Value::Number(k), ov.clone()],
                 )?;
                 if vm.to_boolean(&keep) {
-                    create_data_on(vm, &a, &elem_key(to), v)?;
+                    create_data_elem(vm, &a, to, v)?;
                     to += 1.0;
                 }
             }
@@ -896,9 +933,7 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         let mut acc = acc;
         while k < len {
             vm.native_tick()?;
-            let key = elem_key(k);
-            if vm.has_prop(&ov, &key)? {
-                let v = vm.get_prop(&ov, &key)?;
+            if let Some(v) = has_get_elem(vm, &ov, k)? {
                 acc = vm.call(
                     cb.clone(),
                     Value::Undefined,
