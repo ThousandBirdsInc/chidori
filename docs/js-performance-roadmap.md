@@ -389,15 +389,45 @@ and the new `tests/ic.rs` stale-hint corpus cross-checked against Node).
    capture-focused differential corpus (`tests/localize.rs`) across all four
    {fuse}×{localize} combinations.
 
+Round 3 (same session) added four more commits:
+
+7. **Rope strings** — `s += chunk` was O(total²): string_build's profile was
+   96.5% memcpy. `JsString` gained a rope arm: each `+` over well-formed
+   operands is one O(1) node; bytes are copied exactly once on first
+   observation. `.length` and the size guard stay O(1) via stored totals;
+   flatten and drop are both iterative. **string_build: 5.00 G → 0.18 G
+   instructions (27×)** — and prompt-building via `+=` is the canonical
+   agent pattern.
+8. **Dense-array element fast paths** — every `a[i]` converted the Number
+   key to a heap-allocated string (grisu formatting!) and reparsed it.
+   `GetPropDynamic`/`SetPropDynamic` and the array iteration builtins
+   (map/filter/forEach/reduce, the array iterator) now access unshadowed
+   in-bounds dense elements directly. array_push_sum −26%, array_hof −17%.
+9. **Prototype-level inline caches** — `IcEntry` carries an independent
+   `proto_slot` + holder: a data property on the receiver's DIRECT
+   prototype (the `arr.push` / class-method pattern) is cached, verified by
+   holder pointer identity (which doubles as realm isolation) and
+   no-own-props shadowing. The own-hit path never touches the holder.
+10. **Owned-args calls** — the interpreter's call ops move their pooled
+    argument buffer into the callee frame instead of re-copying.
+
 ### 6.1 Instruction counts (callgrind — deterministic, the load-bearing metric)
 
-Whole-workload totals, branch start → after the push:
+Whole-workload totals, branch start → after rounds 1–3:
 
 | workload | before | after | Δ |
 | --- | ---: | ---: | ---: |
-| property_access | 10.98 G | 3.59 G | **−67%** |
-| arith_loop | 3.17 G | 2.13 G | **−33%** |
-| fib_recursive | 12.83 G | 8.66 G | **−33%** |
+| string_build | 5.00 G | 0.18 G | **−96%** |
+| property_access | 10.98 G | 3.95 G | **−64%** |
+| arith_loop | 3.17 G | 2.28 G | **−28%** |
+| fib_recursive | 12.83 G | 8.59 G | **−33%** |
+| array_push_sum | 5.04 G¹ | 3.73 G | −26%¹ |
+| array_hof | 3.03 G¹ | 2.52 G | −17%¹ |
+
+¹ vs. the post-round-2 measurement (no branch-start baseline was taken).
+The zero-host agent-replay example is instruction-identical before/after
+round 3 (11.05 G) — its cost is host-effect glue, not the paths these
+rounds touched.
 
 malloc/free (16.7% of fib at branch start) and SipHash (48.7% of
 property_access) have left the profiles' top ranks entirely.
@@ -426,12 +456,25 @@ predicts.
 
 ### 6.3 What's next (new baseline)
 
-§3.2 (cells→locals) is now **landed** (item 6 above). The remaining
-big-structure items: **register bytecode** (§3.5 — with bindings already in
-flat indexed slots, the distance to "ops address slots directly" has shrunk
-substantially), and **shapes** (§3.7) if property-heavy profiles still show
-`get_index_of` after the ICs. Re-run the callgrind sweep before choosing;
-the noise-floor and idle-machine caveats in §1.1 stand.
+§3.2 (cells→locals) and the property/array cache work are **landed**. Hash
+probing (`get_index_of`) no longer appears in any workload's top profile
+ranks — the shapes question (§3.7) is answered for now. What the profiles
+show after round 3:
+
+- **sort (14.1 G, the biggest remaining)**: ~25% pure call ceremony for the
+  tiny comparator — `Frame` is 408 bytes and its construction, pool
+  round-trips, and drop dominate each comparison. The lever is a **Frame
+  diet** (box the rarely-used fields: handlers, dispose scopes, enumerators,
+  with/eval state) and/or a leaf-call fast path that skips unused frame
+  machinery.
+- **register bytecode** (§3.5) remains the dispatch-side end-game for the
+  arith/fib class (step + run_frame are >50% there).
+- A discovered pre-existing conformance gap: sealed-array appends are not
+  rejected (`Object.seal(a); a[len] = v` writes). Tracked for a separate
+  fix validated by Test262.
+
+Re-run the callgrind sweep before choosing; the noise-floor and idle-machine
+caveats in §1.1 stand.
 
 ## 7. References
 
