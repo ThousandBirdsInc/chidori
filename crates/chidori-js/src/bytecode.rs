@@ -180,12 +180,14 @@ pub struct FuncProto {
     pub templates: Vec<TemplateParts>,
 }
 
-/// One inline-cache entry (see [`FuncProto::ic`]). `holder == None` means
-/// `slot` indexes the RECEIVER's own property map; `holder == Some(p)` means
-/// the property was found on `p`, the receiver's direct prototype, at `slot`.
+/// One inline-cache entry (see [`FuncProto::ic`]). `own_slot` indexes the
+/// RECEIVER's own property map; independently, `proto_slot` indexes `holder`
+/// (the receiver's direct prototype as last seen). Two separate slots keep
+/// the hot own-property hit path from ever touching the holder `RefCell`.
 #[derive(Debug, Default)]
 pub struct IcEntry {
-    pub slot: std::cell::Cell<u32>,
+    pub own_slot: std::cell::Cell<u32>,
+    pub proto_slot: std::cell::Cell<u32>,
     pub holder: std::cell::RefCell<Option<crate::value::JsObject>>,
 }
 

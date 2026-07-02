@@ -1739,7 +1739,8 @@ impl Compiler {
             ic: code
                 .iter()
                 .map(|_| crate::bytecode::IcEntry {
-                    slot: std::cell::Cell::new(u32::MAX),
+                    own_slot: std::cell::Cell::new(u32::MAX),
+                    proto_slot: std::cell::Cell::new(u32::MAX),
                     holder: std::cell::RefCell::new(None),
                 })
                 .collect(),

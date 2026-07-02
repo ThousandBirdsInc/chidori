@@ -1354,7 +1354,7 @@ impl Vm {
                 if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
                     let b = g.borrow();
                     if let Some((PropertyKey::Str(k), prop)) =
-                        b.props.get_index(ic.slot.get() as usize)
+                        b.props.get_index(ic.own_slot.get() as usize)
                     {
                         if let PropertyKind::Data { value, .. } = &prop.kind {
                             if k == &name {
@@ -1383,7 +1383,7 @@ impl Vm {
                             },
                         )) => {
                             if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
-                                ic.slot.set(idx as u32);
+                                ic.own_slot.set(idx as u32);
                             }
                             Some(value.clone())
                         }
@@ -1946,35 +1946,31 @@ impl Vm {
                             || (name.as_str() != "length"
                                 && crate::value::canonical_index(name.as_str()).is_none());
                         if (is_ord || is_arr) && plain_key {
-                            let slot = ic.slot.get() as usize;
-                            let holder = ic.holder.borrow();
-                            match &*holder {
-                                None if is_ord => {
-                                    if let Some((PropertyKey::Str(k), prop)) =
-                                        b.props.get_index(slot)
-                                    {
-                                        if let PropertyKind::Data { value, .. } = &prop.kind {
-                                            if k == &name {
-                                                let v = value.clone();
-                                                drop(holder);
-                                                drop(b);
-                                                push!(v);
-                                                return Ok(Ctl::Next);
-                                            }
+                            // Own-property hit: never touches the holder cell.
+                            if is_ord {
+                                if let Some((PropertyKey::Str(k), prop)) =
+                                    b.props.get_index(ic.own_slot.get() as usize)
+                                {
+                                    if let PropertyKind::Data { value, .. } = &prop.kind {
+                                        if k == &name {
+                                            let v = value.clone();
+                                            drop(b);
+                                            push!(v);
+                                            return Ok(Ctl::Next);
                                         }
                                     }
                                 }
-                                Some(h) => {
-                                    // Proto hit: valid only when the receiver
-                                    // has no own props (nothing can shadow)
-                                    // and its CURRENT direct proto is the
-                                    // cached holder.
-                                    if b.props.is_empty()
-                                        && b.proto.as_ref().is_some_and(|p| p.ptr_eq(h))
-                                    {
+                            }
+                            // Proto hit: valid only when the receiver has no
+                            // own props (nothing can shadow) and its CURRENT
+                            // direct proto is the cached holder.
+                            if b.props.is_empty() {
+                                let holder = ic.holder.borrow();
+                                if let Some(h) = &*holder {
+                                    if b.proto.as_ref().is_some_and(|p| p.ptr_eq(h)) {
                                         let hb = h.borrow();
                                         if let Some((PropertyKey::Str(k), prop)) =
-                                            hb.props.get_index(slot)
+                                            hb.props.get_index(ic.proto_slot.get() as usize)
                                         {
                                             if let PropertyKind::Data { value, .. } = &prop.kind {
                                                 if k == &name {
@@ -1989,9 +1985,7 @@ impl Vm {
                                         }
                                     }
                                 }
-                                None => {}
                             }
-                            drop(holder);
                             // Refill: own data property first (ordinary only),
                             // then a one-level proto data property when no own
                             // props can shadow.
@@ -1999,8 +1993,7 @@ impl Vm {
                             if is_ord {
                                 if let Some((idx, _, prop)) = b.props.get_full(&key) {
                                     if let PropertyKind::Data { value, .. } = &prop.kind {
-                                        ic.slot.set(idx as u32);
-                                        *ic.holder.borrow_mut() = None;
+                                        ic.own_slot.set(idx as u32);
                                         let v = value.clone();
                                         drop(b);
                                         push!(v);
@@ -2016,7 +2009,7 @@ impl Vm {
                                     {
                                         if let Some((idx, _, prop)) = pb.props.get_full(&key) {
                                             if let PropertyKind::Data { value, .. } = &prop.kind {
-                                                ic.slot.set(idx as u32);
+                                                ic.proto_slot.set(idx as u32);
                                                 let v = value.clone();
                                                 let holder_obj = p.clone();
                                                 drop(pb);
@@ -2487,10 +2480,9 @@ impl Vm {
                 if let Value::Object(o) = &obj {
                     if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
                         let mut b = o.borrow_mut();
-                        if matches!(b.internal, Internal::Ordinary) && ic.holder.borrow().is_none()
-                        {
+                        if matches!(b.internal, Internal::Ordinary) {
                             if let Some((PropertyKey::Str(k), prop)) =
-                                b.props.get_index_mut(ic.slot.get() as usize)
+                                b.props.get_index_mut(ic.own_slot.get() as usize)
                             {
                                 if k == &name {
                                     if let PropertyKind::Data {
@@ -2512,7 +2504,7 @@ impl Vm {
                                     writable: true,
                                 } = &mut prop.kind
                                 {
-                                    ic.slot.set(idx as u32);
+                                    ic.own_slot.set(idx as u32);
                                     *slot = value.clone();
                                     drop(b);
                                     push!(value);
