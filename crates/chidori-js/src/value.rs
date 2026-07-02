@@ -929,7 +929,7 @@ pub type NativeFn = Rc<dyn Fn(&mut crate::vm::Vm, Value, &[Value]) -> Result<Val
 
 pub enum FunctionInner {
     Native(NativeFunction),
-    Bytecode(BytecodeFunction),
+    Bytecode(Rc<BytecodeFunction>),
     Bound(BoundFunction),
 }
 

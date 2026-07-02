@@ -302,14 +302,14 @@ impl Vm {
                 b.compiled.has_tla,
             )
         };
-        let bf = BytecodeFunction {
+        let bf = Rc::new(BytecodeFunction {
             proto: proto.clone(),
             upvalues: Vec::new(),
             home_object: None,
             is_class_ctor: false,
             captured_with: Vec::new(),
             captured_priv_env: None,
-        };
+        });
         let mut frame = self.make_frame(bf, Value::Undefined, &[], Value::Undefined);
         frame.cells = cells;
         rec.borrow_mut().status = ModuleStatus::Evaluated;

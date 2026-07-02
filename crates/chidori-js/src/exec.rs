@@ -89,7 +89,7 @@ impl Vm {
         // recursive call.
         enum Disp {
             Native(NativeFn),
-            Bytecode(BytecodeFunction),
+            Bytecode(Rc<BytecodeFunction>),
             Bound(JsObject, Value, Vec<Value>),
         }
         let disp = {
@@ -119,7 +119,7 @@ impl Vm {
     fn call_bytecode(
         &mut self,
         func_obj: &JsObject,
-        bf: BytecodeFunction,
+        bf: Rc<BytecodeFunction>,
         this: Value,
         args: &[Value],
         new_target: Value,
@@ -316,19 +316,50 @@ impl Vm {
         self.recycle_value_vec(stack);
         self.recycle_value_vec(locals);
         self.recycle_value_vec(args);
+        let mut cells = std::mem::take(&mut frame.cells);
+        for cell in cells.drain(..) {
+            self.recycle_cell(cell);
+        }
+        if cells.capacity() > 0 && self.cells_vec_pool.len() < Self::VALUE_VEC_POOL_CAP {
+            self.cells_vec_pool.push(cells);
+        }
+    }
+
+    /// Pull a binding cell holding `v` from the pool, or allocate a fresh one.
+    pub(crate) fn take_cell(&mut self, v: Value) -> Rc<RefCell<Value>> {
+        match self.cell_pool.pop() {
+            Some(c) => {
+                *c.borrow_mut() = v;
+                c
+            }
+            None => Rc::new(RefCell::new(v)),
+        }
+    }
+
+    /// Return a cell to the pool — ONLY when nothing else can ever see it
+    /// (`strong_count == 1`; a cell captured by a closure, upvalue chain,
+    /// mapped-arguments alias, or module link stays out). Cleared on the way
+    /// in so the pool never extends a value's lifetime.
+    pub(crate) fn recycle_cell(&mut self, c: Rc<RefCell<Value>>) {
+        if Rc::strong_count(&c) == 1 && self.cell_pool.len() < Self::VALUE_VEC_POOL_CAP {
+            *c.borrow_mut() = Value::Undefined;
+            self.cell_pool.push(c);
+        }
     }
 
     pub fn make_frame(
         &mut self,
-        bf: BytecodeFunction,
+        bf: Rc<BytecodeFunction>,
         this: Value,
         args: &[Value],
         new_target: Value,
     ) -> Frame {
         let proto = bf.proto.clone();
-        let cells = (0..proto.num_cells)
-            .map(|_| Rc::new(RefCell::new(Value::Undefined)))
-            .collect();
+        let mut cells = self.cells_vec_pool.pop().unwrap_or_default();
+        for _ in 0..proto.num_cells {
+            let c = self.take_cell(Value::Undefined);
+            cells.push(c);
+        }
         // A closure created inside `with (o) { … }` carries the with-object
         // chain; seed the frame's with-scope stack with it so the body's
         // dynamic name ops resolve against it (under any with the body enters).
@@ -408,7 +439,7 @@ impl Vm {
     ) -> Result<Value, Value> {
         enum Disp {
             Native(NativeFn),
-            Bytecode(BytecodeFunction),
+            Bytecode(Rc<BytecodeFunction>),
             Bound(JsObject, Vec<Value>),
             NotCtor,
         }
@@ -809,7 +840,7 @@ impl Vm {
             };
             upvalues.push(cell);
         }
-        let bf = BytecodeFunction {
+        let bf = Rc::new(BytecodeFunction {
             proto: Rc::new(compiled.proto),
             upvalues,
             home_object: frame.func.home_object.clone(),
@@ -817,7 +848,7 @@ impl Vm {
             captured_with: frame.with_scope.clone(),
             // The eval body resolves `#x` against the caller's private scope.
             captured_priv_env: frame.priv_env.clone(),
-        };
+        });
         self.call_depth += 1;
         if self.call_depth > self.max_call_depth {
             self.call_depth -= 1;
@@ -1029,7 +1060,9 @@ impl Vm {
                 if frame.func.proto.stable_flags[*i as usize] {
                     *frame.cells[*i as usize].borrow_mut() = v;
                 } else {
-                    frame.cells[*i as usize] = Rc::new(RefCell::new(v));
+                    let fresh = self.take_cell(v);
+                    let old = std::mem::replace(&mut frame.cells[*i as usize], fresh);
+                    self.recycle_cell(old);
                 }
             }
             Op::InitCellTdz(i) => {
@@ -1038,7 +1071,9 @@ impl Vm {
                 if frame.func.proto.stable_flags[*i as usize] {
                     *frame.cells[*i as usize].borrow_mut() = Value::Uninitialized;
                 } else {
-                    frame.cells[*i as usize] = Rc::new(RefCell::new(Value::Uninitialized));
+                    let fresh = self.take_cell(Value::Uninitialized);
+                    let old = std::mem::replace(&mut frame.cells[*i as usize], fresh);
+                    self.recycle_cell(old);
                 }
             }
             Op::LoadUpvalue(i) => {
@@ -1517,7 +1552,7 @@ impl Vm {
                         if let Internal::Function(FunctionInner::Bytecode(bf)) =
                             &mut m.borrow_mut().internal
                         {
-                            bf.home_object = Some(home);
+                            Rc::make_mut(bf).home_object = Some(home);
                         }
                     }
                 }
@@ -1532,7 +1567,7 @@ impl Vm {
                         if let Internal::Function(FunctionInner::Bytecode(bf)) =
                             &mut m.borrow_mut().internal
                         {
-                            bf.home_object = Some(home);
+                            Rc::make_mut(bf).home_object = Some(home);
                         }
                     }
                 }
@@ -2318,6 +2353,7 @@ impl Vm {
                     if let Internal::Function(FunctionInner::Bytecode(bf)) =
                         &mut f.borrow_mut().internal
                     {
+                        let bf = Rc::make_mut(bf);
                         bf.captured_with = frame.with_scope.clone();
                         bf.captured_priv_env = frame.priv_env.clone();
                         if inherit_home {
@@ -2588,7 +2624,9 @@ impl Vm {
                 if frame.func.proto.stable_flags[*dest as usize] {
                     *frame.cells[*dest as usize].borrow_mut() = v;
                 } else {
-                    frame.cells[*dest as usize] = Rc::new(RefCell::new(v));
+                    let fresh = self.take_cell(v);
+                    let old = std::mem::replace(&mut frame.cells[*dest as usize], fresh);
+                    self.recycle_cell(old);
                 }
             }
             Op::JumpIfFalsyPeek(t) => {
@@ -3031,14 +3069,14 @@ impl Vm {
         let length = proto.num_params;
         let name = proto.name.clone();
         let kind = proto.kind;
-        let bf = BytecodeFunction {
+        let bf = Rc::new(BytecodeFunction {
             proto,
             upvalues,
             home_object: None,
             is_class_ctor: kind.is_class_ctor(),
             captured_with: Vec::new(),
             captured_priv_env: None,
-        };
+        });
         // [[Prototype]] is the function-kind intrinsic: %GeneratorFunction.prototype%,
         // %AsyncFunction.prototype%, %AsyncGeneratorFunction.prototype%, or
         // %Function.prototype% for ordinary/arrow/method functions.

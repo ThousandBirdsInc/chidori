@@ -87,7 +87,7 @@ pub struct TryHandler {
 /// A single call frame. Self-contained (own operand stack + locals) so that a
 /// suspended async/generator frame can be frozen in memory and resumed later.
 pub struct Frame {
-    pub func: BytecodeFunction,
+    pub func: Rc<BytecodeFunction>,
     pub ip: usize,
     pub stack: Vec<Value>,
     pub locals: Vec<Value>,
@@ -306,6 +306,15 @@ pub struct Vm {
     /// Best-effort: a suspended (generator/async) frame keeps its buffers, and
     /// the list is size-capped so it never grows without bound.
     pub(crate) value_vec_pool: Vec<Vec<Value>>,
+    /// Free-list of binding cells, and of the per-frame `Vec` that holds them.
+    /// A cell is recycled ONLY when its `Rc::strong_count` is 1 — proof that no
+    /// closure, upvalue, mapped-arguments alias, or module link still sees it —
+    /// so reuse is unobservable by construction: a pooled cell is reachable
+    /// from nowhere. Cleared to `Undefined` on recycle so no value's lifetime
+    /// is extended by the pool. Kills the dominant malloc/free traffic of the
+    /// call path (one heap allocation per binding per call).
+    pub(crate) cell_pool: Vec<Rc<RefCell<Value>>>,
+    pub(crate) cells_vec_pool: Vec<Vec<Rc<RefCell<Value>>>>,
 }
 
 impl Vm {
@@ -335,6 +344,8 @@ impl Vm {
             gc_cell_roots: Vec::new(),
             template_cache: std::collections::HashMap::new(),
             value_vec_pool: Vec::new(),
+            cell_pool: Vec::new(),
+            cells_vec_pool: Vec::new(),
         };
         crate::realm::init_realm(&mut vm);
         // The placeholder realm's intrinsic objects were created before the VM
@@ -1867,15 +1878,32 @@ fn break_internal_cycles(internal: &mut Internal, stack: &mut Vec<JsObject>) {
         }
         Internal::Function(f) => match f {
             FunctionInner::Bytecode(bf) => {
-                if let Some(h) = bf.home_object.take() {
-                    stack.push(h);
+                // Detach this object's closure environment by swapping in an
+                // empty shell — the same edge-breaking the previous in-place
+                // `take`s did, but valid now that the `BytecodeFunction` is
+                // shared by `Rc` (a suspended generator/async frame may hold a
+                // second handle; that frame's copy is torn down by its own
+                // dispose arm).
+                let taken = std::mem::replace(
+                    bf,
+                    Rc::new(BytecodeFunction {
+                        proto: bf.proto.clone(),
+                        upvalues: Vec::new(),
+                        home_object: None,
+                        is_class_ctor: bf.is_class_ctor,
+                        captured_with: Vec::new(),
+                        captured_priv_env: None,
+                    }),
+                );
+                if let Some(h) = &taken.home_object {
+                    stack.push(h.clone());
                 }
-                for cell in std::mem::take(&mut bf.upvalues) {
+                for cell in &taken.upvalues {
                     let v = cell.borrow().clone();
                     push_dispose_obj(v, stack);
                 }
-                for o in std::mem::take(&mut bf.captured_with) {
-                    stack.push(o);
+                for o in &taken.captured_with {
+                    stack.push(o.clone());
                 }
             }
             FunctionInner::Bound(b) => {
