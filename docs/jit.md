@@ -1,13 +1,27 @@
 # An experimental closure-threading "JIT" for `chidori-js`
 
-> **Status:** experimental, **on by default**, gated by the full conformance /
-> replay / differential suite. Lives on branch
-> `claude/chidori-js-jit-compiler-btc3ec`. This is a deliberate experiment that
-> runs *against* the recommendation in
-> [`docs/interpreter-optimization.md`](./interpreter-optimization.md) — read that
-> first; §2 and §11.5 there explain why a JIT is normally the wrong tool for this
-> engine. This document records what a JIT *can* look like here without breaking
-> the engine's invariants, and what it measurably buys.
+> **Status: RETIRED — implemented, measured, removed.** The closure-threading
+> backend described below was built, landed on by default with the full
+> conformance/replay/differential gate green, measured (§5), and then
+> **removed** on the same branch. The measurements are the reason: 1.01–1.11×
+> on the micro-benchmarks — mostly under the environment's noise floor — in
+> exchange for one boxed closure per bytecode op of memory, a first-activation
+> compile cost, and a permanent second dispatch path that every future engine
+> change would have to keep semantically identical to `step`. Meanwhile the
+> cache work in [`docs/resume-performance.md`](./resume-performance.md)
+> (transpile ~3.9 ms/source, proto + regexp caches) delivered strictly larger
+> wins for near-zero complexity. This is the same call quickjs-ng made when it
+> removed its inline caches ("sometimes faster, sometimes slower, always more
+> memory hungry"). The document is kept as the record of the experiment — the
+> design, the determinism argument, and the numbers — so the next person
+> tempted by a dispatch-side JIT can start from data. The implementation
+> remains in this branch's git history (`Add experimental closure-threading
+> JIT for chidori-js`).
+>
+> This was a deliberate experiment that ran *against* the recommendation in
+> [`docs/interpreter-optimization.md`](./interpreter-optimization.md) — §2 and
+> §11.5 there explain why a JIT is the wrong tool for this engine; the
+> experiment confirmed it empirically.
 
 ---
 

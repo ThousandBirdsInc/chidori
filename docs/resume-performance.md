@@ -5,7 +5,7 @@
 > proposal. **Related:** [`docs/value-checkpoints.md`](./value-checkpoints.md)
 > (the `chidori.step` memoization primitive),
 > [`docs/interpreter-optimization.md`](./interpreter-optimization.md) and
-> [`docs/jit.md`](./jit.md) (interpreter-side speed),
+> [`docs/jit.md`](./jit.md) (the retired dispatch-JIT experiment),
 > [`docs/replay.md`](./replay.md) (the durability model this must never bend).
 
 ---
@@ -96,9 +96,8 @@ cross-thread state). Two consumers:
   realm — but the parse+lower step is memoized.
 
 Sharing one proto across VMs is sound because a `FuncProto` is immutable
-after compilation; the only interior-mutable field (the experimental JIT
-thread cache, `jit.rs`) memoizes a pure function of the bytecode and is
-VM-independent by design. `tests/replay.rs::
+after compilation — all per-VM state (closures, the tagged-template cache,
+the module-capture hook) lives on the VM, not the proto. `tests/replay.rs::
 shared_cached_proto_replays_are_independent_and_identical` pins the property
 that matters: two runtimes sharing a cached proto replay independently with
 byte-identical journals.

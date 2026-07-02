@@ -306,14 +306,6 @@ pub struct Vm {
     /// Best-effort: a suspended (generator/async) frame keeps its buffers, and
     /// the list is size-capped so it never grows without bound.
     pub(crate) value_vec_pool: Vec<Vec<Value>>,
-    /// Experimental closure-threading JIT toggle (see `src/jit.rs`,
-    /// `docs/jit.md`). `true` (default) runs each frame through its proto's
-    /// lazily-compiled closure thread; `false` runs the original switch-dispatch
-    /// interpreter. Both paths are required to produce byte-identical results,
-    /// errors, and host-call journals — the toggle is the differential oracle
-    /// that `tests/jit.rs` uses to assert the JIT is a pure performance side
-    /// effect (the toggle-equivalence property the determinism contract demands).
-    pub jit_enabled: bool,
 }
 
 impl Vm {
@@ -343,7 +335,6 @@ impl Vm {
             gc_cell_roots: Vec::new(),
             template_cache: std::collections::HashMap::new(),
             value_vec_pool: Vec::new(),
-            jit_enabled: true,
         };
         crate::realm::init_realm(&mut vm);
         // The placeholder realm's intrinsic objects were created before the VM

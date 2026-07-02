@@ -65,9 +65,7 @@ pub fn compile_script(src: &str) -> Result<FuncProto, String> {
 /// Sharing one proto across VMs on the same thread is sound: a `FuncProto` is
 /// immutable after compilation — closures instantiated from it, the per-VM
 /// tagged-template cache (keyed by proto pointer *per VM*), and the module
-/// hook all hold their own per-VM state. The only interior-mutable field, the
-/// experimental JIT thread cache, memoizes a pure function of the bytecode and
-/// is explicitly VM-independent (`src/jit.rs`). The cache is keyed by the FULL
+/// hook all hold their own per-VM state. The cache is keyed by the FULL
 /// source string (hash + equality via `HashMap`), so a hit can never alias two
 /// distinct programs, and it is a pure performance side effect: compilation is
 /// deterministic, so a cached proto is byte-for-byte the proto a fresh compile
@@ -1714,7 +1712,6 @@ impl Compiler {
             this_cell: fc.this_cell,
             inherit_home: fc.inherit_home,
             templates: fc.templates,
-            jit: crate::jit::JitCache::new(),
         }
     }
 

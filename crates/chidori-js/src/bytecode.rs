@@ -156,13 +156,6 @@ pub struct FuncProto {
     /// at runtime by `(this proto's pointer, index)` — the spec's per-Parse
     /// Node template cache (a shared proto is the same Parse Node).
     pub templates: Vec<TemplateParts>,
-    /// Lazily-built closure-threaded execution form of `code` (the experimental
-    /// JIT, see `src/jit.rs` and `docs/jit.md`). Compiled on this proto's first
-    /// activation and reused thereafter; a **pure performance side effect** — it
-    /// is never serialized, never observed by the journal, and produces output
-    /// byte-identical to the switch interpreter (the `Vm::jit_enabled` toggle
-    /// proves this equivalence in `tests/jit.rs`). Cleared/absent costs nothing.
-    pub jit: crate::jit::JitCache,
 }
 
 impl FuncProto {
@@ -187,7 +180,6 @@ impl FuncProto {
             this_cell: None,
             inherit_home: false,
             templates: Vec::new(),
-            jit: crate::jit::JitCache::new(),
         }
     }
 }
