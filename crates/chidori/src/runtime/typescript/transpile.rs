@@ -1149,7 +1149,9 @@ mod tests {
             ));
         }
         let path = Path::new("/tmp/project-timing/agent.ts");
-        let opts = TranspileOptions { import_policy: TypeScriptImportPolicy::Relative };
+        let opts = TranspileOptions {
+            import_policy: TypeScriptImportPolicy::Relative,
+        };
         println!("source: {} KB", source.len() / 1024);
         let t0 = std::time::Instant::now();
         let a = transpile_module(path, &source, &opts).unwrap();
