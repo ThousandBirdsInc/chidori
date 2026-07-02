@@ -1,7 +1,11 @@
 # JS execution performance: the road toward JIT-class throughput
 
-> **Status:** profiling review complete (2026-07-02); first fix (deterministic
-> fast hasher) landed in this change. This document is the successor to the
+> **Status:** profiling review complete (2026-07-02); the optimization push it
+> scoped has **landed on this branch** — deterministic fast hasher, quick-wins
+> batch, key-verified inline caches, superinstruction round 2, and the
+> call-path slimming (cell pool + `Rc`-shared `BytecodeFunction`). Measured
+> results in **§6**; the remaining roadmap (register bytecode, full
+> cells→locals, shapes) is unchanged below. This document is the successor to the
 > per-phase plan in [`docs/interpreter-optimization.md`](./interpreter-optimization.md)
 > (Phases 0–2 landed there) and the retired closure-threading experiment in
 > [`docs/jit.md`](./jit.md). It re-scopes the goal from "make the interpreter
@@ -344,7 +348,81 @@ Every roadmap item ships only when all four hold:
 
 ---
 
-## 6. References
+## 6. Results of the 2026-07-02 optimization push (landed)
+
+Five commits on this branch implement §2, §3.1 (the cheap half), §3.3, §3.4,
+§3.6, and an allocation-free approximation of §3.2. All of it is safe Rust,
+zero new dependencies, and gated green on both crates' full suites (98 + 603
+tests, including record→replay byte-identity, the fusion differential corpus,
+and the new `tests/ic.rs` stale-hint corpus cross-checked against Node).
+
+1. **Deterministic Fx hasher** (§2) for property maps and Map/Set stores.
+2. **Quick wins:** O(1) `stable_cells` flags; integer fast path for `%`
+   (libm `fmod` was 5.9% of arith_loop); `Rc` pointer-equality fast path in
+   `JsString::eq`.
+3. **Key-verified inline caches** on `GetProp`/`SetProp`/`LoadGlobal`
+   (`FuncProto::ic`): a slot-index hint per op site, verified against the key
+   stored at that slot on every use — a stale hint is a miss, never a wrong
+   answer, so no invalidation protocol exists. Own-data-property reads/writes
+   and global reads skip hashing entirely on hits.
+4. **Superinstruction round 2:** the fusion pass matches variable-length
+   windows and runs to a fixed point. A whole `i < N` loop test
+   (`CmpCellConstBranchFalse`), a statement-position `i++` (`IncCellStmt`,
+   the 6-op window), `cell <op> const` operands (`AddCellConst`/
+   `ArithCellConst`), and the per-iteration `let` copy (`LoadCellInit`) are
+   each ONE dispatch. The canonical counting loop: 21 → 12 dispatches per
+   iteration.
+5. **Call-path slimming:** binding cells are pooled (recycled only at
+   `Rc::strong_count == 1` — provably unreachable, so reuse is unobservable);
+   `FunctionInner::Bytecode` holds `Rc<BytecodeFunction>`, making the
+   per-call clone a refcount bump instead of one or two Vec allocations.
+
+### 6.1 Instruction counts (callgrind — deterministic, the load-bearing metric)
+
+Whole-workload totals, branch start → after the push:
+
+| workload | before | after | Δ |
+| --- | ---: | ---: | ---: |
+| property_access | 10.98 G | 3.78 G | **−66%** |
+| arith_loop | 3.17 G | 2.28 G | **−28%** |
+| fib_recursive | 12.83 G | 9.49 G | **−26%** |
+
+malloc/free (16.7% of fib at branch start) and SipHash (48.7% of
+property_access) have left the profiles' top ranks entirely.
+
+### 6.2 Wall-clock (idle container, 5-run median, execution-only)
+
+Against the same-day pre-push idle-machine run (§1.1 methodology):
+
+| workload | before | after | speedup |
+| --- | ---: | ---: | ---: |
+| property_access | 904 ms | 310 ms | **2.9×** |
+| arith_loop | 342 ms | 199 ms | 1.7× |
+| fib_recursive | 1.38 s | 900 ms | 1.5× |
+| closures | 624 ms | 451 ms | 1.4× |
+| array_push_sum | 590 ms | 436 ms | 1.4× |
+| array_hof | 362 ms | 276 ms | 1.3× |
+| sort | 1.73 s | 1.38 s | 1.3× |
+| json_roundtrip | 223 ms | 183 ms | 1.2× |
+| string_build | 440 ms | 382 ms | 1.2× |
+
+Geometric mean ≈ **1.5×** across the suite (2.9× where property access
+dominates), on top of the hasher win the same day. The zero-host agent-replay
+path (`examples/agent_replay`) went 21.0 → 18.5 ms (−12%) — it is
+host-effect glue rather than tight loops, as §11.5 of the interpreter doc
+predicts.
+
+### 6.3 What's next (unchanged ranking, new baseline)
+
+The remaining items are the big-structure ones: **full cells→locals**
+(§3.2 — the pool removed the allocations, but every access still pays
+`Rc`+`RefCell` indirection; localization also unlocks register-style
+addressing), **register bytecode** (§3.5), and **shapes** (§3.7) if
+property-heavy profiles still show `get_index_of` after the ICs. Re-run the
+callgrind sweep before choosing; the noise-floor and idle-machine caveats in
+§1.1 stand.
+
+## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —
   Phases 0–2 (measurement, hot-loop cleanup, fusion), the noise-floor
