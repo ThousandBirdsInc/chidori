@@ -376,6 +376,18 @@ and the new `tests/ic.rs` stale-hint corpus cross-checked against Node).
    `Rc::strong_count == 1` — provably unreachable, so reuse is unobservable);
    `FunctionInner::Bytecode` holds `Rc<BytecodeFunction>`, making the
    per-call clone a refcount bump instead of one or two Vec allocations.
+6. **Cells→locals localization (§3.2, landed)** — `localize.rs` rewrites
+   provably-uncaptured bindings to flat `frame.locals` slots at compile
+   finish. Captured/stable/aliased cells keep their ORIGINAL indices (child
+   protos' upvalue references stay valid, no patching); dynamic-resolution
+   functions (direct `eval`, `with`, materialized `arguments`) bail whole.
+   Every superinstruction gained a local mirror, so localized loops keep
+   their one-dispatch tests/updates. En route, `mapped_param_cells` — which
+   pinned every sloppy function's parameters as stable heap cells — is now
+   built only when the function can actually materialize `arguments`;
+   `fib`-style leaf calls now allocate **zero** cells. Gated by a
+   capture-focused differential corpus (`tests/localize.rs`) across all four
+   {fuse}×{localize} combinations.
 
 ### 6.1 Instruction counts (callgrind — deterministic, the load-bearing metric)
 
@@ -383,9 +395,9 @@ Whole-workload totals, branch start → after the push:
 
 | workload | before | after | Δ |
 | --- | ---: | ---: | ---: |
-| property_access | 10.98 G | 3.78 G | **−66%** |
-| arith_loop | 3.17 G | 2.28 G | **−28%** |
-| fib_recursive | 12.83 G | 9.49 G | **−26%** |
+| property_access | 10.98 G | 3.59 G | **−67%** |
+| arith_loop | 3.17 G | 2.13 G | **−33%** |
+| fib_recursive | 12.83 G | 8.66 G | **−33%** |
 
 malloc/free (16.7% of fib at branch start) and SipHash (48.7% of
 property_access) have left the profiles' top ranks entirely.
@@ -412,15 +424,14 @@ path (`examples/agent_replay`) went 21.0 → 18.5 ms (−12%) — it is
 host-effect glue rather than tight loops, as §11.5 of the interpreter doc
 predicts.
 
-### 6.3 What's next (unchanged ranking, new baseline)
+### 6.3 What's next (new baseline)
 
-The remaining items are the big-structure ones: **full cells→locals**
-(§3.2 — the pool removed the allocations, but every access still pays
-`Rc`+`RefCell` indirection; localization also unlocks register-style
-addressing), **register bytecode** (§3.5), and **shapes** (§3.7) if
-property-heavy profiles still show `get_index_of` after the ICs. Re-run the
-callgrind sweep before choosing; the noise-floor and idle-machine caveats in
-§1.1 stand.
+§3.2 (cells→locals) is now **landed** (item 6 above). The remaining
+big-structure items: **register bytecode** (§3.5 — with bindings already in
+flat indexed slots, the distance to "ops address slots directly" has shrunk
+substantially), and **shapes** (§3.7) if property-heavy profiles still show
+`get_index_of` after the ICs. Re-run the callgrind sweep before choosing;
+the noise-floor and idle-machine caveats in §1.1 stand.
 
 ## 7. References
 
