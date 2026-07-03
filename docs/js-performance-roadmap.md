@@ -454,7 +454,7 @@ path (`examples/agent_replay`) went 21.0 → 18.5 ms (−12%) — it is
 host-effect glue rather than tight loops, as §11.5 of the interpreter doc
 predicts.
 
-### 6.3 What's next (new baseline)
+### 6.3 What's next (assessment after round 3 — now addressed by §6.4)
 
 §3.2 (cells→locals) and the property/array cache work are **landed**. Hash
 probing (`get_index_of`) no longer appears in any workload's top profile
@@ -464,14 +464,102 @@ show after round 3:
 - **sort (14.1 G, the biggest remaining)**: ~25% pure call ceremony for the
   tiny comparator — `Frame` is 408 bytes and its construction, pool
   round-trips, and drop dominate each comparison. The lever is a **Frame
-  diet** (box the rarely-used fields: handlers, dispose scopes, enumerators,
-  with/eval state) and/or a leaf-call fast path that skips unused frame
-  machinery.
+  diet** (box the rarely-used fields) and/or a leaf-call fast path that
+  skips unused frame machinery. *(→ landed as the frame POOL + direct-call
+  path, §6.4.)*
 - **register bytecode** (§3.5) remains the dispatch-side end-game for the
   arith/fib class (step + run_frame are >50% there).
 - A discovered pre-existing conformance gap: sealed-array appends are not
   rejected (`Object.seal(a); a[len] = v` writes). Tracked for a separate
   fix validated by Test262.
+
+## 6.4 Round 4 (2026-07-02, follow-up session): the call-ceremony round
+
+Callgrind confirmed §6.3's read: after round 3, ~30–40% of sort/fib-class
+execution was **per-call ceremony** — frame construction (`make_frame_owned`
+6.3%), frame drop (3.9%), buffer-pool round-trips (`recycle_frame` +
+`recycle_value_vec` 7%), ~400-byte `Frame` moves (memcpy 2.8%), and the
+layered call dispatch (~6%). This round attacks exactly that; all safe Rust,
+zero new dependencies, byte-identical benchmark checksums.
+
+1. **Frame pool** — frames are now recycled WHOLE as `Box<Frame>`
+   (`Vm::frame_pool`): a synchronously-finished frame is scrubbed (every
+   value-bearing field cleared, so the pool never extends a value's lifetime
+   — the cell pool's discipline) and parked; the next call re-initializes
+   fields in place. The operand-stack/locals/cells/args buffer *capacities*
+   stay attached to the frame across calls (the per-call
+   `take_value_vec`/`recycle_value_vec` round-trips for three buffers are
+   gone), `run_frame` takes the box (a pointer move, not a ~400-byte
+   memcpy), and a suspension keeps its box (no `Box::new` per await/yield).
+   A pooled frame's `func` slot holds a shared placeholder
+   (`Vm::dummy_bf`) so no `BytecodeFunction` outlives its frame.
+
+2. **Direct call path** (`Op::Call`/`Op::CallMethodless` →
+   `Vm::call_direct`): the callee is peeked on the operand stack; a plain
+   (sync, non-generator, non-class-ctor) bytecode function skips the
+   generic dispatch layers and its arguments MOVE straight from the
+   caller's operand stack into the pooled callee frame — no intermediate
+   pooled `Vec`, no second copy, and the popped function value is reused as
+   `func_obj` without refcount traffic. Everything else (native, bound,
+   proxy, async, generator, not-callable) takes the generic path unchanged.
+   The generic `call_valuevec` itself was collapsed to a single object
+   borrow (callable check + dispatch extraction were two).
+
+3. **Interpreter-loop slimming** — the per-op budget/interrupt checks
+   hoisted behind one `counting` bool sampled at frame entry (both are only
+   ever installed before execution starts); the common case pays one
+   predicted branch instead of two `Option` loads through `self` per op.
+
+4. **`merge_sort` scratch buffer** — the recursion allocated TWO fresh
+   `Vec` clones per node (O(n log n) allocations + refcount churn). Now one
+   scratch buffer for the whole sort; the left run MOVES into it and merges
+   back in place (zero `Value` clones). Identical recursion structure and
+   stable-merge order, so the comparator sees the exact same call sequence.
+
+5. **Sort loop fast paths** — `Array.prototype.sort`'s snapshot loop now
+   uses the existing `has_get_elem` dense fast path (round 3) instead of
+   per-index `HasProperty`/`Get` with a heap-allocated string key, and
+   write-back overwrites existing dense elements in place under the same
+   gate as `Op::SetPropDynamic` (`props.is_empty()` + in-bounds non-hole).
+   The undefined-partition pass moves values instead of cloning.
+
+6. **`func_obj` gating** — the per-call `Rc` round-trip is skipped unless
+   `proto.uses_arguments` (its only consumer is `arguments.callee`).
+
+### 6.4.1 Instruction counts (callgrind, whole workload, deterministic)
+
+| workload | round-3 baseline | after | Δ |
+| --- | ---: | ---: | ---: |
+| sort | 14.09 G | 11.58 G | **−17.8%** |
+| fib_recursive | 8.59 G | 7.45 G | **−13.3%** |
+| closures | 4.47 G | 4.00 G | **−10.4%** |
+| array_hof | 2.52 G | 2.38 G | −5.4% |
+| property_access | 3.95 G | 3.85 G | −2.6% |
+| arith_loop | 2.28 G | 2.23 G | −2.5% |
+| array_push_sum | 3.73 G | 3.67 G | −1.7% |
+| string_build | 0.18 G | 0.18 G | 0% |
+
+Benchmark RESULT checksums are byte-identical before/after every change.
+Wall-clock (5-run median, same shared container, indicative only per §1.1):
+sort 1.09 s → 0.93 s, fib 696 → 572 ms, closures 350 → 311 ms.
+An incidental robustness gain: heap-boxed frames raised the native-stack
+recursion ceiling from ~1160 to ~1460 JS frames (see the known issue below).
+
+### 6.4.2 What's next (new baseline)
+
+- **step dispatch is now the wall**: `step` + `run_frame` are 25–43% of
+  every workload (fib 42%, arith 50%+, sort 25%) with the call ceremony
+  halved. Register bytecode (§3.5) is the remaining structural lever.
+- **Known issue (pre-existing, NOT introduced here)**: `max_call_depth`
+  (2000) exceeds what the default 8 MB native stack supports —
+  `rec(1500)`-style recursion aborts with a native stack overflow instead
+  of throwing a catchable RangeError (main: overflow at ~1160 frames; this
+  branch: ~1460, i.e. strictly better but still short of 2000). Fix
+  options: lower the default depth, raise thread stack at the embedding
+  boundary, or shrink `step`'s stack frame (~5 KB/call, the giant match's
+  unioned locals). Tracked separately; Test262's recursion tests pass
+  because the runner threads carry larger stacks.
+- The sealed-array append gap from §6.3 still stands.
 
 Re-run the callgrind sweep before choosing; the noise-floor and idle-machine
 caveats in §1.1 stand.

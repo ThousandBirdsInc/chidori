@@ -8,6 +8,25 @@ use crate::bytecode::{CmpOp, Const, FuncKind, Op, UpvalueSource};
 use crate::value::*;
 use crate::vm::*;
 
+/// Peek a call op's callee: `Some(bf)` when it is a PLAIN bytecode function —
+/// synchronous, not a generator, not a class constructor — i.e. the class the
+/// interpreter can run via [`Vm::call_direct`] without any of the generic
+/// path's special-casing. Everything else (native, bound, proxy, async,
+/// generator, class ctor, non-callable) returns `None` and takes the generic
+/// path, which owns the error reporting for the non-callable case.
+#[inline]
+fn peek_plain_bytecode(v: &Value) -> Option<Rc<BytecodeFunction>> {
+    if let Value::Object(o) = v {
+        if let Internal::Function(FunctionInner::Bytecode(bf)) = &o.borrow().internal {
+            let k = bf.proto.kind;
+            if !bf.is_class_ctor && !k.is_generator() && !k.is_async() {
+                return Some(bf.clone());
+            }
+        }
+    }
+    None
+}
+
 /// Control-flow signal from a single opcode step.
 enum Ctl {
     Next,
@@ -54,26 +73,75 @@ impl Vm {
     /// path copies the arguments a second time in make_frame. Native/bound/
     /// proxy callees borrow the vec and recycle it; every early error simply
     /// drops it (a pool miss, never a leak).
+    ///
+    /// This is the interpreter's hottest call entry, so the callable check and
+    /// the dispatch extraction are ONE object borrow (the layered
+    /// `call_object_vec` path borrows once for `is_callable` and again for the
+    /// dispatch), and the depth guard is applied here directly.
     pub(crate) fn call_valuevec(
         &mut self,
         func: Value,
         this: Value,
         args: Vec<Value>,
     ) -> Result<Value, Value> {
+        enum Disp {
+            Native(NativeFn),
+            Bytecode(Rc<BytecodeFunction>),
+            Bound(JsObject, Value, Vec<Value>),
+            Proxy,
+            NotCallable,
+        }
         if let Value::Object(o) = &func {
-            let o = o.clone();
-            let (callable, is_proxy) = {
+            let disp = {
                 let b = o.borrow();
-                (b.is_callable(), matches!(b.internal, Internal::Proxy(_)))
+                match &b.internal {
+                    Internal::Function(FunctionInner::Native(nf)) => Disp::Native(nf.func.clone()),
+                    Internal::Function(FunctionInner::Bytecode(bf)) => Disp::Bytecode(bf.clone()),
+                    Internal::Function(FunctionInner::Bound(bound)) => Disp::Bound(
+                        bound.target.clone(),
+                        bound.bound_this.clone(),
+                        bound.bound_args.clone(),
+                    ),
+                    Internal::Proxy(p) if p.callable => Disp::Proxy,
+                    _ => Disp::NotCallable,
+                }
             };
-            if is_proxy {
-                if callable {
+            match disp {
+                Disp::NotCallable => {}
+                Disp::Proxy => {
+                    let o = o.clone();
                     let r = self.proxy_call(&o, this, &args);
                     self.recycle_value_vec(args);
                     return r;
                 }
-            } else if callable {
-                return self.call_object_vec(&o, this, args, Value::Undefined);
+                disp => {
+                    self.call_depth += 1;
+                    if self.call_depth > self.max_call_depth {
+                        self.call_depth -= 1;
+                        return Err(self.throw_range("Maximum call stack size exceeded"));
+                    }
+                    let r = match disp {
+                        Disp::Bytecode(bf) => {
+                            let o = o.clone();
+                            self.call_bytecode_vec(&o, bf, this, args, Value::Undefined)
+                        }
+                        Disp::Native(f) => {
+                            let r = f(self, this, &args);
+                            self.recycle_value_vec(args);
+                            r
+                        }
+                        Disp::Bound(target, bthis, bargs) => {
+                            let mut all = bargs;
+                            let mut args = args;
+                            all.append(&mut args);
+                            self.recycle_value_vec(args);
+                            self.call_object_vec(&target, bthis, all, Value::Undefined)
+                        }
+                        Disp::Proxy | Disp::NotCallable => unreachable!(),
+                    };
+                    self.call_depth -= 1;
+                    return r;
+                }
             }
         }
         let desc = self.describe(&func);
@@ -158,8 +226,14 @@ impl Vm {
             self.recycle_value_vec(args);
             return r;
         }
+        let uses_arguments = bf.proto.uses_arguments;
         let mut frame = self.make_frame_owned(bf, this, args, new_target);
-        frame.func_obj = Some(func_obj.clone());
+        // `func_obj` has exactly one consumer — the `arguments` object's
+        // `callee` — so the per-call `Rc` round-trip is skipped for the
+        // overwhelming majority of functions that never materialize it.
+        if uses_arguments {
+            frame.func_obj = Some(func_obj.clone());
+        }
         let token = self.trace_enter(&frame.func.proto);
         frame.trace_token = token;
         if kind.is_async() {
@@ -180,6 +254,58 @@ impl Vm {
                 }
             }
         }
+    }
+
+    /// The interpreter call ops' fast path (see `Op::Call`): the callee was
+    /// already peeked as a plain (non-generator, non-async, non-class-ctor)
+    /// bytecode function sitting on the caller's operand stack under `n`
+    /// arguments at `at..`. Moves the arguments straight off the caller stack
+    /// into the pooled callee frame — no intermediate pooled Vec round-trip —
+    /// and reuses the popped function VALUE as the callee's `func_obj` (no
+    /// refcount traffic). Behavior is identical to the generic
+    /// `call_valuevec` → `call_bytecode_vec` chain for this callee class.
+    fn call_direct(
+        &mut self,
+        caller: &mut Frame,
+        at: usize,
+        bf: Rc<BytecodeFunction>,
+        has_this: bool,
+    ) -> Result<Value, Value> {
+        self.call_depth += 1;
+        if self.call_depth > self.max_call_depth {
+            self.call_depth -= 1;
+            return Err(self.throw_range("Maximum call stack size exceeded"));
+        }
+        let mut callee = self.take_frame();
+        callee.args.extend(caller.stack.drain(at..));
+        let this = if has_this {
+            caller.stack.pop().unwrap_or(Value::Undefined)
+        } else {
+            Value::Undefined
+        };
+        let func_v = caller.stack.pop().unwrap_or(Value::Undefined);
+        let uses_arguments = bf.proto.uses_arguments;
+        self.init_frame(&mut callee, bf, this, Value::Undefined);
+        if uses_arguments {
+            if let Value::Object(o) = func_v {
+                callee.func_obj = Some(o);
+            }
+        }
+        let token = self.trace_enter(&callee.func.proto);
+        callee.trace_token = token;
+        let r = match self.run_frame(callee) {
+            Flow::Return(v) => {
+                self.trace_exit(token, false);
+                Ok(v)
+            }
+            Flow::Throw(e) => {
+                self.trace_exit(token, true);
+                Err(e)
+            }
+            Flow::Suspend(_) => Err(self.throw_type("internal: sync function suspended")),
+        };
+        self.call_depth -= 1;
+        r
     }
 
     fn describe(&self, v: &Value) -> String {
@@ -270,8 +396,12 @@ impl Vm {
         if kind.is_generator() {
             return self.make_generator(func_obj, bf, this, args, new_target);
         }
+        let uses_arguments = bf.proto.uses_arguments;
         let mut frame = self.make_frame(bf, this, args, new_target);
-        frame.func_obj = Some(func_obj.clone());
+        // See `call_bytecode_vec`: `func_obj` only feeds `arguments.callee`.
+        if uses_arguments {
+            frame.func_obj = Some(func_obj.clone());
+        }
         let token = self.trace_enter(&frame.func.proto);
         frame.trace_token = token;
         if kind.is_async() {
@@ -425,13 +555,15 @@ impl Vm {
     const VALUE_VEC_POOL_CAP: usize = 4096;
 
     /// Pull a cleared `Vec<Value>` from the pool, or allocate a fresh one.
-    fn take_value_vec(&mut self) -> Vec<Value> {
+    #[inline]
+    pub(crate) fn take_value_vec(&mut self) -> Vec<Value> {
         self.value_vec_pool.pop().unwrap_or_default()
     }
 
     /// Return a buffer to the pool for reuse (clearing it drops any residual
     /// values). A never-grown (capacity 0) buffer isn't worth pooling; the list
     /// is size-capped so it can't retain memory without bound.
+    #[inline]
     fn recycle_value_vec(&mut self, mut v: Vec<Value>) {
         if v.capacity() == 0 || self.value_vec_pool.len() >= Self::VALUE_VEC_POOL_CAP {
             return;
@@ -440,23 +572,50 @@ impl Vm {
         self.value_vec_pool.push(v);
     }
 
-    /// Reclaim a synchronously-finished frame's reusable buffers into the pool.
-    /// Only called on `Return`/`Throw` exits — a suspended frame keeps its
-    /// buffers (they ride inside the `Suspension`/generator state).
-    fn recycle_frame(&mut self, frame: &mut Frame) {
-        let stack = std::mem::take(&mut frame.stack);
-        let locals = std::mem::take(&mut frame.locals);
-        let args = std::mem::take(&mut frame.args);
-        self.recycle_value_vec(stack);
-        self.recycle_value_vec(locals);
-        self.recycle_value_vec(args);
-        let mut cells = std::mem::take(&mut frame.cells);
-        for cell in cells.drain(..) {
+    /// Reclaim a synchronously-finished frame WHOLE into the frame pool: every
+    /// value-bearing field is cleared (the pool must never extend a value's
+    /// lifetime — same discipline as the cell pool), while the stack / locals /
+    /// cells / args buffers keep their capacity for the next call. Only called
+    /// on `Return`/`Throw` exits — a suspended frame keeps its box (it rides
+    /// inside the `Suspension`/generator state).
+    #[inline]
+    fn recycle_frame(&mut self, mut frame: Box<Frame>) {
+        if self.frame_pool.len() >= Self::VALUE_VEC_POOL_CAP {
+            // Over cap: fall back to recycling the inner buffers individually.
+            let stack = std::mem::take(&mut frame.stack);
+            let locals = std::mem::take(&mut frame.locals);
+            let args = std::mem::take(&mut frame.args);
+            self.recycle_value_vec(stack);
+            self.recycle_value_vec(locals);
+            self.recycle_value_vec(args);
+            for cell in frame.cells.drain(..) {
+                self.recycle_cell(cell);
+            }
+            return;
+        }
+        frame.func = self.dummy_bf.clone();
+        frame.stack.clear();
+        frame.locals.clear();
+        for cell in frame.cells.drain(..) {
             self.recycle_cell(cell);
         }
-        if cells.capacity() > 0 && self.cells_vec_pool.len() < Self::VALUE_VEC_POOL_CAP {
-            self.cells_vec_pool.push(cells);
-        }
+        frame.this = Value::Undefined;
+        frame.new_target = Value::Undefined;
+        frame.handlers.clear();
+        frame.pending_completion = None;
+        frame.pending_throw = None;
+        frame.pending_return = None;
+        frame.args.clear();
+        frame.func_obj = None;
+        frame.dispose_scopes.clear();
+        frame.completion = Value::Undefined;
+        frame.enumerators.clear();
+        frame.with_scope.clear();
+        frame.trace_token = None;
+        frame.skip_delegation_throw = false;
+        frame.eval_vars = None;
+        frame.priv_env = None;
+        self.frame_pool.push(frame);
     }
 
     /// Pull a binding cell holding `v` from the pool, or allocate a fresh one.
@@ -487,7 +646,7 @@ impl Vm {
         this: Value,
         args: &[Value],
         new_target: Value,
-    ) -> Frame {
+    ) -> Box<Frame> {
         let mut args_buf = self.take_value_vec();
         args_buf.extend_from_slice(args);
         self.make_frame_owned(bf, this, args_buf, new_target)
@@ -495,16 +654,71 @@ impl Vm {
 
     /// As [`Vm::make_frame`], but adopts an already-owned argument buffer
     /// (the interpreter's pooled call-op buffer) as `frame.args` directly,
-    /// skipping the copy. `recycle_frame` returns it to the pool at exit.
+    /// skipping the copy.
+    ///
+    /// The frame itself comes from the frame pool when one is available: a
+    /// recycled frame arrives scrubbed (see [`Vm::recycle_frame`]) with its
+    /// four buffers' capacities intact, so this only re-initializes fields in
+    /// place — no buffer pool round-trips, no ~400-byte struct move.
     pub fn make_frame_owned(
         &mut self,
         bf: Rc<BytecodeFunction>,
         this: Value,
         args: Vec<Value>,
         new_target: Value,
-    ) -> Frame {
-        let proto = bf.proto.clone();
-        let mut cells = self.cells_vec_pool.pop().unwrap_or_default();
+    ) -> Box<Frame> {
+        let mut f = self.take_frame();
+        self.init_frame(&mut f, bf, this, new_target);
+        let old_args = std::mem::replace(&mut f.args, args);
+        self.recycle_value_vec(old_args);
+        f
+    }
+
+    /// Pop a scrubbed frame from the pool, or allocate a fresh (equally blank)
+    /// one. Every field of a pooled frame was reset by [`Vm::recycle_frame`].
+    #[inline]
+    fn take_frame(&mut self) -> Box<Frame> {
+        match self.frame_pool.pop() {
+            Some(f) => f,
+            None => Box::new(Frame {
+                func: self.dummy_bf.clone(),
+                ip: 0,
+                stack: Vec::with_capacity(8),
+                locals: Vec::new(),
+                cells: Vec::new(),
+                this: Value::Undefined,
+                new_target: Value::Undefined,
+                handlers: Vec::new(),
+                pending_completion: None,
+                pending_throw: None,
+                pending_return: None,
+                args: Vec::new(),
+                func_obj: None,
+                dispose_scopes: Vec::new(),
+                completion: Value::Undefined,
+                enumerators: Vec::new(),
+                with_scope: Vec::new(),
+                trace_token: None,
+                skip_delegation_throw: false,
+                eval_vars: None,
+                priv_env: None,
+            }),
+        }
+    }
+
+    /// Initialize a blank (fresh or pool-scrubbed) frame's per-call fields in
+    /// place. The caller provides `args` separately (either an owned buffer
+    /// swapped in, or values moved straight off its operand stack).
+    #[inline]
+    fn init_frame(
+        &mut self,
+        f: &mut Frame,
+        bf: Rc<BytecodeFunction>,
+        this: Value,
+        new_target: Value,
+    ) {
+        f.ip = 0;
+        let proto = &bf.proto;
         for i in 0..proto.num_cells as usize {
             // A localized index lives in `frame.locals`; its cell slot is a
             // shared never-read placeholder (`Rc` bump, no pool round-trip).
@@ -513,43 +727,17 @@ impl Vm {
             } else {
                 self.take_cell(Value::Undefined)
             };
-            cells.push(c);
+            f.cells.push(c);
         }
+        f.locals.resize(proto.num_locals as usize, Value::Undefined);
         // A closure created inside `with (o) { … }` carries the with-object
         // chain; seed the frame's with-scope stack with it so the body's
         // dynamic name ops resolve against it (under any with the body enters).
-        let with_scope = bf.captured_with.clone();
-        let priv_env = bf.captured_priv_env.clone();
-        // Reuse pooled buffers for the three per-call vectors (operand stack,
-        // locals, args) instead of allocating each one fresh.
-        let mut stack = self.take_value_vec();
-        stack.reserve(8);
-        let mut locals = self.take_value_vec();
-        locals.resize(proto.num_locals as usize, Value::Undefined);
-        let args_buf = args;
-        Frame {
-            func: bf,
-            ip: 0,
-            stack,
-            locals,
-            cells,
-            this,
-            new_target,
-            handlers: Vec::new(),
-            pending_completion: None,
-            pending_throw: None,
-            pending_return: None,
-            args: args_buf,
-            func_obj: None,
-            dispose_scopes: Vec::new(),
-            completion: Value::Undefined,
-            enumerators: Vec::new(),
-            with_scope,
-            trace_token: None,
-            skip_delegation_throw: false,
-            eval_vars: None,
-            priv_env,
-        }
+        f.with_scope.extend_from_slice(&bf.captured_with);
+        f.priv_env = bf.captured_priv_env.clone();
+        f.func = bf;
+        f.this = this;
+        f.new_target = new_target;
     }
 
     // =====================================================================
@@ -735,15 +923,15 @@ impl Vm {
     // The interpreter loop
     // =====================================================================
 
-    pub fn run_frame(&mut self, mut frame: Frame) -> Flow {
-        // Recycle this frame's pooled buffers into the free-list, then return the
+    pub fn run_frame(&mut self, mut frame: Box<Frame>) -> Flow {
+        // Recycle this frame whole into the frame pool, then return the
         // (already-owned) outcome. Used only on synchronous Return/Throw exits;
         // the Suspend paths move the whole frame (buffers included) into the
         // Suspension/generator state, so they must NOT recycle here.
         macro_rules! done {
             ($flow:expr) => {{
                 let outcome = $flow;
-                self.recycle_frame(&mut frame);
+                self.recycle_frame(frame);
                 return outcome;
             }};
         }
@@ -784,27 +972,40 @@ impl Vm {
                 },
             }
         }
+        // Budget/interrupt accounting hoisted to ONE register-friendly bool: in
+        // the common case (no op budget, no interrupt flag — every production
+        // run) the per-op cost is a single predicted-not-taken branch instead
+        // of two `Option` loads through `self`. Sampled once per frame entry;
+        // both are only ever installed BEFORE execution starts (the conformance
+        // runner, untrusted eval), never from inside a running frame, so no
+        // frame can miss a budget that applies to it. The interrupt latch below
+        // zeroes the budget of an already-`counting` frame, and every frame
+        // entered afterwards re-samples.
+        let counting = self.op_budget.is_some() || self.interrupt.is_some();
         loop {
-            if let Some(budget) = self.op_budget.as_mut() {
-                if *budget == 0 {
-                    // Uncatchable so execution is guaranteed to terminate.
-                    done!(Flow::Throw(self.throw_range("execution budget exceeded")));
+            if counting {
+                if let Some(budget) = self.op_budget.as_mut() {
+                    if *budget == 0 {
+                        // Uncatchable so execution is guaranteed to terminate.
+                        done!(Flow::Throw(self.throw_range("execution budget exceeded")));
+                    }
+                    *budget -= 1;
                 }
-                *budget -= 1;
-            }
-            // Cooperative cancellation: poll the interrupt flag every 256 ops to
-            // keep the atomic load off the hot per-op path while still reacting
-            // promptly even when individual ops are expensive (e.g. O(n) string
-            // concatenation in a loop). Once observed, latch it by zeroing the op
-            // budget so a JS `try/catch` around the slow loop can't resume
-            // execution — guaranteeing a prompt, terminating unwind.
-            if self.interrupt.is_some() {
-                interrupt_poll = interrupt_poll.wrapping_add(1);
-                if interrupt_poll & 0xFF == 0 {
-                    if let Some(flag) = &self.interrupt {
-                        if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                            self.op_budget = Some(0);
-                            done!(Flow::Throw(self.throw_range("execution interrupted")));
+                // Cooperative cancellation: poll the interrupt flag every 256
+                // ops to keep the atomic load off the hot per-op path while
+                // still reacting promptly even when individual ops are expensive
+                // (e.g. O(n) string concatenation in a loop). Once observed,
+                // latch it by zeroing the op budget so a JS `try/catch` around
+                // the slow loop can't resume execution — guaranteeing a prompt,
+                // terminating unwind.
+                if self.interrupt.is_some() {
+                    interrupt_poll = interrupt_poll.wrapping_add(1);
+                    if interrupt_poll & 0xFF == 0 {
+                        if let Some(flag) = &self.interrupt {
+                            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                self.op_budget = Some(0);
+                                done!(Flow::Throw(self.throw_range("execution interrupted")));
+                            }
                         }
                     }
                 }
@@ -842,25 +1043,25 @@ impl Vm {
                 }
                 Ok(Ctl::Await(v)) => {
                     return Flow::Suspend(Suspension {
-                        frame: Box::new(frame),
+                        frame,
                         kind: SuspendKind::Await(v),
                     })
                 }
                 Ok(Ctl::Yield(v)) => {
                     return Flow::Suspend(Suspension {
-                        frame: Box::new(frame),
+                        frame,
                         kind: SuspendKind::Yield(v),
                     })
                 }
                 Ok(Ctl::YieldStar(v)) => {
                     return Flow::Suspend(Suspension {
-                        frame: Box::new(frame),
+                        frame,
                         kind: SuspendKind::YieldStar(v),
                     })
                 }
                 Ok(Ctl::GeneratorStart) => {
                     return Flow::Suspend(Suspension {
-                        frame: Box::new(frame),
+                        frame,
                         kind: SuspendKind::GeneratorStart,
                     })
                 }
@@ -2636,26 +2837,40 @@ impl Vm {
             Op::Call(argc) => {
                 let n = *argc as usize;
                 let at = frame.stack.len() - n;
-                // Move the argument values into a pooled buffer rather than
-                // `split_off` (which allocates a fresh Vec on every call).
-                let mut args = self.take_value_vec();
-                args.extend(frame.stack.drain(at..));
-                let this = pop!();
-                let func = pop!();
-                // Owned-args path: the pooled buffer moves into the callee
-                // frame (recycled by its recycle_frame), skipping the second
-                // copy make_frame's slice path would do.
-                let r = self.call_valuevec(func, this, args);
-                push!(r?);
+                // Stack layout: [func, this, a0..]. A plain sync bytecode
+                // callee takes the direct path: its args MOVE straight from
+                // this operand stack into the pooled callee frame.
+                if let Some(bf) = peek_plain_bytecode(&frame.stack[at - 2]) {
+                    let r = self.call_direct(frame, at, bf, true)?;
+                    push!(r);
+                } else {
+                    // Move the argument values into a pooled buffer rather than
+                    // `split_off` (which allocates a fresh Vec on every call).
+                    let mut args = self.take_value_vec();
+                    args.extend(frame.stack.drain(at..));
+                    let this = pop!();
+                    let func = pop!();
+                    // Owned-args path: the pooled buffer moves into the callee
+                    // frame (recycled by its recycle_frame), skipping the second
+                    // copy make_frame's slice path would do.
+                    let r = self.call_valuevec(func, this, args);
+                    push!(r?);
+                }
             }
             Op::CallMethodless(argc) => {
                 let n = *argc as usize;
                 let at = frame.stack.len() - n;
-                let mut args = self.take_value_vec();
-                args.extend(frame.stack.drain(at..));
-                let func = pop!();
-                let r = self.call_valuevec(func, Value::Undefined, args);
-                push!(r?);
+                // Stack layout: [func, a0..] — no explicit `this`.
+                if let Some(bf) = peek_plain_bytecode(&frame.stack[at - 1]) {
+                    let r = self.call_direct(frame, at, bf, false)?;
+                    push!(r);
+                } else {
+                    let mut args = self.take_value_vec();
+                    args.extend(frame.stack.drain(at..));
+                    let func = pop!();
+                    let r = self.call_valuevec(func, Value::Undefined, args);
+                    push!(r?);
+                }
             }
             Op::CallSpread => {
                 let args_arr = pop!();

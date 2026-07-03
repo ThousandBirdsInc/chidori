@@ -314,13 +314,31 @@ pub struct Vm {
     /// is extended by the pool. Kills the dominant malloc/free traffic of the
     /// call path (one heap allocation per binding per call).
     pub(crate) cell_pool: Vec<Rc<RefCell<Value>>>,
-    pub(crate) cells_vec_pool: Vec<Vec<Rc<RefCell<Value>>>>,
     /// Shared placeholder filling the cell-vec slots of LOCALIZED bindings
     /// (see `localize.rs`): those indices are never dereferenced (their ops
     /// were rewritten to `frame.locals`), so one `Rc` bump replaces a pooled
     /// cell per slot. Its strong count is always > 1, so `recycle_cell` can
     /// never pull it into the pool.
     pub(crate) dummy_cell: Rc<RefCell<Value>>,
+    /// Free-list of whole call frames. A synchronously-finished frame is
+    /// scrubbed (every value-bearing field cleared, so the pool never extends
+    /// a value's lifetime) and parked here BOXED; the next call pops it and
+    /// re-initializes the fields in place. This keeps the operand-stack /
+    /// locals / cells / args buffer *capacities* attached to the frame across
+    /// calls (no per-call pool round-trips for four buffers) and makes every
+    /// frame move — into `run_frame`, into a `Suspension` — a pointer move
+    /// instead of a ~400-byte memcpy. Suspended frames simply keep their box
+    /// (a pool miss, never a leak).
+    ///
+    /// The boxing is the point (frames circulate as `Box<Frame>` through
+    /// `run_frame` and `Suspension`); a `Vec<Frame>` pool would re-move the
+    /// ~400-byte struct on every round-trip.
+    #[allow(clippy::vec_box)]
+    pub(crate) frame_pool: Vec<Box<Frame>>,
+    /// Placeholder function installed in a pooled frame's `func` slot so the
+    /// pool holds no live `BytecodeFunction` (whose upvalues/home object would
+    /// otherwise outlive their frame). Shared, empty, never executed.
+    pub(crate) dummy_bf: Rc<BytecodeFunction>,
 }
 
 impl Vm {
@@ -351,8 +369,19 @@ impl Vm {
             template_cache: std::collections::HashMap::new(),
             value_vec_pool: Vec::new(),
             cell_pool: Vec::new(),
-            cells_vec_pool: Vec::new(),
             dummy_cell: Rc::new(RefCell::new(Value::Undefined)),
+            frame_pool: Vec::new(),
+            dummy_bf: Rc::new(BytecodeFunction {
+                proto: Rc::new(crate::bytecode::FuncProto::empty(
+                    "",
+                    crate::bytecode::FuncKind::Normal,
+                )),
+                upvalues: Vec::new(),
+                home_object: None,
+                is_class_ctor: false,
+                captured_with: Vec::new(),
+                captured_priv_env: None,
+            }),
         };
         crate::realm::init_realm(&mut vm);
         // The placeholder realm's intrinsic objects were created before the VM
