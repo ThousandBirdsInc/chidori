@@ -110,6 +110,48 @@ pub fn compile_script_passes(src: &str, fuse: bool, localize: bool) -> Result<Fu
     compile_script_impl(src, false, fuse, localize)
 }
 
+/// Compile with the loop-kernel pass toggled — used by the kernel differential
+/// test (`tests/kernels.rs`), which asserts kernelized and generic execution
+/// are byte-identical. Production uses [`compile_script`] (kernels on).
+pub fn compile_script_kernels(src: &str, kernels: bool) -> Result<FuncProto, String> {
+    let allocator = Allocator::default();
+    let source_type = SourceType::script();
+    let ret = Parser::new(&allocator, src, source_type).parse();
+    if !ret.errors.is_empty() {
+        let msg = ret
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("SyntaxError: {msg}"));
+    }
+    let program = ret.program;
+    let sem = oxc::semantic::SemanticBuilder::new()
+        .with_check_syntax_error(true)
+        .build(&program);
+    if !sem.errors.is_empty() {
+        return Err(format!(
+            "SyntaxError: {}",
+            sem.errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    let mut c = Compiler::new();
+    c.source = src.to_string();
+    c.kernelize = kernels;
+    c.compile_toplevel(&program).map_err(|e| {
+        if e.starts_with("SyntaxError") {
+            e
+        } else {
+            format!("SyntaxError: {e}")
+        }
+    })
+}
+
 /// Compile global eval code — `(0,eval)(src)`: identical to a script except
 /// `return` is illegal and the global `var`/function bindings it creates are
 /// DELETABLE (CreateGlobalVarBinding with D=true).
@@ -744,6 +786,10 @@ struct Compiler {
     /// function. Always on in production; disabled only for the differential
     /// test that proves localized and cell-only bytecode execute identically.
     localize: bool,
+    /// Compile typed loop kernels (`kernel.rs`) for eligible numeric loops.
+    /// Always on in production; disabled for the kernel differential test and
+    /// under the `op-histogram` feature (kernels would hide per-op counts).
+    kernelize: bool,
 }
 
 impl Compiler {
@@ -767,6 +813,7 @@ impl Compiler {
             in_field_initializer: false,
             fuse: true,
             localize: true,
+            kernelize: !cfg!(feature = "op-histogram"),
         }
     }
 
@@ -1733,9 +1780,19 @@ impl Compiler {
         } else {
             loc.code
         };
+        // Typed loop kernels (docs/js-performance-roadmap.md §6.5): translate
+        // eligible numeric loops into unboxed register programs. Runs LAST so
+        // it sees the final (localized + fused) op stream; it replaces loop
+        // header ops in place, so no jump target shifts.
+        let (code, kernels) = if self.kernelize {
+            crate::kernel::kernelize(code, &fc.consts)
+        } else {
+            (code, Vec::new())
+        };
         FuncProto {
             eval_scopes: fc.eval_scopes.clone(),
             name: fc.name,
+            kernels,
             ic: code
                 .iter()
                 .map(|_| crate::bytecode::IcEntry {

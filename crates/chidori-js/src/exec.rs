@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::bytecode::{CmpOp, Const, FuncKind, Op, UpvalueSource};
+use crate::bytecode::{CmpOp, Const, FuncKind, KOp, Op, UpvalueSource};
 use crate::value::*;
 use crate::vm::*;
 
@@ -306,6 +306,132 @@ impl Vm {
         };
         self.call_depth -= 1;
         r
+    }
+
+    /// Execute the typed loop kernel at `Op::LoopKernel(idx)` (see
+    /// `kernel.rs` for the model). Runs only when per-op accounting is off
+    /// (no op budget) and every mapped local holds a `Number`; otherwise the
+    /// original header op (`Kernel::fallback`) executes and the generic
+    /// interpreter takes this iteration — the kernel simply retries the next
+    /// time the back-edge reaches the header.
+    fn run_kernel_op(&mut self, frame: &mut Frame, idx: u32) -> Result<Ctl, Value> {
+        let proto = frame.func.proto.clone();
+        let k = &proto.kernels[idx as usize];
+        // An installed op budget makes per-op counts observable (the
+        // exhaustion throw lands on an exact op); kernels would skew it.
+        if self.op_budget.is_some() {
+            return self.step(frame, &k.fallback);
+        }
+        for &l in k.locals.iter() {
+            if !matches!(frame.locals[l as usize], Value::Number(_)) {
+                return self.step(frame, &k.fallback);
+            }
+        }
+        // Unboxed register file (pooled on the Vm; kernels never nest).
+        let mut regs = std::mem::take(&mut self.kernel_regs);
+        regs.clear();
+        regs.resize(k.n_regs as usize, 0.0);
+        for (r, &l) in k.locals.iter().enumerate() {
+            if let Value::Number(n) = frame.locals[l as usize] {
+                regs[r] = n;
+            }
+        }
+        let interrupt = self.interrupt.clone();
+        let mut poll: u32 = 0;
+        let code = &k.code;
+        let mut pc = 0usize;
+        let (resume_ip, stack) = loop {
+            // Taken branches funnel through here so back-edges can poll the
+            // cooperative interrupt flag at the interpreter's cadence.
+            macro_rules! branch {
+                ($t:expr) => {{
+                    let t = $t as usize;
+                    if t <= pc {
+                        poll = poll.wrapping_add(1);
+                        if poll & 0xFF == 0 {
+                            if let Some(flag) = &interrupt {
+                                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                    // Same latch-and-unwind as the interpreter
+                                    // loop: zero the budget so a JS catch
+                                    // cannot resume execution.
+                                    for (r, &l) in k.locals.iter().enumerate() {
+                                        frame.locals[l as usize] = Value::Number(regs[r]);
+                                    }
+                                    self.kernel_regs = regs;
+                                    self.op_budget = Some(0);
+                                    return Err(self.throw_range("execution interrupted"));
+                                }
+                            }
+                        }
+                    }
+                    pc = t;
+                    continue;
+                }};
+            }
+            match code[pc] {
+                KOp::Mov { dst, src } => regs[dst as usize] = regs[src as usize],
+                KOp::Const { dst, k } => regs[dst as usize] = k,
+                KOp::Add { dst, a, b } => regs[dst as usize] = regs[a as usize] + regs[b as usize],
+                KOp::AddK { dst, a, k } => regs[dst as usize] = regs[a as usize] + k,
+                KOp::Arith { kind, dst, a, b } => {
+                    regs[dst as usize] = number_arith_raw(regs[a as usize], regs[b as usize], kind)
+                }
+                KOp::ArithK { kind, dst, a, k } => {
+                    regs[dst as usize] = number_arith_raw(regs[a as usize], k, kind)
+                }
+                KOp::Neg { dst, src } => regs[dst as usize] = -regs[src as usize],
+                KOp::BitNot { dst, src } => {
+                    regs[dst as usize] = !crate::vm::to_int32(regs[src as usize]) as f64
+                }
+                KOp::Br { target } => branch!(target),
+                KOp::BrCmp {
+                    cmp,
+                    a,
+                    b,
+                    if_true,
+                    target,
+                } => {
+                    if knum_cmp(cmp, regs[a as usize], regs[b as usize]) == if_true {
+                        branch!(target)
+                    }
+                }
+                KOp::BrCmpK {
+                    cmp,
+                    a,
+                    k,
+                    if_true,
+                    target,
+                } => {
+                    if knum_cmp(cmp, regs[a as usize], k) == if_true {
+                        branch!(target)
+                    }
+                }
+                KOp::BrFalsy { src, target } => {
+                    if !knum_truthy(regs[src as usize]) {
+                        branch!(target)
+                    }
+                }
+                KOp::BrTruthy { src, target } => {
+                    if knum_truthy(regs[src as usize]) {
+                        branch!(target)
+                    }
+                }
+                KOp::Exit { resume_ip, stack } => break (resume_ip, stack),
+            }
+            pc += 1;
+        };
+        // Materialize: every mapped local back to the frame (as Numbers), any
+        // live canonical stack slots onto the operand stack, then resume the
+        // bytecode interpreter at the exit's target.
+        for (r, &l) in k.locals.iter().enumerate() {
+            frame.locals[l as usize] = Value::Number(regs[r]);
+        }
+        let stack_base = k.locals.len();
+        for d in 0..stack as usize {
+            frame.stack.push(Value::Number(regs[stack_base + d]));
+        }
+        self.kernel_regs = regs;
+        Ok(Ctl::Jump(resume_ip as usize))
     }
 
     fn describe(&self, v: &Value) -> String {
@@ -2361,6 +2487,8 @@ impl Vm {
                 };
                 push!(Value::String(out));
             }
+            Op::LoopKernel(i) => return self.run_kernel_op(frame, *i),
+
             _ => return self.step_cold(frame, op),
         }
         Ok(Ctl::Next)
@@ -4188,9 +4316,37 @@ fn bin_arith(vm: &mut Vm, frame: &mut Frame, kind: ArithKind) -> Result<(), Valu
 }
 
 /// Number (f64) arithmetic preserving the original JS semantics.
+/// Numeric comparison for kernel registers — exactly the interpreter's
+/// `cmp_values`/`less_than` restricted to `Number` operands: `f64` ordered
+/// comparisons are false on NaN, and `==` gives NaN != NaN, +0 == -0.
+#[inline]
+fn knum_cmp(cmp: CmpOp, a: f64, b: f64) -> bool {
+    match cmp {
+        CmpOp::Eq | CmpOp::StrictEq => a == b,
+        CmpOp::Ne | CmpOp::StrictNe => a != b,
+        CmpOp::Lt => a < b,
+        CmpOp::Gt => a > b,
+        CmpOp::Le => a <= b,
+        CmpOp::Ge => a >= b,
+    }
+}
+
+/// ToBoolean restricted to `Number`: false for `0`, `-0`, and NaN.
+#[inline]
+fn knum_truthy(x: f64) -> bool {
+    x != 0.0 && !x.is_nan()
+}
+
 fn number_arith(x: f64, y: f64, kind: ArithKind) -> Value {
+    Value::Number(number_arith_raw(x, y, kind))
+}
+
+/// The raw `f64` form of [`number_arith`] — shared with the typed loop
+/// kernels (`kernel.rs` / [`Vm::run_kernel_op`]) so kernel arithmetic is
+/// bit-identical to the interpreter's Number×Number paths by construction.
+pub(crate) fn number_arith_raw(x: f64, y: f64, kind: ArithKind) -> f64 {
     use crate::vm::{to_int32, to_uint32};
-    Value::Number(match kind {
+    match kind {
         ArithKind::Sub => x - y,
         ArithKind::Mul => x * y,
         ArithKind::Div => x / y,
@@ -4202,7 +4358,7 @@ fn number_arith(x: f64, y: f64, kind: ArithKind) -> Value {
         ArithKind::Shl => to_int32(x).wrapping_shl(to_uint32(y) & 31) as f64,
         ArithKind::Shr => to_int32(x).wrapping_shr(to_uint32(y) & 31) as f64,
         ArithKind::UShr => (to_uint32(x) >> (to_uint32(y) & 31)) as f64,
-    })
+    }
 }
 
 // ---- BigInt comparison helpers (relational + loose-equality) ----

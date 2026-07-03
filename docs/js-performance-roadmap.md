@@ -582,11 +582,78 @@ Both known issues flagged during this round's review are **fixed**:
   TypeError in strict — matching Node/spec exactly. One Test262 test flips
   to passing (baseline refreshed).
 
-### 6.4.3 What's next (new baseline)
+## 6.5 Typed loop kernels (landed): unboxed register execution for numeric loops
 
-- **step dispatch is now the wall**: `step` + `run_frame` are 25–43% of
-  every workload (fib 42%, arith 50%+, sort 25%) with the call ceremony
-  halved. Register bytecode (§3.5) is the remaining structural lever.
+The answer to "can we selectively fast-path compute-heavy loops in a
+limited context" — a deterministic, safe-Rust, zero-dependency middle tier
+between the interpreter and a real JIT. Design informed directly by the
+retired closure-threading experiment (docs/jit.md): removing *dispatch*
+alone bought 1.01–1.11×, so this tier removes the **boxing** instead — the
+`Value` clone/match/drop and operand-stack traffic around every add and
+compare.
+
+**How it works** (`kernel.rs`, `Op::LoopKernel`, `Vm::run_kernel_op`):
+
+- At compile finish (after localize + fuse), back-edges identify loop
+  regions. A region qualifies only if every op is on a numeric allowlist —
+  loads/stores of localized `frame.locals` slots, `Number` constants,
+  arithmetic/comparisons/branches and their fused forms; anything else
+  (calls, property access, cells, TDZ init, try handlers, suspension)
+  disqualifies it entirely. The region's stack bytecode is translated by
+  abstract interpretation into a flat register program over unboxed `f64`s
+  (canonical stack slots become registers; compare ops must feed branches —
+  a materialized boolean disqualifies). The loop-header op is REPLACED by
+  `Op::LoopKernel` (indices/jump targets everywhere are untouched); the
+  original header op is preserved as the kernel's `fallback`.
+- At runtime the kernel enters only when (a) no op budget is installed
+  (per-op accounting stays exact — the conformance runner's budgeted runs
+  execute fully generically) and (b) every mapped local currently holds a
+  `Number`. JS numeric ops are CLOSED over numbers, so after the guard no
+  non-number can appear mid-kernel — there is no deopt map because there is
+  nothing to deopt. A failed guard executes the fallback op and the generic
+  interpreter takes that iteration; the kernel retries at the next
+  back-edge arrival (so a `let x;` warming to a number on iteration 1
+  enters the kernel from iteration 2). Loop exits write the registers back
+  and resume the interpreter at the exit ip. The cooperative interrupt flag
+  is polled on kernel back-edges at the interpreter's cadence.
+- Arithmetic calls the SAME `number_arith_raw`/`js_mod`/`to_int32` helpers
+  as the interpreter's Number×Number fast paths — results are bit-identical
+  by construction (NaN, -0, shift masking, `%` sign, `>>>`).
+
+**Measured (callgrind, whole workload, deterministic):**
+
+| workload | before | after | Δ |
+| --- | ---: | ---: | ---: |
+| arith_loop | 2.23 G | 0.46 G | **−79% (4.8×)** |
+| all others | — | — | unchanged (no eligible loops / call-bound) |
+
+Wall-clock arith_loop: ~245 ms → **~44 ms** (5.6×) on the shared container;
+the gap to V8 on this workload drops from ~100× to ~20×. `fib` (calls),
+`sort` (comparator calls), and property/string workloads are untouched by
+design — kernels only fire where the loop body is pure local numerics.
+
+**Gates:** the differential corpus + 300-case deterministic fuzz
+(`tests/kernels.rs`) require byte-identical behavior kernels-on vs
+kernels-off across break/continue/labels, NaN/-0/precision edges, guard
+bails, late entry, nested loops, and op-budget interaction; structural
+tests assert the canonical loop actually kernelizes; full suites + Test262
+gate green (kernels are additionally OFF under the runner's op budget, so
+conformance runs the generic path — the corpus carries kernel-specific
+coverage). The pass is disabled under the `op-histogram` feature (it would
+hide per-op counts).
+
+### 6.5.1 What's next (new baseline)
+
+- Kernel v2 candidates, in value order: dense-array element access inside
+  kernels (`sum += a[i]` — per-access bounds+density+number guards with
+  precise bail, unlocking array_push_sum/array_hof-class loops), `Math.*`
+  intrinsics as kernel ops, and materialized booleans (0/1-typed registers)
+  for `let ok = a < b` patterns.
+- **step dispatch remains the wall for non-kernel code**: `step` +
+  `run_frame` are 25–43% of call-heavy workloads. Register bytecode (§3.5)
+  is the remaining structural lever, and kernels shrink its risk: the
+  translator's abstract-stack machinery is exactly the analysis a register
+  allocator needs.
 
 Re-run the callgrind sweep before choosing; the noise-floor and idle-machine
 caveats in §1.1 stand.

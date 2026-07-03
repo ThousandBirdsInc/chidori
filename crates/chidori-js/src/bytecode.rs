@@ -105,6 +105,10 @@ pub struct FuncProto {
     pub name: String,
     pub code: Vec<Op>,
     pub consts: Vec<Const>,
+    /// Typed loop kernels compiled by `kernel.rs` (docs/js-performance-roadmap.md
+    /// §6.5): an [`Op::LoopKernel`] at a loop header indexes into this table.
+    /// Empty for functions with no eligible loops.
+    pub kernels: Vec<Kernel>,
     /// Number of plain (non-captured) local slots.
     pub num_locals: u32,
     /// Number of cell (captured-by-closure) slots.
@@ -197,6 +201,7 @@ impl FuncProto {
             name: name.to_string(),
             code: Vec::new(),
             consts: Vec::new(),
+            kernels: Vec::new(),
             num_locals: 0,
             num_cells: 0,
             num_params: 0,
@@ -901,4 +906,103 @@ pub enum Op {
     Nop,
     /// Create the `arguments` object from current frame.
     LoadArguments,
+    /// A typed loop kernel sits at this loop header (see [`Kernel`] and
+    /// `kernel.rs`). The payload indexes [`FuncProto::kernels`]. Placed by the
+    /// kernelization pass REPLACING the original header op (which is preserved
+    /// as [`Kernel::fallback`]), so every other instruction index — and every
+    /// jump target — in the function is unchanged.
+    LoopKernel(u32),
+}
+
+// =============================================================================
+// Typed loop kernels
+// =============================================================================
+
+/// The kernel register machine's instruction set: unboxed `f64` registers, no
+/// operand stack, no heap values. Produced by `kernel.rs` from an eligible
+/// loop region's bytecode; executed by `Vm::run_kernel`. `target` fields index
+/// [`Kernel::code`]. Numeric semantics are shared with the interpreter
+/// (`number_arith_raw`, `js_mod`, `to_int32`, …) so results are bit-identical
+/// to the generic path on `Number` inputs — which the entry guard establishes
+/// and the (closed-under-arithmetic) op set preserves.
+#[derive(Clone, Copy, Debug)]
+pub enum KOp {
+    /// `regs[dst] = regs[src]`
+    Mov { dst: u16, src: u16 },
+    /// `regs[dst] = k`
+    Const { dst: u16, k: f64 },
+    /// `regs[dst] = regs[a] + regs[b]` (numeric `+`; strings can't occur here)
+    Add { dst: u16, a: u16, b: u16 },
+    /// `regs[dst] = regs[a] + k`
+    AddK { dst: u16, a: u16, k: f64 },
+    /// `regs[dst] = regs[a] <kind> regs[b]` (same table as `number_arith`)
+    Arith {
+        kind: crate::exec::ArithKind,
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    /// `regs[dst] = regs[a] <kind> k`
+    ArithK {
+        kind: crate::exec::ArithKind,
+        dst: u16,
+        a: u16,
+        k: f64,
+    },
+    /// `regs[dst] = -regs[src]`
+    Neg { dst: u16, src: u16 },
+    /// `regs[dst] = ~ToInt32(regs[src])`
+    BitNot { dst: u16, src: u16 },
+    /// unconditional jump
+    Br { target: u16 },
+    /// numeric compare-and-branch: jump when `cmp(a, b) == if_true`
+    BrCmp {
+        cmp: CmpOp,
+        a: u16,
+        b: u16,
+        if_true: bool,
+        target: u16,
+    },
+    /// as [`KOp::BrCmp`] with a constant right operand
+    BrCmpK {
+        cmp: CmpOp,
+        a: u16,
+        k: f64,
+        if_true: bool,
+        target: u16,
+    },
+    /// jump when `regs[src]` is falsy (`0`, `-0`, or NaN)
+    BrFalsy { src: u16, target: u16 },
+    /// jump when `regs[src]` is truthy
+    BrTruthy { src: u16, target: u16 },
+    /// Leave the kernel: write every mapped local back to `frame.locals`, push
+    /// registers `S0..S(stack-1)` onto the operand stack (as Numbers), and
+    /// resume the bytecode interpreter at `resume_ip`.
+    Exit { resume_ip: u32, stack: u16 },
+}
+
+/// One compiled loop kernel: the register program for a bytecode loop region
+/// whose every op is numeric and whose every binding is a `frame.locals` slot.
+///
+/// Register file layout: registers `0..locals.len()` mirror the mapped frame
+/// locals (`regs[r]` ↔ `frame.locals[locals[r]]`); registers above that are
+/// the canonical operand-stack slots (`S(d) = locals.len() + d`).
+///
+/// The runtime contract lives in `Vm::run_kernel`: the kernel runs only when
+/// no op budget is installed, and only after verifying every mapped local
+/// currently holds a `Number` (the GUARD). A guard failure executes
+/// `fallback` — the original loop-header op — so the loop proceeds generically
+/// for that iteration and the kernel retries at the next back-edge arrival
+/// (late entry: a `let x;` warming to a number on iteration 1 enters the
+/// kernel from iteration 2).
+#[derive(Clone, Debug)]
+pub struct Kernel {
+    pub code: Box<[KOp]>,
+    /// `frame.locals` indices mirrored into registers `0..locals.len()`.
+    pub locals: Box<[u32]>,
+    /// Total register count (mapped locals + canonical stack slots).
+    pub n_regs: u16,
+    /// The original loop-header op this kernel replaced; executed verbatim
+    /// when the guard declines.
+    pub fallback: Box<Op>,
 }

@@ -93,8 +93,22 @@ fn localization_preserves_observable_behavior() {
     }
 }
 
+/// Count ops matching `pred` across a proto and its nested function
+/// templates. The loop-kernel pass may replace a loop-header op with
+/// `Op::LoopKernel`, preserving the original as the kernel's fallback —
+/// count that op too, since it is what the generic path executes.
 fn count_ops(proto: &FuncProto, pred: fn(&Op) -> bool) -> usize {
-    let here = proto.code.iter().filter(|op| pred(op)).count();
+    let here = proto
+        .code
+        .iter()
+        .map(|op| match op {
+            Op::LoopKernel(i) => {
+                let fb = &proto.kernels[*i as usize].fallback;
+                usize::from(pred(op)) + usize::from(pred(fb))
+            }
+            _ => usize::from(pred(op)),
+        })
+        .sum::<usize>();
     let nested: usize = proto
         .consts
         .iter()

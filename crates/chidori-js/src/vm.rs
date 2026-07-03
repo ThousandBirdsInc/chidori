@@ -339,6 +339,12 @@ pub struct Vm {
     /// pool holds no live `BytecodeFunction` (whose upvalues/home object would
     /// otherwise outlive their frame). Shared, empty, never executed.
     pub(crate) dummy_bf: Rc<BytecodeFunction>,
+    /// Scratch register file for the typed loop kernels (`kernel.rs`): reused
+    /// across activations so entering a kernel allocates nothing. Kernels
+    /// never nest (a region containing a `LoopKernel` op is not kernelized),
+    /// and the generic interpreter running under a kernel's fallback path
+    /// never touches this, so one buffer per Vm suffices.
+    pub(crate) kernel_regs: Vec<f64>,
 }
 
 impl Vm {
@@ -371,6 +377,7 @@ impl Vm {
             cell_pool: Vec::new(),
             dummy_cell: Rc::new(RefCell::new(Value::Undefined)),
             frame_pool: Vec::new(),
+            kernel_regs: Vec::new(),
             dummy_bf: Rc::new(BytecodeFunction {
                 proto: Rc::new(crate::bytecode::FuncProto::empty(
                     "",
