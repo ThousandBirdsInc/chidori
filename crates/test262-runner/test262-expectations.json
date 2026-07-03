@@ -10791,7 +10791,7 @@
     "test/built-ins/Object/preventExtensions/15.2.3.10-3-23.js": "pass",
     "test/built-ins/Object/preventExtensions/15.2.3.10-3-24.js": "pass",
     "test/built-ins/Object/preventExtensions/15.2.3.10-3-3.js": "pass",
-    "test/built-ins/Object/preventExtensions/15.2.3.10-3-4.js": "fail",
+    "test/built-ins/Object/preventExtensions/15.2.3.10-3-4.js": "pass",
     "test/built-ins/Object/preventExtensions/15.2.3.10-3-5-1.js": "pass",
     "test/built-ins/Object/preventExtensions/15.2.3.10-3-5.js": "pass",
     "test/built-ins/Object/preventExtensions/15.2.3.10-3-6.js": "pass",
@@ -47293,9 +47293,9 @@
     "test/language/white-space/string-vertical-tab.js": "pass"
   },
   "summary": {
-    "fail": 371,
-    "pass": 39823,
-    "pass_pct": 99.07697666318356,
+    "fail": 370,
+    "pass": 39824,
+    "pass_pct": 99.07946459670598,
     "skip": 7097
   }
 }

@@ -686,7 +686,7 @@ fn cmd_run(
     let providers = Arc::new(ProviderRegistry::from_env());
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
     let tokio_rt =
-        Arc::new(tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?);
+        Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
 
     // Auto-discover tools from `<project>/tools/` plus any `--tools` dirs.
     let mut tool_dirs: Vec<PathBuf> = vec![base_dir.join("tools")];
@@ -782,7 +782,7 @@ fn cmd_run_stream(
     let providers = Arc::new(ProviderRegistry::from_env());
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
     let tokio_rt =
-        Arc::new(tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?);
+        Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
 
     let mut tool_dirs: Vec<PathBuf> = vec![base_dir.join("tools")];
     tool_dirs.extend(extra_tool_dirs.iter().cloned());
@@ -920,7 +920,7 @@ fn cmd_chat(
     let providers = Arc::new(ProviderRegistry::from_env());
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
     let tokio_rt =
-        Arc::new(tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?);
+        Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
 
     let mut tool_dirs: Vec<PathBuf> = vec![base_dir.join("tools")];
     tool_dirs.extend(extra_tool_dirs.iter().cloned());
@@ -1038,7 +1038,7 @@ fn cmd_check(file: &PathBuf) -> Result<()> {
     let providers = Arc::new(ProviderRegistry::new());
     let template_engine = Arc::new(TemplateEngine::new("."));
     let tokio_rt =
-        Arc::new(tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?);
+        Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
 
     let engine = Engine::new(providers, template_engine, tokio_rt);
     engine.check(file)?;
@@ -1114,7 +1114,7 @@ fn cmd_resume(file: &PathBuf, run_id: &str, dir: Option<&std::path::Path>) -> Re
     let providers = Arc::new(ProviderRegistry::from_env());
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
     let tokio_rt =
-        Arc::new(tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?);
+        Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
     let tools_dir = base_dir.join("tools");
     let tools = Arc::new(
         ToolRegistry::load_from_dirs(&[tools_dir]).unwrap_or_else(|_| ToolRegistry::new()),
@@ -1154,7 +1154,7 @@ fn branch_engine(dir: Option<&std::path::Path>) -> Result<Engine> {
     let providers = Arc::new(ProviderRegistry::from_env());
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
     let tokio_rt =
-        Arc::new(tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?);
+        Arc::new(scheduler::new_tokio_runtime().context("Failed to create tokio runtime")?);
     let tools_dir = base_dir.join("tools");
     let tools = Arc::new(
         ToolRegistry::load_from_dirs(&[tools_dir]).unwrap_or_else(|_| ToolRegistry::new()),
@@ -1402,7 +1402,7 @@ fn cmd_serve(
     // Validate the agent file before starting the server.
     {
         let rt = Arc::new(
-            tokio::runtime::Runtime::new().context("Failed to create validation runtime")?,
+            scheduler::new_tokio_runtime().context("Failed to create validation runtime")?,
         );
         let engine = Engine::new(providers.clone(), template_engine.clone(), rt);
         engine.check(file).context("Agent file validation failed")?;
@@ -1415,7 +1415,7 @@ fn cmd_serve(
     crate::runtime::isolate::warn_if_untrusted_without_isolation(!trusted);
 
     let (policy, policy_posture) = serve_policy(untrusted, trusted);
-    let tokio_rt = tokio::runtime::Runtime::new().context("Failed to create server runtime")?;
+    let tokio_rt = scheduler::new_tokio_runtime().context("Failed to create server runtime")?;
     tokio_rt.block_on(server::serve(
         providers,
         template_engine,

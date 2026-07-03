@@ -545,21 +545,48 @@ sort 1.09 s → 0.93 s, fib 696 → 572 ms, closures 350 → 311 ms.
 An incidental robustness gain: heap-boxed frames raised the native-stack
 recursion ceiling from ~1160 to ~1460 JS frames (see the known issue below).
 
-### 6.4.2 What's next (new baseline)
+### 6.4.2 Robustness follow-ups (landed with this round)
+
+Both known issues flagged during this round's review are **fixed**:
+
+- **Deep recursion now throws instead of aborting the process.** The
+  pre-existing failure: `max_call_depth` (2000) exceeded what the default
+  8 MB native stack supports, so `rec(1500)`-style recursion killed the
+  process with an uncatchable native stack overflow (main aborted at ~1160
+  frames; the frame pool had already raised that to ~1460). Root cause:
+  `step`'s single ~190-arm match carried a **4 KB stack frame** (LLVM's
+  imperfect stack coloring unions the arms' locals), so every JS call cost
+  ~5.5 KB of native stack. Fix, two-sided:
+  - `step` is split: hot ops stay inline (~2.7 KB frame), everything else
+    delegates to an `#[inline(never)] step_cold`. Each op has exactly ONE
+    implementation. A plain JS→JS call's native footprint is now ~3 KB, so
+    the 2000-frame guard fires (catchable RangeError) comfortably inside
+    8 MB. Probe-verified: `rec(1900)` returns, unbounded recursion throws
+    `RangeError`, spread-call recursion included. Callgrind cost of the
+    split: ≈0.5% geomean (fib +1.1% worst) — the price of the abort→throw
+    conversion.
+  - The chidori server/CLI ran agent JS on `tokio::spawn_blocking` threads
+    with tokio's **2 MiB** default stacks (abort at ~350 frames!). All
+    tokio runtimes are now built via `scheduler::new_tokio_runtime()` with
+    16 MiB threads (`JS_THREAD_STACK_BYTES`, matching the branch worker
+    threads' existing choice).
+  - Remaining sharp edge (accepted): recursion THROUGH `direct eval`
+    (`perform_direct_eval` holds its own 4 KB frame) stacks ~10 KB/frame
+    and can still hit the native limit before the depth guard on small
+    stacks. Pathological; unchanged from before.
+- **Sealed-array appends are rejected.** `Object.seal(a); a[a.len] = v`
+  (and `push`/`unshift`, in-bounds hole writes, `preventExtensions`-only
+  receivers) wrote through the dense-array Set path, which never consulted
+  `extensible` when CREATING an element. `ordinary_define_own` now rejects
+  creation on a non-extensible dense array — silently in sloppy mode,
+  TypeError in strict — matching Node/spec exactly. One Test262 test flips
+  to passing (baseline refreshed).
+
+### 6.4.3 What's next (new baseline)
 
 - **step dispatch is now the wall**: `step` + `run_frame` are 25–43% of
   every workload (fib 42%, arith 50%+, sort 25%) with the call ceremony
   halved. Register bytecode (§3.5) is the remaining structural lever.
-- **Known issue (pre-existing, NOT introduced here)**: `max_call_depth`
-  (2000) exceeds what the default 8 MB native stack supports —
-  `rec(1500)`-style recursion aborts with a native stack overflow instead
-  of throwing a catchable RangeError (main: overflow at ~1160 frames; this
-  branch: ~1460, i.e. strictly better but still short of 2000). Fix
-  options: lower the default depth, raise thread stack at the embedding
-  boundary, or shrink `step`'s stack frame (~5 KB/call, the giant match's
-  unioned locals). Tracked separately; Test262's recursion tests pass
-  because the runner threads carry larger stacks.
-- The sealed-array append gap from §6.3 still stands.
 
 Re-run the callgrind sweep before choosing; the noise-floor and idle-machine
 caveats in §1.1 stand.

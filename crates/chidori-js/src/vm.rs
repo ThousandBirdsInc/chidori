@@ -1360,6 +1360,7 @@ impl Vm {
         // the dense store, so route the write through the ordinary props path
         // below (which honours its writable flag) when such an entry exists.
         let has_props_entry = b.props.contains_key(key);
+        let extensible = b.extensible;
         // A non-writable `length` marker blocks index writes past the end.
         let len_not_writable = matches!(
             b.props.get(&PropertyKey::str("length")),
@@ -1392,6 +1393,22 @@ impl Vm {
                 }
                 if let Some(idx) = key.array_index() {
                     let idx = idx as usize;
+                    // An append OR an in-bounds hole fill CREATES a property
+                    // (a hole is absent), so a non-extensible receiver rejects
+                    // it (OrdinarySet → CreateDataProperty → [[DefineOwnProperty]]
+                    // step 2.b): silently in sloppy mode, TypeError in strict.
+                    // Object.seal/preventExtensions on a dense array land here.
+                    let creates = idx >= arr.len() || matches!(arr[idx], Value::Hole);
+                    if creates && !extensible {
+                        if strict {
+                            drop(b);
+                            return Err(self.throw_type(&format!(
+                                "Cannot add property {}, object is not extensible",
+                                key_display(key)
+                            )));
+                        }
+                        return Ok(());
+                    }
                     if idx >= arr.len() {
                         if len_not_writable {
                             // Growing past a non-writable `length` is rejected

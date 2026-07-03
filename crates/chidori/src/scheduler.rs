@@ -24,6 +24,26 @@ use crate::runtime::template::TemplateEngine;
 use crate::storage::{SessionStatus, SessionStore, StoredSession};
 use crate::tools::ToolRegistry;
 
+/// Stack size for every thread that may run the JS interpreter — tokio
+/// workers/blocking threads (agent runs go through `spawn_blocking`) and the
+/// branch worker threads. The interpreter recurses natively with the agent's
+/// JS call depth (`max_call_depth` = 2000 frames), which needs more headroom
+/// than tokio's 2 MiB default; on 64-bit the extra virtual space is only
+/// committed if actually touched.
+pub const JS_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Build the process's tokio runtime. Exactly `tokio::runtime::Runtime::new()`
+/// plus [`JS_THREAD_STACK_BYTES`]-sized threads: agent JS executes on this
+/// runtime's blocking threads, and a 2 MiB-stack thread aborts the whole
+/// process on ~350 frames of JS recursion instead of letting the engine's
+/// depth guard throw a catchable RangeError at 2000.
+pub fn new_tokio_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(JS_THREAD_STACK_BYTES)
+        .build()
+}
+
 #[derive(Clone)]
 pub struct SchedulerDeps {
     pub template_engine: Arc<TemplateEngine>,
@@ -88,7 +108,7 @@ pub async fn run_once(recipe: &Recipe, deps: &SchedulerDeps) -> Result<String> {
     let recipe_name = recipe.name.clone();
 
     let (id, session) = tokio::task::spawn_blocking(move || -> Result<(String, StoredSession)> {
-        let rt = Arc::new(tokio::runtime::Runtime::new()?);
+        let rt = Arc::new(crate::scheduler::new_tokio_runtime()?);
         let providers = Arc::new(ProviderRegistry::from_env());
 
         // Build the tool registry: recipe-local dirs + default `<agent>/tools`
