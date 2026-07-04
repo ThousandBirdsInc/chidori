@@ -164,8 +164,10 @@ Or ask a single question non-interactively:
 ## What it can (and can't) see
 
 - The agent reads **only** the files under `docs/` in this folder. `chidori`
-  scopes the workspace to this project directory — it cannot read elsewhere on
-  your machine.
+  scopes the workspace to this project directory — the folder containing
+  `agent.ts` — automatically, with no configuration. It cannot read elsewhere on
+  your machine. (Point it at a different root by setting `CHIDORI_WORKSPACE_ROOT`
+  if you ever need to.)
 - The only data sent to the model is **your question plus these docs**. Your own
   files are never read or transmitted.
 - Every turn is a recorded host call, so replaying the whole conversation costs

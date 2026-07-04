@@ -35,6 +35,12 @@ pub struct Engine {
     approvals: Vec<(String, serde_json::Value)>,
     /// If set, each run persists its call log to `<persist_base>/<run_id>/checkpoint.json`.
     persist_base: Option<PathBuf>,
+    /// Default root for `chidori.workspace`, used when the run's context has no
+    /// workspace root of its own. The CLI points this at the agent's project
+    /// directory so `chidori.workspace` works out of the box; an explicit
+    /// `CHIDORI_WORKSPACE_ROOT` env var still wins (it populates the context
+    /// default, which takes precedence over this fallback).
+    workspace_root: Option<PathBuf>,
 }
 
 pub struct RunResult {
@@ -133,6 +139,7 @@ impl Engine {
             mcp: Arc::new(McpManager::new()),
             approvals: Vec::new(),
             persist_base: None,
+            workspace_root: None,
         }
     }
 
@@ -158,6 +165,14 @@ impl Engine {
 
     pub fn with_persist_base(mut self, base: PathBuf) -> Self {
         self.persist_base = Some(base);
+        self
+    }
+
+    /// Set the default `chidori.workspace` root, applied to each run whose
+    /// context doesn't already carry one (i.e. when `CHIDORI_WORKSPACE_ROOT` is
+    /// unset). Lets the CLI scope the workspace to the agent's project dir.
+    pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
+        self.workspace_root = Some(root);
         self
     }
 
@@ -505,6 +520,17 @@ impl Engine {
         inputs: &Value,
         ctx: RuntimeContext,
     ) -> Result<RunResult> {
+        // Fall back to the engine's default workspace root when the context
+        // doesn't already have one. `CHIDORI_WORKSPACE_ROOT` populates the
+        // context default (via `RuntimeContext::new`), so an explicit env var
+        // still takes precedence; this only fills in the CLI's project-dir
+        // default so `chidori.workspace` works without extra configuration.
+        if ctx.workspace_root().is_none() {
+            if let Some(ref root) = self.workspace_root {
+                ctx.set_workspace_root(root.clone());
+            }
+        }
+
         // Enable on-disk persistence if configured.
         if let Some(ref base) = self.persist_base {
             let run_dir = ctx.enable_persistence(base.clone());

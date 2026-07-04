@@ -1409,11 +1409,31 @@ pub(crate) fn workspace_list(
     complete_only: bool,
 ) -> std::result::Result<serde_json::Value, String> {
     let manifest = read_workspace_manifest(root)?;
-    let entries = manifest
-        .files
-        .into_iter()
-        .filter(|(_, entry)| !complete_only || entry.status == WorkspaceFileStatus::Complete)
-        .map(|(path, entry)| {
+
+    // Union the real on-disk files with the generation manifest so `list()`
+    // mirrors `read()`'s disk-backed view: a project's existing files show up
+    // even when they were never written through `workspace.write` (e.g. the
+    // scaffolded `docs/*.md` the `docs` template reads). Manifest metadata is
+    // authoritative for files it tracks; disk-only files are reported as
+    // Complete (they exist fully on disk). BTreeMap keeps the output sorted.
+    let mut entries: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for (path, bytes) in scan_workspace_disk(root) {
+        entries.insert(
+            path.clone(),
+            serde_json::json!({
+                "path": path,
+                "status": WorkspaceFileStatus::Complete,
+                "sha256": serde_json::Value::Null,
+                "bytes": bytes,
+                "language": language_for_path(Path::new(&path)),
+                "attempt": serde_json::Value::Null,
+                "updatedAt": serde_json::Value::Null,
+            }),
+        );
+    }
+    for (path, entry) in manifest.files {
+        entries.insert(
+            path.clone(),
             serde_json::json!({
                 "path": path,
                 "status": entry.status,
@@ -1422,10 +1442,64 @@ pub(crate) fn workspace_list(
                 "language": entry.language,
                 "attempt": entry.attempt,
                 "updatedAt": entry.updated_at,
-            })
+            }),
+        );
+    }
+
+    let entries = entries
+        .into_values()
+        .filter(|entry| {
+            !complete_only
+                || entry.get("status")
+                    == Some(&serde_json::to_value(WorkspaceFileStatus::Complete).unwrap())
         })
         .collect::<Vec<_>>();
     Ok(serde_json::Value::Array(entries))
+}
+
+/// Walk the workspace root and return `(relative-path, byte-len)` for every
+/// regular file, skipping dot-prefixed entries (the `.generation`/`.chidori`
+/// metadata dirs, `.git`, etc.) and never following symlinks. Best-effort:
+/// unreadable directories are silently skipped so a listing degrades to the
+/// manifest view rather than erroring.
+fn scan_workspace_disk(root: &Path) -> Vec<(String, u64)> {
+    let mut files: Vec<(String, u64)> = Vec::new();
+    // (absolute dir, relative-from-root) pairs; depth-bounded to avoid runaway
+    // trees. Symlinks are never enqueued, so there are no directory cycles.
+    let mut stack: Vec<(PathBuf, PathBuf)> = vec![(root.to_path_buf(), PathBuf::new())];
+    const MAX_DEPTH: usize = 64;
+    while let Some((dir, rel)) = stack.pop() {
+        if rel.components().count() > MAX_DEPTH {
+            continue;
+        }
+        let Ok(read_dir) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // Skip metadata/hidden entries at every level.
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let child_rel = rel.join(&*name);
+            if file_type.is_dir() {
+                stack.push((entry.path(), child_rel));
+            } else if file_type.is_file() {
+                if let Ok(rel_str) = relative_path_string(&child_rel) {
+                    let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    files.push((rel_str, bytes));
+                }
+            }
+        }
+    }
+    files
 }
 
 pub(crate) fn workspace_read(root: &Path, path: &str) -> std::result::Result<String, String> {

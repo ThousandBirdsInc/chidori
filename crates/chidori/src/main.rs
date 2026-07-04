@@ -720,6 +720,18 @@ fn serve_policy(untrusted: bool, trusted: bool) -> (Arc<policy::PolicyConfig>, S
     }
 }
 
+/// Resolve a project base directory to an absolute path so the workspace root
+/// stays stable even if the process later changes its current directory. Falls
+/// back to joining the CWD when the path can't be canonicalized (e.g. it's
+/// relative and some component doesn't exist yet).
+fn abs_dir(dir: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(dir))
+            .unwrap_or_else(|_| dir.to_path_buf())
+    })
+}
+
 fn cmd_run(
     file: &PathBuf,
     inputs: &[String],
@@ -761,7 +773,8 @@ fn cmd_run(
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
         .with_policy(cli_policy(untrusted))
-        .with_persist_base(base_dir.join(".chidori").join("runs"));
+        .with_persist_base(base_dir.join(".chidori").join("runs"))
+        .with_workspace_root(abs_dir(&base_dir));
 
     // Run the agent.
     let result = engine.run(file, &input_value)?;
@@ -998,7 +1011,8 @@ fn cmd_chat(
 
     let engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
-        .with_policy(cli_policy(untrusted));
+        .with_policy(cli_policy(untrusted))
+        .with_workspace_root(abs_dir(&base_dir));
 
     eprintln!("chidori chat — type a message and press enter. Type 'exit' or Ctrl-D to quit.");
     if !tool_names.is_empty() {

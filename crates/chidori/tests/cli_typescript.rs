@@ -419,6 +419,38 @@ fn cli_workspace_read_allowed_while_write_denied() {
     fs::remove_dir_all(dir).ok();
 }
 
+/// `chidori.workspace` must resolve out of the box (like the `docs` init
+/// template), scoping to the agent's project directory even when
+/// `CHIDORI_WORKSPACE_ROOT` is unset. Regression for the scaffolded `docs`
+/// template failing with "requires CHIDORI_WORKSPACE_ROOT or a runtime
+/// workspace root" on `chidori run`/`chat`.
+#[test]
+fn cli_workspace_defaults_to_project_dir_without_env() {
+    let dir = temp_project("workspace-default-root");
+    fs::create_dir_all(dir.join("docs")).unwrap();
+    fs::write(dir.join("docs").join("readme.md"), "workspace-ok").unwrap();
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                const entries = await chidori.workspace.list();
+                const md = entries.map((e) => e.path).find((p) => p.endsWith("readme.md"));
+                return { content: await chidori.workspace.read(md) };
+            }
+        "#,
+    )
+    .unwrap();
+
+    // Note: no CHIDORI_WORKSPACE_ROOT — the CLI must fall back to the agent dir.
+    let output = run_chidori(&["run", agent.to_str().unwrap(), "--input", r#"{}"#], &dir);
+    assert_success(&output);
+    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(stdout["content"], "workspace-ok");
+
+    fs::remove_dir_all(dir).ok();
+}
+
 #[test]
 fn cli_untrusted_profile_denies_workspace_write() {
     let dir = temp_project("untrusted-workspace-write");
