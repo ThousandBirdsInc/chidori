@@ -672,13 +672,45 @@ budget, so conformance runs the generic path — the corpus carries
 kernel-specific coverage). The pass is disabled under the `op-histogram`
 feature (it would hide per-op counts).
 
+**Kernel v3 (same branch): `Math.*` intrinsics + in-body `const`/`let`.**
+
+- The compiler's Math method-call pattern (`LoadGlobal("Math"); Dup;
+  GetProp(name); Swap; args…; Call(n)`) translates to direct kernel ops for
+  `abs floor ceil round trunc sign sqrt fround` (unary) and
+  `min max pow imul` (binary, exact-arity only). Every kind calls the SAME
+  core function its builtin uses (`builtins::numbers`), so results are
+  bit-identical — including `Math.round`'s half-up negatives, `min/max`
+  NaN-poisoning and ±0 ordering, and `imul`'s int32 wrap. The **entry
+  guard** identity-checks the global `Math` binding (a plain data property
+  holding the canonical object — accessors/replacements decline) and each
+  used method (methods are writable; a monkeypatched `Math.max` makes the
+  kernel decline and the patch runs generically, observably). `Math.PI`-
+  class value constants are non-writable AND non-configurable on the
+  canonical object, so with the object identity guarded they fold to
+  literal constants at translation. Unsupported methods/arities
+  (`hypot`, `log`, variadic `max`) reject the region as before.
+- In-body `const x = …` / `let y = …` emit a TDZ-init op
+  (`InitLocalTdz`) that previously rejected the region — the single
+  biggest eligibility hole in practice. It is now ELIDED under the same
+  proof as the dead `undefined` store: the local must be re-stored before
+  any read, branch, or branch target; a genuine conditional-TDZ-read
+  region stays generic so the ReferenceError comes from the spec path
+  (pinned in the corpus).
+
+Measured on a Math-heavy loop (clamp + `imul` hash over 2M iterations, the
+DSP/aggregation shape): **2058 ms → 199 ms (10.3×)**, node at 57 ms — the
+gap on this class drops from ~36× to ~3.5×. Benchmark-suite counts are
+otherwise unchanged (checksums identical); the corpus grew Math edge cases
+(NaN/±0 ordering, half-up rounding, monkeypatching, wholesale `Math`
+replacement, accessor-on-globalThis, patch-between-activations) plus
+in-body-declaration cases, and the fuzz generator now routes values
+through Math intrinsics.
+
 ### 6.5.1 What's next (new baseline)
 
-- Kernel v3 candidates, in value order: `Math.*` intrinsics as kernel ops
-  (entry-guarded against the canonical builtins — `Math.abs/min/max/floor`
-  in numeric loops are common), materialized booleans (would need typed
-  write-back, since `typeof ok` distinguishes `true` from `1`), and dense
-  appends (`a[a.length] = v` currently bails every iteration).
+- Kernel v4 candidates: materialized booleans (needs typed write-back,
+  since `typeof ok` distinguishes `true` from `1`), and dense appends
+  (`a[a.length] = v` currently bails every iteration).
 - **step dispatch remains the wall for non-kernel code**: `step` +
   `run_frame` are 25–43% of call-heavy workloads. Register bytecode (§3.5)
   is the remaining structural lever, and kernels shrink its risk: the

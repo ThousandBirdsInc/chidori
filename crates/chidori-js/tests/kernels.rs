@@ -159,6 +159,40 @@ const CORPUS: &[&str] = &[
     "const a = [0,1,NaN,3]; let c = 0; for (let i = 0; i < a.length; i++) { if (a[i]) c += 1; c += a[i] || 10; } console.log(c);",
     // Writing NaN/-0/Infinity through the kernel store.
     "const a = [0,0,0]; for (let i = 0; i < 3; i++) { a[i] = i === 0 ? -0 : i === 1 ? NaN : 1/0; } console.log(Object.is(a[0], -0), a[1] !== a[1], a[2]);",
+    // ---- Math intrinsics (kernel v3) ----
+    // The supported set, exercised across sign/NaN/-0/half-way edges.
+    "let s = 0; for (let i = -5; i < 6; i++) { s += Math.abs(i) + Math.max(i, 2) + Math.min(i, -2); } console.log(s);",
+    "let s = ''; for (let i = 0; i < 5; i++) { const x = i - 2.5; s += Math.round(x) + '/' + Math.floor(x) + '/' + Math.ceil(x) + '/' + Math.trunc(x) + ';'; } console.log(s);",
+    "console.log((() => { let r = 0; for (let i = 0; i < 4; i++) { r += Math.round(-0.5 - i) * 2 + Math.sign(i - 2); } return r; })());",
+    "let z = 0; for (let i = 0; i < 3; i++) { z = Math.min(0, -0) + Math.max(0, -0) + z; } console.log(Object.is(Math.min(0,-0), -0), Object.is(Math.max(-0,0), 0), z);",
+    "let s = 0; for (let i = 1; i <= 10; i++) { s += Math.sqrt(i) + Math.pow(i, 1.5); } console.log(s);",
+    "let h = 0; for (let i = 0; i < 200; i++) { h = (Math.imul(h, 31) + i) | 0; } console.log(h);",
+    "let f = 0; for (let i = 0; i < 8; i++) { f += Math.fround(0.1 * i); } console.log(f);",
+    "let n = 0; for (let i = 0; i < 4; i++) { n += Math.max(i === 2 ? NaN : i, 1); } console.log(n, n === n);",
+    // Math constants fold (non-writable, non-configurable on the canonical).
+    "let c = 0; for (let i = 0; i < 5; i++) { c += Math.PI * i + Math.E - Math.LN2 + Math.SQRT2 * Math.LOG2E; } console.log(c);",
+    // Math mixed with array access (bail shapes carrying Math entries).
+    "const a = [3,-1,4,-1,5]; let s = 0; for (let i = 0; i < a.length; i++) { s += Math.abs(a[i]); } console.log(s);",
+    "const a = [1,'x',3]; let s = 0; for (let i = 0; i < a.length; i++) { s += Math.max(+a[i] || 0, 1); } console.log(s);",
+    // MONKEYPATCHED Math.max: the guard must decline and run the patch.
+    "let calls = 0; const orig = Math.max; Math.max = function(a, b) { calls++; return orig(a, b) + 100; }; let s = 0; for (let i = 0; i < 3; i++) { s += Math.max(i, 1); } Math.max = orig; console.log(s, calls);",
+    // Math REPLACED wholesale / deleted mid-program.
+    "const RealMath = Math; let s = 0; globalThis.Math = { max: () => 7 }; for (let i = 0; i < 3; i++) { s += Math.max(i, 1); } globalThis.Math = RealMath; console.log(s);",
+    // Patch BETWEEN two activations of the same kernelized function.
+    "function f() { let s = 0; for (let i = 0; i < 3; i++) { s += Math.abs(i - 1); } return s; } const first = f(); const orig = Math.abs; Math.abs = () => 42; const second = f(); Math.abs = orig; console.log(first, second);",
+    // Accessor on globalThis.Math must fire per LoadGlobal (guard declines).
+    "const RealMath = Math; let gets = 0; Object.defineProperty(globalThis, 'Math', { get() { gets++; return RealMath; }, configurable: true }); let s = 0; for (let i = 0; i < 3; i++) { s += Math.abs(-i); } Object.defineProperty(globalThis, 'Math', { value: RealMath, writable: true, configurable: true }); console.log(s, gets >= 3);",
+    // Unsupported arities / methods stay generic but correct.
+    "let s = 0; for (let i = 0; i < 4; i++) { s += Math.max(i, 1, 2) + Math.min(i) + Math.hypot(i, 4); } console.log(s);",
+    "let s = 0; for (let i = 1; i < 5; i++) { s += Math.log(i) + Math.atan2(i, 2); } console.log(s);",
+    // ---- in-body block-scoped declarations (TDZ-init elision) ----
+    // Multiple consts per iteration, chained.
+    "function f(n) { let s = 0; for (let i = 0; i < n; i++) { const a = i * 2; const b = a + 1; s += b - a; } return s; } console.log(f(50));",
+    // A REAL TDZ read on one path must still throw identically (region has
+    // a conditional read before the init -> stays generic).
+    "try { for (let i = 1; i >= 0; i--) { if (i === 0) { y; } const y = i; } } catch (e) { console.log('tdz', e.constructor.name); }",
+    // const inside the loop feeding Math and array access.
+    "const arr = [4,1,3,2]; let s = 0; for (let i = 0; i < arr.length; i++) { const v = arr[i]; s += Math.max(v, 2); } console.log(s);",
 ];
 
 #[test]
@@ -234,6 +268,25 @@ fn array_and_nested_loops_get_kernels() {
     );
 }
 
+/// Math-using loops actually kernelize (pins v3 eligibility).
+#[test]
+fn math_loops_get_kernels() {
+    let proto = compile_script(
+        "function f(n) { let s = 0; for (let i = 0; i < n; i++) { s += Math.max(Math.abs(i - 5), 1) * Math.PI; } return s; }",
+    )
+    .expect("compiles");
+    fn count(p: &FuncProto) -> usize {
+        let mut n = p.kernels.len();
+        for c in &p.consts {
+            if let Const::Func(f) = c {
+                n += count(f);
+            }
+        }
+        n
+    }
+    assert!(count(&proto) >= 1, "Math loop must kernelize");
+}
+
 /// Deterministic fuzz: generate random numeric loops (random arithmetic,
 /// comparisons, short-circuits, breaks, and occasional type pollution to
 /// force guard bails) and require kernel-on/off equivalence on every one.
@@ -278,6 +331,20 @@ fn kernel_fuzz_differential() {
         }
         if case % 17 == 0 {
             body.push_str(&format!("if (i === 7) v{} = 'x';\n", rnd(nvars as u64)));
+        }
+        // Some cases route a value through a supported Math intrinsic.
+        if case % 5 == 0 {
+            let v = rnd(nvars as u64);
+            let w = rnd(nvars as u64);
+            let m = [
+                "Math.abs(v{W})",
+                "Math.max(v{W}, i)",
+                "Math.min(v{W}, 10)",
+                "Math.floor(v{W} / 3)",
+                "Math.imul(v{W}, 7)",
+                "Math.round(v{W} * 0.3)",
+            ][rnd(6) as usize];
+            body.push_str(&format!("v{v} = {};\n", m.replace("{W}", &w.to_string())));
         }
         // A third of the cases mix in dense-array reads/writes (in-bounds,
         // hole-adjacent, and occasionally out-of-bounds — all must bail or

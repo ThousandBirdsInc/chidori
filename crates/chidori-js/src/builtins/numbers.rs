@@ -720,12 +720,76 @@ fn install_math(vm: &mut Vm) {
         },
     );
 
+    // Register the canonical Math object and the kernel-supported methods so
+    // the typed loop kernels (`kernel.rs`) can identity-check them at entry:
+    // a kernel using `Math.max` runs only while the global `Math` binding and
+    // the method are still these exact objects (methods are writable).
+    vm.realm.math_object = Some(math.clone());
+    vm.realm.math_kernel = crate::bytecode::KMath::ALL
+        .iter()
+        .map(|k| {
+            match math
+                .borrow()
+                .props
+                .get(&PropertyKey::str(k.name()))
+                .and_then(|p| p.value().cloned())
+            {
+                Some(Value::Object(o)) => o,
+                _ => unreachable!("Math.{} installed above", k.name()),
+            }
+        })
+        .collect();
     vm.define_value(&vm.realm.global.clone(), "Math", Value::Object(math));
 }
 
 /// Math.round: round half toward +Infinity, preserving the sign of zero and the
 /// edge case where the result is in `(-1, -0]` (e.g. `round(-0.5) === -0`).
-fn math_round(n: f64) -> f64 {
+/// The 2-argument folds of `Math.max`/`Math.min` — EXACTLY the builtin
+/// closures' logic over two elements, shared with the typed loop kernels so
+/// kernel results are bit-identical (NaN poisoning, +0 beats -0, etc.).
+pub(crate) fn math_max2(a: f64, b: f64) -> f64 {
+    let mut m = f64::NEG_INFINITY;
+    for n in [a, b] {
+        if n.is_nan() {
+            return f64::NAN;
+        }
+        if n > m || (n == 0.0 && m == 0.0 && n.is_sign_positive()) {
+            m = n;
+        }
+    }
+    m
+}
+
+pub(crate) fn math_min2(a: f64, b: f64) -> f64 {
+    let mut m = f64::INFINITY;
+    for n in [a, b] {
+        if n.is_nan() {
+            return f64::NAN;
+        }
+        if n < m || (n == 0.0 && m == 0.0 && n.is_sign_negative()) {
+            m = n;
+        }
+    }
+    m
+}
+
+pub(crate) fn math_imul2(a: f64, b: f64) -> f64 {
+    crate::vm::to_int32(a).wrapping_mul(crate::vm::to_int32(b)) as f64
+}
+
+pub(crate) fn math_sign(n: f64) -> f64 {
+    f64::signum_js(n)
+}
+
+pub(crate) fn math_fround(n: f64) -> f64 {
+    if n.is_nan() {
+        f64::NAN
+    } else {
+        n as f32 as f64
+    }
+}
+
+pub(crate) fn math_round(n: f64) -> f64 {
     if n.is_nan() || n.is_infinite() || n == 0.0 {
         return n;
     }
@@ -746,7 +810,7 @@ fn math_round(n: f64) -> f64 {
 
 /// Math.pow with ECMAScript exponentiation special cases that `f64::powf` does
 /// not match (notably `pow(1, ±Inf)` and `pow(±1, NaN)` -> NaN).
-fn math_pow(base: f64, exp: f64) -> f64 {
+pub(crate) fn math_pow(base: f64, exp: f64) -> f64 {
     if exp.is_nan() {
         return f64::NAN;
     }

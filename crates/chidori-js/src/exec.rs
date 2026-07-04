@@ -308,6 +308,40 @@ impl Vm {
         r
     }
 
+    /// Verify the global `Math` binding and each used method are still the
+    /// realm's canonical objects, as plain data properties. Any deviation —
+    /// deleted/replaced/shadowed `Math`, an accessor, a monkeypatched method
+    /// — declines the kernel (the generic path then does whatever the
+    /// program set up, observably).
+    fn kernel_math_ok(&self, used: &[crate::bytecode::KMath]) -> bool {
+        let Some(canon) = &self.realm.math_object else {
+            return false;
+        };
+        {
+            let g = self.realm.global.borrow();
+            let math_ok = matches!(
+                g.props.get(&PropertyKey::str("Math")),
+                Some(Property {
+                    kind: PropertyKind::Data { value: Value::Object(o), .. },
+                    ..
+                }) if o.ptr_eq(canon)
+            );
+            if !math_ok {
+                return false;
+            }
+        }
+        let mb = canon.borrow();
+        used.iter().all(|k| {
+            matches!(
+                mb.props.get(&PropertyKey::str(k.name())),
+                Some(Property {
+                    kind: PropertyKind::Data { value: Value::Object(o), .. },
+                    ..
+                }) if o.ptr_eq(&self.realm.math_kernel[*k as usize])
+            )
+        })
+    }
+
     /// Execute the typed loop kernel at `Op::LoopKernel(idx)` (see
     /// `kernel.rs` for the model). Runs only when per-op accounting is off
     /// (no op budget), every mapped numeric local holds a `Number`, and every
@@ -335,6 +369,14 @@ impl Vm {
             if !matches!(frame.locals[l as usize], Value::Object(_)) {
                 return self.step(frame, &k.fallback);
             }
+        }
+        // Math intrinsics: the global `Math` binding must still be the
+        // canonical object as a plain DATA property (an accessor or a
+        // replacement would be observable), and each used method must still
+        // be the canonical builtin (methods are writable). Nothing inside a
+        // kernel region can mutate globals, so entry-time checks suffice.
+        if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
+            return self.step(frame, &k.fallback);
         }
         // Unboxed register file + array-base cache (both pooled on the Vm;
         // kernels never nest at runtime). The base objects are pinned for the
@@ -489,6 +531,12 @@ impl Vm {
                         branch!(bail)
                     }
                 }
+                KOp::Math1 { kind, dst, src } => {
+                    regs[dst as usize] = kmath1(kind, regs[src as usize])
+                }
+                KOp::Math2 { kind, dst, a, b } => {
+                    regs[dst as usize] = kmath2(kind, regs[a as usize], regs[b as usize])
+                }
                 // Dense array `length` (unshadowed only), else bail.
                 KOp::LoadLen { dst, obj, bail } => {
                     let mut ok = false;
@@ -524,6 +572,13 @@ impl Vm {
                 crate::bytecode::KShapeSlot::Obj(o) => {
                     frame.stack.push(Value::Object(objs[*o as usize].clone()))
                 }
+                // The guard proved the live values ARE the canonicals.
+                crate::bytecode::KShapeSlot::MathObj => frame.stack.push(Value::Object(
+                    self.realm.math_object.clone().expect("guarded"),
+                )),
+                crate::bytecode::KShapeSlot::MathFn(kind) => frame.stack.push(Value::Object(
+                    self.realm.math_kernel[*kind as usize].clone(),
+                )),
             }
         }
         self.kernel_regs = regs;
@@ -4433,6 +4488,36 @@ fn knum_cmp(cmp: CmpOp, a: f64, b: f64) -> bool {
 #[inline]
 fn knum_truthy(x: f64) -> bool {
     x != 0.0 && !x.is_nan()
+}
+
+/// Kernel Math dispatch — every arm is the SAME core its builtin uses, so a
+/// kernelized `Math.round` (etc.) is bit-identical to the generic call.
+fn kmath1(kind: crate::bytecode::KMath, x: f64) -> f64 {
+    use crate::builtins::numbers as m;
+    use crate::bytecode::KMath;
+    match kind {
+        KMath::Abs => x.abs(),
+        KMath::Floor => x.floor(),
+        KMath::Ceil => x.ceil(),
+        KMath::Round => m::math_round(x),
+        KMath::Trunc => x.trunc(),
+        KMath::Sign => m::math_sign(x),
+        KMath::Sqrt => x.sqrt(),
+        KMath::Fround => m::math_fround(x),
+        _ => unreachable!("binary Math kind in Math1"),
+    }
+}
+
+fn kmath2(kind: crate::bytecode::KMath, a: f64, b: f64) -> f64 {
+    use crate::builtins::numbers as m;
+    use crate::bytecode::KMath;
+    match kind {
+        KMath::Min2 => m::math_min2(a, b),
+        KMath::Max2 => m::math_max2(a, b),
+        KMath::Pow2 => m::math_pow(a, b),
+        KMath::Imul2 => m::math_imul2(a, b),
+        _ => unreachable!("unary Math kind in Math2"),
+    }
 }
 
 fn number_arith(x: f64, y: f64, kind: ArithKind) -> Value {

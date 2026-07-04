@@ -57,7 +57,7 @@
 //! corpus + fuzz (`tests/kernels.rs`) runs every supported construct with
 //! kernels on and off and asserts byte-identical behavior.
 
-use crate::bytecode::{CmpOp, Const, KOp, KShapeSlot, Kernel, Op};
+use crate::bytecode::{CmpOp, Const, KMath, KOp, KShapeSlot, Kernel, Op};
 use crate::exec::ArithKind;
 
 /// Bounds keeping `u16` fields comfortable and per-kernel work finite. Loops
@@ -179,6 +179,13 @@ enum VE {
     Num,
     /// An array base: object slot index.
     Obj(u16),
+    /// The canonical `Math` object, from `LoadGlobal("Math")` — speculative:
+    /// the entry guard verifies the global binding still IS the canonical
+    /// object (a data property, not shadowed/replaced/accessor'd) before the
+    /// kernel runs; otherwise the whole kernel declines.
+    MathObj,
+    /// A kernel-supported `Math` method, from `GetProp` on [`VE::MathObj`].
+    MathFn(KMath),
     /// The value `undefined`, from `LoadUndefined`. Exists only transiently
     /// within a basic block: its ONLY legal consumer is a store to a local
     /// that is provably re-stored before any read (the compiler's
@@ -216,6 +223,8 @@ struct Xlate<'a> {
     fixups: Vec<(usize, usize)>,
     /// pending exits: (kop index or LoadElem-style bail, resume ip, shape).
     exits: Vec<(usize, u32, Vec<VE>)>,
+    /// Math intrinsics used (entry guard checks each against the realm).
+    math_used: Vec<KMath>,
     /// a compare op fused with its following conditional jump: skip that ip.
     absorbed: Option<usize>,
     max_stack: u16,
@@ -258,6 +267,7 @@ fn translate(
         vstack: Vec::new(),
         fixups: Vec::new(),
         exits: Vec::new(),
+        math_used: Vec::new(),
         absorbed: None,
         max_stack: 0,
     };
@@ -404,6 +414,15 @@ fn translate(
                 *val = remap(*val);
             }
             KOp::LoadLen { dst, .. } => *dst = remap(*dst),
+            KOp::Math1 { dst, src, .. } => {
+                *dst = remap(*dst);
+                *src = remap(*src);
+            }
+            KOp::Math2 { dst, a, b, .. } => {
+                *dst = remap(*dst);
+                *a = remap(*a);
+                *b = remap(*b);
+            }
             KOp::Br { .. } | KOp::Exit { .. } => {}
         }
     }
@@ -415,6 +434,8 @@ fn translate(
                 .map(|(p, e)| match e {
                     VE::Num => KShapeSlot::Num(remap(STACK_BASE + p as u16)),
                     VE::Obj(o) => KShapeSlot::Obj(*o),
+                    VE::MathObj => KShapeSlot::MathObj,
+                    VE::MathFn(k) => KShapeSlot::MathFn(*k),
                     VE::Undef => unreachable!("undef never crosses block boundaries"),
                 })
                 .collect()
@@ -431,6 +452,7 @@ fn translate(
             locals: locals.into_boxed_slice(),
             oslots: x.oslot_locals.to_vec().into_boxed_slice(),
             shapes: shapes.into_boxed_slice(),
+            math_used: x.math_used.into_boxed_slice(),
             n_regs: n_locals + x.max_stack + 1,
             fallback: Box::new(Op::Nop), // caller stores the real header op
         },
@@ -486,7 +508,7 @@ impl Xlate<'_> {
         let p = self.vstack.len().checked_sub(1 + depth_from_top)?;
         match self.vstack[p] {
             VE::Num => self.preg(p),
-            VE::Obj(_) | VE::Undef => None,
+            _ => None,
         }
     }
 
@@ -529,7 +551,7 @@ impl Xlate<'_> {
         let p = self.vstack.len().checked_sub(1 + depth_from_top)?;
         match self.vstack[p] {
             VE::Obj(s) => Some(s),
-            VE::Undef => None,
+            VE::Undef | VE::MathObj | VE::MathFn(_) => None,
             VE::Num => {
                 // Phase 1 discovery only. (A local used BOTH as a base and
                 // numerically is caught in phase 2: its loads become `Obj`
@@ -633,6 +655,18 @@ impl Xlate<'_> {
                 self.origins.push(None);
             }
 
+            // The ONLY supported global: `Math` (speculatively — the entry
+            // guard verifies the global binding is still the canonical data
+            // property before the kernel runs).
+            Op::LoadGlobal(c) => {
+                match self.consts.get(*c as usize)? {
+                    Const::String(n) if n.as_str() == "Math" => {}
+                    _ => return None,
+                }
+                self.vstack.push(VE::MathObj);
+                self.origins.push(None);
+            }
+
             // An inner loop's kernel header: translate the op it replaced.
             Op::LoopKernel(idx) => {
                 let fb = (*self.inner.get(*idx as usize)?.fallback).clone();
@@ -676,6 +710,18 @@ impl Xlate<'_> {
                     self.store_of(*l);
                 }
             }
+            // A block-scoped declaration's TDZ marker: writes `Uninitialized`
+            // to the slot. Elidable exactly like the dead `undefined` store —
+            // the local must be provably re-stored before anything can read
+            // it (a genuine TDZ read would need the generic path's
+            // ReferenceError, so such regions stay generic).
+            Op::InitLocalTdz(l) => {
+                self.lreg(*l)?;
+                if !self.dead_store_ahead(i + 1, *l) {
+                    return None;
+                }
+                self.store_of(*l);
+            }
             Op::CopyLocal { src, dest } => {
                 let s = self.lreg(*src)?;
                 let d = self.lreg(*dest)?;
@@ -717,16 +763,22 @@ impl Xlate<'_> {
                         self.vstack.push(VE::Obj(s));
                         self.origins.push(None);
                     }
-                    VE::Undef => return None,
+                    VE::MathObj => {
+                        self.vstack.push(VE::MathObj);
+                        self.origins.push(None);
+                    }
+                    VE::MathFn(_) | VE::Undef => return None,
                 }
             }
             Op::Swap => {
                 let n = self.vstack.len();
                 let (pa, pb) = (n.checked_sub(2)?, n - 1);
                 let (ea, eb) = (self.vstack[pa], self.vstack[pb]);
-                match (ea, eb) {
-                    (VE::Undef, _) | (_, VE::Undef) => return None,
-                    (VE::Num, VE::Num) => {
+                if ea == VE::Undef || eb == VE::Undef {
+                    return None;
+                }
+                match (ea == VE::Num, eb == VE::Num) {
+                    (true, true) => {
                         let (ra, rb) = (self.preg(pa)?, self.preg(pb)?);
                         self.kops.push(K::Mov {
                             dst: SCRATCH0,
@@ -738,16 +790,16 @@ impl Xlate<'_> {
                             src: SCRATCH0,
                         });
                     }
-                    (VE::Num, VE::Obj(_)) => {
+                    (true, false) => {
                         // The number moves from position pa's reg to pb's.
                         let (ra, rb) = (self.preg(pa)?, self.preg(pb)?);
                         self.kops.push(K::Mov { dst: rb, src: ra });
                     }
-                    (VE::Obj(_), VE::Num) => {
+                    (false, true) => {
                         let (ra, rb) = (self.preg(pa)?, self.preg(pb)?);
                         self.kops.push(K::Mov { dst: ra, src: rb });
                     }
-                    (VE::Obj(_), VE::Obj(_)) => {}
+                    (false, false) => {}
                 }
                 self.vstack.swap(pa, pb);
                 self.origins.swap(pa, pb);
@@ -905,8 +957,43 @@ impl Xlate<'_> {
                     self.kops.push(K::Mov { dst, src: val });
                 }
             }
-            // `a.length` (the only named property access supported).
+            // Named property access: `a.length` on an array base, or a
+            // method/constant on the (guarded canonical) `Math` object.
             Op::GetProp(c) => {
+                if matches!(self.vstack.last(), Some(VE::MathObj)) {
+                    let name = match self.consts.get(*c as usize)? {
+                        Const::String(n) => n.as_str().to_string(),
+                        _ => return None,
+                    };
+                    if let Some(kind) = KMath::from_name(&name) {
+                        self.pop()?;
+                        self.vstack.push(VE::MathFn(kind));
+                        self.origins.push(None);
+                        if !self.math_used.contains(&kind) {
+                            self.math_used.push(kind);
+                        }
+                        return Some(());
+                    }
+                    // The canonical Math object's value constants are
+                    // non-writable AND non-configurable — immutable forever —
+                    // so with the object identity guarded they fold to
+                    // constants outright.
+                    let k = match name.as_str() {
+                        "PI" => std::f64::consts::PI,
+                        "E" => std::f64::consts::E,
+                        "LN2" => std::f64::consts::LN_2,
+                        "LN10" => std::f64::consts::LN_10,
+                        "LOG2E" => std::f64::consts::LOG2_E,
+                        "LOG10E" => std::f64::consts::LOG10_E,
+                        "SQRT2" => std::f64::consts::SQRT_2,
+                        "SQRT1_2" => std::f64::consts::FRAC_1_SQRT_2,
+                        _ => return None,
+                    };
+                    self.pop()?;
+                    let dst = self.push_num()?;
+                    self.kops.push(K::Const { dst, k });
+                    return Some(());
+                }
                 match self.consts.get(*c as usize)? {
                     Const::String(s) if s.as_str() == "length" => {}
                     _ => return None,
@@ -922,6 +1009,42 @@ impl Xlate<'_> {
                     bail: u16::MAX,
                 });
                 self.exits.push((kidx, self.base_ip + i as u32, shape));
+            }
+
+            // A call is supported ONLY as the compiler's Math method-call
+            // pattern: [.., MathFn(kind), MathObj(this), args...] with the
+            // kind's exact arity. Everything else rejects the region.
+            Op::Call(argc) => {
+                let n = *argc as usize;
+                let fn_pos = self.vstack.len().checked_sub(n + 2)?;
+                let kind = match self.vstack.get(fn_pos)? {
+                    VE::MathFn(k) => *k,
+                    _ => return None,
+                };
+                if !matches!(self.vstack.get(fn_pos + 1)?, VE::MathObj) || kind.arity() != n {
+                    return None;
+                }
+                match n {
+                    1 => {
+                        let src = self.top_reg(0)?;
+                        self.pop()?; // arg
+                        self.pop()?; // this (MathObj)
+                        self.pop()?; // fn
+                        let dst = self.push_num()?;
+                        self.kops.push(K::Math1 { kind, dst, src });
+                    }
+                    2 => {
+                        let b = self.top_reg(0)?;
+                        let a = self.top_reg(1)?;
+                        self.pop()?;
+                        self.pop()?;
+                        self.pop()?; // this
+                        self.pop()?; // fn
+                        let dst = self.push_num()?;
+                        self.kops.push(K::Math2 { kind, dst, a, b });
+                    }
+                    _ => return None,
+                }
             }
 
             // ---- comparisons: supported only in compare-and-branch form. A

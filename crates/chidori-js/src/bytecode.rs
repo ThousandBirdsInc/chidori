@@ -1000,6 +1000,15 @@ pub enum KOp {
     /// `regs[dst] = <length>` of the dense array in object slot `obj`
     /// (unshadowed only — a reified `length` marker bails).
     LoadLen { dst: u16, obj: u16, bail: u16 },
+    /// `regs[dst] = Math.<kind>(regs[src])` via the builtin's own core fn.
+    Math1 { kind: KMath, dst: u16, src: u16 },
+    /// `regs[dst] = Math.<kind>(regs[a], regs[b])`.
+    Math2 {
+        kind: KMath,
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
     /// Leave the kernel: write every mapped local back to `frame.locals`,
     /// materialize the operand stack from `shapes[shape]` (Numbers from
     /// registers, objects from object slots), and resume the bytecode
@@ -1008,11 +1017,84 @@ pub enum KOp {
 }
 
 /// One operand-stack slot of a kernel exit shape, bottom-up: a `Number` read
-/// from a register, or an object read from an object slot.
+/// from a register, an object read from an object slot, or a canonical Math
+/// intrinsic (the entry guard proved the live values ARE the canonicals, so a
+/// bail can reconstruct them from the realm).
 #[derive(Clone, Copy, Debug)]
 pub enum KShapeSlot {
     Num(u16),
     Obj(u16),
+    MathObj,
+    MathFn(KMath),
+}
+
+/// The `Math` methods the loop kernels can execute directly. Every kind maps
+/// to the SAME core function its builtin uses (`builtins::numbers`), so
+/// results are bit-identical; the kernel entry guard identity-checks the
+/// global `Math` binding and each used method against the realm's canonical
+/// objects (methods are writable — a monkeypatched `Math.max` makes the
+/// kernel decline, it never runs the stale intrinsic).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KMath {
+    Abs,
+    Floor,
+    Ceil,
+    Round,
+    Trunc,
+    Sign,
+    Sqrt,
+    Fround,
+    Min2,
+    Max2,
+    Pow2,
+    Imul2,
+}
+
+impl KMath {
+    pub const ALL: [KMath; 12] = [
+        KMath::Abs,
+        KMath::Floor,
+        KMath::Ceil,
+        KMath::Round,
+        KMath::Trunc,
+        KMath::Sign,
+        KMath::Sqrt,
+        KMath::Fround,
+        KMath::Min2,
+        KMath::Max2,
+        KMath::Pow2,
+        KMath::Imul2,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            KMath::Abs => "abs",
+            KMath::Floor => "floor",
+            KMath::Ceil => "ceil",
+            KMath::Round => "round",
+            KMath::Trunc => "trunc",
+            KMath::Sign => "sign",
+            KMath::Sqrt => "sqrt",
+            KMath::Fround => "fround",
+            KMath::Min2 => "min",
+            KMath::Max2 => "max",
+            KMath::Pow2 => "pow",
+            KMath::Imul2 => "imul",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<KMath> {
+        KMath::ALL.iter().copied().find(|k| k.name() == name)
+    }
+
+    /// Call arity the kernel translates (`Math.min`/`max` are variadic; only
+    /// the 2-argument form is kernelized).
+    pub fn arity(self) -> usize {
+        match self {
+            KMath::Min2 | KMath::Max2 | KMath::Pow2 | KMath::Imul2 => 2,
+            _ => 1,
+        }
+    }
 }
 
 /// One compiled loop kernel: the register program for a bytecode loop region
@@ -1041,6 +1123,10 @@ pub struct Kernel {
     pub oslots: Box<[u32]>,
     /// Operand-stack shapes for [`KOp::Exit`] (bottom-up).
     pub shapes: Box<[Box<[KShapeSlot]>]>,
+    /// Math intrinsics this kernel executes: the entry guard identity-checks
+    /// the global `Math` binding and each of these methods against the
+    /// realm's canonical objects before running.
+    pub math_used: Box<[KMath]>,
     /// Total register count (mapped locals + canonical stack slots).
     pub n_regs: u16,
     /// The original loop-header op this kernel replaced; executed verbatim
