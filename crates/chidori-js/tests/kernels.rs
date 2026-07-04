@@ -114,6 +114,51 @@ const CORPUS: &[&str] = &[
     "let s = 0; for (let i = 0; i < 12; i++) { switch (i % 3) { case 0: s += 1; break; case 1: s += 10; break; default: s += 100; } } console.log(s);",
     // Deeply chained expression stressing canonical stack depth.
     "let s = 0; for (let i = 1; i < 20; i++) { s += ((i + 1) * (i + 2) - (i + 3)) / ((i % 5) + 1) + ((i << 2) ^ (i >> 1)); } console.log(s);",
+    // ---- dense-array element access (kernel v2) ----
+    // Read loop with `a.length` condition.
+    "const a = [1,2,3,4,5]; let s = 0; for (let i = 0; i < a.length; i++) { s += a[i]; } console.log(s);",
+    // In-place write loop; values visible after.
+    "const a = [1,2,3]; for (let i = 0; i < a.length; i++) { a[i] = a[i] * 10 + i; } console.log(a.join(','));",
+    // Compound element update, reversed iteration, index arithmetic.
+    "const a = [5,4,3,2,1]; let s = 0; for (let i = a.length - 1; i >= 0; i--) { a[i] += i; s += a[i]; } console.log(s, a.join(','));",
+    // Dot product across two arrays.
+    "const x = [1,2,3,4], y = [10,20,30,40]; let d = 0; for (let i = 0; i < x.length; i++) { d += x[i] * y[i]; } console.log(d);",
+    // ALIASED bases: writes through one visible through the other.
+    "const a = [1,2,3]; const b = a; let s = 0; for (let i = 0; i < a.length; i++) { b[i] = a[i] + 1; s += a[i]; } console.log(s, a.join(','));",
+    // Nested indexing a[b[i]].
+    "const idx = [2,0,1], v = [10,20,30]; let s = 0; for (let i = 0; i < idx.length; i++) { s = s * 100 + v[idx[i]]; } console.log(s);",
+    // HOLES: element read falls back to the prototype chain.
+    "Array.prototype[1] = 99; const a = [1,,3]; let s = 0; for (let i = 0; i < a.length; i++) { s += a[i]; } delete Array.prototype[1]; console.log(s);",
+    // Hole WRITE (creates a property — non-extensible interactions aside,
+    // plain arrays fill the hole; kernel must bail and match).
+    "const a = [1,,3]; for (let i = 0; i < a.length; i++) { a[i] = (a[i] || 0) + 1; } console.log(a.join(','), 1 in a);",
+    // Out-of-bounds read (undefined -> NaN via arithmetic; loop bound lies).
+    "const a = [1,2]; let s = 0; for (let i = 0; i < 4; i++) { s += a[i] === undefined ? 100 : a[i]; } console.log(s);",
+    // Non-number elements: strings force per-access bail; result exact.
+    "const a = [1,'x',3]; let s = ''; for (let i = 0; i < a.length; i++) { s += a[i]; } console.log(s);",
+    // Float / negative / huge indices take the generic path mid-kernel.
+    "const a = [1,2,3]; a[1.5] = 7; let s = 0; for (let i = 0; i < 3; i += 0.5) { s += a[i] || 0; } console.log(s, a['1.5']);",
+    "const a = [9]; let s = 0; for (let i = -1; i < 2; i++) { s += a[i] || 0; } console.log(s);",
+    // Frozen / sealed arrays: reified props make every access bail; sloppy
+    // writes are silently ignored, exactly like the generic path.
+    "const a = Object.freeze([1,2,3]); let s = 0; for (let i = 0; i < a.length; i++) { s += a[i]; a[i] = 0; } console.log(s, a.join(','));",
+    "const a = Object.seal([1,2,3]); for (let i = 0; i < a.length; i++) { a[i] = a[i] * 2; } console.log(a.join(','));",
+    // Accessor element (defineProperty): getter must fire on every read.
+    "const a = [1,2,3]; let got = 0; Object.defineProperty(a, 1, { get() { got++; return 50; } }); let s = 0; for (let i = 0; i < a.length; i++) { s += a[i]; } console.log(s, got);",
+    // Array GROWTH inside the loop (appends bail; length re-read each pass).
+    "const a = [1]; for (let i = 0; i < a.length && i < 5; i++) { a[a.length] = a[i] + 1; } console.log(a.join(','));",
+    // Base REASSIGNED inside the loop: translation must reject (store to a
+    // base local) and the generic loop must swap arrays mid-flight.
+    "let a = [1,2,3,4]; const b = [100,200,300,400]; let s = 0; for (let i = 0; i < a.length; i++) { s += a[i]; if (i === 1) a = b; } console.log(s);",
+    // The base local holding a non-array (typed later): guard declines.
+    "let a = 5; let s = 0; for (let i = 0; i < 3; i++) { s += a; } console.log(s);",
+    // Fully-kernelized nested loops inside a function (incl. 2D array walk).
+    "function grid(n) { let m = 0; for (let i = 0; i < n; i++) { for (let j = 0; j < n; j++) { m += i ^ j; } } return m; } console.log(grid(20));",
+    "function sum2d(g) { let s = 0; for (let i = 0; i < g.length; i++) { const row = g[i]; for (let j = 0; j < row.length; j++) { s += row[j]; } } return s; } console.log(sum2d([[1,2],[3,4],[5,6]]));",
+    // Element values feeding branches and short-circuits.
+    "const a = [0,1,NaN,3]; let c = 0; for (let i = 0; i < a.length; i++) { if (a[i]) c += 1; c += a[i] || 10; } console.log(c);",
+    // Writing NaN/-0/Infinity through the kernel store.
+    "const a = [0,0,0]; for (let i = 0; i < 3; i++) { a[i] = i === 0 ? -0 : i === 1 ? NaN : 1/0; } console.log(Object.is(a[0], -0), a[1] !== a[1], a[2]);",
 ];
 
 #[test]
@@ -151,6 +196,41 @@ fn canonical_loop_gets_a_kernel() {
     assert!(
         proto.code.iter().any(|op| matches!(op, Op::LoopKernel(_))),
         "expected a LoopKernel op at the loop header"
+    );
+}
+
+/// Array-access loops and function-level nested loops actually kernelize
+/// (pins v2 eligibility against silent regressions).
+#[test]
+fn array_and_nested_loops_get_kernels() {
+    fn kernels_in(src: &str) -> usize {
+        fn count(p: &FuncProto) -> usize {
+            let mut n = p.kernels.len();
+            for c in &p.consts {
+                if let Const::Func(f) = c {
+                    n += count(f);
+                }
+            }
+            n
+        }
+        count(&compile_script(src).expect("compiles"))
+    }
+    // `s += a[i]` with an `a.length` bound: one kernel.
+    assert!(
+        kernels_in("function f(a) { let s = 0; for (let i = 0; i < a.length; i++) { s += a[i]; } return s; }") >= 1,
+        "array read loop must kernelize"
+    );
+    // In-place write loop: one kernel.
+    assert!(
+        kernels_in("function f(a) { for (let i = 0; i < a.length; i++) { a[i] = a[i] * 2; } }")
+            >= 1,
+        "array write loop must kernelize"
+    );
+    // Nested numeric loops in a function: TWO kernels (inner on its own, and
+    // the outer subsuming it via the inner header's fallback).
+    assert!(
+        kernels_in("function g(n) { let m = 0; for (let i = 0; i < n; i++) { for (let j = 0; j < n; j++) { m += i ^ j; } } return m; }") >= 2,
+        "nested loops must both kernelize"
     );
 }
 
@@ -199,12 +279,37 @@ fn kernel_fuzz_differential() {
         if case % 17 == 0 {
             body.push_str(&format!("if (i === 7) v{} = 'x';\n", rnd(nvars as u64)));
         }
+        // A third of the cases mix in dense-array reads/writes (in-bounds,
+        // hole-adjacent, and occasionally out-of-bounds — all must bail or
+        // fast-path to identical results).
+        let use_array = case % 3 == 0;
+        if use_array {
+            let v = rnd(nvars as u64);
+            match rnd(4) {
+                0 => body.push_str(&format!("v{v} += arr[i % arr.length];\n")),
+                1 => body.push_str(&format!("arr[i % arr.length] = v{v} + i;\n")),
+                2 => body.push_str(&format!("v{v} = arr[i] === undefined ? 1 : arr[i];\n")),
+                _ => body.push_str(&format!(
+                    "arr[i % arr.length] += v{v}; v{v} = arr[(i + 1) % arr.length];\n"
+                )),
+            }
+        }
         let decls: Vec<String> = (0..nvars)
             .map(|v| format!("let v{v} = {};", [0, 1, -1, 42][v % 4]))
             .collect();
         let prints: Vec<String> = (0..nvars).map(|v| format!("v{v}")).collect();
+        let arr_decl = if use_array {
+            match case % 9 {
+                0 => "const arr = [3,,7,1];\n",         // holey
+                3 => "const arr = [0.5, 2, 'k', 4];\n", // string element
+                _ => "const arr = [2,4,6,8,10];\n",
+            }
+        } else {
+            ""
+        };
+        let arr_print = if use_array { ", arr.join('|')" } else { "" };
         let src = format!(
-            "{}\nfor (let i = 0; i < 25; i++) {{\n{body}}}\nconsole.log({});",
+            "{}\n{arr_decl}for (let i = 0; i < 25; i++) {{\n{body}}}\nconsole.log({}{arr_print});",
             decls.join(" "),
             prints.join(", ")
         );

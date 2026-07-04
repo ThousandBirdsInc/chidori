@@ -310,10 +310,14 @@ impl Vm {
 
     /// Execute the typed loop kernel at `Op::LoopKernel(idx)` (see
     /// `kernel.rs` for the model). Runs only when per-op accounting is off
-    /// (no op budget) and every mapped local holds a `Number`; otherwise the
-    /// original header op (`Kernel::fallback`) executes and the generic
-    /// interpreter takes this iteration — the kernel simply retries the next
-    /// time the back-edge reaches the header.
+    /// (no op budget), every mapped numeric local holds a `Number`, and every
+    /// array-base local holds an object; otherwise the original header op
+    /// (`Kernel::fallback`) executes and the generic interpreter takes this
+    /// iteration — the kernel simply retries the next time the back-edge
+    /// reaches the header. Array-element accesses re-check their fast-path
+    /// conditions on every use and BAIL to the generic interpreter at the
+    /// access op (operand stack reconstructed from the kernel's shape table)
+    /// on any surprise — a bail is a slow iteration, never a wrong answer.
     fn run_kernel_op(&mut self, frame: &mut Frame, idx: u32) -> Result<Ctl, Value> {
         let proto = frame.func.proto.clone();
         let k = &proto.kernels[idx as usize];
@@ -327,7 +331,15 @@ impl Vm {
                 return self.step(frame, &k.fallback);
             }
         }
-        // Unboxed register file (pooled on the Vm; kernels never nest).
+        for &l in k.oslots.iter() {
+            if !matches!(frame.locals[l as usize], Value::Object(_)) {
+                return self.step(frame, &k.fallback);
+            }
+        }
+        // Unboxed register file + array-base cache (both pooled on the Vm;
+        // kernels never nest at runtime). The base objects are pinned for the
+        // whole activation — sound because stores to base LOCALS inside the
+        // region are rejected at translation.
         let mut regs = std::mem::take(&mut self.kernel_regs);
         regs.clear();
         regs.resize(k.n_regs as usize, 0.0);
@@ -336,11 +348,18 @@ impl Vm {
                 regs[r] = n;
             }
         }
+        let mut objs = std::mem::take(&mut self.kernel_objs);
+        objs.clear();
+        for &l in k.oslots.iter() {
+            if let Value::Object(o) = &frame.locals[l as usize] {
+                objs.push(o.clone());
+            }
+        }
         let interrupt = self.interrupt.clone();
         let mut poll: u32 = 0;
         let code = &k.code;
         let mut pc = 0usize;
-        let (resume_ip, stack) = loop {
+        let (resume_ip, shape) = loop {
             // Taken branches funnel through here so back-edges can poll the
             // cooperative interrupt flag at the interpreter's cadence.
             macro_rules! branch {
@@ -358,6 +377,8 @@ impl Vm {
                                         frame.locals[l as usize] = Value::Number(regs[r]);
                                     }
                                     self.kernel_regs = regs;
+                                    objs.clear();
+                                    self.kernel_objs = objs;
                                     self.op_budget = Some(0);
                                     return Err(self.throw_range("execution interrupted"));
                                 }
@@ -416,21 +437,98 @@ impl Vm {
                         branch!(target)
                     }
                 }
-                KOp::Exit { resume_ip, stack } => break (resume_ip, stack),
+                // Dense element read: full fast-path re-check, else bail to
+                // the generic op (the `bail` target is an Exit stub).
+                KOp::LoadElem {
+                    dst,
+                    obj,
+                    idx,
+                    bail,
+                } => {
+                    let i = regs[idx as usize];
+                    let mut ok = false;
+                    if i.fract() == 0.0 && (0.0..4294967295.0).contains(&i) {
+                        let b = objs[obj as usize].borrow();
+                        if b.props.is_empty() {
+                            if let Internal::Array(arr) = &b.internal {
+                                if let Some(Value::Number(n)) = arr.get(i as usize) {
+                                    regs[dst as usize] = *n;
+                                    ok = true;
+                                }
+                            }
+                        }
+                    }
+                    if !ok {
+                        branch!(bail)
+                    }
+                }
+                // Dense element in-place overwrite: exactly the
+                // `Op::SetPropDynamic` fast-path conditions, else bail.
+                KOp::StoreElem {
+                    obj,
+                    idx,
+                    val,
+                    bail,
+                } => {
+                    let i = regs[idx as usize];
+                    let mut ok = false;
+                    if i.fract() == 0.0 && (0.0..4294967295.0).contains(&i) {
+                        let mut b = objs[obj as usize].borrow_mut();
+                        if b.props.is_empty() {
+                            if let Internal::Array(arr) = &mut b.internal {
+                                if let Some(slot) = arr.get_mut(i as usize) {
+                                    if !matches!(slot, Value::Hole) {
+                                        *slot = Value::Number(regs[val as usize]);
+                                        ok = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !ok {
+                        branch!(bail)
+                    }
+                }
+                // Dense array `length` (unshadowed only), else bail.
+                KOp::LoadLen { dst, obj, bail } => {
+                    let mut ok = false;
+                    {
+                        let b = objs[obj as usize].borrow();
+                        if b.props.is_empty() {
+                            if let Internal::Array(arr) = &b.internal {
+                                regs[dst as usize] = arr.len() as f64;
+                                ok = true;
+                            }
+                        }
+                    }
+                    if !ok {
+                        branch!(bail)
+                    }
+                }
+                KOp::Exit { resume_ip, shape } => break (resume_ip, shape),
             }
             pc += 1;
         };
-        // Materialize: every mapped local back to the frame (as Numbers), any
-        // live canonical stack slots onto the operand stack, then resume the
+        // Materialize: every mapped numeric local back to the frame (as
+        // Numbers), then the operand stack from the exit's shape (bottom-up:
+        // registers as Numbers, object slots as objects), then resume the
         // bytecode interpreter at the exit's target.
         for (r, &l) in k.locals.iter().enumerate() {
             frame.locals[l as usize] = Value::Number(regs[r]);
         }
-        let stack_base = k.locals.len();
-        for d in 0..stack as usize {
-            frame.stack.push(Value::Number(regs[stack_base + d]));
+        for slot in k.shapes[shape as usize].iter() {
+            match slot {
+                crate::bytecode::KShapeSlot::Num(r) => {
+                    frame.stack.push(Value::Number(regs[*r as usize]))
+                }
+                crate::bytecode::KShapeSlot::Obj(o) => {
+                    frame.stack.push(Value::Object(objs[*o as usize].clone()))
+                }
+            }
         }
         self.kernel_regs = regs;
+        objs.clear();
+        self.kernel_objs = objs;
         Ok(Ctl::Jump(resume_ip as usize))
     }
 

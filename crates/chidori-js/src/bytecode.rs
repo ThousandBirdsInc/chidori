@@ -975,10 +975,44 @@ pub enum KOp {
     BrFalsy { src: u16, target: u16 },
     /// jump when `regs[src]` is truthy
     BrTruthy { src: u16, target: u16 },
-    /// Leave the kernel: write every mapped local back to `frame.locals`, push
-    /// registers `S0..S(stack-1)` onto the operand stack (as Numbers), and
-    /// resume the bytecode interpreter at `resume_ip`.
-    Exit { resume_ip: u32, stack: u16 },
+    /// `regs[dst] = <element>` of the dense array in object slot `obj` at
+    /// index `regs[idx]` — IF the index is a non-negative integral f64, the
+    /// array is unshadowed (`props` empty), the element is in bounds, not a
+    /// hole, and a `Number`. Anything else jumps to the [`KOp::Exit`] at
+    /// kernel pc `bail`, which resumes the generic interpreter AT the access
+    /// op with the operand stack reconstructed — the slow path then performs
+    /// the exact spec semantics (prototype walk, holes, getters, strings).
+    LoadElem {
+        dst: u16,
+        obj: u16,
+        idx: u16,
+        bail: u16,
+    },
+    /// In-place dense element overwrite (the `Op::SetPropDynamic` fast-path
+    /// conditions exactly: unshadowed dense array, integral in-bounds index,
+    /// existing non-hole slot). Everything else bails like [`KOp::LoadElem`].
+    StoreElem {
+        obj: u16,
+        idx: u16,
+        val: u16,
+        bail: u16,
+    },
+    /// `regs[dst] = <length>` of the dense array in object slot `obj`
+    /// (unshadowed only — a reified `length` marker bails).
+    LoadLen { dst: u16, obj: u16, bail: u16 },
+    /// Leave the kernel: write every mapped local back to `frame.locals`,
+    /// materialize the operand stack from `shapes[shape]` (Numbers from
+    /// registers, objects from object slots), and resume the bytecode
+    /// interpreter at `resume_ip`.
+    Exit { resume_ip: u32, shape: u16 },
+}
+
+/// One operand-stack slot of a kernel exit shape, bottom-up: a `Number` read
+/// from a register, or an object read from an object slot.
+#[derive(Clone, Copy, Debug)]
+pub enum KShapeSlot {
+    Num(u16),
+    Obj(u16),
 }
 
 /// One compiled loop kernel: the register program for a bytecode loop region
@@ -1000,6 +1034,13 @@ pub struct Kernel {
     pub code: Box<[KOp]>,
     /// `frame.locals` indices mirrored into registers `0..locals.len()`.
     pub locals: Box<[u32]>,
+    /// `frame.locals` indices of ARRAY BASES (`a` in `a[i]`/`a.length`):
+    /// object slot `s` caches that local's `JsObject` at kernel entry. The
+    /// guard requires each to hold an object; per-access checks do the rest.
+    /// Disjoint from `locals`, and never stored to inside the region.
+    pub oslots: Box<[u32]>,
+    /// Operand-stack shapes for [`KOp::Exit`] (bottom-up).
+    pub shapes: Box<[Box<[KShapeSlot]>]>,
     /// Total register count (mapped locals + canonical stack slots).
     pub n_regs: u16,
     /// The original loop-header op this kernel replaced; executed verbatim

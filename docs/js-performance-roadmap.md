@@ -620,39 +620,69 @@ compare.
   as the interpreter's Number×Number fast paths — results are bit-identical
   by construction (NaN, -0, shift masking, `%` sign, `>>>`).
 
+**Kernel v2 (same branch): dense-array access + nested loops.** The
+translator's virtual stack became TYPED — number registers vs. array-base
+entries (a two-phase walk first discovers which locals are used as bases) —
+which generalizes the tier to the `s += a[i]` class:
+
+- `a[i]` reads, `a[i] = v` in-place writes, and `a.length` translate to
+  `LoadElem`/`StoreElem`/`LoadLen` kernel ops. Each access RE-CHECKS its
+  full fast-path condition at runtime (unshadowed dense array, integral
+  in-bounds index, non-hole `Number` element — the same conditions as
+  `Op::SetPropDynamic`'s existing fast path) and otherwise **bails
+  precisely**: registers write back and the generic interpreter resumes AT
+  the access op, its operand stack reconstructed from a per-kernel shape
+  table (numbers from registers, bases from the pinned object slots). A
+  bail is a slow iteration, never a wrong answer — holes that read through
+  the prototype, accessor elements, frozen/sealed arrays, string elements,
+  float/negative/OOB indices, and mid-loop growth all take the exact spec
+  path (differentially pinned in the corpus and cross-checked against
+  Node).
+- Base locals are pinned at entry (stores to them reject at translation),
+  aliased bases work (per-access borrows), and `a[b[i]]` nests.
+- An inner loop's `Op::LoopKernel` header translates as its preserved
+  fallback op, so nested numeric loops collapse into ONE outer kernel
+  (the per-iteration `let j` reset — a dead `undefined` store — is elided
+  when provably re-stored before any read within the block).
+
 **Measured (callgrind, whole workload, deterministic):**
 
 | workload | before | after | Δ |
 | --- | ---: | ---: | ---: |
-| arith_loop | 2.23 G | 0.46 G | **−79% (4.8×)** |
-| all others | — | — | unchanged (no eligible loops / call-bound) |
+| arith_loop | 2.23 G | 0.48 G | **−78% (4.6×)** |
+| array_sum (new workload) | 10.67 G | 3.76 G | **−65% (2.8×)** |
+| array_push_sum | 3.67 G | 2.72 G | **−26%** (its sum loop kernels) |
+| sort / fib / closures / property / string / json | — | — | unchanged |
 
-Wall-clock arith_loop: ~245 ms → **~44 ms** (5.6×) on the shared container;
-the gap to V8 on this workload drops from ~100× to ~20×. `fib` (calls),
-`sort` (comparator calls), and property/string workloads are untouched by
-design — kernels only fire where the loop body is pure local numerics.
+Wall-clock arith_loop ~245 ms → ~44 ms (5.6×); a mixed array/nested
+workload (dot products + 2D walk) 686 ms → 193 ms (3.6×). The gap to V8 on
+pure numeric loops drops from ~100× to ~20×. `fib` (calls), `sort`
+(comparator calls), and property/string workloads are untouched by design —
+kernels only fire where the loop body is local numerics and dense-array
+element access.
 
-**Gates:** the differential corpus + 300-case deterministic fuzz
-(`tests/kernels.rs`) require byte-identical behavior kernels-on vs
+**Gates:** the differential corpus (70+ programs) + 300-case deterministic
+fuzz (`tests/kernels.rs`) require byte-identical behavior kernels-on vs
 kernels-off across break/continue/labels, NaN/-0/precision edges, guard
-bails, late entry, nested loops, and op-budget interaction; structural
-tests assert the canonical loop actually kernelizes; full suites + Test262
-gate green (kernels are additionally OFF under the runner's op budget, so
-conformance runs the generic path — the corpus carries kernel-specific
-coverage). The pass is disabled under the `op-histogram` feature (it would
-hide per-op counts).
+bails, late entry, nested loops, array holes/accessors/freeze/aliasing/
+growth/reassignment, and op-budget interaction; structural tests pin the
+canonical, array, and nested loops to actually kernelize; full suites +
+Test262 gate green (kernels are additionally OFF under the runner's op
+budget, so conformance runs the generic path — the corpus carries
+kernel-specific coverage). The pass is disabled under the `op-histogram`
+feature (it would hide per-op counts).
 
 ### 6.5.1 What's next (new baseline)
 
-- Kernel v2 candidates, in value order: dense-array element access inside
-  kernels (`sum += a[i]` — per-access bounds+density+number guards with
-  precise bail, unlocking array_push_sum/array_hof-class loops), `Math.*`
-  intrinsics as kernel ops, and materialized booleans (0/1-typed registers)
-  for `let ok = a < b` patterns.
+- Kernel v3 candidates, in value order: `Math.*` intrinsics as kernel ops
+  (entry-guarded against the canonical builtins — `Math.abs/min/max/floor`
+  in numeric loops are common), materialized booleans (would need typed
+  write-back, since `typeof ok` distinguishes `true` from `1`), and dense
+  appends (`a[a.length] = v` currently bails every iteration).
 - **step dispatch remains the wall for non-kernel code**: `step` +
   `run_frame` are 25–43% of call-heavy workloads. Register bytecode (§3.5)
   is the remaining structural lever, and kernels shrink its risk: the
-  translator's abstract-stack machinery is exactly the analysis a register
+  translator's typed-stack machinery is exactly the analysis a register
   allocator needs.
 
 Re-run the callgrind sweep before choosing; the noise-floor and idle-machine

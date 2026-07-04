@@ -345,6 +345,10 @@ pub struct Vm {
     /// and the generic interpreter running under a kernel's fallback path
     /// never touches this, so one buffer per Vm suffices.
     pub(crate) kernel_regs: Vec<f64>,
+    /// Scratch cache of the array-base objects for the active kernel (see
+    /// `kernel_regs`); cleared after every activation so the pool never
+    /// extends an object's lifetime.
+    pub(crate) kernel_objs: Vec<crate::value::JsObject>,
 }
 
 impl Vm {
@@ -378,6 +382,7 @@ impl Vm {
             dummy_cell: Rc::new(RefCell::new(Value::Undefined)),
             frame_pool: Vec::new(),
             kernel_regs: Vec::new(),
+            kernel_objs: Vec::new(),
             dummy_bf: Rc::new(BytecodeFunction {
                 proto: Rc::new(crate::bytecode::FuncProto::empty(
                     "",
