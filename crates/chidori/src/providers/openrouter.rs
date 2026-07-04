@@ -118,7 +118,12 @@ fn hyphen_version_to_dot(s: &str) -> String {
         && !segs[n - 2].is_empty()
         && segs[n - 2].bytes().all(|b| b.is_ascii_digit())
     {
-        format!("{}-{}.{}", segs[..n - 2].join("-"), segs[n - 2], segs[n - 1])
+        format!(
+            "{}-{}.{}",
+            segs[..n - 2].join("-"),
+            segs[n - 2],
+            segs[n - 1]
+        )
     } else {
         s.to_string()
     }
@@ -158,15 +163,14 @@ pub fn saved_api_key() -> Option<String> {
     let path = credentials_path()?;
     let raw = std::fs::read_to_string(path).ok()?;
     let creds: Credentials = serde_json::from_str(&raw).ok()?;
-    creds
-        .openrouter_api_key
-        .filter(|k| !k.trim().is_empty())
+    creds.openrouter_api_key.filter(|k| !k.trim().is_empty())
 }
 
 /// Persist an OpenRouter API key to the user-level credential store, creating
 /// `~/.chidori/` (mode 0700 on Unix) if needed.
 pub fn save_api_key(key: &str) -> Result<PathBuf> {
-    let path = credentials_path().context("could not resolve a home directory to save credentials")?;
+    let path =
+        credentials_path().context("could not resolve a home directory to save credentials")?;
     let dir = path.parent().expect("credentials path always has a parent");
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     #[cfg(unix)]
@@ -255,9 +259,15 @@ pub async fn oauth_login() -> Result<String> {
             let error = query_param(path, "error");
 
             let (status, message) = if code.is_some() {
-                ("200 OK", "Signed in to OpenRouter. You can close this tab and return to your terminal.")
+                (
+                    "200 OK",
+                    "Signed in to OpenRouter. You can close this tab and return to your terminal.",
+                )
             } else {
-                ("400 Bad Request", "Sign-in failed. Return to your terminal and try again.")
+                (
+                    "400 Bad Request",
+                    "Sign-in failed. Return to your terminal and try again.",
+                )
             };
             let body = callback_html(message);
             let response = format!(
@@ -451,15 +461,30 @@ mod tests {
 
     #[test]
     fn maps_default_claude_model_to_openrouter_slug() {
-        assert_eq!(to_openrouter_slug("claude-sonnet-4-6"), "anthropic/claude-sonnet-4.6");
-        assert_eq!(to_openrouter_slug("claude-opus-4-7"), "anthropic/claude-opus-4.7");
-        assert_eq!(to_openrouter_slug("claude-haiku-4-5"), "anthropic/claude-haiku-4.5");
+        assert_eq!(
+            to_openrouter_slug("claude-sonnet-4-6"),
+            "anthropic/claude-sonnet-4.6"
+        );
+        assert_eq!(
+            to_openrouter_slug("claude-opus-4-7"),
+            "anthropic/claude-opus-4.7"
+        );
+        assert_eq!(
+            to_openrouter_slug("claude-haiku-4-5"),
+            "anthropic/claude-haiku-4.5"
+        );
     }
 
     #[test]
     fn maps_claude_aliases_before_slugging() {
-        assert_eq!(to_openrouter_slug("claude-sonnet"), "anthropic/claude-sonnet-4.6");
-        assert_eq!(to_openrouter_slug("claude-3-5-sonnet"), "anthropic/claude-sonnet-4.6");
+        assert_eq!(
+            to_openrouter_slug("claude-sonnet"),
+            "anthropic/claude-sonnet-4.6"
+        );
+        assert_eq!(
+            to_openrouter_slug("claude-3-5-sonnet"),
+            "anthropic/claude-sonnet-4.6"
+        );
     }
 
     #[test]
@@ -475,13 +500,19 @@ mod tests {
             to_openrouter_slug("anthropic/claude-sonnet-4.5"),
             "anthropic/claude-sonnet-4.5"
         );
-        assert_eq!(to_openrouter_slug("meta-llama/llama-3.1-70b"), "meta-llama/llama-3.1-70b");
+        assert_eq!(
+            to_openrouter_slug("meta-llama/llama-3.1-70b"),
+            "meta-llama/llama-3.1-70b"
+        );
         assert_eq!(to_openrouter_slug("some-local-model"), "some-local-model");
     }
 
     #[test]
     fn hyphen_version_only_touches_trailing_numeric_pair() {
-        assert_eq!(hyphen_version_to_dot("claude-sonnet-4-6"), "claude-sonnet-4.6");
+        assert_eq!(
+            hyphen_version_to_dot("claude-sonnet-4-6"),
+            "claude-sonnet-4.6"
+        );
         assert_eq!(hyphen_version_to_dot("claude-3-opus"), "claude-3-opus");
         assert_eq!(hyphen_version_to_dot("no-version"), "no-version");
     }
@@ -490,8 +521,8 @@ mod tests {
     fn pkce_challenge_is_sha256_of_verifier() {
         use sha2::{Digest, Sha256};
         let (verifier, challenge) = pkce_pair();
-        let expected =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(verifier.as_bytes()));
         assert_eq!(challenge, expected);
         // Unpadded URL-safe base64 has no '=', '+', or '/'.
         assert!(!challenge.contains(['=', '+', '/']));

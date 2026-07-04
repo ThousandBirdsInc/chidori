@@ -623,14 +623,18 @@ fn cmd_login() -> Result<()> {
     // An explicit env key already wins over any saved credential, so a browser
     // sign-in would be pointless — respect it and bow out.
     if std::env::var_os("OPENROUTER_API_KEY").is_some() {
-        println!("OPENROUTER_API_KEY is already set — using it. Unset it to sign in with OAuth instead.");
+        println!(
+            "OPENROUTER_API_KEY is already set — using it. Unset it to sign in with OAuth instead."
+        );
         return Ok(());
     }
     if providers::openrouter::credentials_path()
         .map(|p| p.exists())
         .unwrap_or(false)
     {
-        println!("Already signed in to OpenRouter — re-running the browser sign-in to refresh the key…");
+        println!(
+            "Already signed in to OpenRouter — re-running the browser sign-in to refresh the key…"
+        );
     }
     providers::openrouter::login_and_save()?;
     Ok(())
