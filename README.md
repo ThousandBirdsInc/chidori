@@ -153,11 +153,16 @@ The fastest way to feel what Chidori does: scaffold an agent that answers
 questions from a local docs folder, and chat with it.
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...   # or OPENAI_API_KEY=...
+chidori login                         # sign in with OpenRouter — no API key to set up
 chidori init my-agent --template docs
 cd my-agent
 chidori chat agent.ts
 ```
+
+`chidori login` opens your browser, signs you in with OpenRouter, and saves a
+key to `~/.chidori/credentials.json` — the zero-setup way to try things out.
+Prefer your own provider key? Set `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY`)
+instead; explicit keys always take precedence over the OpenRouter fallback.
 
 Then ask it things like *"What is a host call?"* or *"How do I write a tool?"*.
 
@@ -197,8 +202,8 @@ for free.
 ### 3. Run it
 
 ```bash
-# A provider key (set in step 1) is all you need:
-export ANTHROPIC_API_KEY=sk-ant-...        # or OPENAI_API_KEY=...
+# The OpenRouter sign-in from step 1 is all you need. Prefer your own key?
+# export ANTHROPIC_API_KEY=sk-ant-...        # or OPENAI_API_KEY=...
 # Or route through a LiteLLM proxy:
 # export LITELLM_API_URL=http://localhost:4401/v1
 # export LITELLM_API_KEY=sk-litellm-master-key
@@ -211,13 +216,21 @@ Re-run the same agent with `chidori resume summarizer.ts <run_id>` to replay it
 byte-for-byte with zero model calls (the run id is printed under
 `.chidori/runs/`).
 
-### 4. No API key? Try the bundled examples
+### 4. Try the bundled examples
 
-From a checkout of the repo (the build-from-source option in step 0), several
-examples run with no provider key at all:
+From a checkout of the repo (the build-from-source option in step 0),
+`chidori demo` is an interactive picker of runnable examples. The LLM-backed
+ones use whatever provider you've configured — or prompt you to sign in with
+OpenRouter on the spot (`chidori login`) if you have no key set:
 
 ```bash
 chidori demo                                              # interactive picker
+```
+
+Several examples need **no provider at all** (pure compute and local tools),
+so they run with zero setup:
+
+```bash
 chidori run examples/agents/hello.ts --input name=Colton  # no LLM calls
 chidori run examples/agents/tool_use.ts \
   --input query=chidori --tools examples/tools            # local TS tool, no LLM

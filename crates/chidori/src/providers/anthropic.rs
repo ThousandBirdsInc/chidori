@@ -199,7 +199,7 @@ fn build_request_body(request: &LlmRequest, stream: bool) -> Result<(Value, bool
 ///
 /// Falls through unchanged for any model name that already looks
 /// versioned, so user-supplied full ids keep working.
-fn resolve_alias(model: &str) -> &str {
+pub(crate) fn resolve_alias(model: &str) -> &str {
     match model {
         "claude-sonnet" => "claude-sonnet-4-6",
         "claude-opus" => "claude-opus-4-7",

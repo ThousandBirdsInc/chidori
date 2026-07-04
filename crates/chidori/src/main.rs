@@ -45,6 +45,12 @@ enum Commands {
     /// Pick from an interactive list of example agents to run
     Demo,
 
+    /// Sign in with OpenRouter (browser OAuth) so agents can call an LLM
+    /// without setting a provider API key. The key is saved to
+    /// `~/.chidori/credentials.json` and used automatically as a fallback
+    /// whenever no `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` is configured.
+    Login,
+
     /// Run a TypeScript agent file
     Run {
         /// Path to the agent .ts file
@@ -321,6 +327,7 @@ fn main() {
         }
         Commands::RunWorker => unreachable!("handled before the dispatch match"),
         Commands::Demo => (cmd_demo(), false),
+        Commands::Login => (cmd_login(), false),
         Commands::Init { dir, template } => (
             init::run(
                 &dir.unwrap_or_else(|| PathBuf::from(".")),
@@ -515,9 +522,11 @@ fn cmd_demo() -> Result<()> {
     println!();
     println!("Running: {}", demo.command);
 
-    if demo.requires_provider && !has_llm_provider() {
+    if demo.requires_provider && !ensure_llm_provider_interactive() {
         println!();
-        println!("This demo needs an LLM provider. Set one of:");
+        println!("This demo needs an LLM provider. Either sign in with OpenRouter:");
+        println!("  chidori login");
+        println!("or set one of:");
         println!("  export ANTHROPIC_API_KEY=sk-ant-...");
         println!("  export OPENAI_API_KEY=sk-...");
         println!("  export LITELLM_API_URL=http://localhost:4401/v1");
@@ -606,6 +615,57 @@ fn has_llm_provider() -> bool {
     std::env::var_os("ANTHROPIC_API_KEY").is_some()
         || std::env::var_os("OPENAI_API_KEY").is_some()
         || std::env::var_os("LITELLM_API_URL").is_some()
+        || providers::openrouter::saved_api_key().is_some()
+}
+
+/// Explicit `chidori login`: run the OpenRouter OAuth flow and save the key.
+fn cmd_login() -> Result<()> {
+    // An explicit env key already wins over any saved credential, so a browser
+    // sign-in would be pointless — respect it and bow out.
+    if std::env::var_os("OPENROUTER_API_KEY").is_some() {
+        println!("OPENROUTER_API_KEY is already set — using it. Unset it to sign in with OAuth instead.");
+        return Ok(());
+    }
+    if providers::openrouter::credentials_path()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+    {
+        println!("Already signed in to OpenRouter — re-running the browser sign-in to refresh the key…");
+    }
+    providers::openrouter::login_and_save()?;
+    Ok(())
+}
+
+/// Shared fallback for the interactive "try it out" surfaces (`demo`, `chat`,
+/// interactive `run`): if no provider is configured, offer an OpenRouter OAuth
+/// sign-in. Returns `true` when a provider is available afterwards.
+///
+/// Non-interactive callers (no TTY, e.g. piped/scripted runs) never block on a
+/// prompt — they just report `false` so the caller can surface the usual
+/// "set a key" guidance instead of hanging.
+fn ensure_llm_provider_interactive() -> bool {
+    use std::io::IsTerminal;
+
+    if has_llm_provider() {
+        return true;
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return false;
+    }
+
+    println!();
+    println!("No LLM provider key found (ANTHROPIC_API_KEY / OPENAI_API_KEY).");
+    println!("You can sign in with OpenRouter to try this out — no API key setup needed.");
+    if !providers::openrouter::confirm_login() {
+        return false;
+    }
+    match providers::openrouter::login_and_save() {
+        Ok(_) => true,
+        Err(err) => {
+            eprintln!("OpenRouter sign-in failed: {err}");
+            false
+        }
+    }
 }
 
 /// Resolve the permission policy for a CLI invocation. `--untrusted` selects
@@ -917,6 +977,10 @@ fn cmd_chat(
         }
     };
 
+    // Chat always calls the model, so offer an OpenRouter sign-in up front when
+    // no provider key is configured — building the registry after so it picks
+    // up a freshly saved key.
+    let _ = ensure_llm_provider_interactive();
     let providers = Arc::new(ProviderRegistry::from_env());
     let template_engine = Arc::new(TemplateEngine::new(&base_dir));
     let tokio_rt =

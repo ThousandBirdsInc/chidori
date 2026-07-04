@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod openai;
+pub mod openrouter;
 pub mod rate_limit;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -381,6 +382,18 @@ impl ProviderRegistry {
             registry.register(Box::new(p));
         }
 
+        // OpenRouter is the zero-config fallback: an `OPENROUTER_API_KEY`, or a
+        // key saved by a prior `chidori login` / demo OAuth sign-in. Registered
+        // last and matching every model, so it only handles requests no
+        // explicit provider above claimed. See [`openrouter`] for the flow.
+        if let Some(api_key) = openrouter::saved_api_key() {
+            let mut p = openrouter::OpenRouterProvider::new(api_key);
+            if let Some(rpm) = rpm_env("CHIDORI_OPENROUTER_RPM") {
+                p = p.with_rate_limit(rpm);
+            }
+            registry.register(Box::new(p));
+        }
+
         registry
     }
 
@@ -392,7 +405,7 @@ impl ProviderRegistry {
             }
         }
         bail!(
-            "No provider found for model '{}'. Set ANTHROPIC_API_KEY or OPENAI_API_KEY.",
+            "No provider found for model '{}'. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, or run `chidori login` to sign in with OpenRouter.",
             request.model
         );
     }
@@ -410,7 +423,7 @@ impl ProviderRegistry {
             }
         }
         bail!(
-            "No provider found for model '{}'. Set ANTHROPIC_API_KEY or OPENAI_API_KEY.",
+            "No provider found for model '{}'. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, or run `chidori login` to sign in with OpenRouter.",
             request.model
         );
     }
