@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chidori"
-version = "3.5.0"
+version = "3.5.1"
 description = "Python SDK for the Chidori agent framework — HTTP client for running and replaying TypeScript agents."
 readme = "README.md"
 license = { text = "Apache-2.0" }
