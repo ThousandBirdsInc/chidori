@@ -741,16 +741,69 @@ was bailing per-iteration on holes). A run-scanning workload (append-build
 + boolean-flag scan, 500k elements ×4) goes **2065 ms → 204 ms (10.1×)**.
 Other suite counts unchanged (±layout noise), checksums byte-identical.
 
+**Kernel v5 (same branch): FUNCTION kernels — frameless tiny callees.**
+
+The sort/HOF profile is ~55% comparator-call ceremony (frame init/recycle,
+operand-stack moves, `Value` clones/drops) around an 8-op body. A function
+whose ENTIRE body is on the kernel allowlist now also compiles to a register
+program (`FuncProto::fn_kernel`), and the call paths (`call_direct`,
+`call_bytecode_vec`, the slice-based `call_bytecode`) execute it FRAMELESS:
+no frame, no operand stack, no pool traffic — arguments load straight into
+registers and `Return` yields the result value (`KOp::Ret`, typed
+Number/Bool).
+
+- **Entry guard, per call**: every consumed argument present and a `Number`
+  (a missing/extra/string argument declines THAT call, generically);
+  captured upvalues hold `Number`s (read-only snapshots — no calls can run
+  inside a kernelized body, so nothing writes a cell mid-execution); no op
+  budget; no trace sink (it must see an enter/exit per call); `Math`
+  canonicals verified as in v3. Callers apply the depth guard before the
+  hook, so the max-call-depth RangeError fires identically on both paths.
+- **fn-mode translation rules** on top of the loop allowlist: `LoadArg`
+  reads become guarded argument registers; locals are pure register scratch
+  — there is no guard to type them, so every read must be DOMINATED by a
+  real store, tracked as a sorted `init` set merged under the same
+  must-match rule as the virtual-stack shape (a genuine TDZ read or
+  use-before-init rejects; the generic path owns the error). Element access
+  and `a.length` reject outright (a bail needs a frame to resume into). The
+  declared-function prologue (`this`/`new.target` materialized into locals)
+  translates via an OPAQUE stack entry whose only legal consumer is a store
+  to a never-read local — arrows and declared functions both kernelize.
+  Bodies with loops work (the interior `Op::LoopKernel` translates as its
+  fallback, and kernel back-edges poll the interrupt flag as usual).
+
+Measured (callgrind, RESULT checksums byte-identical across the suite):
+**sort 11.56 G → 6.21 G (−46%)**, **closures 4.03 G → 2.31 G (−43%)** (its
+callbacks capture numeric upvalues — the guarded-snapshot rule covers them),
+**array_hof 2.38 G → 1.72 G (−28%)**, arith_loop/array_sum −3.4% each;
+fib_recursive +0.07% (the `fn_kernel.is_some()` probe on a never-eligible
+callee — ~1 instruction per call), property_access unchanged. Wall-clock
+sort ~1.4 s → ~0.6 s on the dev box.
+
+**Gates:** corpus grew ~20 function-kernel programs (comparators incl.
+boolean-returning and ternary, map/filter/reduce/every/findIndex callbacks,
+upvalue capture with number and string cells, missing/extra/non-number
+arguments, monkeypatched Math, −0/NaN pins, `.call`/`.apply` entry,
+recursion staying generic, loops inside kernelized bodies); structural pins
+require the canonical tiny functions to carry `fn_kernel` and
+frame-dependent bodies (`arguments`, property access, calls, allocation,
+implicit-undefined return) to NEVER carry one; the op-budget test now also
+covers a call-heavy program (function kernels are OFF under a budget, like
+loop kernels).
+
 ### 6.5.1 What's next (new baseline)
 
 - Remaining kernel candidates: `String.prototype.charCodeAt`-class reads,
-  loop bounds via own-frame CELLS (captured accumulators), and typed-array
-  element access (a natural fit — elements are statically numeric).
+  loop bounds via own-frame CELLS (captured accumulators), typed-array
+  element access (a natural fit — elements are statically numeric), and
+  argument-typed ARRAY parameters for function kernels (`(a, i) => a[i]`
+  needs arg object slots + a bail-free access story).
 - **step dispatch remains the wall for non-kernel code**: `step` +
   `run_frame` are 25–43% of call-heavy workloads. Register bytecode (§3.5)
   is the remaining structural lever, and kernels shrink its risk: the
   translator's typed-stack machinery is exactly the analysis a register
-  allocator needs.
+  allocator needs. fib_recursive (7.5 G) is now almost pure frame ceremony —
+  its body recurses, so no kernel tier can reach it.
 
 Re-run the callgrind sweep before choosing; the noise-floor and idle-machine
 caveats in §1.1 stand.

@@ -1,6 +1,13 @@
 //! Typed loop kernels: translate eligible bytecode loops into unboxed-`f64`
 //! register programs (docs/js-performance-roadmap.md §6.5).
 //!
+//! The same translator also compiles FUNCTION kernels
+//! ([`kernelize_function`]): a tiny pure-scalar body — a sort comparator, a
+//! `map`/`filter`/`reduce` callback — becomes a register program the call
+//! paths execute FRAMELESS when its per-call entry guard passes (arguments
+//! present and `Number`s, upvalues `Number`s, no op budget, no trace sink);
+//! any guard failure takes the ordinary frame path. See `Vm::run_fn_kernel`.
+//!
 //! ## Why
 //!
 //! The retired closure-threading experiment (docs/jit.md) proved that removing
@@ -139,6 +146,7 @@ pub fn kernelize(mut code: Vec<Op>, consts: &[Const]) -> (Vec<Op>, Vec<Kernel>) 
                 &kernels,
                 &oslots,
                 &bools,
+                false,
             );
             let mut grew = false;
             for o in d_obj {
@@ -165,6 +173,53 @@ pub fn kernelize(mut code: Vec<Op>, consts: &[Const]) -> (Vec<Op>, Vec<Kernel>) 
         }
     }
     (code, kernels)
+}
+
+/// Bound keeping FUNCTION-kernel translation cheap: bodies beyond this stay
+/// generic (the win is tiny leaf callbacks — comparators, HOF callbacks;
+/// larger bodies amortize their frame anyway).
+const MAX_FN_OPS: usize = 128;
+
+/// Translate an ENTIRE function body into a kernel executed FRAMELESS at call
+/// time (`FuncProto::fn_kernel`): no frame, no operand stack, no local slots —
+/// arguments load straight into registers under the entry guard (every
+/// consumed argument present and a `Number`, captured upvalues `Number`s) and
+/// `Return` yields the call's result directly. Eligibility is the loop-kernel
+/// allowlist plus fn-mode rules: no element access or `a.length` (a bail
+/// needs a frame to resume into), every local read dominated by a real store
+/// on every path (there is no guard to type frameless locals), and every
+/// completing path ending at `Return` with a scalar. `None` = stay generic.
+pub fn kernelize_function(code: &[Op], consts: &[Const], inner: &[Kernel]) -> Option<Kernel> {
+    if code.len() > MAX_FN_OPS {
+        return None;
+    }
+    // Cheap pre-screen: a kernelizable body always ends paths at `Op::Return`.
+    if !code.iter().any(|op| matches!(op, Op::Return)) {
+        return None;
+    }
+    // Same boolean-local fixpoint as `kernelize`; array-base discoveries
+    // reject outright (element access can't run frameless).
+    let mut bools: Vec<u32> = Vec::new();
+    for _ in 0..6 {
+        let (k, d_obj, d_bool) = translate(code, 0, consts, inner, &[], &bools, true);
+        if !d_obj.is_empty() {
+            return None;
+        }
+        let mut grew = false;
+        for b in d_bool {
+            if !bools.contains(&b) {
+                bools.push(b);
+                grew = true;
+            }
+        }
+        if !grew {
+            let k = k?;
+            // Frameless kernels are self-contained by construction.
+            debug_assert!(k.oslots.is_empty() && k.shapes.is_empty());
+            return Some(k);
+        }
+    }
+    None
 }
 
 /// Every code index an op can transfer control to (not counting fallthrough).
@@ -230,6 +285,12 @@ enum VE {
     /// per-iteration `let` reset emits `LoadUndefined; StoreLocal(j)` right
     /// before the loop re-initializes `j`). Everything else rejects.
     Undef,
+    /// fn mode only: a value the kernel cannot represent — `this` /
+    /// `new.target`, which a declared function's calling-convention prologue
+    /// materializes into locals the body may never touch. Its ONLY legal
+    /// consumer is a store to a local (the `init` tracking then rejects any
+    /// read of that local); everything else rejects.
+    Opaque,
 }
 
 struct Xlate<'a> {
@@ -239,6 +300,12 @@ struct Xlate<'a> {
     /// Already-built kernels (inner loops) — `Op::LoopKernel` translates as
     /// its fallback op.
     inner: &'a [Kernel],
+    /// FUNCTION-kernel translation (`kernelize_function`): the region is an
+    /// entire function body executed FRAMELESS. `Op::LoadArg`/`Op::Return`
+    /// join the allowlist; exits are impossible (no frame to resume), and
+    /// every local read must be dominated by a real store (`init` tracking) —
+    /// there is no entry guard over locals to type them.
+    fn_mode: bool,
     /// Locals designated as array bases (phase 2) — empty in phase 1.
     oslot_locals: &'a [u32],
     /// Locals statically typed BOOLEAN (fixpoint-discovered from stores).
@@ -248,6 +315,13 @@ struct Xlate<'a> {
     kpc: Vec<u16>,
     /// expected virtual-stack shape at each region-relative ip, when known.
     shape_at: Vec<Option<Vec<VE>>>,
+    /// fn mode: the set of locals provably stored on the current path,
+    /// SORTED. Merge points require identical sets — the same rule as the
+    /// stack shape — so a read is dominated by a store on EVERY path.
+    init: Vec<u32>,
+    /// fn mode: expected `init` set at each region-relative ip, when known
+    /// (kept in lockstep with `shape_at`).
+    init_at: Vec<Option<Vec<u32>>>,
     /// in-region branch targets (any op branching to that ip).
     is_target: Vec<bool>,
     /// numeric slots (locals and read-only upvalues): (source, register),
@@ -286,6 +360,7 @@ fn translate(
     inner: &[Kernel],
     oslot_locals: &[u32],
     bool_locals: &[u32],
+    fn_mode: bool,
 ) -> (Option<Kernel>, Vec<u32>, Vec<u32>) {
     let mut is_target = vec![false; region.len()];
     for op in region {
@@ -302,11 +377,14 @@ fn translate(
         base_ip,
         consts,
         inner,
+        fn_mode,
         oslot_locals,
         bool_locals,
         kops: Vec::new(),
         kpc: vec![u16::MAX; region.len()],
         shape_at: vec![None; region.len()],
+        init: Vec::new(),
+        init_at: vec![None; region.len()],
         is_target,
         local_reg: Vec::new(),
         bool_reg: Vec::new(),
@@ -322,6 +400,7 @@ fn translate(
         max_stack: 0,
     };
     x.shape_at[0] = Some(Vec::new());
+    x.init_at[0] = Some(Vec::new());
     let kernel = translate_inner(&mut x);
     let d_obj = std::mem::take(&mut x.discovered);
     let d_bool = std::mem::take(&mut x.discovered_bools);
@@ -345,6 +424,16 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                 if reachable && shape != x.vstack {
                     return None; // inconsistent stack shape at a merge point
                 }
+                if x.fn_mode {
+                    // The initialized-locals set merges under the same rule.
+                    let init = x.init_at[i].clone().unwrap_or_default();
+                    if reachable && init != x.init {
+                        return None;
+                    }
+                    if !reachable {
+                        x.init = init;
+                    }
+                }
                 if !reachable {
                     x.vstack = shape.clone();
                     x.origins = vec![None; shape.len()];
@@ -362,6 +451,9 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                 // Record the shape every executed op is translated at, so a
                 // later BACKWARD branch to it verifies register alignment.
                 x.shape_at[i] = Some(x.vstack.clone());
+                if x.fn_mode {
+                    x.init_at[i] = Some(x.init.clone());
+                }
             }
         }
         x.kpc[i] = u16::try_from(x.kops.len()).ok()?;
@@ -372,7 +464,9 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
             return None;
         }
         // Ops with no fallthrough edge end the current basic block.
-        if matches!(region[i], Op::Jump(_) | Op::JumpIfNullishPeek(_)) {
+        if matches!(region[i], Op::Jump(_) | Op::JumpIfNullishPeek(_))
+            || (x.fn_mode && matches!(region[i], Op::Return))
+        {
             reachable = false;
         }
     }
@@ -396,14 +490,20 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
         }
         patch(&mut x.kops, kidx, pc);
     }
+    // A FUNCTION kernel runs frameless — there is no bytecode frame to
+    // resume, so any path needing a generic-interpreter exit rejects the
+    // whole function (element access, or a body not ending in `Return`).
+    if x.fn_mode && !x.exits.is_empty() {
+        return None;
+    }
     // Synthesize exit stubs (deduplicated by resume ip + shape) and collect
     // the shape table.
     let exits = std::mem::take(&mut x.exits);
     let mut shapes: Vec<Vec<VE>> = Vec::new();
     let mut stubs: Vec<(u32, u16, u16)> = Vec::new(); // (resume, shape idx, pc)
     for (kidx, resume_ip, shape) in exits {
-        if shape.contains(&VE::Undef) {
-            return None; // `undefined` never survives to an exit
+        if shape.contains(&VE::Undef) || shape.contains(&VE::Opaque) {
+            return None; // undefined/opaque never survives to an exit
         }
         let sidx = match shapes.iter().position(|s| *s == shape) {
             Some(p) => p as u16,
@@ -486,6 +586,7 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                 *val = remap(*val);
             }
             KOp::LoadLen { dst, .. } => *dst = remap(*dst),
+            KOp::Ret { src, .. } => *src = remap(*src),
             KOp::Math1 { dst, src, .. } => {
                 *dst = remap(*dst);
                 *src = remap(*src);
@@ -509,7 +610,9 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                     VE::Obj(o) => KShapeSlot::Obj(*o),
                     VE::MathObj => KShapeSlot::MathObj,
                     VE::MathFn(k) => KShapeSlot::MathFn(*k),
-                    VE::Undef => unreachable!("undef never crosses block boundaries"),
+                    VE::Undef | VE::Opaque => {
+                        unreachable!("undef/opaque never crosses block boundaries")
+                    }
                 })
                 .collect()
         })
@@ -604,6 +707,49 @@ impl Xlate<'_> {
         Some(r)
     }
 
+    /// FUNCTION kernels: register holding call argument `a` (read-only; the
+    /// entry guard requires it present and a `Number`). Shares the numeric
+    /// slot space with locals/upvalues.
+    fn argreg(&mut self, a: u32) -> Option<u16> {
+        let slot = KSlot::Arg(a);
+        if let Some(&(_, r)) = self.local_reg.iter().find(|(sl, _)| *sl == slot) {
+            return Some(r);
+        }
+        let r = u16::try_from(self.local_reg.len()).ok()?;
+        if r >= BOOL_BASE {
+            return None;
+        }
+        self.local_reg.push((slot, r));
+        Some(r)
+    }
+
+    /// fn mode: a local may be read only when a real store to it dominates
+    /// (tracked per-path in `init`; merge points require identical sets — no
+    /// entry guard exists to type frameless locals). Loop mode: always true.
+    fn local_readable(&self, l: u32) -> bool {
+        !self.fn_mode || self.init.binary_search(&l).is_ok()
+    }
+
+    /// Record a real (value-carrying) store to local `l` on this path.
+    fn mark_init(&mut self, l: u32) {
+        if self.fn_mode {
+            if let Err(p) = self.init.binary_search(&l) {
+                self.init.insert(p, l);
+            }
+        }
+    }
+
+    /// fn mode: local `l` no longer holds a readable value on this path (an
+    /// elided `undefined`/TDZ store — the generic slot would be
+    /// `undefined`/`Uninitialized`, which no kernel register can represent).
+    fn clear_init(&mut self, l: u32) {
+        if self.fn_mode {
+            if let Ok(p) = self.init.binary_search(&l) {
+                self.init.remove(p);
+            }
+        }
+    }
+
     /// Register mirroring BOOLEAN-typed `frame.locals[l]` (holds 0.0/1.0; the
     /// guard requires `Value::Bool`, write-back restores it). Records the
     /// local for the caller's fixpoint when it is not yet in this run's set.
@@ -633,8 +779,12 @@ impl Xlate<'_> {
 
     /// Read-only scalar register for local `l` — numeric or boolean space
     /// (coercing consumers treat a boolean's 0.0/1.0 exactly as ToNumber
-    /// would). Never valid for array bases.
+    /// would). Never valid for array bases. Every caller is a READ, so fn
+    /// mode demands a dominating store.
     fn scalar_lreg(&mut self, l: u32) -> Option<u16> {
+        if !self.local_readable(l) {
+            return None;
+        }
         if self.bool_locals.contains(&l) {
             self.blreg(l)
         } else {
@@ -745,7 +895,7 @@ impl Xlate<'_> {
         let p = self.vstack.len().checked_sub(1 + depth_from_top)?;
         match self.vstack[p] {
             VE::Obj(s) => Some(s),
-            VE::Bool | VE::Undef | VE::MathObj | VE::MathFn(_) => None,
+            VE::Bool | VE::Undef | VE::Opaque | VE::MathObj | VE::MathFn(_) => None,
             VE::Num => {
                 // Phase 1 discovery only. (A local used BOTH as a base and
                 // numerically is caught in phase 2: its loads become `Obj`
@@ -809,8 +959,8 @@ impl Xlate<'_> {
 
     /// Record a branch to absolute bytecode ip `t` from the kop at `kidx`.
     fn branch_to(&mut self, kidx: usize, t: u32, shape: Vec<VE>) -> Option<()> {
-        if shape.contains(&VE::Undef) {
-            return None; // `undefined` never crosses block boundaries
+        if shape.contains(&VE::Undef) || shape.contains(&VE::Opaque) {
+            return None; // undefined/opaque never crosses block boundaries
         }
         let rel = (t as usize).wrapping_sub(self.base_ip as usize);
         if rel < self.region.len() {
@@ -818,6 +968,14 @@ impl Xlate<'_> {
                 Some(s) if *s != shape => return None,
                 Some(_) => {}
                 None => self.shape_at[rel] = Some(shape),
+            }
+            if self.fn_mode {
+                // The initialized-locals set must agree at the target too.
+                match &self.init_at[rel] {
+                    Some(s) if *s != self.init => return None,
+                    Some(_) => {}
+                    None => self.init_at[rel] = Some(self.init.clone()),
+                }
             }
             self.fixups.push((kidx, rel));
         } else {
@@ -851,6 +1009,22 @@ impl Xlate<'_> {
                 self.origins.push(None);
             }
 
+            // fn mode: the declared-function prologue materializes `this`
+            // and `new.target` into locals. The values are unrepresentable
+            // (`VE::Opaque`) — legal only when stored into locals the body
+            // never reads (`init` tracking rejects any read).
+            Op::LoadThis | Op::LoadNewTarget if self.fn_mode => {
+                self.vstack.push(VE::Opaque);
+                self.origins.push(None);
+            }
+            // OrdinaryCallBindThis (sloppy): coerces the top-of-stack `this`
+            // — opaque in, opaque out.
+            Op::BindThisSloppy if self.fn_mode => {
+                if !matches!(self.vstack.last(), Some(VE::Opaque)) {
+                    return None;
+                }
+            }
+
             // The ONLY supported global: `Math` (speculatively — the entry
             // guard verifies the global binding is still the canonical data
             // property before the kernel runs).
@@ -872,6 +1046,9 @@ impl Xlate<'_> {
             // ---- locals (TDZ subsumed by the entry guard: a mapped local is
             // a Number, never Uninitialized) ----
             Op::LoadLocal(l) => {
+                if !self.local_readable(*l) {
+                    return None;
+                }
                 if let Some(pos) = self.oslot_locals.iter().position(|&o| o == *l) {
                     // This local is an array base — push the object.
                     self.vstack.push(VE::Obj(pos as u16));
@@ -894,22 +1071,50 @@ impl Xlate<'_> {
                 let dst = self.push_num()?;
                 self.kops.push(K::Mov { dst, src });
             }
+            // FUNCTION kernels: a call argument (read-only; the entry guard
+            // requires it present and a `Number`). Loop regions never see
+            // `LoadArg` — parameters are copied to locals in the prologue.
+            Op::LoadArg(a) if self.fn_mode => {
+                let src = self.argreg(*a)?;
+                let dst = self.push_num()?;
+                self.kops.push(K::Mov { dst, src });
+            }
+            // FUNCTION kernels: yield the (scalar) result and finish the
+            // frameless call. Loop regions reject `Return` (the catch-all).
+            Op::Return if self.fn_mode => {
+                let boolean = self.top_is_bool(0)?;
+                let src = self.pop_scalar()?;
+                self.kops.push(K::Ret { src, boolean });
+            }
 
             // The checked store's TDZ test reads the CURRENT slot value; the
-            // guard proves it is a Number, so the store is a plain move.
+            // loop-kernel guard proves it is a Number, so the store is a
+            // plain move. fn mode has no such guard: the checked store is
+            // only provably non-throwing when a real store already dominates
+            // (the slot then holds a value, never `Uninitialized`).
             Op::StoreLocal(l) | Op::StoreLocalChecked(l) => {
+                if self.fn_mode
+                    && matches!(op, Op::StoreLocalChecked(_))
+                    && !self.local_readable(*l)
+                {
+                    return None;
+                }
                 match self.vstack.last() {
-                    Some(VE::Undef) => {
-                        // Storing `undefined` can only be elided if the local
-                        // is provably RE-STORED before any read, branch, or
+                    Some(VE::Undef) | Some(VE::Opaque) => {
+                        // Storing an unrepresentable value is elided. fn
+                        // mode: sound outright — the `init` tracking rejects
+                        // any read of the local not dominated by a real
+                        // store. Loop mode (`undefined` only): the local must
+                        // provably be RE-STORED before any read, branch, or
                         // branch target — i.e. the store is dead within this
-                        // basic block (the per-iteration `let` reset pattern).
-                        // Otherwise the region is rejected.
-                        if !self.dead_store_ahead(i + 1, *l) {
+                        // basic block (the per-iteration `let` reset
+                        // pattern). Otherwise the region is rejected.
+                        if !self.fn_mode && !self.dead_store_ahead(i + 1, *l) {
                             return None;
                         }
                         self.pop()?;
                         self.store_of(*l);
+                        self.clear_init(*l);
                     }
                     Some(VE::Bool) => {
                         // A boolean store TYPES the local (fixpoint feedback);
@@ -922,12 +1127,14 @@ impl Xlate<'_> {
                         let src = self.pop_scalar()?;
                         self.kops.push(K::Mov { dst, src });
                         self.store_of(*l);
+                        self.mark_init(*l);
                     }
                     _ => {
                         let dst = self.lreg(*l)?;
                         let src = self.pop_num()?;
                         self.kops.push(K::Mov { dst, src });
                         self.store_of(*l);
+                        self.mark_init(*l);
                     }
                 }
             }
@@ -939,12 +1146,19 @@ impl Xlate<'_> {
             Op::InitLocalTdz(l) => {
                 // No type demand here — the local's static type comes from
                 // the actual store that must follow (numeric or boolean).
-                if !self.dead_store_ahead(i + 1, *l) {
+                // fn mode: `init` tracking subsumes the dead-store proof (a
+                // genuine TDZ read rejects the region, and the generic path
+                // then raises the ReferenceError).
+                if !self.fn_mode && !self.dead_store_ahead(i + 1, *l) {
                     return None;
                 }
                 self.store_of(*l);
+                self.clear_init(*l);
             }
             Op::CopyLocal { src, dest } => {
+                if !self.local_readable(*src) {
+                    return None;
+                }
                 let (s, d) = if self.is_bool_local(*src) {
                     let s = self.blreg(*src)?;
                     let d = self.blreg(*dest)?;
@@ -959,6 +1173,7 @@ impl Xlate<'_> {
                     self.kops.push(K::Mov { dst: d, src: s });
                 }
                 self.store_of(*dest);
+                self.mark_init(*dest);
             }
             Op::LoadConst(c) => {
                 let (k, is_bool) = self.scalar_const(*c)?;
@@ -983,6 +1198,9 @@ impl Xlate<'_> {
                 self.kops.push(K::BoolNot { dst, src });
             }
             Op::LoadLocalConst { local, konst } => {
+                if !self.local_readable(*local) {
+                    return None;
+                }
                 let (k, k_bool) = self.scalar_const(*konst)?;
                 if self.is_bool_local(*local) {
                     let src = self.blreg(*local)?;
@@ -1028,14 +1246,14 @@ impl Xlate<'_> {
                         self.vstack.push(VE::MathObj);
                         self.origins.push(None);
                     }
-                    VE::MathFn(_) | VE::Undef => return None,
+                    VE::MathFn(_) | VE::Undef | VE::Opaque => return None,
                 }
             }
             Op::Swap => {
                 let n = self.vstack.len();
                 let (pa, pb) = (n.checked_sub(2)?, n - 1);
                 let (ea, eb) = (self.vstack[pa], self.vstack[pb]);
-                if ea == VE::Undef || eb == VE::Undef {
+                if matches!(ea, VE::Undef | VE::Opaque) || matches!(eb, VE::Undef | VE::Opaque) {
                     return None;
                 }
                 let is_reg = |e: VE| matches!(e, VE::Num | VE::Bool);
@@ -1074,7 +1292,10 @@ impl Xlate<'_> {
                 let (pa, pb, pc_) = (n.checked_sub(3)?, n - 2, n - 1);
                 let (ra, rb, rc) = (self.preg(pa)?, self.preg(pb)?, self.preg(pc_)?);
                 let (ea, eb, ec) = (self.vstack[pa], self.vstack[pb], self.vstack[pc_]);
-                if ea == VE::Undef || eb == VE::Undef || ec == VE::Undef {
+                if [ea, eb, ec]
+                    .iter()
+                    .any(|e| matches!(e, VE::Undef | VE::Opaque))
+                {
                     return None;
                 }
                 let is_reg = |e: VE| matches!(e, VE::Num | VE::Bool);
@@ -1175,6 +1396,10 @@ impl Xlate<'_> {
                 });
             }
             Op::IncLocalStmt { local, dec } => {
+                // Reads the local before writing it.
+                if !self.local_readable(*local) {
+                    return None;
+                }
                 let r = self.lreg(*local)?;
                 self.kops.push(K::AddK {
                     dst: r,

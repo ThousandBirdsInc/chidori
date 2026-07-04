@@ -109,6 +109,13 @@ pub struct FuncProto {
     /// §6.5): an [`Op::LoopKernel`] at a loop header indexes into this table.
     /// Empty for functions with no eligible loops.
     pub kernels: Vec<Kernel>,
+    /// FUNCTION kernel (docs/js-performance-roadmap.md §6.5): the ENTIRE body
+    /// as a register program, executed FRAMELESS by the call paths when the
+    /// entry guard passes (every consumed argument a `Number`, captured
+    /// upvalues `Number`s, no op budget, no trace sink). Guard failure takes
+    /// the ordinary frame path. `None` for anything but tiny pure-scalar
+    /// bodies (sort comparators, map/filter/reduce callbacks).
+    pub fn_kernel: Option<Kernel>,
     /// Number of plain (non-captured) local slots.
     pub num_locals: u32,
     /// Number of cell (captured-by-closure) slots.
@@ -202,6 +209,7 @@ impl FuncProto {
             code: Vec::new(),
             consts: Vec::new(),
             kernels: Vec::new(),
+            fn_kernel: None,
             num_locals: 0,
             num_cells: 0,
             num_params: 0,
@@ -1025,14 +1033,22 @@ pub enum KOp {
     /// registers, objects from object slots), and resume the bytecode
     /// interpreter at `resume_ip`.
     Exit { resume_ip: u32, shape: u16 },
+    /// FUNCTION kernels only (`FuncProto::fn_kernel`): finish the frameless
+    /// call, yielding `regs[src]` as the call's result — `Value::Bool` when
+    /// the register is statically boolean-typed, else `Value::Number`. Never
+    /// emitted for loop kernels (their region has no `Return` on the
+    /// allowlist).
+    Ret { src: u16, boolean: bool },
 }
 
-/// A numeric register's source: a frame local (read/write) or a captured
-/// upvalue cell (read-only snapshot).
+/// A numeric register's source: a frame local (read/write), a captured
+/// upvalue cell (read-only snapshot), or — FUNCTION kernels only — a call
+/// argument (read-only; the entry guard requires it present and a `Number`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KSlot {
     Local(u32),
     Upvalue(u32),
+    Arg(u32),
 }
 
 /// One operand-stack slot of a kernel exit shape, bottom-up: a `Number` read
@@ -1141,6 +1157,12 @@ pub struct Kernel {
     /// inside a kernel, so nothing can write a captured cell mid-activation;
     /// in-region upvalue WRITES reject at translation). The guard requires
     /// `Value::Number` in every one; only `Local` slots write back.
+    ///
+    /// FUNCTION kernels additionally use `Arg` slots (read-only; the guard
+    /// requires the argument present and a `Number`), and their `Local` slots
+    /// are pure register scratch — no frame exists, so they are neither
+    /// guarded nor written back (translation proves store-before-read on
+    /// every path).
     pub locals: Box<[KSlot]>,
     /// `frame.locals` indices statically typed BOOLEAN, mirrored into the
     /// registers right after the numeric ones (as 0.0/1.0). The guard

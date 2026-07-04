@@ -231,6 +231,52 @@ const CORPUS: &[&str] = &[
     "'use strict'; const a = [1]; Object.preventExtensions(a); try { for (let i = 0; i < 3; i++) { a[a.length] = 9; } } catch (e) { console.log('strict', e.constructor.name); } console.log(a.length);",
     // Append far past the end leaves holes (generic path).
     "const a = []; for (let i = 0; i < 4; i++) { a[i * 2] = i; } console.log(a.length, 1 in a, a.join('|'));",
+    // ---- function kernels (frameless tiny callees) ----
+    // The canonical sort comparators, ascending/descending/ternary/bitmask.
+    "const a = [5,3,8,1,9,2,7]; a.sort((x, y) => x - y); console.log(a.join(','));",
+    "const a = [5,3,8,1,9,2,7]; a.sort((x, y) => y - x); console.log(a.join(','));",
+    "const a = [3,1,2,1,3]; a.sort((x, y) => x < y ? -1 : x > y ? 1 : 0); console.log(a.join(','));",
+    "const f = (a, b) => (a & 15) - (b & 15); const xs = [30, 7, 22, 13]; xs.sort(f); console.log(xs.join(','));",
+    // A BOOLEAN-returning comparator (ToNumber(true/false) inside sort).
+    "const f = (a, b) => a > b; console.log([3,1,2].sort(f).join(','), f(1, 2), typeof f(1, 2));",
+    // Declared function with a body-local temporary.
+    "function f(a, b) { const d = a - b; return d; } console.log(f(9, 4), typeof f(9, 4), f(0.5, 0.25));",
+    // HOF callbacks: map / filter / reduce / every / findIndex.
+    "const f = (x) => x % 2 === 0; console.log([1,2,3,4,5,6].filter(f).join(','));",
+    "console.log([1,2,3].map((x) => x * x + 1).join(','));",
+    "console.log([1,2,3,4].reduce((acc, v) => acc + v * 2, 0));",
+    "console.log([2,4,6].every((x) => x % 2 === 0), [1,2].findIndex((x) => x > 1));",
+    // Captured numeric upvalue (guarded snapshot) — and a non-number one
+    // (guard declines; the generic path concatenates).
+    "const k = 3; console.log([1,2,3].map(x => x * k).join(','));",
+    "let k = 'no'; const g = x => x + k; console.log(g(1));",
+    // Missing / extra / non-number arguments decline per CALL, not per fn.
+    "function f(a, b) { return a + b; } console.log(f(1), f(1, 2), f(1, 2, 3), f('x', 'y'));",
+    // Math intrinsics inside a function kernel; then monkeypatched (decline).
+    "const f = x => Math.abs(x) + Math.max(x, 0); console.log(f(-5), f(5));",
+    "const orig = Math.abs; Math.abs = () => 42; const f = x => Math.abs(x); console.log(f(-5)); Math.abs = orig;",
+    // Boolean returns and typeof pins.
+    "const f = x => !x; console.log(f(0), f(1), f(NaN), typeof f(0));",
+    "const f = n => n !== n; console.log(f(NaN), f(1), typeof f(NaN));",
+    // Exact float semantics through the frameless path: -0 and NaN.
+    "const f = (x, y) => x * y; console.log(Object.is(f(-0, 5), -0), Object.is(f(0, -5), -0), f(NaN, 1) !== f(NaN, 1) === false);",
+    "const a = [1e-9, -0, 0, 2]; a.sort((x, y) => 1 / x - 1 / y); console.log(a.map(v => Object.is(v, -0) ? '-0' : String(v)).join(','));",
+    // Short-circuit predicate (&& across blocks) and a loop INSIDE the body.
+    "const f = x => x > 0 && x < 10; console.log(f(5), f(-1), f(20), typeof f(5));",
+    "function f(x) { let s = 0; for (let i = 0; i < x; i++) s += i; return s; } console.log(f(10), f(0), f(1));",
+    // Recursion is a call op — never kernelized, still correct.
+    "function fact(n) { return n <= 1 ? 1 : n * fact(n - 1); } console.log(fact(6));",
+    // Comparator called through .call / .apply (generic entry paths).
+    "const f = (a, b) => a - b; console.log(f.call(null, 5, 2), f.apply(null, [5, 2]));",
+    // `new` on a kernel-carrying function takes [[Construct]] (an object!).
+    "function f(a, b) { return a - b; } const o = new f(1, 2); console.log(typeof o, f(1, 2));",
+    // Default parameter: supplied-numbers kernelize; the default fires only
+    // via the guard-declined generic call.
+    "const f = (a, b = 10) => a - b; console.log(f(3, 1), f(3));",
+    // Strict-mode body (different `this` prologue shape).
+    "'use strict'; function f(a, b) { return a * b; } console.log(f(6, 7));",
+    // Boolean ARGUMENT declines (guard is Number-only) — generic coercion.
+    "const f = (a, b) => a - b; console.log(f(true, 1), f(5, false));",
 ];
 
 #[test]
@@ -336,6 +382,55 @@ fn v4_loops_get_kernels() {
         kernels_in("const N = 100; function f() { let s = 0; for (let i = 0; i < N; i++) { s += i; } return s; } f();") >= 1,
         "upvalue-bound loop must kernelize"
     );
+}
+
+/// Tiny pure-scalar functions get a FUNCTION kernel (frameless call path) —
+/// and frame-dependent bodies never do (pins fn-kernel eligibility).
+#[test]
+fn tiny_functions_get_fn_kernels() {
+    fn fn_kernels(p: &FuncProto) -> usize {
+        let mut n = usize::from(p.fn_kernel.is_some());
+        for c in &p.consts {
+            if let Const::Func(f) = c {
+                n += fn_kernels(f);
+            }
+        }
+        n
+    }
+    for src in [
+        "const f = (a, b) => a - b;",
+        "const f = (a, b) => a < b ? -1 : a > b ? 1 : 0;",
+        "const f = x => x % 2 === 0;",
+        "const f = x => Math.abs(x) + Math.max(x, 0);",
+        "const k = 2; const f = x => x * k;",
+        "function f(a, b) { const d = a - b; return d; }",
+        "const f = x => x > 0 && x < 10;",
+    ] {
+        let proto = compile_script(src).expect("compiles");
+        assert!(
+            fn_kernels(&proto) >= 1,
+            "expected a function kernel in {src:?}"
+        );
+    }
+    for src in [
+        // `arguments` needs a real frame.
+        "function f() { return arguments.length; }",
+        // Property access needs a frame to bail into.
+        "const f = (a) => a.length;",
+        // Calls (incl. recursion) are off the allowlist.
+        "function f(a, b) { return f(a) - b; }",
+        // Allocation is off the allowlist.
+        "const f = (a) => [a];",
+        // Falling off the end returns `undefined` — not a scalar `Return`.
+        "const f = (a) => { a - 1; };",
+    ] {
+        let proto = compile_script(src).expect("compiles");
+        assert_eq!(
+            fn_kernels(&proto),
+            0,
+            "expected NO function kernel in {src:?}"
+        );
+    }
 }
 
 /// Math-using loops actually kernelize (pins v3 eligibility).
@@ -482,23 +577,28 @@ fn kernel_fuzz_differential() {
 /// budget must observe the SAME counts as the generic path.
 #[test]
 fn op_budget_identical_with_kernels() {
-    let src = "let s = 0; for (let i = 0; i < 100; i++) { s += i; }";
-    // Find the exact op count via a generous budget on a kernel-on engine.
-    let mut probe = Engine::new();
-    probe.vm.op_budget = Some(1_000_000);
-    probe.eval(src).expect("runs");
-    let used = 1_000_000 - probe.vm.op_budget.unwrap();
+    for src in [
+        "let s = 0; for (let i = 0; i < 100; i++) { s += i; }",
+        // Call-heavy: function kernels must also be disabled under a budget.
+        "const f = (a, b) => a - b; let s = 0; for (let i = 0; i < 40; i++) { s += f(i, 2 * i); }",
+    ] {
+        // Find the exact op count via a generous budget on a kernel-on engine.
+        let mut probe = Engine::new();
+        probe.vm.op_budget = Some(1_000_000);
+        probe.eval(src).expect("runs");
+        let used = 1_000_000 - probe.vm.op_budget.unwrap();
 
-    // Exhaustion one op short must throw on BOTH compilations.
-    for kernels in [true, false] {
-        let proto = Rc::new(compile_script_kernels(src, kernels).expect("compiles"));
-        let mut engine = Engine::new();
-        engine.vm.op_budget = Some(used - 1);
-        let func = engine.vm.make_closure(proto, Vec::new());
-        let res = engine.vm.call(Value::Object(func), Value::Undefined, &[]);
-        assert!(
-            res.is_err(),
-            "budget exhaustion must throw (kernels={kernels})"
-        );
+        // Exhaustion one op short must throw on BOTH compilations.
+        for kernels in [true, false] {
+            let proto = Rc::new(compile_script_kernels(src, kernels).expect("compiles"));
+            let mut engine = Engine::new();
+            engine.vm.op_budget = Some(used - 1);
+            let func = engine.vm.make_closure(proto, Vec::new());
+            let res = engine.vm.call(Value::Object(func), Value::Undefined, &[]);
+            assert!(
+                res.is_err(),
+                "budget exhaustion must throw (kernels={kernels})"
+            );
+        }
     }
 }

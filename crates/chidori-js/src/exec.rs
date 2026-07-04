@@ -226,6 +226,15 @@ impl Vm {
             self.recycle_value_vec(args);
             return r;
         }
+        // Function kernel (kernel.rs): a tiny pure-scalar body executes
+        // FRAMELESS when the entry guard passes. Only plain sync functions
+        // ever carry one, so this can't intercept async/generator callees.
+        if bf.proto.fn_kernel.is_some() {
+            if let Some(r) = self.run_fn_kernel(&bf, &args) {
+                self.recycle_value_vec(args);
+                return r;
+            }
+        }
         let uses_arguments = bf.proto.uses_arguments;
         let mut frame = self.make_frame_owned(bf, this, args, new_target);
         // `func_obj` has exactly one consumer — the `arguments` object's
@@ -275,6 +284,19 @@ impl Vm {
         if self.call_depth > self.max_call_depth {
             self.call_depth -= 1;
             return Err(self.throw_range("Maximum call stack size exceeded"));
+        }
+        // Function kernel: run frameless straight off the caller's operand
+        // stack (the arguments sit at `at..`), then pop the ceremony.
+        if bf.proto.fn_kernel.is_some() {
+            if let Some(r) = self.run_fn_kernel(&bf, &caller.stack[at..]) {
+                caller.stack.truncate(at);
+                if has_this {
+                    caller.stack.pop();
+                }
+                caller.stack.pop(); // the function value
+                self.call_depth -= 1;
+                return r;
+            }
         }
         let mut callee = self.take_frame();
         callee.args.extend(caller.stack.drain(at..));
@@ -368,6 +390,8 @@ impl Vm {
                 crate::bytecode::KSlot::Upvalue(u) => {
                     matches!(*frame.func.upvalues[*u as usize].borrow(), Value::Number(_))
                 }
+                // Function-kernel-only slot; loop translation never maps one.
+                crate::bytecode::KSlot::Arg(_) => false,
             };
             if !ok {
                 return self.step(frame, &k.fallback);
@@ -404,6 +428,7 @@ impl Vm {
                 crate::bytecode::KSlot::Upvalue(u) => {
                     frame.func.upvalues[*u as usize].borrow().clone()
                 }
+                crate::bytecode::KSlot::Arg(_) => unreachable!("declined by the guard"),
             };
             if let Value::Number(n) = v {
                 regs[r] = n;
@@ -625,6 +650,8 @@ impl Vm {
                     }
                 }
                 KOp::Exit { resume_ip, shape } => break (resume_ip, shape),
+                // Function-kernel-only op; loop translation never emits it.
+                KOp::Ret { .. } => unreachable!("Ret in a loop kernel"),
             }
             pc += 1;
         };
@@ -664,6 +691,169 @@ impl Vm {
         objs.clear();
         self.kernel_objs = objs;
         Ok(Ctl::Jump(resume_ip as usize))
+    }
+
+    /// Execute a FUNCTION kernel (`FuncProto::fn_kernel`): the entire call
+    /// runs in unboxed registers with no frame at all. `None` = the entry
+    /// guard declined (an op budget installed — per-op counts are observable;
+    /// a trace sink active — it must see an enter/exit per call; a consumed
+    /// argument or captured upvalue not a `Number`; a monkeypatched `Math`) —
+    /// the caller proceeds down the ordinary frame path. `Some` is the call's
+    /// exact result, bit-identical to the generic path by the loop-kernel
+    /// argument (shared numeric cores, an op set closed over numbers, typed
+    /// returns). Callers have already applied the depth guard, so the
+    /// max-call-depth RangeError fires identically on both paths.
+    fn run_fn_kernel(
+        &mut self,
+        bf: &BytecodeFunction,
+        args: &[Value],
+    ) -> Option<Result<Value, Value>> {
+        let k = bf.proto.fn_kernel.as_ref()?;
+        if self.op_budget.is_some() || self.trace_sink.is_some() {
+            return None;
+        }
+        let mut regs = std::mem::take(&mut self.kernel_regs);
+        regs.clear();
+        regs.resize(k.n_regs as usize, 0.0);
+        for (r, slot) in k.locals.iter().enumerate() {
+            match slot {
+                crate::bytecode::KSlot::Arg(a) => match args.get(*a as usize) {
+                    Some(Value::Number(n)) => regs[r] = *n,
+                    _ => {
+                        self.kernel_regs = regs;
+                        return None;
+                    }
+                },
+                // Internal locals are pure register scratch: translation
+                // proved a store dominates every read, so no frame slot is
+                // needed (and none exists).
+                crate::bytecode::KSlot::Local(_) => {}
+                crate::bytecode::KSlot::Upvalue(u) => match &*bf.upvalues[*u as usize].borrow() {
+                    Value::Number(n) => regs[r] = *n,
+                    _ => {
+                        self.kernel_regs = regs;
+                        return None;
+                    }
+                },
+            }
+        }
+        if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
+            self.kernel_regs = regs;
+            return None;
+        }
+        let interrupt = self.interrupt.clone();
+        let mut poll: u32 = 0;
+        let code = &k.code;
+        let mut pc = 0usize;
+        let ret = loop {
+            // Back-edges poll the cooperative interrupt flag, as in
+            // `run_kernel_op`; registers are pure scratch, nothing to write
+            // back on the unwind.
+            macro_rules! branch {
+                ($t:expr) => {{
+                    let t = $t as usize;
+                    if t <= pc {
+                        poll = poll.wrapping_add(1);
+                        if poll & 0xFF == 0 {
+                            if let Some(flag) = &interrupt {
+                                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                    self.kernel_regs = regs;
+                                    self.op_budget = Some(0);
+                                    return Some(Err(self.throw_range("execution interrupted")));
+                                }
+                            }
+                        }
+                    }
+                    pc = t;
+                    continue;
+                }};
+            }
+            match code[pc] {
+                KOp::Mov { dst, src } => regs[dst as usize] = regs[src as usize],
+                KOp::Const { dst, k } => regs[dst as usize] = k,
+                KOp::Add { dst, a, b } => regs[dst as usize] = regs[a as usize] + regs[b as usize],
+                KOp::AddK { dst, a, k } => regs[dst as usize] = regs[a as usize] + k,
+                KOp::Arith { kind, dst, a, b } => {
+                    regs[dst as usize] = number_arith_raw(regs[a as usize], regs[b as usize], kind)
+                }
+                KOp::ArithK { kind, dst, a, k } => {
+                    regs[dst as usize] = number_arith_raw(regs[a as usize], k, kind)
+                }
+                KOp::Neg { dst, src } => regs[dst as usize] = -regs[src as usize],
+                KOp::BitNot { dst, src } => {
+                    regs[dst as usize] = !crate::vm::to_int32(regs[src as usize]) as f64
+                }
+                KOp::Br { target } => branch!(target),
+                KOp::BrCmp {
+                    cmp,
+                    a,
+                    b,
+                    if_true,
+                    target,
+                } => {
+                    if knum_cmp(cmp, regs[a as usize], regs[b as usize]) == if_true {
+                        branch!(target)
+                    }
+                }
+                KOp::BrCmpK {
+                    cmp,
+                    a,
+                    k,
+                    if_true,
+                    target,
+                } => {
+                    if knum_cmp(cmp, regs[a as usize], k) == if_true {
+                        branch!(target)
+                    }
+                }
+                KOp::BrFalsy { src, target } => {
+                    if !knum_truthy(regs[src as usize]) {
+                        branch!(target)
+                    }
+                }
+                KOp::BrTruthy { src, target } => {
+                    if knum_truthy(regs[src as usize]) {
+                        branch!(target)
+                    }
+                }
+                KOp::CmpSet { cmp, dst, a, b } => {
+                    regs[dst as usize] = if knum_cmp(cmp, regs[a as usize], regs[b as usize]) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                KOp::BoolNot { dst, src } => {
+                    regs[dst as usize] = if knum_truthy(regs[src as usize]) {
+                        0.0
+                    } else {
+                        1.0
+                    }
+                }
+                KOp::Math1 { kind, dst, src } => {
+                    regs[dst as usize] = kmath1(kind, regs[src as usize])
+                }
+                KOp::Math2 { kind, dst, a, b } => {
+                    regs[dst as usize] = kmath2(kind, regs[a as usize], regs[b as usize])
+                }
+                KOp::Ret { src, boolean } => {
+                    break if boolean {
+                        Value::Bool(regs[src as usize] != 0.0)
+                    } else {
+                        Value::Number(regs[src as usize])
+                    }
+                }
+                // A frameless kernel has no bytecode frame to bail into;
+                // fn-mode translation rejects anything needing one.
+                KOp::LoadElem { .. }
+                | KOp::StoreElem { .. }
+                | KOp::LoadLen { .. }
+                | KOp::Exit { .. } => unreachable!("bail op in a function kernel"),
+            }
+            pc += 1;
+        };
+        self.kernel_regs = regs;
+        Some(Ok(ret))
     }
 
     fn describe(&self, v: &Value) -> String {
@@ -753,6 +943,12 @@ impl Vm {
         }
         if kind.is_generator() {
             return self.make_generator(func_obj, bf, this, args, new_target);
+        }
+        // Function kernel: frameless fast path (see `call_bytecode_vec`).
+        if bf.proto.fn_kernel.is_some() {
+            if let Some(r) = self.run_fn_kernel(&bf, args) {
+                return r;
+            }
         }
         let uses_arguments = bf.proto.uses_arguments;
         let mut frame = self.make_frame(bf, this, args, new_target);

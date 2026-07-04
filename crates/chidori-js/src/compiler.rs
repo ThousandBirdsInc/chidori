@@ -1789,10 +1789,24 @@ impl Compiler {
         } else {
             (code, Vec::new())
         };
+        // Function kernels (kernel.rs): a tiny pure-scalar body — a sort
+        // comparator, a map/filter/reduce callback — additionally compiles to
+        // a register program the call paths execute FRAMELESS when its entry
+        // guard passes. Plain sync functions only; `arguments` (and every
+        // construct off the allowlist, `this` included) needs a real frame.
+        let fn_kernel = if self.kernelize
+            && matches!(fc.kind, FuncKind::Normal | FuncKind::Arrow)
+            && !fc.uses_arguments
+        {
+            crate::kernel::kernelize_function(&code, &fc.consts, &kernels)
+        } else {
+            None
+        };
         FuncProto {
             eval_scopes: fc.eval_scopes.clone(),
             name: fc.name,
             kernels,
+            fn_kernel,
             ic: code
                 .iter()
                 .map(|_| crate::bytecode::IcEntry {
