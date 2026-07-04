@@ -1,0 +1,10 @@
+# Repo dev tooling, managed by mise (https://mise.jdx.dev).
+#
+# Provides the git-hook runner (hk) and its config language (pkl) so the
+# formatting hook in hk.pkl works. The Rust toolchain itself comes from
+# rust-toolchain.toml (rustup), not mise.
+#
+# After cloning:  mise install && hk install
+[tools]
+hk = "1"
+pkl = "0.31"

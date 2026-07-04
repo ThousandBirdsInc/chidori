@@ -1,0 +1,40 @@
+// hk (https://hk.jdx.dev) — git hooks for this repo, run via `mise`.
+//
+// One hook today: `cargo fmt`. It mirrors the CI "Rust workspace → Check
+// formatting" gate (`cargo fmt --check`), but as a pre-commit hook it *fixes*
+// formatting before the commit lands, so that gate never fails on a push.
+//
+// Setup (one time, per clone):
+//   mise install          # gets hk + pkl (see mise.toml)
+//   hk install            # writes the git hooks (or `hk install --global` once)
+//
+// Manual use:
+//   hk fix                # format everything now
+//   hk check              # verify formatting without editing (what CI does)
+amends "package://github.com/jdx/hk/releases/download/v1.49.0/hk@1.49.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v1.49.0/hk@1.49.0#/Builtins.pkl"
+
+local linters = new Mapping<String, Step> {
+    // Rust formatter. `check` runs `cargo fmt --check`; `fix` runs `cargo fmt`.
+    // Only runs when *.rs files are involved. Add `Builtins.cargo_clippy` here
+    // later if we want lint enforcement too.
+    ["cargo-fmt"] = Builtins.cargo_fmt
+}
+
+hooks {
+    // On commit: auto-format staged Rust, stashing anything unstaged first.
+    ["pre-commit"] {
+        fix = true
+        stash = "git"
+        steps = linters
+    }
+    // `hk fix`: format the whole tree on demand.
+    ["fix"] {
+        fix = true
+        steps = linters
+    }
+    // `hk check` / CI parity: verify formatting without modifying files.
+    ["check"] {
+        steps = linters
+    }
+}
