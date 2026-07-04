@@ -57,7 +57,7 @@
 //! corpus + fuzz (`tests/kernels.rs`) runs every supported construct with
 //! kernels on and off and asserts byte-identical behavior.
 
-use crate::bytecode::{CmpOp, Const, KMath, KOp, KShapeSlot, Kernel, Op};
+use crate::bytecode::{CmpOp, Const, KMath, KOp, KShapeSlot, KSlot, Kernel, Op};
 use crate::exec::ArithKind;
 
 /// Bounds keeping `u16` fields comfortable and per-kernel work finite. Loops
@@ -69,6 +69,10 @@ const MAX_KOPS: usize = 2048;
 /// unused — uniform numbering keeps shuffles and merges trivial); `SCRATCH0`
 /// is the shuffle scratch. A final remap compacts the register file.
 const STACK_BASE: u16 = 64;
+/// Provisional register space for BOOLEAN-typed locals (numeric locals are
+/// `0..BOOL_BASE`, boolean locals `BOOL_BASE..STACK_BASE`); compacted by the
+/// final remap to sit right after the numeric locals.
+const BOOL_BASE: u16 = 32;
 const SCRATCH0: u16 = 252;
 
 /// Find every eligible loop in `code` and install kernels for them. Returns
@@ -118,16 +122,43 @@ pub fn kernelize(mut code: Vec<Op>, consts: &[Const]) -> (Vec<Op>, Vec<Kernel>) 
         if jumps_into_interior {
             continue;
         }
-        // Phase 1 discovers which locals are used as array BASES (`a[i]`);
-        // phase 2 re-translates with those locals as object slots. Both
-        // phases reject identically on anything off the allowlist.
-        let oslots = match translate(&code[start..=end], start as u32, consts, &kernels, &[]) {
-            Some((_, discovered)) => discovered,
-            None => continue,
-        };
-        if let Some((mut k, _)) =
-            translate(&code[start..=end], start as u32, consts, &kernels, &oslots)
-        {
+        // Iterate translation to a FIXPOINT over the discovered local types:
+        // array bases (`a` in `a[i]`) become object slots, and locals that
+        // receive boolean stores become Bool-typed registers. Each run feeds
+        // its discoveries into the next; a stable run whose translation
+        // succeeded installs the kernel. (Discovery is monotone over a
+        // bounded set, so the cap is belt-and-braces.)
+        let mut oslots: Vec<u32> = Vec::new();
+        let mut bools: Vec<u32> = Vec::new();
+        let mut installed: Option<Kernel> = None;
+        for _ in 0..6 {
+            let (k, d_obj, d_bool) = translate(
+                &code[start..=end],
+                start as u32,
+                consts,
+                &kernels,
+                &oslots,
+                &bools,
+            );
+            let mut grew = false;
+            for o in d_obj {
+                if !oslots.contains(&o) {
+                    oslots.push(o);
+                    grew = true;
+                }
+            }
+            for b in d_bool {
+                if !bools.contains(&b) {
+                    bools.push(b);
+                    grew = true;
+                }
+            }
+            if !grew {
+                installed = k;
+                break;
+            }
+        }
+        if let Some(mut k) = installed {
             k.fallback = Box::new(code[start].clone());
             code[start] = Op::LoopKernel(kernels.len() as u32);
             kernels.push(k);
@@ -179,6 +210,13 @@ enum VE {
     Num,
     /// An array base: object slot index.
     Obj(u16),
+    /// A value statically known BOOLEAN, in the entry's position register as
+    /// exactly 0.0/1.0. Coercing consumers (arithmetic, branches, Math args)
+    /// read the register raw — identical to ToNumber/ToBoolean on a boolean —
+    /// but exits materialize `Value::Bool`, array indices/elements refuse it
+    /// (`a[true]` is the property "true"!), and strict equality against a
+    /// statically-Number operand folds to a constant.
+    Bool,
     /// The canonical `Math` object, from `LoadGlobal("Math")` — speculative:
     /// the entry guard verifies the global binding still IS the canonical
     /// object (a data property, not shadowed/replaced/accessor'd) before the
@@ -203,6 +241,8 @@ struct Xlate<'a> {
     inner: &'a [Kernel],
     /// Locals designated as array bases (phase 2) — empty in phase 1.
     oslot_locals: &'a [u32],
+    /// Locals statically typed BOOLEAN (fixpoint-discovered from stores).
+    bool_locals: &'a [u32],
     kops: Vec<KOp>,
     /// kernel pc for each region-relative ip (`u16::MAX` = not emitted).
     kpc: Vec<u16>,
@@ -210,10 +250,15 @@ struct Xlate<'a> {
     shape_at: Vec<Option<Vec<VE>>>,
     /// in-region branch targets (any op branching to that ip).
     is_target: Vec<bool>,
-    /// numeric locals: (frame-local index, register), registers dense from 0.
-    local_reg: Vec<(u32, u16)>,
+    /// numeric slots (locals and read-only upvalues): (source, register),
+    /// registers dense from 0.
+    local_reg: Vec<(KSlot, u16)>,
+    /// boolean locals: (frame-local index, register from BOOL_BASE).
+    bool_reg: Vec<(u32, u16)>,
     /// phase 1: locals observed as array bases (with clean origins).
     discovered: Vec<u32>,
+    /// locals observed receiving BOOLEAN stores (fixpoint feedback).
+    discovered_bools: Vec<u32>,
     /// phase 1 origin tracking: (local, version) of a pushed LoadLocal.
     origins: Vec<Option<(u32, u32)>>,
     versions: std::collections::HashMap<u32, u32>,
@@ -231,15 +276,17 @@ struct Xlate<'a> {
 }
 
 /// Attempt to translate a region. Returns the kernel (fallback is a
-/// placeholder) and the discovered array-base locals, or `None` — the loop
-/// stays generic — on ANY construct outside the allowlist.
+/// placeholder; `None` on ANY construct outside the allowlist) plus whatever
+/// array-base and boolean-local discoveries were made up to the point of
+/// success or failure — the caller iterates those to a fixpoint.
 fn translate(
     region: &[Op],
     base_ip: u32,
     consts: &[Const],
     inner: &[Kernel],
     oslot_locals: &[u32],
-) -> Option<(Kernel, Vec<u32>)> {
+    bool_locals: &[u32],
+) -> (Option<Kernel>, Vec<u32>, Vec<u32>) {
     let mut is_target = vec![false; region.len()];
     for op in region {
         for t in op_targets(op) {
@@ -256,12 +303,15 @@ fn translate(
         consts,
         inner,
         oslot_locals,
+        bool_locals,
         kops: Vec::new(),
         kpc: vec![u16::MAX; region.len()],
         shape_at: vec![None; region.len()],
         is_target,
         local_reg: Vec::new(),
+        bool_reg: Vec::new(),
         discovered: Vec::new(),
+        discovered_bools: Vec::new(),
         origins: Vec::new(),
         versions: std::collections::HashMap::new(),
         vstack: Vec::new(),
@@ -272,6 +322,15 @@ fn translate(
         max_stack: 0,
     };
     x.shape_at[0] = Some(Vec::new());
+    let kernel = translate_inner(&mut x);
+    let d_obj = std::mem::take(&mut x.discovered);
+    let d_bool = std::mem::take(&mut x.discovered_bools);
+    (kernel, d_obj, d_bool)
+}
+
+fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
+    let region = x.region;
+    let base_ip = x.base_ip;
 
     let mut reachable = true;
     // The index is load-bearing (kpc/shape_at bookkeeping keyed by ip).
@@ -371,16 +430,20 @@ fn translate(
         return None;
     }
 
-    // Compact the register file: numeric locals stay 0..n, provisional stack
-    // position regs move to n.., scratch to the top.
+    // Compact the register file: numeric locals stay 0..n, boolean locals
+    // follow at n.., provisional stack position regs after those, scratch at
+    // the top.
     let n_locals = u16::try_from(x.local_reg.len()).ok()?;
+    let n_bools = u16::try_from(x.bool_reg.len()).ok()?;
     let remap = |r: u16| -> u16 {
-        if r < STACK_BASE {
+        if r < BOOL_BASE {
             r
+        } else if r < STACK_BASE {
+            n_locals + (r - BOOL_BASE)
         } else if r == SCRATCH0 {
-            n_locals + x.max_stack
+            n_locals + n_bools + x.max_stack
         } else {
-            n_locals + (r - STACK_BASE)
+            n_locals + n_bools + (r - STACK_BASE)
         }
     };
     for kop in &mut x.kops {
@@ -405,6 +468,15 @@ fn translate(
             }
             KOp::BrCmpK { a, .. } => *a = remap(*a),
             KOp::BrFalsy { src, .. } | KOp::BrTruthy { src, .. } => *src = remap(*src),
+            KOp::CmpSet { dst, a, b, .. } => {
+                *dst = remap(*dst);
+                *a = remap(*a);
+                *b = remap(*b);
+            }
+            KOp::BoolNot { dst, src } => {
+                *dst = remap(*dst);
+                *src = remap(*src);
+            }
             KOp::LoadElem { dst, idx, .. } => {
                 *dst = remap(*dst);
                 *idx = remap(*idx);
@@ -433,6 +505,7 @@ fn translate(
                 .enumerate()
                 .map(|(p, e)| match e {
                     VE::Num => KShapeSlot::Num(remap(STACK_BASE + p as u16)),
+                    VE::Bool => KShapeSlot::Bool(remap(STACK_BASE + p as u16)),
                     VE::Obj(o) => KShapeSlot::Obj(*o),
                     VE::MathObj => KShapeSlot::MathObj,
                     VE::MathFn(k) => KShapeSlot::MathFn(*k),
@@ -442,22 +515,40 @@ fn translate(
         })
         .collect();
 
-    let mut locals: Vec<u32> = vec![0; n_locals as usize];
-    for &(l, r) in &x.local_reg {
-        locals[r as usize] = l;
+    let mut locals: Vec<KSlot> = vec![KSlot::Local(0); n_locals as usize];
+    for &(sl, r) in &x.local_reg {
+        locals[r as usize] = sl;
     }
-    Some((
-        Kernel {
-            code: x.kops.into_boxed_slice(),
-            locals: locals.into_boxed_slice(),
-            oslots: x.oslot_locals.to_vec().into_boxed_slice(),
-            shapes: shapes.into_boxed_slice(),
-            math_used: x.math_used.into_boxed_slice(),
-            n_regs: n_locals + x.max_stack + 1,
-            fallback: Box::new(Op::Nop), // caller stores the real header op
-        },
-        x.discovered,
-    ))
+    let mut bool_locals: Vec<u32> = vec![0; n_bools as usize];
+    for &(l, r) in &x.bool_reg {
+        bool_locals[(r - BOOL_BASE) as usize] = l;
+    }
+    Some(Kernel {
+        code: std::mem::take(&mut x.kops).into_boxed_slice(),
+        locals: locals.into_boxed_slice(),
+        bool_locals: bool_locals.into_boxed_slice(),
+        oslots: x.oslot_locals.to_vec().into_boxed_slice(),
+        shapes: shapes.into_boxed_slice(),
+        math_used: std::mem::take(&mut x.math_used).into_boxed_slice(),
+        n_regs: n_locals + n_bools + x.max_stack + 1,
+        fallback: Box::new(Op::Nop), // caller stores the real header op
+    })
+}
+
+/// Statically-decidable comparison outcome: strict (in)equality between a
+/// boolean-typed and a number-typed operand is `false`/`true` regardless of
+/// values (the generic `strict_equals` checks the type tag first). All other
+/// combinations are dynamic — raw register comparison matches the generic
+/// numeric coercions exactly.
+fn static_cmp(cmp: CmpOp, a_bool: bool, b_bool: bool) -> Option<bool> {
+    if a_bool == b_bool {
+        return None;
+    }
+    match cmp {
+        CmpOp::StrictEq => Some(false),
+        CmpOp::StrictNe => Some(true),
+        _ => None,
+    }
 }
 
 fn patch(kops: &mut [KOp], kidx: usize, pc: u16) {
@@ -475,22 +566,85 @@ fn patch(kops: &mut [KOp], kidx: usize, pc: u16) {
 }
 
 impl Xlate<'_> {
-    /// Register mirroring numeric `frame.locals[l]`. An array-base local can
-    /// never be a numeric local (that would need it to hold a Number and an
-    /// object at once — some iteration would bail every time; reject).
+    /// Register mirroring numeric `frame.locals[l]`. A local can have exactly
+    /// ONE static type: an array base, a boolean, or a number — mixed use
+    /// rejects the region (some iteration would bail every time anyway).
     fn lreg(&mut self, l: u32) -> Option<u16> {
-        if self.oslot_locals.contains(&l) {
+        if self.oslot_locals.contains(&l)
+            || self.bool_locals.contains(&l)
+            || self.bool_reg.iter().any(|&(ll, _)| ll == l)
+        {
             return None;
         }
-        if let Some(&(_, r)) = self.local_reg.iter().find(|(ll, _)| *ll == l) {
+        let slot = KSlot::Local(l);
+        if let Some(&(_, r)) = self.local_reg.iter().find(|(sl, _)| *sl == slot) {
             return Some(r);
         }
         let r = u16::try_from(self.local_reg.len()).ok()?;
+        if r >= BOOL_BASE {
+            return None;
+        }
+        self.local_reg.push((slot, r));
+        Some(r)
+    }
+
+    /// Register snapshotting captured upvalue cell `u` (read-only: nothing
+    /// can write the cell during a kernel — regions contain no calls — and
+    /// in-region upvalue writes are not on the allowlist).
+    fn uvreg(&mut self, u: u32) -> Option<u16> {
+        let slot = KSlot::Upvalue(u);
+        if let Some(&(_, r)) = self.local_reg.iter().find(|(sl, _)| *sl == slot) {
+            return Some(r);
+        }
+        let r = u16::try_from(self.local_reg.len()).ok()?;
+        if r >= BOOL_BASE {
+            return None;
+        }
+        self.local_reg.push((slot, r));
+        Some(r)
+    }
+
+    /// Register mirroring BOOLEAN-typed `frame.locals[l]` (holds 0.0/1.0; the
+    /// guard requires `Value::Bool`, write-back restores it). Records the
+    /// local for the caller's fixpoint when it is not yet in this run's set.
+    fn blreg(&mut self, l: u32) -> Option<u16> {
+        // Record the discovery FIRST: "this local receives boolean stores" is
+        // true even when this run cannot use it yet (e.g. an earlier load in
+        // this run already typed it numeric — the next fixpoint run reloads
+        // it as a boolean).
+        if !self.bool_locals.contains(&l) && !self.discovered_bools.contains(&l) {
+            self.discovered_bools.push(l);
+        }
+        if self.oslot_locals.contains(&l)
+            || self.local_reg.iter().any(|&(sl, _)| sl == KSlot::Local(l))
+        {
+            return None;
+        }
+        if let Some(&(_, r)) = self.bool_reg.iter().find(|(ll, _)| *ll == l) {
+            return Some(r);
+        }
+        let r = BOOL_BASE + u16::try_from(self.bool_reg.len()).ok()?;
         if r >= STACK_BASE {
             return None;
         }
-        self.local_reg.push((l, r));
+        self.bool_reg.push((l, r));
         Some(r)
+    }
+
+    /// Read-only scalar register for local `l` — numeric or boolean space
+    /// (coercing consumers treat a boolean's 0.0/1.0 exactly as ToNumber
+    /// would). Never valid for array bases.
+    fn scalar_lreg(&mut self, l: u32) -> Option<u16> {
+        if self.bool_locals.contains(&l) {
+            self.blreg(l)
+        } else {
+            self.lreg(l)
+        }
+    }
+
+    /// Whether local `l` is boolean-typed IN THIS RUN.
+    fn is_bool_local(&self, l: u32) -> bool {
+        self.bool_locals.contains(&l)
     }
 
     /// Provisional register owned by virtual-stack position `p`.
@@ -502,9 +656,21 @@ impl Xlate<'_> {
         Some(r as u16)
     }
 
-    /// Register of the CURRENT top-of-stack numeric entry `depth_from_top`
-    /// below the top (0 = top).
+    /// Register of the entry `depth_from_top` below the top (0 = top) when it
+    /// is a SCALAR (number or statically-typed boolean — coercing consumers
+    /// read the raw 0.0/1.0). `None` for objects/Math/undefined.
     fn top_reg(&self, depth_from_top: usize) -> Option<u16> {
+        let p = self.vstack.len().checked_sub(1 + depth_from_top)?;
+        match self.vstack[p] {
+            VE::Num | VE::Bool => self.preg(p),
+            _ => None,
+        }
+    }
+
+    /// As [`Xlate::top_reg`], but NUMBER-only — array indices and stored
+    /// elements must refuse booleans (`a[true]` is the property "true", and
+    /// a stored element must not change type).
+    fn top_num_reg(&self, depth_from_top: usize) -> Option<u16> {
         let p = self.vstack.len().checked_sub(1 + depth_from_top)?;
         match self.vstack[p] {
             VE::Num => self.preg(p),
@@ -512,11 +678,23 @@ impl Xlate<'_> {
         }
     }
 
-    fn num_const(&self, idx: u32) -> Option<f64> {
-        match self.consts.get(idx as usize)? {
-            Const::Number(n) => Some(*n),
+    /// Static type of the scalar entry `depth_from_top` below the top:
+    /// `Some(true)` boolean, `Some(false)` number, `None` non-scalar.
+    fn top_is_bool(&self, depth_from_top: usize) -> Option<bool> {
+        let p = self.vstack.len().checked_sub(1 + depth_from_top)?;
+        match self.vstack[p] {
+            VE::Bool => Some(true),
+            VE::Num => Some(false),
             _ => None,
         }
+    }
+
+    /// Push a Bool entry, returning its register.
+    fn push_bool(&mut self) -> Option<u16> {
+        let r = self.preg(self.vstack.len())?;
+        self.vstack.push(VE::Bool);
+        self.origins.push(None);
+        Some(r)
     }
 
     /// Push a Num entry, returning its register.
@@ -532,11 +710,27 @@ impl Xlate<'_> {
         self.vstack.pop()
     }
 
-    /// Pop, requiring a Num entry; returns its (position) register.
-    fn pop_num(&mut self) -> Option<u16> {
+    /// Pop, requiring a SCALAR entry (number/boolean); returns its register.
+    fn pop_scalar(&mut self) -> Option<u16> {
         let r = self.top_reg(0)?;
         self.pop();
         Some(r)
+    }
+
+    /// Pop, requiring a NUMBER entry; returns its register.
+    fn pop_num(&mut self) -> Option<u16> {
+        let r = self.top_num_reg(0)?;
+        self.pop();
+        Some(r)
+    }
+
+    /// A constant usable as a scalar operand: `(value, is_bool)`.
+    fn scalar_const(&self, idx: u32) -> Option<(f64, bool)> {
+        match self.consts.get(idx as usize)? {
+            Const::Number(n) => Some((*n, false)),
+            Const::Bool(b) => Some((if *b { 1.0 } else { 0.0 }, true)),
+            _ => None,
+        }
     }
 
     /// Bump a local's version (any store invalidates pushed origins).
@@ -551,7 +745,7 @@ impl Xlate<'_> {
         let p = self.vstack.len().checked_sub(1 + depth_from_top)?;
         match self.vstack[p] {
             VE::Obj(s) => Some(s),
-            VE::Undef | VE::MathObj | VE::MathFn(_) => None,
+            VE::Bool | VE::Undef | VE::MathObj | VE::MathFn(_) => None,
             VE::Num => {
                 // Phase 1 discovery only. (A local used BOTH as a base and
                 // numerically is caught in phase 2: its loads become `Obj`
@@ -633,10 +827,12 @@ impl Xlate<'_> {
     }
 
     fn bin(&mut self, kind: ArithKind) -> Option<()> {
-        let b = self.pop_num()?;
+        let b = self.pop_scalar()?;
         let a = self.top_reg(0)?;
         self.kops.push(KOp::Arith { kind, dst: a, a, b });
-        self.origins[self.vstack.len() - 1] = None;
+        let p = self.vstack.len() - 1;
+        self.vstack[p] = VE::Num; // ToNumeric(boolean) -> number
+        self.origins[p] = None;
         Some(())
     }
 
@@ -677,9 +873,13 @@ impl Xlate<'_> {
             // a Number, never Uninitialized) ----
             Op::LoadLocal(l) => {
                 if let Some(pos) = self.oslot_locals.iter().position(|&o| o == *l) {
-                    // Phase 2: this local is an array base — push the object.
+                    // This local is an array base — push the object.
                     self.vstack.push(VE::Obj(pos as u16));
                     self.origins.push(None);
+                } else if self.is_bool_local(*l) {
+                    let src = self.blreg(*l)?;
+                    let dst = self.push_bool()?;
+                    self.kops.push(K::Mov { dst, src });
                 } else {
                     let src = self.lreg(*l)?;
                     let dst = self.push_num()?;
@@ -688,26 +888,47 @@ impl Xlate<'_> {
                     *self.origins.last_mut()? = Some((*l, ver));
                 }
             }
+            // A captured (read-only in-region) numeric upvalue: snapshot.
+            Op::LoadUpvalue(u) => {
+                let src = self.uvreg(*u)?;
+                let dst = self.push_num()?;
+                self.kops.push(K::Mov { dst, src });
+            }
+
             // The checked store's TDZ test reads the CURRENT slot value; the
             // guard proves it is a Number, so the store is a plain move.
             Op::StoreLocal(l) | Op::StoreLocalChecked(l) => {
-                if matches!(self.vstack.last(), Some(VE::Undef)) {
-                    // Storing `undefined` to a numeric local can only be
-                    // elided if the local is provably RE-STORED before any
-                    // read, branch, or branch target — i.e. the store is dead
-                    // within this basic block (the per-iteration `let` reset
-                    // pattern). Otherwise the region is rejected.
-                    self.lreg(*l)?;
-                    if !self.dead_store_ahead(i + 1, *l) {
-                        return None;
+                match self.vstack.last() {
+                    Some(VE::Undef) => {
+                        // Storing `undefined` can only be elided if the local
+                        // is provably RE-STORED before any read, branch, or
+                        // branch target — i.e. the store is dead within this
+                        // basic block (the per-iteration `let` reset pattern).
+                        // Otherwise the region is rejected.
+                        if !self.dead_store_ahead(i + 1, *l) {
+                            return None;
+                        }
+                        self.pop()?;
+                        self.store_of(*l);
                     }
-                    self.pop()?;
-                    self.store_of(*l);
-                } else {
-                    let dst = self.lreg(*l)?;
-                    let src = self.pop_num()?;
-                    self.kops.push(K::Mov { dst, src });
-                    self.store_of(*l);
+                    Some(VE::Bool) => {
+                        // A boolean store TYPES the local (fixpoint feedback);
+                        // in the stable run the local is in the bool set and
+                        // its loads/guard/write-back use `Value::Bool`.
+                        let dst = self.blreg(*l)?;
+                        if !self.is_bool_local(*l) {
+                            return None; // rerun with the discovery applied
+                        }
+                        let src = self.pop_scalar()?;
+                        self.kops.push(K::Mov { dst, src });
+                        self.store_of(*l);
+                    }
+                    _ => {
+                        let dst = self.lreg(*l)?;
+                        let src = self.pop_num()?;
+                        self.kops.push(K::Mov { dst, src });
+                        self.store_of(*l);
+                    }
                 }
             }
             // A block-scoped declaration's TDZ marker: writes `Uninitialized`
@@ -716,33 +937,69 @@ impl Xlate<'_> {
             // it (a genuine TDZ read would need the generic path's
             // ReferenceError, so such regions stay generic).
             Op::InitLocalTdz(l) => {
-                self.lreg(*l)?;
+                // No type demand here — the local's static type comes from
+                // the actual store that must follow (numeric or boolean).
                 if !self.dead_store_ahead(i + 1, *l) {
                     return None;
                 }
                 self.store_of(*l);
             }
             Op::CopyLocal { src, dest } => {
-                let s = self.lreg(*src)?;
-                let d = self.lreg(*dest)?;
+                let (s, d) = if self.is_bool_local(*src) {
+                    let s = self.blreg(*src)?;
+                    let d = self.blreg(*dest)?;
+                    if !self.is_bool_local(*dest) {
+                        return None; // rerun with the discovery applied
+                    }
+                    (s, d)
+                } else {
+                    (self.lreg(*src)?, self.lreg(*dest)?)
+                };
                 if s != d {
                     self.kops.push(K::Mov { dst: d, src: s });
                 }
                 self.store_of(*dest);
             }
             Op::LoadConst(c) => {
-                let k = self.num_const(*c)?;
-                let dst = self.push_num()?;
+                let (k, is_bool) = self.scalar_const(*c)?;
+                let dst = if is_bool {
+                    self.push_bool()?
+                } else {
+                    self.push_num()?
+                };
                 self.kops.push(K::Const { dst, k });
             }
+            Op::LoadTrue | Op::LoadFalse => {
+                let dst = self.push_bool()?;
+                self.kops.push(K::Const {
+                    dst,
+                    k: if matches!(op, Op::LoadTrue) { 1.0 } else { 0.0 },
+                });
+            }
+            // `!x` on a scalar: ToBoolean then negate — a boolean result.
+            Op::Not => {
+                let src = self.pop_scalar()?;
+                let dst = self.push_bool()?;
+                self.kops.push(K::BoolNot { dst, src });
+            }
             Op::LoadLocalConst { local, konst } => {
-                let src = self.lreg(*local)?;
-                let k = self.num_const(*konst)?;
-                let dst0 = self.push_num()?;
-                self.kops.push(K::Mov { dst: dst0, src });
-                let ver = *self.versions.get(local).unwrap_or(&0);
-                *self.origins.last_mut()? = Some((*local, ver));
-                let dst1 = self.push_num()?;
+                let (k, k_bool) = self.scalar_const(*konst)?;
+                if self.is_bool_local(*local) {
+                    let src = self.blreg(*local)?;
+                    let dst0 = self.push_bool()?;
+                    self.kops.push(K::Mov { dst: dst0, src });
+                } else {
+                    let src = self.lreg(*local)?;
+                    let dst0 = self.push_num()?;
+                    self.kops.push(K::Mov { dst: dst0, src });
+                    let ver = *self.versions.get(local).unwrap_or(&0);
+                    *self.origins.last_mut()? = Some((*local, ver));
+                }
+                let dst1 = if k_bool {
+                    self.push_bool()?
+                } else {
+                    self.push_num()?
+                };
                 self.kops.push(K::Const { dst: dst1, k });
             }
 
@@ -754,9 +1011,13 @@ impl Xlate<'_> {
             Op::Dup => {
                 let top = *self.vstack.last()?;
                 match top {
-                    VE::Num => {
+                    VE::Num | VE::Bool => {
                         let src = self.top_reg(0)?;
-                        let dst = self.push_num()?;
+                        let dst = if top == VE::Bool {
+                            self.push_bool()?
+                        } else {
+                            self.push_num()?
+                        };
                         self.kops.push(K::Mov { dst, src });
                     }
                     VE::Obj(s) => {
@@ -777,7 +1038,8 @@ impl Xlate<'_> {
                 if ea == VE::Undef || eb == VE::Undef {
                     return None;
                 }
-                match (ea == VE::Num, eb == VE::Num) {
+                let is_reg = |e: VE| matches!(e, VE::Num | VE::Bool);
+                match (is_reg(ea), is_reg(eb)) {
                     (true, true) => {
                         let (ra, rb) = (self.preg(pa)?, self.preg(pb)?);
                         self.kops.push(K::Mov {
@@ -815,20 +1077,21 @@ impl Xlate<'_> {
                 if ea == VE::Undef || eb == VE::Undef || ec == VE::Undef {
                     return None;
                 }
+                let is_reg = |e: VE| matches!(e, VE::Num | VE::Bool);
                 // c -> position a, a -> position b, b -> position c.
-                if ec == VE::Num {
+                if is_reg(ec) {
                     self.kops.push(K::Mov {
                         dst: SCRATCH0,
                         src: rc,
                     });
                 }
-                if eb == VE::Num {
+                if is_reg(eb) {
                     self.kops.push(K::Mov { dst: rc, src: rb });
                 }
-                if ea == VE::Num {
+                if is_reg(ea) {
                     self.kops.push(K::Mov { dst: rb, src: ra });
                 }
-                if ec == VE::Num {
+                if is_reg(ec) {
                     self.kops.push(K::Mov {
                         dst: ra,
                         src: SCRATCH0,
@@ -841,10 +1104,11 @@ impl Xlate<'_> {
 
             // ---- arithmetic (numbers in, numbers out) ----
             Op::Add => {
-                let b = self.pop_num()?;
+                let b = self.pop_scalar()?;
                 let a = self.top_reg(0)?;
                 self.kops.push(K::Add { dst: a, a, b });
                 let p = self.vstack.len() - 1;
+                self.vstack[p] = VE::Num;
                 self.origins[p] = None;
             }
             Op::Sub => self.bin(ArithKind::Sub)?,
@@ -862,18 +1126,23 @@ impl Xlate<'_> {
                 let s = self.top_reg(0)?;
                 self.kops.push(K::Neg { dst: s, src: s });
                 let p = self.vstack.len() - 1;
+                self.vstack[p] = VE::Num;
                 self.origins[p] = None;
             }
             Op::BitNot => {
                 let s = self.top_reg(0)?;
                 self.kops.push(K::BitNot { dst: s, src: s });
                 let p = self.vstack.len() - 1;
+                self.vstack[p] = VE::Num;
                 self.origins[p] = None;
             }
-            // ToNumber/ToNumeric on a Number is the identity — but only on a
-            // NUMBER entry (an object would coerce: reject).
+            // ToNumber/ToNumeric on a scalar: identity on the 0/1 register,
+            // but the RESULT is a number (retype a boolean entry).
             Op::Pos | Op::ToNumeric => {
                 self.top_reg(0)?;
+                let p = self.vstack.len() - 1;
+                self.vstack[p] = VE::Num;
+                self.origins[p] = None;
             }
             Op::Inc | Op::Dec => {
                 let s = self.top_reg(0)?;
@@ -883,19 +1152,20 @@ impl Xlate<'_> {
                     k: if matches!(op, Op::Inc) { 1.0 } else { -1.0 },
                 });
                 let p = self.vstack.len() - 1;
+                self.vstack[p] = VE::Num;
                 self.origins[p] = None;
             }
 
             // ---- fused local-const forms ----
             Op::AddLocalConst { local, konst } => {
-                let a = self.lreg(*local)?;
-                let k = self.num_const(*konst)?;
+                let a = self.scalar_lreg(*local)?;
+                let (k, _) = self.scalar_const(*konst)?;
                 let dst = self.push_num()?;
                 self.kops.push(K::AddK { dst, a, k });
             }
             Op::ArithLocalConst { local, konst, kind } => {
-                let a = self.lreg(*local)?;
-                let k = self.num_const(*konst)?;
+                let a = self.scalar_lreg(*local)?;
+                let (k, _) = self.scalar_const(*konst)?;
                 let dst = self.push_num()?;
                 self.kops.push(K::ArithK {
                     kind: *kind,
@@ -921,7 +1191,7 @@ impl Xlate<'_> {
                 // expects on a bail.
                 let shape = self.vstack.clone();
                 let obj = self.base_slot(1)?;
-                let idx = self.top_reg(0)?;
+                let idx = self.top_num_reg(0)?;
                 self.pop()?; // idx
                 self.pop()?; // base
                 let dst = self.push_num()?;
@@ -938,8 +1208,8 @@ impl Xlate<'_> {
             Op::SetPropDynamic => {
                 let shape = self.vstack.clone();
                 let obj = self.base_slot(2)?;
-                let val = self.top_reg(0)?;
-                let idx = self.top_reg(1)?;
+                let val = self.top_num_reg(0)?;
+                let idx = self.top_num_reg(1)?;
                 self.pop()?; // val
                 self.pop()?; // idx
                 self.pop()?; // base
@@ -1047,9 +1317,11 @@ impl Xlate<'_> {
                 }
             }
 
-            // ---- comparisons: supported only in compare-and-branch form. A
-            // materialized boolean (stored, returned, fed to arithmetic)
-            // would put a non-number on the stack — reject the region.
+            // ---- comparisons: fused into the following conditional jump
+            // when one immediately consumes them, otherwise MATERIALIZED as a
+            // boolean register (CmpSet). Strict (in)equality between
+            // statically mixed boolean/number operands folds to a constant —
+            // the generic `strict_equals` never compares values across types.
             Op::Eq | Op::Ne | Op::StrictEq | Op::StrictNe | Op::Lt | Op::Gt | Op::Le | Op::Ge => {
                 let cmp = match op {
                     Op::Eq => CmpOp::Eq,
@@ -1062,25 +1334,53 @@ impl Xlate<'_> {
                     Op::Ge => CmpOp::Ge,
                     _ => unreachable!(),
                 };
-                // Must be immediately consumed by a conditional jump that is
-                // itself not a branch target (it is fused away entirely).
-                let (if_true, target) = match self.region.get(i + 1) {
-                    Some(Op::JumpIfFalse(t)) if !self.is_target[i + 1] => (false, *t),
-                    Some(Op::JumpIfTrue(t)) if !self.is_target[i + 1] => (true, *t),
-                    _ => return None,
+                let b_bool = self.top_is_bool(0)?;
+                let a_bool = self.top_is_bool(1)?;
+                let fixed = static_cmp(cmp, a_bool, b_bool);
+                // Fused form: immediately consumed by a conditional jump that
+                // is itself not a branch target.
+                let fuse = match self.region.get(i + 1) {
+                    Some(Op::JumpIfFalse(t)) if !self.is_target[i + 1] => Some((false, *t)),
+                    Some(Op::JumpIfTrue(t)) if !self.is_target[i + 1] => Some((true, *t)),
+                    _ => None,
                 };
-                let b = self.pop_num()?;
-                let a = self.pop_num()?;
-                let kidx = self.kops.len();
-                self.kops.push(K::BrCmp {
-                    cmp,
-                    a,
-                    b,
-                    if_true,
-                    target: u16::MAX,
-                });
-                self.branch_to(kidx, target, self.vstack.clone())?;
-                self.absorbed = Some(i + 1);
+                let b = self.pop_scalar()?;
+                let a = self.pop_scalar()?;
+                match (fuse, fixed) {
+                    (Some((if_true, target)), None) => {
+                        let kidx = self.kops.len();
+                        self.kops.push(K::BrCmp {
+                            cmp,
+                            a,
+                            b,
+                            if_true,
+                            target: u16::MAX,
+                        });
+                        self.branch_to(kidx, target, self.vstack.clone())?;
+                        self.absorbed = Some(i + 1);
+                    }
+                    (Some((if_true, target)), Some(outcome)) => {
+                        // Statically decided branch: taken -> unconditional
+                        // jump; not taken -> fall through (operands consumed).
+                        if outcome == if_true {
+                            let kidx = self.kops.len();
+                            self.kops.push(K::Br { target: u16::MAX });
+                            self.branch_to(kidx, target, self.vstack.clone())?;
+                        }
+                        self.absorbed = Some(i + 1);
+                    }
+                    (None, None) => {
+                        let dst = self.push_bool()?;
+                        self.kops.push(K::CmpSet { cmp, dst, a, b });
+                    }
+                    (None, Some(outcome)) => {
+                        let dst = self.push_bool()?;
+                        self.kops.push(K::Const {
+                            dst,
+                            k: if outcome { 1.0 } else { 0.0 },
+                        });
+                    }
+                }
             }
 
             // ---- branches ----
@@ -1090,7 +1390,7 @@ impl Xlate<'_> {
                 self.branch_to(kidx, *t, self.vstack.clone())?;
             }
             Op::JumpIfFalse(t) | Op::JumpIfTrue(t) => {
-                let src = self.pop_num()?;
+                let src = self.pop_scalar()?;
                 let kidx = self.kops.len();
                 if matches!(op, Op::JumpIfFalse(_)) {
                     self.kops.push(K::BrFalsy {
@@ -1142,17 +1442,27 @@ impl Xlate<'_> {
 
             Op::CmpBranchFalse { cmp, target } | Op::CmpBranchTrue { cmp, target } => {
                 let if_true = matches!(op, Op::CmpBranchTrue { .. });
-                let b = self.pop_num()?;
-                let a = self.pop_num()?;
-                let kidx = self.kops.len();
-                self.kops.push(K::BrCmp {
-                    cmp: *cmp,
-                    a,
-                    b,
-                    if_true,
-                    target: u16::MAX,
-                });
-                self.branch_to(kidx, *target, self.vstack.clone())?;
+                let b_bool = self.top_is_bool(0)?;
+                let a_bool = self.top_is_bool(1)?;
+                let b = self.pop_scalar()?;
+                let a = self.pop_scalar()?;
+                if let Some(outcome) = static_cmp(*cmp, a_bool, b_bool) {
+                    if outcome == if_true {
+                        let kidx = self.kops.len();
+                        self.kops.push(K::Br { target: u16::MAX });
+                        self.branch_to(kidx, *target, self.vstack.clone())?;
+                    }
+                } else {
+                    let kidx = self.kops.len();
+                    self.kops.push(K::BrCmp {
+                        cmp: *cmp,
+                        a,
+                        b,
+                        if_true,
+                        target: u16::MAX,
+                    });
+                    self.branch_to(kidx, *target, self.vstack.clone())?;
+                }
             }
             Op::CmpLocalConstBranchFalse {
                 local,
@@ -1167,17 +1477,26 @@ impl Xlate<'_> {
                 target,
             } => {
                 let if_true = matches!(op, Op::CmpLocalConstBranchTrue { .. });
-                let a = self.lreg(*local)?;
-                let k = self.num_const(*konst)?;
-                let kidx = self.kops.len();
-                self.kops.push(K::BrCmpK {
-                    cmp: *cmp,
-                    a,
-                    k,
-                    if_true,
-                    target: u16::MAX,
-                });
-                self.branch_to(kidx, *target, self.vstack.clone())?;
+                let a_bool = self.is_bool_local(*local);
+                let a = self.scalar_lreg(*local)?;
+                let (k, k_bool) = self.scalar_const(*konst)?;
+                if let Some(outcome) = static_cmp(*cmp, a_bool, k_bool) {
+                    if outcome == if_true {
+                        let kidx = self.kops.len();
+                        self.kops.push(K::Br { target: u16::MAX });
+                        self.branch_to(kidx, *target, self.vstack.clone())?;
+                    }
+                } else {
+                    let kidx = self.kops.len();
+                    self.kops.push(K::BrCmpK {
+                        cmp: *cmp,
+                        a,
+                        k,
+                        if_true,
+                        target: u16::MAX,
+                    });
+                    self.branch_to(kidx, *target, self.vstack.clone())?;
+                }
             }
 
             // Anything else — calls, other property access, cells, upvalues,

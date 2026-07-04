@@ -1000,6 +1000,17 @@ pub enum KOp {
     /// `regs[dst] = <length>` of the dense array in object slot `obj`
     /// (unshadowed only — a reified `length` marker bails).
     LoadLen { dst: u16, obj: u16, bail: u16 },
+    /// Materialize a comparison as a BOOLEAN register (`0.0`/`1.0`): the
+    /// translator types the destination as Bool, so it writes back as
+    /// `Value::Bool` and never feeds an array index.
+    CmpSet {
+        cmp: CmpOp,
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    /// `regs[dst] = ToBoolean(regs[src]) ? 0.0 : 1.0` (JS `!x` on a scalar).
+    BoolNot { dst: u16, src: u16 },
     /// `regs[dst] = Math.<kind>(regs[src])` via the builtin's own core fn.
     Math1 { kind: KMath, dst: u16, src: u16 },
     /// `regs[dst] = Math.<kind>(regs[a], regs[b])`.
@@ -1016,6 +1027,14 @@ pub enum KOp {
     Exit { resume_ip: u32, shape: u16 },
 }
 
+/// A numeric register's source: a frame local (read/write) or a captured
+/// upvalue cell (read-only snapshot).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KSlot {
+    Local(u32),
+    Upvalue(u32),
+}
+
 /// One operand-stack slot of a kernel exit shape, bottom-up: a `Number` read
 /// from a register, an object read from an object slot, or a canonical Math
 /// intrinsic (the entry guard proved the live values ARE the canonicals, so a
@@ -1023,6 +1042,9 @@ pub enum KOp {
 #[derive(Clone, Copy, Debug)]
 pub enum KShapeSlot {
     Num(u16),
+    /// A register statically typed BOOLEAN (holds exactly 0.0/1.0):
+    /// materialized as `Value::Bool` — `typeof` must not see a number.
+    Bool(u16),
     Obj(u16),
     MathObj,
     MathFn(KMath),
@@ -1114,8 +1136,17 @@ impl KMath {
 #[derive(Clone, Debug)]
 pub struct Kernel {
     pub code: Box<[KOp]>,
-    /// `frame.locals` indices mirrored into registers `0..locals.len()`.
-    pub locals: Box<[u32]>,
+    /// Numeric slots mirrored into registers `0..locals.len()`: frame locals
+    /// (read/write) and UPVALUES (read-only snapshots — no call can run
+    /// inside a kernel, so nothing can write a captured cell mid-activation;
+    /// in-region upvalue WRITES reject at translation). The guard requires
+    /// `Value::Number` in every one; only `Local` slots write back.
+    pub locals: Box<[KSlot]>,
+    /// `frame.locals` indices statically typed BOOLEAN, mirrored into the
+    /// registers right after the numeric ones (as 0.0/1.0). The guard
+    /// requires `Value::Bool`; write-back restores `Value::Bool` — a kernel
+    /// must never turn a boolean binding into a number (`typeof`).
+    pub bool_locals: Box<[u32]>,
     /// `frame.locals` indices of ARRAY BASES (`a` in `a[i]`/`a.length`):
     /// object slot `s` caches that local's `JsObject` at kernel entry. The
     /// guard requires each to hold an object; per-access checks do the rest.

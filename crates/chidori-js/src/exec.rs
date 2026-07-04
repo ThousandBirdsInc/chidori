@@ -360,8 +360,21 @@ impl Vm {
         if self.op_budget.is_some() {
             return self.step(frame, &k.fallback);
         }
-        for &l in k.locals.iter() {
-            if !matches!(frame.locals[l as usize], Value::Number(_)) {
+        for slot in k.locals.iter() {
+            let ok = match slot {
+                crate::bytecode::KSlot::Local(l) => {
+                    matches!(frame.locals[*l as usize], Value::Number(_))
+                }
+                crate::bytecode::KSlot::Upvalue(u) => {
+                    matches!(*frame.func.upvalues[*u as usize].borrow(), Value::Number(_))
+                }
+            };
+            if !ok {
+                return self.step(frame, &k.fallback);
+            }
+        }
+        for &l in k.bool_locals.iter() {
+            if !matches!(frame.locals[l as usize], Value::Bool(_)) {
                 return self.step(frame, &k.fallback);
             }
         }
@@ -385,9 +398,21 @@ impl Vm {
         let mut regs = std::mem::take(&mut self.kernel_regs);
         regs.clear();
         regs.resize(k.n_regs as usize, 0.0);
-        for (r, &l) in k.locals.iter().enumerate() {
-            if let Value::Number(n) = frame.locals[l as usize] {
+        for (r, slot) in k.locals.iter().enumerate() {
+            let v = match slot {
+                crate::bytecode::KSlot::Local(l) => frame.locals[*l as usize].clone(),
+                crate::bytecode::KSlot::Upvalue(u) => {
+                    frame.func.upvalues[*u as usize].borrow().clone()
+                }
+            };
+            if let Value::Number(n) = v {
                 regs[r] = n;
+            }
+        }
+        let bool_base = k.locals.len();
+        for (j, &l) in k.bool_locals.iter().enumerate() {
+            if let Value::Bool(b) = frame.locals[l as usize] {
+                regs[bool_base + j] = if b { 1.0 } else { 0.0 };
             }
         }
         let mut objs = std::mem::take(&mut self.kernel_objs);
@@ -415,8 +440,14 @@ impl Vm {
                                     // Same latch-and-unwind as the interpreter
                                     // loop: zero the budget so a JS catch
                                     // cannot resume execution.
-                                    for (r, &l) in k.locals.iter().enumerate() {
-                                        frame.locals[l as usize] = Value::Number(regs[r]);
+                                    for (r, slot) in k.locals.iter().enumerate() {
+                                        if let crate::bytecode::KSlot::Local(l) = slot {
+                                            frame.locals[*l as usize] = Value::Number(regs[r]);
+                                        }
+                                    }
+                                    for (j, &l) in k.bool_locals.iter().enumerate() {
+                                        frame.locals[l as usize] =
+                                            Value::Bool(regs[bool_base + j] != 0.0);
                                     }
                                     self.kernel_regs = regs;
                                     objs.clear();
@@ -504,8 +535,15 @@ impl Vm {
                         branch!(bail)
                     }
                 }
-                // Dense element in-place overwrite: exactly the
-                // `Op::SetPropDynamic` fast-path conditions, else bail.
+                // Dense element write: in-place overwrite (exactly the
+                // `Op::SetPropDynamic` fast-path conditions), an in-bounds
+                // HOLE fill, or an exact one-past-the-end APPEND. Filling and
+                // appending CREATE a property, so they additionally require
+                // the array to be extensible (a sealed/prevented receiver
+                // must reject through the generic path: silent in sloppy,
+                // TypeError in strict) and to stay under the dense-storage
+                // bound (the generic path owns that RangeError). Everything
+                // else bails.
                 KOp::StoreElem {
                     obj,
                     idx,
@@ -517,11 +555,30 @@ impl Vm {
                     if i.fract() == 0.0 && (0.0..4294967295.0).contains(&i) {
                         let mut b = objs[obj as usize].borrow_mut();
                         if b.props.is_empty() {
+                            let extensible = b.extensible;
                             if let Internal::Array(arr) = &mut b.internal {
-                                if let Some(slot) = arr.get_mut(i as usize) {
-                                    if !matches!(slot, Value::Hole) {
+                                let iu = i as usize;
+                                match arr.get_mut(iu) {
+                                    Some(slot) if !matches!(slot, Value::Hole) => {
                                         *slot = Value::Number(regs[val as usize]);
                                         ok = true;
+                                    }
+                                    Some(slot) => {
+                                        // In-bounds hole: creation.
+                                        if extensible {
+                                            *slot = Value::Number(regs[val as usize]);
+                                            ok = true;
+                                        }
+                                    }
+                                    None => {
+                                        // Exact append (no hole gap).
+                                        if extensible
+                                            && iu == arr.len()
+                                            && iu < crate::value::MAX_DENSE_ARRAY
+                                        {
+                                            arr.push(Value::Number(regs[val as usize]));
+                                            ok = true;
+                                        }
                                     }
                                 }
                             }
@@ -529,6 +586,20 @@ impl Vm {
                     }
                     if !ok {
                         branch!(bail)
+                    }
+                }
+                KOp::CmpSet { cmp, dst, a, b } => {
+                    regs[dst as usize] = if knum_cmp(cmp, regs[a as usize], regs[b as usize]) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                KOp::BoolNot { dst, src } => {
+                    regs[dst as usize] = if knum_truthy(regs[src as usize]) {
+                        0.0
+                    } else {
+                        1.0
                     }
                 }
                 KOp::Math1 { kind, dst, src } => {
@@ -561,13 +632,21 @@ impl Vm {
         // Numbers), then the operand stack from the exit's shape (bottom-up:
         // registers as Numbers, object slots as objects), then resume the
         // bytecode interpreter at the exit's target.
-        for (r, &l) in k.locals.iter().enumerate() {
-            frame.locals[l as usize] = Value::Number(regs[r]);
+        for (r, slot) in k.locals.iter().enumerate() {
+            if let crate::bytecode::KSlot::Local(l) = slot {
+                frame.locals[*l as usize] = Value::Number(regs[r]);
+            }
+        }
+        for (j, &l) in k.bool_locals.iter().enumerate() {
+            frame.locals[l as usize] = Value::Bool(regs[bool_base + j] != 0.0);
         }
         for slot in k.shapes[shape as usize].iter() {
             match slot {
                 crate::bytecode::KShapeSlot::Num(r) => {
                     frame.stack.push(Value::Number(regs[*r as usize]))
+                }
+                crate::bytecode::KShapeSlot::Bool(r) => {
+                    frame.stack.push(Value::Bool(regs[*r as usize] != 0.0))
                 }
                 crate::bytecode::KShapeSlot::Obj(o) => {
                     frame.stack.push(Value::Object(objs[*o as usize].clone()))

@@ -706,11 +706,46 @@ replacement, accessor-on-globalThis, patch-between-activations) plus
 in-body-declaration cases, and the fuzz generator now routes values
 through Math intrinsics.
 
+**Kernel v4 (same branch): dense appends, materialized booleans, and
+captured loop bounds.**
+
+- **Appends & hole fills**: `StoreElem` now performs an exact
+  one-past-the-end append (`a[a.length] = v`, `arr.push`-free building)
+  and in-bounds hole fills — both CREATE a property, so they additionally
+  require the array extensible and under the dense-storage bound;
+  otherwise they bail to the generic path, which owns the sloppy-silent /
+  strict-TypeError / RangeError semantics. This unlocks the fill-by-append
+  and `new Array(n)` fill idioms.
+- **Booleans as first-class kernel values**: the virtual stack and the
+  local map are statically TYPED. A stored comparison (`const hi = x > 5`),
+  `!x`, `true`/`false` literals, and loop-carried flags become Bool
+  registers holding exactly 0.0/1.0; the guard requires `Value::Bool` and
+  write-back restores it — `typeof ok` never sees a number. Coercing
+  consumers (arithmetic, conditions, Math args) read the raw register —
+  identical to `ToNumber`/`ToBoolean` on a boolean — while array
+  indices/elements REFUSE bools (`a[true]` is the property `"true"`), and
+  strict (in)equality between statically mixed bool/number operands folds
+  to its constant (the generic `strict_equals` never compares across
+  types). Local types are discovered to a FIXPOINT (a boolean store types
+  the local; the next translation run reloads it as Bool); genuinely
+  mixed-type locals keep the loop generic.
+- **Captured loop bounds**: a read-only-in-region UPVALUE (`const N`
+  captured from the enclosing scope — the classic module-level bound)
+  snapshots into a register at entry, guarded `Number`. Sound because
+  kernel regions contain no calls: nothing can write the cell
+  mid-activation. In-region upvalue writes still reject.
+
+Measured: array_sum drops further, 3.74 G → 2.03 G instructions (−81%
+total from its 10.67 G pre-kernel baseline — the `new Array(N)` fill loop
+was bailing per-iteration on holes). A run-scanning workload (append-build
++ boolean-flag scan, 500k elements ×4) goes **2065 ms → 204 ms (10.1×)**.
+Other suite counts unchanged (±layout noise), checksums byte-identical.
+
 ### 6.5.1 What's next (new baseline)
 
-- Kernel v4 candidates: materialized booleans (needs typed write-back,
-  since `typeof ok` distinguishes `true` from `1`), and dense appends
-  (`a[a.length] = v` currently bails every iteration).
+- Remaining kernel candidates: `String.prototype.charCodeAt`-class reads,
+  loop bounds via own-frame CELLS (captured accumulators), and typed-array
+  element access (a natural fit — elements are statically numeric).
 - **step dispatch remains the wall for non-kernel code**: `step` +
   `run_frame` are 25–43% of call-heavy workloads. Register bytecode (§3.5)
   is the remaining structural lever, and kernels shrink its risk: the

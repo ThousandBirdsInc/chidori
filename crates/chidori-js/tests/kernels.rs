@@ -193,6 +193,44 @@ const CORPUS: &[&str] = &[
     "try { for (let i = 1; i >= 0; i--) { if (i === 0) { y; } const y = i; } } catch (e) { console.log('tdz', e.constructor.name); }",
     // const inside the loop feeding Math and array access.
     "const arr = [4,1,3,2]; let s = 0; for (let i = 0; i < arr.length; i++) { const v = arr[i]; s += Math.max(v, 2); } console.log(s);",
+    // ---- materialized booleans (kernel v4) ----
+    // A stored comparison stays a BOOLEAN across write-back (typeof!).
+    "let ok = false; for (let i = 0; i < 10; i++) { ok = i > 4; } console.log(ok, typeof ok);",
+    "function f(n) { let even = true; for (let i = 0; i < n; i++) { even = !even; } return [even, typeof even]; } console.log(f(7).join(','), f(8).join(','));",
+    // Boolean fed to arithmetic coerces to 0/1; result is a NUMBER.
+    "let c = 0; for (let i = 0; i < 20; i++) { const big = i >= 10; c += big; } console.log(c, typeof c);",
+    // Strict equality between a boolean and a number is ALWAYS false.
+    "let hits = 0; for (let i = 0; i < 5; i++) { const t = i < 3; if (t === 1) hits += 100; if (t == 1) hits += 1; if (t === true) hits += 10; } console.log(hits);",
+    "let s = 0; for (let i = 0; i < 6; i++) { const b = i % 2 === 0; s += b !== 1 ? 1 : 0; s += b === (i < 100) ? 10 : 0; } console.log(s);",
+    // !x / !!x chains on numbers and booleans.
+    "let n = 0; for (let i = -3; i < 4; i++) { n += !i ? 100 : 0; n += !!i ? 1 : 0; } console.log(n);",
+    // Boolean as ARRAY INDEX reads the \"true\"/\"false\" properties, not 0/1.
+    "const a = [10, 20]; a[true] = 77; let s = 0; for (let i = 0; i < 4; i++) { const b = i % 2 === 1; s += a[b] || 0; } console.log(s, a['true']);",
+    // Boolean STORED INTO an element must stay a boolean element.
+    "const a = [0, 0, 0]; for (let i = 0; i < 3; i++) { a[i] = i > 0; } console.log(a.join(','), typeof a[0], typeof a[2]);",
+    // Late entry: undefined -> boolean transition.
+    "let f; let c = 0; for (let i = 0; i < 6; i++) { if (f) c++; f = i % 2 === 0; } console.log(c, typeof f);",
+    // Loop-carried toggle driving control flow.
+    "let flip = false, s = 0; for (let i = 0; i < 9; i++) { if (flip) s += i; flip = !flip; } console.log(s, flip);",
+    // Booleans crossing an exit shape (break with a live comparison).
+    "let last = false; for (let i = 0; i < 10; i++) { last = i > 7; if (last) break; } console.log(last, typeof last);",
+    // Boolean local compared with relational operators (coerces to 0/1).
+    "let s = 0; for (let i = 0; i < 6; i++) { const b = i > 2; if (b < 1) s += 1; if (b >= 1) s += 10; } console.log(s);",
+    // A local that is SOMETIMES number, sometimes boolean: stays generic.
+    "let m = 0; for (let i = 0; i < 6; i++) { m = i % 2 ? (i > 2) : i; } console.log(m, typeof m);",
+    // ---- dense appends (kernel v4) ----
+    // The classic fill-by-append loop.
+    "const a = []; for (let i = 0; i < 100; i++) { a[a.length] = i * 2; } console.log(a.length, a[0], a[99]);",
+    // Fill of a `new Array(n)` (in-bounds hole fills).
+    "const a = new Array(50); for (let i = 0; i < a.length; i++) { a[i] = i * i; } console.log(a.length, a[49], 0 in a);",
+    // Append with the length read live in the condition (bounded growth).
+    "const a = [1]; for (let i = 0; i < a.length && a.length < 20; i++) { a[a.length] = a[i] + 1; } console.log(a.length, a.join(','));",
+    // Append blocked by preventExtensions (generic path: silent in sloppy).
+    "const a = [1]; Object.preventExtensions(a); for (let i = 0; i < 3; i++) { a[a.length] = 9; } console.log(a.length, a.join(','));",
+    // ... and throwing in strict mode.
+    "'use strict'; const a = [1]; Object.preventExtensions(a); try { for (let i = 0; i < 3; i++) { a[a.length] = 9; } } catch (e) { console.log('strict', e.constructor.name); } console.log(a.length);",
+    // Append far past the end leaves holes (generic path).
+    "const a = []; for (let i = 0; i < 4; i++) { a[i * 2] = i; } console.log(a.length, 1 in a, a.join('|'));",
 ];
 
 #[test]
@@ -268,6 +306,38 @@ fn array_and_nested_loops_get_kernels() {
     );
 }
 
+/// Boolean, append, and captured-bound loops actually kernelize (pins v4).
+#[test]
+fn v4_loops_get_kernels() {
+    fn kernels_in(src: &str) -> usize {
+        fn count(p: &FuncProto) -> usize {
+            let mut n = p.kernels.len();
+            for c in &p.consts {
+                if let Const::Func(f) = c {
+                    n += count(f);
+                }
+            }
+            n
+        }
+        count(&compile_script(src).expect("compiles"))
+    }
+    // Materialized boolean local (stored comparison + toggle + branch).
+    assert!(
+        kernels_in("function f(n) { let flip = false, s = 0; for (let i = 0; i < n; i++) { const hi = i > 5; if (hi !== flip) s++; flip = !hi; } return s; }") >= 1,
+        "boolean loop must kernelize"
+    );
+    // Append-fill loop.
+    assert!(
+        kernels_in("function f(n) { const a = []; for (let i = 0; i < n; i++) { a[a.length] = i; } return a.length; }") >= 1,
+        "append loop must kernelize"
+    );
+    // Loop bound captured from the enclosing scope (upvalue snapshot).
+    assert!(
+        kernels_in("const N = 100; function f() { let s = 0; for (let i = 0; i < N; i++) { s += i; } return s; } f();") >= 1,
+        "upvalue-bound loop must kernelize"
+    );
+}
+
 /// Math-using loops actually kernelize (pins v3 eligibility).
 #[test]
 fn math_loops_get_kernels() {
@@ -332,6 +402,18 @@ fn kernel_fuzz_differential() {
         if case % 17 == 0 {
             body.push_str(&format!("if (i === 7) v{} = 'x';\n", rnd(nvars as u64)));
         }
+        // Some cases carry a BOOLEAN variable: stored comparisons, negation,
+        // use in conditions and arithmetic (differential must preserve
+        // boolean-ness through write-back).
+        if case % 4 == 0 {
+            let v = rnd(nvars as u64);
+            let w = rnd(nvars as u64);
+            match rnd(3) {
+                0 => body.push_str(&format!("bfz = v{v} < v{w};\n")),
+                1 => body.push_str(&format!("bfz = !bfz; if (bfz) v{v} += 1;\n")),
+                _ => body.push_str(&format!("v{v} += bfz; bfz = v{w} % 2 === 0;\n")),
+            }
+        }
         // Some cases route a value through a supported Math intrinsic.
         if case % 5 == 0 {
             let v = rnd(nvars as u64);
@@ -375,8 +457,18 @@ fn kernel_fuzz_differential() {
             ""
         };
         let arr_print = if use_array { ", arr.join('|')" } else { "" };
+        let bool_decl = if case % 4 == 0 {
+            "let bfz = false; "
+        } else {
+            ""
+        };
+        let bool_print = if case % 4 == 0 {
+            ", bfz, typeof bfz"
+        } else {
+            ""
+        };
         let src = format!(
-            "{}\n{arr_decl}for (let i = 0; i < 25; i++) {{\n{body}}}\nconsole.log({}{arr_print});",
+            "{}\n{bool_decl}{arr_decl}for (let i = 0; i < 25; i++) {{\n{body}}}\nconsole.log({}{arr_print}{bool_print});",
             decls.join(" "),
             prints.join(", ")
         );
