@@ -2108,6 +2108,35 @@ pub fn string_to_number(s: &str) -> f64 {
     t.parse::<f64>().unwrap_or(f64::NAN)
 }
 
+/// Append Number::toString(n) to `out`. Integral |n| <= 2^53 — every such
+/// f64 is exact and its plain decimal digits ARE the spec's shortest
+/// round-trip form — formats directly into the buffer, skipping the grisu +
+/// `format!` machinery (`String(2**60)`-class values, where the shortest
+/// form is NOT the exact integer, stay on the slow path). Hot in
+/// JSON.stringify.
+pub fn push_number_string(n: f64, out: &mut String) {
+    if n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_992.0 {
+        let mut i = n as i64; // -0.0 casts to 0: prints "0" like the spec
+        if i < 0 {
+            out.push('-');
+            i = -i;
+        }
+        let mut buf = [0u8; 16]; // 2^53 has 16 digits
+        let mut p = buf.len();
+        loop {
+            p -= 1;
+            buf[p] = b'0' + (i % 10) as u8;
+            i /= 10;
+            if i == 0 {
+                break;
+            }
+        }
+        out.push_str(std::str::from_utf8(&buf[p..]).expect("ascii digits"));
+    } else {
+        out.push_str(&number_to_string(n));
+    }
+}
+
 /// ECMAScript Number::toString (radix 10).
 pub fn number_to_string(n: f64) -> String {
     if n.is_nan() {

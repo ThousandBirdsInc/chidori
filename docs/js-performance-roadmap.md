@@ -887,6 +887,45 @@ shape changes, non-Ordinary receivers, and −0/NaN pins.
 Re-run the callgrind sweep before choosing; the noise-floor and idle-machine
 caveats in §1.1 stand.
 
+## 6.6 JSON round-trip (landed): single-buffer stringify + parser fast paths
+
+json_roundtrip's profile was ~30% raw allocator traffic and ~12% Rust
+`format!` machinery: the serializer built a fresh `String` per LEAF, a
+`Vec<String>` + `join` + `format!` wrap per tree LEVEL, and allocated an
+`Rc<str>` property key per member [[Get]]; the parser built every string
+char-by-char and the number formatter ran grisu for every integer.
+
+Changes (`builtins/numbers.rs`, `vm.rs`) — no spec-visible effect moves:
+the [[Get]] order, toJSON/replacer calls, and proxy traps are untouched,
+and a 25-case differential battery (escapes, indent modes, replacer
+allowlists/omission, boxed primitives, toJSON, surrogate escapes,
+control-char rejection, circular detection, −0/1e21/2^53-class numbers)
+is byte-identical to node 22:
+
+- **One output buffer for the whole tree**: `json_stringify` appends and
+  returns emitted/omitted; an omitted object member TRUNCATES its written
+  `"key":` prefix back off (its side effects already ran, exactly as the
+  spec orders). Separators are direct pushes; the pretty-print strings
+  are all empty in compact mode.
+- **Run-based escaping** (`json_quote_into`): only `"`, `\` and control
+  bytes escape — all single ASCII bytes — so maximal clean runs copy as
+  slices, multi-byte UTF-8 included wholesale.
+- **`JsString` keys end-to-end**: member keys stay `Rc` (clone = refcount
+  bump) through the key list, the member [[Get]], toJSON/replacer
+  arguments, and quoting — no per-member allocation.
+- **Small-integer number formatting** (`push_number_string`): integral
+  |n| ≤ 2^53 — exact, and its plain decimal digits ARE the shortest
+  round-trip form — formats straight into the buffer; larger/fractional
+  values keep the spec grisu path (`String(2**60)`-class values differ!).
+- **Parser no-escape fast path**: a string body without escapes/control
+  bytes is ONE slice copy; the escape-aware loop only runs from the first
+  backslash.
+
+Measured: **json_roundtrip 2.07 G → 1.20 G instructions (−42%)**, RESULT
+checksums byte-identical across the suite. Remaining costs are parse-side
+object building (property-map hashing) and the interpreter reads around
+the loop — shape-cache territory, out of scope here.
+
 ## 7. References
 
 - [`docs/interpreter-optimization.md`](./interpreter-optimization.md) —

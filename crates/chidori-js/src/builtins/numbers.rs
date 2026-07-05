@@ -933,9 +933,19 @@ fn install_json(vm: &mut Vm) {
             .borrow_mut()
             .props
             .insert(PropertyKey::str(""), Property::data(value));
-        match json_stringify(vm, &Value::Object(holder), "", "", &mut state)? {
-            Some(s) => Ok(Value::str(s)),
-            None => Ok(Value::Undefined),
+        let mut out = String::with_capacity(128);
+        let root_key = JsString::from("");
+        if json_stringify(
+            vm,
+            &Value::Object(holder),
+            &root_key,
+            "",
+            &mut state,
+            &mut out,
+        )? {
+            Ok(Value::str(out))
+        } else {
+            Ok(Value::Undefined)
         }
     });
     // JSON[Symbol.toStringTag] = "JSON" (non-writable, non-enumerable, configurable).
@@ -957,7 +967,7 @@ fn install_json(vm: &mut Vm) {
 struct StringifyState {
     indent: String,
     rep_fn: Option<Value>,
-    rep_list: Option<Vec<String>>,
+    rep_list: Option<Vec<JsString>>,
     seen: Vec<usize>,
 }
 
@@ -966,7 +976,7 @@ struct StringifyState {
 fn json_build_replacer(
     vm: &mut Vm,
     replacer: &Value,
-) -> Result<(Option<Value>, Option<Vec<String>>), Value> {
+) -> Result<(Option<Value>, Option<Vec<JsString>>), Value> {
     if vm.is_callable(replacer) {
         return Ok((Some(replacer.clone()), None));
     }
@@ -977,18 +987,18 @@ fn json_build_replacer(
         if is_array {
             let len_v = vm.get_prop(replacer, &PropertyKey::str("length"))?;
             let len = vm.to_length(&len_v)?;
-            let mut list: Vec<String> = Vec::new();
+            let mut list: Vec<JsString> = Vec::new();
             for i in 0..len {
                 let el = vm.get_prop(replacer, &PropertyKey::from_index(i as u32))?;
                 // A property name is added for String/Number entries (and the
                 // boxed forms thereof).
                 let name = match &el {
-                    Value::String(s) => Some(s.as_str().to_string()),
-                    Value::Number(n) => Some(number_to_string(*n)),
+                    Value::String(s) => Some(s.clone()),
+                    Value::Number(n) => Some(JsString::from(number_to_string(*n))),
                     Value::Object(obj) => {
                         let cls = obj.borrow().class_name();
                         if cls == "String" || cls == "Number" {
-                            Some(vm.to_js_string(&el)?.as_str().to_string())
+                            Some(vm.to_js_string(&el)?)
                         } else {
                             None
                         }
@@ -1198,7 +1208,26 @@ impl<'a> JsonParser<'a> {
     }
     fn parse_string(&mut self, vm: &mut Vm) -> Result<String, Value> {
         self.pos += 1; // opening quote
-        let mut s = String::new();
+                       // Fast path: a string with no escapes and no control characters —
+                       // the overwhelmingly common case — is ONE slice copy instead of
+                       // per-char pushes. (Multi-byte UTF-8 passes through: continuation
+                       // bytes are ≥ 0x80 and match none of the terminators.)
+        let start = self.pos;
+        let mut i = self.pos;
+        while i < self.bytes.len() {
+            match self.bytes[i] {
+                b'"' => {
+                    self.pos = i + 1;
+                    return Ok(self.src[start..i].to_string());
+                }
+                b'\\' | 0x00..=0x1f => break,
+                _ => i += 1,
+            }
+        }
+        // Slow path: seed with the clean prefix, continue escape-aware.
+        let mut s = String::with_capacity((i - start) + 16);
+        s.push_str(&self.src[start..i]);
+        self.pos = i;
         while self.pos < self.bytes.len() {
             let c = self.bytes[self.pos];
             match c {
@@ -1350,37 +1379,54 @@ impl<'a> JsonParser<'a> {
     }
 }
 
-fn json_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+/// QuoteJSONString, appended to `out`. Only `"`, `\` and control characters
+/// need escaping — all single ASCII bytes — so the scan copies maximal
+/// clean RUNS (multi-byte UTF-8 included wholesale; every continuation byte
+/// is ≥ 0x80 and never matches) instead of pushing char by char.
+fn json_quote_into(s: &str, out: &mut String) {
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+    let bytes = s.as_bytes();
+    let mut run = 0usize;
+    for (i, &c) in bytes.iter().enumerate() {
+        if c == b'"' || c == b'\\' || c < 0x20 {
+            out.push_str(&s[run..i]);
+            match c {
+                b'"' => out.push_str("\\\""),
+                b'\\' => out.push_str("\\\\"),
+                b'\n' => out.push_str("\\n"),
+                b'\r' => out.push_str("\\r"),
+                b'\t' => out.push_str("\\t"),
+                0x08 => out.push_str("\\b"),
+                0x0c => out.push_str("\\f"),
+                c => {
+                    use std::fmt::Write;
+                    let _ = write!(out, "\\u{:04x}", c);
+                }
+            }
+            run = i + 1;
         }
     }
+    out.push_str(&s[run..]);
     out.push('"');
-    out
 }
 
-/// SerializeJSONProperty: stringify `holder[key]`, applying toJSON and the
-/// function replacer (which both observe `key`). Returns `None` when the value
-/// is to be omitted (undefined / function / symbol after transforms).
+/// SerializeJSONProperty: stringify `holder[key]` APPENDED to `out`,
+/// applying toJSON and the function replacer (which both observe `key`).
+/// Returns `false` when the value is to be omitted (undefined / function /
+/// symbol after transforms) — the caller then truncates whatever prefix it
+/// wrote. One shared buffer for the whole tree: no per-node Strings, no
+/// joins, no format! assembly (the old shape was ~40% of the round-trip
+/// profile in allocator + fmt machinery). Every spec-visible effect
+/// ([[Get]] order, toJSON/replacer calls, proxy traps) is unchanged.
 fn json_stringify(
     vm: &mut Vm,
     holder: &Value,
-    key: &str,
+    key: &JsString,
     cur_indent: &str,
     state: &mut StringifyState,
-) -> Result<Option<String>, Value> {
-    let mut value = vm.get_prop(holder, &PropertyKey::str(key))?;
+    out: &mut String,
+) -> Result<bool, Value> {
+    let mut value = vm.get_prop(holder, &PropertyKey::Str(key.clone()))?;
 
     // toJSON: looked up for an Object OR a BigInt value (spec
     // SerializeJSONProperty step 2), called with the value as `this`.
@@ -1388,14 +1434,14 @@ fn json_stringify(
         let to_json = vm.get_prop(&value, &PropertyKey::str("toJSON"))?;
         if vm.is_callable(&to_json) {
             let this = value.clone();
-            value = vm.call(to_json, this, &[Value::str(key)])?;
+            value = vm.call(to_json, this, &[Value::String(key.clone())])?;
         }
     }
 
     // Function replacer.
     if let Some(rep) = &state.rep_fn {
         let rep = rep.clone();
-        value = vm.call(rep, holder.clone(), &[Value::str(key), value])?;
+        value = vm.call(rep, holder.clone(), &[Value::String(key.clone()), value])?;
     }
 
     // Unwrap boxed primitives (Number/String/Boolean) to their primitive value.
@@ -1441,18 +1487,30 @@ fn json_stringify(
         | Value::Uninitialized
         | Value::Hole
         | Value::Symbol(_)
-        | Value::BigInt(_) => None,
-        Value::Null => Some("null".into()),
-        Value::Bool(b) => Some(b.to_string()),
-        Value::Number(n) => Some(if n.is_finite() {
-            number_to_string(*n)
-        } else {
-            "null".into()
-        }),
-        Value::String(s) => Some(json_quote(s.as_str())),
+        | Value::BigInt(_) => false,
+        Value::Null => {
+            out.push_str("null");
+            true
+        }
+        Value::Bool(b) => {
+            out.push_str(if *b { "true" } else { "false" });
+            true
+        }
+        Value::Number(n) => {
+            if n.is_finite() {
+                crate::vm::push_number_string(*n, out);
+            } else {
+                out.push_str("null");
+            }
+            true
+        }
+        Value::String(s) => {
+            json_quote_into(s.as_str(), out);
+            true
+        }
         Value::Object(o) => {
             if o.borrow().is_callable() {
-                return Ok(None);
+                return Ok(false);
             }
             let id = o.ptr_id();
             if state.seen.contains(&id) {
@@ -1460,39 +1518,39 @@ fn json_stringify(
             }
             state.seen.push(id);
             let is_array = crate::builtins::fundamental::is_array_exotic(vm, o)?;
-            let indent = state.indent.clone();
-            let new_indent = format!("{cur_indent}{indent}");
-            let (nl, sp) = if indent.is_empty() {
-                (String::new(), String::new())
+            // Pretty-print separators — ALL empty in the common compact
+            // mode, so assembly below is pure buffer pushes.
+            let (new_indent, nl, close_nl, sp) = if state.indent.is_empty() {
+                (String::new(), String::new(), String::new(), "")
             } else {
-                (format!("\n{new_indent}"), " ".to_string())
+                let ni = format!("{cur_indent}{}", state.indent);
+                let nl = format!("\n{ni}");
+                (ni, nl, format!("\n{cur_indent}"), " ")
             };
-            let result = if is_array {
+            if is_array {
                 // SerializeJSONArray reads `length` via [[Get]] (a proxy trap
                 // fires) and ToLength; elements go through [[Get]] too.
                 let len_v = vm.get_prop(&value, &PropertyKey::str("length"))?;
                 let len = vm.to_length(&len_v)?;
-                if len == 0 {
-                    "[]".to_string()
-                } else {
-                    let mut parts = Vec::new();
+                out.push('[');
+                if len != 0 {
                     for i in 0..len {
-                        let k = i.to_string();
-                        let s = json_stringify(vm, &value, &k, &new_indent, state)?
-                            .unwrap_or_else(|| "null".into());
-                        parts.push(s);
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        out.push_str(&nl);
+                        let k = JsString::from(i.to_string());
+                        if !json_stringify(vm, &value, &k, &new_indent, state, out)? {
+                            out.push_str("null");
+                        }
                     }
-                    let close_nl = if indent.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\n{cur_indent}")
-                    };
-                    format!("[{nl}{}{close_nl}]", parts.join(&format!(",{nl}")))
+                    out.push_str(&close_nl);
                 }
+                out.push(']');
             } else {
                 // Property key list: the allowlist if present, else all enumerable
                 // own string keys.
-                let keys: Vec<String> = if let Some(list) = &state.rep_list {
+                let keys: Vec<JsString> = if let Some(list) = &state.rep_list {
                     list.clone()
                 } else {
                     // EnumerableOwnPropertyNames via [[OwnPropertyKeys]] +
@@ -1500,30 +1558,39 @@ fn json_stringify(
                     vm.enumerable_own_keys_dyn(o)?
                         .into_iter()
                         .filter_map(|k| match k {
-                            PropertyKey::Str(s) => Some(s.as_str().to_string()),
+                            PropertyKey::Str(s) => Some(s),
                             PropertyKey::Sym(_) => None,
                         })
                         .collect()
                 };
-                let mut parts = Vec::new();
+                out.push('{');
+                let mut first = true;
                 for k in keys {
-                    if let Some(s) = json_stringify(vm, &value, &k, &new_indent, state)? {
-                        parts.push(format!("{}:{sp}{s}", json_quote(&k)));
+                    // Write the member prefix, then the value; an OMITTED
+                    // member (undefined/function/symbol) truncates the
+                    // prefix back off. Side effects (getters, toJSON, the
+                    // replacer) still ran — exactly as the spec orders.
+                    let mark = out.len();
+                    if !first {
+                        out.push(',');
+                    }
+                    out.push_str(&nl);
+                    json_quote_into(k.as_str(), out);
+                    out.push(':');
+                    out.push_str(sp);
+                    if json_stringify(vm, &value, &k, &new_indent, state, out)? {
+                        first = false;
+                    } else {
+                        out.truncate(mark);
                     }
                 }
-                if parts.is_empty() {
-                    "{}".to_string()
-                } else {
-                    let close_nl = if indent.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\n{cur_indent}")
-                    };
-                    format!("{{{nl}{}{close_nl}}}", parts.join(&format!(",{nl}")))
+                if !first {
+                    out.push_str(&close_nl);
                 }
-            };
+                out.push('}');
+            }
             state.seen.pop();
-            Some(result)
+            true
         }
     })
 }
