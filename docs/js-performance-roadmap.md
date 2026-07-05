@@ -867,6 +867,44 @@ non-writable stores (sloppy + strict), prototype reads, aliasing,
 create-in-loop late entry, `delete`-in-loop rejection, between-activation
 shape changes, non-Ordinary receivers, and −0/NaN pins.
 
+**Kernel v8 (same branch): pinned-closure calls inside loop kernels.**
+
+The closures shape — `for (…) s = f(s) - 4` over a tiny capturing callback
+— spent ~2300 instructions per iteration on generic dispatch and call
+ceremony around ~15 instructions of work (the callee itself already ran
+frameless via its v5 function kernel). A call of an OBJECT-TYPED LOCAL
+under a plain `undefined` this now translates to `KOp::CallKernel`: the
+callee local is pinned exactly like an array base (in-region stores to it
+reject), and the callee's function-kernel register program runs INLINE on
+a dedicated window above the caller's registers.
+
+- **One guard per activation** covers everything `run_fn_kernel` checks
+  per call: plain bytecode function, has a (non-recursive,
+  Number-returning) fn kernel, every consumed argument index below the
+  smallest argc any site supplies, canonical Math, Number upvalues — the
+  upvalue snapshot loads into the window ONCE (callee code never writes
+  upvalue registers, and no calls can run between iterations). Loop calls
+  happen at a constant depth, so one depth check stands in for the
+  per-call guard; an active trace sink declines (it must see an
+  enter/exit per call). Argument registers must be statically NUMBER
+  (they copy raw into the callee's guarded-Number arg registers).
+- **Per call**: copy argc registers, run the callee window (its
+  back-edges poll the interrupt through the caller's counter), copy the
+  `Ret` register out. No frames, no `Value`s, no operand stacks.
+- **Codegen isolation**: the register loop is MONOMORPHIZED on a const
+  `CALLEES` flag — kernels without closure calls compile the arm and its
+  state out entirely. (The naive single loop cost arith_loop/array_sum/
+  property_access 7–10% in register spills; the split restored all three
+  to their prior counts.)
+
+Measured: **closures 2.32 G → 0.57 G instructions (−76%; −86% from the
+4.03 G session start)**, other suite counts within ±1%, checksums
+byte-identical. Corpus grew multi-callee regions, non-number upvalues,
+mid-loop and between-activation callee reassignment, boolean-returning /
+kernel-less / native / recursive callees (all decline observably),
+short/extra argument counts, monkeypatched Math, −0 pins, and callee
+results flowing into property/element stores.
+
 ### 6.5.1 What's next (new baseline)
 
 - Remaining kernel candidates: `String.prototype.charCodeAt`-class reads,

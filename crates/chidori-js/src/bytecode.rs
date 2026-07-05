@@ -1055,6 +1055,25 @@ pub enum KOp {
     /// `Op::SetProp` fast-path conditions). See [`KOp::LoadProp`] for why no
     /// per-access check is needed.
     StoreProp { prop: u16, src: u16 },
+    /// LOOP kernels only: call the PINNED CLOSURE in oslot
+    /// [`Kernel::callee_slots`]`[fslot]` — a plain bytecode function whose
+    /// proto carries a (non-recursive, Number-returning) function kernel —
+    /// by running that kernel's register program on a dedicated window above
+    /// the caller's registers. The window's upvalue registers were loaded
+    /// ONCE at entry (the callee local is an oslot: in-region stores to it
+    /// reject, so the closure identity is pinned); per call only the `argc`
+    /// argument registers at `base..` copy in, and the callee's `Ret` value
+    /// copies out to `dst`. The entry guard verified everything a per-call
+    /// `run_fn_kernel` guard would (arguments are statically Numbers here),
+    /// plus one depth check for the whole activation (the loop calls at a
+    /// CONSTANT depth). No trace sink may be active (it would see an
+    /// enter/exit per call on the generic path).
+    CallKernel {
+        dst: u16,
+        fslot: u16,
+        base: u16,
+        argc: u16,
+    },
     /// FUNCTION kernels only: a DIRECT SELF-RECURSIVE call (`fib(n - 1)`
     /// inside `fib`), executed as a fresh register WINDOW running the same
     /// kernel code from pc 0 — no frame, no `Value`s, just an explicit
@@ -1095,6 +1114,17 @@ pub struct KProp {
     pub key: Box<str>,
     pub load: bool,
     pub store: bool,
+}
+
+/// One pinned CALLEE of a loop kernel (see [`KOp::CallKernel`]): the oslot
+/// local holding the closure, and the smallest `argc` any call site in the
+/// region supplies — the entry guard requires the callee's function kernel
+/// to consume no argument index at or beyond it (a shorter call would need
+/// the generic `undefined` parameter).
+#[derive(Clone, Debug)]
+pub struct KCallee {
+    pub oslot: u16,
+    pub min_argc: u16,
 }
 
 /// One operand-stack slot of a kernel exit shape, bottom-up: a `Number` read
@@ -1225,6 +1255,9 @@ pub struct Kernel {
     /// Named-property access classes ([`KOp::LoadProp`]/[`KOp::StoreProp`]),
     /// entry-resolved to raw slot indices. See [`KProp`].
     pub props_used: Box<[KProp]>,
+    /// Pinned closure callees ([`KOp::CallKernel`]), entry-verified. See
+    /// [`KCallee`].
+    pub callee_slots: Box<[KCallee]>,
     /// Math intrinsics this kernel executes: the entry guard identity-checks
     /// the global `Math` binding and each of these methods against the
     /// realm's canonical objects before running.

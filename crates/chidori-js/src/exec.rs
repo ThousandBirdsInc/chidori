@@ -379,8 +379,30 @@ impl Vm {
     /// and keeping its large register loop out of `step` pins the codegen of
     /// both — growing this function must not perturb the interpreter's hot
     /// dispatch.
+    ///
+    /// The register loop is MONOMORPHIZED on whether the kernel calls pinned
+    /// closures: the plain instantiation compiles the `CallKernel` arm (and
+    /// the callee state's liveness) out entirely, so growing the closure
+    /// tier cannot tax pure numeric/array/property loops with register
+    /// spills in their dispatch.
     #[inline(never)]
     fn run_kernel_op(&mut self, frame: &mut Frame, idx: u32) -> Result<Ctl, Value> {
+        if frame.func.proto.kernels[idx as usize]
+            .callee_slots
+            .is_empty()
+        {
+            self.run_kernel_op_impl::<false>(frame, idx)
+        } else {
+            self.run_kernel_op_impl::<true>(frame, idx)
+        }
+    }
+
+    #[inline(never)]
+    fn run_kernel_op_impl<const CALLEES: bool>(
+        &mut self,
+        frame: &mut Frame,
+        idx: u32,
+    ) -> Result<Ctl, Value> {
         let proto = frame.func.proto.clone();
         let k = &proto.kernels[idx as usize];
         // An installed op budget makes per-op counts observable (the
@@ -488,6 +510,90 @@ impl Vm {
                 objs.push(o.clone());
             }
         }
+        // Pinned closure callees (`KOp::CallKernel`): ONE guard per
+        // activation covers everything the per-call `run_fn_kernel` guard
+        // would check — the callee object is an oslot (in-region stores to
+        // it reject), so its identity, kernel, upvalue types and the Math
+        // canonicals cannot change while the loop runs. Loop calls happen at
+        // one constant depth, so a single depth check suffices; a trace sink
+        // declines (it must see an enter/exit per call).
+        let mut callee_bfs = std::mem::take(&mut self.kernel_callees);
+        callee_bfs.clear();
+        if CALLEES {
+            let mut ok = self.trace_sink.is_none() && self.call_depth < self.max_call_depth;
+            let mut win = k.n_regs as usize;
+            if ok {
+                for c in k.callee_slots.iter() {
+                    let bf = {
+                        let b = objs[c.oslot as usize].borrow();
+                        match &b.internal {
+                            Internal::Function(FunctionInner::Bytecode(bf))
+                                if !bf.is_class_ctor =>
+                            {
+                                Some(bf.clone())
+                            }
+                            _ => None,
+                        }
+                    };
+                    let Some(bf) = bf else {
+                        ok = false;
+                        break;
+                    };
+                    let Some(ck) = bf.proto.fn_kernel.as_ref() else {
+                        ok = false;
+                        break;
+                    };
+                    // Number-returning, non-recursive, fully-supplied args,
+                    // canonical Math, Number upvalues — else stay generic.
+                    let ck_ok = ck.self_global.is_none()
+                        && ck
+                            .code
+                            .iter()
+                            .all(|op| !matches!(op, KOp::Ret { boolean: true, .. }))
+                        && ck.locals.iter().all(|sl| match sl {
+                            crate::bytecode::KSlot::Arg(a) => *a < u32::from(c.min_argc),
+                            _ => true,
+                        })
+                        && (ck.math_used.is_empty() || self.kernel_math_ok(&ck.math_used))
+                        && ck.locals.iter().all(|sl| match sl {
+                            crate::bytecode::KSlot::Upvalue(u) => {
+                                matches!(*bf.upvalues[*u as usize].borrow(), Value::Number(_))
+                            }
+                            _ => true,
+                        });
+                    if !ck_ok {
+                        ok = false;
+                        break;
+                    }
+                    let n = ck.n_regs as usize;
+                    callee_bfs.push((bf, win as u32));
+                    win += n;
+                }
+            }
+            if !ok {
+                self.kernel_regs = regs;
+                objs.clear();
+                self.kernel_objs = objs;
+                self.kernel_prop_slots = prop_slots;
+                callee_bfs.clear();
+                self.kernel_callees = callee_bfs;
+                return self.step(frame, &k.fallback);
+            }
+            // Extend the register file with the callee windows and load each
+            // window's upvalue snapshot ONCE (identities are pinned; callee
+            // code never writes an upvalue register).
+            regs.resize(win, 0.0);
+            for (bf, wb) in callee_bfs.iter() {
+                let ck = bf.proto.fn_kernel.as_ref().expect("guarded");
+                for (r, slot) in ck.locals.iter().enumerate() {
+                    if let crate::bytecode::KSlot::Upvalue(u) = slot {
+                        if let Value::Number(n) = *bf.upvalues[*u as usize].borrow() {
+                            regs[*wb as usize + r] = n;
+                        }
+                    }
+                }
+            }
+        }
         let interrupt = self.interrupt.clone();
         let mut poll: u32 = 0;
         let code = &k.code;
@@ -519,6 +625,8 @@ impl Vm {
                                     objs.clear();
                                     self.kernel_objs = objs;
                                     self.kernel_prop_slots = prop_slots;
+                                    callee_bfs.clear();
+                                    self.kernel_callees = callee_bfs;
                                     self.op_budget = Some(0);
                                     return Err(self.throw_range("execution interrupted"));
                                 }
@@ -726,7 +834,47 @@ impl Vm {
                         _ => unreachable!("kernel prop slot invariant"),
                     }
                 }
+                // A pinned-closure call: copy the arguments into the
+                // callee's window and run its (guarded) kernel inline.
+                KOp::CallKernel {
+                    dst,
+                    fslot,
+                    base,
+                    argc: _,
+                } if CALLEES => {
+                    let (bf, wb) = &callee_bfs[fslot as usize];
+                    let ck = bf.proto.fn_kernel.as_ref().expect("guarded");
+                    let win = *wb as usize;
+                    for (r, slot) in ck.locals.iter().enumerate() {
+                        if let crate::bytecode::KSlot::Arg(a) = slot {
+                            regs[win + r] = regs[base as usize + *a as usize];
+                        }
+                    }
+                    if !run_callee_window(&mut regs, ck, win, dst as usize, &interrupt, &mut poll) {
+                        // Interrupted on a callee back-edge: the same
+                        // latch-and-unwind as an interrupted caller edge.
+                        for (r, slot) in k.locals.iter().enumerate() {
+                            if let crate::bytecode::KSlot::Local(l) = slot {
+                                frame.locals[*l as usize] = Value::Number(regs[r]);
+                            }
+                        }
+                        for (j, &l) in k.bool_locals.iter().enumerate() {
+                            frame.locals[l as usize] = Value::Bool(regs[bool_base + j] != 0.0);
+                        }
+                        self.kernel_regs = regs;
+                        objs.clear();
+                        self.kernel_objs = objs;
+                        self.kernel_prop_slots = prop_slots;
+                        callee_bfs.clear();
+                        self.kernel_callees = callee_bfs;
+                        self.op_budget = Some(0);
+                        return Err(self.throw_range("execution interrupted"));
+                    }
+                }
                 KOp::Exit { resume_ip, shape } => break (resume_ip, shape),
+                // Plain instantiation: a kernel without callee_slots never
+                // contains CallKernel (translator invariant).
+                KOp::CallKernel { .. } => unreachable!("CallKernel in a plain kernel loop"),
                 // Function-kernel-only ops; loop translation never emits them.
                 KOp::Ret { .. } | KOp::SelfCall { .. } => unreachable!("fn op in a loop kernel"),
             }
@@ -768,6 +916,8 @@ impl Vm {
         objs.clear();
         self.kernel_objs = objs;
         self.kernel_prop_slots = prop_slots;
+        callee_bfs.clear();
+        self.kernel_callees = callee_bfs;
         Ok(Ctl::Jump(resume_ip as usize))
     }
 
@@ -934,6 +1084,7 @@ impl Vm {
                 | KOp::LoadProp { .. }
                 | KOp::StoreProp { .. }
                 | KOp::Exit { .. }
+                | KOp::CallKernel { .. }
                 | KOp::SelfCall { .. } => unreachable!("bail op in a function kernel"),
             }
             pc += 1;
@@ -1172,6 +1323,7 @@ impl Vm {
                 | KOp::LoadLen { .. }
                 | KOp::LoadProp { .. }
                 | KOp::StoreProp { .. }
+                | KOp::CallKernel { .. }
                 | KOp::Exit { .. } => unreachable!("bail op in a function kernel"),
             }
             pc += 1;
@@ -5065,6 +5217,133 @@ fn bin_arith(vm: &mut Vm, frame: &mut Frame, kind: ArithKind) -> Result<(), Valu
     let r = vm.arith(a, b, kind)?;
     frame.stack.push(r);
     Ok(())
+}
+
+/// Execute the pinned-callee kernel `ck` (guarded by the caller loop
+/// kernel's entry: non-recursive, Number-returning, args/upvalues in the
+/// window at `win`) and write its return value to `regs[dst]`. Returns
+/// `false` when the cooperative interrupt fired on a callee back-edge — the
+/// caller then unwinds exactly like one of its own interrupted edges.
+#[inline(never)]
+fn run_callee_window(
+    regs: &mut [f64],
+    ck: &crate::bytecode::Kernel,
+    win: usize,
+    dst: usize,
+    interrupt: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    poll: &mut u32,
+) -> bool {
+    let code = &ck.code;
+    let mut pc = 0usize;
+    loop {
+        macro_rules! branch {
+            ($t:expr) => {{
+                let t = $t as usize;
+                if t <= pc {
+                    *poll = poll.wrapping_add(1);
+                    if *poll & 0xFF == 0 {
+                        if let Some(flag) = interrupt {
+                            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                pc = t;
+                continue;
+            }};
+        }
+        match code[pc] {
+            KOp::Mov { dst, src } => regs[win + dst as usize] = regs[win + src as usize],
+            KOp::Const { dst, k } => regs[win + dst as usize] = k,
+            KOp::Add { dst, a, b } => {
+                regs[win + dst as usize] = regs[win + a as usize] + regs[win + b as usize]
+            }
+            KOp::AddK { dst, a, k } => regs[win + dst as usize] = regs[win + a as usize] + k,
+            KOp::Arith { kind, dst, a, b } => {
+                regs[win + dst as usize] =
+                    number_arith_raw(regs[win + a as usize], regs[win + b as usize], kind)
+            }
+            KOp::ArithK { kind, dst, a, k } => {
+                regs[win + dst as usize] = number_arith_raw(regs[win + a as usize], k, kind)
+            }
+            KOp::Neg { dst, src } => regs[win + dst as usize] = -regs[win + src as usize],
+            KOp::BitNot { dst, src } => {
+                regs[win + dst as usize] = !crate::vm::to_int32(regs[win + src as usize]) as f64
+            }
+            KOp::Br { target } => branch!(target),
+            KOp::BrCmp {
+                cmp,
+                a,
+                b,
+                if_true,
+                target,
+            } => {
+                if knum_cmp(cmp, regs[win + a as usize], regs[win + b as usize]) == if_true {
+                    branch!(target)
+                }
+            }
+            KOp::BrCmpK {
+                cmp,
+                a,
+                k,
+                if_true,
+                target,
+            } => {
+                if knum_cmp(cmp, regs[win + a as usize], k) == if_true {
+                    branch!(target)
+                }
+            }
+            KOp::BrFalsy { src, target } => {
+                if !knum_truthy(regs[win + src as usize]) {
+                    branch!(target)
+                }
+            }
+            KOp::BrTruthy { src, target } => {
+                if knum_truthy(regs[win + src as usize]) {
+                    branch!(target)
+                }
+            }
+            KOp::CmpSet { cmp, dst, a, b } => {
+                regs[win + dst as usize] =
+                    if knum_cmp(cmp, regs[win + a as usize], regs[win + b as usize]) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+            }
+            KOp::BoolNot { dst, src } => {
+                regs[win + dst as usize] = if knum_truthy(regs[win + src as usize]) {
+                    0.0
+                } else {
+                    1.0
+                }
+            }
+            KOp::Math1 { kind, dst, src } => {
+                regs[win + dst as usize] = kmath1(kind, regs[win + src as usize])
+            }
+            KOp::Math2 { kind, dst, a, b } => {
+                regs[win + dst as usize] =
+                    kmath2(kind, regs[win + a as usize], regs[win + b as usize])
+            }
+            KOp::Ret { src, boolean: _ } => {
+                // Number-only (the caller guard rejected boolean returns).
+                regs[dst] = regs[win + src as usize];
+                return true;
+            }
+            // Impossible in a guarded callee: no bails, no exits, no
+            // recursion, no nested closure calls.
+            KOp::LoadElem { .. }
+            | KOp::StoreElem { .. }
+            | KOp::LoadLen { .. }
+            | KOp::LoadProp { .. }
+            | KOp::StoreProp { .. }
+            | KOp::Exit { .. }
+            | KOp::SelfCall { .. }
+            | KOp::CallKernel { .. } => unreachable!("unsupported op in a callee kernel"),
+        }
+        pc += 1;
+    }
 }
 
 /// Number (f64) arithmetic preserving the original JS semantics.

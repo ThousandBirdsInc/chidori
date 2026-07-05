@@ -352,6 +352,9 @@ pub struct Vm {
     /// Pooled entry-resolved property-slot indices for kernel
     /// `LoadProp`/`StoreProp` (see `KProp`).
     pub(crate) kernel_prop_slots: Vec<u32>,
+    /// Pooled entry-verified closure callees for kernel `CallKernel`:
+    /// (callee function, register-window base).
+    pub(crate) kernel_callees: Vec<(std::rc::Rc<crate::value::BytecodeFunction>, u32)>,
 }
 
 impl Vm {
@@ -387,6 +390,7 @@ impl Vm {
             kernel_regs: Vec::new(),
             kernel_objs: Vec::new(),
             kernel_prop_slots: Vec::new(),
+            kernel_callees: Vec::new(),
             dummy_bf: Rc::new(BytecodeFunction {
                 proto: Rc::new(crate::bytecode::FuncProto::empty(
                     "",

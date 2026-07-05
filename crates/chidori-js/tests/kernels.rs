@@ -335,6 +335,40 @@ const CORPUS: &[&str] = &[
     // `length` as a plain object property takes the array bail path per
     // access (LoadLen on a non-array) — correct, just generic.
     "const o = { length: 4 }; let s = 0; for (let i = 0; i < o.length; i++) { s += i; } console.log(s);",
+    // ---- pinned-closure calls inside loop kernels (CallKernel) ----
+    // The closures workload shape: capturing adder called per iteration.
+    "function adder(n) { return function (x) { return x + n; }; } const f = adder(5); let s = 0; for (let i = 0; i < 100; i++) s = f(s) - 4; console.log(s);",
+    // Arrow callee, two args, result feeding compound arithmetic.
+    "const mul = (a, b) => a * b + 1; let s = 0; for (let i = 1; i <= 20; i++) { s += mul(i, s % 7); } console.log(s);",
+    // TWO distinct callees in one region.
+    "const inc = x => x + 1; const dbl = x => x * 2; let s = 0; for (let i = 0; i < 10; i++) { s = dbl(inc(s)); } console.log(s);",
+    // Callee with a NON-number captured upvalue: declines, generic concat.
+    "function tag(t) { return x => x + t; } const g = tag('!'); let s = ''; for (let i = 0; i < 3; i++) { s = g(s); } console.log(s);",
+    // Callee REASSIGNED inside the loop: base-local store rejects the
+    // region; the generic loop swaps functions mid-flight.
+    "let f = x => x + 1; const g = x => x * 10; let s = 0; for (let i = 0; i < 6; i++) { s = f(s); if (i === 2) f = g; } console.log(s);",
+    // Callee changed BETWEEN activations of a kernelized loop.
+    "function run(f, n) { let s = 0; for (let i = 0; i < n; i++) { s = f(s) + 1; } return s; } console.log(run(x => x + 2, 5), run(x => x * 2, 5));",
+    // BOOLEAN-returning callee declines (result register is Number-typed).
+    "const isPos = x => x > 0; let c = 0; for (let i = -3; i < 4; i++) { if (isPos(i)) c++; const t = isPos(i); c += typeof t === 'boolean' ? 10 : 0; } console.log(c);",
+    // Callee without a function kernel (touches a property): generic.
+    "const o = { v: 2 }; const get = x => o.v + x; let s = 0; for (let i = 0; i < 5; i++) { s = get(s); } console.log(s);",
+    // NATIVE callee (not a bytecode function): declines.
+    "const f = Math.sqrt; let s = 0; for (let i = 0; i < 5; i++) { s += f(i * i); } console.log(s);",
+    // RECURSIVE callee (has a self-kernel): declines the loop tier; the
+    // recursive kernel still runs per call through the generic loop.
+    "function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } let s = 0; for (let i = 0; i < 8; i++) { s += fib(i); } console.log(s);",
+    // Fewer args than the callee consumes: guard declines (undefined param).
+    "const add = (a, b) => a + b; let s = 0; for (let i = 0; i < 4; i++) { s = add(i); s = typeof s; } console.log(s);",
+    // Extra args are ignored on both paths.
+    "const one = a => a + 1; let s = 0; for (let i = 0; i < 5; i++) { s = one(s, i, 99); } console.log(s);",
+    // Callee with Math intrinsics; then a monkeypatched Math declines.
+    "const clamp = x => Math.max(Math.min(x, 10), 0); let s = 0; for (let i = -5; i < 15; i++) { s += clamp(i); } console.log(s);",
+    "const orig = Math.abs; const f = x => Math.abs(x); let s = 0; Math.abs = () => 7; for (let i = -2; i < 2; i++) { s += f(i); } Math.abs = orig; console.log(s);",
+    // Declared-function callee (this/new.target prologue) with -0/NaN pins.
+    "function m(x, y) { return x * y; } let z = 1; for (let i = 0; i < 3; i++) { z = m(-0, i); } console.log(Object.is(z, -0), Object.is(m(0, -1), -0));",
+    // Callee result stored through kernel props and elements.
+    "const step = x => (x * 3 + 1) % 97; const o = { v: 5 }; const a = [0, 0, 0]; for (let i = 0; i < a.length; i++) { o.v = step(o.v); a[i] = o.v; } console.log(a.join(','), o.v);",
 ];
 
 #[test]
@@ -589,6 +623,31 @@ fn property_loops_get_kernels() {
     )
     .expect("compiles");
     assert!(count(&proto) >= 1, "property get/set loop must kernelize");
+}
+
+/// Loops calling a pinned tiny closure actually kernelize (pins the
+/// CallKernel tier — the whole region rejects if the call can't fuse).
+#[test]
+fn closure_call_loops_get_kernels() {
+    fn count(p: &FuncProto) -> usize {
+        let mut n = p.kernels.len();
+        for c in &p.consts {
+            if let Const::Func(f) = c {
+                n += count(f);
+            }
+        }
+        n
+    }
+    for src in [
+        "function adder(n) { return function (x) { return x + n; }; } const f = adder(5); let s = 0; for (let i = 0; i < 10; i++) s = f(s) - 4; s;",
+        "const inc = x => x + 1; const dbl = x => x * 2; let s = 0; for (let i = 0; i < 10; i++) { s = dbl(inc(s)); } s;",
+    ] {
+        let proto = compile_script(src).expect("compiles");
+        assert!(
+            count(&proto) >= 1,
+            "closure-call loop must kernelize in {src:?}"
+        );
+    }
 }
 
 /// Math-using loops actually kernelize (pins v3 eligibility).

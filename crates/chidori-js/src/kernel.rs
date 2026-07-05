@@ -64,7 +64,7 @@
 //! corpus + fuzz (`tests/kernels.rs`) runs every supported construct with
 //! kernels on and off and asserts byte-identical behavior.
 
-use crate::bytecode::{CmpOp, Const, KMath, KOp, KProp, KShapeSlot, KSlot, Kernel, Op};
+use crate::bytecode::{CmpOp, Const, KCallee, KMath, KOp, KProp, KShapeSlot, KSlot, Kernel, Op};
 use crate::exec::ArithKind;
 
 /// Bounds keeping `u16` fields comfortable and per-kernel work finite. Loops
@@ -386,6 +386,9 @@ struct Xlate<'a> {
     /// Named-property access classes over oslot bases (entry-resolved; see
     /// [`KProp`]). Deduplicated by (oslot, key); flags OR together.
     props_used: Vec<KProp>,
+    /// Pinned closure callees (loop mode; see [`KCallee`]): per oslot, the
+    /// smallest argc any call site supplies.
+    callees: Vec<KCallee>,
     /// a compare op fused with its following conditional jump: skip that ip.
     absorbed: Option<usize>,
     max_stack: u16,
@@ -444,6 +447,7 @@ fn translate(
         exits: Vec::new(),
         math_used: Vec::new(),
         props_used: Vec::new(),
+        callees: Vec::new(),
         absorbed: None,
         max_stack: 0,
     };
@@ -639,6 +643,10 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
             KOp::LoadLen { dst, .. } => *dst = remap(*dst),
             KOp::LoadProp { dst, .. } => *dst = remap(*dst),
             KOp::StoreProp { src, .. } => *src = remap(*src),
+            KOp::CallKernel { dst, base, .. } => {
+                *dst = remap(*dst);
+                *base = remap(*base);
+            }
             KOp::Ret { src, .. } => *src = remap(*src),
             KOp::SelfCall { dst, base, .. } => {
                 *dst = remap(*dst);
@@ -691,6 +699,7 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
         shapes: shapes.into_boxed_slice(),
         math_used: std::mem::take(&mut x.math_used).into_boxed_slice(),
         props_used: std::mem::take(&mut x.props_used).into_boxed_slice(),
+        callee_slots: std::mem::take(&mut x.callees).into_boxed_slice(),
         n_regs: n_locals + n_bools + x.max_stack + 1,
         self_global: None, // `kernelize_function` fills it for recursive kernels
         fallback: Box::new(Op::Nop), // caller stores the real header op
@@ -1661,6 +1670,48 @@ impl Xlate<'_> {
                         dst,
                         base,
                         argc: u16::try_from(n).ok()?,
+                    });
+                    return Some(());
+                }
+                // LOOP mode: a call of a PINNED closure — the callee is an
+                // object-typed local (oslot machinery, discovered exactly
+                // like an array base) under a plain `undefined` this.
+                // Arguments must be statically NUMBER registers: they copy
+                // raw into the callee kernel's guarded-Number arg registers.
+                if !self.fn_mode
+                    && matches!(self.vstack.get(fn_pos + 1)?, VE::Undef)
+                    && !matches!(self.vstack.get(fn_pos)?, VE::MathFn(_) | VE::MathObj)
+                {
+                    for d in 0..n {
+                        self.top_num_reg(d)?;
+                    }
+                    let oslot = self.base_slot(n + 1)?;
+                    let argc = u16::try_from(n).ok()?;
+                    // `fslot` indexes the CALLEE table (parallel to the
+                    // executor's per-activation window list), NOT the oslots.
+                    let fslot = match self.callees.iter().position(|c| c.oslot == oslot) {
+                        Some(i) => {
+                            self.callees[i].min_argc = self.callees[i].min_argc.min(argc);
+                            i
+                        }
+                        None => {
+                            self.callees.push(KCallee {
+                                oslot,
+                                min_argc: argc,
+                            });
+                            self.callees.len() - 1
+                        }
+                    };
+                    let base = if n > 0 { self.preg(fn_pos + 2)? } else { 0 };
+                    for _ in 0..n + 2 {
+                        self.pop()?;
+                    }
+                    let dst = self.push_num()?;
+                    self.kops.push(K::CallKernel {
+                        dst,
+                        fslot: u16::try_from(fslot).ok()?,
+                        base,
+                        argc,
                     });
                     return Some(());
                 }
