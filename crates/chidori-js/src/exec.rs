@@ -374,6 +374,12 @@ impl Vm {
     /// conditions on every use and BAIL to the generic interpreter at the
     /// access op (operand stack reconstructed from the kernel's shape table)
     /// on any surprise — a bail is a slow iteration, never a wrong answer.
+    ///
+    /// `inline(never)`: called once per loop ACTIVATION (not per iteration),
+    /// and keeping its large register loop out of `step` pins the codegen of
+    /// both — growing this function must not perturb the interpreter's hot
+    /// dispatch.
+    #[inline(never)]
     fn run_kernel_op(&mut self, frame: &mut Frame, idx: u32) -> Result<Ctl, Value> {
         let proto = frame.func.proto.clone();
         let k = &proto.kernels[idx as usize];
@@ -414,6 +420,41 @@ impl Vm {
         // kernel region can mutate globals, so entry-time checks suffice.
         if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
             return self.step(frame, &k.fallback);
+        }
+        // Named-property access classes resolve ONCE per activation to raw
+        // slot indices (see `KProp`): each base must be an ORDINARY object
+        // whose own data property exists — a Number where loaded, writable
+        // where stored. Slots stay valid for the whole activation because
+        // nothing inside a kernel region can create/delete properties or run
+        // user code; in-kernel `StoreProp` only overwrites values in place.
+        let mut prop_slots = std::mem::take(&mut self.kernel_prop_slots);
+        prop_slots.clear();
+        for p in k.props_used.iter() {
+            let mut ok = false;
+            if let Value::Object(o) = &frame.locals[k.oslots[p.oslot as usize] as usize] {
+                let b = o.borrow();
+                if matches!(b.internal, Internal::Ordinary) {
+                    if let Some((
+                        idx,
+                        _,
+                        Property {
+                            kind: PropertyKind::Data { value, writable },
+                            ..
+                        },
+                    )) = b.props.get_full(&PropertyKey::str(&p.key))
+                    {
+                        if (!p.load || matches!(value, Value::Number(_))) && (!p.store || *writable)
+                        {
+                            prop_slots.push(idx as u32);
+                            ok = true;
+                        }
+                    }
+                }
+            }
+            if !ok {
+                self.kernel_prop_slots = prop_slots;
+                return self.step(frame, &k.fallback);
+            }
         }
         // Unboxed register file + array-base cache (both pooled on the Vm;
         // kernels never nest at runtime). The base objects are pinned for the
@@ -477,6 +518,7 @@ impl Vm {
                                     self.kernel_regs = regs;
                                     objs.clear();
                                     self.kernel_objs = objs;
+                                    self.kernel_prop_slots = prop_slots;
                                     self.op_budget = Some(0);
                                     return Err(self.throw_range("execution interrupted"));
                                 }
@@ -649,6 +691,41 @@ impl Vm {
                         branch!(bail)
                     }
                 }
+                // Entry-resolved named property access: raw slot, no check —
+                // the activation invariant (no map restructuring inside a
+                // kernel) keeps the slot AND its Number-ness valid.
+                KOp::LoadProp { dst, prop } => {
+                    let p = &k.props_used[prop as usize];
+                    let b = objs[p.oslot as usize].borrow();
+                    match b.props.get_index(prop_slots[prop as usize] as usize) {
+                        Some((
+                            _,
+                            Property {
+                                kind:
+                                    PropertyKind::Data {
+                                        value: Value::Number(n),
+                                        ..
+                                    },
+                                ..
+                            },
+                        )) => regs[dst as usize] = *n,
+                        _ => unreachable!("kernel prop slot invariant"),
+                    }
+                }
+                KOp::StoreProp { prop, src } => {
+                    let p = &k.props_used[prop as usize];
+                    let mut b = objs[p.oslot as usize].borrow_mut();
+                    match b.props.get_index_mut(prop_slots[prop as usize] as usize) {
+                        Some((
+                            _,
+                            Property {
+                                kind: PropertyKind::Data { value, .. },
+                                ..
+                            },
+                        )) => *value = Value::Number(regs[src as usize]),
+                        _ => unreachable!("kernel prop slot invariant"),
+                    }
+                }
                 KOp::Exit { resume_ip, shape } => break (resume_ip, shape),
                 // Function-kernel-only ops; loop translation never emits them.
                 KOp::Ret { .. } | KOp::SelfCall { .. } => unreachable!("fn op in a loop kernel"),
@@ -690,6 +767,7 @@ impl Vm {
         self.kernel_regs = regs;
         objs.clear();
         self.kernel_objs = objs;
+        self.kernel_prop_slots = prop_slots;
         Ok(Ctl::Jump(resume_ip as usize))
     }
 
@@ -853,6 +931,8 @@ impl Vm {
                 KOp::LoadElem { .. }
                 | KOp::StoreElem { .. }
                 | KOp::LoadLen { .. }
+                | KOp::LoadProp { .. }
+                | KOp::StoreProp { .. }
                 | KOp::Exit { .. }
                 | KOp::SelfCall { .. } => unreachable!("bail op in a function kernel"),
             }
@@ -1090,6 +1170,8 @@ impl Vm {
                 KOp::LoadElem { .. }
                 | KOp::StoreElem { .. }
                 | KOp::LoadLen { .. }
+                | KOp::LoadProp { .. }
+                | KOp::StoreProp { .. }
                 | KOp::Exit { .. } => unreachable!("bail op in a function kernel"),
             }
             pc += 1;

@@ -349,6 +349,9 @@ pub struct Vm {
     /// `kernel_regs`); cleared after every activation so the pool never
     /// extends an object's lifetime.
     pub(crate) kernel_objs: Vec<crate::value::JsObject>,
+    /// Pooled entry-resolved property-slot indices for kernel
+    /// `LoadProp`/`StoreProp` (see `KProp`).
+    pub(crate) kernel_prop_slots: Vec<u32>,
 }
 
 impl Vm {
@@ -383,6 +386,7 @@ impl Vm {
             frame_pool: Vec::new(),
             kernel_regs: Vec::new(),
             kernel_objs: Vec::new(),
+            kernel_prop_slots: Vec::new(),
             dummy_bf: Rc::new(BytecodeFunction {
                 proto: Rc::new(crate::bytecode::FuncProto::empty(
                     "",

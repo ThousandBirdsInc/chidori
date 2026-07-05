@@ -830,6 +830,43 @@ boolean-return and mutual-recursion negatives, per-call declines, and a
 dedicated depth-overflow differential (`max_call_depth = 64` on a big-stack
 thread) pinning the abandon-and-rerun RangeError path.
 
+**Kernel v7 (same branch): named-property access on pinned objects.**
+
+The property_access shape — a monomorphic `o.a = i; o.b = o.a + 1; …`
+get/set loop over a plain object — was pure interpreter tax (44% `step`,
+27% `Value` clone/drop/push). `Op::GetProp`/`Op::SetProp` over an
+oslot-pinned base now translate to `KOp::LoadProp`/`KOp::StoreProp`, with
+a resolution model STRONGER than an inline cache: each (base, key) class
+resolves ONCE at kernel entry to a raw property-map slot index, and then
+runs with **zero per-access checks and no bail path**. That is sound
+because nothing inside a kernel region can restructure a property map —
+no calls, no property creation or deletion (`delete` rejects the region;
+a creating store never translates) — and the only in-kernel property
+writes are `StoreProp`'s in-place `Number` overwrites, so both the slot
+index and the loaded-value Number-ness are activation invariants.
+
+- **Entry conditions** per class (mirroring `Op::SetProp`'s interpreter
+  fast path): the base holds an `Internal::Ordinary` object (exotic
+  receivers — Proxy, module namespace, typed arrays, `Date`&c. — decline),
+  the property exists as an OWN data property, holds a `Number` where the
+  region loads it, and is writable where the region stores it. Any miss
+  declines the ACTIVATION into the generic fallback iteration (accessors
+  fire, frozen objects fail silently/throw, prototype reads walk the
+  chain — all observably, on the spec path), and the kernel re-tries at
+  the next back-edge (late entry covers the create-then-loop idiom).
+- Aliased bases stay coherent (every access reads/writes the object's
+  real storage); slots re-resolve on every activation, so shape changes
+  BETWEEN activations are fine. `o.length` keeps the array `LoadLen`
+  path.
+
+Measured: **property_access 3.84 G → 0.69 G instructions (−82%, 5.5×)**,
+checksums byte-identical across the suite. The fatter kernel dispatch
+loop costs arith_loop/array_sum ~+2.5% (register pressure), dwarfed by
+the win. Corpus grew getter/setter observation counts, frozen and
+non-writable stores (sloppy + strict), prototype reads, aliasing,
+create-in-loop late entry, `delete`-in-loop rejection, between-activation
+shape changes, non-Ordinary receivers, and −0/NaN pins.
+
 ### 6.5.1 What's next (new baseline)
 
 - Remaining kernel candidates: `String.prototype.charCodeAt`-class reads,

@@ -302,6 +302,39 @@ const CORPUS: &[&str] = &[
     // Non-number argument at the top call (per-call decline; the inner
     // numeric self-calls still kernelize mid-recursion).
     "function s(n) { return n < 2 ? n : s(n - 1) + s(n - 2); } console.log(s(8), s('4'));",
+    // ---- named-property access on pinned objects (LoadProp/StoreProp) ----
+    // The canonical get/set loop (mirrors the property_access workload).
+    "const o = { a: 0, b: 0, c: 0 }; for (let i = 0; i < 100; i++) { o.a = i; o.b = o.a + 1; o.c = o.b + o.a; } console.log(o.a, o.b, o.c);",
+    // ALIASED bases: writes through one binding read through the other.
+    "const o = { v: 0 }; const p = o; let s = 0; for (let i = 0; i < 10; i++) { o.v = i * 2; s += p.v; } console.log(s, p.v);",
+    // GETTER on the receiver: entry declines; the getter fires per read.
+    "let gets = 0; const o = { n: 3, get x() { gets++; return this.n; } }; let s = 0; for (let i = 0; i < 5; i++) { s += o.x; } console.log(s, gets);",
+    // SETTER: entry declines; the setter observes every write.
+    "let sets = 0; const o = { n: 0, set v(x) { sets++; this.n = x * 2; } }; for (let i = 0; i < 4; i++) { o.v = i; } console.log(o.n, sets);",
+    // Frozen receiver: sloppy silent no-op / strict TypeError, generically.
+    "const o = Object.freeze({ k: 1 }); let s = 0; for (let i = 0; i < 3; i++) { o.k = i; s += o.k; } console.log(s, o.k);",
+    "'use strict'; const o = Object.freeze({ k: 1 }); try { for (let i = 0; i < 3; i++) { o.k = i; } } catch (e) { console.log('frozen', e.constructor.name); }",
+    // Single non-writable property via defineProperty.
+    "const o = { a: 0 }; Object.defineProperty(o, 'b', { value: 9, writable: false, enumerable: true }); let s = 0; for (let i = 0; i < 3; i++) { o.a = i; o.b = i; s += o.a + o.b; } console.log(s, o.b);",
+    // PROTOTYPE-inherited read (no own property): stays generic.
+    "const proto = { k: 7 }; const o = Object.create(proto); let s = 0; for (let i = 0; i < 4; i++) { s += o.k; } console.log(s);",
+    // Property CREATED by the loop's first iteration (late entry after).
+    "const o = {}; for (let i = 0; i < 10; i++) { o.d = (o.d || 0) + i; } console.log(o.d);",
+    // Non-number property value: per-iteration decline, exact semantics.
+    "const o = { s: '' }; for (let i = 0; i < 3; i++) { o.s = o.s + i; } console.log(o.s);",
+    // `delete` inside the loop rejects the region; still correct.
+    "const o = { a: 1, b: 2 }; let s = 0; for (let i = 0; i < 4; i++) { o.a = i; s += o.a; if (i === 1) { delete o.b; } } console.log(s, 'b' in o);",
+    // Shape changed BETWEEN activations (slots re-resolve per entry).
+    "function f(o, n) { let s = 0; for (let i = 0; i < n; i++) { o.x = i; s += o.x + o.y; } return s; } const o = { x: 0, y: 10 }; console.log(f(o, 5)); delete o.x; o.z = 1; o.x = 0; console.log(f(o, 5));",
+    // Non-Ordinary receiver (Date): declines, generic path.
+    "const d = new Date(0); d.foo = 0; let s = 0; for (let i = 0; i < 3; i++) { d.foo = i; s += d.foo; } console.log(s);",
+    // Props mixed with dense-element access in one region.
+    "const o = { sum: 0 }; const a = [5, 6, 7]; for (let i = 0; i < a.length; i++) { o.sum = o.sum + a[i]; } console.log(o.sum);",
+    // -0 / NaN through property writes; typeof pins.
+    "const o = { z: 1, n: 1 }; for (let i = 0; i < 3; i++) { o.z = -0 * i; o.n = i === 1 ? NaN : i; } console.log(Object.is(o.z, -0), o.n !== o.n, typeof o.z);",
+    // `length` as a plain object property takes the array bail path per
+    // access (LoadLen on a non-array) — correct, just generic.
+    "const o = { length: 4 }; let s = 0; for (let i = 0; i < o.length; i++) { s += i; } console.log(s);",
 ];
 
 #[test]
@@ -536,6 +569,26 @@ fn self_kernel_depth_overflow_reruns_generic() {
         .expect("spawns")
         .join()
         .expect("no panic");
+}
+
+/// Named-property get/set loops on plain objects actually kernelize
+/// (pins the LoadProp/StoreProp tier against silent regressions).
+#[test]
+fn property_loops_get_kernels() {
+    fn count(p: &FuncProto) -> usize {
+        let mut n = p.kernels.len();
+        for c in &p.consts {
+            if let Const::Func(f) = c {
+                n += count(f);
+            }
+        }
+        n
+    }
+    let proto = compile_script(
+        "const o = { a: 0, b: 0, c: 0 }; for (let i = 0; i < 10; i++) { o.a = i; o.b = o.a + 1; o.c = o.b + o.a; } o.c;",
+    )
+    .expect("compiles");
+    assert!(count(&proto) >= 1, "property get/set loop must kernelize");
 }
 
 /// Math-using loops actually kernelize (pins v3 eligibility).

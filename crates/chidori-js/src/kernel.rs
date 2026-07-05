@@ -64,7 +64,7 @@
 //! corpus + fuzz (`tests/kernels.rs`) runs every supported construct with
 //! kernels on and off and asserts byte-identical behavior.
 
-use crate::bytecode::{CmpOp, Const, KMath, KOp, KShapeSlot, KSlot, Kernel, Op};
+use crate::bytecode::{CmpOp, Const, KMath, KOp, KProp, KShapeSlot, KSlot, Kernel, Op};
 use crate::exec::ArithKind;
 
 /// Bounds keeping `u16` fields comfortable and per-kernel work finite. Loops
@@ -383,6 +383,9 @@ struct Xlate<'a> {
     exits: Vec<(usize, u32, Vec<VE>)>,
     /// Math intrinsics used (entry guard checks each against the realm).
     math_used: Vec<KMath>,
+    /// Named-property access classes over oslot bases (entry-resolved; see
+    /// [`KProp`]). Deduplicated by (oslot, key); flags OR together.
+    props_used: Vec<KProp>,
     /// a compare op fused with its following conditional jump: skip that ip.
     absorbed: Option<usize>,
     max_stack: u16,
@@ -440,6 +443,7 @@ fn translate(
         fixups: Vec::new(),
         exits: Vec::new(),
         math_used: Vec::new(),
+        props_used: Vec::new(),
         absorbed: None,
         max_stack: 0,
     };
@@ -633,6 +637,8 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                 *val = remap(*val);
             }
             KOp::LoadLen { dst, .. } => *dst = remap(*dst),
+            KOp::LoadProp { dst, .. } => *dst = remap(*dst),
+            KOp::StoreProp { src, .. } => *src = remap(*src),
             KOp::Ret { src, .. } => *src = remap(*src),
             KOp::SelfCall { dst, base, .. } => {
                 *dst = remap(*dst);
@@ -684,6 +690,7 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
         oslots: x.oslot_locals.to_vec().into_boxed_slice(),
         shapes: shapes.into_boxed_slice(),
         math_used: std::mem::take(&mut x.math_used).into_boxed_slice(),
+        props_used: std::mem::take(&mut x.props_used).into_boxed_slice(),
         n_regs: n_locals + n_bools + x.max_stack + 1,
         self_global: None, // `kernelize_function` fills it for recursive kernels
         fallback: Box::new(Op::Nop), // caller stores the real header op
@@ -966,6 +973,31 @@ impl Xlate<'_> {
                 Some(u16::try_from(s).ok()?)
             }
         }
+    }
+
+    /// Named-property access class for (`oslot`, `key`), deduplicated with
+    /// flags OR'd (a site that both loads and stores demands both entry
+    /// conditions). Bounded so per-activation entry resolution stays cheap.
+    fn kprop(&mut self, oslot: u16, key: &str, load: bool, store: bool) -> Option<u16> {
+        if let Some(i) = self
+            .props_used
+            .iter()
+            .position(|p| p.oslot == oslot && &*p.key == key)
+        {
+            self.props_used[i].load |= load;
+            self.props_used[i].store |= store;
+            return u16::try_from(i).ok();
+        }
+        if self.props_used.len() >= 64 {
+            return None;
+        }
+        self.props_used.push(KProp {
+            oslot,
+            key: key.into(),
+            load,
+            store,
+        });
+        u16::try_from(self.props_used.len() - 1).ok()
     }
 
     /// Within the same basic block starting at region-relative ip `from`, is
@@ -1553,21 +1585,51 @@ impl Xlate<'_> {
                     self.kops.push(K::Const { dst, k });
                     return Some(());
                 }
-                match self.consts.get(*c as usize)? {
-                    Const::String(s) if s.as_str() == "length" => {}
+                let key = match self.consts.get(*c as usize)? {
+                    Const::String(s) => s.as_str().to_string(),
                     _ => return None,
+                };
+                if key == "length" {
+                    // Arrays: derived length, per-access checked, bailable.
+                    let shape = self.vstack.clone();
+                    let obj = self.base_slot(0)?;
+                    self.pop()?; // base
+                    let dst = self.push_num()?;
+                    let kidx = self.kops.len();
+                    self.kops.push(K::LoadLen {
+                        dst,
+                        obj,
+                        bail: u16::MAX,
+                    });
+                    self.exits.push((kidx, self.base_ip + i as u32, shape));
+                } else {
+                    // Ordinary-object own data property: entry-resolved slot,
+                    // no per-access check, no bail (see `KOp::LoadProp`).
+                    let obj = self.base_slot(0)?;
+                    let prop = self.kprop(obj, &key, true, false)?;
+                    self.pop()?; // base
+                    let dst = self.push_num()?;
+                    self.kops.push(K::LoadProp { dst, prop });
                 }
-                let shape = self.vstack.clone();
-                let obj = self.base_slot(0)?;
+            }
+
+            // `o.k = v` named write: the entry-resolved in-place overwrite
+            // (`KOp::StoreProp`); the op's result is the assigned value.
+            Op::SetProp(c) => {
+                let key = match self.consts.get(*c as usize)? {
+                    Const::String(s) => s.as_str().to_string(),
+                    _ => return None,
+                };
+                let val = self.top_num_reg(0)?;
+                let obj = self.base_slot(1)?;
+                let prop = self.kprop(obj, &key, false, true)?;
+                self.pop()?; // val
                 self.pop()?; // base
                 let dst = self.push_num()?;
-                let kidx = self.kops.len();
-                self.kops.push(K::LoadLen {
-                    dst,
-                    obj,
-                    bail: u16::MAX,
-                });
-                self.exits.push((kidx, self.base_ip + i as u32, shape));
+                self.kops.push(K::StoreProp { prop, src: val });
+                if dst != val {
+                    self.kops.push(K::Mov { dst, src: val });
+                }
             }
 
             // A call is supported ONLY as the compiler's Math method-call

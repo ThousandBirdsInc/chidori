@@ -1039,6 +1039,22 @@ pub enum KOp {
     /// emitted for loop kernels (their region has no `Return` on the
     /// allowlist).
     Ret { src: u16, boolean: bool },
+    /// Named own-property READ (`o.a`) on the pinned object in
+    /// [`Kernel::props_used`] entry `prop`. No per-access check and no bail:
+    /// the kernel ENTRY resolved the property to a raw slot index and proved
+    /// it a `Number`-holding own data property on an `Internal::Ordinary`
+    /// object — and nothing inside a kernel region can restructure a
+    /// property map (no calls, no property creation/deletion; the only
+    /// in-kernel property writes are [`KOp::StoreProp`]'s in-place `Number`
+    /// overwrites), so the slot and its Number-ness hold for the whole
+    /// activation. Any entry-time surprise declines the activation into the
+    /// generic fallback iteration instead.
+    LoadProp { dst: u16, prop: u16 },
+    /// Named own-property WRITE (`o.a = v`) — the in-place overwrite of the
+    /// entry-resolved WRITABLE own data property (exactly the interpreter's
+    /// `Op::SetProp` fast-path conditions). See [`KOp::LoadProp`] for why no
+    /// per-access check is needed.
+    StoreProp { prop: u16, src: u16 },
     /// FUNCTION kernels only: a DIRECT SELF-RECURSIVE call (`fib(n - 1)`
     /// inside `fib`), executed as a fresh register WINDOW running the same
     /// kernel code from pc 0 — no frame, no `Value`s, just an explicit
@@ -1063,6 +1079,22 @@ pub enum KSlot {
     Local(u32),
     Upvalue(u32),
     Arg(u32),
+}
+
+/// One named-property access class in a kernel (`o.a` / `o.a = v` sites over
+/// the pinned base object in oslot `oslot`): resolved ONCE per kernel
+/// activation to a raw property-map slot index. The entry check requires an
+/// [`crate::value::Internal::Ordinary`] receiver whose OWN data property
+/// `key` exists — holding a `Number` when `load` (reads must produce what
+/// the guard typed), writable when `store` — and declines the activation
+/// otherwise. Slot indices are stable for the activation because kernel
+/// regions contain no calls and no property creation/deletion.
+#[derive(Clone, Debug)]
+pub struct KProp {
+    pub oslot: u16,
+    pub key: Box<str>,
+    pub load: bool,
+    pub store: bool,
 }
 
 /// One operand-stack slot of a kernel exit shape, bottom-up: a `Number` read
@@ -1190,6 +1222,9 @@ pub struct Kernel {
     pub oslots: Box<[u32]>,
     /// Operand-stack shapes for [`KOp::Exit`] (bottom-up).
     pub shapes: Box<[Box<[KShapeSlot]>]>,
+    /// Named-property access classes ([`KOp::LoadProp`]/[`KOp::StoreProp`]),
+    /// entry-resolved to raw slot indices. See [`KProp`].
+    pub props_used: Box<[KProp]>,
     /// Math intrinsics this kernel executes: the entry guard identity-checks
     /// the global `Math` binding and each of these methods against the
     /// realm's canonical objects before running.
