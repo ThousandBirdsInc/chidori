@@ -13,6 +13,13 @@ pub struct Realm {
     /// The %eval% intrinsic function object — `Op::DirectEval` compares the
     /// callee against it to decide direct-vs-ordinary call semantics.
     pub eval_fn: Option<JsObject>,
+    /// The canonical `Math` object and its kernel-supported methods (indexed
+    /// by [`crate::bytecode::KMath`]), captured at install. The typed loop
+    /// kernels identity-check these at entry: a kernel using `Math.max` runs
+    /// only while the global `Math` binding and the method are still these
+    /// exact objects; anything else declines to the generic path.
+    pub math_object: Option<JsObject>,
+    pub math_kernel: Vec<JsObject>,
 
     pub object_proto: JsObject,
     pub function_proto: JsObject,
@@ -164,6 +171,8 @@ impl Realm {
         Realm {
             global: bare(),
             eval_fn: None,
+            math_object: None,
+            math_kernel: Vec::new(),
             object_proto: bare(),
             function_proto: bare(),
             array_proto: bare(),

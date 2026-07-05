@@ -105,6 +105,17 @@ pub struct FuncProto {
     pub name: String,
     pub code: Vec<Op>,
     pub consts: Vec<Const>,
+    /// Typed loop kernels compiled by `kernel.rs` (docs/js-performance-roadmap.md
+    /// §6.5): an [`Op::LoopKernel`] at a loop header indexes into this table.
+    /// Empty for functions with no eligible loops.
+    pub kernels: Vec<Kernel>,
+    /// FUNCTION kernel (docs/js-performance-roadmap.md §6.5): the ENTIRE body
+    /// as a register program, executed FRAMELESS by the call paths when the
+    /// entry guard passes (every consumed argument a `Number`, captured
+    /// upvalues `Number`s, no op budget, no trace sink). Guard failure takes
+    /// the ordinary frame path. `None` for anything but tiny pure-scalar
+    /// bodies (sort comparators, map/filter/reduce callbacks).
+    pub fn_kernel: Option<Kernel>,
     /// Number of plain (non-captured) local slots.
     pub num_locals: u32,
     /// Number of cell (captured-by-closure) slots.
@@ -197,6 +208,8 @@ impl FuncProto {
             name: name.to_string(),
             code: Vec::new(),
             consts: Vec::new(),
+            kernels: Vec::new(),
+            fn_kernel: None,
             num_locals: 0,
             num_cells: 0,
             num_params: 0,
@@ -901,4 +914,364 @@ pub enum Op {
     Nop,
     /// Create the `arguments` object from current frame.
     LoadArguments,
+    /// A typed loop kernel sits at this loop header (see [`Kernel`] and
+    /// `kernel.rs`). The payload indexes [`FuncProto::kernels`]. Placed by the
+    /// kernelization pass REPLACING the original header op (which is preserved
+    /// as [`Kernel::fallback`]), so every other instruction index — and every
+    /// jump target — in the function is unchanged.
+    LoopKernel(u32),
+}
+
+// =============================================================================
+// Typed loop kernels
+// =============================================================================
+
+/// The kernel register machine's instruction set: unboxed `f64` registers, no
+/// operand stack, no heap values. Produced by `kernel.rs` from an eligible
+/// loop region's bytecode; executed by `Vm::run_kernel`. `target` fields index
+/// [`Kernel::code`]. Numeric semantics are shared with the interpreter
+/// (`number_arith_raw`, `js_mod`, `to_int32`, …) so results are bit-identical
+/// to the generic path on `Number` inputs — which the entry guard establishes
+/// and the (closed-under-arithmetic) op set preserves.
+#[derive(Clone, Copy, Debug)]
+pub enum KOp {
+    /// `regs[dst] = regs[src]`
+    Mov { dst: u16, src: u16 },
+    /// `regs[dst] = k`
+    Const { dst: u16, k: f64 },
+    /// `regs[dst] = regs[a] + regs[b]` (numeric `+`; strings can't occur here)
+    Add { dst: u16, a: u16, b: u16 },
+    /// `regs[dst] = regs[a] + k`
+    AddK { dst: u16, a: u16, k: f64 },
+    /// `regs[dst] = regs[a] <kind> regs[b]` (same table as `number_arith`)
+    Arith {
+        kind: crate::exec::ArithKind,
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    /// `regs[dst] = regs[a] <kind> k`
+    ArithK {
+        kind: crate::exec::ArithKind,
+        dst: u16,
+        a: u16,
+        k: f64,
+    },
+    /// `regs[dst] = -regs[src]`
+    Neg { dst: u16, src: u16 },
+    /// `regs[dst] = ~ToInt32(regs[src])`
+    BitNot { dst: u16, src: u16 },
+    /// unconditional jump
+    Br { target: u16 },
+    /// numeric compare-and-branch: jump when `cmp(a, b) == if_true`
+    BrCmp {
+        cmp: CmpOp,
+        a: u16,
+        b: u16,
+        if_true: bool,
+        target: u16,
+    },
+    /// as [`KOp::BrCmp`] with a constant right operand
+    BrCmpK {
+        cmp: CmpOp,
+        a: u16,
+        k: f64,
+        if_true: bool,
+        target: u16,
+    },
+    /// jump when `regs[src]` is falsy (`0`, `-0`, or NaN)
+    BrFalsy { src: u16, target: u16 },
+    /// jump when `regs[src]` is truthy
+    BrTruthy { src: u16, target: u16 },
+    /// `regs[dst] = <element>` of the dense array in object slot `obj` at
+    /// index `regs[idx]` — IF the index is a non-negative integral f64, the
+    /// array is unshadowed (`props` empty), the element is in bounds, not a
+    /// hole, and a `Number`. Anything else jumps to the [`KOp::Exit`] at
+    /// kernel pc `bail`, which resumes the generic interpreter AT the access
+    /// op with the operand stack reconstructed — the slow path then performs
+    /// the exact spec semantics (prototype walk, holes, getters, strings).
+    LoadElem {
+        dst: u16,
+        obj: u16,
+        idx: u16,
+        bail: u16,
+    },
+    /// In-place dense element overwrite (the `Op::SetPropDynamic` fast-path
+    /// conditions exactly: unshadowed dense array, integral in-bounds index,
+    /// existing non-hole slot). Everything else bails like [`KOp::LoadElem`].
+    StoreElem {
+        obj: u16,
+        idx: u16,
+        val: u16,
+        bail: u16,
+    },
+    /// `regs[dst] = <length>` of the dense array in object slot `obj`
+    /// (unshadowed only — a reified `length` marker bails).
+    LoadLen { dst: u16, obj: u16, bail: u16 },
+    /// Materialize a comparison as a BOOLEAN register (`0.0`/`1.0`): the
+    /// translator types the destination as Bool, so it writes back as
+    /// `Value::Bool` and never feeds an array index.
+    CmpSet {
+        cmp: CmpOp,
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    /// `regs[dst] = ToBoolean(regs[src]) ? 0.0 : 1.0` (JS `!x` on a scalar).
+    BoolNot { dst: u16, src: u16 },
+    /// `regs[dst] = Math.<kind>(regs[src])` via the builtin's own core fn.
+    Math1 { kind: KMath, dst: u16, src: u16 },
+    /// `regs[dst] = Math.<kind>(regs[a], regs[b])`.
+    Math2 {
+        kind: KMath,
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    /// Leave the kernel: write every mapped local back to `frame.locals`,
+    /// materialize the operand stack from `shapes[shape]` (Numbers from
+    /// registers, objects from object slots), and resume the bytecode
+    /// interpreter at `resume_ip`.
+    Exit { resume_ip: u32, shape: u16 },
+    /// FUNCTION kernels only (`FuncProto::fn_kernel`): finish the frameless
+    /// call, yielding `regs[src]` as the call's result — `Value::Bool` when
+    /// the register is statically boolean-typed, else `Value::Number`. Never
+    /// emitted for loop kernels (their region has no `Return` on the
+    /// allowlist).
+    Ret { src: u16, boolean: bool },
+    /// Named own-property READ (`o.a`) on the pinned object in
+    /// [`Kernel::props_used`] entry `prop`. No per-access check and no bail:
+    /// the kernel ENTRY resolved the property to a raw slot index and proved
+    /// it a `Number`-holding own data property on an `Internal::Ordinary`
+    /// object — and nothing inside a kernel region can restructure a
+    /// property map (no calls, no property creation/deletion; the only
+    /// in-kernel property writes are [`KOp::StoreProp`]'s in-place `Number`
+    /// overwrites), so the slot and its Number-ness hold for the whole
+    /// activation. Any entry-time surprise declines the activation into the
+    /// generic fallback iteration instead.
+    LoadProp { dst: u16, prop: u16 },
+    /// Named own-property WRITE (`o.a = v`) — the in-place overwrite of the
+    /// entry-resolved WRITABLE own data property (exactly the interpreter's
+    /// `Op::SetProp` fast-path conditions). See [`KOp::LoadProp`] for why no
+    /// per-access check is needed.
+    StoreProp { prop: u16, src: u16 },
+    /// LOOP kernels only: call the PINNED CLOSURE in oslot
+    /// [`Kernel::callee_slots`]`[fslot]` — a plain bytecode function whose
+    /// proto carries a (non-recursive, Number-returning) function kernel —
+    /// by running that kernel's register program on a dedicated window above
+    /// the caller's registers. The window's upvalue registers were loaded
+    /// ONCE at entry (the callee local is an oslot: in-region stores to it
+    /// reject, so the closure identity is pinned); per call only the `argc`
+    /// argument registers at `base..` copy in, and the callee's `Ret` value
+    /// copies out to `dst`. The entry guard verified everything a per-call
+    /// `run_fn_kernel` guard would (arguments are statically Numbers here),
+    /// plus one depth check for the whole activation (the loop calls at a
+    /// CONSTANT depth). No trace sink may be active (it would see an
+    /// enter/exit per call on the generic path).
+    CallKernel {
+        dst: u16,
+        fslot: u16,
+        base: u16,
+        argc: u16,
+    },
+    /// FUNCTION kernels only: a DIRECT SELF-RECURSIVE call (`fib(n - 1)`
+    /// inside `fib`), executed as a fresh register WINDOW running the same
+    /// kernel code from pc 0 — no frame, no `Value`s, just an explicit
+    /// (return-pc, dst, window) stack in the executor. `argc` argument
+    /// registers sit contiguously at `base..`; the callee's `Ret` lands in
+    /// `regs[dst]` of the calling window (always a Number — recursive
+    /// kernels reject boolean returns). Only emitted when the body's callee
+    /// is `LoadGlobal` of the function's OWN name; the entry guard then
+    /// verifies that global binding still holds the very closure being
+    /// invoked ([`Kernel::self_global`]), so a rebound name declines to the
+    /// generic path. Depth is tracked against the interpreter's limit; an
+    /// overflow ABANDONS the (pure, side-effect-free) kernel activation and
+    /// reruns the whole call generically, which raises the spec RangeError.
+    SelfCall { dst: u16, base: u16, argc: u16 },
+}
+
+/// A numeric register's source: a frame local (read/write), a captured
+/// upvalue cell (read-only snapshot), or — FUNCTION kernels only — a call
+/// argument (read-only; the entry guard requires it present and a `Number`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KSlot {
+    Local(u32),
+    Upvalue(u32),
+    Arg(u32),
+}
+
+/// One named-property access class in a kernel (`o.a` / `o.a = v` sites over
+/// the pinned base object in oslot `oslot`): resolved ONCE per kernel
+/// activation to a raw property-map slot index. The entry check requires an
+/// [`crate::value::Internal::Ordinary`] receiver whose OWN data property
+/// `key` exists — holding a `Number` when `load` (reads must produce what
+/// the guard typed), writable when `store` — and declines the activation
+/// otherwise. Slot indices are stable for the activation because kernel
+/// regions contain no calls and no property creation/deletion.
+#[derive(Clone, Debug)]
+pub struct KProp {
+    pub oslot: u16,
+    pub key: Box<str>,
+    pub load: bool,
+    pub store: bool,
+}
+
+/// One pinned CALLEE of a loop kernel (see [`KOp::CallKernel`]): the oslot
+/// local holding the closure, and the smallest `argc` any call site in the
+/// region supplies — the entry guard requires the callee's function kernel
+/// to consume no argument index at or beyond it (a shorter call would need
+/// the generic `undefined` parameter).
+#[derive(Clone, Debug)]
+pub struct KCallee {
+    pub oslot: u16,
+    pub min_argc: u16,
+}
+
+/// One operand-stack slot of a kernel exit shape, bottom-up: a `Number` read
+/// from a register, an object read from an object slot, or a canonical Math
+/// intrinsic (the entry guard proved the live values ARE the canonicals, so a
+/// bail can reconstruct them from the realm).
+#[derive(Clone, Copy, Debug)]
+pub enum KShapeSlot {
+    Num(u16),
+    /// A register statically typed BOOLEAN (holds exactly 0.0/1.0):
+    /// materialized as `Value::Bool` — `typeof` must not see a number.
+    Bool(u16),
+    Obj(u16),
+    MathObj,
+    MathFn(KMath),
+}
+
+/// The `Math` methods the loop kernels can execute directly. Every kind maps
+/// to the SAME core function its builtin uses (`builtins::numbers`), so
+/// results are bit-identical; the kernel entry guard identity-checks the
+/// global `Math` binding and each used method against the realm's canonical
+/// objects (methods are writable — a monkeypatched `Math.max` makes the
+/// kernel decline, it never runs the stale intrinsic).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KMath {
+    Abs,
+    Floor,
+    Ceil,
+    Round,
+    Trunc,
+    Sign,
+    Sqrt,
+    Fround,
+    Min2,
+    Max2,
+    Pow2,
+    Imul2,
+}
+
+impl KMath {
+    pub const ALL: [KMath; 12] = [
+        KMath::Abs,
+        KMath::Floor,
+        KMath::Ceil,
+        KMath::Round,
+        KMath::Trunc,
+        KMath::Sign,
+        KMath::Sqrt,
+        KMath::Fround,
+        KMath::Min2,
+        KMath::Max2,
+        KMath::Pow2,
+        KMath::Imul2,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            KMath::Abs => "abs",
+            KMath::Floor => "floor",
+            KMath::Ceil => "ceil",
+            KMath::Round => "round",
+            KMath::Trunc => "trunc",
+            KMath::Sign => "sign",
+            KMath::Sqrt => "sqrt",
+            KMath::Fround => "fround",
+            KMath::Min2 => "min",
+            KMath::Max2 => "max",
+            KMath::Pow2 => "pow",
+            KMath::Imul2 => "imul",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<KMath> {
+        KMath::ALL.iter().copied().find(|k| k.name() == name)
+    }
+
+    /// Call arity the kernel translates (`Math.min`/`max` are variadic; only
+    /// the 2-argument form is kernelized).
+    pub fn arity(self) -> usize {
+        match self {
+            KMath::Min2 | KMath::Max2 | KMath::Pow2 | KMath::Imul2 => 2,
+            _ => 1,
+        }
+    }
+}
+
+/// One compiled loop kernel: the register program for a bytecode loop region
+/// whose every op is numeric and whose every binding is a `frame.locals` slot.
+///
+/// Register file layout: registers `0..locals.len()` mirror the mapped frame
+/// locals (`regs[r]` ↔ `frame.locals[locals[r]]`); registers above that are
+/// the canonical operand-stack slots (`S(d) = locals.len() + d`).
+///
+/// The runtime contract lives in `Vm::run_kernel`: the kernel runs only when
+/// no op budget is installed, and only after verifying every mapped local
+/// currently holds a `Number` (the GUARD). A guard failure executes
+/// `fallback` — the original loop-header op — so the loop proceeds generically
+/// for that iteration and the kernel retries at the next back-edge arrival
+/// (late entry: a `let x;` warming to a number on iteration 1 enters the
+/// kernel from iteration 2).
+#[derive(Clone, Debug)]
+pub struct Kernel {
+    pub code: Box<[KOp]>,
+    /// Numeric slots mirrored into registers `0..locals.len()`: frame locals
+    /// (read/write) and UPVALUES (read-only snapshots — no call can run
+    /// inside a kernel, so nothing can write a captured cell mid-activation;
+    /// in-region upvalue WRITES reject at translation). The guard requires
+    /// `Value::Number` in every one; only `Local` slots write back.
+    ///
+    /// FUNCTION kernels additionally use `Arg` slots (read-only; the guard
+    /// requires the argument present and a `Number`), and their `Local` slots
+    /// are pure register scratch — no frame exists, so they are neither
+    /// guarded nor written back (translation proves store-before-read on
+    /// every path).
+    pub locals: Box<[KSlot]>,
+    /// `frame.locals` indices statically typed BOOLEAN, mirrored into the
+    /// registers right after the numeric ones (as 0.0/1.0). The guard
+    /// requires `Value::Bool`; write-back restores `Value::Bool` — a kernel
+    /// must never turn a boolean binding into a number (`typeof`).
+    pub bool_locals: Box<[u32]>,
+    /// `frame.locals` indices of ARRAY BASES (`a` in `a[i]`/`a.length`):
+    /// object slot `s` caches that local's `JsObject` at kernel entry. The
+    /// guard requires each to hold an object; per-access checks do the rest.
+    /// Disjoint from `locals`, and never stored to inside the region.
+    pub oslots: Box<[u32]>,
+    /// Operand-stack shapes for [`KOp::Exit`] (bottom-up).
+    pub shapes: Box<[Box<[KShapeSlot]>]>,
+    /// Named-property access classes ([`KOp::LoadProp`]/[`KOp::StoreProp`]),
+    /// entry-resolved to raw slot indices. See [`KProp`].
+    pub props_used: Box<[KProp]>,
+    /// Pinned closure callees ([`KOp::CallKernel`]), entry-verified. See
+    /// [`KCallee`].
+    pub callee_slots: Box<[KCallee]>,
+    /// Math intrinsics this kernel executes: the entry guard identity-checks
+    /// the global `Math` binding and each of these methods against the
+    /// realm's canonical objects before running.
+    pub math_used: Box<[KMath]>,
+    /// Total register count (mapped locals + canonical stack slots).
+    pub n_regs: u16,
+    /// FUNCTION kernels containing [`KOp::SelfCall`]: the GLOBAL name the
+    /// body's recursive callee resolves through. The entry guard requires
+    /// the global binding to be a plain data property holding the very
+    /// closure being invoked (pointer identity) — a shadowed/rebound/
+    /// accessor'd name declines the kernel and the call runs generically.
+    /// `None` for loop kernels and non-recursive function kernels.
+    pub self_global: Option<Box<str>>,
+    /// The original loop-header op this kernel replaced; executed verbatim
+    /// when the guard declines.
+    pub fallback: Box<Op>,
 }

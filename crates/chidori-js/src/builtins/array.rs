@@ -277,6 +277,32 @@ fn create_data_elem(vm: &mut Vm, target: &Value, idx: f64, v: Value) -> Result<(
     create_data_property_or_throw(vm, &o, &elem_key(idx), v)
 }
 
+/// `Set(O, ToString(k), V, Throw=true)` for the mutating builtins' write-back
+/// loops, with the dense fast path of `Op::SetPropDynamic`: overwriting an
+/// EXISTING in-bounds non-hole element of an unshadowed dense array in place.
+/// Such a slot is a plain writable data property (per the array exotic
+/// [[Set]]), so no setter, no length change, and no extensibility interaction
+/// is observable. Appends, holes, out-of-bounds indices, shadowed elements,
+/// and array-likes take the exact spec path.
+fn set_elem(vm: &mut Vm, base: &Value, idx: f64, v: Value) -> Result<(), Value> {
+    if idx >= 0.0 && idx <= u32::MAX as f64 {
+        if let Value::Object(o) = base {
+            let mut b = o.borrow_mut();
+            if b.props.is_empty() {
+                if let Internal::Array(arr) = &mut b.internal {
+                    if let Some(slot) = arr.get_mut(idx as usize) {
+                        if !matches!(slot, Value::Hole) {
+                            *slot = v;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    vm.set_prop_strict(base, &elem_key(idx), v)
+}
+
 /// `DeletePropertyOrThrow(O, key)`: a failed delete (non-configurable property)
 /// raises a TypeError instead of silently succeeding.
 fn delete_or_throw(vm: &mut Vm, o: &Value, key: &PropertyKey) -> Result<(), Value> {
@@ -1135,28 +1161,28 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         let mut k = 0.0;
         while k < len {
             vm.native_tick()?;
-            let key = elem_key(k);
-            if vm.has_prop(&ov, &key)? {
-                items.push(vm.get_prop(&ov, &key)?);
+            // Dense fast path (`has_get_elem`): no idx→String key, no hashing,
+            // no prototype walk for an unshadowed dense element; everything
+            // else takes the exact HasProperty/Get spec sequence.
+            if let Some(v) = has_get_elem(vm, &ov, k)? {
+                items.push(v);
             }
             k += 1.0;
         }
         let item_count = items.len();
         // Undefineds sort to the end without the comparator ever seeing them.
-        let mut defined: Vec<Value> = items
-            .iter()
-            .filter(|v| !v.is_undefined())
-            .cloned()
-            .collect();
+        // (Values MOVE out of the snapshot — no clone pass.)
+        let mut defined = items;
+        defined.retain(|v| !v.is_undefined());
         let undef_count = item_count - defined.len();
         merge_sort(vm, &mut defined, &cmp, has_cmp)?;
         let mut j = 0.0;
         for v in defined {
-            vm.set_prop_strict(&ov, &elem_key(j), v)?;
+            set_elem(vm, &ov, j, v)?;
             j += 1.0;
         }
         for _ in 0..undef_count {
-            vm.set_prop_strict(&ov, &elem_key(j), Value::Undefined)?;
+            set_elem(vm, &ov, j, Value::Undefined)?;
             j += 1.0;
         }
         // Indices [itemCount, len) were holes (absent) — delete them.
@@ -1187,12 +1213,10 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
             items.push(vm.get_prop(&ov, &elem_key(k))?);
             k += 1.0;
         }
-        let mut defined: Vec<Value> = items
-            .iter()
-            .filter(|v| !v.is_undefined())
-            .cloned()
-            .collect();
-        let undef_count = items.len() - defined.len();
+        let item_count = items.len();
+        let mut defined = items;
+        defined.retain(|v| !v.is_undefined());
+        let undef_count = item_count - defined.len();
         merge_sort(vm, &mut defined, &cmp, has_cmp)?;
         defined.extend(std::iter::repeat(Value::Undefined).take(undef_count));
         Ok(Value::Object(vm.new_array(defined)))
@@ -1425,41 +1449,68 @@ fn merge_sort(
     cmp: &Value,
     has_cmp: bool,
 ) -> Result<(), Value> {
+    if items.len() <= 1 {
+        return Ok(());
+    }
+    // One scratch buffer for the whole sort (max use: the larger half) instead
+    // of two fresh Vec clones per recursion node — the naive version's
+    // malloc/free + refcount churn was a measurable slice of sort-heavy runs.
+    let mut aux: Vec<Value> = Vec::with_capacity(items.len() / 2 + 1);
     let n = items.len();
+    merge_sort_range(vm, items, &mut aux, 0, n, cmp, has_cmp)
+}
+
+/// Sort `items[lo..hi]` in place. Identical recursion structure and stable
+/// merge order as the previous out-of-place version, so the comparator sees
+/// the exact same call sequence (observable via side effects); only the
+/// buffer management changed. On a comparator throw the scratch's contents
+/// are abandoned mid-merge — harmless, because every caller sorts a detached
+/// scratch list and only writes back to the array on success.
+fn merge_sort_range(
+    vm: &mut Vm,
+    items: &mut [Value],
+    aux: &mut Vec<Value>,
+    lo: usize,
+    hi: usize,
+    cmp: &Value,
+    has_cmp: bool,
+) -> Result<(), Value> {
+    let n = hi - lo;
     if n <= 1 {
         return Ok(());
     }
-    let mid = n / 2;
-    let mut left = items[..mid].to_vec();
-    let mut right = items[mid..].to_vec();
-    merge_sort(vm, &mut left, cmp, has_cmp)?;
-    merge_sort(vm, &mut right, cmp, has_cmp)?;
-    let mut i = 0;
-    let mut j = 0;
-    let mut k = 0;
-    // Stable merge: take from `left` on ties (order <= 0) so equal elements
-    // preserve their original relative order.
-    while i < left.len() && j < right.len() {
-        let order = compare_values(vm, &left[i], &right[j], cmp, has_cmp)?;
+    let mid = lo + n / 2;
+    merge_sort_range(vm, items, aux, lo, mid, cmp, has_cmp)?;
+    merge_sort_range(vm, items, aux, mid, hi, cmp, has_cmp)?;
+    // Move the left run into the scratch (no clones; the vacated slots are
+    // overwritten before they are ever read), then merge back into
+    // `items[lo..]`. Take from the left on ties (order <= 0) so equal
+    // elements keep their original relative order (stable sort).
+    aux.clear();
+    for slot in &mut items[lo..mid] {
+        aux.push(std::mem::replace(slot, Value::Undefined));
+    }
+    let mut i = 0; // over aux (left run)
+    let mut j = mid; // over items (right run)
+    let mut k = lo; // write cursor; k <= j always, so unread right
+                    // elements are never overwritten
+    while i < aux.len() && j < hi {
+        let order = compare_values(vm, &aux[i], &items[j], cmp, has_cmp)?;
         if order <= 0 {
-            items[k] = left[i].clone();
+            items[k] = std::mem::replace(&mut aux[i], Value::Undefined);
             i += 1;
         } else {
-            items[k] = right[j].clone();
+            items.swap(k, j);
             j += 1;
         }
         k += 1;
     }
-    while i < left.len() {
-        items[k] = left[i].clone();
+    while i < aux.len() {
+        items[k] = std::mem::replace(&mut aux[i], Value::Undefined);
         i += 1;
         k += 1;
     }
-    while j < right.len() {
-        items[k] = right[j].clone();
-        j += 1;
-        k += 1;
-    }
+    // Any right-run tail is already in place.
     Ok(())
 }
 
@@ -1472,8 +1523,13 @@ fn compare_values(
 ) -> Result<i32, Value> {
     if has_cmp {
         // SortCompare with a user comparator: call it, coerce the result via
-        // ToNumber, and treat NaN as 0 (spec). Errors propagate.
-        let r = vm.call(cmp.clone(), Value::Undefined, &[a.clone(), b.clone()])?;
+        // ToNumber, and treat NaN as 0 (spec). Errors propagate. Owned-args
+        // path: the pooled buffer moves straight into the callee frame instead
+        // of being copied a second time by the slice path's make_frame.
+        let mut argv = vm.take_value_vec();
+        argv.push(a.clone());
+        argv.push(b.clone());
+        let r = vm.call_valuevec(cmp.clone(), Value::Undefined, argv)?;
         let n = vm.to_number(&r)?;
         Ok(if n < 0.0 {
             -1

@@ -4,9 +4,28 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::bytecode::{CmpOp, Const, FuncKind, Op, UpvalueSource};
+use crate::bytecode::{CmpOp, Const, FuncKind, KOp, Op, UpvalueSource};
 use crate::value::*;
 use crate::vm::*;
+
+/// Peek a call op's callee: `Some(bf)` when it is a PLAIN bytecode function —
+/// synchronous, not a generator, not a class constructor — i.e. the class the
+/// interpreter can run via [`Vm::call_direct`] without any of the generic
+/// path's special-casing. Everything else (native, bound, proxy, async,
+/// generator, class ctor, non-callable) returns `None` and takes the generic
+/// path, which owns the error reporting for the non-callable case.
+#[inline]
+fn peek_plain_bytecode(v: &Value) -> Option<Rc<BytecodeFunction>> {
+    if let Value::Object(o) = v {
+        if let Internal::Function(FunctionInner::Bytecode(bf)) = &o.borrow().internal {
+            let k = bf.proto.kind;
+            if !bf.is_class_ctor && !k.is_generator() && !k.is_async() {
+                return Some(bf.clone());
+            }
+        }
+    }
+    None
+}
 
 /// Control-flow signal from a single opcode step.
 enum Ctl {
@@ -54,26 +73,75 @@ impl Vm {
     /// path copies the arguments a second time in make_frame. Native/bound/
     /// proxy callees borrow the vec and recycle it; every early error simply
     /// drops it (a pool miss, never a leak).
+    ///
+    /// This is the interpreter's hottest call entry, so the callable check and
+    /// the dispatch extraction are ONE object borrow (the layered
+    /// `call_object_vec` path borrows once for `is_callable` and again for the
+    /// dispatch), and the depth guard is applied here directly.
     pub(crate) fn call_valuevec(
         &mut self,
         func: Value,
         this: Value,
         args: Vec<Value>,
     ) -> Result<Value, Value> {
+        enum Disp {
+            Native(NativeFn),
+            Bytecode(Rc<BytecodeFunction>),
+            Bound(JsObject, Value, Vec<Value>),
+            Proxy,
+            NotCallable,
+        }
         if let Value::Object(o) = &func {
-            let o = o.clone();
-            let (callable, is_proxy) = {
+            let disp = {
                 let b = o.borrow();
-                (b.is_callable(), matches!(b.internal, Internal::Proxy(_)))
+                match &b.internal {
+                    Internal::Function(FunctionInner::Native(nf)) => Disp::Native(nf.func.clone()),
+                    Internal::Function(FunctionInner::Bytecode(bf)) => Disp::Bytecode(bf.clone()),
+                    Internal::Function(FunctionInner::Bound(bound)) => Disp::Bound(
+                        bound.target.clone(),
+                        bound.bound_this.clone(),
+                        bound.bound_args.clone(),
+                    ),
+                    Internal::Proxy(p) if p.callable => Disp::Proxy,
+                    _ => Disp::NotCallable,
+                }
             };
-            if is_proxy {
-                if callable {
+            match disp {
+                Disp::NotCallable => {}
+                Disp::Proxy => {
+                    let o = o.clone();
                     let r = self.proxy_call(&o, this, &args);
                     self.recycle_value_vec(args);
                     return r;
                 }
-            } else if callable {
-                return self.call_object_vec(&o, this, args, Value::Undefined);
+                disp => {
+                    self.call_depth += 1;
+                    if self.call_depth > self.max_call_depth {
+                        self.call_depth -= 1;
+                        return Err(self.throw_range("Maximum call stack size exceeded"));
+                    }
+                    let r = match disp {
+                        Disp::Bytecode(bf) => {
+                            let o = o.clone();
+                            self.call_bytecode_vec(&o, bf, this, args, Value::Undefined)
+                        }
+                        Disp::Native(f) => {
+                            let r = f(self, this, &args);
+                            self.recycle_value_vec(args);
+                            r
+                        }
+                        Disp::Bound(target, bthis, bargs) => {
+                            let mut all = bargs;
+                            let mut args = args;
+                            all.append(&mut args);
+                            self.recycle_value_vec(args);
+                            self.call_object_vec(&target, bthis, all, Value::Undefined)
+                        }
+                        Disp::Proxy | Disp::NotCallable => unreachable!(),
+                    };
+                    self.call_depth -= 1;
+                    return r;
+                }
             }
         }
         let desc = self.describe(&func);
@@ -158,8 +226,23 @@ impl Vm {
             self.recycle_value_vec(args);
             return r;
         }
+        // Function kernel (kernel.rs): a tiny pure-scalar body executes
+        // FRAMELESS when the entry guard passes. Only plain sync functions
+        // ever carry one, so this can't intercept async/generator callees.
+        if bf.proto.fn_kernel.is_some() {
+            if let Some(r) = self.run_fn_kernel(&bf, &args) {
+                self.recycle_value_vec(args);
+                return r;
+            }
+        }
+        let uses_arguments = bf.proto.uses_arguments;
         let mut frame = self.make_frame_owned(bf, this, args, new_target);
-        frame.func_obj = Some(func_obj.clone());
+        // `func_obj` has exactly one consumer — the `arguments` object's
+        // `callee` — so the per-call `Rc` round-trip is skipped for the
+        // overwhelming majority of functions that never materialize it.
+        if uses_arguments {
+            frame.func_obj = Some(func_obj.clone());
+        }
         let token = self.trace_enter(&frame.func.proto);
         frame.trace_token = token;
         if kind.is_async() {
@@ -180,6 +263,1073 @@ impl Vm {
                 }
             }
         }
+    }
+
+    /// The interpreter call ops' fast path (see `Op::Call`): the callee was
+    /// already peeked as a plain (non-generator, non-async, non-class-ctor)
+    /// bytecode function sitting on the caller's operand stack under `n`
+    /// arguments at `at..`. Moves the arguments straight off the caller stack
+    /// into the pooled callee frame — no intermediate pooled Vec round-trip —
+    /// and reuses the popped function VALUE as the callee's `func_obj` (no
+    /// refcount traffic). Behavior is identical to the generic
+    /// `call_valuevec` → `call_bytecode_vec` chain for this callee class.
+    fn call_direct(
+        &mut self,
+        caller: &mut Frame,
+        at: usize,
+        bf: Rc<BytecodeFunction>,
+        has_this: bool,
+    ) -> Result<Value, Value> {
+        self.call_depth += 1;
+        if self.call_depth > self.max_call_depth {
+            self.call_depth -= 1;
+            return Err(self.throw_range("Maximum call stack size exceeded"));
+        }
+        // Function kernel: run frameless straight off the caller's operand
+        // stack (the arguments sit at `at..`), then pop the ceremony.
+        if bf.proto.fn_kernel.is_some() {
+            if let Some(r) = self.run_fn_kernel(&bf, &caller.stack[at..]) {
+                caller.stack.truncate(at);
+                if has_this {
+                    caller.stack.pop();
+                }
+                caller.stack.pop(); // the function value
+                self.call_depth -= 1;
+                return r;
+            }
+        }
+        let mut callee = self.take_frame();
+        callee.args.extend(caller.stack.drain(at..));
+        let this = if has_this {
+            caller.stack.pop().unwrap_or(Value::Undefined)
+        } else {
+            Value::Undefined
+        };
+        let func_v = caller.stack.pop().unwrap_or(Value::Undefined);
+        let uses_arguments = bf.proto.uses_arguments;
+        self.init_frame(&mut callee, bf, this, Value::Undefined);
+        if uses_arguments {
+            if let Value::Object(o) = func_v {
+                callee.func_obj = Some(o);
+            }
+        }
+        let token = self.trace_enter(&callee.func.proto);
+        callee.trace_token = token;
+        let r = match self.run_frame(callee) {
+            Flow::Return(v) => {
+                self.trace_exit(token, false);
+                Ok(v)
+            }
+            Flow::Throw(e) => {
+                self.trace_exit(token, true);
+                Err(e)
+            }
+            Flow::Suspend(_) => Err(self.throw_type("internal: sync function suspended")),
+        };
+        self.call_depth -= 1;
+        r
+    }
+
+    /// Verify the global `Math` binding and each used method are still the
+    /// realm's canonical objects, as plain data properties. Any deviation —
+    /// deleted/replaced/shadowed `Math`, an accessor, a monkeypatched method
+    /// — declines the kernel (the generic path then does whatever the
+    /// program set up, observably).
+    fn kernel_math_ok(&self, used: &[crate::bytecode::KMath]) -> bool {
+        let Some(canon) = &self.realm.math_object else {
+            return false;
+        };
+        {
+            let g = self.realm.global.borrow();
+            let math_ok = matches!(
+                g.props.get(&PropertyKey::str("Math")),
+                Some(Property {
+                    kind: PropertyKind::Data { value: Value::Object(o), .. },
+                    ..
+                }) if o.ptr_eq(canon)
+            );
+            if !math_ok {
+                return false;
+            }
+        }
+        let mb = canon.borrow();
+        used.iter().all(|k| {
+            matches!(
+                mb.props.get(&PropertyKey::str(k.name())),
+                Some(Property {
+                    kind: PropertyKind::Data { value: Value::Object(o), .. },
+                    ..
+                }) if o.ptr_eq(&self.realm.math_kernel[*k as usize])
+            )
+        })
+    }
+
+    /// Execute the typed loop kernel at `Op::LoopKernel(idx)` (see
+    /// `kernel.rs` for the model). Runs only when per-op accounting is off
+    /// (no op budget), every mapped numeric local holds a `Number`, and every
+    /// array-base local holds an object; otherwise the original header op
+    /// (`Kernel::fallback`) executes and the generic interpreter takes this
+    /// iteration — the kernel simply retries the next time the back-edge
+    /// reaches the header. Array-element accesses re-check their fast-path
+    /// conditions on every use and BAIL to the generic interpreter at the
+    /// access op (operand stack reconstructed from the kernel's shape table)
+    /// on any surprise — a bail is a slow iteration, never a wrong answer.
+    ///
+    /// `inline(never)`: called once per loop ACTIVATION (not per iteration),
+    /// and keeping its large register loop out of `step` pins the codegen of
+    /// both — growing this function must not perturb the interpreter's hot
+    /// dispatch.
+    ///
+    /// The register loop is MONOMORPHIZED on whether the kernel calls pinned
+    /// closures: the plain instantiation compiles the `CallKernel` arm (and
+    /// the callee state's liveness) out entirely, so growing the closure
+    /// tier cannot tax pure numeric/array/property loops with register
+    /// spills in their dispatch.
+    #[inline(never)]
+    fn run_kernel_op(&mut self, frame: &mut Frame, idx: u32) -> Result<Ctl, Value> {
+        if frame.func.proto.kernels[idx as usize]
+            .callee_slots
+            .is_empty()
+        {
+            self.run_kernel_op_impl::<false>(frame, idx)
+        } else {
+            self.run_kernel_op_impl::<true>(frame, idx)
+        }
+    }
+
+    #[inline(never)]
+    fn run_kernel_op_impl<const CALLEES: bool>(
+        &mut self,
+        frame: &mut Frame,
+        idx: u32,
+    ) -> Result<Ctl, Value> {
+        let proto = frame.func.proto.clone();
+        let k = &proto.kernels[idx as usize];
+        // An installed op budget makes per-op counts observable (the
+        // exhaustion throw lands on an exact op); kernels would skew it.
+        if self.op_budget.is_some() {
+            return self.step(frame, &k.fallback);
+        }
+        for slot in k.locals.iter() {
+            let ok = match slot {
+                crate::bytecode::KSlot::Local(l) => {
+                    matches!(frame.locals[*l as usize], Value::Number(_))
+                }
+                crate::bytecode::KSlot::Upvalue(u) => {
+                    matches!(*frame.func.upvalues[*u as usize].borrow(), Value::Number(_))
+                }
+                // Function-kernel-only slot; loop translation never maps one.
+                crate::bytecode::KSlot::Arg(_) => false,
+            };
+            if !ok {
+                return self.step(frame, &k.fallback);
+            }
+        }
+        for &l in k.bool_locals.iter() {
+            if !matches!(frame.locals[l as usize], Value::Bool(_)) {
+                return self.step(frame, &k.fallback);
+            }
+        }
+        for &l in k.oslots.iter() {
+            if !matches!(frame.locals[l as usize], Value::Object(_)) {
+                return self.step(frame, &k.fallback);
+            }
+        }
+        // Math intrinsics: the global `Math` binding must still be the
+        // canonical object as a plain DATA property (an accessor or a
+        // replacement would be observable), and each used method must still
+        // be the canonical builtin (methods are writable). Nothing inside a
+        // kernel region can mutate globals, so entry-time checks suffice.
+        if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
+            return self.step(frame, &k.fallback);
+        }
+        // Named-property access classes resolve ONCE per activation to raw
+        // slot indices (see `KProp`): each base must be an ORDINARY object
+        // whose own data property exists — a Number where loaded, writable
+        // where stored. Slots stay valid for the whole activation because
+        // nothing inside a kernel region can create/delete properties or run
+        // user code; in-kernel `StoreProp` only overwrites values in place.
+        let mut prop_slots = std::mem::take(&mut self.kernel_prop_slots);
+        prop_slots.clear();
+        for p in k.props_used.iter() {
+            let mut ok = false;
+            if let Value::Object(o) = &frame.locals[k.oslots[p.oslot as usize] as usize] {
+                let b = o.borrow();
+                if matches!(b.internal, Internal::Ordinary) {
+                    if let Some((
+                        idx,
+                        _,
+                        Property {
+                            kind: PropertyKind::Data { value, writable },
+                            ..
+                        },
+                    )) = b.props.get_full(&PropertyKey::str(&p.key))
+                    {
+                        if (!p.load || matches!(value, Value::Number(_))) && (!p.store || *writable)
+                        {
+                            prop_slots.push(idx as u32);
+                            ok = true;
+                        }
+                    }
+                }
+            }
+            if !ok {
+                self.kernel_prop_slots = prop_slots;
+                return self.step(frame, &k.fallback);
+            }
+        }
+        // Unboxed register file + array-base cache (both pooled on the Vm;
+        // kernels never nest at runtime). The base objects are pinned for the
+        // whole activation — sound because stores to base LOCALS inside the
+        // region are rejected at translation.
+        let mut regs = std::mem::take(&mut self.kernel_regs);
+        regs.clear();
+        regs.resize(k.n_regs as usize, 0.0);
+        for (r, slot) in k.locals.iter().enumerate() {
+            let v = match slot {
+                crate::bytecode::KSlot::Local(l) => frame.locals[*l as usize].clone(),
+                crate::bytecode::KSlot::Upvalue(u) => {
+                    frame.func.upvalues[*u as usize].borrow().clone()
+                }
+                crate::bytecode::KSlot::Arg(_) => unreachable!("declined by the guard"),
+            };
+            if let Value::Number(n) = v {
+                regs[r] = n;
+            }
+        }
+        let bool_base = k.locals.len();
+        for (j, &l) in k.bool_locals.iter().enumerate() {
+            if let Value::Bool(b) = frame.locals[l as usize] {
+                regs[bool_base + j] = if b { 1.0 } else { 0.0 };
+            }
+        }
+        let mut objs = std::mem::take(&mut self.kernel_objs);
+        objs.clear();
+        for &l in k.oslots.iter() {
+            if let Value::Object(o) = &frame.locals[l as usize] {
+                objs.push(o.clone());
+            }
+        }
+        // Pinned closure callees (`KOp::CallKernel`): ONE guard per
+        // activation covers everything the per-call `run_fn_kernel` guard
+        // would check — the callee object is an oslot (in-region stores to
+        // it reject), so its identity, kernel, upvalue types and the Math
+        // canonicals cannot change while the loop runs. Loop calls happen at
+        // one constant depth, so a single depth check suffices; a trace sink
+        // declines (it must see an enter/exit per call).
+        let mut callee_bfs = std::mem::take(&mut self.kernel_callees);
+        callee_bfs.clear();
+        if CALLEES {
+            let mut ok = self.trace_sink.is_none() && self.call_depth < self.max_call_depth;
+            let mut win = k.n_regs as usize;
+            if ok {
+                for c in k.callee_slots.iter() {
+                    let bf = {
+                        let b = objs[c.oslot as usize].borrow();
+                        match &b.internal {
+                            Internal::Function(FunctionInner::Bytecode(bf))
+                                if !bf.is_class_ctor =>
+                            {
+                                Some(bf.clone())
+                            }
+                            _ => None,
+                        }
+                    };
+                    let Some(bf) = bf else {
+                        ok = false;
+                        break;
+                    };
+                    let Some(ck) = bf.proto.fn_kernel.as_ref() else {
+                        ok = false;
+                        break;
+                    };
+                    // Number-returning, non-recursive, fully-supplied args,
+                    // canonical Math, Number upvalues — else stay generic.
+                    let ck_ok = ck.self_global.is_none()
+                        && ck
+                            .code
+                            .iter()
+                            .all(|op| !matches!(op, KOp::Ret { boolean: true, .. }))
+                        && ck.locals.iter().all(|sl| match sl {
+                            crate::bytecode::KSlot::Arg(a) => *a < u32::from(c.min_argc),
+                            _ => true,
+                        })
+                        && (ck.math_used.is_empty() || self.kernel_math_ok(&ck.math_used))
+                        && ck.locals.iter().all(|sl| match sl {
+                            crate::bytecode::KSlot::Upvalue(u) => {
+                                matches!(*bf.upvalues[*u as usize].borrow(), Value::Number(_))
+                            }
+                            _ => true,
+                        });
+                    if !ck_ok {
+                        ok = false;
+                        break;
+                    }
+                    let n = ck.n_regs as usize;
+                    callee_bfs.push((bf, win as u32));
+                    win += n;
+                }
+            }
+            if !ok {
+                self.kernel_regs = regs;
+                objs.clear();
+                self.kernel_objs = objs;
+                self.kernel_prop_slots = prop_slots;
+                callee_bfs.clear();
+                self.kernel_callees = callee_bfs;
+                return self.step(frame, &k.fallback);
+            }
+            // Extend the register file with the callee windows and load each
+            // window's upvalue snapshot ONCE (identities are pinned; callee
+            // code never writes an upvalue register).
+            regs.resize(win, 0.0);
+            for (bf, wb) in callee_bfs.iter() {
+                let ck = bf.proto.fn_kernel.as_ref().expect("guarded");
+                for (r, slot) in ck.locals.iter().enumerate() {
+                    if let crate::bytecode::KSlot::Upvalue(u) = slot {
+                        if let Value::Number(n) = *bf.upvalues[*u as usize].borrow() {
+                            regs[*wb as usize + r] = n;
+                        }
+                    }
+                }
+            }
+        }
+        let interrupt = self.interrupt.clone();
+        let mut poll: u32 = 0;
+        let code = &k.code;
+        let mut pc = 0usize;
+        let (resume_ip, shape) = loop {
+            // Taken branches funnel through here so back-edges can poll the
+            // cooperative interrupt flag at the interpreter's cadence.
+            macro_rules! branch {
+                ($t:expr) => {{
+                    let t = $t as usize;
+                    if t <= pc {
+                        poll = poll.wrapping_add(1);
+                        if poll & 0xFF == 0 {
+                            if let Some(flag) = &interrupt {
+                                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                    // Same latch-and-unwind as the interpreter
+                                    // loop: zero the budget so a JS catch
+                                    // cannot resume execution.
+                                    for (r, slot) in k.locals.iter().enumerate() {
+                                        if let crate::bytecode::KSlot::Local(l) = slot {
+                                            frame.locals[*l as usize] = Value::Number(regs[r]);
+                                        }
+                                    }
+                                    for (j, &l) in k.bool_locals.iter().enumerate() {
+                                        frame.locals[l as usize] =
+                                            Value::Bool(regs[bool_base + j] != 0.0);
+                                    }
+                                    self.kernel_regs = regs;
+                                    objs.clear();
+                                    self.kernel_objs = objs;
+                                    self.kernel_prop_slots = prop_slots;
+                                    callee_bfs.clear();
+                                    self.kernel_callees = callee_bfs;
+                                    self.op_budget = Some(0);
+                                    return Err(self.throw_range("execution interrupted"));
+                                }
+                            }
+                        }
+                    }
+                    pc = t;
+                    continue;
+                }};
+            }
+            match code[pc] {
+                KOp::Mov { dst, src } => regs[dst as usize] = regs[src as usize],
+                KOp::Const { dst, k } => regs[dst as usize] = k,
+                KOp::Add { dst, a, b } => regs[dst as usize] = regs[a as usize] + regs[b as usize],
+                KOp::AddK { dst, a, k } => regs[dst as usize] = regs[a as usize] + k,
+                KOp::Arith { kind, dst, a, b } => {
+                    regs[dst as usize] = number_arith_raw(regs[a as usize], regs[b as usize], kind)
+                }
+                KOp::ArithK { kind, dst, a, k } => {
+                    regs[dst as usize] = number_arith_raw(regs[a as usize], k, kind)
+                }
+                KOp::Neg { dst, src } => regs[dst as usize] = -regs[src as usize],
+                KOp::BitNot { dst, src } => {
+                    regs[dst as usize] = !crate::vm::to_int32(regs[src as usize]) as f64
+                }
+                KOp::Br { target } => branch!(target),
+                KOp::BrCmp {
+                    cmp,
+                    a,
+                    b,
+                    if_true,
+                    target,
+                } => {
+                    if knum_cmp(cmp, regs[a as usize], regs[b as usize]) == if_true {
+                        branch!(target)
+                    }
+                }
+                KOp::BrCmpK {
+                    cmp,
+                    a,
+                    k,
+                    if_true,
+                    target,
+                } => {
+                    if knum_cmp(cmp, regs[a as usize], k) == if_true {
+                        branch!(target)
+                    }
+                }
+                KOp::BrFalsy { src, target } => {
+                    if !knum_truthy(regs[src as usize]) {
+                        branch!(target)
+                    }
+                }
+                KOp::BrTruthy { src, target } => {
+                    if knum_truthy(regs[src as usize]) {
+                        branch!(target)
+                    }
+                }
+                // Dense element read: full fast-path re-check, else bail to
+                // the generic op (the `bail` target is an Exit stub).
+                KOp::LoadElem {
+                    dst,
+                    obj,
+                    idx,
+                    bail,
+                } => {
+                    let i = regs[idx as usize];
+                    let mut ok = false;
+                    if i.fract() == 0.0 && (0.0..4294967295.0).contains(&i) {
+                        let b = objs[obj as usize].borrow();
+                        if b.props.is_empty() {
+                            if let Internal::Array(arr) = &b.internal {
+                                if let Some(Value::Number(n)) = arr.get(i as usize) {
+                                    regs[dst as usize] = *n;
+                                    ok = true;
+                                }
+                            }
+                        }
+                    }
+                    if !ok {
+                        branch!(bail)
+                    }
+                }
+                // Dense element write: in-place overwrite (exactly the
+                // `Op::SetPropDynamic` fast-path conditions), an in-bounds
+                // HOLE fill, or an exact one-past-the-end APPEND. Filling and
+                // appending CREATE a property, so they additionally require
+                // the array to be extensible (a sealed/prevented receiver
+                // must reject through the generic path: silent in sloppy,
+                // TypeError in strict) and to stay under the dense-storage
+                // bound (the generic path owns that RangeError). Everything
+                // else bails.
+                KOp::StoreElem {
+                    obj,
+                    idx,
+                    val,
+                    bail,
+                } => {
+                    let i = regs[idx as usize];
+                    let mut ok = false;
+                    if i.fract() == 0.0 && (0.0..4294967295.0).contains(&i) {
+                        let mut b = objs[obj as usize].borrow_mut();
+                        if b.props.is_empty() {
+                            let extensible = b.extensible;
+                            if let Internal::Array(arr) = &mut b.internal {
+                                let iu = i as usize;
+                                match arr.get_mut(iu) {
+                                    Some(slot) if !matches!(slot, Value::Hole) => {
+                                        *slot = Value::Number(regs[val as usize]);
+                                        ok = true;
+                                    }
+                                    Some(slot) => {
+                                        // In-bounds hole: creation.
+                                        if extensible {
+                                            *slot = Value::Number(regs[val as usize]);
+                                            ok = true;
+                                        }
+                                    }
+                                    None => {
+                                        // Exact append (no hole gap).
+                                        if extensible
+                                            && iu == arr.len()
+                                            && iu < crate::value::MAX_DENSE_ARRAY
+                                        {
+                                            arr.push(Value::Number(regs[val as usize]));
+                                            ok = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !ok {
+                        branch!(bail)
+                    }
+                }
+                KOp::CmpSet { cmp, dst, a, b } => {
+                    regs[dst as usize] = if knum_cmp(cmp, regs[a as usize], regs[b as usize]) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                KOp::BoolNot { dst, src } => {
+                    regs[dst as usize] = if knum_truthy(regs[src as usize]) {
+                        0.0
+                    } else {
+                        1.0
+                    }
+                }
+                KOp::Math1 { kind, dst, src } => {
+                    regs[dst as usize] = kmath1(kind, regs[src as usize])
+                }
+                KOp::Math2 { kind, dst, a, b } => {
+                    regs[dst as usize] = kmath2(kind, regs[a as usize], regs[b as usize])
+                }
+                // Dense array `length` (unshadowed only), else bail.
+                KOp::LoadLen { dst, obj, bail } => {
+                    let mut ok = false;
+                    {
+                        let b = objs[obj as usize].borrow();
+                        if b.props.is_empty() {
+                            if let Internal::Array(arr) = &b.internal {
+                                regs[dst as usize] = arr.len() as f64;
+                                ok = true;
+                            }
+                        }
+                    }
+                    if !ok {
+                        branch!(bail)
+                    }
+                }
+                // Entry-resolved named property access: raw slot, no check —
+                // the activation invariant (no map restructuring inside a
+                // kernel) keeps the slot AND its Number-ness valid.
+                KOp::LoadProp { dst, prop } => {
+                    let p = &k.props_used[prop as usize];
+                    let b = objs[p.oslot as usize].borrow();
+                    match b.props.get_index(prop_slots[prop as usize] as usize) {
+                        Some((
+                            _,
+                            Property {
+                                kind:
+                                    PropertyKind::Data {
+                                        value: Value::Number(n),
+                                        ..
+                                    },
+                                ..
+                            },
+                        )) => regs[dst as usize] = *n,
+                        _ => unreachable!("kernel prop slot invariant"),
+                    }
+                }
+                KOp::StoreProp { prop, src } => {
+                    let p = &k.props_used[prop as usize];
+                    let mut b = objs[p.oslot as usize].borrow_mut();
+                    match b.props.get_index_mut(prop_slots[prop as usize] as usize) {
+                        Some((
+                            _,
+                            Property {
+                                kind: PropertyKind::Data { value, .. },
+                                ..
+                            },
+                        )) => *value = Value::Number(regs[src as usize]),
+                        _ => unreachable!("kernel prop slot invariant"),
+                    }
+                }
+                // A pinned-closure call: copy the arguments into the
+                // callee's window and run its (guarded) kernel inline.
+                KOp::CallKernel {
+                    dst,
+                    fslot,
+                    base,
+                    argc: _,
+                } if CALLEES => {
+                    let (bf, wb) = &callee_bfs[fslot as usize];
+                    let ck = bf.proto.fn_kernel.as_ref().expect("guarded");
+                    let win = *wb as usize;
+                    for (r, slot) in ck.locals.iter().enumerate() {
+                        if let crate::bytecode::KSlot::Arg(a) = slot {
+                            regs[win + r] = regs[base as usize + *a as usize];
+                        }
+                    }
+                    if !run_callee_window(&mut regs, ck, win, dst as usize, &interrupt, &mut poll) {
+                        // Interrupted on a callee back-edge: the same
+                        // latch-and-unwind as an interrupted caller edge.
+                        for (r, slot) in k.locals.iter().enumerate() {
+                            if let crate::bytecode::KSlot::Local(l) = slot {
+                                frame.locals[*l as usize] = Value::Number(regs[r]);
+                            }
+                        }
+                        for (j, &l) in k.bool_locals.iter().enumerate() {
+                            frame.locals[l as usize] = Value::Bool(regs[bool_base + j] != 0.0);
+                        }
+                        self.kernel_regs = regs;
+                        objs.clear();
+                        self.kernel_objs = objs;
+                        self.kernel_prop_slots = prop_slots;
+                        callee_bfs.clear();
+                        self.kernel_callees = callee_bfs;
+                        self.op_budget = Some(0);
+                        return Err(self.throw_range("execution interrupted"));
+                    }
+                }
+                KOp::Exit { resume_ip, shape } => break (resume_ip, shape),
+                // Plain instantiation: a kernel without callee_slots never
+                // contains CallKernel (translator invariant).
+                KOp::CallKernel { .. } => unreachable!("CallKernel in a plain kernel loop"),
+                // Function-kernel-only ops; loop translation never emits them.
+                KOp::Ret { .. } | KOp::SelfCall { .. } => unreachable!("fn op in a loop kernel"),
+            }
+            pc += 1;
+        };
+        // Materialize: every mapped numeric local back to the frame (as
+        // Numbers), then the operand stack from the exit's shape (bottom-up:
+        // registers as Numbers, object slots as objects), then resume the
+        // bytecode interpreter at the exit's target.
+        for (r, slot) in k.locals.iter().enumerate() {
+            if let crate::bytecode::KSlot::Local(l) = slot {
+                frame.locals[*l as usize] = Value::Number(regs[r]);
+            }
+        }
+        for (j, &l) in k.bool_locals.iter().enumerate() {
+            frame.locals[l as usize] = Value::Bool(regs[bool_base + j] != 0.0);
+        }
+        for slot in k.shapes[shape as usize].iter() {
+            match slot {
+                crate::bytecode::KShapeSlot::Num(r) => {
+                    frame.stack.push(Value::Number(regs[*r as usize]))
+                }
+                crate::bytecode::KShapeSlot::Bool(r) => {
+                    frame.stack.push(Value::Bool(regs[*r as usize] != 0.0))
+                }
+                crate::bytecode::KShapeSlot::Obj(o) => {
+                    frame.stack.push(Value::Object(objs[*o as usize].clone()))
+                }
+                // The guard proved the live values ARE the canonicals.
+                crate::bytecode::KShapeSlot::MathObj => frame.stack.push(Value::Object(
+                    self.realm.math_object.clone().expect("guarded"),
+                )),
+                crate::bytecode::KShapeSlot::MathFn(kind) => frame.stack.push(Value::Object(
+                    self.realm.math_kernel[*kind as usize].clone(),
+                )),
+            }
+        }
+        self.kernel_regs = regs;
+        objs.clear();
+        self.kernel_objs = objs;
+        self.kernel_prop_slots = prop_slots;
+        callee_bfs.clear();
+        self.kernel_callees = callee_bfs;
+        Ok(Ctl::Jump(resume_ip as usize))
+    }
+
+    /// Execute a FUNCTION kernel (`FuncProto::fn_kernel`): the entire call
+    /// runs in unboxed registers with no frame at all. `None` = the entry
+    /// guard declined (an op budget installed — per-op counts are observable;
+    /// a trace sink active — it must see an enter/exit per call; a consumed
+    /// argument or captured upvalue not a `Number`; a monkeypatched `Math`) —
+    /// the caller proceeds down the ordinary frame path. `Some` is the call's
+    /// exact result, bit-identical to the generic path by the loop-kernel
+    /// argument (shared numeric cores, an op set closed over numbers, typed
+    /// returns). Callers have already applied the depth guard, so the
+    /// max-call-depth RangeError fires identically on both paths.
+    fn run_fn_kernel(
+        &mut self,
+        bf: &BytecodeFunction,
+        args: &[Value],
+    ) -> Option<Result<Value, Value>> {
+        let k = bf.proto.fn_kernel.as_ref()?;
+        if self.op_budget.is_some() || self.trace_sink.is_some() {
+            return None;
+        }
+        // Self-recursive kernels run the windowed executor.
+        if k.self_global.is_some() {
+            return self.run_fn_kernel_rec(bf, args);
+        }
+        let mut regs = std::mem::take(&mut self.kernel_regs);
+        regs.clear();
+        regs.resize(k.n_regs as usize, 0.0);
+        for (r, slot) in k.locals.iter().enumerate() {
+            match slot {
+                crate::bytecode::KSlot::Arg(a) => match args.get(*a as usize) {
+                    Some(Value::Number(n)) => regs[r] = *n,
+                    _ => {
+                        self.kernel_regs = regs;
+                        return None;
+                    }
+                },
+                // Internal locals are pure register scratch: translation
+                // proved a store dominates every read, so no frame slot is
+                // needed (and none exists).
+                crate::bytecode::KSlot::Local(_) => {}
+                crate::bytecode::KSlot::Upvalue(u) => match &*bf.upvalues[*u as usize].borrow() {
+                    Value::Number(n) => regs[r] = *n,
+                    _ => {
+                        self.kernel_regs = regs;
+                        return None;
+                    }
+                },
+            }
+        }
+        if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
+            self.kernel_regs = regs;
+            return None;
+        }
+        let interrupt = self.interrupt.clone();
+        let mut poll: u32 = 0;
+        let code = &k.code;
+        let mut pc = 0usize;
+        let ret = loop {
+            // Back-edges poll the cooperative interrupt flag, as in
+            // `run_kernel_op`; registers are pure scratch, nothing to write
+            // back on the unwind.
+            macro_rules! branch {
+                ($t:expr) => {{
+                    let t = $t as usize;
+                    if t <= pc {
+                        poll = poll.wrapping_add(1);
+                        if poll & 0xFF == 0 {
+                            if let Some(flag) = &interrupt {
+                                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                    self.kernel_regs = regs;
+                                    self.op_budget = Some(0);
+                                    return Some(Err(self.throw_range("execution interrupted")));
+                                }
+                            }
+                        }
+                    }
+                    pc = t;
+                    continue;
+                }};
+            }
+            match code[pc] {
+                KOp::Mov { dst, src } => regs[dst as usize] = regs[src as usize],
+                KOp::Const { dst, k } => regs[dst as usize] = k,
+                KOp::Add { dst, a, b } => regs[dst as usize] = regs[a as usize] + regs[b as usize],
+                KOp::AddK { dst, a, k } => regs[dst as usize] = regs[a as usize] + k,
+                KOp::Arith { kind, dst, a, b } => {
+                    regs[dst as usize] = number_arith_raw(regs[a as usize], regs[b as usize], kind)
+                }
+                KOp::ArithK { kind, dst, a, k } => {
+                    regs[dst as usize] = number_arith_raw(regs[a as usize], k, kind)
+                }
+                KOp::Neg { dst, src } => regs[dst as usize] = -regs[src as usize],
+                KOp::BitNot { dst, src } => {
+                    regs[dst as usize] = !crate::vm::to_int32(regs[src as usize]) as f64
+                }
+                KOp::Br { target } => branch!(target),
+                KOp::BrCmp {
+                    cmp,
+                    a,
+                    b,
+                    if_true,
+                    target,
+                } => {
+                    if knum_cmp(cmp, regs[a as usize], regs[b as usize]) == if_true {
+                        branch!(target)
+                    }
+                }
+                KOp::BrCmpK {
+                    cmp,
+                    a,
+                    k,
+                    if_true,
+                    target,
+                } => {
+                    if knum_cmp(cmp, regs[a as usize], k) == if_true {
+                        branch!(target)
+                    }
+                }
+                KOp::BrFalsy { src, target } => {
+                    if !knum_truthy(regs[src as usize]) {
+                        branch!(target)
+                    }
+                }
+                KOp::BrTruthy { src, target } => {
+                    if knum_truthy(regs[src as usize]) {
+                        branch!(target)
+                    }
+                }
+                KOp::CmpSet { cmp, dst, a, b } => {
+                    regs[dst as usize] = if knum_cmp(cmp, regs[a as usize], regs[b as usize]) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                KOp::BoolNot { dst, src } => {
+                    regs[dst as usize] = if knum_truthy(regs[src as usize]) {
+                        0.0
+                    } else {
+                        1.0
+                    }
+                }
+                KOp::Math1 { kind, dst, src } => {
+                    regs[dst as usize] = kmath1(kind, regs[src as usize])
+                }
+                KOp::Math2 { kind, dst, a, b } => {
+                    regs[dst as usize] = kmath2(kind, regs[a as usize], regs[b as usize])
+                }
+                KOp::Ret { src, boolean } => {
+                    break if boolean {
+                        Value::Bool(regs[src as usize] != 0.0)
+                    } else {
+                        Value::Number(regs[src as usize])
+                    }
+                }
+                // A frameless kernel has no bytecode frame to bail into;
+                // fn-mode translation rejects anything needing one. A
+                // SelfCall implies `self_global`, dispatched above.
+                KOp::LoadElem { .. }
+                | KOp::StoreElem { .. }
+                | KOp::LoadLen { .. }
+                | KOp::LoadProp { .. }
+                | KOp::StoreProp { .. }
+                | KOp::Exit { .. }
+                | KOp::CallKernel { .. }
+                | KOp::SelfCall { .. } => unreachable!("bail op in a function kernel"),
+            }
+            pc += 1;
+        };
+        self.kernel_regs = regs;
+        Some(Ok(ret))
+    }
+
+    /// The WINDOWED executor for self-recursive function kernels
+    /// (`Kernel::self_global`): each [`KOp::SelfCall`] pushes a fresh
+    /// `n_regs`-wide register window and an explicit (return-pc, dst,
+    /// caller-window) record — the whole recursion runs without a single
+    /// frame or `Value`. Extra guard over `run_fn_kernel`: the global the
+    /// recursive callee resolves through must be a plain data property
+    /// holding the VERY closure being invoked (pointer identity), so a
+    /// shadowed/rebound/accessor'd name declines and the call runs
+    /// generically. Depth mirrors the interpreter's limit; on overflow the
+    /// activation is ABANDONED and `None` returned — sound because kernels
+    /// are pure (registers only), and the caller's generic rerun then
+    /// raises the spec RangeError from the exact frame it belongs to.
+    fn run_fn_kernel_rec(
+        &mut self,
+        bf: &BytecodeFunction,
+        args: &[Value],
+    ) -> Option<Result<Value, Value>> {
+        let k = bf.proto.fn_kernel.as_ref()?;
+        let name = k.self_global.as_deref()?;
+        {
+            let g = self.realm.global.borrow();
+            let ok = matches!(
+                g.props.get(&PropertyKey::str(name)),
+                Some(Property {
+                    kind: PropertyKind::Data { value: Value::Object(o), .. },
+                    ..
+                }) if matches!(
+                    &o.borrow().internal,
+                    Internal::Function(FunctionInner::Bytecode(bf2))
+                        if std::ptr::eq(Rc::as_ptr(bf2), bf)
+                )
+            );
+            if !ok {
+                return None;
+            }
+        }
+        let n_regs = k.n_regs as usize;
+        let mut regs = std::mem::take(&mut self.kernel_regs);
+        regs.clear();
+        regs.resize(n_regs, 0.0);
+        for (r, slot) in k.locals.iter().enumerate() {
+            match slot {
+                crate::bytecode::KSlot::Arg(a) => match args.get(*a as usize) {
+                    Some(Value::Number(n)) => regs[r] = *n,
+                    _ => {
+                        self.kernel_regs = regs;
+                        return None;
+                    }
+                },
+                crate::bytecode::KSlot::Local(_) => {}
+                crate::bytecode::KSlot::Upvalue(u) => match &*bf.upvalues[*u as usize].borrow() {
+                    Value::Number(n) => regs[r] = *n,
+                    _ => {
+                        self.kernel_regs = regs;
+                        return None;
+                    }
+                },
+            }
+        }
+        if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
+            self.kernel_regs = regs;
+            return None;
+        }
+        let interrupt = self.interrupt.clone();
+        let mut poll: u32 = 0;
+        let code = &k.code;
+        // (return pc, dst register, caller window base) per live self-call.
+        let mut calls: Vec<(u16, u16, usize)> = Vec::new();
+        let mut base = 0usize;
+        let mut pc = 0usize;
+        let ret = loop {
+            // Back-edges AND self-calls poll the cooperative interrupt flag.
+            macro_rules! poll_interrupt {
+                () => {{
+                    poll = poll.wrapping_add(1);
+                    if poll & 0xFF == 0 {
+                        if let Some(flag) = &interrupt {
+                            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                self.kernel_regs = regs;
+                                self.op_budget = Some(0);
+                                return Some(Err(self.throw_range("execution interrupted")));
+                            }
+                        }
+                    }
+                }};
+            }
+            macro_rules! branch {
+                ($t:expr) => {{
+                    let t = $t as usize;
+                    if t <= pc {
+                        poll_interrupt!();
+                    }
+                    pc = t;
+                    continue;
+                }};
+            }
+            match code[pc] {
+                KOp::Mov { dst, src } => regs[base + dst as usize] = regs[base + src as usize],
+                KOp::Const { dst, k } => regs[base + dst as usize] = k,
+                KOp::Add { dst, a, b } => {
+                    regs[base + dst as usize] = regs[base + a as usize] + regs[base + b as usize]
+                }
+                KOp::AddK { dst, a, k } => regs[base + dst as usize] = regs[base + a as usize] + k,
+                KOp::Arith { kind, dst, a, b } => {
+                    regs[base + dst as usize] =
+                        number_arith_raw(regs[base + a as usize], regs[base + b as usize], kind)
+                }
+                KOp::ArithK { kind, dst, a, k } => {
+                    regs[base + dst as usize] = number_arith_raw(regs[base + a as usize], k, kind)
+                }
+                KOp::Neg { dst, src } => regs[base + dst as usize] = -regs[base + src as usize],
+                KOp::BitNot { dst, src } => {
+                    regs[base + dst as usize] =
+                        !crate::vm::to_int32(regs[base + src as usize]) as f64
+                }
+                KOp::Br { target } => branch!(target),
+                KOp::BrCmp {
+                    cmp,
+                    a,
+                    b,
+                    if_true,
+                    target,
+                } => {
+                    if knum_cmp(cmp, regs[base + a as usize], regs[base + b as usize]) == if_true {
+                        branch!(target)
+                    }
+                }
+                KOp::BrCmpK {
+                    cmp,
+                    a,
+                    k,
+                    if_true,
+                    target,
+                } => {
+                    if knum_cmp(cmp, regs[base + a as usize], k) == if_true {
+                        branch!(target)
+                    }
+                }
+                KOp::BrFalsy { src, target } => {
+                    if !knum_truthy(regs[base + src as usize]) {
+                        branch!(target)
+                    }
+                }
+                KOp::BrTruthy { src, target } => {
+                    if knum_truthy(regs[base + src as usize]) {
+                        branch!(target)
+                    }
+                }
+                KOp::CmpSet { cmp, dst, a, b } => {
+                    regs[base + dst as usize] =
+                        if knum_cmp(cmp, regs[base + a as usize], regs[base + b as usize]) {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                }
+                KOp::BoolNot { dst, src } => {
+                    regs[base + dst as usize] = if knum_truthy(regs[base + src as usize]) {
+                        0.0
+                    } else {
+                        1.0
+                    }
+                }
+                KOp::Math1 { kind, dst, src } => {
+                    regs[base + dst as usize] = kmath1(kind, regs[base + src as usize])
+                }
+                KOp::Math2 { kind, dst, a, b } => {
+                    regs[base + dst as usize] =
+                        kmath2(kind, regs[base + a as usize], regs[base + b as usize])
+                }
+                KOp::SelfCall {
+                    dst,
+                    base: abase,
+                    argc: _,
+                } => {
+                    // Mirror the generic per-call depth guard: an overflow
+                    // abandons the pure activation; the generic rerun then
+                    // recurses to the same depth and raises the RangeError.
+                    if self.call_depth + calls.len() + 1 > self.max_call_depth {
+                        self.kernel_regs = regs;
+                        return None;
+                    }
+                    poll_interrupt!();
+                    let new_base = base + n_regs;
+                    if regs.len() < new_base + n_regs {
+                        regs.resize(new_base + n_regs, 0.0);
+                    }
+                    // Populate the callee window: arguments from the call
+                    // site's contiguous registers, upvalues copied through
+                    // (same closure — the guard proved it), locals are
+                    // scratch (store-before-read proven at translation).
+                    for (r, slot) in k.locals.iter().enumerate() {
+                        match slot {
+                            crate::bytecode::KSlot::Arg(a) => {
+                                // Translation guarantees argc covers every
+                                // consumed argument index.
+                                regs[new_base + r] = regs[base + abase as usize + *a as usize];
+                            }
+                            crate::bytecode::KSlot::Upvalue(_) => {
+                                regs[new_base + r] = regs[base + r];
+                            }
+                            crate::bytecode::KSlot::Local(_) => {}
+                        }
+                    }
+                    calls.push((pc as u16 + 1, dst, base));
+                    base = new_base;
+                    pc = 0;
+                    continue;
+                }
+                KOp::Ret { src, boolean } => {
+                    // Recursive kernels are Number-only (enforced at
+                    // translation) — a boolean would land in a caller
+                    // register statically typed Num.
+                    debug_assert!(!boolean);
+                    let v = regs[base + src as usize];
+                    match calls.pop() {
+                        Some((ret_pc, dst, prev)) => {
+                            base = prev;
+                            regs[base + dst as usize] = v;
+                            pc = ret_pc as usize;
+                            continue;
+                        }
+                        None => break Value::Number(v),
+                    }
+                }
+                KOp::LoadElem { .. }
+                | KOp::StoreElem { .. }
+                | KOp::LoadLen { .. }
+                | KOp::LoadProp { .. }
+                | KOp::StoreProp { .. }
+                | KOp::CallKernel { .. }
+                | KOp::Exit { .. } => unreachable!("bail op in a function kernel"),
+            }
+            pc += 1;
+        };
+        self.kernel_regs = regs;
+        Some(Ok(ret))
     }
 
     fn describe(&self, v: &Value) -> String {
@@ -270,8 +1420,18 @@ impl Vm {
         if kind.is_generator() {
             return self.make_generator(func_obj, bf, this, args, new_target);
         }
+        // Function kernel: frameless fast path (see `call_bytecode_vec`).
+        if bf.proto.fn_kernel.is_some() {
+            if let Some(r) = self.run_fn_kernel(&bf, args) {
+                return r;
+            }
+        }
+        let uses_arguments = bf.proto.uses_arguments;
         let mut frame = self.make_frame(bf, this, args, new_target);
-        frame.func_obj = Some(func_obj.clone());
+        // See `call_bytecode_vec`: `func_obj` only feeds `arguments.callee`.
+        if uses_arguments {
+            frame.func_obj = Some(func_obj.clone());
+        }
         let token = self.trace_enter(&frame.func.proto);
         frame.trace_token = token;
         if kind.is_async() {
@@ -425,13 +1585,15 @@ impl Vm {
     const VALUE_VEC_POOL_CAP: usize = 4096;
 
     /// Pull a cleared `Vec<Value>` from the pool, or allocate a fresh one.
-    fn take_value_vec(&mut self) -> Vec<Value> {
+    #[inline]
+    pub(crate) fn take_value_vec(&mut self) -> Vec<Value> {
         self.value_vec_pool.pop().unwrap_or_default()
     }
 
     /// Return a buffer to the pool for reuse (clearing it drops any residual
     /// values). A never-grown (capacity 0) buffer isn't worth pooling; the list
     /// is size-capped so it can't retain memory without bound.
+    #[inline]
     fn recycle_value_vec(&mut self, mut v: Vec<Value>) {
         if v.capacity() == 0 || self.value_vec_pool.len() >= Self::VALUE_VEC_POOL_CAP {
             return;
@@ -440,23 +1602,50 @@ impl Vm {
         self.value_vec_pool.push(v);
     }
 
-    /// Reclaim a synchronously-finished frame's reusable buffers into the pool.
-    /// Only called on `Return`/`Throw` exits — a suspended frame keeps its
-    /// buffers (they ride inside the `Suspension`/generator state).
-    fn recycle_frame(&mut self, frame: &mut Frame) {
-        let stack = std::mem::take(&mut frame.stack);
-        let locals = std::mem::take(&mut frame.locals);
-        let args = std::mem::take(&mut frame.args);
-        self.recycle_value_vec(stack);
-        self.recycle_value_vec(locals);
-        self.recycle_value_vec(args);
-        let mut cells = std::mem::take(&mut frame.cells);
-        for cell in cells.drain(..) {
+    /// Reclaim a synchronously-finished frame WHOLE into the frame pool: every
+    /// value-bearing field is cleared (the pool must never extend a value's
+    /// lifetime — same discipline as the cell pool), while the stack / locals /
+    /// cells / args buffers keep their capacity for the next call. Only called
+    /// on `Return`/`Throw` exits — a suspended frame keeps its box (it rides
+    /// inside the `Suspension`/generator state).
+    #[inline]
+    fn recycle_frame(&mut self, mut frame: Box<Frame>) {
+        if self.frame_pool.len() >= Self::VALUE_VEC_POOL_CAP {
+            // Over cap: fall back to recycling the inner buffers individually.
+            let stack = std::mem::take(&mut frame.stack);
+            let locals = std::mem::take(&mut frame.locals);
+            let args = std::mem::take(&mut frame.args);
+            self.recycle_value_vec(stack);
+            self.recycle_value_vec(locals);
+            self.recycle_value_vec(args);
+            for cell in frame.cells.drain(..) {
+                self.recycle_cell(cell);
+            }
+            return;
+        }
+        frame.func = self.dummy_bf.clone();
+        frame.stack.clear();
+        frame.locals.clear();
+        for cell in frame.cells.drain(..) {
             self.recycle_cell(cell);
         }
-        if cells.capacity() > 0 && self.cells_vec_pool.len() < Self::VALUE_VEC_POOL_CAP {
-            self.cells_vec_pool.push(cells);
-        }
+        frame.this = Value::Undefined;
+        frame.new_target = Value::Undefined;
+        frame.handlers.clear();
+        frame.pending_completion = None;
+        frame.pending_throw = None;
+        frame.pending_return = None;
+        frame.args.clear();
+        frame.func_obj = None;
+        frame.dispose_scopes.clear();
+        frame.completion = Value::Undefined;
+        frame.enumerators.clear();
+        frame.with_scope.clear();
+        frame.trace_token = None;
+        frame.skip_delegation_throw = false;
+        frame.eval_vars = None;
+        frame.priv_env = None;
+        self.frame_pool.push(frame);
     }
 
     /// Pull a binding cell holding `v` from the pool, or allocate a fresh one.
@@ -487,7 +1676,7 @@ impl Vm {
         this: Value,
         args: &[Value],
         new_target: Value,
-    ) -> Frame {
+    ) -> Box<Frame> {
         let mut args_buf = self.take_value_vec();
         args_buf.extend_from_slice(args);
         self.make_frame_owned(bf, this, args_buf, new_target)
@@ -495,16 +1684,71 @@ impl Vm {
 
     /// As [`Vm::make_frame`], but adopts an already-owned argument buffer
     /// (the interpreter's pooled call-op buffer) as `frame.args` directly,
-    /// skipping the copy. `recycle_frame` returns it to the pool at exit.
+    /// skipping the copy.
+    ///
+    /// The frame itself comes from the frame pool when one is available: a
+    /// recycled frame arrives scrubbed (see [`Vm::recycle_frame`]) with its
+    /// four buffers' capacities intact, so this only re-initializes fields in
+    /// place — no buffer pool round-trips, no ~400-byte struct move.
     pub fn make_frame_owned(
         &mut self,
         bf: Rc<BytecodeFunction>,
         this: Value,
         args: Vec<Value>,
         new_target: Value,
-    ) -> Frame {
-        let proto = bf.proto.clone();
-        let mut cells = self.cells_vec_pool.pop().unwrap_or_default();
+    ) -> Box<Frame> {
+        let mut f = self.take_frame();
+        self.init_frame(&mut f, bf, this, new_target);
+        let old_args = std::mem::replace(&mut f.args, args);
+        self.recycle_value_vec(old_args);
+        f
+    }
+
+    /// Pop a scrubbed frame from the pool, or allocate a fresh (equally blank)
+    /// one. Every field of a pooled frame was reset by [`Vm::recycle_frame`].
+    #[inline]
+    fn take_frame(&mut self) -> Box<Frame> {
+        match self.frame_pool.pop() {
+            Some(f) => f,
+            None => Box::new(Frame {
+                func: self.dummy_bf.clone(),
+                ip: 0,
+                stack: Vec::with_capacity(8),
+                locals: Vec::new(),
+                cells: Vec::new(),
+                this: Value::Undefined,
+                new_target: Value::Undefined,
+                handlers: Vec::new(),
+                pending_completion: None,
+                pending_throw: None,
+                pending_return: None,
+                args: Vec::new(),
+                func_obj: None,
+                dispose_scopes: Vec::new(),
+                completion: Value::Undefined,
+                enumerators: Vec::new(),
+                with_scope: Vec::new(),
+                trace_token: None,
+                skip_delegation_throw: false,
+                eval_vars: None,
+                priv_env: None,
+            }),
+        }
+    }
+
+    /// Initialize a blank (fresh or pool-scrubbed) frame's per-call fields in
+    /// place. The caller provides `args` separately (either an owned buffer
+    /// swapped in, or values moved straight off its operand stack).
+    #[inline]
+    fn init_frame(
+        &mut self,
+        f: &mut Frame,
+        bf: Rc<BytecodeFunction>,
+        this: Value,
+        new_target: Value,
+    ) {
+        f.ip = 0;
+        let proto = &bf.proto;
         for i in 0..proto.num_cells as usize {
             // A localized index lives in `frame.locals`; its cell slot is a
             // shared never-read placeholder (`Rc` bump, no pool round-trip).
@@ -513,43 +1757,17 @@ impl Vm {
             } else {
                 self.take_cell(Value::Undefined)
             };
-            cells.push(c);
+            f.cells.push(c);
         }
+        f.locals.resize(proto.num_locals as usize, Value::Undefined);
         // A closure created inside `with (o) { … }` carries the with-object
         // chain; seed the frame's with-scope stack with it so the body's
         // dynamic name ops resolve against it (under any with the body enters).
-        let with_scope = bf.captured_with.clone();
-        let priv_env = bf.captured_priv_env.clone();
-        // Reuse pooled buffers for the three per-call vectors (operand stack,
-        // locals, args) instead of allocating each one fresh.
-        let mut stack = self.take_value_vec();
-        stack.reserve(8);
-        let mut locals = self.take_value_vec();
-        locals.resize(proto.num_locals as usize, Value::Undefined);
-        let args_buf = args;
-        Frame {
-            func: bf,
-            ip: 0,
-            stack,
-            locals,
-            cells,
-            this,
-            new_target,
-            handlers: Vec::new(),
-            pending_completion: None,
-            pending_throw: None,
-            pending_return: None,
-            args: args_buf,
-            func_obj: None,
-            dispose_scopes: Vec::new(),
-            completion: Value::Undefined,
-            enumerators: Vec::new(),
-            with_scope,
-            trace_token: None,
-            skip_delegation_throw: false,
-            eval_vars: None,
-            priv_env,
-        }
+        f.with_scope.extend_from_slice(&bf.captured_with);
+        f.priv_env = bf.captured_priv_env.clone();
+        f.func = bf;
+        f.this = this;
+        f.new_target = new_target;
     }
 
     // =====================================================================
@@ -735,15 +1953,15 @@ impl Vm {
     // The interpreter loop
     // =====================================================================
 
-    pub fn run_frame(&mut self, mut frame: Frame) -> Flow {
-        // Recycle this frame's pooled buffers into the free-list, then return the
+    pub fn run_frame(&mut self, mut frame: Box<Frame>) -> Flow {
+        // Recycle this frame whole into the frame pool, then return the
         // (already-owned) outcome. Used only on synchronous Return/Throw exits;
         // the Suspend paths move the whole frame (buffers included) into the
         // Suspension/generator state, so they must NOT recycle here.
         macro_rules! done {
             ($flow:expr) => {{
                 let outcome = $flow;
-                self.recycle_frame(&mut frame);
+                self.recycle_frame(frame);
                 return outcome;
             }};
         }
@@ -784,27 +2002,40 @@ impl Vm {
                 },
             }
         }
+        // Budget/interrupt accounting hoisted to ONE register-friendly bool: in
+        // the common case (no op budget, no interrupt flag — every production
+        // run) the per-op cost is a single predicted-not-taken branch instead
+        // of two `Option` loads through `self`. Sampled once per frame entry;
+        // both are only ever installed BEFORE execution starts (the conformance
+        // runner, untrusted eval), never from inside a running frame, so no
+        // frame can miss a budget that applies to it. The interrupt latch below
+        // zeroes the budget of an already-`counting` frame, and every frame
+        // entered afterwards re-samples.
+        let counting = self.op_budget.is_some() || self.interrupt.is_some();
         loop {
-            if let Some(budget) = self.op_budget.as_mut() {
-                if *budget == 0 {
-                    // Uncatchable so execution is guaranteed to terminate.
-                    done!(Flow::Throw(self.throw_range("execution budget exceeded")));
+            if counting {
+                if let Some(budget) = self.op_budget.as_mut() {
+                    if *budget == 0 {
+                        // Uncatchable so execution is guaranteed to terminate.
+                        done!(Flow::Throw(self.throw_range("execution budget exceeded")));
+                    }
+                    *budget -= 1;
                 }
-                *budget -= 1;
-            }
-            // Cooperative cancellation: poll the interrupt flag every 256 ops to
-            // keep the atomic load off the hot per-op path while still reacting
-            // promptly even when individual ops are expensive (e.g. O(n) string
-            // concatenation in a loop). Once observed, latch it by zeroing the op
-            // budget so a JS `try/catch` around the slow loop can't resume
-            // execution — guaranteeing a prompt, terminating unwind.
-            if self.interrupt.is_some() {
-                interrupt_poll = interrupt_poll.wrapping_add(1);
-                if interrupt_poll & 0xFF == 0 {
-                    if let Some(flag) = &self.interrupt {
-                        if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                            self.op_budget = Some(0);
-                            done!(Flow::Throw(self.throw_range("execution interrupted")));
+                // Cooperative cancellation: poll the interrupt flag every 256
+                // ops to keep the atomic load off the hot per-op path while
+                // still reacting promptly even when individual ops are expensive
+                // (e.g. O(n) string concatenation in a loop). Once observed,
+                // latch it by zeroing the op budget so a JS `try/catch` around
+                // the slow loop can't resume execution — guaranteeing a prompt,
+                // terminating unwind.
+                if self.interrupt.is_some() {
+                    interrupt_poll = interrupt_poll.wrapping_add(1);
+                    if interrupt_poll & 0xFF == 0 {
+                        if let Some(flag) = &self.interrupt {
+                            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                self.op_budget = Some(0);
+                                done!(Flow::Throw(self.throw_range("execution interrupted")));
+                            }
                         }
                     }
                 }
@@ -842,25 +2073,25 @@ impl Vm {
                 }
                 Ok(Ctl::Await(v)) => {
                     return Flow::Suspend(Suspension {
-                        frame: Box::new(frame),
+                        frame,
                         kind: SuspendKind::Await(v),
                     })
                 }
                 Ok(Ctl::Yield(v)) => {
                     return Flow::Suspend(Suspension {
-                        frame: Box::new(frame),
+                        frame,
                         kind: SuspendKind::Yield(v),
                     })
                 }
                 Ok(Ctl::YieldStar(v)) => {
                     return Flow::Suspend(Suspension {
-                        frame: Box::new(frame),
+                        frame,
                         kind: SuspendKind::YieldStar(v),
                     })
                 }
                 Ok(Ctl::GeneratorStart) => {
                     return Flow::Suspend(Suspension {
-                        frame: Box::new(frame),
+                        frame,
                         kind: SuspendKind::GeneratorStart,
                     })
                 }
@@ -1115,6 +2346,15 @@ impl Vm {
         }
     }
 
+    /// One opcode. Split in two for the sake of the NATIVE stack: the hot
+    /// ops (loads/stores, arithmetic, comparisons, branches, calls, property
+    /// access, the fused superinstructions) are handled inline here, and every
+    /// other op delegates to the `#[inline(never)]` [`Vm::step_cold`]. With
+    /// one giant match, LLVM's imperfect stack coloring gave `step` a ~4 KB
+    /// stack frame -- the UNION of ~190 arms' locals -- which is what a JS
+    /// call's native-stack footprint is mostly made of (deep JS recursion
+    /// must exhaust `max_call_depth` before the native stack). Each op has
+    /// exactly ONE implementation: here, or in `step_cold`, never both.
     fn step(&mut self, frame: &mut Frame, op: &Op) -> Result<Ctl, Value> {
         macro_rules! pop {
             () => {
@@ -1135,40 +2375,12 @@ impl Vm {
             Op::LoadTrue => push!(Value::Bool(true)),
             Op::LoadFalse => push!(Value::Bool(false)),
             Op::LoadThis => push!(frame.this.clone()),
-            Op::RequireObjectCoercible => {
-                if frame.stack.last().map(|v| v.is_nullish()).unwrap_or(true) {
-                    return Err(self.throw_type("Cannot destructure a null or undefined value"));
-                }
-            }
-            Op::BindThisSloppy => {
-                let t = pop!();
-                let bound = match t {
-                    Value::Undefined | Value::Null => Value::Object(self.realm.global.clone()),
-                    Value::Object(_) => t,
-                    // A primitive `this` is boxed (ToObject) in sloppy mode.
-                    other => Value::Object(self.to_object(&other)?),
-                };
-                push!(bound);
-            }
             Op::LoadNewTarget => push!(frame.new_target.clone()),
             Op::LoadArg(i) => push!(frame
                 .args
                 .get(*i as usize)
                 .cloned()
                 .unwrap_or(Value::Undefined)),
-            Op::LoadRestArgs(n) => {
-                let rest: Vec<Value> = if (*n as usize) < frame.args.len() {
-                    frame.args[*n as usize..].to_vec()
-                } else {
-                    Vec::new()
-                };
-                push!(Value::Object(self.new_array(rest)));
-            }
-            Op::LoadArguments => {
-                let o = self.make_arguments_object(frame);
-                push!(o);
-            }
-
             Op::LoadLocal(i) => {
                 let v = frame.locals[*i as usize].clone();
                 if matches!(v, Value::Uninitialized) {
@@ -1406,13 +2618,6 @@ impl Vm {
                 };
                 push!(v);
             }
-            Op::LoadGlobalTypeof(i) => {
-                let name = self.const_name(frame, *i);
-                let key = PropertyKey::Str(name);
-                let g = self.realm.global.clone();
-                let v = self.get_prop(&Value::Object(g), &key)?;
-                push!(v);
-            }
             Op::StoreGlobal(i) => {
                 let name = self.const_name(frame, *i);
                 let v = pop!();
@@ -1427,6 +2632,824 @@ impl Vm {
                     return Err(self.throw_reference(&format!("{} is not defined", name.as_str())));
                 }
                 self.put_value(&Value::Object(g), &key, v, strict)?;
+            }
+            Op::Pop => {
+                frame.stack.pop();
+            }
+            Op::Dup => {
+                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                push!(v);
+            }
+            Op::Swap => {
+                let n = frame.stack.len();
+                if n >= 2 {
+                    frame.stack.swap(n - 1, n - 2);
+                }
+            }
+            Op::Rot3 => {
+                let n = frame.stack.len();
+                if n >= 3 {
+                    // a b c -> b c a
+                    frame.stack[n - 3..].rotate_left(1);
+                }
+            }
+
+            Op::NewObject => push!(Value::Object(self.new_object())),
+            Op::NewArray(n) => {
+                let n = *n as usize;
+                let at = frame.stack.len() - n;
+                let elems = frame.stack.split_off(at);
+                push!(Value::Object(self.new_array(elems)));
+            }
+            Op::GetProp(i) => {
+                let name = self.const_name(frame, *i);
+                let obj = pop!();
+                // Inline cache (key-verified hints; see `FuncProto::ic`).
+                // Two levels:
+                //  - `holder == None`: the receiver's OWN data property at
+                //    `slot` (ordinary objects).
+                //  - `holder == Some(p)`: a data property at `slot` on `p`,
+                //    verified to still be the receiver's DIRECT prototype and
+                //    not shadowed by an own property — the method-lookup
+                //    pattern (`arr.push`, class instances calling prototype
+                //    methods). Array receivers exclude keys with exotic own
+                //    behavior (`length`, indices). Deeper chains, accessors,
+                //    proxies, and every other exotic fall to the unchanged
+                //    slow path.
+                if let Value::Object(o) = &obj {
+                    if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
+                        let b = o.borrow();
+                        let (is_ord, is_arr) = (
+                            matches!(b.internal, Internal::Ordinary),
+                            matches!(b.internal, Internal::Array(_)),
+                        );
+                        // Array exotics: `length` and index keys never take
+                        // the IC (they don't live in the props map).
+                        let plain_key = !is_arr
+                            || (name.as_str() != "length"
+                                && crate::value::canonical_index(name.as_str()).is_none());
+                        if (is_ord || is_arr) && plain_key {
+                            // Own-property hit: never touches the holder cell.
+                            if is_ord {
+                                if let Some((PropertyKey::Str(k), prop)) =
+                                    b.props.get_index(ic.own_slot.get() as usize)
+                                {
+                                    if let PropertyKind::Data { value, .. } = &prop.kind {
+                                        if k == &name {
+                                            let v = value.clone();
+                                            drop(b);
+                                            push!(v);
+                                            return Ok(Ctl::Next);
+                                        }
+                                    }
+                                }
+                            }
+                            // Proto hit: valid only when the receiver has no
+                            // own props (nothing can shadow) and its CURRENT
+                            // direct proto is the cached holder.
+                            if b.props.is_empty() {
+                                let holder = ic.holder.borrow();
+                                if let Some(h) = &*holder {
+                                    if b.proto.as_ref().is_some_and(|p| p.ptr_eq(h)) {
+                                        let hb = h.borrow();
+                                        if let Some((PropertyKey::Str(k), prop)) =
+                                            hb.props.get_index(ic.proto_slot.get() as usize)
+                                        {
+                                            if let PropertyKind::Data { value, .. } = &prop.kind {
+                                                if k == &name {
+                                                    let v = value.clone();
+                                                    drop(hb);
+                                                    drop(holder);
+                                                    drop(b);
+                                                    push!(v);
+                                                    return Ok(Ctl::Next);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Refill: own data property first (ordinary only),
+                            // then a one-level proto data property when no own
+                            // props can shadow.
+                            let key = PropertyKey::Str(name.clone());
+                            if is_ord {
+                                if let Some((idx, _, prop)) = b.props.get_full(&key) {
+                                    if let PropertyKind::Data { value, .. } = &prop.kind {
+                                        ic.own_slot.set(idx as u32);
+                                        let v = value.clone();
+                                        drop(b);
+                                        push!(v);
+                                        return Ok(Ctl::Next);
+                                    }
+                                }
+                            }
+                            if b.props.is_empty() {
+                                if let Some(p) = &b.proto {
+                                    let pb = p.borrow();
+                                    if matches!(pb.internal, Internal::Ordinary)
+                                        || matches!(pb.internal, Internal::Array(_))
+                                    {
+                                        if let Some((idx, _, prop)) = pb.props.get_full(&key) {
+                                            if let PropertyKind::Data { value, .. } = &prop.kind {
+                                                ic.proto_slot.set(idx as u32);
+                                                let v = value.clone();
+                                                let holder_obj = p.clone();
+                                                drop(pb);
+                                                *ic.holder.borrow_mut() = Some(holder_obj);
+                                                drop(b);
+                                                push!(v);
+                                                return Ok(Ctl::Next);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let v = self.get_prop(&obj, &PropertyKey::Str(name))?;
+                push!(v);
+            }
+            Op::SetProp(i) => {
+                let name = self.const_name(frame, *i);
+                let value = pop!();
+                let obj = pop!();
+                // Inline cache (key-verified slot hint; see `FuncProto::ic`).
+                // Fast path only when the receiver is an ordinary object whose
+                // OWN property at the hinted slot is a WRITABLE data property —
+                // per OrdinarySetWithOwnDescriptor that assignment updates the
+                // value in place (attributes and slot order preserved, no
+                // prototype setter can intervene). Everything else (missing own
+                // key → proto-chain setters/read-only checks, accessors,
+                // non-writable → strict TypeError, exotics) takes the
+                // unchanged put_value path, which also refills the hint.
+                if let Value::Object(o) = &obj {
+                    if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
+                        let mut b = o.borrow_mut();
+                        if matches!(b.internal, Internal::Ordinary) {
+                            if let Some((PropertyKey::Str(k), prop)) =
+                                b.props.get_index_mut(ic.own_slot.get() as usize)
+                            {
+                                if k == &name {
+                                    if let PropertyKind::Data {
+                                        value: slot,
+                                        writable: true,
+                                    } = &mut prop.kind
+                                    {
+                                        *slot = value.clone();
+                                        drop(b);
+                                        push!(value);
+                                        return Ok(Ctl::Next);
+                                    }
+                                }
+                            }
+                            let key = PropertyKey::Str(name.clone());
+                            if let Some((idx, _, prop)) = b.props.get_full_mut(&key) {
+                                if let PropertyKind::Data {
+                                    value: slot,
+                                    writable: true,
+                                } = &mut prop.kind
+                                {
+                                    ic.own_slot.set(idx as u32);
+                                    *slot = value.clone();
+                                    drop(b);
+                                    push!(value);
+                                    return Ok(Ctl::Next);
+                                }
+                            }
+                        }
+                    }
+                }
+                let strict = frame.func.proto.is_strict;
+                self.put_value(&obj, &PropertyKey::Str(name), value.clone(), strict)?;
+                push!(value);
+            }
+            Op::GetPropDynamic => {
+                let key_v = pop!();
+                let obj = pop!();
+                // Integer fast path: `a[i]` on a dense array with an integral
+                // Number key reads the element directly — skipping
+                // ToPropertyKey's Number→String conversion (a float-format +
+                // heap allocation per access!), the reparse back to an index,
+                // and the property-map machinery. Only when no reified props
+                // entry can shadow the dense element (`props.is_empty()`) and
+                // the slot is a real element (in bounds, not a hole);
+                // everything else takes the unchanged spec path.
+                if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
+                    if n.fract() == 0.0 && *n >= 0.0 && *n < 4294967295.0 {
+                        let b = o.borrow();
+                        if let Internal::Array(arr) = &b.internal {
+                            if b.props.is_empty() {
+                                if let Some(v) = arr.get(*n as usize) {
+                                    if !matches!(v, Value::Hole) {
+                                        let v = v.clone();
+                                        drop(b);
+                                        push!(v);
+                                        return Ok(Ctl::Next);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // GetValue: RequireObjectCoercible(base) (via ToObject) throws
+                // BEFORE ToPropertyKey coerces the key expression's value.
+                self.require_object_coercible(&obj, "read properties of")?;
+                let key = self.to_property_key(&key_v)?;
+                let v = self.get_prop(&obj, &key)?;
+                push!(v);
+            }
+            Op::SetPropDynamic => {
+                let value = pop!();
+                let key_v = pop!();
+                let obj = pop!();
+                // Integer fast path mirroring `GetPropDynamic`: overwrite an
+                // EXISTING dense element in place. An in-bounds non-hole dense
+                // slot is a plain writable data property (per the array exotic
+                // [[Set]]), so no setter, no length change, and no
+                // extensibility interaction is observable. Appends, holes,
+                // out-of-bounds, and shadowed elements take the spec path.
+                if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
+                    if n.fract() == 0.0 && *n >= 0.0 && *n < 4294967295.0 {
+                        let mut b = o.borrow_mut();
+                        if b.props.is_empty() {
+                            if let Internal::Array(arr) = &mut b.internal {
+                                let i = *n as usize;
+                                if let Some(slot) = arr.get_mut(i) {
+                                    if !matches!(slot, Value::Hole) {
+                                        *slot = value.clone();
+                                        drop(b);
+                                        push!(value);
+                                        return Ok(Ctl::Next);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                self.require_object_coercible(&obj, "set properties of")?;
+                let key = self.to_property_key(&key_v)?;
+                let strict = frame.func.proto.is_strict;
+                self.put_value(&obj, &key, value.clone(), strict)?;
+                push!(value);
+            }
+            Op::HasProp => {
+                let obj = pop!();
+                let key_v = pop!();
+                let key = self.to_property_key(&key_v)?;
+                let r = self.has_prop(&obj, &key)?;
+                push!(Value::Bool(r));
+            }
+            Op::JumpIfNullish(t) => {
+                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                if v.is_nullish() {
+                    // An optional chain short-circuits to `undefined` even when
+                    // the base was `null` (the other emit sites pop the value).
+                    if let Some(top) = frame.stack.last_mut() {
+                        *top = Value::Undefined;
+                    }
+                    return Ok(Ctl::Jump(*t as usize));
+                }
+            }
+
+            Op::Call(argc) => {
+                let n = *argc as usize;
+                let at = frame.stack.len() - n;
+                // Stack layout: [func, this, a0..]. A plain sync bytecode
+                // callee takes the direct path: its args MOVE straight from
+                // this operand stack into the pooled callee frame.
+                if let Some(bf) = peek_plain_bytecode(&frame.stack[at - 2]) {
+                    let r = self.call_direct(frame, at, bf, true)?;
+                    push!(r);
+                } else {
+                    // Move the argument values into a pooled buffer rather than
+                    // `split_off` (which allocates a fresh Vec on every call).
+                    let mut args = self.take_value_vec();
+                    args.extend(frame.stack.drain(at..));
+                    let this = pop!();
+                    let func = pop!();
+                    // Owned-args path: the pooled buffer moves into the callee
+                    // frame (recycled by its recycle_frame), skipping the second
+                    // copy make_frame's slice path would do.
+                    let r = self.call_valuevec(func, this, args);
+                    push!(r?);
+                }
+            }
+            Op::CallMethodless(argc) => {
+                let n = *argc as usize;
+                let at = frame.stack.len() - n;
+                // Stack layout: [func, a0..] — no explicit `this`.
+                if let Some(bf) = peek_plain_bytecode(&frame.stack[at - 1]) {
+                    let r = self.call_direct(frame, at, bf, false)?;
+                    push!(r);
+                } else {
+                    let mut args = self.take_value_vec();
+                    args.extend(frame.stack.drain(at..));
+                    let func = pop!();
+                    let r = self.call_valuevec(func, Value::Undefined, args);
+                    push!(r?);
+                }
+            }
+            Op::CallSpread => {
+                let args_arr = pop!();
+                let this = pop!();
+                let func = pop!();
+                let args = self.iterate_to_vec(&args_arr)?;
+                let r = self.call(func, this, &args)?;
+                push!(r);
+            }
+            Op::New(argc) => {
+                let n = *argc as usize;
+                let at = frame.stack.len() - n;
+                let args = frame.stack.split_off(at);
+                let ctor = pop!();
+                let r = self.construct(&ctor, &args, &ctor)?;
+                push!(r);
+            }
+            Op::NewSpread => {
+                let args_arr = pop!();
+                let ctor = pop!();
+                let args = self.iterate_to_vec(&args_arr)?;
+                let r = self.construct(&ctor, &args, &ctor)?;
+                push!(r);
+            }
+            Op::Return => {
+                let v = pop!();
+                // Route through any enclosing `finally` blocks before returning.
+                return self.do_completion(frame, Completion::Return(v));
+            }
+            Op::ReturnUndefined => {
+                let v = frame.completion.clone();
+                return self.do_completion(frame, Completion::Return(v));
+            }
+
+            Op::Closure(i) => {
+                let proto = match &frame.func.proto.consts[*i as usize] {
+                    Const::Func(p) => p.clone(),
+                    _ => return Err(self.throw_type("internal: bad closure const")),
+                };
+                let upvalues = proto
+                    .upvalues
+                    .iter()
+                    .map(|src| match src {
+                        UpvalueSource::ParentCell(idx) => frame.cells[*idx as usize].clone(),
+                        UpvalueSource::ParentUpvalue(idx) => {
+                            frame.func.upvalues[*idx as usize].clone()
+                        }
+                    })
+                    .collect();
+                let inherit_home = proto.kind.is_arrow() || proto.inherit_home;
+                let f = self.make_closure(proto, upvalues);
+                // Capture the active with-scope chain (closures defined inside
+                // `with` resolve free identifiers against it after the block)
+                // and the active private-environment chain (methods and
+                // initializers defined inside class bodies resolve `#x`
+                // against it). Arrows (and synthetic in-class closures) also
+                // inherit the creating frame's [[HomeObject]], so `super.x`
+                // inside them resolves like the enclosing method.
+                if !frame.with_scope.is_empty()
+                    || frame.priv_env.is_some()
+                    || (inherit_home && frame.func.home_object.is_some())
+                {
+                    if let Internal::Function(FunctionInner::Bytecode(bf)) =
+                        &mut f.borrow_mut().internal
+                    {
+                        let bf = Rc::make_mut(bf);
+                        bf.captured_with = frame.with_scope.clone();
+                        bf.captured_priv_env = frame.priv_env.clone();
+                        if inherit_home {
+                            bf.home_object = frame.func.home_object.clone();
+                        }
+                    }
+                }
+                push!(Value::Object(f));
+            }
+
+            // ---- arithmetic ----
+            Op::Add => {
+                let b = pop!();
+                let a = pop!();
+                let r = self.op_add(a, b)?;
+                push!(r);
+            }
+            Op::Sub => bin_arith(self, frame, ArithKind::Sub)?,
+            Op::Mul => bin_arith(self, frame, ArithKind::Mul)?,
+            Op::Div => bin_arith(self, frame, ArithKind::Div)?,
+            Op::Mod => bin_arith(self, frame, ArithKind::Mod)?,
+            Op::Pow => bin_arith(self, frame, ArithKind::Pow)?,
+            Op::Neg => {
+                let a = pop!();
+                push!(self.unary_arith(a, UnaryKind::Neg)?);
+            }
+            Op::Pos => {
+                // ToNumber throws TypeError for BigInt (unary + is invalid on it).
+                let a = pop!();
+                let n = self.to_number(&a)?;
+                push!(Value::Number(n));
+            }
+            Op::ToNumeric => {
+                // ToNumeric: like ToNumber but keeps BigInt (used by ++/-- to
+                // produce the coerced old value).
+                let a = pop!();
+                push!(self.to_numeric(&a)?);
+            }
+            Op::Inc => {
+                let a = pop!();
+                push!(self.unary_arith(a, UnaryKind::Inc)?);
+            }
+            Op::Dec => {
+                let a = pop!();
+                push!(self.unary_arith(a, UnaryKind::Dec)?);
+            }
+            Op::BitNot => {
+                let a = pop!();
+                push!(self.unary_arith(a, UnaryKind::BitNot)?);
+            }
+            Op::Not => {
+                let a = pop!();
+                push!(Value::Bool(!self.to_boolean(&a)));
+            }
+            Op::BitAnd => bin_arith(self, frame, ArithKind::BitAnd)?,
+            Op::BitOr => bin_arith(self, frame, ArithKind::BitOr)?,
+            Op::BitXor => bin_arith(self, frame, ArithKind::BitXor)?,
+            Op::Shl => bin_arith(self, frame, ArithKind::Shl)?,
+            Op::Shr => bin_arith(self, frame, ArithKind::Shr)?,
+            Op::UShr => bin_arith(self, frame, ArithKind::UShr)?,
+            Op::TypeofExpr => {
+                let a = pop!();
+                push!(Value::str(a.type_of()));
+            }
+
+            // ---- comparison ----
+            Op::Eq => {
+                let b = pop!();
+                let a = pop!();
+                let r = self.loose_equals(&a, &b)?;
+                push!(Value::Bool(r));
+            }
+            Op::Ne => {
+                let b = pop!();
+                let a = pop!();
+                let r = self.loose_equals(&a, &b)?;
+                push!(Value::Bool(!r));
+            }
+            Op::StrictEq => {
+                let b = pop!();
+                let a = pop!();
+                push!(Value::Bool(self.strict_equals(&a, &b)));
+            }
+            Op::StrictNe => {
+                let b = pop!();
+                let a = pop!();
+                push!(Value::Bool(!self.strict_equals(&a, &b)));
+            }
+            Op::Lt => {
+                let b = pop!();
+                let a = pop!();
+                let r = self.less_than(&a, &b)?;
+                push!(Value::Bool(r == Some(true)));
+            }
+            Op::Gt => {
+                let b = pop!();
+                let a = pop!();
+                let r = self.less_than(&b, &a)?;
+                push!(Value::Bool(r == Some(true)));
+            }
+            Op::Le => {
+                let b = pop!();
+                let a = pop!();
+                let r = self.less_than(&b, &a)?;
+                push!(Value::Bool(r == Some(false)));
+            }
+            Op::Ge => {
+                let b = pop!();
+                let a = pop!();
+                let r = self.less_than(&a, &b)?;
+                push!(Value::Bool(r == Some(false)));
+            }
+            Op::InstanceOf => {
+                let ctor = pop!();
+                let obj = pop!();
+                let r = self.instance_of(&obj, &ctor)?;
+                push!(Value::Bool(r));
+            }
+
+            // ---- control flow ----
+            Op::Jump(t) => return Ok(Ctl::Jump(*t as usize)),
+            Op::JumpIfTrue(t) => {
+                let v = pop!();
+                if self.to_boolean(&v) {
+                    return Ok(Ctl::Jump(*t as usize));
+                }
+            }
+            Op::JumpIfFalse(t) => {
+                let v = pop!();
+                if !self.to_boolean(&v) {
+                    return Ok(Ctl::Jump(*t as usize));
+                }
+            }
+            // Fused `cmp ; JumpIfFalse` (see `fuse.rs`). Each arm reuses the
+            // SAME helper as the standalone comparison op, so coercion and any
+            // thrown error are identical; the boolean the pair would materialize
+            // is consumed directly by the branch instead of round-tripping the
+            // operand stack. `to_boolean(Bool(r)) == r`, so the branch condition
+            // matches `JumpIfFalse` exactly.
+            Op::CmpBranchFalse { cmp, target } => {
+                let b = pop!();
+                let a = pop!();
+                if !self.cmp_values(*cmp, &a, &b)? {
+                    return Ok(Ctl::Jump(*target as usize));
+                }
+            }
+            // Fused `cmp ; JumpIfTrue` — mirror of `CmpBranchFalse`; branches when
+            // the comparison is true. Same helpers, so behavior is identical.
+            Op::CmpBranchTrue { cmp, target } => {
+                let b = pop!();
+                let a = pop!();
+                let r = self.cmp_values(*cmp, &a, &b)?;
+                if r {
+                    return Ok(Ctl::Jump(*target as usize));
+                }
+            }
+            // Fused `LoadCellConst ; CmpBranchFalse` — a whole `i < N` loop test.
+            // Same TDZ check, comparison helpers, and branch as the sequence.
+            Op::CmpCellConstBranchFalse {
+                cell,
+                konst,
+                cmp,
+                target,
+            } => {
+                let a = frame.cells[*cell as usize].borrow().clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                if !self.cmp_values(*cmp, &a, &b)? {
+                    return Ok(Ctl::Jump(*target as usize));
+                }
+            }
+            Op::CmpCellConstBranchTrue {
+                cell,
+                konst,
+                cmp,
+                target,
+            } => {
+                let a = frame.cells[*cell as usize].borrow().clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                if self.cmp_values(*cmp, &a, &b)? {
+                    return Ok(Ctl::Jump(*target as usize));
+                }
+            }
+            // Fused `LoadCellConst ; Add` / `LoadCellConst ; <binop>` — the same
+            // op_add / arith helpers compute the result; only the intermediate
+            // stack traffic is elided.
+            Op::AddCellConst { cell, konst } => {
+                let a = frame.cells[*cell as usize].borrow().clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                let r = self.op_add(a, b)?;
+                push!(r);
+            }
+            Op::ArithCellConst { cell, konst, kind } => {
+                let a = frame.cells[*cell as usize].borrow().clone();
+                if matches!(a, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let b = self.const_val(frame, *konst);
+                let r = self.arith(a, b, *kind)?;
+                push!(r);
+            }
+            // Fused statement-position `i++`/`--i`-style update on a cell. The
+            // exact sequence semantics: TDZ-checked read, ToNumeric (which may
+            // run user code that reassigns the binding — the borrow is released
+            // before it runs), the same unary_arith step, plain in-place store.
+            Op::IncCellStmt { cell, dec } => {
+                let v = frame.cells[*cell as usize].borrow().clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                let n = self.to_numeric(&v)?;
+                let r = self.unary_arith(n, if *dec { UnaryKind::Dec } else { UnaryKind::Inc })?;
+                *frame.cells[*cell as usize].borrow_mut() = r;
+            }
+            // Fused `LoadCell(src) ; InitCell(dest)` — per-iteration `let` copy.
+            Op::LoadCellInit { src, dest } => {
+                let v = frame.cells[*src as usize].borrow().clone();
+                if matches!(v, Value::Uninitialized) {
+                    return Err(self.throw_reference("Cannot access binding before initialization"));
+                }
+                if frame.func.proto.stable_flags[*dest as usize] {
+                    *frame.cells[*dest as usize].borrow_mut() = v;
+                } else {
+                    let fresh = self.take_cell(v);
+                    let old = std::mem::replace(&mut frame.cells[*dest as usize], fresh);
+                    self.recycle_cell(old);
+                }
+            }
+            Op::JumpIfFalsyPeek(t) => {
+                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                if !self.to_boolean(&v) {
+                    return Ok(Ctl::Jump(*t as usize));
+                }
+                frame.stack.pop();
+            }
+            Op::JumpIfTruthyPeek(t) => {
+                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                if self.to_boolean(&v) {
+                    return Ok(Ctl::Jump(*t as usize));
+                }
+                frame.stack.pop();
+            }
+            Op::JumpIfNullishPeek(t) => {
+                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                if !v.is_nullish() {
+                    return Ok(Ctl::Jump(*t as usize));
+                }
+                frame.stack.pop();
+            }
+
+            // ---- exceptions ----
+            Op::Throw => {
+                let v = pop!();
+                return Err(v);
+            }
+            Op::PushTryHandler { catch, finally } => {
+                frame.handlers.push(TryHandler {
+                    catch_ip: if *catch == u32::MAX {
+                        None
+                    } else {
+                        Some(*catch)
+                    },
+                    finally_ip: if *finally == u32::MAX {
+                        None
+                    } else {
+                        Some(*finally)
+                    },
+                    stack_depth: frame.stack.len(),
+                    with_depth: frame.with_scope.len(),
+                    priv_env: frame.priv_env.clone(),
+                    delegation: false,
+                    delegation_return_ip: None,
+                });
+            }
+            Op::PopTryHandler => {
+                frame.handlers.pop();
+            }
+            Op::GetIterator => {
+                let v = pop!();
+                let it = self.get_iterator(&v)?;
+                push!(it);
+            }
+            Op::IteratorNext => {
+                let it = frame.stack.last().cloned().unwrap_or(Value::Undefined);
+                let next = self.get_prop(&it, &PropertyKey::str("next"))?;
+                let res = self.call(next, it, &[])?;
+                push!(res);
+            }
+            Op::ForInPop => {
+                frame.enumerators.pop();
+            }
+            Op::ForInNext => {
+                let idx = frame.enumerators.len() - 1;
+                let (keys, cursor) = &mut frame.enumerators[idx];
+                if *cursor < keys.len() {
+                    let k = keys[*cursor].clone();
+                    *cursor += 1;
+                    push!(Value::String(k));
+                    push!(Value::Bool(true));
+                } else {
+                    push!(Value::Undefined);
+                    push!(Value::Bool(false));
+                }
+            }
+
+            // ---- generators / async ----
+            Op::Await => {
+                let v = pop!();
+                return Ok(Ctl::Await(v));
+            }
+            Op::Yield => {
+                let v = pop!();
+                return Ok(Ctl::Yield(v));
+            }
+            Op::GeneratorStart => return Ok(Ctl::GeneratorStart),
+            Op::YieldStar => {
+                let v = pop!();
+                return Ok(Ctl::YieldStar(v));
+            }
+            Op::ToPropertyKey => {
+                let v = pop!();
+                let k = self.to_property_key(&v)?;
+                push!(match k {
+                    PropertyKey::Str(s) => Value::String(s),
+                    PropertyKey::Sym(s) => Value::Symbol(s),
+                });
+            }
+            Op::ToStringOp => {
+                let v = pop!();
+                let s = self.to_js_string(&v)?;
+                push!(Value::String(s));
+            }
+            Op::ConcatStrings(n) => {
+                let n = *n as usize;
+                let at = frame.stack.len() - n;
+                let parts = frame.stack.split_off(at);
+                let mut strs = Vec::with_capacity(parts.len());
+                let mut total = 0usize;
+                for p in &parts {
+                    let s = self.to_js_string(p)?;
+                    // Same bound as `op_add`: a template-literal join in a doubling
+                    // loop (`` s = `${s}${s}` ``) must not grow without limit.
+                    total += s.byte_len();
+                    if total > crate::value::MAX_STRING_LEN {
+                        return Err(self.throw_range("invalid string length"));
+                    }
+                    strs.push(s);
+                }
+                // Fast path when every part is well-formed (the common case):
+                // a plain UTF-8 join. Otherwise go through code units so a
+                // surrogate straddling a boundary re-pairs (and lone surrogates
+                // survive instead of becoming U+FFFD).
+                let out = if strs.iter().all(|s| s.is_well_formed()) {
+                    let mut out = String::with_capacity(total);
+                    for s in &strs {
+                        out.push_str(s.as_str());
+                    }
+                    JsString::new(out)
+                } else {
+                    let mut units = Vec::new();
+                    for s in &strs {
+                        units.extend(s.code_units());
+                    }
+                    JsString::from_code_units(&units)
+                };
+                push!(Value::String(out));
+            }
+            Op::LoopKernel(i) => return self.run_kernel_op(frame, *i),
+
+            _ => return self.step_cold(frame, op),
+        }
+        Ok(Ctl::Next)
+    }
+
+    /// The non-hot ops (declarations, names/with/eval, object/class
+    /// definition, super/private, iterators' slow paths, dispose, spread,
+    /// regexp, dynamic import, ...). `#[inline(never)]` keeps their (large,
+    /// unioned) locals out of `step`'s frame; see `step` for why. An op
+    /// handled in `step` never reaches this match.
+    #[inline(never)]
+    fn step_cold(&mut self, frame: &mut Frame, op: &Op) -> Result<Ctl, Value> {
+        macro_rules! pop {
+            () => {
+                frame.stack.pop().unwrap_or(Value::Undefined)
+            };
+        }
+        macro_rules! push {
+            ($v:expr) => {
+                frame.stack.push($v)
+            };
+        }
+        match op {
+            Op::RequireObjectCoercible => {
+                if frame.stack.last().map(|v| v.is_nullish()).unwrap_or(true) {
+                    return Err(self.throw_type("Cannot destructure a null or undefined value"));
+                }
+            }
+            Op::BindThisSloppy => {
+                let t = pop!();
+                let bound = match t {
+                    Value::Undefined | Value::Null => Value::Object(self.realm.global.clone()),
+                    Value::Object(_) => t,
+                    // A primitive `this` is boxed (ToObject) in sloppy mode.
+                    other => Value::Object(self.to_object(&other)?),
+                };
+                push!(bound);
+            }
+            Op::LoadRestArgs(n) => {
+                let rest: Vec<Value> = if (*n as usize) < frame.args.len() {
+                    frame.args[*n as usize..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                push!(Value::Object(self.new_array(rest)));
+            }
+            Op::LoadArguments => {
+                let o = self.make_arguments_object(frame);
+                push!(o);
+            }
+
+            Op::LoadGlobalTypeof(i) => {
+                let name = self.const_name(frame, *i);
+                let key = PropertyKey::Str(name);
+                let g = self.realm.global.clone();
+                let v = self.get_prop(&Value::Object(g), &key)?;
+                push!(v);
             }
             Op::DeclareGlobal { name: i, deletable } => {
                 let name = self.const_name(frame, *i);
@@ -1639,34 +3662,6 @@ impl Vm {
                 }
             }
 
-            Op::Pop => {
-                frame.stack.pop();
-            }
-            Op::Dup => {
-                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                push!(v);
-            }
-            Op::Swap => {
-                let n = frame.stack.len();
-                if n >= 2 {
-                    frame.stack.swap(n - 1, n - 2);
-                }
-            }
-            Op::Rot3 => {
-                let n = frame.stack.len();
-                if n >= 3 {
-                    // a b c -> b c a
-                    frame.stack[n - 3..].rotate_left(1);
-                }
-            }
-
-            Op::NewObject => push!(Value::Object(self.new_object())),
-            Op::NewArray(n) => {
-                let n = *n as usize;
-                let at = frame.stack.len() - n;
-                let elems = frame.stack.split_off(at);
-                push!(Value::Object(self.new_array(elems)));
-            }
             Op::GetTemplateObject(idx) => {
                 let key = (Rc::as_ptr(&frame.func.proto) as *const () as usize, *idx);
                 if let Some(o) = self.template_cache.get(&key) {
@@ -1917,116 +3912,6 @@ impl Vm {
                     }
                 }
                 push!(target);
-            }
-            Op::GetProp(i) => {
-                let name = self.const_name(frame, *i);
-                let obj = pop!();
-                // Inline cache (key-verified hints; see `FuncProto::ic`).
-                // Two levels:
-                //  - `holder == None`: the receiver's OWN data property at
-                //    `slot` (ordinary objects).
-                //  - `holder == Some(p)`: a data property at `slot` on `p`,
-                //    verified to still be the receiver's DIRECT prototype and
-                //    not shadowed by an own property — the method-lookup
-                //    pattern (`arr.push`, class instances calling prototype
-                //    methods). Array receivers exclude keys with exotic own
-                //    behavior (`length`, indices). Deeper chains, accessors,
-                //    proxies, and every other exotic fall to the unchanged
-                //    slow path.
-                if let Value::Object(o) = &obj {
-                    if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
-                        let b = o.borrow();
-                        let (is_ord, is_arr) = (
-                            matches!(b.internal, Internal::Ordinary),
-                            matches!(b.internal, Internal::Array(_)),
-                        );
-                        // Array exotics: `length` and index keys never take
-                        // the IC (they don't live in the props map).
-                        let plain_key = !is_arr
-                            || (name.as_str() != "length"
-                                && crate::value::canonical_index(name.as_str()).is_none());
-                        if (is_ord || is_arr) && plain_key {
-                            // Own-property hit: never touches the holder cell.
-                            if is_ord {
-                                if let Some((PropertyKey::Str(k), prop)) =
-                                    b.props.get_index(ic.own_slot.get() as usize)
-                                {
-                                    if let PropertyKind::Data { value, .. } = &prop.kind {
-                                        if k == &name {
-                                            let v = value.clone();
-                                            drop(b);
-                                            push!(v);
-                                            return Ok(Ctl::Next);
-                                        }
-                                    }
-                                }
-                            }
-                            // Proto hit: valid only when the receiver has no
-                            // own props (nothing can shadow) and its CURRENT
-                            // direct proto is the cached holder.
-                            if b.props.is_empty() {
-                                let holder = ic.holder.borrow();
-                                if let Some(h) = &*holder {
-                                    if b.proto.as_ref().is_some_and(|p| p.ptr_eq(h)) {
-                                        let hb = h.borrow();
-                                        if let Some((PropertyKey::Str(k), prop)) =
-                                            hb.props.get_index(ic.proto_slot.get() as usize)
-                                        {
-                                            if let PropertyKind::Data { value, .. } = &prop.kind {
-                                                if k == &name {
-                                                    let v = value.clone();
-                                                    drop(hb);
-                                                    drop(holder);
-                                                    drop(b);
-                                                    push!(v);
-                                                    return Ok(Ctl::Next);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            // Refill: own data property first (ordinary only),
-                            // then a one-level proto data property when no own
-                            // props can shadow.
-                            let key = PropertyKey::Str(name.clone());
-                            if is_ord {
-                                if let Some((idx, _, prop)) = b.props.get_full(&key) {
-                                    if let PropertyKind::Data { value, .. } = &prop.kind {
-                                        ic.own_slot.set(idx as u32);
-                                        let v = value.clone();
-                                        drop(b);
-                                        push!(v);
-                                        return Ok(Ctl::Next);
-                                    }
-                                }
-                            }
-                            if b.props.is_empty() {
-                                if let Some(p) = &b.proto {
-                                    let pb = p.borrow();
-                                    if matches!(pb.internal, Internal::Ordinary)
-                                        || matches!(pb.internal, Internal::Array(_))
-                                    {
-                                        if let Some((idx, _, prop)) = pb.props.get_full(&key) {
-                                            if let PropertyKind::Data { value, .. } = &prop.kind {
-                                                ic.proto_slot.set(idx as u32);
-                                                let v = value.clone();
-                                                let holder_obj = p.clone();
-                                                drop(pb);
-                                                *ic.holder.borrow_mut() = Some(holder_obj);
-                                                drop(b);
-                                                push!(v);
-                                                return Ok(Ctl::Next);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                let v = self.get_prop(&obj, &PropertyKey::Str(name))?;
-                push!(v);
             }
             Op::PrivateGet(i) => {
                 let name = self.resolve_private_name(frame, *i)?;
@@ -2464,129 +4349,6 @@ impl Vm {
                 let has = o.borrow().private_get(name.id).is_some();
                 push!(Value::Bool(has));
             }
-            Op::SetProp(i) => {
-                let name = self.const_name(frame, *i);
-                let value = pop!();
-                let obj = pop!();
-                // Inline cache (key-verified slot hint; see `FuncProto::ic`).
-                // Fast path only when the receiver is an ordinary object whose
-                // OWN property at the hinted slot is a WRITABLE data property —
-                // per OrdinarySetWithOwnDescriptor that assignment updates the
-                // value in place (attributes and slot order preserved, no
-                // prototype setter can intervene). Everything else (missing own
-                // key → proto-chain setters/read-only checks, accessors,
-                // non-writable → strict TypeError, exotics) takes the
-                // unchanged put_value path, which also refills the hint.
-                if let Value::Object(o) = &obj {
-                    if let Some(ic) = frame.func.proto.ic.get(frame.ip.wrapping_sub(1)) {
-                        let mut b = o.borrow_mut();
-                        if matches!(b.internal, Internal::Ordinary) {
-                            if let Some((PropertyKey::Str(k), prop)) =
-                                b.props.get_index_mut(ic.own_slot.get() as usize)
-                            {
-                                if k == &name {
-                                    if let PropertyKind::Data {
-                                        value: slot,
-                                        writable: true,
-                                    } = &mut prop.kind
-                                    {
-                                        *slot = value.clone();
-                                        drop(b);
-                                        push!(value);
-                                        return Ok(Ctl::Next);
-                                    }
-                                }
-                            }
-                            let key = PropertyKey::Str(name.clone());
-                            if let Some((idx, _, prop)) = b.props.get_full_mut(&key) {
-                                if let PropertyKind::Data {
-                                    value: slot,
-                                    writable: true,
-                                } = &mut prop.kind
-                                {
-                                    ic.own_slot.set(idx as u32);
-                                    *slot = value.clone();
-                                    drop(b);
-                                    push!(value);
-                                    return Ok(Ctl::Next);
-                                }
-                            }
-                        }
-                    }
-                }
-                let strict = frame.func.proto.is_strict;
-                self.put_value(&obj, &PropertyKey::Str(name), value.clone(), strict)?;
-                push!(value);
-            }
-            Op::GetPropDynamic => {
-                let key_v = pop!();
-                let obj = pop!();
-                // Integer fast path: `a[i]` on a dense array with an integral
-                // Number key reads the element directly — skipping
-                // ToPropertyKey's Number→String conversion (a float-format +
-                // heap allocation per access!), the reparse back to an index,
-                // and the property-map machinery. Only when no reified props
-                // entry can shadow the dense element (`props.is_empty()`) and
-                // the slot is a real element (in bounds, not a hole);
-                // everything else takes the unchanged spec path.
-                if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
-                    if n.fract() == 0.0 && *n >= 0.0 && *n < 4294967295.0 {
-                        let b = o.borrow();
-                        if let Internal::Array(arr) = &b.internal {
-                            if b.props.is_empty() {
-                                if let Some(v) = arr.get(*n as usize) {
-                                    if !matches!(v, Value::Hole) {
-                                        let v = v.clone();
-                                        drop(b);
-                                        push!(v);
-                                        return Ok(Ctl::Next);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // GetValue: RequireObjectCoercible(base) (via ToObject) throws
-                // BEFORE ToPropertyKey coerces the key expression's value.
-                self.require_object_coercible(&obj, "read properties of")?;
-                let key = self.to_property_key(&key_v)?;
-                let v = self.get_prop(&obj, &key)?;
-                push!(v);
-            }
-            Op::SetPropDynamic => {
-                let value = pop!();
-                let key_v = pop!();
-                let obj = pop!();
-                // Integer fast path mirroring `GetPropDynamic`: overwrite an
-                // EXISTING dense element in place. An in-bounds non-hole dense
-                // slot is a plain writable data property (per the array exotic
-                // [[Set]]), so no setter, no length change, and no
-                // extensibility interaction is observable. Appends, holes,
-                // out-of-bounds, and shadowed elements take the spec path.
-                if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
-                    if n.fract() == 0.0 && *n >= 0.0 && *n < 4294967295.0 {
-                        let mut b = o.borrow_mut();
-                        if b.props.is_empty() {
-                            if let Internal::Array(arr) = &mut b.internal {
-                                let i = *n as usize;
-                                if let Some(slot) = arr.get_mut(i) {
-                                    if !matches!(slot, Value::Hole) {
-                                        *slot = value.clone();
-                                        drop(b);
-                                        push!(value);
-                                        return Ok(Ctl::Next);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                self.require_object_coercible(&obj, "set properties of")?;
-                let key = self.to_property_key(&key_v)?;
-                let strict = frame.func.proto.is_strict;
-                self.put_value(&obj, &key, value.clone(), strict)?;
-                push!(value);
-            }
             Op::DeleteProp(i) => {
                 let name = self.const_name(frame, *i);
                 let obj = pop!();
@@ -2613,152 +4375,6 @@ impl Vm {
                     return Err(self.throw_type("Cannot delete property in strict mode"));
                 }
                 push!(Value::Bool(r));
-            }
-            Op::HasProp => {
-                let obj = pop!();
-                let key_v = pop!();
-                let key = self.to_property_key(&key_v)?;
-                let r = self.has_prop(&obj, &key)?;
-                push!(Value::Bool(r));
-            }
-            Op::JumpIfNullish(t) => {
-                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                if v.is_nullish() {
-                    // An optional chain short-circuits to `undefined` even when
-                    // the base was `null` (the other emit sites pop the value).
-                    if let Some(top) = frame.stack.last_mut() {
-                        *top = Value::Undefined;
-                    }
-                    return Ok(Ctl::Jump(*t as usize));
-                }
-            }
-
-            Op::Call(argc) => {
-                let n = *argc as usize;
-                let at = frame.stack.len() - n;
-                // Move the argument values into a pooled buffer rather than
-                // `split_off` (which allocates a fresh Vec on every call).
-                let mut args = self.take_value_vec();
-                args.extend(frame.stack.drain(at..));
-                let this = pop!();
-                let func = pop!();
-                // Owned-args path: the pooled buffer moves into the callee
-                // frame (recycled by its recycle_frame), skipping the second
-                // copy make_frame's slice path would do.
-                let r = self.call_valuevec(func, this, args);
-                push!(r?);
-            }
-            Op::CallMethodless(argc) => {
-                let n = *argc as usize;
-                let at = frame.stack.len() - n;
-                let mut args = self.take_value_vec();
-                args.extend(frame.stack.drain(at..));
-                let func = pop!();
-                let r = self.call_valuevec(func, Value::Undefined, args);
-                push!(r?);
-            }
-            Op::CallSpread => {
-                let args_arr = pop!();
-                let this = pop!();
-                let func = pop!();
-                let args = self.iterate_to_vec(&args_arr)?;
-                let r = self.call(func, this, &args)?;
-                push!(r);
-            }
-            Op::New(argc) => {
-                let n = *argc as usize;
-                let at = frame.stack.len() - n;
-                let args = frame.stack.split_off(at);
-                let ctor = pop!();
-                let r = self.construct(&ctor, &args, &ctor)?;
-                push!(r);
-            }
-            Op::NewSpread => {
-                let args_arr = pop!();
-                let ctor = pop!();
-                let args = self.iterate_to_vec(&args_arr)?;
-                let r = self.construct(&ctor, &args, &ctor)?;
-                push!(r);
-            }
-            Op::Return => {
-                let v = pop!();
-                // Route through any enclosing `finally` blocks before returning.
-                return self.do_completion(frame, Completion::Return(v));
-            }
-            Op::ReturnUndefined => {
-                let v = frame.completion.clone();
-                return self.do_completion(frame, Completion::Return(v));
-            }
-
-            Op::Closure(i) => {
-                let proto = match &frame.func.proto.consts[*i as usize] {
-                    Const::Func(p) => p.clone(),
-                    _ => return Err(self.throw_type("internal: bad closure const")),
-                };
-                let upvalues = proto
-                    .upvalues
-                    .iter()
-                    .map(|src| match src {
-                        UpvalueSource::ParentCell(idx) => frame.cells[*idx as usize].clone(),
-                        UpvalueSource::ParentUpvalue(idx) => {
-                            frame.func.upvalues[*idx as usize].clone()
-                        }
-                    })
-                    .collect();
-                let inherit_home = proto.kind.is_arrow() || proto.inherit_home;
-                let f = self.make_closure(proto, upvalues);
-                // Capture the active with-scope chain (closures defined inside
-                // `with` resolve free identifiers against it after the block)
-                // and the active private-environment chain (methods and
-                // initializers defined inside class bodies resolve `#x`
-                // against it). Arrows (and synthetic in-class closures) also
-                // inherit the creating frame's [[HomeObject]], so `super.x`
-                // inside them resolves like the enclosing method.
-                if !frame.with_scope.is_empty()
-                    || frame.priv_env.is_some()
-                    || (inherit_home && frame.func.home_object.is_some())
-                {
-                    if let Internal::Function(FunctionInner::Bytecode(bf)) =
-                        &mut f.borrow_mut().internal
-                    {
-                        let bf = Rc::make_mut(bf);
-                        bf.captured_with = frame.with_scope.clone();
-                        bf.captured_priv_env = frame.priv_env.clone();
-                        if inherit_home {
-                            bf.home_object = frame.func.home_object.clone();
-                        }
-                    }
-                }
-                push!(Value::Object(f));
-            }
-
-            // ---- arithmetic ----
-            Op::Add => {
-                let b = pop!();
-                let a = pop!();
-                let r = self.op_add(a, b)?;
-                push!(r);
-            }
-            Op::Sub => bin_arith(self, frame, ArithKind::Sub)?,
-            Op::Mul => bin_arith(self, frame, ArithKind::Mul)?,
-            Op::Div => bin_arith(self, frame, ArithKind::Div)?,
-            Op::Mod => bin_arith(self, frame, ArithKind::Mod)?,
-            Op::Pow => bin_arith(self, frame, ArithKind::Pow)?,
-            Op::Neg => {
-                let a = pop!();
-                push!(self.unary_arith(a, UnaryKind::Neg)?);
-            }
-            Op::Pos => {
-                // ToNumber throws TypeError for BigInt (unary + is invalid on it).
-                let a = pop!();
-                let n = self.to_number(&a)?;
-                push!(Value::Number(n));
-            }
-            Op::ToNumeric => {
-                // ToNumeric: like ToNumber but keeps BigInt (used by ++/-- to
-                // produce the coerced old value).
-                let a = pop!();
-                push!(self.to_numeric(&a)?);
             }
             Op::ThrowConstAssign => {
                 return Err(self.throw_type("Assignment to constant variable."));
@@ -2799,250 +4415,6 @@ impl Vm {
                 }
                 push!(Value::Object(p));
             }
-            Op::Inc => {
-                let a = pop!();
-                push!(self.unary_arith(a, UnaryKind::Inc)?);
-            }
-            Op::Dec => {
-                let a = pop!();
-                push!(self.unary_arith(a, UnaryKind::Dec)?);
-            }
-            Op::BitNot => {
-                let a = pop!();
-                push!(self.unary_arith(a, UnaryKind::BitNot)?);
-            }
-            Op::Not => {
-                let a = pop!();
-                push!(Value::Bool(!self.to_boolean(&a)));
-            }
-            Op::BitAnd => bin_arith(self, frame, ArithKind::BitAnd)?,
-            Op::BitOr => bin_arith(self, frame, ArithKind::BitOr)?,
-            Op::BitXor => bin_arith(self, frame, ArithKind::BitXor)?,
-            Op::Shl => bin_arith(self, frame, ArithKind::Shl)?,
-            Op::Shr => bin_arith(self, frame, ArithKind::Shr)?,
-            Op::UShr => bin_arith(self, frame, ArithKind::UShr)?,
-            Op::TypeofExpr => {
-                let a = pop!();
-                push!(Value::str(a.type_of()));
-            }
-
-            // ---- comparison ----
-            Op::Eq => {
-                let b = pop!();
-                let a = pop!();
-                let r = self.loose_equals(&a, &b)?;
-                push!(Value::Bool(r));
-            }
-            Op::Ne => {
-                let b = pop!();
-                let a = pop!();
-                let r = self.loose_equals(&a, &b)?;
-                push!(Value::Bool(!r));
-            }
-            Op::StrictEq => {
-                let b = pop!();
-                let a = pop!();
-                push!(Value::Bool(self.strict_equals(&a, &b)));
-            }
-            Op::StrictNe => {
-                let b = pop!();
-                let a = pop!();
-                push!(Value::Bool(!self.strict_equals(&a, &b)));
-            }
-            Op::Lt => {
-                let b = pop!();
-                let a = pop!();
-                let r = self.less_than(&a, &b)?;
-                push!(Value::Bool(r == Some(true)));
-            }
-            Op::Gt => {
-                let b = pop!();
-                let a = pop!();
-                let r = self.less_than(&b, &a)?;
-                push!(Value::Bool(r == Some(true)));
-            }
-            Op::Le => {
-                let b = pop!();
-                let a = pop!();
-                let r = self.less_than(&b, &a)?;
-                push!(Value::Bool(r == Some(false)));
-            }
-            Op::Ge => {
-                let b = pop!();
-                let a = pop!();
-                let r = self.less_than(&a, &b)?;
-                push!(Value::Bool(r == Some(false)));
-            }
-            Op::InstanceOf => {
-                let ctor = pop!();
-                let obj = pop!();
-                let r = self.instance_of(&obj, &ctor)?;
-                push!(Value::Bool(r));
-            }
-
-            // ---- control flow ----
-            Op::Jump(t) => return Ok(Ctl::Jump(*t as usize)),
-            Op::JumpIfTrue(t) => {
-                let v = pop!();
-                if self.to_boolean(&v) {
-                    return Ok(Ctl::Jump(*t as usize));
-                }
-            }
-            Op::JumpIfFalse(t) => {
-                let v = pop!();
-                if !self.to_boolean(&v) {
-                    return Ok(Ctl::Jump(*t as usize));
-                }
-            }
-            // Fused `cmp ; JumpIfFalse` (see `fuse.rs`). Each arm reuses the
-            // SAME helper as the standalone comparison op, so coercion and any
-            // thrown error are identical; the boolean the pair would materialize
-            // is consumed directly by the branch instead of round-tripping the
-            // operand stack. `to_boolean(Bool(r)) == r`, so the branch condition
-            // matches `JumpIfFalse` exactly.
-            Op::CmpBranchFalse { cmp, target } => {
-                let b = pop!();
-                let a = pop!();
-                if !self.cmp_values(*cmp, &a, &b)? {
-                    return Ok(Ctl::Jump(*target as usize));
-                }
-            }
-            // Fused `cmp ; JumpIfTrue` — mirror of `CmpBranchFalse`; branches when
-            // the comparison is true. Same helpers, so behavior is identical.
-            Op::CmpBranchTrue { cmp, target } => {
-                let b = pop!();
-                let a = pop!();
-                let r = self.cmp_values(*cmp, &a, &b)?;
-                if r {
-                    return Ok(Ctl::Jump(*target as usize));
-                }
-            }
-            // Fused `LoadCellConst ; CmpBranchFalse` — a whole `i < N` loop test.
-            // Same TDZ check, comparison helpers, and branch as the sequence.
-            Op::CmpCellConstBranchFalse {
-                cell,
-                konst,
-                cmp,
-                target,
-            } => {
-                let a = frame.cells[*cell as usize].borrow().clone();
-                if matches!(a, Value::Uninitialized) {
-                    return Err(self.throw_reference("Cannot access binding before initialization"));
-                }
-                let b = self.const_val(frame, *konst);
-                if !self.cmp_values(*cmp, &a, &b)? {
-                    return Ok(Ctl::Jump(*target as usize));
-                }
-            }
-            Op::CmpCellConstBranchTrue {
-                cell,
-                konst,
-                cmp,
-                target,
-            } => {
-                let a = frame.cells[*cell as usize].borrow().clone();
-                if matches!(a, Value::Uninitialized) {
-                    return Err(self.throw_reference("Cannot access binding before initialization"));
-                }
-                let b = self.const_val(frame, *konst);
-                if self.cmp_values(*cmp, &a, &b)? {
-                    return Ok(Ctl::Jump(*target as usize));
-                }
-            }
-            // Fused `LoadCellConst ; Add` / `LoadCellConst ; <binop>` — the same
-            // op_add / arith helpers compute the result; only the intermediate
-            // stack traffic is elided.
-            Op::AddCellConst { cell, konst } => {
-                let a = frame.cells[*cell as usize].borrow().clone();
-                if matches!(a, Value::Uninitialized) {
-                    return Err(self.throw_reference("Cannot access binding before initialization"));
-                }
-                let b = self.const_val(frame, *konst);
-                let r = self.op_add(a, b)?;
-                push!(r);
-            }
-            Op::ArithCellConst { cell, konst, kind } => {
-                let a = frame.cells[*cell as usize].borrow().clone();
-                if matches!(a, Value::Uninitialized) {
-                    return Err(self.throw_reference("Cannot access binding before initialization"));
-                }
-                let b = self.const_val(frame, *konst);
-                let r = self.arith(a, b, *kind)?;
-                push!(r);
-            }
-            // Fused statement-position `i++`/`--i`-style update on a cell. The
-            // exact sequence semantics: TDZ-checked read, ToNumeric (which may
-            // run user code that reassigns the binding — the borrow is released
-            // before it runs), the same unary_arith step, plain in-place store.
-            Op::IncCellStmt { cell, dec } => {
-                let v = frame.cells[*cell as usize].borrow().clone();
-                if matches!(v, Value::Uninitialized) {
-                    return Err(self.throw_reference("Cannot access binding before initialization"));
-                }
-                let n = self.to_numeric(&v)?;
-                let r = self.unary_arith(n, if *dec { UnaryKind::Dec } else { UnaryKind::Inc })?;
-                *frame.cells[*cell as usize].borrow_mut() = r;
-            }
-            // Fused `LoadCell(src) ; InitCell(dest)` — per-iteration `let` copy.
-            Op::LoadCellInit { src, dest } => {
-                let v = frame.cells[*src as usize].borrow().clone();
-                if matches!(v, Value::Uninitialized) {
-                    return Err(self.throw_reference("Cannot access binding before initialization"));
-                }
-                if frame.func.proto.stable_flags[*dest as usize] {
-                    *frame.cells[*dest as usize].borrow_mut() = v;
-                } else {
-                    let fresh = self.take_cell(v);
-                    let old = std::mem::replace(&mut frame.cells[*dest as usize], fresh);
-                    self.recycle_cell(old);
-                }
-            }
-            Op::JumpIfFalsyPeek(t) => {
-                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                if !self.to_boolean(&v) {
-                    return Ok(Ctl::Jump(*t as usize));
-                }
-                frame.stack.pop();
-            }
-            Op::JumpIfTruthyPeek(t) => {
-                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                if self.to_boolean(&v) {
-                    return Ok(Ctl::Jump(*t as usize));
-                }
-                frame.stack.pop();
-            }
-            Op::JumpIfNullishPeek(t) => {
-                let v = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                if !v.is_nullish() {
-                    return Ok(Ctl::Jump(*t as usize));
-                }
-                frame.stack.pop();
-            }
-
-            // ---- exceptions ----
-            Op::Throw => {
-                let v = pop!();
-                return Err(v);
-            }
-            Op::PushTryHandler { catch, finally } => {
-                frame.handlers.push(TryHandler {
-                    catch_ip: if *catch == u32::MAX {
-                        None
-                    } else {
-                        Some(*catch)
-                    },
-                    finally_ip: if *finally == u32::MAX {
-                        None
-                    } else {
-                        Some(*finally)
-                    },
-                    stack_depth: frame.stack.len(),
-                    with_depth: frame.with_scope.len(),
-                    priv_env: frame.priv_env.clone(),
-                    delegation: false,
-                    delegation_return_ip: None,
-                });
-            }
             Op::MarkDelegationHandler(return_ip) => {
                 if let Some(h) = frame.handlers.last_mut() {
                     h.delegation = true;
@@ -3082,9 +4454,6 @@ impl Vm {
                     push!(v);
                 }
             }
-            Op::PopTryHandler => {
-                frame.handlers.pop();
-            }
             Op::CompletionJump { target, boundary } => {
                 return self.do_completion(
                     frame,
@@ -3104,17 +4473,6 @@ impl Vm {
             }
 
             // ---- iteration ----
-            Op::GetIterator => {
-                let v = pop!();
-                let it = self.get_iterator(&v)?;
-                push!(it);
-            }
-            Op::IteratorNext => {
-                let it = frame.stack.last().cloned().unwrap_or(Value::Undefined);
-                let next = self.get_prop(&it, &PropertyKey::str("next"))?;
-                let res = self.call(next, it, &[])?;
-                push!(res);
-            }
             Op::IteratorClose => {
                 // Reached only on an abrupt completion of a `for-of` loop, with
                 // that completion parked in `pending_completion`. Per spec
@@ -3162,91 +4520,12 @@ impl Vm {
                 frame.enumerators.push((keys, 0));
                 push!(Value::Number((frame.enumerators.len() - 1) as f64));
             }
-            Op::ForInPop => {
-                frame.enumerators.pop();
-            }
-            Op::ForInNext => {
-                let idx = frame.enumerators.len() - 1;
-                let (keys, cursor) = &mut frame.enumerators[idx];
-                if *cursor < keys.len() {
-                    let k = keys[*cursor].clone();
-                    *cursor += 1;
-                    push!(Value::String(k));
-                    push!(Value::Bool(true));
-                } else {
-                    push!(Value::Undefined);
-                    push!(Value::Bool(false));
-                }
-            }
-
-            // ---- generators / async ----
-            Op::Await => {
-                let v = pop!();
-                return Ok(Ctl::Await(v));
-            }
-            Op::Yield => {
-                let v = pop!();
-                return Ok(Ctl::Yield(v));
-            }
-            Op::GeneratorStart => return Ok(Ctl::GeneratorStart),
-            Op::YieldStar => {
-                let v = pop!();
-                return Ok(Ctl::YieldStar(v));
-            }
             Op::AsyncReturn => {
                 let v = pop!();
                 return Ok(Ctl::Return(v));
             }
 
             // ---- misc ----
-            Op::ToPropertyKey => {
-                let v = pop!();
-                let k = self.to_property_key(&v)?;
-                push!(match k {
-                    PropertyKey::Str(s) => Value::String(s),
-                    PropertyKey::Sym(s) => Value::Symbol(s),
-                });
-            }
-            Op::ToStringOp => {
-                let v = pop!();
-                let s = self.to_js_string(&v)?;
-                push!(Value::String(s));
-            }
-            Op::ConcatStrings(n) => {
-                let n = *n as usize;
-                let at = frame.stack.len() - n;
-                let parts = frame.stack.split_off(at);
-                let mut strs = Vec::with_capacity(parts.len());
-                let mut total = 0usize;
-                for p in &parts {
-                    let s = self.to_js_string(p)?;
-                    // Same bound as `op_add`: a template-literal join in a doubling
-                    // loop (`` s = `${s}${s}` ``) must not grow without limit.
-                    total += s.byte_len();
-                    if total > crate::value::MAX_STRING_LEN {
-                        return Err(self.throw_range("invalid string length"));
-                    }
-                    strs.push(s);
-                }
-                // Fast path when every part is well-formed (the common case):
-                // a plain UTF-8 join. Otherwise go through code units so a
-                // surrogate straddling a boundary re-pairs (and lone surrogates
-                // survive instead of becoming U+FFFD).
-                let out = if strs.iter().all(|s| s.is_well_formed()) {
-                    let mut out = String::with_capacity(total);
-                    for s in &strs {
-                        out.push_str(s.as_str());
-                    }
-                    JsString::new(out)
-                } else {
-                    let mut units = Vec::new();
-                    for s in &strs {
-                        units.extend(s.code_units());
-                    }
-                    JsString::from_code_units(&units)
-                };
-                push!(Value::String(out));
-            }
             Op::NewRegExp { pattern, flags } => {
                 let p = self.const_name(frame, *pattern);
                 let f = self.const_name(frame, *flags);
@@ -3258,6 +4537,7 @@ impl Vm {
                 let it = self.get_async_iterator(&v)?;
                 push!(it);
             }
+            _ => unreachable!("op handled inline in step: {op:?}"),
         }
         Ok(Ctl::Next)
     }
@@ -3939,10 +5219,195 @@ fn bin_arith(vm: &mut Vm, frame: &mut Frame, kind: ArithKind) -> Result<(), Valu
     Ok(())
 }
 
+/// Execute the pinned-callee kernel `ck` (guarded by the caller loop
+/// kernel's entry: non-recursive, Number-returning, args/upvalues in the
+/// window at `win`) and write its return value to `regs[dst]`. Returns
+/// `false` when the cooperative interrupt fired on a callee back-edge — the
+/// caller then unwinds exactly like one of its own interrupted edges.
+#[inline(never)]
+fn run_callee_window(
+    regs: &mut [f64],
+    ck: &crate::bytecode::Kernel,
+    win: usize,
+    dst: usize,
+    interrupt: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    poll: &mut u32,
+) -> bool {
+    let code = &ck.code;
+    let mut pc = 0usize;
+    loop {
+        macro_rules! branch {
+            ($t:expr) => {{
+                let t = $t as usize;
+                if t <= pc {
+                    *poll = poll.wrapping_add(1);
+                    if *poll & 0xFF == 0 {
+                        if let Some(flag) = interrupt {
+                            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                pc = t;
+                continue;
+            }};
+        }
+        match code[pc] {
+            KOp::Mov { dst, src } => regs[win + dst as usize] = regs[win + src as usize],
+            KOp::Const { dst, k } => regs[win + dst as usize] = k,
+            KOp::Add { dst, a, b } => {
+                regs[win + dst as usize] = regs[win + a as usize] + regs[win + b as usize]
+            }
+            KOp::AddK { dst, a, k } => regs[win + dst as usize] = regs[win + a as usize] + k,
+            KOp::Arith { kind, dst, a, b } => {
+                regs[win + dst as usize] =
+                    number_arith_raw(regs[win + a as usize], regs[win + b as usize], kind)
+            }
+            KOp::ArithK { kind, dst, a, k } => {
+                regs[win + dst as usize] = number_arith_raw(regs[win + a as usize], k, kind)
+            }
+            KOp::Neg { dst, src } => regs[win + dst as usize] = -regs[win + src as usize],
+            KOp::BitNot { dst, src } => {
+                regs[win + dst as usize] = !crate::vm::to_int32(regs[win + src as usize]) as f64
+            }
+            KOp::Br { target } => branch!(target),
+            KOp::BrCmp {
+                cmp,
+                a,
+                b,
+                if_true,
+                target,
+            } => {
+                if knum_cmp(cmp, regs[win + a as usize], regs[win + b as usize]) == if_true {
+                    branch!(target)
+                }
+            }
+            KOp::BrCmpK {
+                cmp,
+                a,
+                k,
+                if_true,
+                target,
+            } => {
+                if knum_cmp(cmp, regs[win + a as usize], k) == if_true {
+                    branch!(target)
+                }
+            }
+            KOp::BrFalsy { src, target } => {
+                if !knum_truthy(regs[win + src as usize]) {
+                    branch!(target)
+                }
+            }
+            KOp::BrTruthy { src, target } => {
+                if knum_truthy(regs[win + src as usize]) {
+                    branch!(target)
+                }
+            }
+            KOp::CmpSet { cmp, dst, a, b } => {
+                regs[win + dst as usize] =
+                    if knum_cmp(cmp, regs[win + a as usize], regs[win + b as usize]) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+            }
+            KOp::BoolNot { dst, src } => {
+                regs[win + dst as usize] = if knum_truthy(regs[win + src as usize]) {
+                    0.0
+                } else {
+                    1.0
+                }
+            }
+            KOp::Math1 { kind, dst, src } => {
+                regs[win + dst as usize] = kmath1(kind, regs[win + src as usize])
+            }
+            KOp::Math2 { kind, dst, a, b } => {
+                regs[win + dst as usize] =
+                    kmath2(kind, regs[win + a as usize], regs[win + b as usize])
+            }
+            KOp::Ret { src, boolean: _ } => {
+                // Number-only (the caller guard rejected boolean returns).
+                regs[dst] = regs[win + src as usize];
+                return true;
+            }
+            // Impossible in a guarded callee: no bails, no exits, no
+            // recursion, no nested closure calls.
+            KOp::LoadElem { .. }
+            | KOp::StoreElem { .. }
+            | KOp::LoadLen { .. }
+            | KOp::LoadProp { .. }
+            | KOp::StoreProp { .. }
+            | KOp::Exit { .. }
+            | KOp::SelfCall { .. }
+            | KOp::CallKernel { .. } => unreachable!("unsupported op in a callee kernel"),
+        }
+        pc += 1;
+    }
+}
+
 /// Number (f64) arithmetic preserving the original JS semantics.
+/// Numeric comparison for kernel registers — exactly the interpreter's
+/// `cmp_values`/`less_than` restricted to `Number` operands: `f64` ordered
+/// comparisons are false on NaN, and `==` gives NaN != NaN, +0 == -0.
+#[inline]
+fn knum_cmp(cmp: CmpOp, a: f64, b: f64) -> bool {
+    match cmp {
+        CmpOp::Eq | CmpOp::StrictEq => a == b,
+        CmpOp::Ne | CmpOp::StrictNe => a != b,
+        CmpOp::Lt => a < b,
+        CmpOp::Gt => a > b,
+        CmpOp::Le => a <= b,
+        CmpOp::Ge => a >= b,
+    }
+}
+
+/// ToBoolean restricted to `Number`: false for `0`, `-0`, and NaN.
+#[inline]
+fn knum_truthy(x: f64) -> bool {
+    x != 0.0 && !x.is_nan()
+}
+
+/// Kernel Math dispatch — every arm is the SAME core its builtin uses, so a
+/// kernelized `Math.round` (etc.) is bit-identical to the generic call.
+fn kmath1(kind: crate::bytecode::KMath, x: f64) -> f64 {
+    use crate::builtins::numbers as m;
+    use crate::bytecode::KMath;
+    match kind {
+        KMath::Abs => x.abs(),
+        KMath::Floor => x.floor(),
+        KMath::Ceil => x.ceil(),
+        KMath::Round => m::math_round(x),
+        KMath::Trunc => x.trunc(),
+        KMath::Sign => m::math_sign(x),
+        KMath::Sqrt => x.sqrt(),
+        KMath::Fround => m::math_fround(x),
+        _ => unreachable!("binary Math kind in Math1"),
+    }
+}
+
+fn kmath2(kind: crate::bytecode::KMath, a: f64, b: f64) -> f64 {
+    use crate::builtins::numbers as m;
+    use crate::bytecode::KMath;
+    match kind {
+        KMath::Min2 => m::math_min2(a, b),
+        KMath::Max2 => m::math_max2(a, b),
+        KMath::Pow2 => m::math_pow(a, b),
+        KMath::Imul2 => m::math_imul2(a, b),
+        _ => unreachable!("unary Math kind in Math2"),
+    }
+}
+
 fn number_arith(x: f64, y: f64, kind: ArithKind) -> Value {
+    Value::Number(number_arith_raw(x, y, kind))
+}
+
+/// The raw `f64` form of [`number_arith`] — shared with the typed loop
+/// kernels (`kernel.rs` / [`Vm::run_kernel_op`]) so kernel arithmetic is
+/// bit-identical to the interpreter's Number×Number paths by construction.
+pub(crate) fn number_arith_raw(x: f64, y: f64, kind: ArithKind) -> f64 {
     use crate::vm::{to_int32, to_uint32};
-    Value::Number(match kind {
+    match kind {
         ArithKind::Sub => x - y,
         ArithKind::Mul => x * y,
         ArithKind::Div => x / y,
@@ -3954,7 +5419,7 @@ fn number_arith(x: f64, y: f64, kind: ArithKind) -> Value {
         ArithKind::Shl => to_int32(x).wrapping_shl(to_uint32(y) & 31) as f64,
         ArithKind::Shr => to_int32(x).wrapping_shr(to_uint32(y) & 31) as f64,
         ArithKind::UShr => (to_uint32(x) >> (to_uint32(y) & 31)) as f64,
-    })
+    }
 }
 
 // ---- BigInt comparison helpers (relational + loose-equality) ----

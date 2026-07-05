@@ -314,13 +314,47 @@ pub struct Vm {
     /// is extended by the pool. Kills the dominant malloc/free traffic of the
     /// call path (one heap allocation per binding per call).
     pub(crate) cell_pool: Vec<Rc<RefCell<Value>>>,
-    pub(crate) cells_vec_pool: Vec<Vec<Rc<RefCell<Value>>>>,
     /// Shared placeholder filling the cell-vec slots of LOCALIZED bindings
     /// (see `localize.rs`): those indices are never dereferenced (their ops
     /// were rewritten to `frame.locals`), so one `Rc` bump replaces a pooled
     /// cell per slot. Its strong count is always > 1, so `recycle_cell` can
     /// never pull it into the pool.
     pub(crate) dummy_cell: Rc<RefCell<Value>>,
+    /// Free-list of whole call frames. A synchronously-finished frame is
+    /// scrubbed (every value-bearing field cleared, so the pool never extends
+    /// a value's lifetime) and parked here BOXED; the next call pops it and
+    /// re-initializes the fields in place. This keeps the operand-stack /
+    /// locals / cells / args buffer *capacities* attached to the frame across
+    /// calls (no per-call pool round-trips for four buffers) and makes every
+    /// frame move — into `run_frame`, into a `Suspension` — a pointer move
+    /// instead of a ~400-byte memcpy. Suspended frames simply keep their box
+    /// (a pool miss, never a leak).
+    ///
+    /// The boxing is the point (frames circulate as `Box<Frame>` through
+    /// `run_frame` and `Suspension`); a `Vec<Frame>` pool would re-move the
+    /// ~400-byte struct on every round-trip.
+    #[allow(clippy::vec_box)]
+    pub(crate) frame_pool: Vec<Box<Frame>>,
+    /// Placeholder function installed in a pooled frame's `func` slot so the
+    /// pool holds no live `BytecodeFunction` (whose upvalues/home object would
+    /// otherwise outlive their frame). Shared, empty, never executed.
+    pub(crate) dummy_bf: Rc<BytecodeFunction>,
+    /// Scratch register file for the typed loop kernels (`kernel.rs`): reused
+    /// across activations so entering a kernel allocates nothing. Kernels
+    /// never nest (a region containing a `LoopKernel` op is not kernelized),
+    /// and the generic interpreter running under a kernel's fallback path
+    /// never touches this, so one buffer per Vm suffices.
+    pub(crate) kernel_regs: Vec<f64>,
+    /// Scratch cache of the array-base objects for the active kernel (see
+    /// `kernel_regs`); cleared after every activation so the pool never
+    /// extends an object's lifetime.
+    pub(crate) kernel_objs: Vec<crate::value::JsObject>,
+    /// Pooled entry-resolved property-slot indices for kernel
+    /// `LoadProp`/`StoreProp` (see `KProp`).
+    pub(crate) kernel_prop_slots: Vec<u32>,
+    /// Pooled entry-verified closure callees for kernel `CallKernel`:
+    /// (callee function, register-window base).
+    pub(crate) kernel_callees: Vec<(std::rc::Rc<crate::value::BytecodeFunction>, u32)>,
 }
 
 impl Vm {
@@ -351,8 +385,23 @@ impl Vm {
             template_cache: std::collections::HashMap::new(),
             value_vec_pool: Vec::new(),
             cell_pool: Vec::new(),
-            cells_vec_pool: Vec::new(),
             dummy_cell: Rc::new(RefCell::new(Value::Undefined)),
+            frame_pool: Vec::new(),
+            kernel_regs: Vec::new(),
+            kernel_objs: Vec::new(),
+            kernel_prop_slots: Vec::new(),
+            kernel_callees: Vec::new(),
+            dummy_bf: Rc::new(BytecodeFunction {
+                proto: Rc::new(crate::bytecode::FuncProto::empty(
+                    "",
+                    crate::bytecode::FuncKind::Normal,
+                )),
+                upvalues: Vec::new(),
+                home_object: None,
+                is_class_ctor: false,
+                captured_with: Vec::new(),
+                captured_priv_env: None,
+            }),
         };
         crate::realm::init_realm(&mut vm);
         // The placeholder realm's intrinsic objects were created before the VM
@@ -1331,6 +1380,7 @@ impl Vm {
         // the dense store, so route the write through the ordinary props path
         // below (which honours its writable flag) when such an entry exists.
         let has_props_entry = b.props.contains_key(key);
+        let extensible = b.extensible;
         // A non-writable `length` marker blocks index writes past the end.
         let len_not_writable = matches!(
             b.props.get(&PropertyKey::str("length")),
@@ -1363,6 +1413,22 @@ impl Vm {
                 }
                 if let Some(idx) = key.array_index() {
                     let idx = idx as usize;
+                    // An append OR an in-bounds hole fill CREATES a property
+                    // (a hole is absent), so a non-extensible receiver rejects
+                    // it (OrdinarySet → CreateDataProperty → [[DefineOwnProperty]]
+                    // step 2.b): silently in sloppy mode, TypeError in strict.
+                    // Object.seal/preventExtensions on a dense array land here.
+                    let creates = idx >= arr.len() || matches!(arr[idx], Value::Hole);
+                    if creates && !extensible {
+                        if strict {
+                            drop(b);
+                            return Err(self.throw_type(&format!(
+                                "Cannot add property {}, object is not extensible",
+                                key_display(key)
+                            )));
+                        }
+                        return Ok(());
+                    }
                     if idx >= arr.len() {
                         if len_not_writable {
                             // Growing past a non-writable `length` is rejected
@@ -2044,6 +2110,35 @@ pub fn string_to_number(s: &str) -> f64 {
             .unwrap_or(f64::NAN);
     }
     t.parse::<f64>().unwrap_or(f64::NAN)
+}
+
+/// Append Number::toString(n) to `out`. Integral |n| <= 2^53 — every such
+/// f64 is exact and its plain decimal digits ARE the spec's shortest
+/// round-trip form — formats directly into the buffer, skipping the grisu +
+/// `format!` machinery (`String(2**60)`-class values, where the shortest
+/// form is NOT the exact integer, stay on the slow path). Hot in
+/// JSON.stringify.
+pub fn push_number_string(n: f64, out: &mut String) {
+    if n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_992.0 {
+        let mut i = n as i64; // -0.0 casts to 0: prints "0" like the spec
+        if i < 0 {
+            out.push('-');
+            i = -i;
+        }
+        let mut buf = [0u8; 16]; // 2^53 has 16 digits
+        let mut p = buf.len();
+        loop {
+            p -= 1;
+            buf[p] = b'0' + (i % 10) as u8;
+            i /= 10;
+            if i == 0 {
+                break;
+            }
+        }
+        out.push_str(std::str::from_utf8(&buf[p..]).expect("ascii digits"));
+    } else {
+        out.push_str(&number_to_string(n));
+    }
 }
 
 /// ECMAScript Number::toString (radix 10).

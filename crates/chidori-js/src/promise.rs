@@ -253,7 +253,7 @@ impl Vm {
     // Async function driving
     // =====================================================================
 
-    pub fn start_async(&mut self, frame: Frame) -> Value {
+    pub fn start_async(&mut self, frame: Box<Frame>) -> Value {
         let promise = self.new_promise();
         // The trace token (set by the caller before start_async) rides the frame
         // through every suspend/resume; capture it here for the synchronous
@@ -302,13 +302,13 @@ impl Vm {
     /// Resume a suspended frame with an injected value (await fulfilled).
     pub fn resume_frame(&mut self, mut frame: Box<Frame>, value: Value) -> Flow {
         frame.stack.push(value);
-        self.run_frame(*frame)
+        self.run_frame(frame)
     }
 
     /// Resume a suspended frame by raising an injected exception (await rejected).
     pub fn resume_frame_throw(&mut self, mut frame: Box<Frame>, err: Value) -> Flow {
         frame.pending_throw = Some(err);
-        self.run_frame(*frame)
+        self.run_frame(frame)
     }
 
     /// Resume a suspended generator frame with an injected `return` completion
@@ -316,7 +316,7 @@ impl Vm {
     /// `yield` run before the frame completes.
     pub fn resume_frame_return(&mut self, mut frame: Box<Frame>, value: Value) -> Flow {
         frame.pending_return = Some(value);
-        self.run_frame(*frame)
+        self.run_frame(frame)
     }
 
     // =====================================================================

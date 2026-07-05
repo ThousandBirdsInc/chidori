@@ -10,6 +10,8 @@ pub mod server;
 pub mod storage;
 pub mod tools;
 
+pub use scheduler::{new_tokio_runtime, JS_THREAD_STACK_BYTES};
+
 pub mod framework {
     pub use crate::mcp::McpManager;
     pub use crate::policy::{Decision, PolicyConfig, PolicyRule};

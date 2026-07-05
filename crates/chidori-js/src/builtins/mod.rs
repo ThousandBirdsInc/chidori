@@ -12,7 +12,7 @@ mod disposable;
 mod date;
 pub(crate) mod fundamental;
 mod intl;
-mod numbers;
+pub(crate) mod numbers;
 
 mod regexp_builtin;
 

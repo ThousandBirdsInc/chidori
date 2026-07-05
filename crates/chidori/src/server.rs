@@ -712,7 +712,7 @@ async fn health() -> impl IntoResponse {
 /// it here (rather than only at create time) keeps the tightened policy in
 /// force across resume/approve/replay re-runs of the same session.
 fn build_engine(app: &AppState, policy_profile: Option<&str>) -> Engine {
-    let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+    let rt = Arc::new(crate::scheduler::new_tokio_runtime().unwrap());
     // Reuse the app's provider registry so a replay-based resume sees the same
     // providers as the live-VM resume path (which drives `state.providers`
     // directly). In production this is the env-derived registry passed to

@@ -48,8 +48,12 @@ impl Vm {
                 }
             }
         };
+        let uses_arguments = bf.proto.uses_arguments;
         let mut frame = self.make_frame(bf, this, args, new_target);
-        frame.func_obj = Some(func_obj.clone());
+        // `func_obj` only feeds `arguments.callee` (see `call_bytecode_vec`).
+        if uses_arguments {
+            frame.func_obj = Some(func_obj.clone());
+        }
         let token = self.trace_enter(&frame.func.proto);
         frame.trace_token = token;
         // Run the parameter prologue now (call-time parameter evaluation): the
@@ -249,7 +253,7 @@ impl Vm {
                     self.trace_resume(token);
                     let flow = match (is_start, kind) {
                         (true, ResumeKind::Throw) => self.resume_frame_throw(frame, value),
-                        (true, _) => self.run_frame(*frame),
+                        (true, _) => self.run_frame(frame),
                         (false, ResumeKind::Throw) => self.resume_frame_throw(frame, value),
                         (false, _) => self.resume_frame(frame, value),
                     };
@@ -439,7 +443,7 @@ impl Vm {
             // First resume: ignore the sent value (spec).
             match kind {
                 ResumeKind::Throw => self.resume_frame_throw(frame, value),
-                _ => self.run_frame(*frame),
+                _ => self.run_frame(frame),
             }
         } else {
             match kind {
