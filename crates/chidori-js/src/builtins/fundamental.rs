@@ -528,8 +528,12 @@ fn define_typed_array_index(
 /// `CreateDataPropertyOrThrow(O, ToString(idx), V)` specialized for integer
 /// keys — how every array-producing builtin (map/filter/from/...) fills its
 /// result. For a plain dense array with no reified props, an in-bounds write
-/// or exact append IS the defined default data property; anything else
-/// (holes, gaps, proxies, frozen/sealed, shadowed) takes the spec path.
+/// (including a HOLE fill: [[DefineOwnProperty]] never consults the
+/// prototype, the receiver is extensible, and an in-bounds index leaves
+/// `length` untouched — so defining over an absent slot IS the plain dense
+/// store; `ArrayCreate(len)`-pre-sized results like map's land here) or an
+/// exact append IS the defined default data property; anything else (gaps,
+/// proxies, frozen/sealed, shadowed) takes the spec path.
 pub(crate) fn create_data_index(
     vm: &mut Vm,
     obj: &JsObject,
@@ -543,10 +547,8 @@ pub(crate) fn create_data_index(
                 let i = idx as usize;
                 match i.cmp(&arr.len()) {
                     std::cmp::Ordering::Less => {
-                        if !matches!(arr[i], Value::Hole) {
-                            arr[i] = value;
-                            return Ok(());
-                        }
+                        arr[i] = value;
+                        return Ok(());
                     }
                     std::cmp::Ordering::Equal => {
                         if i < crate::value::MAX_DENSE_ARRAY {

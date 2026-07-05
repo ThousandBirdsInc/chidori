@@ -27,6 +27,19 @@ fn peek_plain_bytecode(v: &Value) -> Option<Rc<BytecodeFunction>> {
     None
 }
 
+/// A callback prepared once per native higher-order invocation — the
+/// invocation-invariant slice of the `run_fn_kernel` entry guard plus the
+/// register buffer, hoisted out of the per-element call. Built by
+/// [`Vm::prepare_kernel_callback`], executed by [`Vm::exec_prepared_kernel`].
+pub(crate) struct PreparedKernel {
+    bf: Rc<BytecodeFunction>,
+    /// Kernel register file, allocated once for the whole invocation.
+    regs: Vec<f64>,
+    /// Back-edge interrupt poll counter (cadence spans calls).
+    poll: u32,
+    interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
 /// Control-flow signal from a single opcode step.
 enum Ctl {
     Next,
@@ -975,122 +988,19 @@ impl Vm {
         }
         let interrupt = self.interrupt.clone();
         let mut poll: u32 = 0;
-        let code = &k.code;
-        let mut pc = 0usize;
-        let ret = loop {
-            // Back-edges poll the cooperative interrupt flag, as in
-            // `run_kernel_op`; registers are pure scratch, nothing to write
-            // back on the unwind.
-            macro_rules! branch {
-                ($t:expr) => {{
-                    let t = $t as usize;
-                    if t <= pc {
-                        poll = poll.wrapping_add(1);
-                        if poll & 0xFF == 0 {
-                            if let Some(flag) = &interrupt {
-                                if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                                    self.kernel_regs = regs;
-                                    self.op_budget = Some(0);
-                                    return Some(Err(self.throw_range("execution interrupted")));
-                                }
-                            }
-                        }
-                    }
-                    pc = t;
-                    continue;
-                }};
+        match exec_fn_kernel_code(&k.code, &mut regs, &interrupt, &mut poll) {
+            Some(ret) => {
+                self.kernel_regs = regs;
+                Some(Ok(ret))
             }
-            match code[pc] {
-                KOp::Mov { dst, src } => regs[dst as usize] = regs[src as usize],
-                KOp::Const { dst, k } => regs[dst as usize] = k,
-                KOp::Add { dst, a, b } => regs[dst as usize] = regs[a as usize] + regs[b as usize],
-                KOp::AddK { dst, a, k } => regs[dst as usize] = regs[a as usize] + k,
-                KOp::Arith { kind, dst, a, b } => {
-                    regs[dst as usize] = number_arith_raw(regs[a as usize], regs[b as usize], kind)
-                }
-                KOp::ArithK { kind, dst, a, k } => {
-                    regs[dst as usize] = number_arith_raw(regs[a as usize], k, kind)
-                }
-                KOp::Neg { dst, src } => regs[dst as usize] = -regs[src as usize],
-                KOp::BitNot { dst, src } => {
-                    regs[dst as usize] = !crate::vm::to_int32(regs[src as usize]) as f64
-                }
-                KOp::Br { target } => branch!(target),
-                KOp::BrCmp {
-                    cmp,
-                    a,
-                    b,
-                    if_true,
-                    target,
-                } => {
-                    if knum_cmp(cmp, regs[a as usize], regs[b as usize]) == if_true {
-                        branch!(target)
-                    }
-                }
-                KOp::BrCmpK {
-                    cmp,
-                    a,
-                    k,
-                    if_true,
-                    target,
-                } => {
-                    if knum_cmp(cmp, regs[a as usize], k) == if_true {
-                        branch!(target)
-                    }
-                }
-                KOp::BrFalsy { src, target } => {
-                    if !knum_truthy(regs[src as usize]) {
-                        branch!(target)
-                    }
-                }
-                KOp::BrTruthy { src, target } => {
-                    if knum_truthy(regs[src as usize]) {
-                        branch!(target)
-                    }
-                }
-                KOp::CmpSet { cmp, dst, a, b } => {
-                    regs[dst as usize] = if knum_cmp(cmp, regs[a as usize], regs[b as usize]) {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }
-                KOp::BoolNot { dst, src } => {
-                    regs[dst as usize] = if knum_truthy(regs[src as usize]) {
-                        0.0
-                    } else {
-                        1.0
-                    }
-                }
-                KOp::Math1 { kind, dst, src } => {
-                    regs[dst as usize] = kmath1(kind, regs[src as usize])
-                }
-                KOp::Math2 { kind, dst, a, b } => {
-                    regs[dst as usize] = kmath2(kind, regs[a as usize], regs[b as usize])
-                }
-                KOp::Ret { src, boolean } => {
-                    break if boolean {
-                        Value::Bool(regs[src as usize] != 0.0)
-                    } else {
-                        Value::Number(regs[src as usize])
-                    }
-                }
-                // A frameless kernel has no bytecode frame to bail into;
-                // fn-mode translation rejects anything needing one. A
-                // SelfCall implies `self_global`, dispatched above.
-                KOp::LoadElem { .. }
-                | KOp::StoreElem { .. }
-                | KOp::LoadLen { .. }
-                | KOp::LoadProp { .. }
-                | KOp::StoreProp { .. }
-                | KOp::Exit { .. }
-                | KOp::CallKernel { .. }
-                | KOp::SelfCall { .. } => unreachable!("bail op in a function kernel"),
+            None => {
+                // Interrupted on a back-edge: registers are pure scratch,
+                // nothing to write back on the unwind.
+                self.kernel_regs = regs;
+                self.op_budget = Some(0);
+                Some(Err(self.throw_range("execution interrupted")))
             }
-            pc += 1;
-        };
-        self.kernel_regs = regs;
-        Some(Ok(ret))
+        }
     }
 
     /// The WINDOWED executor for self-recursive function kernels
@@ -1330,6 +1240,106 @@ impl Vm {
         };
         self.kernel_regs = regs;
         Some(Ok(ret))
+    }
+
+    /// Prepare a callback for REPEATED calls from a native higher-order
+    /// builtin (sort's comparator, map/filter/reduce/... callbacks): the
+    /// invocation-invariant parts of the `run_fn_kernel` entry — callee
+    /// resolution to a plain bytecode function with a non-recursive function
+    /// kernel, the trace/accounting/depth checks, the register allocation —
+    /// run ONCE here instead of on every element. `None` means the callback
+    /// has no usable kernel; the caller just uses `Vm::call` per element,
+    /// exactly as before.
+    ///
+    /// The prepared calls all happen at the builtin's (constant) call depth,
+    /// so a single depth check mirrors the per-call guard — the same
+    /// argument as the loop-kernel pinned-callee path. Tracing and per-op
+    /// accounting are host-controlled (no JS between two prepared calls can
+    /// enable them), so they too are entry checks; everything user code CAN
+    /// change between elements is re-checked per call in
+    /// [`Vm::exec_prepared_kernel`].
+    pub(crate) fn prepare_kernel_callback(&mut self, func: &Value) -> Option<PreparedKernel> {
+        let Value::Object(o) = func else { return None };
+        let bf = {
+            let b = o.borrow();
+            match &b.internal {
+                Internal::Function(FunctionInner::Bytecode(bf)) if !bf.is_class_ctor => bf.clone(),
+                _ => return None,
+            }
+        };
+        let kind = bf.proto.kind;
+        if kind.is_generator() || kind.is_async() {
+            return None;
+        }
+        {
+            let k = bf.proto.fn_kernel.as_ref()?;
+            if k.self_global.is_some() {
+                return None;
+            }
+        }
+        if self.op_budget.is_some() || self.trace_sink.is_some() {
+            return None;
+        }
+        if self.call_depth + 1 > self.max_call_depth {
+            return None;
+        }
+        let n_regs = bf.proto.fn_kernel.as_ref().expect("checked").n_regs as usize;
+        Some(PreparedKernel {
+            regs: vec![0.0; n_regs],
+            poll: 0,
+            interrupt: self.interrupt.clone(),
+            bf,
+        })
+    }
+
+    /// One prepared call (see [`Vm::prepare_kernel_callback`]). `None` = a
+    /// per-call guard failed — a non-`Number` argument or upvalue, per-op
+    /// accounting installed, a non-canonical `Math` — and the caller falls
+    /// back to the generic `Vm::call` for THIS element (keeping the handle
+    /// for the next). `Some` is the call's exact result, bit-identical to
+    /// the generic path by the `run_fn_kernel` argument.
+    ///
+    /// Math and upvalues are re-checked/re-read on EVERY call, unlike inside
+    /// a single kernel activation: user code can run between two prepared
+    /// calls (an element's getter or `valueOf` on the generic fallback path)
+    /// and patch `Math` or write a captured cell.
+    pub(crate) fn exec_prepared_kernel(
+        &mut self,
+        p: &mut PreparedKernel,
+        args: &[Value],
+    ) -> Option<Result<Value, Value>> {
+        if self.op_budget.is_some() {
+            return None;
+        }
+        let k = p.bf.proto.fn_kernel.as_ref().expect("prepared");
+        if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
+            return None;
+        }
+        for (r, slot) in k.locals.iter().enumerate() {
+            match slot {
+                crate::bytecode::KSlot::Arg(a) => match args.get(*a as usize) {
+                    Some(Value::Number(n)) => p.regs[r] = *n,
+                    _ => return None,
+                },
+                // Register scratch: translation proved a store dominates
+                // every read, so a stale value from the previous call is
+                // never observable.
+                crate::bytecode::KSlot::Local(_) => {}
+                crate::bytecode::KSlot::Upvalue(u) => match &*p.bf.upvalues[*u as usize].borrow() {
+                    Value::Number(n) => p.regs[r] = *n,
+                    _ => return None,
+                },
+            }
+        }
+        match exec_fn_kernel_code(&k.code, &mut p.regs, &p.interrupt, &mut p.poll) {
+            Some(v) => Some(Ok(v)),
+            None => {
+                // Same latch-and-unwind as an interrupted kernel back-edge:
+                // zero the budget so a JS catch cannot resume execution.
+                self.op_budget = Some(0);
+                Some(Err(self.throw_range("execution interrupted")))
+            }
+        }
     }
 
     fn describe(&self, v: &Value) -> String {
@@ -2865,24 +2875,55 @@ impl Vm {
                 let key_v = pop!();
                 let obj = pop!();
                 // Integer fast path mirroring `GetPropDynamic`: overwrite an
-                // EXISTING dense element in place. An in-bounds non-hole dense
-                // slot is a plain writable data property (per the array exotic
-                // [[Set]]), so no setter, no length change, and no
-                // extensibility interaction is observable. Appends, holes,
-                // out-of-bounds, and shadowed elements take the spec path.
+                // EXISTING dense element in place (an in-bounds non-hole dense
+                // slot is a plain writable data property per the array exotic
+                // [[Set]] — no setter, no length change, no extensibility
+                // interaction), fill an in-bounds HOLE, or append at exactly
+                // `length` — the same conditions as the kernel `StoreElem`
+                // fast path. Filling and appending CREATE a property, so they
+                // additionally require the array to be extensible (a sealed/
+                // prevented receiver must reject through the generic path)
+                // and to stay under the dense-storage bound (the generic path
+                // owns that RangeError). Gaps past the end, shadowed elements,
+                // and non-arrays take the spec path.
                 if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
                     if n.fract() == 0.0 && *n >= 0.0 && *n < 4294967295.0 {
                         let mut b = o.borrow_mut();
                         if b.props.is_empty() {
+                            let extensible = b.extensible;
                             if let Internal::Array(arr) = &mut b.internal {
                                 let i = *n as usize;
-                                if let Some(slot) = arr.get_mut(i) {
-                                    if !matches!(slot, Value::Hole) {
+                                let ok = match arr.get_mut(i) {
+                                    Some(slot) if !matches!(slot, Value::Hole) => {
                                         *slot = value.clone();
-                                        drop(b);
-                                        push!(value);
-                                        return Ok(Ctl::Next);
+                                        true
                                     }
+                                    Some(slot) => {
+                                        // In-bounds hole: creation.
+                                        if extensible {
+                                            *slot = value.clone();
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    }
+                                    None => {
+                                        // Exact append (no hole gap).
+                                        if extensible
+                                            && i == arr.len()
+                                            && i < crate::value::MAX_DENSE_ARRAY
+                                        {
+                                            arr.push(value.clone());
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    }
+                                };
+                                if ok {
+                                    drop(b);
+                                    push!(value);
+                                    return Ok(Ctl::Next);
                                 }
                             }
                         }
@@ -5225,6 +5266,126 @@ fn bin_arith(vm: &mut Vm, frame: &mut Frame, kind: ArithKind) -> Result<(), Valu
 /// `false` when the cooperative interrupt fired on a callee back-edge — the
 /// caller then unwinds exactly like one of its own interrupted edges.
 #[inline(never)]
+/// Execute a plain (non-recursive, frameless) FUNCTION kernel body over
+/// `regs`, returning the call's result — `Value::Number`, or `Value::Bool`
+/// for a boolean-typed `Ret`. Shared by the per-call [`Vm::run_fn_kernel`]
+/// entry and the prepared-callback path ([`Vm::exec_prepared_kernel`]).
+/// Returns `None` when the cooperative interrupt flag latched on a back-edge
+/// poll — the caller owns the budget-zeroing unwind.
+fn exec_fn_kernel_code(
+    code: &[KOp],
+    regs: &mut [f64],
+    interrupt: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    poll: &mut u32,
+) -> Option<Value> {
+    let mut pc = 0usize;
+    loop {
+        macro_rules! branch {
+            ($t:expr) => {{
+                let t = $t as usize;
+                if t <= pc {
+                    *poll = poll.wrapping_add(1);
+                    if *poll & 0xFF == 0 {
+                        if let Some(flag) = interrupt {
+                            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                pc = t;
+                continue;
+            }};
+        }
+        match code[pc] {
+            KOp::Mov { dst, src } => regs[dst as usize] = regs[src as usize],
+            KOp::Const { dst, k } => regs[dst as usize] = k,
+            KOp::Add { dst, a, b } => regs[dst as usize] = regs[a as usize] + regs[b as usize],
+            KOp::AddK { dst, a, k } => regs[dst as usize] = regs[a as usize] + k,
+            KOp::Arith { kind, dst, a, b } => {
+                regs[dst as usize] = number_arith_raw(regs[a as usize], regs[b as usize], kind)
+            }
+            KOp::ArithK { kind, dst, a, k } => {
+                regs[dst as usize] = number_arith_raw(regs[a as usize], k, kind)
+            }
+            KOp::Neg { dst, src } => regs[dst as usize] = -regs[src as usize],
+            KOp::BitNot { dst, src } => {
+                regs[dst as usize] = !crate::vm::to_int32(regs[src as usize]) as f64
+            }
+            KOp::Br { target } => branch!(target),
+            KOp::BrCmp {
+                cmp,
+                a,
+                b,
+                if_true,
+                target,
+            } => {
+                if knum_cmp(cmp, regs[a as usize], regs[b as usize]) == if_true {
+                    branch!(target)
+                }
+            }
+            KOp::BrCmpK {
+                cmp,
+                a,
+                k,
+                if_true,
+                target,
+            } => {
+                if knum_cmp(cmp, regs[a as usize], k) == if_true {
+                    branch!(target)
+                }
+            }
+            KOp::BrFalsy { src, target } => {
+                if !knum_truthy(regs[src as usize]) {
+                    branch!(target)
+                }
+            }
+            KOp::BrTruthy { src, target } => {
+                if knum_truthy(regs[src as usize]) {
+                    branch!(target)
+                }
+            }
+            KOp::CmpSet { cmp, dst, a, b } => {
+                regs[dst as usize] = if knum_cmp(cmp, regs[a as usize], regs[b as usize]) {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            KOp::BoolNot { dst, src } => {
+                regs[dst as usize] = if knum_truthy(regs[src as usize]) {
+                    0.0
+                } else {
+                    1.0
+                }
+            }
+            KOp::Math1 { kind, dst, src } => regs[dst as usize] = kmath1(kind, regs[src as usize]),
+            KOp::Math2 { kind, dst, a, b } => {
+                regs[dst as usize] = kmath2(kind, regs[a as usize], regs[b as usize])
+            }
+            KOp::Ret { src, boolean } => {
+                return Some(if boolean {
+                    Value::Bool(regs[src as usize] != 0.0)
+                } else {
+                    Value::Number(regs[src as usize])
+                })
+            }
+            // A frameless kernel has no bytecode frame to bail into;
+            // fn-mode translation rejects anything needing one. A
+            // SelfCall implies `self_global`, dispatched by the caller.
+            KOp::LoadElem { .. }
+            | KOp::StoreElem { .. }
+            | KOp::LoadLen { .. }
+            | KOp::LoadProp { .. }
+            | KOp::StoreProp { .. }
+            | KOp::Exit { .. }
+            | KOp::CallKernel { .. }
+            | KOp::SelfCall { .. } => unreachable!("bail op in a function kernel"),
+        }
+        pc += 1;
+    }
+}
+
 fn run_callee_window(
     regs: &mut [f64],
     ck: &crate::bytecode::Kernel,
