@@ -277,6 +277,31 @@ const CORPUS: &[&str] = &[
     "'use strict'; function f(a, b) { return a * b; } console.log(f(6, 7));",
     // Boolean ARGUMENT declines (guard is Number-only) — generic coercion.
     "const f = (a, b) => a - b; console.log(f(true, 1), f(5, false));",
+    // ---- self-recursive function kernels (SelfCall) ----
+    // The canonical fib shape (global function declaration).
+    "function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } console.log(fib(15), fib(0), fib(1));",
+    // Two arguments, self-call feeding a self-call argument (Ackermann).
+    "function ack(m, n) { return m === 0 ? n + 1 : n === 0 ? ack(m - 1, 1) : ack(m - 1, ack(m, n - 1)); } console.log(ack(2, 3));",
+    // Euclid: argument expressions evaluated at the call site.
+    "function gcd(a, b) { return b === 0 ? a : gcd(b, a % b); } console.log(gcd(1071, 462), gcd(3, 7), gcd(0, 5));",
+    // Anonymous function expression recursing through its global `var`.
+    "var f = function (n) { return n <= 0 ? 0 : n + f(n - 1); }; console.log(f(10));",
+    // REBINDING the global mid-program: the old closure's self-call must see
+    // the NEW binding (guard declines; generic LoadGlobal resolves it).
+    "function g(n) { return n <= 0 ? 0 : 1 + g(n - 1); } const orig = g; console.log(orig(5)); globalThis.g = (n) => 100; console.log(orig(5));",
+    // Math intrinsics inside a recursive kernel.
+    "function h(n) { return n < 2 ? n : Math.max(h(n - 1), h(n - 2)) + 1; } console.log(h(10));",
+    // Mutual recursion is NOT a self-call — stays generic, still correct.
+    "function even(n) { return n === 0 ? 1 : odd(n - 1); } function odd(n) { return n === 0 ? 0 : even(n - 1); } console.log(even(10), odd(7));",
+    // A boolean-returning recursive function must stay generic (a bool
+    // result would land in a Number-typed caller register).
+    "function tob(n) { return n <= 0 ? true : tob(n - 1); } console.log(tob(5), typeof tob(5), tob(0));",
+    // Named function EXPRESSION: the inner name is a lexical binding, not a
+    // global — no self-fusion, still correct.
+    "const k = function inner(n) { return n <= 0 ? 0 : n + inner(n - 1); }; console.log(k(6));",
+    // Non-number argument at the top call (per-call decline; the inner
+    // numeric self-calls still kernelize mid-recursion).
+    "function s(n) { return n < 2 ? n : s(n - 1) + s(n - 2); } console.log(s(8), s('4'));",
 ];
 
 #[test]
@@ -431,6 +456,86 @@ fn tiny_functions_get_fn_kernels() {
             "expected NO function kernel in {src:?}"
         );
     }
+}
+
+/// Self-recursive numeric functions get a RECURSIVE function kernel
+/// (`self_global` set), and the shapes that must not — boolean returns,
+/// mutual recursion, named-expression self-reference — never do.
+#[test]
+fn recursive_functions_get_self_kernels() {
+    fn self_kernels(p: &FuncProto) -> usize {
+        let mut n = usize::from(
+            p.fn_kernel
+                .as_ref()
+                .is_some_and(|k| k.self_global.is_some()),
+        );
+        for c in &p.consts {
+            if let Const::Func(f) = c {
+                n += self_kernels(f);
+            }
+        }
+        n
+    }
+    for src in [
+        "function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }",
+        "function gcd(a, b) { return b === 0 ? a : gcd(b, a % b); }",
+        "function ack(m, n) { return m === 0 ? n + 1 : n === 0 ? ack(m - 1, 1) : ack(m - 1, ack(m, n - 1)); }",
+        "var f = function (n) { return n <= 0 ? 0 : n + f(n - 1); };",
+    ] {
+        let proto = compile_script(src).expect("compiles");
+        assert!(
+            self_kernels(&proto) >= 1,
+            "expected a recursive kernel in {src:?}"
+        );
+    }
+    for src in [
+        // Boolean-returning recursion (result register is Number-typed).
+        "function tob(n) { return n <= 0 ? true : tob(n - 1); }",
+        // Mutual recursion is not a SELF call.
+        "function even(n) { return n === 0 ? 1 : odd(n - 1); }",
+        // A named expression's self-reference is lexical, not global.
+        "const k = function inner(n) { return n <= 0 ? 0 : n + inner(n - 1); };",
+    ] {
+        let proto = compile_script(src).expect("compiles");
+        assert_eq!(
+            self_kernels(&proto),
+            0,
+            "expected NO recursive kernel in {src:?}"
+        );
+    }
+}
+
+/// Depth-limit fidelity for recursive kernels: overflowing the limit must
+/// abandon the (pure) kernel activation and rerun generically, raising the
+/// exact spec RangeError — byte-identical to the kernels-off run. Uses a
+/// tiny `max_call_depth` so the generic recursion fits a test-thread stack.
+#[test]
+fn self_kernel_depth_overflow_reruns_generic() {
+    // A dedicated big-stack thread: 60+ generic interpreter levels don't fit
+    // a default 2 MiB test thread in DEBUG builds (production runs the VM on
+    // 16 MiB stacks; the JS depth limit is sized for release frames).
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let src = "function rec(n) { return n <= 0 ? 0 : 1 + rec(n - 1); } \
+                       try { console.log(rec(1000)); } catch (e) { console.log('deep', e.constructor.name); } \
+                       console.log(rec(10));";
+            let mut outs = Vec::new();
+            for kernels in [true, false] {
+                let proto = Rc::new(compile_script_kernels(src, kernels).expect("compiles"));
+                let mut engine = Engine::new();
+                engine.vm.max_call_depth = 64;
+                let func = engine.vm.make_closure(proto, Vec::new());
+                let res = engine.vm.call(Value::Object(func), Value::Undefined, &[]);
+                assert!(res.is_ok(), "caught in-script (kernels={kernels})");
+                outs.push(engine.console().to_vec());
+            }
+            assert_eq!(outs[0], outs[1], "depth overflow diverged");
+            assert_eq!(outs[0][0], "deep RangeError");
+        })
+        .expect("spawns")
+        .join()
+        .expect("no panic");
 }
 
 /// Math-using loops actually kernelize (pins v3 eligibility).

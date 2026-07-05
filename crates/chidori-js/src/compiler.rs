@@ -1798,7 +1798,15 @@ impl Compiler {
             && matches!(fc.kind, FuncKind::Normal | FuncKind::Arrow)
             && !fc.uses_arguments
         {
-            crate::kernel::kernelize_function(&code, &fc.consts, &kernels)
+            // The function's own (non-empty) name lets a direct recursive
+            // call fuse to `KOp::SelfCall` — validity is the RUNTIME guard's
+            // problem (the global binding must hold the invoked closure).
+            let self_name = if fc.name.is_empty() {
+                None
+            } else {
+                Some(fc.name.as_str())
+            };
+            crate::kernel::kernelize_function(&code, &fc.consts, &kernels, self_name)
         } else {
             None
         };

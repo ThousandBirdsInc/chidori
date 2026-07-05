@@ -1039,6 +1039,20 @@ pub enum KOp {
     /// emitted for loop kernels (their region has no `Return` on the
     /// allowlist).
     Ret { src: u16, boolean: bool },
+    /// FUNCTION kernels only: a DIRECT SELF-RECURSIVE call (`fib(n - 1)`
+    /// inside `fib`), executed as a fresh register WINDOW running the same
+    /// kernel code from pc 0 — no frame, no `Value`s, just an explicit
+    /// (return-pc, dst, window) stack in the executor. `argc` argument
+    /// registers sit contiguously at `base..`; the callee's `Ret` lands in
+    /// `regs[dst]` of the calling window (always a Number — recursive
+    /// kernels reject boolean returns). Only emitted when the body's callee
+    /// is `LoadGlobal` of the function's OWN name; the entry guard then
+    /// verifies that global binding still holds the very closure being
+    /// invoked ([`Kernel::self_global`]), so a rebound name declines to the
+    /// generic path. Depth is tracked against the interpreter's limit; an
+    /// overflow ABANDONS the (pure, side-effect-free) kernel activation and
+    /// reruns the whole call generically, which raises the spec RangeError.
+    SelfCall { dst: u16, base: u16, argc: u16 },
 }
 
 /// A numeric register's source: a frame local (read/write), a captured
@@ -1182,6 +1196,13 @@ pub struct Kernel {
     pub math_used: Box<[KMath]>,
     /// Total register count (mapped locals + canonical stack slots).
     pub n_regs: u16,
+    /// FUNCTION kernels containing [`KOp::SelfCall`]: the GLOBAL name the
+    /// body's recursive callee resolves through. The entry guard requires
+    /// the global binding to be a plain data property holding the very
+    /// closure being invoked (pointer identity) — a shadowed/rebound/
+    /// accessor'd name declines the kernel and the call runs generically.
+    /// `None` for loop kernels and non-recursive function kernels.
+    pub self_global: Option<Box<str>>,
     /// The original loop-header op this kernel replaced; executed verbatim
     /// when the guard declines.
     pub fallback: Box<Op>,

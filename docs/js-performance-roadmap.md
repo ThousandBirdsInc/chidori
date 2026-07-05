@@ -791,6 +791,45 @@ implicit-undefined return) to NEVER carry one; the op-budget test now also
 covers a call-heavy program (function kernels are OFF under a budget, like
 loop kernels).
 
+**Kernel v6 (same branch): SELF-RECURSIVE function kernels.**
+
+fib-class functions are pure scalar bodies whose only off-allowlist ops are
+the recursive call sites. `LoadGlobal` of the function's OWN name now
+translates (fn mode) to a speculative "self" entry, and the plain-call
+pattern over it fuses to `KOp::SelfCall`: the executor
+(`Vm::run_fn_kernel_rec`) runs the whole recursion as stacked REGISTER
+WINDOWS over one grown `Vec<f64>` with an explicit (return-pc, dst,
+window) stack — zero frames, zero `Value`s, zero operand stacks for the
+entire call tree.
+
+- **Guard** (on top of v5's): the global the callee resolves through must
+  be a plain data property holding the VERY closure being invoked (pointer
+  identity) — a rebound/shadowed/accessor'd name declines and the generic
+  `LoadGlobal` observably resolves whatever the program set up. Checked
+  once per top-level entry: nothing inside a kernel can write globals.
+- **Depth fidelity**: self-calls track depth against the interpreter's
+  limit (`call_depth + window count`); an overflow ABANDONS the activation
+  and returns "guard declined" — sound because function kernels are pure
+  (registers only) — so the caller's generic rerun recurses to the same
+  depth and raises the exact spec RangeError from the exact frame.
+  Interrupts poll on self-calls and back-edges as usual.
+- **Static safety rails**: every self-call must supply every argument
+  index the body consumes (a short call would need the generic `undefined`
+  parameter), and a recursive kernel must return NUMBERS only (a boolean
+  would land in a caller register statically typed Num, diverging under
+  `typeof`/strict-eq). Argument expressions must be statically-Number
+  registers. Mutual recursion and named-expression self-reference (a
+  lexical binding, not a global) stay generic.
+
+Measured: **fib_recursive 7.51 G → 0.81 G instructions (−89%, 9.3×)**;
+wall-clock fib(30) ~78 ms vs node 22's ~110 ms total on the same box — the
+first workload where chidori beats node outright. Every other suite count
+is at layout-noise level (±0.15%), checksums byte-identical. Corpus grew
+fib/gcd/Ackermann (nested self-call arguments), rebinding-mid-program,
+boolean-return and mutual-recursion negatives, per-call declines, and a
+dedicated depth-overflow differential (`max_call_depth = 64` on a big-stack
+thread) pinning the abandon-and-rerun RangeError path.
+
 ### 6.5.1 What's next (new baseline)
 
 - Remaining kernel candidates: `String.prototype.charCodeAt`-class reads,
@@ -798,12 +837,15 @@ loop kernels).
   element access (a natural fit — elements are statically numeric), and
   argument-typed ARRAY parameters for function kernels (`(a, i) => a[i]`
   needs arg object slots + a bail-free access story).
+- Kernel-tier extensions with clear shapes: MUTUAL recursion (guard a
+  small set of global bindings instead of one), self-calls through local/
+  captured bindings (`const f = n => … f(…)`), and boolean-returning
+  recursion (type the result register Bool).
 - **step dispatch remains the wall for non-kernel code**: `step` +
   `run_frame` are 25–43% of call-heavy workloads. Register bytecode (§3.5)
   is the remaining structural lever, and kernels shrink its risk: the
   translator's typed-stack machinery is exactly the analysis a register
-  allocator needs. fib_recursive (7.5 G) is now almost pure frame ceremony —
-  its body recurses, so no kernel tier can reach it.
+  allocator needs.
 
 Re-run the callgrind sweep before choosing; the noise-floor and idle-machine
 caveats in §1.1 stand.

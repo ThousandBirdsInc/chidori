@@ -650,8 +650,8 @@ impl Vm {
                     }
                 }
                 KOp::Exit { resume_ip, shape } => break (resume_ip, shape),
-                // Function-kernel-only op; loop translation never emits it.
-                KOp::Ret { .. } => unreachable!("Ret in a loop kernel"),
+                // Function-kernel-only ops; loop translation never emits them.
+                KOp::Ret { .. } | KOp::SelfCall { .. } => unreachable!("fn op in a loop kernel"),
             }
             pc += 1;
         };
@@ -711,6 +711,10 @@ impl Vm {
         let k = bf.proto.fn_kernel.as_ref()?;
         if self.op_budget.is_some() || self.trace_sink.is_some() {
             return None;
+        }
+        // Self-recursive kernels run the windowed executor.
+        if k.self_global.is_some() {
+            return self.run_fn_kernel_rec(bf, args);
         }
         let mut regs = std::mem::take(&mut self.kernel_regs);
         regs.clear();
@@ -844,7 +848,245 @@ impl Vm {
                     }
                 }
                 // A frameless kernel has no bytecode frame to bail into;
-                // fn-mode translation rejects anything needing one.
+                // fn-mode translation rejects anything needing one. A
+                // SelfCall implies `self_global`, dispatched above.
+                KOp::LoadElem { .. }
+                | KOp::StoreElem { .. }
+                | KOp::LoadLen { .. }
+                | KOp::Exit { .. }
+                | KOp::SelfCall { .. } => unreachable!("bail op in a function kernel"),
+            }
+            pc += 1;
+        };
+        self.kernel_regs = regs;
+        Some(Ok(ret))
+    }
+
+    /// The WINDOWED executor for self-recursive function kernels
+    /// (`Kernel::self_global`): each [`KOp::SelfCall`] pushes a fresh
+    /// `n_regs`-wide register window and an explicit (return-pc, dst,
+    /// caller-window) record — the whole recursion runs without a single
+    /// frame or `Value`. Extra guard over `run_fn_kernel`: the global the
+    /// recursive callee resolves through must be a plain data property
+    /// holding the VERY closure being invoked (pointer identity), so a
+    /// shadowed/rebound/accessor'd name declines and the call runs
+    /// generically. Depth mirrors the interpreter's limit; on overflow the
+    /// activation is ABANDONED and `None` returned — sound because kernels
+    /// are pure (registers only), and the caller's generic rerun then
+    /// raises the spec RangeError from the exact frame it belongs to.
+    fn run_fn_kernel_rec(
+        &mut self,
+        bf: &BytecodeFunction,
+        args: &[Value],
+    ) -> Option<Result<Value, Value>> {
+        let k = bf.proto.fn_kernel.as_ref()?;
+        let name = k.self_global.as_deref()?;
+        {
+            let g = self.realm.global.borrow();
+            let ok = matches!(
+                g.props.get(&PropertyKey::str(name)),
+                Some(Property {
+                    kind: PropertyKind::Data { value: Value::Object(o), .. },
+                    ..
+                }) if matches!(
+                    &o.borrow().internal,
+                    Internal::Function(FunctionInner::Bytecode(bf2))
+                        if std::ptr::eq(Rc::as_ptr(bf2), bf)
+                )
+            );
+            if !ok {
+                return None;
+            }
+        }
+        let n_regs = k.n_regs as usize;
+        let mut regs = std::mem::take(&mut self.kernel_regs);
+        regs.clear();
+        regs.resize(n_regs, 0.0);
+        for (r, slot) in k.locals.iter().enumerate() {
+            match slot {
+                crate::bytecode::KSlot::Arg(a) => match args.get(*a as usize) {
+                    Some(Value::Number(n)) => regs[r] = *n,
+                    _ => {
+                        self.kernel_regs = regs;
+                        return None;
+                    }
+                },
+                crate::bytecode::KSlot::Local(_) => {}
+                crate::bytecode::KSlot::Upvalue(u) => match &*bf.upvalues[*u as usize].borrow() {
+                    Value::Number(n) => regs[r] = *n,
+                    _ => {
+                        self.kernel_regs = regs;
+                        return None;
+                    }
+                },
+            }
+        }
+        if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
+            self.kernel_regs = regs;
+            return None;
+        }
+        let interrupt = self.interrupt.clone();
+        let mut poll: u32 = 0;
+        let code = &k.code;
+        // (return pc, dst register, caller window base) per live self-call.
+        let mut calls: Vec<(u16, u16, usize)> = Vec::new();
+        let mut base = 0usize;
+        let mut pc = 0usize;
+        let ret = loop {
+            // Back-edges AND self-calls poll the cooperative interrupt flag.
+            macro_rules! poll_interrupt {
+                () => {{
+                    poll = poll.wrapping_add(1);
+                    if poll & 0xFF == 0 {
+                        if let Some(flag) = &interrupt {
+                            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                self.kernel_regs = regs;
+                                self.op_budget = Some(0);
+                                return Some(Err(self.throw_range("execution interrupted")));
+                            }
+                        }
+                    }
+                }};
+            }
+            macro_rules! branch {
+                ($t:expr) => {{
+                    let t = $t as usize;
+                    if t <= pc {
+                        poll_interrupt!();
+                    }
+                    pc = t;
+                    continue;
+                }};
+            }
+            match code[pc] {
+                KOp::Mov { dst, src } => regs[base + dst as usize] = regs[base + src as usize],
+                KOp::Const { dst, k } => regs[base + dst as usize] = k,
+                KOp::Add { dst, a, b } => {
+                    regs[base + dst as usize] = regs[base + a as usize] + regs[base + b as usize]
+                }
+                KOp::AddK { dst, a, k } => regs[base + dst as usize] = regs[base + a as usize] + k,
+                KOp::Arith { kind, dst, a, b } => {
+                    regs[base + dst as usize] =
+                        number_arith_raw(regs[base + a as usize], regs[base + b as usize], kind)
+                }
+                KOp::ArithK { kind, dst, a, k } => {
+                    regs[base + dst as usize] = number_arith_raw(regs[base + a as usize], k, kind)
+                }
+                KOp::Neg { dst, src } => regs[base + dst as usize] = -regs[base + src as usize],
+                KOp::BitNot { dst, src } => {
+                    regs[base + dst as usize] =
+                        !crate::vm::to_int32(regs[base + src as usize]) as f64
+                }
+                KOp::Br { target } => branch!(target),
+                KOp::BrCmp {
+                    cmp,
+                    a,
+                    b,
+                    if_true,
+                    target,
+                } => {
+                    if knum_cmp(cmp, regs[base + a as usize], regs[base + b as usize]) == if_true {
+                        branch!(target)
+                    }
+                }
+                KOp::BrCmpK {
+                    cmp,
+                    a,
+                    k,
+                    if_true,
+                    target,
+                } => {
+                    if knum_cmp(cmp, regs[base + a as usize], k) == if_true {
+                        branch!(target)
+                    }
+                }
+                KOp::BrFalsy { src, target } => {
+                    if !knum_truthy(regs[base + src as usize]) {
+                        branch!(target)
+                    }
+                }
+                KOp::BrTruthy { src, target } => {
+                    if knum_truthy(regs[base + src as usize]) {
+                        branch!(target)
+                    }
+                }
+                KOp::CmpSet { cmp, dst, a, b } => {
+                    regs[base + dst as usize] =
+                        if knum_cmp(cmp, regs[base + a as usize], regs[base + b as usize]) {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                }
+                KOp::BoolNot { dst, src } => {
+                    regs[base + dst as usize] = if knum_truthy(regs[base + src as usize]) {
+                        0.0
+                    } else {
+                        1.0
+                    }
+                }
+                KOp::Math1 { kind, dst, src } => {
+                    regs[base + dst as usize] = kmath1(kind, regs[base + src as usize])
+                }
+                KOp::Math2 { kind, dst, a, b } => {
+                    regs[base + dst as usize] =
+                        kmath2(kind, regs[base + a as usize], regs[base + b as usize])
+                }
+                KOp::SelfCall {
+                    dst,
+                    base: abase,
+                    argc: _,
+                } => {
+                    // Mirror the generic per-call depth guard: an overflow
+                    // abandons the pure activation; the generic rerun then
+                    // recurses to the same depth and raises the RangeError.
+                    if self.call_depth + calls.len() + 1 > self.max_call_depth {
+                        self.kernel_regs = regs;
+                        return None;
+                    }
+                    poll_interrupt!();
+                    let new_base = base + n_regs;
+                    if regs.len() < new_base + n_regs {
+                        regs.resize(new_base + n_regs, 0.0);
+                    }
+                    // Populate the callee window: arguments from the call
+                    // site's contiguous registers, upvalues copied through
+                    // (same closure — the guard proved it), locals are
+                    // scratch (store-before-read proven at translation).
+                    for (r, slot) in k.locals.iter().enumerate() {
+                        match slot {
+                            crate::bytecode::KSlot::Arg(a) => {
+                                // Translation guarantees argc covers every
+                                // consumed argument index.
+                                regs[new_base + r] = regs[base + abase as usize + *a as usize];
+                            }
+                            crate::bytecode::KSlot::Upvalue(_) => {
+                                regs[new_base + r] = regs[base + r];
+                            }
+                            crate::bytecode::KSlot::Local(_) => {}
+                        }
+                    }
+                    calls.push((pc as u16 + 1, dst, base));
+                    base = new_base;
+                    pc = 0;
+                    continue;
+                }
+                KOp::Ret { src, boolean } => {
+                    // Recursive kernels are Number-only (enforced at
+                    // translation) — a boolean would land in a caller
+                    // register statically typed Num.
+                    debug_assert!(!boolean);
+                    let v = regs[base + src as usize];
+                    match calls.pop() {
+                        Some((ret_pc, dst, prev)) => {
+                            base = prev;
+                            regs[base + dst as usize] = v;
+                            pc = ret_pc as usize;
+                            continue;
+                        }
+                        None => break Value::Number(v),
+                    }
+                }
                 KOp::LoadElem { .. }
                 | KOp::StoreElem { .. }
                 | KOp::LoadLen { .. }
