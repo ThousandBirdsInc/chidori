@@ -327,6 +327,13 @@ enum VE {
     /// holds the very closure being invoked. Its ONLY legal consumer is a
     /// `Call` (which fuses to [`KOp::SelfCall`]); everything else rejects.
     SelfFn,
+    /// `a.push` on the array base in the oslot — speculative: the entry
+    /// guard verifies the canonical `Array.prototype.push` still backs the
+    /// `push` property of the canonical prototype, and the op re-checks the
+    /// receiver per call. Consumed by `Call(1)` (fusing to
+    /// [`KOp::ArrayPush`]); survives to exit shapes as
+    /// [`KShapeSlot::ArrayPushFn`] (realm-reconstructed on bail).
+    ArrayPushFn(u16),
 }
 
 struct Xlate<'a> {
@@ -383,6 +390,9 @@ struct Xlate<'a> {
     exits: Vec<(usize, u32, Vec<VE>)>,
     /// Math intrinsics used (entry guard checks each against the realm).
     math_used: Vec<KMath>,
+    /// Whether the region contains a pinned `Array.prototype.push` call
+    /// (entry guard verifies the canonical still resolves).
+    uses_array_push: bool,
     /// Named-property access classes over oslot bases (entry-resolved; see
     /// [`KProp`]). Deduplicated by (oslot, key); flags OR together.
     props_used: Vec<KProp>,
@@ -446,6 +456,7 @@ fn translate(
         fixups: Vec::new(),
         exits: Vec::new(),
         math_used: Vec::new(),
+        uses_array_push: false,
         props_used: Vec::new(),
         callees: Vec::new(),
         absorbed: None,
@@ -636,6 +647,10 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                 *dst = remap(*dst);
                 *idx = remap(*idx);
             }
+            KOp::ArrayPush { dst, val, .. } => {
+                *dst = remap(*dst);
+                *val = remap(*val);
+            }
             KOp::StoreElem { idx, val, .. } => {
                 *idx = remap(*idx);
                 *val = remap(*val);
@@ -679,6 +694,7 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                     VE::Obj(o) => KShapeSlot::Obj(*o),
                     VE::MathObj => KShapeSlot::MathObj,
                     VE::MathFn(k) => KShapeSlot::MathFn(*k),
+                    VE::ArrayPushFn(_) => KShapeSlot::ArrayPushFn,
                     VE::Undef | VE::Opaque | VE::SelfFn => {
                         unreachable!("undef/opaque/self never crosses block boundaries")
                     }
@@ -771,9 +787,15 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
     // Superinstruction fusion — last, so the analyses above never see fused
     // variants.
     fuse_kops(&mut x.kops);
-    let stores_elems = x.kops.iter().any(|op| matches!(op, KOp::StoreElem { .. }));
+    // ArrayPush CREATES an element like a StoreElem append — same entry
+    // chain guard.
+    let stores_elems = x
+        .kops
+        .iter()
+        .any(|op| matches!(op, KOp::StoreElem { .. } | KOp::ArrayPush { .. }));
     Some(Kernel {
         stores_elems,
+        uses_array_push: x.uses_array_push,
         code: std::mem::take(&mut x.kops).into_boxed_slice(),
         locals: locals.into_boxed_slice(),
         bool_locals: bool_locals.into_boxed_slice(),
@@ -813,9 +835,10 @@ fn map_targets(op: &mut KOp, mut f: impl FnMut(u16) -> u16) {
         | KOp::BrFalsy { target, .. }
         | KOp::BrTruthy { target, .. }
         | KOp::AddKBr { target, .. } => *target = f(*target),
-        KOp::LoadElem { bail, .. } | KOp::StoreElem { bail, .. } | KOp::LoadLen { bail, .. } => {
-            *bail = f(*bail)
-        }
+        KOp::LoadElem { bail, .. }
+        | KOp::StoreElem { bail, .. }
+        | KOp::LoadLen { bail, .. }
+        | KOp::ArrayPush { bail, .. } => *bail = f(*bail),
         _ => {}
     }
 }
@@ -1009,6 +1032,10 @@ fn copy_prop_kops(kops: &mut [KOp]) -> bool {
                 resolve!(val);
             }
             KOp::LoadLen { dst, .. } | KOp::LoadProp { dst, .. } => kill!(*dst),
+            KOp::ArrayPush { dst, val, .. } => {
+                resolve!(val);
+                kill!(*dst);
+            }
             KOp::StoreProp { src, .. } => resolve!(src),
             // Argument-window RANGE reads: leave the window registers alone,
             // only the result register is a plain def.
@@ -1074,6 +1101,10 @@ fn max_reg(acc: u16, op: &KOp) -> u16 {
         }
         KOp::StoreElem { idx, val, .. } => {
             see(*idx);
+            see(*val);
+        }
+        KOp::ArrayPush { dst, val, .. } => {
+            see(*dst);
             see(*val);
         }
         KOp::StoreProp { src, .. } => see(*src),
@@ -1161,6 +1192,11 @@ fn dce_movs(kops: &mut Vec<KOp>, always_live: u128, upvalue_uses: u128, n_regs: 
                 succ[i] = (true, Some(*bail));
             }
             KOp::LoadLen { dst, bail, .. } => {
+                defs[i] = bit(*dst);
+                succ[i] = (true, Some(*bail));
+            }
+            KOp::ArrayPush { dst, val, bail, .. } => {
+                uses[i] = bit(*val);
                 defs[i] = bit(*dst);
                 succ[i] = (true, Some(*bail));
             }
@@ -1259,9 +1295,10 @@ fn patch(kops: &mut [KOp], kidx: usize, pc: u16) {
         | KOp::BrCmpK { target, .. }
         | KOp::BrFalsy { target, .. }
         | KOp::BrTruthy { target, .. } => *target = pc,
-        KOp::LoadElem { bail, .. } | KOp::StoreElem { bail, .. } | KOp::LoadLen { bail, .. } => {
-            *bail = pc
-        }
+        KOp::LoadElem { bail, .. }
+        | KOp::StoreElem { bail, .. }
+        | KOp::LoadLen { bail, .. }
+        | KOp::ArrayPush { bail, .. } => *bail = pc,
         _ => unreachable!("patching a non-branch kop"),
     }
 }
@@ -1493,7 +1530,13 @@ impl Xlate<'_> {
         let p = self.vstack.len().checked_sub(1 + depth_from_top)?;
         match self.vstack[p] {
             VE::Obj(s) => Some(s),
-            VE::Bool | VE::Undef | VE::Opaque | VE::SelfFn | VE::MathObj | VE::MathFn(_) => None,
+            VE::Bool
+            | VE::Undef
+            | VE::Opaque
+            | VE::SelfFn
+            | VE::MathObj
+            | VE::MathFn(_)
+            | VE::ArrayPushFn(_) => None,
             VE::Num => {
                 // Phase 1 discovery only. (A local used BOTH as a base and
                 // numerically is caught in phase 2: its loads become `Obj`
@@ -1863,6 +1906,7 @@ impl Xlate<'_> {
                 let top = *self.vstack.last()?;
                 match top {
                     VE::Num | VE::Bool => {
+                        let origin = *self.origins.last()?;
                         let src = self.top_reg(0)?;
                         let dst = if top == VE::Bool {
                             self.push_bool()?
@@ -1870,6 +1914,11 @@ impl Xlate<'_> {
                             self.push_num()?
                         };
                         self.kops.push(K::Mov { dst, src });
+                        // The copy IS the same value of the same local
+                        // version — propagate the origin so phase-1 base
+                        // discovery sees through the method-call prologue's
+                        // `Dup` (receiver duplicated for `this`).
+                        *self.origins.last_mut()? = origin;
                     }
                     VE::Obj(s) => {
                         self.vstack.push(VE::Obj(s));
@@ -1879,7 +1928,9 @@ impl Xlate<'_> {
                         self.vstack.push(VE::MathObj);
                         self.origins.push(None);
                     }
-                    VE::MathFn(_) | VE::Undef | VE::Opaque | VE::SelfFn => return None,
+                    VE::MathFn(_) | VE::Undef | VE::Opaque | VE::SelfFn | VE::ArrayPushFn(_) => {
+                        return None
+                    }
                 }
             }
             Op::Swap => {
@@ -2128,6 +2179,21 @@ impl Xlate<'_> {
                     Const::String(s) => s.as_str().to_string(),
                     _ => return None,
                 };
+                // `a.push` on an array base, in loop mode: the pinned
+                // canonical `Array.prototype.push` (entry-verified like a
+                // Math intrinsic; see `KOp::ArrayPush`). An Ordinary object
+                // with a plain data property named "push" loses its kernel
+                // to this routing — the region then rejects at the
+                // consumer — which is acceptable for so method-shaped a
+                // name.
+                if !self.fn_mode && key == "push" {
+                    let obj = self.base_slot(0)?;
+                    self.pop()?;
+                    self.vstack.push(VE::ArrayPushFn(obj));
+                    self.origins.push(None);
+                    self.uses_array_push = true;
+                    return Some(());
+                }
                 if key == "length" {
                     // Arrays: derived length, per-access checked, bailable.
                     let shape = self.vstack.clone();
@@ -2201,6 +2267,32 @@ impl Xlate<'_> {
                         base,
                         argc: u16::try_from(n).ok()?,
                     });
+                    return Some(());
+                }
+                // `a.push(x)`: the compiler's method-call pattern
+                // [.., ArrayPushFn(s), Obj(s), arg] with exactly one
+                // statically-Number argument. Emits the bailable
+                // [`KOp::ArrayPush`]; the generic `Call` (method object
+                // reconstructed from the realm canonical) owns every
+                // declined receiver.
+                if let VE::ArrayPushFn(s) = *self.vstack.get(fn_pos)? {
+                    if n != 1 || !matches!(self.vstack.get(fn_pos + 1)?, VE::Obj(s2) if *s2 == s) {
+                        return None;
+                    }
+                    let val = self.top_num_reg(0)?;
+                    let shape = self.vstack.clone();
+                    self.pop()?; // arg
+                    self.pop()?; // this (the array)
+                    self.pop()?; // fn
+                    let dst = self.push_num()?;
+                    let kidx = self.kops.len();
+                    self.kops.push(K::ArrayPush {
+                        obj: s,
+                        val,
+                        dst,
+                        bail: u16::MAX,
+                    });
+                    self.exits.push((kidx, self.base_ip + i as u32, shape));
                     return Some(());
                 }
                 // LOOP mode: a call of a PINNED closure — the callee is an

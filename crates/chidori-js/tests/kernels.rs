@@ -156,6 +156,29 @@ const CORPUS: &[&str] = &[
     // A dense proto ELEMENT (plain writable data, no reified entry) must NOT
     // decline: the spec creates the property on the receiver anyway.
     "Array.prototype[2] = 99; const a = [0, 1]; for (let i = 0; i < 3; i++) { a[2] = i; } delete Array.prototype[2]; console.log(a[2], a.length, a.join(','));",
+    // ---- pinned-native `a.push(x)` (KOp::ArrayPush) ----
+    // The canonical push loop; result (new length) used numerically.
+    "const a = []; let n = 0; for (let i = 0; i < 50; i++) { n = a.push(i * 2); } console.log(n, a.length, a[0], a[49]);",
+    // Push interleaved with reads, length, and a second array.
+    "const a = [], b = [9]; let s = 0; for (let i = 0; i < 20; i++) { a.push(i); b.push(a[i] + b[0]); s += a.length + b.length; } console.log(s, a[19], b[20]);",
+    // Argument with a SIDE EFFECT (post-increment) — no replay on any path.
+    "const a = []; let j = 0; for (let i = 0; i < 5; i++) { a.push(j++); } console.log(j, a.join(','));",
+    // Conditional push (skipped iterations).
+    "const a = []; for (let i = 0; i < 10; i++) { if (i % 3 === 0) { a.push(i); } } console.log(a.join(','));",
+    // MONKEYPATCHED Array.prototype.push: the entry guard must decline and
+    // run the patch every iteration.
+    "const orig = Array.prototype.push; let calls = 0; Array.prototype.push = function (x) { calls++; return orig.call(this, x + 100); }; const a = []; for (let i = 0; i < 4; i++) { a.push(i); } Array.prototype.push = orig; console.log(calls, a.join(','));",
+    // OWN `push` property shadowing the prototype's: declines, custom runs.
+    "const a = []; a.push = function (x) { this[this.length] = x * 10; return this.length; }; for (let i = 0; i < 4; i++) { a.push(i); } console.log(a.join(','), a.length);",
+    // Receiver with a CUSTOM prototype (not %Array.prototype%): declines.
+    "const a = []; Object.setPrototypeOf(a, { push(x) { Array.prototype.push.call(this, x + 5); return this.length; } }); for (let i = 0; i < 3; i++) { a.push(i); } console.log(a.join(','));",
+    // Non-extensible receiver: sloppy push throws (spec Set semantics) via
+    // the generic path — the entry guard declines.
+    "const a = [1]; Object.preventExtensions(a); let err = ''; try { for (let i = 0; i < 3; i++) { a.push(i); } } catch (e) { err = e.constructor.name; } console.log(err, a.length);",
+    // Non-Number argument: the region rejects; generic push runs.
+    "const a = []; for (let i = 0; i < 3; i++) { a.push('s' + i); } console.log(a.join(','));",
+    // Method extracted, not called: the region rejects; still correct.
+    "const a = [1]; let t = ''; for (let i = 0; i < 2; i++) { const f = a.push; t = typeof f; } console.log(t, a.length);",
     // Base REASSIGNED inside the loop: translation must reject (store to a
     // base local) and the generic loop must swap arrays mid-flight.
     "let a = [1,2,3,4]; const b = [100,200,300,400]; let s = 0; for (let i = 0; i < a.length; i++) { s += a[i]; if (i === 1) a = b; } console.log(s);",

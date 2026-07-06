@@ -1029,6 +1029,20 @@ pub enum KOp {
         val: u16,
         bail: u16,
     },
+    /// Pinned-native `Array.prototype.push` over the dense array in object
+    /// slot `obj`: append `Value::Number(regs[val])` and set `regs[dst]` to
+    /// the new length. The activation entry verified the canonical `push`
+    /// still resolves (`Kernel::uses_array_push`) and — via the
+    /// `stores_elems` chain guard — that no prototype can intercept element
+    /// creation; the op re-checks the receiver per push (unshadowed `props`
+    /// empty, extensible, direct proto IS the canonical Array.prototype,
+    /// dense bound) and bails to the generic `Call` otherwise.
+    ArrayPush {
+        obj: u16,
+        val: u16,
+        dst: u16,
+        bail: u16,
+    },
     /// `regs[dst] = <length>` of the dense array in object slot `obj`
     /// (unshadowed only — a reified `length` marker bails).
     LoadLen { dst: u16, obj: u16, bail: u16 },
@@ -1165,6 +1179,10 @@ pub struct KCallee {
 #[derive(Clone, Copy, Debug)]
 pub enum KShapeSlot {
     Num(u16),
+    /// The canonical `Array.prototype.push` function object (the entry guard
+    /// proved the live value IS the canonical, so a bail reconstructs it
+    /// from the realm — exactly like `MathFn`).
+    ArrayPushFn,
     /// A register statically typed BOOLEAN (holds exactly 0.0/1.0):
     /// materialized as `Value::Bool` — `typeof` must not see a number.
     Bool(u16),
@@ -1309,6 +1327,10 @@ pub struct Kernel {
     /// reified index entry (`protos_allow_any_index_create`). Read-only
     /// loops skip that walk entirely.
     pub stores_elems: bool,
+    /// Whether the code contains a [`KOp::ArrayPush`]: the activation entry
+    /// must verify the canonical `Array.prototype.push` still backs the
+    /// `push` property of the canonical Array prototype.
+    pub uses_array_push: bool,
     /// The original loop-header op this kernel replaced; executed verbatim
     /// when the guard declines.
     pub fallback: Box<Op>,

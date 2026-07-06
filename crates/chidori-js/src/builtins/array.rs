@@ -146,6 +146,16 @@ pub fn install(vm: &mut Vm) {
 
     install_proto_methods(vm, &proto);
     install_unscopables(vm, &proto);
+    // Pin the canonical `push` for the kernel `ArrayPush` fast path (entry
+    // identity check + bail-shape reconstruction; see `KOp::ArrayPush`).
+    let push_fn = proto
+        .borrow()
+        .props
+        .get(&PropertyKey::str("push"))
+        .and_then(|p| p.value().cloned());
+    if let Some(Value::Object(o)) = push_fn {
+        vm.realm.array_push = Some(o);
+    }
 }
 
 fn array_call(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {

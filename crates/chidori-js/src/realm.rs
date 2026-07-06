@@ -20,6 +20,11 @@ pub struct Realm {
     /// exact objects; anything else declines to the generic path.
     pub math_object: Option<JsObject>,
     pub math_kernel: Vec<JsObject>,
+    /// The canonical `Array.prototype.push` function object, pinned at
+    /// install so the kernel `ArrayPush` entry guard can identity-check the
+    /// live `push` property (and a bail can reconstruct the method on the
+    /// operand stack). `None` only mid-bootstrap.
+    pub array_push: Option<JsObject>,
 
     pub object_proto: JsObject,
     pub function_proto: JsObject,
@@ -173,6 +178,7 @@ impl Realm {
             eval_fn: None,
             math_object: None,
             math_kernel: Vec::new(),
+            array_push: None,
             object_proto: bare(),
             function_proto: bare(),
             array_proto: bare(),

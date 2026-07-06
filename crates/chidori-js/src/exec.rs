@@ -377,6 +377,25 @@ impl Vm {
         })
     }
 
+    /// Entry check for kernels containing [`KOp::ArrayPush`]: the canonical
+    /// Array prototype's `push` property must still be a plain DATA property
+    /// holding the pinned canonical function (methods are writable). The
+    /// receiver-side conditions (unshadowed, extensible, direct proto IS the
+    /// canonical prototype) re-check per push; the element-creation chain
+    /// walk is the `stores_elems` entry guard.
+    fn kernel_array_push_ok(&self) -> bool {
+        let Some(canon) = &self.realm.array_push else {
+            return false;
+        };
+        matches!(
+            self.realm.array_proto.borrow().props.get(&PropertyKey::str("push")),
+            Some(Property {
+                kind: PropertyKind::Data { value: Value::Object(o), .. },
+                ..
+            }) if o.ptr_eq(canon)
+        )
+    }
+
     /// Execute the typed loop kernel at `Op::LoopKernel(idx)` (see
     /// `kernel.rs` for the model). Runs only when per-op accounting is off
     /// (no op budget), every mapped numeric local holds a `Number`, and every
@@ -471,6 +490,40 @@ impl Vm {
         // kernel region can mutate globals, so entry-time checks suffice.
         if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
             return self.step(frame, &k.fallback);
+        }
+        // Pinned `Array.prototype.push` (see `KOp::ArrayPush`): the realm
+        // canonical must still back `Array.prototype.push`, and EVERY push
+        // receiver must resolve `push` to it — an unshadowed (`props`
+        // empty) extensible dense array whose direct proto IS the canonical
+        // prototype. Checked ONCE: nothing inside a kernel region can add a
+        // shadowing property or change a prototype, so the resolution holds
+        // for the whole activation — which is what lets ANY mid-kernel exit
+        // materialize the canonical method object into a resumed operand
+        // stack (`KShapeSlot::ArrayPushFn`). A shadowed/patched/re-proto'd
+        // receiver declines here and the generic loop owns it.
+        if k.uses_array_push {
+            if !self.kernel_array_push_ok() {
+                return self.step(frame, &k.fallback);
+            }
+            for op in k.code.iter() {
+                if let KOp::ArrayPush { obj, .. } = op {
+                    let ok =
+                        if let Value::Object(o) = &frame.locals[k.oslots[*obj as usize] as usize] {
+                            let b = o.borrow();
+                            matches!(b.internal, Internal::Array(_))
+                                && b.props.is_empty()
+                                && b.extensible
+                                && b.proto
+                                    .as_ref()
+                                    .is_some_and(|p| p.ptr_eq(&self.realm.array_proto))
+                        } else {
+                            false
+                        };
+                    if !ok {
+                        return self.step(frame, &k.fallback);
+                    }
+                }
+            }
         }
         // Named-property access classes resolve ONCE per activation to raw
         // slot indices (see `KProp`) — and, since prop LOCALIZATION, to a
@@ -774,6 +827,40 @@ impl Vm {
                         branch!(bail)
                     }
                 }
+                // Pinned-native push: append + new length, in-kernel. The
+                // entry guard proved the canonical method still resolves
+                // and (stores_elems) that no proto can intercept element
+                // creation; the receiver conditions re-check per push —
+                // anything else re-runs the whole generic Call via the
+                // bail (the method object reconstructed from the realm).
+                KOp::ArrayPush {
+                    obj,
+                    val,
+                    dst,
+                    bail,
+                } => {
+                    let mut ok = false;
+                    {
+                        let mut b = objs[obj as usize].borrow_mut();
+                        if b.props.is_empty()
+                            && b.extensible
+                            && b.proto
+                                .as_ref()
+                                .is_some_and(|p| p.ptr_eq(&self.realm.array_proto))
+                        {
+                            if let Internal::Array(arr) = &mut b.internal {
+                                if arr.len() < crate::value::MAX_DENSE_ARRAY {
+                                    arr.push(Value::Number(regs[val as usize]));
+                                    regs[dst as usize] = arr.len() as f64;
+                                    ok = true;
+                                }
+                            }
+                        }
+                    }
+                    if !ok {
+                        branch!(bail)
+                    }
+                }
                 // Dense element write: in-place overwrite (exactly the
                 // `Op::SetPropDynamic` fast-path conditions), an in-bounds
                 // HOLE fill, or an exact one-past-the-end APPEND. Filling and
@@ -970,6 +1057,9 @@ impl Vm {
                 )),
                 crate::bytecode::KShapeSlot::MathFn(kind) => frame.stack.push(Value::Object(
                     self.realm.math_kernel[*kind as usize].clone(),
+                )),
+                crate::bytecode::KShapeSlot::ArrayPushFn => frame.stack.push(Value::Object(
+                    self.realm.array_push.clone().expect("guarded"),
                 )),
             }
         }
@@ -1299,7 +1389,8 @@ impl Vm {
                         None => break Value::Number(v),
                     }
                 }
-                KOp::LoadElem { .. }
+                KOp::ArrayPush { .. }
+                | KOp::LoadElem { .. }
                 | KOp::StoreElem { .. }
                 | KOp::LoadLen { .. }
                 | KOp::LoadProp { .. }
@@ -5618,7 +5709,8 @@ fn exec_fn_kernel_code(
             // A frameless kernel has no bytecode frame to bail into;
             // fn-mode translation rejects anything needing one. A
             // SelfCall implies `self_global`, dispatched by the caller.
-            KOp::LoadElem { .. }
+            KOp::ArrayPush { .. }
+            | KOp::LoadElem { .. }
             | KOp::StoreElem { .. }
             | KOp::LoadLen { .. }
             | KOp::LoadProp { .. }
@@ -5762,7 +5854,8 @@ fn run_callee_window(
             }
             // Impossible in a guarded callee: no bails, no exits, no
             // recursion, no nested closure calls.
-            KOp::LoadElem { .. }
+            KOp::ArrayPush { .. }
+            | KOp::LoadElem { .. }
             | KOp::StoreElem { .. }
             | KOp::LoadLen { .. }
             | KOp::LoadProp { .. }
