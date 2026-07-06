@@ -1,0 +1,124 @@
+<meta charset="utf-8">
+<title>chidori replay demo</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:1200px; height:675px; overflow:hidden; background:#0a0e16;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  #stage { width:1200px; height:675px; position:relative; padding:26px 28px 0; }
+  h1 { color:#e2e8f0; font-size:26px; font-weight:600; letter-spacing:-0.5px; margin-bottom:18px; }
+  h1 .dim { color:#475569; font-weight:400; }
+  .panes { display:flex; gap:20px; }
+  .pane { width:562px; height:492px; background:#0d1320; border:1px solid #1c2740;
+    border-radius:12px; padding:18px 20px; position:relative; overflow:hidden; }
+  .pane.waiting { opacity:.45; }
+  .cmd { color:#e2e8f0; font-size:20px; margin-bottom:14px; white-space:nowrap; }
+  .cmd .p { color:#475569; }
+  .cmd .hl { color:#7dd3fc; }
+  .lines { font-size:17px; line-height:1.72; }
+  .ln { color:#cbd5e1; white-space:nowrap; opacity:0; }
+  .ln.show { opacity:1; }
+  .ln .ok { color:#34d399; }
+  .ln .amber { color:#fbbf24; }
+  .ln .dim { color:#64748b; }
+  .ln .blue { color:#60a5fa; }
+  .foot { position:absolute; left:20px; right:20px; bottom:14px; display:flex;
+    justify-content:space-between; align-items:baseline; border-top:1px solid #1c2740; padding-top:12px; }
+  .stat { color:#94a3b8; font-size:16px; }
+  .stat b { display:block; color:#e2e8f0; font-size:27px; font-weight:700; letter-spacing:-0.5px; }
+  .stat b.zero { color:#34d399; }
+  .stamp { position:absolute; top:200px; left:50%; transform:translateX(-50%) rotate(-7deg) scale(3);
+    opacity:0; border:4px solid #34d399; color:#34d399; border-radius:10px;
+    font-size:30px; font-weight:800; padding:10px 24px; letter-spacing:1px; white-space:nowrap;
+    background:rgba(10,20,16,.85); transition:opacity .18s, transform .18s; }
+  .stamp.show { opacity:1; transform:translateX(-50%) rotate(-7deg) scale(1); }
+  #tag { position:absolute; left:28px; right:28px; bottom:18px; display:flex;
+    justify-content:space-between; align-items:baseline; opacity:0; transition:opacity .5s; }
+  #tag.show { opacity:1; }
+  #tag .l { color:#e2e8f0; font-size:22px; font-weight:600; }
+  #tag .r { color:#64748b; font-size:19px; }
+  .cursor { display:inline-block; width:11px; height:22px; background:#7dd3fc;
+    vertical-align:-4px; animation:blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity:0; } }
+</style>
+<div id="stage">
+  <h1>The same agent run, twice <span class="dim">— live, then replayed from its journal</span></h1>
+  <div class="panes">
+    <div class="pane" id="left">
+      <div class="cmd"><span class="p">$</span> chidori run agent.ts</div>
+      <div class="lines" id="llines"></div>
+      <div class="foot">
+        <div class="stat">wall clock<b id="lt">0:00</b></div>
+        <div class="stat">model calls<b id="lc">0</b></div>
+        <div class="stat">cost<b id="lm">$0.00</b></div>
+      </div>
+    </div>
+    <div class="pane waiting" id="right">
+      <div class="cmd" id="rcmd"><span class="p">$</span> <span class="cursor"></span></div>
+      <div class="lines" id="rlines"></div>
+      <div class="foot">
+        <div class="stat">wall clock<b id="rt">—</b></div>
+        <div class="stat">model calls<b id="rc">—</b></div>
+        <div class="stat">cost<b id="rm">—</b></div>
+      </div>
+      <div class="stamp" id="stamp">BYTE-IDENTICAL ✓</div>
+    </div>
+  </div>
+  <div id="tag">
+    <span class="l">Replay any run. Zero model calls. Byte-identical.</span>
+    <span class="r">github.com/ThousandBirdsInc/chidori</span>
+  </div>
+</div>
+<script>
+const L = [
+  '<span class="ok">✓</span> prompt claude-sonnet-5 <span class="dim">"plan migration"</span> <span class="dim">1.8s</span> $0.42',
+  '<span class="ok">✓</span> tool repo.search <span class="dim">"billing engine"</span> <span class="dim">0.3s</span>',
+  '<span class="ok">✓</span> fetch api.github.com/issues <span class="dim">0.2s</span>',
+  '<span class="ok">✓</span> prompt claude-sonnet-5 <span class="dim">"draft changes"</span> <span class="dim">2.4s</span> $0.61',
+  '<span class="ok">✓</span> tool tests.run <span class="ok">41 passed</span> <span class="dim">1.1s</span>',
+  '<span class="amber">⏸</span> input <span class="dim">"ship it?"</span> — <span class="amber">waiting on a human…</span>',
+  '<span class="ok">✓</span> input approved <span class="dim">· 2h later, new process</span>',
+  '<span class="ok">✓</span> prompt claude-sonnet-5 <span class="dim">"write changelog"</span> <span class="dim">1.6s</span> $0.38',
+  '<span class="ok">✓</span> run complete <span class="dim">→ .chidori/runs/01JZK3</span>',
+];
+const R = L.map((h,i) => {
+  if (i===5) return '<span class="blue">▸</span> input <span class="dim">"ship it?"</span> <span class="blue">replayed · human not re-asked</span>';
+  if (i===6) return '<span class="blue">▸</span> input approved <span class="blue">· from journal</span>';
+  if (i===8) return '<span class="ok">✓</span> run complete <span class="ok">— identical output</span>';
+  return h.replace('<span class="ok">✓</span>','<span class="blue">▸</span>')
+          .replace(/\$0\.\d\d/,'<span class="blue">$0.00</span>');
+});
+const llines = document.getElementById('llines'), rlines = document.getElementById('rlines');
+for (const h of L) { const d=document.createElement('div'); d.className='ln'; d.innerHTML=h; llines.appendChild(d); }
+for (const h of R) { const d=document.createElement('div'); d.className='ln'; d.innerHTML=h; rlines.appendChild(d); }
+const lts=[400,1150,1750,2250,3300,4000,4900,5300,6000];   // left line reveal times
+const t0=performance.now();
+const fmt=s=>Math.floor(s/60)+':'+String(Math.floor(s%60)).padStart(2,'0');
+const ease=x=>x<0?0:x>1?1:x*x*(3-2*x);
+function tick(){
+  const t=performance.now()-t0;
+  llines.childNodes.forEach((n,i)=>{ if(t>=lts[i]) n.classList.add('show'); });
+  // left counters: run "takes" 3m12s wall / $4.83 / 47 calls, compressed into 6s
+  const p=ease(t/6000);
+  document.getElementById('lt').textContent=fmt(192*p);
+  document.getElementById('lm').textContent='$'+(4.83*p).toFixed(2);
+  document.getElementById('lc').textContent=Math.round(47*p);
+  // right pane fires at 6.6s
+  if(t>=6600){
+    const right=document.getElementById('right');
+    right.classList.remove('waiting');
+    document.getElementById('rcmd').innerHTML='<span class="p">$</span> chidori resume agent.ts <span class="hl">01JZK3</span>';
+    rlines.childNodes.forEach((n,i)=>{ if(t>=7000+i*95) n.classList.add('show'); });
+    if(t>=7000){
+      document.getElementById('rt').textContent='0.4s';
+      document.getElementById('rc').textContent='0';
+      document.getElementById('rm').textContent='$0.00';
+      document.getElementById('rc').className='zero';
+      document.getElementById('rm').className='zero';
+    }
+    if(t>=8300) document.getElementById('stamp').classList.add('show');
+    if(t>=8900) document.getElementById('tag').classList.add('show');
+  }
+  if(t<12500) requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
