@@ -69,7 +69,7 @@
     <g class="curline"><rect x="84" y="139" width="252" height="22" rx="3" fill="#FACC15" opacity="0.08"/></g>
     <g font-size="12.5" fill="#E8E8E5" opacity="0.85">
       <text x="94" y="154"><tspan fill="#FACC15">const</tspan> a = <tspan fill="#FACC15">await</tspan> <tspan fill="#F4C752">c.prompt</tspan>(…)</text>
-      <text x="94" y="190"><tspan fill="#FACC15">const</tspan> b = <tspan fill="#FACC15">await</tspan> <tspan fill="#F4C752">c.http</tspan>(…)</text>
+      <text x="94" y="190"><tspan fill="#FACC15">const</tspan> b = <tspan fill="#FACC15">await</tspan> <tspan fill="#F4C752">fetch</tspan>(…)</text>
       <text x="94" y="226"><tspan fill="#FACC15">const</tspan> t = <tspan fill="#FACC15">await</tspan> <tspan fill="#F4C752">c.tool</tspan>(…)</text>
       <text x="94" y="262" fill="#74736d"><tspan fill="#FACC15" fill-opacity="0.7">return</tspan> { a, b, t }</text>
     </g>
@@ -109,7 +109,7 @@
     <!-- cycling call label -->
     <g font-size="13" text-anchor="middle">
       <text class="lbl lbl0" x="610" y="42" fill="#F4C752">chidori.prompt("summarize this…")</text>
-      <text class="lbl lbl1" x="610" y="42" fill="#F4C752">chidori.http("https://api…")</text>
+      <text class="lbl lbl1" x="610" y="42" fill="#F4C752">fetch("https://api…")</text>
       <text class="lbl lbl2" x="610" y="42" fill="#F4C752">chidori.tool("search", { q })</text>
     </g>
 
