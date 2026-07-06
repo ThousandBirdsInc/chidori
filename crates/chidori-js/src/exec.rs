@@ -377,18 +377,19 @@ impl Vm {
         })
     }
 
-    /// Entry check for kernels containing [`KOp::ArrayPush`]: the canonical
-    /// Array prototype's `push` property must still be a plain DATA property
-    /// holding the pinned canonical function (methods are writable). The
-    /// receiver-side conditions (unshadowed, extensible, direct proto IS the
-    /// canonical prototype) re-check per push; the element-creation chain
-    /// walk is the `stores_elems` entry guard.
-    fn kernel_array_push_ok(&self) -> bool {
-        let Some(canon) = &self.realm.array_push else {
+    /// Entry check for kernels containing [`KOp::ArrayPush`]/[`KOp::ArrayPop`]:
+    /// the canonical Array prototype's method property must still be a plain
+    /// DATA property holding the pinned canonical function (methods are
+    /// writable). The receiver-side conditions (unshadowed, extensible,
+    /// direct proto IS the canonical prototype) are entry-checked per
+    /// receiver and re-checked per op; the element-creation chain walk is
+    /// the `stores_elems` entry guard.
+    fn kernel_array_method_ok(&self, name: &str, canon: &Option<JsObject>) -> bool {
+        let Some(canon) = canon else {
             return false;
         };
         matches!(
-            self.realm.array_proto.borrow().props.get(&PropertyKey::str("push")),
+            self.realm.array_proto.borrow().props.get(&PropertyKey::str(name)),
             Some(Property {
                 kind: PropertyKind::Data { value: Value::Object(o), .. },
                 ..
@@ -501,27 +502,35 @@ impl Vm {
         // materialize the canonical method object into a resumed operand
         // stack (`KShapeSlot::ArrayPushFn`). A shadowed/patched/re-proto'd
         // receiver declines here and the generic loop owns it.
-        if k.uses_array_push {
-            if !self.kernel_array_push_ok() {
+        if k.uses_array_push || k.uses_array_pop {
+            if k.uses_array_push
+                && !self.kernel_array_method_ok("push", &self.realm.array_push.clone())
+            {
+                return self.step(frame, &k.fallback);
+            }
+            if k.uses_array_pop
+                && !self.kernel_array_method_ok("pop", &self.realm.array_pop.clone())
+            {
                 return self.step(frame, &k.fallback);
             }
             for op in k.code.iter() {
-                if let KOp::ArrayPush { obj, .. } = op {
-                    let ok =
-                        if let Value::Object(o) = &frame.locals[k.oslots[*obj as usize] as usize] {
-                            let b = o.borrow();
-                            matches!(b.internal, Internal::Array(_))
-                                && b.props.is_empty()
-                                && b.extensible
-                                && b.proto
-                                    .as_ref()
-                                    .is_some_and(|p| p.ptr_eq(&self.realm.array_proto))
-                        } else {
-                            false
-                        };
-                    if !ok {
-                        return self.step(frame, &k.fallback);
-                    }
+                let obj = match op {
+                    KOp::ArrayPush { obj, .. } | KOp::ArrayPop { obj, .. } => *obj,
+                    _ => continue,
+                };
+                let ok = if let Value::Object(o) = &frame.locals[k.oslots[obj as usize] as usize] {
+                    let b = o.borrow();
+                    matches!(b.internal, Internal::Array(_))
+                        && b.props.is_empty()
+                        && b.extensible
+                        && b.proto
+                            .as_ref()
+                            .is_some_and(|p| p.ptr_eq(&self.realm.array_proto))
+                } else {
+                    false
+                };
+                if !ok {
+                    return self.step(frame, &k.fallback);
                 }
             }
         }
@@ -861,6 +870,28 @@ impl Vm {
                         branch!(bail)
                     }
                 }
+                // Pinned-native pop: remove + yield the last element when it
+                // is a plain Number. An empty array (undefined result), a
+                // trailing hole (prototype consult), or a non-Number element
+                // re-runs the generic Call via the bail.
+                KOp::ArrayPop { obj, dst, bail } => {
+                    let mut ok = false;
+                    {
+                        let mut b = objs[obj as usize].borrow_mut();
+                        if b.props.is_empty() && b.extensible {
+                            if let Internal::Array(arr) = &mut b.internal {
+                                if let Some(Value::Number(n)) = arr.last() {
+                                    regs[dst as usize] = *n;
+                                    arr.pop();
+                                    ok = true;
+                                }
+                            }
+                        }
+                    }
+                    if !ok {
+                        branch!(bail)
+                    }
+                }
                 // Dense element write: in-place overwrite (exactly the
                 // `Op::SetPropDynamic` fast-path conditions), an in-bounds
                 // HOLE fill, or an exact one-past-the-end APPEND. Filling and
@@ -1060,6 +1091,9 @@ impl Vm {
                 )),
                 crate::bytecode::KShapeSlot::ArrayPushFn => frame.stack.push(Value::Object(
                     self.realm.array_push.clone().expect("guarded"),
+                )),
+                crate::bytecode::KShapeSlot::ArrayPopFn => frame.stack.push(Value::Object(
+                    self.realm.array_pop.clone().expect("guarded"),
                 )),
             }
         }
@@ -1390,6 +1424,7 @@ impl Vm {
                     }
                 }
                 KOp::ArrayPush { .. }
+                | KOp::ArrayPop { .. }
                 | KOp::LoadElem { .. }
                 | KOp::StoreElem { .. }
                 | KOp::LoadLen { .. }
@@ -5710,6 +5745,7 @@ fn exec_fn_kernel_code(
             // fn-mode translation rejects anything needing one. A
             // SelfCall implies `self_global`, dispatched by the caller.
             KOp::ArrayPush { .. }
+            | KOp::ArrayPop { .. }
             | KOp::LoadElem { .. }
             | KOp::StoreElem { .. }
             | KOp::LoadLen { .. }
@@ -5855,6 +5891,7 @@ fn run_callee_window(
             // Impossible in a guarded callee: no bails, no exits, no
             // recursion, no nested closure calls.
             KOp::ArrayPush { .. }
+            | KOp::ArrayPop { .. }
             | KOp::LoadElem { .. }
             | KOp::StoreElem { .. }
             | KOp::LoadLen { .. }

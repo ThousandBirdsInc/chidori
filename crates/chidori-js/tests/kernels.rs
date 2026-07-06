@@ -179,6 +179,19 @@ const CORPUS: &[&str] = &[
     "const a = []; for (let i = 0; i < 3; i++) { a.push('s' + i); } console.log(a.join(','));",
     // Method extracted, not called: the region rejects; still correct.
     "const a = [1]; let t = ''; for (let i = 0; i < 2; i++) { const f = a.push; t = typeof f; } console.log(t, a.length);",
+    // ---- pinned-native `a.pop()` (KOp::ArrayPop) ----
+    // Drain loop: pop while non-empty (length re-read per iteration).
+    "const a = [1, 2, 3, 4, 5]; let s = 0; while (a.length > 0) { s += a.pop(); } console.log(s, a.length);",
+    // Pop past empty: undefined result arrives via the generic bail.
+    "const a = [7]; let r = 0; for (let i = 0; i < 3; i++) { const v = a.pop(); r += v === undefined ? 100 : v; } console.log(r, a.length);",
+    // Trailing HOLE reads through the prototype on the generic path.
+    "Array.prototype[1] = 55; const a = [9, , ]; const v = a.pop(); delete Array.prototype[1]; console.log(v, a.length);",
+    // Non-Number last element: per-op bail, exact value via generic.
+    "const a = [1, 'two', 3]; let s = ''; for (let i = 0; i < 3; i++) { s += a.pop() + '|'; } console.log(s, a.length);",
+    // MONKEYPATCHED pop declines at entry.
+    "const orig = Array.prototype.pop; let calls = 0; Array.prototype.pop = function () { calls++; return orig.call(this); }; const a = [1, 2, 3]; let s = 0; for (let i = 0; i < 3; i++) { s += a.pop(); } Array.prototype.pop = orig; console.log(calls, s, a.length);",
+    // push + pop mixed in one region.
+    "const a = []; let s = 0; for (let i = 0; i < 10; i++) { a.push(i); if (i % 2) { s += a.pop(); } } console.log(s, a.length, a.join(','));",
     // Base REASSIGNED inside the loop: translation must reject (store to a
     // base local) and the generic loop must swap arrays mid-flight.
     "let a = [1,2,3,4]; const b = [100,200,300,400]; let s = 0; for (let i = 0; i < a.length; i++) { s += a[i]; if (i === 1) a = b; } console.log(s);",

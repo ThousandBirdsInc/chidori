@@ -334,6 +334,8 @@ enum VE {
     /// [`KOp::ArrayPush`]); survives to exit shapes as
     /// [`KShapeSlot::ArrayPushFn`] (realm-reconstructed on bail).
     ArrayPushFn(u16),
+    /// `a.pop`, likewise (consumed by `Call(0)` → [`KOp::ArrayPop`]).
+    ArrayPopFn(u16),
 }
 
 struct Xlate<'a> {
@@ -393,6 +395,8 @@ struct Xlate<'a> {
     /// Whether the region contains a pinned `Array.prototype.push` call
     /// (entry guard verifies the canonical still resolves).
     uses_array_push: bool,
+    /// As `uses_array_push`, for `pop`.
+    uses_array_pop: bool,
     /// Named-property access classes over oslot bases (entry-resolved; see
     /// [`KProp`]). Deduplicated by (oslot, key); flags OR together.
     props_used: Vec<KProp>,
@@ -457,6 +461,7 @@ fn translate(
         exits: Vec::new(),
         math_used: Vec::new(),
         uses_array_push: false,
+        uses_array_pop: false,
         props_used: Vec::new(),
         callees: Vec::new(),
         absorbed: None,
@@ -651,6 +656,7 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                 *dst = remap(*dst);
                 *val = remap(*val);
             }
+            KOp::ArrayPop { dst, .. } => *dst = remap(*dst),
             KOp::StoreElem { idx, val, .. } => {
                 *idx = remap(*idx);
                 *val = remap(*val);
@@ -695,6 +701,7 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                     VE::MathObj => KShapeSlot::MathObj,
                     VE::MathFn(k) => KShapeSlot::MathFn(*k),
                     VE::ArrayPushFn(_) => KShapeSlot::ArrayPushFn,
+                    VE::ArrayPopFn(_) => KShapeSlot::ArrayPopFn,
                     VE::Undef | VE::Opaque | VE::SelfFn => {
                         unreachable!("undef/opaque/self never crosses block boundaries")
                     }
@@ -796,6 +803,7 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
     Some(Kernel {
         stores_elems,
         uses_array_push: x.uses_array_push,
+        uses_array_pop: x.uses_array_pop,
         code: std::mem::take(&mut x.kops).into_boxed_slice(),
         locals: locals.into_boxed_slice(),
         bool_locals: bool_locals.into_boxed_slice(),
@@ -838,7 +846,8 @@ fn map_targets(op: &mut KOp, mut f: impl FnMut(u16) -> u16) {
         KOp::LoadElem { bail, .. }
         | KOp::StoreElem { bail, .. }
         | KOp::LoadLen { bail, .. }
-        | KOp::ArrayPush { bail, .. } => *bail = f(*bail),
+        | KOp::ArrayPush { bail, .. }
+        | KOp::ArrayPop { bail, .. } => *bail = f(*bail),
         _ => {}
     }
 }
@@ -1036,6 +1045,7 @@ fn copy_prop_kops(kops: &mut [KOp]) -> bool {
                 resolve!(val);
                 kill!(*dst);
             }
+            KOp::ArrayPop { dst, .. } => kill!(*dst),
             KOp::StoreProp { src, .. } => resolve!(src),
             // Argument-window RANGE reads: leave the window registers alone,
             // only the result register is a plain def.
@@ -1107,6 +1117,7 @@ fn max_reg(acc: u16, op: &KOp) -> u16 {
             see(*dst);
             see(*val);
         }
+        KOp::ArrayPop { dst, .. } => see(*dst),
         KOp::StoreProp { src, .. } => see(*src),
         KOp::CallKernel {
             dst, base, argc, ..
@@ -1197,6 +1208,10 @@ fn dce_movs(kops: &mut Vec<KOp>, always_live: u128, upvalue_uses: u128, n_regs: 
             }
             KOp::ArrayPush { dst, val, bail, .. } => {
                 uses[i] = bit(*val);
+                defs[i] = bit(*dst);
+                succ[i] = (true, Some(*bail));
+            }
+            KOp::ArrayPop { dst, bail, .. } => {
                 defs[i] = bit(*dst);
                 succ[i] = (true, Some(*bail));
             }
@@ -1298,7 +1313,8 @@ fn patch(kops: &mut [KOp], kidx: usize, pc: u16) {
         KOp::LoadElem { bail, .. }
         | KOp::StoreElem { bail, .. }
         | KOp::LoadLen { bail, .. }
-        | KOp::ArrayPush { bail, .. } => *bail = pc,
+        | KOp::ArrayPush { bail, .. }
+        | KOp::ArrayPop { bail, .. } => *bail = pc,
         _ => unreachable!("patching a non-branch kop"),
     }
 }
@@ -1536,7 +1552,8 @@ impl Xlate<'_> {
             | VE::SelfFn
             | VE::MathObj
             | VE::MathFn(_)
-            | VE::ArrayPushFn(_) => None,
+            | VE::ArrayPushFn(_)
+            | VE::ArrayPopFn(_) => None,
             VE::Num => {
                 // Phase 1 discovery only. (A local used BOTH as a base and
                 // numerically is caught in phase 2: its loads become `Obj`
@@ -1928,9 +1945,12 @@ impl Xlate<'_> {
                         self.vstack.push(VE::MathObj);
                         self.origins.push(None);
                     }
-                    VE::MathFn(_) | VE::Undef | VE::Opaque | VE::SelfFn | VE::ArrayPushFn(_) => {
-                        return None
-                    }
+                    VE::MathFn(_)
+                    | VE::Undef
+                    | VE::Opaque
+                    | VE::SelfFn
+                    | VE::ArrayPushFn(_)
+                    | VE::ArrayPopFn(_) => return None,
                 }
             }
             Op::Swap => {
@@ -2186,12 +2206,17 @@ impl Xlate<'_> {
                 // to this routing — the region then rejects at the
                 // consumer — which is acceptable for so method-shaped a
                 // name.
-                if !self.fn_mode && key == "push" {
+                if !self.fn_mode && (key == "push" || key == "pop") {
                     let obj = self.base_slot(0)?;
                     self.pop()?;
-                    self.vstack.push(VE::ArrayPushFn(obj));
+                    if key == "push" {
+                        self.vstack.push(VE::ArrayPushFn(obj));
+                        self.uses_array_push = true;
+                    } else {
+                        self.vstack.push(VE::ArrayPopFn(obj));
+                        self.uses_array_pop = true;
+                    }
                     self.origins.push(None);
-                    self.uses_array_push = true;
                     return Some(());
                 }
                 if key == "length" {
@@ -2289,6 +2314,24 @@ impl Xlate<'_> {
                     self.kops.push(K::ArrayPush {
                         obj: s,
                         val,
+                        dst,
+                        bail: u16::MAX,
+                    });
+                    self.exits.push((kidx, self.base_ip + i as u32, shape));
+                    return Some(());
+                }
+                // `a.pop()`: [.., ArrayPopFn(s), Obj(s)], no arguments.
+                if let VE::ArrayPopFn(s) = *self.vstack.get(fn_pos)? {
+                    if n != 0 || !matches!(self.vstack.get(fn_pos + 1)?, VE::Obj(s2) if *s2 == s) {
+                        return None;
+                    }
+                    let shape = self.vstack.clone();
+                    self.pop()?; // this (the array)
+                    self.pop()?; // fn
+                    let dst = self.push_num()?;
+                    let kidx = self.kops.len();
+                    self.kops.push(K::ArrayPop {
+                        obj: s,
                         dst,
                         bail: u16::MAX,
                     });

@@ -25,6 +25,8 @@ pub struct Realm {
     /// live `push` property (and a bail can reconstruct the method on the
     /// operand stack). `None` only mid-bootstrap.
     pub array_push: Option<JsObject>,
+    /// As `array_push`, for `Array.prototype.pop` (`KOp::ArrayPop`).
+    pub array_pop: Option<JsObject>,
 
     pub object_proto: JsObject,
     pub function_proto: JsObject,
@@ -179,6 +181,7 @@ impl Realm {
             math_object: None,
             math_kernel: Vec::new(),
             array_push: None,
+            array_pop: None,
             object_proto: bare(),
             function_proto: bare(),
             array_proto: bare(),

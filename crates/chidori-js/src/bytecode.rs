@@ -1043,6 +1043,13 @@ pub enum KOp {
         dst: u16,
         bail: u16,
     },
+    /// Pinned-native `Array.prototype.pop` over the dense array in object
+    /// slot `obj`: remove the last element (a non-hole `Number`, else bail —
+    /// an empty array's `undefined` result and a trailing hole's prototype
+    /// consult belong to the generic path) and set `regs[dst]` to it. Entry
+    /// guard as [`KOp::ArrayPush`] (canonical method + receiver resolution,
+    /// `Kernel::uses_array_pop`); the receiver conditions re-check per op.
+    ArrayPop { obj: u16, dst: u16, bail: u16 },
     /// `regs[dst] = <length>` of the dense array in object slot `obj`
     /// (unshadowed only — a reified `length` marker bails).
     LoadLen { dst: u16, obj: u16, bail: u16 },
@@ -1183,6 +1190,8 @@ pub enum KShapeSlot {
     /// proved the live value IS the canonical, so a bail reconstructs it
     /// from the realm — exactly like `MathFn`).
     ArrayPushFn,
+    /// The canonical `Array.prototype.pop`, likewise.
+    ArrayPopFn,
     /// A register statically typed BOOLEAN (holds exactly 0.0/1.0):
     /// materialized as `Value::Bool` — `typeof` must not see a number.
     Bool(u16),
@@ -1331,6 +1340,8 @@ pub struct Kernel {
     /// must verify the canonical `Array.prototype.push` still backs the
     /// `push` property of the canonical Array prototype.
     pub uses_array_push: bool,
+    /// As `uses_array_push`, for [`KOp::ArrayPop`] / `pop`.
+    pub uses_array_pop: bool,
     /// The original loop-header op this kernel replaced; executed verbatim
     /// when the guard declines.
     pub fallback: Box<Op>,
