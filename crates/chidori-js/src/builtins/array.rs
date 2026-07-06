@@ -339,15 +339,34 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     vm.define_method(proto, "push", 1, |vm, this, args| {
         // Dense fast path: an UNSHADOWED (`props` empty — no reified length
         // marker, no index accessors, not frozen/sealed), extensible dense
-        // array appends straight onto the backing vec — one borrow total, no
-        // per-element index→String key, hashing, or prototype walk. These are
-        // exactly the kernel `StoreElem` append conditions; the dense-storage
-        // bound falls back to the generic path, which owns that RangeError.
+        // array appends straight onto the backing vec — no per-element
+        // index→String key or generic Set machinery. Appending CREATES
+        // properties, so the spec consults the prototype chain: the walk is
+        // one cheap reified-index probe per proto (`protos_allow_index_create`
+        // — a polluted chain declines to the generic path, which fires the
+        // proto accessor). The dense-storage bound also falls back to the
+        // generic path, which owns that RangeError.
         if let Value::Object(o) = &this {
-            let mut b = o.borrow_mut();
-            if b.props.is_empty() && b.extensible {
-                if let Internal::Array(arr) = &mut b.internal {
-                    if arr.len() + args.len() <= crate::value::MAX_DENSE_ARRAY {
+            let start = {
+                let b = o.borrow();
+                if b.props.is_empty() && b.extensible {
+                    match &b.internal {
+                        Internal::Array(arr)
+                            if arr.len() + args.len() <= crate::value::MAX_DENSE_ARRAY =>
+                        {
+                            Some((arr.len() as u32, b.proto.clone()))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some((start, proto)) = start {
+                if crate::value::protos_allow_index_create(proto, start, args.len() as u32) {
+                    // No user code ran since the guard borrow; the conditions
+                    // still hold.
+                    if let Internal::Array(arr) = &mut o.borrow_mut().internal {
                         arr.extend_from_slice(args);
                         return Ok(Value::Number(arr.len() as f64));
                     }

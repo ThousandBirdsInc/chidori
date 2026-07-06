@@ -2879,48 +2879,60 @@ impl Vm {
                 // slot is a plain writable data property per the array exotic
                 // [[Set]] — no setter, no length change, no extensibility
                 // interaction), fill an in-bounds HOLE, or append at exactly
-                // `length` — the same conditions as the kernel `StoreElem`
-                // fast path. Filling and appending CREATE a property, so they
-                // additionally require the array to be extensible (a sealed/
-                // prevented receiver must reject through the generic path)
-                // and to stay under the dense-storage bound (the generic path
-                // owns that RangeError). Gaps past the end, shadowed elements,
-                // and non-arrays take the spec path.
+                // `length`. Filling and appending CREATE a property (the own
+                // property is absent), so they additionally require the array
+                // to be extensible (a sealed/prevented receiver must reject
+                // through the generic path), the dense-storage bound (the
+                // generic path owns that RangeError), and a prototype chain
+                // with no reified entry at the index — OrdinarySet consults
+                // the chain for an absent own property, so a proto accessor /
+                // non-writable index must intercept via the generic path
+                // (`protos_allow_index_create`). Gaps past the end, shadowed
+                // elements, and non-arrays take the spec path.
                 if let (Value::Object(o), Value::Number(n)) = (&obj, &key_v) {
                     if n.fract() == 0.0 && *n >= 0.0 && *n < 4294967295.0 {
-                        let mut b = o.borrow_mut();
-                        if b.props.is_empty() {
-                            let extensible = b.extensible;
-                            if let Internal::Array(arr) = &mut b.internal {
-                                let i = *n as usize;
-                                let ok = match arr.get_mut(i) {
-                                    Some(slot) if !matches!(slot, Value::Hole) => {
-                                        *slot = value.clone();
-                                        true
-                                    }
-                                    Some(slot) => {
-                                        // In-bounds hole: creation.
-                                        if extensible {
+                        let i = *n as usize;
+                        let mut creates = None;
+                        {
+                            let mut b = o.borrow_mut();
+                            if b.props.is_empty() {
+                                let extensible = b.extensible;
+                                if let Internal::Array(arr) = &mut b.internal {
+                                    match arr.get_mut(i) {
+                                        Some(slot) if !matches!(slot, Value::Hole) => {
                                             *slot = value.clone();
-                                            true
-                                        } else {
-                                            false
+                                            drop(b);
+                                            push!(value);
+                                            return Ok(Ctl::Next);
+                                        }
+                                        Some(_) => {
+                                            if extensible {
+                                                creates = Some(b.proto.clone());
+                                            }
+                                        }
+                                        None => {
+                                            if extensible
+                                                && i == arr.len()
+                                                && i < crate::value::MAX_DENSE_ARRAY
+                                            {
+                                                creates = Some(b.proto.clone());
+                                            }
                                         }
                                     }
-                                    None => {
-                                        // Exact append (no hole gap).
-                                        if extensible
-                                            && i == arr.len()
-                                            && i < crate::value::MAX_DENSE_ARRAY
-                                        {
-                                            arr.push(value.clone());
-                                            true
-                                        } else {
-                                            false
-                                        }
+                                }
+                            }
+                        }
+                        if let Some(proto) = creates {
+                            if crate::value::protos_allow_index_create(proto, i as u32, 1) {
+                                // No user code ran since the conditions were
+                                // checked (same native frame), so they still
+                                // hold.
+                                let mut b = o.borrow_mut();
+                                if let Internal::Array(arr) = &mut b.internal {
+                                    match arr.get_mut(i) {
+                                        Some(slot) => *slot = value.clone(),
+                                        None => arr.push(value.clone()),
                                     }
-                                };
-                                if ok {
                                     drop(b);
                                     push!(value);
                                     return Ok(Ctl::Next);
