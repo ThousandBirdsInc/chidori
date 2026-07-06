@@ -894,6 +894,7 @@ fn install_json(vm: &mut Vm) {
             bytes: s.as_str().as_bytes(),
             pos: 0,
             src: s.as_str(),
+            keys: Default::default(),
         };
         p.skip_ws();
         let v = p.parse_value(vm)?;
@@ -1121,6 +1122,17 @@ struct JsonParser<'a> {
     bytes: &'a [u8],
     pos: usize,
     src: &'a str,
+    /// Distinct object keys seen so far, interned by SOURCE SLICE: the
+    /// dominant JSON shape — an array of same-structure records — repeats
+    /// each key once per record, and the naive path paid two allocations
+    /// per occurrence (the parsed `String`, then its `Rc<str>` copy inside
+    /// `PropertyKey::str`). A hit here is one `Rc` bump. Escaped keys (rare)
+    /// take the general string parser uninterned.
+    keys: std::collections::HashMap<
+        &'a str,
+        PropertyKey,
+        std::hash::BuildHasherDefault<crate::fxhash::FxHasher>,
+    >,
 }
 
 impl<'a> JsonParser<'a> {
@@ -1339,6 +1351,31 @@ impl<'a> JsonParser<'a> {
         }
         Ok(Value::Object(vm.new_array(elems)))
     }
+    /// An object key: the unescaped fast path is interned by source slice
+    /// (see the `keys` field); anything needing escape processing falls back
+    /// to the general string parser. `self.pos` is on the opening quote.
+    fn parse_key(&mut self, vm: &mut Vm) -> Result<PropertyKey, Value> {
+        let start = self.pos + 1;
+        let mut i = start;
+        while i < self.bytes.len() {
+            match self.bytes[i] {
+                b'"' => {
+                    let s = &self.src[start..i];
+                    self.pos = i + 1;
+                    if let Some(k) = self.keys.get(s) {
+                        return Ok(k.clone());
+                    }
+                    let k = PropertyKey::str(s);
+                    self.keys.insert(s, k.clone());
+                    return Ok(k);
+                }
+                b'\\' | 0x00..=0x1f => break,
+                _ => i += 1,
+            }
+        }
+        Ok(PropertyKey::str(self.parse_string(vm)?))
+    }
+
     fn parse_object(&mut self, vm: &mut Vm) -> Result<Value, Value> {
         self.pos += 1;
         let obj = vm.new_object();
@@ -1352,16 +1389,14 @@ impl<'a> JsonParser<'a> {
             if self.pos >= self.bytes.len() || self.bytes[self.pos] != b'"' {
                 return Err(vm.throw_syntax("Expected string key in JSON object"));
             }
-            let key = self.parse_string(vm)?;
+            let key = self.parse_key(vm)?;
             self.skip_ws();
             if self.pos >= self.bytes.len() || self.bytes[self.pos] != b':' {
                 return Err(vm.throw_syntax("Expected ':' in JSON object"));
             }
             self.pos += 1;
             let v = self.parse_value(vm)?;
-            obj.borrow_mut()
-                .props
-                .insert(PropertyKey::str(&key), Property::data(v));
+            obj.borrow_mut().props.insert(key, Property::data(v));
             self.skip_ws();
             if self.pos >= self.bytes.len() {
                 return Err(vm.throw_syntax("Unexpected end of JSON input"));
