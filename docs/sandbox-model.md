@@ -1,12 +1,12 @@
 # Sandbox model of the chidori-js runtime
 
-> **Status:** Implemented, with documented gaps (see [Current gaps](#current-gaps)).
-> Two layers ship today: the default **in-process** capability-confinement
+> Two layers ship: the default **in-process** capability-confinement
 > sandbox, and an **opt-in OS-level isolation** mode (`--isolate`) that runs each
 > agent in a confined child process — see
-> [OS-level isolation](#os-level-isolation-opt-in---isolate).
-> **Target engine:** the pure-Rust `chidori-js` engine — the only JS engine in
-> the tree (the QuickJS/C path was removed in #39).
+> [OS-level isolation](#os-level-isolation-opt-in---isolate). Known limitations
+> are documented in [Current gaps](#current-gaps).
+> **Engine:** the pure-Rust `chidori-js` engine — the only JS engine in
+> the tree.
 > **Related:** [`docs/os-isolation-plan.md`](./os-isolation-plan.md),
 > [`docs/captured-effects-vfs-crypto-timers.md`](./captured-effects-vfs-crypto-timers.md),
 > [`docs/conformance.md`](./conformance.md).
@@ -35,7 +35,7 @@ the host *does* inject (`http`, `workspace.*`). Those are real capabilities;
 whether granting them is "safe" depends entirely on whether the agent code is
 trusted.
 
-For that case there is now an **opt-in OS-level isolation mode**
+For that case there is an **opt-in OS-level isolation mode**
 (`--isolate` / `CHIDORI_ISOLATE=process`): each run executes in a disposable
 child process that holds *only* the JS engine and brokers every effect back to
 the trusted parent over a pipe. The child runs under a per-OS sandbox (Linux:
@@ -77,7 +77,7 @@ The pure engine (`crates/chidori-js`) is a parser (`oxc`) → bytecode compiler 
 stack VM with `Rc<RefCell>` reference counting. Two properties make it a sandbox:
 
 1. **Memory safety.** There is **zero `unsafe`** in the engine crate (the word
-   appears only in doc comments — e.g. `host.rs` describing the *old* QuickJS FFI). The
+   appears only in doc comments). The
    whole stack is safe Rust plus `oxc`. The worst an interpreter bug can do is
    panic or misbehave — it cannot corrupt memory or jump into host code. This is a
    categorical improvement over embedding a C/C++ engine (QuickJS, V8) in-process.
@@ -92,9 +92,9 @@ stack VM with `Rc<RefCell>` reference counting. Two properties make it a sandbox
      is **not** a `chidori.*` method — it is brokered through the internal
      `globalThis.__chidori_http` global (forwarded as the `"http"` effect),
      reached only via the captured `fetch`/`node:http` surface. The
-     `execJs`/`execPython`/`execWasm` JS stubs remain defined but are inert — the
-     host backend rejects the effect (`… is not supported on the rust engine`)
-     since the snippet sandboxes were removed in #39.
+     `execJs`/`execPython`/`execWasm` JS stubs are defined but inert — the
+     host backend rejects the effect (`… is not supported on the rust engine`);
+     there are no snippet sandboxes.
    - `Engine::install_sync_natives` wires the synchronous `__chidori_*` natives the
      `node:` shims call (crypto hashing/HMAC, captured randomness, the VFS).
 
@@ -151,8 +151,8 @@ Two complementary layers:
 1. **Per-op string cap (always on, in-engine).** `op_add` and `ConcatStrings`
    (template join) throw `RangeError` when a single concatenation would exceed
    `MAX_STRING_LEN` (16M code units, `crates/chidori-js/src/value.rs`). This closes the
-   exponential `s += s` / `` s = `${s}${s}` `` OOM — previously unbounded, now
-   capped — and matches the existing caps on `repeat`/`padStart`/`padEnd` and on
+   exponential `s += s` / `` s = `${s}${s}` `` OOM
+   and matches the caps on `repeat`/`padStart`/`padEnd` and on
    dense-array allocation (`MAX_DENSE_ARRAY` = 1M). With these caps, no *single*
    opcode can allocate without bound.
 
@@ -217,8 +217,8 @@ interpreter RCE would land in the host process. The `--isolate` mode adds that
 boundary. It is **off by default** (in-process stays the default for trusted
 local dev) and **additive** — agent code, the SDKs, the durable call log, and
 replay semantics are byte-for-byte unchanged (asserted by
-`rust_engine::tests::isolated_run_matches_in_process_byte_for_byte`). The design
-and phasing live in [`docs/os-isolation-plan.md`](./os-isolation-plan.md); this
+`rust_engine::tests::isolated_run_matches_in_process_byte_for_byte`). The full
+design lives in [`docs/os-isolation-plan.md`](./os-isolation-plan.md); this
 is the operator-facing summary. Code: `crates/chidori/src/runtime/isolate/`.
 
 ### Process-per-run with brokered effects
@@ -272,8 +272,8 @@ Deliberately **not** set: `RLIMIT_AS` (address-space caps are too blunt — a
 multi-threaded VM over-reserves virtual memory) and `RLIMIT_NPROC` (counts every
 process of the real uid, fragile under shared-uid concurrency; blocking `fork`
 belongs to seccomp). A hard per-run memory ceiling via cgroup v2 `memory.max` is
-the tracked follow-up; until then the in-process heap watchdog (now a clean
-per-process measure) is the stand-in.
+not yet wired; the in-process heap watchdog (a clean per-process measure under
+isolation) is the stand-in.
 
 On top of the floor the **parent** runs a wall-clock **deadline-kill** watchdog
 (`CHIDORI_ISOLATE_DEADLINE_MS`): a thread that `SIGKILL`s a wedged child that has
@@ -328,10 +328,9 @@ remain legal:
 | Network egress blocked at OS | ✅ empty netns | ✅ Seatbelt deny |
 | Filesystem writes blocked at OS | ✅ Landlock + seccomp | ✅ Seatbelt deny |
 | Syscall confinement | ✅ seccomp denylist | ⚠️ Seatbelt (coarser) |
-| Hard memory ceiling | ⏳ cgroup `memory.max` (deferred) | ⏳ deferred |
+| Hard memory ceiling | ⏳ cgroup `memory.max` (not yet wired) | ⏳ not yet wired |
 
-Windows is documented in the plan as a future tier (Job Object + restricted
-token); it is not a shipped target today.
+Windows is not a shipped isolation target.
 
 ### Failure mapping
 
@@ -373,16 +372,16 @@ These are the known limitations as of this writing. None of them are
 memory-safety holes (the engine is safe Rust); they are confinement and
 resource-precision gaps.
 
-1. **The bare-CLI default is still allow.** The powerful effects — `http` (real
+1. **The bare-CLI default is allow.** The powerful effects — `http` (real
    outbound network requests) and `workspace.*` (real disk I/O within a sanitized
    root) — all pass through the policy enforcement gate (`enforce_policy`), and the
-   surface where untrusted callers actually arrive is now deny-by-default:
+   surface where untrusted callers actually arrive is deny-by-default:
    **`chidori serve` runs under the [`untrusted` profile](#the-untrusted-policy-profile-deny-by-default)
    unless the operator explicitly configures policy** (any valid `CHIDORI_POLICY*`
    source, or the `--trusted` flag to opt back into the permissive default;
    malformed policy configuration fails closed to deny rather than falling back to
-   allow-all). What deliberately remains permissive is `chidori run` without
-   flags: local CLI runs of developer-authored code keep the historical
+   allow-all). What is deliberately permissive is `chidori run` without
+   flags: local CLI runs of developer-authored code get the
    `AlwaysAllow` fallback, with `--untrusted` /
    `CHIDORI_POLICY_PROFILE=untrusted` available when the code being run is not
    trusted.
@@ -390,14 +389,14 @@ resource-precision gaps.
 2. **Per-run memory accounting is thread-attributed, not ownership-attributed.**
    Each run registers a per-run meter on its execution thread
    (`src/mem_guard.rs::RunMeterGuard`), so the cap measures that run's own
-   allocations and concurrent runs no longer trip each other's caps. The residual
+   allocations and concurrent runs do not trip each other's caps. The residual
    imprecision: bytes a host effect allocates on *other* threads (e.g. tokio
    workers buffering an HTTP response) are not charged until they reach the run
    thread, and a value allocated on the run thread but freed elsewhere stays
    charged (the meter clamps at zero in the other direction). For a
-   single-threaded VM run this drift is small; true ownership accounting (charge
-   at string/object allocation, credit on `Drop` inside the engine) remains the
-   eventual fix. **Under [`--isolate`](#os-level-isolation-opt-in---isolate) this
+   single-threaded VM run this drift is small; only true ownership accounting
+   (charge at string/object allocation, credit on `Drop` inside the engine)
+   would eliminate it. **Under [`--isolate`](#os-level-isolation-opt-in---isolate) this
    drift disappears**: each run is its own process, so the meter is a clean
    per-process measure with no cross-tenant attribution.
 
@@ -406,18 +405,18 @@ resource-precision gaps.
    the trip every 256 ops). A run can therefore overshoot the cap briefly before
    unwinding. Bounded in practice because the per-op size caps mean no single
    opcode allocates more than ~16 MB, but it is not a hard instantaneous ceiling.
-   A *hard*, kernel-enforced ceiling (cgroup v2 `memory.max`) is the eventual fix
-   under [`--isolate`](#os-level-isolation-opt-in---isolate) but is deferred — see
+   A *hard*, kernel-enforced ceiling (cgroup v2 `memory.max`) under
+   [`--isolate`](#os-level-isolation-opt-in---isolate) is not yet wired — see
    gap #4.
 
 4. **OS-level isolation is opt-in, not the default.** By default the engine runs
    in-process with the host — no seccomp, namespace, or separate-process boundary
    — so the default posture is purely capability-confinement plus Rust memory
-   safety. The [`--isolate` mode](#os-level-isolation-opt-in---isolate) now
-   *provides* that boundary, but the operator must enable it; in-process remains
-   the default for trusted local dev. Remaining sub-gaps within the isolated path:
-   - **No hard memory ceiling yet.** cgroup v2 `memory.max` needs delegation and
-     is deferred; `RLIMIT_AS` is too blunt for a multi-threaded VM. The polled
+   safety. The [`--isolate` mode](#os-level-isolation-opt-in---isolate)
+   *provides* that boundary, but the operator must enable it; in-process is
+   the default for trusted local dev. Sub-gaps within the isolated path:
+   - **No hard memory ceiling.** cgroup v2 `memory.max` needs delegation and
+     is not yet wired; `RLIMIT_AS` is too blunt for a multi-threaded VM. The polled
      heap watchdog (cleaner per-process under isolation) is the stand-in.
    - **seccomp is a denylist, not an allowlist.** Real confinement today but the
      near-empty allowlist remains the stronger end state.
@@ -434,13 +433,13 @@ resource-precision gaps.
 
 6. **Cycles are reclaimed only at run boundaries.** `Rc<RefCell>` cannot
    reclaim cycles mid-run. `run_module` calls `Vm::dispose()` after every run
-   (`src/runtime/rust_engine.rs`), breaking the realm-connected cycles so a
-   long-lived server thread does not leak run-over-run; a refcount-accounting
-   cycle collector also exists (`Vm::collect_cycles`,
-   `crates/chidori-js/src/gc.rs`) but is not yet wired into the run loop, so
-   within a run cycles accumulate until teardown (and `dispose` misses cycles
-   already disconnected from the realm roots). The per-run memory cap is the
-   backstop for the bytes involved. **The
+   (`src/runtime/rust_engine.rs`), which breaks the outgoing edges of every
+   object the VM allocated — including cycles disconnected from the realm
+   roots — so a long-lived server thread does not leak run-over-run. A
+   refcount-accounting cycle collector also exists (`Vm::collect_cycles`,
+   `crates/chidori-js/src/gc.rs`) but is not wired into the run loop, so
+   within a run cycles accumulate until teardown. The per-run memory cap is
+   the backstop for the bytes involved. **The
    [`--isolate`](#os-level-isolation-opt-in---isolate) path sidesteps this
    entirely**: the child process exits after one run (spawn-per-run, no warm
    pool), so no state — leaked or otherwise — survives across runs.
@@ -579,9 +578,6 @@ The protections above are exercised by:
   caps throw `RangeError` rather than OOM.
 - `src/runtime/rust_engine.rs::tests::run_agent_opcode_budget_terminates_infinite_loop`
   — the opcode budget terminates a runaway loop.
-- Manual end-to-end (rust engine + global allocator active): a Map-of-8 MB-strings
-  agent trips at a 64 MB cap (`execution interrupted`) yet completes under a
-  generous cap; an infinite loop trips a 500 ms deadline.
 
 OS isolation (`--isolate`) is exercised by:
 - `src/runtime/rust_engine.rs::tests::isolated_run_matches_in_process_byte_for_byte`

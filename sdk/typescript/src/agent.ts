@@ -260,7 +260,7 @@ export interface SignalSender {
 }
 
 /**
- * A named message delivered into a run mid-flight (`docs/signals.md` §6.1). The
+ * A named message delivered into a run mid-flight (`docs/signals.md`). The
  * inverse of `input()`: an outside party (human or agent) pushes
  * `{ name, payload, from }` at an agent-declared listen point. Every signal is
  * recorded in the call log, so the multiplayer session replays deterministically.
@@ -283,9 +283,9 @@ export interface SignalOptions {
 
 /**
  * The sentinel a `timeoutMs` listen point resolves to when the deadline passes
- * with no matching delivery (`docs/signals.md` §16, pinned:
- * resolve-to-sentinel rather than reject). `name` is the single awaited name,
- * or `null` for a multi-name `signalAny`.
+ * with no matching delivery — a timeout resolves to this sentinel rather than
+ * rejecting (`docs/signals.md`). `name` is the single awaited name, or `null`
+ * for a multi-name `signalAny`.
  */
 export interface SignalTimeout {
   name: string | null;
@@ -299,7 +299,7 @@ export interface ParallelOptions {
 }
 
 /**
- * One `chidori.branch` variant (`docs/branching-execution.md` §6.1). A branch
+ * One `chidori.branch` variant (`docs/branching-execution.md`). A branch
  * runs its own continuation source module from the parent's anchored state —
  * not a re-run of the parent agent — so `source` is required.
  */

@@ -248,8 +248,7 @@ const result = await chidori.tool("web_search", { query: "snapshot runtime" });
 ```
 
 Tools discovered from disk are TypeScript `.ts` modules or MCP-backed remote
-tools. The legacy Starlark dialect was removed; any `.star` tools left on disk
-are ignored by tool directory discovery.
+tools. Tool directory discovery ignores `.star` files.
 
 ### callAgent
 
@@ -269,9 +268,9 @@ const [a, b] = await chidori.parallel([
 ]);
 ```
 
-The current TypeScript helper uses `Promise.all` semantics;
-`options.concurrency` caps in-flight tasks. True durable parallel host
-execution is gated on host-backed promises and branch snapshots.
+The TypeScript helper uses `Promise.all` semantics;
+`options.concurrency` caps in-flight tasks. Host execution is not durably
+parallel.
 
 ### branch
 
@@ -435,7 +434,7 @@ if (!result.ok) {
 }
 ```
 
-`RetryOptions` also accepts `delayMs` and `backoff`, but the current helper
+`RetryOptions` also accepts `delayMs` and `backoff`, but the helper
 retries immediately — no delay is applied between attempts.
 
 ## TypeScript Tool Shape
@@ -586,10 +585,9 @@ catch-all test provider and avoids external network calls.
 Current resume/replay uses the call log plus persisted host-promise metadata:
 the agent re-executes and host calls return cached records. Persisted
 TypeScript runs also write `runtime.snapshot` and `runtime.snapshot.json`
-metadata. Replay **is** the resume mechanism by design — the QuickJS live-VM
-snapshot path (direct VM continuation from `runtime.snapshot` without replay)
-was removed in #39, not merely deferred, so the manifest carries
-journal/scaffold metadata rather than serialized VM bytes.
+metadata. Replay **is** the resume mechanism by design — there is no direct VM
+continuation from `runtime.snapshot`; the manifest carries journal/scaffold
+metadata rather than serialized VM bytes.
 
 Snapshot manifests record:
 

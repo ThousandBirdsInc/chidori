@@ -1,9 +1,8 @@
 # Context Management — Cache-Aware, Composable Prompts
 
-> **Status:** Shipped. Provider prompt caching, the `chidori.context` builder,
-> the `chidori.conversation` wrapper, window compaction, and the local
-> content-addressed prompt cache are all implemented and on by default where
-> noted below.
+> Provider prompt caching, the `chidori.context` builder, the
+> `chidori.conversation` wrapper, window compaction, and the local
+> content-addressed prompt cache — on by default where noted below.
 > **Related:** `docs/signals.md`, `docs/branching-execution.md`,
 > `docs/captured-effects-vfs-crypto-timers.md`, `docs/architecture.md`.
 > API reference: `sdk/typescript/src/agent.ts`, `llm.txt`. Example:
@@ -179,9 +178,9 @@ auto-marks cacheable boundaries:
 
 - the **`system`** block (stable for the whole run),
 - the **`tools`** array (stable for the whole tool-use loop),
-- the **newest message** — freezing the whole conversation head — whenever a
-  follow-up sharing the prefix is plausible: a tool-use loop is coming
-  (`tools` non-empty) or the request is already multi-turn.
+- the **newest message**, which freezes the whole conversation head — marked
+  whenever a follow-up sharing the prefix is plausible: the request carries
+  tools (so a tool-use loop is likely) or is already multi-turn.
 
 This is `host_core::auto_mark_prompt_cache`
 (`crates/chidori/src/runtime/host_core.rs`), gated by a default-on posture that
@@ -217,7 +216,7 @@ prefix pays for that prefix once instead of ten times, with no code change.
   `total_cost_usd` reflects the real bill.
 - `RunSpan` (`crates/chidori/src/runtime/otel.rs`) stamps
   `gen_ai.usage.cache_creation_tokens` / `_read_tokens` on prompt spans, so cache
-  effectiveness is visible in tael with no new pipeline.
+  effectiveness is visible in OTEL with no new pipeline.
 
 ### 4.4 `cacheBreakpoint()` is advisory and coalesced
 
@@ -311,7 +310,8 @@ recorded result or any replay:
   before request assembly or any provider call. A replayed run can run with
   caching entirely disabled and produce a byte-identical call log. *The log is
   the source of truth; every cache is a live-only optimization* — the same
-  argument the signal mailbox makes (`docs/signals.md` §10).
+  argument the signal mailbox makes (see the determinism argument in
+  `docs/signals.md`).
 - **The local cache is served only on the live path**, after the replay
   short-circuit has already declined, then recorded as a normal `CallRecord` —
   exactly as if the provider had answered.
@@ -453,26 +453,20 @@ Where each piece lives, for maintainers:
 | SDK types & example | `sdk/typescript/src/agent.ts`, `examples/agents/context_qa.ts` |
 
 `chidori-js` is the only JavaScript engine — everything here ships
-unconditionally; there is no engine feature flag or QuickJS path to gate on.
+unconditionally; there is no engine feature flag to gate on.
 
 ---
 
-## 11. Testing & verification
+## 11. Tests
 
-- `cargo check -p chidori` — 0 errors.
-- `cargo test -p chidori --lib` — provider serialization, cost, prompt-cache,
-  and context/digest tests. Notable cases:
-  - `providers/anthropic.rs`: `unmarked_request_body_has_no_cache_control` (no
-    regression), `marked_request_emits_cache_control_layout`,
-    `usage_cache_token_fields_parse_and_default`.
-  - `runtime/cost.rs`: `test_cache_tokens_price_at_documented_multiples`.
-  - `runtime/prompt_cache.rs`: `store_then_lookup_roundtrips_and_misses_are_none`,
-    `disabled_without_env_flag`.
-- Determinism guard: the `chidori-js` Test262 baseline is unchanged — all of this
-  is additive and inert unless an agent opts into `context` / caching.
-- Manual cost check: run the §9 agent with caching on vs `cache: false`; confirm
-  `cache_read` tokens appear from turn 2 and `total_cost_usd` drops with
-  identical answers.
+The guarantees above are pinned by `cargo test -p chidori --lib`:
+
+- `providers/anthropic.rs`: `unmarked_request_body_has_no_cache_control`,
+  `marked_request_emits_cache_control_layout`,
+  `usage_cache_token_fields_parse_and_default`.
+- `runtime/cost.rs`: `test_cache_tokens_price_at_documented_multiples`.
+- `runtime/prompt_cache.rs`: `store_then_lookup_roundtrips_and_misses_are_none`,
+  `disabled_without_env_flag`.
 
 ---
 

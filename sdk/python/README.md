@@ -87,8 +87,8 @@ Snapshot-aware checkpoints include the replay call log plus optional manifest
 metadata. Durable resume is exposed through `client.resume(session_id,
 response)` for paused sessions, recovering through persisted host-promise
 metadata and the replay journal. Replay **is** the resume mechanism by design —
-the QuickJS live-VM snapshot path was removed in #39, not merely deferred, so
-the manifest carries journal/scaffold metadata rather than serialized VM bytes.
+there is no live-VM image to restore; the manifest carries journal/scaffold
+metadata rather than serialized VM bytes.
 
 Mirrors the TypeScript SDK (`sdk/typescript/`) method-for-method. See the
 top-level `examples/sdk_demo.py` for a longer walkthrough and

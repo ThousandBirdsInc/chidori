@@ -17,7 +17,7 @@ API reference.
 | `chidori.tool(name, args)` | Invoke a registered tool |
 | `chidori.callAgent(path, input)` | Call a sub-agent |
 | `chidori.parallel(fns)` | Run functions concurrently |
-| `chidori.branch(variants)` | Fork the run into per-strategy sub-runs from the current state; returns every outcome for comparison ([design](./branching-execution.md)) |
+| `chidori.branch(variants)` | Fork the run into per-strategy sub-runs from the current state; returns every outcome for comparison ([details](./branching-execution.md)) |
 | `chidori.input(msg, options)` | Human-in-the-loop — pauses execution |
 | `chidori.signal(name, options)` | Multiplayer — pause at a named listen point until an outside party (human or agent) delivers `{ name, payload, from }`; drains a durable mailbox if one is queued; `timeoutMs` resolves to a `{ timedOut: true }` sentinel after the deadline |
 | `chidori.pollSignal(name)` | Non-blocking signal check — consume a queued signal of this name or resolve to `null` |
