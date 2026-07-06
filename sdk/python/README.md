@@ -91,8 +91,8 @@ the QuickJS live-VM snapshot path was removed in #39, not merely deferred, so
 the manifest carries journal/scaffold metadata rather than serialized VM bytes.
 
 Mirrors the TypeScript SDK (`sdk/typescript/`) method-for-method. See the
-top-level `examples/sdk_demo.py` for a longer walkthrough and the server's
-`README.md` for the HTTP session API this client wraps.
+top-level `examples/sdk_demo.py` for a longer walkthrough and
+`docs/running-modes.md` for the HTTP session API this client wraps.
 
 ## Testing
 

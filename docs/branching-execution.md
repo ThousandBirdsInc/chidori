@@ -132,10 +132,10 @@ record stream is the durable substrate; `CallRecord` lives in
 `src/runtime/call_log.rs`.
 
 ### 4.2 The rust-engine agent path (what `chidori.branch` plugs into)
-`crates/chidori/src/runtime/rust_engine.rs`: `run_agent` → `run_module(path, source, fallback, input,
-ctx, tools)`. `run_module` transpiles TS→JS, builds a **plain `chidori_js::Engine`**,
-installs the `chidori` host object (`install_chidori_effects(make_dispatch(ctx.clone(),
-tools.clone()))`) whose methods route through `RuntimeBindingBackend::dispatch(ctx, tools, effect, args)`
+`crates/chidori/src/runtime/rust_engine.rs`: `run_agent` → `run_module(path, source,
+fallback_export, input, host)`. `run_module` transpiles TS→JS, builds a **plain `chidori_js::Engine`**,
+installs the `chidori` host object (`engine.install_chidori_effects(dispatch)`) whose
+methods route through `HostBindingBackend::dispatch(effect, args)`
 (in `crates/chidori/src/runtime/typescript/bindings.rs`) → `host_core` on the **shared `RuntimeContext`**, installs the `run(handler)` entrypoint,
 and runs it. **Key fact:** on this path the durable record is the `RuntimeContext`
 `call_log` (global `seq`) — *not* the `crates/chidori-js/src/replay.rs` journal (that
@@ -170,10 +170,11 @@ model. These are the hooks the phase-3 soft-divergence model edits (§8.9).
   paused branch, resolve/reject its pending host op, run to the next block.
 - `merge_parallel_branch_outcomes(manifest, outcomes) -> ParallelMergeResult` —
   validates each branch's records fall in its reserved range and concatenates.
-- QuickJS precedent: `src/runtime/typescript/snapshot.rs::run_parallel_branches_from_snapshot`
-  forks the parent context (`fork_context` = `restore_context`), `call_agent(input)`
-  per branch, collects outputs. (Per-branch call-log capture there is still a stub —
-  it merges empty logs; the rust-engine design below captures real per-branch logs.)
+- QuickJS precedent (removed with that engine in #39):
+  `src/runtime/typescript/snapshot.rs::run_parallel_branches_from_snapshot` forked
+  the parent context, ran `call_agent(input)` per branch, and collected outputs.
+  (Its per-branch call-log capture was a stub — it merged empty logs; the design
+  below captures real per-branch logs.)
 
 ### 4.5 State that survives a fork
 `SnapshotManifest` (snapshot.rs) carries `entry`/`modules` `SourceFingerprint`,

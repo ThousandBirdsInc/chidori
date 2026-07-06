@@ -29,9 +29,9 @@ const plan = await chidori.step("plan", () => buildPlan(input)); // expensive, p
 
 Live, `fn` runs once and its JSON-serializable result is recorded as a `step`
 call-log record. On **every** subsequent replay — crash recovery, `input()` /
-approval / signal resume, `chidori trace` re-derivation, `POST
-/sessions/{id}/replay` — the recorded value is returned (or the recorded error
-re-thrown) **without re-running `fn`**. Resume cost becomes proportional to the
+approval / signal resume, `chidori resume`, `POST /sessions/{id}/replay` — the
+recorded value is returned (or the recorded error re-thrown) **without
+re-running `fn`**. Resume cost becomes proportional to the
 un-wrapped code, not the total compute the run has ever done.
 
 ## 2. The contract: pure, synchronous compute

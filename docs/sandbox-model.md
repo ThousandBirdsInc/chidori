@@ -42,9 +42,7 @@ the trusted parent over a pipe. The child runs under a per-OS sandbox (Linux:
 empty network namespace + Landlock read-only filesystem + seccomp syscall
 denylist; macOS: a Seatbelt deny profile) plus a `setrlimit` floor and a
 parent-side deadline-kill — so even a total compromise of the interpreter has no
-ambient network, filesystem, or sibling-run to reach. It is off by default
-(in-process stays the default for trusted local dev) and is additive: agent
-code, the SDKs, the durable format, and replay semantics are unchanged. See
+ambient network, filesystem, or sibling-run to reach. See
 [OS-level isolation](#os-level-isolation-opt-in---isolate).
 
 ## Threat model
@@ -53,8 +51,8 @@ The framework's primary model is **trusted, developer-authored agent code**. The
 "sandbox" exists chiefly to make execution *deterministic and replayable* (route
 all non-determinism through captured effects) and to provide *defense-in-depth*
 against bugs and accidental resource exhaustion — see the product framing in
-[`docs/conformance.md`](./conformance.md) ("Bun/Node language behavior **plus** our
-security sandbox and deterministic replay").
+[`docs/conformance.md`](./conformance.md) (language conformance measured bare,
+with the security sandbox and deterministic replay layered on top).
 
 This doc additionally evaluates the engine against a stricter model —
 **untrusted agent code** — because the architecture (no ambient authority +
@@ -78,8 +76,8 @@ remaining distance.
 The pure engine (`crates/chidori-js`) is a parser (`oxc`) → bytecode compiler →
 stack VM with `Rc<RefCell>` reference counting. Two properties make it a sandbox:
 
-1. **Memory safety.** There is **zero `unsafe`** in the engine crate (the only
-   occurrence is a doc comment in `host.rs` describing the *old* QuickJS FFI). The
+1. **Memory safety.** There is **zero `unsafe`** in the engine crate (the word
+   appears only in doc comments — e.g. `host.rs` describing the *old* QuickJS FFI). The
    whole stack is safe Rust plus `oxc`. The worst an interpreter bug can do is
    panic or misbehave — it cannot corrupt memory or jump into host code. This is a
    categorical improvement over embedding a C/C++ engine (QuickJS, V8) in-process.
@@ -126,9 +124,9 @@ virtual filesystem on `RuntimeContext` (`src/runtime/context.rs` `vfs_*` →
   (`CryptoPolicy`, `TimerPolicy`).
 
 `workspace.*` is different: it performs **real disk I/O**, but is sanitized to a
-workspace root with `..`/absolute-path rejection and symlink-traversal checks (host
-side, in the TypeScript bindings). It is a deliberate capability, not an isolated
-surface.
+workspace root with `..`/absolute-path rejection and symlink-traversal checks
+(host side, `src/runtime/workspace.rs`). It is a deliberate capability, not an
+isolated surface.
 
 ## Resource limits (DoS protection)
 
@@ -152,7 +150,7 @@ Two complementary layers:
 
 1. **Per-op string cap (always on, in-engine).** `op_add` and `ConcatStrings`
    (template join) throw `RangeError` when a single concatenation would exceed
-   `MAX_STRING_LEN` (16 MB, `crates/chidori-js/src/value.rs`). This closes the
+   `MAX_STRING_LEN` (16M code units, `crates/chidori-js/src/value.rs`). This closes the
    exponential `s += s` / `` s = `${s}${s}` `` OOM — previously unbounded, now
    capped — and matches the existing caps on `repeat`/`padStart`/`padEnd` and on
    dense-array allocation (`MAX_DENSE_ARRAY` = 1M). With these caps, no *single*
@@ -206,7 +204,7 @@ The same watchdog can enforce a wall-clock deadline, also via `vm.interrupt`.
 | Memory ceiling (MB, per-run meter) | `CHIDORI_JS_MEM_CAP_MB` | `4096` | `0` |
 | Memory watchdog poll interval (ms) | `CHIDORI_JS_MEM_POLL_MS` | `10` | — |
 | Wall-clock deadline (ms) | `CHIDORI_JS_DEADLINE_MS` | off | — |
-| String length | (compile constant) | 16 MB | — |
+| String length | (compile constant) | 16M code units | — |
 | Dense array length | (compile constant) | 1,000,000 | — |
 | Call depth | (compile constant) | 2,000 | — |
 | Regex steps | (compile constant) | 100,000 | — |
@@ -315,8 +313,9 @@ remain legal:
 - **Seatbelt** via `sandbox_init` (the deprecated-but-stable libSystem FFI
   Chromium's renderer uses) with an allow-default, targeted-deny SBPL profile
   (`(deny network*)` + `(deny file-write*)`) — the same posture as the Linux
-  seccomp+Landlock pair. The one bit of `unsafe`/FFI in the feature is isolated
-  here, out of the engine crate. (Type-checked on the Linux host but
+  seccomp+Landlock pair. The feature's `unsafe` FFI (Seatbelt, `unshare`,
+  `setrlimit`, `kill`) stays in the host-side `isolate/` module, out of the
+  engine crate. (Type-checked on the Linux host but
   runtime-unverified — no macOS CI host yet; the best-effort design degrades a
   load failure to a logged skip.)
 
@@ -415,10 +414,8 @@ resource-precision gaps.
    in-process with the host — no seccomp, namespace, or separate-process boundary
    — so the default posture is purely capability-confinement plus Rust memory
    safety. The [`--isolate` mode](#os-level-isolation-opt-in---isolate) now
-   *provides* that boundary (process-per-run with brokered effects, seccomp /
-   Seatbelt, network namespace + Landlock, an rlimits floor, and a deadline-kill),
-   but the operator must enable it; in-process remains the default for trusted
-   local dev. Remaining sub-gaps within the isolated path:
+   *provides* that boundary, but the operator must enable it; in-process remains
+   the default for trusted local dev. Remaining sub-gaps within the isolated path:
    - **No hard memory ceiling yet.** cgroup v2 `memory.max` needs delegation and
      is deferred; `RLIMIT_AS` is too blunt for a multi-threaded VM. The polled
      heap watchdog (cleaner per-process under isolation) is the stand-in.
@@ -435,17 +432,20 @@ resource-precision gaps.
    individually capped. The memory ceiling (gap 2) is the backstop for the bytes
    they consume; there is no separate per-container element limit.
 
-6. **Reference-counting GC leaks cycles within a run.** `Rc<RefCell>` cannot
-   reclaim cycles; `Vm::dispose()` exists to break the realm's known cycles but
-   `run_module` builds a fresh engine per run and relies on process/run teardown
-   rather than calling it. Long-lived worker threads that reuse state could
-   accumulate leaked bytes across runs; the baseline-relative memory cap is robust
-   to this within a run but not across many runs on a reused thread. **The
+6. **Cycles are reclaimed only at run boundaries.** `Rc<RefCell>` cannot
+   reclaim cycles mid-run. `run_module` calls `Vm::dispose()` after every run
+   (`src/runtime/rust_engine.rs`), breaking the realm-connected cycles so a
+   long-lived server thread does not leak run-over-run; a refcount-accounting
+   cycle collector also exists (`Vm::collect_cycles`,
+   `crates/chidori-js/src/gc.rs`) but is not yet wired into the run loop, so
+   within a run cycles accumulate until teardown (and `dispose` misses cycles
+   already disconnected from the realm roots). The per-run memory cap is the
+   backstop for the bytes involved. **The
    [`--isolate`](#os-level-isolation-opt-in---isolate) path sidesteps this
    entirely**: the child process exits after one run (spawn-per-run, no warm
    pool), so no state — leaked or otherwise — survives across runs.
 
-7. **Engine maturity.** The pure-Rust engine is at 98.10% Test262 (see
+7. **Engine maturity.** The pure-Rust engine is at 99.08% Test262 (see
    [`docs/conformance.md`](./conformance.md)); spec deviations are not
    memory-unsafe but can produce surprising behavior or, in edge cases, perturb
    determinism/replay. This is a correctness-maturity caveat, not a containment
@@ -453,9 +453,10 @@ resource-precision gaps.
 
 ## The `untrusted` policy profile (deny-by-default)
 
-The permission policy (`src/policy.rs`) gates the powerful host effects — `http`
-and every `workspace:*` action (`workspace:list` / `read` / `write` / `delete` /
-`manifest`) — through `enforce_policy`. The fallback for an unmatched effect
+The permission policy (`src/policy.rs`) gates the powerful host effects — `http`,
+every `workspace:*` action (`workspace:list` / `read` / `write` / `delete` /
+`manifest`), `tool:<name>` calls, and `app_data:<action>` — through
+`enforce_policy` (`src/runtime/typescript/bindings.rs`). The fallback for an unmatched effect
 depends on the surface: on `chidori run` (trusted, developer-authored code on the
 developer's own machine) it is `AlwaysAllow`; on **`chidori serve`** — the surface
 untrusted callers reach — it is **deny-by-default** unless the operator
@@ -564,15 +565,11 @@ If you intend to run code you do not trust on this engine today:
 3. Add OS isolation with `--isolate` (`chidori run --isolate`, `chidori serve
    --isolate`, or `CHIDORI_ISOLATE=process`): each run executes in a confined
    child process and brokers its effects back over a pipe, so a breakout has no
-   ambient process to land in. On Linux the child runs under a network namespace
-   + Landlock read-only filesystem + a seccomp denylist; on macOS under a
-   Seatbelt profile; everywhere it gets a `setrlimit` floor (`CHIDORI_ISOLATE_*`)
-   and a parent-side deadline-kill. Layers are best-effort — set
+   ambient process to land in. Layers are best-effort — set
    `CHIDORI_ISOLATE_REQUIRE_SANDBOX=1` to fail closed if the platform's core
    confinement can't be applied. See
    [OS-level isolation](#os-level-isolation-opt-in---isolate) for the full
-   posture (and [`docs/os-isolation-plan.md`](./os-isolation-plan.md) for the
-   design). (Running each agent in its own container is still complementary.)
+   posture. (Running each agent in its own container is still complementary.)
 4. Keep `node:fs` on `FsPolicy::Captured` (the VFS) and avoid `workspace.*`.
 
 ## Verification

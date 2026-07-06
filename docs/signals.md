@@ -115,7 +115,6 @@ branch to keep. §12 covers the composition.
 - Preemptive interrupts that can fire at *any* instruction (breaks checkpointability).
   Signals are consumed only at agent-declared listen points — that is the determinism
   contract and matches the framing ("points where they pause and listen").
-- The QuickJS engine path (rust engine first; QuickJS port is later if wanted).
 - Per-branch signal addressing (single shared per-run mailbox in v1; §12).
 - Broadcast/pub-sub fan-out to many runs from one publish; signals are addressed to one
   run id.
@@ -178,16 +177,14 @@ have an in-memory `ActiveSession { cancelled: AtomicBool, cancel_tx: mpsc }` in
 `signal` host call therefore appears as a span automatically; `from`/`name` ride in the
 record and can be stamped as span attributes (Phase 2) — no new tracing pipeline.
 
-### 4.7 ⚠️ Load-bearing prerequisite (a latent bug)
-`crates/chidori/src/runtime/engine.rs` `run_with_context` (~lines 425–451): the **rust-engine arm**
-returns `Ok(output)` on success and `Err(e)` on *any* error, and **never calls
-`ctx.take_pending_input()`**. The TypeScript/QuickJS arm (~516–584) does the pause-
-surfacing dance; the rust arm does not. So today, on the rust engine, an `input()` in
-Pause mode throws `PAUSE_MARKER`, `run_agent` returns `Err`, and the run is reported as
-**failed, not paused**. Signals cannot pause-and-resume on the rust engine until this is
-fixed. **Phase 1 task 1** fixes the rust arm to call `take_pending_input()` /
-`take_pending_signal()` and return `RunResult{paused}` — which also fixes rust-engine
-`input()` pausing as a side benefit.
+### 4.7 ⚠️ Load-bearing prerequisite (a latent bug, fixed in Phase 1)
+`crates/chidori/src/runtime/engine.rs` `run_with_context`: the **rust-engine arm**
+originally returned `Ok(output)` on success and `Err(e)` on *any* error, and **never
+called `ctx.take_pending_input()`**. An `input()` in Pause mode threw `PAUSE_MARKER`,
+`run_agent` returned `Err`, and the run was reported as **failed, not paused** — signals
+could not pause-and-resume until this was fixed. **Phase 1 task 1** fixed the arm to
+call `take_pending_input()` / `take_pending_signal()` and surface the pause on
+`RunResult` — which also fixed rust-engine `input()` pausing as a side benefit.
 
 ---
 
@@ -217,7 +214,7 @@ call_log; a replay run never re-reads the inbox.
 ```ts
 import { chidori } from "chidori:agent";
 
-type Signal<T = Json> = { name: string; payload: T; from: SignalSender };
+type Signal<T = AgentJson> = { name: string; payload: T; from: SignalSender };
 type SignalSender = { kind: "human" | "agent"; id: string; runId?: string };
 
 type SignalTimeout = { name: string | null; payload: null; from: null; timedOut: true };
@@ -225,18 +222,18 @@ type SignalTimeout = { name: string | null; payload: null; from: null; timedOut:
 // Blocking: pause at a named listen point until a matching signal is delivered
 // (or already queued in the mailbox). With timeoutMs, resolves to the
 // SignalTimeout sentinel after the deadline (discriminate with "timedOut" in r).
-chidori.signal<T = Json>(name: string, opts?: {
+chidori.signal<T = AgentJson>(name: string, opts?: {
   timeoutMs?: number;
 }): Promise<Signal<T> | SignalTimeout>;
 
 // Non-blocking: consume a queued signal if present, else null. Records
 // the result (value OR null) so replay is deterministic at this seq.
-chidori.pollSignal<T = Json>(name: string): Promise<Signal<T> | null>;
+chidori.pollSignal<T = AgentJson>(name: string): Promise<Signal<T> | null>;
 
 // Fan-in: pause until ANY of the named signals is delivered; the result is the
 // bare consumed signal — its `name` says which fired. Pre-arrived candidates
 // are consumed in arrival order (lowest delivery_seq across the name set).
-chidori.signalAny<T = Json>(names: string[], opts?: {
+chidori.signalAny<T = AgentJson>(names: string[], opts?: {
   timeoutMs?: number;          // sentinel `name` is null (no name fired)
 }): Promise<Signal<T> | SignalTimeout>;
 ```
@@ -334,7 +331,7 @@ await fetch(`${chidoriUrl}/sessions/${targetRun}/signal`, {
   body: JSON.stringify({
     name: "review",
     payload: { decision: violations.length ? "changes" : "approve", notes: summarize(violations) },
-    from: { kind: "agent", id: "compliance-bot", runId: chidori.runId },
+    from: { kind: "agent", id: "compliance-bot" },
   }),
 });
 ```
@@ -375,7 +372,7 @@ agent.run policy_doc
 Run `chidori trace $RUN` and you get a complete, ordered audit: *who* reviewed each draft,
 *what* they said, *when* the lead re-scoped, and which reviewer's "approve" published the
 doc — all reconstructable because the signals are in the call_log, not lost in a chat
-channel. And `chidori resume $RUN` (or any replay) reproduces the **identical** run:
+channel. And `chidori resume policy_doc.ts $RUN` (or any replay) reproduces the **identical** run:
 the editor's notes, the compliance verdict, and the steering are replayed from their
 recorded `CallRecord`s, so a later "why did it publish?" investigation re-derives the exact
 decision path without re-contacting any human or re-running the compliance agent. That is
@@ -434,9 +431,9 @@ name, id})` + throw `PAUSE_MARKER`. All sub-primitives are reused (§4.1).
 - `PendingSignal { seq, name, id }` on the context (sibling of `PendingInput`);
   `set_pending_signal` / `take_pending_signal`.
 - `engine.rs::run_with_context` (rust arm, §4.7 fix) checks `take_pending_signal()` (and
-  `take_pending_input()`) and returns `RunResult{ paused: Some(PendingPause::Signal{seq,
-  name}) }`. The existing `RunResult.paused` shape is extended to carry the name (or a
-  small enum) so the server knows *which* named op is waiting.
+  `take_pending_input()`) and returns `RunResult{ paused_signal: Some(PendingSignal{seq,
+  name, ..}) }` — a sibling of the existing `paused: Option<PendingInput>` — so the
+  server knows *which* named op is waiting.
 
 ### 8.6 Determinism, nesting, tracing — free from the substrate
 A `signal` call goes through `execute_durable_json_call`-style recording, so it carries
@@ -456,7 +453,7 @@ Routing — the run is in exactly one state:
 
 | Run state | Detection | Action |
 |---|---|---|
-| **Paused, waiting on THIS name** | `status == Paused` AND `pending.json` is a `Signal` op whose args `{name}` == body.name | **Resolve + resume** (reuse `complete_persisted_pending_host_operation` with `Signal`; inject synthetic `signal` CallRecord; `run_replay_pausable_with_host_promises_and_vfs`). |
+| **Paused, waiting on THIS name** | `status == Paused` AND `pending.json` is a `Signal` op whose args `{name}` == body.name | **Resolve + resume** (reuse `complete_persisted_pending_host_operation` with `Signal`; inject synthetic `signal` CallRecord; `run_replay_pausable_with_host_promises_vfs_and_signals`). |
 | **Paused on a DIFFERENT name / on input / approval** | `pending.json` kind/name ≠ body | **Enqueue** into `inbox.json`. Run stays paused; drained when it later reaches `signal(name)`. |
 | **Running, not yet listening** | `id` in `active_sessions`, or `status == Running` | Phase 1/2: **enqueue** into `inbox.json` (drained at next matching listen point). Phase 3: also push to live `signal_tx`. |
 | **Completed / Failed / Cancelled** | terminal status | `409 Conflict` — no inbox write (an orphan inbox would mislead a later replay). |
@@ -469,7 +466,7 @@ a *second* queued signal drains it.
 
 **Reused:** `complete_persisted_pending_host_operation`, `complete_persisted_host_promise_record`,
 `load_persisted_host_promises`, `load_persisted_vfs`,
-`run_replay_pausable_with_host_promises_and_vfs`, `SessionStatus`, `session_view`,
+`run_replay_pausable_with_host_promises_vfs_and_signals`, `SessionStatus`, `session_view`,
 `store_or_500`. **New:** `signal_session` handler, `inbox.json` read/write +
 `enqueue_signal_to_inbox` + `load_persisted_signal_inbox`, the `complete_pending_and_resume`
 extraction.
@@ -553,7 +550,7 @@ pick among them.
 ## 14. Implementation plan (phased)
 
 **Phase 1 — Named blocking signal + durable mailbox + paused-run delivery (deterministic)** *(shipped)*
-1. `crates/chidori/src/runtime/engine.rs` (~425–451): **fix the rust-engine arm of `run_with_context`**
+1. `crates/chidori/src/runtime/engine.rs`: **fix the rust-engine arm of `run_with_context`**
    to surface pauses via `take_pending_input()` / `take_pending_signal()` →
    `RunResult{paused}` (prerequisite; also fixes rust-engine `input()` pausing).
 2. `crates/chidori/src/runtime/snapshot.rs`: add `PendingHostOperationKind::Signal`; `QueuedSignal`
@@ -569,7 +566,7 @@ pick among them.
    `complete_pending_and_resume`; thread the inbox into the resume path.
 8. `sdk/typescript/src/agent.ts`: `Signal`/`SignalSender` + `signal` on `Chidori`.
 
-Tests (`--features rust-engine`):
+Tests:
 - `host_core`: `execute_signal` pauses when inbox empty; consumes a queued signal without
   pausing and records a completed op; replay of a recorded signal never touches the inbox.
 - `rust_engine`: agent calls `chidori.signal("review")` → pauses; resume with
@@ -580,7 +577,7 @@ Tests (`--features rust-engine`):
   call_logs.
 - Example: `examples/multiplayer-review/` (the §7 agent) — drafts, `await
   chidori.signal("review")`, a second terminal (or peer agent) POSTs the review; streams
-  to tael (`CHIDORI_JS_ENGINE=rust`).
+  to tael.
 
 **Phase 2 — Non-blocking poll + fan-in/select + timeout + sender identity in trace** *(shipped)*
 - `chidori.pollSignal` (records value *or* null at the seq → deterministic).
@@ -625,10 +622,8 @@ Tests (`--features rust-engine`):
 ---
 
 ## 15. Verification & rollout
-- `cargo check -p chidori` = 0 errors **with and without** `rust-engine`; QuickJS path
-  untouched (`cargo test -p chidori --lib` green).
-- `cargo test -p chidori --features rust-engine --lib` green (new signal + the
-  `run_with_context` pause-surfacing fix tests).
+- `cargo check -p chidori` = 0 errors; `cargo test -p chidori --lib` green (new signal +
+  the `run_with_context` pause-surfacing fix tests).
 - Manual multiplayer: terminal A runs the example agent (paused on `signal("review")`);
   terminal B `curl -XPOST .../sessions/{id}/signal -d '{"name":"review","payload":{...},
   "from":{"kind":"human","id":"mara"}}'` → agent resumes; tael shows a `signal` span with
@@ -664,4 +659,3 @@ Tests (`--features rust-engine`):
 - A tael "participants" view keyed on `from` across a session.
 - Broadcast/pub-sub to multiple runs; agent-to-agent signal helpers in the SDK
   (`chidori.sendSignal(runId, name, payload)` as the symmetric send side).
-- QuickJS port (it has live-VM snapshots, enabling true continue-in-place delivery).

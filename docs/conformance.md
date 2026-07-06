@@ -34,7 +34,7 @@ The runner prints, e.g.:
 
 ```
 Test262 (chidori pure-Rust engine, bare context)
-  pass 39361  fail 413  skip 7517  =>  98.96% of executed
+  pass 39824  fail 370  skip 7097  =>  99.08% of executed
 ```
 
 ## Current result
@@ -44,7 +44,7 @@ pinned suite commit:
 
 | | pass | fail | skip | % of executed |
 |---|---|---|---|---|
-| chidori pure-Rust engine, bare context | 39,361 | 413 | 7,517 | **98.96%** |
+| chidori pure-Rust engine, bare context | 39,824 | 370 | 7,097 | **99.08%** |
 
 The headline percentage is `pass / (pass + fail)` over *executed* tests; the
 skip count is reported alongside so the denominator is never hidden.
@@ -133,9 +133,10 @@ the box (or CI runner) it lands on.
 The runner **skips** (does not count as failure) tests that require features the
 engine intentionally does not implement — the same way Bun/Node skip what their
 engines lack. The list lives in `UNSUPPORTED_FEATURES` in
-`crates/test262-runner/src/main.rs` (e.g. `Temporal`, `decorators`,
-`iterator-helpers`, `import-attributes`, `WeakRef`/`FinalizationRegistry`), plus
-`intl402/` (skipped unless `--intl`) and the agent (`CanBlock`, and the
+`crates/test262-runner/src/main.rs` (e.g. `decorators`, `iterator-helpers`,
+`import-attributes`, `WeakRef`/`FinalizationRegistry`), plus `intl402/`
+(skipped unless `--intl`), Temporal-tagged tests (skipped unless
+`--temporal`), and the agent (`CanBlock`, and the
 `atomicsHelper.js` multi-agent harness) tests. When the engine grows to cover a
 skipped feature, delete its entry and the suite starts holding it to account.
 
@@ -241,14 +242,15 @@ surface is not part of the committed baseline.
 The gate compares the current run against the committed baseline
 (`crates/test262-runner/test262-expectations.json`, ~4 MB, one line per test) and
 **fails only on a regression** — a test the baseline records as `pass` that now
-fails or disappears. Newly *passing* tests never break the build; they print a
+fails, or a failing test absent from the baseline. Newly *passing* tests never
+break the build; they print a
 hint to refresh the baseline. After an intentional conformance change, run
 `scripts/test262.sh --update-baseline` and commit the diff (each flipped test is
 a single readable line in review).
 
 ## Remaining gaps
 
-The residual failures, by area (top clusters of the ~413 total). Strings are now
+The residual failures, by area (top clusters of the ~370 total). Strings are now
 WTF-8-backed with full UTF-16 code-unit semantics — `.length`/indexing/iteration,
 the `String.prototype` surface, the RegExp matcher (non-unicode per code unit,
 unicode per code point), lone-surrogate subjects and patterns, literals,
@@ -356,7 +358,7 @@ suite (`vendor/test262/`) is git-ignored.
 ```
 test262-runner [--test262 <dir>] [--filter <substr>] [--max <n>]
                [--json <out>] [--state <file>] [--baseline <file>]
-               [--verbose] [--no-modules] [--intl] [paths...]
+               [--verbose] [--no-modules] [--intl] [--temporal] [paths...]
 ```
 
 - `--test262 <dir>` — Test262 root (else `$TEST262_DIR`, else `vendor/test262`).
@@ -372,6 +374,7 @@ test262-runner [--test262 <dir>] [--filter <substr>] [--max <n>]
 - `--verbose` — print each failure with the thrown message.
 - `--no-modules` — skip `module`-flag tests (they run by default).
 - `--intl` — opt into `intl402` tests.
+- `--temporal` — opt into `Temporal`-tagged tests.
 
 Environment:
 

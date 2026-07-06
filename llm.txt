@@ -26,10 +26,13 @@ export async function agent(input: { document: string }, chidori: Chidori) {
 
 Rules:
 
-- Export `async function agent(input, chidori)`.
+- Export `async function agent(input, chidori)`, or import `{ run }` from
+  `chidori:agent` and call `run(handler)` — the `agent` export is the fallback
+  entrypoint when `run(...)` wasn't called.
 - Return JSON-compatible values only.
-- Use `chidori.*` for LLMs, tools, HTTP, input, memory, templates, logging, and
-  sandboxed code execution.
+- Use `chidori.*` for LLMs, tools, input, signals, memory, templates, workspace
+  files, and logging. HTTP goes through the standard `fetch`, which the runtime
+  captures.
 - Prefer deterministic code. Durable runs use fixed `Date` and seeded
   `Math.random` policies by default.
 - Local TypeScript imports are governed by runtime policy. Dynamic imports are
@@ -38,7 +41,7 @@ Rules:
 ## CLI
 
 ```bash
-chidori init my-agent --template chat      # scaffold a starter project (or: worker)
+chidori init my-agent --template chat      # scaffold a starter project (or: docs, worker)
 chidori check agents/my_agent.ts
 chidori run agents/my_agent.ts --input key=value
 chidori run agents/my_agent.ts --input '{"document": "text"}'
@@ -52,10 +55,12 @@ chidori trace <run_id>
 chidori snapshot <run_id>
 ```
 
-`chidori init [dir] --template chat|worker` scaffolds a starter project (agent +
-README, plus a `tools/` dir for `worker`); omit `--template` to pick
-interactively. The `chat` template is a conversational agent; the `worker`
-template is an autonomous tool-using loop (see `examples/agents/worker.ts`).
+`chidori init [dir] --template docs|chat|worker` scaffolds a starter project
+(agent + README, plus a `tools/` dir for `worker` and a bundled docs corpus for
+`docs`); omit `--template` to pick interactively. The `docs` template chats
+with the bundled Chidori docs; the `chat` template is a conversational agent;
+the `worker` template is an autonomous tool-using loop (see
+`examples/agents/worker.ts`).
 
 `chidori chat` is an interactive multi-turn REPL backed by `conversation()`. With
 no agent file it chats with the model directly; pass a conversational agent file
@@ -89,9 +94,12 @@ Options:
 - `type`: label for streamed prompt output, such as `"progress"`, `"draft"`,
   `"subagent"`, or `"final"`.
 - `model`: provider model override.
+- `system`: system prompt for this call.
 - `maxTokens` or `max_tokens`: output token cap.
+- `maxTurns` or `max_turns`: cap on provider tool-use turns.
 - `temperature`: sampling temperature.
 - `tools`: registered tool names available to provider tool-use loops.
+- `format`: `"json"` parses the reply as JSON (falls back to the raw string).
 - `cache`: prompt-cache posture. Defaults to on (`"5m"`): the runtime marks
   the stable request head (system, tools, conversation prefix) so providers
   bill repeated prefixes at the cached rate. `false` disables for this call;
@@ -249,9 +257,8 @@ are ignored by tool directory discovery.
 const child = await chidori.callAgent("child.ts", { topic: "snapshots" });
 ```
 
-Sub-agents share the parent runtime context and call log. Runtime dispatch now
-accepts TypeScript `.ts` sub-agents only; archived `.star` examples are kept
-for migration reference.
+Sub-agents share the parent runtime context and call log. Runtime dispatch
+accepts TypeScript `.ts` sub-agents only.
 
 ### parallel
 
@@ -262,8 +269,9 @@ const [a, b] = await chidori.parallel([
 ]);
 ```
 
-The current TypeScript helper uses `Promise.all` semantics. True durable
-parallel host execution is gated on host-backed promises and branch snapshots.
+The current TypeScript helper uses `Promise.all` semantics;
+`options.concurrency` caps in-flight tasks. True durable parallel host
+execution is gated on host-backed promises and branch snapshots.
 
 ### branch
 
@@ -342,6 +350,46 @@ await chidori.memory("clear");
 
 Memory actions are logged and replay-aware.
 
+### workspace
+
+```ts
+const entries = await chidori.workspace.list({ completeOnly: true });
+const text = await chidori.workspace.read("notes/draft.md");
+const entry = await chidori.workspace.write("notes/draft.md", "...", { language: "markdown" });
+await chidori.workspace.delete("notes/draft.md", "superseded");
+const manifest = await chidori.workspace.manifest();
+```
+
+Durable file store rooted at the run's workspace directory
+(`CHIDORI_WORKSPACE_ROOT` when set). Entries carry `{ path, status, sha256,
+bytes }`. Every action is policy-gated (`workspace:write` /
+`workspace:delete` are refused under `untrusted`) and recorded in the call
+log. `remove` is an alias for `delete`.
+
+### appData
+
+```ts
+await chidori.appData.write("insert into notes (body) values ($1)", ["hi"]);
+const rows = await chidori.appData.query("select * from notes", []);
+```
+
+Host-brokered writes/queries against a run-bound app-data cluster (generative
+UI). Params are bound server-side, never string-concatenated; the guest never
+holds a DB credential. Journaled like `http`. Requires a host-side
+`CHIDORI_APP_DATA` binding; without one, calls return
+`{ appDataError: { kind: "no_cluster", ... } }`.
+
+### renderDOM
+
+```ts
+document.body.appendChild(document.createElement("div"));
+const batch = chidori.renderDOM();
+```
+
+Agents get a virtual `document` / `window`. `renderDOM()` flushes the pending
+DOM mutation batch as a journaled `dom_render` effect — recorded live, served
+from the journal on replay. See `docs/dom-runtime-prototype.md`.
+
 ### checkpoint
 
 ```ts
@@ -378,7 +426,7 @@ Use structured logs for progress and debugging. Logs are call-log records.
 ```ts
 const value = await chidori.retry(
   () => fetch("https://example.com").then((r) => r.json()),
-  { attempts: 3, delayMs: 250, backoff: "exponential" },
+  { attempts: 3 },
 );
 
 const result = await chidori.tryCall(() => chidori.tool("maybe_fails", {}));
@@ -386,6 +434,9 @@ if (!result.ok) {
   await chidori.log("Tool failed", { error: result.error });
 }
 ```
+
+`RetryOptions` also accepts `delayMs` and `backoff`, but the current helper
+retries immediately — no delay is applied between attempts.
 
 ## TypeScript Tool Shape
 
@@ -441,6 +492,9 @@ Stream event types:
 - `prompt_start`: prompt stream started.
 - `prompt_delta`: incremental token text.
 - `prompt_end`: prompt stream ended.
+- `paused`: the run paused at a `signal()` / `signalAny()` listen point and
+  stays live; a delivered signal (or the timeout deadline) resumes it on the
+  same stream.
 - `done`: run completed, failed, or paused.
 
 Prompt labels work inside sub-agents and parallel branches because prompt
@@ -473,6 +527,9 @@ Session endpoints:
 - `POST /sessions/{id}/signal`: deliver `{ name, payload?, from? }` — resolves
   a matching signal pause (200), delivers live to a streaming run
   (202 `delivered_live`), or enqueues into the durable mailbox (202 `queued`).
+- `POST /sessions/{id}/approve`: approve or deny a policy-gated call that
+  paused the run as `awaitingapproval`.
+- `POST /sessions/{id}/cancel`: cancel a running session.
 - `POST /sessions/{id}/replay`: replay from a call-log checkpoint.
 - `POST /sessions/stream`: run with SSE events.
 
