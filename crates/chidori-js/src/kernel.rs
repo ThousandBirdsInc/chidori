@@ -662,6 +662,10 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                 *b = remap(*b);
             }
             KOp::Br { .. } | KOp::Exit { .. } => {}
+            // Fusion (`fuse_kops`) runs after this remap.
+            KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
+                unreachable!("fused op before fusion")
+            }
         }
     }
     let shapes: Vec<Box<[KShapeSlot]>> = shapes
@@ -729,6 +733,9 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
             cleanup_kops(&mut x.kops, always_live, upvalue_uses, n_regs);
         }
     }
+    // Superinstruction fusion — last, so the analyses above never see fused
+    // variants.
+    fuse_kops(&mut x.kops);
     let stores_elems = x.kops.iter().any(|op| matches!(op, KOp::StoreElem { .. }));
     Some(Kernel {
         stores_elems,
@@ -769,11 +776,60 @@ fn map_targets(op: &mut KOp, mut f: impl FnMut(u16) -> u16) {
         | KOp::BrCmp { target, .. }
         | KOp::BrCmpK { target, .. }
         | KOp::BrFalsy { target, .. }
-        | KOp::BrTruthy { target, .. } => *target = f(*target),
+        | KOp::BrTruthy { target, .. }
+        | KOp::AddKBr { target, .. } => *target = f(*target),
         KOp::LoadElem { bail, .. } | KOp::StoreElem { bail, .. } | KOp::LoadLen { bail, .. } => {
             *bail = f(*bail)
         }
         _ => {}
+    }
+}
+
+/// Fuse adjacent op pairs into superinstructions — the final pass, after
+/// `cleanup_kops` (which never sees fused variants). The fused op performs
+/// BOTH originals' effects sequentially and skips the second slot; the
+/// unfused second op REMAINS in that slot, so a branch into it executes
+/// identically — fusion only accelerates fall-through execution, no
+/// analysis needed. Overlapping fusions compose for the same reason: every
+/// slot is a valid entry point built from the ORIGINAL pair at that
+/// position.
+fn fuse_kops(kops: &mut [KOp]) {
+    let orig: Vec<KOp> = kops.to_vec();
+    for i in 0..orig.len().saturating_sub(1) {
+        let fused = match (&orig[i], &orig[i + 1]) {
+            (KOp::Mov { dst: d1, src: s1 }, KOp::Mov { dst: d2, src: s2 }) => Some(KOp::Mov2 {
+                d1: *d1,
+                s1: *s1,
+                d2: *d2,
+                s2: *s2,
+            }),
+            (
+                KOp::Arith { kind, dst, a, b },
+                KOp::Add {
+                    dst: d2,
+                    a: a2,
+                    b: b2,
+                },
+            ) => Some(KOp::ArithAdd {
+                kind: *kind,
+                dst: *dst,
+                a: *a,
+                b: *b,
+                d2: *d2,
+                a2: *a2,
+                b2: *b2,
+            }),
+            (KOp::AddK { dst, a, k }, KOp::Br { target }) => Some(KOp::AddKBr {
+                dst: *dst,
+                a: *a,
+                k: *k,
+                target: *target,
+            }),
+            _ => None,
+        };
+        if let Some(f) = fused {
+            kops[i] = f;
+        }
     }
 }
 
@@ -923,6 +979,10 @@ fn copy_prop_kops(kops: &mut [KOp]) -> bool {
             // only the result register is a plain def.
             KOp::CallKernel { dst, .. } | KOp::SelfCall { dst, .. } => kill!(*dst),
             KOp::Br { .. } | KOp::Exit { .. } => {}
+            // Fusion (`fuse_kops`) runs after cleanup.
+            KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
+                unreachable!("fused op before fusion")
+            }
         }
         let target = match op {
             KOp::Br { target }
@@ -992,6 +1052,10 @@ fn max_reg(acc: u16, op: &KOp) -> u16 {
             see(base + argc);
         }
         KOp::Br { .. } | KOp::Exit { .. } => {}
+        // Fusion (`fuse_kops`) runs after cleanup.
+        KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
+            unreachable!("fused op before fusion")
+        }
     }
     m
 }
@@ -1085,6 +1149,10 @@ fn dce_movs(kops: &mut Vec<KOp>, always_live: u128, upvalue_uses: u128, n_regs: 
                 }
                 uses[i] |= upvalue_uses;
                 defs[i] = bit(*dst);
+            }
+            // Fusion (`fuse_kops`) runs after cleanup.
+            KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
+                unreachable!("fused op before fusion")
             }
         }
     }

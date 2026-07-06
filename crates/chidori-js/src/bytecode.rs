@@ -961,6 +961,30 @@ pub enum KOp {
     Neg { dst: u16, src: u16 },
     /// `regs[dst] = ~ToInt32(regs[src])`
     BitNot { dst: u16, src: u16 },
+    /// SUPERINSTRUCTION (translation-time fusion of two adjacent ops; see
+    /// `fuse_kops`): two `Mov`s executed sequentially in one dispatch. The
+    /// unfused second op stays in the next code slot as a branch-target
+    /// landing pad; a fused arm skips it (`pc += 2`).
+    Mov2 { d1: u16, s1: u16, d2: u16, s2: u16 },
+    /// SUPERINSTRUCTION: `Arith` followed by `Add`, sequentially — the
+    /// `s += a <op> b` accumulation shape.
+    ArithAdd {
+        kind: crate::exec::ArithKind,
+        dst: u16,
+        a: u16,
+        b: u16,
+        d2: u16,
+        a2: u16,
+        b2: u16,
+    },
+    /// SUPERINSTRUCTION: `AddK` followed by an unconditional `Br` — the
+    /// `i += 1; continue` loop back-edge (same poll cadence as the `Br`).
+    AddKBr {
+        dst: u16,
+        a: u16,
+        k: f64,
+        target: u16,
+    },
     /// unconditional jump
     Br { target: u16 },
     /// numeric compare-and-branch: jump when `cmp(a, b) == if_true`

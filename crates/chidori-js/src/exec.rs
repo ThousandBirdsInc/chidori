@@ -863,6 +863,30 @@ impl Vm {
                         _ => unreachable!("kernel prop slot invariant"),
                     }
                 }
+                KOp::Mov2 { d1, s1, d2, s2 } => {
+                    regs[d1 as usize] = regs[s1 as usize];
+                    regs[d2 as usize] = regs[s2 as usize];
+                    // The unfused second op remains in the next slot as a
+                    // branch-target landing pad; skip it.
+                    pc += 1;
+                }
+                KOp::ArithAdd {
+                    kind,
+                    dst,
+                    a,
+                    b,
+                    d2,
+                    a2,
+                    b2,
+                } => {
+                    regs[dst as usize] = number_arith_raw(regs[a as usize], regs[b as usize], kind);
+                    regs[d2 as usize] = regs[a2 as usize] + regs[b2 as usize];
+                    pc += 1;
+                }
+                KOp::AddKBr { dst, a, k, target } => {
+                    regs[dst as usize] = regs[a as usize] + k;
+                    branch!(target)
+                }
                 // A pinned-closure call: copy the arguments into the
                 // callee's window and run its (guarded) kernel inline.
                 KOp::CallKernel {
@@ -1188,6 +1212,29 @@ impl Vm {
                 KOp::Math2 { kind, dst, a, b } => {
                     regs[base + dst as usize] =
                         kmath2(kind, regs[base + a as usize], regs[base + b as usize])
+                }
+                KOp::Mov2 { d1, s1, d2, s2 } => {
+                    regs[base + d1 as usize] = regs[base + s1 as usize];
+                    regs[base + d2 as usize] = regs[base + s2 as usize];
+                    pc += 1;
+                }
+                KOp::ArithAdd {
+                    kind,
+                    dst,
+                    a,
+                    b,
+                    d2,
+                    a2,
+                    b2,
+                } => {
+                    regs[base + dst as usize] =
+                        number_arith_raw(regs[base + a as usize], regs[base + b as usize], kind);
+                    regs[base + d2 as usize] = regs[base + a2 as usize] + regs[base + b2 as usize];
+                    pc += 1;
+                }
+                KOp::AddKBr { dst, a, k, target } => {
+                    regs[base + dst as usize] = regs[base + a as usize] + k;
+                    branch!(target)
                 }
                 KOp::SelfCall {
                     dst,
@@ -5495,6 +5542,30 @@ fn exec_fn_kernel_code(
             KOp::Math2 { kind, dst, a, b } => {
                 regs[dst as usize] = kmath2(kind, regs[a as usize], regs[b as usize])
             }
+            KOp::Mov2 { d1, s1, d2, s2 } => {
+                regs[d1 as usize] = regs[s1 as usize];
+                regs[d2 as usize] = regs[s2 as usize];
+                // The unfused second op remains in the next slot as a
+                // branch-target landing pad; skip it.
+                pc += 1;
+            }
+            KOp::ArithAdd {
+                kind,
+                dst,
+                a,
+                b,
+                d2,
+                a2,
+                b2,
+            } => {
+                regs[dst as usize] = number_arith_raw(regs[a as usize], regs[b as usize], kind);
+                regs[d2 as usize] = regs[a2 as usize] + regs[b2 as usize];
+                pc += 1;
+            }
+            KOp::AddKBr { dst, a, k, target } => {
+                regs[dst as usize] = regs[a as usize] + k;
+                branch!(target)
+            }
             KOp::Ret { src, boolean } => {
                 return Some(if boolean {
                     Value::Bool(regs[src as usize] != 0.0)
@@ -5618,6 +5689,29 @@ fn run_callee_window(
             KOp::Math2 { kind, dst, a, b } => {
                 regs[win + dst as usize] =
                     kmath2(kind, regs[win + a as usize], regs[win + b as usize])
+            }
+            KOp::Mov2 { d1, s1, d2, s2 } => {
+                regs[win + d1 as usize] = regs[win + s1 as usize];
+                regs[win + d2 as usize] = regs[win + s2 as usize];
+                pc += 1;
+            }
+            KOp::ArithAdd {
+                kind,
+                dst,
+                a,
+                b,
+                d2,
+                a2,
+                b2,
+            } => {
+                regs[win + dst as usize] =
+                    number_arith_raw(regs[win + a as usize], regs[win + b as usize], kind);
+                regs[win + d2 as usize] = regs[win + a2 as usize] + regs[win + b2 as usize];
+                pc += 1;
+            }
+            KOp::AddKBr { dst, a, k, target } => {
+                regs[win + dst as usize] = regs[win + a as usize] + k;
+                branch!(target)
             }
             KOp::Ret { src, boolean: _ } => {
                 // Number-only (the caller guard rejected boolean returns).
