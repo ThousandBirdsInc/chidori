@@ -695,17 +695,47 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
     for &(l, r) in &x.bool_reg {
         bool_locals[(r - BOOL_BASE) as usize] = l;
     }
+    // Prop LOCALIZATION: each named-property access class gets a dedicated
+    // register at the TAIL of the register file. The activation entry loads
+    // every resolved slot's current Number into its register and the
+    // exit/bail/interrupt paths write STORE-class registers back
+    // (`writeback_kernel_props`), so the in-region accesses are plain
+    // register moves — rewritten here (post-remap) and then propagated /
+    // deleted by the cleanup pass below like any other Mov. Sound for the
+    // same reason slot resolution is: nothing inside a kernel region can
+    // run user code or restructure a property map; the entry guard
+    // additionally declines two classes aliasing one (object, slot).
+    let prop_base = n_locals + n_bools + x.max_stack + 1;
+    let n_props = u16::try_from(x.props_used.len()).ok()?;
+    for op in &mut x.kops {
+        match *op {
+            KOp::LoadProp { dst, prop } => {
+                *op = KOp::Mov {
+                    dst,
+                    src: prop_base + prop,
+                }
+            }
+            KOp::StoreProp { prop, src } => {
+                *op = KOp::Mov {
+                    dst: prop_base + prop,
+                    src,
+                }
+            }
+            _ => {}
+        }
+    }
     // Post-translation cleanup (copy-prop + dead-Mov DCE, see
     // `cleanup_kops`). The always-live set is everything observed outside
     // straight-line execution: loop kernels write mapped Local and bool
-    // registers back to the frame on every exit and interrupt unwind, and
-    // exit shapes reference stack registers. Function kernels are frameless
-    // and pure — only `Ret` (a normal use) and the upvalue-window copies a
-    // `SelfCall` performs observe registers.
+    // registers back to the frame on every exit and interrupt unwind (and
+    // STORE-class prop registers back to their slots), and exit shapes
+    // reference stack registers. Function kernels are frameless and pure —
+    // only `Ret` (a normal use) and the upvalue-window copies a `SelfCall`
+    // performs observe registers.
     {
         let mut always_live: u128 = 0;
         let mut upvalue_uses: u128 = 0;
-        let n_regs = (n_locals + n_bools + x.max_stack + 1) as usize;
+        let n_regs = (prop_base + n_props) as usize;
         if n_regs <= 128 {
             if x.fn_mode {
                 for (r, slot) in locals.iter().enumerate() {
@@ -729,6 +759,11 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                         }
                     }
                 }
+                for (i, p) in x.props_used.iter().enumerate() {
+                    if p.store {
+                        always_live |= 1 << (prop_base as usize + i);
+                    }
+                }
             }
             cleanup_kops(&mut x.kops, always_live, upvalue_uses, n_regs);
         }
@@ -747,7 +782,7 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
         math_used: std::mem::take(&mut x.math_used).into_boxed_slice(),
         props_used: std::mem::take(&mut x.props_used).into_boxed_slice(),
         callee_slots: std::mem::take(&mut x.callees).into_boxed_slice(),
-        n_regs: n_locals + n_bools + x.max_stack + 1,
+        n_regs: prop_base + n_props,
         self_global: None, // `kernelize_function` fills it for recursive kernels
         fallback: Box::new(Op::Nop), // caller stores the real header op
     })

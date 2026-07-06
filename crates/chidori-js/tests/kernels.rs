@@ -339,6 +339,18 @@ const CORPUS: &[&str] = &[
     "const d = new Date(0); d.foo = 0; let s = 0; for (let i = 0; i < 3; i++) { d.foo = i; s += d.foo; } console.log(s);",
     // Props mixed with dense-element access in one region.
     "const o = { sum: 0 }; const a = [5, 6, 7]; for (let i = 0; i < a.length; i++) { o.sum = o.sum + a[i]; } console.log(o.sum);",
+    // CONDITIONAL store: iterations that skip the store must leave the
+    // property untouched (prop localization writes the entry-loaded value
+    // back through the register).
+    "const o = { a: 5 }; for (let i = 0; i < 6; i++) { if (i % 2) { o.a = i * 10; } } console.log(o.a);",
+    "const o = { a: 5 }; for (let i = 0; i < 6; i++) { if (i > 99) { o.a = i; } } console.log(o.a);",
+    // Mid-loop BAIL (non-Number element) with a prop store already executed
+    // this activation: the bail must write the prop register back before
+    // the generic interpreter resumes and reads the property normally.
+    "const o = { t: 0 }; const a = [1, 'x', 3]; let s = ''; for (let i = 0; i < a.length; i++) { o.t = o.t + i; s += a[i]; } console.log(o.t, s);",
+    // Store-only class whose CURRENT value is a non-Number: declines (the
+    // register must carry the entry value for conditional stores).
+    "const o = { v: 'init' }; for (let i = 0; i < 3; i++) { o.v = i; } console.log(o.v);",
     // -0 / NaN through property writes; typeof pins.
     "const o = { z: 1, n: 1 }; for (let i = 0; i < 3; i++) { o.z = -0 * i; o.n = i === 1 ? NaN : i; } console.log(Object.is(o.z, -0), o.n !== o.n, typeof o.z);",
     // `length` as a plain object property takes the array bail path per

@@ -473,13 +473,22 @@ impl Vm {
             return self.step(frame, &k.fallback);
         }
         // Named-property access classes resolve ONCE per activation to raw
-        // slot indices (see `KProp`): each base must be an ORDINARY object
-        // whose own data property exists — a Number where loaded, writable
-        // where stored. Slots stay valid for the whole activation because
-        // nothing inside a kernel region can create/delete properties or run
-        // user code; in-kernel `StoreProp` only overwrites values in place.
+        // slot indices (see `KProp`) — and, since prop LOCALIZATION, to a
+        // dedicated REGISTER each: the entry loads every slot's current
+        // value below, the build pass rewrote the in-region accesses to
+        // register Movs, and store-class registers are written back to the
+        // slots on every exit/bail/interrupt unwind. Each base must be an
+        // ORDINARY object whose own data property exists, holds a Number
+        // (the register must carry the CURRENT value even for a store-only
+        // class — a conditionally skipped store writes the original back),
+        // and is writable where stored. Slots stay valid for the whole
+        // activation because nothing inside a kernel region can
+        // create/delete properties or run user code. Two classes resolving
+        // to the SAME (object, slot) — aliased bases — would split one
+        // property across two registers, so they decline.
         let mut prop_slots = std::mem::take(&mut self.kernel_prop_slots);
         prop_slots.clear();
+        let mut prop_ids: Vec<(usize, u32)> = Vec::with_capacity(k.props_used.len());
         for p in k.props_used.iter() {
             let mut ok = false;
             if let Value::Object(o) = &frame.locals[k.oslots[p.oslot as usize] as usize] {
@@ -494,10 +503,13 @@ impl Vm {
                         },
                     )) = b.props.get_full(&PropertyKey::str(&p.key))
                     {
-                        if (!p.load || matches!(value, Value::Number(_))) && (!p.store || *writable)
-                        {
-                            prop_slots.push(idx as u32);
-                            ok = true;
+                        if matches!(value, Value::Number(_)) && (!p.store || *writable) {
+                            let id = (o.ptr_id(), idx as u32);
+                            if !prop_ids.contains(&id) {
+                                prop_ids.push(id);
+                                prop_slots.push(idx as u32);
+                                ok = true;
+                            }
                         }
                     }
                 }
@@ -537,6 +549,28 @@ impl Vm {
         for &l in k.oslots.iter() {
             if let Value::Object(o) = &frame.locals[l as usize] {
                 objs.push(o.clone());
+            }
+        }
+        // Prop registers (the tail of the register file): load each resolved
+        // slot's current value. The guard above proved every one a Number.
+        if !k.props_used.is_empty() {
+            let prop_base = k.n_regs as usize - k.props_used.len();
+            for (i, p) in k.props_used.iter().enumerate() {
+                let b = objs[p.oslot as usize].borrow();
+                match b.props.get_index(prop_slots[i] as usize) {
+                    Some((
+                        _,
+                        Property {
+                            kind:
+                                PropertyKind::Data {
+                                    value: Value::Number(n),
+                                    ..
+                                },
+                            ..
+                        },
+                    )) => regs[prop_base + i] = *n,
+                    _ => unreachable!("kernel prop slot invariant"),
+                }
             }
         }
         // Pinned closure callees (`KOp::CallKernel`): ONE guard per
@@ -650,6 +684,7 @@ impl Vm {
                                         frame.locals[l as usize] =
                                             Value::Bool(regs[bool_base + j] != 0.0);
                                     }
+                                    writeback_kernel_props(k, &objs, &prop_slots, &regs);
                                     self.kernel_regs = regs;
                                     objs.clear();
                                     self.kernel_objs = objs;
@@ -828,40 +863,11 @@ impl Vm {
                         branch!(bail)
                     }
                 }
-                // Entry-resolved named property access: raw slot, no check —
-                // the activation invariant (no map restructuring inside a
-                // kernel) keeps the slot AND its Number-ness valid.
-                KOp::LoadProp { dst, prop } => {
-                    let p = &k.props_used[prop as usize];
-                    let b = objs[p.oslot as usize].borrow();
-                    match b.props.get_index(prop_slots[prop as usize] as usize) {
-                        Some((
-                            _,
-                            Property {
-                                kind:
-                                    PropertyKind::Data {
-                                        value: Value::Number(n),
-                                        ..
-                                    },
-                                ..
-                            },
-                        )) => regs[dst as usize] = *n,
-                        _ => unreachable!("kernel prop slot invariant"),
-                    }
-                }
-                KOp::StoreProp { prop, src } => {
-                    let p = &k.props_used[prop as usize];
-                    let mut b = objs[p.oslot as usize].borrow_mut();
-                    match b.props.get_index_mut(prop_slots[prop as usize] as usize) {
-                        Some((
-                            _,
-                            Property {
-                                kind: PropertyKind::Data { value, .. },
-                                ..
-                            },
-                        )) => *value = Value::Number(regs[src as usize]),
-                        _ => unreachable!("kernel prop slot invariant"),
-                    }
+                // Prop LOCALIZATION rewrote every LoadProp/StoreProp into a
+                // register Mov at kernel build; the slots live only in the
+                // entry load and the exit/unwind write-back now.
+                KOp::LoadProp { .. } | KOp::StoreProp { .. } => {
+                    unreachable!("prop op survived kernel build")
                 }
                 KOp::Mov2 { d1, s1, d2, s2 } => {
                     regs[d1 as usize] = regs[s1 as usize];
@@ -914,6 +920,7 @@ impl Vm {
                         for (j, &l) in k.bool_locals.iter().enumerate() {
                             frame.locals[l as usize] = Value::Bool(regs[bool_base + j] != 0.0);
                         }
+                        writeback_kernel_props(k, &objs, &prop_slots, &regs);
                         self.kernel_regs = regs;
                         objs.clear();
                         self.kernel_objs = objs;
@@ -945,6 +952,7 @@ impl Vm {
         for (j, &l) in k.bool_locals.iter().enumerate() {
             frame.locals[l as usize] = Value::Bool(regs[bool_base + j] != 0.0);
         }
+        writeback_kernel_props(k, &objs, &prop_slots, &regs);
         for slot in k.shapes[shape as usize].iter() {
             match slot {
                 crate::bytecode::KShapeSlot::Num(r) => {
@@ -5445,6 +5453,40 @@ fn bin_arith(vm: &mut Vm, frame: &mut Frame, kind: ArithKind) -> Result<(), Valu
 /// `false` when the cooperative interrupt fired on a callee back-edge — the
 /// caller then unwinds exactly like one of its own interrupted edges.
 #[inline(never)]
+/// Write the STORE-class prop registers back to their entry-resolved
+/// property slots — the activation-exit half of kernel prop localization
+/// (the entry half loads every slot into the register file's tail). Runs on
+/// every path that leaves the register world: normal exits, bails (which
+/// route through an Exit), and interrupt unwinds. Load-only classes never
+/// change, so their slots are left untouched.
+fn writeback_kernel_props(
+    k: &crate::bytecode::Kernel,
+    objs: &[JsObject],
+    prop_slots: &[u32],
+    regs: &[f64],
+) {
+    if k.props_used.is_empty() {
+        return;
+    }
+    let prop_base = k.n_regs as usize - k.props_used.len();
+    for (i, p) in k.props_used.iter().enumerate() {
+        if !p.store {
+            continue;
+        }
+        let mut b = objs[p.oslot as usize].borrow_mut();
+        match b.props.get_index_mut(prop_slots[i] as usize) {
+            Some((
+                _,
+                Property {
+                    kind: PropertyKind::Data { value, .. },
+                    ..
+                },
+            )) => *value = Value::Number(regs[prop_base + i]),
+            _ => unreachable!("kernel prop slot invariant"),
+        }
+    }
+}
+
 /// Execute a plain (non-recursive, frameless) FUNCTION kernel body over
 /// `regs`, returning the call's result — `Value::Number`, or `Value::Bool`
 /// for a boolean-typed `Ret`. Shared by the per-call [`Vm::run_fn_kernel`]

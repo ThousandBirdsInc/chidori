@@ -1126,12 +1126,19 @@ pub enum KSlot {
 
 /// One named-property access class in a kernel (`o.a` / `o.a = v` sites over
 /// the pinned base object in oslot `oslot`): resolved ONCE per kernel
-/// activation to a raw property-map slot index. The entry check requires an
+/// activation to a raw property-map slot index AND LOCALIZED into a
+/// dedicated register at the tail of the register file — the entry loads
+/// the slot's current value, the build pass rewrote every in-region access
+/// into a register `Mov` (then propagated/deleted by the cleanup pass), and
+/// `store`-class registers are written back to the slot on every exit /
+/// bail / interrupt unwind. The entry check requires an
 /// [`crate::value::Internal::Ordinary`] receiver whose OWN data property
-/// `key` exists — holding a `Number` when `load` (reads must produce what
-/// the guard typed), writable when `store` — and declines the activation
-/// otherwise. Slot indices are stable for the activation because kernel
-/// regions contain no calls and no property creation/deletion.
+/// `key` exists, holds a `Number` (the register must carry the current
+/// value even for a store-only class, so a conditionally skipped store
+/// writes the original back), is writable when `store`, and does not alias
+/// another class's (object, slot) — declining the activation otherwise.
+/// Slot indices are stable for the activation because kernel regions
+/// contain no calls and no property creation/deletion.
 #[derive(Clone, Debug)]
 pub struct KProp {
     pub oslot: u16,
