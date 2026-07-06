@@ -116,7 +116,7 @@ enum Commands {
         /// Directory to scaffold into (defaults to the current directory).
         dir: Option<PathBuf>,
 
-        /// Template to use: `chat` or `worker`. Omit to pick interactively.
+        /// Template to use: `docs`, `chat`, or `worker`. Omit to pick interactively.
         #[arg(short, long)]
         template: Option<String>,
     },
