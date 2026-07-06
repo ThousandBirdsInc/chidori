@@ -9,7 +9,7 @@ results. Given the same inputs, compatible source hashes, and the same cached
 results for host calls, agent control flow is expected to produce the same
 outputs.
 
-1. **Original run:** Every `prompt()`, `tool()`, `http()` call is logged with seq number + result.
+1. **Original run:** Every `prompt()`, `tool()`, `fetch()` call is logged with seq number + result.
 2. **Checkpoint:** The call log is a JSON array — save it to disk, send it over the wire, commit it to git.
 3. **Replay:** Re-run the agent with the call log pre-loaded. Each host function call checks the log for its seq number — hit returns the cached result instantly, miss executes normally.
 

@@ -6,7 +6,7 @@ API, and event-driven HTTP handlers.
 ## 1. One-shot CLI
 
 ```bash
-chidori init my-agent --template chat         # scaffold a starter project (or: worker)
+chidori init my-agent --template chat         # scaffold a starter project (or: docs, worker)
 chidori demo                                  # pick from runnable examples
 chidori run agents/my_agent.ts --input key=value
 chidori run agents/my_agent.ts --input '{"complex": "input"}'
@@ -16,10 +16,11 @@ chidori check agents/my_agent.ts            # validate without running
 chidori tools --dir tools/                   # list available tools
 ```
 
-`chidori init [dir] --template chat|worker` scaffolds a starter project — an
-agent and README, plus a `tools/` directory for the `worker` template. Omit
-`--template` to choose interactively. The `chat` template is a conversational
-agent; the `worker` template is an autonomous tool-using loop.
+`chidori init [dir] --template docs|chat|worker` scaffolds a starter project —
+an agent and README, plus a `tools/` directory for the `worker` template. Omit
+`--template` to choose interactively. The `docs` template chats with a bundled
+copy of the Chidori docs; the `chat` template is a conversational agent; the
+`worker` template is an autonomous tool-using loop.
 
 `chidori chat` is a built-in conversational REPL backed by
 [`chidori.conversation()`](./core-concepts.md#conversational-agents). With no
@@ -51,7 +52,8 @@ Exposes:
 - `GET  /sessions/{id}` — get session result
 - `GET  /sessions/{id}/checkpoint` — get the call log and snapshot manifest metadata
 - `GET  /sessions/{id}/snapshot` — inspect the durable journal-scaffold manifest metadata (no VM image — resume is call-log replay)
-- `POST /sessions/{id}/resume` — resume a paused `input()` or approval session
+- `POST /sessions/{id}/resume` — answer a paused `input()` call and continue the run
+- `POST /sessions/{id}/approve` — approve or deny a policy-gated call that paused the run
 - `POST /sessions/{id}/signal` — deliver a signal `{ name, payload?, from? }`: resolves+resumes a run paused-waiting on that name (200); delivers in-memory to a live streaming run, resuming a matching pause in-process (202 `delivered_live`); else enqueues into the durable mailbox (202 `queued`); 409 for a terminal run
 - `POST /sessions/{id}/replay` — replay from a session's checkpoint
 - `POST /sessions/{id}/cancel` — cancel a running or stored session

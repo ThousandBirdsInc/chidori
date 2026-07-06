@@ -1,11 +1,10 @@
 # Value Checkpoints — `chidori.step(name, fn)`
 
-> **Status:** Implemented. This is the production landing of the engine plan's
-> deferred **P6** ("value checkpoints"): bound resume cost on long histories by
-> memoizing expensive deterministic computation into the durable call log. The
-> engine-level prototype (`durableStep` on `chidori_js::ReplayRuntime`,
-> `crates/chidori-js/src/replay.rs`) shipped with the engine; this doc covers
-> the `chidori.*` host API every agent gets.
+> `chidori.step` bounds resume cost on long histories by memoizing expensive
+> deterministic computation into the durable call log. This doc covers the
+> `chidori.*` host API every agent gets; the lower-level engine-crate
+> counterpart (`durableStep` on `chidori_js::ReplayRuntime`,
+> `crates/chidori-js/src/replay.rs`) is covered in [§5](#5-relation-to-neighbors).
 > **Related:** [`docs/architecture.md`](./architecture.md),
 > [`docs/signals.md`](./signals.md).
 
@@ -29,9 +28,9 @@ const plan = await chidori.step("plan", () => buildPlan(input)); // expensive, p
 
 Live, `fn` runs once and its JSON-serializable result is recorded as a `step`
 call-log record. On **every** subsequent replay — crash recovery, `input()` /
-approval / signal resume, `chidori trace` re-derivation, `POST
-/sessions/{id}/replay` — the recorded value is returned (or the recorded error
-re-thrown) **without re-running `fn`**. Resume cost becomes proportional to the
+approval / signal resume, `chidori resume`, `POST /sessions/{id}/replay` — the
+recorded value is returned (or the recorded error re-thrown) **without
+re-running `fn`**. Resume cost becomes proportional to the
 un-wrapped code, not the total compute the run has ever done.
 
 ## 2. The contract: pure, synchronous compute
@@ -116,22 +115,22 @@ correctness dependency.
   compute yourself; it doesn't skip anything. `step` is the memoizing version:
   the runtime decides record-vs-replay and the callback body is the thing
   being saved.
-- **`durableStep(fn)`** (`ReplayRuntime::install_memo`) is the engine-crate
-  prototype with the same record/replay semantics, keyed by invocation index
-  only. `chidori.step` is the production surface: named, divergence-checked,
-  recorded in the real call log, enforced pure, visible in traces and
-  `chidori trace` output as a `step` record.
+- **`durableStep(fn)`** (`ReplayRuntime::install_memo`) is the lower-level
+  engine-crate counterpart with the same record/replay semantics, keyed by
+  invocation index only. `chidori.step` is the agent-facing surface: named,
+  divergence-checked, recorded in the real call log, enforced pure, visible in
+  traces and `chidori trace` output as a `step` record.
 - **Provider prompt caching** (`docs/context-management.md`) bounds *token*
   re-billing; `step` bounds *CPU* re-execution. Both are live-only
   optimizations layered under the same source of truth, the call log.
 
-## 6. Future work
+## 6. Limitations
 
-- **Periodic value snapshots of agent-declared state** ("restore from the last
-  checkpoint, skip the prefix entirely") would bound even the un-wrapped
-  replay cost, at the price of a checkpoint-aware programming model for loops.
-  `step` is the composable primitive that doesn't change the model; revisit
-  the bigger version if journals grow past what stepped replay handles.
-- **Async step bodies** (awaiting only pure promises) could be supported by
-  draining jobs inside the binding; deferred until a real agent needs it.
-- A `chidori stats` / trace view that reports replay time saved per step.
+- **Un-wrapped code still replays linearly.** There is no periodic value
+  snapshot of agent-declared state ("restore from the last checkpoint, skip
+  the prefix entirely"); that would bound even the un-wrapped replay cost, at
+  the price of a checkpoint-aware programming model for loops. `step` is the
+  composable primitive that doesn't change the model.
+- **Step bodies must be synchronous.** Async callbacks (even ones awaiting
+  only pure promises) throw rather than being drained inside the binding.
+- Traces do not report replay time saved per step.

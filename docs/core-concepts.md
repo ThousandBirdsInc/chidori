@@ -17,14 +17,15 @@ API reference.
 | `chidori.tool(name, args)` | Invoke a registered tool |
 | `chidori.callAgent(path, input)` | Call a sub-agent |
 | `chidori.parallel(fns)` | Run functions concurrently |
-| `chidori.branch(variants)` | Fork the run into per-strategy sub-runs from the current state; returns every outcome for comparison ([design](./branching-execution.md)) |
+| `chidori.branch(variants)` | Fork the run into per-strategy sub-runs from the current state; returns every outcome for comparison ([details](./branching-execution.md)) |
 | `chidori.input(msg, options)` | Human-in-the-loop — pauses execution |
 | `chidori.signal(name, options)` | Multiplayer — pause at a named listen point until an outside party (human or agent) delivers `{ name, payload, from }`; drains a durable mailbox if one is queued; `timeoutMs` resolves to a `{ timedOut: true }` sentinel after the deadline |
 | `chidori.pollSignal(name)` | Non-blocking signal check — consume a queued signal of this name or resolve to `null` |
 | `chidori.signalAny(names, options)` | Fan-in — pause until ANY of the named signals is delivered; the result's `name` says which fired |
-| `chidori.memory(action, ...)` | Persistent storage (key-value + vector) |
+| `chidori.memory(action, ...)` | Persistent key-value storage, namespaced on disk |
+| `chidori.workspace.{list,read,write,delete,manifest}` | Shared workspace files under the run's workspace root — policy-gated, recorded like every other effect |
 | `chidori.log(msg, data)` | Structured logging |
-| `chidori.checkpoint(label, meta)` | Record an explicit call-log marker for trace/replay |
+| `chidori.checkpoint(label, data)` | Record an explicit call-log marker for trace/replay |
 | `chidori.step(name, fn)` | Durable value checkpoint — run pure compute once, journal the result, never re-pay it on replay/resume |
 | `chidori.retry(fn, options)` | Retry with backoff |
 | `chidori.tryCall(fn)` | Capture errors without raising |

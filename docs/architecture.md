@@ -26,7 +26,7 @@ A high-level map of the runtime.
 - **TypeScript runtime** transpiles `.ts` agents and exposes a deterministic `chidori` host API.
 - **Host functions** are the only way agents touch the outside world.
 - **Call-log / replay engine** records every host call and replays the journal for deterministic, zero-LLM-call resume.
-- **LLM providers** (Anthropic, OpenAI, LiteLLM-compatible) are swappable via `reqwest`.
+- **LLM providers** (Anthropic, OpenAI, LiteLLM-compatible, OpenRouter as the `chidori login` fallback) are swappable via `reqwest`.
 - **Template engine** uses `minijinja` for Jinja2 prompt templates.
 - **HTTP server** (`axum`) powers the `serve` command and session API.
 
@@ -54,7 +54,8 @@ chidori/
 │   │   │   ├── providers/
 │   │   │   │   ├── mod.rs          # Provider registry, model routing
 │   │   │   │   ├── anthropic.rs    # Anthropic Messages API
-│   │   │   │   └── openai.rs       # OpenAI-compatible (incl. LiteLLM)
+│   │   │   │   ├── openai.rs       # OpenAI-compatible (incl. LiteLLM)
+│   │   │   │   └── openrouter.rs   # OpenRouter OAuth fallback (`chidori login`)
 │   │   │   └── tools/
 │   │   │       └── mod.rs          # Tool discovery + JSON schema generation
 │   │   └── tests/             # CLI integration tests
@@ -65,7 +66,11 @@ chidori/
 │   └── python/chidori/     # Python SDK (pure stdlib, no deps)
 ├── examples/
 │   ├── agents/             # Example .ts agents
+│   ├── branching/          # `chidori.branch` — fork strategies, compare, pick one
+│   ├── interactive-pipeline/ # Long-running human-in-the-loop pipeline
+│   ├── multiplayer-review/ # `chidori.signal` + durable mailbox
 │   ├── prompts/            # Example .jinja templates
+│   ├── record-replay/      # Record/replay patterns on non-LLM behaviors
 │   ├── tools/              # Example tools
 │   └── sdk_demo.py         # Python SDK demo
 └── llm.txt                 # Complete API reference for LLM-assisted development

@@ -1,7 +1,7 @@
 import type { Chidori, Signal } from "chidori:agent";
 
 /**
- * Multiplayer policy-doc drafting agent (docs/signals.md §7).
+ * Multiplayer policy-doc drafting agent (the worked example in docs/signals.md).
  *
  * Three participants collaborate on ONE live run:
  *   - a human editor (e.g. Mara) reviews drafts and asks for changes,
