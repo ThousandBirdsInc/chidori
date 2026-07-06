@@ -691,7 +691,9 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
     for &(l, r) in &x.bool_reg {
         bool_locals[(r - BOOL_BASE) as usize] = l;
     }
+    let stores_elems = x.kops.iter().any(|op| matches!(op, KOp::StoreElem { .. }));
     Some(Kernel {
+        stores_elems,
         code: std::mem::take(&mut x.kops).into_boxed_slice(),
         locals: locals.into_boxed_slice(),
         bool_locals: bool_locals.into_boxed_slice(),

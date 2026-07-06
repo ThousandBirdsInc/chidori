@@ -448,6 +448,22 @@ impl Vm {
                 return self.step(frame, &k.fallback);
             }
         }
+        // A `StoreElem` may CREATE an element (hole fill / exact append), and
+        // the spec's OrdinarySet consults the prototype chain when the own
+        // property is absent — so a chain carrying a reified index entry (a
+        // defineProperty'd accessor / non-writable index) or an exotic proto
+        // must intercept via the generic path. One entry check covers the
+        // whole activation: nothing inside a kernel region can run user code
+        // or restructure a property map. Read-only loops skip the walk.
+        if k.stores_elems {
+            for &l in k.oslots.iter() {
+                if let Value::Object(o) = &frame.locals[l as usize] {
+                    if !crate::value::protos_allow_any_index_create(o) {
+                        return self.step(frame, &k.fallback);
+                    }
+                }
+            }
+        }
         // Math intrinsics: the global `Math` binding must still be the
         // canonical object as a plain DATA property (an accessor or a
         // replacement would be observable), and each used method must still
@@ -1331,6 +1347,19 @@ impl Vm {
                 },
             }
         }
+        // Poll the cooperative interrupt flag per CALL as well as on kernel
+        // back-edges: a tiny comparator body has no back-edge, and the native
+        // merge loop between calls never ticks — without this, a hostile
+        // n·log n sort would be uninterruptible.
+        p.poll = p.poll.wrapping_add(1);
+        if p.poll & 0xFF == 0 {
+            if let Some(flag) = &p.interrupt {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    self.op_budget = Some(0);
+                    return Some(Err(self.throw_range("execution interrupted")));
+                }
+            }
+        }
         match exec_fn_kernel_code(&k.code, &mut p.regs, &p.interrupt, &mut p.poll) {
             Some(v) => Some(Ok(v)),
             None => {
@@ -1338,6 +1367,97 @@ impl Vm {
                 // zero the budget so a JS catch cannot resume execution.
                 self.op_budget = Some(0);
                 Some(Err(self.throw_range("execution interrupted")))
+            }
+        }
+    }
+
+    /// Verify the guards `exec_prepared_kernel` re-checks per call — no op
+    /// accounting, canonical `Math`, all-`Number` upvalues (pre-loaded into
+    /// the registers here) — ONCE, for a run during which no user code can
+    /// execute between calls: the all-Number sort specialization, where
+    /// every value fed to the comparator is a raw `f64` and everything
+    /// between two comparator calls is engine Rust + the pure kernel, so
+    /// nothing can patch `Math`, write a captured cell, or install a budget
+    /// mid-run. Returns the register indices of the two comparator
+    /// parameters (`None` for a parameter the body never consumes); `None`
+    /// overall declines the specialization.
+    pub(crate) fn prime_prepared_cmp(
+        &self,
+        p: &mut PreparedKernel,
+    ) -> Option<(Option<usize>, Option<usize>)> {
+        if self.op_budget.is_some() {
+            return None;
+        }
+        let k = p.bf.proto.fn_kernel.as_ref().expect("prepared");
+        if !k.math_used.is_empty() && !self.kernel_math_ok(&k.math_used) {
+            return None;
+        }
+        let mut ra = None;
+        let mut rb = None;
+        for (r, slot) in k.locals.iter().enumerate() {
+            match slot {
+                crate::bytecode::KSlot::Arg(0) => ra = Some(r),
+                crate::bytecode::KSlot::Arg(1) => rb = Some(r),
+                // Consumes a third argument the comparator is never given.
+                crate::bytecode::KSlot::Arg(_) => return None,
+                crate::bytecode::KSlot::Local(_) => {}
+                crate::bytecode::KSlot::Upvalue(u) => match &*p.bf.upvalues[*u as usize].borrow() {
+                    Value::Number(n) => p.regs[r] = *n,
+                    _ => return None,
+                },
+            }
+        }
+        Some((ra, rb))
+    }
+
+    /// One primed comparator call over raw `f64`s (see
+    /// [`Vm::prime_prepared_cmp`]): write the two parameter registers, run
+    /// the kernel, fold the `Number`/`Bool` result to the sort's -1/0/1
+    /// (NaN → 0, as SortCompare's ToNumber+comparison does). The per-call
+    /// interrupt poll stands in for the native merge loop, which never
+    /// ticks.
+    pub(crate) fn exec_prepared_cmp_f64(
+        &mut self,
+        p: &mut PreparedKernel,
+        regs_ab: (Option<usize>, Option<usize>),
+        x: f64,
+        y: f64,
+    ) -> Result<i32, Value> {
+        if let Some(r) = regs_ab.0 {
+            p.regs[r] = x;
+        }
+        if let Some(r) = regs_ab.1 {
+            p.regs[r] = y;
+        }
+        p.poll = p.poll.wrapping_add(1);
+        let interrupted = if p.poll & 0xFF == 0 {
+            if let Some(flag) = &p.interrupt {
+                flag.load(std::sync::atomic::Ordering::Relaxed)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let k = p.bf.proto.fn_kernel.as_ref().expect("prepared");
+        let ret = if interrupted {
+            None
+        } else {
+            exec_fn_kernel_code(&k.code, &mut p.regs, &p.interrupt, &mut p.poll)
+        };
+        match ret {
+            Some(Value::Number(n)) => Ok(if n < 0.0 {
+                -1
+            } else if n > 0.0 {
+                1
+            } else {
+                0
+            }),
+            Some(Value::Bool(b)) => Ok(if b { 1 } else { 0 }),
+            Some(_) => unreachable!("fn kernels return Number or Bool"),
+            None => {
+                self.op_budget = Some(0);
+                Err(self.throw_range("execution interrupted"))
             }
         }
     }

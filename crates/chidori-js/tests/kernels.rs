@@ -147,6 +147,15 @@ const CORPUS: &[&str] = &[
     "const a = [1,2,3]; let got = 0; Object.defineProperty(a, 1, { get() { got++; return 50; } }); let s = 0; for (let i = 0; i < a.length; i++) { s += a[i]; } console.log(s, got);",
     // Array GROWTH inside the loop (appends bail; length re-read each pass).
     "const a = [1]; for (let i = 0; i < a.length && i < 5; i++) { a[a.length] = a[i] + 1; } console.log(a.join(','));",
+    // A reified Array.prototype index ACCESSOR intercepts loop APPENDS (the
+    // own property is absent, so OrdinarySet consults the chain): the kernel
+    // entry guard must decline and route through the setter every iteration.
+    "let calls = 0; Object.defineProperty(Array.prototype, 3, { set(v) { calls += v; }, configurable: true }); const a = [0, 1, 2]; for (let i = 1; i <= 3; i++) { a[3] = i; } delete Array.prototype[3]; console.log(calls, a.length, a[3]);",
+    // ... and HOLE FILLS (same chain consult for an absent own property).
+    "let calls = 0; Object.defineProperty(Array.prototype, 1, { set(v) { calls++; }, configurable: true }); const a = [7, , 9]; for (let i = 0; i < 2; i++) { a[1] = i; } delete Array.prototype[1]; console.log(calls, 1 in a, a.length);",
+    // A dense proto ELEMENT (plain writable data, no reified entry) must NOT
+    // decline: the spec creates the property on the receiver anyway.
+    "Array.prototype[2] = 99; const a = [0, 1]; for (let i = 0; i < 3; i++) { a[2] = i; } delete Array.prototype[2]; console.log(a[2], a.length, a.join(','));",
     // Base REASSIGNED inside the loop: translation must reject (store to a
     // base local) and the generic loop must swap arrays mid-flight.
     "let a = [1,2,3,4]; const b = [100,200,300,400]; let s = 0; for (let i = 0; i < a.length; i++) { s += a[i]; if (i === 1) a = b; } console.log(s);",

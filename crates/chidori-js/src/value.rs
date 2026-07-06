@@ -732,6 +732,32 @@ pub fn protos_allow_index_create(proto: Option<JsObject>, idx: u32, count: u32) 
     true
 }
 
+/// The activation-scoped variant of [`protos_allow_index_create`] for the
+/// kernel `StoreElem` fast path: true when no object on `start`'s prototype
+/// chain could observably intercept the creation of ANY array-index property
+/// on `start` — every prototype a plain `Ordinary`/dense-`Array` object with
+/// no reified index-keyed `props` entry at all. Checked ONCE per kernel
+/// activation (nothing inside a kernel region can run user code or
+/// restructure a property map, so the verdict holds for the whole
+/// activation); the per-key probes stay in the per-write helper above.
+pub fn protos_allow_any_index_create(start: &JsObject) -> bool {
+    let mut cur = start.borrow().proto.clone();
+    while let Some(p) = cur {
+        let b = p.borrow();
+        match &b.internal {
+            Internal::Ordinary | Internal::Array(_) => {}
+            _ => return false,
+        }
+        if !b.props.is_empty() && b.props.keys().any(|k| k.array_index().is_some()) {
+            return false;
+        }
+        let next = b.proto.clone();
+        drop(b);
+        cur = next;
+    }
+    true
+}
+
 #[derive(Clone)]
 pub struct Property {
     pub kind: PropertyKind,

@@ -1541,12 +1541,84 @@ fn merge_sort(
     } else {
         None
     };
+    // All-Number specialization: with a kernel comparator and a snapshot of
+    // nothing but Numbers, the whole sort runs over raw `f64`s — no `Value`
+    // moves in the merge, and (`prime_prepared_cmp`) no per-call guard: no
+    // user code can run between two comparator calls, so the entry checks
+    // hold for the entire sort. The recursion/merge structure is IDENTICAL
+    // to the generic `merge_sort_range`, so an inconsistent comparator
+    // produces the exact same (implementation-defined) order either way.
+    if let Some(p) = prep.as_mut() {
+        if items.iter().all(|v| matches!(v, Value::Number(_))) {
+            if let Some(regs_ab) = vm.prime_prepared_cmp(p) {
+                let mut nums: Vec<f64> = items
+                    .iter()
+                    .map(|v| match v {
+                        Value::Number(n) => *n,
+                        _ => unreachable!("checked all-Number"),
+                    })
+                    .collect();
+                let mut aux: Vec<f64> = Vec::with_capacity(nums.len() / 2 + 1);
+                let n = nums.len();
+                merge_sort_range_f64(vm, &mut nums, &mut aux, 0, n, p, regs_ab)?;
+                for (slot, n) in items.iter_mut().zip(nums) {
+                    *slot = Value::Number(n);
+                }
+                return Ok(());
+            }
+        }
+    }
     // One scratch buffer for the whole sort (max use: the larger half) instead
     // of two fresh Vec clones per recursion node — the naive version's
     // malloc/free + refcount churn was a measurable slice of sort-heavy runs.
     let mut aux: Vec<Value> = Vec::with_capacity(items.len() / 2 + 1);
     let n = items.len();
     merge_sort_range(vm, items, &mut aux, 0, n, cmp, has_cmp, &mut prep)
+}
+
+/// [`merge_sort_range`] over raw `f64`s for the all-Number/kernel-comparator
+/// specialization — same recursion, same stable take-left-on-ties merge, so
+/// the result (even under an inconsistent comparator) is bit-identical to
+/// the generic path; only the value representation changed. Shared with the
+/// TypedArray sort (same split/merge structure there too).
+pub(crate) fn merge_sort_range_f64(
+    vm: &mut Vm,
+    items: &mut [f64],
+    aux: &mut Vec<f64>,
+    lo: usize,
+    hi: usize,
+    p: &mut crate::exec::PreparedKernel,
+    regs_ab: (Option<usize>, Option<usize>),
+) -> Result<(), Value> {
+    let n = hi - lo;
+    if n <= 1 {
+        return Ok(());
+    }
+    let mid = lo + n / 2;
+    merge_sort_range_f64(vm, items, aux, lo, mid, p, regs_ab)?;
+    merge_sort_range_f64(vm, items, aux, mid, hi, p, regs_ab)?;
+    aux.clear();
+    aux.extend_from_slice(&items[lo..mid]);
+    let mut i = 0; // over aux (left run)
+    let mut j = mid; // over items (right run)
+    let mut k = lo; // write cursor; k <= j always
+    while i < aux.len() && j < hi {
+        let order = vm.exec_prepared_cmp_f64(p, regs_ab, aux[i], items[j])?;
+        if order <= 0 {
+            items[k] = aux[i];
+            i += 1;
+        } else {
+            items[k] = items[j];
+            j += 1;
+        }
+        k += 1;
+    }
+    while i < aux.len() {
+        items[k] = aux[i];
+        i += 1;
+        k += 1;
+    }
+    Ok(())
 }
 
 /// Sort `items[lo..hi]` in place. Identical recursion structure and stable

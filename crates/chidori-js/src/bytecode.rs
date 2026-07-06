@@ -1271,6 +1271,13 @@ pub struct Kernel {
     /// accessor'd name declines the kernel and the call runs generically.
     /// `None` for loop kernels and non-recursive function kernels.
     pub self_global: Option<Box<str>>,
+    /// Whether the code contains a [`KOp::StoreElem`]. A store may CREATE an
+    /// element (hole fill / exact append), and the spec's OrdinarySet
+    /// consults the prototype chain when the own property is absent — so the
+    /// activation entry guard must verify the array bases' chains carry no
+    /// reified index entry (`protos_allow_any_index_create`). Read-only
+    /// loops skip that walk entirely.
+    pub stores_elems: bool,
     /// The original loop-header op this kernel replaced; executed verbatim
     /// when the guard declines.
     pub fallback: Box<Op>,
