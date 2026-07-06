@@ -569,10 +569,48 @@ impl PrivateEnv {
 
 /// A property key: string or symbol. Integer-index keys are stored as their
 /// string form; enumeration re-derives integer ordering.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum PropertyKey {
     Str(JsString),
     Sym(JsSymbol),
+}
+
+/// Manual (not derived) so [`StrKeyRef`] — the alloc-free `&str` probe — can
+/// reproduce the exact same stream for string keys.
+impl std::hash::Hash for PropertyKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            PropertyKey::Str(s) => {
+                state.write_u8(0);
+                s.hash(state);
+            }
+            PropertyKey::Sym(s) => {
+                state.write_u8(1);
+                s.hash(state);
+            }
+        }
+    }
+}
+
+/// A borrowed string key for probing a property map WITHOUT allocating a
+/// `PropertyKey` (whose `JsString` is heap-backed). Hashes exactly like
+/// `PropertyKey::Str` of a well-formed string, so
+/// `props.contains_key(&StrKeyRef(s))` is equivalent to building the key.
+pub struct StrKeyRef<'a>(pub &'a str);
+
+impl std::hash::Hash for StrKeyRef<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // `PropertyKey::Str` hashes tag 0 + the string's canonical WTF-8
+        // bytes; a well-formed &str's bytes ARE its WTF-8 bytes.
+        state.write_u8(0);
+        self.0.as_bytes().hash(state);
+    }
+}
+
+impl indexmap::Equivalent<PropertyKey> for StrKeyRef<'_> {
+    fn equivalent(&self, key: &PropertyKey) -> bool {
+        matches!(key, PropertyKey::Str(s) if s.wtf8_bytes() == self.0.as_bytes())
+    }
 }
 
 impl PropertyKey {
@@ -631,6 +669,93 @@ pub fn canonical_index(s: &str) -> Option<u32> {
         Ok(n) if (n as u64) < (u32::MAX as u64) => Some(n),
         _ => None,
     }
+}
+
+/// Format an array index into `buf`, returning the digit string. Alloc-free
+/// backing for the property-map probes below.
+fn fmt_index(idx: u32, buf: &mut [u8; 10]) -> &str {
+    let mut i = buf.len();
+    let mut n = idx;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    std::str::from_utf8(&buf[i..]).expect("ASCII digits")
+}
+
+/// True when no object on the PROTOTYPE chain starting at `proto` could
+/// observably intercept the CREATION of the array-index properties
+/// `idx..idx+count` on the receiver (an append or in-bounds hole fill, whose
+/// own property is absent — so the spec's OrdinarySet consults the chain):
+/// every prototype must be a plain `Ordinary` or dense-`Array` object with
+/// no reified `props` entry at those indices. A dense proto ELEMENT is a
+/// plain writable data property — OrdinarySet then creates the property on
+/// the receiver anyway, so skipping it is unobservable; only a reified entry
+/// (which may be an accessor or non-writable) can intercept or veto the
+/// write. The hot dense-array write fast paths call this before creating;
+/// anything else declines to the generic path.
+pub fn protos_allow_index_create(proto: Option<JsObject>, idx: u32, count: u32) -> bool {
+    // Stack-format the first index once — the common `count == 1` case
+    // (a push of one element, one `a[i] = v` store) reuses it at every level.
+    let mut buf = [0u8; 10];
+    let first = fmt_index(idx, &mut buf);
+    let mut cur = proto;
+    while let Some(p) = cur {
+        let b = p.borrow();
+        match &b.internal {
+            Internal::Ordinary | Internal::Array(_) => {}
+            // Exotic protos (Proxy traps, TypedArray index absorption,
+            // String character slots, mapped Arguments, …) own their [[Set]].
+            _ => return false,
+        }
+        if !b.props.is_empty() {
+            if b.props.contains_key(&StrKeyRef(first)) {
+                return false;
+            }
+            for j in 1..count {
+                let mut buf = [0u8; 10];
+                if b.props
+                    .contains_key(&StrKeyRef(fmt_index(idx + j, &mut buf)))
+                {
+                    return false;
+                }
+            }
+        }
+        let next = b.proto.clone();
+        drop(b);
+        cur = next;
+    }
+    true
+}
+
+/// The activation-scoped variant of [`protos_allow_index_create`] for the
+/// kernel `StoreElem` fast path: true when no object on `start`'s prototype
+/// chain could observably intercept the creation of ANY array-index property
+/// on `start` — every prototype a plain `Ordinary`/dense-`Array` object with
+/// no reified index-keyed `props` entry at all. Checked ONCE per kernel
+/// activation (nothing inside a kernel region can run user code or
+/// restructure a property map, so the verdict holds for the whole
+/// activation); the per-key probes stay in the per-write helper above.
+pub fn protos_allow_any_index_create(start: &JsObject) -> bool {
+    let mut cur = start.borrow().proto.clone();
+    while let Some(p) = cur {
+        let b = p.borrow();
+        match &b.internal {
+            Internal::Ordinary | Internal::Array(_) => {}
+            _ => return false,
+        }
+        if !b.props.is_empty() && b.props.keys().any(|k| k.array_index().is_some()) {
+            return false;
+        }
+        let next = b.proto.clone();
+        drop(b);
+        cur = next;
+    }
+    true
 }
 
 #[derive(Clone)]
@@ -720,6 +845,17 @@ impl ObjectData {
     }
     pub fn private_get(&self, id: u64) -> Option<&PrivateElement> {
         self.privates.as_ref().and_then(|p| p.get(&id))
+    }
+    /// Does `props` hold a (reified) entry for the array index `idx`?
+    /// Alloc-free: the index is formatted into a stack buffer and probed via
+    /// [`StrKeyRef`], so hot fast-path guards can call this per element.
+    pub fn has_index_prop(&self, idx: u32) -> bool {
+        if self.props.is_empty() {
+            return false;
+        }
+        let mut buf = [0u8; 10];
+        self.props
+            .contains_key(&StrKeyRef(fmt_index(idx, &mut buf)))
     }
     /// Append a private element; `false` (no insert) when `id` is already
     /// present — the caller's duplicate-initialization TypeError.

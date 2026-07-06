@@ -1680,6 +1680,47 @@ fn ta_snapshot_array(vm: &mut Vm, o: &JsObject) -> JsObject {
 /// (Number or BigInt). Default compare is ascending numeric (NaN sorts to the
 /// end); an optional comparator is honored. Stable merge sort.
 fn ta_sort(vm: &mut Vm, items: &mut Vec<Value>, cmp: &Value, has_cmp: bool) -> Result<(), Value> {
+    // The comparator's function kernel, prepared ONCE for the whole sort
+    // (see `Vm::prepare_kernel_callback`).
+    let mut prep = if has_cmp {
+        vm.prepare_kernel_callback(cmp)
+    } else {
+        None
+    };
+    // All-Number specialization (every non-BigInt element kind): raw-`f64`
+    // merge sort with a primed comparator — the same split/merge structure
+    // as `ta_sort_range`, so results match the generic path exactly. See
+    // `Array.prototype.sort`'s `merge_sort` for the soundness argument.
+    if let Some(p) = prep.as_mut() {
+        if items.iter().all(|v| matches!(v, Value::Number(_))) {
+            if let Some(regs_ab) = vm.prime_prepared_cmp(p) {
+                let mut nums: Vec<f64> = items
+                    .iter()
+                    .map(|v| match v {
+                        Value::Number(n) => *n,
+                        _ => unreachable!("checked all-Number"),
+                    })
+                    .collect();
+                let mut aux: Vec<f64> = Vec::with_capacity(nums.len() / 2 + 1);
+                let n = nums.len();
+                super::array::merge_sort_range_f64(vm, &mut nums, &mut aux, 0, n, p, regs_ab)?;
+                for (slot, n) in items.iter_mut().zip(nums) {
+                    *slot = Value::Number(n);
+                }
+                return Ok(());
+            }
+        }
+    }
+    ta_sort_range(vm, items, cmp, has_cmp, &mut prep)
+}
+
+fn ta_sort_range(
+    vm: &mut Vm,
+    items: &mut Vec<Value>,
+    cmp: &Value,
+    has_cmp: bool,
+    prep: &mut Option<crate::exec::PreparedKernel>,
+) -> Result<(), Value> {
     let n = items.len();
     if n <= 1 {
         return Ok(());
@@ -1687,13 +1728,13 @@ fn ta_sort(vm: &mut Vm, items: &mut Vec<Value>, cmp: &Value, has_cmp: bool) -> R
     let mid = n / 2;
     let mut left = items[..mid].to_vec();
     let mut right = items[mid..].to_vec();
-    ta_sort(vm, &mut left, cmp, has_cmp)?;
-    ta_sort(vm, &mut right, cmp, has_cmp)?;
+    ta_sort_range(vm, &mut left, cmp, has_cmp, prep)?;
+    ta_sort_range(vm, &mut right, cmp, has_cmp, prep)?;
     let mut i = 0;
     let mut j = 0;
     let mut k = 0;
     while i < left.len() && j < right.len() {
-        let order = ta_compare(vm, &left[i], &right[j], cmp, has_cmp)?;
+        let order = ta_compare(vm, &left[i], &right[j], cmp, has_cmp, prep)?;
         if order <= 0 {
             items[k] = left[i].clone();
             i += 1;
@@ -1716,8 +1757,40 @@ fn ta_sort(vm: &mut Vm, items: &mut Vec<Value>, cmp: &Value, has_cmp: bool) -> R
     Ok(())
 }
 
-fn ta_compare(vm: &mut Vm, a: &Value, b: &Value, cmp: &Value, has_cmp: bool) -> Result<i32, Value> {
+fn ta_compare(
+    vm: &mut Vm,
+    a: &Value,
+    b: &Value,
+    cmp: &Value,
+    has_cmp: bool,
+    prep: &mut Option<crate::exec::PreparedKernel>,
+) -> Result<i32, Value> {
     if has_cmp {
+        // Prepared-kernel comparator (as in Array.prototype.sort's
+        // `compare_values`): unboxed registers, result a Number/Bool by
+        // construction; a per-call guard miss falls through generically.
+        if let Some(p) = prep {
+            if let Some(r) = vm.exec_prepared_kernel(p, &[a.clone(), b.clone()]) {
+                let n = match r? {
+                    Value::Number(n) => n,
+                    Value::Bool(bv) => {
+                        if bv {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    _ => unreachable!("fn kernels return Number or Bool"),
+                };
+                return Ok(if n < 0.0 {
+                    -1
+                } else if n > 0.0 {
+                    1
+                } else {
+                    0
+                });
+            }
+        }
         let r = vm.call(cmp.clone(), Value::Undefined, &[a.clone(), b.clone()])?;
         // The comparator result is ToNumber'd even for BigInt arrays; a NaN or
         // ±0 result is treated as 0 (equal).

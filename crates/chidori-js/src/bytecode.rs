@@ -961,6 +961,30 @@ pub enum KOp {
     Neg { dst: u16, src: u16 },
     /// `regs[dst] = ~ToInt32(regs[src])`
     BitNot { dst: u16, src: u16 },
+    /// SUPERINSTRUCTION (translation-time fusion of two adjacent ops; see
+    /// `fuse_kops`): two `Mov`s executed sequentially in one dispatch. The
+    /// unfused second op stays in the next code slot as a branch-target
+    /// landing pad; a fused arm skips it (`pc += 2`).
+    Mov2 { d1: u16, s1: u16, d2: u16, s2: u16 },
+    /// SUPERINSTRUCTION: `Arith` followed by `Add`, sequentially — the
+    /// `s += a <op> b` accumulation shape.
+    ArithAdd {
+        kind: crate::exec::ArithKind,
+        dst: u16,
+        a: u16,
+        b: u16,
+        d2: u16,
+        a2: u16,
+        b2: u16,
+    },
+    /// SUPERINSTRUCTION: `AddK` followed by an unconditional `Br` — the
+    /// `i += 1; continue` loop back-edge (same poll cadence as the `Br`).
+    AddKBr {
+        dst: u16,
+        a: u16,
+        k: f64,
+        target: u16,
+    },
     /// unconditional jump
     Br { target: u16 },
     /// numeric compare-and-branch: jump when `cmp(a, b) == if_true`
@@ -1005,6 +1029,27 @@ pub enum KOp {
         val: u16,
         bail: u16,
     },
+    /// Pinned-native `Array.prototype.push` over the dense array in object
+    /// slot `obj`: append `Value::Number(regs[val])` and set `regs[dst]` to
+    /// the new length. The activation entry verified the canonical `push`
+    /// still resolves (`Kernel::uses_array_push`) and — via the
+    /// `stores_elems` chain guard — that no prototype can intercept element
+    /// creation; the op re-checks the receiver per push (unshadowed `props`
+    /// empty, extensible, direct proto IS the canonical Array.prototype,
+    /// dense bound) and bails to the generic `Call` otherwise.
+    ArrayPush {
+        obj: u16,
+        val: u16,
+        dst: u16,
+        bail: u16,
+    },
+    /// Pinned-native `Array.prototype.pop` over the dense array in object
+    /// slot `obj`: remove the last element (a non-hole `Number`, else bail —
+    /// an empty array's `undefined` result and a trailing hole's prototype
+    /// consult belong to the generic path) and set `regs[dst]` to it. Entry
+    /// guard as [`KOp::ArrayPush`] (canonical method + receiver resolution,
+    /// `Kernel::uses_array_pop`); the receiver conditions re-check per op.
+    ArrayPop { obj: u16, dst: u16, bail: u16 },
     /// `regs[dst] = <length>` of the dense array in object slot `obj`
     /// (unshadowed only — a reified `length` marker bails).
     LoadLen { dst: u16, obj: u16, bail: u16 },
@@ -1102,12 +1147,19 @@ pub enum KSlot {
 
 /// One named-property access class in a kernel (`o.a` / `o.a = v` sites over
 /// the pinned base object in oslot `oslot`): resolved ONCE per kernel
-/// activation to a raw property-map slot index. The entry check requires an
+/// activation to a raw property-map slot index AND LOCALIZED into a
+/// dedicated register at the tail of the register file — the entry loads
+/// the slot's current value, the build pass rewrote every in-region access
+/// into a register `Mov` (then propagated/deleted by the cleanup pass), and
+/// `store`-class registers are written back to the slot on every exit /
+/// bail / interrupt unwind. The entry check requires an
 /// [`crate::value::Internal::Ordinary`] receiver whose OWN data property
-/// `key` exists — holding a `Number` when `load` (reads must produce what
-/// the guard typed), writable when `store` — and declines the activation
-/// otherwise. Slot indices are stable for the activation because kernel
-/// regions contain no calls and no property creation/deletion.
+/// `key` exists, holds a `Number` (the register must carry the current
+/// value even for a store-only class, so a conditionally skipped store
+/// writes the original back), is writable when `store`, and does not alias
+/// another class's (object, slot) — declining the activation otherwise.
+/// Slot indices are stable for the activation because kernel regions
+/// contain no calls and no property creation/deletion.
 #[derive(Clone, Debug)]
 pub struct KProp {
     pub oslot: u16,
@@ -1134,6 +1186,12 @@ pub struct KCallee {
 #[derive(Clone, Copy, Debug)]
 pub enum KShapeSlot {
     Num(u16),
+    /// The canonical `Array.prototype.push` function object (the entry guard
+    /// proved the live value IS the canonical, so a bail reconstructs it
+    /// from the realm — exactly like `MathFn`).
+    ArrayPushFn,
+    /// The canonical `Array.prototype.pop`, likewise.
+    ArrayPopFn,
     /// A register statically typed BOOLEAN (holds exactly 0.0/1.0):
     /// materialized as `Value::Bool` — `typeof` must not see a number.
     Bool(u16),
@@ -1271,6 +1329,19 @@ pub struct Kernel {
     /// accessor'd name declines the kernel and the call runs generically.
     /// `None` for loop kernels and non-recursive function kernels.
     pub self_global: Option<Box<str>>,
+    /// Whether the code contains a [`KOp::StoreElem`]. A store may CREATE an
+    /// element (hole fill / exact append), and the spec's OrdinarySet
+    /// consults the prototype chain when the own property is absent — so the
+    /// activation entry guard must verify the array bases' chains carry no
+    /// reified index entry (`protos_allow_any_index_create`). Read-only
+    /// loops skip that walk entirely.
+    pub stores_elems: bool,
+    /// Whether the code contains a [`KOp::ArrayPush`]: the activation entry
+    /// must verify the canonical `Array.prototype.push` still backs the
+    /// `push` property of the canonical Array prototype.
+    pub uses_array_push: bool,
+    /// As `uses_array_push`, for [`KOp::ArrayPop`] / `pop`.
+    pub uses_array_pop: bool,
     /// The original loop-header op this kernel replaced; executed verbatim
     /// when the guard declines.
     pub fallback: Box<Op>,

@@ -147,6 +147,51 @@ const CORPUS: &[&str] = &[
     "const a = [1,2,3]; let got = 0; Object.defineProperty(a, 1, { get() { got++; return 50; } }); let s = 0; for (let i = 0; i < a.length; i++) { s += a[i]; } console.log(s, got);",
     // Array GROWTH inside the loop (appends bail; length re-read each pass).
     "const a = [1]; for (let i = 0; i < a.length && i < 5; i++) { a[a.length] = a[i] + 1; } console.log(a.join(','));",
+    // A reified Array.prototype index ACCESSOR intercepts loop APPENDS (the
+    // own property is absent, so OrdinarySet consults the chain): the kernel
+    // entry guard must decline and route through the setter every iteration.
+    "let calls = 0; Object.defineProperty(Array.prototype, 3, { set(v) { calls += v; }, configurable: true }); const a = [0, 1, 2]; for (let i = 1; i <= 3; i++) { a[3] = i; } delete Array.prototype[3]; console.log(calls, a.length, a[3]);",
+    // ... and HOLE FILLS (same chain consult for an absent own property).
+    "let calls = 0; Object.defineProperty(Array.prototype, 1, { set(v) { calls++; }, configurable: true }); const a = [7, , 9]; for (let i = 0; i < 2; i++) { a[1] = i; } delete Array.prototype[1]; console.log(calls, 1 in a, a.length);",
+    // A dense proto ELEMENT (plain writable data, no reified entry) must NOT
+    // decline: the spec creates the property on the receiver anyway.
+    "Array.prototype[2] = 99; const a = [0, 1]; for (let i = 0; i < 3; i++) { a[2] = i; } delete Array.prototype[2]; console.log(a[2], a.length, a.join(','));",
+    // ---- pinned-native `a.push(x)` (KOp::ArrayPush) ----
+    // The canonical push loop; result (new length) used numerically.
+    "const a = []; let n = 0; for (let i = 0; i < 50; i++) { n = a.push(i * 2); } console.log(n, a.length, a[0], a[49]);",
+    // Push interleaved with reads, length, and a second array.
+    "const a = [], b = [9]; let s = 0; for (let i = 0; i < 20; i++) { a.push(i); b.push(a[i] + b[0]); s += a.length + b.length; } console.log(s, a[19], b[20]);",
+    // Argument with a SIDE EFFECT (post-increment) — no replay on any path.
+    "const a = []; let j = 0; for (let i = 0; i < 5; i++) { a.push(j++); } console.log(j, a.join(','));",
+    // Conditional push (skipped iterations).
+    "const a = []; for (let i = 0; i < 10; i++) { if (i % 3 === 0) { a.push(i); } } console.log(a.join(','));",
+    // MONKEYPATCHED Array.prototype.push: the entry guard must decline and
+    // run the patch every iteration.
+    "const orig = Array.prototype.push; let calls = 0; Array.prototype.push = function (x) { calls++; return orig.call(this, x + 100); }; const a = []; for (let i = 0; i < 4; i++) { a.push(i); } Array.prototype.push = orig; console.log(calls, a.join(','));",
+    // OWN `push` property shadowing the prototype's: declines, custom runs.
+    "const a = []; a.push = function (x) { this[this.length] = x * 10; return this.length; }; for (let i = 0; i < 4; i++) { a.push(i); } console.log(a.join(','), a.length);",
+    // Receiver with a CUSTOM prototype (not %Array.prototype%): declines.
+    "const a = []; Object.setPrototypeOf(a, { push(x) { Array.prototype.push.call(this, x + 5); return this.length; } }); for (let i = 0; i < 3; i++) { a.push(i); } console.log(a.join(','));",
+    // Non-extensible receiver: sloppy push throws (spec Set semantics) via
+    // the generic path — the entry guard declines.
+    "const a = [1]; Object.preventExtensions(a); let err = ''; try { for (let i = 0; i < 3; i++) { a.push(i); } } catch (e) { err = e.constructor.name; } console.log(err, a.length);",
+    // Non-Number argument: the region rejects; generic push runs.
+    "const a = []; for (let i = 0; i < 3; i++) { a.push('s' + i); } console.log(a.join(','));",
+    // Method extracted, not called: the region rejects; still correct.
+    "const a = [1]; let t = ''; for (let i = 0; i < 2; i++) { const f = a.push; t = typeof f; } console.log(t, a.length);",
+    // ---- pinned-native `a.pop()` (KOp::ArrayPop) ----
+    // Drain loop: pop while non-empty (length re-read per iteration).
+    "const a = [1, 2, 3, 4, 5]; let s = 0; while (a.length > 0) { s += a.pop(); } console.log(s, a.length);",
+    // Pop past empty: undefined result arrives via the generic bail.
+    "const a = [7]; let r = 0; for (let i = 0; i < 3; i++) { const v = a.pop(); r += v === undefined ? 100 : v; } console.log(r, a.length);",
+    // Trailing HOLE reads through the prototype on the generic path.
+    "Array.prototype[1] = 55; const a = [9, , ]; const v = a.pop(); delete Array.prototype[1]; console.log(v, a.length);",
+    // Non-Number last element: per-op bail, exact value via generic.
+    "const a = [1, 'two', 3]; let s = ''; for (let i = 0; i < 3; i++) { s += a.pop() + '|'; } console.log(s, a.length);",
+    // MONKEYPATCHED pop declines at entry.
+    "const orig = Array.prototype.pop; let calls = 0; Array.prototype.pop = function () { calls++; return orig.call(this); }; const a = [1, 2, 3]; let s = 0; for (let i = 0; i < 3; i++) { s += a.pop(); } Array.prototype.pop = orig; console.log(calls, s, a.length);",
+    // push + pop mixed in one region.
+    "const a = []; let s = 0; for (let i = 0; i < 10; i++) { a.push(i); if (i % 2) { s += a.pop(); } } console.log(s, a.length, a.join(','));",
     // Base REASSIGNED inside the loop: translation must reject (store to a
     // base local) and the generic loop must swap arrays mid-flight.
     "let a = [1,2,3,4]; const b = [100,200,300,400]; let s = 0; for (let i = 0; i < a.length; i++) { s += a[i]; if (i === 1) a = b; } console.log(s);",
@@ -330,6 +375,18 @@ const CORPUS: &[&str] = &[
     "const d = new Date(0); d.foo = 0; let s = 0; for (let i = 0; i < 3; i++) { d.foo = i; s += d.foo; } console.log(s);",
     // Props mixed with dense-element access in one region.
     "const o = { sum: 0 }; const a = [5, 6, 7]; for (let i = 0; i < a.length; i++) { o.sum = o.sum + a[i]; } console.log(o.sum);",
+    // CONDITIONAL store: iterations that skip the store must leave the
+    // property untouched (prop localization writes the entry-loaded value
+    // back through the register).
+    "const o = { a: 5 }; for (let i = 0; i < 6; i++) { if (i % 2) { o.a = i * 10; } } console.log(o.a);",
+    "const o = { a: 5 }; for (let i = 0; i < 6; i++) { if (i > 99) { o.a = i; } } console.log(o.a);",
+    // Mid-loop BAIL (non-Number element) with a prop store already executed
+    // this activation: the bail must write the prop register back before
+    // the generic interpreter resumes and reads the property normally.
+    "const o = { t: 0 }; const a = [1, 'x', 3]; let s = ''; for (let i = 0; i < a.length; i++) { o.t = o.t + i; s += a[i]; } console.log(o.t, s);",
+    // Store-only class whose CURRENT value is a non-Number: declines (the
+    // register must carry the entry value for conditional stores).
+    "const o = { v: 'init' }; for (let i = 0; i < 3; i++) { o.v = i; } console.log(o.v);",
     // -0 / NaN through property writes; typeof pins.
     "const o = { z: 1, n: 1 }; for (let i = 0; i < 3; i++) { o.z = -0 * i; o.n = i === 1 ? NaN : i; } console.log(Object.is(o.z, -0), o.n !== o.n, typeof o.z);",
     // `length` as a plain object property takes the array bail path per

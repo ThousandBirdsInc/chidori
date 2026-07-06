@@ -146,6 +146,22 @@ pub fn install(vm: &mut Vm) {
 
     install_proto_methods(vm, &proto);
     install_unscopables(vm, &proto);
+    // Pin the canonical `push`/`pop` for the kernel `ArrayPush`/`ArrayPop`
+    // fast paths (entry identity check + bail-shape reconstruction).
+    for (name, slot) in [("push", 0), ("pop", 1)] {
+        let f = proto
+            .borrow()
+            .props
+            .get(&PropertyKey::str(name))
+            .and_then(|p| p.value().cloned());
+        if let Some(Value::Object(o)) = f {
+            if slot == 0 {
+                vm.realm.array_push = Some(o);
+            } else {
+                vm.realm.array_pop = Some(o);
+            }
+        }
+    }
 }
 
 fn array_call(vm: &mut Vm, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -337,6 +353,42 @@ fn array_create(vm: &mut Vm, len: f64) -> Result<JsObject, Value> {
 
 fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     vm.define_method(proto, "push", 1, |vm, this, args| {
+        // Dense fast path: an UNSHADOWED (`props` empty — no reified length
+        // marker, no index accessors, not frozen/sealed), extensible dense
+        // array appends straight onto the backing vec — no per-element
+        // index→String key or generic Set machinery. Appending CREATES
+        // properties, so the spec consults the prototype chain: the walk is
+        // one cheap reified-index probe per proto (`protos_allow_index_create`
+        // — a polluted chain declines to the generic path, which fires the
+        // proto accessor). The dense-storage bound also falls back to the
+        // generic path, which owns that RangeError.
+        if let Value::Object(o) = &this {
+            let start = {
+                let b = o.borrow();
+                if b.props.is_empty() && b.extensible {
+                    match &b.internal {
+                        Internal::Array(arr)
+                            if arr.len() + args.len() <= crate::value::MAX_DENSE_ARRAY =>
+                        {
+                            Some((arr.len() as u32, b.proto.clone()))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some((start, proto)) = start {
+                if crate::value::protos_allow_index_create(proto, start, args.len() as u32) {
+                    // No user code ran since the guard borrow; the conditions
+                    // still hold.
+                    if let Internal::Array(arr) = &mut o.borrow_mut().internal {
+                        arr.extend_from_slice(args);
+                        return Ok(Value::Number(arr.len() as f64));
+                    }
+                }
+            }
+        }
         // Spec-generic: Set(O, len+i, arg, throw); Set(O, "length", …, throw). The
         // throwing Set surfaces a frozen array / non-writable length as a
         // TypeError, and the 2^53-1 guard runs before any element is written.
@@ -355,6 +407,24 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         Ok(Value::Number(len))
     });
     vm.define_method(proto, "pop", 0, |vm, this, _args| {
+        // Dense fast path mirroring push's: on an unshadowed extensible dense
+        // array the Get/Delete/Set-length sequence collapses to `vec.pop`. A
+        // trailing HOLE takes the generic path (its Get consults the
+        // prototype chain), as does an empty array's length write-back.
+        if let Value::Object(o) = &this {
+            let mut b = o.borrow_mut();
+            if b.props.is_empty() && b.extensible {
+                if let Internal::Array(arr) = &mut b.internal {
+                    match arr.last() {
+                        Some(v) if !matches!(v, Value::Hole) => {
+                            return Ok(arr.pop().expect("checked non-empty"));
+                        }
+                        None => return Ok(Value::Undefined),
+                        _ => {}
+                    }
+                }
+            }
+        }
         // Spec-generic: Get the last element, DeletePropertyOrThrow it, then set
         // the (throwing) length — so a frozen/non-writable receiver throws.
         let o = vm.to_object(&this)?;
@@ -764,13 +834,16 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     });
     vm.define_method(proto, "forEach", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
+        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut k = 0.0;
         while k < len {
             vm.native_tick()?;
             if let Some(v) = has_get_elem(vm, &ov, k)? {
-                vm.call(
-                    cb.clone(),
-                    this_arg.clone(),
+                call_cb(
+                    vm,
+                    &mut prep,
+                    &cb,
+                    &this_arg,
                     &[v, Value::Number(k), ov.clone()],
                 )?;
             }
@@ -783,13 +856,16 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
         // Result via ArraySpeciesCreate; holes map to holes (the callback is not
         // invoked for an absent index and that output slot stays absent).
         let a = array_species_create(vm, &ov, len)?;
+        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut k = 0.0;
         while k < len {
             vm.native_tick()?;
             if let Some(v) = has_get_elem(vm, &ov, k)? {
-                let mapped = vm.call(
-                    cb.clone(),
-                    this_arg.clone(),
+                let mapped = call_cb(
+                    vm,
+                    &mut prep,
+                    &cb,
+                    &this_arg,
                     &[v, Value::Number(k), ov.clone()],
                 )?;
                 create_data_elem(vm, &a, k, mapped)?;
@@ -801,14 +877,17 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     vm.define_method(proto, "filter", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
         let a = array_species_create(vm, &ov, 0.0)?;
+        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut to = 0.0;
         let mut k = 0.0;
         while k < len {
             vm.native_tick()?;
             if let Some(v) = has_get_elem(vm, &ov, k)? {
-                let keep = vm.call(
-                    cb.clone(),
-                    this_arg.clone(),
+                let keep = call_cb(
+                    vm,
+                    &mut prep,
+                    &cb,
+                    &this_arg,
                     &[v.clone(), Value::Number(k), ov.clone()],
                 )?;
                 if vm.to_boolean(&keep) {
@@ -823,13 +902,16 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     vm.define_method(proto, "find", 1, |vm, this, args| {
         // `find` visits every index via Get (holes read as undefined).
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
+        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut k = 0.0;
         while k < len {
             vm.native_tick()?;
             let v = vm.get_prop(&ov, &elem_key(k))?;
-            let r = vm.call(
-                cb.clone(),
-                this_arg.clone(),
+            let r = call_cb(
+                vm,
+                &mut prep,
+                &cb,
+                &this_arg,
                 &[v.clone(), Value::Number(k), ov.clone()],
             )?;
             if vm.to_boolean(&r) {
@@ -841,13 +923,16 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     });
     vm.define_method(proto, "findIndex", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
+        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut k = 0.0;
         while k < len {
             vm.native_tick()?;
             let v = vm.get_prop(&ov, &elem_key(k))?;
-            let r = vm.call(
-                cb.clone(),
-                this_arg.clone(),
+            let r = call_cb(
+                vm,
+                &mut prep,
+                &cb,
+                &this_arg,
                 &[v, Value::Number(k), ov.clone()],
             )?;
             if vm.to_boolean(&r) {
@@ -859,13 +944,16 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     });
     vm.define_method(proto, "findLast", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
+        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut k = len - 1.0;
         while k >= 0.0 {
             vm.native_tick()?;
             let v = vm.get_prop(&ov, &elem_key(k))?;
-            let r = vm.call(
-                cb.clone(),
-                this_arg.clone(),
+            let r = call_cb(
+                vm,
+                &mut prep,
+                &cb,
+                &this_arg,
                 &[v.clone(), Value::Number(k), ov.clone()],
             )?;
             if vm.to_boolean(&r) {
@@ -877,13 +965,16 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     });
     vm.define_method(proto, "findLastIndex", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
+        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut k = len - 1.0;
         while k >= 0.0 {
             vm.native_tick()?;
             let v = vm.get_prop(&ov, &elem_key(k))?;
-            let r = vm.call(
-                cb.clone(),
-                this_arg.clone(),
+            let r = call_cb(
+                vm,
+                &mut prep,
+                &cb,
+                &this_arg,
                 &[v, Value::Number(k), ov.clone()],
             )?;
             if vm.to_boolean(&r) {
@@ -895,15 +986,16 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     });
     vm.define_method(proto, "some", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
+        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut k = 0.0;
         while k < len {
             vm.native_tick()?;
-            let key = elem_key(k);
-            if vm.has_prop(&ov, &key)? {
-                let v = vm.get_prop(&ov, &key)?;
-                let r = vm.call(
-                    cb.clone(),
-                    this_arg.clone(),
+            if let Some(v) = has_get_elem(vm, &ov, k)? {
+                let r = call_cb(
+                    vm,
+                    &mut prep,
+                    &cb,
+                    &this_arg,
                     &[v, Value::Number(k), ov.clone()],
                 )?;
                 if vm.to_boolean(&r) {
@@ -916,15 +1008,16 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
     });
     vm.define_method(proto, "every", 1, |vm, this, args| {
         let (ov, len, cb, this_arg) = iter_setup(vm, &this, args)?;
+        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut k = 0.0;
         while k < len {
             vm.native_tick()?;
-            let key = elem_key(k);
-            if vm.has_prop(&ov, &key)? {
-                let v = vm.get_prop(&ov, &key)?;
-                let r = vm.call(
-                    cb.clone(),
-                    this_arg.clone(),
+            if let Some(v) = has_get_elem(vm, &ov, k)? {
+                let r = call_cb(
+                    vm,
+                    &mut prep,
+                    &cb,
+                    &this_arg,
                     &[v, Value::Number(k), ov.clone()],
                 )?;
                 if !vm.to_boolean(&r) {
@@ -956,13 +1049,16 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
                 }
             }
         }
+        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut acc = acc;
         while k < len {
             vm.native_tick()?;
             if let Some(v) = has_get_elem(vm, &ov, k)? {
-                acc = vm.call(
-                    cb.clone(),
-                    Value::Undefined,
+                acc = call_cb(
+                    vm,
+                    &mut prep,
+                    &cb,
+                    &Value::Undefined,
                     &[acc, v, Value::Number(k), ov.clone()],
                 )?;
             }
@@ -990,15 +1086,16 @@ fn install_proto_methods(vm: &mut Vm, proto: &JsObject) {
                 }
             }
         }
+        let mut prep = vm.prepare_kernel_callback(&cb);
         let mut acc = acc;
         while k >= 0.0 {
             vm.native_tick()?;
-            let key = elem_key(k);
-            if vm.has_prop(&ov, &key)? {
-                let v = vm.get_prop(&ov, &key)?;
-                acc = vm.call(
-                    cb.clone(),
-                    Value::Undefined,
+            if let Some(v) = has_get_elem(vm, &ov, k)? {
+                acc = call_cb(
+                    vm,
+                    &mut prep,
+                    &cb,
+                    &Value::Undefined,
                     &[acc, v, Value::Number(k), ov.clone()],
                 )?;
             }
@@ -1452,12 +1549,92 @@ fn merge_sort(
     if items.len() <= 1 {
         return Ok(());
     }
+    // The comparator's function kernel, prepared ONCE for the whole sort:
+    // the ~n·log n comparator calls then skip the per-call entry ceremony
+    // (callee resolution, register allocation, frame bookkeeping).
+    let mut prep = if has_cmp {
+        vm.prepare_kernel_callback(cmp)
+    } else {
+        None
+    };
+    // All-Number specialization: with a kernel comparator and a snapshot of
+    // nothing but Numbers, the whole sort runs over raw `f64`s — no `Value`
+    // moves in the merge, and (`prime_prepared_cmp`) no per-call guard: no
+    // user code can run between two comparator calls, so the entry checks
+    // hold for the entire sort. The recursion/merge structure is IDENTICAL
+    // to the generic `merge_sort_range`, so an inconsistent comparator
+    // produces the exact same (implementation-defined) order either way.
+    if let Some(p) = prep.as_mut() {
+        if items.iter().all(|v| matches!(v, Value::Number(_))) {
+            if let Some(regs_ab) = vm.prime_prepared_cmp(p) {
+                let mut nums: Vec<f64> = items
+                    .iter()
+                    .map(|v| match v {
+                        Value::Number(n) => *n,
+                        _ => unreachable!("checked all-Number"),
+                    })
+                    .collect();
+                let mut aux: Vec<f64> = Vec::with_capacity(nums.len() / 2 + 1);
+                let n = nums.len();
+                merge_sort_range_f64(vm, &mut nums, &mut aux, 0, n, p, regs_ab)?;
+                for (slot, n) in items.iter_mut().zip(nums) {
+                    *slot = Value::Number(n);
+                }
+                return Ok(());
+            }
+        }
+    }
     // One scratch buffer for the whole sort (max use: the larger half) instead
     // of two fresh Vec clones per recursion node — the naive version's
     // malloc/free + refcount churn was a measurable slice of sort-heavy runs.
     let mut aux: Vec<Value> = Vec::with_capacity(items.len() / 2 + 1);
     let n = items.len();
-    merge_sort_range(vm, items, &mut aux, 0, n, cmp, has_cmp)
+    merge_sort_range(vm, items, &mut aux, 0, n, cmp, has_cmp, &mut prep)
+}
+
+/// [`merge_sort_range`] over raw `f64`s for the all-Number/kernel-comparator
+/// specialization — same recursion, same stable take-left-on-ties merge, so
+/// the result (even under an inconsistent comparator) is bit-identical to
+/// the generic path; only the value representation changed. Shared with the
+/// TypedArray sort (same split/merge structure there too).
+pub(crate) fn merge_sort_range_f64(
+    vm: &mut Vm,
+    items: &mut [f64],
+    aux: &mut Vec<f64>,
+    lo: usize,
+    hi: usize,
+    p: &mut crate::exec::PreparedKernel,
+    regs_ab: (Option<usize>, Option<usize>),
+) -> Result<(), Value> {
+    let n = hi - lo;
+    if n <= 1 {
+        return Ok(());
+    }
+    let mid = lo + n / 2;
+    merge_sort_range_f64(vm, items, aux, lo, mid, p, regs_ab)?;
+    merge_sort_range_f64(vm, items, aux, mid, hi, p, regs_ab)?;
+    aux.clear();
+    aux.extend_from_slice(&items[lo..mid]);
+    let mut i = 0; // over aux (left run)
+    let mut j = mid; // over items (right run)
+    let mut k = lo; // write cursor; k <= j always
+    while i < aux.len() && j < hi {
+        let order = vm.exec_prepared_cmp_f64(p, regs_ab, aux[i], items[j])?;
+        if order <= 0 {
+            items[k] = aux[i];
+            i += 1;
+        } else {
+            items[k] = items[j];
+            j += 1;
+        }
+        k += 1;
+    }
+    while i < aux.len() {
+        items[k] = aux[i];
+        i += 1;
+        k += 1;
+    }
+    Ok(())
 }
 
 /// Sort `items[lo..hi]` in place. Identical recursion structure and stable
@@ -1466,6 +1643,7 @@ fn merge_sort(
 /// buffer management changed. On a comparator throw the scratch's contents
 /// are abandoned mid-merge — harmless, because every caller sorts a detached
 /// scratch list and only writes back to the array on success.
+#[allow(clippy::too_many_arguments)]
 fn merge_sort_range(
     vm: &mut Vm,
     items: &mut [Value],
@@ -1474,14 +1652,15 @@ fn merge_sort_range(
     hi: usize,
     cmp: &Value,
     has_cmp: bool,
+    prep: &mut Option<crate::exec::PreparedKernel>,
 ) -> Result<(), Value> {
     let n = hi - lo;
     if n <= 1 {
         return Ok(());
     }
     let mid = lo + n / 2;
-    merge_sort_range(vm, items, aux, lo, mid, cmp, has_cmp)?;
-    merge_sort_range(vm, items, aux, mid, hi, cmp, has_cmp)?;
+    merge_sort_range(vm, items, aux, lo, mid, cmp, has_cmp, prep)?;
+    merge_sort_range(vm, items, aux, mid, hi, cmp, has_cmp, prep)?;
     // Move the left run into the scratch (no clones; the vacated slots are
     // overwritten before they are ever read), then merge back into
     // `items[lo..]`. Take from the left on ties (order <= 0) so equal
@@ -1495,7 +1674,7 @@ fn merge_sort_range(
     let mut k = lo; // write cursor; k <= j always, so unread right
                     // elements are never overwritten
     while i < aux.len() && j < hi {
-        let order = compare_values(vm, &aux[i], &items[j], cmp, has_cmp)?;
+        let order = compare_values(vm, &aux[i], &items[j], cmp, has_cmp, prep)?;
         if order <= 0 {
             items[k] = std::mem::replace(&mut aux[i], Value::Undefined);
             i += 1;
@@ -1520,8 +1699,36 @@ fn compare_values(
     b: &Value,
     cmp: &Value,
     has_cmp: bool,
+    prep: &mut Option<crate::exec::PreparedKernel>,
 ) -> Result<i32, Value> {
     if has_cmp {
+        // Prepared-kernel comparator: the call runs entirely in unboxed
+        // registers, and its result is a `Number` or `Bool` by construction,
+        // so ToNumber is a direct match (never user code). A per-call guard
+        // miss (non-Number element, patched Math) falls through to the
+        // generic call below for this comparison only.
+        if let Some(p) = prep {
+            if let Some(r) = vm.exec_prepared_kernel(p, &[a.clone(), b.clone()]) {
+                let n = match r? {
+                    Value::Number(n) => n,
+                    Value::Bool(bv) => {
+                        if bv {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    _ => unreachable!("fn kernels return Number or Bool"),
+                };
+                return Ok(if n < 0.0 {
+                    -1
+                } else if n > 0.0 {
+                    1
+                } else {
+                    0
+                });
+            }
+        }
         // SortCompare with a user comparator: call it, coerce the result via
         // ToNumber, and treat NaN as 0 (spec). Errors propagate. Owned-args
         // path: the pooled buffer moves straight into the callee frame instead
@@ -1570,6 +1777,28 @@ fn utf16_cmp(a: &str, b: &str) -> i32 {
             (None, None) => return 0,
         }
     }
+}
+
+/// Call an iteration callback through its prepared function kernel when one
+/// exists (see [`Vm::prepare_kernel_callback`]) — the per-element win behind
+/// the native higher-order builtins — falling back to the generic `Vm::call`
+/// when the callback has no kernel or a per-call guard declines (a
+/// non-`Number` element, a patched `Math`, …). A kernelized callback never
+/// consults `this` (translation rejects `this` uses), so skipping `this_arg`
+/// on the fast path is unobservable.
+fn call_cb(
+    vm: &mut Vm,
+    prep: &mut Option<crate::exec::PreparedKernel>,
+    cb: &Value,
+    this_arg: &Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+    if let Some(p) = prep {
+        if let Some(r) = vm.exec_prepared_kernel(p, args) {
+            return r;
+        }
+    }
+    vm.call(cb.clone(), this_arg.clone(), args)
 }
 
 /// Shared prologue for the callback-taking iteration methods (forEach/map/

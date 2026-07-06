@@ -327,6 +327,15 @@ enum VE {
     /// holds the very closure being invoked. Its ONLY legal consumer is a
     /// `Call` (which fuses to [`KOp::SelfCall`]); everything else rejects.
     SelfFn,
+    /// `a.push` on the array base in the oslot — speculative: the entry
+    /// guard verifies the canonical `Array.prototype.push` still backs the
+    /// `push` property of the canonical prototype, and the op re-checks the
+    /// receiver per call. Consumed by `Call(1)` (fusing to
+    /// [`KOp::ArrayPush`]); survives to exit shapes as
+    /// [`KShapeSlot::ArrayPushFn`] (realm-reconstructed on bail).
+    ArrayPushFn(u16),
+    /// `a.pop`, likewise (consumed by `Call(0)` → [`KOp::ArrayPop`]).
+    ArrayPopFn(u16),
 }
 
 struct Xlate<'a> {
@@ -383,6 +392,11 @@ struct Xlate<'a> {
     exits: Vec<(usize, u32, Vec<VE>)>,
     /// Math intrinsics used (entry guard checks each against the realm).
     math_used: Vec<KMath>,
+    /// Whether the region contains a pinned `Array.prototype.push` call
+    /// (entry guard verifies the canonical still resolves).
+    uses_array_push: bool,
+    /// As `uses_array_push`, for `pop`.
+    uses_array_pop: bool,
     /// Named-property access classes over oslot bases (entry-resolved; see
     /// [`KProp`]). Deduplicated by (oslot, key); flags OR together.
     props_used: Vec<KProp>,
@@ -446,6 +460,8 @@ fn translate(
         fixups: Vec::new(),
         exits: Vec::new(),
         math_used: Vec::new(),
+        uses_array_push: false,
+        uses_array_pop: false,
         props_used: Vec::new(),
         callees: Vec::new(),
         absorbed: None,
@@ -636,6 +652,11 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                 *dst = remap(*dst);
                 *idx = remap(*idx);
             }
+            KOp::ArrayPush { dst, val, .. } => {
+                *dst = remap(*dst);
+                *val = remap(*val);
+            }
+            KOp::ArrayPop { dst, .. } => *dst = remap(*dst),
             KOp::StoreElem { idx, val, .. } => {
                 *idx = remap(*idx);
                 *val = remap(*val);
@@ -662,6 +683,10 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                 *b = remap(*b);
             }
             KOp::Br { .. } | KOp::Exit { .. } => {}
+            // Fusion (`fuse_kops`) runs after this remap.
+            KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
+                unreachable!("fused op before fusion")
+            }
         }
     }
     let shapes: Vec<Box<[KShapeSlot]>> = shapes
@@ -675,6 +700,8 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
                     VE::Obj(o) => KShapeSlot::Obj(*o),
                     VE::MathObj => KShapeSlot::MathObj,
                     VE::MathFn(k) => KShapeSlot::MathFn(*k),
+                    VE::ArrayPushFn(_) => KShapeSlot::ArrayPushFn,
+                    VE::ArrayPopFn(_) => KShapeSlot::ArrayPopFn,
                     VE::Undef | VE::Opaque | VE::SelfFn => {
                         unreachable!("undef/opaque/self never crosses block boundaries")
                     }
@@ -691,7 +718,92 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
     for &(l, r) in &x.bool_reg {
         bool_locals[(r - BOOL_BASE) as usize] = l;
     }
+    // Prop LOCALIZATION: each named-property access class gets a dedicated
+    // register at the TAIL of the register file. The activation entry loads
+    // every resolved slot's current Number into its register and the
+    // exit/bail/interrupt paths write STORE-class registers back
+    // (`writeback_kernel_props`), so the in-region accesses are plain
+    // register moves — rewritten here (post-remap) and then propagated /
+    // deleted by the cleanup pass below like any other Mov. Sound for the
+    // same reason slot resolution is: nothing inside a kernel region can
+    // run user code or restructure a property map; the entry guard
+    // additionally declines two classes aliasing one (object, slot).
+    let prop_base = n_locals + n_bools + x.max_stack + 1;
+    let n_props = u16::try_from(x.props_used.len()).ok()?;
+    for op in &mut x.kops {
+        match *op {
+            KOp::LoadProp { dst, prop } => {
+                *op = KOp::Mov {
+                    dst,
+                    src: prop_base + prop,
+                }
+            }
+            KOp::StoreProp { prop, src } => {
+                *op = KOp::Mov {
+                    dst: prop_base + prop,
+                    src,
+                }
+            }
+            _ => {}
+        }
+    }
+    // Post-translation cleanup (copy-prop + dead-Mov DCE, see
+    // `cleanup_kops`). The always-live set is everything observed outside
+    // straight-line execution: loop kernels write mapped Local and bool
+    // registers back to the frame on every exit and interrupt unwind (and
+    // STORE-class prop registers back to their slots), and exit shapes
+    // reference stack registers. Function kernels are frameless and pure —
+    // only `Ret` (a normal use) and the upvalue-window copies a `SelfCall`
+    // performs observe registers.
+    {
+        let mut always_live: u128 = 0;
+        let mut upvalue_uses: u128 = 0;
+        let n_regs = (prop_base + n_props) as usize;
+        if n_regs <= 128 {
+            if x.fn_mode {
+                for (r, slot) in locals.iter().enumerate() {
+                    if matches!(slot, KSlot::Upvalue(_)) {
+                        upvalue_uses |= 1 << r;
+                    }
+                }
+            } else {
+                for (r, slot) in locals.iter().enumerate() {
+                    if matches!(slot, KSlot::Local(_)) {
+                        always_live |= 1 << r;
+                    }
+                }
+                for j in 0..n_bools {
+                    always_live |= 1 << (n_locals + j);
+                }
+                for s in &shapes {
+                    for e in s.iter() {
+                        if let KShapeSlot::Num(r) | KShapeSlot::Bool(r) = e {
+                            always_live |= 1 << *r;
+                        }
+                    }
+                }
+                for (i, p) in x.props_used.iter().enumerate() {
+                    if p.store {
+                        always_live |= 1 << (prop_base as usize + i);
+                    }
+                }
+            }
+            cleanup_kops(&mut x.kops, always_live, upvalue_uses, n_regs);
+        }
+    }
+    // Superinstruction fusion — last, so the analyses above never see fused
+    // variants.
+    fuse_kops(&mut x.kops);
+    // ArrayPush CREATES an element like a StoreElem append — same entry
+    // chain guard.
+    let stores_elems = x
+        .kops
+        .iter()
+        .any(|op| matches!(op, KOp::StoreElem { .. } | KOp::ArrayPush { .. }));
     Some(Kernel {
+        stores_elems,
+        uses_array_push: x.uses_array_push,
+        uses_array_pop: x.uses_array_pop,
         code: std::mem::take(&mut x.kops).into_boxed_slice(),
         locals: locals.into_boxed_slice(),
         bool_locals: bool_locals.into_boxed_slice(),
@@ -700,7 +812,7 @@ fn translate_inner(x: &mut Xlate) -> Option<Kernel> {
         math_used: std::mem::take(&mut x.math_used).into_boxed_slice(),
         props_used: std::mem::take(&mut x.props_used).into_boxed_slice(),
         callee_slots: std::mem::take(&mut x.callees).into_boxed_slice(),
-        n_regs: n_locals + n_bools + x.max_stack + 1,
+        n_regs: prop_base + n_props,
         self_global: None, // `kernelize_function` fills it for recursive kernels
         fallback: Box::new(Op::Nop), // caller stores the real header op
     })
@@ -722,6 +834,475 @@ fn static_cmp(cmp: CmpOp, a_bool: bool, b_bool: bool) -> Option<bool> {
     }
 }
 
+/// Rewrite every branch/bail target in `op` through `f`.
+fn map_targets(op: &mut KOp, mut f: impl FnMut(u16) -> u16) {
+    match op {
+        KOp::Br { target }
+        | KOp::BrCmp { target, .. }
+        | KOp::BrCmpK { target, .. }
+        | KOp::BrFalsy { target, .. }
+        | KOp::BrTruthy { target, .. }
+        | KOp::AddKBr { target, .. } => *target = f(*target),
+        KOp::LoadElem { bail, .. }
+        | KOp::StoreElem { bail, .. }
+        | KOp::LoadLen { bail, .. }
+        | KOp::ArrayPush { bail, .. }
+        | KOp::ArrayPop { bail, .. } => *bail = f(*bail),
+        _ => {}
+    }
+}
+
+/// Fuse adjacent op pairs into superinstructions — the final pass, after
+/// `cleanup_kops` (which never sees fused variants). The fused op performs
+/// BOTH originals' effects sequentially and skips the second slot; the
+/// unfused second op REMAINS in that slot, so a branch into it executes
+/// identically — fusion only accelerates fall-through execution, no
+/// analysis needed. Overlapping fusions compose for the same reason: every
+/// slot is a valid entry point built from the ORIGINAL pair at that
+/// position.
+fn fuse_kops(kops: &mut [KOp]) {
+    let orig: Vec<KOp> = kops.to_vec();
+    for i in 0..orig.len().saturating_sub(1) {
+        let fused = match (&orig[i], &orig[i + 1]) {
+            (KOp::Mov { dst: d1, src: s1 }, KOp::Mov { dst: d2, src: s2 }) => Some(KOp::Mov2 {
+                d1: *d1,
+                s1: *s1,
+                d2: *d2,
+                s2: *s2,
+            }),
+            (
+                KOp::Arith { kind, dst, a, b },
+                KOp::Add {
+                    dst: d2,
+                    a: a2,
+                    b: b2,
+                },
+            ) => Some(KOp::ArithAdd {
+                kind: *kind,
+                dst: *dst,
+                a: *a,
+                b: *b,
+                d2: *d2,
+                a2: *a2,
+                b2: *b2,
+            }),
+            (KOp::AddK { dst, a, k }, KOp::Br { target }) => Some(KOp::AddKBr {
+                dst: *dst,
+                a: *a,
+                k: *k,
+                target: *target,
+            }),
+            _ => None,
+        };
+        if let Some(f) = fused {
+            kops[i] = f;
+        }
+    }
+}
+
+/// Post-translation cleanup over the finished KOp array: forward
+/// copy-propagation plus dead-`Mov` elimination with real liveness over the
+/// kernel's tiny CFG. The stack-machine lowering routes nearly every value
+/// through a canonical stack register, so `Mov`s dominate hot kernels — the
+/// arith-loop body is 13 ops of which 5 are `Mov`s, and a `(x, y) => x - y`
+/// comparator is 6 `Mov`s around one `Arith`. Purely register-level: every
+/// surviving op reads the same VALUES and writes the same results as
+/// before, so kernel output stays bit-identical to the generic path.
+///
+/// `always_live` marks registers observed outside straight-line execution —
+/// loop kernels write mapped `Local`/bool registers back to the frame on
+/// every exit AND on interrupt unwinds at back-edge polls, and exit shapes
+/// reference stack registers — so writes to them are never dead.
+/// `upvalue_uses` marks the upvalue-slot registers a `SelfCall` implicitly
+/// copies into the callee window (function kernels).
+fn cleanup_kops(kops: &mut Vec<KOp>, always_live: u128, upvalue_uses: u128, n_regs: usize) {
+    if n_regs > 128 {
+        return;
+    }
+    // Alternate the two transforms to a fixpoint: propagation exposes dead
+    // copies; deletion shortens chains for the next round. Each round
+    // strictly reduces rewrites+ops, so this terminates quickly.
+    loop {
+        let mut changed = copy_prop_kops(kops);
+        changed |= dce_movs(kops, always_live, upvalue_uses, n_regs);
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// Forward copy propagation within basic blocks: after `Mov d, s`, reads of
+/// `d` are rewritten to `s` until either register is written. The map is
+/// cleared at every branch/bail target (join points may disagree) — the
+/// per-block window is enough for the lowering's `local → stack-slot → use`
+/// shuttles. Range reads (`SelfCall`/`CallKernel` argument windows) are
+/// never rewritten: the callee reads those exact registers.
+fn copy_prop_kops(kops: &mut [KOp]) -> bool {
+    let n = kops.len();
+    let mut label = vec![false; n];
+    let mut preds = vec![0u32; n];
+    for (j, op) in kops.iter_mut().enumerate() {
+        let falls = !matches!(op, KOp::Br { .. } | KOp::Ret { .. } | KOp::Exit { .. });
+        if falls && j + 1 < n {
+            preds[j + 1] += 1;
+        }
+        map_targets(op, |t| {
+            label[t as usize] = true;
+            preds[t as usize] += 1;
+            t
+        });
+    }
+    // copy[d] = Some(s): regs[d] currently equals regs[s], `s` itself a root.
+    let mut copy: Vec<Option<u16>> = vec![None; 1 + kops.iter().fold(0, max_reg) as usize];
+    // A FORWARD branch to a single-predecessor target carries its copy map
+    // to that target (branch ops write nothing, so the state at the branch
+    // IS the state at the target) — the if/else join shape. Everything else
+    // clears at the label (a join's predecessors may disagree).
+    let mut snapshots: Vec<Option<Vec<Option<u16>>>> = vec![None; n];
+    let mut changed = false;
+    macro_rules! resolve {
+        ($r:expr) => {
+            if let Some(root) = copy[*$r as usize] {
+                if root != *$r {
+                    *$r = root;
+                    changed = true;
+                }
+            }
+        };
+    }
+    macro_rules! kill {
+        ($d:expr) => {{
+            let d = $d;
+            copy[d as usize] = None;
+            for e in copy.iter_mut() {
+                if *e == Some(d) {
+                    *e = None;
+                }
+            }
+        }};
+    }
+    for (i, op) in kops.iter_mut().enumerate() {
+        if label[i] {
+            match snapshots[i].take() {
+                Some(s) => copy = s,
+                None => copy.iter_mut().for_each(|e| *e = None),
+            }
+        }
+        match op {
+            KOp::Mov { dst, src } => {
+                resolve!(src);
+                let (d, s) = (*dst, *src);
+                kill!(d);
+                if d != s {
+                    copy[d as usize] = Some(s);
+                }
+            }
+            KOp::Const { dst, .. } => kill!(*dst),
+            KOp::Add { dst, a, b } | KOp::Arith { dst, a, b, .. } => {
+                resolve!(a);
+                resolve!(b);
+                kill!(*dst);
+            }
+            KOp::AddK { dst, a, .. } | KOp::ArithK { dst, a, .. } => {
+                resolve!(a);
+                kill!(*dst);
+            }
+            KOp::Neg { dst, src } | KOp::BitNot { dst, src } | KOp::BoolNot { dst, src } => {
+                resolve!(src);
+                kill!(*dst);
+            }
+            KOp::CmpSet { dst, a, b, .. } => {
+                resolve!(a);
+                resolve!(b);
+                kill!(*dst);
+            }
+            KOp::Math1 { dst, src, .. } => {
+                resolve!(src);
+                kill!(*dst);
+            }
+            KOp::Math2 { dst, a, b, .. } => {
+                resolve!(a);
+                resolve!(b);
+                kill!(*dst);
+            }
+            KOp::BrCmp { a, b, .. } => {
+                resolve!(a);
+                resolve!(b);
+            }
+            KOp::BrCmpK { a, .. } => resolve!(a),
+            KOp::BrFalsy { src, .. } | KOp::BrTruthy { src, .. } => resolve!(src),
+            KOp::Ret { src, .. } => resolve!(src),
+            KOp::LoadElem { dst, idx, .. } => {
+                resolve!(idx);
+                kill!(*dst);
+            }
+            KOp::StoreElem { idx, val, .. } => {
+                resolve!(idx);
+                resolve!(val);
+            }
+            KOp::LoadLen { dst, .. } | KOp::LoadProp { dst, .. } => kill!(*dst),
+            KOp::ArrayPush { dst, val, .. } => {
+                resolve!(val);
+                kill!(*dst);
+            }
+            KOp::ArrayPop { dst, .. } => kill!(*dst),
+            KOp::StoreProp { src, .. } => resolve!(src),
+            // Argument-window RANGE reads: leave the window registers alone,
+            // only the result register is a plain def.
+            KOp::CallKernel { dst, .. } | KOp::SelfCall { dst, .. } => kill!(*dst),
+            KOp::Br { .. } | KOp::Exit { .. } => {}
+            // Fusion (`fuse_kops`) runs after cleanup.
+            KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
+                unreachable!("fused op before fusion")
+            }
+        }
+        let target = match op {
+            KOp::Br { target }
+            | KOp::BrCmp { target, .. }
+            | KOp::BrCmpK { target, .. }
+            | KOp::BrFalsy { target, .. }
+            | KOp::BrTruthy { target, .. } => Some(*target),
+            _ => None,
+        };
+        if let Some(t) = target {
+            if t as usize > i && preds[t as usize] == 1 {
+                snapshots[t as usize] = Some(copy.clone());
+            }
+        }
+    }
+    changed
+}
+
+/// Highest register index referenced by `op` (fold seed for sizing).
+fn max_reg(acc: u16, op: &KOp) -> u16 {
+    let mut m = acc;
+    let mut see = |r: u16| m = m.max(r);
+    match op {
+        KOp::Mov { dst, src }
+        | KOp::Neg { dst, src }
+        | KOp::BitNot { dst, src }
+        | KOp::BoolNot { dst, src }
+        | KOp::Math1 { dst, src, .. } => {
+            see(*dst);
+            see(*src);
+        }
+        KOp::Const { dst, .. } | KOp::LoadLen { dst, .. } | KOp::LoadProp { dst, .. } => see(*dst),
+        KOp::Add { dst, a, b }
+        | KOp::Arith { dst, a, b, .. }
+        | KOp::CmpSet { dst, a, b, .. }
+        | KOp::Math2 { dst, a, b, .. } => {
+            see(*dst);
+            see(*a);
+            see(*b);
+        }
+        KOp::AddK { dst, a, .. } | KOp::ArithK { dst, a, .. } => {
+            see(*dst);
+            see(*a);
+        }
+        KOp::BrCmp { a, b, .. } => {
+            see(*a);
+            see(*b);
+        }
+        KOp::BrCmpK { a, .. } => see(*a),
+        KOp::BrFalsy { src, .. } | KOp::BrTruthy { src, .. } | KOp::Ret { src, .. } => see(*src),
+        KOp::LoadElem { dst, idx, .. } => {
+            see(*dst);
+            see(*idx);
+        }
+        KOp::StoreElem { idx, val, .. } => {
+            see(*idx);
+            see(*val);
+        }
+        KOp::ArrayPush { dst, val, .. } => {
+            see(*dst);
+            see(*val);
+        }
+        KOp::ArrayPop { dst, .. } => see(*dst),
+        KOp::StoreProp { src, .. } => see(*src),
+        KOp::CallKernel {
+            dst, base, argc, ..
+        }
+        | KOp::SelfCall {
+            dst, base, argc, ..
+        } => {
+            see(*dst);
+            see(base + argc);
+        }
+        KOp::Br { .. } | KOp::Exit { .. } => {}
+        // Fusion (`fuse_kops`) runs after cleanup.
+        KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
+            unreachable!("fused op before fusion")
+        }
+    }
+    m
+}
+
+/// Delete `Mov`s whose destination is dead: backward liveness to a fixpoint
+/// over the kernel CFG (fall-throughs, branch targets, bail edges), then
+/// index compaction with branch retargeting. A branch INTO a deleted `Mov`
+/// lands on the next surviving op — sound precisely because the deleted op
+/// wrote a register nothing observes.
+fn dce_movs(kops: &mut Vec<KOp>, always_live: u128, upvalue_uses: u128, n_regs: usize) -> bool {
+    let n = kops.len();
+    if n == 0 || n_regs > 128 {
+        return false;
+    }
+    let bit = |r: u16| 1u128 << r;
+    // Per-op use/def masks and successor edges.
+    let mut uses = vec![0u128; n];
+    let mut defs = vec![0u128; n];
+    // (fall-through?, branch target)
+    let mut succ: Vec<(bool, Option<u16>)> = vec![(true, None); n];
+    for (i, op) in kops.iter().enumerate() {
+        match op {
+            KOp::Mov { dst, src }
+            | KOp::Neg { dst, src }
+            | KOp::BitNot { dst, src }
+            | KOp::BoolNot { dst, src }
+            | KOp::Math1 { dst, src, .. } => {
+                uses[i] = bit(*src);
+                defs[i] = bit(*dst);
+            }
+            KOp::Const { dst, .. } => defs[i] = bit(*dst),
+            KOp::Add { dst, a, b }
+            | KOp::Arith { dst, a, b, .. }
+            | KOp::CmpSet { dst, a, b, .. }
+            | KOp::Math2 { dst, a, b, .. } => {
+                uses[i] = bit(*a) | bit(*b);
+                defs[i] = bit(*dst);
+            }
+            KOp::AddK { dst, a, .. } | KOp::ArithK { dst, a, .. } => {
+                uses[i] = bit(*a);
+                defs[i] = bit(*dst);
+            }
+            KOp::Br { target } => succ[i] = (false, Some(*target)),
+            KOp::BrCmp { a, b, target, .. } => {
+                uses[i] = bit(*a) | bit(*b);
+                succ[i] = (true, Some(*target));
+            }
+            KOp::BrCmpK { a, target, .. } => {
+                uses[i] = bit(*a);
+                succ[i] = (true, Some(*target));
+            }
+            KOp::BrFalsy { src, target } | KOp::BrTruthy { src, target } => {
+                uses[i] = bit(*src);
+                succ[i] = (true, Some(*target));
+            }
+            KOp::Ret { src, .. } => {
+                uses[i] = bit(*src);
+                succ[i] = (false, None);
+            }
+            KOp::Exit { .. } => succ[i] = (false, None),
+            KOp::LoadElem { dst, idx, bail, .. } => {
+                uses[i] = bit(*idx);
+                defs[i] = bit(*dst);
+                succ[i] = (true, Some(*bail));
+            }
+            KOp::StoreElem { idx, val, bail, .. } => {
+                uses[i] = bit(*idx) | bit(*val);
+                succ[i] = (true, Some(*bail));
+            }
+            KOp::LoadLen { dst, bail, .. } => {
+                defs[i] = bit(*dst);
+                succ[i] = (true, Some(*bail));
+            }
+            KOp::ArrayPush { dst, val, bail, .. } => {
+                uses[i] = bit(*val);
+                defs[i] = bit(*dst);
+                succ[i] = (true, Some(*bail));
+            }
+            KOp::ArrayPop { dst, bail, .. } => {
+                defs[i] = bit(*dst);
+                succ[i] = (true, Some(*bail));
+            }
+            KOp::LoadProp { dst, .. } => defs[i] = bit(*dst),
+            KOp::StoreProp { src, .. } => uses[i] = bit(*src),
+            // The executor copies the argument window (and, for SelfCall,
+            // every upvalue-slot register) into the callee window.
+            KOp::CallKernel {
+                dst, base, argc, ..
+            } => {
+                for r in *base..base + argc {
+                    uses[i] |= bit(r);
+                }
+                defs[i] = bit(*dst);
+            }
+            KOp::SelfCall {
+                dst, base, argc, ..
+            } => {
+                for r in *base..base + argc {
+                    uses[i] |= bit(r);
+                }
+                uses[i] |= upvalue_uses;
+                defs[i] = bit(*dst);
+            }
+            // Fusion (`fuse_kops`) runs after cleanup.
+            KOp::Mov2 { .. } | KOp::ArithAdd { .. } | KOp::AddKBr { .. } => {
+                unreachable!("fused op before fusion")
+            }
+        }
+    }
+    // Backward liveness to a fixpoint (tiny op counts; converges in a few
+    // sweeps).
+    let mut live_in = vec![0u128; n];
+    let mut live_out = vec![0u128; n];
+    loop {
+        let mut changed = false;
+        for i in (0..n).rev() {
+            let mut out = 0u128;
+            let (fall, target) = succ[i];
+            if fall && i + 1 < n {
+                out |= live_in[i + 1];
+            }
+            if let Some(t) = target {
+                out |= live_in[t as usize];
+            }
+            let inn = uses[i] | (out & !defs[i]);
+            if out != live_out[i] || inn != live_in[i] {
+                live_out[i] = out;
+                live_in[i] = inn;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // A Mov is dead when nothing can observe its destination: not live on
+    // any path out, not written back / shape-referenced (always_live), or a
+    // self-move.
+    let dead: Vec<bool> = kops
+        .iter()
+        .enumerate()
+        .map(|(i, op)| match op {
+            KOp::Mov { dst, src } => *dst == *src || (live_out[i] | always_live) & bit(*dst) == 0,
+            _ => false,
+        })
+        .collect();
+    if !dead.iter().any(|&d| d) {
+        return false;
+    }
+    // Compact: old index -> index of the first surviving op at-or-after it.
+    let mut newidx = vec![0u16; n];
+    let mut next = 0u16;
+    for i in 0..n {
+        newidx[i] = next;
+        if !dead[i] {
+            next += 1;
+        }
+    }
+    let mut i = 0;
+    kops.retain(|_| {
+        let keep = !dead[i];
+        i += 1;
+        keep
+    });
+    for op in kops.iter_mut() {
+        map_targets(op, |t| newidx[t as usize]);
+    }
+    true
+}
+
 fn patch(kops: &mut [KOp], kidx: usize, pc: u16) {
     match &mut kops[kidx] {
         KOp::Br { target }
@@ -729,9 +1310,11 @@ fn patch(kops: &mut [KOp], kidx: usize, pc: u16) {
         | KOp::BrCmpK { target, .. }
         | KOp::BrFalsy { target, .. }
         | KOp::BrTruthy { target, .. } => *target = pc,
-        KOp::LoadElem { bail, .. } | KOp::StoreElem { bail, .. } | KOp::LoadLen { bail, .. } => {
-            *bail = pc
-        }
+        KOp::LoadElem { bail, .. }
+        | KOp::StoreElem { bail, .. }
+        | KOp::LoadLen { bail, .. }
+        | KOp::ArrayPush { bail, .. }
+        | KOp::ArrayPop { bail, .. } => *bail = pc,
         _ => unreachable!("patching a non-branch kop"),
     }
 }
@@ -963,7 +1546,14 @@ impl Xlate<'_> {
         let p = self.vstack.len().checked_sub(1 + depth_from_top)?;
         match self.vstack[p] {
             VE::Obj(s) => Some(s),
-            VE::Bool | VE::Undef | VE::Opaque | VE::SelfFn | VE::MathObj | VE::MathFn(_) => None,
+            VE::Bool
+            | VE::Undef
+            | VE::Opaque
+            | VE::SelfFn
+            | VE::MathObj
+            | VE::MathFn(_)
+            | VE::ArrayPushFn(_)
+            | VE::ArrayPopFn(_) => None,
             VE::Num => {
                 // Phase 1 discovery only. (A local used BOTH as a base and
                 // numerically is caught in phase 2: its loads become `Obj`
@@ -1333,6 +1923,7 @@ impl Xlate<'_> {
                 let top = *self.vstack.last()?;
                 match top {
                     VE::Num | VE::Bool => {
+                        let origin = *self.origins.last()?;
                         let src = self.top_reg(0)?;
                         let dst = if top == VE::Bool {
                             self.push_bool()?
@@ -1340,6 +1931,11 @@ impl Xlate<'_> {
                             self.push_num()?
                         };
                         self.kops.push(K::Mov { dst, src });
+                        // The copy IS the same value of the same local
+                        // version — propagate the origin so phase-1 base
+                        // discovery sees through the method-call prologue's
+                        // `Dup` (receiver duplicated for `this`).
+                        *self.origins.last_mut()? = origin;
                     }
                     VE::Obj(s) => {
                         self.vstack.push(VE::Obj(s));
@@ -1349,7 +1945,12 @@ impl Xlate<'_> {
                         self.vstack.push(VE::MathObj);
                         self.origins.push(None);
                     }
-                    VE::MathFn(_) | VE::Undef | VE::Opaque | VE::SelfFn => return None,
+                    VE::MathFn(_)
+                    | VE::Undef
+                    | VE::Opaque
+                    | VE::SelfFn
+                    | VE::ArrayPushFn(_)
+                    | VE::ArrayPopFn(_) => return None,
                 }
             }
             Op::Swap => {
@@ -1598,6 +2199,26 @@ impl Xlate<'_> {
                     Const::String(s) => s.as_str().to_string(),
                     _ => return None,
                 };
+                // `a.push` on an array base, in loop mode: the pinned
+                // canonical `Array.prototype.push` (entry-verified like a
+                // Math intrinsic; see `KOp::ArrayPush`). An Ordinary object
+                // with a plain data property named "push" loses its kernel
+                // to this routing — the region then rejects at the
+                // consumer — which is acceptable for so method-shaped a
+                // name.
+                if !self.fn_mode && (key == "push" || key == "pop") {
+                    let obj = self.base_slot(0)?;
+                    self.pop()?;
+                    if key == "push" {
+                        self.vstack.push(VE::ArrayPushFn(obj));
+                        self.uses_array_push = true;
+                    } else {
+                        self.vstack.push(VE::ArrayPopFn(obj));
+                        self.uses_array_pop = true;
+                    }
+                    self.origins.push(None);
+                    return Some(());
+                }
                 if key == "length" {
                     // Arrays: derived length, per-access checked, bailable.
                     let shape = self.vstack.clone();
@@ -1671,6 +2292,50 @@ impl Xlate<'_> {
                         base,
                         argc: u16::try_from(n).ok()?,
                     });
+                    return Some(());
+                }
+                // `a.push(x)`: the compiler's method-call pattern
+                // [.., ArrayPushFn(s), Obj(s), arg] with exactly one
+                // statically-Number argument. Emits the bailable
+                // [`KOp::ArrayPush`]; the generic `Call` (method object
+                // reconstructed from the realm canonical) owns every
+                // declined receiver.
+                if let VE::ArrayPushFn(s) = *self.vstack.get(fn_pos)? {
+                    if n != 1 || !matches!(self.vstack.get(fn_pos + 1)?, VE::Obj(s2) if *s2 == s) {
+                        return None;
+                    }
+                    let val = self.top_num_reg(0)?;
+                    let shape = self.vstack.clone();
+                    self.pop()?; // arg
+                    self.pop()?; // this (the array)
+                    self.pop()?; // fn
+                    let dst = self.push_num()?;
+                    let kidx = self.kops.len();
+                    self.kops.push(K::ArrayPush {
+                        obj: s,
+                        val,
+                        dst,
+                        bail: u16::MAX,
+                    });
+                    self.exits.push((kidx, self.base_ip + i as u32, shape));
+                    return Some(());
+                }
+                // `a.pop()`: [.., ArrayPopFn(s), Obj(s)], no arguments.
+                if let VE::ArrayPopFn(s) = *self.vstack.get(fn_pos)? {
+                    if n != 0 || !matches!(self.vstack.get(fn_pos + 1)?, VE::Obj(s2) if *s2 == s) {
+                        return None;
+                    }
+                    let shape = self.vstack.clone();
+                    self.pop()?; // this (the array)
+                    self.pop()?; // fn
+                    let dst = self.push_num()?;
+                    let kidx = self.kops.len();
+                    self.kops.push(K::ArrayPop {
+                        obj: s,
+                        dst,
+                        bail: u16::MAX,
+                    });
+                    self.exits.push((kidx, self.base_ip + i as u32, shape));
                     return Some(());
                 }
                 // LOOP mode: a call of a PINNED closure — the callee is an
