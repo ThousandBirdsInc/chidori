@@ -1,12 +1,13 @@
 # Twitter/X launch thread (2026)
 
-11 tweets. Attach `replay-demo.mp4` (in this folder) to tweet 1 and an MP4
+11 tweets. Attach `replay-demo-crt.mp4` (in this folder) to tweet 1 — that's
+the CRT cut; `replay-demo.mp4` is the earlier flat version. Attach an MP4
 conversion of `docs/media/react-agent.svg` to tweet 6 (X rejects SVG).
 Tweets 5 and 10 run slightly past 280 characters and need X Premium or a trim.
 
 ---
 
-**1/** *(attach replay-demo.mp4)*
+**1/** *(attach replay-demo-crt.mp4)*
 
 Three years ago I open-sourced an AI agent framework. I just rewrote nearly all of it, down to a from-scratch JavaScript engine in Rust.
 
