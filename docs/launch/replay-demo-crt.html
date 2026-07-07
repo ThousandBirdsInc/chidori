@@ -6,19 +6,15 @@
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   html,body { background:#000; width:1200px; height:676px; overflow:hidden;
-    font-family: "DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono", ui-monospace, monospace; }
-
-  /* ---------- bezel + screen ---------- */
-  #bezel { position:absolute; inset:0; background:#000; padding:22px 26px;
-    border-radius:26px; }
+    font-family: "DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono", ui-monospace, monospace;
+    font-size:24px; }
+  #bezel { position:absolute; inset:0; background:#000; padding:22px 26px; border-radius:26px; }
   #screen { position:relative; width:100%; height:100%; background:#041006;
     border-radius:40px / 30px; overflow:hidden;
     box-shadow: inset 0 0 90px rgba(0,0,0,.85), inset 0 0 18px rgba(74,255,127,.09); }
-  #content { position:absolute; inset:0; padding:44px 58px;
+  #content { position:absolute; inset:0; padding:40px 56px;
     animation: wobble 4s steps(2) infinite; }
   @keyframes wobble { 0%,100% { transform:translateX(0); } 50% { transform:translateX(.6px); } }
-
-  /* ---------- CRT overlays (always on) ---------- */
   .ov { position:absolute; inset:0; pointer-events:none; border-radius:40px / 30px; }
   #scan { background: repeating-linear-gradient(to bottom,
     rgba(0,0,0,0) 0 2px, rgba(0,0,0,.34) 2px 3px); }
@@ -32,8 +28,6 @@
     background: linear-gradient(to bottom, rgba(120,255,170,0), rgba(120,255,170,.05), rgba(120,255,170,0));
     animation: roll 5.2s linear infinite; }
   @keyframes roll { to { transform: translateY(960px); } }
-
-  /* ---------- phosphor text ---------- */
   .g   { color:#4aff7f; text-shadow: 0 0 7px rgba(74,255,127,.75), 0 0 22px rgba(22,179,74,.45),
          1.3px 0 1px rgba(255,60,60,.28), -1.3px 0 1px rgba(60,120,255,.28); }
   .dim { color:#2d9c53; text-shadow: 0 0 6px rgba(45,156,83,.5); }
@@ -41,97 +35,83 @@
   .red { color:#ff6b5c; text-shadow: 0 0 8px rgba(255,107,92,.8), 0 0 26px rgba(255,60,40,.4); }
   .hot { color:#eafff0; text-shadow: 0 0 9px rgba(234,255,240,.9), 0 0 30px rgba(74,255,127,.6),
          1.6px 0 1px rgba(255,60,60,.3), -1.6px 0 1px rgba(60,120,255,.3); }
-
-  .cmd { font-size:30px; margin-bottom:22px; }
-  .code { font-size:24px; line-height:1.78; }
-  .ln  { font-size:26px; line-height:1.9; animation: pop .14s steps(3); }
+  .ln  { line-height:1.82; animation: pop .14s steps(3); }
   @keyframes pop { 0% {opacity:0;} 34% {opacity:1;} 67% {opacity:.35;} 100% {opacity:1;} }
-
-  #meter { position:absolute; right:58px; bottom:40px; font-size:30px; text-align:right; }
-  #meter .v { position:absolute; right:0; bottom:0; white-space:nowrap; }
-
-  /* ---------- act 2 hero ---------- */
-  #zero { position:absolute; left:0; right:0; top:212px; text-align:center;
-    font-size:128px; font-weight:700; letter-spacing:2px;
-    animation: slam .2s steps(4); }
-  #zerosub { position:absolute; left:0; right:0; top:378px; text-align:center; font-size:33px; }
-  @keyframes slam { 0% { transform:scale(2.6); opacity:0; }
-    40% { transform:scale(1); opacity:1; } 70% { transform:scale(1.06); } 100% { transform:scale(1); } }
-  #stamp { position:absolute; left:0; right:0; top:452px; text-align:center; }
-  #stamp span { display:inline-block; border:4px solid #4aff7f; border-radius:8px;
-    padding:10px 30px; font-size:42px; font-weight:800; letter-spacing:3px;
-    transform:rotate(-4deg); color:#4aff7f;
-    text-shadow:0 0 10px rgba(74,255,127,.8), 0 0 34px rgba(22,179,74,.5);
-    box-shadow:0 0 18px rgba(74,255,127,.35), inset 0 0 14px rgba(74,255,127,.2);
-    animation: slam .18s steps(3); }
-
+  pre.banner { line-height:1.06; animation: pop .18s steps(3); font-family:inherit; }
+  .center { text-align:center; }
+  pre.banner.center { display:table; margin-left:auto; margin-right:auto; text-align:left; }
   #killflash { position:absolute; inset:0; background:rgba(255,80,60,.18); mix-blend-mode:screen; }
-  #hero { position:absolute; left:0; right:0; top:232px; text-align:center;
-    font-size:84px; font-weight:800; letter-spacing:6px; animation: pop .18s steps(3); }
-  #herosub { position:absolute; left:0; right:0; top:352px; text-align:center; font-size:31px; }
-
-  /* ---------- glitch tear ---------- */
   .tear { position:absolute; left:0; right:0; background:rgba(140,255,190,.6);
     mix-blend-mode:screen; animation: tearjit .12s steps(3) infinite; }
   @keyframes tearjit { 0% {transform:translateX(-40px);} 50% {transform:translateX(55px);} 100% {transform:translateX(-25px);} }
-
-  /* ---------- end card ---------- */
-  #wordmark { position:absolute; left:0; right:0; top:198px; text-align:center;
-    font-size:96px; font-weight:800; letter-spacing:26px; text-indent:26px;
-    animation: pop .2s steps(3); }
-  #tagline  { position:absolute; left:0; right:0; top:346px; text-align:center; font-size:34px; }
-  #repo     { position:absolute; left:0; right:0; top:412px; text-align:center; font-size:26px; }
   .blinkc { animation: blinkc 1s steps(1) infinite; }
   @keyframes blinkc { 50% { opacity:0; } }
+  .mt { margin-top:22px; }
 </style>
 </head>
 <body>
-<div id="root" data-composition-id="root" data-width="1200" data-height="676" data-duration="14.7">
+<div id="root" data-composition-id="root" data-width="1200" data-height="676" data-duration="17.4">
   <div id="bezel"><div id="screen">
     <div id="content">
 
-      <!-- ========= ACT 1 : the code (0 - 4.3s) ========= -->
-      <div class="clip cmd g" data-start="0.15" data-duration="4.15">$ cat agent.ts</div>
-      <div class="clip code ln hot" data-start="0.7" data-duration="3.6">export async function agent(input, chidori) {</div>
-      <div class="clip code ln g" data-start="1.15" data-duration="3.15">&nbsp; const plan = await chidori.prompt("Plan: " + input.bug);</div>
-      <div class="clip code ln g" data-start="1.6" data-duration="2.7">&nbsp; const diff = await chidori.tool("repo.apply", { plan });</div>
-      <div class="clip code ln amb" data-start="2.05" data-duration="2.25">&nbsp; await chidori.input("Ship it?", { type: "approval" });</div>
-      <div class="clip code ln g" data-start="2.5" data-duration="1.8">&nbsp; return chidori.prompt("Changelog:\n" + diff);</div>
-      <div class="clip code ln hot" data-start="2.9" data-duration="1.4">}</div>
-      <div class="clip ln amb" data-start="3.35" data-duration="0.95" style="margin-top:20px;">&#9656; a complete, durable, production agent</div>
+      <!-- ACT 1 : the code (0 - 4.3) -->
+      <div class="clip ln g" data-start="0.15" data-duration="4.15">$ cat agent.ts</div>
+      <div class="clip ln hot" data-start="0.7" data-duration="3.6">export async function agent(input, chidori) {</div>
+      <div class="clip ln g" data-start="1.15" data-duration="3.15">&nbsp; const plan = await chidori.prompt("Plan: " + input.bug);</div>
+      <div class="clip ln g" data-start="1.6" data-duration="2.7">&nbsp; const diff = await chidori.tool("repo.apply", { plan });</div>
+      <div class="clip ln amb" data-start="2.05" data-duration="2.25">&nbsp; await chidori.input("Ship it?", { type: "approval" });</div>
+      <div class="clip ln g" data-start="2.5" data-duration="1.8">&nbsp; return chidori.prompt("Changelog:\n" + diff);</div>
+      <div class="clip ln hot" data-start="2.9" data-duration="1.4">}</div>
+      <div class="clip ln amb mt" data-start="3.35" data-duration="0.95">&#9656; a complete, durable, production agent</div>
 
-      <!-- ========= glitch cut ========= -->
       <div class="clip tear" data-start="4.3" data-duration="0.22" style="top:140px; height:14px;"></div>
       <div class="clip tear" data-start="4.35" data-duration="0.18" style="top:400px; height:18px;"></div>
 
-      <!-- ========= ACT 2 : run it, kill it (4.55 - 8.4s) ========= -->
-      <div class="clip cmd g" data-start="4.55" data-duration="3.85">$ chidori run agent.ts</div>
-      <div class="clip ln g"  data-start="5.15" data-duration="3.25">&#9656; prompt <span class="dim">&#183;&#183;&#183;&#183;&#183;&#183;</span> plan ready</div>
-      <div class="clip ln g"  data-start="5.65" data-duration="2.75">&#9656; tool repo.apply <span class="dim">&#183;&#183;&#183;&#183;</span> 12 files changed</div>
-      <div class="clip ln amb" data-start="6.15" data-duration="2.25">&#9646; human: "Ship it?" <span class="dim">&#183;&#183;&#183;&#183;</span> approved</div>
-      <div class="clip ln g"  data-start="6.7" data-duration="1.7">&#9656; prompt <span class="dim">&#8212; changelog streaming&#8230;</span></div>
-      <div class="clip killflash" data-start="7.3" data-duration="0.22"></div>
-      <div class="clip tear" data-start="7.3" data-duration="0.3" style="top:110px; height:16px;"></div>
-      <div class="clip tear" data-start="7.35" data-duration="0.25" style="top:330px; height:10px;"></div>
-      <div class="clip tear" data-start="7.3" data-duration="0.3" style="top:480px; height:20px;"></div>
-      <div class="clip ln red" data-start="7.55" data-duration="0.85" style="font-size:34px; margin-top:18px;">&#10007; SIGKILL &#8212; process died mid-stream</div>
+      <!-- ACT 2 : run it, kill it (4.55 - 8.1) -->
+      <div class="clip ln g" data-start="4.55" data-duration="3.55">$ chidori run agent.ts</div>
+      <div class="clip ln g" data-start="5.1" data-duration="3.0">&#9656; prompt <span class="dim">&#183;&#183;&#183;&#183;&#183;&#183;</span> plan ready</div>
+      <div class="clip ln g" data-start="5.5" data-duration="2.6">&#9656; tool repo.apply <span class="dim">&#183;&#183;&#183;&#183;</span> 12 files changed</div>
+      <div class="clip ln amb" data-start="5.95" data-duration="2.15">&#9646; human: "Ship it?" <span class="dim">&#183;&#183;&#183;&#183;</span> approved</div>
+      <div class="clip ln g" data-start="6.4" data-duration="1.7">&#9656; prompt <span class="dim">&#8212; changelog streaming&#8230;</span></div>
+      <div class="clip killflash" data-start="7.0" data-duration="0.22"></div>
+      <div class="clip tear" data-start="7.0" data-duration="0.3" style="top:110px; height:16px;"></div>
+      <div class="clip tear" data-start="7.05" data-duration="0.25" style="top:330px; height:10px;"></div>
+      <div class="clip tear" data-start="7.0" data-duration="0.3" style="top:480px; height:20px;"></div>
+      <div class="clip ln red mt" data-start="7.25" data-duration="0.85">&#10007; SIGKILL &#8212; process died mid-stream</div>
 
-      <!-- ========= ACT 3 : resume (8.6 - 11.7s) ========= -->
-      <div class="clip cmd g" data-start="8.6" data-duration="3.1">$ chidori resume <span class="hot">01JZK3</span></div>
-      <div class="clip ln dim" data-start="9.0" data-duration="2.7">&#9656; steps 1-4 replayed from the journal &#183; instant</div>
-      <div class="clip ln g"  data-start="9.4" data-duration="2.3">&#9656; resumes <span class="hot">exactly where it died</span></div>
-      <div class="clip ln g"  data-start="9.85" data-duration="1.85">&#9656; run complete</div>
-      <div id="hero" class="clip hot" data-start="10.3" data-duration="1.4">NOTHING LOST</div>
-      <div id="herosub" class="clip g" data-start="10.55" data-duration="1.15">new process &#183; exact step &#183; byte-identical</div>
+      <div class="clip tear" data-start="8.15" data-duration="0.18" style="top:250px; height:12px;"></div>
 
-      <!-- ========= glitch cut ========= -->
-      <div class="clip tear" data-start="11.7" data-duration="0.2" style="top:200px; height:12px;"></div>
-      <div class="clip tear" data-start="11.75" data-duration="0.15" style="top:420px; height:16px;"></div>
+      <!-- ACT 3 : resume (8.35 - 11.8) -->
+      <div class="clip ln g" data-start="8.35" data-duration="3.45">$ chidori resume <span class="hot">01JZK3</span></div>
+      <div class="clip ln dim" data-start="8.75" data-duration="3.05">&#9656; steps 1-4 replayed from the journal &#183; instant</div>
+      <div class="clip ln g" data-start="9.15" data-duration="2.65">&#9656; resumes <span class="hot">exactly where it died</span></div>
+      <div class="clip ln g" data-start="9.55" data-duration="2.25">&#9656; run complete</div>
+      <pre class="clip banner hot mt" data-start="10.05" data-duration="1.75"> _  _  ___ _____ _  _ ___ _  _  ___   _    ___  ___ _____ 
+| \| |/ _ \_   _| || |_ _| \| |/ __| | |  / _ \/ __|_   _|
+| .` | (_) || | | __ || || .` | (_ | | |_| (_) \__ \ | |  
+|_|\_|\___/ |_| |_||_|___|_|\_|\___| |____\___/|___/ |_|  
+                                                          </pre>
 
-      <!-- ========= ACT 4 : end card (11.9 - 14.6s) ========= -->
-      <div id="wordmark" class="clip hot" data-start="11.9" data-duration="2.7">CHIDORI</div>
-      <div id="tagline" class="clip g" data-start="12.2" data-duration="2.4">An agent is one TypeScript function.</div>
-      <div id="repo" class="clip dim" data-start="12.5" data-duration="2.1">github.com/ThousandBirdsInc/chidori<span class="blinkc g">&#9646;</span></div>
+      <div class="clip tear" data-start="11.85" data-duration="0.18" style="top:200px; height:12px;"></div>
+      <div class="clip tear" data-start="11.9" data-duration="0.15" style="top:420px; height:16px;"></div>
+
+      <!-- ACT 4 : the artifact (12.05 - 13.9) -->
+      <div class="clip ln g" data-start="12.05" data-duration="1.85">$ git add .chidori/runs/01JZK3 &amp;&amp; git commit</div>
+      <div class="clip ln amb" data-start="12.6" data-duration="1.3">&#9656; the run is now a regression test &#8212; replays in ms, spends $0</div>
+
+      <div class="clip tear" data-start="13.95" data-duration="0.18" style="top:300px; height:14px;"></div>
+
+      <!-- ACT 5 : end card (14.15 - 17.3) -->
+      <pre class="clip banner hot center" data-start="14.15" data-duration="3.15" style="margin-top:96px;">  _____ _    _ _____ _____   ____  _____  _____ 
+ / ____| |  | |_   _|  __ \ / __ \|  __ \|_   _|
+| |    | |__| | | | | |  | | |  | | |__) | | |  
+| |    |  __  | | | | |  | | |  | |  _  /  | |  
+| |____| |  | |_| |_| |__| | |__| | | \ \ _| |_ 
+ \_____|_|  |_|_____|_____/ \____/|_|  \_\_____|
+                                                
+                                                </pre>
+      <div class="clip ln g center mt" data-start="14.55" data-duration="2.75">Every agent run is a recording.</div>
+      <div class="clip ln dim center" data-start="14.85" data-duration="2.45">github.com/ThousandBirdsInc/chidori<span class="blinkc g">&#9646;</span></div>
 
     </div>
     <div class="ov" id="grille"></div>
