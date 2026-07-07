@@ -1,7 +1,7 @@
 # Twitter/X launch thread (2026)
 
 11 tweets. Attachments: `agent-code.png` on tweet 1, `replay-demo-crt.mp4`
-(the code -> run -> kill -> resume CRT cut) on tweet 4, and an MP4 conversion
+(the CRT cut: code -> run -> SIGKILL -> resume -> commit-as-test) on tweet 4, and an MP4 conversion
 of `docs/media/react-agent.svg` on tweet 7 (X rejects SVG). A few tweets run
 past 280 characters and need X Premium or a trim.
 
@@ -35,9 +35,9 @@ Your function contains no retry logic, no state machine, no checkpointing code. 
 
 **5/**
 
-It works because the agent never touches the world directly. Every prompt, tool call, and fetch goes through the runtime and gets recorded.
+Every agent run is a recording. The agent never touches the world directly: every prompt, tool call, and fetch goes through the runtime and is journaled. A run is a file you can hold.
 
-A run becomes a journal you can resume after a crash, fork into variants, or replay to debug. Commit one to git and you have a regression test.
+Resume it after a crash. Fork it, change the tail. Commit it to git: now it's a regression test.
 
 **6/**
 
