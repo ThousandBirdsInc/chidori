@@ -45,7 +45,7 @@ Exact replay required owning the clock, randomness, and every I/O call. So Chido
 
 99% of the Test262 tests it executes pass, and the skips are listed in the repo. One binary. No Node, no cluster, nothing to deploy onto.
 
-**7/** *(attach MP4 converted from docs/media/react-agent.svg)*
+**7/** *(attach react-agent.mp4)*
 
 Then I ran React on it. Unmodified React 18.
 
