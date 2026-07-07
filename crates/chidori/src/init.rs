@@ -57,7 +57,7 @@ Or call it with a fixed list of messages:
 
 Every turn is a durable host call, so replaying the whole conversation costs
 zero tokens. Set a provider key first (e.g. `ANTHROPIC_API_KEY` or
-`OPENAI_API_KEY`) — or just run `chidori login` to sign in with OpenRouter and
+`OPENAI_API_KEY`) — or just run `chidori model-login` to sign in with OpenRouter and
 skip the env var entirely.
 "#;
 
@@ -74,7 +74,7 @@ until it finishes. Tools live in `tools/`; a sample `reverse` tool is included.
 
 Add your own tools under `tools/` and list their names in the agent's
 `.tools([...])` call. Set a provider key first (e.g. `ANTHROPIC_API_KEY` or
-`OPENAI_API_KEY`) — or just run `chidori login` to sign in with OpenRouter and
+`OPENAI_API_KEY`) — or just run `chidori model-login` to sign in with OpenRouter and
 skip the env var entirely.
 "#;
 
@@ -145,7 +145,7 @@ agent, a sandboxed local workspace, and durable replay.
 
 Sign in once with OpenRouter (opens your browser — no API key to manage):
 
-    chidori login
+    chidori model-login
 
 …or set a provider key instead:
 
@@ -283,7 +283,7 @@ you want available in the agent's `.tools([...])` call, then invoke one with
 - `chidori chat [agent.ts]` — interactive REPL. With no file it chats with the
   model directly; with a file it drives the agent's `messages` input per turn.
 - `chidori demo` — interactive menu of example agents (several need no API key).
-- `chidori login` — sign in with OpenRouter (browser OAuth) so agents can call
+- `chidori model-login` — sign in with OpenRouter (browser OAuth) so agents can call
   an LLM without setting a provider key. Saved to `~/.chidori/credentials.json`.
 - `chidori init [dir] [--template <name>]` — scaffold a starter project.
 - `chidori check <file.ts>` — type/parse-check an agent without running it.
@@ -311,7 +311,7 @@ Set one provider environment variable before runs that call the model:
 - `OPENAI_API_KEY` for OpenAI models.
 - `LITELLM_API_URL` + `LITELLM_API_KEY` to route through a LiteLLM proxy.
 
-No key handy? Run `chidori login` to sign in with OpenRouter in your browser.
+No key handy? Run `chidori model-login` to sign in with OpenRouter in your browser.
 Chidori exchanges the sign-in for a user-scoped key (saved to
 `~/.chidori/credentials.json`) and uses it as a fallback whenever none of the
 provider env vars above are set — so the demos and `chidori chat` just work with

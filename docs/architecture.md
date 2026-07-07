@@ -26,7 +26,7 @@ A high-level map of the runtime.
 - **TypeScript runtime** transpiles `.ts` agents and exposes a deterministic `chidori` host API.
 - **Host functions** are the only way agents touch the outside world.
 - **Call-log / replay engine** records every host call and replays the journal for deterministic, zero-LLM-call resume.
-- **LLM providers** (Anthropic, OpenAI, LiteLLM-compatible, OpenRouter as the `chidori login` fallback) are swappable via `reqwest`.
+- **LLM providers** (Anthropic, OpenAI, LiteLLM-compatible, OpenRouter as the `chidori model-login` fallback) are swappable via `reqwest`.
 - **Template engine** uses `minijinja` for Jinja2 prompt templates.
 - **HTTP server** (`axum`) powers the `serve` command and session API.
 
@@ -55,7 +55,7 @@ chidori/
 │   │   │   │   ├── mod.rs          # Provider registry, model routing
 │   │   │   │   ├── anthropic.rs    # Anthropic Messages API
 │   │   │   │   ├── openai.rs       # OpenAI-compatible (incl. LiteLLM)
-│   │   │   │   └── openrouter.rs   # OpenRouter OAuth fallback (`chidori login`)
+│   │   │   │   └── openrouter.rs   # OpenRouter OAuth fallback (`chidori model-login`)
 │   │   │   └── tools/
 │   │   │       └── mod.rs          # Tool discovery + JSON schema generation
 │   │   └── tests/             # CLI integration tests

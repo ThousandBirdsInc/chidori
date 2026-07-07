@@ -153,7 +153,7 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 /// The OpenRouter API key to use, if any: the `OPENROUTER_API_KEY` env var
-/// wins, otherwise a key saved by a prior `chidori login` / demo OAuth flow.
+/// wins, otherwise a key saved by a prior `chidori model-login` / demo OAuth flow.
 pub fn saved_api_key() -> Option<String> {
     if let Ok(key) = std::env::var(OPENROUTER_API_KEY_ENV) {
         if !key.trim().is_empty() {

@@ -383,7 +383,7 @@ impl ProviderRegistry {
         }
 
         // OpenRouter is the zero-config fallback: an `OPENROUTER_API_KEY`, or a
-        // key saved by a prior `chidori login` / demo OAuth sign-in. Registered
+        // key saved by a prior `chidori model-login` / demo OAuth sign-in. Registered
         // last and matching every model, so it only handles requests no
         // explicit provider above claimed. See [`openrouter`] for the flow.
         if let Some(api_key) = openrouter::saved_api_key() {
@@ -405,7 +405,7 @@ impl ProviderRegistry {
             }
         }
         bail!(
-            "No provider found for model '{}'. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, or run `chidori login` to sign in with OpenRouter.",
+            "No provider found for model '{}'. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, or run `chidori model-login` to sign in with OpenRouter.",
             request.model
         );
     }
@@ -423,7 +423,7 @@ impl ProviderRegistry {
             }
         }
         bail!(
-            "No provider found for model '{}'. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, or run `chidori login` to sign in with OpenRouter.",
+            "No provider found for model '{}'. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, or run `chidori model-login` to sign in with OpenRouter.",
             request.model
         );
     }

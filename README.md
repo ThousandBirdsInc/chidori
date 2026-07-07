@@ -153,13 +153,13 @@ The fastest way to feel what Chidori does: scaffold an agent that answers
 questions from a local docs folder, and chat with it.
 
 ```bash
-chidori login                         # sign in with OpenRouter — no API key to set up
+chidori model-login                   # sign in with OpenRouter — no API key to set up
 chidori init my-agent --template docs
 cd my-agent
 chidori chat agent.ts
 ```
 
-`chidori login` opens your browser, signs you in with OpenRouter, and saves a
+`chidori model-login` opens your browser, signs you in with OpenRouter, and saves a
 key to `~/.chidori/credentials.json` — the zero-setup way to try things out.
 Prefer your own provider key? Set `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY`)
 instead; explicit keys always take precedence over the OpenRouter fallback.
@@ -221,7 +221,7 @@ byte-for-byte with zero model calls (the run id is printed under
 From a checkout of the repo (the build-from-source option in step 0),
 `chidori demo` is an interactive picker of runnable examples. The LLM-backed
 ones use whatever provider you've configured — or prompt you to sign in with
-OpenRouter on the spot (`chidori login`) if you have no key set:
+OpenRouter on the spot (`chidori model-login`) if you have no key set:
 
 ```bash
 chidori demo                                              # interactive picker

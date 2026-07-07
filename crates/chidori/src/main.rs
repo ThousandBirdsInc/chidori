@@ -49,7 +49,7 @@ enum Commands {
     /// without setting a provider API key. The key is saved to
     /// `~/.chidori/credentials.json` and used automatically as a fallback
     /// whenever no `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` is configured.
-    Login,
+    ModelLogin,
 
     /// Run a TypeScript agent file
     Run {
@@ -327,7 +327,7 @@ fn main() {
         }
         Commands::RunWorker => unreachable!("handled before the dispatch match"),
         Commands::Demo => (cmd_demo(), false),
-        Commands::Login => (cmd_login(), false),
+        Commands::ModelLogin => (cmd_login(), false),
         Commands::Init { dir, template } => (
             init::run(
                 &dir.unwrap_or_else(|| PathBuf::from(".")),
@@ -525,7 +525,7 @@ fn cmd_demo() -> Result<()> {
     if demo.requires_provider && !ensure_llm_provider_interactive() {
         println!();
         println!("This demo needs an LLM provider. Either sign in with OpenRouter:");
-        println!("  chidori login");
+        println!("  chidori model-login");
         println!("or set one of:");
         println!("  export ANTHROPIC_API_KEY=sk-ant-...");
         println!("  export OPENAI_API_KEY=sk-...");
@@ -618,7 +618,7 @@ fn has_llm_provider() -> bool {
         || providers::openrouter::saved_api_key().is_some()
 }
 
-/// Explicit `chidori login`: run the OpenRouter OAuth flow and save the key.
+/// Explicit `chidori model-login`: run the OpenRouter OAuth flow and save the key.
 fn cmd_login() -> Result<()> {
     // An explicit env key already wins over any saved credential, so a browser
     // sign-in would be pointless — respect it and bow out.
