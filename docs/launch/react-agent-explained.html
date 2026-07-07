@@ -1,0 +1,152 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>react agent — explained</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { background:#0b1220; width:1200px; height:676px; overflow:hidden;
+    font-family:"DejaVu Sans Mono","Liberation Mono",ui-monospace,monospace;
+    font-size:23px; color:#cbd5e1; }
+  .scene { position:absolute; inset:0; padding:52px 64px; animation:fade .3s; }
+  @keyframes fade { from {opacity:0;} to {opacity:1;} }
+  .step { color:#7dd3fc; margin-bottom:8px; }
+  .cap  { color:#eef2f7; font-weight:700; margin-bottom:34px; }
+  .exp  { position:absolute; left:64px; right:64px; bottom:46px; color:#94a3b8; }
+  .exp b { color:#eef2f7; }
+  .ok  { color:#34d399; } .bad { color:#f87171; } .amb { color:#fbbf24; }
+
+  .card { width:360px; background:#ffffff; border-radius:14px; padding:0 0 22px;
+    color:#0f172a; box-shadow:0 18px 50px rgba(0,0,0,.5); }
+  .card .bar { background:#e8edf4; border-radius:14px 14px 0 0; padding:10px 14px; }
+  .card .bar span { display:inline-block; width:12px; height:12px; border-radius:50%; margin-right:6px; }
+  .card .body { padding:20px 26px 0; }
+  .card h2 { font-size:23px; margin-bottom:4px; }
+  .card .price { color:#4f46e5; font-weight:700; margin-bottom:16px; }
+  .card ul { list-style:none; margin-bottom:18px; }
+  .card ul li { color:#334155; margin-bottom:6px; }
+  .card ul li::before { content:"• "; color:#4f46e5; }
+  .card .cta { display:block; background:#4f46e5; color:#fff; text-align:center;
+    border-radius:9px; padding:11px 0; font-weight:700; margin:0 26px; }
+  .card.dark { background:#111827; color:#f1f5f9; }
+  .card.dark .bar { background:#1f2937; }
+  .card.dark h2 { color:#f1f5f9; }
+  .card.dark ul li { color:#cbd5e1; }
+  .card.dark .price { color:#a5b4fc; }
+  .card.dark .cta { background:#6366f1; }
+
+  .tests { position:absolute; right:64px; top:150px; width:470px; background:#0f1a2e;
+    border:1px solid #223252; border-radius:12px; padding:22px 26px; }
+  .tests h3 { color:#64748b; margin-bottom:14px; }
+  .tests div { margin-bottom:10px; }
+  .cardpos { position:absolute; left:64px; top:150px; }
+  .row { display:flex; gap:36px; position:absolute; left:64px; top:150px; }
+  .centerbox { position:absolute; left:0; right:0; top:190px; text-align:center; }
+  .repo { color:#64748b; }
+</style>
+</head>
+<body>
+<div id="root" data-composition-id="root" data-width="1200" data-height="676" data-duration="22.6">
+
+  <!-- SCENE 1 : the premise -->
+  <div class="scene clip" data-start="0.2" data-duration="3.1">
+    <div class="step">chidori demo — an agent that builds UI</div>
+    <div class="cap">The task: build a React pricing card.</div>
+    <div style="line-height:2.1">
+      The agent writes real React 18. It renders on chidori's engine.<br>
+      <span class="amb">Its own DOM tests decide when the work is done.</span><br>
+      Every model call is recorded as it goes.
+    </div>
+    <div class="exp">watch the test panel — the failures drive each next step</div>
+  </div>
+
+  <!-- SCENE 2 : iteration 1 -->
+  <div class="scene clip" data-start="3.4" data-duration="4.1">
+    <div class="step">iteration 1 · model call #1</div>
+    <div class="cap">First draft: <span class="bad">2 of 4 tests pass</span></div>
+    <div class="cardpos"><div class="card">
+      <div class="bar"><span style="background:#f87171"></span><span style="background:#fbbf24"></span><span style="background:#34d399"></span></div>
+      <div class="body"><h2>Pro</h2><div class="price">$29/mo</div></div>
+      <a class="cta">Buy now</a>
+    </div></div>
+    <div class="tests"><h3>acceptance tests</h3>
+      <div class="ok">✓ renders a heading</div>
+      <div class="ok">✓ shows a $ price</div>
+      <div class="bad">✗ lists 3 features</div>
+      <div class="bad">✗ CTA says "Subscribe"</div>
+    </div>
+    <div class="exp">the two failures are fed back to the model as the next prompt</div>
+  </div>
+
+  <!-- SCENE 3 : iteration 2 -->
+  <div class="scene clip" data-start="7.7" data-duration="3.7">
+    <div class="step">iteration 2 · model call #2</div>
+    <div class="cap">Features added: <span class="amb">3 of 4 tests pass</span></div>
+    <div class="cardpos"><div class="card">
+      <div class="bar"><span style="background:#f87171"></span><span style="background:#fbbf24"></span><span style="background:#34d399"></span></div>
+      <div class="body"><h2>Pro</h2><div class="price">$29/mo</div>
+      <ul><li>Unlimited projects</li><li>Deterministic replay</li><li>Time-travel debugging</li></ul></div>
+      <a class="cta">Buy now</a>
+    </div></div>
+    <div class="tests"><h3>acceptance tests</h3>
+      <div class="ok">✓ renders a heading</div>
+      <div class="ok">✓ shows a $ price</div>
+      <div class="ok">✓ lists 3 features</div>
+      <div class="bad">✗ CTA says "Subscribe"</div>
+    </div>
+    <div class="exp">one failure left — the wrong button label goes back in</div>
+  </div>
+
+  <!-- SCENE 4 : iteration 3, green -->
+  <div class="scene clip" data-start="11.6" data-duration="3.7">
+    <div class="step">iteration 3 · model call #3</div>
+    <div class="cap">CTA fixed: <span class="ok">4 of 4 tests pass ✓</span></div>
+    <div class="cardpos"><div class="card">
+      <div class="bar"><span style="background:#f87171"></span><span style="background:#fbbf24"></span><span style="background:#34d399"></span></div>
+      <div class="body"><h2>Pro</h2><div class="price">$29/mo</div>
+      <ul><li>Unlimited projects</li><li>Deterministic replay</li><li>Time-travel debugging</li></ul></div>
+      <a class="cta">Subscribe</a>
+    </div></div>
+    <div class="tests"><h3>acceptance tests</h3>
+      <div class="ok">✓ renders a heading</div>
+      <div class="ok">✓ shows a $ price</div>
+      <div class="ok">✓ lists 3 features</div>
+      <div class="ok">✓ CTA says "Subscribe"</div>
+    </div>
+    <div class="exp">the agent verified its own work — no human looked at a pixel yet</div>
+  </div>
+
+  <!-- SCENE 5 : fork -->
+  <div class="scene clip" data-start="15.5" data-duration="3.7">
+    <div class="step">fork the run</div>
+    <div class="cap">Try a dark annual variant — <span class="ok">without redoing the work</span></div>
+    <div class="row">
+      <div class="card" style="transform:scale(.92); transform-origin:top left;">
+        <div class="bar"><span style="background:#f87171"></span><span style="background:#fbbf24"></span><span style="background:#34d399"></span></div>
+        <div class="body"><h2>Pro</h2><div class="price">$29/mo</div>
+        <ul><li>Unlimited projects</li><li>Deterministic replay</li><li>Time-travel debugging</li></ul></div>
+        <a class="cta">Subscribe</a>
+      </div>
+      <div class="card dark" style="transform:scale(.92); transform-origin:top left;">
+        <div class="bar"><span style="background:#f87171"></span><span style="background:#fbbf24"></span><span style="background:#34d399"></span></div>
+        <div class="body"><h2>Pro — Annual</h2><div class="price">$290/yr</div>
+        <ul><li>Unlimited projects</li><li>Deterministic replay</li><li>Time-travel debugging</li></ul></div>
+        <a class="cta">Subscribe</a>
+      </div>
+    </div>
+    <div class="exp">calls #1-3 <b>replay from the journal</b> — only the edit is a new model call · both variants test green</div>
+  </div>
+
+  <!-- SCENE 6 : the point -->
+  <div class="scene clip" data-start="19.4" data-duration="3.1">
+    <div class="centerbox">
+      <div class="cap" style="margin-bottom:20px">Replay the whole session: <span class="ok">byte-identical, zero model calls.</span></div>
+      <div style="margin-bottom:14px">Every iteration, every test, every choice — recorded.</div>
+      <div class="amb" style="margin-bottom:40px">The run is now a regression test for this agent.</div>
+      <div class="repo">chidori · github.com/ThousandBirdsInc/chidori</div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
