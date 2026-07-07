@@ -554,7 +554,9 @@ export interface Chidori {
    * Start another agent module as a supervised, addressable actor sub-run
    * (`docs/actors.md`). The actor runs concurrently with this run on its own
    * mailbox; talk to it with `sendActor`, let it wait with `receive` (or the
-   * `signal` family), and settle it with `joinActor`. One durable record: a
+   * `signal` family), and settle it with `joinActor`. Actors can spawn their
+   * own supervised children, forming a supervision tree (settling is
+   * owner-only and supervisors reap their children). One durable record: a
    * replay returns the pid from cache without re-running the actor.
    */
   spawnActor<TInput extends AgentJson = JsonObject>(
@@ -564,8 +566,10 @@ export interface Chidori {
   ): Promise<SpawnedActor>;
   /**
    * Deliver a named message to an actor's mailbox (`to` = pid or registered
-   * name) or back to the spawning run (`to = "parent"`). Never blocks;
-   * resolves to `{ delivered }` (false when the target has already settled).
+   * name) or to the sender's spawner (`to = "parent"`: the owning actor for
+   * a child in a supervision tree, the spawning run for a top-level actor).
+   * Never blocks; resolves to `{ delivered }` (false when the target has
+   * already settled).
    */
   sendActor<T extends AgentJson = AgentJson>(
     to: string,
@@ -586,9 +590,10 @@ export interface Chidori {
   ): Promise<ActorMessage<T> | SignalTimeout>;
   /**
    * Wait for the actor's supervision loop to settle and fold its records into
-   * this run's durable log. The outcome carries the actor's return value
-   * (`completed`), final failure (`failed` — restarts exhausted), park reason
-   * (`paused`), or `stopped`.
+   * this run's durable log. Owner-only: an actor is settled by whoever
+   * spawned it. The outcome carries the actor's return value (`completed`),
+   * final failure (`failed` — restarts exhausted), park reason (`paused`),
+   * or `stopped`.
    */
   joinActor<T extends AgentJson = AgentJson>(
     pid: string,

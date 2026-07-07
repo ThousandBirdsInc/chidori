@@ -49,6 +49,19 @@
 //! `maxRestarts` bounds the loop and `backoffMs` spaces attempts (doubling
 //! per attempt). Restarts never re-fire recorded effects: on `resume` the
 //! replayed prefix returns from cache.
+//!
+//! ## Supervision trees
+//!
+//! Actors can spawn actors: each entry records its `owner`, a child's
+//! reserved range is carved *out of* its owner's range (subdividing by
+//! [`ACTOR_RANGE_SUBDIVISION`] per level, so a whole subtree stays inside the
+//! top-level actor's range and merges upward join by join), `"parent"`
+//! addresses the owner's mailbox, and only the owner may join or stop a
+//! child. Supervisors reap their children: when an actor settles — or
+//! discards its log on a `clean` restart — its still-live children are
+//! cooperatively stopped first ([`ActorHub::stop_owned_subtree`]), so
+//! children never outlive their supervisor and registered names are released
+//! for the restarted attempt to re-claim.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -62,22 +75,33 @@ use serde_json::{json, Value};
 use crate::runtime::call_log::CallRecord;
 use crate::runtime::context::{RuntimeContext, PAUSE_MARKER};
 use crate::runtime::host_core;
-use crate::runtime::snapshot::{
-    CallLogSequenceRange, QueuedSignal, DEFAULT_BRANCH_SEQUENCE_RANGE_WIDTH,
-};
+use crate::runtime::snapshot::{CallLogSequenceRange, QueuedSignal};
 use crate::runtime::typescript::bindings::HostBindingBackend;
 use crate::runtime::vfs::Vfs;
 
-/// Hard cap on actors spawned by one run: every live actor is an OS thread
-/// making real host calls (LLM/tool spend), so an unbounded spawn loop is a
-/// cost hazard before it is a correctness one.
-const MAX_ACTORS: usize = 32;
+/// Hard cap on actors spawned by one run (the whole tree, restarts included):
+/// every live actor is an OS thread making real host calls (LLM/tool spend),
+/// so an unbounded spawn loop is a cost hazard before it is a correctness one.
+const MAX_ACTORS: usize = 128;
 
 /// Stack size for actor threads — the same headroom branch workers get.
 const ACTOR_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
 
-/// Width of each actor's reserved call-log sequence range.
-const ACTOR_SEQUENCE_RANGE_WIDTH: u64 = DEFAULT_BRANCH_SEQUENCE_RANGE_WIDTH;
+/// Width of a top-level actor's reserved call-log sequence range. Wide on
+/// purpose: supervision trees carve child ranges *out of* their parent's
+/// range (that is what keeps a whole subtree inside the confinement check at
+/// the top-level join), dividing by [`ACTOR_RANGE_SUBDIVISION`] per level.
+/// 10^12 → children get 10^9, grandchildren 10^6, great-grandchildren 10^3.
+/// Sequence numbers stay far below 2^53, so recorded seqs remain exact when
+/// they cross into JavaScript or JSON tooling.
+const ACTOR_TOP_RANGE_WIDTH: u64 = 1_000_000_000_000;
+
+/// How many ways each level's range is subdivided for the next level down.
+const ACTOR_RANGE_SUBDIVISION: u64 = 1000;
+
+/// The smallest range an actor can be given (and therefore the depth floor:
+/// an actor whose children would get less than this cannot spawn).
+const MIN_ACTOR_RANGE_WIDTH: u64 = 1000;
 
 /// How long an actor may sit waiting on an empty mailbox with no explicit
 /// `timeoutMs` before the runtime parks it as a `paused` outcome instead of
@@ -87,7 +111,9 @@ const DEFAULT_IDLE_TIMEOUT_MS: u64 = 300_000;
 /// Default restart intensity when a restart strategy is selected.
 const DEFAULT_MAX_RESTARTS: u32 = 3;
 
-/// The reserved `sendActor` / message `from` address for the spawning run.
+/// The reserved `sendActor` target / message `from` address for the sender's
+/// spawner: the owning actor for a child in a supervision tree, or the
+/// spawning run for a top-level actor.
 const PARENT_ADDRESS: &str = "parent";
 
 // --- Supervision options -----------------------------------------------------
@@ -274,6 +300,20 @@ struct ActorEntry {
     shared: Arc<ActorShared>,
     handle: Option<JoinHandle<ActorOutcome>>,
     sequence_range: CallLogSequenceRange,
+    /// The pid of the actor that spawned this one, or `None` for a top-level
+    /// actor spawned by the run. Only the owner may join or stop it; its
+    /// `"parent"`-addressed messages deliver to the owner's mailbox; and the
+    /// owner's settle/clean-restart reaps it.
+    owner: Option<String>,
+    /// The registered name, kept for unregistration when the owner reaps this
+    /// actor (see [`ActorHub::stop_owned_subtree`]).
+    name: Option<String>,
+    /// Width of the range blocks this actor's own children are carved from
+    /// (this actor's range width / [`ACTOR_RANGE_SUBDIVISION`]).
+    child_width: u64,
+    /// Allocation high-water mark for child blocks, relative to this actor's
+    /// range start.
+    child_cursor: u64,
     /// The durable `join_actor`/`stop_actor` outcome once the actor has been
     /// joined and its records merged. A second join returns this instead of
     /// merging twice.
@@ -377,6 +417,73 @@ impl ActorHub {
             .map(|(i, _)| i)?;
         Some(inner.parent_mailbox.remove(idx))
     }
+
+    /// The pid of the actor that spawned `pid` (`None` = the run).
+    fn owner_of(&self, pid: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .actors
+            .get(pid)
+            .and_then(|entry| entry.owner.clone())
+    }
+
+    /// Reap `owner`'s live children: request a cooperative stop on each, wait
+    /// for its supervision loop to settle, join its thread, unregister its
+    /// name, and mark it settled as `stopped` (records discarded — they were
+    /// never joined). Grandchildren are reaped transitively: each child's own
+    /// thread runs this for *its* children on the way out. Called when an
+    /// actor settles (children must not outlive their supervisor) and on a
+    /// `clean` restart (the discarded log's spawns are about to re-run live,
+    /// so the previous attempt's children must go first).
+    fn stop_owned_subtree(&self, owner: &str) {
+        let children: Vec<(String, Arc<ActorShared>)> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .actors
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.owner.as_deref() == Some(owner) && entry.settled_outcome.is_none()
+                })
+                .map(|(pid, entry)| (pid.clone(), entry.shared.clone()))
+                .collect()
+        };
+        for (pid, shared) in children {
+            shared.request_stop();
+            {
+                let mut state = shared.state.lock().unwrap();
+                while !matches!(state.lifecycle, Lifecycle::Terminal(_)) {
+                    state = shared.signal.wait(state).unwrap();
+                }
+            }
+            let (handle, name) = {
+                let mut inner = self.inner.lock().unwrap();
+                let Some(entry) = inner.actors.get_mut(&pid) else {
+                    continue;
+                };
+                (entry.handle.take(), entry.name.clone())
+            };
+            let restarts = shared.state.lock().unwrap().restarts;
+            if let Some(handle) = handle {
+                let _ = handle.join();
+            }
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(name) = name {
+                if inner.names.get(&name).map(String::as_str) == Some(pid.as_str()) {
+                    inner.names.remove(&name);
+                }
+            }
+            if let Some(entry) = inner.actors.get_mut(&pid) {
+                if entry.settled_outcome.is_none() {
+                    entry.settled_outcome = Some(json!({
+                        "pid": pid,
+                        "status": "stopped",
+                        "restarts": restarts,
+                    }));
+                }
+            }
+        }
+    }
 }
 
 impl Default for ActorHub {
@@ -423,12 +530,6 @@ pub(crate) fn spawn_actor(backend: &HostBindingBackend, a: &Value) -> Result<Val
                 .to_string(),
         );
     }
-    if let Some(pid) = ctx.actor_id() {
-        return Err(format!(
-            "chidori.spawnActor is not supported inside an actor ({pid}): actors are spawned \
-             and joined by the run that owns them"
-        ));
-    }
 
     let source = a
         .get("source")
@@ -463,8 +564,16 @@ pub(crate) fn spawn_actor(backend: &HostBindingBackend, a: &Value) -> Result<Val
         "options": options.to_json(),
     });
     host_core::execute_durable_json_call(ctx, "spawn_actor", call_args, || {
-        start_actor(backend, ctx, &source, &input, &options, Vec::new())
-            .map_err(|err| anyhow::anyhow!(err))
+        start_actor(
+            backend,
+            ctx,
+            &source,
+            &input,
+            &options,
+            ctx.actor_id(),
+            Vec::new(),
+        )
+        .map_err(|err| anyhow::anyhow!(err))
     })
     .map_err(|err| err.to_string())
 }
@@ -472,22 +581,28 @@ pub(crate) fn spawn_actor(backend: &HostBindingBackend, a: &Value) -> Result<Val
 /// Allocate a pid and a reserved sequence range, register the optional name,
 /// and start the supervision thread. Shared by the live `spawn_actor` path and
 /// the crash-resume re-creation path (which seeds the mailbox from recorded
-/// sends).
+/// sends). `owner` is the spawning actor's pid (`None` when the run spawns):
+/// a top-level actor's range comes from the run-level arena, a child's range
+/// is carved out of its owner's range — that containment is what lets a whole
+/// supervision tree merge upward through its owner's join while every record
+/// still lands inside the top-level actor's reserved range.
 fn start_actor(
     backend: &HostBindingBackend,
     ctx: &RuntimeContext,
     source: &str,
     input: &Value,
     options: &SupervisionOptions,
+    owner: Option<String>,
     seed_mailbox: Vec<QueuedSignal>,
 ) -> Result<Value, String> {
     let hub = ctx.ensure_actor_hub();
     let shared = Arc::new(ActorShared::new());
-    let (pid, range) = {
+    let (pid, range, child_width) = {
         let mut inner = hub.inner.lock().unwrap();
         if inner.spawned_total >= MAX_ACTORS {
             return Err(format!(
-                "chidori.spawnActor: a run may spawn at most {MAX_ACTORS} actors"
+                "chidori.spawnActor: a run may spawn at most {MAX_ACTORS} actors \
+                 (restarted children count)"
             ));
         }
         if let Some(ref name) = options.name {
@@ -497,24 +612,61 @@ fn start_actor(
                 ));
             }
         }
+
+        // Reserve the next disjoint block above every sequence number used so
+        // far — the spawner's records, merged child ranges (the counter
+        // advances past them at each join), and previously reserved blocks
+        // (the cursor). For the run the arena is the global sequence space;
+        // for an actor it is the actor's own reserved range, subdivided.
+        let (origin, arena_end, width, cursor) = match owner {
+            None => (0, u64::MAX, ACTOR_TOP_RANGE_WIDTH, inner.range_cursor),
+            Some(ref owner_pid) => {
+                let entry = inner.actors.get(owner_pid).ok_or_else(|| {
+                    format!("chidori.spawnActor: unknown owning actor `{owner_pid}`")
+                })?;
+                if entry.child_width < MIN_ACTOR_RANGE_WIDTH {
+                    return Err(format!(
+                        "chidori.spawnActor: supervision tree too deep — actor `{owner_pid}` \
+                         has no sequence-range headroom left to subdivide for children \
+                         (each level divides its range by {ACTOR_RANGE_SUBDIVISION})"
+                    ));
+                }
+                (
+                    entry.sequence_range.start - 1,
+                    entry.sequence_range.end_exclusive - 1,
+                    entry.child_width,
+                    entry.child_cursor,
+                )
+            }
+        };
+        let floor = ctx.current_seq().saturating_sub(origin).max(cursor).max(1);
+        let base = floor.div_ceil(width) * width;
+        if origin + base + width > arena_end {
+            return Err(format!(
+                "chidori.spawnActor: the spawner's reserved sequence range is exhausted \
+                 (cannot fit another child block of width {width})"
+            ));
+        }
+        match owner {
+            None => inner.range_cursor = base + width,
+            Some(ref owner_pid) => {
+                if let Some(entry) = inner.actors.get_mut(owner_pid) {
+                    entry.child_cursor = base + width;
+                }
+            }
+        }
+        let range = CallLogSequenceRange {
+            start: origin + base + 1,
+            end_exclusive: origin + base + 1 + width,
+        };
+
         inner.spawned_total += 1;
         inner.next_index += 1;
         let pid = format!("actor-{}", inner.next_index);
-        // Reserve the next disjoint block above every sequence number used so
-        // far — parent records, merged actor ranges (the counter advances past
-        // them at each join), and previously reserved ranges (the cursor).
-        let width = ACTOR_SEQUENCE_RANGE_WIDTH;
-        let floor = ctx.current_seq().max(inner.range_cursor).max(1);
-        let base = floor.div_ceil(width) * width;
-        inner.range_cursor = base + width;
-        let range = CallLogSequenceRange {
-            start: base + 1,
-            end_exclusive: base + 1 + width,
-        };
         if let Some(ref name) = options.name {
             inner.names.insert(name.clone(), pid.clone());
         }
-        (pid, range)
+        (pid, range, width / ACTOR_RANGE_SUBDIVISION)
     };
 
     {
@@ -556,6 +708,10 @@ fn start_actor(
                     &range,
                     &anchor_vfs,
                 );
+                // Children must not outlive their supervisor: reap any this
+                // actor spawned and never settled, BEFORE going terminal, so
+                // whoever joins this actor observes a fully-settled subtree.
+                hub.stop_owned_subtree(&pid);
                 shared.set_lifecycle(Lifecycle::Terminal(outcome.status.to_string()));
                 // Wake a parent blocked in `receive` so it can re-check
                 // whether anything can still send to it.
@@ -571,6 +727,10 @@ fn start_actor(
             shared,
             handle: Some(thread),
             sequence_range: range,
+            owner,
+            name: options.name.clone(),
+            child_width,
+            child_cursor: 0,
             settled_outcome: None,
         },
     );
@@ -605,7 +765,19 @@ pub(crate) fn send_actor(backend: &HostBindingBackend, a: &Value) -> Result<Valu
             let hub = ctx
                 .actor_hub()
                 .ok_or_else(|| anyhow::anyhow!("chidori.sendActor: no actor hub in this run"))?;
-            hub.deliver_to_parent(&name, payload.clone(), from.clone());
+            // "parent" is the sender's spawner: the owning actor for a child
+            // in a supervision tree, the run's own mailbox for a top-level
+            // actor (or the run itself — a recorded self-send).
+            let owner = ctx.actor_id().and_then(|sender| hub.owner_of(&sender));
+            match owner {
+                Some(owner_pid) => {
+                    let shared = hub.shared_of(&owner_pid).ok_or_else(|| {
+                        anyhow::anyhow!("chidori.sendActor: unknown owning actor `{owner_pid}`")
+                    })?;
+                    shared.deliver(&name, payload.clone(), from.clone());
+                }
+                None => hub.deliver_to_parent(&name, payload.clone(), from.clone()),
+            }
             return Ok(json!({ "delivered": true }));
         }
         let (hub, pid) =
@@ -784,12 +956,6 @@ fn settle_actor_call(
     request_stop: bool,
 ) -> Result<Value, String> {
     let ctx = runtime_ctx(backend, function)?;
-    if let Some(actor) = ctx.actor_id() {
-        return Err(format!(
-            "chidori.{function} is not supported inside an actor ({actor}): actors are joined \
-             by the run that owns them"
-        ));
-    }
     let target = a
         .get("pid")
         .and_then(Value::as_str)
@@ -807,6 +973,19 @@ fn settle_actor_call(
     host_core::execute_durable_json_call_at_seq(ctx, seq, function, call_args, || {
         let (hub, pid) =
             ensure_live_actor(backend, ctx, &target).map_err(|err| anyhow::anyhow!(err))?;
+        // Ownership gate: settling folds the target's records into THIS log,
+        // so only the spawner may do it — the run for top-level actors, the
+        // owning actor for its children in a supervision tree.
+        let caller = ctx.actor_id();
+        let owner = hub.owner_of(&pid);
+        if owner != caller {
+            return Err(anyhow::anyhow!(
+                "chidori.{function}: `{target}` was spawned by {}, not {} — actors are \
+                 settled by their spawner",
+                owner.as_deref().unwrap_or("the run"),
+                caller.as_deref().unwrap_or("the run"),
+            ));
+        }
         if let Some(settled) = hub
             .inner
             .lock()
@@ -1030,7 +1209,15 @@ fn ensure_live_actor(
         })
         .collect();
 
-    let spawned = start_actor(backend, ctx, &source, &input, &options, seed)?;
+    let spawned = start_actor(
+        backend,
+        ctx,
+        &source,
+        &input,
+        &options,
+        ctx.actor_id(),
+        seed,
+    )?;
     let live_pid = spawned
         .get("pid")
         .and_then(Value::as_str)
@@ -1245,6 +1432,12 @@ fn supervise(
             }
             IterationEnd::Failed(message) => {
                 let records = ctx.call_log().into_records();
+                // A stop request surfaces inside the iteration as an error
+                // (e.g. an interrupted `receive`): that is a stop, not a
+                // failure to retry.
+                if shared.state.lock().unwrap().stop_requested {
+                    return outcome("stopped", None, None, None, restarts, records);
+                }
                 let attempts_left =
                     options.restart != RestartStrategy::Never && restarts < options.max_restarts;
                 if !attempts_left {
@@ -1273,7 +1466,14 @@ fn supervise(
                 }
                 carried_inbox = ctx.signal_inbox();
                 replay = match options.restart {
-                    RestartStrategy::Clean => Vec::new(),
+                    RestartStrategy::Clean => {
+                        // The discarded log's `spawn_actor` calls are about to
+                        // re-run live, so the failed attempt's children must
+                        // be reaped first — otherwise they would leak and
+                        // squat on their registered names.
+                        hub.stop_owned_subtree(pid);
+                        Vec::new()
+                    }
                     RestartStrategy::Resume => strip_crash_frontier(records),
                     RestartStrategy::Never => unreachable!("guarded by attempts_left"),
                 };
@@ -1453,7 +1653,7 @@ mod tests {
             .unwrap();
         assert_eq!(worker_log.parent_seq, Some(join.seq));
         assert!(
-            (10_001..20_001).contains(&worker_log.seq),
+            (1_000_000_000_001..2_000_000_000_001u64).contains(&worker_log.seq),
             "{}",
             worker_log.seq
         );
@@ -1870,38 +2070,340 @@ mod tests {
     }
 
     #[test]
-    fn spawn_inside_an_actor_is_rejected() {
-        let dir = test_dir("nested");
-        let worker = write_agent(
+    fn supervision_tree_merges_upward_and_routes_parent_messages_to_the_owner() {
+        // A three-level tree: the run spawns a supervisor actor, which spawns
+        // a child, sends it work, receives the child's "parent"-addressed
+        // reply (proving "parent" routes to the OWNING ACTOR, not the run),
+        // joins it, and returns. The child's records must sit inside a range
+        // carved out of the supervisor's range, and the parent_seq chain must
+        // step child-record → supervisor's join → run's join, so a run replay
+        // absorbs the whole tree at one join.
+        let dir = test_dir("tree");
+        let child = write_agent(
             &dir,
-            "forker.ts",
+            "leaf.ts",
             r#"
             export async function agent() {
-                return await chidori.spawnActor("anything.ts");
+                const task = await chidori.receive("task");
+                await chidori.sendActor("parent", "leaf-done", { doubled: task.payload.n * 2 });
+                return { ok: true };
+            }
+            "#,
+        );
+        let supervisor = write_agent(
+            &dir,
+            "mid.ts",
+            &r#"
+            export async function agent() {
+                const { pid } = await chidori.spawnActor("__CHILD__", {});
+                await chidori.sendActor(pid, "task", { n: 21 });
+                const reply = await chidori.receive("leaf-done");
+                const outcome = await chidori.joinActor(pid);
+                return { fromLeaf: reply.payload.doubled, leafStatus: outcome.status };
+            }
+            "#
+            .replace("__CHILD__", &child),
+        );
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent() {
+                const { pid } = await chidori.spawnActor("__MID__");
+                const outcome = await chidori.joinActor(pid);
+                return outcome.output;
+            }
+        "#
+        .replace("__MID__", &supervisor);
+        std::fs::write(&path, &src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), Arc::new(ToolRegistry::new()));
+        let output = run_agent(&path, &src, &json!({}), &backend).unwrap();
+        assert_eq!(output, json!({ "fromLeaf": 42, "leafStatus": "completed" }));
+
+        // Structure: the supervisor's range is a top-level block; the child's
+        // records live in a 10^9-wide block carved out of it.
+        let records = ctx.call_log().into_records();
+        let run_join = records
+            .iter()
+            .find(|r| r.function == "join_actor" && r.parent_seq.is_none())
+            .unwrap();
+        let mid_join = records
+            .iter()
+            .find(|r| r.function == "join_actor" && r.parent_seq == Some(run_join.seq))
+            .unwrap();
+        let leaf_send = records
+            .iter()
+            .find(|r| {
+                r.function == "send_actor"
+                    && r.args["to"] == json!("parent")
+                    && r.args["name"] == json!("leaf-done")
+            })
+            .unwrap();
+        assert_eq!(leaf_send.parent_seq, Some(mid_join.seq));
+        let top = 1_000_000_000_001..2_000_000_000_001u64;
+        assert!(top.contains(&mid_join.seq), "{}", mid_join.seq);
+        assert!(top.contains(&leaf_send.seq), "{}", leaf_send.seq);
+        // The child block starts at the first 10^9 boundary inside the
+        // supervisor's range.
+        assert!(
+            leaf_send.seq > 1_000_000_000_000 + 1_000_000_000,
+            "{}",
+            leaf_send.seq
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn supervision_tree_replays_from_cache() {
+        // The whole tree — including the grandchild's live tool call — must
+        // come back from the journal on a run replay.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        let tool_counter = counter.clone();
+        registry.register_native("count", "counts live calls", Vec::new(), move |_args| {
+            Ok(json!({ "count": tool_counter.fetch_add(1, Ordering::SeqCst) + 1 }))
+        });
+
+        let dir = test_dir("tree-replay");
+        let child = write_agent(
+            &dir,
+            "leaf.ts",
+            r#"
+            export async function agent() {
+                const { count } = await chidori.tool("count", {});
+                return { count };
+            }
+            "#,
+        );
+        let supervisor = write_agent(
+            &dir,
+            "mid.ts",
+            &r#"
+            export async function agent() {
+                const { pid } = await chidori.spawnActor("__CHILD__");
+                const outcome = await chidori.joinActor(pid);
+                return outcome.output;
+            }
+            "#
+            .replace("__CHILD__", &child),
+        );
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent() {
+                const { pid } = await chidori.spawnActor("__MID__");
+                const outcome = await chidori.joinActor(pid);
+                return outcome.output;
+            }
+        "#
+        .replace("__MID__", &supervisor);
+        std::fs::write(&path, &src).unwrap();
+
+        let live_ctx = RuntimeContext::new();
+        let registry = Arc::new(registry);
+        let live_backend = test_backend(live_ctx.clone(), registry.clone());
+        let live_output = run_agent(&path, &src, &json!({}), &live_backend).unwrap();
+        assert_eq!(live_output, json!({ "count": 1 }));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let records = live_ctx.call_log().into_records();
+        let replay_ctx = RuntimeContext::with_replay(records);
+        let replay_backend = test_backend(replay_ctx, registry);
+        let replay_output = run_agent(&path, &src, &json!({}), &replay_backend).unwrap();
+        assert_eq!(live_output, replay_output);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "a run replay must not re-run any level of the tree"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clean_restart_reaps_children_and_releases_their_names() {
+        // A supervisor that spawns a NAMED child and then fails on its first
+        // attempt. The clean restart discards its log, so the retry re-runs
+        // the spawn live — which only works if the failed attempt's child was
+        // reaped and its registered name released. The child runs once per
+        // supervisor attempt.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let child_runs = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        let tool_attempts = attempts.clone();
+        registry.register_native("attempt", "counts attempts", Vec::new(), move |_args| {
+            Ok(json!({ "n": tool_attempts.fetch_add(1, Ordering::SeqCst) + 1 }))
+        });
+        let tool_child_runs = child_runs.clone();
+        registry.register_native("child_ran", "counts child runs", Vec::new(), move |_args| {
+            Ok(json!({ "n": tool_child_runs.fetch_add(1, Ordering::SeqCst) + 1 }))
+        });
+
+        let dir = test_dir("tree-clean");
+        let child = write_agent(
+            &dir,
+            "kid.ts",
+            r#"
+            export async function agent() {
+                await chidori.tool("child_ran", {});
+                return { ok: true };
+            }
+            "#,
+        );
+        let supervisor = write_agent(
+            &dir,
+            "sup.ts",
+            &r#"
+            export async function agent() {
+                const kid = await chidori.spawnActor("__CHILD__", {}, { name: "kid" });
+                const { n } = await chidori.tool("attempt", {});
+                if (n < 2) throw new Error("supervisor transient failure " + n);
+                const outcome = await chidori.joinActor(kid.pid);
+                return { kid: outcome.status, attempt: n };
+            }
+            "#
+            .replace("__CHILD__", &child),
+        );
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent() {
+                const { pid } = await chidori.spawnActor("__SUP__", {}, {
+                    restart: "clean",
+                    maxRestarts: 2,
+                });
+                return await chidori.joinActor(pid);
+            }
+        "#
+        .replace("__SUP__", &supervisor);
+        std::fs::write(&path, &src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), Arc::new(registry));
+        let output = run_agent(&path, &src, &json!({}), &backend).unwrap();
+
+        assert_eq!(output["status"], json!("completed"));
+        assert_eq!(
+            output["output"],
+            json!({ "kid": "completed", "attempt": 2 })
+        );
+        assert_eq!(output["restarts"], json!(1));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            child_runs.load(Ordering::SeqCst),
+            2,
+            "the clean restart re-spawns the child (one run per attempt)"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn settling_an_actor_spawned_by_someone_else_is_rejected() {
+        // The run spawns a worker X and a meddler actor, hands the meddler
+        // X's pid, and the meddler tries to join it: settling folds records
+        // into the caller's log, so only the spawner may do it.
+        let dir = test_dir("ownership");
+        let worker = write_agent(
+            &dir,
+            "victim.ts",
+            r#"
+            export async function agent() {
+                await chidori.receive("finish");
+                return {};
+            }
+            "#,
+        );
+        let meddler = write_agent(
+            &dir,
+            "meddler.ts",
+            r#"
+            export async function agent(input: { victim: string }) {
+                return await chidori.joinActor(input.victim);
             }
             "#,
         );
         let path = dir.join("agent.ts");
         let src = r#"
             export async function agent() {
-                const { pid } = await chidori.spawnActor("__WORKER__");
-                return await chidori.joinActor(pid);
+                const victim = await chidori.spawnActor("__VICTIM__");
+                const meddler = await chidori.spawnActor("__MEDDLER__", { victim: victim.pid });
+                const meddled = await chidori.joinActor(meddler.pid);
+                await chidori.sendActor(victim.pid, "finish", null);
+                const victimOutcome = await chidori.joinActor(victim.pid);
+                return { meddler: meddled.status, error: meddled.error, victim: victimOutcome.status };
             }
         "#
-        .replace("__WORKER__", &worker);
+        .replace("__VICTIM__", &worker)
+        .replace("__MEDDLER__", &meddler);
         std::fs::write(&path, &src).unwrap();
 
         let ctx = RuntimeContext::new();
         let backend = test_backend(ctx.clone(), Arc::new(ToolRegistry::new()));
         let output = run_agent(&path, &src, &json!({}), &backend).unwrap();
-        assert_eq!(output["status"], json!("failed"));
+        assert_eq!(output["meddler"], json!("failed"));
         assert!(
             output["error"]
                 .as_str()
                 .unwrap()
-                .contains("not supported inside an actor"),
+                .contains("settled by their spawner"),
             "{}",
             output["error"]
+        );
+        assert_eq!(output["victim"], json!("completed"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn supervision_tree_depth_is_bounded_by_range_subdivision() {
+        // Each level's range is its parent's divided by 1000; below the
+        // minimum width there is nothing left to subdivide, so a
+        // fourth-generation actor cannot spawn. The self-recursive module
+        // stops when its spawn is refused, and the refusal bubbles up through
+        // the joined outcomes.
+        let dir = test_dir("tree-depth");
+        let deep_path = dir.join("actors").join("deep.ts");
+        let deep_src = r#"
+            export async function agent(input: { depth: number }) {
+                const child = await chidori.spawnActor("__SELF__", { depth: input.depth + 1 });
+                const outcome = await chidori.joinActor(child.pid);
+                return { depth: input.depth, childOutcome: outcome };
+            }
+        "#
+        .replace("__SELF__", &deep_path.to_string_lossy());
+        std::fs::write(&deep_path, &deep_src).unwrap();
+        let path = dir.join("agent.ts");
+        let src = r#"
+            export async function agent() {
+                const { pid } = await chidori.spawnActor("__DEEP__", { depth: 0 });
+                const outcome = await chidori.joinActor(pid);
+                return outcome.output;
+            }
+        "#
+        .replace("__DEEP__", &deep_path.to_string_lossy());
+        std::fs::write(&path, &src).unwrap();
+
+        let ctx = RuntimeContext::new();
+        let backend = test_backend(ctx.clone(), Arc::new(ToolRegistry::new()));
+        let output = run_agent(&path, &src, &json!({}), &backend).unwrap();
+
+        // depth 0 (width 10^12) → 1 (10^9) → 2 (10^6) → 3 (10^3, cannot
+        // subdivide further): depth 3's spawn fails, and the refusal bubbles
+        // up through the nested joined outcomes.
+        assert_eq!(output["depth"], json!(0));
+        let depth1 = &output["childOutcome"];
+        assert_eq!(depth1["status"], json!("completed"));
+        let depth2 = &depth1["output"]["childOutcome"];
+        assert_eq!(depth2["status"], json!("completed"));
+        let depth3 = &depth2["output"]["childOutcome"];
+        assert_eq!(depth3["status"], json!("failed"));
+        assert!(
+            depth3["error"]
+                .as_str()
+                .unwrap()
+                .contains("supervision tree too deep"),
+            "{}",
+            depth3["error"]
         );
 
         let _ = std::fs::remove_dir_all(dir);
@@ -2075,10 +2577,10 @@ mod tests {
         assert_eq!(sends_to_parent.len(), 4);
         assert!(sends_to_parent
             .iter()
-            .any(|seq| (10_001..20_001).contains(seq)));
+            .any(|seq| (1_000_000_000_001..2_000_000_000_001u64).contains(seq)));
         assert!(sends_to_parent
             .iter()
-            .any(|seq| (20_001..30_001).contains(seq)));
+            .any(|seq| (2_000_000_000_001..3_000_000_000_001u64).contains(seq)));
 
         let _ = std::fs::remove_dir_all(dir);
     }

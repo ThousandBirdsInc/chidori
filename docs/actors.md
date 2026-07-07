@@ -76,11 +76,12 @@ const { pid, name } = await chidori.spawnActor(source, input?, {
 
 `source` resolves like a `branch` variant source: the actor's own module, run
 with `input`. Pids are allocated in spawn order (`actor-1`, `actor-2`, …). A
-run may spawn at most 32 actors; actors may not spawn, join, or stop other
-actors (they *can* send, receive, and look up siblings) — spawn/settle
-ownership stays with the run that owns the log. `spawnActor` inside a
-`chidori.branch` sub-run is rejected for the same range-confinement reason as
-nested branches.
+run may spawn at most 128 actors in total (the whole tree, restarted children
+included). Actors can spawn actors — see [Supervision
+trees](#supervision-trees) — but joining and stopping are **owner-only**: an
+actor is settled by whoever spawned it (its records fold into the spawner's
+log). `spawnActor` inside a `chidori.branch` sub-run is rejected for the same
+range-confinement reason as nested branches.
 
 ### sendActor
 
@@ -89,8 +90,9 @@ await chidori.sendActor(pidOrName, "message-name", payload?);
 // → { delivered: boolean }   (false once the target has settled)
 ```
 
-Delivery never blocks. `to = "parent"` addresses the spawning run's own
-mailbox from inside an actor.
+Delivery never blocks. `to = "parent"` addresses the sender's spawner: the
+owning actor for a child in a supervision tree, or the spawning run for a
+top-level actor.
 
 ### receive
 
@@ -126,7 +128,8 @@ budget spent; carries the final error), `"paused"` (parked on something the
 runtime can't answer in-process — interactive `input()`, a policy approval, or
 the idle cap on a mailbox wait), or `"stopped"`. `stopActor` is cooperative:
 honored between iterations, at mailbox waits, and during restart backoff; a
-live LLM/tool call finishes first.
+live LLM/tool call finishes first. Both are owner-only: an actor is settled
+by whoever spawned it.
 
 ### actorStatus / whereis
 
@@ -153,6 +156,56 @@ live host-call failure) will recur under `resume`; `maxRestarts` bounds the
 loop either way. Messages consumed by a failed attempt are redelivered under
 `resume` (their consumption is in the replayed log) but lost under `clean`,
 matching the from-scratch semantics.
+
+## Supervision trees
+
+Actors spawn actors, forming a supervised hierarchy — a worker pool per
+supervisor, a supervisor per pipeline stage, each level with its own restart
+policy:
+
+```ts
+// supervisor.ts — spawned by the run, supervises its own worker pool.
+export async function agent(input: { shards: string[] }) {
+  const workers = [];
+  for (const shard of input.shards) {
+    workers.push(await chidori.spawnActor("worker.ts", { shard }, {
+      restart: "resume",     // this supervisor's policy for ITS children
+      maxRestarts: 3,
+    }));
+  }
+  const results = [];
+  for (const w of workers) {
+    const outcome = await chidori.joinActor(w.pid);   // owner-only
+    results.push(outcome.output);
+  }
+  return { results };
+}
+```
+
+The tree rules:
+
+- **Ownership.** Every actor records who spawned it. Only the owner may
+  `joinActor`/`stopActor` it; anyone may `sendActor` to it. `"parent"` from a
+  child addresses its owning actor's mailbox (received there with
+  `chidori.receive`), not the run.
+- **Ranges nest.** A child's reserved sequence range is carved out of its
+  owner's range (each level subdivides by 1000: 10^12 for a top-level actor,
+  10^9 for its children, 10^6, then 10^3). That containment is what lets a
+  whole subtree merge upward join by join while every record still lands
+  inside the top-level actor's range at the final confinement check. The
+  subdivision bounds tree depth: a fourth-generation actor has no headroom
+  left to subdivide and its `spawnActor` is refused with a clear error.
+- **Supervisors reap their children.** When an actor settles — completed,
+  failed, stopped, or paused — its still-live children are cooperatively
+  stopped first, transitively, so children never outlive their supervisor. A
+  `clean` restart also reaps the failed attempt's children (its discarded log
+  is about to re-run the spawns live) and releases their registered names for
+  the retry to re-claim. A `resume` restart keeps children: the replayed
+  `spawn_actor` records return their cached pids and the same live children
+  answer.
+- **Replay absorbs the whole tree at one join.** A grandchild's records carry
+  `parent_seq` → its owner's `join_actor` record → the run's `join_actor`
+  record, so replaying the run's join absorbs every level in one pass.
 
 ## Durability and replay
 
@@ -185,9 +238,11 @@ window).
   queued.
 - **Idle actors park, not leak**: an actor waiting on an empty mailbox with no
   explicit timeout settles as `paused` after `idleTimeoutMs` (default 5
-  minutes), so an orphaned wait cannot hold a thread forever.
-- **Join what you spawn**: records only merge at a join/stop. Ending the
-  parent run with actors unjoined discards their (unmerged) work.
+  minutes), so an orphaned wait cannot hold a thread forever — and a settling
+  supervisor reaps its subtree on the way out.
+- **Join what you spawn**: records only merge at a join/stop, and only the
+  spawner may settle an actor. Ending the parent run with actors unjoined
+  discards their (unmerged) work.
 - **Hot code reload across restarts**: each supervision-loop iteration re-reads
   the actor's source module, so an edited module + `resume` restart follows the
   same modify-and-resume contract as run resume (divergence detection applies).

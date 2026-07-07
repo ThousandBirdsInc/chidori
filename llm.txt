@@ -344,8 +344,18 @@ and `receive` waits in place without pausing the run. Restart strategies:
 minus the trailing failed records, so completed work returns from cache and
 only the failing call retries. Every primitive is a durable call — replay of
 the spawning run re-runs nothing — and a crash before a join re-creates the
-actor on resume from the recorded spawn/send records. Actors may not spawn,
-join, or stop other actors; a run may spawn at most 32.
+actor on resume from the recorded spawn/send records.
+
+Actors form **supervision trees**: an actor can spawn its own supervised
+children (each level carves child sequence ranges out of its own, bounding
+depth at four actor levels), `"parent"` addresses the sender's spawner (the
+owning actor, or the run for a top-level actor), and join/stop are owner-only
+— an actor is settled by whoever spawned it. Supervisors reap their children:
+when an actor settles (or discards its log on a `clean` restart) its
+still-live children are cooperatively stopped and their registered names
+released; a `resume` restart keeps children (cached spawn records return the
+same live pids). A run may spawn at most 128 actors in total, restarted
+children included.
 
 ### http (fetch / node:http)
 
