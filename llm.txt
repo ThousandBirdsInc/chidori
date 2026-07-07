@@ -307,6 +307,46 @@ chidori branch-rerun <run-id> <branch-id>                   # re-run edited sour
 A resumed or re-run branch updates only its own store; the parent's recorded
 `branch` outcome is immutable history. See `docs/branching-execution.md`.
 
+### actors: spawnActor / sendActor / receive / joinActor / stopActor / actorStatus / whereis
+
+```ts
+// Start an agent module as a supervised, addressable, concurrent process.
+const { pid } = await chidori.spawnActor("workers/researcher.ts", { topic }, {
+  name: "researcher",      // optional registry name for whereis/sendActor
+  restart: "resume",       // "never" (default) | "clean" | "resume"
+  maxRestarts: 3,
+  backoffMs: 500,          // doubles per attempt
+});
+
+// Message passing (never blocks): to = pid, registered name, or "parent".
+await chidori.sendActor(pid, "focus", { region: "EU" });
+
+// Blocking in-place consumption, in delivery order; fan-in via an array.
+const msg = await chidori.receive("draft");                    // { name, payload, from }
+const any = await chidori.receive(["draft", "cancel"], { timeoutMs: 60000 });
+
+// Settle: fold the actor's records into this run's log and get the outcome.
+const outcome = await chidori.joinActor(pid);
+// → { pid, status: "completed"|"failed"|"paused"|"stopped", output?, error?, restarts }
+await chidori.stopActor(pid);          // cooperative stop, then join
+await chidori.actorStatus(pid);        // { pid, status, restarts, mailbox, waitingFor? }
+await chidori.whereis("researcher");   // { pid } or { pid: null }
+```
+
+Actors are supervised siblings of branches (`docs/actors.md`): each runs its
+own source module on an isolated VM and its records occupy a reserved,
+disjoint sequence range, but an actor is detached and addressable — it runs
+concurrently on its own thread with a durable mailbox. Inside an actor,
+`chidori.signal`/`signalAny`/`pollSignal` consume actor messages too (the
+mailbox uses the signal envelope; `from` is the sender's pid or `"parent"`),
+and `receive` waits in place without pausing the run. Restart strategies:
+`clean` re-runs from scratch; `resume` replays the actor's accumulated log
+minus the trailing failed records, so completed work returns from cache and
+only the failing call retries. Every primitive is a durable call — replay of
+the spawning run re-runs nothing — and a crash before a join re-creates the
+actor on resume from the recorded spawn/send records. Actors may not spawn,
+join, or stop other actors; a run may spawn at most 32.
+
 ### http (fetch / node:http)
 
 There is no `chidori.http`. Use the standard `fetch` API (or the

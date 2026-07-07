@@ -66,7 +66,16 @@ impl HostBindingBackend {
         }
     }
 
-    fn template_engine(&self) -> Arc<TemplateEngine> {
+    /// When this backend's context belongs to an actor sub-run, drain the
+    /// actor's shared mailbox into the run-level signal inbox (no-op
+    /// otherwise). Called before the signal-family effects.
+    fn pump_actor_mailbox(&self) {
+        if let Some(ctx) = self.runtime_ctx() {
+            crate::runtime::host_actor::pump_own_mailbox(ctx);
+        }
+    }
+
+    pub(crate) fn template_engine(&self) -> Arc<TemplateEngine> {
         match self {
             HostBindingBackend::Recorder(_) => Arc::new(TemplateEngine::new(".")),
             HostBindingBackend::Runtime {
@@ -885,9 +894,21 @@ impl HostBindingBackend {
                     .to_string();
                 self.input(prompt).map(serde_json::Value::String)
             }
-            "signal" => self.signal(a),
-            "poll_signal" => self.poll_signal(a),
-            "signal_any" => self.signal_any(a),
+            // Inside an actor sub-run, pump the actor's shared mailbox into
+            // the run-level inbox first, so the listen point's drain sees
+            // every message delivered while the iteration was executing.
+            "signal" => {
+                self.pump_actor_mailbox();
+                self.signal(a)
+            }
+            "poll_signal" => {
+                self.pump_actor_mailbox();
+                self.poll_signal(a)
+            }
+            "signal_any" => {
+                self.pump_actor_mailbox();
+                self.signal_any(a)
+            }
             // The two halves of `chidori.step(name, fn)` — the durable value
             // checkpoint (docs/value-checkpoints.md). The engine binding probes
             // for a recorded result, runs the callback only on a miss, then
@@ -1100,6 +1121,14 @@ impl HostBindingBackend {
                 self.call_agent(path, input)
             }
             "branch" => crate::runtime::host_branch::run_branches(self, a),
+            // Supervised actor sub-runs + message passing (docs/actors.md).
+            "spawn_actor" => crate::runtime::host_actor::spawn_actor(self, a),
+            "send_actor" => crate::runtime::host_actor::send_actor(self, a),
+            "receive" => crate::runtime::host_actor::receive(self, a),
+            "join_actor" => crate::runtime::host_actor::join_actor(self, a),
+            "stop_actor" => crate::runtime::host_actor::stop_actor(self, a),
+            "actor_status" => crate::runtime::host_actor::actor_status(self, a),
+            "whereis" => crate::runtime::host_actor::whereis(self, a),
             "workspace" => self.dispatch_workspace(a),
             "contextDigest" => {
                 let segments = a

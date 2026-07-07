@@ -18,6 +18,11 @@ API reference.
 | `chidori.callAgent(path, input)` | Call a sub-agent |
 | `chidori.parallel(fns)` | Run functions concurrently |
 | `chidori.branch(variants)` | Fork the run into per-strategy sub-runs from the current state; returns every outcome for comparison ([details](./branching-execution.md)) |
+| `chidori.spawnActor(source, input, options)` | Start an agent module as a supervised, addressable, concurrent actor process with a durable mailbox and restart policy ([details](./actors.md)) |
+| `chidori.sendActor(to, name, payload)` | Deliver a named message to an actor (pid or registered name) or to `"parent"`; never blocks |
+| `chidori.receive(names, options)` | Blocking in-place message consumption from the caller's mailbox (fan-in via an array; `timeoutMs` resolves to the timeout sentinel) |
+| `chidori.joinActor(pid, options)` / `chidori.stopActor(pid)` | Settle an actor: wait for its supervision loop, fold its records into this run's log, return `{ status, output?, error?, restarts }` |
+| `chidori.actorStatus(pid)` / `chidori.whereis(name)` | Lifecycle snapshot / name-registry lookup |
 | `chidori.input(msg, options)` | Human-in-the-loop — pauses execution |
 | `chidori.signal(name, options)` | Multiplayer — pause at a named listen point until an outside party (human or agent) delivers `{ name, payload, from }`; drains a durable mailbox if one is queued; `timeoutMs` resolves to a `{ timedOut: true }` sentinel after the deadline |
 | `chidori.pollSignal(name)` | Non-blocking signal check — consume a queued signal of this name or resolve to `null` |
@@ -48,6 +53,7 @@ const data = await res.json();
 ```
 
 See also [`docs/signals.md`](./signals.md) for the multiplayer signal model,
+[`docs/actors.md`](./actors.md) for the actor process model,
 [`docs/value-checkpoints.md`](./value-checkpoints.md) for `chidori.step`, and
 [`docs/captured-effects-vfs-crypto-timers.md`](./captured-effects-vfs-crypto-timers.md)
 for the captured networking/filesystem/crypto/timer model.

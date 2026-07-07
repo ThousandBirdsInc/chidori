@@ -347,6 +347,86 @@ export interface RetryOptions {
   backoff?: "fixed" | "exponential";
 }
 
+/**
+ * What the runtime does when an actor iteration fails (`docs/actors.md`):
+ * - `"never"` (default) — the failure is the actor's final outcome;
+ * - `"clean"` — re-run the actor's module from scratch (fresh log, the
+ *   spawn-time filesystem anchor, the original input);
+ * - `"resume"` — replay the actor's accumulated call log with the trailing
+ *   failed records stripped, so completed work returns from cache and the
+ *   failing call itself retries live.
+ */
+export type ActorRestartStrategy = "never" | "clean" | "resume";
+
+export interface SpawnActorOptions {
+  /** Register the actor under a name for `whereis`/`sendActor` addressing. */
+  name?: string;
+  /** Restart strategy applied when an iteration fails. Default `"never"`. */
+  restart?: ActorRestartStrategy;
+  /** Restart intensity cap (default 3). */
+  maxRestarts?: number;
+  /** Base delay between restarts, doubling per attempt (default 0). */
+  backoffMs?: number;
+  /**
+   * How long the actor may sit at an empty-mailbox listen point with no
+   * explicit `timeoutMs` before the runtime parks it as a `paused` outcome
+   * (default 300 000 ms).
+   */
+  idleTimeoutMs?: number;
+}
+
+/** `{ pid, name }` — the spawned actor's address. */
+export interface SpawnedActor {
+  pid: string;
+  name: string | null;
+}
+
+export type ActorOutcomeStatus = "completed" | "failed" | "paused" | "stopped" | "running";
+
+/** The settlement `joinActor`/`stopActor` resolve to. */
+export interface ActorOutcome<T extends AgentJson = AgentJson> {
+  pid: string;
+  status: ActorOutcomeStatus;
+  /** The actor's return value, when `status` is `"completed"`. */
+  output?: T;
+  /** The final failure, when `status` is `"failed"`. */
+  error?: string;
+  /** What the actor is parked on, when `status` is `"paused"`. */
+  pendingPrompt?: string;
+  /** How many supervised restarts the actor consumed. */
+  restarts: number;
+}
+
+export interface ActorStatus {
+  pid: string;
+  status: ActorOutcomeStatus | "waiting" | "unknown";
+  restarts?: number;
+  /** Messages queued and not yet consumed. */
+  mailbox?: number;
+  /** The listen-point names a `"waiting"` actor is parked on. */
+  waitingFor?: string[];
+}
+
+/** A message consumed from a mailbox: `from` is a pid or `"parent"`. */
+export interface ActorMessage<T = AgentJson> {
+  name: string;
+  payload: T;
+  from: string;
+}
+
+export interface ReceiveOptions {
+  /** Resolve to the `{ timedOut: true }` sentinel after this many ms. */
+  timeoutMs?: number;
+}
+
+export interface JoinActorOptions {
+  /**
+   * Give up waiting after this many ms: the join resolves to
+   * `{ status: "running" }` without settling the actor — join again later.
+   */
+  timeoutMs?: number;
+}
+
 export interface TryCallResult<T> {
   ok: boolean;
   value?: T;
@@ -470,6 +550,60 @@ export interface Chidori {
     variants: BranchVariant[],
     options?: BranchOptions,
   ): Promise<BranchOutcome<T>[]>;
+  /**
+   * Start another agent module as a supervised, addressable actor sub-run
+   * (`docs/actors.md`). The actor runs concurrently with this run on its own
+   * mailbox; talk to it with `sendActor`, let it wait with `receive` (or the
+   * `signal` family), and settle it with `joinActor`. One durable record: a
+   * replay returns the pid from cache without re-running the actor.
+   */
+  spawnActor<TInput extends AgentJson = JsonObject>(
+    source: string,
+    input?: TInput,
+    options?: SpawnActorOptions,
+  ): Promise<SpawnedActor>;
+  /**
+   * Deliver a named message to an actor's mailbox (`to` = pid or registered
+   * name) or back to the spawning run (`to = "parent"`). Never blocks;
+   * resolves to `{ delivered }` (false when the target has already settled).
+   */
+  sendActor<T extends AgentJson = AgentJson>(
+    to: string,
+    name: string,
+    payload?: T,
+  ): Promise<{ delivered: boolean }>;
+  /**
+   * Blocking, in-place message consumption: inside an actor, drains the
+   * actor's own mailbox; in the spawning run, drains messages actors sent to
+   * `"parent"` (and any pre-queued external signals). Unlike `signal()` —
+   * which pauses the whole run so an external party can resume it — `receive`
+   * waits in place and is woken directly by in-process senders.
+   */
+  receive<T = AgentJson>(names: string | string[]): Promise<ActorMessage<T>>;
+  receive<T = AgentJson>(
+    names: string | string[],
+    options: ReceiveOptions,
+  ): Promise<ActorMessage<T> | SignalTimeout>;
+  /**
+   * Wait for the actor's supervision loop to settle and fold its records into
+   * this run's durable log. The outcome carries the actor's return value
+   * (`completed`), final failure (`failed` — restarts exhausted), park reason
+   * (`paused`), or `stopped`.
+   */
+  joinActor<T extends AgentJson = AgentJson>(
+    pid: string,
+    options?: JoinActorOptions,
+  ): Promise<ActorOutcome<T>>;
+  /**
+   * Request a cooperative stop (honored between iterations, at mailbox waits,
+   * and during restart backoff — a live LLM/tool call finishes first), then
+   * settle and merge exactly like `joinActor`.
+   */
+  stopActor<T extends AgentJson = AgentJson>(pid: string): Promise<ActorOutcome<T>>;
+  /** A durable snapshot of an actor's lifecycle. */
+  actorStatus(pid: string): Promise<ActorStatus>;
+  /** Registry lookup: the pid registered under `name`, or `null`. */
+  whereis(name: string): Promise<{ pid: string | null }>;
   tool<TArgs extends JsonObject = JsonObject, TResult extends AgentJson = AgentJson>(
     name: string,
     args?: TArgs,
