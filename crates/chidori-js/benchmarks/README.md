@@ -1,7 +1,7 @@
 # chidori-js cross-runtime benchmarks
 
 A suite that runs the **same JavaScript workloads** under three runtimes and
-compares wall-clock execution time:
+compares wall-clock execution time and peak memory (max RSS):
 
 | runtime    | what it is                                                            |
 | ---------- | --------------------------------------------------------------------- |
@@ -9,11 +9,15 @@ compares wall-clock execution time:
 | `node`     | Node.js (V8)                                                          |
 | `bun`      | Bun (JavaScriptCore)                                                  |
 
-This sits alongside the in-process [`benches/execution.rs`](../benches/execution.rs)
-criterion micro-benchmarks. Those isolate chidori-js's own hot paths (compile /
-interpret / realm setup) in-process; **this** suite answers the different
-question "how does chidori-js compare to the JITs people actually ship?" by
-running each workload as a standalone script under all three runtimes.
+This sits alongside two in-process benchmarks over the same workload corpus:
+the [`benches/execution.rs`](../benches/execution.rs) criterion
+micro-benchmarks, which isolate chidori-js's own hot paths (compile /
+interpret / realm setup), and [`benches/memory.rs`](../benches/memory.rs)
+(`cargo bench -p chidori-js --bench memory`), which reports exact heap
+utilization (realm footprint, per-run peak/churn/retained, leak check) via a
+tracking allocator. **This** suite answers the different question "how does
+chidori-js compare to the JITs people actually ship?" by running each workload
+as a standalone script under all three runtimes.
 
 ## Quick start
 
@@ -46,7 +50,7 @@ fib_recursive    2.15s 228.4x  11.8ms 1.3x        9.4ms        bun
 ...
 ```
 
-Two tables are printed:
+Three tables are printed:
 
 - **Execution-only** — raw subprocess time **minus that runtime's startup
   baseline** (measured separately with `workloads/startup.js`). This is the
@@ -56,6 +60,20 @@ Two tables are printed:
   a small native binary and starts in ~3ms, whereas Node pays ~34ms of V8/runtime
   startup, so for very short scripts chidori can win the *total* even when it
   loses the *execution* — this table makes that visible.
+- **Peak memory** — max RSS of the subprocess, per workload plus a `(startup)`
+  row (the runtime's floor footprint before any workload allocates). Measured
+  in dedicated extra runs (default 3, median; `--mem-runs N`) so the timing
+  methodology is untouched, and reported absolute rather than
+  startup-subtracted — unlike wall-clock, RSS doesn't subtract linearly. The
+  `N.Nx` suffix is the blow-up relative to the smallest runtime on that row.
+  Skip it with `--no-memory`.
+
+Peak RSS comes from the best available source: GNU `time -v` (or Homebrew
+`gtime`) / BSD `time -l`, which report the kernel's exact `ru_maxrss`; without
+those, on Linux the harness polls the monotonic `VmHWM` high-water mark in
+`/proc/<pid>/status` every ~1ms — exact whenever a sample lands after the
+peak, slightly under-reading only for very short-lived processes. On other
+platforms with no usable `time`, the memory table is skipped with a warning.
 
 Pass `--json PATH` to also dump every sample (min/median/mean/max per runtime)
 for offline analysis, or `--markdown PATH` to write the same two tables as a

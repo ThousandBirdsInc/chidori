@@ -58,3 +58,10 @@ criterion = "0.5"
 [[bench]]
 name = "execution"
 harness = false
+
+# Heap-utilization benchmarks over the same workloads: realm footprint,
+# bytecode footprint, per-run peak/churn/retained, and a repeat-run leak
+# check. Run with `cargo bench -p chidori-js --bench memory`.
+[[bench]]
+name = "memory"
+harness = false

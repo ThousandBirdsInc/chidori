@@ -1,8 +1,9 @@
 name: JS benchmarks
 
 # Runs the chidori-js cross-runtime benchmark suite (chidori-js vs Node.js vs
-# Bun) on PRs that touch the engine, and posts the results table as a single
-# sticky comment on the PR (updated in place on each run, not re-posted).
+# Bun, wall-clock + peak memory) on PRs that touch the engine, and posts the
+# results tables as a single sticky comment on the PR (updated in place on
+# each run, not re-posted).
 #
 # These numbers come from a shared GitHub-hosted runner, so treat them as
 # ratios for a quick smell-test, not as a precise performance gate — the job
@@ -44,6 +45,12 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+
+      # GNU time gives the harness exact peak-RSS (ru_maxrss) for the memory
+      # table. Best-effort: without it the harness falls back to polling
+      # /proc/<pid>/status VmHWM, which is near-exact for these workloads.
+      - name: Install GNU time (exact peak-RSS measurement)
+        run: sudo apt-get install -y time || true
 
       - name: Build chidori-js run example (release)
         run: cargo build --release -p chidori-js --example run
