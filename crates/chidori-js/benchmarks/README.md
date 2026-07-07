@@ -84,8 +84,10 @@ Markdown report.
 [`.github/workflows/js-benchmarks.yml`](../../../.github/workflows/js-benchmarks.yml)
 runs this suite on every PR that touches `crates/chidori-js/**` and posts the
 Markdown report (`--markdown`) as a **single sticky comment** on the PR —
-updated in place on each push, never re-posted. The full report is also uploaded
-as a build artifact (`js-benchmark-report`).
+updated in place on each push, never re-posted. The comment also carries the
+in-process heap numbers (`cargo bench -p chidori-js --bench memory`), appended
+as a final section. The full report is also uploaded as a build artifact
+(`js-benchmark-report`).
 
 The job only fails the build on a **correctness mismatch** between runtimes (the
 harness exits non-zero), never on timing — the numbers come from a shared
