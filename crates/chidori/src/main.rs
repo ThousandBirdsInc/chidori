@@ -2,6 +2,7 @@ mod acp;
 mod init;
 mod mcp;
 mod mem_guard;
+mod pkg;
 mod policy;
 mod providers;
 mod recipes;
@@ -109,6 +110,49 @@ enum Commands {
     Check {
         /// Path to the agent .ts file
         file: PathBuf,
+    },
+
+    /// Add npm packages to package.json and install them into node_modules.
+    /// Packages come from the npm registry (or CHIDORI_NPM_REGISTRY), are
+    /// verified against their SHA-512 integrity, cached once per machine in a
+    /// content-addressed store (~/.chidori/cache/packages), and hardlinked
+    /// into the project. Lifecycle scripts never run.
+    Add {
+        /// Packages to add: `name`, `name@1.2.3`, `name@^2`, `@scope/name@tag`
+        packages: Vec<String>,
+
+        /// Add to devDependencies instead of dependencies
+        #[arg(short = 'D', long)]
+        dev: bool,
+
+        /// Project directory (defaults to the current directory)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+
+    /// Install dependencies from chidori.lock.jsonl (or resolve them from
+    /// package.json when the lockfile is missing or out of date). Warm
+    /// installs are fully offline: every package materializes from the
+    /// content-addressed store by hardlink.
+    Install {
+        /// Fail instead of re-resolving when the lockfile is missing or out
+        /// of sync with package.json (for CI).
+        #[arg(long)]
+        frozen: bool,
+
+        /// Project directory (defaults to the current directory)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+
+    /// Remove npm packages from package.json, the lockfile, and node_modules.
+    Remove {
+        /// Package names to remove
+        packages: Vec<String>,
+
+        /// Project directory (defaults to the current directory)
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
 
     /// Scaffold a new agent project from a starter template.
@@ -328,6 +372,18 @@ fn main() {
         Commands::RunWorker => unreachable!("handled before the dispatch match"),
         Commands::Demo => (cmd_demo(), false),
         Commands::ModelLogin => (cmd_login(), false),
+        Commands::Add { packages, dev, dir } => (
+            pkg::cmd_add(&dir.unwrap_or_else(|| PathBuf::from(".")), &packages, dev),
+            false,
+        ),
+        Commands::Install { frozen, dir } => (
+            pkg::cmd_install(&dir.unwrap_or_else(|| PathBuf::from(".")), frozen),
+            false,
+        ),
+        Commands::Remove { packages, dir } => (
+            pkg::cmd_remove(&dir.unwrap_or_else(|| PathBuf::from(".")), &packages),
+            false,
+        ),
         Commands::Init { dir, template } => (
             init::run(
                 &dir.unwrap_or_else(|| PathBuf::from(".")),

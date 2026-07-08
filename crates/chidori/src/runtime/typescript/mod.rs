@@ -4,6 +4,7 @@ pub mod bindings;
 pub mod builtins;
 pub mod check;
 pub mod helpers;
+pub mod loader;
 pub mod module_graph;
 pub mod resolver;
 pub mod tools;

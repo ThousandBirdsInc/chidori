@@ -271,6 +271,11 @@ human-in-the-loop pause/resume loop — see
 - **Cost-efficient prompting** — structural [prompt
   caching](./docs/context-management.md) re-bills stable prefixes at the cached
   rate, and replay pays zero tokens.
+- **npm packages without Node** — `chidori add zod` installs straight from the
+  npm registry into a content-addressed cache (SHA-512 verified, hardlinked
+  `node_modules`, merge-friendly JSONL lockfile, no install scripts ever), and
+  agents just `import { z } from "zod"`. See [package
+  management](./docs/package-management.md).
 
 Agents reach all of this through a fixed set of host functions on the `chidori`
 object — see [**Core concepts**](./docs/core-concepts.md) for the full list and
@@ -319,6 +324,7 @@ deterministic, replayable, and testable for free.
 | [Running modes](./docs/running-modes.md) | One-shot CLI, HTTP server + session API, event-driven agents |
 | [How replay works](./docs/replay.md) | Record/checkpoint/replay model and SDK replay |
 | [Value checkpoints](./docs/value-checkpoints.md) | `chidori.step` — journal expensive pure compute so resume never re-pays it |
+| [Package management](./docs/package-management.md) | `chidori add`/`install`/`remove`: npm packages without Node — content-addressed store, SHA-512 verification, JSONL lockfile |
 | [Architecture & project structure](./docs/architecture.md) | High-level component map and repository layout |
 | [JavaScript conformance (Test262)](./docs/conformance.md) | Running the pure-Rust JS engine against the TC39 suite |
 | [Sandbox & security model](./docs/sandbox-model.md) | Deny-by-default policy, capability injection, resource limits |

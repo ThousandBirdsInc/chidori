@@ -66,8 +66,6 @@ fn exports_async_function(source: &str, name: &str) -> bool {
 }
 
 fn evaluate_tool_definition(path: &Path, javascript: &str) -> Result<TypeScriptToolDefinition> {
-    use crate::runtime::snapshot::TypeScriptImportPolicy;
-
     let mut engine = chidori_js::Engine::new();
     // Deterministic, side-effect-free metadata evaluation: disable host effects,
     // network, timers, Date, and randomness. Mirror the agent runtime's benign
@@ -97,8 +95,9 @@ fn evaluate_tool_definition(path: &Path, javascript: &str) -> Result<TypeScriptT
         .eval(&prelude)
         .map_err(|err| anyhow::anyhow!("installing tool metadata prelude: {err}"))?;
 
-    // Resolve relative + `node:` imports the same way the runtime engine does,
-    // so a tool that splits its schema across sibling modules still discovers.
+    // Resolve relative, bare-npm, and `node:` imports the same way the
+    // runtime engine does, so a tool that splits its schema across sibling
+    // modules (or imports an installed package) still discovers.
     let mut load =
         |specifier: &str, importer_key: &str| -> std::result::Result<(String, String), String> {
             if let Some(name) = specifier.strip_prefix("node:") {
@@ -106,24 +105,7 @@ fn evaluate_tool_definition(path: &Path, javascript: &str) -> Result<TypeScriptT
                     .ok_or_else(|| format!("unsupported node: builtin '{specifier}'"))?;
                 return Ok((format!("node:{name}"), src.to_string()));
             }
-            let importer = Path::new(importer_key);
-            let dir = importer.parent().unwrap_or_else(|| Path::new("."));
-            let resolved = crate::runtime::typescript::transpile::resolve_relative_import(
-                importer, dir, specifier, 0,
-            )
-            .map_err(|e| e.to_string())?;
-            let key = resolved.to_string_lossy().to_string();
-            let src = std::fs::read_to_string(&resolved)
-                .map_err(|e| format!("reading module {}: {e}", resolved.display()))?;
-            let js = transpile_module(
-                &resolved,
-                &src,
-                &TranspileOptions {
-                    import_policy: TypeScriptImportPolicy::Node,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((key, js))
+            super::loader::load_module_source(specifier, importer_key)
         };
 
     let entry_key = path.display().to_string();
