@@ -3,7 +3,7 @@
 Chidori ships a native npm package manager — `chidori add`, `chidori install`,
 `chidori remove` — so agents can use packages from the npm registry without
 Node, npm, or bun installed. It follows the same design that makes modern
-package managers (bun, pnpm, and single-binary toolchains like meow) fast:
+package managers like bun and pnpm fast:
 
 - **Content-addressed global store.** Every package version is downloaded,
   verified, and extracted exactly once per machine, into
@@ -111,19 +111,19 @@ export.
   linker path in the engine; revisit if real agent dependencies demand it.
 - **Auto-installed peer dependencies** — warned instead; install explicitly.
 
-## Comparison notes (meow, bun, pnpm)
+## Comparison notes (bun, pnpm)
 
-This design deliberately matches the properties that make
-[meow](https://github.com/0xchasercat/meow)-style package management fast and
-safe — one binary, content-addressed store, link-based materialization,
-SHA-512 verification off the hot path, merge-resistant JSONL lockfile.
-Capabilities those toolchains have that chidori intentionally does *not* take
-from the package manager:
+This design deliberately matches the properties that make modern single-binary
+package managers fast and safe — content-addressed store, link-based
+materialization, SHA-512 verification off the hot path, merge-resistant JSONL
+lockfile. Capabilities those toolchains have that chidori intentionally does
+*not* take from the package manager:
 
-- **Sandboxed execution of untrusted packages** (`meow x`): chidori already
-  has a stronger equivalent at the runtime layer — the deny-by-default
-  `--untrusted` policy profile and OS-level `--isolate` process sandbox apply
-  to *all* agent code, packages included, not just a special exec mode.
+- **Sandboxed execution of untrusted packages** (`bunx`-style exec modes):
+  chidori already has a stronger equivalent at the runtime layer — the
+  deny-by-default `--untrusted` policy profile and OS-level `--isolate`
+  process sandbox apply to *all* agent code, packages included, not just a
+  special exec mode.
 - **Parse-once toolchain** (one AST feeding runtime/linter/formatter): chidori
   already parses with oxc once per module on the load path; lint/format are
   editor/CI concerns out of chidori's scope.
