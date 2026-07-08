@@ -2,10 +2,11 @@
 // Cross-runtime benchmark harness for the chidori-js JavaScript engine.
 //
 // Runs each workload in `workloads/` as a standalone script under chidori-js,
-// Node.js, and Bun, measuring subprocess wall-clock time. The same `.js` file
-// is fed to all three runtimes and every workload prints a single `RESULT=...`
-// line, so the harness can confirm the runtimes agree before trusting the
-// timings (a fast-but-wrong engine is not a faster engine).
+// Node.js, and Bun, measuring subprocess wall-clock time and peak memory
+// (max RSS). The same `.js` file is fed to all three runtimes and every
+// workload prints a single `RESULT=...` line, so the harness can confirm the
+// runtimes agree before trusting the numbers (a fast-but-wrong engine is not
+// a faster engine).
 //
 // Each runtime pays a fixed process-startup cost (binary load + realm setup).
 // We measure that separately with `workloads/startup.js` and subtract it to
@@ -23,14 +24,16 @@
 //   --no-build          do not `cargo build` the chidori binary first
 //   --json PATH         also write the full results as JSON to PATH
 //   --markdown PATH     also write a Markdown report to PATH (used by CI)
-//   --quick             shorthand for --runs 3 --warmup 0
+//   --mem-runs N        memory-measured runs per workload (default 3)
+//   --no-memory         skip the peak-memory (max RSS) measurement
+//   --quick             shorthand for --runs 3 --warmup 0 --mem-runs 1
 //   -h, --help          show this help
 //
 // Environment:
 //   CHIDORI_RUN_BIN     same as --chidori-bin
 
-import { execFile, execFileSync } from "node:child_process";
-import { existsSync, writeFileSync } from "node:fs";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -54,6 +57,8 @@ function parseArgs(argv) {
     build: true,
     json: null,
     markdown: null,
+    memory: true,
+    memRuns: 3,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -67,7 +72,9 @@ function parseArgs(argv) {
       case "--no-build": opts.build = false; break;
       case "--json": opts.json = next(); break;
       case "--markdown": opts.markdown = next(); break;
-      case "--quick": opts.runs = 3; opts.warmup = 0; break;
+      case "--mem-runs": opts.memRuns = Number(next()); break;
+      case "--no-memory": opts.memory = false; break;
+      case "--quick": opts.runs = 3; opts.warmup = 0; opts.memRuns = 1; break;
       case "-h": case "--help": printHelp(); process.exit(0); break;
       default:
         console.error(`unknown option: ${a}`);
@@ -75,8 +82,8 @@ function parseArgs(argv) {
         process.exit(2);
     }
   }
-  if (!Number.isFinite(opts.runs) || opts.runs < 1) {
-    console.error("--runs must be a positive integer");
+  if (!Number.isFinite(opts.runs) || opts.runs < 1 || !Number.isFinite(opts.memRuns) || opts.memRuns < 1) {
+    console.error("--runs and --mem-runs must be positive integers");
     process.exit(2);
   }
   return opts;
@@ -98,7 +105,9 @@ function printHelp() {
       "  --no-build          do not cargo build the chidori binary first",
       "  --json PATH         also write the full results as JSON to PATH",
       "  --markdown PATH     also write a Markdown report to PATH (used by CI)",
-      "  --quick             shorthand for --runs 3 --warmup 0",
+      "  --mem-runs N        memory-measured runs per workload (default 3)",
+      "  --no-memory         skip the peak-memory (max RSS) measurement",
+      "  --quick             shorthand for --runs 3 --warmup 0 --mem-runs 1",
       "  -h, --help          show this help",
     ].join("\n"),
   );
@@ -217,6 +226,106 @@ function summarize(samples) {
 }
 
 // ---------------------------------------------------------------------------
+// Peak-memory (max RSS) measurement
+// ---------------------------------------------------------------------------
+//
+// Peak RSS of each subprocess is measured in dedicated extra runs (never the
+// timed ones, so the timing methodology is untouched). Best available
+// strategy wins:
+//
+//   1. GNU time (`/usr/bin/time -v`, or `gtime -v` from Homebrew) — exact
+//      ru_maxrss from wait4(), reported in kbytes.
+//   2. BSD time (`/usr/bin/time -l`, macOS) — exact, reported in bytes.
+//   3. Linux /proc poller — sample the kernel-maintained `VmHWM` high-water
+//      mark from `/proc/<pid>/status` every ~1ms while the child runs. Exact
+//      whenever a sample lands after the peak (VmHWM is monotonic); for very
+//      short-lived processes it can under-read slightly or miss entirely
+//      (reported as —).
+//
+// If none applies (non-Linux without a usable `time`), the memory tables are
+// skipped with a warning.
+
+function detectMemoryStrategy() {
+  const gnuParse = (s) => {
+    const m = s.match(/Maximum resident set size \(kbytes\): (\d+)/);
+    return m ? Number(m[1]) * 1024 : null;
+  };
+  const bsdParse = (s) => {
+    const m = s.match(/(\d+)\s+maximum resident set size/);
+    return m ? Number(m[1]) : null;
+  };
+  const candidates = [
+    { cmd: "/usr/bin/time", flag: "-v", parse: gnuParse, label: "GNU time" },
+    { cmd: whichSync("gtime"), flag: "-v", parse: gnuParse, label: "GNU time (gtime)" },
+    { cmd: "/usr/bin/time", flag: "-l", parse: bsdParse, label: "BSD time" },
+  ];
+  for (const c of candidates) {
+    if (!c.cmd || !existsSync(c.cmd)) continue;
+    const probe = spawnSync(c.cmd, [c.flag, "true"], { encoding: "utf8" });
+    if (probe.status === 0 && c.parse(probe.stderr ?? "") != null) {
+      return { kind: "time", ...c };
+    }
+  }
+  if (process.platform === "linux" && existsSync("/proc/self/status")) {
+    return { kind: "proc", label: "/proc VmHWM poller" };
+  }
+  return null;
+}
+
+// One measured run under the `time` wrapper: exact child ru_maxrss in bytes.
+async function rssOnceTime(strategy, runtime, file) {
+  const { stderr } = await execFileP(
+    strategy.cmd,
+    [strategy.flag, runtime.cmd, ...runtime.args, file],
+    { maxBuffer: 64 * 1024 * 1024 },
+  );
+  return strategy.parse(stderr ?? "");
+}
+
+// One measured run polling /proc/<pid>/status VmHWM (bytes; null if the
+// process exited before any sample landed).
+function rssOnceProc(runtime, file) {
+  return new Promise((resolvePromise, reject) => {
+    let hwm = null;
+    let timer = null;
+    const child = execFile(
+      runtime.cmd,
+      [...runtime.args, file],
+      { maxBuffer: 64 * 1024 * 1024 },
+      (err) => {
+        clearInterval(timer);
+        if (err) reject(new Error(`${runtime.name} failed on ${file}: ${err.message}`));
+        else resolvePromise(hwm);
+      },
+    );
+    const sample = () => {
+      try {
+        const status = readFileSync(`/proc/${child.pid}/status`, "utf8");
+        const m = status.match(/^VmHWM:\s+(\d+) kB/m);
+        if (m) hwm = Math.max(hwm ?? 0, Number(m[1]) * 1024);
+      } catch {
+        // Process already gone — keep whatever high-water mark we saw.
+      }
+    };
+    sample();
+    timer = setInterval(sample, 1);
+  });
+}
+
+// Median peak RSS in bytes over `runs` dedicated runs (null when unmeasurable).
+async function measureRss(strategy, runtime, file, runs) {
+  const samples = [];
+  for (let i = 0; i < runs; i++) {
+    const rss =
+      strategy.kind === "time"
+        ? await rssOnceTime(strategy, runtime, file)
+        : await rssOnceProc(runtime, file);
+    if (rss != null) samples.push(rss);
+  }
+  return samples.length ? summarize(samples).median : null;
+}
+
+// ---------------------------------------------------------------------------
 // Reporting
 // ---------------------------------------------------------------------------
 
@@ -224,6 +333,12 @@ function fmtMs(ms) {
   if (ms == null) return "—";
   if (ms >= 1000) return (ms / 1000).toFixed(2) + "s";
   return ms.toFixed(1) + "ms";
+}
+
+function fmtBytes(b) {
+  if (b == null) return "—";
+  if (b >= 1024 * 1024) return (b / (1024 * 1024)).toFixed(1) + "MiB";
+  return (b / 1024).toFixed(0) + "KiB";
 }
 
 function pad(s, w) {
@@ -298,12 +413,58 @@ function printTable(workloads, runtimes, baselines) {
   }
 }
 
+// Smallest peak RSS across runtimes for one row — the reference for the "x"
+// blow-up factors (smaller is better). Shared by the text and Markdown
+// reporters so they can't drift.
+function rssBest(rssByName, rtNames) {
+  const finite = rtNames.map((n) => rssByName[n]).filter((v) => v != null && v > 0);
+  const best = finite.length ? Math.min(...finite) : null;
+  let smallestName = "";
+  for (const n of rtNames) if (rssByName[n] != null && rssByName[n] === best) smallestName = n;
+  return { best, smallestName };
+}
+
+// The memory table rows: the startup probe (the runtime's floor footprint —
+// binary + realm, before any workload allocates) followed by each workload.
+// Peak RSS is reported absolute, not startup-subtracted: unlike wall-clock,
+// RSS does not subtract linearly (allocators reuse the startup pages).
+function memoryRows(workloads, startupRss) {
+  return [{ name: "(startup)", rssByRuntime: startupRss }, ...workloads.map((w) => ({ name: w.name, rssByRuntime: w.rssByRuntime }))];
+}
+
+function printMemoryTable(workloads, rtNames, mem) {
+  const COL = 13;
+  const nameW = Math.max(12, ...workloads.map((w) => w.name.length));
+  console.log(
+    `\nPeak memory (subprocess max RSS, median of ${mem.runs} dedicated run(s); via ${mem.strategy.label})`,
+  );
+  console.log("");
+  let header = pad("workload", nameW);
+  for (const n of rtNames) header += "  " + padLeft(n, COL);
+  header += "  " + padLeft("smallest", 9);
+  console.log(header);
+  console.log("-".repeat(header.length));
+  for (const row of memoryRows(workloads, mem.startupRss)) {
+    let line = pad(row.name, nameW);
+    const { best, smallestName } = rssBest(row.rssByRuntime, rtNames);
+    for (const n of rtNames) {
+      const rss = row.rssByRuntime[n];
+      if (rss == null) { line += "  " + padLeft("—", COL); continue; }
+      const factor = best ? rss / best : 1;
+      const cell = factor <= 1.001 ? fmtBytes(rss) : `${fmtBytes(rss)} ${factor.toFixed(1)}x`;
+      line += "  " + padLeft(cell, COL);
+    }
+    line += "  " + padLeft(smallestName, 9);
+    console.log(line);
+  }
+}
+
 // Stable HTML marker so CI can find-and-update its single sticky comment
 // instead of posting a new one every run.
 const MARKDOWN_MARKER = "<!-- chidori-js-benchmarks -->";
 
 // Render the results as a Markdown report (used for the PR comment).
-function renderMarkdown(workloads, runtimes, baselines, opts) {
+function renderMarkdown(workloads, runtimes, baselines, opts, mem) {
   const rtNames = runtimes.map((r) => r.name);
   const lines = [];
   lines.push(MARKDOWN_MARKER);
@@ -353,11 +514,33 @@ function renderMarkdown(workloads, runtimes, baselines, opts) {
     lines.push(`| ${w.name} | ${cells.join(" | ")} |`);
   }
   lines.push("");
+
+  // Table 3: peak memory (max RSS), smallest bolded, blow-up factors shown.
+  if (mem) {
+    lines.push(
+      `### Peak memory (subprocess max RSS, median of ${mem.runs} dedicated run(s))`,
+    );
+    lines.push("");
+    lines.push(`| workload | ${rtNames.join(" | ")} | smallest |`);
+    lines.push(`|${"---|".repeat(rtNames.length + 2)}`);
+    for (const row of memoryRows(workloads, mem.startupRss)) {
+      const { best, smallestName } = rssBest(row.rssByRuntime, rtNames);
+      const cells = rtNames.map((n) => {
+        const rss = row.rssByRuntime[n];
+        if (rss == null) return "—";
+        const factor = best ? rss / best : 1;
+        return factor <= 1.001 ? `**${fmtBytes(rss)}**` : `${fmtBytes(rss)} (${factor.toFixed(1)}×)`;
+      });
+      lines.push(`| ${row.name} | ${cells.join(" | ")} | ${smallestName} |`);
+    }
+    lines.push("");
+  }
+
   lines.push(
     "<sub>Numbers are machine- and load-dependent (shared CI runner) — read them " +
       "as ratios, not absolutes. chidori-js is an interpreter, so it trails the " +
-      "V8/JSC JITs on compute but starts far faster. A ⚠️ marks a workload whose " +
-      "result disagreed across runtimes.</sub>",
+      "V8/JSC JITs on compute but starts far faster and in far less memory. " +
+      "A ⚠️ marks a workload whose result disagreed across runtimes.</sub>",
   );
   return lines.join("\n") + "\n";
 }
@@ -378,18 +561,32 @@ async function main() {
   if (opts.filter) files = files.filter((f) => f.includes(opts.filter));
   if (files.length === 0) throw new Error("no workloads matched");
 
+  const memStrategy = opts.memory ? detectMemoryStrategy() : null;
+  if (opts.memory && !memStrategy) {
+    process.stderr.write(
+      "warning: no peak-RSS measurement available on this platform (need GNU/BSD `time` or Linux /proc) — memory table skipped\n",
+    );
+  }
+
   console.log(
     `chidori-js cross-runtime benchmarks\n` +
       `runtimes: ${runtimes.map((r) => r.name).join(", ")}  |  ` +
-      `runs: ${opts.runs}  warmup: ${opts.warmup}  workloads: ${files.length}`,
+      `runs: ${opts.runs}  warmup: ${opts.warmup}  workloads: ${files.length}  |  ` +
+      `memory: ${memStrategy ? memStrategy.label : "off"}`,
   );
 
   // Startup baseline per runtime (median of a few extra runs — it's cheap).
+  // With memory on, also probe startup peak RSS: the runtime's floor
+  // footprint before any workload allocates.
   const baselines = {};
+  const startupRss = {};
   const startupFile = join(WORKLOAD_DIR, "startup.js");
   for (const rt of runtimes) {
     const { median } = await timeWorkload(rt, startupFile, Math.max(opts.runs, 5), 1);
     baselines[rt.name] = median;
+    if (memStrategy) {
+      startupRss[rt.name] = await measureRss(memStrategy, rt, startupFile, opts.memRuns);
+    }
   }
 
   const workloads = [];
@@ -399,10 +596,14 @@ async function main() {
     const name = f.replace(/\.js$/, "");
     process.stderr.write(`  ${name} ... `);
     const byRuntime = {};
+    const rssByRuntime = {};
     const results = new Set();
     for (const rt of runtimes) {
       const r = await timeWorkload(rt, file, opts.runs, opts.warmup);
       byRuntime[rt.name] = r;
+      if (memStrategy) {
+        rssByRuntime[rt.name] = await measureRss(memStrategy, rt, file, opts.memRuns);
+      }
       results.add(r.result);
     }
     const agree = results.size === 1;
@@ -415,10 +616,13 @@ async function main() {
     } else {
       process.stderr.write("ok\n");
     }
-    workloads.push({ name, byRuntime, agree, result: [...results][0] });
+    workloads.push({ name, byRuntime, rssByRuntime, agree, result: [...results][0] });
   }
 
+  const mem = memStrategy ? { strategy: memStrategy, startupRss, runs: opts.memRuns } : null;
+
   printTable(workloads, runtimes, baselines);
+  if (mem) printMemoryTable(workloads, runtimes.map((r) => r.name), mem);
 
   if (mismatches > 0) {
     console.log(
@@ -429,9 +633,12 @@ async function main() {
   if (opts.json) {
     const payload = {
       generatedAt: new Date().toISOString(),
-      options: { runs: opts.runs, warmup: opts.warmup },
+      options: { runs: opts.runs, warmup: opts.warmup, memRuns: opts.memRuns },
       runtimes: runtimes.map((r) => ({ name: r.name, cmd: r.cmd })),
       baselinesMs: baselines,
+      memory: mem
+        ? { strategy: mem.strategy.label, startupRssBytes: startupRss }
+        : null,
       workloads: workloads.map((w) => ({
         name: w.name,
         agree: w.agree,
@@ -439,7 +646,14 @@ async function main() {
         runtimes: Object.fromEntries(
           Object.entries(w.byRuntime).map(([n, r]) => [
             n,
-            { median: r.median, min: r.min, max: r.max, mean: r.mean, samples: r.samples },
+            {
+              median: r.median,
+              min: r.min,
+              max: r.max,
+              mean: r.mean,
+              samples: r.samples,
+              maxRssBytes: mem ? (w.rssByRuntime[n] ?? null) : null,
+            },
           ]),
         ),
       })),
@@ -449,7 +663,7 @@ async function main() {
   }
 
   if (opts.markdown) {
-    writeFileSync(opts.markdown, renderMarkdown(workloads, runtimes, baselines, opts));
+    writeFileSync(opts.markdown, renderMarkdown(workloads, runtimes, baselines, opts, mem));
     console.log(`\nwrote ${opts.markdown}`);
   }
 

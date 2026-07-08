@@ -1,8 +1,10 @@
 name: JS benchmarks
 
 # Runs the chidori-js cross-runtime benchmark suite (chidori-js vs Node.js vs
-# Bun) on PRs that touch the engine, and posts the results table as a single
-# sticky comment on the PR (updated in place on each run, not re-posted).
+# Bun, wall-clock + peak memory) plus the in-process heap-utilization bench
+# (`cargo bench -p chidori-js --bench memory`) on PRs that touch the engine,
+# and posts the results tables as a single sticky comment on the PR (updated
+# in place on each run, not re-posted).
 #
 # These numbers come from a shared GitHub-hosted runner, so treat them as
 # ratios for a quick smell-test, not as a precise performance gate — the job
@@ -45,8 +47,23 @@ jobs:
         with:
           bun-version: latest
 
+      # GNU time gives the harness exact peak-RSS (ru_maxrss) for the memory
+      # table. Best-effort: without it the harness falls back to polling
+      # /proc/<pid>/status VmHWM, which is near-exact for these workloads.
+      - name: Install GNU time (exact peak-RSS measurement)
+        run: sudo apt-get install -y time || true
+
       - name: Build chidori-js run example (release)
         run: cargo build --release -p chidori-js --example run
+
+      # In-process heap numbers (tracking allocator: realm footprint, per-run
+      # peak/churn/retained, leak check). Deterministic byte counts, so unlike
+      # the timings they ARE comparable across runs; still informational only —
+      # the step fails solely if the bench itself errors.
+      - name: Run in-process memory benchmarks
+        run: |
+          set -o pipefail
+          cargo bench -p chidori-js --bench memory | tee memory-report.txt
 
       - name: Run cross-runtime benchmarks
         run: |
@@ -54,6 +71,19 @@ jobs:
             --no-build \
             --markdown benchmark-report.md \
             --json benchmark-report.json
+
+      # Fold the heap numbers into the same sticky-comment report, after the
+      # cross-runtime tables.
+      - name: Append memory report to Markdown report
+        run: |
+          {
+            echo ""
+            echo "### In-process heap utilization (exact bytes, tracking allocator)"
+            echo ""
+            echo '```'
+            cat memory-report.txt
+            echo '```'
+          } >> benchmark-report.md
 
       - name: Upload benchmark report
         if: always()
@@ -63,6 +93,7 @@ jobs:
           path: |
             benchmark-report.md
             benchmark-report.json
+            memory-report.txt
 
       # Post/update the sticky PR comment. Skipped for fork PRs (their token is
       # read-only and can't comment) and for manual workflow_dispatch runs.
