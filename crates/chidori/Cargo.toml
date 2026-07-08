@@ -96,6 +96,9 @@ opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 # `satisfies` in odd positions, and overload signatures. oxc parses to a real
 # AST and emits JS via codegen, so unsupported sugar can't slip through.
 oxc = { version = "0.133", features = ["transformer", "codegen", "semantic"] }
+nodejs-semver = "5.0.0"
+tar = "0.4.46"
+flate2 = "1.1.9"
 
 # Unix-only: apply per-process resource limits (setrlimit) and deadline-kill
 # (kill) to the OS-isolation worker child. See `runtime::isolate::limits`.

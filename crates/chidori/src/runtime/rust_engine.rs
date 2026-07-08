@@ -608,30 +608,15 @@ pub(crate) fn run_module(
     }
 }
 
-/// Resolve `specifier` relative to `importer_key`'s directory, read the file, and
-/// transpile it to ES module source — the host half of the rust engine's module
-/// loader (the linker lives in `chidori-js`).
+/// Resolve `specifier` from `importer_key` (relative for agent code, full
+/// Node-style resolution for bare npm specifiers and node_modules-internal
+/// imports), read the file, and produce ES module source — the host half of
+/// the rust engine's module loader (the linker lives in `chidori-js`).
 fn load_module_source(
     specifier: &str,
     importer_key: &str,
 ) -> std::result::Result<(String, String), String> {
-    let importer = Path::new(importer_key);
-    let dir = importer.parent().unwrap_or_else(|| Path::new("."));
-    let resolved =
-        crate::runtime::typescript::transpile::resolve_relative_import(importer, dir, specifier, 0)
-            .map_err(|e| e.to_string())?;
-    let key = resolved.to_string_lossy().to_string();
-    let src = std::fs::read_to_string(&resolved)
-        .map_err(|e| format!("reading module {}: {e}", resolved.display()))?;
-    let js = transpile_module(
-        &resolved,
-        &src,
-        &TranspileOptions {
-            import_policy: TypeScriptImportPolicy::Node,
-        },
-    )
-    .map_err(|e| e.to_string())?;
-    Ok((key, js))
+    crate::runtime::typescript::loader::load_module_source(specifier, importer_key)
 }
 
 /// The synchronous `__chidori_*` natives the `node:` builtin shims and the
